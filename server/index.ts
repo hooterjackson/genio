@@ -1,0 +1,535 @@
+import Fastify, { type FastifyRequest } from "fastify";
+import { CapabilityService, type CapabilitySessionView } from "./capabilities.ts";
+import { createGatewayVerifier, type GatewayIdentity } from "./gateway-auth.ts";
+import { createAppleDeveloperToken, assertOwner, encryptAppleUserToken } from "./owner.ts";
+import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog-import.ts";
+import { Repository } from "./repository.ts";
+import { HttpError, sha256Hex, stableStringify } from "./security.ts";
+import type { PlaylistBrief } from "../shared/types.ts";
+import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
+
+const MAX_BODY_BYTES = 64 * 1024;
+const repository = new Repository();
+const capabilities = new CapabilityService(repository);
+const verifyGateway = createGatewayVerifier(repository);
+const gatewayIdentities = new WeakMap<FastifyRequest, GatewayIdentity>();
+
+const app = Fastify({
+  bodyLimit: MAX_BODY_BYTES,
+  logger: {
+    level: process.env.LOG_LEVEL ?? "info",
+    redact: {
+      paths: [
+        "req.headers.authorization",
+        "req.headers.cookie",
+        "req.headers.x-needle-signature",
+        "req.headers.x-needle-owner-email",
+        "body.capabilityToken",
+        "body.token",
+        "body.musicUserToken",
+        "body.privateKey",
+        "res.headers.set-cookie",
+      ],
+      censor: "[REDACTED]",
+    },
+  },
+});
+
+app.removeContentTypeParser("application/json");
+app.addContentTypeParser("application/json", { parseAs: "buffer", bodyLimit: MAX_BODY_BYTES }, (request, body, done) => {
+  const raw = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  (request as FastifyRequest & { rawBody?: Buffer }).rawBody = raw;
+  if (raw.length === 0) return done(null, {});
+  try {
+    done(null, JSON.parse(raw.toString("utf8")));
+  } catch {
+    done(new HttpError(400, "Request body must be valid JSON", "invalid_json"), undefined);
+  }
+});
+
+app.addHook("onRequest", async (request, reply) => {
+  if (request.url.startsWith("/api/v1/")) {
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Referrer-Policy", "no-referrer");
+  }
+});
+
+app.addHook("preHandler", async (request) => {
+  if (!request.url.startsWith("/api/v1/")) return;
+  gatewayIdentities.set(request, await verifyGateway(request));
+});
+
+function identity(request: FastifyRequest): GatewayIdentity {
+  const value = gatewayIdentities.get(request);
+  if (!value) throw new HttpError(401, "Sites gateway authentication is required", "gateway_required");
+  return value;
+}
+
+function uuid(value: unknown, label = "ID"): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new HttpError(400, `${label} is invalid`, "invalid_id");
+  }
+  return value;
+}
+
+function idempotencyKey(request: FastifyRequest, bodyKey?: unknown): string {
+  const header = request.headers["idempotency-key"];
+  if (Array.isArray(header)) throw new HttpError(400, "Duplicate Idempotency-Key header", "invalid_idempotency_key");
+  const value = String(header ?? bodyKey ?? "").trim();
+  if (!/^[A-Za-z0-9._:-]{8,160}$/.test(value)) throw new HttpError(400, "Idempotency-Key is required", "invalid_idempotency_key");
+  if (bodyKey != null && String(bodyKey) !== value) throw new HttpError(400, "Idempotency keys do not match", "invalid_idempotency_key");
+  return value;
+}
+
+function isBrief(value: unknown): value is PlaylistBrief {
+  if (!value || typeof value !== "object") return false;
+  const brief = value as Partial<PlaylistBrief>;
+  const strings = (candidate: unknown, maxItems: number, maxLength: number) => Array.isArray(candidate) && candidate.length <= maxItems &&
+    candidate.every((item) => typeof item === "string" && item.length <= maxLength);
+  const target = brief.targetSize;
+  const validTarget = target === null || (Boolean(target) && Number.isInteger(target!.min) && Number.isInteger(target!.max) &&
+    target!.min >= 1 && target!.max >= target!.min && target!.max <= 10_000);
+  return typeof brief.title === "string" && brief.title.trim().length > 0 && brief.title.length <= 240 &&
+    typeof brief.description === "string" && brief.description.length <= 2_000 && ["exhaustive", "curated", "hybrid"].includes(String(brief.mode)) &&
+    strings(brief.subjectEntities, 50, 240) && typeof brief.relationship === "string" && brief.relationship.length <= 500 &&
+    strings(brief.include, 100, 500) && strings(brief.exclude, 100, 500) &&
+    typeof brief.versionPolicy === "string" && brief.versionPolicy.length <= 500 &&
+    typeof brief.evidencePolicy === "string" && brief.evidencePolicy.length <= 500 &&
+    typeof brief.orderingPolicy === "string" && brief.orderingPolicy.length > 0 && brief.orderingPolicy.length <= 500 &&
+    strings(brief.ambiguities, 50, 500) && validTarget;
+}
+
+async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
+  const session = await capabilities.authenticate(request);
+  if (session.accessId !== accessId) throw new HttpError(403, "This session cannot access that run", "capability_scope_mismatch");
+  return session;
+}
+
+async function requireWorkerForNewWork(): Promise<void> {
+  const required = process.env.REQUIRE_WORKER_HEARTBEAT === "true" || process.env.NODE_ENV === "production";
+  if (!required) return;
+  const health = await repository.getSystemHealth();
+  if (health.worker.stale) throw new HttpError(503, "Research worker is temporarily unavailable", "worker_unavailable");
+}
+
+async function assertNotPaused(kind: "research" | "publishing"): Promise<void> {
+  if (await repository.getSetting(`${kind}_paused`) === "true") {
+    throw new HttpError(503, `${kind === "research" ? "Research" : "Publishing"} is temporarily paused`, `${kind}_paused`);
+  }
+}
+
+async function enqueueResearchResume(runId: string): Promise<void> {
+  const saved = await repository.getResearchCheckpoint(runId, "resume") as {
+    phase?: string;
+    gapAttempt?: number;
+    generation?: number;
+  } | null;
+  const phase = saved?.phase ?? "scope_resolution";
+  const gapAttempt = Number.isInteger(saved?.gapAttempt) ? Number(saved!.gapAttempt) : 0;
+  const generation = Number.isInteger(saved?.generation) ? Number(saved!.generation) : 0;
+  const checkpoint = phase === "gap_analysis" ? `${phase}:${gapAttempt}` : phase;
+  await repository.enqueueJob({
+    kind: "research",
+    runId,
+    payload: { runId, phase, gapAttempt },
+    dedupeKey: `research:${runId}:${checkpoint}:g${generation}`,
+  });
+}
+
+app.get("/health/live", async () => ({ ok: true, service: "needle-api", version: process.env.RAILWAY_GIT_COMMIT_SHA ?? "development" }));
+
+app.get("/health/ready", async (_request, reply) => {
+  const ok = await repository.ping();
+  const schemaVersion = ok ? await repository.getSchemaVersion() : null;
+  if (!ok || schemaVersion !== DATABASE_SCHEMA_VERSION) return reply.code(503).send({ ok: false, database: ok, schemaVersion });
+  return { ok: true, database: true, schemaVersion };
+});
+
+app.get("/health/system", async (_request, reply) => {
+  try {
+    const health = await repository.getSystemHealth();
+    const schemaVersion = health.database.schemaVersion;
+    const ok = schemaVersion === DATABASE_SCHEMA_VERSION && !health.worker.stale;
+    return reply.code(ok ? 200 : 503).send({
+      ok,
+      database: schemaVersion === DATABASE_SCHEMA_VERSION ? "ready" : "schema_mismatch",
+      worker: health.worker.worker_id ? health.worker.stale ? "stale" : "healthy" : "missing",
+      paused: health.paused.research || health.paused.publishing,
+      queue: health.queue,
+      notifications: {
+        pending: health.notificationBacklog,
+        failed: health.notificationFailures,
+        oldestPendingSeconds: health.oldestNotificationSeconds,
+      },
+      publicationFailures: health.publicationFailures,
+      retention: health.retention,
+    });
+  } catch {
+    return reply.code(503).send({ ok: false, database: "down", worker: "unknown", paused: false });
+  }
+});
+
+app.get("/api/health", async () => ({ ok: await repository.ping(), service: "needle-hosted-api" }));
+
+app.get("/api/v1/system/health", async () => {
+  const health = await repository.getSystemHealth();
+  return {
+    ok: !health.worker.stale,
+    worker: { stale: health.worker.stale },
+    paused: health.paused,
+    queue: health.queue,
+    notifications: { pending: health.notificationBacklog, failed: health.notificationFailures },
+    publicationFailures: health.publicationFailures,
+    retention: health.retention,
+  };
+});
+
+app.post<{ Body: { prompt?: string; idempotencyKey?: string } }>("/api/v1/brief", async (request, reply) => {
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  const caller = identity(request);
+  const prompt = request.body?.prompt?.trim() ?? "";
+  const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
+  const created = await repository.createBriefRequest({
+    prompt,
+    model: process.env.OPENAI_MODEL ?? "gpt-5.6",
+    clientBucket: caller.clientBucket,
+    clientBucketAliases: caller.clientBucketAliases,
+    idempotencyKey: key,
+  });
+  if (created.created) {
+    await repository.enqueueJob({ kind: "brief", briefRequestId: created.id, payload: { briefRequestId: created.id }, dedupeKey: `brief:${created.id}` });
+  }
+  return reply.code(created.created ? 202 : 200).send({ requestId: created.id, status: created.status, pollAfterMs: 1_500 });
+});
+
+app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) => {
+  const brief = await repository.getBriefRequest(uuid(request.params.id, "Brief request ID"));
+  if (!brief) return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
+  if (!identity(request).clientBucketAliases.includes(brief.clientBucket)) {
+    return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
+  }
+  return {
+    requestId: brief.id,
+    status: brief.status,
+    brief: brief.status === "complete" ? brief.brief : undefined,
+    estimateUsd: brief.status === "complete" ? brief.estimateUsd : undefined,
+    error: brief.status === "failed" ? brief.error : undefined,
+  };
+});
+
+app.post<{ Body: { token?: string; capabilityToken?: string } }>("/api/v1/capabilities/exchange", async (request, reply) => {
+  const session = await capabilities.exchange(request.body?.token ?? request.body?.capabilityToken ?? "", reply);
+  return { runId: session.accessId, expiresAt: session.expiresAt.toISOString() };
+});
+
+app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKey?: string } }>("/api/v1/runs", async (request, reply) => {
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  const caller = identity(request);
+  const currentSession = await capabilities.authenticateOptional(request);
+  if (currentSession && await repository.hasActiveRunForSession(currentSession.id)) {
+    throw new HttpError(409, "Finish or delete the active run before starting another", "active_run_exists");
+  }
+  const briefRequestId = uuid(request.body?.briefRequestId, "Brief request ID");
+  const interpreted = await repository.getBriefRequest(briefRequestId);
+  if (!interpreted || interpreted.status !== "complete" || !isBrief(interpreted.brief)) {
+    throw new HttpError(409, "Playlist scope is not ready to confirm", "brief_not_ready");
+  }
+  if (!caller.clientBucketAliases.includes(interpreted.clientBucket)) {
+    throw new HttpError(404, "Brief request not found", "brief_not_found");
+  }
+  const brief = request.body?.brief ?? interpreted.brief;
+  if (!isBrief(brief)) throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  const created = await repository.createRunIdempotent({
+    prompt: interpreted.prompt,
+    brief,
+    estimateUsd: Number(interpreted.estimateUsd ?? 0),
+    approvedBudgetUsd: Number(interpreted.estimateUsd ?? 0) <= Number(process.env.AUTO_RUN_COST_LIMIT_USD ?? process.env.INITIAL_COST_GATE_USD ?? 5) ? Number(interpreted.estimateUsd ?? 0) : 0,
+    clientBucket: caller.clientBucket,
+    clientBucketAliases: caller.clientBucketAliases,
+    idempotencyKey: key,
+  });
+  if (created.created && created.status === "queued") {
+    await enqueueResearchResume(created.runId);
+  }
+  const capability = await capabilities.issue(created.runId, created.accessId);
+  const run = await repository.getRunByAccess(created.accessId);
+  return reply.code(created.created ? 201 : 200).send({ run, capability, reused: created.reused });
+});
+
+app.get<{ Params: { id: string } }>("/api/v1/runs/:id", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  await sessionForAccess(request, accessId);
+  const run = await repository.getRunByAccess(accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return run;
+});
+
+app.post<{ Params: { id: string } }>("/api/v1/runs/:id/capability", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  return { capability: await capabilities.issue(session.runId, accessId), expiresInSeconds: 1_800 };
+});
+
+app.post<{ Params: { id: string } }>("/api/v1/runs/:id/capabilities/transfer", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  return { capability: await capabilities.issue(session.runId, accessId), expiresAt: new Date(Date.now() + 1_800_000).toISOString() };
+});
+
+app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: string } }>("/api/v1/runs/:id/exceptions", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  return repository.listExceptions(session.runId, Number(request.query.page ?? 1), Number(request.query.pageSize ?? 20));
+});
+
+app.post<{ Params: { id: string }; Body: { candidateId?: string; decision?: "accepted" | "rejected"; catalogId?: string; song?: Record<string, unknown> } }>("/api/v1/runs/:id/review", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  const candidateId = uuid(request.body?.candidateId, "Candidate ID");
+  const decision = request.body?.decision;
+  if (decision !== "accepted" && decision !== "rejected") throw new HttpError(400, "Review decision is invalid", "invalid_review");
+  let song = request.body?.song;
+  if (!song && request.body?.catalogId) song = { id: request.body.catalogId };
+  const resultingStatus = await repository.reviewMatch(session.runId, candidateId, decision, song);
+  return { reviewed: true, candidateId, decision: resultingStatus };
+});
+
+app.post<{ Params: { id: string }; Body: { mode?: "reviewed" | "verified_only" } }>("/api/v1/runs/:id/manifest", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  return repository.createManifest(session.runId, { verifiedOnly: request.body?.mode === "verified_only" });
+});
+
+app.post<{ Params: { id: string }; Body: { manifestId?: string } }>("/api/v1/runs/:id/publish", async (request, reply) => {
+  await assertNotPaused("publishing");
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "publish", 10, 24);
+  const manifest = request.body?.manifestId
+    ? await repository.getManifestById(uuid(request.body.manifestId, "Manifest ID"))
+    : await repository.getLatestManifestForRun(session.runId);
+  if (!manifest || manifest.runId !== session.runId) throw new HttpError(409, "Lock a manifest before publishing", "manifest_not_ready");
+  const apple = await repository.getAppleAuthorization();
+  if (!apple || apple.status !== "valid") {
+    await repository.updateRun(session.runId, { status: "waiting_for_apple_authorization", phase: "apple_authorization" });
+    await repository.enqueueNotification("apple_reauthorization_required", { runId: session.runId, manifestId: manifest.id });
+    return reply.code(202).send({ run: await repository.getRunByAccess(accessId) });
+  }
+  await repository.updateRun(session.runId, { status: "publishing", phase: "publication_queued", error: null });
+  await repository.enqueueJob({ kind: "publication", runId: session.runId, payload: { runId: session.runId, manifestId: manifest.id }, dedupeKey: `publication:${manifest.id}` });
+  return reply.code(202).send({ run: await repository.getRunByAccess(accessId) });
+});
+
+app.get<{ Params: { id: string } }>("/api/v1/runs/:id/result", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  return repository.getPublicResult(session.runId);
+});
+
+app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: string } }>("/api/v1/runs/:id/evidence", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  return repository.getEvidenceReport(session.runId, Number(request.query.page ?? 1), Number(request.query.pageSize ?? 50));
+});
+
+app.delete<{ Params: { id: string } }>("/api/v1/runs/:id", async (request, reply) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  await repository.deleteRunAccess(accessId);
+  await capabilities.revoke(request, reply);
+  return reply.code(204).send();
+});
+
+function owner(request: FastifyRequest): string {
+  return assertOwner(identity(request));
+}
+
+app.get("/api/v1/owner/status", async (request) => {
+  owner(request);
+  const health = await repository.getSystemHealth();
+  return {
+    ok: !health.worker.stale,
+    paused: health.paused.research || health.paused.publishing,
+    database: "ready",
+    worker: health.worker.worker_id ? health.worker.stale ? "stale" : "healthy" : "missing",
+    apple: {
+      configured: health.apple.status !== "missing",
+      authorized: health.apple.status === "valid",
+      storefront: health.apple.storefront ?? null,
+      validatedAt: health.apple.lastValidatedAt ?? null,
+      needsReauthorization: health.apple.status === "reauthorization_required",
+    },
+    queuedJobs: health.queue.queued ?? 0,
+    activeJobs: health.queue.leased ?? 0,
+    queueAgeSeconds: health.queue.oldestQueuedSeconds ?? 0,
+    expiredLeases: health.queue.expiredLeases ?? 0,
+    failedJobs: health.queue.failed ?? 0,
+    monthSpendUsd: health.monthSpendUsd,
+    monthReservedUsd: health.monthReservedUsd,
+    notificationBacklog: health.notificationBacklog,
+    notificationFailures: health.notificationFailures,
+    oldestNotificationSeconds: health.oldestNotificationSeconds,
+    publicationFailures: health.publicationFailures,
+    orphanedPlaylists: health.orphanedPlaylists,
+    retention: health.retention,
+    configuration: {
+      openai: Boolean(process.env.OPENAI_API_KEY),
+      appleDeveloper: Boolean(process.env.APPLE_TEAM_ID && process.env.APPLE_KEY_ID && process.env.APPLE_MEDIA_ID && (process.env.APPLE_MUSICKIT_PRIVATE_KEY || process.env.APPLE_MUSICKIT_PRIVATE_KEY_BASE64)),
+      resend: Boolean(process.env.RESEND_API_KEY && (process.env.ALERT_EMAIL || process.env.OWNER_ALERT_EMAIL)),
+    },
+  };
+});
+
+app.get("/api/v1/owner/budgets", async (request) => {
+  owner(request);
+  return { runs: await repository.listAwaitingBudgets(), ceilingUsd: Number(process.env.APP_MONTHLY_COST_LIMIT_USD ?? process.env.MONTHLY_RESEARCH_CEILING_USD ?? 50) };
+});
+
+app.get<{ Querystring: { limit?: string } }>("/api/v1/owner/runs", async (request) => {
+  owner(request);
+  return { runs: await repository.listRecentRuns(Number(request.query.limit ?? 50)) };
+});
+
+app.post<{ Params: { id: string } }>("/api/v1/owner/runs/:id/refresh", async (request) => {
+  const email = owner(request);
+  const runId = uuid(request.params.id, "Run ID");
+  const result = await repository.invalidateRunReuse(runId, email);
+  return { invalidated: true, invalidatedAt: result.invalidatedAt };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { format?: "json" | "csv"; data?: unknown };
+}>("/api/v1/owner/runs/:id/catalog-import", async (request) => {
+  const email = owner(request);
+  const runId = uuid(request.params.id, "Run ID");
+  const parsed = parseOwnerCatalogImport({ format: request.body?.format, data: request.body?.data });
+  // A structurally valid owner catalogue is a discovery input, not proof that
+  // its linked pages support each assertion. Imported claims remain inferred.
+  const importCandidates = unverifiedImportedCandidates(parsed.candidates);
+  const importHash = sha256Hex(stableStringify({ sources: parsed.sources, candidates: importCandidates }));
+  const { newlyAdded } = await repository.importOwnerCatalog({
+    runId,
+    actor: email,
+    importHash,
+    sources: parsed.sources,
+    candidates: importCandidates,
+  });
+  return {
+    imported: true,
+    importHash,
+    sourceCount: parsed.sources.length,
+    candidateCount: parsed.candidates.length,
+    newlyAdded,
+    evidenceState: "inferred",
+  };
+});
+
+app.post<{ Params: { id: string }; Body: { decision?: "approve" | "cancel"; approvedBudgetUsd?: number } }>("/api/v1/owner/runs/:id/budget", async (request) => {
+  const email = owner(request);
+  const runId = uuid(request.params.id, "Run ID");
+  if (request.body?.decision === "cancel") {
+    await repository.cancelRun(runId);
+    await repository.recordAudit(email, "run.budget_cancelled", {}, runId);
+    return { cancelled: true };
+  }
+  if (request.body?.decision !== "approve") throw new HttpError(400, "Budget decision is invalid", "invalid_budget_decision");
+  const approved = Number(request.body.approvedBudgetUsd);
+  await repository.approveRunBudget(runId, approved);
+  await enqueueResearchResume(runId);
+  await repository.recordAudit(email, "run.budget_approved", { approvedBudgetUsd: approved }, runId);
+  return { approved: true, run: await repository.getRun(runId) };
+});
+
+app.post<{ Body: { paused?: boolean; researchPaused?: boolean; publishingPaused?: boolean } }>("/api/v1/owner/emergency-pause", async (request) => {
+  const email = owner(request);
+  const fallback = Boolean(request.body?.paused);
+  const researchPaused = request.body?.researchPaused ?? fallback;
+  const publishingPaused = request.body?.publishingPaused ?? fallback;
+  await repository.setSetting("research_paused", String(Boolean(researchPaused)));
+  await repository.setSetting("publishing_paused", String(Boolean(publishingPaused)));
+  await repository.recordAudit(email, "system.pause_changed", { researchPaused, publishingPaused });
+  return { researchPaused: Boolean(researchPaused), publishingPaused: Boolean(publishingPaused) };
+});
+
+app.get("/api/v1/owner/apple/developer-token", async (request) => {
+  owner(request);
+  return createAppleDeveloperToken();
+});
+
+app.get("/api/v1/owner/apple/authorization", async (request) => {
+  owner(request);
+  const authorization = await repository.getAppleAuthorization();
+  return authorization ? {
+    configured: true,
+    status: authorization.status,
+    storefront: authorization.storefront,
+    lastValidatedAt: authorization.lastValidatedAt?.toISOString() ?? null,
+    lastError: authorization.lastError,
+  } : { configured: false, status: "missing" };
+});
+
+app.post<{ Body: { musicUserToken?: string; storefront?: string } }>("/api/v1/owner/apple/authorization", async (request, reply) => {
+  const email = owner(request);
+  const encrypted = encryptAppleUserToken(request.body?.musicUserToken ?? "", request.body?.storefront ?? "");
+  await repository.saveAppleAuthorization(encrypted);
+  await repository.enqueueJob({ kind: "apple_authorization", payload: {}, dedupeKey: `apple-authorization:${Date.now()}` });
+  await repository.recordAudit(email, "apple.authorization_saved", { storefront: encrypted.storefront });
+  return reply.code(202).send({ configured: true, status: "unverified", storefront: encrypted.storefront });
+});
+
+app.delete("/api/v1/owner/apple/authorization", async (request) => {
+  const email = owner(request);
+  await repository.revokeAppleAuthorization();
+  await repository.recordAudit(email, "apple.authorization_revoked");
+  return { configured: false, status: "missing" };
+});
+
+app.get("/api/v1/owner/publications/orphans", async (request) => {
+  owner(request);
+  return { items: await repository.listOrphanPlaylists() };
+});
+
+app.post<{ Body: { limit?: number } }>("/api/v1/owner/retention/run", async (request) => {
+  const email = owner(request);
+  const purged = await repository.runRetentionSweep(Number(request.body?.limit ?? 50));
+  await repository.recordAudit(email, "retention.sweep", { purged });
+  return { purged };
+});
+
+app.setErrorHandler((error, request, reply) => {
+  const errorRecord = typeof error === "object" && error !== null ? error as { statusCode?: unknown; message?: unknown } : {};
+  const hintedStatus = typeof errorRecord.statusCode === "number" ? errorRecord.statusCode : null;
+  const statusCode = error instanceof HttpError
+    ? error.statusCode
+    : hintedStatus !== null && hintedStatus >= 400 && hintedStatus < 500
+      ? hintedStatus
+      : 500;
+  const code = error instanceof HttpError ? error.code : statusCode === 500 ? "internal_error" : "request_error";
+  if (statusCode >= 500) request.log.error({ err: error }, "request failed");
+  else request.log.info({ code, statusCode }, "request rejected");
+  const message = statusCode >= 500 ? "Needle could not complete that request" : typeof errorRecord.message === "string" ? errorRecord.message : "Request rejected";
+  reply.code(statusCode).send({ error: message, code });
+});
+
+const port = Number(process.env.PORT ?? 8788);
+await app.listen({ port, host: "::" });
+
+async function shutdown(signal: string): Promise<void> {
+  app.log.info({ signal }, "shutting down");
+  await app.close();
+  await repository.close();
+  process.exit(0);
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));

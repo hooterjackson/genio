@@ -1,0 +1,21 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "RAILPACK",
+    "buildCommand": "pnpm run build:server"
+  },
+  "deploy": {
+    "preDeployCommand": ["pnpm run db:migrate"],
+    "startCommand": "pnpm run start:api",
+    "healthcheckPath": "/health/ready",
+    "healthcheckTimeout": 120,
+    "restartPolicyType": "ALWAYS",
+    "multiRegionConfig": {
+      "us-east4-eqdc4a": {
+        "numReplicas": 1
+      }
+    },
+    "overlapSeconds": "30",
+    "drainingSeconds": "15"
+  }
+}

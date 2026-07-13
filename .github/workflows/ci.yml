@@ -1,0 +1,54 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: ci-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:migrate
+      - run: pnpm test
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps chromium webkit
+      - run: pnpm test:e2e

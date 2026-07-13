@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["app/**/*.ts", "app/**/*.tsx", "shared/**/*.ts"],
+  "exclude": ["server", "db", "worker", "tests"]
+}

@@ -1,0 +1,21 @@
+{
+  "version": "2026-07-12",
+  "note": "Frozen regression seed maintained separately from runtime research. Expand through independent liner-note review before claiming benchmark completeness.",
+  "paulinho_da_costa": [
+    { "artist": "Michael Jackson", "title": "Bad", "source": "https://musicbrainz.org/release/8f828464-57b8-404e-88c1-3a97cadea308" },
+    { "artist": "Belinda Carlisle", "title": "In Too Deep", "source": "https://musicbrainz.org/release/c3885330-b940-356a-9d89-fda5cfd9137d" },
+    { "artist": "Phil Collins", "title": "Two Hearts", "source": "https://musicbrainz.org/release/fa82cd13-6949-4fd4-90f6-dcc55236ee5a" },
+    { "artist": "Anita Baker", "title": "Talk to Me", "source": "https://musicbrainz.org/release/1ba02e9d-95bb-4997-b4d8-8f7d8033c12e" }
+  ],
+  "michael_jackson": [
+    { "artist": "Michael Jackson", "title": "Don't Stop 'Til You Get Enough" },
+    { "artist": "Michael Jackson", "title": "Billie Jean" },
+    { "artist": "Michael Jackson", "title": "Human Nature" },
+    { "artist": "Michael Jackson", "title": "Smooth Criminal" }
+  ],
+  "berlin_techno_rubric": {
+    "targetMin": 50,
+    "targetMax": 100,
+    "dimensions": ["citation quality", "historical relevance", "Berlin scene fit", "era diversity", "artist diversity", "duplicate avoidance", "playlist coherence"]
+  }
+}

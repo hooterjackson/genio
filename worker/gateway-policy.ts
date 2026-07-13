@@ -1,0 +1,40 @@
+export type GatewayRouteRule = {
+  method: "GET" | "POST" | "DELETE";
+  path: RegExp;
+  owner?: boolean;
+};
+
+const ROUTE_RULES: readonly GatewayRouteRule[] = [
+  { method: "POST", path: /^\/api\/v1\/brief$/ },
+  { method: "GET", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },
+  { method: "POST", path: /^\/api\/v1\/capabilities\/exchange$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/capabilities\/transfer$/ },
+  { method: "POST", path: /^\/api\/v1\/runs$/ },
+  { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
+  { method: "DELETE", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
+  { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/exceptions$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/review$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/manifest$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/publish$/ },
+  { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/result$/ },
+  { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/evidence$/ },
+  { method: "GET", path: /^\/api\/v1\/owner\/(?:status|budgets|runs|apple\/developer-token|apple\/authorization|publications\/orphans)$/, owner: true },
+  { method: "POST", path: /^\/api\/v1\/owner\/(?:emergency-pause|retention\/run|apple\/authorization)$/, owner: true },
+  { method: "POST", path: /^\/api\/v1\/owner\/runs\/[A-Za-z0-9_-]+\/(?:refresh|catalog-import|budget)$/, owner: true },
+  { method: "DELETE", path: /^\/api\/v1\/owner\/apple\/authorization$/, owner: true },
+];
+
+export function matchGatewayRoute(method: string, pathname: string): GatewayRouteRule | null {
+  const normalized = method.toUpperCase();
+  return ROUTE_RULES.find((rule) => rule.method === normalized && rule.path.test(pathname)) ?? null;
+}
+
+export function isCrossSiteMutation(input: {
+  method: string;
+  origin: string | null;
+  expectedOrigin: string;
+  fetchSite: string | null;
+}): boolean {
+  if (!['POST', 'DELETE'].includes(input.method.toUpperCase())) return false;
+  return Boolean((input.origin && input.origin !== input.expectedOrigin) || input.fetchSite === "cross-site");
+}
