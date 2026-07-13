@@ -1,7 +1,7 @@
 /** Cloudflare Sites entry point and the only browser-to-Railway gateway. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-import { isCrossSiteMutation, matchGatewayRoute } from "./gateway-policy.ts";
+import { forwardedCapabilityCookie, isCrossSiteMutation, matchGatewayRoute } from "./gateway-policy.ts";
 
 interface Env {
   ASSETS: Fetcher;
@@ -298,7 +298,12 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
   });
   if (ownerEmail) headers.set("X-Needle-Owner-Email", ownerEmail);
 
-  const cookie = request.headers.get("cookie");
+  let cookie: string | null;
+  try {
+    cookie = forwardedCapabilityCookie(request.headers.get("cookie"), !isLocal);
+  } catch (caught) {
+    return jsonError(400, caught instanceof Error ? caught.message : "Needle capability cookie is invalid.");
+  }
   const idempotencyKey = request.headers.get("idempotency-key");
   if (contentType && body.byteLength > 0) headers.set("Content-Type", contentType);
   if (cookie) headers.set("Cookie", cookie);

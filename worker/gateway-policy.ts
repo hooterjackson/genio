@@ -38,3 +38,20 @@ export function isCrossSiteMutation(input: {
   if (!['POST', 'DELETE'].includes(input.method.toUpperCase())) return false;
   return Boolean((input.origin && input.origin !== input.expectedOrigin) || input.fetchSite === "cross-site");
 }
+
+export function forwardedCapabilityCookie(cookieHeader: string | null, production: boolean): string | null {
+  if (!cookieHeader) return null;
+  const expectedName = production ? "__Host-needle-session" : "needle-session";
+  const matches = cookieHeader.split(";").flatMap((part) => {
+    const trimmed = part.trim();
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0) return [];
+    const name = trimmed.slice(0, separator).trim();
+    const value = trimmed.slice(separator + 1).trim();
+    if (name !== expectedName) return [];
+    if (!value || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("Needle capability cookie is invalid");
+    return [`${expectedName}=${value}`];
+  });
+  if (matches.length > 1) throw new Error("Duplicate Needle capability cookies are not allowed");
+  return matches[0] ?? null;
+}

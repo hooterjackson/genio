@@ -1161,11 +1161,24 @@ export class Repository {
       const active = await client.query<{ count: number }>("SELECT count(*)::int count FROM job_queue WHERE status='leased' AND lease_expires_at>now()");
       if (active.rows[0]!.count >= capacity) return null;
       const selected = await client.query(
-        `SELECT * FROM job_queue WHERE
-           ((status='queued' AND available_at<=now()) OR (status='leased' AND lease_expires_at<=now()))
-           AND NOT (kind IN ('brief','research','matching') AND COALESCE((SELECT value='true' FROM settings WHERE key='research_paused'),false))
-           AND NOT (kind='publication' AND COALESCE((SELECT value='true' FROM settings WHERE key='publishing_paused'),false))
-           AND attempts<max_attempts ORDER BY available_at,created_at FOR UPDATE SKIP LOCKED LIMIT 1`,
+        `SELECT candidate.* FROM job_queue candidate WHERE
+           ((candidate.status='queued' AND candidate.available_at<=now()) OR (candidate.status='leased' AND candidate.lease_expires_at<=now()))
+           AND NOT (candidate.kind IN ('brief','research','matching') AND COALESCE((SELECT value='true' FROM settings WHERE key='research_paused'),false))
+           AND NOT (candidate.kind='publication' AND COALESCE((SELECT value='true' FROM settings WHERE key='publishing_paused'),false))
+           AND NOT (
+             candidate.kind='publication'
+             AND candidate.payload_json->>'manifestId' IS NOT NULL
+             AND EXISTS (
+               SELECT 1 FROM job_queue active_publication
+               WHERE active_publication.id<>candidate.id
+                 AND active_publication.kind='publication'
+                 AND active_publication.status='leased'
+                 AND active_publication.lease_expires_at>now()
+                 AND active_publication.payload_json->>'manifestId'=candidate.payload_json->>'manifestId'
+             )
+           )
+           AND candidate.attempts<candidate.max_attempts
+           ORDER BY candidate.available_at,candidate.created_at FOR UPDATE OF candidate SKIP LOCKED LIMIT 1`,
       );
       const job = selected.rows[0];
       if (!job) return null;

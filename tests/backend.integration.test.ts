@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { Pool } from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { createDatabase } from "../db/index.ts";
 import { CapabilityService, CAPABILITY_COOKIE } from "../server/capabilities.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
@@ -95,6 +95,16 @@ databaseDescribe("hosted backend integration", () => {
     await applyMigration(handle.pool);
     repository = new Repository(handle);
   }, 30_000);
+
+  beforeEach(async () => {
+    await repository.pool.query(`DO $$
+      DECLARE table_name text;
+      BEGIN
+        FOR table_name IN SELECT tablename FROM pg_tables WHERE schemaname=current_schema() LOOP
+          EXECUTE format('TRUNCATE TABLE %I.%I CASCADE', current_schema(), table_name);
+        END LOOP;
+      END $$`);
+  });
 
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -513,6 +523,29 @@ databaseDescribe("hosted backend integration", () => {
       [finalAttempt.id],
     );
     expect(revived.rows[0]).toMatchObject({ status: "queued", attempts: 0, max_attempts: 3, payload_json: { safeRetry: true } });
+  });
+
+  test("never leases two publication jobs for the same manifest concurrently", async () => {
+    vi.stubEnv("WORKER_CONCURRENCY", "2");
+    const runId = await repository.createRun("Publication serialization", brief, 0, 1);
+    const manifestId = randomUUID();
+    await repository.enqueueJob({
+      kind: "publication",
+      runId,
+      payload: { manifestId },
+      dedupeKey: `publication:${manifestId}`,
+    });
+    await repository.enqueueJob({
+      kind: "publication",
+      runId,
+      payload: { manifestId },
+      dedupeKey: `publication:${manifestId}:reauth`,
+    });
+    const first = await repository.leaseNextJob("publisher-one", 60_000);
+    expect(first).toMatchObject({ kind: "publication" });
+    await expect(repository.leaseNextJob("publisher-two", 60_000)).resolves.toBeNull();
+    await repository.completeJob(first!.id, "publisher-one");
+    await expect(repository.leaseNextJob("publisher-two", 60_000)).resolves.toMatchObject({ kind: "publication" });
   });
 
   test("exchanges capabilities once and rejects revoked sessions", async () => {

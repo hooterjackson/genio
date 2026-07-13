@@ -20,7 +20,10 @@ const apiVariables = preserved([
   "MAX_GLOBAL_NONTERMINAL_RUNS",
   "COST_TIMEZONE",
   "DATABASE_URL",
+  "APP_ORIGIN",
   "GATEWAY_KEY_ID",
+  "GATEWAY_PREVIOUS_KEY_ID",
+  "GATEWAY_PREVIOUS_HMAC_SECRET",
   "OWNER_EMAIL",
   "RUN_LIMIT_PER_24H",
   "APPLE_MUSICKIT_PRIVATE_KEY_BASE64",
@@ -58,6 +61,9 @@ const workerVariables = preserved([
   "WORKER_RENEW_SECONDS",
   "WORKER_STALE_SECONDS",
   "OPENAI_API_KEY",
+  "DISCOGS_TOKEN",
+  "RESEND_API_KEY",
+  "RESEND_FROM",
   "APPLE_MEDIA_ID",
   "APPLE_MUSICKIT_PRIVATE_KEY_BASE64",
   "APPLE_KEY_ID",
@@ -66,11 +72,11 @@ const workerVariables = preserved([
 ] as const);
 
 export default defineRailway(() => {
-  const Postgres = postgres("Postgres", { region: "us-east" });
+  const Postgres = postgres("Postgres", { region: "us-west2" });
   const postgresVolume = volume("postgres-volume", {
     alerts: { usage: { "80": {}, "95": {}, "100": {} } },
     allowOnlineResize: true,
-    region: "us-east",
+    region: "us-west2",
     sizeMB: 500,
   });
   const needleWorker = service("needle-worker", {
@@ -81,7 +87,7 @@ export default defineRailway(() => {
       restartPolicyType: "ALWAYS",
       drainingSeconds: 30,
     },
-    replicas: { "us-east": 1 },
+    replicas: { "us-west2": 1 },
     variables: workerVariables,
   });
   const needleApi = service("needle-api", {
@@ -96,7 +102,7 @@ export default defineRailway(() => {
       overlapSeconds: 30,
       drainingSeconds: 15,
     },
-    replicas: { "us-east": 1 },
+    replicas: { "us-west2": 1 },
     variables: apiVariables,
   });
 

@@ -7,9 +7,9 @@ Use one Railway project with separate staging and production environments:
 | Service | Exposure | Config | Responsibility |
 | --- | --- | --- | --- |
 | Sites | Public custom domain | `.openai/hosting.json` | UI, owner identity, client bucket, signed gateway |
-| `needle-api` | Public Railway HTTPS | `railway.api.json` | Validate/enqueue/read state |
-| `needle-worker` | Railway private network | `railway.worker.json` | Durable paid jobs and deterministic publication |
-| Postgres | Railway private network | Railway service | Authoritative state, leases, cost ledger |
+| `needle-api` | Public Railway HTTPS | `.railway/railway.ts` | Validate/enqueue/read state |
+| `needle-worker` | Railway private network | `.railway/railway.ts` | Durable paid jobs and deterministic publication |
+| Postgres | Railway private network | `.railway/railway.ts` | Authoritative state, leases, cost ledger |
 
 Sites cannot address Railway's private network, so only the API receives a Railway public domain. The API accepts the fixed `/api/v1` route allowlist only after validating the Sites HMAC. Do not expose the worker.
 
@@ -18,7 +18,7 @@ Sites cannot address Railway's private network, so only the API receives a Railw
 1. Create a private source repository and require tests and build checks before merge.
 2. Create the Railway project, staging/production environments, Postgres, API, and worker.
 3. Give both app services the internal `DATABASE_URL`; give only the API a public Railway domain.
-4. Set the API service config path to `/railway.api.json` and the worker path to `/railway.worker.json`.
+4. Preview and apply `.railway/railway.ts`; it is the only Railway configuration source for both services and Postgres.
 5. Enable seven-day Postgres point-in-time recovery before sharing the URL.
 6. Create the Sites project, attach the chosen custom domain, and set Sites gateway secrets.
 7. Add DNS records for Sites and Resend. Set Apple Music browser origins to the exact HTTPS custom origin.

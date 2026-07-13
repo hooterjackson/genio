@@ -2,13 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-
-type MusicKitApi = {
-  configure(options: Record<string, unknown>): Promise<void> | void;
-  getInstance(): {
-    authorize(): Promise<string>;
-  };
-};
+import { configureFreshMusicKit, type MusicKitApi } from "../music-kit.ts";
 
 type OwnerHealth = {
   ok: boolean;
@@ -267,19 +261,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     try {
       const token = await ownerApi<AppleTokenResponse>("/api/v1/owner/apple/developer-token");
       const MusicKit = await loadMusicKit();
-      let music: ReturnType<MusicKitApi["getInstance"]> | null = null;
-      try {
-        music = MusicKit.getInstance();
-      } catch {
-        music = null;
-      }
-      if (!music) {
-        await MusicKit.configure({
-          developerToken: token.developerToken,
-          app: { name: "Needle", build: "1.0.0" },
-        });
-        music = MusicKit.getInstance();
-      }
+      const music = await configureFreshMusicKit(MusicKit, token.developerToken);
       const musicUserToken = await music.authorize();
       const storefrontResponse = await fetch("https://api.music.apple.com/v1/me/storefront", {
         headers: {

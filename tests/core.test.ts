@@ -6,7 +6,7 @@ import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gatewa
 import { manifestContentHash } from "../server/publisher.ts";
 import { playlistShareUrl } from "../server/apple.ts";
 import { assertConfiguredAppleStorefront } from "../server/owner.ts";
-import { isCrossSiteMutation, matchGatewayRoute } from "../worker/gateway-policy.ts";
+import { forwardedCapabilityCookie, isCrossSiteMutation, matchGatewayRoute } from "../worker/gateway-policy.ts";
 import { readFileSync } from "node:fs";
 
 test("normalizes accents, punctuation, and featured artist markers", () => {
@@ -125,6 +125,20 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
     expectedOrigin: "https://needle.example",
     fetchSite: "same-origin",
   })).toBe(false);
+});
+
+test("Sites forwards only Needle's capability cookie across the Railway boundary", () => {
+  expect(forwardedCapabilityCookie(
+    "chatgpt-session=private; __Host-needle-session=capability-token; analytics=tracking",
+    true,
+  )).toBe("__Host-needle-session=capability-token");
+  expect(forwardedCapabilityCookie("needle-session=local-token; unrelated=private", false))
+    .toBe("needle-session=local-token");
+  expect(forwardedCapabilityCookie("chatgpt-session=private", true)).toBeNull();
+  expect(() => forwardedCapabilityCookie(
+    "__Host-needle-session=one; __Host-needle-session=two",
+    true,
+  )).toThrow(/Duplicate Needle capability cookies/);
 });
 
 test("Railway gateway rejects stale, body-tampered, signature-tampered, and replayed requests", async () => {
