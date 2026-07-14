@@ -1056,7 +1056,12 @@ databaseDescribe("hosted backend integration", () => {
       code: "invalid_capability",
     });
     await expect(repository.getRunByAccess(created.accessId)).resolves.toBeNull();
-    await expect(repository.getRun(created.runId)).resolves.toMatchObject({ status: "deleted", phase: "visitor_deleted" });
+    await expect(repository.getRun(created.runId)).rejects.toMatchObject({ statusCode: 404, code: "run_not_found" });
+    const tombstone = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM retention_tombstones WHERE run_id=$1",
+      [created.runId],
+    );
+    expect(tombstone.rows[0]?.count).toBe(1);
     const remaining = await repository.pool.query<{ tokens: number; active_sessions: number }>(
       `SELECT
          (SELECT count(*)::int FROM capability_tokens WHERE access_id=$1) tokens,
