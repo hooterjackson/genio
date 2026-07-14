@@ -68,8 +68,11 @@ describe("playlist brief policy", () => {
   });
 
   test("prices the confirmed brief mode rather than trusting a stale interpretation estimate", () => {
-    expect(estimateResearchCost(brief("curated"))).toBe(1.5);
-    expect(estimateResearchCost(brief("hybrid"))).toBe(3);
+    expect(estimateResearchCost(brief("curated"))).toBe(5);
+    expect(estimateResearchCost({ ...brief("hybrid"), targetSize: { min: 3, max: 3 } })).toBe(5);
+    expect(estimateResearchCost({ ...brief("hybrid"), targetSize: { min: 1, max: 100 } })).toBe(5);
+    expect(estimateResearchCost(brief("hybrid"))).toBe(8);
+    expect(estimateResearchCost({ ...brief("hybrid"), targetSize: { min: 1, max: 101 } })).toBe(8);
     expect(estimateResearchCost(brief("exhaustive"))).toBe(8);
   });
 });

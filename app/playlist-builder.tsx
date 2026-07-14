@@ -584,7 +584,7 @@ function BriefScreen({
       <div className="screen-actions">
         <button className="quiet-button" onClick={onBack}>← EDIT REQUEST</button>
         <div className="estimate">
-          <span>{cached ? "CACHED RESULT" : "ESTIMATED MAX"}</span>
+          <span>{cached ? "CACHED RESULT" : "INITIAL COST EST."}</span>
           <strong>{cached ? "$0.00" : money(estimate)}</strong>
         </div>
         <button className="action-button" onClick={onStart} disabled={busy}>
