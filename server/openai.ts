@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { PlaylistBrief } from "../shared/types.ts";
 import { normalizeBriefTarget } from "./brief-policy.ts";
 import { requireSecret } from "./secrets.ts";
+import { readCostConfiguration } from "./cost-config.ts";
+import { boundedResponseText } from "./bounded-response.ts";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -60,10 +62,11 @@ function retryDelay(response: Response | null, attempt: number): number {
 }
 
 async function boundedJson(response: Response): Promise<any> {
-  const declared = Number(response.headers.get("content-length") ?? 0);
-  if (declared > MAX_RESPONSE_BYTES) throw new Error("OpenAI response exceeded the configured size limit");
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) throw new Error("OpenAI response exceeded the configured size limit");
+  const text = await boundedResponseText(
+    response,
+    MAX_RESPONSE_BYTES,
+    "OpenAI response exceeded the configured size limit",
+  );
   if (!text) return {};
   try { return JSON.parse(text); } catch { throw new Error("OpenAI returned malformed JSON"); }
 }
@@ -255,8 +258,11 @@ export function responseCostUsd(response: any): number {
   const input = Number(response.usage?.input_tokens ?? 0);
   const output = Number(response.usage?.output_tokens ?? 0);
   const webCalls = (response.output ?? []).filter((item: any) => item.type === "web_search_call").length;
-  const inputRate = Number(process.env.OPENAI_INPUT_USD_PER_MILLION ?? 5);
-  const outputRate = Number(process.env.OPENAI_OUTPUT_USD_PER_MILLION ?? 30);
-  const webRate = Number(process.env.OPENAI_WEB_SEARCH_USD ?? 0.01);
-  return input / 1_000_000 * inputRate + output / 1_000_000 * outputRate + webCalls * webRate;
+  if (!Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0) {
+    throw new Error("OpenAI returned invalid usage accounting");
+  }
+  const pricing = readCostConfiguration();
+  return input / 1_000_000 * pricing.openAIInputUsdPerMillion
+    + output / 1_000_000 * pricing.openAIOutputUsdPerMillion
+    + webCalls * pricing.openAIWebSearchUsd;
 }

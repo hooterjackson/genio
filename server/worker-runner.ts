@@ -17,6 +17,8 @@ import {
   createPublicationRepositoryFacade,
   createResearchRepositoryFacade,
 } from "./worker-facades.ts";
+import { failureContextForJob, sanitizeFailure } from "./error-sanitizer.ts";
+import { readCostConfiguration } from "./cost-config.ts";
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_RENEW_MS = 60_000;
@@ -118,6 +120,7 @@ export function defaultJobHandlers(repository: WorkerRepository): Record<string,
 }
 
 export function assertProductionWorkerSecrets(environment: NodeJS.ProcessEnv = process.env): void {
+  readCostConfiguration(environment);
   if (environment.NODE_ENV !== "production") return;
   const required = [
     "OPENAI_API_KEY",
@@ -175,16 +178,14 @@ export class WorkerRunner {
     await this.heartbeat();
     await this.enforceControls();
     this.heartbeatTimer = setInterval(() => {
-      void this.heartbeat().catch((error) => {
-        const message = error instanceof Error ? error.message : "heartbeat failed";
-        process.stderr.write(`[needle-worker] heartbeat: ${message}\n`);
+      void this.heartbeat().catch(() => {
+        process.stderr.write("[needle-worker] heartbeat failed; private diagnostics were suppressed\n");
       });
     }, this.heartbeatMs);
     this.heartbeatTimer.unref?.();
     this.controlTimer = setInterval(() => {
-      void this.enforceControls().catch((error) => {
-        const message = error instanceof Error ? error.message : "control check failed";
-        process.stderr.write(`[needle-worker] controls: ${message}\n`);
+      void this.enforceControls().catch(() => {
+        process.stderr.write("[needle-worker] control check failed; private diagnostics were suppressed\n");
       });
     }, this.controlIntervalMs);
     this.controlTimer.unref?.();
@@ -200,9 +201,8 @@ export class WorkerRunner {
           const active = { promise: Promise.resolve(), controller, job, controlAction: null as "pause" | "cancel" | null };
           this.active.set(job.id, active);
           const promise = this.execute(job, controller)
-            .catch((error) => {
-              const message = error instanceof Error ? error.message : "job finalization failed";
-              process.stderr.write(`[needle-worker] job ${job.id} finalization: ${message}\n`);
+            .catch(() => {
+              process.stderr.write(`[needle-worker] job ${job.id} finalization failed; private diagnostics were suppressed\n`);
             })
             .finally(() => {
               if (this.active.get(job.id) === active) this.active.delete(job.id);
@@ -340,7 +340,7 @@ export class WorkerRunner {
         await this.repository.deferJob(job.id, this.workerId, new Date(Date.now() + 60_000), reason);
         return;
       }
-      const message = error instanceof Error ? error.message.slice(0, 1_000) : "Job failed";
+      const message = sanitizeFailure(error, failureContextForJob(job.kind));
       const retryAt = error instanceof NonRetriableJobError ? null : retryAtFor(job);
       await this.repository.failJob(
         job.id,
@@ -395,9 +395,8 @@ async function runExecutableWorker(): Promise<void> {
 
 const isMainModule = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]!).href;
 if (isMainModule) {
-  runExecutableWorker().catch((error) => {
-    const message = error instanceof Error ? error.message : "Unknown worker failure";
-    process.stderr.write(`[needle-worker] fatal: ${message}\n`);
+  runExecutableWorker().catch(() => {
+    process.stderr.write("[needle-worker] fatal failure; private diagnostics were suppressed\n");
     process.exitCode = 1;
   });
 }

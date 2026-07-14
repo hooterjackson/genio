@@ -5,7 +5,7 @@
   --surface-2: #101110;
   --ink: #f0f1ec;
   --muted: #8d9089;
-  --faint: #555852;
+  --faint: #7a7d76;
   --line: #292b28;
   --line-strong: #4b4e48;
   --danger: #ffb6ad;
@@ -125,9 +125,11 @@ summary:focus-visible {
 }
 
 .header-meta a {
+  min-width: 44px;
   min-height: 44px;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   text-underline-offset: 4px;
 }
 
@@ -642,7 +644,7 @@ dd {
 }
 
 .exception-actions button {
-  min-height: 40px;
+  min-height: 44px;
   padding: 7px 10px;
   overflow: hidden;
   text-align: left;
@@ -857,6 +859,82 @@ dd {
   letter-spacing: .1em;
 }
 
+.site-footer a,
+.privacy-back {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink);
+  text-underline-offset: 4px;
+}
+
+.privacy-back {
+  min-width: 44px;
+  justify-content: flex-end;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .09em;
+}
+
+.privacy-shell {
+  width: min(760px, calc(100% - 40px));
+  min-height: calc(100dvh - 112px);
+  margin: 0 auto;
+  padding: clamp(48px, 8vw, 92px) 0 72px;
+}
+
+.privacy-shell h1 {
+  margin: 0;
+  font-size: clamp(42px, 9vw, 82px);
+  letter-spacing: -.07em;
+  line-height: .95;
+}
+
+.privacy-intro {
+  max-width: 620px;
+  margin: 24px 0 0;
+  color: var(--muted);
+  font-size: clamp(14px, 2vw, 17px);
+}
+
+.privacy-grid {
+  margin-top: 42px;
+  border-top: 1px solid var(--line-strong);
+}
+
+.privacy-grid article {
+  padding: 20px 0;
+  display: grid;
+  grid-template-columns: minmax(130px, .35fr) minmax(0, 1fr);
+  gap: 24px;
+  border-bottom: 1px solid var(--line);
+}
+
+.privacy-grid h2,
+.privacy-grid p {
+  margin: 0;
+}
+
+.privacy-grid h2 {
+  font-size: 10px;
+  letter-spacing: .1em;
+}
+
+.privacy-grid p {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.privacy-grid a {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  text-underline-offset: 4px;
+}
+
 /* Owner shell */
 .owner-shell {
   width: min(var(--content), calc(100% - 40px));
@@ -996,7 +1074,7 @@ dd {
 
 .operator-row button,
 .operator-row a {
-  min-height: 40px;
+  min-height: 44px;
   padding: 0 11px;
   display: inline-flex;
   align-items: center;
@@ -1232,6 +1310,11 @@ dd {
     padding: 10px 16px;
     display: grid;
     gap: 2px;
+  }
+
+  .privacy-grid article {
+    grid-template-columns: 1fr;
+    gap: 8px;
   }
 
   .operator-grid {

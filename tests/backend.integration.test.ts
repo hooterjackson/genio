@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi 
 import { createDatabase } from "../db/index.ts";
 import { CapabilityService, CAPABILITY_COOKIE } from "../server/capabilities.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
+import { processNotificationJob } from "../server/notifications.ts";
 import { Repository } from "../server/repository.ts";
 import { hmacBase64Url, sha256Hex } from "../server/security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
@@ -108,6 +109,7 @@ databaseDescribe("hosted backend integration", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
   afterAll(async () => {
@@ -547,6 +549,63 @@ databaseDescribe("hosted backend integration", () => {
     await repository.releaseProviderCost(fulfilled[0]!.value.reservationId);
   });
 
+  test("monthly cost accounting switches at midnight in America/Sao_Paulo", async () => {
+    const boundary = await repository.pool.query<{ start_at: Date }>(
+      `SELECT date_trunc('month',now() AT TIME ZONE 'America/Sao_Paulo')
+         AT TIME ZONE 'America/Sao_Paulo' start_at`,
+    );
+    const startAt = boundary.rows[0]!.start_at;
+    await repository.pool.query(
+      `INSERT INTO cost_ledger(id,operation,amount_usd,occurred_at) VALUES
+         ($1,'previous-sao-paulo-month',49,$3::timestamptz-interval '1 millisecond'),
+         ($2,'current-sao-paulo-month',2.5,$3)`,
+      [randomUUID(), randomUUID(), startAt],
+    );
+
+    const health = await repository.getSystemHealth();
+    expect(health.monthSpendUsd).toBeCloseTo(2.5, 6);
+    const localBoundary = await repository.pool.query<{ local_value: string }>(
+      "SELECT to_char($1::timestamptz AT TIME ZONE 'America/Sao_Paulo','YYYY-MM-DD HH24:MI:SS') local_value",
+      [startAt],
+    );
+    expect(localBoundary.rows[0]?.local_value).toMatch(/-01 00:00:00$/u);
+  });
+
+  test("auto-starts an exact $5 run, gates an $8 run, and rejects invalid gate configuration", async () => {
+    vi.stubEnv("AUTO_RUN_COST_LIMIT_USD", "5");
+    const create = (label: string, estimateUsd: number, approvedBudgetUsd: number) => {
+      const clientBucket = `cost-gate-${label}-${randomUUID()}`;
+      return repository.createRunIdempotent({
+        prompt: `Cost gate request ${label}`,
+        brief: { ...brief, title: `Cost gate ${label}` },
+        estimateUsd,
+        approvedBudgetUsd,
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: `cost-gate-${label}-${randomUUID()}`,
+        reuseDays: 0,
+        rateLimit: 100,
+        globalLimit: 100,
+      });
+    };
+
+    const exactGate = await create("exact", 5, 5);
+    const aboveGate = await create("above", 8, 0);
+    expect(await repository.getRun(exactGate.runId)).toMatchObject({
+      status: "queued",
+      estimatedCostUsd: 5,
+      approvedBudgetUsd: 5,
+    });
+    expect(await repository.getRun(aboveGate.runId)).toMatchObject({
+      status: "awaiting_budget",
+      estimatedCostUsd: 8,
+      approvedBudgetUsd: 0,
+    });
+
+    vi.stubEnv("AUTO_RUN_COST_LIMIT_USD", "NaN");
+    await expect(create("invalid", 5, 5)).rejects.toThrow(/AUTO_RUN_COST_LIMIT_USD/u);
+  });
+
   test("atomically enforces brief, run, mutation, and publish limits", async () => {
     const briefBucket = `brief-limit-${randomUUID()}`;
     const briefAttempts = await Promise.allSettled(Array.from({ length: 3 }, (_, index) =>
@@ -764,6 +823,135 @@ databaseDescribe("hosted backend integration", () => {
     expect(revived.rows[0]).toMatchObject({ status: "queued", attempts: 0, max_attempts: 3, payload_json: { safeRetry: true } });
   });
 
+  test("refuses an interrupted matching manifest and explicitly accounts for every verified-only candidate", async () => {
+    const runId = await repository.createRun("Manifest accounting invariant", brief, 0, 1);
+    const sourceUrl = `https://credits.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Track-level verification",
+      sourceClass: "web",
+      provenanceRoot: "credits.example",
+      note: "A bounded integration-test source.",
+    }]);
+    const candidateTitles = [
+      "Accepted Recording",
+      "Unavailable Recording",
+      "Review Recording",
+      "Duplicate Recording",
+      "Unsupported Recording",
+      "Evidence-Ineligible Recording",
+    ];
+    await repository.addCandidates(runId, candidateTitles.map((title) => ({
+      artist: "Manifest Artist",
+      title,
+      album: "Manifest Album",
+      releaseYear: 2024,
+      durationMs: 180_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [{
+        sourceUrl,
+        state: title === "Evidence-Ineligible Recording" ? "inferred" as const : "verified" as const,
+        supportScope: "track" as const,
+        relationship: "performed on",
+        note: "Track-level test evidence.",
+      }],
+    })), sourceIds, "track_verification");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
+    const candidate = (title: string) => {
+      const found = candidates.get(title);
+      if (!found) throw new Error(`Missing test candidate ${title}`);
+      return found;
+    };
+    const song = (id: string, name: string) => ({
+      id,
+      name,
+      artistName: "Manifest Artist",
+      albumName: "Manifest Album",
+      releaseDate: "2024-01-01",
+      durationInMillis: 180_000,
+    });
+
+    await repository.saveMatch(runId, {
+      candidateId: candidate("Accepted Recording").id,
+      status: "accepted",
+      basis: "Exact compatible identifier",
+      score: 1,
+      song: song("catalog-accepted", "Accepted Recording"),
+      alternatives: [],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+    await expect(repository.createManifest(runId, { verifiedOnly: true }))
+      .rejects.toMatchObject({ code: "matching_incomplete" });
+    expect((await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM manifests WHERE run_id=$1",
+      [runId],
+    )).rows[0]?.count).toBe(0);
+
+    await repository.saveMatch(runId, {
+      candidateId: candidate("Unavailable Recording").id,
+      status: "unavailable",
+      basis: "No compatible catalog result",
+      score: 0,
+      song: null,
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidate("Review Recording").id,
+      status: "review",
+      basis: "Ambiguous compatible results",
+      score: 0.8,
+      song: song("catalog-review", "Review Recording"),
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidate("Duplicate Recording").id,
+      status: "duplicate",
+      basis: "Stable catalog ID was already accepted",
+      score: 1,
+      song: song("catalog-accepted", "Accepted Recording"),
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidate("Unsupported Recording").id,
+      status: "unsupported",
+      basis: "The storefront does not support this recording",
+      score: 0,
+      song: null,
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidate("Evidence-Ineligible Recording").id,
+      status: "accepted",
+      basis: "Exact metadata match but insufficient evidence",
+      score: 1,
+      song: song("catalog-ineligible", "Evidence-Ineligible Recording"),
+      alternatives: [],
+    });
+
+    await expect(repository.createManifest(runId)).rejects.toMatchObject({ code: "unresolved_exceptions" });
+    const manifest = await repository.createManifest(runId, { verifiedOnly: true });
+    expect(manifest.tracks).toEqual([
+      expect.objectContaining({ candidateId: candidate("Accepted Recording").id, catalogId: "catalog-accepted" }),
+    ]);
+    const accounted = await repository.pool.query<{ title: string; outcome: string; match_status: string }>(
+      `SELECT c.title,c.outcome,m.status match_status FROM track_candidates c
+       JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+       WHERE c.run_id=$1 ORDER BY c.title`,
+      [runId],
+    );
+    expect(accounted.rows).toEqual([
+      { title: "Accepted Recording", outcome: "accepted", match_status: "accepted" },
+      { title: "Duplicate Recording", outcome: "duplicate", match_status: "duplicate" },
+      { title: "Evidence-Ineligible Recording", outcome: "unsupported", match_status: "unsupported" },
+      { title: "Review Recording", outcome: "rejected", match_status: "rejected" },
+      { title: "Unavailable Recording", outcome: "unavailable", match_status: "unavailable" },
+      { title: "Unsupported Recording", outcome: "unsupported", match_status: "unsupported" },
+    ]);
+    expect(accounted.rows.every((row) => ["accepted", "unavailable", "rejected", "duplicate", "unsupported"].includes(row.outcome))).toBe(true);
+  });
+
   test("never leases two publication jobs for the same manifest concurrently", async () => {
     vi.stubEnv("WORKER_CONCURRENCY", "2");
     const runId = await repository.createRun("Publication serialization", brief, 0, 1);
@@ -887,6 +1075,118 @@ databaseDescribe("hosted backend integration", () => {
       phase: "apple_reauthorization",
       error: null,
     });
+  });
+
+  test("raw provider and database failures never cross durable or public boundaries", async () => {
+    const privateFailure = "OpenAI sk-proj-PRIVATE failed at postgres://user:password@private.example/needle";
+    const briefBucket = `brief-redaction-${randomUUID()}`;
+    const briefRequest = await repository.createBriefRequest({
+      prompt: "Build a securely redacted integration playlist",
+      model: "test-model",
+      clientBucket: briefBucket,
+      clientBucketAliases: [briefBucket],
+      rateLimit: 100,
+    });
+    await repository.saveBriefResult(briefRequest.id, { status: "failed", error: privateFailure });
+
+    const clientBucket = `run-redaction-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Public redaction boundary test",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const researchJob = await repository.enqueueJob({
+      kind: "research",
+      runId: created.runId,
+      payload: { runId: created.runId },
+      dedupeKey: `redaction:${created.runId}`,
+      maxAttempts: 1,
+    });
+    expect(await repository.leaseNextJob("redaction-worker", 60_000)).toMatchObject({ id: researchJob.id });
+    await repository.failJob(researchJob.id, "redaction-worker", privateFailure, null);
+
+    const manifestId = randomUUID();
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Redaction result','Public boundary test',$3)",
+      [manifestId, created.runId, "c".repeat(64)],
+    );
+    const notificationId = await repository.enqueueNotification("worker_stale", { runId: created.runId });
+    await repository.markNotificationFailed(notificationId, privateFailure, null);
+
+    const matchingRunId = await repository.createRun("Matching redaction boundary", brief, 0, 1);
+    await repository.updateRun(matchingRunId, { status: "failed", phase: "matching_failed", error: privateFailure });
+
+    const [storedBrief, storedRun, storedJob, storedNotification, storedMatchingRun] = await Promise.all([
+      repository.pool.query<{ error: string }>("SELECT error FROM brief_requests WHERE id=$1", [briefRequest.id]),
+      repository.pool.query<{ error: string }>("SELECT error FROM research_runs WHERE id=$1", [created.runId]),
+      repository.pool.query<{ last_error: string }>("SELECT last_error FROM job_queue WHERE id=$1", [researchJob.id]),
+      repository.pool.query<{ last_error: string }>("SELECT last_error FROM notification_outbox WHERE id=$1", [notificationId]),
+      repository.pool.query<{ error: string }>("SELECT error FROM research_runs WHERE id=$1", [matchingRunId]),
+    ]);
+    const durableErrors = [
+      storedBrief.rows[0]?.error,
+      storedRun.rows[0]?.error,
+      storedJob.rows[0]?.last_error,
+      storedNotification.rows[0]?.last_error,
+      storedMatchingRun.rows[0]?.error,
+    ];
+    expect(durableErrors).toEqual([
+      "Needle could not interpret this request after the final attempt.",
+      "Research could not be completed after the final attempt.",
+      "Research could not be completed after the final attempt.",
+      "Owner notification delivery failed after the final attempt.",
+      "Apple Music matching could not be completed after the final attempt.",
+    ]);
+    expect(JSON.stringify(durableErrors)).not.toContain("sk-proj-PRIVATE");
+    expect(JSON.stringify(durableErrors)).not.toContain("postgres://");
+
+    const [briefView, runView, publicResult] = await Promise.all([
+      repository.getBriefRequest(briefRequest.id),
+      repository.getRunByAccess(created.accessId),
+      repository.getPublicResult(created.runId),
+    ]);
+    expect(briefView?.error).toBe("Needle could not interpret this request after the final attempt.");
+    expect(runView?.error).toBe("Research could not be completed after the final attempt.");
+    expect(publicResult.error).toBe("Research could not be completed after the final attempt.");
+    expect(JSON.stringify({ briefView, runView, publicResult })).not.toContain("sk-proj-PRIVATE");
+    expect(JSON.stringify({ briefView, runView, publicResult })).not.toContain("postgres://");
+  });
+
+  test("a Resend outage keeps the notification outbox pending for a durable retry", async () => {
+    vi.stubEnv("RESEND_API_KEY", "offline-resend-integration-key");
+    vi.stubEnv("RESEND_FROM", "Needle <alerts@example.com>");
+    vi.stubEnv("OWNER_ALERT_EMAIL", "owner@example.com");
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Resend is unavailable"); }));
+    const notificationId = await repository.enqueueNotification("worker_stale", {
+      observedAt: new Date().toISOString(),
+      deduplicationKey: `resend-outage-${randomUUID()}`,
+    });
+
+    await expect(processNotificationJob(repository, { notificationId })).rejects.toThrow(/Resend is unavailable/u);
+    const [notification, job] = await Promise.all([
+      repository.getNotification(notificationId),
+      repository.pool.query<{ count: number }>(
+        "SELECT count(*)::int count FROM job_queue WHERE kind='notification' AND payload_json->>'notificationId'=$1",
+        [notificationId],
+      ),
+    ]);
+    expect(notification).toMatchObject({
+      id: notificationId,
+      status: "pending",
+      attempts: 1,
+      availableAt: expect.any(Date),
+      sentAt: null,
+      lastError: "Owner notification delivery failed after the final attempt.",
+    });
+    expect(notification.availableAt.getTime()).toBeGreaterThan(Date.now());
+    expect(job.rows[0]?.count).toBe(1);
   });
 
   test("exchanges capabilities once and rejects revoked sessions", async () => {
@@ -1071,6 +1371,60 @@ databaseDescribe("hosted backend integration", () => {
     expect(remaining.rows[0]).toEqual({ tokens: 0, active_sessions: 0 });
   });
 
+  test("post-publication deletion removes Needle detail but preserves the public Apple links in a tombstone", async () => {
+    const clientBucket = `published-delete-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Published playlist deletion",
+      brief: { ...brief, title: "Published deletion fixture" },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const manifestId = randomUUID();
+    const contentHash = "d".repeat(64);
+    const shareUrl = "https://music.apple.com/us/playlist/needle-published-deletion/pl.u-test123";
+    await repository.pool.query(
+      `INSERT INTO manifests(id,run_id,name,description,content_hash)
+       VALUES($1,$2,'Published deletion fixture','A published fixture',$3)`,
+      [manifestId, created.runId, contentHash],
+    );
+    await repository.pool.query(
+      `INSERT INTO publication_volumes(
+         id,manifest_id,volume_number,volume_count,start_position,end_position,status,
+         apple_playlist_id,apple_share_url,appended_count,published_at
+       ) VALUES($1,$2,1,1,0,0,'complete','p.library-test',$3,1,now())`,
+      [randomUUID(), manifestId, shareUrl],
+    );
+    await repository.updateRun(created.runId, { status: "complete", phase: "publication_complete" });
+
+    await expect(repository.deleteRunAccess(created.accessId)).resolves.toBe(true);
+    await expect(repository.getRun(created.runId)).rejects.toMatchObject({ statusCode: 404, code: "run_not_found" });
+    const [tombstone, manifestCount, volumeCount] = await Promise.all([
+      repository.pool.query<{
+        manifest_hash: string;
+        playlist_title: string;
+        apple_links_json: string[];
+      }>(
+        "SELECT manifest_hash,playlist_title,apple_links_json FROM retention_tombstones WHERE run_id=$1",
+        [created.runId],
+      ),
+      repository.pool.query<{ count: number }>("SELECT count(*)::int count FROM manifests WHERE run_id=$1", [created.runId]),
+      repository.pool.query<{ count: number }>("SELECT count(*)::int count FROM publication_volumes WHERE manifest_id=$1", [manifestId]),
+    ]);
+    expect(tombstone.rows[0]).toEqual({
+      manifest_hash: contentHash,
+      playlist_title: "Published deletion fixture",
+      apple_links_json: [shareUrl],
+    });
+    expect(manifestCount.rows[0]?.count).toBe(0);
+    expect(volumeCount.rows[0]?.count).toBe(0);
+  });
+
   test("sets host-only production capability cookies with strict security attributes", async () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
@@ -1160,5 +1514,17 @@ databaseDescribe("hosted backend integration", () => {
     expect(health.notificationFailures).toBeGreaterThanOrEqual(1);
     expect(health.publicationFailures.runs).toBeGreaterThanOrEqual(1);
     expect(health.retention).toMatchObject({ dueRuns: expect.any(Number), lastPurged: expect.any(Number) });
+  });
+
+  test("system health marks a stale heartbeat unhealthy and accepts a fresh replacement heartbeat", async () => {
+    vi.stubEnv("WORKER_STALE_SECONDS", "90");
+    await repository.updateWorkerHeartbeat("stale-worker", { schemaVersion: "1", capacity: 2, activeJobs: 1 });
+    await repository.pool.query(
+      "UPDATE worker_heartbeats SET last_seen_at=now()-interval '91 seconds' WHERE worker_id='stale-worker'",
+    );
+    expect((await repository.getSystemHealth()).worker).toMatchObject({ worker_id: "stale-worker", stale: true });
+
+    await repository.updateWorkerHeartbeat("fresh-worker", { schemaVersion: "1", capacity: 2, activeJobs: 0 });
+    expect((await repository.getSystemHealth()).worker).toMatchObject({ worker_id: "fresh-worker", stale: false });
   });
 });

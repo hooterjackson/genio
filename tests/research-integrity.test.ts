@@ -7,6 +7,7 @@ import {
   researchCompletionReadiness,
   researchGapPassLimit,
   researchSegmentLimit,
+  researchToolDefinitions,
   researchTurnsPerSegment,
   responseContextTokenCount,
   validateCandidateBatch,
@@ -39,7 +40,7 @@ function brief(mode: PlaylistBrief["mode"], targetSize: PlaylistBrief["targetSiz
 function candidateArgs(input: {
   sourceUrl?: string;
   sourceClass?: "web" | "musicbrainz" | "discogs" | "apple";
-  state?: "verified" | "corroborated" | "editorial" | "inferred";
+  state?: "verified" | "corroborated" | "editorial" | "inferred" | "disputed";
   supportScope?: "track" | "album" | "session" | "collection" | "editorial";
 } = {}) {
   const sourceUrl = input.sourceUrl ?? "https://credits.example/track";
@@ -72,6 +73,24 @@ function candidateArgs(input: {
 }
 
 describe("claim-level evidence integrity", () => {
+  test("disabled adapters are absent from model tools and their hosted sources are rejected", () => {
+    const tools = researchToolDefinitions(["musicbrainz", "apple"]) as Array<{
+      name?: string;
+      parameters?: { properties?: { adapter?: { enum?: string[] } } };
+    }>;
+    expect(tools.find((tool) => tool.name === "query_source")?.parameters?.properties?.adapter?.enum)
+      .toEqual(["musicbrainz", "apple"]);
+
+    const sourceUrl = "https://www.discogs.com/release/123-disabled";
+    const result = validateCandidateBatch(
+      candidateArgs({ sourceUrl, sourceClass: "discogs", state: "inferred" }),
+      new Set([sourceUrl]),
+      "track_verification",
+      new Set(["discogs"]),
+    );
+    expect(result).toEqual({ sources: [], candidates: [] });
+  });
+
   test("only dedicated track verification can promote explicit track support", () => {
     const args = candidateArgs();
     const known = new Set(["https://credits.example/track"]);
@@ -109,6 +128,81 @@ describe("claim-level evidence integrity", () => {
       expect(result.sources[0]!.sourceClass).toBe(sourceClass);
       expect(result.candidates[0]!.evidence[0]).toMatchObject({ state: "inferred", supportScope: "track" });
     }
+  });
+
+  test("two publisher hosts mirroring one attested database are not independent corroboration", () => {
+    const firstUrl = "https://mirror-one.example/track";
+    const secondUrl = "https://mirror-two.example/track";
+    const originUrl = "https://credits-ledger.example/record/123";
+    const result = validateCandidateBatch({
+      sources: [
+        { url: firstUrl, title: "Mirror one", sourceClass: "web", provenanceRoot: originUrl, note: "Republishes the ledger record." },
+        { url: secondUrl, title: "Mirror two", sourceClass: "web", provenanceRoot: "credits-ledger.example", note: "Republishes the same ledger record." },
+      ],
+      candidates: [{
+        artist: "Test Artist", title: "Mirrored Song", album: null, releaseYear: 2020,
+        durationMs: null, isrc: "USAAA2000001", musicbrainzId: null, versionLabel: null,
+        evidence: [firstUrl, secondUrl].map((sourceUrl) => ({
+          sourceUrl, state: "corroborated", supportScope: "track", relationship: "performed on", note: "Track credit.",
+        })),
+      }],
+    }, new Set([firstUrl, secondUrl, originUrl]), "track_verification");
+
+    expect(result.sources.map((source) => source.provenanceRoot)).toEqual(["credits-ledger.example", "credits-ledger.example"]);
+    expect(result.candidates[0]!.evidence.map((claim) => claim.state)).toEqual(["inferred", "inferred"]);
+  });
+
+  test("circular source attribution cannot manufacture corroboration", () => {
+    const firstUrl = "https://circular-one.example/track";
+    const secondUrl = "https://circular-two.example/track";
+    const result = validateCandidateBatch({
+      sources: [
+        { url: firstUrl, title: "Circular one", sourceClass: "web", provenanceRoot: "circular-two.example", note: "Attributes the claim to circular two." },
+        { url: secondUrl, title: "Circular two", sourceClass: "web", provenanceRoot: "circular-one.example", note: "Attributes the claim to circular one." },
+      ],
+      candidates: [{
+        artist: "Test Artist", title: "Circular Song", album: null, releaseYear: 2020,
+        durationMs: null, isrc: "USAAA2000002", musicbrainzId: null, versionLabel: null,
+        evidence: [firstUrl, secondUrl].map((sourceUrl) => ({
+          sourceUrl, state: "corroborated", supportScope: "track", relationship: "performed on", note: "Track credit.",
+        })),
+      }],
+    }, new Set([firstUrl, secondUrl]), "track_verification");
+
+    expect(result.candidates[0]!.evidence.map((claim) => claim.state)).toEqual(["inferred", "inferred"]);
+  });
+
+  test("conflicting track-level claims remain explicitly disputed and block positive auto-inclusion", () => {
+    const supportUrl = "https://supporting.example/track";
+    const disputeUrl = "https://disputing.example/track";
+    const supportOrigin = "https://support-origin.example/credit";
+    const disputeOrigin = "https://dispute-origin.example/correction";
+    const result = validateCandidateBatch({
+      sources: [
+        { url: supportUrl, title: "Supporting credit", sourceClass: "web", provenanceRoot: supportOrigin, note: "Names the performer." },
+        { url: disputeUrl, title: "Credit correction", sourceClass: "web", provenanceRoot: disputeOrigin, note: "Explicitly denies the performer credit." },
+      ],
+      candidates: [{
+        artist: "Test Artist", title: "Contested Song", album: null, releaseYear: 2020,
+        durationMs: null, isrc: "USAAA2000003", musicbrainzId: null, versionLabel: null,
+        evidence: [
+          { sourceUrl: supportUrl, state: "verified", supportScope: "track", relationship: "performed on", note: "Track credit." },
+          { sourceUrl: disputeUrl, state: "disputed", supportScope: "track", relationship: "not credited as performer", note: "Published correction." },
+        ],
+      }],
+    }, new Set([supportUrl, disputeUrl, supportOrigin, disputeOrigin]), "track_verification");
+
+    expect(result.candidates[0]!.evidence).toEqual([
+      expect.objectContaining({ sourceUrl: supportUrl, state: "inferred" }),
+      expect.objectContaining({ sourceUrl: disputeUrl, state: "disputed" }),
+    ]);
+  });
+
+  test("generic web publisher and invented roots remain unclassified", () => {
+    const sourceUrl = "https://publisher.example/track";
+    const self = validateCandidateBatch(candidateArgs({ sourceUrl, state: "corroborated" }), new Set([sourceUrl]), "track_verification");
+    expect(self.sources[0]!.provenanceRoot).toBe("unclassified");
+    expect(self.candidates[0]!.evidence[0]!.state).toBe("inferred");
   });
 });
 

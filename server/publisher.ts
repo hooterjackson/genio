@@ -11,7 +11,7 @@ import type { PublicationStatus } from "../shared/types.ts";
 const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
 const MAX_REPLACEMENTS = 3;
-const SHARE_POLL_MS = 3_000;
+const SHARE_POLL_MS = process.env.NODE_ENV === "test" ? 0 : 3_000;
 const CONSISTENCY_POLL_MS = process.env.NODE_ENV === "test" ? 0 : 1_000;
 
 function sharePollAttempts(): number {

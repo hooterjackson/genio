@@ -1,5 +1,25 @@
 import { expect, test } from "@playwright/test";
 
+function srgbChannel(value: number): number {
+  const normalized = value / 255;
+  return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const channels = (value: string) => {
+    const match = value.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/u);
+    if (!match) throw new Error(`Could not parse browser color: ${value}`);
+    return match.slice(1, 4).map((channel) => srgbChannel(Number(channel)));
+  };
+  const luminance = (value: string) => {
+    const [red, green, blue] = channels(value);
+    return 0.2126 * red! + 0.7152 * green! + 0.0722 * blue!;
+  };
+  const lighter = Math.max(luminance(foreground), luminance(background));
+  const darker = Math.min(luminance(foreground), luminance(background));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 const brief = {
   title: "Paulinho da Costa — released performances",
   description: "Released recordings with evidence that Paulinho da Costa performed on the track.",
@@ -132,6 +152,10 @@ test("the primary Apple match is selectable once even when alternatives repeat i
   const primaryChoice = page.getByRole("button", { name: "USE: Primary recording / Artist" });
   await expect(primaryChoice).toHaveCount(1);
   await expect(page.getByRole("button", { name: "USE: Alternate recording / Artist" })).toBeVisible();
+  expect(await page.locator(".exception-actions button").evaluateAll((buttons) => buttons.every((button) => {
+    const rect = button.getBoundingClientRect();
+    return rect.width >= 44 && rect.height >= 44;
+  }))).toBe(true);
   await primaryChoice.click();
   const reviewBody = await reviewRequest;
   expect(reviewBody.catalogId).toBe("apple-primary");
@@ -227,7 +251,47 @@ test("manifest locking waits for the first exception page", async ({ page }) => 
 
 test("interactive controls meet the minimum touch target", async ({ page }) => {
   await page.goto("/");
-  const box = await page.getByRole("button", { name: /interpret scope/i }).boundingBox();
-  expect(box).not.toBeNull();
-  expect(box!.height).toBeGreaterThanOrEqual(44);
+  const undersized = await page.locator("button:not([disabled]), a[href], textarea, input, summary").evaluateAll((elements) =>
+    elements.flatMap((element) => {
+      const rect = element.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return [];
+      return rect.width < 44 || rect.height < 44
+        ? [{ label: element.getAttribute("aria-label") ?? element.textContent?.trim() ?? element.tagName, width: rect.width, height: rect.height }]
+        : [];
+    }),
+  );
+  expect(undersized).toEqual([]);
+});
+
+test("desktop keyboard focus remains visible and primary text meets WCAG AA contrast", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const request = page.getByLabel(/what should we find/i);
+  await expect(request).toBeFocused();
+  if (testInfo.project.name === "desktop") {
+    await request.fill("Every released song Paulinho da Costa performed on");
+    await page.keyboard.press("Tab");
+
+    const submit = page.getByRole("button", { name: /interpret scope/i });
+    await expect(submit).toBeFocused();
+    expect(await submit.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe("none");
+  }
+
+  for (const locator of [
+    page.locator("body"),
+    page.locator(".landing-copy"),
+    page.locator(".screen-index"),
+    page.locator(".source-links a").first(),
+  ]) {
+    const colors = await locator.evaluate((element) => {
+      const foreground = getComputedStyle(element).color;
+      let current: Element | null = element;
+      let background = "rgba(0, 0, 0, 0)";
+      while (current && /rgba\([^)]*,\s*0\)$/u.test(background)) {
+        background = getComputedStyle(current).backgroundColor;
+        current = current.parentElement;
+      }
+      return { foreground, background };
+    });
+    expect(contrastRatio(colors.foreground, colors.background)).toBeGreaterThanOrEqual(4.5);
+  }
 });

@@ -69,6 +69,10 @@ test("production worker refuses startup when provider or encryption secrets are 
   expect(() => assertProductionWorkerSecrets({ NODE_ENV: "production" })).toThrow(/OPENAI_API_KEY/);
   expect(() => assertProductionWorkerSecrets({
     NODE_ENV: "production",
+    AUTO_RUN_COST_LIMIT_USD: "NaN",
+  })).toThrow(/AUTO_RUN_COST_LIMIT_USD/u);
+  expect(() => assertProductionWorkerSecrets({
+    NODE_ENV: "production",
     OPENAI_API_KEY: "openai",
     APPLE_TEAM_ID: "team",
     APPLE_KEY_ID: "key",
@@ -313,7 +317,7 @@ test("visitor deletion aborts an active lease without requeueing it", async () =
   }
 });
 
-test("terminal worker failures are persisted only through the repository redaction boundary", async () => {
+test("terminal worker failures are sanitized before crossing the repository boundary", async () => {
   const harness = runnerHarness();
   harness.job.kind = "publication";
   harness.job.maxAttempts = 1;
@@ -333,9 +337,11 @@ test("terminal worker failures are persisted only through the repository redacti
     expect(harness.repository.failJob).toHaveBeenCalledWith(
       harness.job.id,
       expect.any(String),
-      privateFailure,
+      "Apple publication failed after the final attempt; provider details were redacted.",
       null,
     );
+    expect(JSON.stringify(harness.repository.failJob.mock.calls)).not.toContain("sk-proj-PRIVATE");
+    expect(JSON.stringify(harness.repository.failJob.mock.calls)).not.toContain("postgres://");
   } finally {
     await runner.stop();
     await running;

@@ -1247,6 +1247,7 @@ export function PlaylistBuilder() {
       {result && <ResultScreen result={result} onReset={reset} onDelete={deleteRun} />}
 
       <footer className="site-footer">
+        <a href="/privacy">PRIVACY →</a>
         <span>EXHAUSTIVE ACROSS DOCUMENTED SOURCES.</span>
         <span>UNRESOLVED GAPS STAY VISIBLE.</span>
       </footer>

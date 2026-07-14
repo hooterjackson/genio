@@ -5,6 +5,7 @@ import { createDatabase, DATABASE_SCHEMA_VERSION, type DatabaseHandle } from "..
 import { settings } from "../db/schema.ts";
 import type {
   CatalogMatchResult,
+  EvidenceClaimInput,
   PlaylistBrief,
   PlaylistManifest,
   ResearchRunView,
@@ -22,6 +23,14 @@ import {
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
+import {
+  failureContextForJob,
+  failureContextForRun,
+  sanitizeFailure,
+  sanitizeOptionalFailure,
+} from "./error-sanitizer.ts";
+import { readCostConfiguration } from "./cost-config.ts";
+import { resolveEvidenceIntegrity } from "./evidence-integrity.ts";
 
 const ACTIVE_RUN_STATUSES = [
   "queued",
@@ -108,19 +117,6 @@ function date(value: unknown): Date | null {
   return value instanceof Date ? value : new Date(String(value));
 }
 
-function redactedPublicationFailure(error: string): string {
-  const normalized = error.toLowerCase();
-  if (normalized.includes("share link")) return "Apple did not expose a stable public playlist link after the final attempt.";
-  if (normalized.includes("diverg") || normalized.includes("ordered prefix") || normalized.includes("ordered sequence")) {
-    return "Apple playlist ordering diverged from the approved manifest after the final attempt.";
-  }
-  if (normalized.includes("lease expired")) return "The publication worker lease expired after the final attempt.";
-  if (normalized.includes("timeout") || normalized.includes("timed out") || normalized.includes("could not be reached")) {
-    return "Apple Music remained unavailable after the final attempt.";
-  }
-  return "Apple publication failed after the final attempt; provider details were redacted.";
-}
-
 async function markTerminalPublicationVolumes(
   client: Pick<PoolClient, "query">,
   payload: Record<string, unknown> | null,
@@ -128,7 +124,7 @@ async function markTerminalPublicationVolumes(
 ): Promise<void> {
   const manifestId = typeof payload?.manifestId === "string" ? payload.manifestId : "";
   if (!manifestId) return;
-  const publicError = redactedPublicationFailure(error);
+  const publicError = sanitizeFailure(error, "publication");
   const stranded = await client.query<{ id: string; apple_playlist_id: string }>(
     `SELECT id,apple_playlist_id FROM publication_volumes
      WHERE manifest_id=$1 AND apple_playlist_id IS NOT NULL
@@ -295,7 +291,7 @@ export class Repository {
       status: row.status,
       brief: row.brief_json,
       estimateUsd: row.estimate_usd == null ? null : Number(row.estimate_usd),
-      error: row.error,
+      error: sanitizeOptionalFailure(row.error, "brief"),
       clientBucket: row.client_bucket,
       expiresAt: date(row.expires_at),
       createdAt: date(row.created_at),
@@ -309,10 +305,13 @@ export class Repository {
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void> {
+    const persistedError = result.status === "failed"
+      ? sanitizeFailure(result.error, "brief")
+      : null;
     await this.pool.query(
       `UPDATE brief_requests SET status=$2,brief_json=$3,estimate_usd=$4,error=$5,updated_at=now()
        WHERE id=$1`,
-      [id, result.status, result.brief ?? null, result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"), result.error?.slice(0, 2_000) ?? null],
+      [id, result.status, result.brief ?? null, result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"), persistedError],
     );
   }
 
@@ -382,7 +381,7 @@ export class Repository {
         );
         if (active.rows[0]!.count >= (input.globalLimit ?? 10)) throw new HttpError(503, "Needle is at capacity; try again soon", "global_capacity_reached");
         runId = randomUUID();
-        const gate = Number(process.env.AUTO_RUN_COST_LIMIT_USD ?? process.env.INITIAL_COST_GATE_USD ?? 5);
+        const gate = readCostConfiguration().autoRunCostLimitUsd;
         status = estimate > gate && approved < estimate ? "awaiting_budget" : "queued";
         const phase = status === "awaiting_budget" ? "budget_gate" : "queued";
         const canonicalPrompt = `${input.brief.title}: ${input.brief.description}`.slice(0, 2_000);
@@ -433,6 +432,9 @@ export class Repository {
     error?: string | null;
   }): Promise<void> {
     const costDelta = values.costDelta == null ? 0 : finiteMoney(values.costDelta, "Cost delta");
+    const persistedError = values.error === undefined
+      ? undefined
+      : sanitizeOptionalFailure(values.error, failureContextForRun(values.phase));
     const result = await this.pool.query(
       `UPDATE research_runs SET
          status=COALESCE($2,status), phase=COALESCE($3,phase), actual_cost_usd=actual_cost_usd+$4,
@@ -448,7 +450,7 @@ export class Repository {
        WHERE id=$1
          AND NOT (status='failed' AND phase='owner_cancelled')
          AND NOT (status='deleted' OR phase='visitor_deleted')`,
-      [id, values.status ?? null, values.phase ?? null, costDelta, values.approvedBudget ?? null, values.noNewGapPasses ?? null, values.error !== undefined, values.error ?? null],
+      [id, values.status ?? null, values.phase ?? null, costDelta, values.approvedBudget ?? null, values.noNewGapPasses ?? null, values.error !== undefined, persistedError ?? null],
     );
     if (result.rowCount === 0) throw new HttpError(404, "Research run not found", "run_not_found");
   }
@@ -526,7 +528,7 @@ export class Repository {
       approvedBudgetUsd: Number(row.approved_budget_usd),
       reservedCostUsd: Number(row.reserved_cost_usd),
       noNewGapPasses: Number(row.no_new_gap_passes),
-      error: row.error,
+      error: sanitizeOptionalFailure(row.error, failureContextForRun(row.phase)),
       candidateCount: count.candidate_count,
       sourceCount: count.source_count,
       unresolvedCount: count.unresolved_count,
@@ -694,7 +696,7 @@ export class Repository {
           const supportScope = ["track", "album", "session", "collection", "editorial"].includes(evidence.supportScope ?? "")
             ? evidence.supportScope
             : "collection";
-          const storedState = (evidence.state === "verified" || evidence.state === "corroborated")
+          const storedState = (evidence.state === "verified" || evidence.state === "corroborated" || evidence.state === "disputed")
             && (storedPhase !== "track_verification" || supportScope !== "track")
             ? "inferred"
             : evidence.state;
@@ -708,6 +710,56 @@ export class Repository {
                verification_phase=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.verification_phase ELSE evidence_claims.verification_phase END,
                note=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.note ELSE evidence_claims.note END`,
             [randomUUID(), runId, storedId, sourceId, storedState, supportScope, storedPhase, evidence.relationship.slice(0, 240), compactEvidenceNote(evidence.note)],
+          );
+        }
+        const storedEvidence = await client.query<{
+          id: string;
+          source_url: string;
+          source_class: SourceRecordInput["sourceClass"];
+          provenance_root: string;
+          state: EvidenceClaimInput["state"];
+          support_scope: EvidenceClaimInput["supportScope"];
+          relationship: string;
+          note: string;
+        }>(
+          `SELECT e.id,s.url source_url,s.source_class,s.provenance_root,e.state,e.support_scope,e.relationship,e.note
+           FROM evidence_claims e JOIN source_records s ON s.id=e.source_id
+           WHERE e.candidate_id=$1 ORDER BY e.id`,
+          [storedId],
+        );
+        const integrity = resolveEvidenceIntegrity(
+          storedEvidence.rows.map((row) => ({
+            sourceUrl: row.source_url,
+            state: row.state,
+            supportScope: row.support_scope,
+            relationship: row.relationship,
+            note: row.note,
+          })),
+          storedEvidence.rows.map((row) => ({
+            url: row.source_url,
+            sourceClass: row.source_class,
+            provenanceRoot: row.provenance_root,
+          })),
+        );
+        for (let index = 0; index < storedEvidence.rows.length; index += 1) {
+          const row = storedEvidence.rows[index]!;
+          const effective = integrity.evidence[index]!;
+          if (row.state !== effective.state) {
+            await client.query("UPDATE evidence_claims SET state=$2 WHERE id=$1", [row.id, effective.state]);
+          }
+        }
+        if (integrity.hasDisagreement) {
+          await client.query(
+            `INSERT INTO source_frontier(id,run_id,source_class,strategy,cursor,status,discovered_count,recovered_count,note)
+             VALUES($1,$2,'evidence',$3,NULL,'unresolved',1,0,$4)
+             ON CONFLICT(run_id,source_class,strategy) DO UPDATE SET
+               status='unresolved',discovered_count=1,recovered_count=0,note=EXCLUDED.note`,
+            [
+              randomUUID(),
+              runId,
+              `source disagreement:${storedId}`,
+              compactEvidenceNote(`Sources disagree about the track-level relationship for ${candidate.artist} — ${candidate.title}; automatic inclusion is blocked pending visitor review.`),
+            ],
           );
         }
     }
@@ -1017,13 +1069,64 @@ export class Repository {
         };
       }
       if (!["review", "visitor_review"].includes(run.status)) throw new HttpError(409, "Run is not ready for a manifest", "manifest_not_ready");
-      if (!options.verifiedOnly) {
-        const unresolved = await client.query<{ count: number }>(
-          "SELECT count(*)::int count FROM catalog_matches WHERE run_id=$1 AND status IN ('review','unavailable')",
-          [runId],
-        );
-        if (unresolved.rows[0]!.count > 0) {
-          throw new HttpError(409, "Resolve every exception or choose Publish verified tracks", "unresolved_exceptions");
+      const accounting = await client.query<{
+        id: string;
+        outcome: string;
+        match_status: string | null;
+        catalog_id: string | null;
+        evidence_eligible: boolean;
+      }>(
+        `SELECT c.id,c.outcome,m.status match_status,m.catalog_id,
+           EXISTS (
+             SELECT 1 FROM evidence_claims e WHERE e.candidate_id=c.id
+               AND e.state IN ('verified','corroborated') AND e.support_scope='track'
+               AND e.verification_phase='track_verification'
+           ) evidence_eligible
+         FROM track_candidates c
+         LEFT JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+         WHERE c.run_id=$1 ORDER BY c.id`,
+        [runId],
+      );
+      const matchStatuses = new Set(["accepted", "review", "unavailable", "rejected", "duplicate", "unsupported"]);
+      const incomplete = accounting.rows.some((candidate) => (
+        !candidate.match_status
+        || !matchStatuses.has(candidate.match_status)
+        || candidate.outcome === "pending"
+        || candidate.outcome !== candidate.match_status
+        || (candidate.match_status === "accepted" && !candidate.catalog_id)
+      ));
+      if (incomplete) {
+        throw new HttpError(409, "Catalog matching has not accounted for every candidate", "matching_incomplete");
+      }
+      if (!options.verifiedOnly && accounting.rows.some((candidate) => candidate.match_status === "review" || candidate.match_status === "unavailable")) {
+        throw new HttpError(409, "Resolve every exception or choose Publish verified tracks", "unresolved_exceptions");
+      }
+      if (options.verifiedOnly) {
+        // Choosing "Publish verified tracks" is itself the visitor's explicit
+        // disposition for unresolved or evidence-ineligible candidates. Keep
+        // every candidate accounted for before the immutable manifest locks.
+        const rejected = accounting.rows.filter((candidate) => candidate.match_status === "review").map((candidate) => candidate.id);
+        const unsupported = accounting.rows
+          .filter((candidate) => candidate.match_status === "accepted" && !candidate.evidence_eligible)
+          .map((candidate) => candidate.id);
+        if (rejected.length > 0) {
+          await client.query(
+            "UPDATE catalog_matches SET status='rejected',reviewed_at=now() WHERE run_id=$1 AND candidate_id=ANY($2::uuid[])",
+            [runId, rejected],
+          );
+        }
+        if (unsupported.length > 0) {
+          await client.query(
+            "UPDATE catalog_matches SET status='unsupported',reviewed_at=now() WHERE run_id=$1 AND candidate_id=ANY($2::uuid[])",
+            [runId, unsupported],
+          );
+        }
+        if (rejected.length > 0 || unsupported.length > 0) {
+          await client.query(
+            `UPDATE track_candidates c SET outcome=m.status FROM catalog_matches m
+             WHERE c.run_id=$1 AND m.run_id=$1 AND m.candidate_id=c.id`,
+            [runId],
+          );
         }
       }
       const verifiedClause = options.verifiedOnly
@@ -1108,9 +1211,7 @@ export class Repository {
     lastError?: string | null;
     publishedAt?: Date | null;
   }): Promise<void> {
-    const persistedLastError = typeof patch.lastError === "string"
-      ? redactedPublicationFailure(patch.lastError)
-      : patch.lastError;
+    const persistedLastError = sanitizeOptionalFailure(patch.lastError, "publication");
     const result = await this.pool.query(
       `UPDATE publication_volumes SET status=COALESCE($2,status),apple_playlist_id=CASE WHEN $3::boolean THEN $4 ELSE apple_playlist_id END,
        apple_share_url=CASE WHEN $5::boolean THEN $6 ELSE apple_share_url END,appended_count=COALESCE($7,appended_count),
@@ -1135,7 +1236,7 @@ export class Repository {
       appleShareUrl: row.apple_share_url,
       appendedCount: row.appended_count,
       attempt: row.attempt,
-      lastError: row.last_error,
+      lastError: sanitizeOptionalFailure(row.last_error, "publication"),
     }));
   }
 
@@ -1143,14 +1244,17 @@ export class Repository {
     const id = randomUUID();
     await this.pool.query(
       "INSERT INTO orphan_playlists(id,manifest_id,publication_volume_id,apple_playlist_id,reason) VALUES($1,$2,$3,$4,$5)",
-      [id, input.manifestId ?? null, input.publicationVolumeId ?? null, input.applePlaylistId, input.reason.slice(0, 2_000)],
+      [id, input.manifestId ?? null, input.publicationVolumeId ?? null, input.applePlaylistId, sanitizeFailure(input.reason, "publication")],
     );
     return id;
   }
 
   async listOrphanPlaylists(): Promise<any[]> {
     const result = await this.pool.query("SELECT * FROM orphan_playlists WHERE cleaned_at IS NULL ORDER BY created_at DESC");
-    return result.rows;
+    return result.rows.map((row) => ({
+      ...row,
+      reason: sanitizeFailure(row.reason, "publication"),
+    }));
   }
 
   async listWaitingPublicationManifestIds(): Promise<string[]> {
@@ -1204,23 +1308,43 @@ export class Repository {
       await client.query("SELECT pg_advisory_xact_lock($1)", [JOB_ADVISORY_LOCK]);
       const exhausted = await client.query<{ run_id: string | null; brief_request_id: string | null; kind: string; payload_json: Record<string, unknown> | null }>(
         `UPDATE job_queue SET status='failed',completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,
-         last_error=COALESCE(last_error,'Worker lease expired after the final attempt'),updated_at=now()
+         last_error=CASE kind
+           WHEN 'brief' THEN $1
+           WHEN 'research' THEN $2
+           WHEN 'matching' THEN $3
+           WHEN 'publication' THEN $4
+           WHEN 'notification' THEN $5
+           WHEN 'apple_authorization' THEN $6
+           ELSE $7 END,
+         updated_at=now()
          WHERE status='leased' AND lease_expires_at<=now() AND attempts>=max_attempts
          RETURNING run_id,brief_request_id,kind,payload_json`,
+        [
+          sanitizeFailure(null, "brief"),
+          sanitizeFailure(null, "research"),
+          sanitizeFailure(null, "matching"),
+          sanitizeFailure("Worker lease expired after the final attempt", "publication"),
+          sanitizeFailure(null, "notification"),
+          sanitizeFailure(null, "apple_authorization"),
+          sanitizeFailure(null, "background"),
+        ],
       );
       for (const job of exhausted.rows) {
         if (job.run_id && ["research", "matching", "publication"].includes(job.kind)) {
           await client.query(
-            `UPDATE research_runs SET status='failed',phase=$2,error='Worker lease expired after the final attempt',
+            `UPDATE research_runs SET status='failed',phase=$2,error=$3,
              completed_at=COALESCE(completed_at,now()),updated_at=now()
              WHERE id=$1 AND status NOT IN ('complete','partial','failed','expired','deleted','waiting_for_apple_authorization')`,
-            [job.run_id, `${job.kind}_failed`],
+            [job.run_id, `${job.kind}_failed`, sanitizeFailure(
+              job.kind === "publication" ? "Worker lease expired after the final attempt" : null,
+              failureContextForJob(job.kind),
+            )],
           );
         }
         if (job.brief_request_id && job.kind === "brief") {
           await client.query(
-            "UPDATE brief_requests SET status='failed',error='Worker lease expired after the final attempt',updated_at=now() WHERE id=$1 AND status<>'complete'",
-            [job.brief_request_id],
+            "UPDATE brief_requests SET status='failed',error=$2,updated_at=now() WHERE id=$1 AND status<>'complete'",
+            [job.brief_request_id, sanitizeFailure(null, "brief")],
           );
         }
         if (job.kind === "publication") {
@@ -1231,9 +1355,9 @@ export class Repository {
           : null;
         if (notificationId) {
           await client.query(
-            `UPDATE notification_outbox SET status='failed',last_error='Worker lease expired after the final attempt',updated_at=now()
+            `UPDATE notification_outbox SET status='failed',last_error=$2,updated_at=now()
              WHERE id=$1 AND status<>'sent'`,
-            [notificationId],
+            [notificationId, sanitizeFailure(null, "notification")],
           );
         }
       }
@@ -1286,7 +1410,7 @@ export class Repository {
       `UPDATE job_queue SET status='queued',attempts=GREATEST(0,attempts-1),available_at=$3,
        lease_owner=NULL,lease_expires_at=NULL,last_error=$4,completed_at=NULL,updated_at=now()
        WHERE id=$1 AND lease_owner=$2 AND status='leased'`,
-      [jobId, workerId, availableAt, reason.slice(0, 1_000)],
+      [jobId, workerId, availableAt, sanitizeFailure(reason, "background")],
     );
     if (!result.rowCount) throw new HttpError(409, "Job lease was lost", "job_lease_lost");
   }
@@ -1296,7 +1420,7 @@ export class Repository {
       `UPDATE job_queue SET status='cancelled',completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,
        last_error=$3,updated_at=now()
        WHERE id=$1 AND lease_owner=$2 AND status='leased'`,
-      [jobId, workerId, reason.slice(0, 1_000)],
+      [jobId, workerId, sanitizeFailure(reason, "background")],
     );
   }
 
@@ -1317,9 +1441,8 @@ export class Repository {
       );
       if (!current.rows[0]) throw new HttpError(409, "Job lease was lost", "job_lease_lost");
       const retry = retryAt && current.rows[0].attempts < current.rows[0].max_attempts;
-      const persistedError = current.rows[0].kind === "publication"
-        ? redactedPublicationFailure(error)
-        : error.slice(0, 4_000);
+      const context = failureContextForJob(current.rows[0].kind);
+      const persistedError = sanitizeFailure(error, context);
       await client.query(
         `UPDATE job_queue SET status=$3::varchar,available_at=COALESCE($4,available_at),last_error=$5,
          completed_at=CASE WHEN $3::varchar='failed' THEN now() ELSE NULL END,lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
@@ -1339,7 +1462,7 @@ export class Repository {
       if (!retry && current.rows[0].brief_request_id && current.rows[0].kind === "brief") {
         await client.query(
           "UPDATE brief_requests SET status='failed',error=$2,updated_at=now() WHERE id=$1 AND status<>'complete'",
-          [current.rows[0].brief_request_id, error.slice(0, 2_000)],
+          [current.rows[0].brief_request_id, sanitizeFailure(error, "brief")],
         );
       }
       const notificationId = !retry && current.rows[0].kind === "notification" && typeof current.rows[0].payload_json?.notificationId === "string"
@@ -1348,7 +1471,7 @@ export class Repository {
       if (notificationId) {
         await client.query(
           "UPDATE notification_outbox SET status='failed',last_error=$2,updated_at=now() WHERE id=$1 AND status<>'sent'",
-          [notificationId, error.slice(0, 2_000)],
+          [notificationId, sanitizeFailure(error, "notification")],
         );
       }
     });
@@ -1479,7 +1602,7 @@ export class Repository {
           COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE occurred_at >= date_trunc('month',now() AT TIME ZONE 'America/Sao_Paulo') AT TIME ZONE 'America/Sao_Paulo'),0)::float8 spent,
           COALESCE((SELECT sum(reserved_usd) FROM cost_reservations WHERE status='reserved' AND expires_at>now()),0)::float8 reserved`,
       );
-      const ceiling = Number(process.env.APP_MONTHLY_COST_LIMIT_USD ?? process.env.MONTHLY_RESEARCH_CEILING_USD ?? 50);
+      const ceiling = readCostConfiguration().monthlyCostLimitUsd;
       if (monthly.rows[0]!.spent + monthly.rows[0]!.reserved + amount > ceiling) {
         throw new HttpError(402, "Monthly research budget has been reached", "monthly_budget_reached");
       }
@@ -1522,7 +1645,7 @@ export class Repository {
           COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE occurred_at >= date_trunc('month',now() AT TIME ZONE 'America/Sao_Paulo') AT TIME ZONE 'America/Sao_Paulo'),0)::float8 spent,
           COALESCE((SELECT sum(reserved_usd) FROM cost_reservations WHERE status='reserved'),0)::float8 reserved`,
       );
-      const monthlyCeiling = Number(process.env.APP_MONTHLY_COST_LIMIT_USD ?? process.env.MONTHLY_RESEARCH_CEILING_USD ?? 50);
+      const monthlyCeiling = readCostConfiguration().monthlyCostLimitUsd;
       const monthlyProjected = monthly.rows[0]!.spent + Math.max(0, monthly.rows[0]!.reserved - reserved) + actual;
       let runCeilingExceeded = false;
       if (row.run_id) {
@@ -1603,18 +1726,19 @@ export class Repository {
       storefront: row.storefront,
       status: row.status,
       lastValidatedAt: date(row.last_validated_at),
-      lastError: row.last_error,
+      lastError: sanitizeOptionalFailure(row.last_error, "apple_authorization"),
       updatedAt: date(row.updated_at),
     };
   }
 
   async saveAppleAuthorization(input: EncryptedAppleAuthorizationInput): Promise<void> {
+    const persistedLastError = sanitizeOptionalFailure(input.lastError, "apple_authorization");
     await this.pool.query(
       `INSERT INTO apple_authorizations(id,ciphertext,iv,auth_tag,key_version,storefront,status,last_validated_at,last_error)
        VALUES('owner',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET ciphertext=EXCLUDED.ciphertext,
        iv=EXCLUDED.iv,auth_tag=EXCLUDED.auth_tag,key_version=EXCLUDED.key_version,storefront=EXCLUDED.storefront,
        status=EXCLUDED.status,last_validated_at=EXCLUDED.last_validated_at,last_error=EXCLUDED.last_error,updated_at=now()`,
-      [input.ciphertext, input.iv, input.authTag, input.keyVersion, input.storefront, input.status ?? "unverified", input.lastValidatedAt ?? null, input.lastError ?? null],
+      [input.ciphertext, input.iv, input.authTag, input.keyVersion, input.storefront, input.status ?? "unverified", input.lastValidatedAt ?? null, persistedLastError],
     );
   }
 
@@ -1625,7 +1749,7 @@ export class Repository {
   async updateAppleAuthorizationStatus(status: string, lastError: string | null = null): Promise<void> {
     await this.pool.query(
       "UPDATE apple_authorizations SET status=$1,last_error=$2,last_validated_at=CASE WHEN $1='valid' THEN now() ELSE last_validated_at END,updated_at=now() WHERE id='owner'",
-      [status, lastError],
+      [status, sanitizeOptionalFailure(lastError, "apple_authorization")],
     );
   }
 
@@ -1645,7 +1769,7 @@ export class Repository {
         input.expectedKeyVersion,
         input.storefront ?? null,
         input.status,
-        input.lastError ?? null,
+        sanitizeOptionalFailure(input.lastError, "apple_authorization"),
       ],
     );
     return Boolean(result.rowCount);
@@ -1681,7 +1805,7 @@ export class Repository {
   async getNotification(id: string): Promise<any | null> {
     const result = await this.pool.query("SELECT * FROM notification_outbox WHERE id=$1", [id]);
     const row = result.rows[0];
-    return row ? { id: row.id, kind: row.kind, payload: row.payload_json, status: row.status, attempts: row.attempts, availableAt: date(row.available_at), sentAt: date(row.sent_at)?.toISOString() ?? null, lastError: row.last_error } : null;
+    return row ? { id: row.id, kind: row.kind, payload: row.payload_json, status: row.status, attempts: row.attempts, availableAt: date(row.available_at), sentAt: date(row.sent_at)?.toISOString() ?? null, lastError: sanitizeOptionalFailure(row.last_error, "notification") } : null;
   }
 
   async markNotificationSent(id: string, providerId: string | null = null): Promise<void> {
@@ -1694,7 +1818,7 @@ export class Repository {
   async markNotificationFailed(id: string, error: string, retryAt: Date | null): Promise<void> {
     await this.pool.query(
       `UPDATE notification_outbox SET status=$2,attempts=attempts+1,available_at=COALESCE($3,available_at),last_error=$4,updated_at=now() WHERE id=$1`,
-      [id, retryAt ? "pending" : "failed", retryAt, error.slice(0, 2_000)],
+      [id, retryAt ? "pending" : "failed", retryAt, sanitizeFailure(error, "notification")],
     );
   }
 
@@ -1712,7 +1836,7 @@ export class Repository {
               budget_approval_expires_at,created_at
        FROM research_runs WHERE status='awaiting_budget' AND budget_approval_expires_at>now() AND deleted_at IS NULL ORDER BY created_at`,
     );
-    const monthlyCeiling = Number(process.env.APP_MONTHLY_COST_LIMIT_USD ?? process.env.MONTHLY_RESEARCH_CEILING_USD ?? 50);
+    const monthlyCeiling = readCostConfiguration().monthlyCostLimitUsd;
     return result.rows.map((row) => ({
       id: row.id,
       brief: row.brief_json,
@@ -1919,8 +2043,8 @@ export class Repository {
       },
       monthSpendUsd: Number(costs.rows[0]?.month_spend ?? 0),
       monthReservedUsd: Number(costs.rows[0]?.month_reserved ?? 0),
-      monthCeilingUsd: Number(process.env.APP_MONTHLY_COST_LIMIT_USD ?? process.env.MONTHLY_RESEARCH_CEILING_USD ?? 50),
-      apple: apple.rows[0] ? { status: apple.rows[0].status, storefront: apple.rows[0].storefront, lastValidatedAt: date(apple.rows[0].last_validated_at)?.toISOString() ?? null, lastError: apple.rows[0].last_error } : { status: "missing" },
+      monthCeilingUsd: readCostConfiguration().monthlyCostLimitUsd,
+      apple: apple.rows[0] ? { status: apple.rows[0].status, storefront: apple.rows[0].storefront, lastValidatedAt: date(apple.rows[0].last_validated_at)?.toISOString() ?? null, lastError: sanitizeOptionalFailure(apple.rows[0].last_error, "apple_authorization") } : { status: "missing" },
       notificationBacklog: Number(notificationRow.pending ?? 0),
       notificationFailures: Number(notificationRow.failed ?? 0),
       oldestNotificationSeconds: Number(notificationRow.oldest_pending_seconds ?? 0),

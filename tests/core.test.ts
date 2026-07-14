@@ -225,6 +225,82 @@ test("Railway gateway rejects stale, body-tampered, signature-tampered, and repl
   }
 });
 
+test("Railway accepts current and previous gateway keys during rotation and rejects retired keys", async () => {
+  const names = [
+    "GATEWAY_KEY_ID",
+    "GATEWAY_HMAC_SECRET",
+    "GATEWAY_PREVIOUS_KEY_ID",
+    "GATEWAY_PREVIOUS_HMAC_SECRET",
+    "GATEWAY_KEYS_JSON",
+  ] as const;
+  const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  const current = { id: "rotation-v2", secret: "rotation-current-secret-at-least-32-bytes" };
+  const previous = { id: "rotation-v1", secret: "rotation-previous-secret-at-least-32-bytes" };
+  const path = "/api/v1/brief";
+  const body = Buffer.from("{}");
+  const bodyHash = sha256Hex(body);
+  const clientBucket = `2026-07-13.${"r".repeat(43)}`;
+  const timestamp = String(Math.floor(Date.now() / 1_000));
+
+  try {
+    process.env.GATEWAY_KEY_ID = current.id;
+    process.env.GATEWAY_HMAC_SECRET = current.secret;
+    process.env.GATEWAY_PREVIOUS_KEY_ID = previous.id;
+    process.env.GATEWAY_PREVIOUS_HMAC_SECRET = previous.secret;
+    delete process.env.GATEWAY_KEYS_JSON;
+    const claimed = new Set<string>();
+    const verify = createGatewayVerifier({
+      async claimGatewayNonce(keyId, nonce) {
+        const key = `${keyId}:${nonce}`;
+        if (claimed.has(key)) return false;
+        claimed.add(key);
+        return true;
+      },
+    });
+    const request = (key: { id: string; secret: string }, nonce: string) => {
+      const signature = hmacBase64Url(key.secret, canonicalGatewayRequest({
+        keyId: key.id,
+        timestamp,
+        nonce,
+        method: "POST",
+        path,
+        bodyHash,
+        clientBucket,
+        ownerEmail: "",
+      }));
+      const headers = {
+        "x-needle-key-id": key.id,
+        "x-needle-timestamp": timestamp,
+        "x-needle-nonce": nonce,
+        "x-needle-body-sha256": bodyHash,
+        "x-needle-client-bucket": clientBucket,
+        "x-needle-signature": signature,
+      };
+      return {
+        method: "POST",
+        url: path,
+        rawBody: body,
+        raw: { rawHeaders: Object.entries(headers).flatMap(([name, value]) => [name, value]), url: path },
+      } as never;
+    };
+
+    await expect(verify(request(previous, `nonce_${"p".repeat(32)}`)))
+      .resolves.toMatchObject({ keyId: previous.id });
+    await expect(verify(request(current, `nonce_${"c".repeat(32)}`)))
+      .resolves.toMatchObject({ keyId: current.id });
+    await expect(verify(request(
+      { id: "rotation-retired", secret: "rotation-retired-secret-at-least-32-bytes" },
+      `nonce_${"x".repeat(32)}`,
+    ))).rejects.toMatchObject({ code: "invalid_gateway_signature" });
+  } finally {
+    for (const name of names) {
+      const value = original[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
 test("Apple user-token envelopes authenticate ciphertext and support key rotation", () => {
   const original = {
     key: process.env.APPLE_TOKEN_ENCRYPTION_KEY,

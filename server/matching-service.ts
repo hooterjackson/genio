@@ -37,6 +37,7 @@ const wait = (ms: number) => new Promise<void>((resolve) => {
 
 function isEvidenceEligible(brief: PlaylistBrief, candidate: Candidate): boolean {
   const states = new Set(candidate.evidence.map((claim) => claim.state));
+  if (states.has("disputed")) return false;
   return brief.mode === "curated"
     ? states.has("editorial") || states.has("verified") || states.has("corroborated")
     : states.has("verified") || states.has("corroborated");
@@ -44,6 +45,9 @@ function isEvidenceEligible(brief: PlaylistBrief, candidate: Candidate): boolean
 
 function ineligibleEvidenceBasis(brief: PlaylistBrief, candidate: Candidate): string {
   const states = new Set(candidate.evidence.map((claim) => claim.state));
+  if (states.has("disputed")) {
+    return "Sources disagree about the asserted track relationship; visitor review is required";
+  }
   if (states.has("inferred") && !states.has("verified") && !states.has("corroborated")) {
     return "Inferred evidence requires visitor approval";
   }

@@ -5,6 +5,7 @@ import type {
   TrackCandidateInput,
 } from "../shared/types.ts";
 import { assertPublicHttpsUrl, candidateIdentityKey, compactEvidenceNote, HttpError } from "./security.ts";
+import { provenanceLineageKeys } from "./evidence-integrity.ts";
 
 export const OWNER_CATALOG_IMPORT_LIMITS = Object.freeze({
   maxRows: 10_000,
@@ -80,6 +81,9 @@ const EVIDENCE_STATES = new Map<string, EvidenceState>([
   ["probable", "inferred"],
   ["albumlevel", "inferred"],
   ["unspecified", "inferred"],
+  ["disputed", "disputed"],
+  ["contradicted", "disputed"],
+  ["conflicting", "disputed"],
 ]);
 
 const SUPPORT_SCOPES = new Map<string, SupportScope>([
@@ -190,6 +194,7 @@ function normalizeSupportScope(value: unknown, row: number): SupportScope {
 
 function scopeAdjustedState(state: EvidenceState, scope: SupportScope): EvidenceState {
   if (scope === "track") return state;
+  if (state === "disputed") return "inferred";
   if (scope === "editorial") return state === "inferred" ? "inferred" : "editorial";
   return "inferred";
 }
@@ -356,32 +361,49 @@ export function parseOwnerCatalogImport(input: unknown): OwnerCatalogImportResul
   const rows = requestRows(input);
   if (rows.length === 0) importError("Catalogue must contain at least one row");
   const normalizedRows = rows.map((row, index) => normalizeRow(row, index + 1));
-  const rootsByCandidate = new Map<string, Set<string>>();
-  for (const normalized of normalizedRows) {
-    const key = corroborationSubjectKey(normalized.candidate);
-    if (!key) continue;
-    const roots = rootsByCandidate.get(key) ?? new Set<string>();
-    if (["verified", "corroborated"].includes(normalized.candidate.evidence[0]?.state ?? "")) {
-      roots.add(normalized.source.provenanceRoot);
-    }
-    rootsByCandidate.set(key, roots);
-  }
-
-  const candidates: TrackCandidateInput[] = [];
   const sourcesByUrl = new Map<string, SourceRecordInput>();
-
   normalizedRows.forEach((normalized, index) => {
     const existing = sourcesByUrl.get(normalized.source.url);
     if (existing && existing.provenanceRoot !== normalized.source.provenanceRoot) {
       importError("A source URL cannot have conflicting provenance roots", index + 1, "provenanceRoot");
     }
     if (!existing) sourcesByUrl.set(normalized.source.url, normalized.source);
+  });
+
+  const lineageByUrl = provenanceLineageKeys([...sourcesByUrl.values()]);
+  const rootsByCandidate = new Map<string, Set<string>>();
+  const statesByCandidate = new Map<string, Set<EvidenceState>>();
+  for (const normalized of normalizedRows) {
+    const key = corroborationSubjectKey(normalized.candidate);
+    if (!key) continue;
+    const roots = rootsByCandidate.get(key) ?? new Set<string>();
+    if (["verified", "corroborated"].includes(normalized.candidate.evidence[0]?.state ?? "")) {
+      const lineage = lineageByUrl.get(normalized.source.url);
+      if (lineage) roots.add(lineage);
+    }
+    rootsByCandidate.set(key, roots);
+    const states = statesByCandidate.get(key) ?? new Set<EvidenceState>();
+    states.add(normalized.candidate.evidence[0]!.state);
+    statesByCandidate.set(key, states);
+  }
+
+  const candidates: TrackCandidateInput[] = [];
+
+  normalizedRows.forEach((normalized) => {
     const claim = normalized.candidate.evidence[0]!;
     const corroborationKey = corroborationSubjectKey(normalized.candidate);
     const independentRoots = corroborationKey ? rootsByCandidate.get(corroborationKey)?.size ?? 0 : 0;
-    candidates.push(claim.state === "corroborated" && independentRoots < 2
-      ? { ...normalized.candidate, evidence: [{ ...claim, state: "inferred" }] }
-      : normalized.candidate);
+    const states = corroborationKey ? statesByCandidate.get(corroborationKey) : null;
+    const hasDisagreement = Boolean(states?.has("disputed")
+      && [...states].some((state) => state === "verified" || state === "corroborated" || state === "editorial"));
+    const state = hasDisagreement && (claim.state === "verified" || claim.state === "corroborated" || claim.state === "editorial")
+      ? "inferred"
+      : claim.state === "corroborated" && independentRoots < 2
+        ? "inferred"
+        : claim.state;
+    candidates.push(state === claim.state
+      ? normalized.candidate
+      : { ...normalized.candidate, evidence: [{ ...claim, state }] });
   });
 
   return { sources: [...sourcesByUrl.values()], candidates };

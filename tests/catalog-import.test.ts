@@ -111,6 +111,26 @@ describe("owner catalogue import", () => {
     ]);
     expect(unknownRoots.sources.map((source) => source.provenanceRoot)).toEqual(["unclassified", "unclassified"]);
     expect(unknownRoots.candidates.map((candidate) => candidate.evidence[0]?.state)).toEqual(["inferred", "inferred"]);
+
+    const mirrored = parseOwnerCatalogImport([
+      { artist: "Artist", title: "Song", isrc: "USAAA2000003", sourceUrl, evidenceState: "corroborated", supportScope: "track", provenanceRoot: "underlying-ledger" },
+      { artist: "Artist", title: "Song", isrc: "USAAA2000003", sourceUrl: "https://mirror.example.net/song", evidenceState: "corroborated", supportScope: "track", provenanceRoot: "underlying-ledger" },
+    ]);
+    expect(mirrored.candidates.map((candidate) => candidate.evidence[0]?.state)).toEqual(["inferred", "inferred"]);
+
+    const circular = parseOwnerCatalogImport([
+      { artist: "Artist", title: "Song", isrc: "USAAA2000004", sourceUrl: "https://circular-one.example/song", evidenceState: "corroborated", supportScope: "track", provenanceRoot: "circular-two.example" },
+      { artist: "Artist", title: "Song", isrc: "USAAA2000004", sourceUrl: "https://circular-two.example/song", evidenceState: "corroborated", supportScope: "track", provenanceRoot: "circular-one.example" },
+    ]);
+    expect(circular.candidates.map((candidate) => candidate.evidence[0]?.state)).toEqual(["inferred", "inferred"]);
+  });
+
+  test("retains a conflicting track assertion as disputed and demotes positive support", () => {
+    const parsed = parseOwnerCatalogImport([
+      { artist: "Artist", title: "Contested", isrc: "USAAA2000005", sourceUrl, evidenceState: "verified", supportScope: "track", provenanceRoot: "source-a" },
+      { artist: "Artist", title: "Contested", isrc: "USAAA2000005", sourceUrl: "https://corrections.example.net/song", evidenceState: "disputed", supportScope: "track", provenanceRoot: "source-b", relationship: "not credited as performer" },
+    ]);
+    expect(parsed.candidates.map((candidate) => candidate.evidence[0]?.state)).toEqual(["inferred", "disputed"]);
   });
 
   test("production ingestion cannot self-promote owner-declared evidence", () => {

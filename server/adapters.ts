@@ -11,6 +11,7 @@ import type {
 import { assertPublicHttpsUrl } from "./security.ts";
 import { optionalSecret } from "./secrets.ts";
 import { searchAppleCatalog } from "./apple.ts";
+import { boundedResponseText } from "./bounded-response.ts";
 
 const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("Adapter request aborted"));
@@ -49,8 +50,6 @@ async function adapterFetch(url: URL, expectedHost: string, init: RequestInit, s
       });
       lastStatus = response.status;
       if (response.status >= 300 && response.status < 400) throw new Error("Structured adapter redirects are not allowed");
-      const declared = Number(response.headers.get("content-length") ?? 0);
-      if (declared > MAX_ADAPTER_RESPONSE_BYTES) throw new Error("Structured adapter response exceeded the size limit");
       if (response.ok) return response;
       if (response.status !== 429 && response.status < 500) return response;
       if (attempt < 2) {
@@ -68,8 +67,11 @@ async function adapterFetch(url: URL, expectedHost: string, init: RequestInit, s
 }
 
 async function adapterJson(response: Response): Promise<any> {
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_ADAPTER_RESPONSE_BYTES) throw new Error("Structured adapter response exceeded the size limit");
+  const text = await boundedResponseText(
+    response,
+    MAX_ADAPTER_RESPONSE_BYTES,
+    "Structured adapter response exceeded the size limit",
+  );
   try { return JSON.parse(text); } catch { throw new Error("Structured adapter returned malformed JSON"); }
 }
 
@@ -567,9 +569,16 @@ class AppleAdapter implements SourceAdapter {
   }
 }
 
+export function discogsAdapterEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
+  return environment.NODE_ENV !== "production" && environment.ENABLE_DISCOGS_ADAPTER === "true";
+}
+
 export function createAdapterRegistry(_legacyRepository?: unknown): Map<string, SourceAdapter> {
   void _legacyRepository;
-  const adapters: SourceAdapter[] = [new MusicBrainzAdapter(), new DiscogsAdapter(), new AppleAdapter()];
+  const adapters: SourceAdapter[] = [new MusicBrainzAdapter(), new AppleAdapter()];
+  // Discogs is deliberately excluded from production while its public-service
+  // terms and operating limits are unresolved. A token alone never enables it.
+  if (discogsAdapterEnabled()) adapters.splice(1, 0, new DiscogsAdapter());
   return new Map(adapters.map((adapter) => [adapter.id, adapter]));
 }
 

@@ -10,8 +10,10 @@ import { estimateResearchCost, isPlaylistBrief } from "./brief-policy.ts";
 import { researchResumeJob, type ResearchResumeCheckpoint } from "./research-resume.ts";
 import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
+import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
+const costConfiguration = readCostConfiguration();
 const repository = new Repository();
 const capabilities = new CapabilityService(repository);
 const verifyGateway = createGatewayVerifier(repository);
@@ -218,7 +220,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     prompt: interpreted.prompt,
     brief,
     estimateUsd: confirmedEstimateUsd,
-    approvedBudgetUsd: confirmedEstimateUsd <= Number(process.env.AUTO_RUN_COST_LIMIT_USD ?? process.env.INITIAL_COST_GATE_USD ?? 5) ? confirmedEstimateUsd : 0,
+    approvedBudgetUsd: initialApprovedBudgetUsd(confirmedEstimateUsd),
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
@@ -362,7 +364,7 @@ app.get("/api/v1/owner/status", async (request) => {
 
 app.get("/api/v1/owner/budgets", async (request) => {
   owner(request);
-  return { runs: await repository.listAwaitingBudgets(), ceilingUsd: Number(process.env.APP_MONTHLY_COST_LIMIT_USD ?? process.env.MONTHLY_RESEARCH_CEILING_USD ?? 50) };
+  return { runs: await repository.listAwaitingBudgets(), ceilingUsd: costConfiguration.monthlyCostLimitUsd };
 });
 
 app.get<{ Querystring: { limit?: string } }>("/api/v1/owner/runs", async (request) => {
@@ -490,9 +492,13 @@ app.setErrorHandler((error, request, reply) => {
       ? hintedStatus
       : 500;
   const code = error instanceof HttpError ? error.code : statusCode === 500 ? "internal_error" : "request_error";
-  if (statusCode >= 500) request.log.error({ err: error }, "request failed");
+  if (statusCode >= 500) request.log.error({ code, statusCode }, "request failed; private diagnostics suppressed");
   else request.log.info({ code, statusCode }, "request rejected");
-  const message = statusCode >= 500 ? "Needle could not complete that request" : typeof errorRecord.message === "string" ? errorRecord.message : "Request rejected";
+  const message = error instanceof HttpError
+    ? error.message
+    : statusCode >= 500
+      ? "Needle could not complete that request"
+      : "Request rejected";
   reply.code(statusCode).send({ error: message, code });
 });
 

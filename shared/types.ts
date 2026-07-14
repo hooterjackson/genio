@@ -1,5 +1,5 @@
 export type PlaylistMode = "exhaustive" | "curated" | "hybrid";
-export type EvidenceState = "verified" | "corroborated" | "editorial" | "inferred";
+export type EvidenceState = "verified" | "corroborated" | "editorial" | "inferred" | "disputed";
 export type RunStatus =
   | "draft"
   | "queued"

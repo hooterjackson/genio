@@ -9,7 +9,23 @@ afterEach(() => {
 });
 
 describe("structured source adapters", () => {
+  test("Discogs stays unregistered by default even when a token exists", () => {
+    vi.stubEnv("DISCOGS_TOKEN", "test-token");
+    expect(createAdapterRegistry().has("discogs")).toBe(false);
+  });
+
+  test("Discogs requires an explicit non-production opt-in", () => {
+    vi.stubEnv("ENABLE_DISCOGS_ADAPTER", "true");
+    vi.stubEnv("DISCOGS_TOKEN", "test-token");
+    vi.stubEnv("NODE_ENV", "development");
+    expect(createAdapterRegistry().has("discogs")).toBe(true);
+
+    vi.stubEnv("NODE_ENV", "production");
+    expect(createAdapterRegistry().has("discogs")).toBe(false);
+  });
+
   test("Discogs discovery persists release references and normalizes track credits as inferred-only evidence", async () => {
+    vi.stubEnv("ENABLE_DISCOGS_ADAPTER", "true");
     vi.stubEnv("DISCOGS_TOKEN", "test-token");
     const responses = [
       {
@@ -73,6 +89,7 @@ describe("structured source adapters", () => {
   });
 
   test("Discogs paginates a release larger than the model tool-output item cap without losing tracks", async () => {
+    vi.stubEnv("ENABLE_DISCOGS_ADAPTER", "true");
     vi.stubEnv("DISCOGS_TOKEN", "test-token");
     const tracklist = Array.from({ length: 61 }, (_, index) => ({
       type_: "track",

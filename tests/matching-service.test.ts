@@ -39,7 +39,7 @@ type Candidate = TrackCandidateInput & {
   duplicateClusterKey?: string | null;
 };
 
-function candidate(id: string, state: "verified" | "corroborated" | "editorial" | "inferred", duplicateClusterKey: string | null = null): Candidate {
+function candidate(id: string, state: "verified" | "corroborated" | "editorial" | "inferred" | "disputed", duplicateClusterKey: string | null = null): Candidate {
   return {
     id,
     artist: "Test Artist",
@@ -85,6 +85,21 @@ test("inferred evidence keeps ranked Apple choices but is forced to visitor revi
     song: { id: "apple-1" },
   });
   expect(repository.matches[0]?.basis).toContain("Inferred evidence");
+});
+
+test("disputed evidence surfaces source disagreement for visitor review", async () => {
+  const disputed = candidate("disputed", "disputed");
+  disputed.evidence.push({
+    sourceUrl: "https://example.net/support",
+    state: "verified",
+    supportScope: "track",
+    relationship: "performed on",
+    note: "Conflicting positive credit",
+  });
+  const repository = new MemoryMatchingRepository([disputed]);
+  await matchResearchRun(repository, "run", "us");
+  expect(repository.matches[0]).toMatchObject({ candidateId: "disputed", status: "review" });
+  expect(repository.matches[0]?.basis).toContain("Sources disagree");
 });
 
 test("every surviving member of a metadata duplicate cluster requires review", async () => {

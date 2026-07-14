@@ -51,7 +51,12 @@ Railway worker secrets:
 - dedicated `OPENAI_API_KEY`
 - Apple Team ID, Key ID, Media ID, and full `.p8`
 - the same versioned 32-byte Apple-token encryption key and temporary decryption keyring
-- optional Discogs and Resend keys
+- optional Resend key
+
+The Discogs adapter is excluded from production at launch, even if a legacy
+`DISCOGS_TOKEN` remains configured. `ENABLE_DISCOGS_ADAPTER=true` is available
+only for explicit non-production testing while the service terms and operating
+limits remain unresolved.
 
 The Apple developer credentials and token-encryption key deliberately exist in both app services for version one: the API needs them for owner authorization, while only the private worker imports the deterministic Apple write path. Research modules never receive an Apple client or write capability.
 
