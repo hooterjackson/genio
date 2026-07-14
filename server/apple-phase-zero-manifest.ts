@@ -144,19 +144,22 @@ export async function createApplePhaseZeroManifest(
     );
 
     const rows = input.tracks.map((track, position) => ({
-      candidateId: candidateIds[position]!,
+      // jsonb_to_recordset matches JSON keys to SQL column names exactly.
+      // Keep the persistence payload in snake_case so UUID/FK fields cannot
+      // silently decode as NULL in PostgreSQL.
+      candidate_id: candidateIds[position]!,
       position,
-      canonicalKey: `phase-zero:${input.fixtureHash}:${input.caseId}:${position}:${track.id}`,
+      canonical_key: `phase-zero:${input.fixtureHash}:${input.caseId}:${position}:${track.id}`,
       artist: track.artistName.slice(0, 240),
       title: track.name.slice(0, 240),
       album: track.albumName.slice(0, 240) || null,
-      releaseYear: releaseYear(track.releaseDate),
-      durationMs: track.durationInMillis ?? null,
-      versionLabel: track.versionLabel?.slice(0, 120) ?? null,
-      catalogId: track.id,
+      release_year: releaseYear(track.releaseDate),
+      duration_ms: track.durationInMillis ?? null,
+      version_label: track.versionLabel?.slice(0, 120) ?? null,
+      catalog_id: track.id,
       song: track,
-      evidenceId: deterministicUuid(`${namespace}:evidence:${position}:${track.id}`),
-      matchId: deterministicUuid(`${namespace}:match:${position}:${track.id}`),
+      evidence_id: deterministicUuid(`${namespace}:evidence:${position}:${track.id}`),
+      match_id: deterministicUuid(`${namespace}:match:${position}:${track.id}`),
     }));
     const json = JSON.stringify(rows);
     await client.query(
@@ -173,7 +176,8 @@ export async function createApplePhaseZeroManifest(
          id,run_id,candidate_id,source_id,state,support_scope,verification_phase,
          subject_entity,subject_relationship,relationship,note)
        SELECT x.evidence_id,$2,x.candidate_id,$3,'inferred','track','catalog_enrichment',
-         'Explicit owner-approved Apple catalog IDs','Operational phase-zero fixture',
+         left(x.artist || ' — ' || x.title || ' [Apple ' || x.catalog_id || ']',240),
+         'operational Apple catalog fixture',
          'phase-zero operational catalog fixture',
          'The owner explicitly accepted this Apple catalog ID for capacity testing; no research claim is asserted.'
        FROM jsonb_to_recordset($1::jsonb) AS x(
