@@ -24,6 +24,19 @@ export interface AppleAuthorizationStore {
   updateAppleAuthorizationStatus(status: string, lastError?: string | null): Promise<void>;
 }
 
+type AppleAuthorizationIdentity = Pick<AppleAuthorizationRecord, "ciphertext" | "keyVersion">;
+
+export function appleAuthorizationGeneration(record: AppleAuthorizationIdentity): string {
+  return createHash("sha256")
+    .update(`${record.keyVersion}:${record.ciphertext}`)
+    .digest("hex")
+    .slice(0, 20);
+}
+
+export function appleAuthorizationJobDedupeKey(record: AppleAuthorizationIdentity): string {
+  return `apple-authorization:${appleAuthorizationGeneration(record)}`;
+}
+
 export class AppleApiError extends Error {
   readonly name: string = "AppleApiError";
 
@@ -188,7 +201,10 @@ export interface AppleRequestOptions extends RequestInit {
 }
 
 export class AppleMusicClient {
-  constructor(private readonly musicUserToken?: string) {}
+  constructor(
+    private readonly musicUserToken?: string,
+    private readonly storefront?: string,
+  ) {}
 
   async request(path: string, options: AppleRequestOptions = {}): Promise<any> {
     if (!path.startsWith("/v1/")) throw new Error("Apple API path is not allowed");
@@ -253,7 +269,13 @@ export class AppleMusicClient {
   async createLibraryPlaylist(name: string, description: string, signal?: AbortSignal): Promise<{ id: string; url: string | null }> {
     const payload = await this.request("/v1/me/library/playlists", {
       method: "POST",
-      body: JSON.stringify({ attributes: { name: name.slice(0, 240), description: description.slice(0, 1_000) } }),
+      body: JSON.stringify({
+        attributes: {
+          name: name.slice(0, 240),
+          description: description.slice(0, 1_000),
+          isPublic: true,
+        },
+      }),
       retrySafe: false,
       signal,
     });
@@ -291,7 +313,31 @@ export class AppleMusicClient {
 
   async getLibraryPlaylist(playlistId: string, signal?: AbortSignal): Promise<any | null> {
     try {
-      const payload = await this.request(`/v1/me/library/playlists/${encodeURIComponent(playlistId)}`, { signal });
+      const payload = await this.request(`/v1/me/library/playlists/${encodeURIComponent(playlistId)}?include=catalog`, { signal });
+      return payload?.data?.[0] ?? null;
+    } catch (error) {
+      if (error instanceof AppleApiError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async getLibraryPlaylistCatalog(playlistId: string, signal?: AbortSignal): Promise<any | null> {
+    try {
+      const payload = await this.request(`/v1/me/library/playlists/${encodeURIComponent(playlistId)}/catalog`, { signal });
+      return payload?.data?.[0] ?? null;
+    } catch (error) {
+      if (error instanceof AppleApiError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async getCatalogPlaylist(catalogId: string, signal?: AbortSignal): Promise<any | null> {
+    if (!this.storefront || !/^[a-z]{2}$/i.test(this.storefront)) return null;
+    try {
+      const payload = await this.request(
+        `/v1/catalog/${encodeURIComponent(this.storefront.toLowerCase())}/playlists/${encodeURIComponent(catalogId)}`,
+        { signal },
+      );
       return payload?.data?.[0] ?? null;
     } catch (error) {
       if (error instanceof AppleApiError && error.status === 404) return null;
@@ -311,12 +357,31 @@ export class AppleMusicClient {
     return null;
   }
 
-  async pollStableShareUrl(playlistId: string, attempts = 10, delayMs = 1_500, signal?: AbortSignal): Promise<string> {
+  async resolveLibraryPlaylistShareUrl(playlistId: string, signal?: AbortSignal): Promise<string | null> {
+    const libraryPlaylist = await this.getLibraryPlaylist(playlistId, signal);
+    const direct = libraryPlaylist ? playlistShareUrl(libraryPlaylist) : null;
+    if (direct) return direct;
+
+    const includedCatalog = libraryPlaylist?.relationships?.catalog?.data?.[0] ?? null;
+    const includedUrl = includedCatalog ? playlistShareUrl(includedCatalog) : null;
+    if (includedUrl) return includedUrl;
+
+    let catalogId = playlistCatalogId(libraryPlaylist) ?? playlistCatalogId(includedCatalog);
+    const relatedCatalog = await this.getLibraryPlaylistCatalog(playlistId, signal);
+    const relatedUrl = relatedCatalog ? playlistShareUrl(relatedCatalog) : null;
+    if (relatedUrl) return relatedUrl;
+    catalogId ??= playlistCatalogId(relatedCatalog);
+
+    if (!catalogId) return null;
+    const catalogPlaylist = await this.getCatalogPlaylist(catalogId, signal);
+    return catalogPlaylist ? playlistShareUrl(catalogPlaylist) : null;
+  }
+
+  async pollStableShareUrl(playlistId: string, attempts = 100, delayMs = 3_000, signal?: AbortSignal): Promise<string> {
     let previous: string | null = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       signal?.throwIfAborted();
-      const item = await this.getLibraryPlaylist(playlistId, signal);
-      const current = item ? playlistShareUrl(item) : null;
+      const current = await this.resolveLibraryPlaylistShareUrl(playlistId, signal);
       if (current && current === previous) return current;
       previous = current;
       if (attempt < attempts - 1) await wait(delayMs, signal);
@@ -345,12 +410,27 @@ export function playlistShareUrl(item: any): string | null {
   return null;
 }
 
+export function playlistCatalogId(item: any): string | null {
+  const candidates = [
+    item?.relationships?.catalog?.data?.[0]?.id,
+    item?.attributes?.playParams?.globalId,
+    item?.type === "playlists" ? item?.id : null,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && /^pl\.[A-Za-z0-9_-]{1,200}$/u.test(value)) return value;
+  }
+  return null;
+}
+
 export async function authorizedAppleClient(
   store: Pick<AppleAuthorizationStore, "getAppleAuthorization">,
 ): Promise<{ client: AppleMusicClient; authorization: AppleAuthorizationRecord }> {
   const authorization = await store.getAppleAuthorization();
   if (!authorization || authorization.status !== "valid") throw new AppleAuthorizationRequiredError(401);
-  return { client: new AppleMusicClient(decryptMusicUserToken(tokenEnvelope(authorization))), authorization };
+  return {
+    client: new AppleMusicClient(decryptMusicUserToken(tokenEnvelope(authorization)), authorization.storefront),
+    authorization,
+  };
 }
 
 export async function validateStoredAppleAuthorization(store: AppleAuthorizationStore, signal?: AbortSignal): Promise<string> {
@@ -371,6 +451,13 @@ export async function validateStoredAppleAuthorization(store: AppleAuthorization
 }
 
 export interface AppleAuthorizationJobRepository extends AppleAuthorizationStore {
+  updateAppleAuthorizationValidation(input: {
+    expectedCiphertext: string;
+    expectedKeyVersion: string;
+    storefront?: string;
+    status: "valid" | "reauthorization_required";
+    lastError?: string | null;
+  }): Promise<boolean>;
   listWaitingPublicationManifestIds(): Promise<string[]>;
   getManifestById(manifestId: string): Promise<{ runId: string } | null>;
   enqueueJob(input: {
@@ -381,26 +468,54 @@ export interface AppleAuthorizationJobRepository extends AppleAuthorizationStore
   }): Promise<unknown>;
 }
 
+export interface AppleAuthorizationRecoveryRepository {
+  getAppleAuthorization(): Promise<AppleAuthorizationRecord | null>;
+  enqueueJob(input: {
+    kind: string;
+    payload?: Record<string, unknown>;
+    dedupeKey?: string;
+    maxAttempts?: number;
+  }): Promise<unknown>;
+}
+
+/** Recover the API-save/queue crash window without validating a user token in the startup path. */
+export async function recoverUnverifiedAppleAuthorizationJob(
+  repository: AppleAuthorizationRecoveryRepository,
+): Promise<boolean> {
+  const authorization = await repository.getAppleAuthorization();
+  if (!authorization || authorization.status !== "unverified") return false;
+  const authorizationGeneration = appleAuthorizationGeneration(authorization);
+  await repository.enqueueJob({
+    kind: "apple_authorization",
+    payload: { authorizationGeneration },
+    dedupeKey: appleAuthorizationJobDedupeKey(authorization),
+    maxAttempts: 3,
+  });
+  return true;
+}
+
 export async function processAppleAuthorizationJob(
   repository: AppleAuthorizationJobRepository,
-  _payload: Record<string, unknown>,
+  payload: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted();
   const authorization = await repository.getAppleAuthorization();
   if (!authorization) return;
+  const authorizationGeneration = appleAuthorizationGeneration(authorization);
+  if (typeof payload.authorizationGeneration === "string" && payload.authorizationGeneration !== authorizationGeneration) return;
   const token = decryptMusicUserToken(tokenEnvelope(authorization));
   try {
     const storefront = await new AppleMusicClient(token).validateAuthorization(signal);
     signal?.throwIfAborted();
-    await repository.saveAppleAuthorization({
-      ...authorization,
+    const stillCurrent = await repository.updateAppleAuthorizationValidation({
+      expectedCiphertext: authorization.ciphertext,
+      expectedKeyVersion: authorization.keyVersion,
       storefront,
       status: "valid",
-      lastValidatedAt: new Date(),
       lastError: null,
     });
-    const authorizationGeneration = createHash("sha256").update(authorization.ciphertext).digest("hex").slice(0, 20);
+    if (!stillCurrent) return;
     for (const manifestId of await repository.listWaitingPublicationManifestIds()) {
       signal?.throwIfAborted();
       const manifest = await repository.getManifestById(manifestId);
@@ -414,7 +529,12 @@ export async function processAppleAuthorizationJob(
     }
   } catch (error) {
     if (error instanceof AppleAuthorizationRequiredError) {
-      await repository.updateAppleAuthorizationStatus("reauthorization_required", error.message);
+      await repository.updateAppleAuthorizationValidation({
+        expectedCiphertext: authorization.ciphertext,
+        expectedKeyVersion: authorization.keyVersion,
+        status: "reauthorization_required",
+        lastError: error.message,
+      });
       return;
     }
     throw error;

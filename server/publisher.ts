@@ -6,16 +6,17 @@ import {
   type AppleAuthorizationStore,
   authorizedAppleClient,
 } from "./apple.ts";
+import type { PublicationStatus } from "../shared/types.ts";
 
 const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
 const MAX_REPLACEMENTS = 3;
-const SHARE_POLL_MS = 1_500;
+const SHARE_POLL_MS = 3_000;
 const CONSISTENCY_POLL_MS = process.env.NODE_ENV === "test" ? 0 : 1_000;
 
 function sharePollAttempts(): number {
-  const seconds = Number(process.env.APPLE_SHARE_URL_TIMEOUT_SECONDS ?? 120);
-  const boundedSeconds = Number.isFinite(seconds) ? Math.min(Math.max(seconds, 15), 10 * 60) : 120;
+  const seconds = Number(process.env.APPLE_SHARE_URL_TIMEOUT_SECONDS ?? 300);
+  const boundedSeconds = Number.isFinite(seconds) ? Math.min(Math.max(seconds, 15), 10 * 60) : 300;
   return Math.ceil(boundedSeconds * 1_000 / SHARE_POLL_MS);
 }
 
@@ -49,7 +50,7 @@ export interface PublicationVolume {
   playlistId: string | null;
   shareUrl: string | null;
   appendedCount: number;
-  status: "pending" | "publishing" | "waiting_for_owner" | "complete" | "orphaned" | "failed";
+  status: PublicationStatus;
 }
 
 export interface PublicationRepository extends Pick<AppleAuthorizationStore, "getAppleAuthorization" | "updateAppleAuthorizationStatus"> {
@@ -256,8 +257,17 @@ function normalizeVolume(raw: any, manifest: LockedManifest): PublicationVolume 
     playlistId: raw.applePlaylistId ?? raw.apple_playlist_id ?? null,
     shareUrl: raw.appleShareUrl ?? raw.apple_share_url ?? null,
     appendedCount: Number(raw.appendedCount ?? raw.appended_count ?? 0),
-    status: raw.status ?? "pending",
+    status: normalizePublicationStatus(raw.status),
   };
+}
+
+function normalizePublicationStatus(value: unknown): PublicationStatus {
+  if (value === "pending") return "queued";
+  if (value === "publishing") return "appending";
+  if (["queued", "creating", "appending", "waiting_for_share_url", "complete", "orphaned", "waiting_for_owner", "failed"].includes(String(value))) {
+    return value as PublicationStatus;
+  }
+  return "queued";
 }
 
 async function loadVolumes(repository: PublicationRepository, manifest: LockedManifest): Promise<PublicationVolume[]> {
@@ -283,7 +293,7 @@ async function getOrCreateVolumes(
         volumeCount: planned.volumeCount,
         startPosition: planned.startPosition,
         endPosition: planned.endPosition,
-        status: "pending",
+        status: "queued",
       });
       volume = (await loadVolumes(repository, manifest)).find((item) => item.volumeIndex === planned.volumeIndex);
       if (!volume) throw new Error(`Publication volume ${planned.volumeIndex + 1} was not persisted`);
@@ -308,8 +318,8 @@ async function ensureApplePlaylist(
   if (recovered?.id) {
     const playlistId = String(recovered.id);
     signal?.throwIfAborted();
-    await repository.updatePublicationVolume(volume.id, { applePlaylistId: playlistId, status: "publishing" });
-    return { ...volume, playlistId, status: "publishing" };
+    await repository.updatePublicationVolume(volume.id, { applePlaylistId: playlistId, status: "appending" });
+    return { ...volume, playlistId, status: "appending" };
   }
 
   const description = volumeDescription(manifest, marker);
@@ -320,17 +330,17 @@ async function ensureApplePlaylist(
     await repository.updatePublicationVolume(volume.id, {
       applePlaylistId: created.id,
       appleShareUrl: created.url,
-      status: "publishing",
+      status: "appending",
     });
-    return { ...volume, playlistId: created.id, shareUrl: created.url, description, status: "publishing" };
+    return { ...volume, playlistId: created.id, shareUrl: created.url, description, status: "appending" };
   } catch (error) {
     if (error instanceof AppleApiError && error.uncertainMutation) {
       const afterFailure = await client.findLibraryPlaylistByMarker(marker, signal);
       if (afterFailure?.id) {
         const playlistId = String(afterFailure.id);
         signal?.throwIfAborted();
-        await repository.updatePublicationVolume(volume.id, { applePlaylistId: playlistId, status: "publishing" });
-        return { ...volume, playlistId, description, status: "publishing" };
+        await repository.updatePublicationVolume(volume.id, { applePlaylistId: playlistId, status: "appending" });
+        return { ...volume, playlistId, description, status: "appending" };
       }
     }
     throw error;
@@ -367,9 +377,9 @@ async function abandonDivergedPlaylist(
     applePlaylistId: null,
     appleShareUrl: null,
     appendedCount: 0,
-    status: "pending",
+    status: "queued",
   });
-  return { ...volume, attempt, playlistId: null, shareUrl: null, appendedCount: 0, status: "pending" };
+  return { ...volume, attempt, playlistId: null, shareUrl: null, appendedCount: 0, status: "queued" };
 }
 
 export async function appendExactVolume(
@@ -403,7 +413,7 @@ export async function appendExactVolume(
         signal?.throwIfAborted();
         existing = [...existing, ...batch];
         stalledAttempts = 0;
-        await repository.updatePublicationVolume(volume.id, { appendedCount: existing.length, status: "publishing" });
+        await repository.updatePublicationVolume(volume.id, { appendedCount: existing.length, status: "appending" });
       } catch (error) {
         if (error instanceof AppleAuthorizationRequiredError) throw error;
         const observation = await observeStablePrefix(client, playlistId, expected, signal);
@@ -428,17 +438,28 @@ export async function appendExactVolume(
       continue;
     }
     if (verified.length < expected.length) {
-      await repository.updatePublicationVolume(volume.id, { appendedCount: verified.length, status: "publishing" });
-      volume = { ...volume, appendedCount: verified.length, status: "publishing" };
+      await repository.updatePublicationVolume(volume.id, { appendedCount: verified.length, status: "appending" });
+      volume = { ...volume, appendedCount: verified.length, status: "appending" };
       continue;
     }
     await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
-    const shareUrl = await client.pollStableShareUrl(playlistId, sharePollAttempts(), SHARE_POLL_MS, signal);
+    let shareUrl: string;
+    try {
+      shareUrl = await client.pollStableShareUrl(playlistId, sharePollAttempts(), SHARE_POLL_MS, signal);
+    } catch (error) {
+      await repository.updatePublicationVolume(volume.id, {
+        appendedCount: verified.length,
+        status: "waiting_for_share_url",
+        lastError: error instanceof Error ? error.message : "Apple did not expose a stable share link",
+      });
+      throw error;
+    }
     signal?.throwIfAborted();
     await repository.updatePublicationVolume(volume.id, {
       appendedCount: verified.length,
       appleShareUrl: shareUrl,
       status: "complete",
+      lastError: null,
       publishedAt: new Date(),
     });
     return { ...volume, appendedCount: verified.length, shareUrl, status: "complete" };

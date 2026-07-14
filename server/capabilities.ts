@@ -73,6 +73,14 @@ export class CapabilityService {
     return session;
   }
 
+  async authenticateForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
+    const session = await this.authenticate(request);
+    if (session.accessId !== accessId) {
+      throw new HttpError(403, "This session cannot access that run", "capability_scope_mismatch");
+    }
+    return session;
+  }
+
   async authenticateOptional(request: FastifyRequest): Promise<CapabilitySessionView | null> {
     const token = getCookie(request, CAPABILITY_COOKIE);
     if (!token) return null;

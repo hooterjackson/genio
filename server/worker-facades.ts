@@ -70,6 +70,7 @@ export function createAppleAuthorizationRepositoryFacade(source: AppleAuthorizat
     getAppleAuthorization: (...args: Parameters<AppleAuthorizationJobRepository["getAppleAuthorization"]>) => source.getAppleAuthorization(...args),
     saveAppleAuthorization: (...args: Parameters<AppleAuthorizationJobRepository["saveAppleAuthorization"]>) => source.saveAppleAuthorization(...args),
     updateAppleAuthorizationStatus: (...args: Parameters<AppleAuthorizationJobRepository["updateAppleAuthorizationStatus"]>) => source.updateAppleAuthorizationStatus(...args),
+    updateAppleAuthorizationValidation: (...args: Parameters<AppleAuthorizationJobRepository["updateAppleAuthorizationValidation"]>) => source.updateAppleAuthorizationValidation(...args),
     listWaitingPublicationManifestIds: (...args: Parameters<AppleAuthorizationJobRepository["listWaitingPublicationManifestIds"]>) => source.listWaitingPublicationManifestIds(...args),
     getManifestById: async (...args: Parameters<AppleAuthorizationJobRepository["getManifestById"]>) => {
       const manifest = await source.getManifestById(...args);

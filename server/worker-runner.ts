@@ -4,7 +4,11 @@ import { ResearchOrchestrator, processBriefInterpretationJob, type ResearchRepos
 import { processMatchingJob, type MatchingRepository } from "./matching-service.ts";
 import { processPublicationJob, PublicationPausedError, type PublicationRepository } from "./publisher.ts";
 import { processNotificationJob, type NotificationRepository } from "./notifications.ts";
-import { processAppleAuthorizationJob, type AppleAuthorizationJobRepository } from "./apple.ts";
+import {
+  processAppleAuthorizationJob,
+  recoverUnverifiedAppleAuthorizationJob,
+  type AppleAuthorizationJobRepository,
+} from "./apple.ts";
 import { Repository } from "./repository.ts";
 import {
   createAppleAuthorizationRepositoryFacade,
@@ -167,6 +171,7 @@ export class WorkerRunner {
   async run(): Promise<void> {
     assertProductionWorkerSecrets();
     await this.repository.ensureSchemaVersion();
+    await recoverUnverifiedAppleAuthorizationJob(this.repository);
     await this.heartbeat();
     await this.enforceControls();
     this.heartbeatTimer = setInterval(() => {

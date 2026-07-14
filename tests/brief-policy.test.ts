@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  estimateResearchCost,
   isPlaylistBrief,
   isValidBriefTarget,
   manifestDescriptionForBrief,
@@ -64,5 +65,11 @@ describe("playlist brief policy", () => {
     expect(manifestDescriptionForBrief(brief("hybrid"))).toContain("within the confirmed constraints");
     expect(manifestDescriptionForBrief(brief("curated"))).toContain("editorial selection");
     expect(manifestDescriptionForBrief(brief("curated"))).not.toContain("Exhaustive across");
+  });
+
+  test("prices the confirmed brief mode rather than trusting a stale interpretation estimate", () => {
+    expect(estimateResearchCost(brief("curated"))).toBe(1.5);
+    expect(estimateResearchCost(brief("hybrid"))).toBe(3);
+    expect(estimateResearchCost(brief("exhaustive"))).toBe(8);
   });
 });

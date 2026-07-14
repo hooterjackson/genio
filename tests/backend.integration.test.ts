@@ -547,6 +547,149 @@ databaseDescribe("hosted backend integration", () => {
     await repository.releaseProviderCost(fulfilled[0]!.value.reservationId);
   });
 
+  test("atomically enforces brief, run, mutation, and publish limits", async () => {
+    const briefBucket = `brief-limit-${randomUUID()}`;
+    const briefAttempts = await Promise.allSettled(Array.from({ length: 3 }, (_, index) =>
+      repository.createBriefRequest({
+        prompt: `Brief rate-limit request ${index}`,
+        model: "test-model",
+        clientBucket: briefBucket,
+        clientBucketAliases: [briefBucket],
+        rateLimit: 2,
+      })));
+    expect(briefAttempts.filter((result) => result.status === "fulfilled")).toHaveLength(2);
+    expect(briefAttempts.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(briefAttempts.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 429, code: "rate_limited" },
+    });
+
+    const runBucket = `run-limit-${randomUUID()}`;
+    const runAttempts = await Promise.allSettled(Array.from({ length: 3 }, (_, index) =>
+      repository.createRunIdempotent({
+        prompt: `Run rate-limit request ${index}`,
+        brief,
+        estimateUsd: 0,
+        approvedBudgetUsd: 1,
+        clientBucket: runBucket,
+        clientBucketAliases: [runBucket],
+        idempotencyKey: `run-limit-${index}-${randomUUID()}`,
+        reuseDays: 0,
+        rateLimit: 2,
+        globalLimit: 100,
+      })));
+    expect(runAttempts.filter((result) => result.status === "fulfilled")).toHaveLength(2);
+    expect(runAttempts.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(runAttempts.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 429, code: "rate_limited" },
+    });
+
+    const mutationBucket = `mutation-limit-${randomUUID()}`;
+    const mutationAttempts = await Promise.allSettled([
+      repository.consumeRateLimit([mutationBucket], "mutation", 1, 1),
+      repository.consumeRateLimit([mutationBucket], "mutation", 1, 1),
+    ]);
+    expect(mutationAttempts.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(mutationAttempts.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 429, code: "rate_limited" },
+    });
+
+    const publishBucket = `publish-limit-${randomUUID()}`;
+    const publishAttempts = await Promise.allSettled([
+      repository.consumeRateLimit([publishBucket], "publish", 1, 24),
+      repository.consumeRateLimit([publishBucket], "publish", 1, 24),
+    ]);
+    expect(publishAttempts.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(publishAttempts.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 429, code: "rate_limited" },
+    });
+
+    const counts = await repository.pool.query<{ client_bucket: string; action: string; count: number }>(
+      `SELECT client_bucket,action,count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) GROUP BY client_bucket,action`,
+      [[briefBucket, runBucket, mutationBucket, publishBucket]],
+    );
+    expect(counts.rows).toEqual(expect.arrayContaining([
+      { client_bucket: briefBucket, action: "brief", count: 2 },
+      { client_bucket: runBucket, action: "run", count: 2 },
+      { client_bucket: mutationBucket, action: "mutation", count: 1 },
+      { client_bucket: publishBucket, action: "publish", count: 1 },
+    ]));
+  });
+
+  test("keeps concurrent idempotent brief and run submissions single-effect", async () => {
+    const briefBucket = `brief-idempotency-${randomUUID()}`;
+    const briefKey = `brief-${randomUUID()}`;
+    const createBrief = () => repository.createBriefRequest({
+      prompt: "Concurrent idempotent brief request",
+      model: "test-model",
+      clientBucket: briefBucket,
+      clientBucketAliases: [briefBucket],
+      idempotencyKey: briefKey,
+      rateLimit: 1,
+    });
+    const briefResults = await Promise.all([createBrief(), createBrief()]);
+    expect(new Set(briefResults.map((result) => result.id)).size).toBe(1);
+    expect(briefResults.filter((result) => result.created)).toHaveLength(1);
+
+    const runBucket = `run-idempotency-${randomUUID()}`;
+    const runKey = `run-${randomUUID()}`;
+    const createRun = () => repository.createRunIdempotent({
+      prompt: "Concurrent idempotent run request",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: runBucket,
+      clientBucketAliases: [runBucket],
+      idempotencyKey: runKey,
+      reuseDays: 0,
+      rateLimit: 1,
+      globalLimit: 100,
+    });
+    const runResults = await Promise.all([createRun(), createRun()]);
+    expect(new Set(runResults.map((result) => result.runId)).size).toBe(1);
+    expect(new Set(runResults.map((result) => result.accessId)).size).toBe(1);
+    expect(runResults.filter((result) => result.created)).toHaveLength(1);
+
+    const eventCounts = await repository.pool.query<{ client_bucket: string; count: number }>(
+      `SELECT client_bucket,count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) GROUP BY client_bucket`,
+      [[briefBucket, runBucket]],
+    );
+    expect(eventCounts.rows).toEqual(expect.arrayContaining([
+      { client_bucket: briefBucket, count: 1 },
+      { client_bucket: runBucket, count: 1 },
+    ]));
+  });
+
+  test("serializes global active-run admission across different client buckets", async () => {
+    const create = (label: string) => {
+      const bucket = `global-capacity-${label}-${randomUUID()}`;
+      return repository.createRunIdempotent({
+        prompt: `Global capacity request ${label}`,
+        brief: { ...brief, title: `Global capacity ${label}` },
+        estimateUsd: 0,
+        approvedBudgetUsd: 1,
+        clientBucket: bucket,
+        clientBucketAliases: [bucket],
+        idempotencyKey: `global-${label}-${randomUUID()}`,
+        reuseDays: 0,
+        rateLimit: 10,
+        globalLimit: 1,
+      });
+    };
+    const results = await Promise.allSettled([create("left"), create("right")]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 503, code: "global_capacity_reached" },
+    });
+    const active = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count FROM research_runs
+       WHERE status IN ('queued','awaiting_budget','researching','ready_for_matching','matching','review','visitor_review','manifest_ready','publishing','waiting_for_apple_authorization')
+         AND deleted_at IS NULL`,
+    );
+    expect(active.rows[0]?.count).toBe(1);
+  });
+
   test("reconciliation expands within ceilings and durably pauses a true provider overrun", async () => {
     vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
     const withinRunId = await repository.createRun("Reconciliation expansion test", brief, 0, 1);
@@ -778,6 +921,180 @@ databaseDescribe("hosted backend integration", () => {
     await capabilities.revoke(request, revokeReply as unknown as FastifyReply);
     expect(revokeReply.headers.get("set-cookie")).toContain("Max-Age=0");
     await expect(capabilities.authenticate(request)).rejects.toMatchObject({ statusCode: 401, code: "capability_required" });
+  });
+
+  test("keeps capability sessions isolated to their own run access", async () => {
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const create = (label: string) => {
+      const clientBucket = `capability-scope-${label}-${randomUUID()}`;
+      return repository.createRunIdempotent({
+        prompt: `Capability scope ${label}`,
+        brief: { ...brief, title: `Capability scope ${label}` },
+        estimateUsd: 0,
+        approvedBudgetUsd: 1,
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        reuseDays: 0,
+        rateLimit: 100,
+        globalLimit: 100,
+      });
+    };
+    const [left, right] = await Promise.all([create("left"), create("right")]);
+    const capabilities = new CapabilityService(repository);
+    const reply = new ReplyStub();
+    await capabilities.exchange(
+      await capabilities.issue(left.runId, left.accessId),
+      reply as unknown as FastifyReply,
+    );
+    const request = cookieRequest(reply.headers.get("set-cookie")!.split(";")[0]!);
+
+    await expect(capabilities.authenticateForAccess(request, left.accessId)).resolves.toMatchObject({
+      runId: left.runId,
+      accessId: left.accessId,
+    });
+    await expect(capabilities.authenticateForAccess(request, right.accessId)).rejects.toMatchObject({
+      statusCode: 403,
+      code: "capability_scope_mismatch",
+    });
+  });
+
+  test("allows exactly one concurrent exchange of a one-time capability", async () => {
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const clientBucket = `capability-race-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Concurrent capability exchange",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const capabilities = new CapabilityService(repository);
+    const token = await capabilities.issue(created.runId, created.accessId);
+    const results = await Promise.allSettled([
+      capabilities.exchange(token, new ReplyStub() as unknown as FastifyReply),
+      capabilities.exchange(token, new ReplyStub() as unknown as FastifyReply),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 401, code: "invalid_capability" },
+    });
+    const sessions = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM capability_sessions WHERE access_id=$1 AND revoked_at IS NULL",
+      [created.accessId],
+    );
+    expect(sessions.rows[0]?.count).toBe(1);
+  });
+
+  test("expires transfer capabilities and permits only one successful use", async () => {
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const clientBucket = `capability-transfer-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Transfer capability expiry",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const capabilities = new CapabilityService(repository);
+    const expired = await capabilities.issue(created.runId, created.accessId, -1);
+    await expect(capabilities.exchange(expired, new ReplyStub() as unknown as FastifyReply)).rejects.toMatchObject({
+      statusCode: 401,
+      code: "invalid_capability",
+    });
+
+    const transfer = await capabilities.issue(created.runId, created.accessId, 60_000);
+    await expect(capabilities.exchange(transfer, new ReplyStub() as unknown as FastifyReply)).resolves.toMatchObject({
+      runId: created.runId,
+      accessId: created.accessId,
+    });
+    await expect(capabilities.exchange(transfer, new ReplyStub() as unknown as FastifyReply)).rejects.toMatchObject({
+      statusCode: 401,
+      code: "invalid_capability",
+    });
+  });
+
+  test("deletion revokes active sessions and unexchanged capabilities", async () => {
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const clientBucket = `capability-delete-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Capability deletion revocation",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const capabilities = new CapabilityService(repository);
+    const reply = new ReplyStub();
+    await capabilities.exchange(
+      await capabilities.issue(created.runId, created.accessId),
+      reply as unknown as FastifyReply,
+    );
+    const pending = await capabilities.issue(created.runId, created.accessId);
+    const request = cookieRequest(reply.headers.get("set-cookie")!.split(";")[0]!);
+
+    await expect(repository.deleteRunAccess(created.accessId)).resolves.toBe(true);
+    await expect(capabilities.authenticate(request)).rejects.toMatchObject({ statusCode: 401, code: "capability_required" });
+    await expect(capabilities.exchange(pending, new ReplyStub() as unknown as FastifyReply)).rejects.toMatchObject({
+      statusCode: 401,
+      code: "invalid_capability",
+    });
+    await expect(repository.getRunByAccess(created.accessId)).resolves.toBeNull();
+    await expect(repository.getRun(created.runId)).resolves.toMatchObject({ status: "deleted", phase: "visitor_deleted" });
+    const remaining = await repository.pool.query<{ tokens: number; active_sessions: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM capability_tokens WHERE access_id=$1) tokens,
+         (SELECT count(*)::int FROM capability_sessions WHERE access_id=$1 AND revoked_at IS NULL) active_sessions`,
+      [created.accessId],
+    );
+    expect(remaining.rows[0]).toEqual({ tokens: 0, active_sessions: 0 });
+  });
+
+  test("sets host-only production capability cookies with strict security attributes", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    vi.resetModules();
+    const productionModule = await import("../server/capabilities.ts");
+    expect(productionModule.CAPABILITY_COOKIE).toBe("__Host-needle-session");
+
+    const clientBucket = `capability-cookie-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Production cookie attributes",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const capabilities = new productionModule.CapabilityService(repository);
+    const reply = new ReplyStub();
+    await capabilities.exchange(
+      await capabilities.issue(created.runId, created.accessId),
+      reply as unknown as FastifyReply,
+    );
+    const setCookie = reply.headers.get("set-cookie")!;
+    expect(setCookie).toMatch(/^__Host-needle-session=[A-Za-z0-9_-]+; Path=\/; HttpOnly; SameSite=Strict; Secure; Expires=/u);
+    expect(setCookie).not.toMatch(/;\s*Domain=/iu);
   });
 
   test("retention preserves a minimal tombstone and removes run-level detail", async () => {

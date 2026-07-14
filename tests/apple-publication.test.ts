@@ -5,6 +5,12 @@ import {
   AppleAuthorizationRequiredError,
   AppleMusicClient,
   ApplePlaylistDivergedError,
+  AppleShareLinkUnavailableError,
+  appleAuthorizationGeneration,
+  appleAuthorizationJobDedupeKey,
+  encryptMusicUserToken,
+  processAppleAuthorizationJob,
+  recoverUnverifiedAppleAuthorizationJob,
   type AppleAuthorizationRecord,
 } from "../server/apple.ts";
 import {
@@ -38,6 +44,8 @@ const originalAppleEnvironment = {
   privateKey: process.env.APPLE_MUSICKIT_PRIVATE_KEY,
   privateKeyBase64: process.env.APPLE_MUSICKIT_PRIVATE_KEY_BASE64,
   storefront: process.env.APPLE_STOREFRONT,
+  encryptionKey: process.env.APPLE_TOKEN_ENCRYPTION_KEY,
+  encryptionKeyId: process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID,
 };
 
 const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -49,6 +57,8 @@ beforeEach(() => {
   process.env.APPLE_MUSICKIT_PRIVATE_KEY = testPrivateKey;
   delete process.env.APPLE_MUSICKIT_PRIVATE_KEY_BASE64;
   process.env.APPLE_STOREFRONT = "us";
+  process.env.APPLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+  process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID = "test-v1";
 });
 
 afterEach(() => {
@@ -60,6 +70,8 @@ afterEach(() => {
     APPLE_MUSICKIT_PRIVATE_KEY: originalAppleEnvironment.privateKey,
     APPLE_MUSICKIT_PRIVATE_KEY_BASE64: originalAppleEnvironment.privateKeyBase64,
     APPLE_STOREFRONT: originalAppleEnvironment.storefront,
+    APPLE_TOKEN_ENCRYPTION_KEY: originalAppleEnvironment.encryptionKey,
+    APPLE_TOKEN_ENCRYPTION_KEY_ID: originalAppleEnvironment.encryptionKeyId,
   })) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -88,6 +100,142 @@ describe("Apple Music client failure classification", () => {
       .rejects.toMatchObject({ name: "AppleApiError", status: 503, retriable: true, uncertainMutation: true });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  test("playlist creation explicitly requests a public library playlist", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      void input;
+      void init;
+      return new Response(JSON.stringify({
+        data: [{ id: "p.public", type: "library-playlists", attributes: { isPublic: true } }],
+      }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new AppleMusicClient("private-user-token", "us").createLibraryPlaylist("Needle", "Public test"))
+      .resolves.toEqual({ id: "p.public", url: null });
+    const request = fetchMock.mock.calls[0]?.[1] as unknown as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      attributes: { name: "Needle", description: "Public test", isPublic: true },
+    });
+  });
+
+  test("share polling follows a library globalId to the catalog playlist URL", async () => {
+    const publicUrl = "https://music.apple.com/us/playlist/needle/pl.u-public";
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/v1/me/library/playlists/p.library?include=catalog")) {
+        return new Response(JSON.stringify({
+          data: [{
+            id: "p.library",
+            type: "library-playlists",
+            attributes: { playParams: { globalId: "pl.u-public" } },
+          }],
+        }), { status: 200 });
+      }
+      if (url.endsWith("/v1/me/library/playlists/p.library/catalog")) {
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }
+      if (url.endsWith("/v1/catalog/us/playlists/pl.u-public")) {
+        return new Response(JSON.stringify({
+          data: [{ id: "pl.u-public", type: "playlists", attributes: { url: publicUrl } }],
+        }), { status: 200 });
+      }
+      throw new Error(`Unexpected Apple test URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new AppleMusicClient("private-user-token", "us").pollStableShareUrl("p.library", 2, 0))
+      .resolves.toBe(publicUrl);
+    expect(fetchMock.mock.calls.map((call) => String(call[0])))
+      .toContain("https://api.music.apple.com/v1/catalog/us/playlists/pl.u-public");
+  });
+
+  test("share resolution follows the library playlist catalog relationship", async () => {
+    const publicUrl = "https://music.apple.com/us/playlist/needle/pl.relationship";
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/v1/me/library/playlists/p.relationship?include=catalog")) {
+        return new Response(JSON.stringify({ data: [{ id: "p.relationship", type: "library-playlists" }] }), { status: 200 });
+      }
+      if (url.endsWith("/v1/me/library/playlists/p.relationship/catalog")) {
+        return new Response(JSON.stringify({
+          data: [{ id: "pl.relationship", type: "playlists", attributes: { url: publicUrl } }],
+        }), { status: 200 });
+      }
+      throw new Error(`Unexpected Apple test URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new AppleMusicClient("private-user-token", "us").resolveLibraryPlaylistShareUrl("p.relationship"))
+      .resolves.toBe(publicUrl);
+  });
+});
+
+test("worker recovery queues exactly the current unverified Apple authorization generation", async () => {
+  const authorization = { ...validAuthorization, status: "unverified" };
+  const repository = {
+    getAppleAuthorization: vi.fn(async () => authorization),
+    enqueueJob: vi.fn(async () => ({ created: true })),
+  };
+
+  await expect(recoverUnverifiedAppleAuthorizationJob(repository)).resolves.toBe(true);
+  expect(repository.enqueueJob).toHaveBeenCalledWith({
+    kind: "apple_authorization",
+    payload: { authorizationGeneration: appleAuthorizationGeneration(authorization) },
+    dedupeKey: appleAuthorizationJobDedupeKey(authorization),
+    maxAttempts: 3,
+  });
+
+  repository.getAppleAuthorization.mockResolvedValue({ ...authorization, status: "valid" });
+  await expect(recoverUnverifiedAppleAuthorizationJob(repository)).resolves.toBe(false);
+  expect(repository.enqueueJob).toHaveBeenCalledTimes(1);
+});
+
+test("Apple authorization validation updates only the token generation that was checked", async () => {
+  const envelope = JSON.parse(encryptMusicUserToken("private-valid-apple-user-token")) as {
+    ciphertext: string;
+    iv: string;
+    tag: string;
+    kid: string;
+  };
+  const authorization: AppleAuthorizationRecord = {
+    ciphertext: envelope.ciphertext,
+    iv: envelope.iv,
+    authTag: envelope.tag,
+    keyVersion: envelope.kid,
+    storefront: "us",
+    status: "unverified",
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: [{ id: "us" }] }), { status: 200 })));
+  const repository = {
+    getAppleAuthorization: vi.fn(async () => authorization),
+    saveAppleAuthorization: vi.fn(async () => undefined),
+    updateAppleAuthorizationStatus: vi.fn(async () => undefined),
+    updateAppleAuthorizationValidation: vi.fn(async () => false),
+    listWaitingPublicationManifestIds: vi.fn(async () => ["manifest-stale"]),
+    getManifestById: vi.fn(async () => ({ runId: "run-stale" })),
+    enqueueJob: vi.fn(async () => ({ created: true })),
+  };
+
+  await processAppleAuthorizationJob(repository, {
+    authorizationGeneration: appleAuthorizationGeneration(authorization),
+  });
+  expect(repository.updateAppleAuthorizationValidation).toHaveBeenCalledWith({
+    expectedCiphertext: authorization.ciphertext,
+    expectedKeyVersion: authorization.keyVersion,
+    storefront: "us",
+    status: "valid",
+    lastError: null,
+  });
+  expect(repository.listWaitingPublicationManifestIds).not.toHaveBeenCalled();
+  expect(repository.enqueueJob).not.toHaveBeenCalled();
+
+  repository.updateAppleAuthorizationValidation.mockResolvedValue(true);
+  await processAppleAuthorizationJob(repository, { authorizationGeneration: "stale-generation" });
+  expect(repository.updateAppleAuthorizationValidation).toHaveBeenCalledTimes(1);
 });
 
 test("the live smoke CLI requires both explicit test naming and write confirmation", () => {
@@ -192,7 +340,7 @@ function pendingVolume(): PublicationVolume {
     playlistId: null,
     shareUrl: null,
     appendedCount: 0,
-    status: "pending",
+    status: "queued",
   };
 }
 
@@ -245,6 +393,30 @@ test("publisher orphans a divergent playlist and creates a clean replacement", a
   }));
   expect(result).toMatchObject({ playlistId: "p.replacement", appendedCount: 2, status: "complete" });
   expect(states.get("p.replacement")).toEqual(["101", "202"]);
+});
+
+test("publisher preserves the Apple playlist ID and exact track count when share polling times out", async () => {
+  const repository = publicationRepository();
+  let state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.shareless", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => { state = [...state, ...ids]; }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => [...state]),
+    pollStableShareUrl: vi.fn(async () => { throw new AppleShareLinkUnavailableError("p.shareless"); }),
+  };
+
+  await expect(appendExactVolume(repository, client, manifest, pendingVolume(), ["101"], validAuthorization))
+    .rejects.toMatchObject({ name: "AppleShareLinkUnavailableError", playlistId: "p.shareless" });
+  expect(repository.updatePublicationVolume).toHaveBeenCalledWith("volume-id", expect.objectContaining({
+    applePlaylistId: "p.shareless",
+    status: "appending",
+  }));
+  expect(repository.updatePublicationVolume).toHaveBeenLastCalledWith("volume-id", {
+    appendedCount: 1,
+    status: "waiting_for_share_url",
+    lastError: "Apple did not expose a stable share link for playlist p.shareless",
+  });
 });
 
 test("safe smoke failures never serialize an arbitrary provider or database error", () => {

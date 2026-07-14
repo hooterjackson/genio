@@ -6,9 +6,10 @@ import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog
 import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
-import { isPlaylistBrief } from "./brief-policy.ts";
+import { estimateResearchCost, isPlaylistBrief } from "./brief-policy.ts";
 import { researchResumeJob, type ResearchResumeCheckpoint } from "./research-resume.ts";
 import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
+import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const repository = new Repository();
@@ -85,9 +86,7 @@ function idempotencyKey(request: FastifyRequest, bodyKey?: unknown): string {
 }
 
 async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
-  const session = await capabilities.authenticate(request);
-  if (session.accessId !== accessId) throw new HttpError(403, "This session cannot access that run", "capability_scope_mismatch");
-  return session;
+  return capabilities.authenticateForAccess(request, accessId);
 }
 
 async function requireWorkerForNewWork(): Promise<void> {
@@ -213,12 +212,13 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   }
   const brief = request.body?.brief ?? interpreted.brief;
   if (!isPlaylistBrief(brief)) throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
+  const confirmedEstimateUsd = estimateResearchCost(brief);
   const key = idempotencyKey(request, request.body?.idempotencyKey);
   const created = await repository.createRunIdempotent({
     prompt: interpreted.prompt,
     brief,
-    estimateUsd: Number(interpreted.estimateUsd ?? 0),
-    approvedBudgetUsd: Number(interpreted.estimateUsd ?? 0) <= Number(process.env.AUTO_RUN_COST_LIMIT_USD ?? process.env.INITIAL_COST_GATE_USD ?? 5) ? Number(interpreted.estimateUsd ?? 0) : 0,
+    estimateUsd: confirmedEstimateUsd,
+    approvedBudgetUsd: confirmedEstimateUsd <= Number(process.env.AUTO_RUN_COST_LIMIT_USD ?? process.env.INITIAL_COST_GATE_USD ?? 5) ? confirmedEstimateUsd : 0,
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
@@ -453,7 +453,11 @@ app.post<{ Body: { musicUserToken?: string; storefront?: string } }>("/api/v1/ow
   const email = owner(request);
   const encrypted = encryptAppleUserToken(request.body?.musicUserToken ?? "", request.body?.storefront ?? "");
   await repository.saveAppleAuthorization(encrypted);
-  await repository.enqueueJob({ kind: "apple_authorization", payload: {}, dedupeKey: `apple-authorization:${Date.now()}` });
+  await repository.enqueueJob({
+    kind: "apple_authorization",
+    payload: { authorizationGeneration: appleAuthorizationGeneration(encrypted) },
+    dedupeKey: appleAuthorizationJobDedupeKey(encrypted),
+  });
   await repository.recordAudit(email, "apple.authorization_saved", { storefront: encrypted.storefront });
   return reply.code(202).send({ configured: true, status: "unverified", storefront: encrypted.storefront });
 });

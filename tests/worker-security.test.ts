@@ -78,6 +78,33 @@ test("production worker refuses startup when provider or encryption secrets are 
   })).not.toThrow();
 });
 
+test("worker startup durably recovers an unverified Apple authorization", async () => {
+  const harness = runnerHarness();
+  const unverified = { ...validAuthorization, status: "unverified" };
+  harness.repository.getAppleAuthorization.mockResolvedValue(unverified);
+  harness.repository.leaseNextJob.mockResolvedValue(null);
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    heartbeatMs: 60_000,
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.enqueueJob.mock.calls.some(
+      ([input]: [{ kind?: string }]) => input.kind === "apple_authorization",
+    ));
+    expect(harness.repository.enqueueJob).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration: expect.stringMatching(/^[a-f0-9]{20}$/u) },
+      dedupeKey: expect.stringMatching(/^apple-authorization:[a-f0-9]{20}$/u),
+      maxAttempts: 3,
+    }));
+  } finally {
+    await runner.stop();
+    await running;
+  }
+});
+
 function controlRepository(input: {
   paused?: boolean;
   authorization?: AppleAuthorizationRecord | null;

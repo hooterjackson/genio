@@ -38,6 +38,7 @@ const ACTIVE_RUN_STATUSES = [
 const TERMINAL_RUN_STATUSES = ["complete", "partial", "failed", "expired", "deleted"];
 const JOB_ADVISORY_LOCK = 694_207_551;
 const BUDGET_ADVISORY_LOCK = 694_207_552;
+const RUN_CAPACITY_ADVISORY_LOCK = 694_207_553;
 
 type CandidateRow = TrackCandidateInput & {
   id: string;
@@ -127,6 +128,23 @@ async function markTerminalPublicationVolumes(
 ): Promise<void> {
   const manifestId = typeof payload?.manifestId === "string" ? payload.manifestId : "";
   if (!manifestId) return;
+  const publicError = redactedPublicationFailure(error);
+  const stranded = await client.query<{ id: string; apple_playlist_id: string }>(
+    `SELECT id,apple_playlist_id FROM publication_volumes
+     WHERE manifest_id=$1 AND apple_playlist_id IS NOT NULL
+       AND status NOT IN ('complete','waiting_for_owner')`,
+    [manifestId],
+  );
+  for (const volume of stranded.rows) {
+    await client.query(
+      `INSERT INTO orphan_playlists(id,manifest_id,publication_volume_id,apple_playlist_id,reason)
+       SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS (
+         SELECT 1 FROM orphan_playlists
+         WHERE publication_volume_id=$3 AND apple_playlist_id=$4 AND cleaned_at IS NULL
+       )`,
+      [randomUUID(), manifestId, volume.id, volume.apple_playlist_id, publicError],
+    );
+  }
   await client.query(
     `UPDATE publication_volumes pv SET status='failed',last_error=$2,updated_at=now()
      WHERE pv.manifest_id=$1 AND pv.status NOT IN ('complete','waiting_for_owner')
@@ -134,7 +152,7 @@ async function markTerminalPublicationVolumes(
          SELECT 1 FROM manifests m JOIN research_runs r ON r.id=m.run_id
          WHERE m.id=pv.manifest_id AND r.status<>'waiting_for_apple_authorization'
        )`,
-    [manifestId, redactedPublicationFailure(error)],
+    [manifestId, publicError],
   );
 }
 
@@ -236,6 +254,9 @@ export class Repository {
     if (prompt.length < 4 || prompt.length > 2_000) throw new HttpError(400, "Describe the playlist in 4–2,000 characters", "invalid_prompt");
     return this.transaction(async (client) => {
       if (input.idempotencyKey) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+          `brief:${[...new Set(input.clientBucketAliases)].sort().join(":")}:${input.idempotencyKey}`,
+        ]);
         const existing = await client.query<{ id: string; status: string }>(
           "SELECT id, status FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
           [input.clientBucketAliases, input.idempotencyKey],
@@ -351,6 +372,10 @@ export class Repository {
       const reused = Boolean(runId);
       let status = "complete";
       if (!runId) {
+        // Capacity is a system-wide invariant. A plain count followed by an
+        // insert lets requests from different client buckets race past the
+        // limit, so serialize only this short count-and-create section.
+        await client.query("SELECT pg_advisory_xact_lock($1)", [RUN_CAPACITY_ADVISORY_LOCK]);
         const active = await client.query<{ count: number }>(
           "SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL",
           [ACTIVE_RUN_STATUSES],
@@ -1069,7 +1094,7 @@ export class Repository {
       `INSERT INTO publication_volumes(id,manifest_id,volume_number,volume_count,start_position,end_position,status)
        VALUES($1,$2,$3,$4,$5,$6,$7)
        ON CONFLICT(manifest_id,volume_number) DO UPDATE SET volume_count=EXCLUDED.volume_count RETURNING *`,
-      [id, input.manifestId, input.volumeNumber, input.volumeCount, input.startPosition, input.endPosition, input.status ?? "pending"],
+      [id, input.manifestId, input.volumeNumber, input.volumeCount, input.startPosition, input.endPosition, input.status ?? "queued"],
     );
     return result.rows[0];
   }
@@ -1602,6 +1627,28 @@ export class Repository {
       "UPDATE apple_authorizations SET status=$1,last_error=$2,last_validated_at=CASE WHEN $1='valid' THEN now() ELSE last_validated_at END,updated_at=now() WHERE id='owner'",
       [status, lastError],
     );
+  }
+
+  async updateAppleAuthorizationValidation(input: {
+    expectedCiphertext: string;
+    expectedKeyVersion: string;
+    storefront?: string;
+    status: "valid" | "reauthorization_required";
+    lastError?: string | null;
+  }): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE apple_authorizations SET storefront=COALESCE($3,storefront),status=$4,last_error=$5,
+       last_validated_at=CASE WHEN $4='valid' THEN now() ELSE last_validated_at END,updated_at=now()
+       WHERE id='owner' AND ciphertext=$1 AND key_version=$2`,
+      [
+        input.expectedCiphertext,
+        input.expectedKeyVersion,
+        input.storefront ?? null,
+        input.status,
+        input.lastError ?? null,
+      ],
+    );
+    return Boolean(result.rowCount);
   }
 
   async revokeAppleAuthorization(): Promise<void> {

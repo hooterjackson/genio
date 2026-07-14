@@ -4,6 +4,12 @@ const CURATED_MINIMUM = 50;
 const CURATED_MAXIMUM = 100;
 const ABSOLUTE_MAXIMUM = 10_000;
 
+export function estimateResearchCost(brief: Pick<PlaylistBrief, "mode">): number {
+  if (brief.mode === "exhaustive") return 8;
+  if (brief.mode === "hybrid") return 3;
+  return 1.5;
+}
+
 export function normalizeBriefTarget(
   mode: PlaylistBrief["mode"],
   target: PlaylistBrief["targetSize"],

@@ -142,8 +142,8 @@ export async function runApplePublicationSmoke(
   runtime: AppleSmokeRuntime = {},
 ): Promise<AppleSmokeResult> {
   const input = validateAppleSmokeInput(rawInput);
-  const pollAttempts = Math.min(Math.max(Math.floor(runtime.pollAttempts ?? 12), 2), 120);
-  const pollDelayMs = Math.min(Math.max(Math.floor(runtime.pollDelayMs ?? 1_000), 0), 10_000);
+  const pollAttempts = Math.min(Math.max(Math.floor(runtime.pollAttempts ?? 100), 2), 120);
+  const pollDelayMs = Math.min(Math.max(Math.floor(runtime.pollDelayMs ?? 3_000), 0), 10_000);
   const authorize = runtime.authorize ?? (async (authorizationStore) => {
     const authorized = await authorizedAppleClient(authorizationStore);
     return { client: authorized.client as AppleMusicClient, authorization: authorized.authorization };

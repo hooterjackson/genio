@@ -12,6 +12,7 @@ import type {
 import { createOpenAIResponse, interpretPrompt, responseCostUsd } from "./openai.ts";
 import { assertPublicHttpsUrl, collectKnownUrls, compactEvidenceNote } from "./security.ts";
 import { bestAdapters, createAdapterRegistry } from "./adapters.ts";
+import { estimateResearchCost } from "./brief-policy.ts";
 
 export type ResearchPhase =
   | "scope_resolution"
@@ -1615,10 +1616,4 @@ export async function processBriefInterpretationJob(
     });
     throw error;
   }
-}
-
-export function estimateResearchCost(brief: PlaylistBrief): number {
-  if (brief.mode === "exhaustive") return 8;
-  if (brief.mode === "hybrid") return 3;
-  return 1.5;
 }
