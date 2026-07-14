@@ -337,16 +337,6 @@ export class WorkerRunner {
       }
       const message = error instanceof Error ? error.message.slice(0, 1_000) : "Job failed";
       const retryAt = error instanceof NonRetriableJobError ? null : retryAtFor(job);
-      if (!retryAt && job.runId && ["research", "matching", "publication"].includes(job.kind)) {
-        await this.repository.updateRun(job.runId, {
-          status: "failed",
-          phase: `${job.kind}_failed`,
-          error: message,
-        }).catch((updateError) => {
-          const updateMessage = updateError instanceof Error ? updateError.message : "run update failed";
-          process.stderr.write(`[needle-worker] could not mark run failed: ${updateMessage}\n`);
-        });
-      }
       await this.repository.failJob(
         job.id,
         this.workerId,

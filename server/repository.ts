@@ -21,6 +21,7 @@ import {
   stableStringify,
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
+import { manifestDescriptionForBrief } from "./brief-policy.ts";
 
 const ACTIVE_RUN_STATUSES = [
   "queued",
@@ -104,6 +105,37 @@ function finiteMoney(value: number, field: string): number {
 function date(value: unknown): Date | null {
   if (!value) return null;
   return value instanceof Date ? value : new Date(String(value));
+}
+
+function redactedPublicationFailure(error: string): string {
+  const normalized = error.toLowerCase();
+  if (normalized.includes("share link")) return "Apple did not expose a stable public playlist link after the final attempt.";
+  if (normalized.includes("diverg") || normalized.includes("ordered prefix") || normalized.includes("ordered sequence")) {
+    return "Apple playlist ordering diverged from the approved manifest after the final attempt.";
+  }
+  if (normalized.includes("lease expired")) return "The publication worker lease expired after the final attempt.";
+  if (normalized.includes("timeout") || normalized.includes("timed out") || normalized.includes("could not be reached")) {
+    return "Apple Music remained unavailable after the final attempt.";
+  }
+  return "Apple publication failed after the final attempt; provider details were redacted.";
+}
+
+async function markTerminalPublicationVolumes(
+  client: Pick<PoolClient, "query">,
+  payload: Record<string, unknown> | null,
+  error: string,
+): Promise<void> {
+  const manifestId = typeof payload?.manifestId === "string" ? payload.manifestId : "";
+  if (!manifestId) return;
+  await client.query(
+    `UPDATE publication_volumes pv SET status='failed',last_error=$2,updated_at=now()
+     WHERE pv.manifest_id=$1 AND pv.status NOT IN ('complete','waiting_for_owner')
+       AND EXISTS (
+         SELECT 1 FROM manifests m JOIN research_runs r ON r.id=m.run_id
+         WHERE m.id=pv.manifest_id AND r.status<>'waiting_for_apple_authorization'
+       )`,
+    [manifestId, redactedPublicationFailure(error)],
+  );
 }
 
 function manifestOrderSql(policy: string): string {
@@ -724,12 +756,29 @@ export class Repository {
           `INSERT INTO research_containers(
              id,run_id,source_record_id,parent_container_id,container_type,provider_id,title,status,cursor,
              advertised_total,recovered_total,metadata_json,completed_at)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,CASE WHEN $8='complete' THEN now() ELSE NULL END)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::varchar,$9,$10,$11,$12,CASE WHEN $8::varchar='complete' THEN now() ELSE NULL END)
            ON CONFLICT(run_id,container_type,provider_id) DO UPDATE SET source_record_id=COALESCE(EXCLUDED.source_record_id,research_containers.source_record_id),
              parent_container_id=COALESCE(EXCLUDED.parent_container_id,research_containers.parent_container_id),title=EXCLUDED.title,
-             status=EXCLUDED.status,cursor=EXCLUDED.cursor,advertised_total=EXCLUDED.advertised_total,
-             recovered_total=EXCLUDED.recovered_total,metadata_json=EXCLUDED.metadata_json,
-             completed_at=CASE WHEN EXCLUDED.status='complete' THEN COALESCE(research_containers.completed_at,now()) ELSE NULL END,updated_at=now()`,
+             status=CASE WHEN EXCLUDED.status='discovered' THEN research_containers.status ELSE EXCLUDED.status END,
+             cursor=CASE
+               WHEN EXCLUDED.status='discovered' AND research_containers.status<>'discovered' THEN research_containers.cursor
+               WHEN EXCLUDED.status='discovered' THEN COALESCE(research_containers.cursor,EXCLUDED.cursor)
+               ELSE EXCLUDED.cursor END,
+             advertised_total=CASE
+               WHEN EXCLUDED.status='discovered' AND research_containers.status<>'discovered' THEN research_containers.advertised_total
+               WHEN EXCLUDED.status='discovered' THEN COALESCE(research_containers.advertised_total,EXCLUDED.advertised_total)
+               ELSE EXCLUDED.advertised_total END,
+             recovered_total=CASE
+               WHEN EXCLUDED.status='discovered' AND research_containers.status<>'discovered' THEN research_containers.recovered_total
+               WHEN EXCLUDED.status='discovered' THEN GREATEST(research_containers.recovered_total,EXCLUDED.recovered_total)
+               ELSE EXCLUDED.recovered_total END,
+             metadata_json=CASE WHEN EXCLUDED.status='discovered'
+               THEN COALESCE(EXCLUDED.metadata_json,'{}'::jsonb)||COALESCE(research_containers.metadata_json,'{}'::jsonb)
+               ELSE EXCLUDED.metadata_json END,
+             completed_at=CASE
+               WHEN EXCLUDED.status='discovered' THEN research_containers.completed_at
+               WHEN EXCLUDED.status='complete' THEN COALESCE(research_containers.completed_at,now())
+               ELSE NULL END,updated_at=now()`,
           [item.id ?? randomUUID(), runId, item.sourceRecordId ?? null, item.parentContainerId ?? null, item.containerType.slice(0, 48), item.providerId.slice(0, 240), item.title.slice(0, 240), item.status.slice(0, 32), item.cursor ?? null, item.advertisedTotal ?? null, item.recoveredTotal ?? 0, item.metadata ?? {}],
         );
       }
@@ -976,7 +1025,7 @@ export class Repository {
       const now = new Date();
       const brief = run.brief_json as PlaylistBrief;
       const name = `${brief.title} · ${now.toISOString().slice(0, 10)}`.slice(0, 240);
-      const description = `Built by Needle. ${brief.description} Exhaustive across the documented sources in this run.`;
+      const description = manifestDescriptionForBrief(brief);
       await client.query("INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,$3,$4,$5)", [id, runId, name, description, contentHash]);
       for (const track of tracks) {
         await client.query(
@@ -1034,12 +1083,15 @@ export class Repository {
     lastError?: string | null;
     publishedAt?: Date | null;
   }): Promise<void> {
+    const persistedLastError = typeof patch.lastError === "string"
+      ? redactedPublicationFailure(patch.lastError)
+      : patch.lastError;
     const result = await this.pool.query(
       `UPDATE publication_volumes SET status=COALESCE($2,status),apple_playlist_id=CASE WHEN $3::boolean THEN $4 ELSE apple_playlist_id END,
        apple_share_url=CASE WHEN $5::boolean THEN $6 ELSE apple_share_url END,appended_count=COALESCE($7,appended_count),
        attempt=attempt+$8,last_error=CASE WHEN $9::boolean THEN $10 ELSE last_error END,
        published_at=CASE WHEN $11::boolean THEN $12 ELSE published_at END,updated_at=now() WHERE id=$1`,
-      [id, patch.status ?? null, patch.applePlaylistId !== undefined, patch.applePlaylistId ?? null, patch.appleShareUrl !== undefined, patch.appleShareUrl ?? null, patch.appendedCount ?? null, patch.attemptDelta ?? 0, patch.lastError !== undefined, patch.lastError ?? null, patch.publishedAt !== undefined, patch.publishedAt ?? null],
+      [id, patch.status ?? null, patch.applePlaylistId !== undefined, patch.applePlaylistId ?? null, patch.appleShareUrl !== undefined, patch.appleShareUrl ?? null, patch.appendedCount ?? null, patch.attemptDelta ?? 0, patch.lastError !== undefined, persistedLastError ?? null, patch.publishedAt !== undefined, patch.publishedAt ?? null],
     );
     if (!result.rowCount) throw new HttpError(404, "Publication volume not found", "publication_not_found");
   }
@@ -1146,6 +1198,9 @@ export class Repository {
             [job.brief_request_id],
           );
         }
+        if (job.kind === "publication") {
+          await markTerminalPublicationVolumes(client, job.payload_json, "Worker lease expired after the final attempt");
+        }
         const notificationId = job.kind === "notification" && typeof job.payload_json?.notificationId === "string"
           ? job.payload_json.notificationId
           : null;
@@ -1237,18 +1292,24 @@ export class Repository {
       );
       if (!current.rows[0]) throw new HttpError(409, "Job lease was lost", "job_lease_lost");
       const retry = retryAt && current.rows[0].attempts < current.rows[0].max_attempts;
+      const persistedError = current.rows[0].kind === "publication"
+        ? redactedPublicationFailure(error)
+        : error.slice(0, 4_000);
       await client.query(
-        `UPDATE job_queue SET status=$3,available_at=COALESCE($4,available_at),last_error=$5,
-         completed_at=CASE WHEN $3='failed' THEN now() ELSE NULL END,lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+        `UPDATE job_queue SET status=$3::varchar,available_at=COALESCE($4,available_at),last_error=$5,
+         completed_at=CASE WHEN $3::varchar='failed' THEN now() ELSE NULL END,lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
          WHERE id=$1 AND lease_owner=$2`,
-        [jobId, workerId, retry ? "queued" : "failed", retry ? retryAt : null, error.slice(0, 4_000)],
+        [jobId, workerId, retry ? "queued" : "failed", retry ? retryAt : null, persistedError],
       );
       if (!retry && current.rows[0].run_id && ["research", "matching", "publication"].includes(current.rows[0].kind)) {
         await client.query(
           `UPDATE research_runs SET status='failed',phase=$2,error=$3,completed_at=COALESCE(completed_at,now()),updated_at=now()
            WHERE id=$1 AND status NOT IN ('complete','partial','failed','expired','deleted','waiting_for_apple_authorization')`,
-          [current.rows[0].run_id, `${current.rows[0].kind}_failed`, error.slice(0, 2_000)],
+          [current.rows[0].run_id, `${current.rows[0].kind}_failed`, persistedError.slice(0, 2_000)],
         );
+      }
+      if (!retry && current.rows[0].kind === "publication") {
+        await markTerminalPublicationVolumes(client, current.rows[0].payload_json, error);
       }
       if (!retry && current.rows[0].brief_request_id && current.rows[0].kind === "brief") {
         await client.query(

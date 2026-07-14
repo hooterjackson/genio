@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { PlaylistBrief } from "../shared/types.ts";
+import { normalizeBriefTarget } from "./brief-policy.ts";
 import { requireSecret } from "./secrets.ts";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
@@ -41,7 +42,6 @@ export class ProviderRequestError extends Error {
 const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("Request aborted"));
   const timer = setTimeout(resolve, ms);
-  timer.unref?.();
   signal?.addEventListener("abort", () => {
     clearTimeout(timer);
     reject(signal.reason ?? new Error("Request aborted"));
@@ -206,6 +206,7 @@ function validatedBrief(value: unknown): PlaylistBrief {
     if (!Array.isArray(raw[key])) throw new Error(`OpenAI returned an invalid ${key}`);
     return (raw[key] as unknown[]).slice(0, maxItems).filter((item): item is string => typeof item === "string").map((item) => item.trim().slice(0, 240)).filter(Boolean);
   };
+  if (!Object.hasOwn(raw, "targetSize")) throw new Error("OpenAI returned a playlist brief without target size");
   let targetSize: PlaylistBrief["targetSize"] = null;
   if (raw.targetSize !== null) {
     const target = raw.targetSize as { min?: unknown; max?: unknown };
@@ -215,18 +216,21 @@ function validatedBrief(value: unknown): PlaylistBrief {
     if (min < 1 || max < min || max > 10_000) throw new Error("OpenAI returned an invalid target size range");
     targetSize = { min, max };
   }
+  const mode = raw.mode as PlaylistBrief["mode"];
+  const subjectEntities = strings("subjectEntities", 25);
+  if (subjectEntities.length === 0) throw new Error("OpenAI returned a playlist brief without a subject entity");
   return {
     title: string("title", 240),
     description: string("description", 1_000),
-    mode: raw.mode as PlaylistBrief["mode"],
-    subjectEntities: strings("subjectEntities", 25),
+    mode,
+    subjectEntities,
     relationship: string("relationship", 500),
     include: strings("include", 50),
     exclude: strings("exclude", 50),
     versionPolicy: string("versionPolicy", 500),
     evidencePolicy: string("evidencePolicy", 500),
     orderingPolicy: string("orderingPolicy", 500),
-    targetSize,
+    targetSize: normalizeBriefTarget(mode, targetSize),
     ambiguities: strings("ambiguities", 25),
   };
 }

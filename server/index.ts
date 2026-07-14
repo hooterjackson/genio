@@ -6,6 +6,8 @@ import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog
 import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
+import { isPlaylistBrief } from "./brief-policy.ts";
+import { researchResumeJob, type ResearchResumeCheckpoint } from "./research-resume.ts";
 import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -82,24 +84,6 @@ function idempotencyKey(request: FastifyRequest, bodyKey?: unknown): string {
   return value;
 }
 
-function isBrief(value: unknown): value is PlaylistBrief {
-  if (!value || typeof value !== "object") return false;
-  const brief = value as Partial<PlaylistBrief>;
-  const strings = (candidate: unknown, maxItems: number, maxLength: number) => Array.isArray(candidate) && candidate.length <= maxItems &&
-    candidate.every((item) => typeof item === "string" && item.length <= maxLength);
-  const target = brief.targetSize;
-  const validTarget = target === null || (Boolean(target) && Number.isInteger(target!.min) && Number.isInteger(target!.max) &&
-    target!.min >= 1 && target!.max >= target!.min && target!.max <= 10_000);
-  return typeof brief.title === "string" && brief.title.trim().length > 0 && brief.title.length <= 240 &&
-    typeof brief.description === "string" && brief.description.length <= 2_000 && ["exhaustive", "curated", "hybrid"].includes(String(brief.mode)) &&
-    strings(brief.subjectEntities, 50, 240) && typeof brief.relationship === "string" && brief.relationship.length <= 500 &&
-    strings(brief.include, 100, 500) && strings(brief.exclude, 100, 500) &&
-    typeof brief.versionPolicy === "string" && brief.versionPolicy.length <= 500 &&
-    typeof brief.evidencePolicy === "string" && brief.evidencePolicy.length <= 500 &&
-    typeof brief.orderingPolicy === "string" && brief.orderingPolicy.length > 0 && brief.orderingPolicy.length <= 500 &&
-    strings(brief.ambiguities, 50, 500) && validTarget;
-}
-
 async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
   const session = await capabilities.authenticate(request);
   if (session.accessId !== accessId) throw new HttpError(403, "This session cannot access that run", "capability_scope_mismatch");
@@ -120,21 +104,8 @@ async function assertNotPaused(kind: "research" | "publishing"): Promise<void> {
 }
 
 async function enqueueResearchResume(runId: string): Promise<void> {
-  const saved = await repository.getResearchCheckpoint(runId, "resume") as {
-    phase?: string;
-    gapAttempt?: number;
-    generation?: number;
-  } | null;
-  const phase = saved?.phase ?? "scope_resolution";
-  const gapAttempt = Number.isInteger(saved?.gapAttempt) ? Number(saved!.gapAttempt) : 0;
-  const generation = Number.isInteger(saved?.generation) ? Number(saved!.generation) : 0;
-  const checkpoint = phase === "gap_analysis" ? `${phase}:${gapAttempt}` : phase;
-  await repository.enqueueJob({
-    kind: "research",
-    runId,
-    payload: { runId, phase, gapAttempt },
-    dedupeKey: `research:${runId}:${checkpoint}:g${generation}`,
-  });
+  const saved = await repository.getResearchCheckpoint(runId, "resume") as ResearchResumeCheckpoint | null;
+  await repository.enqueueJob(researchResumeJob(runId, saved));
 }
 
 app.get("/health/live", async () => ({ ok: true, service: "needle-api", version: process.env.RAILWAY_GIT_COMMIT_SHA ?? "development" }));
@@ -234,14 +205,14 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   }
   const briefRequestId = uuid(request.body?.briefRequestId, "Brief request ID");
   const interpreted = await repository.getBriefRequest(briefRequestId);
-  if (!interpreted || interpreted.status !== "complete" || !isBrief(interpreted.brief)) {
+  if (!interpreted || interpreted.status !== "complete" || !isPlaylistBrief(interpreted.brief)) {
     throw new HttpError(409, "Playlist scope is not ready to confirm", "brief_not_ready");
   }
   if (!caller.clientBucketAliases.includes(interpreted.clientBucket)) {
     throw new HttpError(404, "Brief request not found", "brief_not_found");
   }
   const brief = request.body?.brief ?? interpreted.brief;
-  if (!isBrief(brief)) throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
+  if (!isPlaylistBrief(brief)) throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
   const key = idempotencyKey(request, request.body?.idempotencyKey);
   const created = await repository.createRunIdempotent({
     prompt: interpreted.prompt,

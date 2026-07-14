@@ -19,7 +19,6 @@ const apiVariables = preserved([
   "BRIEF_LIMIT_PER_24H",
   "MAX_GLOBAL_NONTERMINAL_RUNS",
   "COST_TIMEZONE",
-  "DATABASE_URL",
   "APP_ORIGIN",
   "GATEWAY_KEY_ID",
   "GATEWAY_PREVIOUS_KEY_ID",
@@ -44,7 +43,6 @@ const workerVariables = preserved([
   "APPLE_TOKEN_DECRYPTION_KEYS_JSON",
   "APPLE_TOKEN_ENCRYPTION_KEY_ID",
   "APP_MONTHLY_COST_LIMIT_USD",
-  "DATABASE_URL",
   "LOG_LEVEL",
   "AUTO_RUN_COST_LIMIT_USD",
   "COST_TIMEZONE",
@@ -60,6 +58,9 @@ const workerVariables = preserved([
   "WORKER_POLL_MS",
   "WORKER_RENEW_SECONDS",
   "WORKER_STALE_SECONDS",
+  "RESEARCH_TURNS_PER_SEGMENT",
+  "RESEARCH_MAX_SEGMENTS_PER_PASS",
+  "RESEARCH_MAX_GAP_PASSES",
   "OPENAI_API_KEY",
   "DISCOGS_TOKEN",
   "RESEND_API_KEY",
@@ -88,7 +89,10 @@ export default defineRailway(() => {
       drainingSeconds: 30,
     },
     replicas: { "us-west2": 1 },
-    variables: workerVariables,
+    variables: {
+      ...workerVariables,
+      DATABASE_URL: Postgres.env.DATABASE_URL,
+    },
   });
   const needleApi = service("needle-api", {
     source: github("hooterjackson/needle", { branch: "main" }),
@@ -103,10 +107,14 @@ export default defineRailway(() => {
       drainingSeconds: 15,
     },
     replicas: { "us-west2": 1 },
-    variables: apiVariables,
+    variables: {
+      ...apiVariables,
+      DATABASE_URL: Postgres.env.DATABASE_URL,
+    },
   });
 
   return project("needle", {
+    environments: ["staging", "production"],
     resources: [needleWorker, needleApi, Postgres, postgresVolume],
   });
 });

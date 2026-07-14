@@ -4,6 +4,17 @@ These gates require live owner credentials and cannot be replaced by mocks. Stop
 
 ## Apple authorization and publication
 
+After owner authorization is stored and the worker environment has its Apple and database secrets, run the guarded three-track probe from that environment:
+
+```sh
+pnpm smoke:apple -- --confirm-live-write --name "[NEEDLE TEST] three-track" \
+  --catalog-id <APPLE_SONG_ID> \
+  --catalog-id <APPLE_SONG_ID> \
+  --catalog-id <APPLE_SONG_ID>
+```
+
+The command refuses names outside the `[NEEDLE TEST]` namespace, refuses more than 25 IDs, verifies exact ordered membership (including duplicate occurrences), and prints only safe playlist metadata. Delete the test playlist manually after the second-account import check.
+
 - [ ] Authorize the owner's personal Apple Music account and persist only an AES-256-GCM encrypted user token.
 - [ ] Restart API and worker; validate that publication still works.
 - [ ] Force an Apple 401/403; verify the manifest remains locked and publication enters `waiting_for_apple_authorization` without repeated retries.

@@ -32,8 +32,7 @@ export interface MatchingRepository {
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => {
-  const timer = setTimeout(resolve, ms);
-  timer.unref?.();
+  setTimeout(resolve, ms);
 });
 
 function isEvidenceEligible(brief: PlaylistBrief, candidate: Candidate): boolean {

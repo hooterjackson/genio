@@ -221,6 +221,102 @@ databaseDescribe("hosted backend integration", () => {
     expect(run.unresolvedCount).toBe(2);
   });
 
+  test("container rediscovery preserves enumeration progress while later enumeration can advance it", async () => {
+    const runId = await repository.createRun("Container merge integrity", brief, 0, 1);
+    const identity = {
+      containerType: "release" as const,
+      providerId: "musicbrainz:release:merge-test",
+      title: "Merge Test Release",
+    };
+
+    await repository.upsertResearchContainers(runId, [{
+      ...identity,
+      status: "enumerating",
+      cursor: "page:2",
+      advertisedTotal: 12,
+      recoveredTotal: 7,
+      metadata: { pagesRead: 2, enumerationSource: "release endpoint" },
+    }]);
+    await repository.upsertResearchContainers(runId, [{
+      ...identity,
+      title: "Merge Test Release Rediscovered",
+      status: "discovered",
+      cursor: null,
+      advertisedTotal: null,
+      recoveredTotal: 0,
+      metadata: { pagesRead: 0, rediscoveredBy: "gap pass" },
+    }]);
+    const rediscoveredDuringEnumeration = (await repository.listResearchContainers(runId))[0];
+    expect(rediscoveredDuringEnumeration).toMatchObject({
+      title: "Merge Test Release Rediscovered",
+      status: "enumerating",
+      cursor: "page:2",
+      advertisedTotal: 12,
+      recoveredTotal: 7,
+      metadata: { pagesRead: 2, enumerationSource: "release endpoint", rediscoveredBy: "gap pass" },
+    });
+
+    await repository.upsertResearchContainers(runId, [{
+      ...identity,
+      status: "complete",
+      cursor: null,
+      advertisedTotal: 12,
+      recoveredTotal: 12,
+      metadata: { pagesRead: 3, enumerationSource: "release endpoint", reconciled: true },
+    }]);
+    const completed = (await repository.listResearchContainers(runId))[0];
+    expect(completed).toMatchObject({
+      status: "complete",
+      cursor: null,
+      advertisedTotal: 12,
+      recoveredTotal: 12,
+      metadata: { pagesRead: 3, enumerationSource: "release endpoint", reconciled: true },
+    });
+    expect(completed.completedAt).not.toBeNull();
+
+    await repository.upsertResearchContainers(runId, [{
+      ...identity,
+      title: "Merge Test Release Rediscovered",
+      status: "discovered",
+      cursor: null,
+      advertisedTotal: null,
+      recoveredTotal: 0,
+      metadata: { pagesRead: 0, rediscoveredBy: "gap pass" },
+    }]);
+    const rediscoveredAfterCompletion = (await repository.listResearchContainers(runId))[0];
+    expect(rediscoveredAfterCompletion).toMatchObject({
+      title: "Merge Test Release Rediscovered",
+      status: "complete",
+      cursor: null,
+      advertisedTotal: 12,
+      recoveredTotal: 12,
+      metadata: {
+        pagesRead: 3,
+        enumerationSource: "release endpoint",
+        reconciled: true,
+        rediscoveredBy: "gap pass",
+      },
+      completedAt: completed.completedAt,
+    });
+
+    await repository.upsertResearchContainers(runId, [{
+      ...identity,
+      status: "complete",
+      cursor: null,
+      advertisedTotal: 13,
+      recoveredTotal: 13,
+      metadata: { pagesRead: 4, enumerationSource: "release endpoint", refreshed: true },
+    }]);
+    expect((await repository.listResearchContainers(runId))[0]).toMatchObject({
+      status: "complete",
+      cursor: null,
+      advertisedTotal: 13,
+      recoveredTotal: 13,
+      metadata: { pagesRead: 4, enumerationSource: "release endpoint", refreshed: true },
+      completedAt: completed.completedAt,
+    });
+  });
+
   test("owner catalogue import is paused, quiescent, inferred, atomic, and audited", async () => {
     const runId = await repository.createRun("Owner import transaction", brief, 0, 1);
     const sourceUrl = `https://catalog.example/${randomUUID()}`;
@@ -546,6 +642,108 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.leaseNextJob("publisher-two", 60_000)).resolves.toBeNull();
     await repository.completeJob(first!.id, "publisher-one");
     await expect(repository.leaseNextJob("publisher-two", 60_000)).resolves.toMatchObject({ kind: "publication" });
+  });
+
+  test("terminal publication failures mark only active volumes failed with redacted diagnostics", async () => {
+    const runId = await repository.createRun("Terminal publication diagnostics", brief, 0, 1);
+    const manifestId = randomUUID();
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Terminal diagnostics','Test manifest',$3)",
+      [manifestId, runId, "a".repeat(64)],
+    );
+    await repository.createPublicationVolume({
+      manifestId,
+      volumeNumber: 1,
+      volumeCount: 2,
+      startPosition: 0,
+      endPosition: 24,
+      status: "publishing",
+    });
+    await repository.createPublicationVolume({
+      manifestId,
+      volumeNumber: 2,
+      volumeCount: 2,
+      startPosition: 25,
+      endPosition: 49,
+      status: "complete",
+    });
+    const queued = await repository.enqueueJob({
+      kind: "publication",
+      runId,
+      payload: { manifestId },
+      dedupeKey: `publication-diagnostics:${manifestId}`,
+      maxAttempts: 2,
+    });
+    const first = await repository.leaseNextJob("publisher-diagnostics", 60_000);
+    expect(first).toMatchObject({ id: queued.id, attempts: 1, maxAttempts: 2 });
+    await repository.failJob(queued.id, "publisher-diagnostics", "temporary Apple timeout", new Date(Date.now() + 60_000));
+    let volumes = await repository.listPublicationVolumes(manifestId);
+    expect(volumes[0]).toMatchObject({ status: "publishing", lastError: null });
+    expect(volumes[1]).toMatchObject({ status: "complete", lastError: null });
+    expect((await repository.pool.query<{ last_error: string }>(
+      "SELECT last_error FROM job_queue WHERE id=$1",
+      [queued.id],
+    )).rows[0]?.last_error).toBe("Apple Music remained unavailable after the final attempt.");
+
+    await repository.pool.query("UPDATE job_queue SET available_at=now() WHERE id=$1", [queued.id]);
+    const final = await repository.leaseNextJob("publisher-diagnostics", 60_000);
+    expect(final).toMatchObject({ id: queued.id, attempts: 2, maxAttempts: 2 });
+    const privateFailure = "provider failure sk-proj-PRIVATE postgres://user:password@private.example/needle";
+    await repository.failJob(queued.id, "publisher-diagnostics", privateFailure, new Date(Date.now() + 60_000));
+    volumes = await repository.listPublicationVolumes(manifestId);
+    expect(volumes[0]).toMatchObject({
+      status: "failed",
+      lastError: "Apple publication failed after the final attempt; provider details were redacted.",
+    });
+    expect(volumes[0].lastError).not.toContain("sk-proj");
+    expect(volumes[0].lastError).not.toContain("password");
+    expect(volumes[1]).toMatchObject({ status: "complete", lastError: null });
+    const persistedJob = (await repository.pool.query<{ last_error: string }>(
+      "SELECT last_error FROM job_queue WHERE id=$1",
+      [queued.id],
+    )).rows[0]?.last_error;
+    const persistedRun = await repository.getRun(runId);
+    expect(persistedJob).toBe("Apple publication failed after the final attempt; provider details were redacted.");
+    expect(persistedRun.error).toBe("Apple publication failed after the final attempt; provider details were redacted.");
+    expect(`${persistedJob} ${persistedRun.error} ${volumes[0].lastError}`).not.toContain("sk-proj");
+    expect(`${persistedJob} ${persistedRun.error} ${volumes[0].lastError}`).not.toContain("password");
+    await repository.updatePublicationVolume(volumes[0].id, { lastError: privateFailure });
+    expect((await repository.listPublicationVolumes(manifestId))[0]?.lastError)
+      .toBe("Apple publication failed after the final attempt; provider details were redacted.");
+
+    const waitingRunId = await repository.createRun("Authorization waiting diagnostics", brief, 0, 1);
+    await repository.updateRun(waitingRunId, { status: "waiting_for_apple_authorization", phase: "apple_reauthorization" });
+    const waitingManifestId = randomUUID();
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Authorization waiting','Test manifest',$3)",
+      [waitingManifestId, waitingRunId, "b".repeat(64)],
+    );
+    await repository.createPublicationVolume({
+      manifestId: waitingManifestId,
+      volumeNumber: 1,
+      volumeCount: 1,
+      startPosition: 0,
+      endPosition: 2,
+      status: "waiting_for_owner",
+    });
+    const waitingJob = await repository.enqueueJob({
+      kind: "publication",
+      runId: waitingRunId,
+      payload: { manifestId: waitingManifestId },
+      dedupeKey: `publication-auth-waiting:${waitingManifestId}`,
+      maxAttempts: 1,
+    });
+    expect(await repository.leaseNextJob("publisher-auth-waiting", 60_000)).toMatchObject({ id: waitingJob.id });
+    await repository.failJob(waitingJob.id, "publisher-auth-waiting", "Apple returned 403", null);
+    expect((await repository.listPublicationVolumes(waitingManifestId))[0]).toMatchObject({
+      status: "waiting_for_owner",
+      lastError: null,
+    });
+    expect(await repository.getRun(waitingRunId)).toMatchObject({
+      status: "waiting_for_apple_authorization",
+      phase: "apple_reauthorization",
+      error: null,
+    });
   });
 
   test("exchanges capabilities once and rejects revoked sessions", async () => {

@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import {
   AppleApiError,
   AppleAuthorizationRequiredError,
-  AppleMusicClient,
   type AppleAuthorizationRecord,
   type AppleAuthorizationStore,
   authorizedAppleClient,
@@ -12,6 +11,7 @@ const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
 const MAX_REPLACEMENTS = 3;
 const SHARE_POLL_MS = 1_500;
+const CONSISTENCY_POLL_MS = process.env.NODE_ENV === "test" ? 0 : 1_000;
 
 function sharePollAttempts(): number {
   const seconds = Number(process.env.APPLE_SHARE_URL_TIMEOUT_SECONDS ?? 120);
@@ -83,6 +83,14 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
   }): Promise<string>;
   updateRun(runId: string, patch: { status?: string; phase?: string; error?: string | null }): Promise<void>;
   enqueueNotification(kind: string, payload: Record<string, unknown>): Promise<string>;
+}
+
+export interface PublicationAppleClient {
+  findLibraryPlaylistByMarker(marker: string, signal?: AbortSignal): Promise<any | null>;
+  createLibraryPlaylist(name: string, description: string, signal?: AbortSignal): Promise<{ id: string; url: string | null }>;
+  appendCatalogTracks(playlistId: string, catalogIds: readonly string[], signal?: AbortSignal): Promise<void>;
+  getOrderedPlaylistCatalogIds(playlistId: string, signal?: AbortSignal): Promise<string[]>;
+  pollStableShareUrl(playlistId: string, attempts?: number, delayMs?: number, signal?: AbortSignal): Promise<string>;
 }
 
 export class PublicationPausedError extends Error {
@@ -190,7 +198,6 @@ export function nextPublicationAppendBatch(expected: readonly string[], appended
 const consistencyWait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("Publication aborted"));
   const timer = setTimeout(resolve, ms);
-  timer.unref?.();
   signal?.addEventListener("abort", () => {
     clearTimeout(timer);
     reject(signal.reason ?? new Error("Publication aborted"));
@@ -198,7 +205,7 @@ const consistencyWait = (ms: number, signal?: AbortSignal) => new Promise<void>(
 });
 
 async function observeStablePrefix(
-  client: AppleMusicClient,
+  client: PublicationAppleClient,
   playlistId: string,
   expected: readonly string[],
   signal?: AbortSignal,
@@ -215,7 +222,7 @@ async function observeStablePrefix(
     if (ids.length === expected.length || stableReads >= 3) {
       return { ids, diverged: false };
     }
-    await consistencyWait(1_000, signal);
+    await consistencyWait(CONSISTENCY_POLL_MS, signal);
   }
   throw new AppleApiError("Apple playlist reads did not become stable", null, true, false);
 }
@@ -288,7 +295,7 @@ async function getOrCreateVolumes(
 
 async function ensureApplePlaylist(
   repository: PublicationRepository,
-  client: AppleMusicClient,
+  client: PublicationAppleClient,
   manifest: LockedManifest,
   volume: PublicationVolume,
   expectedAuthorization: AuthorizationIdentity,
@@ -365,9 +372,9 @@ async function abandonDivergedPlaylist(
   return { ...volume, attempt, playlistId: null, shareUrl: null, appendedCount: 0, status: "pending" };
 }
 
-async function appendExactVolume(
+export async function appendExactVolume(
   repository: PublicationRepository,
-  client: AppleMusicClient,
+  client: PublicationAppleClient,
   manifest: LockedManifest,
   originalVolume: PublicationVolume,
   expected: readonly string[],

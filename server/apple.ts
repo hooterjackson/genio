@@ -160,7 +160,6 @@ export async function createDeveloperToken(optionsOrLegacy?: DeveloperTokenOptio
 const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("Request aborted"));
   const timer = setTimeout(resolve, ms);
-  timer.unref?.();
   signal?.addEventListener("abort", () => {
     clearTimeout(timer);
     reject(signal.reason ?? new Error("Request aborted"));

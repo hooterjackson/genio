@@ -20,6 +20,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "benchmark": "node --experimental-transform-types scripts/evaluate-benchmarks.ts",
+    "smoke:apple": "node --experimental-transform-types scripts/apple-publication-smoke.ts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate"

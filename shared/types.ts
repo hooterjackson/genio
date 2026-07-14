@@ -259,12 +259,64 @@ export interface SourceAdapterResult {
   nextCursor: string | null;
   complete: boolean;
   note: string;
+  advertisedTotal: number;
+  /** Containers discovered by a structured source. These are persisted by
+   * the server before the model sees the tool result. */
+  containers: SourceAdapterContainer[];
+  /** Server-normalized evidence capabilities. Structured metadata is never
+   * silently upgraded into relationship proof. */
+  evidence: SourceAdapterEvidence[];
+}
+
+export type SourceAdapterId = "musicbrainz" | "discogs" | "apple";
+export type SourceAdapterAction = "discover" | "enumerate" | "lookup";
+export type SourceAdapterEntity = "artist" | "release" | "recording" | "catalog";
+
+export interface SourceAdapterContainer {
+  containerType: "artist" | "release" | "session" | "collection";
+  /** Provider-stable and adapter-namespaced, so IDs from different providers
+   * cannot collide in the research frontier. */
+  providerId: string;
+  title: string;
+  advertisedTotal: number | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface SourceAdapterContainerRef extends SourceAdapterContainer {
+  id: string;
+  status: "discovered" | "enumerating" | "complete" | "inaccessible" | "unresolved";
+  cursor: string | null;
+  recoveredTotal: number;
+}
+
+export interface SourceAdapterEvidence {
+  sourceUrl: string;
+  evidenceKind: "metadata" | "track_credit" | "container_credit";
+  supportScope: "track" | "album" | "session" | "collection" | "editorial";
+  subject: string | null;
+  relationship: string;
+  trackTitle: string | null;
+  note: string;
+  /** Structured adapter evidence remains inferred until a claim-bound policy
+   * explicitly promotes it. Generic search metadata is always false. */
+  eligibleForAutomaticVerification: boolean;
+}
+
+export interface SourceAdapterContext {
+  action: SourceAdapterAction;
+  entity: SourceAdapterEntity;
+  query: string | null;
+  container: SourceAdapterContainerRef | null;
+  providerId: string | null;
 }
 
 export interface SourceAdapter {
-  id: "musicbrainz" | "discogs" | "apple";
+  id: SourceAdapterId;
   supports(brief: PlaylistBrief): number;
-  query(operation: string, query: string, cursor: string | null): Promise<SourceAdapterResult>;
+  discover(entity: SourceAdapterEntity, query: string, cursor: string | null, signal?: AbortSignal): Promise<SourceAdapterResult>;
+  enumerate(container: SourceAdapterContainerRef, cursor: string | null, signal?: AbortSignal): Promise<SourceAdapterResult>;
+  lookup(entity: SourceAdapterEntity, providerId: string, signal?: AbortSignal): Promise<SourceAdapterResult>;
+  normalizeEvidence(result: SourceAdapterResult, context: SourceAdapterContext): SourceAdapterEvidence[];
 }
 
 export interface ApiErrorPayload {

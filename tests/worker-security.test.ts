@@ -285,3 +285,32 @@ test("visitor deletion aborts an active lease without requeueing it", async () =
     await running;
   }
 });
+
+test("terminal worker failures are persisted only through the repository redaction boundary", async () => {
+  const harness = runnerHarness();
+  harness.job.kind = "publication";
+  harness.job.maxAttempts = 1;
+  const privateFailure = "provider failure sk-proj-PRIVATE postgres://user:password@private.example/needle";
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    controlIntervalMs: 60_000,
+    heartbeatMs: 60_000,
+    renewMs: 60_000,
+    handlers: { publication: async () => { throw new Error(privateFailure); } },
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.failJob.mock.calls.length === 1);
+    expect(harness.repository.updateRun).not.toHaveBeenCalled();
+    expect(harness.repository.failJob).toHaveBeenCalledWith(
+      harness.job.id,
+      expect.any(String),
+      privateFailure,
+      null,
+    );
+  } finally {
+    await runner.stop();
+    await running;
+  }
+});
