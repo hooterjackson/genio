@@ -16,6 +16,13 @@ describe("acceptance benchmark evaluator", () => {
     expect(evaluateMatchingQuality(failing)).toMatchObject({ precision: 0.995, passed: true });
     failing[1] = { ...failing[1]!, correct: false };
     expect(evaluateMatchingQuality(failing).passed).toBe(false);
+    expect(evaluateMatchingQuality(passing.slice(0, 99))).toMatchObject({
+      sampleSize: 99,
+      minimumSampleSize: 100,
+      precision: 1,
+      resolvability: 1,
+      passed: false,
+    });
   });
 
   test("scores curated size, citations, uniqueness, concentration, and human rubric dimensions", () => {

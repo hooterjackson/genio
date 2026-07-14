@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { PlaylistBrief } from "../shared/types.ts";
 import { normalizeBriefTarget } from "./brief-policy.ts";
 import { requireSecret } from "./secrets.ts";
-import { readCostConfiguration } from "./cost-config.ts";
+import { readCostConfiguration, readOpenAITokenPricing } from "./cost-config.ts";
 import { boundedResponseText } from "./bounded-response.ts";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
@@ -246,8 +246,9 @@ export async function interpretPrompt(
   const stableKey = context.idempotencyKey ?? createHash("sha256").update(`brief:${model}:${prompt}`).digest("hex");
   const response = await createOpenAIResponse({
     model,
-    max_output_tokens: 1_500,
-    instructions: "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for editorial requests, and hybrid for constrained enumeration. Never invent artist-specific rules. Default subjective playlists to 50-100 tracks. Explicitly surface meaningful ambiguity.",
+    reasoning: { effort: "none" },
+    max_output_tokens: 1_200,
+    instructions: "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, or representative, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. Default subjective playlists to 50-100 tracks. Explicitly surface only ambiguity that materially changes scope.",
     input: prompt.slice(0, 4_000),
     text: { format: { type: "json_schema", name: "playlist_brief", strict: true, schema: briefSchema } },
   }, { ...context, operation: context.operation ?? "brief.interpret", idempotencyKey: stableKey });
@@ -262,7 +263,8 @@ export function responseCostUsd(response: any): number {
     throw new Error("OpenAI returned invalid usage accounting");
   }
   const pricing = readCostConfiguration();
-  return input / 1_000_000 * pricing.openAIInputUsdPerMillion
-    + output / 1_000_000 * pricing.openAIOutputUsdPerMillion
+  const tokenPricing = readOpenAITokenPricing(typeof response.model === "string" ? response.model : "");
+  return input / 1_000_000 * tokenPricing.inputUsdPerMillion
+    + output / 1_000_000 * tokenPricing.outputUsdPerMillion
     + webCalls * pricing.openAIWebSearchUsd;
 }

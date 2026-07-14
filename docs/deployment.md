@@ -49,6 +49,8 @@ Railway worker secrets:
 
 - `DATABASE_URL`
 - dedicated `OPENAI_API_KEY`
+- `OPENAI_BRIEF_MODEL`, `OPENAI_FAST_MODEL`, and `OPENAI_DEEP_MODEL`, plus the matching model-specific price variables used by the cost ledger
+- fast-profile deadline, hosted-search, token, and Apple matching concurrency limits from `.env.example`
 - Apple Team ID, Key ID, Media ID, and full `.p8`
 - the same versioned 32-byte Apple-token encryption key and temporary decryption keyring
 - optional Resend key
@@ -67,11 +69,16 @@ Back up the Apple `.p8`, Apple-token encryption key, capability pepper, and both
 1. Deploy the exact revision to staging.
 2. Run unit, integration, mobile E2E, signed-gateway, anonymous-run, and Apple smoke tests.
 3. Verify the production PITR window and a recent worker heartbeat.
-4. Run expand-only schema migrations once through the API pre-deploy step.
+4. Pause new research, drain the old worker, then run the expand-compatible schema migrations once through the API pre-deploy step.
 5. Deploy API; verify liveness, readiness, schema compatibility, and replay rejection.
 6. Deploy worker; verify heartbeat and a reclaimed test lease.
 7. Deploy Sites last and run custom-domain and owner-authorization smoke tests.
 8. Promote manually. Keep one-release backward compatibility before contract migrations.
+
+`GET /health/live` exposes only the package version and a validated Git commit
+revision from the deployment environment. Record its `build.identifier` beside
+the successful CI revision during every smoke test; a missing revision is a
+deployment-observability failure, not evidence that production matches CI.
 
 Never run an automatic destructive down-migration. A worker refuses an unsupported schema version.
 

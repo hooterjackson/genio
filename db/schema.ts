@@ -119,6 +119,7 @@ export const trackCandidates = pgTable("track_candidates", {
   runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
   canonicalKey: text("canonical_key").notNull(),
   duplicateClusterKey: text("duplicate_cluster_key"),
+  selectionRank: integer("selection_rank"),
   artist: varchar("artist", { length: 240 }).notNull(),
   title: varchar("title", { length: 240 }).notNull(),
   album: varchar("album", { length: 240 }),
@@ -132,7 +133,25 @@ export const trackCandidates = pgTable("track_candidates", {
 }, (table) => [
   uniqueIndex("candidate_run_key_idx").on(table.runId, table.canonicalKey),
   index("candidate_duplicate_cluster_idx").on(table.runId, table.duplicateClusterKey),
+  index("candidate_selection_rank_idx").on(table.runId, table.selectionRank),
   index("candidate_run_outcome_idx").on(table.runId, table.outcome),
+]);
+
+export const citationAttestations = pgTable("citation_attestations", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  attestationKey: varchar("attestation_key", { length: 64 }).notNull(),
+  sourceUrl: text("source_url").notNull(),
+  responseId: varchar("response_id", { length: 240 }).notNull(),
+  outputItemId: varchar("output_item_id", { length: 240 }).notNull(),
+  contentIndex: integer("content_index").notNull(),
+  startIndex: integer("start_index").notNull(),
+  endIndex: integer("end_index").notNull(),
+  excerpt: varchar("excerpt", { length: 1000 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("citation_attestation_run_key_idx").on(table.runId, table.attestationKey),
+  index("citation_attestation_run_idx").on(table.runId),
 ]);
 
 export const evidenceClaims = pgTable("evidence_claims", {
@@ -140,14 +159,24 @@ export const evidenceClaims = pgTable("evidence_claims", {
   runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
   candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id, { onDelete: "cascade" }),
   sourceId: uuid("source_id").notNull().references(() => sourceRecords.id, { onDelete: "cascade" }),
+  citationAttestationId: uuid("citation_attestation_id").references(() => citationAttestations.id, { onDelete: "set null" }),
   state: varchar("state", { length: 32 }).notNull(),
   supportScope: varchar("support_scope", { length: 32 }).notNull().default("collection"),
   verificationPhase: varchar("verification_phase", { length: 80 }).notNull().default("unverified"),
+  subjectEntity: varchar("subject_entity", { length: 240 }).notNull(),
+  subjectRelationship: varchar("subject_relationship", { length: 240 }).notNull(),
   relationship: varchar("relationship", { length: 240 }).notNull(),
   note: varchar("note", { length: 500 }).notNull(),
 }, (table) => [
-  uniqueIndex("evidence_claim_unique_idx").on(table.candidateId, table.sourceId, table.relationship),
+  uniqueIndex("evidence_claim_unique_idx").on(
+    table.candidateId,
+    table.sourceId,
+    table.subjectEntity,
+    table.subjectRelationship,
+    table.relationship,
+  ),
   index("evidence_run_idx").on(table.runId),
+  index("evidence_citation_attestation_idx").on(table.citationAttestationId),
 ]);
 
 export const sourceFrontier = pgTable("source_frontier", {
@@ -200,6 +229,15 @@ export const catalogMatches = pgTable("catalog_matches", {
   songJson: jsonb("song_json"),
   alternativesJson: jsonb("alternatives_json").notNull().default([]),
   reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+  // Immutable first matcher decision. Final status fields above may change
+  // during review or manifest overflow, so benchmark precision must never be
+  // reconstructed from them.
+  initialStatus: varchar("initial_status", { length: 40 }),
+  initialBasis: text("initial_basis"),
+  initialScore: numeric("initial_score", { precision: 8, scale: 6, mode: "number" }),
+  initialCatalogId: varchar("initial_catalog_id", { length: 100 }),
+  initialSongJson: jsonb("initial_song_json"),
+  initialMatchedAt: timestamp("initial_matched_at", { withTimezone: true }),
 }, (table) => [
   uniqueIndex("match_candidate_idx").on(table.candidateId),
   index("match_run_status_idx").on(table.runId, table.status),

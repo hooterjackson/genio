@@ -18,6 +18,7 @@ import {
   compactEvidenceNote,
   duplicateClusterKey,
   HttpError,
+  assertPublicHttpsUrl,
   sha256Hex,
   stableStringify,
 } from "./security.ts";
@@ -31,6 +32,18 @@ import {
 } from "./error-sanitizer.ts";
 import { readCostConfiguration } from "./cost-config.ts";
 import { resolveEvidenceIntegrity } from "./evidence-integrity.ts";
+import {
+  createFastRouteCheckpoint,
+  researchExecutionPolicy,
+  researchPolicyFingerprint,
+} from "./research-policy.ts";
+import { resolveEvidenceSubjectBinding } from "./evidence-binding.ts";
+import {
+  citationAttestationKey,
+  citationTextIsLocalToClaim,
+  MAX_CITATION_EXCERPT_CHARS,
+  type HostedCitationAttestation,
+} from "./citation-attestation.ts";
 
 const ACTIVE_RUN_STATUSES = [
   "queued",
@@ -75,6 +88,13 @@ export interface PublicationVolumeInput {
   startPosition: number;
   endPosition: number;
   status?: string;
+}
+
+export interface PublicationQueueResult {
+  queued: boolean;
+  state: "queued" | "in_flight" | "waiting_for_apple_authorization" | "terminal";
+  runStatus: string;
+  jobId: string | null;
 }
 
 export interface EncryptedAppleAuthorizationInput {
@@ -152,14 +172,24 @@ async function markTerminalPublicationVolumes(
   );
 }
 
-function manifestOrderSql(policy: string): string {
-  const normalized = policy.toLowerCase();
+export function manifestOrderSql(brief: Pick<PlaylistBrief, "mode" | "orderingPolicy">): string {
+  // Curated extraction persists the model's reviewed editorial sequence as a
+  // one-based rank. Use the strict brief mode—not free-form model wording—to
+  // decide whether that rank governs truncation and the immutable manifest.
+  if (brief.mode === "curated") {
+    return "c.selection_rank NULLS LAST,c.artist,c.title,c.id";
+  }
+  const normalized = brief.orderingPolicy.toLowerCase();
   if (normalized.includes("evidence") || normalized.includes("confidence")) {
     return `(SELECT COALESCE(max(CASE
         WHEN e.state='verified' AND e.support_scope='track' AND e.verification_phase='track_verification' THEN 4
         WHEN e.state='corroborated' AND e.support_scope='track' AND e.verification_phase='track_verification' THEN 3
         WHEN e.state='editorial' THEN 2 ELSE 1 END),0)
-      FROM evidence_claims e WHERE e.candidate_id=c.id) DESC,c.artist,c.title,c.id`;
+      FROM evidence_claims e
+      JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+      JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+        AND ca.run_id=e.run_id AND ca.source_url=es.url
+      WHERE e.candidate_id=c.id) DESC,c.artist,c.title,c.id`;
   }
   if (normalized.includes("discover")) return "c.created_at,c.id";
   if (normalized.includes("chronolog") || normalized.includes("release") || normalized.includes("year")) {
@@ -329,7 +359,11 @@ export class Repository {
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
-    const briefHash = sha256Hex(stableStringify(input.brief));
+    const briefHash = sha256Hex(stableStringify({
+      brief: input.brief,
+      researchPolicy: researchPolicyFingerprint(input.brief),
+    }));
+    const executionPolicy = researchExecutionPolicy(input.brief);
     const reuseDays = Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`run:${input.clientBucket}:${input.idempotencyKey}`]);
@@ -385,13 +419,22 @@ export class Repository {
         status = estimate > gate && approved < estimate ? "awaiting_budget" : "queued";
         const phase = status === "awaiting_budget" ? "budget_gate" : "queued";
         const canonicalPrompt = `${input.brief.title}: ${input.brief.description}`.slice(0, 2_000);
-        await client.query(
+        const insertedRun = await client.query<{ created_at: Date }>(
           `INSERT INTO research_runs(
              id,prompt,brief_json,brief_hash,status,phase,client_bucket,idempotency_key,
              estimated_cost_usd,approved_budget_usd,budget_approval_expires_at,retention_expires_at)
-           VALUES($1,$2,$3,$4,$5::varchar,$6,$7,$8,$9,$10,CASE WHEN $5::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,now()+interval '90 days')`,
+           VALUES($1,$2,$3,$4,$5::varchar,$6,$7,$8,$9,$10,CASE WHEN $5::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,now()+interval '90 days')
+           RETURNING created_at`,
           [runId, canonicalPrompt, input.brief, briefHash, status, phase, input.clientBucket, input.idempotencyKey, estimate, Math.max(approved, status === "queued" ? estimate : 0)],
         );
+        if (executionPolicy.kind === "fast_curated") {
+          const route = createFastRouteCheckpoint(executionPolicy, insertedRun.rows[0]!.created_at);
+          await client.query(
+            `INSERT INTO research_checkpoints(run_id,phase,state_json)
+             VALUES($1,$2,$3)`,
+            [runId, `fast:route:${executionPolicy.version}`, route],
+          );
+        }
       } else {
         const reusedRun = await client.query<{ status: string }>("SELECT status FROM research_runs WHERE id=$1", [runId]);
         status = reusedRun.rows[0]!.status;
@@ -644,26 +687,94 @@ export class Repository {
     return this.transaction((client) => this.addSourcesInTransaction(client, runId, sources));
   }
 
+  async addCitationAttestations(runId: string, attestations: readonly HostedCitationAttestation[]): Promise<void> {
+    if (attestations.length === 0) return;
+    await this.transaction(async (client) => {
+      for (const raw of attestations.slice(0, 1_000)) {
+        const sourceUrl = assertPublicHttpsUrl(raw.sourceUrl).toString();
+        if (!raw.responseId || raw.responseId.length > 240 || !raw.outputItemId || raw.outputItemId.length > 240
+          || !Number.isInteger(raw.contentIndex) || raw.contentIndex < 0
+          || !Number.isInteger(raw.startIndex) || raw.startIndex < 0
+          || !Number.isInteger(raw.endIndex) || raw.endIndex <= raw.startIndex
+          || typeof raw.excerpt !== "string" || raw.excerpt.trim().length < 8
+          || raw.excerpt.length > MAX_CITATION_EXCERPT_CHARS
+          || raw.endIndex - raw.startIndex !== raw.excerpt.length
+          || /[\uD800-\uDFFF]/.test(raw.excerpt)) {
+          throw new HttpError(400, "Citation attestation is invalid", "invalid_citation_attestation");
+        }
+        const attestation: HostedCitationAttestation = { ...raw, sourceUrl };
+        await client.query(
+          `INSERT INTO citation_attestations(
+             id,run_id,attestation_key,source_url,response_id,output_item_id,
+             content_index,start_index,end_index,excerpt)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT(run_id,attestation_key) DO NOTHING`,
+          [
+            randomUUID(), runId, citationAttestationKey(attestation), sourceUrl,
+            attestation.responseId, attestation.outputItemId, attestation.contentIndex,
+            attestation.startIndex, attestation.endIndex, attestation.excerpt,
+          ],
+        );
+      }
+    });
+  }
+
   private async addCandidatesInTransaction(client: PoolClient, runId: string, candidates: TrackCandidateInput[], sourceIds: Map<string, string>, verificationPhase = "unverified"): Promise<number> {
     const allowedPhases = new Set([
       "scope_resolution", "source_discovery", "container_discovery", "container_enumeration",
       "track_verification", "catalog_enrichment", "gap_analysis",
     ]);
     const storedPhase = allowedPhases.has(verificationPhase) ? verificationPhase : "unverified";
+    const briefResult = await client.query<{ brief_json: PlaylistBrief }>(
+      "SELECT brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL",
+      [runId],
+    );
+    const brief = briefResult.rows[0]?.brief_json;
+    if (!brief) throw new HttpError(404, "Research run not found", "run_not_found");
     let added = 0;
     for (const candidate of candidates) {
+        const boundEvidence = candidate.evidence.map((evidence) => {
+          const binding = resolveEvidenceSubjectBinding(
+            brief,
+            evidence.subjectEntity,
+            evidence.subjectRelationship,
+          );
+          if (!binding) {
+            throw new HttpError(
+              400,
+              "Evidence claim subject does not match the confirmed playlist scope",
+              "evidence_subject_mismatch",
+            );
+          }
+          return { ...evidence, ...binding };
+        });
         const identityKey = candidateIdentityKey(candidate);
         const candidateId = randomUUID();
-        const inserted = await client.query<{ id: string }>(
+        const selectionRank = Number.isInteger(candidate.selectionRank)
+          && Number(candidate.selectionRank) > 0
+          && Number(candidate.selectionRank) <= 10_000
+          ? Number(candidate.selectionRank)
+          : null;
+        const inserted = await client.query<{ id: string; inserted: boolean }>(
           `INSERT INTO track_candidates(
-             id,run_id,canonical_key,duplicate_cluster_key,artist,title,album,release_year,duration_ms,isrc,musicbrainz_id,version_label)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-           ON CONFLICT(run_id,canonical_key) DO NOTHING RETURNING id`,
-          [candidateId, runId, identityKey, duplicateClusterKey(candidate), candidate.artist.slice(0, 240), candidate.title.slice(0, 240), candidate.album?.slice(0, 240) ?? null, candidate.releaseYear, candidate.durationMs, candidate.isrc, candidate.musicbrainzId, candidate.versionLabel?.slice(0, 120) ?? null],
+             id,run_id,canonical_key,duplicate_cluster_key,selection_rank,artist,title,album,release_year,duration_ms,isrc,musicbrainz_id,version_label)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+           ON CONFLICT(run_id,canonical_key) DO UPDATE SET
+             selection_rank=CASE
+               WHEN EXCLUDED.selection_rank IS NULL THEN track_candidates.selection_rank
+               WHEN track_candidates.selection_rank IS NULL THEN EXCLUDED.selection_rank
+               ELSE LEAST(track_candidates.selection_rank,EXCLUDED.selection_rank)
+             END
+           RETURNING id,(xmax=0) inserted`,
+          [candidateId, runId, identityKey, duplicateClusterKey(candidate), selectionRank,
+            candidate.artist.slice(0, 240), candidate.title.slice(0, 240), candidate.album?.slice(0, 240) ?? null,
+            candidate.releaseYear, candidate.durationMs, candidate.isrc, candidate.musicbrainzId,
+            candidate.versionLabel?.slice(0, 120) ?? null],
         );
-        let storedId = inserted.rows[0]?.id;
-        if (storedId) added += 1;
-        else {
+        const storedId = inserted.rows[0]?.id;
+        if (!storedId) throw new Error("Candidate upsert did not return an identifier");
+        if (inserted.rows[0]!.inserted) added += 1;
+        if (!inserted.rows[0]!.inserted) {
           const existing = await client.query<{ id: string; artist: string; title: string; version_label: string | null }>(
             "SELECT id,artist,title,version_label FROM track_candidates WHERE run_id=$1 AND canonical_key=$2",
             [runId, identityKey],
@@ -676,10 +787,9 @@ export class Repository {
             || versionConflict) {
             throw new HttpError(409, "A stable recording identifier has conflicting artist, title, or version metadata", "recording_identifier_conflict");
           }
-          storedId = prior.id;
         }
         if (storedPhase === "track_verification") {
-          const verifiedSourceIds = [...new Set(candidate.evidence
+          const verifiedSourceIds = [...new Set(boundEvidence
             .map((evidence) => sourceIds.get(evidence.sourceUrl))
             .filter((sourceId): sourceId is string => Boolean(sourceId)))];
           if (verifiedSourceIds.length > 0) {
@@ -692,26 +802,66 @@ export class Repository {
             );
           }
         }
-        for (const evidence of candidate.evidence) {
+        for (const evidence of boundEvidence) {
           const sourceId = sourceIds.get(evidence.sourceUrl);
           if (!sourceId) continue;
+          const sourceResult = await client.query<{ source_class: SourceRecordInput["sourceClass"]; url: string }>(
+            "SELECT source_class,url FROM source_records WHERE id=$1 AND run_id=$2",
+            [sourceId, runId],
+          );
+          const storedSource = sourceResult.rows[0];
+          if (!storedSource || storedSource.url !== evidence.sourceUrl) continue;
           const supportScope = ["track", "album", "session", "collection", "editorial"].includes(evidence.supportScope ?? "")
             ? evidence.supportScope
             : "collection";
-          const storedState = (evidence.state === "verified" || evidence.state === "corroborated" || evidence.state === "disputed")
+          let citationAttestationId: string | null = null;
+          if (storedSource.source_class === "web" && evidence.citationSupport
+            && citationTextIsLocalToClaim(
+              evidence.citationSupport.excerpt,
+              candidate.title,
+              evidence.subjectEntity,
+              evidence.relationship,
+            )) {
+            const attestation: HostedCitationAttestation = {
+              sourceUrl: storedSource.url,
+              ...evidence.citationSupport,
+            };
+            const citation = await client.query<{ id: string }>(
+              `SELECT id FROM citation_attestations
+               WHERE run_id=$1 AND attestation_key=$2 AND source_url=$3
+                 AND response_id=$4 AND output_item_id=$5 AND content_index=$6
+                 AND start_index=$7 AND end_index=$8 AND excerpt=$9`,
+              [
+                runId, citationAttestationKey(attestation), storedSource.url,
+                attestation.responseId, attestation.outputItemId, attestation.contentIndex,
+                attestation.startIndex, attestation.endIndex, attestation.excerpt,
+              ],
+            );
+            citationAttestationId = citation.rows[0]?.id ?? null;
+          }
+          const needsStrongSupport = evidence.state === "verified" || evidence.state === "corroborated"
+            || evidence.state === "editorial" || evidence.state === "disputed";
+          const sourceCannotAttestRelationship = storedSource.source_class !== "web";
+          const missingWebAttestation = storedSource.source_class === "web" && !citationAttestationId;
+          const storedState = ((evidence.state === "verified" || evidence.state === "corroborated" || evidence.state === "disputed")
             && (storedPhase !== "track_verification" || supportScope !== "track")
+            || (needsStrongSupport && (sourceCannotAttestRelationship || missingWebAttestation)))
             ? "inferred"
             : evidence.state;
           await client.query(
             `INSERT INTO evidence_claims(
-               id,run_id,candidate_id,source_id,state,support_scope,verification_phase,relationship,note)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             ON CONFLICT(candidate_id,source_id,relationship) DO UPDATE SET
+               id,run_id,candidate_id,source_id,citation_attestation_id,state,support_scope,verification_phase,
+               subject_entity,subject_relationship,relationship,note)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             ON CONFLICT(candidate_id,source_id,subject_entity,subject_relationship,relationship) DO UPDATE SET
                state=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.state ELSE evidence_claims.state END,
                support_scope=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.support_scope ELSE evidence_claims.support_scope END,
                verification_phase=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.verification_phase ELSE evidence_claims.verification_phase END,
+               citation_attestation_id=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.citation_attestation_id ELSE evidence_claims.citation_attestation_id END,
                note=CASE WHEN EXCLUDED.verification_phase='track_verification' THEN EXCLUDED.note ELSE evidence_claims.note END`,
-            [randomUUID(), runId, storedId, sourceId, storedState, supportScope, storedPhase, evidence.relationship.slice(0, 240), compactEvidenceNote(evidence.note)],
+            [randomUUID(), runId, storedId, sourceId, citationAttestationId, storedState, supportScope, storedPhase,
+              evidence.subjectEntity, evidence.subjectRelationship,
+              evidence.relationship.slice(0, 240), compactEvidenceNote(evidence.note)],
           );
         }
         const storedEvidence = await client.query<{
@@ -721,10 +871,13 @@ export class Repository {
           provenance_root: string;
           state: EvidenceClaimInput["state"];
           support_scope: EvidenceClaimInput["supportScope"];
+          subject_entity: string;
+          subject_relationship: string;
           relationship: string;
           note: string;
         }>(
-          `SELECT e.id,s.url source_url,s.source_class,s.provenance_root,e.state,e.support_scope,e.relationship,e.note
+          `SELECT e.id,s.url source_url,s.source_class,s.provenance_root,e.state,e.support_scope,
+             e.subject_entity,e.subject_relationship,e.relationship,e.note
            FROM evidence_claims e JOIN source_records s ON s.id=e.source_id
            WHERE e.candidate_id=$1 ORDER BY e.id`,
           [storedId],
@@ -734,6 +887,8 @@ export class Repository {
             sourceUrl: row.source_url,
             state: row.state,
             supportScope: row.support_scope,
+            subjectEntity: row.subject_entity,
+            subjectRelationship: row.subject_relationship,
             relationship: row.relationship,
             note: row.note,
           })),
@@ -809,17 +964,27 @@ export class Repository {
       this.pool.query<{ verified_count: number; editorial_count: number }>(
         `SELECT
            count(*) FILTER (WHERE EXISTS (
-             SELECT 1 FROM evidence_claims e WHERE e.candidate_id=c.id
+             SELECT 1 FROM evidence_claims e
+             JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+             JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+               AND ca.run_id=e.run_id AND ca.source_url=es.url
+             WHERE e.candidate_id=c.id
              AND e.state IN ('verified','corroborated')
              AND e.support_scope='track' AND e.verification_phase='track_verification'
+             AND e.subject_entity=ANY($2::text[]) AND e.subject_relationship=$3
            ))::int verified_count,
            count(*) FILTER (WHERE EXISTS (
-             SELECT 1 FROM evidence_claims e WHERE e.candidate_id=c.id
+             SELECT 1 FROM evidence_claims e
+             JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+             JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+               AND ca.run_id=e.run_id AND ca.source_url=es.url
+             WHERE e.candidate_id=c.id
              AND ((e.state IN ('verified','corroborated') AND e.support_scope='track' AND e.verification_phase='track_verification')
                OR e.state='editorial')
+             AND e.subject_entity=ANY($2::text[]) AND e.subject_relationship=$3
            ))::int editorial_count
          FROM track_candidates c WHERE c.run_id=$1`,
-        [runId],
+        [runId, run.brief.subjectEntities, run.brief.relationship],
       ),
     ]);
     const eligibleCandidateCount = run.brief.mode === "curated"
@@ -888,15 +1053,56 @@ export class Repository {
   }
 
   async listCandidates(runId: string): Promise<CandidateRow[]> {
-    const result = await this.pool.query(
-      "SELECT * FROM track_candidates WHERE run_id=$1 ORDER BY artist,release_year NULLS LAST,album NULLS LAST,title,id",
-      [runId],
-    );
-    const output: CandidateRow[] = [];
-    for (const row of result.rows) {
-      output.push({
+    const [result, evidenceResult] = await Promise.all([
+      this.pool.query(
+        "SELECT * FROM track_candidates WHERE run_id=$1 ORDER BY selection_rank NULLS LAST,artist,release_year NULLS LAST,album NULLS LAST,title,id",
+        [runId],
+      ),
+      this.pool.query(
+        `SELECT e.candidate_id,s.url source_url,s.source_class,e.state,e.support_scope,e.verification_phase,
+           e.subject_entity,e.subject_relationship,e.relationship,e.note,
+           ca.response_id,ca.output_item_id,ca.content_index,ca.start_index,ca.end_index,ca.excerpt
+         FROM evidence_claims e
+         JOIN source_records s ON s.id=e.source_id
+         LEFT JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+           AND ca.run_id=e.run_id AND ca.source_url=s.url
+         WHERE e.run_id=$1 ORDER BY e.candidate_id,e.state,s.url`,
+        [runId],
+      ),
+    ]);
+    const evidenceByCandidate = new Map<string, any[]>();
+    for (const row of evidenceResult.rows) {
+      const evidence = evidenceByCandidate.get(row.candidate_id) ?? [];
+      evidence.push({
+        sourceUrl: row.source_url,
+        sourceClass: row.source_class,
+        state: ((row.state === "verified" || row.state === "corroborated" || row.state === "disputed")
+            && (row.support_scope !== "track" || row.verification_phase !== "track_verification"
+              || row.source_class !== "web" || !row.response_id))
+          || (row.state === "editorial" && (row.source_class !== "web" || !row.response_id))
+          ? "inferred"
+          : row.state,
+        supportScope: row.support_scope,
+        verificationPhase: row.verification_phase,
+        subjectEntity: row.subject_entity,
+        subjectRelationship: row.subject_relationship,
+        relationship: row.relationship,
+        note: row.note,
+        citationSupport: row.response_id ? {
+          responseId: row.response_id,
+          outputItemId: row.output_item_id,
+          contentIndex: row.content_index,
+          startIndex: row.start_index,
+          endIndex: row.end_index,
+          excerpt: row.excerpt,
+        } : null,
+      });
+      evidenceByCandidate.set(row.candidate_id, evidence);
+    }
+    return result.rows.map((row): CandidateRow => ({
         id: row.id,
         runId: row.run_id,
+        selectionRank: row.selection_rank,
         artist: row.artist,
         title: row.title,
         album: row.album,
@@ -907,34 +1113,21 @@ export class Repository {
         versionLabel: row.version_label,
         outcome: row.outcome,
         duplicateClusterKey: row.duplicate_cluster_key,
-        evidence: await this.getCandidateEvidence(row.id),
-      });
-    }
-    return output;
-  }
-
-  private async getCandidateEvidence(candidateId: string): Promise<any[]> {
-    const result = await this.pool.query(
-      `SELECT s.url source_url,e.state,e.support_scope,e.verification_phase,e.relationship,e.note FROM evidence_claims e
-       JOIN source_records s ON s.id=e.source_id WHERE e.candidate_id=$1 ORDER BY e.state,s.url`,
-      [candidateId],
-    );
-    return result.rows.map((row) => ({
-      sourceUrl: row.source_url,
-      state: (row.state === "verified" || row.state === "corroborated")
-        && (row.support_scope !== "track" || row.verification_phase !== "track_verification")
-        ? "inferred"
-        : row.state,
-      supportScope: row.support_scope,
-      verificationPhase: row.verification_phase,
-      relationship: row.relationship,
-      note: row.note,
-    }));
+        evidence: evidenceByCandidate.get(row.id) ?? [],
+      }));
   }
 
   async saveMatch(runId: string, match: CatalogMatchResult): Promise<void> {
     await this.transaction(async (client) => {
-      await client.query("SELECT id FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
+      const run = await client.query("SELECT id FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
+      if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      const candidate = await client.query(
+        "SELECT id FROM track_candidates WHERE id=$1 AND run_id=$2 FOR UPDATE",
+        [match.candidateId, runId],
+      );
+      if (!candidate.rows[0]) {
+        throw new HttpError(409, "Catalog match candidate does not belong to this run", "catalog_candidate_scope_mismatch");
+      }
       let resultingStatus = match.status;
       if (match.status === "accepted" && match.song?.id) {
         const duplicate = await client.query(
@@ -944,13 +1137,55 @@ export class Repository {
         if (duplicate.rows[0]) resultingStatus = "duplicate";
       }
       await client.query(
-        `INSERT INTO catalog_matches(id,run_id,candidate_id,status,basis,score,catalog_id,song_json,alternatives_json)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        `INSERT INTO catalog_matches(
+           id,run_id,candidate_id,status,basis,score,catalog_id,song_json,alternatives_json,
+           initial_status,initial_basis,initial_score,initial_catalog_id,initial_song_json,initial_matched_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$4,$5,$6,$7,$8,now())
          ON CONFLICT(candidate_id) DO UPDATE SET status=EXCLUDED.status,basis=EXCLUDED.basis,score=EXCLUDED.score,
            catalog_id=EXCLUDED.catalog_id,song_json=EXCLUDED.song_json,alternatives_json=EXCLUDED.alternatives_json`,
         [randomUUID(), runId, match.candidateId, resultingStatus, match.basis, match.score, match.song?.id ?? null, match.song, match.alternatives],
       );
       await client.query("UPDATE track_candidates SET outcome=$1 WHERE id=$2 AND run_id=$3", [resultingStatus, match.candidateId, runId]);
+    });
+  }
+
+  async saveTimeoutMatches(runId: string, candidateIds: string[], basis: string): Promise<void> {
+    if (candidateIds.length === 0) return;
+    const uniqueCandidateIds = [...new Set(candidateIds)];
+    if (uniqueCandidateIds.length !== candidateIds.length) {
+      throw new HttpError(409, "Timed-out catalog candidates must be unique", "catalog_candidate_duplicate");
+    }
+    await this.transaction(async (client) => {
+      const run = await client.query("SELECT id FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
+      if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      const scoped = await client.query<{ id: string }>(
+        "SELECT id FROM track_candidates WHERE run_id=$1 AND id=ANY($2::uuid[]) FOR UPDATE",
+        [runId, uniqueCandidateIds],
+      );
+      if (scoped.rows.length !== uniqueCandidateIds.length) {
+        throw new HttpError(409, "Catalog match candidate does not belong to this run", "catalog_candidate_scope_mismatch");
+      }
+      const existing = await client.query(
+        "SELECT candidate_id FROM catalog_matches WHERE run_id=$1 AND candidate_id=ANY($2::uuid[]) LIMIT 1",
+        [runId, uniqueCandidateIds],
+      );
+      if (existing.rows[0]) {
+        throw new HttpError(409, "A timed-out catalog candidate already has an outcome", "catalog_candidate_already_matched");
+      }
+      const matchIds = uniqueCandidateIds.map(() => randomUUID());
+      await client.query(
+        `INSERT INTO catalog_matches(
+           id,run_id,candidate_id,status,basis,score,catalog_id,song_json,alternatives_json,
+           initial_status,initial_basis,initial_score,initial_catalog_id,initial_song_json,initial_matched_at)
+         SELECT batch.match_id,$1,batch.candidate_id,'review',$4,0,NULL,NULL,'[]'::jsonb,
+                'review',$4,0,NULL,NULL,now()
+         FROM unnest($2::uuid[],$3::uuid[]) AS batch(match_id,candidate_id)`,
+        [runId, matchIds, uniqueCandidateIds, basis],
+      );
+      await client.query(
+        "UPDATE track_candidates SET outcome='review' WHERE run_id=$1 AND id=ANY($2::uuid[])",
+        [runId, uniqueCandidateIds],
+      );
     });
   }
 
@@ -1071,6 +1306,7 @@ export class Repository {
         };
       }
       if (!["review", "visitor_review"].includes(run.status)) throw new HttpError(409, "Run is not ready for a manifest", "manifest_not_ready");
+      const brief = run.brief_json as PlaylistBrief;
       const accounting = await client.query<{
         id: string;
         outcome: string;
@@ -1080,16 +1316,21 @@ export class Repository {
       }>(
         `SELECT c.id,c.outcome,m.status match_status,m.catalog_id,
            EXISTS (
-             SELECT 1 FROM evidence_claims e WHERE e.candidate_id=c.id
+             SELECT 1 FROM evidence_claims e
+             JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+             JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+               AND ca.run_id=e.run_id AND ca.source_url=es.url
+             WHERE e.candidate_id=c.id
                AND e.state IN ('verified','corroborated') AND e.support_scope='track'
                AND e.verification_phase='track_verification'
+               AND e.subject_entity=ANY($2::text[]) AND e.subject_relationship=$3
            ) evidence_eligible
          FROM track_candidates c
          LEFT JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
          WHERE c.run_id=$1 ORDER BY c.id`,
-        [runId],
+        [runId, brief.subjectEntities, brief.relationship],
       );
-      const matchStatuses = new Set(["accepted", "review", "unavailable", "rejected", "duplicate", "unsupported"]);
+      const matchStatuses = new Set(["accepted", "review", "unavailable", "rejected", "duplicate", "unsupported", "overflow"]);
       const incomplete = accounting.rows.some((candidate) => (
         !candidate.match_status
         || !matchStatuses.has(candidate.match_status)
@@ -1132,17 +1373,47 @@ export class Repository {
         }
       }
       const verifiedClause = options.verifiedOnly
-        ? "AND EXISTS (SELECT 1 FROM evidence_claims e WHERE e.candidate_id=c.id AND e.state IN ('verified','corroborated') AND e.support_scope='track' AND e.verification_phase='track_verification')"
+        ? `AND EXISTS (
+             SELECT 1 FROM evidence_claims e
+             JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+             JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+               AND ca.run_id=e.run_id AND ca.source_url=es.url
+             WHERE e.candidate_id=c.id AND e.state IN ('verified','corroborated')
+               AND e.support_scope='track' AND e.verification_phase='track_verification'
+               AND e.subject_entity=ANY($2::text[]) AND e.subject_relationship=$3
+           )`
         : "";
-      const orderSql = manifestOrderSql((run.brief_json as PlaylistBrief).orderingPolicy ?? "artist/title");
+      const orderSql = manifestOrderSql(brief);
       const matches = await client.query(
         `SELECT m.candidate_id,m.catalog_id,m.song_json,c.artist,c.title FROM catalog_matches m
          JOIN track_candidates c ON c.id=m.candidate_id
          WHERE m.run_id=$1 AND m.status='accepted' AND m.catalog_id IS NOT NULL ${verifiedClause}
          ORDER BY ${orderSql}`,
-        [runId],
+        options.verifiedOnly ? [runId, brief.subjectEntities, brief.relationship] : [runId],
       );
-      const tracks = matches.rows.map((match, index) => ({
+      const maximumTracks = brief.mode === "curated"
+        ? Math.max(1, Math.floor(brief.targetSize?.max ?? 100))
+        : Number.POSITIVE_INFINITY;
+      const selectedMatches = matches.rows.slice(0, maximumTracks);
+      const overflowMatches = matches.rows.slice(maximumTracks);
+      if (overflowMatches.length > 0) {
+        const overflowIds = overflowMatches.map((match) => match.candidate_id);
+        await client.query(
+          `UPDATE catalog_matches SET status='overflow',
+             basis=$3,reviewed_at=now()
+           WHERE run_id=$1 AND candidate_id=ANY($2::uuid[]) AND status='accepted'`,
+          [
+            runId,
+            overflowIds,
+            `Excluded by the confirmed curated target maximum of ${maximumTracks} tracks after deterministic ${brief.orderingPolicy || "artist/title"} ordering`,
+          ],
+        );
+        await client.query(
+          "UPDATE track_candidates SET outcome='overflow' WHERE run_id=$1 AND id=ANY($2::uuid[])",
+          [runId, overflowIds],
+        );
+      }
+      const tracks = selectedMatches.map((match, index) => ({
         position: index,
         candidateId: match.candidate_id,
         catalogId: match.catalog_id,
@@ -1153,7 +1424,6 @@ export class Repository {
       const contentHash = sha256Hex(JSON.stringify(tracks.map((track) => [track.position, track.candidateId, track.catalogId])));
       const id = randomUUID();
       const now = new Date();
-      const brief = run.brief_json as PlaylistBrief;
       const name = `${brief.title} · ${now.toISOString().slice(0, 10)}`.slice(0, 240);
       const description = manifestDescriptionForBrief(brief);
       await client.query("INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,$3,$4,$5)", [id, runId, name, description, contentHash]);
@@ -1269,6 +1539,125 @@ export class Repository {
     return result.rows.map((row) => row.id);
   }
 
+  /**
+   * Atomically transitions a locked manifest into publication and creates its
+   * durable job. The run row is the serialization boundary, so a retry that
+   * races with the worker can never move a terminal run back to `publishing`.
+   */
+  async queueManifestPublication(input: {
+    runId: string;
+    manifestId: string;
+    appleAuthorized: boolean;
+    clientBucket: string;
+    clientBucketAliases: string[];
+    rateLimit?: number;
+  }): Promise<PublicationQueueResult> {
+    return this.transaction(async (client) => {
+      const runResult = await client.query<{ status: string; phase: string }>(
+        "SELECT status,phase FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [input.runId],
+      );
+      const run = runResult.rows[0];
+      if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+
+      const manifest = await client.query<{ id: string }>(
+        "SELECT id FROM manifests WHERE id=$1 AND run_id=$2",
+        [input.manifestId, input.runId],
+      );
+      if (!manifest.rows[0]) throw new HttpError(409, "Lock a manifest before publishing", "manifest_not_ready");
+
+      const dedupeKey = `publication:${input.manifestId}`;
+      const existingJob = await client.query<{ id: string; status: string }>(
+        `SELECT id,status FROM job_queue
+         WHERE kind='publication' AND run_id=$1 AND payload_json->>'manifestId'=$2
+         ORDER BY CASE
+           WHEN status IN ('queued','retry','leased') THEN 0
+           WHEN status IN ('failed','cancelled') THEN 1
+           ELSE 2 END,created_at DESC
+         LIMIT 1 FOR UPDATE`,
+        [input.runId, input.manifestId],
+      );
+      const job = existingJob.rows[0] ?? null;
+
+      if (["complete", "partial"].includes(run.status)) {
+        return { queued: false, state: "terminal", runStatus: run.status, jobId: job?.id ?? null };
+      }
+      if (run.status === "waiting_for_apple_authorization") {
+        return {
+          queued: false,
+          state: "waiting_for_apple_authorization",
+          runStatus: run.status,
+          jobId: job?.id ?? null,
+        };
+      }
+      if (job && ["queued", "retry", "leased"].includes(job.status)) {
+        if (run.status !== "publishing") {
+          await client.query(
+            "UPDATE research_runs SET status='publishing',phase='publication_queued',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
+            [input.runId],
+          );
+        }
+        return { queued: false, state: "in_flight", runStatus: "publishing", jobId: job.id };
+      }
+      if (job?.status === "complete") {
+        // A completed worker job must have committed the terminal run state
+        // first. Refuse to regress an inconsistent legacy row; the health and
+        // owner surfaces can expose it for repair without creating duplicates.
+        throw new HttpError(409, "Publication already completed; refresh the run result", "publication_already_complete");
+      }
+
+      if (!input.appleAuthorized) {
+        await client.query(
+          "UPDATE research_runs SET status='waiting_for_apple_authorization',phase='apple_authorization',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
+          [input.runId],
+        );
+        return {
+          queued: false,
+          state: "waiting_for_apple_authorization",
+          runStatus: "waiting_for_apple_authorization",
+          jobId: job?.id ?? null,
+        };
+      }
+
+      const retryableFailure = run.status === "failed" && run.phase === "publication_failed";
+      if (run.status !== "manifest_ready" && run.status !== "publishing" && !retryableFailure) {
+        throw new HttpError(409, "Run is not ready for publication", "publication_not_ready");
+      }
+
+      const aliases = [...new Set(input.clientBucketAliases)].sort();
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:publish:${aliases.join(":")}`]);
+      const rate = await client.query<{ count: number }>(
+        "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='publish' AND occurred_at>now()-interval '24 hours'",
+        [aliases],
+      );
+      if (rate.rows[0]!.count >= (input.rateLimit ?? 10)) {
+        throw new HttpError(429, "Publication limit reached; try again later", "rate_limited");
+      }
+
+      const jobId = job?.id ?? randomUUID();
+      if (job) {
+        await client.query(
+          `UPDATE job_queue SET run_id=$2,payload_json=$3,status='queued',attempts=0,max_attempts=3,
+             available_at=now(),lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,completed_at=NULL,updated_at=now()
+           WHERE id=$1 AND status IN ('failed','cancelled')`,
+          [jobId, input.runId, { runId: input.runId, manifestId: input.manifestId }],
+        );
+      } else {
+        await client.query(
+          `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
+           VALUES($1,$2,'publication',$3,$4,3)`,
+          [jobId, input.runId, dedupeKey, { runId: input.runId, manifestId: input.manifestId }],
+        );
+      }
+      await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'publish')", [input.clientBucket]);
+      await client.query(
+        "UPDATE research_runs SET status='publishing',phase='publication_queued',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
+        [input.runId],
+      );
+      return { queued: true, state: "queued", runStatus: "publishing", jobId };
+    });
+  }
+
   async enqueueJob(input: {
     kind: string;
     runId?: string | null;
@@ -1366,6 +1755,9 @@ export class Repository {
       const capacity = Math.max(1, Math.min(Number(process.env.WORKER_CONCURRENCY ?? process.env.MAX_WORKER_JOBS ?? 2), 10));
       const active = await client.query<{ count: number }>("SELECT count(*)::int count FROM job_queue WHERE status='leased' AND lease_expires_at>now()");
       if (active.rows[0]!.count >= capacity) return null;
+      // Brief and explicitly marked fast jobs normally lead the queue. Once an
+      // operational job has been runnable for 30 seconds it is promoted above
+      // that lane, preventing an endless stream of fast jobs from starving it.
       const selected = await client.query(
         `SELECT candidate.* FROM job_queue candidate WHERE
            ((candidate.status='queued' AND candidate.available_at<=now()) OR (candidate.status='leased' AND candidate.lease_expires_at<=now()))
@@ -1380,11 +1772,32 @@ export class Repository {
                  AND active_publication.kind='publication'
                  AND active_publication.status='leased'
                  AND active_publication.lease_expires_at>now()
-                 AND active_publication.payload_json->>'manifestId'=candidate.payload_json->>'manifestId'
+               AND active_publication.payload_json->>'manifestId'=candidate.payload_json->>'manifestId'
+             )
+           )
+           AND NOT (
+             candidate.kind IN ('research','matching')
+             AND NOT (candidate.payload_json @> '{"fast":true}'::jsonb)
+             AND EXISTS (
+               SELECT 1 FROM job_queue active_deep
+               WHERE active_deep.status='leased'
+                 AND active_deep.lease_expires_at>now()
+                 AND active_deep.kind IN ('research','matching')
+                 AND NOT (active_deep.payload_json @> '{"fast":true}'::jsonb)
              )
            )
            AND candidate.attempts<candidate.max_attempts
-           ORDER BY candidate.available_at,candidate.created_at FOR UPDATE OF candidate SKIP LOCKED LIMIT 1`,
+           ORDER BY CASE
+             WHEN candidate.kind NOT IN ('brief','research','matching')
+               AND candidate.available_at<=now()-interval '30 seconds' THEN 0
+             WHEN candidate.kind='matching'
+               AND candidate.payload_json @> '{"fast":true}'::jsonb THEN 0
+             WHEN candidate.kind='brief' THEN 1
+             WHEN candidate.kind IN ('research','matching')
+               AND candidate.payload_json @> '{"fast":true}'::jsonb THEN 1
+             ELSE 2
+           END,
+           candidate.available_at,candidate.created_at FOR UPDATE OF candidate SKIP LOCKED LIMIT 1`,
       );
       const job = selected.rows[0];
       if (!job) return null;
@@ -1924,8 +2337,8 @@ export class Repository {
       if (pause.rows[0]?.value !== "true") {
         throw new HttpError(409, "Pause research before importing a specialist catalogue", "catalog_import_requires_pause");
       }
-      const result = await client.query<{ status: string; phase: string; leased: boolean; locked: boolean }>(
-        `SELECT r.status,r.phase,
+      const result = await client.query<{ status: string; phase: string; brief_json: PlaylistBrief; leased: boolean; locked: boolean }>(
+        `SELECT r.status,r.phase,r.brief_json,
           EXISTS(SELECT 1 FROM job_queue j WHERE j.run_id=r.id AND j.status='leased') leased,
           EXISTS(SELECT 1 FROM manifests m WHERE m.run_id=r.id) locked
          FROM research_runs r WHERE r.id=$1 AND r.deleted_at IS NULL FOR UPDATE OF r`,
@@ -1939,8 +2352,27 @@ export class Repository {
         throw new HttpError(409, "Catalogue imports are allowed only before matching begins", "catalog_import_too_late");
       }
 
+      const candidates = input.candidates.map((candidate) => ({
+        ...candidate,
+        evidence: candidate.evidence.map((claim) => {
+          if (claim.subjectEntity.trim() || claim.subjectRelationship.trim()) return claim;
+          if (run.brief_json.subjectEntities.length !== 1) {
+            throw new HttpError(
+              400,
+              "Multi-subject catalogue imports must name the confirmed subject and relationship",
+              "evidence_subject_mismatch",
+            );
+          }
+          return {
+            ...claim,
+            subjectEntity: run.brief_json.subjectEntities[0]!,
+            subjectRelationship: run.brief_json.relationship,
+          };
+        }),
+      }));
+
       const sourceIds = await this.addSourcesInTransaction(client, input.runId, input.sources);
-      const newlyAdded = await this.addCandidatesInTransaction(client, input.runId, input.candidates, sourceIds, "unverified");
+      const newlyAdded = await this.addCandidatesInTransaction(client, input.runId, candidates, sourceIds, "unverified");
       await this.upsertFrontierInTransaction(client, input.runId, [{
         sourceClass: "import",
         strategy: `owner catalogue ${input.importHash.slice(0, 16)}`,
@@ -2035,7 +2467,12 @@ export class Repository {
     const staleAfterMs = (Number.isFinite(configuredStaleSeconds) ? Math.max(30, configuredStaleSeconds) : 90) * 1_000;
     return {
       database: { ok: true, schemaVersion: await this.getSchemaVersion() },
-      worker: heartbeat ? { ...heartbeat, lastSeenAt: lastSeenAt?.toISOString(), stale: !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs } : { stale: true },
+      worker: heartbeat ? {
+        ...heartbeat,
+        lastSeenAt: lastSeenAt?.toISOString(),
+        stale: !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs,
+        schemaCompatible: heartbeat.schema_version === DATABASE_SCHEMA_VERSION,
+      } : { stale: true, schemaCompatible: false },
       queue: {
         queued: Number(queueRow.queued ?? 0),
         leased: Number(queueRow.leased ?? 0),
@@ -2103,13 +2540,24 @@ export class Repository {
     const candidates = await this.pool.query(
       `SELECT c.id,c.artist,c.title,c.album,c.outcome,
        COALESCE(json_agg(json_build_object('state',CASE
-           WHEN e.state IN ('verified','corroborated') AND (e.support_scope<>'track' OR e.verification_phase<>'track_verification') THEN 'inferred'
+           WHEN e.state IN ('verified','corroborated','disputed') AND (
+             e.support_scope<>'track' OR e.verification_phase<>'track_verification'
+             OR s.source_class<>'web' OR ca.id IS NULL
+           ) THEN 'inferred'
+           WHEN e.state='editorial' AND (s.source_class<>'web' OR ca.id IS NULL) THEN 'inferred'
            ELSE e.state END,'supportScope',e.support_scope,
          'verificationPhase',e.verification_phase,'relationship',e.relationship,'note',e.note,
+         'subjectEntity',e.subject_entity,'subjectRelationship',e.subject_relationship,
+         'citationSupport',CASE WHEN ca.id IS NULL THEN NULL ELSE json_build_object(
+           'responseId',ca.response_id,'outputItemId',ca.output_item_id,'contentIndex',ca.content_index,
+           'startIndex',ca.start_index,'endIndex',ca.end_index,'excerpt',ca.excerpt) END,
          'source',json_build_object('url',s.url,'title',s.title,'class',s.source_class,'provenanceRoot',s.provenance_root))
          ORDER BY e.state,s.url) FILTER (WHERE e.id IS NOT NULL),'[]'::json) evidence
        FROM track_candidates c LEFT JOIN evidence_claims e ON e.candidate_id=c.id
-       LEFT JOIN source_records s ON s.id=e.source_id WHERE c.run_id=$1
+       LEFT JOIN source_records s ON s.id=e.source_id
+       LEFT JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+         AND ca.run_id=e.run_id AND ca.source_url=s.url
+       WHERE c.run_id=$1
        GROUP BY c.id ORDER BY c.artist,c.title,c.id LIMIT $2 OFFSET $3`,
       [runId, size, (safePage - 1) * size],
     );

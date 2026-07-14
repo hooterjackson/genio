@@ -321,6 +321,20 @@ export class AppleMusicClient {
     }
   }
 
+  async listLibraryPlaylists(signal?: AbortSignal): Promise<any[]> {
+    const items: any[] = [];
+    let path: string | null = "/v1/me/library/playlists?limit=100";
+    for (let page = 0; path && page < 100; page += 1) {
+      signal?.throwIfAborted();
+      const payload = await this.request(path, { signal });
+      if (!Array.isArray(payload?.data)) throw new Error("Apple returned an invalid library-playlist page");
+      items.push(...payload.data);
+      path = normalizeAppleNext(payload?.next);
+    }
+    if (path) throw new Error("Apple library-playlist pagination exceeded the safety limit");
+    return items;
+  }
+
   async getLibraryPlaylistCatalog(playlistId: string, signal?: AbortSignal): Promise<any | null> {
     try {
       const payload = await this.request(`/v1/me/library/playlists/${encodeURIComponent(playlistId)}/catalog`, { signal });
@@ -577,4 +591,25 @@ export async function lookupAppleCatalogByIsrc(storefront: string, isrc: string,
     { signal },
   );
   return appleSongs(payload?.data);
+}
+
+export async function lookupAppleCatalogByIds(
+  storefront: string,
+  catalogIds: readonly string[],
+  signal?: AbortSignal,
+): Promise<CatalogSong[]> {
+  if (!/^[a-z]{2}$/iu.test(storefront)) throw new Error("Apple storefront must be a two-letter code");
+  if (catalogIds.length < 1 || catalogIds.length > 25) throw new Error("Apple catalog-ID lookups require 1-25 IDs");
+  const normalized = catalogIds.map((id) => id.trim());
+  if (normalized.some((id) => !/^\d{1,32}$/u.test(id)) || new Set(normalized).size !== normalized.length) {
+    throw new Error("Apple catalog-ID lookups require unique numeric song IDs");
+  }
+  const params = new URLSearchParams({ ids: normalized.join(",") });
+  const payload = await new AppleMusicClient().request(
+    `/v1/catalog/${encodeURIComponent(storefront.toLowerCase())}/songs?${params}`,
+    { signal },
+  );
+  const songs = appleSongs(payload?.data);
+  if (songs.some((song) => !normalized.includes(song.id))) throw new Error("Apple returned an unexpected catalog song");
+  return songs;
 }

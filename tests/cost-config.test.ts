@@ -1,7 +1,12 @@
 import { describe, expect, test } from "vitest";
-import { initialApprovedBudgetUsd, readCostConfiguration } from "../server/cost-config.ts";
+import { initialApprovedBudgetUsd, readCostConfiguration, readOpenAITokenPricing } from "../server/cost-config.ts";
 
 describe("fail-closed cost configuration", () => {
+  test("prices Luna and Terra from bounded model-specific tiers", () => {
+    expect(readOpenAITokenPricing("gpt-5.6-luna", {})).toEqual({ inputUsdPerMillion: 1, outputUsdPerMillion: 6 });
+    expect(readOpenAITokenPricing("gpt-5.6-terra", {})).toEqual({ inputUsdPerMillion: 2.5, outputUsdPerMillion: 15 });
+    expect(readOpenAITokenPricing("gpt-5.6-sol", {})).toEqual({ inputUsdPerMillion: 5, outputUsdPerMillion: 30 });
+  });
   test("uses the documented default limits and pricing", () => {
     expect(readCostConfiguration({})).toEqual({
       autoRunCostLimitUsd: 5,

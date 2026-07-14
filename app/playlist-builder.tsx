@@ -17,6 +17,20 @@ type PlaylistBrief = {
   orderingPolicy?: string;
   targetSize: { min: number; max: number } | null;
   ambiguities: string[];
+  ambiguityAcceptance?: string[];
+};
+
+type ResearchCostFactor = {
+  label: string;
+  minimumUsd: number;
+  maximumUsd: number;
+};
+
+type ResearchCostEstimate = {
+  minimumUsd: number;
+  maximumUsd: number;
+  approvalUsd: number;
+  factors: ResearchCostFactor[];
 };
 
 type FrontierItem = {
@@ -117,6 +131,7 @@ type BriefResponse = {
   brief?: PlaylistBrief;
   estimateUsd?: number;
   estimatedCostUsd?: number;
+  estimate?: ResearchCostEstimate;
   cached?: boolean;
   requestId?: string;
   status?: string;
@@ -133,9 +148,9 @@ type RunResponse = {
 type JsonObject = Record<string, unknown>;
 
 const examples = [
-  "Every released song Paulinho da Costa performed on",
+  "Paulinho da Costa’s 100 most influential songs",
   "Every Michael Jackson song",
-  "Influential Berlin techno",
+  "50 influential Berlin techno tracks",
 ];
 
 const terminalStatuses = new Set(["complete", "partial", "failed", "expired", "deleted"]);
@@ -144,13 +159,15 @@ const progressByPhase: Record<string, number> = {
   queued: 4,
   scope: 9,
   source_discovery: 18,
+  fast_research: 55,
   container_discovery: 30,
   container_enumeration: 44,
   track_verification: 62,
   catalog_enrichment: 75,
   gap_analysis: 88,
-  matching: 94,
-  research_complete: 100,
+  matching: 88,
+  catalog_matching: 88,
+  research_complete: 82,
 };
 
 class ApiError extends Error {
@@ -349,6 +366,23 @@ function money(value: number): string {
   return "$" + numberValue(value).toFixed(2);
 }
 
+function normalizeCostEstimate(response: BriefResponse): ResearchCostEstimate {
+  const legacy = numberValue(response.estimateUsd ?? response.estimatedCostUsd);
+  const minimumUsd = numberValue(response.estimate?.minimumUsd, legacy);
+  const maximumUsd = numberValue(response.estimate?.maximumUsd, legacy);
+  return {
+    minimumUsd: Math.min(minimumUsd, maximumUsd),
+    maximumUsd: Math.max(minimumUsd, maximumUsd),
+    approvalUsd: numberValue(response.estimate?.approvalUsd, maximumUsd),
+    factors: Array.isArray(response.estimate?.factors) ? response.estimate.factors : [],
+  };
+}
+
+function moneyRange(estimate: ResearchCostEstimate): string {
+  if (estimate.minimumUsd === estimate.maximumUsd) return money(estimate.maximumUsd);
+  return money(estimate.minimumUsd) + "–" + money(estimate.maximumUsd);
+}
+
 function statusLabel(status: string): string {
   return status.replaceAll("_", " ");
 }
@@ -391,8 +425,12 @@ function phaseMessage(run: ResearchRun): string {
   if (run.status === "awaiting_budget") return "Research is paused while the owner reviews the next spending window.";
   if (run.status === "waiting_for_apple_authorization") return "The manifest is safe; publication resumes after the owner reconnects Apple Music.";
   if (run.status === "failed") return run.error || "The run stopped before completion.";
-  if (run.status === "queued") return "Your request is queued and will begin when a research slot opens.";
+  if (run.status === "queued") return run.brief.mode === "curated"
+    ? "Fast research is queued inside the under-two-minute run window."
+    : "Deep research is queued and will begin when a research slot opens.";
   if (run.status === "publishing") return "Needle is publishing the locked manifest in ordered, reconciled Apple Music batches.";
+  if (run.brief.mode === "curated" && run.phase === "fast_research") return "Fast mode is building a cited editorial selection inside a fixed research window.";
+  if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) return "Research is complete. Needle is matching the cited tracks to Apple Music in parallel.";
   return "Needle is tracing sources, verifying recordings, and preserving every unresolved gap.";
 }
 
@@ -422,7 +460,7 @@ function useRunPolling(
         onRunRef.current(next);
         if (terminalStatuses.has(next.status) || reviewStatuses.has(next.status) || next.status === "manifest_ready") return;
         pollCount += 1;
-        timer = setTimeout(poll, pollCount < 12 ? 5000 : 15000);
+        timer = setTimeout(poll, pollCount < 60 ? 2000 : 5000);
       } catch (caught) {
         if (cancelled) return;
         const error = caught as ApiError;
@@ -431,7 +469,7 @@ function useRunPolling(
           return;
         }
         pollCount += 1;
-        timer = setTimeout(poll, pollCount < 12 ? 5000 : 15000);
+        timer = setTimeout(poll, pollCount < 60 ? 2000 : 5000);
       }
     };
 
@@ -480,15 +518,62 @@ function AppHeader({
   );
 }
 
+function ErrorBar({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  if (!message) return null;
+  return (
+    <div className="error-bar" role="alert">
+      <span>[ERROR]</span>
+      <p>{message}</p>
+      <button onClick={onDismiss} aria-label="Dismiss error">×</button>
+    </div>
+  );
+}
+
+function IntroScreen({ stage, onContinue }: { stage: "reveal" | "landing"; onContinue: () => void }) {
+  if (stage === "reveal") {
+    return (
+      <section className="intro-screen intro-reveal" aria-label="Needle loading">
+        <pre className="ascii-needle" aria-hidden="true">{String.raw`
+┌────────────────────┐
+│ [N] NEEDLE_        │
+│     SOURCE → SONG  │
+└────────────────────┘`}</pre>
+        <span className="sr-only" role="status">Opening Needle</span>
+      </section>
+    );
+  }
+
+  return (
+    <section className="intro-screen intro-landing" aria-labelledby="intro-title">
+      <div className="intro-mark">
+        <span aria-hidden="true">[N] NEEDLE_</span>
+        <a href="/privacy">PRIVACY</a>
+      </div>
+      <div className="intro-copy">
+        <div className="screen-index">/ DEEP PLAYLIST RESEARCH</div>
+        <h1 id="intro-title">GO PAST<br />THE FIRST 25.</h1>
+        <p>Apple Music’s Playlist Playground makes a quick mix. Needle follows the sources and builds the deeper playlist.</p>
+      </div>
+      <div className="step-footer intro-footer">
+        <button className="action-button step-primary" onClick={onContinue}>
+          RESEARCH A PLAYLIST →
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function PromptScreen({
   prompt,
   busy,
   onPrompt,
+  onBack,
   onSubmit,
 }: {
   prompt: string;
   busy: boolean;
   onPrompt: (value: string) => void;
+  onBack: () => void;
   onSubmit: () => void;
 }) {
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -497,17 +582,15 @@ function PromptScreen({
   }
 
   return (
-    <section className="screen prompt-screen" aria-labelledby="prompt-title">
-      <div className="screen-index">/ REQUEST</div>
-      <h1 id="prompt-title">DEEP PLAYLIST<br />RESEARCH.</h1>
-      <p className="landing-copy">Apple Music’s Playlist Playground suggests 25 tracks. Needle is for deeper work: Paulinho da Costa’s own biography credits him on more than 6,000 songs, so Needle researches the evidence and assembles the source-backed playlist.</p>
-      <div className="source-links" aria-label="Landing claim sources">
-        <a href="https://support.apple.com/en-lamr/118289" target="_blank" rel="noreferrer">APPLE SUPPORT ↗</a>
-        <a href="https://paulinho.com/about/" target="_blank" rel="noreferrer">DA COSTA BIOGRAPHY ↗</a>
-      </div>
+    <section className="screen flow-screen prompt-screen" aria-labelledby="prompt-title">
+      <div className="flow-body">
+        <button className="flow-back" type="button" onClick={onBack}>← BACK</button>
+        <div className="screen-index">/ 01 REQUEST</div>
+        <h1 id="prompt-title">WHAT SHOULD<br />NEEDLE BUILD?</h1>
+        <p>Describe the playlist in plain language.</p>
 
-      <form className="command-form" onSubmit={submit}>
-        <label htmlFor="playlist-request">&gt; WHAT SHOULD WE FIND?</label>
+        <form className="command-form prompt-form" onSubmit={submit}>
+        <label htmlFor="playlist-request">&gt; PLAYLIST REQUEST</label>
         <div className="command-line">
           <span aria-hidden="true">$</span>
           <textarea
@@ -518,19 +601,35 @@ function PromptScreen({
             maxLength={2000}
             autoFocus
             spellCheck
-            placeholder="Every released song..."
+            placeholder="e.g. every released song..."
           />
         </div>
-        <button className="action-button" disabled={busy || prompt.trim().length < 4}>
-          {busy ? "INTERPRETING..." : "INTERPRET SCOPE →"}
-        </button>
-      </form>
+        </form>
 
-      <div className="examples" aria-label="Example requests">
-        <span>TRY:</span>
+        <div className="examples" aria-label="Example requests">
+        <span>TRY ONE</span>
         {examples.map((example) => (
-          <button key={example} onClick={() => onPrompt(example)}>{example}</button>
+          <button
+            key={example}
+            className={prompt === example ? "selected" : ""}
+            aria-pressed={prompt === example}
+            onClick={() => onPrompt(example)}
+          >
+            {example}
+          </button>
         ))}
+        </div>
+      </div>
+
+      <div className="step-footer">
+        <button
+          className="action-button step-primary"
+          type="button"
+          onClick={onSubmit}
+          disabled={busy || prompt.trim().length < 4}
+        >
+          {busy ? "INTERPRETING..." : "CONTINUE →"}
+        </button>
       </div>
     </section>
   );
@@ -541,54 +640,85 @@ function BriefScreen({
   estimate,
   cached,
   busy,
+  ambiguitiesAccepted,
   onBack,
+  onAmbiguitiesAccepted,
   onStart,
 }: {
   brief: PlaylistBrief;
-  estimate: number;
+  estimate: ResearchCostEstimate;
   cached: boolean;
   busy: boolean;
+  ambiguitiesAccepted: boolean;
   onBack: () => void;
+  onAmbiguitiesAccepted: (accepted: boolean) => void;
   onStart: () => void;
 }) {
+  const needsAmbiguityAcceptance = brief.ambiguities.length > 0;
+  const isFast = brief.mode === "curated";
   return (
-    <section className="screen" aria-labelledby="brief-title">
-      <div className="screen-index">/ SCOPE</div>
-      <div className="title-row">
+    <section className="screen flow-screen scope-screen" aria-labelledby="brief-title">
+      <div className="flow-body">
+        <button className="flow-back" type="button" onClick={onBack}>← EDIT REQUEST</button>
+        <div className="screen-index">/ 02 CHECK THE SCOPE</div>
+        <span className="tag profile-tag">[{isFast ? "FAST · <2 MIN TARGET" : "DEEP · SOURCE FRONTIER"}]</span>
         <h1 id="brief-title">{brief.title}</h1>
-        <span className="tag">[{brief.mode.toUpperCase()}]</span>
-      </div>
-      <p>{brief.description}</p>
+        <p>{brief.description}</p>
+        <p className="profile-note">{isFast
+          ? "Cited editorial selection; partial results stay visible if the time box closes."
+          : "Source-bounded completeness attempt; unresolved evidence stays visible."}</p>
 
-      <dl className="scope-grid">
-        <div><dt>SUBJECT</dt><dd>{brief.subjectEntities.join(", ") || "—"}</dd></div>
-        <div><dt>RELATIONSHIP</dt><dd>{brief.relationship}</dd></div>
-        <div><dt>VERSIONS</dt><dd>{brief.versionPolicy}</dd></div>
-        <div><dt>ORDER</dt><dd>{brief.orderingPolicy || "Evidence confidence, then release date"}</dd></div>
-        <div><dt>EVIDENCE</dt><dd>{brief.evidencePolicy}</dd></div>
-        <div><dt>TARGET</dt><dd>{brief.targetSize ? brief.targetSize.min + "–" + brief.targetSize.max : "Source-bounded"}</dd></div>
-      </dl>
-
-      <div className="rule-block">
-        <div><span>+</span><strong>INCLUDE</strong><p>{brief.include.join(" / ") || "All qualifying recordings"}</p></div>
-        <div><span>−</span><strong>EXCLUDE</strong><p>{brief.exclude.join(" / ") || "Nothing beyond the stated scope"}</p></div>
-      </div>
-
-      {brief.ambiguities.length > 0 && (
-        <details className="terminal-details" open>
-          <summary>ASSUMPTIONS [{brief.ambiguities.length}]</summary>
-          <ul>{brief.ambiguities.map((item) => <li key={item}>{item}</li>)}</ul>
-        </details>
-      )}
-
-      <div className="screen-actions">
-        <button className="quiet-button" onClick={onBack}>← EDIT REQUEST</button>
-        <div className="estimate">
-          <span>{cached ? "CACHED RESULT" : "INITIAL COST EST."}</span>
-          <strong>{cached ? "$0.00" : money(estimate)}</strong>
+        <div className="scope-snapshot" aria-label="Research scope summary">
+          <div><span>TARGET</span><strong>{brief.targetSize ? brief.targetSize.min + "–" + brief.targetSize.max + " tracks" : "Source-bounded"}</strong></div>
+          <div><span>EVIDENCE</span><strong>{brief.evidencePolicy}</strong></div>
         </div>
-        <button className="action-button" onClick={onStart} disabled={busy}>
-          {busy ? "QUEUING..." : "CONFIRM + RESEARCH →"}
+
+        <details className="terminal-details scope-details">
+          <summary>REVIEW FULL SCOPE</summary>
+          <dl>
+            <div><dt>SUBJECT</dt><dd>{brief.subjectEntities.join(", ") || "—"}</dd></div>
+            <div><dt>RELATIONSHIP</dt><dd>{brief.relationship}</dd></div>
+            <div><dt>VERSIONS</dt><dd>{brief.versionPolicy}</dd></div>
+            <div><dt>ORDER</dt><dd>{brief.orderingPolicy || "Evidence confidence, then release date"}</dd></div>
+            <div><dt>INCLUDE</dt><dd>{brief.include.join(" / ") || "All qualifying recordings"}</dd></div>
+            <div><dt>EXCLUDE</dt><dd>{brief.exclude.join(" / ") || "Nothing beyond the stated scope"}</dd></div>
+          </dl>
+        </details>
+
+        {needsAmbiguityAcceptance && (
+          <div className="assumption-block">
+            <strong>CONFIRM {brief.ambiguities.length} ASSUMPTION{brief.ambiguities.length === 1 ? "" : "S"}</strong>
+            <ul>{brief.ambiguities.map((item) => <li key={item}>{item}</li>)}</ul>
+            <label className="ambiguity-confirmation">
+              <input
+                type="checkbox"
+                checked={ambiguitiesAccepted}
+                onChange={(event) => onAmbiguitiesAccepted(event.target.checked)}
+              />
+              <span>I ACCEPT THIS SCOPE.</span>
+            </label>
+          </div>
+        )}
+
+        {!cached && estimate.factors.length > 0 && (
+          <details className="terminal-details cost-details">
+            <summary>COST BASIS [{estimate.factors.length}]</summary>
+            <ul>{estimate.factors.map((factor) => <li key={factor.label}>{factor.label}</li>)}</ul>
+          </details>
+        )}
+      </div>
+
+      <div className="step-footer scope-footer">
+        <div className="estimate">
+          <span>{cached ? "CACHED" : "ESTIMATE"}</span>
+          <strong>{cached ? "$0.00" : moneyRange(estimate)}</strong>
+        </div>
+        <button
+          className="action-button step-primary"
+          onClick={onStart}
+          disabled={busy || (needsAmbiguityAcceptance && !ambiguitiesAccepted)}
+        >
+          {busy ? "QUEUING..." : isFast ? "START FAST RESEARCH →" : "START DEEP RESEARCH →"}
         </button>
       </div>
     </section>
@@ -598,42 +728,27 @@ function BriefScreen({
 function RunScreen({ run, onReset }: { run: ResearchRun; onReset: () => void }) {
   const progress = progressByPhase[run.phase] ?? (run.status === "queued" ? 4 : 12);
   const showReset = terminalStatuses.has(run.status);
+  const profile = run.brief.mode === "curated" ? "FAST" : "DEEP";
 
   return (
-    <section className="screen" aria-labelledby="run-title">
-      <div className="screen-index">/ RESEARCH</div>
-      <div className="title-row">
-        <h1 id="run-title">{run.brief.title}</h1>
-        <span className="tag">[{statusLabel(run.status).toUpperCase()}]</span>
+    <section className="screen flow-screen research-screen" aria-labelledby="run-title">
+      <div className="flow-body research-body">
+        <div className="screen-index">/ 03 RESEARCH</div>
+        <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
+        <h1 id="run-title">FOLLOWING<br />THE SOURCES.</h1>
+        <p className="run-subject">{run.brief.title}</p>
+        <p className="research-status" role="status">{phaseMessage(run)}</p>
+        <div className="progress research-progress" aria-label={"Research " + progress + "% complete"}>
+          <span style={{ width: progress + "%" }} />
+        </div>
+        <div className="phase-line"><span className="cursor" aria-hidden="true">▋</span>{statusLabel(run.phase || run.status)}</div>
       </div>
-      <p>{phaseMessage(run)}</p>
 
-      <div className="progress" aria-label={"Research " + progress + "% complete"}>
-        <span style={{ width: progress + "%" }} />
-      </div>
-      <div className="phase-line"><span className="cursor" aria-hidden="true">▋</span>{statusLabel(run.phase || run.status)}</div>
-
-      <dl className="metric-grid">
-        <div><dt>CANDIDATES</dt><dd>{numberValue(run.candidateCount)}</dd></div>
-        <div><dt>SOURCES</dt><dd>{numberValue(run.sourceCount)}</dd></div>
-        <div><dt>OPEN GAPS</dt><dd>{numberValue(run.unresolvedCount)}</dd></div>
-        <div><dt>SPENT</dt><dd>{money(run.actualCostUsd)}</dd></div>
-      </dl>
-
-      {run.frontier?.length > 0 && (
-        <div className="frontier" aria-label="Source frontier">
-          <div className="frontier-head"><span>SOURCE / STRATEGY</span><span>FOUND</span><span>STATE</span></div>
-          {run.frontier.slice(0, 8).map((item, index) => (
-            <div key={item.sourceClass + item.strategy + index}>
-              <span><strong>{item.sourceClass}</strong><small>{item.strategy}</small></span>
-              <span>{item.recoveredCount}/{item.discoveredCount || "?"}</span>
-              <span>[{item.status}]</span>
-            </div>
-          ))}
+      {showReset && (
+        <div className="step-footer">
+          <button className="action-button step-primary" onClick={onReset}>NEW REQUEST →</button>
         </div>
       )}
-
-      {showReset && <button className="quiet-button standalone" onClick={onReset}>← NEW REQUEST</button>}
     </section>
   );
 }
@@ -641,80 +756,83 @@ function RunScreen({ run, onReset }: { run: ResearchRun; onReset: () => void }) 
 function ReviewScreen({
   page,
   busy,
-  onPage,
   onDecision,
   onManifest,
 }: {
   page: ExceptionPage | null;
   busy: string;
-  onPage: (page: number) => void;
-  onDecision: (item: ExceptionItem, decision: "accepted" | "rejected", song?: CatalogSong) => void;
+  onDecision: (item: ExceptionItem, decision: "accepted" | "rejected", song?: CatalogSong) => Promise<void>;
   onManifest: (verifiedOnly: boolean) => void;
 }) {
   const unresolved = page?.unresolvedCount ?? 0;
+  const active = page?.items[0] ?? null;
+  const [reviewedCount, setReviewedCount] = useState(0);
+
+  async function decide(decision: "accepted" | "rejected", song?: CatalogSong) {
+    if (!active) return;
+    try {
+      await onDecision(active, decision, song);
+      setReviewedCount((count) => count + 1);
+    } catch {
+      // The parent surface displays the actionable request error.
+    }
+  }
+
+  const total = page ? Math.max(page.total, page.items.length) : 0;
+  const position = total > 0 ? Math.min(reviewedCount + 1, total) : 0;
 
   return (
-    <section className="screen" aria-labelledby="review-title">
-      <div className="screen-index">/ EXCEPTIONS</div>
-      <div className="title-row">
-        <h1 id="review-title">CHECK THE<br />UNCERTAIN TRACKS.</h1>
-        <span className="tag">[{page?.total ?? "…"} TOTAL]</span>
-      </div>
-      <p>Exact matches are already accepted; unavailable, inferred, and conflicting recordings remain visible here.</p>
-
-      {!page && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING EXCEPTIONS</div>}
-      {page && page.items.length === 0 && <div className="empty-state">[NO EXCEPTIONS]</div>}
-      {page && page.items.length > 0 && (
-        <div className="exception-list">
-          {page.items.map((item, index) => (
-            <article className="exception-row" key={item.candidateId}>
-              <div className="exception-number">{String((page.page - 1) * page.pageSize + index + 1).padStart(3, "0")}</div>
-              <div className="exception-copy">
-                <strong>{item.title}</strong>
-                <span>{item.artist}{item.album ? " / " + item.album : ""}</span>
-                <small>{item.basis || item.evidenceState || statusLabel(item.status)}</small>
-              </div>
-              <div className="exception-actions">
-                {exceptionChoices(item).map((song) => (
-                  <button
-                    key={song.id}
-                    onClick={() => onDecision(item, "accepted", song)}
-                    disabled={Boolean(busy)}
-                  >
-                    USE: {song.name} / {song.artistName}
-                  </button>
-                ))}
+    <section className="screen flow-screen review-screen" aria-labelledby="review-title">
+      <div className="flow-body review-body">
+        <div className="screen-index">/ 04 CHECK EXCEPTIONS</div>
+        {!page && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING EXCEPTIONS</div>}
+        {page && !active && (
+          <div className="review-complete">
+            <span className="tag">[NO EXCEPTIONS]</span>
+            <h1 id="review-title">READY TO<br />LOCK.</h1>
+            <p>Every discovered candidate now has an explicit outcome.</p>
+          </div>
+        )}
+        {active && (
+          <>
+            <span className="tag">[{position} OF {total}]</span>
+            <h1 id="review-title">{active.title}</h1>
+            <p className="exception-artist">{active.artist}{active.album ? " / " + active.album : ""}</p>
+            <p className="exception-basis">{active.basis || active.evidenceState || statusLabel(active.status)}</p>
+            <div className="exception-actions exception-choices" aria-label="Apple Music match choices">
+              {exceptionChoices(active).map((song) => (
                 <button
-                  className="reject"
-                  onClick={() => onDecision(item, "rejected")}
+                  key={song.id}
+                  onClick={() => void decide("accepted", song)}
                   disabled={Boolean(busy)}
                 >
-                  EXCLUDE
+                  <span>USE THIS MATCH</span>
+                  <strong>{song.name}</strong>
+                  <small>{song.artistName}{song.albumName ? " / " + song.albumName : ""}</small>
                 </button>
-              </div>
-            </article>
-          ))}
-        </div>
-      )}
+              ))}
+              <button
+                className="reject"
+                onClick={() => void decide("rejected")}
+                disabled={Boolean(busy)}
+              >
+                EXCLUDE THIS TRACK
+              </button>
+            </div>
+          </>
+        )}
+      </div>
 
-      {page && page.totalPages > 1 && (
-        <nav className="pagination" aria-label="Exception pages">
-          <button disabled={Boolean(busy) || page.page <= 1} onClick={() => onPage(page.page - 1)}>← PREV</button>
-          <span>{String(page.page).padStart(2, "0")} / {String(page.totalPages).padStart(2, "0")}</span>
-          <button disabled={Boolean(busy) || page.page >= page.totalPages} onClick={() => onPage(page.page + 1)}>NEXT →</button>
-        </nav>
-      )}
-
-      <div className="screen-actions review-footer">
-        <div className="estimate"><span>OPEN EXCEPTIONS</span><strong>{unresolved}</strong></div>
-        {unresolved > 0 && (
+      <div className="step-footer review-footer">
+        {unresolved > 0 ? (
           <button className="quiet-button" onClick={() => onManifest(true)} disabled={!page || Boolean(busy)}>
-            SKIP OPEN + PUBLISH VERIFIED
+            SKIP {unresolved} OPEN + PUBLISH VERIFIED
+          </button>
+        ) : (
+          <button className="action-button step-primary" onClick={() => onManifest(false)} disabled={!page || Boolean(busy)}>
+            {busy === "manifest" ? "LOCKING..." : "LOCK PLAYLIST →"}
           </button>
         )}
-        <button className="action-button" onClick={() => onManifest(false)} disabled={!page || Boolean(busy) || unresolved > 0}>
-          {busy === "manifest" ? "LOCKING..." : "LOCK REVIEWED MANIFEST →"}
-        </button>
       </div>
     </section>
   );
@@ -737,41 +855,46 @@ function ManifestScreen({
   const waitingForApple = runStatus === "waiting_for_apple_authorization";
 
   return (
-    <section className="screen" aria-labelledby="manifest-title">
-      <div className="screen-index">/ MANIFEST</div>
-      <div className="title-row">
-        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />LOCKED.</h1>
+    <section className="screen flow-screen manifest-screen" aria-labelledby="manifest-title">
+      <div className="flow-body">
+        <div className="screen-index">/ 05 PUBLISH</div>
         <span className="tag">[{volumeCount} {volumeCount === 1 ? "VOLUME" : "VOLUMES"}]</span>
+        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />LOCKED.</h1>
+        <p>{waitingForApple
+          ? "The manifest is safe; publication resumes after the owner reconnects Apple Music."
+          : publishing
+            ? "Needle is publishing the ordered playlist now."
+            : "Research is locked. Apple Music will receive exactly this ordered manifest."}</p>
+
+        <details className="terminal-details manifest-details">
+          <summary>PREVIEW LOCKED MANIFEST</summary>
+          {manifest.tracks.length > 0 ? (
+            <ol className="manifest-list">
+              {manifest.tracks.slice(0, 8).map((track, index) => (
+                <li key={track.candidateId + index}>
+                  <span>{String(index + 1).padStart(3, "0")}</span>
+                  <strong>{track.title}</strong>
+                  <small>{track.artist}</small>
+                </li>
+              ))}
+              {trackCount > 8 && <li className="manifest-more">… +{trackCount - 8} TRACKS</li>}
+            </ol>
+          ) : (
+            <div className="empty-state">[ORDERED MANIFEST LOCKED ON SERVER]</div>
+          )}
+          {manifest.contentHash && <code className="manifest-hash">SHA256/{manifest.contentHash.slice(0, 20)}…</code>}
+        </details>
       </div>
-      <p>{waitingForApple
-        ? "The manifest is safe; publication resumes after the owner reconnects Apple Music."
-        : publishing
-          ? "Needle is publishing the locked catalog IDs in deterministic batches."
-          : "Apple Music will receive exactly these catalog IDs in this order; research can no longer alter the manifest."}</p>
 
-      {manifest.tracks.length > 0 ? (
-        <ol className="manifest-list">
-          {manifest.tracks.slice(0, 8).map((track, index) => (
-            <li key={track.candidateId + index}>
-              <span>{String(index + 1).padStart(3, "0")}</span>
-              <strong>{track.title}</strong>
-              <small>{track.artist}</small>
-            </li>
-          ))}
-          {trackCount > 8 && <li className="manifest-more">… +{trackCount - 8} TRACKS</li>}
-        </ol>
-      ) : (
-        <div className="empty-state">[ORDERED MANIFEST LOCKED ON SERVER]</div>
-      )}
-
-      {manifest.contentHash && <code className="manifest-hash">SHA256/{manifest.contentHash.slice(0, 20)}…</code>}
-      <button className="action-button publish-button" onClick={onPublish} disabled={busy}>
-        {waitingForApple
-          ? "WAITING FOR APPLE AUTHORIZATION"
-          : publishing || busy
-            ? "PUBLICATION IN PROGRESS..."
-            : "PUBLISH TO APPLE MUSIC →"}
-      </button>
+      <div className="step-footer">
+        <button className="action-button step-primary" onClick={onPublish} disabled={busy}>
+          {waitingForApple
+            ? "WAITING FOR APPLE AUTHORIZATION"
+            : publishing || busy
+              ? "PUBLICATION IN PROGRESS..."
+              : "PUBLISH TO APPLE MUSIC →"}
+        </button>
+      </div>
     </section>
   );
 }
@@ -788,36 +911,39 @@ function ResultScreen({
   const outcomes = Object.entries(result.outcomeCounts ?? {});
 
   return (
-    <section className="screen" aria-labelledby="result-title">
-      <div className="screen-index">/ RESULT</div>
-      <div className="title-row">
-        <h1 id="result-title">{result.status === "partial" ? "PUBLISHED WITH GAPS." : "PUBLISHED."}</h1>
+    <section className="screen flow-screen result-screen" aria-labelledby="result-title">
+      <div className="flow-body">
+        <div className="screen-index">/ 06 RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
+        <h1 id="result-title">{result.status === "partial" ? "PUBLISHED<br />WITH GAPS." : "PUBLISHED."}</h1>
+        <p>{result.coverageSummary || "The Apple Music links and source-bounded coverage report are ready."}</p>
+        <small className="result-note">Share-link access is public; Apple search, profile visibility, and regional availability are not guaranteed.</small>
+
+        <div className="volume-list">
+          {result.volumes.map((volume) => (
+            <article key={volume.index}>
+              <span>[{String(volume.index).padStart(2, "0")}]</span>
+              <div><strong>{volume.name}</strong><small>{volume.trackCount.toLocaleString()} tracks</small></div>
+              {volume.url
+                ? <a href={volume.url} target="_blank" rel="noreferrer">OPEN IN APPLE MUSIC ↗</a>
+                : <span className="pending-link">LINK PENDING</span>}
+            </article>
+          ))}
+        </div>
+
+        <details className="terminal-details result-details">
+          <summary>VIEW COVERAGE REPORT</summary>
+          <dl className="result-grid">
+            <div><dt>SOURCES</dt><dd>{numberValue(result.sourceCount)}</dd></div>
+            <div><dt>OPEN GAPS</dt><dd>{numberValue(result.unresolvedGapCount)}</dd></div>
+            {outcomes.slice(0, 4).map(([label, value]) => (
+              <div key={label}><dt>{statusLabel(label).toUpperCase()}</dt><dd>{value}</dd></div>
+            ))}
+          </dl>
+        </details>
       </div>
-      <p>{result.coverageSummary || "The Apple Music links and source-bounded coverage report are ready."}</p>
-      <small className="result-note">Share-link access is public; Apple search, profile visibility, and regional availability are not guaranteed.</small>
 
-      <div className="volume-list">
-        {result.volumes.map((volume) => (
-          <article key={volume.index}>
-            <span>[{String(volume.index).padStart(2, "0")}]</span>
-            <div><strong>{volume.name}</strong><small>{volume.trackCount.toLocaleString()} tracks</small></div>
-            {volume.url
-              ? <a href={volume.url} target="_blank" rel="noreferrer">OPEN IN APPLE MUSIC ↗</a>
-              : <span className="pending-link">LINK PENDING</span>}
-          </article>
-        ))}
-      </div>
-
-      <dl className="result-grid">
-        <div><dt>SOURCES</dt><dd>{numberValue(result.sourceCount)}</dd></div>
-        <div><dt>OPEN GAPS</dt><dd>{numberValue(result.unresolvedGapCount)}</dd></div>
-        {outcomes.slice(0, 4).map(([label, value]) => (
-          <div key={label}><dt>{statusLabel(label).toUpperCase()}</dt><dd>{value}</dd></div>
-        ))}
-      </dl>
-
-      <div className="screen-actions result-actions">
+      <div className="step-footer result-actions">
         <button className="quiet-button" onClick={onReset}>← NEW REQUEST</button>
         {result.evidenceUrl && <a className="quiet-link" href={result.evidenceUrl} target="_blank" rel="noreferrer">VIEW EVIDENCE ↗</a>}
         <button className="text-danger" onClick={onDelete}>DELETE RUN DATA</button>
@@ -827,10 +953,17 @@ function ResultScreen({
 }
 
 export function PlaylistBuilder() {
+  const [entryStage, setEntryStage] = useState<"reveal" | "landing" | "prompt">("reveal");
   const [prompt, setPrompt] = useState("");
   const [brief, setBrief] = useState<PlaylistBrief | null>(null);
   const [briefRequestId, setBriefRequestId] = useState<string | null>(null);
-  const [estimate, setEstimate] = useState(0);
+  const [estimate, setEstimate] = useState<ResearchCostEstimate>({
+    minimumUsd: 0,
+    maximumUsd: 0,
+    approvalUsd: 0,
+    factors: [],
+  });
+  const [ambiguitiesAccepted, setAmbiguitiesAccepted] = useState(false);
   const [cached, setCached] = useState(false);
   const [run, setRun] = useState<ResearchRun | null>(null);
   const [exceptionPage, setExceptionPage] = useState<ExceptionPage | null>(null);
@@ -846,10 +979,12 @@ export function PlaylistBuilder() {
   const reviewingRef = useRef(false);
 
   const reset = useCallback(() => {
+    setEntryStage("landing");
     setPrompt("");
     setBrief(null);
     setBriefRequestId(null);
-    setEstimate(0);
+    setEstimate({ minimumUsd: 0, maximumUsd: 0, approvalUsd: 0, factors: [] });
+    setAmbiguitiesAccepted(false);
     setCached(false);
     setRun(null);
     setExceptionPage(null);
@@ -914,7 +1049,8 @@ export function PlaylistBuilder() {
           const response = await waitForBrief(queuedBriefId);
           setBrief(response.brief ?? null);
           setBriefRequestId(queuedBriefId);
-          setEstimate(numberValue(response.estimateUsd ?? response.estimatedCostUsd));
+          setEstimate(normalizeCostEstimate(response));
+          setAmbiguitiesAccepted(false);
         }
       } catch (caught) {
         setError((caught as Error).message);
@@ -928,6 +1064,13 @@ export function PlaylistBuilder() {
     };
     void restore();
   }, [exchangeCapability, loadRun]);
+
+  useEffect(() => {
+    if (restoring || entryStage !== "reveal" || brief || run || manifest || result) return;
+    const delay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 1_350;
+    const timer = window.setTimeout(() => setEntryStage("landing"), delay);
+    return () => window.clearTimeout(timer);
+  }, [restoring, entryStage, brief, run, manifest, result]);
 
   const loadExceptions = useCallback(async (pageNumber: number) => {
     if (!run) return;
@@ -1004,7 +1147,8 @@ export function PlaylistBuilder() {
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
       setBrief(response.brief);
       setBriefRequestId(response.requestId ?? null);
-      setEstimate(numberValue(response.estimateUsd ?? response.estimatedCostUsd));
+      setEstimate(normalizeCostEstimate(response));
+      setAmbiguitiesAccepted(false);
       setCached(Boolean(response.cached));
       briefIdempotencyKey.current = null;
     } catch (caught) {
@@ -1016,16 +1160,23 @@ export function PlaylistBuilder() {
 
   async function startResearch() {
     if (!brief) return;
+    if (brief.ambiguities.length > 0 && !ambiguitiesAccepted) {
+      setError("Accept every material scope assumption before research.");
+      return;
+    }
     setBusy("run");
     setError("");
     if (!idempotencyKey.current) idempotencyKey.current = crypto.randomUUID();
     try {
+      const confirmedBrief: PlaylistBrief = brief.ambiguities.length > 0
+        ? { ...brief, ambiguityAcceptance: [...brief.ambiguities] }
+        : brief;
       const response = await api<ResearchRun | RunResponse>("/api/v1/runs", {
         method: "POST",
         headers: { "Idempotency-Key": idempotencyKey.current },
         body: JSON.stringify({
           briefRequestId,
-          brief: briefRequestId ? undefined : brief,
+          brief: confirmedBrief,
         }),
       });
       const next = unwrapRun(response);
@@ -1065,6 +1216,7 @@ export function PlaylistBuilder() {
       await loadExceptions(exceptionPage?.page ?? 1);
     } catch (caught) {
       setError((caught as Error).message);
+      throw caught;
     } finally {
       reviewingRef.current = false;
       setBusy("");
@@ -1176,24 +1328,29 @@ export function PlaylistBuilder() {
     );
   }
 
+  if (!brief && !run && !manifest && !result && entryStage !== "prompt") {
+    return (
+      <main className="app-shell entry-shell">
+        <ErrorBar message={error} onDismiss={() => setError("")} />
+        <IntroScreen stage={entryStage} onContinue={() => setEntryStage("prompt")} />
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
-      <AppHeader
-        step={step}
-        hasRun={Boolean(run)}
-        transferState={transferState}
-        onTransfer={transferRun}
-        onReset={reset}
-      />
-      {error && (
-        <div className="error-bar" role="alert">
-          <span>[ERROR]</span>
-          <p>{error}</p>
-          <button onClick={() => setError("")} aria-label="Dismiss error">×</button>
-        </div>
+      {(brief || run || manifest || result) && (
+        <AppHeader
+          step={step}
+          hasRun={Boolean(run)}
+          transferState={transferState}
+          onTransfer={transferRun}
+          onReset={reset}
+        />
       )}
+      <ErrorBar message={error} onDismiss={() => setError("")} />
 
-      {!brief && (
+      {!brief && entryStage === "prompt" && (
         <PromptScreen
           prompt={prompt}
           busy={busy === "brief"}
@@ -1201,6 +1358,7 @@ export function PlaylistBuilder() {
             setPrompt(value);
             briefIdempotencyKey.current = null;
           }}
+          onBack={() => setEntryStage("landing")}
           onSubmit={interpret}
         />
       )}
@@ -1211,12 +1369,16 @@ export function PlaylistBuilder() {
           estimate={estimate}
           cached={cached}
           busy={busy === "run"}
+          ambiguitiesAccepted={ambiguitiesAccepted}
           onBack={() => {
             setBrief(null);
             setBriefRequestId(null);
+            setAmbiguitiesAccepted(false);
+            setEntryStage("prompt");
             idempotencyKey.current = null;
             window.history.replaceState(null, "", window.location.pathname);
           }}
+          onAmbiguitiesAccepted={setAmbiguitiesAccepted}
           onStart={startResearch}
         />
       )}
@@ -1225,7 +1387,6 @@ export function PlaylistBuilder() {
         <ReviewScreen
           page={exceptionPage}
           busy={busy}
-          onPage={loadExceptions}
           onDecision={review}
           onManifest={buildManifest}
         />
@@ -1245,12 +1406,6 @@ export function PlaylistBuilder() {
       )}
 
       {result && <ResultScreen result={result} onReset={reset} onDelete={deleteRun} />}
-
-      <footer className="site-footer">
-        <a href="/privacy">PRIVACY →</a>
-        <span>EXHAUSTIVE ACROSS DOCUMENTED SOURCES.</span>
-        <span>UNRESOLVED GAPS STAY VISIBLE.</span>
-      </footer>
     </main>
   );
 }

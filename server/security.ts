@@ -135,20 +135,18 @@ function normalize(value: string | null | undefined): string {
 export function candidateIdentityKey(candidate: TrackCandidateInput): string {
   if (candidate.isrc?.trim()) return `isrc:${normalize(candidate.isrc).replace(/[^a-z0-9]/g, "")}`;
   if (candidate.musicbrainzId?.trim()) return `mbid:${normalize(candidate.musicbrainzId)}`;
-  const claimIdentity = {
+  // Evidence is deliberately excluded. Rediscovering the same identifierless
+  // recording through a second source must merge the new claim into the
+  // existing candidate instead of manufacturing a second recording.
+  const recordingDescriptor = {
     artist: normalize(candidate.artist),
     title: normalize(candidate.title),
     album: normalize(candidate.album),
     releaseYear: candidate.releaseYear ?? null,
     durationMs: candidate.durationMs ?? null,
     versionLabel: normalize(candidate.versionLabel),
-    evidence: candidate.evidence.map((claim) => ({
-      sourceUrl: claim.sourceUrl,
-      relationship: normalize(claim.relationship),
-      note: normalize(claim.note),
-    })).sort((a, b) => stableStringify(a).localeCompare(stableStringify(b))),
   };
-  return `claim:${sha256Hex(stableStringify(claimIdentity))}`;
+  return `metadata:${sha256Hex(stableStringify(recordingDescriptor))}`;
 }
 
 export function duplicateClusterKey(candidate: TrackCandidateInput): string {

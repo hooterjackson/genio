@@ -6,6 +6,8 @@ Needle turns a plain-language request into a cited, reviewable Apple Music playl
 
 Needle uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 
+Curated prompts such as “100 most influential…” use a separate **fast** profile: one bounded cited web synthesis, one structured extraction, and concurrent Apple catalog lookup. The product targets confirmation-to-review in under two minutes and reports an explicit partial result when evidence or provider latency prevents the requested count. Exhaustive and hybrid prompts retain the slower source-frontier workflow and make no two-minute promise.
+
 ## Architecture
 
 - `app/` — dark, terminal-style Sites UI.
@@ -37,9 +39,11 @@ pnpm lint
 pnpm test:e2e
 ```
 
-After staging produces an independently reviewed result artifact, run `pnpm benchmark -- <results.json>`. The evaluator fails unless the factual holdouts reach 100% recovery, auto-match precision reaches 99.5%, storefront-available resolvability reaches 95%, and the 50–100-track curated result passes citation, uniqueness, concentration, and seven-dimension human review gates. The checked-in holdout is deliberately only a seed and must be independently expanded before launch acceptance can be claimed.
+After staging, use `pnpm benchmark:export -- prepare ...`, complete the independent review, then use `pnpm benchmark:export -- finalize ...` and `pnpm benchmark -- <artifact.json>`. The evaluator accepts only a hash-bound Postgres export and fails unless the factual holdouts reach 100% recovery, at least 100 factual matches reach 99.5% auto-match precision and 95% storefront-available resolvability, and the 50–100-track curated result passes citation, uniqueness, concentration, and seven-dimension human review gates. See [`docs/benchmark-holdouts.md`](docs/benchmark-holdouts.md).
 
 Local requests use the same gateway signature and capability flow as production. A real research run additionally requires `OPENAI_API_KEY`; Apple publication requires the owner MusicKit credentials and a stored owner user token.
+
+The default model split is Luna for brief interpretation and fast curated research, and Terra for deep research. Configure the three profiles independently with `OPENAI_BRIEF_MODEL`, `OPENAI_FAST_MODEL`, and `OPENAI_DEEP_MODEL`; `OPENAI_MODEL` remains a legacy deep-only override.
 
 ## Production
 

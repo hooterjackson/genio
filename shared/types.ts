@@ -20,7 +20,7 @@ export type RunStatus =
 
 export type JobKind = "brief" | "research" | "matching" | "publication" | "retention" | "notification";
 export type JobStatus = "queued" | "leased" | "retry" | "complete" | "failed" | "cancelled";
-export type MatchStatus = "accepted" | "review" | "unavailable" | "rejected" | "duplicate" | "unsupported";
+export type MatchStatus = "accepted" | "review" | "unavailable" | "rejected" | "duplicate" | "unsupported" | "overflow";
 export type PublicationStatus = "queued" | "creating" | "appending" | "waiting_for_share_url" | "complete" | "orphaned" | "waiting_for_owner" | "failed";
 
 export interface PlaylistBrief {
@@ -36,6 +36,8 @@ export interface PlaylistBrief {
   orderingPolicy: string;
   targetSize: { min: number; max: number } | null;
   ambiguities: string[];
+  /** Stable, exact acknowledgements added only when a visitor confirms material ambiguities. */
+  ambiguityAcceptance?: string[];
 }
 
 export interface SourceRecordInput {
@@ -46,6 +48,21 @@ export interface SourceRecordInput {
   note: string;
 }
 
+/**
+ * A server-attested URL citation emitted by the OpenAI Responses API. The
+ * excerpt is the exact bounded output-text line surrounding the provider's
+ * citation location. The server derives it from the provider response; it is
+ * never accepted from model-supplied evidence metadata on its own.
+ */
+export interface CitationAttestationInput {
+  responseId: string;
+  outputItemId: string;
+  contentIndex: number;
+  startIndex: number;
+  endIndex: number;
+  excerpt: string;
+}
+
 export interface EvidenceClaimInput {
   sourceUrl: string;
   state: EvidenceState;
@@ -54,11 +71,22 @@ export interface EvidenceClaimInput {
    * accepted only when the source explicitly supports the individual track.
    */
   supportScope: "track" | "album" | "session" | "collection" | "editorial";
+  /** Exact canonical subject copied from PlaylistBrief.subjectEntities. */
+  subjectEntity: string;
+  /** Exact canonical relationship copied from PlaylistBrief.relationship. */
+  subjectRelationship: string;
+  /** Source-specific wording for the assertion or contradiction. */
   relationship: string;
   note: string;
+  /** Server-owned source classification, populated when evidence is read. */
+  sourceClass?: SourceRecordInput["sourceClass"];
+  /** Exact provider-attested citation support, when this is a hosted-web claim. */
+  citationSupport?: CitationAttestationInput | null;
 }
 
 export interface TrackCandidateInput {
+  /** One-based editorial order from a curated research pass, when applicable. */
+  selectionRank?: number | null;
   artist: string;
   title: string;
   album: string | null;
