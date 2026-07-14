@@ -58,6 +58,15 @@ function safeMessage(payload: unknown, status: number): string {
   return `Needle returned HTTP ${status}`;
 }
 
+function scopedCapabilityCookie(setCookie: string | null, current: string): string {
+  if (!setCookie) return current;
+  for (const name of ["__Host-needle-session", "needle_session"]) {
+    const match = setCookie.match(new RegExp(`(?:^|,\\s*)(${name}=[^;,\\s]+)`, "u"));
+    if (match?.[1]) return match[1];
+  }
+  return current;
+}
+
 async function request(
   origin: string,
   path: string,
@@ -74,7 +83,7 @@ async function request(
     : { text: await response.text().catch(() => "") };
   if (!response.ok) throw new Error(safeMessage(payload, response.status));
   const setCookie = response.headers.get("set-cookie");
-  const nextCookie = setCookie?.split(";", 1)[0] ?? cookie;
+  const nextCookie = scopedCapabilityCookie(setCookie, cookie);
   return { payload, cookie: nextCookie };
 }
 
@@ -150,10 +159,27 @@ async function main(): Promise<void> {
   log("run_started", { accessId, status: initialRun.status });
 
   let run = initialRun;
+  let awaitingBudgetSince: number | null = null;
   for (let attempt = 0; attempt < 360; attempt += 1) {
     if (REVIEW_RUN_STATUSES.has(String(run.status)) || TERMINAL_RUN_STATUSES.has(String(run.status))) break;
-    if (run.status === "awaiting_budget") throw new Error("The smoke run unexpectedly requires owner budget approval");
-    await wait(5_000);
+    if (run.status === "awaiting_budget") {
+      if (awaitingBudgetSince === null) {
+        awaitingBudgetSince = Date.now();
+        log("awaiting_owner_budget", {
+          accessId,
+          actualCostUsd: Number(run.actualCostUsd ?? 0),
+          approvedBudgetUsd: Number(run.approvedBudgetUsd ?? 0),
+        });
+      }
+      if (Date.now() - awaitingBudgetSince > 30 * 60 * 1_000) {
+        throw new Error("The smoke run was not approved within the 30-minute harness window");
+      }
+      await wait(10_000);
+    } else {
+      if (awaitingBudgetSince !== null) log("owner_budget_approved", { accessId });
+      awaitingBudgetSince = null;
+      await wait(5_000);
+    }
     const response = await request(origin, `/api/v1/runs/${encodeURIComponent(accessId)}`, {}, cookie);
     cookie = response.cookie;
     const nextRun = asRecord(response.payload.run ?? response.payload);
