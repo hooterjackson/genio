@@ -60,6 +60,10 @@ const COLUMN_ALIASES = new Map<string, string>([
   ["confidence", "evidenceState"],
   ["supportscope", "supportScope"],
   ["scope", "supportScope"],
+  ["subjectentity", "subjectEntity"],
+  ["subject", "subjectEntity"],
+  ["subjectrelationship", "subjectRelationship"],
+  ["briefrelationship", "subjectRelationship"],
   ["relationship", "relationship"],
   ["evidencenote", "evidenceNote"],
   ["note", "evidenceNote"],
@@ -322,6 +326,13 @@ function normalizeRow(row: ImportRow, rowNumber: number): { source: SourceRecord
   const evidenceState = scopeAdjustedState(normalizeEvidenceState(row.evidenceState, rowNumber), supportScope);
   const relationship = normalizeText(row.relationship, { row: rowNumber, field: "relationship", max: 240 })
     ?? "owner catalogue attribution";
+  const subjectEntity = normalizeText(row.subjectEntity, { row: rowNumber, field: "subjectEntity", max: 240 })
+    ?? "";
+  const subjectRelationship = normalizeText(row.subjectRelationship, {
+    row: rowNumber,
+    field: "subjectRelationship",
+    max: 240,
+  }) ?? "";
   const evidenceNote = compactEvidenceNote(normalizeText(row.evidenceNote, {
     row: rowNumber,
     field: "evidenceNote",
@@ -352,7 +363,15 @@ function normalizeRow(row: ImportRow, rowNumber: number): { source: SourceRecord
       isrc: normalizeIsrc(row.isrc, rowNumber),
       musicbrainzId: normalizeMusicBrainzId(row.musicbrainzId, rowNumber),
       versionLabel: normalizeText(row.versionLabel, { row: rowNumber, field: "versionLabel", max: 120 }),
-      evidence: [{ sourceUrl, state: evidenceState, supportScope, relationship, note: evidenceNote }],
+      evidence: [{
+        sourceUrl,
+        state: evidenceState,
+        supportScope,
+        subjectEntity,
+        subjectRelationship,
+        relationship,
+        note: evidenceNote,
+      }],
     },
   };
 }

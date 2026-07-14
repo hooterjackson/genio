@@ -5,6 +5,7 @@ export type GatewayRouteRule = {
 };
 
 const ROUTE_RULES: readonly GatewayRouteRule[] = [
+  { method: "GET", path: /^\/health\/live$/ },
   { method: "POST", path: /^\/api\/v1\/brief$/ },
   { method: "GET", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },
   { method: "POST", path: /^\/api\/v1\/capabilities\/exchange$/ },

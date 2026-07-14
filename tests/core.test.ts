@@ -7,10 +7,20 @@ import { manifestContentHash } from "../server/publisher.ts";
 import { playlistShareUrl } from "../server/apple.ts";
 import { assertConfiguredAppleStorefront } from "../server/owner.ts";
 import { forwardedCapabilityCookie, isCrossSiteMutation, matchGatewayRoute } from "../worker/gateway-policy.ts";
+import { manifestOrderSql } from "../server/repository.ts";
 import { readFileSync } from "node:fs";
 
 test("normalizes accents, punctuation, and featured artist markers", () => {
   expect(normalizeMusicText("Água de Beber (feat. João)")).toBe("agua de beber joao");
+});
+
+test("curated manifests always preserve editorial selection rank", () => {
+  for (const orderingPolicy of ["editorial", "curated order", "playlist flow", "chronological"]) {
+    expect(manifestOrderSql({ mode: "curated", orderingPolicy }))
+      .toBe("c.selection_rank NULLS LAST,c.artist,c.title,c.id");
+  }
+  expect(manifestOrderSql({ mode: "exhaustive", orderingPolicy: "chronological by first release" }))
+    .toContain("c.release_year NULLS LAST");
 });
 
 test("stable identifiers take precedence for canonical recording identity", () => {
@@ -75,18 +85,18 @@ test("stable identifiers deduplicate while metadata only creates a possible-dupl
   const first = {
     artist: "Artist", title: "Song", album: "Album", releaseYear: 2020,
     durationMs: 240000, isrc: "US-AAA-20-00001", musicbrainzId: null, versionLabel: null,
-    evidence: [{ sourceUrl: "https://example.com/a", state: "verified" as const, supportScope: "track" as const, relationship: "performed on", note: "liner notes" }],
+    evidence: [{ sourceUrl: "https://example.com/a", state: "verified" as const, supportScope: "track" as const, subjectEntity: "Artist", subjectRelationship: "performed on", relationship: "performed on", note: "liner notes" }],
   };
   const second = {
     ...first,
     isrc: "USAAA2000001",
-    evidence: [{ sourceUrl: "https://example.org/b", state: "verified" as const, supportScope: "track" as const, relationship: "performed on", note: "session log" }],
+    evidence: [{ sourceUrl: "https://example.org/b", state: "verified" as const, supportScope: "track" as const, subjectEntity: "Artist", subjectRelationship: "performed on", relationship: "performed on", note: "session log" }],
   };
   expect(candidateIdentityKey(first)).toBe(candidateIdentityKey(second));
 
   const withoutIdentifiersA = { ...first, isrc: null };
   const withoutIdentifiersB = { ...second, isrc: null };
-  expect(candidateIdentityKey(withoutIdentifiersA)).not.toBe(candidateIdentityKey(withoutIdentifiersB));
+  expect(candidateIdentityKey(withoutIdentifiersA)).toBe(candidateIdentityKey(withoutIdentifiersB));
   expect(duplicateClusterKey(withoutIdentifiersA)).toBe(duplicateClusterKey(withoutIdentifiersB));
 });
 
@@ -110,6 +120,8 @@ test("gateway canonicalization binds method, path, body, client bucket, and owne
 
 test("Sites gateway uses an explicit route matrix and rejects cross-site mutations", () => {
   expect(matchGatewayRoute("GET", "/api/v1/owner/status")).toMatchObject({ owner: true });
+  expect(matchGatewayRoute("GET", "/health/live")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute("GET", "/health/live")?.owner).toBeUndefined();
   expect(matchGatewayRoute("POST", "/api/v1/owner/runs/run-id/catalog-import")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/api/v1/owner/unknown")).toBeNull();
   expect(matchGatewayRoute("PATCH", "/api/v1/owner/status")).toBeNull();

@@ -18,6 +18,7 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
     updateRun: (...args: Parameters<ResearchRepository["updateRun"]>) => source.updateRun(...args),
     getCoverage: (...args: Parameters<ResearchRepository["getCoverage"]>) => source.getCoverage(...args),
     addSources: (...args: Parameters<ResearchRepository["addSources"]>) => source.addSources(...args),
+    addCitationAttestations: (...args: Parameters<ResearchRepository["addCitationAttestations"]>) => source.addCitationAttestations(...args),
     addCandidates: (...args: Parameters<ResearchRepository["addCandidates"]>) => source.addCandidates(...args),
     upsertFrontier: (...args: Parameters<ResearchRepository["upsertFrontier"]>) => source.upsertFrontier(...args),
     upsertResearchContainers: (...args: Parameters<ResearchRepository["upsertResearchContainers"]>) => source.upsertResearchContainers(...args),
@@ -43,6 +44,7 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
     listCandidates: (...args: Parameters<MatchingRepository["listCandidates"]>) => source.listCandidates(...args),
     listMatches: (...args: Parameters<MatchingRepository["listMatches"]>) => source.listMatches(...args),
     saveMatch: (...args: Parameters<MatchingRepository["saveMatch"]>) => source.saveMatch(...args),
+    saveTimeoutMatches: (...args: Parameters<MatchingRepository["saveTimeoutMatches"]>) => source.saveTimeoutMatches(...args),
     getResearchCheckpoint: (...args: Parameters<MatchingRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<MatchingRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
   });

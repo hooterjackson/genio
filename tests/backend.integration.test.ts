@@ -3,17 +3,25 @@ import { readFileSync } from "node:fs";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { createDatabase } from "../db/index.ts";
+import { createDatabase, DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 import { CapabilityService, CAPABILITY_COOKIE } from "../server/capabilities.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { processNotificationJob } from "../server/notifications.ts";
 import { Repository } from "../server/repository.ts";
+import type { HostedCitationAttestation } from "../server/research.ts";
 import { hmacBase64Url, sha256Hex } from "../server/security.ts";
-import type { PlaylistBrief } from "../shared/types.ts";
+import type { CitationAttestationInput, PlaylistBrief } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
-const migrationSql = ["0000_needle_initial.sql", "0001_evidence_scope.sql"]
+const migrationSql = [
+  "0000_needle_initial.sql",
+  "0001_evidence_scope.sql",
+  "0002_research_integrity.sql",
+  "0003_match_initial_snapshot.sql",
+  "0004_citation_attestation.sql",
+  "0005_candidate_selection_rank.sql",
+]
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
 
@@ -31,6 +39,28 @@ const brief: PlaylistBrief = {
   targetSize: null,
   ambiguities: [],
 };
+const evidenceBinding = {
+  subjectEntity: brief.subjectEntities[0]!,
+  subjectRelationship: brief.relationship,
+};
+
+function citationFixture(
+  sourceUrl: string,
+  title: string,
+  relationship: string,
+  subjectEntity = evidenceBinding.subjectEntity,
+): { attestation: HostedCitationAttestation; support: CitationAttestationInput } {
+  const excerpt = `${subjectEntity} — ${relationship} — ${title}.`;
+  const support = {
+    responseId: `resp-${randomUUID()}`,
+    outputItemId: `msg-${randomUUID()}`,
+    contentIndex: 0,
+    startIndex: 0,
+    endIndex: excerpt.length,
+    excerpt,
+  };
+  return { support, attestation: { sourceUrl, ...support } };
+}
 
 async function applyMigration(pool: Pool): Promise<void> {
   const client = await pool.connect();
@@ -121,7 +151,23 @@ databaseDescribe("hosted backend integration", () => {
   }, 30_000);
 
   test("applies the Postgres migration idempotently and reports schema readiness", async () => {
+    const constraintBefore = await repository.pool.query<{ oid: string; convalidated: boolean }>(
+      `SELECT oid::text,convalidated
+       FROM pg_constraint
+       WHERE conname='track_candidates_selection_rank_check'
+         AND conrelid='track_candidates'::regclass`,
+    );
+    expect(constraintBefore.rows).toEqual([
+      expect.objectContaining({ convalidated: true }),
+    ]);
     await applyMigration(repository.pool);
+    const constraintAfter = await repository.pool.query<{ oid: string; convalidated: boolean }>(
+      `SELECT oid::text,convalidated
+       FROM pg_constraint
+       WHERE conname='track_candidates_selection_rank_check'
+         AND conrelid='track_candidates'::regclass`,
+    );
+    expect(constraintAfter.rows).toEqual(constraintBefore.rows);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     const result = await repository.pool.query<{ name: string }>(
       `SELECT unnest(ARRAY[
@@ -130,7 +176,8 @@ databaseDescribe("hosted backend integration", () => {
         to_regclass('job_queue')::text,
         to_regclass('cost_reservations')::text,
         to_regclass('gateway_nonces')::text,
-        to_regclass('capability_sessions')::text
+        to_regclass('capability_sessions')::text,
+        to_regclass('citation_attestations')::text
       ]) AS name`,
     );
     expect(result.rows.map((row) => row.name)).toEqual([
@@ -140,14 +187,27 @@ databaseDescribe("hosted backend integration", () => {
       "cost_reservations",
       "gateway_nonces",
       "capability_sessions",
+      "citation_attestations",
     ]);
     const evidenceColumns = await repository.pool.query<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
        WHERE table_schema=current_schema() AND table_name='evidence_claims'
-         AND column_name IN ('support_scope','verification_phase')
+         AND column_name IN ('citation_attestation_id','subject_entity','subject_relationship','support_scope','verification_phase')
        ORDER BY column_name`,
     );
-    expect(evidenceColumns.rows.map((row) => row.column_name)).toEqual(["support_scope", "verification_phase"]);
+    expect(evidenceColumns.rows.map((row) => row.column_name)).toEqual([
+      "citation_attestation_id",
+      "subject_entity",
+      "subject_relationship",
+      "support_scope",
+      "verification_phase",
+    ]);
+    const candidateColumns = await repository.pool.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema=current_schema() AND table_name='track_candidates'
+         AND column_name='selection_rank'`,
+    );
+    expect(candidateColumns.rows.map((row) => row.column_name)).toEqual(["selection_rank"]);
   });
 
   test("track verification can promote and later demote the same persisted claim", async () => {
@@ -170,12 +230,16 @@ databaseDescribe("hosted backend integration", () => {
       musicbrainzId: null,
       versionLabel: null,
     };
+    const citation = citationFixture(sourceUrl, candidate.title, "performed on");
+    await repository.addCitationAttestations(runId, [citation.attestation]);
     const claim = (state: "verified" | "inferred", supportScope: "track" | "album", relationship = "performed on") => ({
       sourceUrl,
       state,
       supportScope,
+      ...evidenceBinding,
       relationship,
       note: "The relationship under verification.",
+      citationSupport: relationship === "performed on" ? citation.support : null,
     });
 
     await repository.addCandidates(runId, [{ ...candidate, evidence: [claim("verified", "album")] }], sourceIds, "source_discovery");
@@ -205,6 +269,127 @@ databaseDescribe("hosted backend integration", () => {
       expect.objectContaining({ support_scope: "track", verification_phase: "track_verification" }),
     ]));
     expect((await repository.getCoverage(runId)).eligibleCandidateCount).toBe(0);
+  });
+
+  test("strong web evidence requires a persisted exact citation attestation", async () => {
+    const runId = await repository.createRun("Citation attestation integrity", brief, 0, 1);
+    const sourceUrl = `https://credits.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Attested credit source",
+      sourceClass: "web",
+      provenanceRoot: "credits.example",
+      note: "A bounded citation-attestation test source.",
+    }]);
+    const candidate = {
+      artist: "Recording Artist",
+      title: "Attested Song",
+      album: null,
+      releaseYear: 2024,
+      durationMs: 180_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+    };
+    const citation = citationFixture(sourceUrl, candidate.title, "performed on");
+    const claim = (citationSupport: CitationAttestationInput) => ({
+      sourceUrl,
+      state: "verified" as const,
+      supportScope: "track" as const,
+      ...evidenceBinding,
+      relationship: "performed on",
+      note: "Track-level support.",
+      citationSupport,
+    });
+
+    await repository.addCandidates(runId, [{ ...candidate, evidence: [claim(citation.support)] }], sourceIds, "track_verification");
+    expect((await repository.pool.query(
+      "SELECT state,citation_attestation_id FROM evidence_claims WHERE run_id=$1",
+      [runId],
+    )).rows[0]).toMatchObject({ state: "inferred", citation_attestation_id: null });
+
+    await repository.addCitationAttestations(runId, [citation.attestation]);
+    await repository.addCandidates(runId, [{ ...candidate, evidence: [claim(citation.support)] }], sourceIds, "track_verification");
+    expect((await repository.pool.query(
+      "SELECT state,citation_attestation_id IS NOT NULL attested FROM evidence_claims WHERE run_id=$1",
+      [runId],
+    )).rows[0]).toEqual({ state: "verified", attested: true });
+    expect((await repository.getCoverage(runId)).eligibleCandidateCount).toBe(1);
+    expect((await repository.getEvidenceReport(runId)).candidates[0].evidence[0].citationSupport)
+      .toMatchObject({ responseId: citation.support.responseId, excerpt: citation.support.excerpt });
+
+    await applyMigration(repository.pool);
+    expect((await repository.pool.query(
+      "SELECT state,citation_attestation_id IS NOT NULL attested FROM evidence_claims WHERE run_id=$1",
+      [runId],
+    )).rows[0]).toEqual({ state: "verified", attested: true });
+
+    await repository.addCandidates(runId, [{
+      ...candidate,
+      evidence: [claim({ ...citation.support, excerpt: `${citation.support.excerpt} invented` })],
+    }], sourceIds, "track_verification");
+    expect((await repository.pool.query(
+      "SELECT state,citation_attestation_id FROM evidence_claims WHERE run_id=$1",
+      [runId],
+    )).rows[0]).toMatchObject({ state: "inferred", citation_attestation_id: null });
+    expect((await repository.getCoverage(runId)).eligibleCandidateCount).toBe(0);
+  });
+
+  test("identifierless rediscovery merges evidence and rejects an unbound subject", async () => {
+    const runId = await repository.createRun("Identifierless evidence merge", brief, 0, 1);
+    const urls = [
+      `https://credits-one.example/${randomUUID()}`,
+      `https://credits-two.example/${randomUUID()}`,
+    ];
+    const sourceIds = await repository.addSources(runId, urls.map((url, index) => ({
+      url,
+      title: `Credit source ${index + 1}`,
+      sourceClass: "web" as const,
+      provenanceRoot: `credits-${index + 1}.example`,
+      note: "Independent track-credit source.",
+    })));
+    const descriptor = {
+      artist: "Recording Artist",
+      title: "Identifierless Song",
+      album: "Identifierless Album",
+      releaseYear: 2020,
+      durationMs: 240_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: "studio",
+    };
+    const candidate = (sourceUrl: string, note: string) => ({
+      ...descriptor,
+      evidence: [{
+        sourceUrl,
+        state: "verified" as const,
+        supportScope: "track" as const,
+        ...evidenceBinding,
+        relationship: "performed on",
+        note,
+      }],
+    });
+
+    await expect(repository.addCandidates(runId, [candidate(urls[0]!, "First credit")], sourceIds, "track_verification"))
+      .resolves.toBe(1);
+    await expect(repository.addCandidates(runId, [candidate(urls[1]!, "Second credit")], sourceIds, "track_verification"))
+      .resolves.toBe(0);
+    const merged = await repository.pool.query<{ candidates: number; claims: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
+        (SELECT count(*)::int FROM evidence_claims WHERE run_id=$1) claims`,
+      [runId],
+    );
+    expect(merged.rows[0]).toEqual({ candidates: 1, claims: 2 });
+
+    const wrongSubject = candidate(urls[0]!, "Wrong subject");
+    wrongSubject.evidence[0]!.subjectEntity = "Adjacent Artist";
+    await expect(repository.addCandidates(runId, [wrongSubject], sourceIds, "track_verification"))
+      .rejects.toMatchObject({ code: "evidence_subject_mismatch" });
+    expect((await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM evidence_claims WHERE run_id=$1",
+      [runId],
+    )).rows[0]?.count).toBe(2);
   });
 
   test("counts pending frontier work and incomplete containers as unresolved coverage", async () => {
@@ -342,6 +527,8 @@ databaseDescribe("hosted backend integration", () => {
         sourceUrl,
         state: "inferred" as const,
         supportScope: "track" as const,
+        subjectEntity: "",
+        subjectRelationship: "",
         relationship: "owner catalogue attribution",
         note: "Linked support has not been fetched.",
       }],
@@ -366,11 +553,12 @@ databaseDescribe("hosted backend integration", () => {
         (SELECT count(*)::int FROM source_records WHERE run_id=$1) sources,
         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
         (SELECT count(*)::int FROM evidence_claims WHERE run_id=$1 AND state='inferred' AND verification_phase='unverified') inferred,
+        (SELECT count(*)::int FROM evidence_claims WHERE run_id=$1 AND subject_entity=$2 AND subject_relationship=$3) bound,
         (SELECT count(*)::int FROM source_frontier WHERE run_id=$1 AND source_class='import' AND status='complete') frontier,
         (SELECT count(*)::int FROM audit_events WHERE run_id=$1 AND action='run.catalog_imported') audits`,
-      [runId],
+      [runId, evidenceBinding.subjectEntity, evidenceBinding.subjectRelationship],
     );
-    expect(stored.rows[0]).toMatchObject({ sources: 1, candidates: 1, inferred: 1, frontier: 1, audits: 1 });
+    expect(stored.rows[0]).toMatchObject({ sources: 1, candidates: 1, inferred: 1, bound: 1, frontier: 1, audits: 1 });
 
     const rollbackRunId = await repository.createRun("Owner import rollback", brief, 0, 1);
     const conflictInput = {
@@ -416,7 +604,7 @@ databaseDescribe("hosted backend integration", () => {
         sources: [{ url: concreteUrl, title: "Import", sourceClass: "import", provenanceRoot: "unclassified", note: "Import row." }],
         candidates: [{
           artist: "Artist", title: "Song", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null,
-          evidence: [{ sourceUrl: concreteUrl, state: "inferred", supportScope: "track", relationship: "attribution", note: "Not verified." }],
+          evidence: [{ sourceUrl: concreteUrl, state: "inferred", supportScope: "track", ...evidenceBinding, relationship: "attribution", note: "Not verified." }],
         }],
       });
       let stored = await repository.pool.query("SELECT source_class,provenance_root,title FROM source_records WHERE run_id=$1 AND url=$2", [concreteRun, concreteUrl]);
@@ -431,7 +619,7 @@ databaseDescribe("hosted backend integration", () => {
         sources: [{ url: upgradeUrl, title: "Import", sourceClass: "import", provenanceRoot: "unclassified", note: "Import row." }],
         candidates: [{
           artist: "Artist", title: "Song", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null,
-          evidence: [{ sourceUrl: upgradeUrl, state: "inferred", supportScope: "track", relationship: "attribution", note: "Not verified." }],
+          evidence: [{ sourceUrl: upgradeUrl, state: "inferred", supportScope: "track", ...evidenceBinding, relationship: "attribution", note: "Not verified." }],
         }],
       });
       await repository.addSources(upgradeRun, [{
@@ -720,6 +908,58 @@ databaseDescribe("hosted backend integration", () => {
     ]));
   });
 
+  test("atomically records a new fast route without reclassifying an unmarked idempotent retry", async () => {
+    const clientBucket = `fast-route-${randomUUID()}`;
+    const idempotencyKey = `fast-route-${randomUUID()}`;
+    const curatedBrief: PlaylistBrief = {
+      ...brief,
+      title: "Fast route transaction",
+      mode: "curated",
+      targetSize: { min: 50, max: 100 },
+    };
+    const create = () => repository.createRunIdempotent({
+      prompt: "Create an influential test playlist",
+      brief: curatedBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey,
+      reuseDays: 0,
+      rateLimit: 10,
+      globalLimit: 100,
+    });
+
+    const created = await create();
+    expect(created).toMatchObject({ created: true, reused: false, status: "queued" });
+    const originalRoute = await repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1") as any;
+    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v1", matchingReserveMs: 25_000 });
+    expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.confirmedAt)).toBe(120_000);
+    expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.researchDeadlineAt)).toBe(25_000);
+    const createdRun = await repository.getRun(created.runId);
+    expect(originalRoute.confirmedAt).toBe(createdRun.createdAt);
+
+    const retry = await create();
+    expect(retry).toMatchObject({
+      runId: created.runId,
+      accessId: created.accessId,
+      created: false,
+      reused: false,
+    });
+    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1"))
+      .resolves.toEqual(originalRoute);
+
+    // This represents a legacy run created before route checkpoints existed.
+    // An idempotent retry may repair its queue handoff, but must remain deep.
+    await repository.pool.query(
+      "DELETE FROM research_checkpoints WHERE run_id=$1 AND phase='fast:route:fast_curated_v1'",
+      [created.runId],
+    );
+    await create();
+    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1"))
+      .resolves.toBeNull();
+  });
+
   test("serializes global active-run admission across different client buckets", async () => {
     const create = (label: string) => {
       const bucket = `global-capacity-${label}-${randomUUID()}`;
@@ -823,6 +1063,83 @@ databaseDescribe("hosted backend integration", () => {
     expect(revived.rows[0]).toMatchObject({ status: "queued", attempts: 0, max_attempts: 3, payload_json: { safeRetry: true } });
   });
 
+  test("reserves one worker slot from deep research while prioritizing exact fast jobs", async () => {
+    vi.stubEnv("WORKER_CONCURRENCY", "2");
+    const deepResearch = await repository.enqueueJob({
+      kind: "research",
+      payload: { route: "deep" },
+      dedupeKey: randomUUID(),
+    });
+    const deepMatching = await repository.enqueueJob({
+      kind: "matching",
+      payload: { fast: "true" },
+      dedupeKey: randomUUID(),
+    });
+    const fastResearch = await repository.enqueueJob({
+      kind: "research",
+      payload: { fast: true },
+      dedupeKey: randomUUID(),
+    });
+
+    const fastLease = await repository.leaseNextJob("qos-fast", 60_000);
+    expect(fastLease).toMatchObject({ id: fastResearch.id, payload: { fast: true } });
+
+    const deepLease = await repository.leaseNextJob("qos-deep-one", 60_000);
+    expect([deepResearch.id, deepMatching.id]).toContain(deepLease?.id);
+    await repository.completeJob(fastLease!.id, "qos-fast");
+
+    await expect(repository.leaseNextJob("qos-reserved", 60_000)).resolves.toBeNull();
+    await repository.completeJob(deepLease!.id, "qos-deep-one");
+
+    const remainingDeep = await repository.leaseNextJob("qos-deep-two", 60_000);
+    expect([deepResearch.id, deepMatching.id]).toContain(remainingDeep?.id);
+    expect(remainingDeep?.id).not.toBe(deepLease?.id);
+    await repository.completeJob(remainingDeep!.id, "qos-deep-two");
+  });
+
+  test("promotes operational work after a bounded fast-lane wait", async () => {
+    vi.stubEnv("WORKER_CONCURRENCY", "2");
+    const freshOperational = await repository.enqueueJob({
+      kind: "notification",
+      payload: { event: "fresh" },
+      dedupeKey: randomUUID(),
+    });
+    const firstFast = await repository.enqueueJob({
+      kind: "research",
+      payload: { fast: true },
+      dedupeKey: randomUUID(),
+    });
+
+    const prioritizedFast = await repository.leaseNextJob("fairness-fast", 60_000);
+    expect(prioritizedFast).toMatchObject({ id: firstFast.id });
+    await repository.completeJob(prioritizedFast!.id, "fairness-fast");
+    const freshLease = await repository.leaseNextJob("fairness-fresh-operation", 60_000);
+    expect(freshLease).toMatchObject({ id: freshOperational.id });
+    await repository.completeJob(freshLease!.id, "fairness-fresh-operation");
+
+    const agedOperational = await repository.enqueueJob({
+      kind: "publication",
+      payload: { manifestId: randomUUID() },
+      dedupeKey: randomUUID(),
+    });
+    await repository.pool.query(
+      "UPDATE job_queue SET available_at=now()-interval '31 seconds' WHERE id=$1",
+      [agedOperational.id],
+    );
+    const secondFast = await repository.enqueueJob({
+      kind: "matching",
+      payload: { fast: true },
+      dedupeKey: randomUUID(),
+    });
+
+    const promotedOperation = await repository.leaseNextJob("fairness-promoted-operation", 60_000);
+    expect(promotedOperation).toMatchObject({ id: agedOperational.id });
+    await repository.completeJob(promotedOperation!.id, "fairness-promoted-operation");
+    const remainingFast = await repository.leaseNextJob("fairness-remaining-fast", 60_000);
+    expect(remainingFast).toMatchObject({ id: secondFast.id });
+    await repository.completeJob(remainingFast!.id, "fairness-remaining-fast");
+  });
+
   test("refuses an interrupted matching manifest and explicitly accounts for every verified-only candidate", async () => {
     const runId = await repository.createRun("Manifest accounting invariant", brief, 0, 1);
     const sourceUrl = `https://credits.example/${randomUUID()}`;
@@ -841,6 +1158,8 @@ databaseDescribe("hosted backend integration", () => {
       "Unsupported Recording",
       "Evidence-Ineligible Recording",
     ];
+    const citations = new Map(candidateTitles.map((title) => [title, citationFixture(sourceUrl, title, "performed on")]));
+    await repository.addCitationAttestations(runId, [...citations.values()].map((item) => item.attestation));
     await repository.addCandidates(runId, candidateTitles.map((title) => ({
       artist: "Manifest Artist",
       title,
@@ -854,8 +1173,10 @@ databaseDescribe("hosted backend integration", () => {
         sourceUrl,
         state: title === "Evidence-Ineligible Recording" ? "inferred" as const : "verified" as const,
         supportScope: "track" as const,
+        ...evidenceBinding,
         relationship: "performed on",
         note: "Track-level test evidence.",
+        citationSupport: citations.get(title)!.support,
       }],
     })), sourceIds, "track_verification");
     const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
@@ -952,6 +1273,167 @@ databaseDescribe("hosted backend integration", () => {
     expect(accounted.rows.every((row) => ["accepted", "unavailable", "rejected", "duplicate", "unsupported"].includes(row.outcome))).toBe(true);
   });
 
+  test("curated manifests deterministically cap tracks and account for overflow", async () => {
+    const curatedBrief: PlaylistBrief = {
+      ...brief,
+      title: "Curated cap",
+      mode: "curated",
+      orderingPolicy: "artist/title",
+      targetSize: { min: 1, max: 2 },
+    };
+    const runId = await repository.createRun("Curated overflow", curatedBrief, 0, 1);
+    const sourceUrl = `https://editorial.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Editorial source",
+      sourceClass: "web",
+      provenanceRoot: "editorial.example",
+      note: "Track-specific curated evidence.",
+    }]);
+    const titles = ["Gamma", "Alpha", "Beta"];
+    const citations = new Map(titles.map((title) => [title, citationFixture(sourceUrl, title, "primary artist")]));
+    await repository.addCitationAttestations(runId, [...citations.values()].map((item) => item.attestation));
+    await repository.addCandidates(runId, titles.map((title) => ({
+      artist: "Curated Artist",
+      title,
+      album: "Curated Album",
+      releaseYear: 2024,
+      durationMs: 180_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [{
+        sourceUrl,
+        state: "verified" as const,
+        supportScope: "track" as const,
+        ...evidenceBinding,
+        relationship: "primary artist",
+        note: "Track-specific support.",
+        citationSupport: citations.get(title)!.support,
+      }],
+    })), sourceIds, "track_verification");
+    const candidates = await repository.listCandidates(runId);
+    for (const candidate of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible match",
+        score: 1,
+        song: {
+          id: `catalog-${candidate.title.toLowerCase()}`,
+          name: candidate.title,
+          artistName: candidate.artist,
+          albumName: candidate.album ?? "",
+        },
+        alternatives: [],
+      });
+    }
+    const gamma = candidates.find((candidate) => candidate.title === "Gamma")!;
+    await repository.saveMatch(runId, {
+      candidateId: gamma.id,
+      status: "review",
+      basis: "Retry observed ambiguous metadata",
+      score: 0.7,
+      song: { id: "catalog-gamma-alternate", name: "Gamma (Alternate)", artistName: gamma.artist, albumName: "Curated Album" },
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: gamma.id,
+      status: "accepted",
+      basis: "Retry restored exact compatible match",
+      score: 1,
+      song: { id: "catalog-gamma", name: gamma.title, artistName: gamma.artist, albumName: "Curated Album" },
+      alternatives: [],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => track.title)).toEqual(["Alpha", "Beta"]);
+    const outcomes = await repository.pool.query<{
+      title: string;
+      outcome: string;
+      status: string;
+      basis: string;
+      initial_status: string;
+      initial_catalog_id: string;
+      initial_basis: string;
+    }>(
+      `SELECT c.title,c.outcome,m.status,m.basis,m.initial_status,m.initial_catalog_id,m.initial_basis FROM track_candidates c
+       JOIN catalog_matches m ON m.candidate_id=c.id WHERE c.run_id=$1 ORDER BY c.title`,
+      [runId],
+    );
+    expect(outcomes.rows).toEqual([
+      expect.objectContaining({ title: "Alpha", outcome: "accepted", status: "accepted" }),
+      expect.objectContaining({ title: "Beta", outcome: "accepted", status: "accepted" }),
+      expect.objectContaining({
+        title: "Gamma",
+        outcome: "overflow",
+        status: "overflow",
+        basis: expect.stringContaining("target maximum of 2"),
+        initial_status: "accepted",
+        initial_catalog_id: "catalog-gamma",
+        initial_basis: "Exact compatible match",
+      }),
+    ]);
+  });
+
+  test("curated influence manifests preserve the fast research selection rank", async () => {
+    const rankedBrief: PlaylistBrief = {
+      ...brief,
+      title: "Ranked curated order",
+      mode: "curated",
+      orderingPolicy: "influence rank",
+      targetSize: { min: 1, max: 3 },
+    };
+    const runId = await repository.createRun("Ranked curated order", rankedBrief, 0, 1);
+    await repository.addCandidates(runId, [
+      { selectionRank: 3, artist: "Ranked Artist", title: "Third", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 1, artist: "Ranked Artist", title: "First", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 2, artist: "Ranked Artist", title: "Second", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+    ], new Map(), "unverified");
+    const candidates = await repository.listCandidates(runId);
+    for (const candidate of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible match",
+        score: 1,
+        song: { id: `catalog-${candidate.title.toLowerCase()}`, name: candidate.title, artistName: candidate.artist, albumName: "" },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => track.title)).toEqual(["First", "Second", "Third"]);
+  });
+
+  test("catalog matches cannot mutate a candidate owned by another run", async () => {
+    const firstRunId = await repository.createRun("First match scope", brief, 0, 1);
+    const secondRunId = await repository.createRun("Second match scope", brief, 0, 1);
+    await repository.addCandidates(firstRunId, [{
+      artist: "Scoped Artist",
+      title: "Scoped Track",
+      album: null,
+      releaseYear: null,
+      durationMs: null,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(firstRunId))[0]!;
+    await expect(repository.saveMatch(secondRunId, {
+      candidateId: candidate.id,
+      status: "accepted",
+      basis: "Cross-run attempt",
+      score: 1,
+      song: { id: "cross-run-catalog", name: candidate.title, artistName: candidate.artist, albumName: "" },
+      alternatives: [],
+    })).rejects.toMatchObject({ code: "catalog_candidate_scope_mismatch" });
+    expect(await repository.listMatches(firstRunId)).toEqual([]);
+    expect(await repository.listMatches(secondRunId)).toEqual([]);
+  });
+
   test("never leases two publication jobs for the same manifest concurrently", async () => {
     vi.stubEnv("WORKER_CONCURRENCY", "2");
     const runId = await repository.createRun("Publication serialization", brief, 0, 1);
@@ -973,6 +1455,122 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.leaseNextJob("publisher-two", 60_000)).resolves.toBeNull();
     await repository.completeJob(first!.id, "publisher-one");
     await expect(repository.leaseNextJob("publisher-two", 60_000)).resolves.toMatchObject({ kind: "publication" });
+  });
+
+  test("a repeated publication request while the first response is in flight queues exactly one job", async () => {
+    const runId = await repository.createRun("Publication request race", brief, 0, 1);
+    const manifestId = randomUUID();
+    const clientBucket = `publish-in-flight-${randomUUID()}`;
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Publication request race','Test manifest',$3)",
+      [manifestId, runId, "1".repeat(64)],
+    );
+    await repository.updateRun(runId, { status: "manifest_ready", phase: "manifest" });
+
+    const request = () => repository.queueManifestPublication({
+      runId,
+      manifestId,
+      appleAuthorized: true,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+    });
+    const results = await Promise.all([request(), request()]);
+
+    expect(results.filter((result) => result.queued)).toHaveLength(1);
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ queued: true, state: "queued", runStatus: "publishing" }),
+      expect.objectContaining({ queued: false, state: "in_flight", runStatus: "publishing" }),
+    ]));
+    expect(new Set(results.map((result) => result.jobId)).size).toBe(1);
+    expect(await repository.getRunControlState(runId)).toEqual({ status: "publishing", phase: "publication_queued" });
+    const persisted = await repository.pool.query<{ jobs: number; rate_events: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM job_queue WHERE kind='publication' AND dedupe_key=$1) jobs,
+         (SELECT count(*)::int FROM rate_limit_events WHERE client_bucket=$2 AND action='publish') rate_events`,
+      [`publication:${manifestId}`, clientBucket],
+    );
+    expect(persisted.rows[0]).toEqual({ jobs: 1, rate_events: 1 });
+  });
+
+  test("a retry after a lost publication response never regresses a completed run or requeues its job", async () => {
+    const runId = await repository.createRun("Completed publication retry", brief, 0, 1);
+    const manifestId = randomUUID();
+    const clientBucket = `publish-complete-${randomUUID()}`;
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Completed publication retry','Test manifest',$3)",
+      [manifestId, runId, "2".repeat(64)],
+    );
+    await repository.updateRun(runId, { status: "manifest_ready", phase: "manifest" });
+    const input = {
+      runId,
+      manifestId,
+      appleAuthorized: true,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+    };
+
+    const first = await repository.queueManifestPublication(input);
+    expect(first).toMatchObject({ queued: true, state: "queued" });
+    const leased = await repository.leaseNextJob("lost-response-publisher", 60_000);
+    expect(leased).toMatchObject({ id: first.jobId, kind: "publication" });
+    await repository.updateRun(runId, { status: "complete", phase: "published", error: null });
+    await repository.completeJob(leased!.id, "lost-response-publisher");
+
+    const retry = await repository.queueManifestPublication(input);
+    expect(retry).toMatchObject({ queued: false, state: "terminal", runStatus: "complete", jobId: first.jobId });
+    expect(await repository.getRunControlState(runId)).toEqual({ status: "complete", phase: "published" });
+    const persisted = await repository.pool.query<{ jobs: number; complete_jobs: number; rate_events: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM job_queue WHERE kind='publication' AND dedupe_key=$1) jobs,
+         (SELECT count(*)::int FROM job_queue WHERE kind='publication' AND dedupe_key=$1 AND status='complete') complete_jobs,
+         (SELECT count(*)::int FROM rate_limit_events WHERE client_bucket=$2 AND action='publish') rate_events`,
+      [`publication:${manifestId}`, clientBucket],
+    );
+    expect(persisted.rows[0]).toEqual({ jobs: 1, complete_jobs: 1, rate_events: 1 });
+  });
+
+  test("publication retries while Apple authorization is unavailable reuse one owner notification", async () => {
+    const runId = await repository.createRun("Apple authorization publication retry", brief, 0, 1);
+    const manifestId = randomUUID();
+    const clientBucket = `publish-apple-wait-${randomUUID()}`;
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Apple authorization retry','Test manifest',$3)",
+      [manifestId, runId, "3".repeat(64)],
+    );
+    await repository.updateRun(runId, { status: "manifest_ready", phase: "manifest" });
+    const request = () => repository.queueManifestPublication({
+      runId,
+      manifestId,
+      appleAuthorized: false,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+    });
+    const notify = () => repository.enqueueNotification("apple_reauthorization_required", {
+      deduplicationKey: `apple-reauthorization:${manifestId}`,
+      runId,
+      manifestId,
+    });
+
+    const first = await request();
+    const firstNotification = await notify();
+    const retry = await request();
+    const retryNotification = await notify();
+
+    expect(first).toMatchObject({ queued: false, state: "waiting_for_apple_authorization" });
+    expect(retry).toMatchObject({ queued: false, state: "waiting_for_apple_authorization" });
+    expect(retryNotification).toBe(firstNotification);
+    expect(await repository.getRunControlState(runId)).toEqual({
+      status: "waiting_for_apple_authorization",
+      phase: "apple_authorization",
+    });
+    const persisted = await repository.pool.query<{ jobs: number; notifications: number; rate_events: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM job_queue WHERE kind='publication' AND run_id=$1) jobs,
+         (SELECT count(*)::int FROM notification_outbox WHERE dedupe_key=$2) notifications,
+         (SELECT count(*)::int FROM rate_limit_events WHERE client_bucket=$3 AND action='publish') rate_events`,
+      [runId, `apple-reauthorization:${manifestId}`, clientBucket],
+    );
+    expect(persisted.rows[0]).toEqual({ jobs: 0, notifications: 1, rate_events: 0 });
   });
 
   test("terminal publication failures mark only active volumes failed with redacted diagnostics", async () => {
@@ -1524,7 +2122,18 @@ databaseDescribe("hosted backend integration", () => {
     );
     expect((await repository.getSystemHealth()).worker).toMatchObject({ worker_id: "stale-worker", stale: true });
 
-    await repository.updateWorkerHeartbeat("fresh-worker", { schemaVersion: "1", capacity: 2, activeJobs: 0 });
-    expect((await repository.getSystemHealth()).worker).toMatchObject({ worker_id: "fresh-worker", stale: false });
+    await repository.updateWorkerHeartbeat("fresh-worker", { schemaVersion: DATABASE_SCHEMA_VERSION, capacity: 2, activeJobs: 0 });
+    expect((await repository.getSystemHealth()).worker).toMatchObject({
+      worker_id: "fresh-worker",
+      stale: false,
+      schemaCompatible: true,
+    });
+
+    await repository.updateWorkerHeartbeat("wrong-schema-worker", { schemaVersion: "1", capacity: 2, activeJobs: 0 });
+    expect((await repository.getSystemHealth()).worker).toMatchObject({
+      worker_id: "wrong-schema-worker",
+      stale: false,
+      schemaCompatible: false,
+    });
   });
 });

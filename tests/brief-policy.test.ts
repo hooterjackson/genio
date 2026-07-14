@@ -2,9 +2,11 @@ import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
   estimateResearchCost,
+  estimateResearchCostRange,
   isPlaylistBrief,
   isValidBriefTarget,
   manifestDescriptionForBrief,
+  materialAmbiguitiesAccepted,
   normalizeBriefTarget,
 } from "../server/brief-policy.ts";
 
@@ -67,12 +69,68 @@ describe("playlist brief policy", () => {
     expect(manifestDescriptionForBrief(brief("curated"))).not.toContain("Exhaustive across");
   });
 
-  test("prices the confirmed brief mode rather than trusting a stale interpretation estimate", () => {
-    expect(estimateResearchCost(brief("curated"))).toBe(5);
-    expect(estimateResearchCost({ ...brief("hybrid"), targetSize: { min: 3, max: 3 } })).toBe(5);
-    expect(estimateResearchCost({ ...brief("hybrid"), targetSize: { min: 1, max: 100 } })).toBe(5);
-    expect(estimateResearchCost(brief("hybrid"))).toBe(8);
-    expect(estimateResearchCost({ ...brief("hybrid"), targetSize: { min: 1, max: 101 } })).toBe(8);
-    expect(estimateResearchCost(brief("exhaustive"))).toBe(8);
+  test("derives a transparent range from mode, size, breadth, relationship, and version complexity", () => {
+    const bounded = estimateResearchCostRange({ ...brief("hybrid"), targetSize: { min: 3, max: 3 } });
+    const broadBrief: PlaylistBrief = {
+      ...brief("exhaustive"),
+      title: "Every released performance",
+      description: "An exhaustive career catalogue.",
+      relationship: "performed on as a credited session musician",
+      versionPolicy: "include every live, remix, edit, and regional version",
+    };
+    const broad = estimateResearchCostRange(broadBrief);
+
+    expect(bounded).toMatchObject({ minimumUsd: 1.75, maximumUsd: 3.75, approvalUsd: 3.75 });
+    expect(broad.maximumUsd).toBeGreaterThan(bounded.maximumUsd);
+    expect(broad.factors.map((factor) => factor.label)).toEqual(expect.arrayContaining([
+      "open-ended exhaustive research",
+      "unbounded source frontier",
+      "track-level relationship verification",
+      "multi-version reconciliation",
+      "broad catalogue language",
+    ]));
+    expect(estimateResearchCost(broadBrief)).toBe(broad.maximumUsd);
+  });
+
+  test("prices curated prompts from the fixed fast execution profile", () => {
+    expect(estimateResearchCostRange({
+      ...brief("curated"),
+      relationship: "performed on as a session musician",
+      versionPolicy: "all remixes, live versions, and edits",
+    })).toEqual({
+      minimumUsd: 0.15,
+      maximumUsd: 0.5,
+      approvalUsd: 0.5,
+      factors: [{ label: "fast cited editorial research", minimumUsd: 0.15, maximumUsd: 0.5 }],
+    });
+  });
+
+  test("uses the pessimistic edge of the range for the approval gate", () => {
+    const small = { ...brief("hybrid"), targetSize: { min: 3, max: 3 } };
+    const unbounded = brief("hybrid");
+    expect(estimateResearchCost(small)).toBeLessThanOrEqual(5);
+    expect(estimateResearchCost(unbounded)).toBeGreaterThan(5);
+  });
+
+  test("requires an exact acknowledgement of every interpreted material ambiguity", () => {
+    const unambiguous = brief("hybrid");
+    expect(materialAmbiguitiesAccepted(unambiguous, [])).toBe(true);
+
+    const ambiguities = ["Include guest appearances", "Use original releases only"];
+    const interpreted = { ...unambiguous, ambiguities };
+    expect(materialAmbiguitiesAccepted(interpreted, ambiguities)).toBe(false);
+    expect(materialAmbiguitiesAccepted({
+      ...interpreted,
+      ambiguityAcceptance: ambiguities,
+    }, ambiguities)).toBe(true);
+    expect(materialAmbiguitiesAccepted({
+      ...interpreted,
+      ambiguityAcceptance: [ambiguities[1]!, ambiguities[0]!],
+    }, ambiguities)).toBe(false);
+    expect(materialAmbiguitiesAccepted({
+      ...interpreted,
+      ambiguities: [],
+      ambiguityAcceptance: [],
+    }, ambiguities)).toBe(false);
   });
 });

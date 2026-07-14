@@ -54,3 +54,35 @@ Excluded by design: Motown-era solo albums, Jackson 5/Jacksons releases, guest a
 - Do not silently replace a source with an aggregator or model-generated URL.
 - Passing the Paulinho holdout proves recovery of this independently frozen sample only. It does not prove an exhaustive career catalogue.
 - Passing the Michael Jackson holdout proves complete recovery only inside the frozen 80-track scope.
+
+## Attested staging export
+
+The evaluator no longer accepts a hand-authored results object. Produce its input from the three locked staging runs in two steps:
+
+```sh
+pnpm benchmark:export -- prepare \
+  --paulinho-run <uuid> \
+  --michael-run <uuid> \
+  --berlin-run <uuid> \
+  --output benchmark-review.json
+```
+
+`prepare` opens one read-only, repeatable-read database snapshot. It verifies the US catalog-matching checkpoint, recomputes each manifest hash from its ordered tracks, and exports persisted candidate and initial/final match context. The review file contains a separate `attestation` section. The independent reviewer fills only:
+
+- their name and review timestamp;
+- availability, acceptable Apple catalog IDs, and a note for every factual candidate;
+- the seven Berlin-techno scores and a written rationale for each score.
+
+The exact factual and curated attestation statements must remain unchanged. Candidate, run, manifest, and snapshot identifiers must not be edited.
+
+```sh
+pnpm benchmark:export -- finalize \
+  --review benchmark-review.json \
+  --output benchmark-artifact.json
+
+pnpm benchmark -- benchmark-artifact.json
+```
+
+`finalize` re-reads Postgres and fails on changed manifests or matches, missing or extra judgments, legacy matches without an immutable first decision, non-US storefronts, or unknown attestation fields. Tracks, citations, automatic-match status, correctness, and resolvability are derived by the exporter; reviewers cannot supply those result fields. The evaluator verifies the export schema, database provenance, attestation digest, and artifact digest before scoring. Matching acceptance also requires at least 100 factual candidates, so a tiny perfect sample cannot pass.
+
+The detailed staging rows are removed by retention. Prepare, review, and finalize the artifact before the 90-day detail window closes.

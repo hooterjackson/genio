@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 function srgbChannel(value: number): number {
   const normalized = value / 255;
@@ -51,24 +51,155 @@ const run = {
   frontier: [],
 };
 
+const estimate = {
+  minimumUsd: 4.25,
+  maximumUsd: 9.5,
+  approvalUsd: 9.5,
+  factors: [
+    { label: "open-ended exhaustive research", minimumUsd: 2.5, maximumUsd: 4 },
+    { label: "unbounded source frontier", minimumUsd: 1.5, maximumUsd: 3 },
+    { label: "track-level relationship verification", minimumUsd: 0.25, maximumUsd: 2.5 },
+  ],
+};
+
+const curatedBrief = {
+  ...brief,
+  title: "Influential Berlin techno",
+  description: "A cited editorial selection of historically influential Berlin techno.",
+  mode: "curated",
+  subjectEntities: ["Berlin techno"],
+  relationship: "historically influential within",
+  include: ["released tracks with editorial support"],
+  exclude: ["unsupported selections"],
+  versionPolicy: "one canonical version per track",
+  evidencePolicy: "citation-attested editorial evidence",
+  orderingPolicy: "editorial rank",
+  targetSize: { min: 50, max: 100 },
+};
+
+const fastEstimate = {
+  minimumUsd: 0.1,
+  maximumUsd: 0.5,
+  approvalUsd: 0.5,
+  factors: [{ label: "time-boxed curated research", minimumUsd: 0.1, maximumUsd: 0.5 }],
+};
+
+async function openPrompt(page: Page): Promise<void> {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: /go past the first 25/i })).toBeVisible();
+  await page.getByRole("button", { name: /research a playlist/i }).click();
+  await expect(page.getByRole("heading", { name: /what should needle build/i })).toBeVisible();
+}
+
 test("the request and scope flow remains usable at mobile widths", async ({ page }) => {
   await page.route("**/api/v1/brief", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ brief, estimateUsd: 8, cached: false }),
+      body: JSON.stringify({ brief, estimateUsd: estimate.approvalUsd, estimate, cached: false }),
     });
   });
 
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: /deep playlist research/i })).toBeVisible();
-  await page.getByLabel(/what should we find/i).fill("Every released song Paulinho da Costa performed on");
-  await page.getByRole("button", { name: /interpret scope/i }).click();
+  await openPrompt(page);
+  const example = page.getByRole("button", { name: "Paulinho da Costa’s 100 most influential songs" });
+  await example.click();
+  await expect(example).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByLabel(/playlist request/i)).toHaveValue("Paulinho da Costa’s 100 most influential songs");
+  await page.getByRole("button", { name: /back/i }).click();
+  await expect(page.getByRole("heading", { name: /go past the first 25/i })).toBeVisible();
+  await page.getByRole("button", { name: /research a playlist/i }).click();
+  await page.getByLabel(/playlist request/i).fill("Every released song Paulinho da Costa performed on");
+  await page.getByRole("button", { name: /continue/i }).click();
   await expect(page.getByRole("heading", { name: brief.title })).toBeVisible();
-  await expect(page.getByText("$8.00")).toBeVisible();
+  await expect(page.getByText("[DEEP · SOURCE FRONTIER]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Source-bounded completeness attempt; unresolved evidence stays visible.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /start deep research/i })).toBeVisible();
+  await expect(page.getByText("$4.25–$9.50")).toBeVisible();
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("curated requests are clearly labeled as the time-boxed fast path", async ({ page }) => {
+  await page.route("**/api/v1/brief", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ brief: curatedBrief, estimateUsd: fastEstimate.approvalUsd, estimate: fastEstimate, cached: false }),
+    });
+  });
+
+  await openPrompt(page);
+  await page.getByLabel(/playlist request/i).fill("Influential Berlin techno");
+  await page.getByRole("button", { name: /continue/i }).click();
+
+  await expect(page.getByText("[FAST · <2 MIN TARGET]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Cited editorial selection; partial results stay visible if the time box closes.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /start fast research/i })).toBeVisible();
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("an active fast run keeps its profile and concise phase message visible", async ({ page }) => {
+  const fastRun = {
+    ...run,
+    id: "run-fast",
+    brief: curatedBrief,
+    status: "researching",
+    phase: "fast_research",
+    candidateCount: 24,
+    sourceCount: 4,
+    unresolvedCount: 0,
+  };
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: fastRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-fast", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fastRun) });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-fast");
+  await expect(page.getByText("[FAST · RESEARCHING]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Fast mode is building a cited editorial selection inside a fixed research window.")).toBeVisible();
+});
+
+test("material scope assumptions must be accepted and are preserved in the confirmed brief", async ({ page }) => {
+  const ambiguities = ["Include credited guest appearances", "Use the first released studio version"];
+  const ambiguousBrief = { ...brief, ambiguities };
+  await page.route("**/api/v1/brief", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ brief: ambiguousBrief, estimateUsd: estimate.approvalUsd, estimate, cached: false }),
+    });
+  });
+
+  let captureRun!: (body: Record<string, unknown>) => void;
+  const runRequest = new Promise<Record<string, unknown>>((resolve) => { captureRun = resolve; });
+  await page.route("**/api/v1/runs", async (route) => {
+    captureRun(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "Stopped after request capture" }),
+    });
+  });
+
+  await openPrompt(page);
+  await page.getByLabel(/playlist request/i).fill("Every released song Paulinho da Costa performed on");
+  await page.getByRole("button", { name: /continue/i }).click();
+
+  const confirm = page.getByRole("button", { name: /start deep research/i });
+  await expect(confirm).toBeDisabled();
+  const acceptance = page.getByRole("checkbox", { name: /i accept this scope/i });
+  await acceptance.check();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+
+  const body = await runRequest;
+  const confirmed = body.brief as typeof ambiguousBrief & { ambiguityAcceptance?: string[] };
+  expect(confirmed.ambiguities).toEqual(ambiguities);
+  expect(confirmed.ambiguityAcceptance).toEqual(ambiguities);
 });
 
 test("capabilities are exchanged and removed from the URL fragment", async ({ page }) => {
@@ -96,10 +227,11 @@ test("capabilities are exchanged and removed from the URL fragment", async ({ pa
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await expect(page.getByRole("heading", { name: /check the uncertain tracks/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Uncertain track 1" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.hash)).toBe("");
-  await expect(page.locator(".exception-row")).toHaveCount(20);
-  await expect(page.getByRole("button", { name: /next/i })).toBeEnabled();
+  await expect(page.getByText("[1 OF 21]", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Uncertain track 2" })).toHaveCount(0);
+  await expect(page.locator(".exception-choices")).toHaveCount(1);
 });
 
 test("the primary Apple match is selectable once even when alternatives repeat it", async ({ page }) => {
@@ -149,9 +281,9 @@ test("the primary Apple match is selectable once even when alternatives repeat i
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  const primaryChoice = page.getByRole("button", { name: "USE: Primary recording / Artist" });
+  const primaryChoice = page.getByRole("button", { name: /use this match primary recording/i });
   await expect(primaryChoice).toHaveCount(1);
-  await expect(page.getByRole("button", { name: "USE: Alternate recording / Artist" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /use this match alternate recording/i })).toBeVisible();
   expect(await page.locator(".exception-actions button").evaluateAll((buttons) => buttons.every((button) => {
     const rect = button.getBoundingClientRect();
     return rect.width >= 44 && rect.height >= 44;
@@ -242,7 +374,7 @@ test("manifest locking waits for the first exception page", async ({ page }) => 
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await expect(page.getByText("LOADING EXCEPTIONS")).toBeVisible();
-  const lockButton = page.getByRole("button", { name: /lock reviewed manifest/i });
+  const lockButton = page.getByRole("button", { name: /lock playlist/i });
   await expect(lockButton).toBeDisabled();
   releaseExceptions();
   await expect(page.getByText("[NO EXCEPTIONS]")).toBeVisible();
@@ -250,7 +382,7 @@ test("manifest locking waits for the first exception page", async ({ page }) => 
 });
 
 test("interactive controls meet the minimum touch target", async ({ page }) => {
-  await page.goto("/");
+  await openPrompt(page);
   const undersized = await page.locator("button:not([disabled]), a[href], textarea, input, summary").evaluateAll((elements) =>
     elements.flatMap((element) => {
       const rect = element.getBoundingClientRect();
@@ -265,22 +397,15 @@ test("interactive controls meet the minimum touch target", async ({ page }) => {
 
 test("desktop keyboard focus remains visible and primary text meets WCAG AA contrast", async ({ page }, testInfo) => {
   await page.goto("/");
-  const request = page.getByLabel(/what should we find/i);
-  await expect(request).toBeFocused();
-  if (testInfo.project.name === "desktop") {
-    await request.fill("Every released song Paulinho da Costa performed on");
-    await page.keyboard.press("Tab");
-
-    const submit = page.getByRole("button", { name: /interpret scope/i });
-    await expect(submit).toBeFocused();
-    expect(await submit.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe("none");
-  }
+  const primary = page.getByRole("button", { name: /research a playlist/i });
+  await primary.focus();
+  await expect(primary).toBeFocused();
 
   for (const locator of [
     page.locator("body"),
-    page.locator(".landing-copy"),
+    page.locator(".intro-copy p"),
     page.locator(".screen-index"),
-    page.locator(".source-links a").first(),
+    page.locator(".intro-mark"),
   ]) {
     const colors = await locator.evaluate((element) => {
       const foreground = getComputedStyle(element).color;
@@ -293,5 +418,13 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
       return { foreground, background };
     });
     expect(contrastRatio(colors.foreground, colors.background)).toBeGreaterThanOrEqual(4.5);
+  }
+
+  if (testInfo.project.name === "desktop") {
+    await primary.click();
+    const request = page.getByLabel(/playlist request/i);
+    await expect(request).toBeFocused();
+    await request.fill("Every released song Paulinho da Costa performed on");
+    expect(await request.evaluate((element) => getComputedStyle(element).outlineColor)).toBe("rgb(224, 96, 41)");
   }
 });

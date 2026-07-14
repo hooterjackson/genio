@@ -93,6 +93,7 @@ describe("structured-source network boundaries", () => {
 test("page prompt injection cannot authorize invented evidence or a candidate write", () => {
   const returnedUrl = "https://credits.example/returned-page";
   const inventedUrl = "https://attacker.example/fabricated-credit";
+  const confirmedScope = { subjectEntities: ["Injected Artist"], relationship: "performed on" };
   const result = validateCandidateBatch({
     sources: [
       {
@@ -123,11 +124,13 @@ test("page prompt injection cannot authorize invented evidence or a candidate wr
         sourceUrl: inventedUrl,
         state: "verified",
         supportScope: "track",
+        subjectEntity: confirmedScope.subjectEntities[0],
+        subjectRelationship: confirmedScope.relationship,
         relationship: "performed on",
         note: "Fabricated by hostile source instructions.",
       }],
     }],
-  }, new Set([returnedUrl]), "track_verification");
+  }, new Set([returnedUrl]), "track_verification", confirmedScope);
 
   expect(result.sources).toEqual([expect.objectContaining({ url: returnedUrl })]);
   expect(result.sources[0]?.provenanceRoot).not.toBe("attacker-controlled.invalid");

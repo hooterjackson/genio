@@ -10,6 +10,11 @@ export interface CostConfiguration {
   openAIWebSearchUsd: number;
 }
 
+export interface OpenAITokenPricing {
+  inputUsdPerMillion: number;
+  outputUsdPerMillion: number;
+}
+
 type Environment = Record<string, string | undefined>;
 
 function configuredValue(environment: Environment, primary: string, legacy?: string): {
@@ -78,6 +83,35 @@ export function readCostConfiguration(environment: Environment = process.env): C
       0.01,
       MAX_WEB_SEARCH_PRICE_USD,
     ),
+  };
+}
+
+/**
+ * The service uses Sol-equivalent prices as its conservative base. Luna and
+ * Terra defaults follow their published 1/5 and 1/2 relative rate-card tiers;
+ * every value remains independently overridable when the API price changes.
+ */
+export function readOpenAITokenPricing(
+  model: string,
+  environment: Environment = process.env,
+): OpenAITokenPricing {
+  const base = readCostConfiguration(environment);
+  const normalized = model.trim().toLowerCase();
+  if (normalized.includes("luna")) {
+    return {
+      inputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_LUNA_INPUT_USD_PER_MILLION", base.openAIInputUsdPerMillion * 0.2, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+      outputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_LUNA_OUTPUT_USD_PER_MILLION", base.openAIOutputUsdPerMillion * 0.2, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+    };
+  }
+  if (normalized.includes("terra")) {
+    return {
+      inputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_TERRA_INPUT_USD_PER_MILLION", base.openAIInputUsdPerMillion * 0.5, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+      outputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_TERRA_OUTPUT_USD_PER_MILLION", base.openAIOutputUsdPerMillion * 0.5, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+    };
+  }
+  return {
+    inputUsdPerMillion: base.openAIInputUsdPerMillion,
+    outputUsdPerMillion: base.openAIOutputUsdPerMillion,
   };
 }
 

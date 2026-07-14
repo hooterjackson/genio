@@ -15,6 +15,55 @@ pnpm smoke:apple -- --confirm-live-write --name "[NEEDLE TEST] three-track" \
 
 The command refuses names outside the `[NEEDLE TEST]` namespace, refuses more than 25 IDs, verifies exact ordered membership (including duplicate occurrences), and prints only safe playlist metadata. Delete the test playlist manually after the second-account import check.
 
+After the three-track probe succeeds, use the comprehensive capacity harness. Create `.artifacts/phase-zero/` (already ignored by Git), then start with a local JSON file there containing 3–25 explicit US Apple song IDs:
+
+```json
+{
+  "schemaVersion": 1,
+  "suiteId": "live-YYYY-MM-DD",
+  "storefront": "us",
+  "catalogIds": ["<APPLE_SONG_ID>", "<APPLE_SONG_ID>", "<APPLE_SONG_ID>"]
+}
+```
+
+Resolve and inspect the immutable 5,000-occurrence fixture before authorizing writes:
+
+```sh
+pnpm phase-zero:apple -- resolve \
+  --input .artifacts/phase-zero/seeds.json \
+  --output .artifacts/phase-zero/resolved.json \
+  --expected-storefront us \
+  --confirm-seed-count 3
+```
+
+The publish command creates nine `[NEEDLE TEST]` playlists containing 6,603 total occurrences: 3, 100, 500, 1,000, and five ordered 1,000-track volumes. Run it only after the owner explicitly approves those live writes and supplies the exact fixture hash printed by `resolve`:
+
+```sh
+pnpm phase-zero:apple -- publish \
+  --fixture .artifacts/phase-zero/resolved.json \
+  --output .artifacts/phase-zero/report.json \
+  --expected-storefront us \
+  --accept-fixture-sha256 <PRINTED_FIXTURE_HASH> \
+  --confirm-track-count 6603 \
+  --confirm-live-write
+
+pnpm phase-zero:apple -- verify \
+  --fixture .artifacts/phase-zero/resolved.json \
+  --report .artifacts/phase-zero/report.json \
+  --output .artifacts/phase-zero/verification.json \
+  --expected-storefront us \
+  --accept-fixture-sha256 <PRINTED_FIXTURE_HASH> \
+  --accept-report-sha256 <PRINTED_REPORT_HASH>
+```
+
+Inventory is deliberately read-only because Apple does not document a library-playlist deletion endpoint. Use the resulting list for manual cleanup in Apple Music:
+
+```sh
+pnpm phase-zero:apple -- inventory \
+  --output .artifacts/phase-zero/inventory.json \
+  --expected-storefront us
+```
+
 - [ ] Authorize the owner's personal Apple Music account and persist only an AES-256-GCM encrypted user token.
 - [ ] Restart API and worker; validate that publication still works.
 - [ ] Force an Apple 401/403; verify the manifest remains locked and publication enters `waiting_for_apple_authorization` without repeated retries.
@@ -54,5 +103,5 @@ The command refuses names outside the `[NEEDLE TEST]` namespace, refuses more th
 ## Independent quality acceptance
 
 - [ ] Expand the checked-in Paulinho da Costa and Michael Jackson seed fixtures through independent review; do not use runtime research output to author the expected catalogue.
-- [ ] Export the staging holdout recovery, reviewed Apple matching decisions, and Berlin-techno human rubric scores into one benchmark artifact.
+- [ ] Prepare and finalize the Postgres-derived, hash-bound staging benchmark artifact with independently reviewed Apple judgments and Berlin-techno scores plus rationales.
 - [ ] Run `pnpm benchmark -- <artifact.json>` and retain the passing report with the release record (100% factual holdout recovery, at least 99.5% auto-match precision, and at least 95% storefront-available resolvability).

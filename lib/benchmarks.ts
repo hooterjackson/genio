@@ -23,6 +23,8 @@ export interface CuratedRatings {
   playlistCoherence: number;
 }
 
+export const MINIMUM_FACTUAL_MATCH_SAMPLE = 100;
+
 function trackKey(track: Pick<BenchmarkTrack, "artist" | "title">): string {
   return `${normalizeMusicText(track.artist)}\u0000${normalizeMusicText(track.title)}`;
 }
@@ -35,17 +37,21 @@ export function evaluateHoldoutRecovery(expected: BenchmarkTrack[], actual: Benc
   return { expected: expected.length, recovered, recall, missing, passed: recall === 1 };
 }
 
-export function evaluateMatchingQuality(rows: MatchAuditRow[]) {
+export function evaluateMatchingQuality(rows: MatchAuditRow[], minimumSampleSize = MINIMUM_FACTUAL_MATCH_SAMPLE) {
   const accepted = rows.filter((row) => row.autoAccepted);
   const available = rows.filter((row) => row.storefrontAvailable);
   const precision = accepted.length === 0 ? null : accepted.filter((row) => row.correct).length / accepted.length;
   const resolvability = available.length === 0 ? null : available.filter((row) => row.resolved).length / available.length;
   return {
     autoAccepted: accepted.length,
+    sampleSize: rows.length,
+    minimumSampleSize,
     storefrontAvailable: available.length,
     precision,
     resolvability,
-    passed: precision !== null && precision >= 0.995 && resolvability !== null && resolvability >= 0.95,
+    passed: rows.length >= minimumSampleSize
+      && precision !== null && precision >= 0.995
+      && resolvability !== null && resolvability >= 0.95,
   };
 }
 

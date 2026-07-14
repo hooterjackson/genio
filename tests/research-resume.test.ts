@@ -33,3 +33,28 @@ test("new research runs start at the first durable segment", () => {
     dedupeKey: "research:run-2:scope_resolution:g0",
   });
 });
+
+test("fast resumes carry an exact server-owned queue marker", () => {
+  expect(researchResumeJob("run-fast", null, { fast: true })).toMatchObject({
+    payload: {
+      runId: "run-fast",
+      phase: "scope_resolution",
+      fast: true,
+    },
+  });
+  expect(researchResumeJob("run-deep", null, { fast: false }).payload).not.toHaveProperty("fast");
+});
+
+test("fast resume reconstruction preserves the original absolute timing", () => {
+  const fastRoute = {
+    confirmedAt: "2026-07-14T12:00:00.000Z",
+    researchDeadlineAt: "2026-07-14T12:01:35.000Z",
+    deadlineAt: "2026-07-14T12:02:00.000Z",
+  };
+  expect(researchResumeJob("run-fast-timed", null, { fast: true, fastRoute }).payload).toMatchObject({
+    fast: true,
+    fastConfirmedAt: fastRoute.confirmedAt,
+    fastResearchDeadlineAt: fastRoute.researchDeadlineAt,
+    fastDeadlineAt: fastRoute.deadlineAt,
+  });
+});

@@ -366,7 +366,7 @@ const worker = {
       return safeResponse(response, false, url.hostname === "localhost" || url.hostname === "127.0.0.1");
     }
 
-    if (url.pathname.startsWith("/api/v1/")) {
+    if (url.pathname.startsWith("/api/v1/") || url.pathname === "/health/live") {
       return safeResponse(
         await gateway(request, env, url),
         true,

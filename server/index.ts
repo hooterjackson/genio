@@ -6,11 +6,22 @@ import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog
 import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
-import { estimateResearchCost, isPlaylistBrief } from "./brief-policy.ts";
+import {
+  estimateResearchCost,
+  estimateResearchCostRange,
+  isPlaylistBrief,
+  materialAmbiguitiesAccepted,
+} from "./brief-policy.ts";
 import { researchResumeJob, type ResearchResumeCheckpoint } from "./research-resume.ts";
+import {
+  briefInterpretationModel,
+  parseFastRouteCheckpoint,
+  researchExecutionPolicy,
+} from "./research-policy.ts";
 import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
+import { buildInformation } from "./build-info.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const costConfiguration = readCostConfiguration();
@@ -95,7 +106,9 @@ async function requireWorkerForNewWork(): Promise<void> {
   const required = process.env.REQUIRE_WORKER_HEARTBEAT === "true" || process.env.NODE_ENV === "production";
   if (!required) return;
   const health = await repository.getSystemHealth();
-  if (health.worker.stale) throw new HttpError(503, "Research worker is temporarily unavailable", "worker_unavailable");
+  if (health.worker.stale || !health.worker.schemaCompatible) {
+    throw new HttpError(503, "Research worker is temporarily unavailable", "worker_unavailable");
+  }
 }
 
 async function assertNotPaused(kind: "research" | "publishing"): Promise<void> {
@@ -105,11 +118,28 @@ async function assertNotPaused(kind: "research" | "publishing"): Promise<void> {
 }
 
 async function enqueueResearchResume(runId: string): Promise<void> {
-  const saved = await repository.getResearchCheckpoint(runId, "resume") as ResearchResumeCheckpoint | null;
-  await repository.enqueueJob(researchResumeJob(runId, saved));
+  const [run, saved] = await Promise.all([
+    repository.getRun(runId),
+    repository.getResearchCheckpoint(runId, "resume") as Promise<ResearchResumeCheckpoint | null>,
+  ]);
+  const policy = researchExecutionPolicy(run.brief);
+  let fast = false;
+  let fastRoute = null;
+  if (policy.kind === "fast_curated") {
+    const [route, started] = await Promise.all([
+      repository.getResearchCheckpoint(runId, `fast:route:${policy.version}`),
+      repository.getResearchCheckpoint(runId, `fast:policy:${policy.version}`),
+    ]);
+    fast = Boolean(route || started);
+    fastRoute = parseFastRouteCheckpoint(route, policy.version);
+  }
+  await repository.enqueueJob(researchResumeJob(runId, saved, { fast, fastRoute }));
 }
 
-app.get("/health/live", async () => ({ ok: true, service: "needle-api", version: process.env.RAILWAY_GIT_COMMIT_SHA ?? "development" }));
+app.get("/health/live", async () => {
+  const build = buildInformation();
+  return { ok: true, service: "needle-api", version: build.version, revision: build.revision, build };
+});
 
 app.get("/health/ready", async (_request, reply) => {
   const ok = await repository.ping();
@@ -122,11 +152,19 @@ app.get("/health/system", async (_request, reply) => {
   try {
     const health = await repository.getSystemHealth();
     const schemaVersion = health.database.schemaVersion;
-    const ok = schemaVersion === DATABASE_SCHEMA_VERSION && !health.worker.stale;
+    const ok = schemaVersion === DATABASE_SCHEMA_VERSION
+      && !health.worker.stale
+      && health.worker.schemaCompatible;
     return reply.code(ok ? 200 : 503).send({
       ok,
       database: schemaVersion === DATABASE_SCHEMA_VERSION ? "ready" : "schema_mismatch",
-      worker: health.worker.worker_id ? health.worker.stale ? "stale" : "healthy" : "missing",
+      worker: health.worker.worker_id
+        ? health.worker.stale
+          ? "stale"
+          : health.worker.schemaCompatible
+            ? "healthy"
+            : "schema_mismatch"
+        : "missing",
       paused: health.paused.research || health.paused.publishing,
       queue: health.queue,
       notifications: {
@@ -147,8 +185,8 @@ app.get("/api/health", async () => ({ ok: await repository.ping(), service: "nee
 app.get("/api/v1/system/health", async () => {
   const health = await repository.getSystemHealth();
   return {
-    ok: !health.worker.stale,
-    worker: { stale: health.worker.stale },
+    ok: !health.worker.stale && health.worker.schemaCompatible,
+    worker: { stale: health.worker.stale, schemaCompatible: health.worker.schemaCompatible },
     paused: health.paused,
     queue: health.queue,
     notifications: { pending: health.notificationBacklog, failed: health.notificationFailures },
@@ -165,7 +203,7 @@ app.post<{ Body: { prompt?: string; idempotencyKey?: string } }>("/api/v1/brief"
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
   const created = await repository.createBriefRequest({
     prompt,
-    model: process.env.OPENAI_MODEL ?? "gpt-5.6",
+    model: briefInterpretationModel(),
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
@@ -187,6 +225,9 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     status: brief.status,
     brief: brief.status === "complete" ? brief.brief : undefined,
     estimateUsd: brief.status === "complete" ? brief.estimateUsd : undefined,
+    estimate: brief.status === "complete" && isPlaylistBrief(brief.brief)
+      ? estimateResearchCostRange(brief.brief)
+      : undefined,
     error: brief.status === "failed" ? brief.error : undefined,
   };
 });
@@ -214,6 +255,13 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   }
   const brief = request.body?.brief ?? interpreted.brief;
   if (!isPlaylistBrief(brief)) throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
+  if (!materialAmbiguitiesAccepted(brief, interpreted.brief.ambiguities)) {
+    throw new HttpError(
+      409,
+      "Accept every material scope assumption before research",
+      "ambiguities_unresolved",
+    );
+  }
   const confirmedEstimateUsd = estimateResearchCost(brief);
   const key = idempotencyKey(request, request.body?.idempotencyKey);
   const created = await repository.createRunIdempotent({
@@ -225,7 +273,9 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
   });
-  if (created.created && created.status === "queued") {
+  // A repeated idempotent request repairs a crash between the committed run
+  // transaction and the queue insert. Cached completed runs need no handoff.
+  if (!created.reused && created.status === "queued") {
     await enqueueResearchResume(created.runId);
   }
   const capability = await capabilities.issue(created.runId, created.accessId);
@@ -283,22 +333,34 @@ app.post<{ Params: { id: string }; Body: { mode?: "reviewed" | "verified_only" }
 
 app.post<{ Params: { id: string }; Body: { manifestId?: string } }>("/api/v1/runs/:id/publish", async (request, reply) => {
   await assertNotPaused("publishing");
+  idempotencyKey(request);
   const accessId = uuid(request.params.id, "Run ID");
   const session = await sessionForAccess(request, accessId);
-  await repository.consumeRateLimit(identity(request).clientBucketAliases, "publish", 10, 24);
   const manifest = request.body?.manifestId
     ? await repository.getManifestById(uuid(request.body.manifestId, "Manifest ID"))
     : await repository.getLatestManifestForRun(session.runId);
   if (!manifest || manifest.runId !== session.runId) throw new HttpError(409, "Lock a manifest before publishing", "manifest_not_ready");
   const apple = await repository.getAppleAuthorization();
-  if (!apple || apple.status !== "valid") {
-    await repository.updateRun(session.runId, { status: "waiting_for_apple_authorization", phase: "apple_authorization" });
-    await repository.enqueueNotification("apple_reauthorization_required", { runId: session.runId, manifestId: manifest.id });
-    return reply.code(202).send({ run: await repository.getRunByAccess(accessId) });
+  const caller = identity(request);
+  const publication = await repository.queueManifestPublication({
+    runId: session.runId,
+    manifestId: manifest.id,
+    appleAuthorized: apple?.status === "valid",
+    clientBucket: caller.clientBucket,
+    clientBucketAliases: caller.clientBucketAliases,
+    rateLimit: 10,
+  });
+  if (publication.state === "waiting_for_apple_authorization") {
+    await repository.enqueueNotification("apple_reauthorization_required", {
+      deduplicationKey: `apple-reauthorization:${manifest.id}`,
+      runId: session.runId,
+      manifestId: manifest.id,
+    });
   }
-  await repository.updateRun(session.runId, { status: "publishing", phase: "publication_queued", error: null });
-  await repository.enqueueJob({ kind: "publication", runId: session.runId, payload: { runId: session.runId, manifestId: manifest.id }, dedupeKey: `publication:${manifest.id}` });
-  return reply.code(202).send({ run: await repository.getRunByAccess(accessId) });
+  return reply.code(publication.state === "terminal" ? 200 : 202).send({
+    run: await repository.getRunByAccess(accessId),
+    publication: { state: publication.state, queued: publication.queued },
+  });
 });
 
 app.get<{ Params: { id: string } }>("/api/v1/runs/:id/result", async (request) => {

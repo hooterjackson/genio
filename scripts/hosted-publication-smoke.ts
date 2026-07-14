@@ -97,6 +97,17 @@ function log(event: string, detail: Record<string, unknown> = {}): void {
 
 async function main(): Promise<void> {
   const { origin } = parseArgs(process.argv.slice(2));
+  const live = await request(origin, "/health/live");
+  const build = asRecord(live.payload.build);
+  const revision = typeof build.revision === "string" ? build.revision.toLowerCase() : "";
+  if (!/^[0-9a-f]{7,64}$/u.test(revision)) {
+    throw new Error("Hosted API did not expose a valid deployment revision");
+  }
+  log("build_verified", {
+    identifier: build.identifier,
+    version: build.version,
+    revision,
+  });
   const prompt = [
     "Build a playlist containing exactly these three original studio recordings, in this order:",
     ...DEFAULT_TRACKS.map((track, index) => `${index + 1}. ${track.artist} — ${track.title}`),
@@ -122,6 +133,9 @@ async function main(): Promise<void> {
   if (!briefPayload.brief) throw new Error("Brief interpretation did not finish within the smoke-test window");
 
   const interpreted = briefPayload.brief as Record<string, unknown>;
+  const ambiguities = Array.isArray(interpreted.ambiguities)
+    ? interpreted.ambiguities.filter((item): item is string => typeof item === "string")
+    : [];
   const confirmedBrief = {
     ...interpreted,
     title: "[NEEDLE TEST] Hosted three-track flow",
@@ -135,7 +149,8 @@ async function main(): Promise<void> {
     evidencePolicy: "Require stored track-level release evidence and a compatible Apple Music catalog match.",
     orderingPolicy: "Discovery order matching the three-track input sequence.",
     targetSize: { min: 3, max: 3 },
-    ambiguities: [],
+    ambiguities,
+    ambiguityAcceptance: ambiguities,
   };
   log("brief_confirmed", { estimateUsd: Number(briefPayload.estimateUsd ?? 0), targetSize: 3 });
 
