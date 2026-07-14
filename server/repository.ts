@@ -579,10 +579,12 @@ export class Repository {
             ? await client.query("SELECT apple_share_url FROM publication_volumes WHERE manifest_id=$1 AND apple_share_url IS NOT NULL ORDER BY volume_number", [manifest.rows[0].id])
             : { rows: [] };
           const counts = await client.query("SELECT outcome,count(*)::int count FROM track_candidates WHERE run_id=$1 GROUP BY outcome", [runId]);
+          const appleLinks = volumes.rows.map((volume) => volume.apple_share_url);
+          const outcomeCounts = Object.fromEntries(counts.rows.map((entry) => [entry.outcome, entry.count]));
           await client.query(
             `INSERT INTO retention_tombstones(run_id,manifest_hash,playlist_title,apple_links_json,outcome_counts_json,aggregate_cost_usd)
-             VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(run_id) DO NOTHING`,
-            [runId, manifest.rows[0]?.content_hash ?? null, manifest.rows[0]?.name ?? null, volumes.rows.map((volume) => volume.apple_share_url), Object.fromEntries(counts.rows.map((entry) => [entry.outcome, entry.count])), Number(run.rows[0].actual_cost_usd)],
+             VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6) ON CONFLICT(run_id) DO NOTHING`,
+            [runId, manifest.rows[0]?.content_hash ?? null, manifest.rows[0]?.name ?? null, JSON.stringify(appleLinks), JSON.stringify(outcomeCounts), Number(run.rows[0].actual_cost_usd)],
           );
           const notificationIds = await client.query<{ id: string }>(
             `SELECT id FROM notification_outbox
@@ -2166,10 +2168,12 @@ export class Repository {
         ? await client.query("SELECT apple_share_url FROM publication_volumes WHERE manifest_id=$1 AND apple_share_url IS NOT NULL ORDER BY volume_number", [manifest.rows[0].id])
         : { rows: [] };
       const counts = await client.query("SELECT outcome,count(*)::int count FROM track_candidates WHERE run_id=$1 GROUP BY outcome", [runId]);
+      const appleLinks = volumes.rows.map((volume) => volume.apple_share_url);
+      const outcomeCounts = Object.fromEntries(counts.rows.map((entry) => [entry.outcome, entry.count]));
       await client.query(
         `INSERT INTO retention_tombstones(run_id,manifest_hash,playlist_title,apple_links_json,outcome_counts_json,aggregate_cost_usd)
-         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(run_id) DO NOTHING`,
-        [runId, manifest.rows[0]?.content_hash ?? null, manifest.rows[0]?.name ?? null, volumes.rows.map((volume) => volume.apple_share_url), Object.fromEntries(counts.rows.map((entry) => [entry.outcome, entry.count])), Number(run.rows[0].actual_cost_usd)],
+         VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6) ON CONFLICT(run_id) DO NOTHING`,
+        [runId, manifest.rows[0]?.content_hash ?? null, manifest.rows[0]?.name ?? null, JSON.stringify(appleLinks), JSON.stringify(outcomeCounts), Number(run.rows[0].actual_cost_usd)],
       );
       const notificationIds = await client.query<{ id: string }>(
         `SELECT id FROM notification_outbox
