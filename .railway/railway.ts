@@ -19,7 +19,6 @@ const apiVariables = preserved([
   "BRIEF_LIMIT_PER_24H",
   "MAX_GLOBAL_NONTERMINAL_RUNS",
   "COST_TIMEZONE",
-  "APP_ORIGIN",
   "GATEWAY_KEY_ID",
   "GATEWAY_PREVIOUS_KEY_ID",
   "GATEWAY_PREVIOUS_HMAC_SECRET",
@@ -109,6 +108,7 @@ export default defineRailway(() => {
     replicas: { "us-west2": 1 },
     variables: {
       ...apiVariables,
+      APP_ORIGIN: "https://needle.hooterjackson.chatgpt.site",
       DATABASE_URL: Postgres.env.DATABASE_URL,
     },
   });
