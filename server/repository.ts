@@ -369,6 +369,7 @@ export class Repository {
     clientBucketAliases: string[];
     idempotencyKey?: string | null;
     rateLimit?: number;
+    bypassVisitorRateLimit?: boolean;
   }): Promise<{ id: string; status: string; created: boolean }> {
     const prompt = input.prompt.trim();
     if (prompt.length < 4 || prompt.length > 2_000) throw new HttpError(400, "Describe the playlist in 4–2,000 characters", "invalid_prompt");
@@ -383,19 +384,23 @@ export class Repository {
         );
         if (existing.rows[0]) return { ...existing.rows[0], created: false };
       }
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:brief:${input.clientBucketAliases.join(":")}`]);
-      const rate = await client.query<{ count: number }>(
-        "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='brief' AND occurred_at>now()-interval '24 hours'",
-        [input.clientBucketAliases],
-      );
-      if (rate.rows[0]!.count >= (input.rateLimit ?? 10)) throw new HttpError(429, "Brief limit reached; try again later", "rate_limited");
+      if (!input.bypassVisitorRateLimit) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:brief:${input.clientBucketAliases.join(":")}`]);
+        const rate = await client.query<{ count: number }>(
+          "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='brief' AND occurred_at>now()-interval '24 hours'",
+          [input.clientBucketAliases],
+        );
+        if (rate.rows[0]!.count >= (input.rateLimit ?? 10)) throw new HttpError(429, "Brief limit reached; try again later", "rate_limited");
+      }
       const id = randomUUID();
       await client.query(
         `INSERT INTO brief_requests(id,prompt,model,status,client_bucket,idempotency_key,expires_at)
          VALUES($1,$2,$3,'queued',$4,$5,now()+interval '24 hours')`,
         [id, prompt, input.model, input.clientBucket, input.idempotencyKey ?? null],
       );
-      await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'brief')", [input.clientBucket]);
+      if (!input.bypassVisitorRateLimit) {
+        await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'brief')", [input.clientBucket]);
+      }
       return { id, status: "queued", created: true };
     });
   }
@@ -474,6 +479,7 @@ export class Repository {
     rateLimit?: number;
     globalLimit?: number;
     capabilitySessionId?: string;
+    bypassVisitorRateLimit?: boolean;
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
@@ -508,12 +514,14 @@ export class Repository {
         };
       }
 
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:run:${input.clientBucketAliases.join(":")}`]);
-      const rate = await client.query<{ count: number }>(
-        "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='run' AND occurred_at>now()-interval '24 hours'",
-        [input.clientBucketAliases],
-      );
-      if (rate.rows[0]!.count >= (input.rateLimit ?? 3)) throw new HttpError(429, "Research-run limit reached; try again later", "rate_limited");
+      if (!input.bypassVisitorRateLimit) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:run:${input.clientBucketAliases.join(":")}`]);
+        const rate = await client.query<{ count: number }>(
+          "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='run' AND occurred_at>now()-interval '24 hours'",
+          [input.clientBucketAliases],
+        );
+        if (rate.rows[0]!.count >= (input.rateLimit ?? 3)) throw new HttpError(429, "Research-run limit reached; try again later", "rate_limited");
+      }
       let runId: string | null = null;
       if (reuseDays > 0) {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`brief:${briefHash}`]);
@@ -577,7 +585,9 @@ export class Repository {
       if (input.capabilitySessionId) {
         await this.attachCapabilitySessionAccess(client, input.capabilitySessionId, runId, accessId);
       }
-      await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'run')", [input.clientBucket]);
+      if (!input.bypassVisitorRateLimit) {
+        await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'run')", [input.clientBucket]);
+      }
       return { runId, accessId, status, created: !reused, reused };
     });
   }

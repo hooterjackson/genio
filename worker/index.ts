@@ -209,12 +209,11 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
 
   const expectedOwner = normalizeOwnerEmail(env.OWNER_EMAIL ?? null);
   const authenticatedEmail = normalizeOwnerEmail(request.headers.get("oai-authenticated-user-email"));
-  let ownerEmail = "";
+  const ownerEmail = expectedOwner && authenticatedEmail === expectedOwner ? authenticatedEmail : "";
   if (rule.owner) {
     if (!expectedOwner) return jsonError(503, "Owner allowlist is not configured.");
     if (!authenticatedEmail) return jsonError(401, "ChatGPT owner authentication required.");
     if (authenticatedEmail !== expectedOwner) return jsonError(403, "Owner access denied.");
-    ownerEmail = authenticatedEmail;
   }
 
   const isLocal = url.hostname === "localhost" || url.hostname === "127.0.0.1";

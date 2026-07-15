@@ -11,10 +11,15 @@ export interface EncryptedAppleAuthorization {
   status: "unverified";
 }
 
+export function isOwner(identity: GatewayIdentity): boolean {
+  const configured = process.env.OWNER_EMAIL?.trim().toLowerCase();
+  return Boolean(configured && identity.ownerEmail === configured);
+}
+
 export function assertOwner(identity: GatewayIdentity): string {
   const configured = process.env.OWNER_EMAIL?.trim().toLowerCase();
   if (!configured) throw new Error("OWNER_EMAIL is required");
-  if (!identity.ownerEmail || identity.ownerEmail !== configured) {
+  if (!isOwner(identity)) {
     throw new HttpError(403, "Owner access is required", "owner_required");
   }
   return configured;

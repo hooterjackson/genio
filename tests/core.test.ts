@@ -5,7 +5,7 @@ import { decryptSecret, encryptSecret } from "../server/crypto.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { manifestContentHash } from "../server/publisher.ts";
 import { playlistShareUrl } from "../server/apple.ts";
-import { assertConfiguredAppleStorefront } from "../server/owner.ts";
+import { assertConfiguredAppleStorefront, isOwner } from "../server/owner.ts";
 import {
   BULK_SELECTION_BODY_LIMIT,
   DEFAULT_GATEWAY_BODY_LIMIT,
@@ -123,6 +123,25 @@ test("gateway canonicalization binds method, path, body, client bucket, and owne
     "/api/v1/runs?view=full", "a".repeat(64),
     "2026-07-13.bucket|2026-07-12.previous", "owner@example.com",
   ]);
+});
+
+test("owner rate-limit identity requires the exact configured allowlist email", () => {
+  const previous = process.env.OWNER_EMAIL;
+  process.env.OWNER_EMAIL = "mrcloblima@gmail.com";
+  const identity = (ownerEmail: string | null) => ({
+    keyId: "v1",
+    clientBucket: "bucket",
+    clientBucketAliases: ["bucket"],
+    ownerEmail,
+  });
+  try {
+    expect(isOwner(identity("mrcloblima@gmail.com"))).toBe(true);
+    expect(isOwner(identity("someoneelse@gmail.com"))).toBe(false);
+    expect(isOwner(identity(null))).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env.OWNER_EMAIL;
+    else process.env.OWNER_EMAIL = previous;
+  }
 });
 
 test("Sites gateway uses an explicit route matrix and rejects cross-site mutations", () => {

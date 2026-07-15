@@ -870,6 +870,94 @@ databaseDescribe("hosted backend integration", () => {
     ]));
   });
 
+  test("owner brief and run requests bypass visitor quotas without consuming visitor events", async () => {
+    const briefBucket = `owner-brief-limit-${randomUUID()}`;
+    const createBrief = (label: string, bypassVisitorRateLimit?: boolean) => repository.createBriefRequest({
+      prompt: `Owner brief quota request ${label}`,
+      model: "test-model",
+      clientBucket: briefBucket,
+      clientBucketAliases: [briefBucket],
+      rateLimit: 1,
+      bypassVisitorRateLimit,
+    });
+    await expect(createBrief("visitor")).resolves.toMatchObject({ created: true });
+    await expect(createBrief("wrong-identity", false)).rejects.toMatchObject({
+      statusCode: 429,
+      code: "rate_limited",
+    });
+    await expect(createBrief("anonymous")).rejects.toMatchObject({
+      statusCode: 429,
+      code: "rate_limited",
+    });
+    await expect(createBrief("owner-one", true)).resolves.toMatchObject({ created: true });
+    await expect(createBrief("owner-two", true)).resolves.toMatchObject({ created: true });
+
+    const runBucket = `owner-run-limit-${randomUUID()}`;
+    const createRun = (label: string, bypassVisitorRateLimit?: boolean) => repository.createRunIdempotent({
+      prompt: `Owner run quota request ${label}`,
+      brief: { ...brief, title: `Owner quota ${label}` },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: runBucket,
+      clientBucketAliases: [runBucket],
+      idempotencyKey: `owner-run-${label}-${randomUUID()}`,
+      reuseDays: 0,
+      rateLimit: 1,
+      globalLimit: 100,
+      bypassVisitorRateLimit,
+    });
+    await expect(createRun("visitor")).resolves.toMatchObject({ created: true });
+    await expect(createRun("wrong-identity", false)).rejects.toMatchObject({
+      statusCode: 429,
+      code: "rate_limited",
+    });
+    await expect(createRun("anonymous")).rejects.toMatchObject({
+      statusCode: 429,
+      code: "rate_limited",
+    });
+    await expect(createRun("owner-one", true)).resolves.toMatchObject({ created: true });
+    await expect(createRun("owner-two", true)).resolves.toMatchObject({ created: true });
+
+    const events = await repository.pool.query<{ client_bucket: string; action: string; count: number }>(
+      `SELECT client_bucket,action,count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) GROUP BY client_bucket,action ORDER BY client_bucket,action`,
+      [[briefBucket, runBucket]],
+    );
+    expect(events.rows).toEqual(expect.arrayContaining([
+      { client_bucket: briefBucket, action: "brief", count: 1 },
+      { client_bucket: runBucket, action: "run", count: 1 },
+    ]));
+    expect(events.rows).toHaveLength(2);
+  });
+
+  test("owner visitor-rate bypass never bypasses global run capacity", async () => {
+    const create = (label: string) => {
+      const bucket = `owner-global-capacity-${label}-${randomUUID()}`;
+      return repository.createRunIdempotent({
+        prompt: `Owner global capacity request ${label}`,
+        brief: { ...brief, title: `Owner global capacity ${label}` },
+        estimateUsd: 0,
+        approvedBudgetUsd: 1,
+        clientBucket: bucket,
+        clientBucketAliases: [bucket],
+        idempotencyKey: `owner-global-${label}-${randomUUID()}`,
+        reuseDays: 0,
+        rateLimit: 0,
+        globalLimit: 1,
+        bypassVisitorRateLimit: true,
+      });
+    };
+    await expect(create("first")).resolves.toMatchObject({ created: true });
+    await expect(create("second")).rejects.toMatchObject({
+      statusCode: 503,
+      code: "global_capacity_reached",
+    });
+    const events = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM rate_limit_events WHERE action='run'",
+    );
+    expect(events.rows[0]?.count).toBe(0);
+  });
+
   test("keeps concurrent idempotent brief and run submissions single-effect", async () => {
     const briefBucket = `brief-idempotency-${randomUUID()}`;
     const briefKey = `brief-${randomUUID()}`;

@@ -1,7 +1,7 @@
 import Fastify, { type FastifyRequest } from "fastify";
 import { CapabilityService, type CapabilitySessionView } from "./capabilities.ts";
 import { createGatewayVerifier, type GatewayIdentity } from "./gateway-auth.ts";
-import { createAppleDeveloperToken, assertOwner, encryptAppleUserToken } from "./owner.ts";
+import { createAppleDeveloperToken, assertOwner, encryptAppleUserToken, isOwner } from "./owner.ts";
 import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog-import.ts";
 import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
@@ -229,6 +229,7 @@ app.post<{ Body: { prompt?: string; idempotencyKey?: string } }>("/api/v1/brief"
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
+    bypassVisitorRateLimit: isOwner(caller),
   });
   if (created.created) {
     await repository.enqueueJob({ kind: "brief", briefRequestId: created.id, payload: { briefRequestId: created.id }, dedupeKey: `brief:${created.id}` });
@@ -297,6 +298,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
     capabilitySessionId: currentSession?.id,
+    bypassVisitorRateLimit: isOwner(caller),
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
