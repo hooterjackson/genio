@@ -5,7 +5,12 @@ import { decryptSecret, encryptSecret } from "../server/crypto.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { manifestContentHash } from "../server/publisher.ts";
 import { playlistShareUrl } from "../server/apple.ts";
-import { assertConfiguredAppleStorefront, isOwner } from "../server/owner.ts";
+import {
+  assertConfiguredAppleStorefront,
+  encryptAppleUserToken,
+  isOwner,
+  selectAppleAuthorizationStage,
+} from "../server/owner.ts";
 import {
   BULK_SELECTION_BODY_LIMIT,
   DEFAULT_GATEWAY_BODY_LIMIT,
@@ -416,6 +421,43 @@ test("owner Apple authorization must match the configured canonical storefront",
   } finally {
     if (original === undefined) delete process.env.APPLE_STOREFRONT;
     else process.env.APPLE_STOREFRONT = original;
+  }
+});
+
+test("retrying the same Apple user token reuses its durable authorization generation", () => {
+  const original = {
+    key: process.env.APPLE_TOKEN_ENCRYPTION_KEY,
+    id: process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID,
+    storefront: process.env.APPLE_STOREFRONT,
+  };
+  try {
+    process.env.APPLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 9).toString("base64url");
+    process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID = "idempotent-test";
+    process.env.APPLE_STOREFRONT = "us";
+    const token = "private-owner-user-token-for-idempotency";
+    const existing = encryptAppleUserToken(token, "us");
+    const newlyEncrypted = encryptAppleUserToken(token, "us");
+    expect(newlyEncrypted.ciphertext).not.toBe(existing.ciphertext);
+
+    expect(selectAppleAuthorizationStage(existing, token, newlyEncrypted)).toEqual({
+      authorization: existing,
+      sameAuthorization: true,
+    });
+    expect(selectAppleAuthorizationStage(existing, "different-owner-user-token", newlyEncrypted)).toEqual({
+      authorization: newlyEncrypted,
+      sameAuthorization: false,
+    });
+    expect(selectAppleAuthorizationStage({ ...existing, authTag: "malformed" }, token, newlyEncrypted)).toEqual({
+      authorization: newlyEncrypted,
+      sameAuthorization: false,
+    });
+  } finally {
+    if (original.key === undefined) delete process.env.APPLE_TOKEN_ENCRYPTION_KEY;
+    else process.env.APPLE_TOKEN_ENCRYPTION_KEY = original.key;
+    if (original.id === undefined) delete process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID;
+    else process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID = original.id;
+    if (original.storefront === undefined) delete process.env.APPLE_STOREFRONT;
+    else process.env.APPLE_STOREFRONT = original.storefront;
   }
 });
 

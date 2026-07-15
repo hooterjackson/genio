@@ -28,6 +28,16 @@ const FAILURE_MESSAGES: Record<FailureContext, string> = {
   background: "Background work failed after the final attempt.",
 };
 
+const APPLE_AUTHORIZATION_RATE_LIMITED = "Apple Music temporarily rate-limited authorization validation (HTTP 429).";
+const APPLE_AUTHORIZATION_UNAVAILABLE = "Apple Music authorization validation was temporarily unavailable.";
+const APPLE_AUTHORIZATION_UNREACHABLE = "Needle could not reach Apple Music while validating authorization.";
+const SAFE_APPLE_AUTHORIZATION_MESSAGES = new Set([
+  FAILURE_MESSAGES.apple_authorization,
+  APPLE_AUTHORIZATION_RATE_LIMITED,
+  APPLE_AUTHORIZATION_UNAVAILABLE,
+  APPLE_AUTHORIZATION_UNREACHABLE,
+]);
+
 const PUBLICATION_SHARE_LINK_FAILURE = "Apple did not expose a stable public playlist link after the final attempt.";
 const PUBLICATION_ORDER_FAILURE = "Apple playlist ordering diverged from the approved manifest after the final attempt.";
 const PUBLICATION_LEASE_FAILURE = "The publication worker lease expired after the final attempt.";
@@ -58,6 +68,12 @@ export function failureContextForRun(phase?: string | null): FailureContext {
 }
 
 export function sanitizeFailure(error: unknown, context: FailureContext = "background"): string {
+  if (context === "apple_authorization") {
+    const suppliedMessage = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    return SAFE_APPLE_AUTHORIZATION_MESSAGES.has(suppliedMessage)
+      ? suppliedMessage
+      : FAILURE_MESSAGES.apple_authorization;
+  }
   if (context !== "publication") return FAILURE_MESSAGES[context];
 
   const suppliedMessage = error instanceof Error ? error.message : typeof error === "string" ? error : "";
@@ -79,6 +95,22 @@ export function sanitizeFailure(error: unknown, context: FailureContext = "backg
     return PUBLICATION_AVAILABILITY_FAILURE;
   }
   return FAILURE_MESSAGES.publication;
+}
+
+/**
+ * Preserve only a small, non-secret diagnostic class for owner-facing Apple
+ * authorization failures. Raw provider bodies, URLs, and tokens never cross
+ * the durable job boundary.
+ */
+export function safeAppleAuthorizationFailure(error: unknown): string {
+  const value = error && typeof error === "object" ? error as { status?: unknown } : {};
+  const status = typeof value.status === "number" ? value.status : null;
+  if (status === 429) return APPLE_AUTHORIZATION_RATE_LIMITED;
+  if (status !== null && status >= 500) return APPLE_AUTHORIZATION_UNAVAILABLE;
+  if (status === null && error instanceof Error && error.name === "AppleApiError") {
+    return APPLE_AUTHORIZATION_UNREACHABLE;
+  }
+  return FAILURE_MESSAGES.apple_authorization;
 }
 
 export function sanitizeOptionalFailure(

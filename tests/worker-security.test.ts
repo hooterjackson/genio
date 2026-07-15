@@ -101,7 +101,7 @@ test("worker startup durably recovers an unverified Apple authorization", async 
       kind: "apple_authorization",
       payload: { authorizationGeneration: expect.stringMatching(/^[a-f0-9]{20}$/u) },
       dedupeKey: expect.stringMatching(/^apple-authorization:[a-f0-9]{20}$/u),
-      maxAttempts: 3,
+      maxAttempts: 6,
     }));
   } finally {
     await runner.stop();

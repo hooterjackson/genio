@@ -49,6 +49,7 @@ import {
   MAX_CITATION_EXCERPT_CHARS,
   type HostedCitationAttestation,
 } from "./citation-attestation.ts";
+import { appleAuthorizationGeneration } from "./apple.ts";
 
 const ACTIVE_RUN_STATUSES = [
   "queued",
@@ -2452,6 +2453,25 @@ export class Repository {
          WHERE id=$1 AND lease_owner=$2`,
         [jobId, workerId, retry ? "queued" : "failed", retry ? retryAt : null, persistedError],
       );
+      if (!retry && current.rows[0].kind === "apple_authorization") {
+        const authorization = await client.query<{ ciphertext: string; key_version: string }>(
+          "SELECT ciphertext,key_version FROM apple_authorizations WHERE id='owner' FOR UPDATE",
+        );
+        const row = authorization.rows[0];
+        const expectedGeneration = typeof current.rows[0].payload_json?.authorizationGeneration === "string"
+          ? current.rows[0].payload_json.authorizationGeneration
+          : null;
+        if (row && expectedGeneration === appleAuthorizationGeneration({
+          ciphertext: row.ciphertext,
+          keyVersion: row.key_version,
+        })) {
+          await client.query(
+            `UPDATE apple_authorizations SET status='validation_failed',last_error=$1,updated_at=now()
+             WHERE id='owner'`,
+            [persistedError],
+          );
+        }
+      }
       const recoveryFailure = !retry
         && Boolean(current.rows[0].run_id)
         && current.rows[0].kind === "matching"

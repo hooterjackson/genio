@@ -514,7 +514,7 @@ export async function recoverUnverifiedAppleAuthorizationJob(
     kind: "apple_authorization",
     payload: { authorizationGeneration },
     dedupeKey: appleAuthorizationJobDedupeKey(authorization),
-    maxAttempts: 3,
+    maxAttempts: 6,
   });
   return true;
 }

@@ -17,7 +17,11 @@ import {
   createPublicationRepositoryFacade,
   createResearchRepositoryFacade,
 } from "./worker-facades.ts";
-import { failureContextForJob, sanitizeFailure } from "./error-sanitizer.ts";
+import {
+  failureContextForJob,
+  safeAppleAuthorizationFailure,
+  sanitizeFailure,
+} from "./error-sanitizer.ts";
 import { readCostConfiguration } from "./cost-config.ts";
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
@@ -94,6 +98,9 @@ const wait = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, re
 
 function retryAtFor(job: DurableJob): Date | null {
   if (job.attempts >= job.maxAttempts) return null;
+  if (job.kind === "apple_authorization") {
+    return new Date(Date.now() + Math.min(5_000 * 2 ** Math.max(0, job.attempts - 1), 30_000));
+  }
   return new Date(Date.now() + Math.min(2 ** Math.max(0, job.attempts - 1) * 30_000, 15 * 60_000));
 }
 
@@ -340,7 +347,9 @@ export class WorkerRunner {
         await this.repository.deferJob(job.id, this.workerId, new Date(Date.now() + 60_000), reason);
         return;
       }
-      const message = sanitizeFailure(error, failureContextForJob(job.kind));
+      const message = job.kind === "apple_authorization"
+        ? safeAppleAuthorizationFailure(error)
+        : sanitizeFailure(error, failureContextForJob(job.kind));
       const retryAt = error instanceof NonRetriableJobError ? null : retryAtFor(job);
       await this.repository.failJob(
         job.id,

@@ -18,9 +18,11 @@ type OwnerHealth = {
   apple: {
     configured: boolean;
     authorized: boolean;
+    status: string;
     storefront: string | null;
     validatedAt: string | null;
     needsReauthorization: boolean;
+    lastError: string | null;
   };
   queuedJobs: number;
   activeJobs: number;
@@ -265,7 +267,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     setApplePreparationAttempt((current) => current + 1);
   }, []);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setBusy((current) => current || "refresh");
     const [healthResult, budgetResult, orphanResult, runResult] = await Promise.allSettled([
       ownerApi<OwnerHealth>("/api/v1/owner/status"),
@@ -276,9 +278,13 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
 
     if (healthResult.status === "fulfilled") {
       setHealth(healthResult.value);
-      setAppleStatusMessage(healthResult.value.apple.authorized
+      setAppleStatusMessage(healthResult.value.apple.status === "valid"
         ? `APPLE MUSIC CONNECTED · ${healthResult.value.apple.storefront?.toUpperCase() ?? "UNKNOWN STOREFRONT"} · TOKEN SAVED AND VALIDATED`
-        : healthResult.value.apple.needsReauthorization
+        : healthResult.value.apple.status === "unverified"
+          ? `APPLE MUSIC AUTHORIZATION SAVED · ${healthResult.value.apple.storefront?.toUpperCase() ?? "UNKNOWN STOREFRONT"} · VALIDATION PENDING`
+          : healthResult.value.apple.status === "validation_failed"
+            ? healthResult.value.apple.lastError ?? "APPLE MUSIC VALIDATION FAILED · RETRY VALIDATION"
+            : healthResult.value.apple.needsReauthorization
           ? "APPLE MUSIC AUTHORIZATION EXPIRED · AUTHORIZE AGAIN"
           : "APPLE MUSIC IS NOT CONNECTED");
       setError("");
@@ -297,12 +303,18 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
       setImportRunId((current) => current || runs.find((run) => ["queued", "awaiting_budget", "researching", "ready_for_matching"].includes(run.status))?.id || "");
     }
     setBusy("");
-  }
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void refresh(), 0);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (health?.apple.status !== "unverified") return;
+    const timer = window.setInterval(() => void refresh(), 3_000);
+    return () => window.clearInterval(timer);
+  }, [health?.apple.status, refresh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -526,7 +538,15 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
           </article>
           <article className="operator-card">
             <span>APPLE MUSIC</span>
-            <strong>{health?.apple?.authorized ? "AUTHORIZED" : "OFFLINE"}</strong>
+            <strong>{health?.apple?.status === "valid"
+              ? "AUTHORIZED"
+              : health?.apple?.status === "unverified"
+                ? "VALIDATING"
+                : health?.apple?.status === "validation_failed"
+                  ? "RETRY"
+                  : health?.apple?.status === "reauthorization_required"
+                    ? "EXPIRED"
+                    : "OFFLINE"}</strong>
             <small>{health?.apple?.storefront?.toUpperCase() ?? "—"} storefront</small>
           </article>
           <article className="operator-card">
@@ -552,12 +572,16 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
             onClick={() => appleConnectorState === "failed"
               ? restartAppleConnector()
               : void authorizeApple()}
-            disabled={Boolean(busy) || appleConnectorState === "preparing"}
+            disabled={Boolean(busy) || appleConnectorState === "preparing" || health?.apple?.status === "unverified"}
           >
             {appleConnectorState === "preparing"
               ? "PREPARING APPLE"
               : appleConnectorState === "failed"
                 ? "RETRY APPLE SETUP"
+              : health?.apple?.status === "unverified"
+                ? "VALIDATING APPLE"
+              : health?.apple?.status === "validation_failed"
+                ? "RETRY APPLE VALIDATION"
               : health?.apple?.authorized && !health.apple.needsReauthorization
                 ? "REAUTHORIZE APPLE"
                 : "AUTHORIZE APPLE"}

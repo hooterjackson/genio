@@ -40,9 +40,11 @@ export async function waitForDurableAppleAuthorization(
   const attempts = Math.max(1, Math.min(Math.floor(options.attempts ?? 12), 60));
   const delayMs = Math.max(0, Math.min(Math.floor(options.delayMs ?? 1_500), 10_000));
   const waitForNextAttempt = options.wait ?? wait;
+  let latest: DurableAppleAuthorization | null = null;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const authorization = normalizeAuthorization(await readAuthorization());
+    latest = authorization;
     if (!authorization.configured || authorization.status === "missing") {
       throw new Error("Apple Music authorization was not saved. Try authorizing again.");
     }
@@ -52,16 +54,27 @@ export async function waitForDurableAppleAuthorization(
         ? `Apple Music rejected the saved authorization: ${authorization.lastError}`
         : "Apple Music rejected the saved authorization. Authorize again.");
     }
+    if (authorization.status === "validation_failed") {
+      throw new Error(authorization.lastError
+        ? `Apple Music authorization validation failed: ${authorization.lastError}`
+        : "Apple Music authorization validation failed. Retry validation.");
+    }
     if (authorization.status !== "unverified") {
       throw new Error(`Apple Music returned an unexpected authorization status: ${authorization.status}.`);
     }
     if (attempt < attempts - 1) await waitForNextAttempt(delayMs);
   }
-  throw new Error("Apple Music authorization was saved, but validation timed out. Refresh and try again.");
+  // The durable worker deliberately retries transient Apple failures with
+  // backoff longer than this short UI wait. A saved authorization remains a
+  // pending background operation, not a failed browser authorization.
+  return latest!;
 }
 
 export function durableAppleAuthorizationMessage(authorization: DurableAppleAuthorization): string {
   const storefront = authorization.storefront?.toUpperCase() ?? "UNKNOWN STOREFRONT";
+  if (authorization.status === "unverified") {
+    return `APPLE MUSIC AUTHORIZATION SAVED · ${storefront} · VALIDATION PENDING`;
+  }
   return `APPLE MUSIC CONNECTED · ${storefront} · TOKEN SAVED AND VALIDATED`;
 }
 

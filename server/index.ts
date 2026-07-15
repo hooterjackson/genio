@@ -1,7 +1,13 @@
 import Fastify, { type FastifyRequest } from "fastify";
 import { CapabilityService, type CapabilitySessionView } from "./capabilities.ts";
 import { createGatewayVerifier, type GatewayIdentity } from "./gateway-auth.ts";
-import { createAppleDeveloperToken, assertOwner, encryptAppleUserToken, isOwner } from "./owner.ts";
+import {
+  createAppleDeveloperToken,
+  assertOwner,
+  encryptAppleUserToken,
+  isOwner,
+  selectAppleAuthorizationStage,
+} from "./owner.ts";
 import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog-import.ts";
 import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
@@ -475,9 +481,11 @@ app.get("/api/v1/owner/status", async (request) => {
     apple: {
       configured: health.apple.status !== "missing",
       authorized: health.apple.status === "valid",
+      status: health.apple.status,
       storefront: health.apple.storefront ?? null,
       validatedAt: health.apple.lastValidatedAt ?? null,
       needsReauthorization: health.apple.status === "reauthorization_required",
+      lastError: health.apple.lastError ?? null,
     },
     queuedJobs: health.queue.queued ?? 0,
     activeJobs: health.queue.leased ?? 0,
@@ -591,14 +599,36 @@ app.get("/api/v1/owner/apple/authorization", async (request) => {
 
 app.post<{ Body: { musicUserToken?: string; storefront?: string } }>("/api/v1/owner/apple/authorization", async (request, reply) => {
   const email = owner(request);
-  const encrypted = encryptAppleUserToken(request.body?.musicUserToken ?? "", request.body?.storefront ?? "");
-  await repository.saveAppleAuthorization(encrypted);
+  const musicUserToken = request.body?.musicUserToken ?? "";
+  const encrypted = encryptAppleUserToken(musicUserToken, request.body?.storefront ?? "");
+  const existing = await repository.getAppleAuthorization();
+  const { authorization: staged, sameAuthorization } = selectAppleAuthorizationStage(
+    existing,
+    musicUserToken,
+    encrypted,
+  );
+  if (sameAuthorization && existing?.status === "valid") {
+    return reply.code(200).send({
+      configured: true,
+      status: "valid",
+      storefront: existing.storefront,
+      lastValidatedAt: existing.lastValidatedAt?.toISOString() ?? null,
+    });
+  }
+  if (sameAuthorization) {
+    await repository.updateAppleAuthorizationStatus("unverified", null);
+  } else {
+    await repository.saveAppleAuthorization(encrypted);
+  }
   await repository.enqueueJob({
     kind: "apple_authorization",
-    payload: { authorizationGeneration: appleAuthorizationGeneration(encrypted) },
-    dedupeKey: appleAuthorizationJobDedupeKey(encrypted),
+    payload: { authorizationGeneration: appleAuthorizationGeneration(staged) },
+    dedupeKey: appleAuthorizationJobDedupeKey(staged),
+    maxAttempts: 6,
   });
-  await repository.recordAudit(email, "apple.authorization_saved", { storefront: encrypted.storefront });
+  await repository.recordAudit(email, sameAuthorization ? "apple.authorization_validation_retried" : "apple.authorization_saved", {
+    storefront: encrypted.storefront,
+  });
   return reply.code(202).send({ configured: true, status: "unverified", storefront: encrypted.storefront });
 });
 

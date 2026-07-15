@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import type { GatewayIdentity } from "./gateway-auth.ts";
 import { createDeveloperToken, decryptMusicUserToken, encryptMusicUserToken } from "./apple.ts";
 import { HttpError } from "./security.ts";
@@ -70,6 +71,41 @@ export function decryptAppleUserToken(input: Pick<EncryptedAppleAuthorization, "
     ciphertext: input.ciphertext,
     tag: input.authTag,
   }));
+}
+
+export function appleUserTokenMatches(
+  input: Pick<EncryptedAppleAuthorization, "ciphertext" | "iv" | "authTag" | "keyVersion">,
+  candidate: string,
+): boolean {
+  try {
+    const stored = Buffer.from(decryptAppleUserToken(input), "utf8");
+    const supplied = Buffer.from(candidate.trim(), "utf8");
+    return stored.length === supplied.length && timingSafeEqual(stored, supplied);
+  } catch {
+    return false;
+  }
+}
+
+export function selectAppleAuthorizationStage<T extends {
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  keyVersion: string;
+  storefront: string;
+}>(
+  existing: T | null,
+  candidate: string,
+  encrypted: EncryptedAppleAuthorization,
+): { authorization: T | EncryptedAppleAuthorization; sameAuthorization: boolean } {
+  const sameAuthorization = Boolean(
+    existing
+    && existing.storefront === encrypted.storefront
+    && appleUserTokenMatches(existing, candidate),
+  );
+  return {
+    authorization: sameAuthorization && existing ? existing : encrypted,
+    sameAuthorization,
+  };
 }
 
 export async function createAppleDeveloperToken(): Promise<{ developerToken: string; mediaId: string; expiresAt: string }> {

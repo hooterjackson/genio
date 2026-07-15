@@ -12,6 +12,7 @@ import {
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { processNotificationJob } from "../server/notifications.ts";
 import { Repository } from "../server/repository.ts";
+import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
 import { hmacBase64Url, sha256Hex } from "../server/security.ts";
 import type { CitationAttestationInput, PlaylistBrief } from "../shared/types.ts";
@@ -2147,6 +2148,39 @@ databaseDescribe("hosted backend integration", () => {
       [runId, `apple-reauthorization:${manifestId}`, clientBucket],
     );
     expect(persisted.rows[0]).toEqual({ jobs: 0, notifications: 1, rate_events: 0 });
+  });
+
+  test("terminal Apple validation failures update only the current durable authorization", async () => {
+    const authorization = {
+      ciphertext: "encrypted-current-authorization",
+      iv: "iv",
+      authTag: "tag",
+      keyVersion: "v1",
+      storefront: "us",
+      status: "unverified",
+      lastValidatedAt: null,
+      lastError: null,
+    };
+    await repository.saveAppleAuthorization(authorization);
+    const authorizationGeneration = appleAuthorizationGeneration(authorization);
+    const queued = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration },
+      dedupeKey: `apple-authorization:${authorizationGeneration}`,
+      maxAttempts: 1,
+    });
+    const leased = await repository.leaseNextJob("apple-validation-diagnostics", 60_000);
+    expect(leased).toMatchObject({ id: queued.id, kind: "apple_authorization", attempts: 1 });
+    await repository.failJob(
+      queued.id,
+      "apple-validation-diagnostics",
+      "Apple Music temporarily rate-limited authorization validation (HTTP 429).",
+      null,
+    );
+    await expect(repository.getAppleAuthorization()).resolves.toMatchObject({
+      status: "validation_failed",
+      lastError: "Apple Music temporarily rate-limited authorization validation (HTTP 429).",
+    });
   });
 
   test("terminal publication failures mark only active volumes failed with redacted diagnostics", async () => {

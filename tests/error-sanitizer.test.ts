@@ -3,6 +3,7 @@ import {
   failureContextForJob,
   failureContextForRun,
   publicToolFailure,
+  safeAppleAuthorizationFailure,
   sanitizeFailure,
   sanitizeOptionalFailure,
   type FailureContext,
@@ -39,6 +40,35 @@ describe("durable and public error sanitization", () => {
       .toBe("Apple Music remained unavailable after the final attempt.");
     const alreadySafe = "Apple Music remained unavailable after the final attempt.";
     expect(sanitizeFailure(sanitizeFailure(alreadySafe, "publication"), "publication")).toBe(alreadySafe);
+  });
+
+  test("Apple authorization diagnostics retain only a safe failure class", () => {
+    const rateLimit = Object.assign(new Error("private upstream body sk-proj-PRIVATE"), {
+      name: "AppleApiError",
+      status: 429,
+    });
+    const unavailable = Object.assign(new Error("private provider detail"), {
+      name: "AppleApiError",
+      status: 503,
+    });
+    const unreachable = Object.assign(new Error("private DNS host"), {
+      name: "AppleApiError",
+      status: null,
+    });
+    expect(safeAppleAuthorizationFailure(rateLimit)).toBe(
+      "Apple Music temporarily rate-limited authorization validation (HTTP 429).",
+    );
+    expect(safeAppleAuthorizationFailure(unavailable)).toBe(
+      "Apple Music authorization validation was temporarily unavailable.",
+    );
+    expect(safeAppleAuthorizationFailure(unreachable)).toBe(
+      "Needle could not reach Apple Music while validating authorization.",
+    );
+    for (const error of [rateLimit, unavailable, unreachable]) {
+      const result = sanitizeFailure(safeAppleAuthorizationFailure(error), "apple_authorization");
+      expect(result).not.toContain("private");
+      expect(result).not.toContain("sk-proj");
+    }
   });
 
   test("job and run phases select fixed public contexts", () => {

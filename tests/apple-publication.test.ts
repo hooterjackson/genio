@@ -303,7 +303,7 @@ test("worker recovery queues exactly the current unverified Apple authorization 
     kind: "apple_authorization",
     payload: { authorizationGeneration: appleAuthorizationGeneration(authorization) },
     dedupeKey: appleAuthorizationJobDedupeKey(authorization),
-    maxAttempts: 3,
+    maxAttempts: 6,
   });
 
   repository.getAppleAuthorization.mockResolvedValue({ ...authorization, status: "valid" });
