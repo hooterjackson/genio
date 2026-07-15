@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { configureFreshMusicKit, type MusicKitApi } from "../music-kit.ts";
+import { configureFreshMusicKit, type MusicKitApi, type MusicKitInstance } from "../music-kit.ts";
 import {
   appleAuthorizationErrorMessage,
   durableAppleAuthorizationMessage,
@@ -65,6 +65,13 @@ type AppleTokenResponse = {
   mediaId?: string;
   expiresAt?: string;
 };
+
+type PreparedAppleAuthorization = {
+  music: MusicKitInstance;
+  token: AppleTokenResponse;
+};
+
+type AppleConnectorState = "preparing" | "ready" | "failed";
 
 // MusicKit v3 currently completes Apple's consent UI and then rejects
 // authorize() with AUTHORIZATION_ERROR/Unauthorized before returning a user
@@ -221,6 +228,20 @@ function loadMusicKit(): Promise<MusicKitApi> {
   return musicKitPromise;
 }
 
+async function prepareAppleAuthorization(): Promise<PreparedAppleAuthorization> {
+  const token = await ownerApi<AppleTokenResponse>("/api/v1/owner/apple/developer-token");
+  const MusicKit = await loadMusicKit();
+  return {
+    music: await configureFreshMusicKit(MusicKit, token.developerToken),
+    token,
+  };
+}
+
+function appleDeveloperTokenIsFresh(token: AppleTokenResponse, minimumLifetimeMs = 120_000): boolean {
+  const expiresAt = Date.parse(token.expiresAt ?? "");
+  return Number.isFinite(expiresAt) && expiresAt - Date.now() > minimumLifetimeMs;
+}
+
 export function OwnerConsole({ email, signOutPath }: { email: string; signOutPath: string }) {
   const [health, setHealth] = useState<OwnerHealth | null>(null);
   const [budgets, setBudgets] = useState<BudgetItem[]>([]);
@@ -230,8 +251,19 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importStatus, setImportStatus] = useState("");
   const [appleStatusMessage, setAppleStatusMessage] = useState("CHECKING APPLE MUSIC STATUS");
+  const [appleConnectorState, setAppleConnectorState] = useState<AppleConnectorState>("preparing");
+  const [appleConnectorError, setAppleConnectorError] = useState("");
+  const [applePreparationAttempt, setApplePreparationAttempt] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const preparedAppleAuthorization = useRef<PreparedAppleAuthorization | null>(null);
+
+  const restartAppleConnector = useCallback(() => {
+    preparedAppleAuthorization.current = null;
+    setAppleConnectorState("preparing");
+    setAppleConnectorError("");
+    setApplePreparationAttempt((current) => current + 1);
+  }, []);
 
   async function refresh() {
     setBusy((current) => current || "refresh");
@@ -272,24 +304,74 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     return () => window.clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    let refreshRequested = false;
+    let tokenRefreshTimer: number | undefined;
+    const requestFreshConnector = () => {
+      if (cancelled || refreshRequested) return;
+      refreshRequested = true;
+      restartAppleConnector();
+    };
+    const refreshIfStale = () => {
+      const prepared = preparedAppleAuthorization.current;
+      if (!prepared || !appleDeveloperTokenIsFresh(prepared.token)) requestFreshConnector();
+    };
+
+    void prepareAppleAuthorization().then((prepared) => {
+      if (cancelled) return;
+      preparedAppleAuthorization.current = prepared;
+      setAppleConnectorState("ready");
+      const expiresAt = Date.parse(prepared.token.expiresAt ?? "");
+      const refreshDelay = Number.isFinite(expiresAt)
+        ? Math.max(1_000, expiresAt - Date.now() - 120_000)
+        : 10 * 60_000;
+      tokenRefreshTimer = window.setTimeout(requestFreshConnector, refreshDelay);
+    }).catch((caught) => {
+      if (cancelled) return;
+      preparedAppleAuthorization.current = null;
+      setAppleConnectorState("failed");
+      setAppleConnectorError(`Apple Music connector could not load: ${appleAuthorizationErrorMessage(caught)}`);
+    });
+    window.addEventListener("focus", refreshIfStale);
+    document.addEventListener("visibilitychange", refreshIfStale);
+    return () => {
+      cancelled = true;
+      if (tokenRefreshTimer) window.clearTimeout(tokenRefreshTimer);
+      window.removeEventListener("focus", refreshIfStale);
+      document.removeEventListener("visibilitychange", refreshIfStale);
+    };
+  }, [applePreparationAttempt, restartAppleConnector]);
+
   async function authorizeApple() {
     setBusy("apple");
     setError("");
     setAppleStatusMessage("APPLE MUSIC AUTHORIZATION IN PROGRESS");
     try {
-      const token = await ownerApi<AppleTokenResponse>("/api/v1/owner/apple/developer-token");
-      const MusicKit = await loadMusicKit();
-      const music = await configureFreshMusicKit(MusicKit, token.developerToken);
+      const prepared = preparedAppleAuthorization.current;
+      if (!prepared) {
+        throw new Error("Apple Music is still preparing. Wait for the authorization button to become available.");
+      }
+      if (!appleDeveloperTokenIsFresh(prepared.token, 30_000)) {
+        restartAppleConnector();
+        throw new Error("Apple Music setup expired. Wait for the authorization button to become available, then try again.");
+      }
+      // Start authorization before the first await so Apple receives the
+      // browser's trusted click and may open its consent window.
+      const authorizationPromise = prepared.music.authorize();
       let authorizationResult: unknown;
       try {
-        authorizationResult = await music.authorize();
+        authorizationResult = await authorizationPromise;
       } catch (caught) {
         throw new Error(`Apple Music did not issue a user token: ${appleAuthorizationErrorMessage(caught)}`);
       }
       const musicUserToken = requireMusicUserToken(authorizationResult);
+      // Consent may stay open until the prepared token is near expiry. Use a
+      // newly issued developer token for the authenticated storefront read.
+      const storefrontToken = await ownerApi<AppleTokenResponse>("/api/v1/owner/apple/developer-token");
       const storefrontResponse = await fetch("https://api.music.apple.com/v1/me/storefront", {
         headers: {
-          Authorization: "Bearer " + token.developerToken,
+          Authorization: "Bearer " + storefrontToken.developerToken,
           "Music-User-Token": musicUserToken,
         },
       });
@@ -310,6 +392,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     } catch (caught) {
       await refresh();
       setError(appleAuthorizationErrorMessage(caught));
+      restartAppleConnector();
     } finally {
       setBusy("");
     }
@@ -465,8 +548,19 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
 
         <div className="operator-actions">
           <button onClick={() => void refresh()} disabled={Boolean(busy)}>REFRESH</button>
-          <button onClick={() => void authorizeApple()} disabled={Boolean(busy)}>
-            {health?.apple?.authorized && !health.apple.needsReauthorization ? "REAUTHORIZE APPLE" : "AUTHORIZE APPLE"}
+          <button
+            onClick={() => appleConnectorState === "failed"
+              ? restartAppleConnector()
+              : void authorizeApple()}
+            disabled={Boolean(busy) || appleConnectorState === "preparing"}
+          >
+            {appleConnectorState === "preparing"
+              ? "PREPARING APPLE"
+              : appleConnectorState === "failed"
+                ? "RETRY APPLE SETUP"
+              : health?.apple?.authorized && !health.apple.needsReauthorization
+                ? "REAUTHORIZE APPLE"
+                : "AUTHORIZE APPLE"}
           </button>
           {health?.apple?.authorized && <button onClick={() => void revokeApple()} disabled={Boolean(busy)}>REVOKE APPLE</button>}
           <button className="danger-control" onClick={() => void setPaused(!health?.paused)} disabled={Boolean(busy)}>
@@ -474,7 +568,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
           </button>
         </div>
         <p className="operator-note" role="status">
-          {appleStatusMessage}
+          {appleConnectorError || appleStatusMessage}
         </p>
 
         <section className="operator-section" aria-labelledby="budgets-title">
