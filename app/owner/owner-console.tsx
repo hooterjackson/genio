@@ -275,7 +275,13 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
       const token = await ownerApi<AppleTokenResponse>("/api/v1/owner/apple/developer-token");
       const MusicKit = await loadMusicKit();
       const music = await configureFreshMusicKit(MusicKit, token.developerToken);
-      const musicUserToken = requireMusicUserToken(await music.authorize());
+      let authorizationResult: unknown;
+      try {
+        authorizationResult = await music.authorize();
+      } catch (caught) {
+        throw new Error(`Apple Music did not issue a user token: ${appleAuthorizationErrorMessage(caught)}`);
+      }
+      const musicUserToken = requireMusicUserToken(authorizationResult);
       const storefrontResponse = await fetch("https://api.music.apple.com/v1/me/storefront", {
         headers: {
           Authorization: "Bearer " + token.developerToken,

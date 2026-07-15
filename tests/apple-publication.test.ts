@@ -8,6 +8,7 @@ import {
   AppleShareLinkUnavailableError,
   appleAuthorizationGeneration,
   appleAuthorizationJobDedupeKey,
+  createDeveloperToken,
   encryptMusicUserToken,
   libraryPlaylistIsPublic,
   processAppleAuthorizationJob,
@@ -84,6 +85,18 @@ afterEach(() => {
 });
 
 describe("Apple Music client failure classification", () => {
+  test("browser developer tokens bind the allowed origin as an array", async () => {
+    const token = await createDeveloperToken({
+      origin: "https://needle.example/owner?from=test",
+      ttlSeconds: 60,
+    });
+    const payload = token.split(".")[1];
+    expect(payload).toBeTruthy();
+    const claims = JSON.parse(Buffer.from(payload!, "base64url").toString("utf8")) as Record<string, unknown>;
+
+    expect(claims.origin).toEqual(["https://needle.example"]);
+  });
+
   test.each([401, 403] as const)("authenticated Apple %s responses require owner reauthorization", async (status) => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ errors: [{ title: "Denied" }] }), {
       status,

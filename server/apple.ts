@@ -159,8 +159,11 @@ export async function createDeveloperToken(optionsOrLegacy?: DeveloperTokenOptio
   const now = Math.floor(Date.now() / 1_000);
   const ttlSeconds = Math.min(Math.max(options.ttlSeconds ?? 15 * 60, 60), 15 * 60);
   const header = base64url(JSON.stringify({ alg: "ES256", kid: keyId, typ: "JWT" }));
-  const claims: Record<string, string | number> = { iss: teamId, iat: now, exp: now + ttlSeconds };
-  if (options.origin) claims.origin = new URL(options.origin).origin;
+  const claims: Record<string, string | number | string[]> = { iss: teamId, iat: now, exp: now + ttlSeconds };
+  // Apple defines the web-only origin claim as an array, even when a token is
+  // restricted to a single origin. Catalog requests currently tolerate a
+  // string, but MusicKit's user-authorization service can reject that shape.
+  if (options.origin) claims.origin = [new URL(options.origin).origin];
   const payload = base64url(JSON.stringify(claims));
   const body = `${header}.${payload}`;
   const signature = sign("sha256", Buffer.from(body), {
