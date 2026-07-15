@@ -141,6 +141,20 @@ describe("claim-level evidence integrity", () => {
     expect(validateTestCandidates(args, known, "track_verification", new Set(), citations).candidates[0]!.evidence[0]!.state).toBe("verified");
   });
 
+  test("binds meaningful relationship words despite harmless function-word differences", () => {
+    const sourceUrl = "https://credits.example/track";
+    const excerpt = "Test Artist is credited with percussion on Test Song.";
+    const citation = extractedCitation(sourceUrl, excerpt);
+    const args = candidateArgs({
+      sourceUrl,
+      relationship: "Test Artist credited with percussion",
+      supportExcerpt: excerpt,
+    });
+
+    expect(validateTestCandidates(args, new Set([sourceUrl]), "track_verification", new Set(), [citation])
+      .candidates[0]!.evidence[0]).toMatchObject({ state: "verified", citationSupport: citation });
+  });
+
   test("requires an exact same-URL provider span local to the subject, track, and source wording", () => {
     const sourceUrl = "https://credits.example/track";
     const excerpt = "Test Artist receives a percussion credit on Test Song.";
@@ -839,9 +853,9 @@ describe("fast curated orchestration", () => {
     });
   });
 
-  test("uses exactly one bounded web synthesis and one no-web extraction, then matches", async () => {
+  test("uses one bounded web synthesis when the confirmed minimum is met, then matches", async () => {
     const state = segmentedRepository();
-    state.run.brief = brief("curated", { min: 50, max: 100 });
+    state.run.brief = brief("curated", { min: 1, max: 50 });
     state.run.status = "queued";
     state.run.phase = "queued";
     const persistedCandidates: any[] = [];
@@ -913,8 +927,8 @@ describe("fast curated orchestration", () => {
     expect(persistedCandidates).toHaveLength(1);
     expect(frontier).toContainEqual(expect.objectContaining({
       sourceClass: "fast_policy",
-      status: "unresolved",
-      discoveredCount: 50,
+      status: "complete",
+      discoveredCount: 1,
       recoveredCount: 1,
     }));
     expect(state.checkpoints.get("fast:complete:fast_curated_v1")).toMatchObject({
@@ -926,9 +940,245 @@ describe("fast curated orchestration", () => {
     expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
   });
 
+  test("an exact 100-track curated target persists 100 citation-eligible candidates before matching", async () => {
+    const state = segmentedRepository();
+    state.run.brief = {
+      ...brief("curated", { min: 100, max: 100 }),
+      title: "Paulinho da Costa’s 100 most influential songs",
+      subjectEntities: ["Paulinho da Costa"],
+      relationship: "influential recording featuring",
+      orderingPolicy: "influence rank",
+    };
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    const persistedCandidates: any[] = [];
+    const frontier: any[] = [];
+    state.repository.addSources = async (_runId?: string, sources?: any[]) => new Map(
+      (sources ?? []).map((source: any, index: number) => [source.url, `source-${index}`]),
+    );
+    state.repository.addCandidates = async (_runId?: string, candidates?: any[]) => {
+      persistedCandidates.push(...(candidates ?? []));
+      state.coverage.candidateCount = persistedCandidates.length;
+      state.coverage.eligibleCandidateCount = persistedCandidates.length;
+      return candidates?.length ?? 0;
+    };
+    state.repository.upsertFrontier = async (_runId?: string, items?: any[]) => { frontier.push(...(items ?? [])); };
+
+    const annotations: Array<Record<string, unknown>> = [];
+    const lines: string[] = [];
+    let offset = 0;
+    for (let group = 0; group < 10; group += 1) {
+      const pairs = Array.from({ length: 10 }, (_, pairIndex) => {
+        const ordinal = group * 10 + pairIndex + 1;
+        const suffix = String(ordinal).padStart(3, "0");
+        return `Performer ${suffix} — Track ${suffix}`;
+      });
+      const support = `Paulinho da Costa influential recording featuring ${pairs.join(", ")}.`;
+      const marker = `[source-${group + 1}]`;
+      const line = `${support} ${marker}`;
+      const markerStart = offset + support.length + 1;
+      annotations.push({
+        type: "url_citation",
+        url: `https://evidence.example/paulinho/rank-${group + 1}`,
+        title: `Paulinho ranking source ${group + 1}`,
+        start_index: markerStart,
+        end_index: markerStart + marker.length,
+      });
+      lines.push(line);
+      offset += line.length + 1;
+    }
+    const synthesis = {
+      id: "fast-web-100",
+      model: "gpt-5.6-luna",
+      usage: { input_tokens: 1_000, output_tokens: 2_000 },
+      output: [
+        { type: "web_search_call", action: { type: "search", query: "Paulinho da Costa influential recordings" } },
+        { id: "fast-message-100", type: "message", content: [{
+          type: "output_text",
+          text: lines.join("\n"),
+          annotations,
+        }] },
+      ],
+    };
+    const extractedCandidates = Array.from({ length: 100 }, (_, index) => {
+      const suffix = String(index + 1).padStart(3, "0");
+      return {
+        artist: `Performer ${suffix}`,
+        title: `Track ${suffix}`,
+        album: null,
+        releaseYear: null,
+        versionLabel: null,
+        relationship: "influential recording featuring",
+        citationIndexes: [Math.floor(index / 10)],
+      };
+    });
+    const extraction = {
+      id: "fast-extract-100",
+      model: "gpt-5.6-luna",
+      usage: { input_tokens: 2_000, output_tokens: 4_000 },
+      output_text: JSON.stringify({ candidates: extractedCandidates }),
+    };
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [synthesis, extraction]);
+
+    await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
+
+    expect(orchestrator.calls).toHaveLength(2);
+    expect(persistedCandidates).toHaveLength(100);
+    expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
+      Array.from({ length: 100 }, (_, index) => index + 1),
+    );
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(100);
+    expect(frontier).toContainEqual(expect.objectContaining({
+      sourceClass: "fast_policy",
+      status: "complete",
+      discoveredCount: 100,
+      recoveredCount: 100,
+    }));
+    expect(state.checkpoints.get("fast:complete:fast_curated_v1")).toMatchObject({
+      status: "complete",
+      extractedCandidateCount: 100,
+      citationEligibleCandidateCount: 100,
+      rejectedCandidateCount: 0,
+      shortfall: 0,
+    });
+    expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
+  });
+
+  test("an exact 100-track target refills after only 20 of the first 50 extracted rows survive validation", async () => {
+    const state = segmentedRepository();
+    state.run.brief = {
+      ...brief("curated", { min: 100, max: 100 }),
+      title: "Paulinho da Costa’s 100 most influential songs",
+      subjectEntities: ["Paulinho da Costa"],
+      relationship: "influential recording featuring",
+      orderingPolicy: "influence rank",
+    };
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    const persistedCandidates: any[] = [];
+    const frontier: any[] = [];
+    const matchingCandidateCounts: number[] = [];
+    state.repository.addSources = async (_runId?: string, sources?: any[]) => new Map(
+      (sources ?? []).map((source: any, index: number) => [source.url, `source-${index}`]),
+    );
+    state.repository.addCandidates = async (_runId?: string, candidates?: any[]) => {
+      persistedCandidates.push(...(candidates ?? []));
+      state.coverage.candidateCount = persistedCandidates.length;
+      state.coverage.eligibleCandidateCount = persistedCandidates.length;
+      return candidates?.length ?? 0;
+    };
+    state.repository.upsertFrontier = async (_runId?: string, items?: any[]) => { frontier.push(...(items ?? [])); };
+    const enqueueJob = state.repository.enqueueJob.bind(state.repository);
+    state.repository.enqueueJob = async (input: any) => {
+      if (input?.kind === "matching") matchingCandidateCounts.push(persistedCandidates.length);
+      return enqueueJob(input);
+    };
+
+    function synthesisFixture(start: number, count: number, id: string) {
+      const annotations: Array<Record<string, unknown>> = [];
+      const lines: string[] = [];
+      let offset = 0;
+      for (let groupStart = start; groupStart < start + count; groupStart += 10) {
+        const groupCount = Math.min(10, start + count - groupStart);
+        const pairs = Array.from({ length: groupCount }, (_, pairIndex) => {
+          const suffix = String(groupStart + pairIndex).padStart(3, "0");
+          return `Performer ${suffix} — Track ${suffix}`;
+        });
+        const support = `Paulinho da Costa influential recording featuring ${pairs.join(", ")}.`;
+        const marker = `[${id}-source-${lines.length + 1}]`;
+        const line = `${support} ${marker}`;
+        const markerStart = offset + support.length + 1;
+        annotations.push({
+          type: "url_citation",
+          url: `https://evidence.example/paulinho/${id}/${lines.length + 1}`,
+          title: `${id} source ${lines.length + 1}`,
+          start_index: markerStart,
+          end_index: markerStart + marker.length,
+        });
+        lines.push(line);
+        offset += line.length + 1;
+      }
+      return {
+        id,
+        model: "gpt-5.6-luna",
+        usage: { input_tokens: 1_000, output_tokens: 2_000 },
+        output: [
+          { type: "web_search_call", action: { type: "search", query: `${id} fixture` } },
+          { id: `${id}-message`, type: "message", content: [{
+            type: "output_text",
+            text: lines.join("\n"),
+            annotations,
+          }] },
+        ],
+      };
+    }
+
+    function extractedRow(ordinal: number, citationIndex: number) {
+      const suffix = String(ordinal).padStart(3, "0");
+      return {
+        artist: `Performer ${suffix}`,
+        title: `Track ${suffix}`,
+        album: null,
+        releaseYear: null,
+        versionLabel: null,
+        relationship: "influential recording featuring",
+        citationIndexes: [citationIndex],
+      };
+    }
+
+    const initialSynthesis = synthesisFixture(1, 20, "fast-web-initial");
+    const initialExtraction = {
+      id: "fast-extract-initial",
+      model: "gpt-5.6-luna",
+      usage: { input_tokens: 2_000, output_tokens: 3_000 },
+      output_text: JSON.stringify({
+        candidates: [
+          ...Array.from({ length: 20 }, (_, index) => extractedRow(index + 1, Math.floor(index / 10))),
+          ...Array.from({ length: 30 }, (_, index) => extractedRow(index + 21, 999)),
+        ],
+      }),
+    };
+    const refillSynthesis = synthesisFixture(21, 80, "fast-web-refill");
+    const refillExtraction = {
+      id: "fast-extract-refill",
+      model: "gpt-5.6-luna",
+      usage: { input_tokens: 2_000, output_tokens: 5_000 },
+      output_text: JSON.stringify({
+        candidates: Array.from({ length: 80 }, (_, index) => extractedRow(index + 21, Math.floor(index / 10))),
+      }),
+    };
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      initialSynthesis,
+      initialExtraction,
+      refillSynthesis,
+      refillExtraction,
+    ]);
+
+    await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
+
+    expect(orchestrator.calls.filter((call) => call.operation.includes(".web"))).toHaveLength(2);
+    expect(orchestrator.calls.filter((call) => call.operation.includes(".extract"))).toHaveLength(2);
+    expect(persistedCandidates).toHaveLength(100);
+    expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
+      Array.from({ length: 100 }, (_, index) => index + 1),
+    );
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(100);
+    expect(matchingCandidateCounts).toEqual([100]);
+    expect(frontier.filter((item) => item.sourceClass === "fast_policy").at(-1)).toMatchObject({
+      status: "complete",
+      discoveredCount: 100,
+      recoveredCount: 100,
+    });
+    expect(state.checkpoints.get("fast:complete:fast_curated_v1")).toMatchObject({
+      status: "complete",
+      citationEligibleCandidateCount: 100,
+      shortfall: 0,
+    });
+  });
+
   test("resumes from persisted web synthesis without paying for it again", async () => {
     const state = segmentedRepository();
-    state.run.brief = brief("curated", { min: 50, max: 100 });
+    state.run.brief = brief("curated", { min: 1, max: 50 });
     state.run.status = "queued";
     state.run.phase = "queued";
     const route = installFastRoute(state);
@@ -998,7 +1248,7 @@ describe("fast curated orchestration", () => {
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", fast: true });
 
     expect(orchestrator.calls).toHaveLength(0);
-    expect(state.run).toMatchObject({ status: "failed", phase: "fast_research_deadline" });
+    expect(state.run).toMatchObject({ status: "failed", phase: "fast_research_shortfall" });
     expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(false);
     expect(state.checkpoints.get("fast:policy:fast_curated_v1")).toMatchObject({
       status: "deadline",

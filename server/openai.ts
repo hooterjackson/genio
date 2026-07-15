@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { PlaylistBrief } from "../shared/types.ts";
-import { normalizeBriefTarget } from "./brief-policy.ts";
+import { normalizeBriefTarget, preserveExplicitTrackCount } from "./brief-policy.ts";
 import { requireSecret } from "./secrets.ts";
 import { readCostConfiguration, readOpenAITokenPricing } from "./cost-config.ts";
 import { boundedResponseText } from "./bounded-response.ts";
@@ -252,7 +252,11 @@ export async function interpretPrompt(
     input: prompt.slice(0, 4_000),
     text: { format: { type: "json_schema", name: "playlist_brief", strict: true, schema: briefSchema } },
   }, { ...context, operation: context.operation ?? "brief.interpret", idempotencyKey: stableKey });
-  return { brief: validatedBrief(JSON.parse(extractOutputText(response))), usage: response.usage ?? {}, costUsd: responseCostUsd(response) };
+  const brief = preserveExplicitTrackCount(
+    prompt,
+    validatedBrief(JSON.parse(extractOutputText(response))),
+  );
+  return { brief, usage: response.usage ?? {}, costUsd: responseCostUsd(response) };
 }
 
 export function responseCostUsd(response: any): number {

@@ -5,7 +5,13 @@ import {
   lookupAppleCatalogByIsrc,
   searchAppleCatalog,
 } from "./apple.ts";
-import { rankCatalogMatches } from "../lib/matching.ts";
+import {
+  hasDirectCatalogMatch,
+  mergeCatalogSongs,
+  normalizeMusicBaseTitle,
+  normalizeMusicText,
+  rankCatalogMatches,
+} from "../lib/matching.ts";
 import { resolveEvidenceSubjectBinding } from "./evidence-binding.ts";
 import {
   isRetryableCatalogMatch,
@@ -58,20 +64,53 @@ function boundedEnvironmentInteger(name: string, fallback: number, minimum: numb
 }
 
 export function matchingConcurrency(): number {
-  return boundedEnvironmentInteger("APPLE_MATCHING_CONCURRENCY", 4, 1, 6);
+  return boundedEnvironmentInteger("APPLE_MATCHING_CONCURRENCY", 8, 1, 12);
 }
 
 export function catalogRecoveryDeadlineMs(): number {
   return boundedEnvironmentInteger("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", 45_000, 10_000, 60_000);
 }
 
-async function lookupCandidateSongs(
+export function catalogSearchQueries(candidate: Pick<Candidate, "artist" | "title" | "album">): string[] {
+  const artist = candidate.artist.trim();
+  const title = candidate.title.trim();
+  const album = candidate.album?.trim() ?? "";
+  const baseTitle = normalizeMusicBaseTitle(title);
+  const queries: string[] = [];
+  const seen = new Set<string>();
+  const add = (...parts: string[]) => {
+    const query = parts.map((part) => part.trim()).filter(Boolean).join(" ").slice(0, 300);
+    const key = normalizeMusicText(query);
+    if (!query || !key || seen.has(key)) return;
+    seen.add(key);
+    queries.push(query);
+  };
+
+  // Start with the most discriminating metadata, then progressively remove
+  // fields that research sources commonly misattribute or omit.
+  add(artist, title, album);
+  add(artist, title);
+  if (baseTitle && baseTitle !== normalizeMusicText(title)) add(artist, baseTitle);
+  if (album) add(title, album);
+  add(title);
+  return queries;
+}
+
+export async function lookupCandidateSongs(
   candidate: Candidate,
   storefront: string,
   signal?: AbortSignal,
 ): Promise<CatalogSong[]> {
   let songs = candidate.isrc ? await lookupAppleCatalogByIsrc(storefront, candidate.isrc, signal) : [];
-  if (songs.length === 0) songs = await searchAppleCatalog(storefront, `${candidate.artist} ${candidate.title}`, signal);
+  if (hasDirectCatalogMatch(candidate, songs)) return songs;
+
+  const maximumQueries = boundedEnvironmentInteger("APPLE_MATCH_MAX_QUERIES", 5, 1, 5);
+  for (const query of catalogSearchQueries(candidate).slice(0, maximumQueries)) {
+    signal?.throwIfAborted();
+    const results = await searchAppleCatalog(storefront, query, signal);
+    songs = mergeCatalogSongs(songs, results);
+    if (hasDirectCatalogMatch(candidate, songs)) break;
+  }
   return songs;
 }
 

@@ -488,7 +488,11 @@ export class Repository {
       researchPolicy: researchPolicyFingerprint(input.brief),
     }));
     const executionPolicy = researchExecutionPolicy(input.brief);
-    const reuseDays = Math.max(0, Math.min(input.reuseDays ?? 30, 30));
+    // Owner requests are deliberate test/refresh runs. Never attach them to a
+    // prior visitor result, even when the confirmed brief hashes identically.
+    const reuseDays = input.bypassVisitorRateLimit
+      ? 0
+      : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`run:${input.clientBucket}:${input.idempotencyKey}`]);
       const existing = await client.query(
@@ -527,10 +531,17 @@ export class Repository {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`brief:${briefHash}`]);
         const cached = await client.query<{ id: string; status: string }>(
           `SELECT id,status FROM research_runs
-           WHERE brief_hash=$1 AND status IN ('complete','partial') AND completed_at >= now()-($2::text || ' days')::interval
+           WHERE brief_hash=$1 AND status='complete' AND completed_at >= now()-($2::text || ' days')::interval
              AND completed_at >= COALESCE(
                (SELECT value::timestamptz FROM settings WHERE key='reuse_not_before:' || $1),
                '-infinity'::timestamptz
+             )
+             AND (
+               COALESCE((brief_json #>> '{targetSize,min}')::int,0)=0
+               OR (SELECT count(*)::int
+                   FROM manifests m
+                   JOIN manifest_tracks mt ON mt.manifest_id=m.id
+                   WHERE m.run_id=research_runs.id) >= (brief_json #>> '{targetSize,min}')::int
              )
              AND deleted_at IS NULL ORDER BY completed_at DESC LIMIT 1`,
           [briefHash, String(reuseDays)],

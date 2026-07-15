@@ -144,6 +144,160 @@ test("curated requests are clearly labeled as the time-boxed fast path", async (
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
+test("an explicit 100-track request stays at 100 through research, matching, and publication", async ({ page }) => {
+  const prompt = "Paulinho da Costa’s 100 most influential songs";
+  const exactBrief = {
+    ...curatedBrief,
+    title: "Paulinho da Costa’s 100 most influential songs",
+    description: "A cited ranking of 100 influential recordings featuring Paulinho da Costa.",
+    subjectEntities: ["Paulinho da Costa"],
+    relationship: "influential recording featuring",
+    targetSize: { min: 100, max: 100 },
+  };
+  const fastRun = {
+    ...run,
+    id: "run-100",
+    prompt,
+    brief: exactBrief,
+    status: "researching",
+    phase: "fast_research",
+    candidateCount: 0,
+    sourceCount: 0,
+    unresolvedCount: 0,
+  };
+  const matchingRun = {
+    ...fastRun,
+    status: "matching",
+    phase: "catalog_matching",
+    candidateCount: 100,
+    sourceCount: 10,
+  };
+  const reviewRun = {
+    ...matchingRun,
+    status: "visitor_review",
+    phase: "exception_review",
+  };
+  const tracks = Array.from({ length: 100 }, (_, index) => ({
+    position: index,
+    candidateId: `candidate-100-${index}`,
+    artist: `Artist ${index + 1}`,
+    title: `Influential track ${index + 1}`,
+    album: `Album ${index + 1}`,
+    status: "accepted",
+    catalogId: `apple-100-${index}`,
+    song: {
+      id: `apple-100-${index}`,
+      name: `Influential track ${index + 1}`,
+      artistName: `Artist ${index + 1}`,
+      albumName: `Album ${index + 1}`,
+    },
+    alternatives: [],
+    evidenceEligible: true,
+    selected: true,
+    selectable: true,
+  }));
+
+  let briefBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/brief", async (route) => {
+    briefBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ brief: exactBrief, estimateUsd: fastEstimate.approvalUsd, estimate: fastEstimate, cached: false }),
+    });
+  });
+
+  let runBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs", async (route) => {
+    runBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ run: fastRun, capability: "one-time-100-track-capability" }),
+    });
+  });
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: fastRun.id }) });
+  });
+
+  let statusRead = 0;
+  await page.route("**/api/v1/runs/run-100", async (route) => {
+    const states = [fastRun, matchingRun, reviewRun];
+    const next = states[Math.min(statusRead, states.length - 1)]!;
+    statusRead += 1;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(next) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-100\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: tracks,
+        page: 1,
+        pageSize: 500,
+        total: 100,
+        totalPages: 1,
+        selectableCount: 100,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+
+  let selectionBody: Record<string, unknown> | null = null;
+  const manifestTracks = tracks.map((track) => ({
+    position: track.position,
+    candidateId: track.candidateId,
+    catalogId: track.catalogId,
+    artist: track.artist,
+    title: track.title,
+  }));
+  await page.route("**/api/v1/runs/run-100/selection", async (route) => {
+    selectionBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "manifest-100",
+        runId: fastRun.id,
+        name: exactBrief.title,
+        contentHash: "manifest-hash-100",
+        trackCount: 100,
+        tracks: manifestTracks,
+      }),
+    });
+  });
+  let publishBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs/run-100/publish", async (route) => {
+    publishBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ ...reviewRun, status: "publishing", phase: "publication" }),
+    });
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill(prompt);
+  await page.getByRole("button", { name: /review request/i }).click();
+  await expect(page.getByText("100–100 tracks", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /start research/i }).click();
+
+  await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
+  await expect(page.getByText("100 OF 100 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+  await expect(page.getByRole("checkbox")).toHaveCount(100);
+  await expect(page.getByText("Influential track 100", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+
+  expect(briefBody).toMatchObject({ prompt });
+  expect(runBody).toMatchObject({ brief: { targetSize: { min: 100, max: 100 } } });
+  expect(selectionBody).toEqual({ useRecommended: true, excludedCandidateIds: [], overrides: [] });
+  expect(manifestTracks).toHaveLength(100);
+  expect(publishBody).toEqual({ manifestId: "manifest-100" });
+  await expect(page.getByText("Creating the playlist in Apple Music.")).toBeVisible();
+});
+
 test("an active fast run keeps its profile and concise phase message visible", async ({ page }) => {
   const fastRun = {
     ...run,

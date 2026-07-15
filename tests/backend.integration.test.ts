@@ -667,6 +667,40 @@ databaseDescribe("hosted backend integration", () => {
     expect(audit.rows[0]?.count).toBe(1);
   });
 
+  test("does not reuse partial, target-short, or owner refresh runs", async () => {
+    const bucket = `cache-eligibility-${randomUUID()}`;
+    const exactBrief: PlaylistBrief = {
+      ...brief,
+      mode: "curated",
+      targetSize: { min: 100, max: 100 },
+    };
+    const create = (key: string, owner = false) => repository.createRunIdempotent({
+      prompt: "same exact-count prompt",
+      brief: exactBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: bucket,
+      clientBucketAliases: [bucket],
+      idempotencyKey: key,
+      rateLimit: 20,
+      reuseDays: 30,
+      bypassVisitorRateLimit: owner,
+    });
+
+    const partial = await create(`partial-${randomUUID()}`);
+    await repository.updateRun(partial.runId, { status: "partial", phase: "complete" });
+    const afterPartial = await create(`after-partial-${randomUUID()}`);
+    expect(afterPartial).toMatchObject({ created: true, reused: false });
+
+    await repository.updateRun(afterPartial.runId, { status: "complete", phase: "complete" });
+    const afterShortfall = await create(`after-shortfall-${randomUUID()}`);
+    expect(afterShortfall).toMatchObject({ created: true, reused: false });
+
+    await repository.updateRun(afterShortfall.runId, { status: "complete", phase: "complete" });
+    const ownerRefresh = await create(`owner-${randomUUID()}`, true);
+    expect(ownerRefresh).toMatchObject({ created: true, reused: false });
+  });
+
   test("accepts one valid gateway request and rejects an exact replay", async () => {
     const keyId = "integration-v1";
     const secret = "integration-gateway-secret-32-bytes";
@@ -1028,9 +1062,9 @@ databaseDescribe("hosted backend integration", () => {
     const created = await create();
     expect(created).toMatchObject({ created: true, reused: false, status: "queued" });
     const originalRoute = await repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1") as any;
-    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v1", matchingReserveMs: 25_000 });
+    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v1", matchingReserveMs: 40_000 });
     expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.confirmedAt)).toBe(120_000);
-    expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.researchDeadlineAt)).toBe(25_000);
+    expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.researchDeadlineAt)).toBe(40_000);
     const createdRun = await repository.getRun(created.runId);
     expect(originalRoute.confirmedAt).toBe(createdRun.createdAt);
 

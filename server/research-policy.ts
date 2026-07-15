@@ -10,6 +10,7 @@ export interface FastResearchPolicy {
   runDeadlineMs: number;
   matchingReserveMs: number;
   candidateLimit: number;
+  maxPasses: number;
   maxWebToolCalls: number;
   maxSynthesisTokens: number;
   maxExtractionTokens: number;
@@ -25,7 +26,10 @@ export interface DeepResearchPolicy {
 export type ResearchExecutionPolicy = FastResearchPolicy | DeepResearchPolicy;
 
 export const FAST_RUN_DEADLINE_MS = 120_000;
-export const FAST_MATCHING_RESERVE_MS = 25_000;
+// Catalog lookup now uses a precision-preserving query ladder. Reserve enough
+// of the same two-minute route to finish that work instead of turning the tail
+// of every medium playlist into timeout placeholders.
+export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
 
 export interface FastRouteCheckpoint {
@@ -127,6 +131,10 @@ export function researchExecutionPolicy(
     runDeadlineMs: FAST_RUN_DEADLINE_MS,
     matchingReserveMs: FAST_MATCHING_RESERVE_MS,
     candidateLimit: Math.min(120, Math.ceil(targetMaximum * 1.2)),
+    // A short first answer is a refill signal, never a successful completion.
+    // Three independently checkpointed passes fit the two-minute route while
+    // giving the model two bounded chances to close any validated shortfall.
+    maxPasses: 3,
     maxWebToolCalls: boundedInteger(environment.FAST_RESEARCH_MAX_WEB_CALLS, 5, 1, 6),
     maxSynthesisTokens: boundedInteger(environment.FAST_RESEARCH_MAX_SYNTHESIS_TOKENS, 6_000, 2_000, 8_000),
     maxExtractionTokens: boundedInteger(environment.FAST_RESEARCH_MAX_EXTRACTION_TOKENS, 8_000, 2_000, 12_000),

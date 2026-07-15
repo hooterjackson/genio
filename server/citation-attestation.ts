@@ -50,10 +50,10 @@ const RELATIONSHIP_STOPWORDS = new Set([
   "a", "an", "and", "at", "by", "for", "from", "in", "is", "of", "on", "or", "the", "to", "with",
 ]);
 
-function meaningfulRelationshipPhrase(value: string, identityTokens: ReadonlySet<string>): string | null {
+function meaningfulRelationshipTokens(value: string, identityTokens: ReadonlySet<string>): string[] {
   const phrase = normalizeCitationPhrase(value);
   const meaningful = phrase.split(" ").filter((token) => token.length >= 3 && !RELATIONSHIP_STOPWORDS.has(token));
-  return meaningful.some((token) => !identityTokens.has(token)) ? phrase : null;
+  return meaningful.some((token) => !identityTokens.has(token)) ? meaningful : [];
 }
 
 export function citationTextIsLocalToClaim(
@@ -66,11 +66,16 @@ export function citationTextIsLocalToClaim(
   const title = normalizeCitationPhrase(candidateTitle);
   const subject = normalizeCitationPhrase(subjectEntity);
   const identityTokens = new Set(`${title} ${subject}`.split(" ").filter(Boolean));
-  const relationshipPhrase = meaningfulRelationshipPhrase(relationship, identityTokens);
-  return Boolean(title && subject && relationshipPhrase
+  const relationshipTokens = meaningfulRelationshipTokens(relationship, identityTokens);
+  return Boolean(title && subject && relationshipTokens.length > 0
     && normalized.includes(title)
     && normalized.includes(subject)
-    && normalized.includes(relationshipPhrase));
+    // Function words and light grammatical inflections are not evidence. The
+    // provider-attested line must contain every meaningful relationship token,
+    // but "credited with percussion" must still bind to "is credited with
+    // percussion". Requiring the model's full phrase verbatim discarded valid
+    // groups whenever an extractor omitted a word such as "is".
+    && relationshipTokens.every((token) => normalized.split(" ").includes(token)));
 }
 
 export function citationAttestationKey(attestation: HostedCitationAttestation): string {

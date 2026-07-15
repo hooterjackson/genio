@@ -8,6 +8,8 @@ import {
   manifestDescriptionForBrief,
   materialAmbiguitiesAccepted,
   normalizeBriefTarget,
+  explicitTrackCount,
+  preserveExplicitTrackCount,
 } from "../server/brief-policy.ts";
 
 function brief(mode: PlaylistBrief["mode"]): PlaylistBrief {
@@ -34,6 +36,28 @@ describe("playlist brief policy", () => {
     expect(normalizeBriefTarget("curated", { min: 75, max: 90 })).toEqual({ min: 75, max: 90 });
   });
 
+  test("preserves an explicit requested song count instead of the model's broad range", () => {
+    const interpreted = { ...brief("curated"), targetSize: { min: 50, max: 100 } };
+
+    expect(preserveExplicitTrackCount(
+      "Paulinho da Costa's 100 most influential songs",
+      interpreted,
+    ).targetSize).toEqual({ min: 100, max: 100 });
+    expect(preserveExplicitTrackCount(
+      "50 influential Berlin techno songs",
+      interpreted,
+    ).targetSize).toEqual({ min: 50, max: 50 });
+    expect(preserveExplicitTrackCount(
+      "Make a 25-track introduction to Detroit techno",
+      interpreted,
+    ).targetSize).toEqual({ min: 25, max: 25 });
+  });
+
+  test("does not confuse music years or unrelated numbers with a track count", () => {
+    expect(explicitTrackCount("Influential Berlin techno songs from 1990 to 1999")).toBeNull();
+    expect(explicitTrackCount("Songs by artists with more than 100 releases")).toBeNull();
+  });
+
   test("prevents target caps from silently weakening exhaustive prompts", () => {
     expect(normalizeBriefTarget("exhaustive", { min: 25, max: 25 })).toBeNull();
     expect(isValidBriefTarget("exhaustive", null)).toBe(true);
@@ -42,7 +66,8 @@ describe("playlist brief policy", () => {
 
   test("validates curated and hybrid ranges independently", () => {
     expect(isValidBriefTarget("curated", { min: 50, max: 100 })).toBe(true);
-    expect(isValidBriefTarget("curated", { min: 49, max: 100 })).toBe(false);
+    expect(isValidBriefTarget("curated", { min: 25, max: 25 })).toBe(true);
+    expect(isValidBriefTarget("curated", { min: 0, max: 100 })).toBe(false);
     expect(isValidBriefTarget("hybrid", { min: 1, max: 500 })).toBe(true);
     expect(isValidBriefTarget("hybrid", null)).toBe(true);
   });

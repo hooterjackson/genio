@@ -232,6 +232,46 @@ test("catalog reads use bounded concurrency while match decisions stay ordered",
   });
 });
 
+test("fast matching preserves 100 distinct candidates as 100 accepted Apple tracks", async () => {
+  const candidates = Array.from({ length: 100 }, (_, index) => {
+    const ordinal = index + 1;
+    const title = `Influential Track ${String(ordinal).padStart(3, "0")}`;
+    const isrc = `USAAA26${String(ordinal).padStart(5, "0")}`;
+    const item = candidate(`candidate-${ordinal}`, "editorial");
+    item.title = title;
+    item.isrc = isrc;
+    item.evidence[0]!.citationSupport!.excerpt = `Test Artist performed on ${title}.`;
+    return item;
+  });
+  const songsByIsrc = new Map(candidates.map((item, index): [string, CatalogSong] => [
+    item.isrc!,
+    {
+      ...song,
+      id: `apple-${index + 1}`,
+      name: item.title,
+      isrc: item.isrc!,
+    },
+  ]));
+  vi.mocked(lookupAppleCatalogByIsrc).mockImplementation(async (_storefront, isrc) => {
+    const match = songsByIsrc.get(isrc);
+    return match ? [match] : [];
+  });
+  const exactCuratedBrief = { ...curatedBrief, targetSize: { min: 100, max: 100 } };
+  const repository = new MemoryMatchingRepository(candidates, exactCuratedBrief, new Map([
+    ["fast:route:fast_curated_v1", routeCheckpoint()],
+  ]));
+
+  await matchResearchRun(repository, "run", "us", undefined, { fast: true });
+
+  expect(repository.matches).toHaveLength(100);
+  expect(repository.matches.every((match) => match.status === "accepted")).toBe(true);
+  expect(repository.matches.map((match) => match.song?.id)).toEqual(
+    Array.from({ length: 100 }, (_, index) => `apple-${index + 1}`),
+  );
+  expect(new Set(repository.matches.map((match) => match.song?.id)).size).toBe(100);
+  expect(repository.updates.at(-1)).toMatchObject({ status: "visitor_review", phase: "exception_review" });
+});
+
 test("fast matching converts a transient Apple failure into an explicit review outcome", async () => {
   vi.mocked(lookupAppleCatalogByIsrc)
     .mockRejectedValueOnce(new AppleApiError("Apple overloaded", 503, true))

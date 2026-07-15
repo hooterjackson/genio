@@ -4,6 +4,8 @@ const CURATED_MINIMUM = 50;
 const CURATED_MAXIMUM = 100;
 const ABSOLUTE_MAXIMUM = 10_000;
 
+const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u2014]\s*)?(?:(?:[\p{L}][\p{L}'\u2019.-]*|&)\s+){0,8}(?:songs?|tracks?|recordings?|titles?)\b/giu;
+
 export interface ResearchCostFactor {
   label: string;
   minimumUsd: number;
@@ -107,6 +109,31 @@ export function normalizeBriefTarget(
   return target;
 }
 
+/**
+ * Recover a track quantity that the user wrote explicitly. This is kept
+ * deterministic because a model can otherwise turn "50 songs" into the
+ * product's broad 50-100 default. Four-digit years are deliberately ignored
+ * unless they are outside the plausible year range.
+ */
+export function explicitTrackCount(prompt: string): number | null {
+  TRACK_COUNT_PATTERN.lastIndex = 0;
+  for (const match of prompt.matchAll(TRACK_COUNT_PATTERN)) {
+    const value = Number(match[1]!.replaceAll(",", ""));
+    if (!Number.isInteger(value) || value < 1 || value > ABSOLUTE_MAXIMUM) continue;
+    if (value >= 1900 && value <= 2099) continue;
+    return value;
+  }
+  return null;
+}
+
+/** Preserve an explicit supported quantity after model-output normalization. */
+export function preserveExplicitTrackCount(prompt: string, brief: PlaylistBrief): PlaylistBrief {
+  const count = explicitTrackCount(prompt);
+  if (count === null || brief.mode === "exhaustive") return brief;
+  if (brief.mode === "curated" && count > CURATED_MAXIMUM) return brief;
+  return { ...brief, targetSize: { min: count, max: count } };
+}
+
 export function isValidBriefTarget(
   mode: PlaylistBrief["mode"],
   target: PlaylistBrief["targetSize"],
@@ -116,7 +143,7 @@ export function isValidBriefTarget(
     return target !== null
       && Number.isInteger(target.min)
       && Number.isInteger(target.max)
-      && target.min >= CURATED_MINIMUM
+      && target.min >= 1
       && target.max >= target.min
       && target.max <= CURATED_MAXIMUM;
   }
