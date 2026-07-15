@@ -55,6 +55,11 @@ describe("durable and public error sanitization", () => {
       name: "AppleApiError",
       status: null,
     });
+    const rejected = Object.assign(new Error("private Apple response body"), {
+      name: "AppleApiError",
+      status: 400,
+    });
+    const invalidResponse = new Error("Apple did not return the owner storefront");
     expect(safeAppleAuthorizationFailure(rateLimit)).toBe(
       "Apple Music temporarily rate-limited authorization validation (HTTP 429).",
     );
@@ -64,7 +69,13 @@ describe("durable and public error sanitization", () => {
     expect(safeAppleAuthorizationFailure(unreachable)).toBe(
       "Needle could not reach Apple Music while validating authorization.",
     );
-    for (const error of [rateLimit, unavailable, unreachable]) {
+    expect(safeAppleAuthorizationFailure(rejected)).toBe(
+      "Apple Music rejected Needle's authorization validation request (HTTP 400).",
+    );
+    expect(safeAppleAuthorizationFailure(invalidResponse)).toBe(
+      "Apple Music returned an invalid authorization-validation response.",
+    );
+    for (const error of [rateLimit, unavailable, unreachable, rejected, invalidResponse]) {
       const result = sanitizeFailure(safeAppleAuthorizationFailure(error), "apple_authorization");
       expect(result).not.toContain("private");
       expect(result).not.toContain("sk-proj");

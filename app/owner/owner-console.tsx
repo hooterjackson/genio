@@ -424,6 +424,20 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     }
   }
 
+  async function retryAppleValidation() {
+    setBusy("apple-validation");
+    setError("");
+    setAppleStatusMessage("APPLE MUSIC AUTHORIZATION SAVED · VALIDATION PENDING");
+    try {
+      await ownerApi("/api/v1/owner/apple/authorization/validate", { method: "POST" });
+      await refresh();
+    } catch (caught) {
+      setError(appleAuthorizationErrorMessage(caught));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function setPaused(paused: boolean) {
     setBusy("pause");
     try {
@@ -569,19 +583,23 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
         <div className="operator-actions">
           <button onClick={() => void refresh()} disabled={Boolean(busy)}>REFRESH</button>
           <button
-            onClick={() => appleConnectorState === "failed"
-              ? restartAppleConnector()
-              : void authorizeApple()}
-            disabled={Boolean(busy) || appleConnectorState === "preparing" || health?.apple?.status === "unverified"}
+            onClick={() => health?.apple?.status === "validation_failed"
+              ? void retryAppleValidation()
+              : appleConnectorState === "failed"
+                ? restartAppleConnector()
+                : void authorizeApple()}
+            disabled={Boolean(busy)
+              || health?.apple?.status === "unverified"
+              || (health?.apple?.status !== "validation_failed" && appleConnectorState === "preparing")}
           >
-            {appleConnectorState === "preparing"
+            {health?.apple?.status === "validation_failed"
+              ? "RETRY APPLE VALIDATION"
+              : appleConnectorState === "preparing"
               ? "PREPARING APPLE"
               : appleConnectorState === "failed"
                 ? "RETRY APPLE SETUP"
               : health?.apple?.status === "unverified"
                 ? "VALIDATING APPLE"
-              : health?.apple?.status === "validation_failed"
-                ? "RETRY APPLE VALIDATION"
               : health?.apple?.authorized && !health.apple.needsReauthorization
                 ? "REAUTHORIZE APPLE"
                 : "AUTHORIZE APPLE"}

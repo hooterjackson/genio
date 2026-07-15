@@ -91,6 +91,16 @@ describe("Sites owner gateway boundary", () => {
     expect(response.headers.get("referrer-policy")).toBe("no-referrer");
   });
 
+  test("the owner can retry the saved Apple authorization through the signed gateway", async () => {
+    const response = await worker.fetch(apiRequest("/api/v1/owner/apple/authorization/validate", {
+      "OAI-Authenticated-User-Email": "owner@example.com",
+    }), env as never, ctx);
+
+    expect(response.status).toBe(200);
+    expect(upstreamFetch).toHaveBeenCalledOnce();
+    expect(forwardedHeaders().get("x-needle-owner-email")).toBe("owner@example.com");
+  });
+
   test("owner HTML sends origin-only referrer context required by MusicKit authorization", async () => {
     const response = await worker.fetch(new Request("https://needle.example/owner", {
       headers: { "OAI-Authenticated-User-Email": "owner@example.com" },

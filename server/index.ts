@@ -632,6 +632,41 @@ app.post<{ Body: { musicUserToken?: string; storefront?: string } }>("/api/v1/ow
   return reply.code(202).send({ configured: true, status: "unverified", storefront: encrypted.storefront });
 });
 
+app.post("/api/v1/owner/apple/authorization/validate", async (request, reply) => {
+  const email = owner(request);
+  const authorization = await repository.getAppleAuthorization();
+  if (!authorization) {
+    throw new HttpError(404, "Apple Music authorization has not been saved", "apple_authorization_missing");
+  }
+  if (authorization.status === "valid") {
+    return {
+      configured: true,
+      status: "valid",
+      storefront: authorization.storefront,
+      lastValidatedAt: authorization.lastValidatedAt?.toISOString() ?? null,
+    };
+  }
+  if (authorization.status === "reauthorization_required") {
+    throw new HttpError(409, "Apple Music rejected the saved authorization; authorize again", "apple_reauthorization_required");
+  }
+  await repository.updateAppleAuthorizationStatus("unverified", null);
+  const authorizationGeneration = appleAuthorizationGeneration(authorization);
+  await repository.enqueueJob({
+    kind: "apple_authorization",
+    payload: { authorizationGeneration },
+    dedupeKey: appleAuthorizationJobDedupeKey(authorization),
+    maxAttempts: 6,
+  });
+  await repository.recordAudit(email, "apple.authorization_validation_retried", {
+    storefront: authorization.storefront,
+  });
+  return reply.code(202).send({
+    configured: true,
+    status: "unverified",
+    storefront: authorization.storefront,
+  });
+});
+
 app.delete("/api/v1/owner/apple/authorization", async (request) => {
   const email = owner(request);
   await repository.revokeAppleAuthorization();
