@@ -646,7 +646,10 @@ test("publisher orphans a divergent playlist and creates a clean replacement", a
   };
 
   const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101", "202"], validAuthorization);
-  expect(repository.markPlaylistOrphan).toHaveBeenCalledWith(expect.objectContaining({ applePlaylistId: "p.diverged" }));
+  expect(repository.markPlaylistOrphan).toHaveBeenCalledWith(expect.objectContaining({
+    applePlaylistId: "p.diverged",
+    reason: "Apple playlist catalog mismatch at position 1: expected 101, observed wrong-track (observed 1 tracks)",
+  }));
   expect(repository.updatePublicationVolume).toHaveBeenCalledWith("volume-id", expect.objectContaining({
     attemptDelta: 1,
     applePlaylistId: null,

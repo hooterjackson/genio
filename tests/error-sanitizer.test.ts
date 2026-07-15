@@ -44,6 +44,10 @@ describe("durable and public error sanitization", () => {
       .toBe("Apple Music rate-limited playlist publication (HTTP 429).");
     expect(sanitizeFailure(Object.assign(new Error("private Apple detail"), { status: 503 }), "publication"))
       .toBe("Apple Music remained unavailable after the final attempt.");
+    expect(sanitizeFailure(
+      "Apple playlist catalog mismatch at position 2: expected 12345, observed 67890 (observed 25 tracks)",
+      "publication",
+    )).toBe("Apple playlist catalog mismatch at position 2: expected 12345, observed 67890 (observed 25 tracks)");
     const alreadySafe = "Apple Music remained unavailable after the final attempt.";
     expect(sanitizeFailure(sanitizeFailure(alreadySafe, "publication"), "publication")).toBe(alreadySafe);
   });

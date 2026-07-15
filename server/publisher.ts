@@ -370,11 +370,15 @@ async function ensureApplePlaylist(
 async function abandonDivergedPlaylist(
   repository: PublicationRepository,
   volume: PublicationVolume,
-  observedCount: number,
+  observedIds: readonly string[],
+  expectedIds: readonly string[],
   signal?: AbortSignal,
 ): Promise<PublicationVolume> {
+  const mismatchIndex = observedIds.findIndex((catalogId, index) => catalogId !== expectedIds[index]);
+  const position = mismatchIndex >= 0 ? mismatchIndex : Math.min(observedIds.length, expectedIds.length);
+  const safeId = (value: string | undefined) => /^[A-Za-z0-9._-]{1,200}$/u.test(value ?? "") ? value : "missing";
   return abandonPlaylist(repository, volume,
-    `The Apple playlist was not an exact ordered prefix of the immutable manifest volume (observed ${observedCount} tracks)`,
+    `Apple playlist catalog mismatch at position ${position + 1}: expected ${safeId(expectedIds[position])}, observed ${safeId(observedIds[position])} (observed ${observedIds.length} tracks)`,
     signal);
 }
 
@@ -445,7 +449,7 @@ export async function appendExactVolume(
     }
     let existing = initial.ids;
     if (initial.diverged) {
-      volume = await abandonDivergedPlaylist(repository, volume, initial.ids.length, signal);
+      volume = await abandonDivergedPlaylist(repository, volume, initial.ids, expected, signal);
       continue;
     }
 
@@ -464,7 +468,7 @@ export async function appendExactVolume(
         const observation = await observeStablePrefix(client, playlistId, expected, signal);
         const reconciled = observation.ids;
         if (observation.diverged) {
-          volume = await abandonDivergedPlaylist(repository, volume, reconciled.length, signal);
+          volume = await abandonDivergedPlaylist(repository, volume, reconciled, expected, signal);
           break;
         }
         if (reconciled.length === existing.length) stalledAttempts += 1;
@@ -479,7 +483,7 @@ export async function appendExactVolume(
     const finalObservation = await observeStablePrefix(client, playlistId, expected, signal);
     const verified = finalObservation.ids;
     if (finalObservation.diverged) {
-      volume = await abandonDivergedPlaylist(repository, volume, verified.length, signal);
+      volume = await abandonDivergedPlaylist(repository, volume, verified, expected, signal);
       continue;
     }
     if (verified.length < expected.length) {

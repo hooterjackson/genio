@@ -47,6 +47,7 @@ const PUBLICATION_LEASE_FAILURE = "The publication worker lease expired after th
 const PUBLICATION_AVAILABILITY_FAILURE = "Apple Music remained unavailable after the final attempt.";
 const PUBLICATION_RATE_LIMITED = "Apple Music rate-limited playlist publication (HTTP 429).";
 const PUBLICATION_CLIENT_REJECTION = /^Apple Music rejected playlist publication \(HTTP 4\d\d\)\.$/u;
+const PUBLICATION_CATALOG_MISMATCH = /^Apple playlist catalog mismatch at position \d+: expected [A-Za-z0-9._-]+, observed [A-Za-z0-9._-]+ \(observed \d+ tracks\)$/u;
 const SAFE_PUBLICATION_MESSAGES = new Set([
   FAILURE_MESSAGES.publication,
   PUBLICATION_SHARE_LINK_FAILURE,
@@ -83,7 +84,9 @@ export function sanitizeFailure(error: unknown, context: FailureContext = "backg
   if (context !== "publication") return FAILURE_MESSAGES[context];
 
   const suppliedMessage = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  if (SAFE_PUBLICATION_MESSAGES.has(suppliedMessage) || PUBLICATION_CLIENT_REJECTION.test(suppliedMessage)) return suppliedMessage;
+  if (SAFE_PUBLICATION_MESSAGES.has(suppliedMessage)
+    || PUBLICATION_CLIENT_REJECTION.test(suppliedMessage)
+    || PUBLICATION_CATALOG_MISMATCH.test(suppliedMessage)) return suppliedMessage;
 
   const value = error && typeof error === "object" ? error as { status?: unknown } : {};
   const status = typeof value.status === "number" ? value.status : null;
