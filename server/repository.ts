@@ -216,9 +216,9 @@ async function markTerminalPublicationVolumes(
   for (const volume of stranded.rows) {
     await client.query(
       `INSERT INTO orphan_playlists(id,manifest_id,publication_volume_id,apple_playlist_id,reason)
-       SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS (
+       SELECT $1,$2,$3,$4::varchar,$5 WHERE NOT EXISTS (
          SELECT 1 FROM orphan_playlists
-         WHERE publication_volume_id=$3 AND apple_playlist_id=$4 AND cleaned_at IS NULL
+         WHERE publication_volume_id=$3 AND apple_playlist_id=$4::varchar AND cleaned_at IS NULL
        )`,
       [randomUUID(), manifestId, volume.id, volume.apple_playlist_id, publicError],
     );
@@ -2490,7 +2490,7 @@ export class Repository {
       const context = failureContextForJob(current.rows[0].kind);
       const persistedError = sanitizeFailure(error, context);
       await client.query(
-        `UPDATE job_queue SET status=$3::varchar,available_at=COALESCE($4,available_at),last_error=$5,
+        `UPDATE job_queue SET status=$3::varchar,available_at=COALESCE($4::timestamptz,available_at),last_error=$5,
          completed_at=CASE WHEN $3::varchar='failed' THEN now() ELSE NULL END,lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
          WHERE id=$1 AND lease_owner=$2`,
         [jobId, workerId, retry ? "queued" : "failed", retry ? retryAt : null, persistedError],

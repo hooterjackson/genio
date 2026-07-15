@@ -38,6 +38,12 @@ describe("durable and public error sanitization", () => {
       .toBe("Apple playlist ordering diverged from the approved manifest after the final attempt.");
     expect(sanitizeFailure("provider timed out with password=private", "publication"))
       .toBe("Apple Music remained unavailable after the final attempt.");
+    expect(sanitizeFailure(Object.assign(new Error("private Apple detail"), { status: 400 }), "publication"))
+      .toBe("Apple Music rejected playlist publication (HTTP 400).");
+    expect(sanitizeFailure(Object.assign(new Error("private Apple detail"), { status: 429 }), "publication"))
+      .toBe("Apple Music rate-limited playlist publication (HTTP 429).");
+    expect(sanitizeFailure(Object.assign(new Error("private Apple detail"), { status: 503 }), "publication"))
+      .toBe("Apple Music remained unavailable after the final attempt.");
     const alreadySafe = "Apple Music remained unavailable after the final attempt.";
     expect(sanitizeFailure(sanitizeFailure(alreadySafe, "publication"), "publication")).toBe(alreadySafe);
   });

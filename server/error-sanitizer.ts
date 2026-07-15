@@ -45,12 +45,15 @@ const PUBLICATION_SHARE_LINK_FAILURE = "Apple did not expose a stable public pla
 const PUBLICATION_ORDER_FAILURE = "Apple playlist ordering diverged from the approved manifest after the final attempt.";
 const PUBLICATION_LEASE_FAILURE = "The publication worker lease expired after the final attempt.";
 const PUBLICATION_AVAILABILITY_FAILURE = "Apple Music remained unavailable after the final attempt.";
+const PUBLICATION_RATE_LIMITED = "Apple Music rate-limited playlist publication (HTTP 429).";
+const PUBLICATION_CLIENT_REJECTION = /^Apple Music rejected playlist publication \(HTTP 4\d\d\)\.$/u;
 const SAFE_PUBLICATION_MESSAGES = new Set([
   FAILURE_MESSAGES.publication,
   PUBLICATION_SHARE_LINK_FAILURE,
   PUBLICATION_ORDER_FAILURE,
   PUBLICATION_LEASE_FAILURE,
   PUBLICATION_AVAILABILITY_FAILURE,
+  PUBLICATION_RATE_LIMITED,
 ]);
 
 export function failureContextForJob(kind: string): FailureContext {
@@ -80,7 +83,15 @@ export function sanitizeFailure(error: unknown, context: FailureContext = "backg
   if (context !== "publication") return FAILURE_MESSAGES[context];
 
   const suppliedMessage = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  if (SAFE_PUBLICATION_MESSAGES.has(suppliedMessage)) return suppliedMessage;
+  if (SAFE_PUBLICATION_MESSAGES.has(suppliedMessage) || PUBLICATION_CLIENT_REJECTION.test(suppliedMessage)) return suppliedMessage;
+
+  const value = error && typeof error === "object" ? error as { status?: unknown } : {};
+  const status = typeof value.status === "number" ? value.status : null;
+  if (status === 429) return PUBLICATION_RATE_LIMITED;
+  if (status !== null && status >= 400 && status < 500) {
+    return `Apple Music rejected playlist publication (HTTP ${Math.floor(status)}).`;
+  }
+  if (status !== null && status >= 500) return PUBLICATION_AVAILABILITY_FAILURE;
 
   // Publication reconciliation has a few useful, non-sensitive outcomes. The
   // raw message is used only for classification and is never returned.
