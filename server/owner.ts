@@ -77,7 +77,13 @@ export async function createAppleDeveloperToken(): Promise<{ developerToken: str
   if (!mediaId) throw new Error("APPLE_MEDIA_ID is required");
   const ttlSeconds = 15 * 60;
   return {
-    developerToken: await createDeveloperToken({ origin: process.env.APP_ORIGIN, ttlSeconds }),
+    // This token is available only from the owner-authenticated endpoint and
+    // expires after 15 minutes. Apple documents `origin` as optional, and its
+    // web authorization service currently rejects some otherwise-valid
+    // origin-bound tokens before returning a Music User Token. Keep the
+    // general token helper origin-aware, but omit the optional restriction for
+    // this short-lived owner authorization exchange.
+    developerToken: await createDeveloperToken({ ttlSeconds }),
     mediaId,
     expiresAt: new Date(Date.now() + ttlSeconds * 1_000).toISOString(),
   };
