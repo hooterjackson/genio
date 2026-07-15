@@ -56,7 +56,7 @@ function routeCheckpoint(confirmedAt = new Date()) {
 
 function fastRepository(candidates: Candidate[], confirmedAt = new Date()): MemoryMatchingRepository {
   return new MemoryMatchingRepository(candidates, curatedBrief, new Map([
-    ["fast:route:fast_curated_v2", routeCheckpoint(confirmedAt)],
+    ["fast:route:fast_curated_v3", routeCheckpoint(confirmedAt)],
   ]));
 }
 
@@ -265,7 +265,7 @@ test("fast matching preserves 100 distinct candidates as 100 accepted Apple trac
   });
   const exactCuratedBrief = { ...curatedBrief, targetSize: { min: 100, max: 100 } };
   const repository = new MemoryMatchingRepository(candidates, exactCuratedBrief, new Map([
-    ["fast:route:fast_curated_v2", routeCheckpoint()],
+    ["fast:route:fast_curated_v3", routeCheckpoint()],
   ]));
 
   await matchResearchRun(repository, "run", "us", undefined, { fast: true });
@@ -282,7 +282,7 @@ test("fast matching preserves 100 distinct candidates as 100 accepted Apple trac
 test("matching records an explicit shortfall instead of presenting a partial requested count as complete", async () => {
   const exactTargetBrief = { ...curatedBrief, targetSize: { min: 4, max: 4 } };
   const repository = new MemoryMatchingRepository([], exactTargetBrief, new Map([
-    ["fast:route:fast_curated_v2", routeCheckpoint()],
+    ["fast:route:fast_curated_v3", routeCheckpoint()],
   ]));
   repository.matches.push(
     { candidateId: "accepted", status: "accepted", basis: "exact", score: 100, song: { ...song, id: "apple-a" }, alternatives: [] },

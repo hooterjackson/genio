@@ -196,7 +196,8 @@ function compareCatalogSong(candidate: TrackCandidateInput, song: CatalogSong): 
     // Spacing in electronic aliases is inconsistent across catalogs
     // ("Model500" vs "Model 500"). This compatibility is review-only and is
     // never sufficient for an automatic metadata match.
-    artistCompatible: artistCompactExact || artistLeadingArticleExact || artistCollaboratorSetExact,
+    artistCompatible: artistCompactExact || artistLeadingArticleExact
+      || artistCollaboratorSetExact,
     artistCompactExact,
     artistLeadingArticleExact,
     artistCollaboratorSetExact,
@@ -236,7 +237,10 @@ export function hasDirectCatalogMatch(candidate: TrackCandidateInput, songs: Cat
     if (comparison.isrcConflict || comparison.versionConflict) return false;
     const titleCompatible = comparison.titleExact || comparison.baseTitleExact
       || comparison.compactTitleExact || comparison.partStemExact;
-    return titleCompatible && (comparison.artistCompatible || comparison.albumExact);
+    // Album/title agreement alone cannot bind a recording to a different
+    // credited artist. Compilations, covers, and similarly named releases are
+    // common, so keep searching for an artist-compatible result.
+    return titleCompatible && comparison.artistCompatible;
   });
 }
 
@@ -298,7 +302,7 @@ export function rankCatalogMatches(
     const directReview = !comparison.isrcConflict && !comparison.versionConflict
       && (comparison.titleExact || comparison.baseTitleExact
         || comparison.compactTitleExact || comparison.partStemExact)
-      && (comparison.artistCompatible || comparison.albumExact);
+      && comparison.artistCompatible;
     const titleReview = !comparison.isrcConflict
       && (comparison.titleExact || comparison.baseTitleExact);
     return {

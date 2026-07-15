@@ -1062,8 +1062,8 @@ databaseDescribe("hosted backend integration", () => {
 
     const created = await create();
     expect(created).toMatchObject({ created: true, reused: false, status: "queued" });
-    const originalRoute = await repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v2") as any;
-    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v2", matchingReserveMs: 40_000 });
+    const originalRoute = await repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v3") as any;
+    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v3", matchingReserveMs: 40_000 });
     expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.confirmedAt)).toBe(120_000);
     expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.researchDeadlineAt)).toBe(40_000);
     const createdRun = await repository.getRun(created.runId);
@@ -1076,17 +1076,17 @@ databaseDescribe("hosted backend integration", () => {
       created: false,
       reused: false,
     });
-    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v2"))
+    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v3"))
       .resolves.toEqual(originalRoute);
 
     // This represents a legacy run created before route checkpoints existed.
     // An idempotent retry may repair its queue handoff, but must remain deep.
     await repository.pool.query(
-      "DELETE FROM research_checkpoints WHERE run_id=$1 AND phase='fast:route:fast_curated_v2'",
+      "DELETE FROM research_checkpoints WHERE run_id=$1 AND phase='fast:route:fast_curated_v3'",
       [created.runId],
     );
     await create();
-    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v2"))
+    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v3"))
       .resolves.toBeNull();
   });
 

@@ -23,7 +23,19 @@ const brief: PlaylistBrief = {
   ambiguities: [],
 };
 
-function synthesisResponse(support = "Berlin techno histories identify Fixture Artist — Signal One (1992) and Second Artist — Signal Two as historically influential scene recordings.") {
+function evidenceGroup(input: {
+  subject?: string;
+  relationship?: string;
+  tracks: string[];
+  containers?: string[];
+}): string {
+  return `EVIDENCE GROUP | SUBJECT: ${input.subject ?? "Berlin techno"} | RELATIONSHIP: ${input.relationship ?? "historically influential in the scene"} | TRACKS: ${input.tracks.join("; ")} | CONTAINERS: ${input.containers?.join("; ") ?? "NONE"}`;
+}
+
+function synthesisResponse(support = evidenceGroup({
+  tracks: ["Fixture Artist — Signal One", "Second Artist — Signal Two"],
+  containers: ["Fixture Artist — Album Alpha", "YEAR 1992 — VERSION original mix"],
+})) {
   const marker = "[source]";
   const text = `${support} ${marker}`;
   return {
@@ -80,7 +92,11 @@ describe("fast curated research", () => {
       selectionRank: 1,
       artist: "Fixture Artist",
       title: "Signal One",
-      evidence: [expect.objectContaining({ state: "editorial", citationSupport: expect.any(Object) })],
+      evidence: [expect.objectContaining({
+        state: "editorial",
+        relationship: "historically influential in the scene",
+        citationSupport: expect.any(Object),
+      })],
     });
     expect(result.sources.map((sourceRecord) => sourceRecord.url)).toEqual(["https://history.example/berlin-techno"]);
     expect(result.rejectedCandidateCount).toBe(3);
@@ -88,7 +104,10 @@ describe("fast curated research", () => {
 
   test("rejects model-supplied matching metadata that is absent from the citation", () => {
     const source = synthesisResponse(
-      "Berlin techno histories call Fixture Artist — Signal One from Album Alpha (1992, original mix) historically influential in the scene.",
+      evidenceGroup({
+        tracks: ["Fixture Artist — Signal One"],
+        containers: ["Fixture Artist — Album Alpha", "YEAR 1992 — VERSION original mix"],
+      }),
     );
     const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
     const rows = parseFastExtraction({
@@ -116,14 +135,18 @@ describe("fast curated research", () => {
     expect(result.rejectedCandidateCount).toBe(4);
   });
 
-  test("one cited subject mention also binds the artist when the subject is the artist", () => {
+  test("the strict subject field binds the artist when the subject is the recording artist", () => {
     const artistBrief: PlaylistBrief = {
       ...brief,
       subjectEntities: ["Michael Jackson"],
       relationship: "released",
     };
-    const support = "Michael Jackson released Billie Jean in 1982 on the album Thriller as the original studio version.";
-    expect(support.match(/Michael Jackson/gu)).toHaveLength(1);
+    const support = evidenceGroup({
+      subject: "Michael Jackson",
+      relationship: "released",
+      tracks: ["Michael Jackson — Billie Jean"],
+      containers: ["Michael Jackson — Thriller", "YEAR 1982 — VERSION original studio version"],
+    });
     const source = synthesisResponse(support);
     const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
     const rows = parseFastExtraction({
@@ -144,6 +167,29 @@ describe("fast curated research", () => {
 
     expect(result.rejectedCandidateCount).toBe(0);
     expect(result.candidates).toHaveLength(1);
+  });
+
+  test("rejects release and album titles tagged as containers instead of tracks", () => {
+    const source = synthesisResponse(evidenceGroup({
+      tracks: ["Underground Resistance — Final Frontier"],
+      containers: ["X-101 — X-101", "Surgeon — Basictonalvocabulary"],
+    }));
+    const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
+    const rows = parseFastExtraction({
+      output_text: JSON.stringify({
+        candidates: [
+          { artist: "Underground Resistance", title: "Final Frontier", album: null, releaseYear: null, versionLabel: null, relationship: "influential techno recording", citationIndexes: [0] },
+          { artist: "X-101", title: "X-101", album: null, releaseYear: null, versionLabel: null, relationship: "influential techno recording", citationIndexes: [0] },
+          { artist: "Surgeon", title: "Basictonalvocabulary", album: null, releaseYear: null, versionLabel: null, relationship: "influential techno recording", citationIndexes: [0] },
+        ],
+      }),
+    }, 120);
+
+    const result = validateFastCandidates(rows, brief, synthesis);
+
+    expect(result.candidates.map((candidate) => `${candidate.artist} — ${candidate.title}`))
+      .toEqual(["Underground Resistance — Final Frontier"]);
+    expect(result.rejectedCandidateCount).toBe(2);
   });
 
   test("bounds the extraction schema to the server candidate ceiling", () => {

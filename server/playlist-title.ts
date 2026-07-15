@@ -10,11 +10,19 @@ type PlaylistTitleContext = Pick<
 const PROMPT_LEAD = /^(?:(?:please|can you|could you|would you|i want you to|i(?:'|’)d like you to)\s+)*(?:(?:give|show|find|make|build|create|generate|assemble|compile|research|put together)\s+(?:me\s+)?)?/iu;
 const PLAYLIST_WRAPPER = /^(?:(?:a|an|the)\s+)?(?:apple music\s+)?playlist(?:\s+(?:of|with|for|containing))?\s*/iu;
 const GENERIC_OR_SCOPE_LEAD = /^(?:every|all|the\s+\d[\d,]*\s+most)\b/iu;
+const GENERIC_TITLE = /^(?:(?:the|my)\s+)?(?:(?:best|top|essential|influential|selected|complete|ultimate|definitive|favorite|favourite|greatest)\s*)?(?:music|songs?|tracks?|recordings?|playlist|essentials|favorites?|favourites?|deep cuts|greatest hits|discography)$/iu;
+const MAX_EDITORIAL_WORDS = 10;
+
+const graphemeSegmenter = typeof Intl.Segmenter === "function"
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
 
 function cleanInlineText(value: string): string {
   return value
     .normalize("NFKC")
-    .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
+    // Remove control, bidi, and invisible separator characters while retaining
+    // the zero-width joiner used inside valid emoji grapheme clusters.
+    .replace(/[\p{Cc}\p{Cf}]/gu, (character) => character === "\u200d" ? character : " ")
     .replace(/[*_`]+/gu, "")
     .replace(/\s+/gu, " ")
     .trim()
@@ -23,23 +31,41 @@ function cleanInlineText(value: string): string {
     .trim();
 }
 
-function codePoints(value: string): string[] {
-  return Array.from(value);
+function graphemes(value: string): string[] {
+  return graphemeSegmenter
+    ? Array.from(graphemeSegmenter.segment(value), (segment) => segment.segment)
+    : Array.from(value);
+}
+
+function codePointLength(value: string): number {
+  return Array.from(value).length;
 }
 
 function truncateTitle(value: string, maximum = PLAYLIST_TITLE_MAX_LENGTH): string {
-  const points = codePoints(value);
-  if (points.length <= maximum) return value;
+  if (codePointLength(value) <= maximum) return value;
   if (maximum <= 1) return "…".slice(0, maximum);
-  const raw = points.slice(0, maximum - 1).join("");
+  const budget = maximum - 1;
+  let used = 0;
+  const retained: string[] = [];
+  for (const grapheme of graphemes(value)) {
+    const size = codePointLength(grapheme);
+    if (used + size > budget) break;
+    retained.push(grapheme);
+    used += size;
+  }
+  const raw = retained.join("");
   const lastSpace = raw.lastIndexOf(" ");
   const boundary = lastSpace >= Math.floor(maximum * 0.55) ? raw.slice(0, lastSpace) : raw;
   return `${boundary.trimEnd()}…`;
 }
 
 function capitalizeFirst(value: string): string {
-  const [first, ...rest] = codePoints(value);
+  const [first, ...rest] = graphemes(value);
   return first ? `${first.toLocaleUpperCase()}${rest.join("")}` : value;
+}
+
+function wordCount(value: string): number {
+  return value ? value.split(/\s+/u).length : 0;
 }
 
 function exactTargetCount(context: PlaylistTitleContext): number | null {
@@ -51,6 +77,10 @@ function fallbackDescriptor(context: PlaylistTitleContext): string {
   const relationship = context.relationship.toLocaleLowerCase();
   if (/influen|important|landmark/u.test(relationship)) return "Influential Tracks";
   if (/essential|representative|canonical/u.test(relationship)) return "Essential Tracks";
+  if (/collab|duet|recorded together|performed together/u.test(relationship)) return "Collaborations";
+  if (/remix/u.test(relationship)) return "Remixes";
+  if (/cover|interpretation of|versions? of/u.test(relationship)) return "Covers";
+  if (/live recording|concert performance/u.test(relationship)) return "Live Recordings";
   if (/perform|played on|session|contribut/u.test(relationship)) return "Performance Credits";
   if (/produc/u.test(relationship)) return "Production Credits";
   if (/wrote|written|songwrit|compos/u.test(relationship)) return "Songwriting Credits";
@@ -63,16 +93,33 @@ function fallbackDescriptor(context: PlaylistTitleContext): string {
 }
 
 function fallbackTitle(context: PlaylistTitleContext): string {
-  const subject = cleanInlineText(context.subjectEntities[0] ?? "Music") || "Music";
+  const subjects = context.subjectEntities
+    .map(cleanInlineText)
+    .filter(Boolean)
+    .filter((subject, index, all) => all.findIndex((other) => other.toLocaleLowerCase() === subject.toLocaleLowerCase()) === index);
+  const primarySubject = subjects[0] ?? "Music";
   const count = exactTargetCount(context);
   const qualifier = `${count === null ? "" : `${count} `}${fallbackDescriptor(context)}`;
-  const complete = `${subject}: ${qualifier}`;
-  if (codePoints(complete).length <= PLAYLIST_TITLE_MAX_LENGTH) return complete;
+  // Two named subjects are material for comparisons and collaborations. Keep
+  // both when they fit; broader entity lists fall back to the primary subject.
+  const joinedSubject = subjects.length === 2 ? `${subjects[0]} + ${subjects[1]}` : primarySubject;
+  const complete = `${joinedSubject}: ${qualifier}`;
+  if (codePointLength(complete) <= PLAYLIST_TITLE_MAX_LENGTH) return complete;
+
+  const primaryComplete = `${primarySubject}: ${qualifier}`;
+  if (codePointLength(primaryComplete) <= PLAYLIST_TITLE_MAX_LENGTH) return primaryComplete;
 
   const shortQualifier = `${count === null ? "" : `${count} `}Tracks`;
   const suffix = `: ${shortQualifier}`;
-  const available = Math.max(8, PLAYLIST_TITLE_MAX_LENGTH - codePoints(suffix).length);
-  return `${truncateTitle(subject, available)}${suffix}`;
+  const available = Math.max(8, PLAYLIST_TITLE_MAX_LENGTH - codePointLength(suffix));
+  return `${truncateTitle(primarySubject, available)}${suffix}`;
+}
+
+function beginsWithRequestedCount(value: string, context: PlaylistTitleContext): boolean {
+  const expected = exactTargetCount(context);
+  if (expected === null) return false;
+  const match = value.match(/^(?:the\s+)?([\d,]+)\b/iu);
+  return match ? Number(match[1]!.replaceAll(",", "")) === expected : false;
 }
 
 /**
@@ -93,11 +140,13 @@ export function normalizePlaylistTitle(value: string, context: PlaylistTitleCont
   const editorialPromptTitle = /\bmost\s+(?:influential|important|essential|representative)\b/iu.test(candidate)
     && /influen|essential|important|representative|landmark/u.test(relationship);
   const unsuitable = !candidate
-    || /^(?:playlist|music|songs?|tracks?)$/iu.test(candidate)
+    || GENERIC_TITLE.test(candidate)
     || GENERIC_OR_SCOPE_LEAD.test(candidate)
+    || beginsWithRequestedCount(candidate, context)
     || editorialPromptTitle
-    || codePoints(candidate).length > PLAYLIST_TITLE_MAX_LENGTH
-    || (hadCommandLead && /\b(?:that|which)\b/iu.test(candidate));
+    || codePointLength(candidate) > PLAYLIST_TITLE_MAX_LENGTH
+    || wordCount(candidate) > MAX_EDITORIAL_WORDS
+    || (hadCommandLead && /\b(?:that|which|whose|where)\b/iu.test(candidate));
 
   return truncateTitle(unsuitable ? fallbackTitle(context) : candidate);
 }
@@ -108,7 +157,7 @@ export function appendPlaylistTitleSuffix(title: string, suffix: string): string
   const cleanSuffix = truncateTitle(cleanInlineText(suffix), PLAYLIST_TITLE_MAX_LENGTH - 2);
   if (!cleanSuffix) return truncateTitle(cleanTitle);
   const suffixText = ` ${cleanSuffix}`;
-  const suffixLength = codePoints(suffixText).length;
+  const suffixLength = codePointLength(suffixText);
   const available = Math.max(1, PLAYLIST_TITLE_MAX_LENGTH - suffixLength);
   return `${truncateTitle(cleanTitle, available)}${suffixText}`;
 }

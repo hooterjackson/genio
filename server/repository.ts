@@ -1562,11 +1562,17 @@ export class Repository {
       unmatchedCount: Number(totals.unmatched_count),
       retryableCount: Number(totals.retryable_count),
       matchingComplete: Boolean(totals.matching_complete),
-      requestedTrackCount: brief.mode === "curated"
-        && brief.targetSize
-        && brief.targetSize.min === brief.targetSize.max
-        ? brief.targetSize.max
-        : null,
+      requestedTrackCount: (() => {
+        const minimum = Number(brief.targetSize?.min);
+        const maximum = Number(brief.targetSize?.max);
+        return brief.mode === "curated"
+          && brief.targetSize
+          && Number.isInteger(minimum)
+          && Number.isInteger(maximum)
+          && minimum === maximum
+          ? maximum
+          : null;
+      })(),
     };
   }
 

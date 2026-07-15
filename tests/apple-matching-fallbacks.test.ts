@@ -69,12 +69,27 @@ test("Apple query ladder goes from specific metadata to cautious title-only sear
     "In the Marketplace (Interlude) Earth, Wind & Fire",
     "Earth, Wind & Fire In the Marketplace (Interlude)",
     "In the Marketplace (Interlude) All 'N All",
+    "All 'N All In the Marketplace (Interlude)",
     "in the marketplace Earth, Wind & Fire",
     "Earth, Wind & Fire in the marketplace",
     "In the Marketplace (Interlude)",
     "in the marketplace",
   ]);
   expect(normalizeMusicBaseTitle("The Gentle Rain (Chuva Delicada)")).toBe("the gentle rain");
+});
+
+test("Apple query ladder keeps collaboration fallbacks bound to the full credit or album", () => {
+  expect(catalogSearchQueries(candidate({
+    artist: "Paulinho da Costa & Joe Pass",
+    title: "Corcovado",
+    album: "Tudo Bem!",
+  }))).toEqual([
+    "Corcovado Paulinho da Costa & Joe Pass",
+    "Paulinho da Costa & Joe Pass Corcovado",
+    "Corcovado Tudo Bem!",
+    "Tudo Bem! Corcovado",
+    "Corcovado",
+  ]);
 });
 
 test("a direct artist/title/album result stops the query ladder after one request", async () => {
@@ -114,6 +129,7 @@ test("a unique exact Apple title with the wrong artist remains an unselected alt
     "Corcovado Paulinho da Costa",
     "Paulinho da Costa Corcovado",
     "Corcovado Agora",
+    "Agora Corcovado",
     "Corcovado",
   ]);
   expect(result).toMatchObject({
@@ -122,6 +138,35 @@ test("a unique exact Apple title with the wrong artist remains an unselected alt
   });
   expect(result.alternatives).toEqual([appleSong]);
   expect(result.basis).toContain("unresolved artist or album attribution");
+});
+
+test("a wrong artist on the same album cannot stop the ladder before a compatible artist result", async () => {
+  const wrongArtist: CatalogSong = {
+    id: "apple-wrong-artist",
+    name: "Test Song",
+    artistName: "Unrelated Artist",
+    albumName: "Test Album",
+  };
+  const compatibleArtist: CatalogSong = {
+    ...exactSong,
+    id: "apple-compatible-artist",
+  };
+  vi.mocked(searchAppleCatalog).mockImplementation(async (_storefront, query) => {
+    if (query === "Test Song Test Artist") return [wrongArtist];
+    if (query === "Test Artist Test Song") return [compatibleArtist];
+    return [];
+  });
+  const input = candidate();
+
+  const songs = await lookupCandidateSongs(input, "us");
+  const result = rankCatalogMatches(input.id, input, songs);
+
+  expect(searchAppleCatalog).toHaveBeenCalledTimes(2);
+  expect(result).toMatchObject({
+    status: "review",
+    song: { id: "apple-compatible-artist", artistName: "Test Artist" },
+  });
+  expect(result.alternatives).toContainEqual(expect.objectContaining({ id: "apple-wrong-artist" }));
 });
 
 test("a leading article artist variant is selectable for review but not auto-accepted", () => {
@@ -158,6 +203,38 @@ test("an order-insensitive collaborator set is selectable for review but not aut
     song: { id: "apple-corcovado-duo", artistName: "Joe Pass & Paulinho Da Costa" },
   });
   expect(result.basis).toContain("order-insensitive collaborator set");
+});
+
+test("a catalog credit that adds or omits one collaborator remains alternatives-only", () => {
+  const addedProject = candidate({ artist: "Juan Atkins", title: "Skyway", album: null });
+  const addedProjectResult = rankCatalogMatches(addedProject.id, addedProject, [{
+    id: "apple-skyway",
+    name: "Skyway",
+    artistName: "Infiniti & Juan Atkins",
+    albumName: "The Remixes, Pt. 2",
+  }]);
+  expect(addedProjectResult).toMatchObject({
+    status: "review",
+    song: null,
+  });
+  expect(addedProjectResult.alternatives).toEqual([expect.objectContaining({ id: "apple-skyway" })]);
+
+  const omittedCollaborator = candidate({
+    artist: "Paulinho da Costa & Joe Pass",
+    title: "Corcovado",
+    album: null,
+  });
+  const omittedCollaboratorResult = rankCatalogMatches(omittedCollaborator.id, omittedCollaborator, [{
+    id: "apple-corcovado-pass",
+    name: "Corcovado",
+    artistName: "Joe Pass",
+    albumName: "Tudo Bem!",
+  }]);
+  expect(omittedCollaboratorResult).toMatchObject({
+    status: "review",
+    song: null,
+  });
+  expect(omittedCollaboratorResult.alternatives).toEqual([expect.objectContaining({ id: "apple-corcovado-pass" })]);
 });
 
 test("a wrong-artist unique title can never become the primary Apple selection", () => {

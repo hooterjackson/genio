@@ -86,8 +86,8 @@ async function finalizeMatchingOutcome(
 ): Promise<void> {
   const matches = await repository.listMatches(runId);
   const safePrimaryCount = matches.filter(isSafePrimaryMatch).length;
-  const configuredMinimum = brief.targetSize?.min;
-  const targetMinimum = typeof configuredMinimum === "number" && Number.isFinite(configuredMinimum)
+  const configuredMinimum = Number(brief.targetSize?.min);
+  const targetMinimum = brief.targetSize && Number.isFinite(configuredMinimum)
     ? Math.max(0, Math.floor(configuredMinimum))
     : null;
   const shortfall = targetMinimum === null ? 0 : Math.max(0, targetMinimum - safePrimaryCount);
@@ -159,7 +159,14 @@ export function catalogSearchQueries(candidate: Pick<Candidate, "artist" | "titl
   // the fast route before its tail was searched.
   add(title, artist);
   add(artist, title);
-  if (album) add(title, album);
+  // Keep the next fallback bound to a release container. Splitting a
+  // collaboration into individual member searches can surface aliases,
+  // side-projects, and unrelated member recordings; those are not safe
+  // recording identity evidence.
+  if (album) {
+    add(title, album);
+    add(album, title);
+  }
   if (baseTitle && baseTitle !== normalizeMusicText(title)) {
     add(baseTitle, artist);
     add(artist, baseTitle);
@@ -177,7 +184,7 @@ export async function lookupCandidateSongs(
   let songs = candidate.isrc ? await lookupAppleCatalogByIsrc(storefront, candidate.isrc, signal) : [];
   if (hasDirectCatalogMatch(candidate, songs)) return songs;
 
-  const maximumQueries = boundedEnvironmentInteger("APPLE_MATCH_MAX_QUERIES", 7, 1, 7);
+  const maximumQueries = boundedEnvironmentInteger("APPLE_MATCH_MAX_QUERIES", 8, 1, 8);
   for (const query of catalogSearchQueries(candidate).slice(0, maximumQueries)) {
     signal?.throwIfAborted();
     const results = await searchAppleCatalog(storefront, query, signal);

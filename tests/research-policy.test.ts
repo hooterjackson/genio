@@ -33,7 +33,7 @@ describe("research execution policy", () => {
     const policy = researchExecutionPolicy(brief("curated"), {});
     expect(policy).toMatchObject({
       kind: "fast_curated",
-      version: "fast_curated_v2",
+      version: "fast_curated_v3",
       model: "gpt-5.6-luna",
       runDeadlineMs: 120_000,
       matchingReserveMs: 40_000,
@@ -103,7 +103,7 @@ describe("research execution policy", () => {
     expect(JSON.parse(researchPolicyFingerprint(brief("curated"), {}))).toEqual({
       fingerprintVersion: 2,
       kind: "fast_curated",
-      version: "fast_curated_v2",
+      version: "fast_curated_v3",
       model: "gpt-5.6-luna",
       runDeadlineMs: 120_000,
       matchingReserveMs: 40_000,

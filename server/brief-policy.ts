@@ -32,8 +32,8 @@ export function estimateResearchCostRange(brief: PlaylistBrief): ResearchCostEst
   };
 
   if (brief.mode === "curated") {
-    // Curated requests use the fixed fast profile: two bounded Luna research
-    // shards, low-context hosted search, and no exhaustive frontier passes.
+    // Curated requests use the fixed fast profile: bounded Luna research
+    // passes, low-context hosted search, and no exhaustive frontier passes.
     // Keep this estimate aligned with researchExecutionPolicy rather than the
     // semantic complexity table used by open-ended deep research.
     add("fast cited editorial research", 0.15, 0.5);

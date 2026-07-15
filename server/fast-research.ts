@@ -4,7 +4,7 @@ import { citationTextIsLocalToClaim } from "./citation-attestation.ts";
 import { extractOutputText } from "./openai.ts";
 import { assertPublicHttpsUrl, compactEvidenceNote } from "./security.ts";
 
-export const FAST_RESEARCH_CHECKPOINT_VERSION = "fast_curated_v2";
+export const FAST_RESEARCH_CHECKPOINT_VERSION = "fast_curated_v3";
 
 export interface FastSynthesisCheckpoint {
   version: typeof FAST_RESEARCH_CHECKPOINT_VERSION;
@@ -83,6 +83,70 @@ function evidenceContainsExactPhrase(excerpt: string, phrase: string): boolean {
   const normalizedPhrase = normalizeEvidencePhrase(phrase);
   return Boolean(normalizedExcerpt && normalizedPhrase
     && ` ${normalizedExcerpt} `.includes(` ${normalizedPhrase} `));
+}
+
+interface FastEvidencePair {
+  artist: string;
+  title: string;
+}
+
+interface FastEvidenceGroup {
+  subjectEntity: string;
+  relationship: string;
+  tracks: FastEvidencePair[];
+  containers: FastEvidencePair[];
+}
+
+function evidencePairs(value: string): FastEvidencePair[] {
+  return value.split(";").map((entry): FastEvidencePair | null => {
+    // The synthesis contract requires an em dash surrounded by spaces. An en
+    // dash is accepted defensively because it cannot be confused with a
+    // hyphen inside an artist or recording title.
+    const match = entry.trim().match(/^(.+?)\s+[—–]\s+(.+?)\s*$/u);
+    if (!match) return null;
+    const artist = safeText(match[1], 240);
+    const title = safeText(match[2], 240);
+    return artist && title ? { artist, title } : null;
+  }).filter((pair: FastEvidencePair | null): pair is FastEvidencePair => pair !== null);
+}
+
+function withoutTrailingCitationMarkers(value: string): string {
+  let current = value.trim();
+  let previous = "";
+  while (current !== previous) {
+    previous = current;
+    current = current.replace(/\s*(?:\[[^\]]+\]|【[^】]+】|cite[^]*)\s*$/u, "").trim();
+  }
+  return current;
+}
+
+/**
+ * Parse the deliberately rigid, one-line synthesis protocol. Keeping tracks
+ * and source containers in separate tagged fields prevents an extractor from
+ * turning a cited album, EP, compilation, or release title into a recording.
+ */
+function parseFastEvidenceGroup(excerpt: string): FastEvidenceGroup | null {
+  const match = excerpt.match(
+    /^\s*EVIDENCE GROUP\s*\|\s*SUBJECT:\s*([^|]+?)\s*\|\s*RELATIONSHIP:\s*([^|]+?)\s*\|\s*TRACKS:\s*([^|]+?)\s*\|\s*CONTAINERS:\s*(.+?)\s*$/iu,
+  );
+  if (!match) return null;
+  const subjectEntity = safeText(match[1], 240);
+  const relationship = safeText(match[2], 240);
+  const tracks = evidencePairs(match[3] ?? "");
+  const containers = evidencePairs(withoutTrailingCitationMarkers(match[4] ?? ""));
+  if (!subjectEntity || !relationship || tracks.length === 0) return null;
+  return { subjectEntity, relationship, tracks, containers };
+}
+
+function evidencePairEquals(left: FastEvidencePair, right: FastEvidencePair): boolean {
+  return normalizeEvidencePhrase(left.artist) === normalizeEvidencePhrase(right.artist)
+    && normalizeEvidencePhrase(left.title) === normalizeEvidencePhrase(right.title);
+}
+
+function groupExplicitlySupportsTrack(group: FastEvidenceGroup, row: RawFastCandidate): boolean {
+  const candidate = { artist: row.artist, title: row.title };
+  return group.tracks.some((pair) => evidencePairEquals(pair, candidate))
+    && !group.containers.some((pair) => evidencePairEquals(pair, candidate));
 }
 
 /**
@@ -189,12 +253,21 @@ export function validateFastCandidates(
     for (const index of row.citationIndexes) {
       const attestation = synthesis.citationAttestations[index];
       if (!attestation || !Object.hasOwn(synthesis.sourceTitles, attestation.sourceUrl)) continue;
-      const subjectEntity = brief.subjectEntities.find((entity) => citationTextIsLocalToClaim(
-        attestation.excerpt,
-        row.title,
-        entity,
-        row.relationship,
-      ) && citationSupportsExtractedMetadata(attestation.excerpt, row, entity));
+      const evidenceGroup = parseFastEvidenceGroup(attestation.excerpt);
+      if (!evidenceGroup || !groupExplicitlySupportsTrack(evidenceGroup, row)) continue;
+      const subjectEntity = brief.subjectEntities.find((entity) => (
+        normalizeEvidencePhrase(entity) === normalizeEvidencePhrase(evidenceGroup.subjectEntity)
+        && citationTextIsLocalToClaim(
+          attestation.excerpt,
+          row.title,
+          entity,
+          // The provider-attested EVIDENCE GROUP owns the source wording.
+          // Recover it deterministically instead of trusting a paraphrase in
+          // the separate extraction response.
+          evidenceGroup.relationship,
+        )
+        && citationSupportsExtractedMetadata(attestation.excerpt, row, entity)
+      ));
       if (!subjectEntity) continue;
       sourcesByUrl.set(attestation.sourceUrl, {
         url: attestation.sourceUrl,
@@ -209,7 +282,7 @@ export function validateFastCandidates(
         supportScope: "editorial",
         subjectEntity,
         subjectRelationship: brief.relationship,
-        relationship: row.relationship,
+        relationship: evidenceGroup.relationship,
         note: compactEvidenceNote("Track appears in a cited editorial evidence group from the fast research pass."),
         sourceClass: "web",
         citationSupport: {

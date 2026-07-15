@@ -52,6 +52,76 @@ describe("playlist title normalization", () => {
       .toBe("Berlin Techno Foundations");
   });
 
+  test("rejects an under-limit request restatement that starts with the requested count", () => {
+    const brief = context({
+      subjectEntities: ["Paulinho da Costa"],
+      targetSize: { min: 200, max: 200 },
+      relationship: "recordings on which Paulinho da Costa performed",
+    });
+
+    expect(normalizePlaylistTitle(
+      "200 Songs Paulinho da Costa Performed On Across Six Decades",
+      brief,
+    )).toBe("Paulinho da Costa: 200 Performance Credits");
+  });
+
+  test("rejects generic model titles while preserving specific editorial titles", () => {
+    expect(normalizePlaylistTitle("The Essentials", context()))
+      .toBe("Berlin techno: 50 Influential Tracks");
+    expect(normalizePlaylistTitle("Machine City After Dark", context()))
+      .toBe("Machine City After Dark");
+  });
+
+  test("uses both subjects for a concise collaboration fallback", () => {
+    const brief = context({
+      subjectEntities: ["Beyoncé", "JAY-Z"],
+      relationship: "collaborations recorded together",
+      targetSize: { min: 25, max: 25 },
+    });
+
+    expect(normalizePlaylistTitle(
+      "Please compile all 25 songs where Beyoncé and JAY-Z recorded together",
+      brief,
+    )).toBe("Beyoncé + JAY-Z: 25 Collaborations");
+  });
+
+  test("preserves Unicode, diacritics, and joined emoji without splitting graphemes", () => {
+    const brief = context({
+      subjectEntities: ["Gênio brasileiro 🎧‍🔥"],
+      relationship: "historically influential recordings",
+      targetSize: { min: 50, max: 50 },
+    });
+    const title = normalizePlaylistTitle(
+      "Give me the 50 most influential canções connected to this very detailed Brazilian music history request",
+      brief,
+    );
+
+    expect(title).toBe("Gênio brasileiro 🎧‍🔥: 50 Influential Tracks");
+    expect(title).toContain("ê");
+    expect(title).toContain("🎧‍🔥");
+
+    const suffixedEmojiTitle = appendPlaylistTitleSuffix("🎧‍🔥".repeat(30), "[1/2]");
+    expect(Array.from(suffixedEmojiTitle).length).toBeLessThanOrEqual(PLAYLIST_TITLE_MAX_LENGTH);
+    expect(suffixedEmojiTitle).not.toMatch(/‍…/u);
+    expect(suffixedEmojiTitle.endsWith("[1/2]")).toBe(true);
+  });
+
+  test("normalization is deterministic and never mutates the detailed brief", () => {
+    const brief = context({
+      description: "Keep this complete, detailed scope for the research report and Apple description.",
+      subjectEntities: ["Late-night dream pop"],
+      relationship: "fits the requested mood and listening arc",
+      targetSize: { min: 75, max: 75 },
+    });
+    const before = structuredClone(brief);
+    const proposed = "Create a playlist of dream pop that gradually becomes stranger and quieter toward dawn";
+
+    expect(normalizePlaylistTitle(proposed, brief))
+      .toBe(normalizePlaylistTitle(proposed, brief));
+    expect(brief).toEqual(before);
+    expect(brief.description).toBe(before.description);
+  });
+
   test("falls back from a long natural-language request without losing the subject or count", () => {
     const brief = context({
       subjectEntities: ["Late-night dream pop"],

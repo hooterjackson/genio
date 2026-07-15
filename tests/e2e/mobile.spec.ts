@@ -826,6 +826,10 @@ test("an unresolved Apple shortfall cannot silently generate fewer tracks than r
   const shortfallRun = {
     ...run,
     id: "run-catalog-shortfall",
+    brief: {
+      ...curatedBrief,
+      targetSize: { min: 50, max: 50 },
+    },
     status: "visitor_review",
     phase: "catalog_matching_shortfall",
     error: "Apple Music matching found 28 safe catalog matches for the required 50; 22 remain unresolved.",
@@ -871,7 +875,8 @@ test("an unresolved Apple shortfall cannot silently generate fewer tracks than r
         unmatchedCount: 22,
         retryableCount: 0,
         matchingComplete: true,
-        requestedTrackCount: 50,
+        // Exercise the browser-side fallback used while an older gateway is
+        // still serving a response that predates requestedTrackCount.
       }),
     });
   });

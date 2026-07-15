@@ -375,6 +375,15 @@ function normalizeTrackSelection(payload: unknown, requestedPage: number): Track
   };
 }
 
+function exactRequestedTrackCount(brief: PlaylistBrief): number | null {
+  if (brief.mode !== "curated" || !brief.targetSize) return null;
+  const minimum = Number(brief.targetSize.min);
+  const maximum = Number(brief.targetSize.max);
+  return Number.isInteger(minimum) && Number.isInteger(maximum) && minimum === maximum
+    ? Math.max(1, maximum)
+    : null;
+}
+
 function trackChoices(item: SelectableTrack, limit = 12): CatalogSong[] {
   const seen = new Set<string>();
   const choices: CatalogSong[] = [];
@@ -1488,13 +1497,22 @@ export function PlaylistBuilder() {
     tracksRequestRef.current = controller;
     setBusy("tracks");
     try {
-      const first = normalizeTrackSelection(
+      const normalizedFirst = normalizeTrackSelection(
         await api<unknown>(
           "/api/v1/runs/" + encodeURIComponent(runId) + "/tracks?page=1&pageSize=500",
           { signal: controller.signal },
         ),
         1,
       );
+      // The run brief is already confirmed and durable. Use it as the final
+      // guard when an older gateway or stringly JSON response omits the exact
+      // requested count, so the browser can never offer a silent partial
+      // playlist while the server rejects it.
+      const first: TrackSelection = {
+        ...normalizedFirst,
+        requestedTrackCount: normalizedFirst.requestedTrackCount
+          ?? exactRequestedTrackCount(run.brief),
+      };
       const pagesLoaded = [first];
       for (let start = 2; start <= first.totalPages; start += 5) {
         const pages = await Promise.all(

@@ -5,7 +5,7 @@ type Environment = Record<string, string | undefined>;
 
 export interface FastResearchPolicy {
   kind: "fast_curated";
-  version: "fast_curated_v2";
+  version: "fast_curated_v3";
   model: string;
   runDeadlineMs: number;
   matchingReserveMs: number;
@@ -113,7 +113,7 @@ export function createFastRouteCheckpoint(
 
 export function parseFastRouteCheckpoint(
   value: unknown,
-  expectedVersion: FastResearchPolicy["version"] = "fast_curated_v2",
+  expectedVersion: FastResearchPolicy["version"] = "fast_curated_v3",
 ): FastRouteCheckpoint | null {
   if (!value || typeof value !== "object") return null;
   const row = value as Partial<FastRouteCheckpoint>;
@@ -181,7 +181,7 @@ export function researchExecutionPolicy(
 
   return {
     kind: "fast_curated",
-    version: "fast_curated_v2",
+    version: "fast_curated_v3",
     model: fastResearchModel(environment),
     // One immutable wall-clock budget begins when the run is confirmed. The
     // research cutoff leaves a fixed tail for Apple catalog matching; phases
