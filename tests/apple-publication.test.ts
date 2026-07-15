@@ -334,9 +334,6 @@ test("Apple authorization validation updates only the token generation that was 
     saveAppleAuthorization: vi.fn(async () => undefined),
     updateAppleAuthorizationStatus: vi.fn(async () => undefined),
     updateAppleAuthorizationValidation: vi.fn(async () => false),
-    listWaitingPublicationManifestIds: vi.fn(async () => ["manifest-stale"]),
-    getManifestById: vi.fn(async () => ({ runId: "run-stale" })),
-    enqueueJob: vi.fn(async () => ({ created: true })),
   };
 
   await processAppleAuthorizationJob(repository, {
@@ -349,9 +346,6 @@ test("Apple authorization validation updates only the token generation that was 
     status: "valid",
     lastError: null,
   });
-  expect(repository.listWaitingPublicationManifestIds).not.toHaveBeenCalled();
-  expect(repository.enqueueJob).not.toHaveBeenCalled();
-
   repository.updateAppleAuthorizationValidation.mockResolvedValue(true);
   await processAppleAuthorizationJob(repository, { authorizationGeneration: "stale-generation" });
   expect(repository.updateAppleAuthorizationValidation).toHaveBeenCalledTimes(1);
@@ -364,22 +358,20 @@ test("waiting publication recovery is independent, generation-scoped, and requir
   };
   const repository = {
     getAppleAuthorization: vi.fn(async () => authorization),
-    listWaitingPublicationManifestIds: vi.fn(async () => ["manifest-waiting"]),
-    getManifestById: vi.fn(async () => ({ runId: "run-waiting" })),
-    enqueueJob: vi.fn(async () => ({ created: true })),
+    listWaitingPublicationManifests: vi.fn(async () => [{ manifestId: "manifest-waiting", runId: "run-waiting" }]),
+    enqueueWaitingPublicationRecovery: vi.fn(async () => true),
   };
 
   await expect(recoverWaitingApplePublicationJobs(repository)).resolves.toBe(1);
-  expect(repository.enqueueJob).toHaveBeenCalledWith({
-    kind: "publication",
+  expect(repository.enqueueWaitingPublicationRecovery).toHaveBeenCalledWith({
     runId: "run-waiting",
-    payload: { manifestId: "manifest-waiting" },
-    dedupeKey: `publication:manifest-waiting:reauth:${appleAuthorizationGeneration(authorization)}`,
+    manifestId: "manifest-waiting",
+    dedupeKey: `publication:manifest-waiting:reauth:${appleAuthorizationGeneration(authorization)}:legacy`,
   });
 
   repository.getAppleAuthorization.mockResolvedValue({ ...authorization, status: "validation_failed" });
   await expect(recoverWaitingApplePublicationJobs(repository)).resolves.toBe(0);
-  expect(repository.enqueueJob).toHaveBeenCalledTimes(1);
+  expect(repository.enqueueWaitingPublicationRecovery).toHaveBeenCalledTimes(1);
 });
 
 test("the live smoke CLI requires both explicit test naming and write confirmation", () => {
@@ -561,6 +553,7 @@ function durablePublicationHarness(input: {
       storefront: update.storefront ?? authorization.storefront,
       status: update.status,
       lastError: update.lastError ?? null,
+      lastValidatedAt: update.status === "valid" ? new Date() : authorization.lastValidatedAt,
     };
     return true;
   });
@@ -595,9 +588,12 @@ function durablePublicationHarness(input: {
   repository.getPublicationCompleteness.mockResolvedValue({ omittedCandidateCount: 0, unresolvedCoverageCount: 0 });
   repository.markPlaylistOrphan.mockImplementation(async () => `orphan-${repository.markPlaylistOrphan.mock.calls.length}`);
   repository.enqueueNotification.mockImplementation(async () => `notification-${repository.enqueueNotification.mock.calls.length}`);
-  repository.listWaitingPublicationManifestIds.mockImplementation(async () => (
-    run?.status === "waiting_for_apple_authorization" && activeManifest ? [activeManifest.id] : []
+  repository.listWaitingPublicationManifests.mockImplementation(async () => (
+    run?.status === "waiting_for_apple_authorization" && activeManifest
+      ? [{ manifestId: activeManifest.id, runId: activeManifest.runId }]
+      : []
   ));
+  repository.enqueueWaitingPublicationRecovery.mockResolvedValue(true);
   repository.enqueueJob.mockResolvedValue({ created: true });
 
   return {
@@ -913,11 +909,12 @@ test("a production Apple 403 preserves the manifest and resumes it after a repla
   });
   expect(harness.authorization).toMatchObject({ status: "valid", storefront: "us" });
   await expect(recoverWaitingApplePublicationJobs(harness.repository)).resolves.toBe(1);
-  expect(harness.repository.enqueueJob).toHaveBeenCalledWith({
-    kind: "publication",
+  const validationEpoch = harness.authorization?.lastValidatedAt?.getTime().toString(36);
+  expect(validationEpoch).toBeTruthy();
+  expect(harness.repository.enqueueWaitingPublicationRecovery).toHaveBeenCalledWith({
     runId: productionManifest.runId,
-    payload: { manifestId: productionManifest.id },
-    dedupeKey: `publication:${productionManifest.id}:reauth:${appleAuthorizationGeneration(replacementAuthorization)}`,
+    manifestId: productionManifest.id,
+    dedupeKey: `publication:${productionManifest.id}:reauth:${appleAuthorizationGeneration(replacementAuthorization)}:${validationEpoch}`,
   });
 
   await expect(publishManifest(harness.repository, productionManifest.id)).resolves.toMatchObject({

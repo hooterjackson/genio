@@ -2096,14 +2096,36 @@ export class Repository {
     }));
   }
 
-  async listWaitingPublicationManifestIds(): Promise<string[]> {
-    const result = await this.pool.query<{ id: string }>(
-      `SELECT DISTINCT ON (m.run_id) m.id FROM manifests m
+  async listWaitingPublicationManifests(): Promise<Array<{ manifestId: string; runId: string }>> {
+    const result = await this.pool.query<{ id: string; run_id: string }>(
+      `SELECT DISTINCT ON (m.run_id) m.id,m.run_id FROM manifests m
        JOIN research_runs r ON r.id=m.run_id
        WHERE r.status='waiting_for_apple_authorization' AND r.deleted_at IS NULL
        ORDER BY m.run_id,m.created_at DESC`,
     );
-    return result.rows.map((row) => row.id);
+    return result.rows.map((row) => ({ manifestId: row.id, runId: row.run_id }));
+  }
+
+  /**
+   * Queue one publication recovery for this exact authorization-validation
+   * epoch. Completed, cancelled, and terminally failed recoveries are never
+   * revived by a heartbeat; a later successful reauthorization uses a new
+   * epoch and therefore a new durable job.
+   */
+  async enqueueWaitingPublicationRecovery(input: {
+    manifestId: string;
+    runId: string;
+    dedupeKey: string;
+  }): Promise<boolean> {
+    const result = await this.pool.query<{ id: string }>(
+      `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
+       SELECT $1,m.run_id,'publication',$4,$5,3
+       FROM manifests m JOIN research_runs r ON r.id=m.run_id
+       WHERE m.id=$2 AND m.run_id=$3 AND r.status='waiting_for_apple_authorization' AND r.deleted_at IS NULL
+       ON CONFLICT(kind,dedupe_key) DO NOTHING RETURNING id`,
+      [randomUUID(), input.manifestId, input.runId, input.dedupeKey.slice(0, 160), { manifestId: input.manifestId }],
+    );
+    return Boolean(result.rowCount);
   }
 
   /**

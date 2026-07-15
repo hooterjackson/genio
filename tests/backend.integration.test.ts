@@ -2150,6 +2150,36 @@ databaseDescribe("hosted backend integration", () => {
     expect(persisted.rows[0]).toEqual({ jobs: 0, notifications: 1, rate_events: 0 });
   });
 
+  test("Apple publication recovery never heartbeat-revives a terminal job and a new validation epoch can resume it", async () => {
+    const runId = await repository.createRun("Apple publication recovery epoch", brief, 0, 1);
+    const manifestId = randomUUID();
+    await repository.pool.query(
+      "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Authorization recovery','Test manifest',$3)",
+      [manifestId, runId, "7".repeat(64)],
+    );
+    await repository.updateRun(runId, { status: "waiting_for_apple_authorization", phase: "apple_reauthorization" });
+
+    await expect(repository.listWaitingPublicationManifests()).resolves.toEqual([{ manifestId, runId }]);
+    const firstKey = `publication:${manifestId}:reauth:generation:epoch-one`;
+    await expect(repository.enqueueWaitingPublicationRecovery({ manifestId, runId, dedupeKey: firstKey })).resolves.toBe(true);
+    await repository.pool.query(
+      "UPDATE job_queue SET status='failed',attempts=max_attempts,completed_at=now() WHERE kind='publication' AND dedupe_key=$1",
+      [firstKey],
+    );
+
+    await expect(repository.enqueueWaitingPublicationRecovery({ manifestId, runId, dedupeKey: firstKey })).resolves.toBe(false);
+    const secondKey = `publication:${manifestId}:reauth:generation:epoch-two`;
+    await expect(repository.enqueueWaitingPublicationRecovery({ manifestId, runId, dedupeKey: secondKey })).resolves.toBe(true);
+    const jobs = await repository.pool.query<{ dedupe_key: string; status: string }>(
+      "SELECT dedupe_key,status FROM job_queue WHERE kind='publication' AND run_id=$1 ORDER BY created_at",
+      [runId],
+    );
+    expect(jobs.rows).toEqual([
+      { dedupe_key: firstKey, status: "failed" },
+      { dedupe_key: secondKey, status: "queued" },
+    ]);
+  });
+
   test("terminal Apple validation failures update only the current durable authorization", async () => {
     const authorization = {
       ciphertext: "encrypted-current-authorization",

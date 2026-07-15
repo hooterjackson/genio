@@ -147,8 +147,8 @@ test("worker heartbeat reconciles an unverified Apple authorization saved after 
 
 test("worker heartbeat independently resumes publications after Apple authorization becomes valid", async () => {
   const harness = runnerHarness();
-  harness.repository.listWaitingPublicationManifestIds.mockResolvedValue(["manifest-waiting"]);
-  harness.repository.getManifestById.mockResolvedValue({ runId: "run-waiting" });
+  harness.repository.listWaitingPublicationManifests.mockResolvedValue([{ manifestId: "manifest-waiting", runId: "run-waiting" }]);
+  harness.repository.enqueueWaitingPublicationRecovery.mockResolvedValue(true);
   harness.repository.leaseNextJob.mockResolvedValue(null);
   const runner = new WorkerRunner(harness.repository, {
     concurrency: 1,
@@ -158,18 +158,39 @@ test("worker heartbeat independently resumes publications after Apple authorizat
   });
   const running = runner.run();
   try {
-    await waitFor(() => harness.repository.enqueueJob.mock.calls.some(
-      ([input]: [{ kind?: string }]) => input.kind === "publication",
-    ));
-    expect(harness.repository.enqueueJob).toHaveBeenCalledWith({
-      kind: "publication",
+    await waitFor(() => harness.repository.enqueueWaitingPublicationRecovery.mock.calls.length > 0);
+    expect(harness.repository.enqueueWaitingPublicationRecovery).toHaveBeenCalledWith({
       runId: "run-waiting",
-      payload: { manifestId: "manifest-waiting" },
-      dedupeKey: `publication:manifest-waiting:reauth:${appleAuthorizationGeneration(validAuthorization)}`,
+      manifestId: "manifest-waiting",
+      dedupeKey: `publication:manifest-waiting:reauth:${appleAuthorizationGeneration(validAuthorization)}:legacy`,
     });
   } finally {
     await runner.stop();
     await running;
+  }
+});
+
+test("a publication-recovery reconciliation error cannot prevent worker startup", async () => {
+  const harness = runnerHarness();
+  harness.repository.listWaitingPublicationManifests
+    .mockRejectedValueOnce(new Error("private transient database failure"))
+    .mockResolvedValue([]);
+  harness.repository.leaseNextJob.mockResolvedValue(null);
+  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    heartbeatMs: 10,
+    controlIntervalMs: 60_000,
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.leaseNextJob.mock.calls.length > 0);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("publication recovery reconciliation failed"));
+  } finally {
+    await runner.stop();
+    await running;
+    stderr.mockRestore();
   }
 });
 
@@ -276,7 +297,8 @@ function runnerHarness(): RunnerHarness {
   repository.renewJobLease.mockResolvedValue(true);
   repository.getSetting.mockImplementation(async (key: string) => key === "research_paused" && researchPaused ? "true" : "false");
   repository.getAppleAuthorization.mockResolvedValue(validAuthorization);
-  repository.listWaitingPublicationManifestIds.mockResolvedValue([]);
+  repository.listWaitingPublicationManifests.mockResolvedValue([]);
+  repository.enqueueWaitingPublicationRecovery.mockResolvedValue(false);
   repository.getRunControlState.mockImplementation(async () => run);
   repository.deferJob.mockResolvedValue(undefined);
   repository.cancelLeasedJob.mockResolvedValue(undefined);

@@ -487,14 +487,12 @@ export interface AppleAuthorizationJobRepository extends AppleAuthorizationStore
 
 export interface ApplePublicationRecoveryRepository {
   getAppleAuthorization(): Promise<AppleAuthorizationRecord | null>;
-  listWaitingPublicationManifestIds(): Promise<string[]>;
-  getManifestById(manifestId: string): Promise<{ runId: string } | null>;
-  enqueueJob(input: {
-    kind: string;
-    runId?: string | null;
-    payload?: Record<string, unknown>;
-    dedupeKey?: string;
-  }): Promise<unknown>;
+  listWaitingPublicationManifests(): Promise<Array<{ manifestId: string; runId: string }>>;
+  enqueueWaitingPublicationRecovery(input: {
+    manifestId: string;
+    runId: string;
+    dedupeKey: string;
+  }): Promise<boolean>;
 }
 
 export interface AppleAuthorizationRecoveryRepository {
@@ -538,18 +536,16 @@ export async function recoverWaitingApplePublicationJobs(
   const authorization = await repository.getAppleAuthorization();
   if (!authorization || authorization.status !== "valid") return 0;
   const authorizationGeneration = appleAuthorizationGeneration(authorization);
+  const validationEpoch = authorization.lastValidatedAt?.getTime().toString(36) ?? "legacy";
   let queued = 0;
-  for (const manifestId of await repository.listWaitingPublicationManifestIds()) {
+  for (const { manifestId, runId } of await repository.listWaitingPublicationManifests()) {
     signal?.throwIfAborted();
-    const manifest = await repository.getManifestById(manifestId);
-    if (!manifest) continue;
-    await repository.enqueueJob({
-      kind: "publication",
-      runId: manifest.runId,
-      payload: { manifestId },
-      dedupeKey: `publication:${manifestId}:reauth:${authorizationGeneration}`,
+    const created = await repository.enqueueWaitingPublicationRecovery({
+      manifestId,
+      runId,
+      dedupeKey: `publication:${manifestId}:reauth:${authorizationGeneration}:${validationEpoch}`,
     });
-    queued += 1;
+    if (created) queued += 1;
   }
   return queued;
 }

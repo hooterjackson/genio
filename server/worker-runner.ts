@@ -185,7 +185,6 @@ export class WorkerRunner {
   async run(): Promise<void> {
     assertProductionWorkerSecrets();
     await this.repository.ensureSchemaVersion();
-    await recoverUnverifiedAppleAuthorizationJob(this.repository);
     await this.heartbeat();
     await this.enforceControls();
     this.heartbeatTimer = setInterval(() => {
@@ -248,11 +247,19 @@ export class WorkerRunner {
       capacity: this.concurrency,
       activeJobs: this.active.size,
     });
-    // Reconcile the narrow API crash window between persisting a user token
-    // and enqueuing its validation. The generation-scoped queue key keeps
-    // this idempotent, including when a completed validation is retried.
-    await recoverUnverifiedAppleAuthorizationJob(this.repository);
-    await recoverWaitingApplePublicationJobs(this.repository);
+    // Reconciliation is best-effort maintenance. A transient queue/database
+    // error here must not prevent the worker from starting or processing
+    // unrelated jobs; the next heartbeat will retry it.
+    try {
+      await recoverUnverifiedAppleAuthorizationJob(this.repository);
+    } catch {
+      process.stderr.write("[needle-worker] Apple authorization reconciliation failed; private diagnostics were suppressed\n");
+    }
+    try {
+      await recoverWaitingApplePublicationJobs(this.repository);
+    } catch {
+      process.stderr.write("[needle-worker] Apple publication recovery reconciliation failed; private diagnostics were suppressed\n");
+    }
     const day = new Intl.DateTimeFormat("en-CA", {
       timeZone: "America/Sao_Paulo",
       year: "numeric",
