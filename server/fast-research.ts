@@ -4,7 +4,7 @@ import { citationTextIsLocalToClaim } from "./citation-attestation.ts";
 import { extractOutputText } from "./openai.ts";
 import { assertPublicHttpsUrl, compactEvidenceNote } from "./security.ts";
 
-export const FAST_RESEARCH_CHECKPOINT_VERSION = "fast_curated_v1";
+export const FAST_RESEARCH_CHECKPOINT_VERSION = "fast_curated_v2";
 
 export interface FastSynthesisCheckpoint {
   version: typeof FAST_RESEARCH_CHECKPOINT_VERSION;

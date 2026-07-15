@@ -1062,8 +1062,8 @@ databaseDescribe("hosted backend integration", () => {
 
     const created = await create();
     expect(created).toMatchObject({ created: true, reused: false, status: "queued" });
-    const originalRoute = await repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1") as any;
-    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v1", matchingReserveMs: 40_000 });
+    const originalRoute = await repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v2") as any;
+    expect(originalRoute).toMatchObject({ status: "queued", profile: "fast_curated_v2", matchingReserveMs: 40_000 });
     expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.confirmedAt)).toBe(120_000);
     expect(Date.parse(originalRoute.deadlineAt) - Date.parse(originalRoute.researchDeadlineAt)).toBe(40_000);
     const createdRun = await repository.getRun(created.runId);
@@ -1076,17 +1076,17 @@ databaseDescribe("hosted backend integration", () => {
       created: false,
       reused: false,
     });
-    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1"))
+    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v2"))
       .resolves.toEqual(originalRoute);
 
     // This represents a legacy run created before route checkpoints existed.
     // An idempotent retry may repair its queue handoff, but must remain deep.
     await repository.pool.query(
-      "DELETE FROM research_checkpoints WHERE run_id=$1 AND phase='fast:route:fast_curated_v1'",
+      "DELETE FROM research_checkpoints WHERE run_id=$1 AND phase='fast:route:fast_curated_v2'",
       [created.runId],
     );
     await create();
-    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v1"))
+    await expect(repository.getResearchCheckpoint(created.runId, "fast:route:fast_curated_v2"))
       .resolves.toBeNull();
   });
 
@@ -1623,9 +1623,6 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.finalizeCatalogSelection(runId, {
       selected: [{ candidateId: candidates.get("Override")!.id, catalogId: "catalog-not-returned" }],
     })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
-    await expect(repository.finalizeCatalogSelection(runId, {
-      selected: [{ candidateId: candidates.get("Unavailable")!.id, catalogId: "catalog-unrelated" }],
-    })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
     await repository.reviewMatch(runId, candidates.get("Unchecked")!.id, "rejected");
     const rejectedPage = await repository.listCatalogTracks(runId, 1, 200);
     expect(rejectedPage.items.find((item) => item.title === "Unchecked")).toMatchObject({
@@ -1653,6 +1650,76 @@ databaseDescribe("hosted backend integration", () => {
       { title: "Unchecked", status: "rejected", outcome: "rejected" },
       { title: "Unavailable", status: "unavailable", outcome: "unavailable" },
     ]);
+  });
+
+  test("requires an explicit visitor choice before a no-primary Apple alternative can enter the manifest", async () => {
+    const selectionBrief: PlaylistBrief = {
+      ...brief,
+      title: "Manual Apple version choice",
+      mode: "curated",
+      targetSize: { min: 1, max: 1 },
+    };
+    const runId = await repository.createRun("Manual Apple version choice", selectionBrief, 0, 1);
+    await repository.addCandidates(runId, [{
+      selectionRank: 1,
+      artist: "Expected Artist",
+      title: "Expected Track",
+      album: null,
+      releaseYear: null,
+      durationMs: null,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    const alternative = {
+      id: "catalog-title-only-alternative",
+      name: "Expected Track",
+      artistName: "Different Artist",
+      albumName: "Catalog Result",
+    };
+    await repository.saveMatch(runId, {
+      candidateId: candidate.id,
+      status: "review",
+      basis: "Multiple title matches require visitor review",
+      score: 0.35,
+      song: null,
+      alternatives: [alternative],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    await expect(repository.listCatalogTracks(runId, 1, 200)).resolves.toMatchObject({
+      selectableCount: 0,
+      unmatchedCount: 1,
+      requestedTrackCount: 1,
+      items: [{
+        candidateId: candidate.id,
+        song: null,
+        alternatives: [alternative],
+        selectable: false,
+        selected: false,
+      }],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "catalog_matching_shortfall" });
+    await expect(repository.finalizeCatalogSelection(runId, {
+      useRecommended: true,
+      excludedCandidateIds: [],
+      overrides: [],
+    })).rejects.toMatchObject({ code: "playlist_target_shortfall" });
+    await expect(repository.finalizeCatalogSelection(runId, {
+      selected: [{ candidateId: candidate.id, catalogId: "not-a-server-choice" }],
+    })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
+
+    const manifest = await repository.finalizeCatalogSelection(runId, {
+      selected: [{ candidateId: candidate.id, catalogId: alternative.id }],
+    });
+    expect(manifest.tracks).toEqual([expect.objectContaining({
+      candidateId: candidate.id,
+      catalogId: alternative.id,
+      artist: "Expected Artist",
+      title: "Expected Track",
+    })]);
   });
 
   test("queues one durable recovery job for legacy fast-match timeout rows", async () => {

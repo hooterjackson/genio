@@ -298,6 +298,215 @@ test("an explicit 100-track request stays at 100 through research, matching, and
   await expect(page.getByText("Creating the playlist in Apple Music.")).toBeVisible();
 });
 
+test("a 50-track request uses reserve matches but generates exactly 50 tracks", async ({ page }) => {
+  const exactBrief = {
+    ...curatedBrief,
+    title: "Berlin Techno: 50 Influential Tracks",
+    targetSize: { min: 50, max: 50 },
+  };
+  const exactRun = {
+    ...run,
+    id: "run-exact-50",
+    prompt: "50 influential Berlin techno tracks",
+    brief: exactBrief,
+    status: "visitor_review",
+    phase: "exception_review",
+    candidateCount: 100,
+    sourceCount: 8,
+    unresolvedCount: 44,
+  };
+  const items = Array.from({ length: 100 }, (_, index) => {
+    const matched = index < 56;
+    const song = matched ? {
+      id: `apple-50-${index}`,
+      name: `Berlin track ${index + 1}`,
+      artistName: `Berlin artist ${index + 1}`,
+    } : null;
+    return {
+      position: index,
+      candidateId: `candidate-50-${index}`,
+      artist: `Berlin artist ${index + 1}`,
+      title: `Berlin track ${index + 1}`,
+      status: matched ? "review" : "unavailable",
+      catalogId: song?.id ?? null,
+      song,
+      alternatives: [],
+      evidenceEligible: true,
+      selected: false,
+      selectable: matched,
+    };
+  });
+
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: exactRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-exact-50", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(exactRun) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-exact-50\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items,
+        page: 1,
+        pageSize: 500,
+        total: items.length,
+        totalPages: 1,
+        selectableCount: 56,
+        unmatchedCount: 44,
+        retryableCount: 0,
+        matchingComplete: true,
+        requestedTrackCount: 50,
+      }),
+    });
+  });
+
+  let selectionBody: Record<string, unknown> | null = null;
+  const manifestTracks = items.slice(0, 50).map((item, position) => ({
+    position,
+    candidateId: item.candidateId,
+    catalogId: item.song!.id,
+    artist: item.artist,
+    title: item.title,
+  }));
+  await page.route("**/api/v1/runs/run-exact-50/selection", async (route) => {
+    selectionBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "manifest-exact-50",
+        runId: exactRun.id,
+        name: exactBrief.title,
+        trackCount: 50,
+        tracks: manifestTracks,
+      }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-exact-50/publish", async (route) => {
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ ...exactRun, status: "publishing", phase: "publication" }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-exact-50");
+  await expect(page.getByText("50 OF 56 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+
+  await expect.poll(() => selectionBody).toEqual({
+    useRecommended: true,
+    excludedCandidateIds: Array.from({ length: 6 }, (_, index) => `candidate-50-${index + 50}`),
+    overrides: [],
+  });
+  await expect(page.getByRole("heading", { name: "50 TRACKS READY." })).toBeVisible();
+});
+
+test("a 200-track request selects exactly 200 tracks from its 300-candidate reserve", async ({ page }) => {
+  const exactBrief = {
+    ...curatedBrief,
+    title: "Paulinho da Costa: 200 Essential Tracks",
+    subjectEntities: ["Paulinho da Costa"],
+    targetSize: { min: 200, max: 200 },
+  };
+  const exactRun = {
+    ...run,
+    id: "run-exact-200",
+    prompt: "Paulinho da Costa's 200 most influential songs",
+    brief: exactBrief,
+    status: "visitor_review",
+    phase: "exception_review",
+    candidateCount: 300,
+    sourceCount: 20,
+    unresolvedCount: 0,
+  };
+  const items = Array.from({ length: 300 }, (_, index) => ({
+    position: index,
+    candidateId: `candidate-200-${index}`,
+    artist: `Artist ${index + 1}`,
+    title: `Influential recording ${index + 1}`,
+    status: "review",
+    catalogId: `apple-200-${index}`,
+    song: {
+      id: `apple-200-${index}`,
+      name: `Influential recording ${index + 1}`,
+      artistName: `Artist ${index + 1}`,
+    },
+    alternatives: [],
+    evidenceEligible: true,
+    selected: false,
+    selectable: true,
+  }));
+
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: exactRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-exact-200", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(exactRun) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-exact-200\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items,
+        page: 1,
+        pageSize: 500,
+        total: items.length,
+        totalPages: 1,
+        selectableCount: 300,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+        requestedTrackCount: 200,
+      }),
+    });
+  });
+
+  let selectionBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs/run-exact-200/selection", async (route) => {
+    selectionBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "manifest-exact-200",
+        runId: exactRun.id,
+        name: exactBrief.title,
+        trackCount: 200,
+        tracks: items.slice(0, 200).map((item, position) => ({
+          position,
+          candidateId: item.candidateId,
+          catalogId: item.catalogId,
+          artist: item.artist,
+          title: item.title,
+        })),
+      }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-exact-200/publish", async (route) => {
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ ...exactRun, status: "publishing", phase: "publication" }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-exact-200");
+  await expect(page.getByText("200 OF 300 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+  await expect(page.getByRole("checkbox")).toHaveCount(300);
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+
+  await expect.poll(() => selectionBody).toEqual({
+    useRecommended: true,
+    excludedCandidateIds: Array.from({ length: 100 }, (_, index) => `candidate-200-${index + 200}`),
+    overrides: [],
+  });
+  await expect(page.getByRole("heading", { name: "200 TRACKS READY." })).toBeVisible();
+});
+
 test("an active fast run keeps its profile and concise phase message visible", async ({ page }) => {
   const fastRun = {
     ...run,
@@ -552,6 +761,126 @@ test("the whole list can be cleared, restored, and edited without reviewing trac
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
+test("reserve matches stay visible but default and Select all stop at the requested track count", async ({ page }) => {
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    const items = Array.from({ length: 5 }, (_, index) => ({
+      position: index,
+      candidateId: `candidate-reserve-${index}`,
+      artist: "Artist",
+      title: `Reserve track ${index + 1}`,
+      status: "accepted",
+      catalogId: `apple-reserve-${index}`,
+      song: { id: `apple-reserve-${index}`, name: `Reserve track ${index + 1}`, artistName: "Artist" },
+      alternatives: [],
+      evidenceEligible: true,
+      selected: true,
+      selectable: true,
+    }));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items,
+        page: 1,
+        pageSize: 200,
+        total: 5,
+        totalPages: 1,
+        selectableCount: 5,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+        requestedTrackCount: 3,
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await expect(page.getByText("3 OF 5 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+  await expect(page.getByText("3 tracks selected from 5 tracks matched. Additional matches are available as replacements.", { exact: true })).toBeVisible();
+  const checkboxes = page.getByRole("checkbox");
+  await expect(checkboxes).toHaveCount(5);
+  expect(await checkboxes.evaluateAll((items) => items.map((item) => (item as HTMLInputElement).checked))).toEqual([
+    true, true, true, false, false,
+  ]);
+
+  await checkboxes.nth(4).check();
+  expect(await checkboxes.evaluateAll((items) => items.map((item) => (item as HTMLInputElement).checked))).toEqual([
+    true, true, false, false, true,
+  ]);
+  await expect(page.getByText("3 OF 5 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "CLEAR", exact: true }).click();
+  await page.getByRole("button", { name: "SELECT ALL", exact: true }).click();
+  expect(await checkboxes.evaluateAll((items) => items.map((item) => (item as HTMLInputElement).checked))).toEqual([
+    true, true, true, false, false,
+  ]);
+});
+
+test("an unresolved Apple shortfall cannot silently generate fewer tracks than requested", async ({ page }) => {
+  const shortfallRun = {
+    ...run,
+    id: "run-catalog-shortfall",
+    status: "visitor_review",
+    phase: "catalog_matching_shortfall",
+    error: "Apple Music matching found 28 safe catalog matches for the required 50; 22 remain unresolved.",
+  };
+  const items = Array.from({ length: 50 }, (_, index) => {
+    const matched = index < 28;
+    return {
+      position: index,
+      candidateId: `candidate-shortfall-${index}`,
+      artist: `Artist ${index + 1}`,
+      title: `Track ${index + 1}`,
+      status: matched ? "review" : "unavailable",
+      catalogId: matched ? `apple-shortfall-${index}` : null,
+      song: matched ? {
+        id: `apple-shortfall-${index}`,
+        name: `Track ${index + 1}`,
+        artistName: `Artist ${index + 1}`,
+      } : null,
+      alternatives: [],
+      evidenceEligible: true,
+      selected: false,
+      selectable: matched,
+    };
+  });
+
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: shortfallRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-catalog-shortfall", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(shortfallRun) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-catalog-shortfall\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items,
+        page: 1,
+        pageSize: 200,
+        total: items.length,
+        totalPages: 1,
+        selectableCount: 28,
+        unmatchedCount: 22,
+        retryableCount: 0,
+        matchingComplete: true,
+        requestedTrackCount: 50,
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-catalog-shortfall");
+  await expect(page.getByText("28 of 50 requested tracks are ready. Resolve 22 more Apple Music matches to generate the playlist.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+});
+
 test("legacy timed-out Apple matches recover automatically before selection", async ({ page }) => {
   let currentRun = run;
   await page.route("**/api/v1/capabilities/exchange", async (route) => {
@@ -737,6 +1066,90 @@ test("terminal Apple matching failures are distinct from unavailable tracks and 
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("a no-primary Apple alternative requires an explicit version choice before bulk selection", async ({ page }) => {
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          position: 0,
+          candidateId: "candidate-manual-choice",
+          artist: "Expected Artist",
+          title: "Expected Track",
+          status: "review",
+          basis: "Multiple title matches require visitor review",
+          catalogId: null,
+          song: null,
+          alternatives: [{
+            id: "apple-title-only-alternative",
+            name: "Expected Track",
+            artistName: "Different Artist",
+            albumName: "Catalog Result",
+          }],
+          evidenceEligible: true,
+          selected: false,
+          selectable: false,
+        }],
+        page: 1,
+        pageSize: 200,
+        total: 1,
+        totalPages: 1,
+        selectableCount: 0,
+        unmatchedCount: 1,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+
+  let selectionBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs/run-1/selection", async (route) => {
+    selectionBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "manifest-manual-choice", runId: run.id, name: "Manual choice", tracks: [] }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-1/publish", async (route) => {
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ ...run, status: "publishing", phase: "publication" }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await expect(page.getByText("CHOOSE VERSION", { exact: true })).toBeVisible();
+  await expect(page.getByText("0 tracks matched. Choose an Apple Music version for 1 track to make those tracks selectable.", { exact: true })).toBeVisible();
+  const checkbox = page.getByRole("checkbox", { name: /expected track/i });
+  const selectAll = page.getByRole("button", { name: "SELECT ALL", exact: true });
+  const version = page.getByRole("combobox", { name: /apple music version/i });
+  await expect(checkbox).toBeDisabled();
+  await expect(checkbox).not.toBeChecked();
+  await expect(selectAll).toBeDisabled();
+  await expect(version).toHaveValue("");
+  await expect(version.locator("option").nth(1)).toHaveText("Expected Track — Different Artist / Catalog Result");
+
+  await version.selectOption("apple-title-only-alternative");
+  await expect(checkbox).toBeEnabled();
+  await expect(checkbox).not.toBeChecked();
+  await expect(selectAll).toBeEnabled();
+  await selectAll.click();
+  await expect(checkbox).toBeChecked();
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await expect.poll(() => selectionBody).toEqual({
+    selected: [{ candidateId: "candidate-manual-choice", catalogId: "apple-title-only-alternative" }],
+  });
 });
 
 test("one Generate playlist action saves the list and starts Apple publication", async ({ page }) => {

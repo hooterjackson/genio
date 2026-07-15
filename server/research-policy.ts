@@ -5,10 +5,13 @@ type Environment = Record<string, string | undefined>;
 
 export interface FastResearchPolicy {
   kind: "fast_curated";
-  version: "fast_curated_v1";
+  version: "fast_curated_v2";
   model: string;
   runDeadlineMs: number;
   matchingReserveMs: number;
+  targetMinimum: number;
+  targetMaximum: number;
+  candidateGoal: number;
   candidateLimit: number;
   maxPasses: number;
   maxWebToolCalls: number;
@@ -31,6 +34,54 @@ export const FAST_RUN_DEADLINE_MS = 120_000;
 // of every medium playlist into timeout placeholders.
 export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
+export const FAST_CURATED_TARGET_MAXIMUM = 200;
+export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
+export const FAST_POST_MATCH_REFILL_LIMIT = 2;
+export const FAST_MINIMUM_RESERVE_CANDIDATES = 50;
+export const FAST_RESERVE_RATIO = 0.5;
+
+export interface FastPostMatchRefillPlan {
+  state: "satisfied" | "refill" | "shortfall";
+  requestedMinimum: number;
+  selectableCount: number;
+  shortfall: number;
+  additionalCandidateGoal: number;
+}
+
+/**
+ * Plan a bounded evidence-research refill after catalog matching. This helper
+ * does not weaken the requested minimum: after the bounded refill limit, a
+ * remaining deficit is an explicit terminal shortfall rather than a smaller
+ * successful playlist.
+ */
+export function fastPostMatchRefillPlan(input: {
+  requestedMinimum: number;
+  selectableCount: number;
+  attemptedCandidateCount: number;
+  refillAttempts: number;
+}): FastPostMatchRefillPlan {
+  const requestedMinimum = Math.max(1, Math.floor(input.requestedMinimum));
+  const selectableCount = Math.max(0, Math.floor(input.selectableCount));
+  const attemptedCandidateCount = Math.max(selectableCount, Math.floor(input.attemptedCandidateCount));
+  const shortfall = Math.max(0, requestedMinimum - selectableCount);
+  if (shortfall === 0) {
+    return { state: "satisfied", requestedMinimum, selectableCount, shortfall: 0, additionalCandidateGoal: 0 };
+  }
+  if (Math.max(0, Math.floor(input.refillAttempts)) >= FAST_POST_MATCH_REFILL_LIMIT) {
+    return { state: "shortfall", requestedMinimum, selectableCount, shortfall, additionalCandidateGoal: 0 };
+  }
+
+  // Use observed storefront yield but keep the estimate bounded when the
+  // first pass is exceptionally good or bad. The extra 25% is a reserve for
+  // the refill itself; the per-pass ceiling preserves the fast-route bound.
+  const observedYield = attemptedCandidateCount > 0 ? selectableCount / attemptedCandidateCount : 0;
+  const planningYield = Math.min(0.95, Math.max(0.25, observedYield));
+  const additionalCandidateGoal = Math.min(
+    FAST_EXTRACTION_CANDIDATE_LIMIT,
+    Math.max(shortfall, Math.ceil((shortfall / planningYield) * 1.25)),
+  );
+  return { state: "refill", requestedMinimum, selectableCount, shortfall, additionalCandidateGoal };
+}
 
 export interface FastRouteCheckpoint {
   status: "queued";
@@ -62,7 +113,7 @@ export function createFastRouteCheckpoint(
 
 export function parseFastRouteCheckpoint(
   value: unknown,
-  expectedVersion: FastResearchPolicy["version"] = "fast_curated_v1",
+  expectedVersion: FastResearchPolicy["version"] = "fast_curated_v2",
 ): FastRouteCheckpoint | null {
   if (!value || typeof value !== "object") return null;
   const row = value as Partial<FastRouteCheckpoint>;
@@ -115,26 +166,40 @@ export function researchExecutionPolicy(
   brief: Pick<PlaylistBrief, "mode" | "targetSize">,
   environment: Environment = process.env,
 ): ResearchExecutionPolicy {
-  if (brief.mode !== "curated") {
+  const requestedMinimum = Math.max(1, Math.floor(brief.targetSize?.min ?? 50));
+  const requestedMaximum = Math.max(requestedMinimum, Math.floor(brief.targetSize?.max ?? 100));
+  if (brief.mode !== "curated" || requestedMaximum > FAST_CURATED_TARGET_MAXIMUM) {
     return { kind: "deep", version: "deep_v1", model: deepResearchModel(environment) };
   }
 
-  const targetMaximum = Math.max(50, Math.min(100, Math.floor(brief.targetSize?.max ?? 100)));
+  const targetMaximum = Math.max(50, requestedMaximum);
+  const targetMinimum = requestedMinimum;
+  const reserve = targetMinimum >= 20
+    ? Math.max(FAST_MINIMUM_RESERVE_CANDIDATES, Math.ceil(targetMinimum * FAST_RESERVE_RATIO))
+    : 0;
+  const candidateGoal = targetMinimum + reserve;
 
   return {
     kind: "fast_curated",
-    version: "fast_curated_v1",
+    version: "fast_curated_v2",
     model: fastResearchModel(environment),
     // One immutable wall-clock budget begins when the run is confirmed. The
     // research cutoff leaves a fixed tail for Apple catalog matching; phases
     // never start independent countdowns.
     runDeadlineMs: FAST_RUN_DEADLINE_MS,
     matchingReserveMs: FAST_MATCHING_RESERVE_MS,
-    candidateLimit: Math.min(120, Math.ceil(targetMaximum * 1.2)),
+    targetMinimum,
+    targetMaximum,
+    // Research a reserve so catalog misses can be backfilled while the
+    // immutable manifest still respects targetMaximum.
+    candidateGoal,
+    // The ceiling is per extraction response, not per playlist. Larger fast
+    // requests are filled by independently cited, deduplicated passes.
+    candidateLimit: Math.min(FAST_EXTRACTION_CANDIDATE_LIMIT, candidateGoal),
     // A short first answer is a refill signal, never a successful completion.
-    // Three independently checkpointed passes fit the two-minute route while
-    // giving the model two bounded chances to close any validated shortfall.
-    maxPasses: 3,
+    // Independently checkpointed passes include one refill opportunity after
+    // the minimum number needed to fill the reserve.
+    maxPasses: Math.max(3, Math.ceil(candidateGoal / FAST_EXTRACTION_CANDIDATE_LIMIT) + 1),
     maxWebToolCalls: boundedInteger(environment.FAST_RESEARCH_MAX_WEB_CALLS, 5, 1, 6),
     maxSynthesisTokens: boundedInteger(environment.FAST_RESEARCH_MAX_SYNTHESIS_TOKENS, 6_000, 2_000, 8_000),
     maxExtractionTokens: boundedInteger(environment.FAST_RESEARCH_MAX_EXTRACTION_TOKENS, 8_000, 2_000, 12_000),

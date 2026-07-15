@@ -30,9 +30,9 @@ function brief(mode: PlaylistBrief["mode"]): PlaylistBrief {
 }
 
 describe("playlist brief policy", () => {
-  test("defaults and clamps curated prompts to the promised 50-100 range", () => {
+  test("uses 50-100 as the curated default without treating 100 as a hard ceiling", () => {
     expect(normalizeBriefTarget("curated", null)).toEqual({ min: 50, max: 100 });
-    expect(normalizeBriefTarget("curated", { min: 10, max: 200 })).toEqual({ min: 50, max: 100 });
+    expect(normalizeBriefTarget("curated", { min: 10, max: 200 })).toEqual({ min: 50, max: 200 });
     expect(normalizeBriefTarget("curated", { min: 75, max: 90 })).toEqual({ min: 75, max: 90 });
   });
 
@@ -51,6 +51,10 @@ describe("playlist brief policy", () => {
       "Make a 25-track introduction to Detroit techno",
       interpreted,
     ).targetSize).toEqual({ min: 25, max: 25 });
+    expect(preserveExplicitTrackCount(
+      "Paulinho da Costa's 200 most influential songs",
+      interpreted,
+    ).targetSize).toEqual({ min: 200, max: 200 });
   });
 
   test("does not confuse music years or unrelated numbers with a track count", () => {
@@ -67,6 +71,7 @@ describe("playlist brief policy", () => {
   test("validates curated and hybrid ranges independently", () => {
     expect(isValidBriefTarget("curated", { min: 50, max: 100 })).toBe(true);
     expect(isValidBriefTarget("curated", { min: 25, max: 25 })).toBe(true);
+    expect(isValidBriefTarget("curated", { min: 200, max: 200 })).toBe(true);
     expect(isValidBriefTarget("curated", { min: 0, max: 100 })).toBe(false);
     expect(isValidBriefTarget("hybrid", { min: 1, max: 500 })).toBe(true);
     expect(isValidBriefTarget("hybrid", null)).toBe(true);
@@ -85,6 +90,8 @@ describe("playlist brief policy", () => {
     expect(isPlaylistBrief({ ...brief("hybrid"), targetSize: { min: 0, max: 100 } })).toBe(false);
     expect(isPlaylistBrief({ ...valid, subjectEntities: [] })).toBe(false);
     expect(isPlaylistBrief({ ...valid, relationship: "   " })).toBe(false);
+    expect(isPlaylistBrief({ ...valid, title: "x".repeat(60) })).toBe(true);
+    expect(isPlaylistBrief({ ...valid, title: "x".repeat(61) })).toBe(false);
   });
 
   test("describes each manifest mode without claiming every playlist is exhaustive", () => {

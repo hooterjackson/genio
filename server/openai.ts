@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { PlaylistBrief } from "../shared/types.ts";
 import { normalizeBriefTarget, preserveExplicitTrackCount } from "./brief-policy.ts";
+import { normalizePlaylistTitle, PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
 import { requireSecret } from "./secrets.ts";
 import { readCostConfiguration, readOpenAITokenPricing } from "./cost-config.ts";
 import { boundedResponseText } from "./bounded-response.ts";
@@ -175,7 +176,12 @@ const briefSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    title: { type: "string" },
+    title: {
+      type: "string",
+      minLength: 1,
+      maxLength: PLAYLIST_TITLE_MAX_LENGTH,
+      description: "A concise Apple Music playlist name, not a restatement of the request.",
+    },
     description: { type: "string" },
     mode: { type: "string", enum: ["exhaustive", "curated", "hybrid"] },
     subjectEntities: { type: "array", items: { type: "string" } },
@@ -222,18 +228,20 @@ function validatedBrief(value: unknown): PlaylistBrief {
   const mode = raw.mode as PlaylistBrief["mode"];
   const subjectEntities = strings("subjectEntities", 25);
   if (subjectEntities.length === 0) throw new Error("OpenAI returned a playlist brief without a subject entity");
+  const relationship = string("relationship", 500);
+  const normalizedTarget = normalizeBriefTarget(mode, targetSize);
   return {
-    title: string("title", 240),
+    title: string("title", 1_000),
     description: string("description", 1_000),
     mode,
     subjectEntities,
-    relationship: string("relationship", 500),
+    relationship,
     include: strings("include", 50),
     exclude: strings("exclude", 50),
     versionPolicy: string("versionPolicy", 500),
     evidencePolicy: string("evidencePolicy", 500),
     orderingPolicy: string("orderingPolicy", 500),
-    targetSize: normalizeBriefTarget(mode, targetSize),
+    targetSize: normalizedTarget,
     ambiguities: strings("ambiguities", 25),
   };
 }
@@ -248,14 +256,18 @@ export async function interpretPrompt(
     model,
     reasoning: { effort: "none" },
     max_output_tokens: 1_200,
-    instructions: "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, or representative, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. Default subjective playlists to 50-100 tracks. Explicitly surface only ambiguity that materially changes scope.",
+    instructions: "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, or representative, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. Default subjective playlists to 50-100 tracks. Set title to a short, specific Apple Music playlist name of at most 60 characters, not a restatement of the request: remove command phrases such as 'give me' or 'create a playlist of', prefer the key artist, topic, or scene plus a compact qualifier, and include a requested count only when it helps distinguish the playlist. Preserve the complete requested scope in description and the structured scope fields. Explicitly surface only ambiguity that materially changes scope.",
     input: prompt.slice(0, 4_000),
     text: { format: { type: "json_schema", name: "playlist_brief", strict: true, schema: briefSchema } },
   }, { ...context, operation: context.operation ?? "brief.interpret", idempotencyKey: stableKey });
-  const brief = preserveExplicitTrackCount(
+  const scopedBrief = preserveExplicitTrackCount(
     prompt,
     validatedBrief(JSON.parse(extractOutputText(response))),
   );
+  const brief = {
+    ...scopedBrief,
+    title: normalizePlaylistTitle(scopedBrief.title, scopedBrief),
+  };
   return { brief, usage: response.usage ?? {}, costUsd: responseCostUsd(response) };
 }
 

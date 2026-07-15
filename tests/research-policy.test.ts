@@ -4,6 +4,7 @@ import {
   briefInterpretationModel,
   createFastRouteCheckpoint,
   FAST_MATCHING_RESERVE_MS,
+  fastPostMatchRefillPlan,
   FAST_RUN_DEADLINE_MS,
   parseFastRouteCheckpoint,
   researchExecutionPolicy,
@@ -32,11 +33,14 @@ describe("research execution policy", () => {
     const policy = researchExecutionPolicy(brief("curated"), {});
     expect(policy).toMatchObject({
       kind: "fast_curated",
-      version: "fast_curated_v1",
+      version: "fast_curated_v2",
       model: "gpt-5.6-luna",
       runDeadlineMs: 120_000,
       matchingReserveMs: 40_000,
-      candidateLimit: 120,
+      targetMinimum: 50,
+      targetMaximum: 100,
+      candidateGoal: 100,
+      candidateLimit: 100,
       maxPasses: 3,
       maxWebToolCalls: 5,
       maxSynthesisTokens: 6_000,
@@ -51,15 +55,62 @@ describe("research execution policy", () => {
       .toEqual({ kind: "deep", version: "deep_v1", model: "deep-snapshot" });
   });
 
+  test("plans bounded post-match refills without accepting a smaller successful playlist", () => {
+    expect(fastPostMatchRefillPlan({
+      requestedMinimum: 50,
+      selectableCount: 28,
+      attemptedCandidateCount: 63,
+      refillAttempts: 0,
+    })).toEqual({
+      state: "refill",
+      requestedMinimum: 50,
+      selectableCount: 28,
+      shortfall: 22,
+      additionalCandidateGoal: 62,
+    });
+    expect(fastPostMatchRefillPlan({
+      requestedMinimum: 50,
+      selectableCount: 50,
+      attemptedCandidateCount: 63,
+      refillAttempts: 1,
+    }).state).toBe("satisfied");
+    expect(fastPostMatchRefillPlan({
+      requestedMinimum: 50,
+      selectableCount: 49,
+      attemptedCandidateCount: 120,
+      refillAttempts: 2,
+    })).toMatchObject({ state: "shortfall", shortfall: 1, additionalCandidateGoal: 0 });
+  });
+
+  test("keeps an explicit 200-track editorial request on the bounded multi-pass fast path", () => {
+    const exact200 = { ...brief("curated", 200), targetSize: { min: 200, max: 200 } };
+    expect(researchExecutionPolicy(exact200, {})).toMatchObject({
+      kind: "fast_curated",
+      targetMinimum: 200,
+      targetMaximum: 200,
+      candidateGoal: 300,
+      candidateLimit: 120,
+      maxPasses: 4,
+    });
+    expect(researchExecutionPolicy({ ...exact200, targetSize: { min: 201, max: 201 } }, {})).toEqual({
+      kind: "deep",
+      version: "deep_v1",
+      model: "gpt-5.6-terra",
+    });
+  });
+
   test("binds cache identity to the complete effective fast and deep policies", () => {
     expect(JSON.parse(researchPolicyFingerprint(brief("curated"), {}))).toEqual({
       fingerprintVersion: 2,
       kind: "fast_curated",
-      version: "fast_curated_v1",
+      version: "fast_curated_v2",
       model: "gpt-5.6-luna",
       runDeadlineMs: 120_000,
       matchingReserveMs: 40_000,
-      candidateLimit: 120,
+      targetMinimum: 50,
+      targetMaximum: 100,
+      candidateGoal: 100,
+      candidateLimit: 100,
       maxPasses: 3,
       maxWebToolCalls: 5,
       maxSynthesisTokens: 6_000,

@@ -845,7 +845,7 @@ describe("fast curated orchestration", () => {
     expect(state.jobs.at(-1)).toMatchObject({ kind: "research" });
     expect((state.jobs.at(-1) as any).payload).not.toHaveProperty("fast");
 
-    state.checkpoints.set("fast:route:fast_curated_v1", { status: "queued" });
+    state.checkpoints.set("fast:route:fast_curated_v2", { status: "queued" });
     await orchestrator.enqueue(state.run.id);
     expect(state.jobs.at(-1)).toMatchObject({
       kind: "research",
@@ -931,7 +931,7 @@ describe("fast curated orchestration", () => {
       discoveredCount: 1,
       recoveredCount: 1,
     }));
-    expect(state.checkpoints.get("fast:complete:fast_curated_v1")).toMatchObject({
+    expect(state.checkpoints.get("fast:complete:fast_curated_v2")).toMatchObject({
       status: "complete",
       hostedWebSearchCalls: 1,
       modelCallCount: 2,
@@ -940,7 +940,7 @@ describe("fast curated orchestration", () => {
     expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
   });
 
-  test("an exact 100-track curated target persists 100 citation-eligible candidates before matching", async () => {
+  test("an exact 100-track curated target persists a 50-track catalog reserve before matching", async () => {
     const state = segmentedRepository();
     state.run.brief = {
       ...brief("curated", { min: 100, max: 100 }),
@@ -967,7 +967,7 @@ describe("fast curated orchestration", () => {
     const annotations: Array<Record<string, unknown>> = [];
     const lines: string[] = [];
     let offset = 0;
-    for (let group = 0; group < 10; group += 1) {
+    for (let group = 0; group < 12; group += 1) {
       const pairs = Array.from({ length: 10 }, (_, pairIndex) => {
         const ordinal = group * 10 + pairIndex + 1;
         const suffix = String(ordinal).padStart(3, "0");
@@ -1000,7 +1000,7 @@ describe("fast curated orchestration", () => {
         }] },
       ],
     };
-    const extractedCandidates = Array.from({ length: 100 }, (_, index) => {
+    const extractedCandidates = Array.from({ length: 120 }, (_, index) => {
       const suffix = String(index + 1).padStart(3, "0");
       return {
         artist: `Performer ${suffix}`,
@@ -1018,39 +1018,215 @@ describe("fast curated orchestration", () => {
       usage: { input_tokens: 2_000, output_tokens: 4_000 },
       output_text: JSON.stringify({ candidates: extractedCandidates }),
     };
-    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [synthesis, extraction]);
+    const refillPairs = Array.from({ length: 30 }, (_, index) => {
+      const suffix = String(index + 121).padStart(3, "0");
+      return `Performer ${suffix} — Track ${suffix}`;
+    });
+    const refillSupport = `Paulinho da Costa influential recording featuring ${refillPairs.join(", ")}.`;
+    const refillMarker = "[refill-source]";
+    const refillSynthesis = {
+      id: "fast-web-100-refill",
+      model: "gpt-5.6-luna",
+      usage: { input_tokens: 500, output_tokens: 500 },
+      output: [
+        { type: "web_search_call", action: { type: "search", query: "Paulinho da Costa refill" } },
+        { id: "fast-message-100-refill", type: "message", content: [{
+          type: "output_text",
+          text: `${refillSupport} ${refillMarker}`,
+          annotations: [{
+            type: "url_citation",
+            url: "https://evidence.example/paulinho/refill",
+            title: "Paulinho refill source",
+            start_index: refillSupport.length + 1,
+            end_index: refillSupport.length + 1 + refillMarker.length,
+          }],
+        }] },
+      ],
+    };
+    const refillExtraction = {
+      id: "fast-extract-100-refill",
+      model: "gpt-5.6-luna",
+      usage: { input_tokens: 500, output_tokens: 500 },
+      output_text: JSON.stringify({
+        candidates: Array.from({ length: 30 }, (_, index) => {
+          const suffix = String(index + 121).padStart(3, "0");
+          return {
+            artist: `Performer ${suffix}`,
+            title: `Track ${suffix}`,
+            album: null,
+            releaseYear: null,
+            versionLabel: null,
+            relationship: "influential recording featuring",
+            citationIndexes: [0],
+          };
+        }),
+      }),
+    };
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      synthesis,
+      extraction,
+      refillSynthesis,
+      refillExtraction,
+    ]);
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
 
-    expect(orchestrator.calls).toHaveLength(2);
-    expect(persistedCandidates).toHaveLength(100);
+    expect(orchestrator.calls).toHaveLength(4);
+    expect(persistedCandidates).toHaveLength(150);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
-      Array.from({ length: 100 }, (_, index) => index + 1),
+      Array.from({ length: 150 }, (_, index) => index + 1),
     );
-    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(100);
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(150);
     expect(frontier).toContainEqual(expect.objectContaining({
       sourceClass: "fast_policy",
       status: "complete",
-      discoveredCount: 100,
-      recoveredCount: 100,
+      discoveredCount: 150,
+      recoveredCount: 150,
     }));
-    expect(state.checkpoints.get("fast:complete:fast_curated_v1")).toMatchObject({
+    expect(state.checkpoints.get("fast:complete:fast_curated_v2")).toMatchObject({
       status: "complete",
-      extractedCandidateCount: 100,
-      citationEligibleCandidateCount: 100,
+      extractedCandidateCount: 150,
+      citationEligibleCandidateCount: 150,
       rejectedCandidateCount: 0,
+      candidateGoal: 150,
+      reserveShortfall: 0,
       shortfall: 0,
     });
     expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
   });
 
-  test("an exact 100-track target refills after only 20 of the first 50 extracted rows survive validation", async () => {
+  test("an exact 200-track curated target spans bounded passes and persists a catalog reserve before matching", async () => {
     const state = segmentedRepository();
     state.run.brief = {
-      ...brief("curated", { min: 100, max: 100 }),
-      title: "Paulinho da Costa’s 100 most influential songs",
+      ...brief("curated", { min: 200, max: 200 }),
+      title: "Paulinho da Costa’s 200 most influential songs",
       subjectEntities: ["Paulinho da Costa"],
       relationship: "influential recording featuring",
+      orderingPolicy: "influence rank",
+    };
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    const persistedCandidates: any[] = [];
+    const matchingCandidateCounts: number[] = [];
+    state.repository.addSources = async (_runId?: string, sources?: any[]) => new Map(
+      (sources ?? []).map((source: any, index: number) => [source.url, `source-${index}`]),
+    );
+    state.repository.addCandidates = async (_runId?: string, candidates?: any[]) => {
+      persistedCandidates.push(...(candidates ?? []));
+      state.coverage.candidateCount = persistedCandidates.length;
+      state.coverage.eligibleCandidateCount = persistedCandidates.length;
+      return candidates?.length ?? 0;
+    };
+    const enqueueJob = state.repository.enqueueJob.bind(state.repository);
+    state.repository.enqueueJob = async (input: any) => {
+      if (input?.kind === "matching") matchingCandidateCounts.push(persistedCandidates.length);
+      return enqueueJob(input);
+    };
+
+    function citedPass(start: number, count: number, id: string) {
+      const annotations: Array<Record<string, unknown>> = [];
+      const lines: string[] = [];
+      let offset = 0;
+      for (let groupStart = 0; groupStart < count; groupStart += 10) {
+        const groupCount = Math.min(10, count - groupStart);
+        const pairs = Array.from({ length: groupCount }, (_, pairIndex) => {
+          const ordinal = start + groupStart + pairIndex;
+          const suffix = String(ordinal).padStart(3, "0");
+          return `Performer ${suffix} — Track ${suffix}`;
+        });
+        const support = `Paulinho da Costa influential recording featuring ${pairs.join(", ")}.`;
+        const marker = `[${id}-source-${groupStart / 10 + 1}]`;
+        const line = `${support} ${marker}`;
+        const markerStart = offset + support.length + 1;
+        annotations.push({
+          type: "url_citation",
+          url: `https://evidence.example/paulinho/${id}/${groupStart / 10 + 1}`,
+          title: `${id} source ${groupStart / 10 + 1}`,
+          start_index: markerStart,
+          end_index: markerStart + marker.length,
+        });
+        lines.push(line);
+        offset += line.length + 1;
+      }
+      return [{
+        id: `${id}-web`,
+        model: "gpt-5.6-luna",
+        usage: { input_tokens: 1_000, output_tokens: 2_000 },
+        output: [
+          { type: "web_search_call", action: { type: "search", query: id } },
+          { id: `${id}-message`, type: "message", content: [{
+            type: "output_text",
+            text: lines.join("\n"),
+            annotations,
+          }] },
+        ],
+      }, {
+        id: `${id}-extract`,
+        model: "gpt-5.6-luna",
+        usage: { input_tokens: 2_000, output_tokens: 4_000 },
+        output_text: JSON.stringify({
+          candidates: Array.from({ length: count }, (_, index) => {
+            const ordinal = start + index;
+            const suffix = String(ordinal).padStart(3, "0");
+            return {
+              artist: `Performer ${suffix}`,
+              title: `Track ${suffix}`,
+              album: null,
+              releaseYear: null,
+              versionLabel: null,
+              relationship: "influential recording featuring",
+              citationIndexes: [Math.floor(index / 10)],
+            };
+          }),
+        }),
+      }];
+    }
+
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      ...citedPass(1, 120, "first-120"),
+      ...citedPass(121, 120, "second-120"),
+      ...citedPass(241, 60, "final-60"),
+    ]);
+
+    await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
+
+    expect(orchestrator.calls).toHaveLength(6);
+    expect(JSON.parse(String(orchestrator.calls[0]!.body.input))).toMatchObject({
+      minimumCandidateCount: 300,
+      candidateLimit: 120,
+    });
+    expect(JSON.parse(String(orchestrator.calls[2]!.body.input))).toMatchObject({
+      minimumCandidateCount: 180,
+      candidateLimit: 120,
+    });
+    expect(JSON.parse(String(orchestrator.calls[4]!.body.input))).toMatchObject({
+      minimumCandidateCount: 60,
+      candidateLimit: 75,
+    });
+    expect(persistedCandidates).toHaveLength(300);
+    expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
+      Array.from({ length: 300 }, (_, index) => index + 1),
+    );
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(300);
+    expect(matchingCandidateCounts).toEqual([300]);
+    expect(state.checkpoints.get("fast:complete:fast_curated_v2")).toMatchObject({
+      status: "complete",
+      extractedCandidateCount: 300,
+      citationEligibleCandidateCount: 300,
+      rejectedCandidateCount: 0,
+      candidateGoal: 300,
+      reserveShortfall: 0,
+      shortfall: 0,
+    });
+  });
+
+  test("an exact 50-track target refills when the first pass returns only 28", async () => {
+    const state = segmentedRepository();
+    state.run.brief = {
+      ...brief("curated", { min: 50, max: 50 }),
+      title: "50 influential Berlin techno tracks",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential in the scene",
       orderingPolicy: "influence rank",
     };
     state.run.status = "queued";
@@ -1084,7 +1260,7 @@ describe("fast curated orchestration", () => {
           const suffix = String(groupStart + pairIndex).padStart(3, "0");
           return `Performer ${suffix} — Track ${suffix}`;
         });
-        const support = `Paulinho da Costa influential recording featuring ${pairs.join(", ")}.`;
+        const support = `Berlin techno historically influential in the scene ${pairs.join(", ")}.`;
         const marker = `[${id}-source-${lines.length + 1}]`;
         const line = `${support} ${marker}`;
         const markerStart = offset + support.length + 1;
@@ -1121,30 +1297,27 @@ describe("fast curated orchestration", () => {
         album: null,
         releaseYear: null,
         versionLabel: null,
-        relationship: "influential recording featuring",
+        relationship: "historically influential in the scene",
         citationIndexes: [citationIndex],
       };
     }
 
-    const initialSynthesis = synthesisFixture(1, 20, "fast-web-initial");
+    const initialSynthesis = synthesisFixture(1, 28, "fast-web-initial");
     const initialExtraction = {
       id: "fast-extract-initial",
       model: "gpt-5.6-luna",
       usage: { input_tokens: 2_000, output_tokens: 3_000 },
       output_text: JSON.stringify({
-        candidates: [
-          ...Array.from({ length: 20 }, (_, index) => extractedRow(index + 1, Math.floor(index / 10))),
-          ...Array.from({ length: 30 }, (_, index) => extractedRow(index + 21, 999)),
-        ],
+        candidates: Array.from({ length: 28 }, (_, index) => extractedRow(index + 1, Math.floor(index / 10))),
       }),
     };
-    const refillSynthesis = synthesisFixture(21, 80, "fast-web-refill");
+    const refillSynthesis = synthesisFixture(29, 72, "fast-web-refill");
     const refillExtraction = {
       id: "fast-extract-refill",
       model: "gpt-5.6-luna",
       usage: { input_tokens: 2_000, output_tokens: 5_000 },
       output_text: JSON.stringify({
-        candidates: Array.from({ length: 80 }, (_, index) => extractedRow(index + 21, Math.floor(index / 10))),
+        candidates: Array.from({ length: 72 }, (_, index) => extractedRow(index + 29, Math.floor(index / 10))),
       }),
     };
     const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
@@ -1158,6 +1331,14 @@ describe("fast curated orchestration", () => {
 
     expect(orchestrator.calls.filter((call) => call.operation.includes(".web"))).toHaveLength(2);
     expect(orchestrator.calls.filter((call) => call.operation.includes(".extract"))).toHaveLength(2);
+    expect(JSON.parse(String(orchestrator.calls[0]!.body.input))).toMatchObject({
+      minimumCandidateCount: 100,
+      candidateLimit: 100,
+    });
+    expect(JSON.parse(String(orchestrator.calls[2]!.body.input))).toMatchObject({
+      minimumCandidateCount: 72,
+      candidateLimit: 90,
+    });
     expect(persistedCandidates).toHaveLength(100);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
       Array.from({ length: 100 }, (_, index) => index + 1),
@@ -1169,9 +1350,11 @@ describe("fast curated orchestration", () => {
       discoveredCount: 100,
       recoveredCount: 100,
     });
-    expect(state.checkpoints.get("fast:complete:fast_curated_v1")).toMatchObject({
+    expect(state.checkpoints.get("fast:complete:fast_curated_v2")).toMatchObject({
       status: "complete",
       citationEligibleCandidateCount: 100,
+      candidateGoal: 100,
+      reserveShortfall: 0,
       shortfall: 0,
     });
   });
@@ -1183,13 +1366,13 @@ describe("fast curated orchestration", () => {
     state.run.phase = "queued";
     const route = installFastRoute(state);
     const support = "Test Artist performed on Fixture Performer — Test Song in this cited selection. [source]";
-    state.checkpoints.set("fast:policy:fast_curated_v1", {
+    state.checkpoints.set("fast:policy:fast_curated_v2", {
       status: "active",
       startedAt: new Date().toISOString(),
       deadlineAt: new Date(Date.now() + 60_000).toISOString(),
     });
-    state.checkpoints.set("fast:web:fast_curated_v1", {
-      version: "fast_curated_v1",
+    state.checkpoints.set("fast:web:fast_curated_v2", {
+      version: "fast_curated_v2",
       status: "complete",
       responseId: "saved-web",
       outputText: support,
@@ -1229,7 +1412,7 @@ describe("fast curated orchestration", () => {
       kind: "matching",
       payload: expect.objectContaining({ fastDeadlineAt: route.deadlineAt }),
     });
-    expect(state.checkpoints.get("fast:route:fast_curated_v1")).toEqual(route);
+    expect(state.checkpoints.get("fast:route:fast_curated_v2")).toEqual(route);
   });
 
   test("delayed pickup performs no paid call and fails honestly when no candidate exists", async () => {
@@ -1250,7 +1433,7 @@ describe("fast curated orchestration", () => {
     expect(orchestrator.calls).toHaveLength(0);
     expect(state.run).toMatchObject({ status: "failed", phase: "fast_research_shortfall" });
     expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(false);
-    expect(state.checkpoints.get("fast:policy:fast_curated_v1")).toMatchObject({
+    expect(state.checkpoints.get("fast:policy:fast_curated_v2")).toMatchObject({
       status: "deadline",
       deadlineAt: route.deadlineAt,
     });

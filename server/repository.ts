@@ -25,6 +25,7 @@ import {
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
+import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
 import {
   failureContextForJob,
   failureContextForRun,
@@ -134,6 +135,7 @@ export interface CatalogTrackPage {
   unmatchedCount: number;
   retryableCount: number;
   matchingComplete: boolean;
+  requestedTrackCount: number | null;
 }
 
 export interface CatalogSelectionInput {
@@ -1560,6 +1562,11 @@ export class Repository {
       unmatchedCount: Number(totals.unmatched_count),
       retryableCount: Number(totals.retryable_count),
       matchingComplete: Boolean(totals.matching_complete),
+      requestedTrackCount: brief.mode === "curated"
+        && brief.targetSize
+        && brief.targetSize.min === brief.targetSize.max
+        ? brief.targetSize.max
+        : null,
     };
   }
 
@@ -1687,8 +1694,8 @@ export class Repository {
     input: CatalogSelectionInput,
   ): Promise<PlaylistManifest & { contentHash: string; lockedAt: string }> {
     return this.transaction(async (client) => {
-      const runResult = await client.query<{ status: string; brief_json: PlaylistBrief }>(
-        "SELECT status,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+      const runResult = await client.query<{ status: string; phase: string; brief_json: PlaylistBrief }>(
+        "SELECT status,phase,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
       );
       const run = runResult.rows[0];
@@ -1746,10 +1753,9 @@ export class Repository {
       }
       const choicesByCandidate = new Map<string, Map<string, CatalogSong>>();
       for (const row of candidates.rows) {
-        const hasPrimary = Boolean(row.song_json && typeof row.song_json === "object" && typeof row.song_json.id === "string");
         const choices = [
           row.song_json,
-          ...(hasPrimary && Array.isArray(row.alternatives_json) ? row.alternatives_json : []),
+          ...(Array.isArray(row.alternatives_json) ? row.alternatives_json : []),
         ]
           .filter((song): song is CatalogSong => Boolean(song && typeof song === "object" && typeof song.id === "string"));
         choicesByCandidate.set(row.id, new Map(choices.map((song) => [song.id, song])));
@@ -1775,6 +1781,16 @@ export class Repository {
           throw new HttpError(400, "A selected Apple recording was not one of the server-provided choices", "catalog_match_not_permitted");
         }
         selectedSongs.set(candidateId, choice);
+      }
+      const requestedMinimum = run.brief_json.targetSize?.min;
+      if (run.phase === "catalog_matching_shortfall"
+        && typeof requestedMinimum === "number"
+        && new Set([...selectedSongs.values()].map((song) => song.id)).size < requestedMinimum) {
+        throw new HttpError(
+          409,
+          `Resolve enough Apple Music matches to reach the requested ${requestedMinimum} tracks before generating the playlist`,
+          "playlist_target_shortfall",
+        );
       }
       if (selectedSongs.size === 0) throw new HttpError(409, "Select at least one Apple Music track", "empty_selection");
       const acceptedCatalogIds = new Set<string>();
@@ -1976,7 +1992,8 @@ export class Repository {
       const contentHash = sha256Hex(JSON.stringify(tracks.map((track) => [track.position, track.candidateId, track.catalogId])));
       const id = randomUUID();
       const now = new Date();
-      const name = `${brief.title} · ${now.toISOString().slice(0, 10)}`.slice(0, 240);
+      const normalizedTitle = normalizePlaylistTitle(brief.title, brief);
+      const name = appendPlaylistTitleSuffix(normalizedTitle, `· ${now.toISOString().slice(0, 10)}`);
       const description = manifestDescriptionForBrief(brief);
       await client.query("INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,$3,$4,$5)", [id, runId, name, description, contentHash]);
       for (const track of tracks) {

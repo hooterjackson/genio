@@ -47,6 +47,15 @@ interface MatchingCheckpoint {
   updatedAt: string;
 }
 
+interface MatchingOutcomeCheckpoint {
+  storefront: string;
+  targetMinimum: number | null;
+  safePrimaryCount: number;
+  shortfall: number;
+  status: "complete" | "shortfall";
+  updatedAt: string;
+}
+
 export interface MatchingRepository {
   getRun(runId: string): Promise<{ brief: PlaylistBrief; createdAt?: string }>;
   updateRun(runId: string, patch: { status?: string; phase?: string; error?: string | null }): Promise<void>;
@@ -56,6 +65,51 @@ export interface MatchingRepository {
   saveTimeoutMatches(runId: string, candidateIds: string[], basis: string): Promise<void>;
   getResearchCheckpoint(runId: string, phase: string): Promise<unknown | null>;
   saveResearchCheckpoint(runId: string, phase: string, checkpoint: unknown): Promise<void>;
+}
+
+const MATCHING_OUTCOME_CHECKPOINT = "catalog_matching_outcome";
+
+function isSafePrimaryMatch(match: ExistingMatch): boolean {
+  // A review row with a concrete Apple ID is intentionally selectable: it
+  // represents a plausible catalog version that still needs a visitor choice.
+  // Duplicate/unavailable rows and title-only alternatives have no safe
+  // primary and therefore cannot satisfy the confirmed requested count.
+  return (match.status === "accepted" || match.status === "review")
+    && Boolean(match.song?.id);
+}
+
+async function finalizeMatchingOutcome(
+  repository: MatchingRepository,
+  runId: string,
+  brief: PlaylistBrief,
+  storefront: string,
+): Promise<void> {
+  const matches = await repository.listMatches(runId);
+  const safePrimaryCount = matches.filter(isSafePrimaryMatch).length;
+  const configuredMinimum = brief.targetSize?.min;
+  const targetMinimum = typeof configuredMinimum === "number" && Number.isFinite(configuredMinimum)
+    ? Math.max(0, Math.floor(configuredMinimum))
+    : null;
+  const shortfall = targetMinimum === null ? 0 : Math.max(0, targetMinimum - safePrimaryCount);
+  const checkpoint: MatchingOutcomeCheckpoint = {
+    storefront,
+    targetMinimum,
+    safePrimaryCount,
+    shortfall,
+    status: shortfall > 0 ? "shortfall" : "complete",
+    updatedAt: new Date().toISOString(),
+  };
+  await repository.saveResearchCheckpoint(runId, MATCHING_OUTCOME_CHECKPOINT, checkpoint);
+
+  if (shortfall > 0) {
+    await repository.updateRun(runId, {
+      status: "visitor_review",
+      phase: "catalog_matching_shortfall",
+      error: `Apple Music matching found ${safePrimaryCount} safe catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}; ${shortfall} remain unresolved.`,
+    });
+    return;
+  }
+  await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review", error: null });
 }
 
 function boundedEnvironmentInteger(name: string, fallback: number, minimum: number, maximum: number): number {
@@ -68,7 +122,19 @@ export function matchingConcurrency(): number {
 }
 
 export function catalogRecoveryDeadlineMs(): number {
-  return boundedEnvironmentInteger("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", 45_000, 10_000, 60_000);
+  // Recovery is the accuracy path after the two-minute fast route.  The old
+  // 45-second ceiling could repeatedly time out the same tail of a 100-track
+  // run before Apple's broader searches had a chance to complete.  Keep the
+  // fast route bounded, but give one recovery generation enough time to
+  // actually settle a medium playlist.
+  return boundedEnvironmentInteger("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", 90_000, 90_000, 180_000);
+}
+
+export function catalogLookupTimeoutMs(recovery: boolean): number {
+  const fastTimeout = boundedEnvironmentInteger("FAST_MATCH_LOOKUP_TIMEOUT_MS", 7_000, 3_000, 12_000);
+  // Apple may retry a safe GET after a transient 429/5xx. Recovery lookups
+  // need room for that bounded retry; the initial fast pass does not.
+  return recovery ? Math.max(20_000, fastTimeout) : fastTimeout;
 }
 
 export function catalogSearchQueries(candidate: Pick<Candidate, "artist" | "title" | "album">): string[] {
@@ -86,13 +152,20 @@ export function catalogSearchQueries(candidate: Pick<Candidate, "artist" | "titl
     queries.push(query);
   };
 
-  // Start with the most discriminating metadata, then progressively remove
-  // fields that research sources commonly misattribute or omit.
-  add(artist, title, album);
+  // Apple ranks song searches more reliably when the title leads. Start with
+  // the two fields that identify the recording without over-constraining the
+  // request to an album spelling or edition. The previous album-first query
+  // commonly spent two requests on every otherwise-exact track, exhausting
+  // the fast route before its tail was searched.
+  add(title, artist);
   add(artist, title);
-  if (baseTitle && baseTitle !== normalizeMusicText(title)) add(artist, baseTitle);
   if (album) add(title, album);
+  if (baseTitle && baseTitle !== normalizeMusicText(title)) {
+    add(baseTitle, artist);
+    add(artist, baseTitle);
+  }
   add(title);
+  if (baseTitle && baseTitle !== normalizeMusicText(title)) add(baseTitle);
   return queries;
 }
 
@@ -104,7 +177,7 @@ export async function lookupCandidateSongs(
   let songs = candidate.isrc ? await lookupAppleCatalogByIsrc(storefront, candidate.isrc, signal) : [];
   if (hasDirectCatalogMatch(candidate, songs)) return songs;
 
-  const maximumQueries = boundedEnvironmentInteger("APPLE_MATCH_MAX_QUERIES", 5, 1, 5);
+  const maximumQueries = boundedEnvironmentInteger("APPLE_MATCH_MAX_QUERIES", 7, 1, 7);
   for (const query of catalogSearchQueries(candidate).slice(0, maximumQueries)) {
     signal?.throwIfAborted();
     const results = await searchAppleCatalog(storefront, query, signal);
@@ -198,7 +271,7 @@ export async function matchResearchRun(
     ? null
     : await repository.getResearchCheckpoint(runId, checkpointPhase) as MatchingCheckpoint | null;
   if (!recovery && checkpoint?.complete && checkpoint.storefront === normalizedStorefront) {
-    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review", error: null });
+    await finalizeMatchingOutcome(repository, runId, run.brief, normalizedStorefront);
     return;
   }
   const start = checkpoint?.storefront === normalizedStorefront ? checkpoint.nextIndex : 0;
@@ -305,7 +378,7 @@ export async function matchResearchRun(
                 ...(signal ? [signal] : []),
                 AbortSignal.timeout(Math.max(1, Math.min(
                   lookupBudget,
-                  boundedEnvironmentInteger("FAST_MATCH_LOOKUP_TIMEOUT_MS", 7_000, 3_000, 12_000),
+                  catalogLookupTimeoutMs(recovery),
                 ))),
               ])
             : signal;
@@ -378,7 +451,7 @@ export async function matchResearchRun(
       updatedAt: new Date().toISOString(),
     });
   }
-  await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+  await finalizeMatchingOutcome(repository, runId, run.brief, normalizedStorefront);
 }
 
 export async function processMatchingJob(repository: MatchingRepository, payload: Record<string, unknown>, signal?: AbortSignal): Promise<void> {

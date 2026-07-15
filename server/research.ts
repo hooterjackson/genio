@@ -1183,6 +1183,7 @@ export class ResearchOrchestrator {
       await this.repository.updateRun(runId, { status: "researching", phase: "fast_research", error: null });
 
       const requestedMinimum = Math.max(1, brief.targetSize?.min ?? 50);
+      const candidateGoal = Math.max(requestedMinimum, policy.candidateGoal);
       let totalExtracted = 0;
       let totalRejected = 0;
       let totalSearchCalls = 0;
@@ -1194,9 +1195,9 @@ export class ResearchOrchestrator {
         assertActive(signal);
         const coverageBefore = await this.repository.getCoverage(runId);
         const eligibleBefore = Math.max(0, Number(coverageBefore.eligibleCandidateCount ?? 0));
-        if (eligibleBefore >= requestedMinimum) break;
+        if (eligibleBefore >= candidateGoal) break;
 
-        const remainingNeeded = requestedMinimum - eligibleBefore;
+        const remainingNeeded = candidateGoal - eligibleBefore;
         const passCandidateLimit = Math.min(
           policy.candidateLimit,
           Math.max(remainingNeeded, Math.ceil(remainingNeeded * 1.25)),
@@ -1299,8 +1300,7 @@ export class ResearchOrchestrator {
         completedPasses += 1;
         if (validated.candidates.length === 0) continue;
 
-        const confirmedMaximum = Math.max(requestedMinimum, brief.targetSize?.max ?? requestedMinimum);
-        const remainingCapacity = Math.max(0, confirmedMaximum - eligibleBefore);
+        const remainingCapacity = Math.max(0, candidateGoal - eligibleBefore);
         const rankedCandidates = validated.candidates.slice(0, remainingCapacity).map((candidate, index) => ({
           ...candidate,
           selectionRank: eligibleBefore + index + 1,
@@ -1320,6 +1320,7 @@ export class ResearchOrchestrator {
       const coverage = await this.repository.getCoverage(runId);
       const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? 0));
       const shortfall = Math.max(0, requestedMinimum - eligibleCount);
+      const reserveShortfall = Math.max(0, candidateGoal - eligibleCount);
       await this.repository.upsertFrontier(runId, [
         {
           sourceClass: "web",
@@ -1332,14 +1333,25 @@ export class ResearchOrchestrator {
         },
         {
           sourceClass: "fast_policy",
-          strategy: "time-boxed curated candidate target",
+          strategy: "confirmed curated playlist minimum",
           cursor: null,
           status: shortfall === 0 ? "complete" : "unresolved",
           discoveredCount: requestedMinimum,
-          recoveredCount: eligibleCount,
+          recoveredCount: Math.min(requestedMinimum, eligibleCount),
           note: shortfall === 0
-            ? `${eligibleCount} citation-eligible candidates met the confirmed minimum`
+            ? `${requestedMinimum} citation-eligible candidates met the confirmed minimum`
             : `${shortfall} tracks remain below the confirmed minimum after ${completedPasses} bounded fast passes`,
+        },
+        {
+          sourceClass: "fast_policy",
+          strategy: "Apple catalog matching reserve",
+          cursor: null,
+          status: reserveShortfall === 0 ? "complete" : "unresolved",
+          discoveredCount: candidateGoal,
+          recoveredCount: Math.min(candidateGoal, eligibleCount),
+          note: reserveShortfall === 0
+            ? `${candidateGoal - requestedMinimum} additional citation-eligible candidates are available to backfill catalog misses`
+            : `${reserveShortfall} reserve candidates were not recovered before the bounded fast cutoff`,
         },
       ]);
       if (shortfall > 0) {
@@ -1361,6 +1373,8 @@ export class ResearchOrchestrator {
           modelCallCount: completedPasses * 2,
           newlyAdded,
           shortfall,
+          candidateGoal,
+          reserveShortfall,
         });
         await this.repository.saveResearchCheckpoint(runId, policyKey, {
           status: "shortfall",
@@ -1393,6 +1407,8 @@ export class ResearchOrchestrator {
         modelCallCount: completedPasses * 2,
         newlyAdded,
         shortfall,
+        candidateGoal,
+        reserveShortfall,
       });
       await this.repository.saveResearchCheckpoint(runId, policyKey, {
         status: "complete",

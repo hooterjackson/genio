@@ -104,6 +104,7 @@ type TrackSelection = {
   unmatchedCount: number;
   retryableCount: number;
   matchingComplete: boolean;
+  requestedTrackCount: number | null;
 };
 
 type TrackSelectionRequest =
@@ -368,6 +369,9 @@ function normalizeTrackSelection(payload: unknown, requestedPage: number): Track
     unmatchedCount: numberValue(object.unmatchedCount, items.filter((item) => !item.selectable).length),
     retryableCount: numberValue(object.retryableCount),
     matchingComplete: object.matchingComplete !== false,
+    requestedTrackCount: typeof object.requestedTrackCount === "number"
+      ? Math.max(1, Math.floor(object.requestedTrackCount))
+      : null,
   };
 }
 
@@ -402,10 +406,11 @@ const RETRYABLE_APPLE_MATCH_BASES = new Set([
 const FAILED_APPLE_MATCH_BASIS =
   "Apple catalog recovery could not resolve this track after retry attempts";
 
-type TrackReviewState = "matched" | "needs-match" | "match-failed" | "unavailable" | "excluded";
+type TrackReviewState = "matched" | "choose-match" | "needs-match" | "match-failed" | "unavailable" | "excluded";
 
 function trackReviewLabel(state: TrackReviewState): string {
   switch (state) {
+    case "choose-match": return "CHOOSE VERSION";
     case "needs-match": return "NEEDS MATCH";
     case "match-failed": return "MATCH FAILED";
     case "unavailable": return "UNAVAILABLE";
@@ -904,6 +909,17 @@ function TrackSelectionScreen({
   onRetry: () => void;
   onGenerate: (request: TrackSelectionRequest) => void;
 }) {
+  const requestedTrackCount = selection.requestedTrackCount;
+  const recommendedCandidates = useMemo(
+    () => selection.items.filter(recommendedByDefault),
+    [selection.items],
+  );
+  // When matching originally satisfied the request, visitors may still make
+  // an intentional shorter playlist by unchecking tracks. A run that reached
+  // review with a catalog shortfall must first resolve enough Apple choices to
+  // meet the requested count; it can no longer silently publish a partial.
+  const initialRequestSatisfied = requestedTrackCount === null
+    || recommendedCandidates.length >= requestedTrackCount;
   const [catalogIds, setCatalogIds] = useState<Record<string, string>>(() => {
     const nextCatalogIds: Record<string, string> = {};
     for (const item of selection.items) {
@@ -914,18 +930,31 @@ function TrackSelectionScreen({
     return nextCatalogIds;
   });
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(
-    selection.items
-      .filter(recommendedByDefault)
+    recommendedCandidates
+      .slice(0, requestedTrackCount ?? undefined)
       .map((item) => item.candidateId),
   ));
 
+  const manualChoiceCandidateIds = useMemo(() => new Set(
+    selection.items
+      .filter((item) => !item.selectable && trackChoices(item).length > 0)
+      .map((item) => item.candidateId),
+  ), [selection.items]);
+
   const selectable = useMemo(
-    () => selection.items.filter((item) => item.selectable && Boolean(catalogIds[item.candidateId])),
-    [selection, catalogIds],
+    () => selection.items.filter((item) => (
+      Boolean(catalogIds[item.candidateId])
+      && (item.selectable || manualChoiceCandidateIds.has(item.candidateId))
+    )),
+    [selection, catalogIds, manualChoiceCandidateIds],
   );
   const selected = useMemo(
     () => selectable.filter((item) => selectedIds.has(item.candidateId)),
     [selectable, selectedIds],
+  );
+  const selectAllCandidates = useMemo(
+    () => selectable.slice(0, requestedTrackCount ?? undefined),
+    [selectable, requestedTrackCount],
   );
 
   const retryableCandidateIds = useMemo(() => {
@@ -961,6 +990,9 @@ function TrackSelectionScreen({
       if (item.selectable && Boolean(recommendedCatalogId(item))) {
         return [item.candidateId, item.status === "rejected" ? "excluded" : "matched"];
       }
+      if (manualChoiceCandidateIds.has(item.candidateId)) {
+        return [item.candidateId, catalogIds[item.candidateId] ? "matched" : "choose-match"];
+      }
       if (retryableCandidateIds.has(item.candidateId)) return [item.candidateId, "needs-match"];
       if (item.status === "unavailable") return [item.candidateId, "unavailable"];
       if (item.basis === FAILED_APPLE_MATCH_BASIS || ["review", "pending"].includes(item.status)) {
@@ -968,15 +1000,28 @@ function TrackSelectionScreen({
       }
       return [item.candidateId, "excluded"];
     }),
-  ), [selection.items, retryableCandidateIds]);
+  ), [selection.items, retryableCandidateIds, manualChoiceCandidateIds, catalogIds]);
 
+  const chooseMatchCount = [...reviewStateByCandidateId.values()].filter((state) => state === "choose-match").length;
   const needsMatchCount = [...reviewStateByCandidateId.values()].filter((state) => state === "needs-match").length;
   const matchFailedCount = [...reviewStateByCandidateId.values()].filter((state) => state === "match-failed").length;
   const unavailableCount = [...reviewStateByCandidateId.values()].filter((state) => state === "unavailable").length;
+  const requestedShortfall = requestedTrackCount === null
+    ? 0
+    : Math.max(0, requestedTrackCount - selected.length);
+  const blocksPartialGeneration = !initialRequestSatisfied && requestedShortfall > 0;
 
   let reviewSummary: string;
   if (selection.items.length === 0) {
     reviewSummary = "No tracks are available to generate.";
+  } else if (blocksPartialGeneration && requestedTrackCount) {
+    reviewSummary = `${selected.length.toLocaleString()} of ${requestedTrackCount.toLocaleString()} requested tracks are ready. Resolve ${requestedShortfall.toLocaleString()} more Apple Music ${requestedShortfall === 1 ? "match" : "matches"} to generate the playlist.`;
+  } else if (chooseMatchCount > 0) {
+    const remaining = [
+      needsMatchCount > 0 ? ` Retry matching for ${trackCountLabel(needsMatchCount)}.` : "",
+      unavailableCount > 0 ? ` ${unavailableTrackCountLabel(unavailableCount)} will be omitted.` : "",
+    ].join("");
+    reviewSummary = `${trackCountLabel(selectable.length)} matched. Choose an Apple Music version for ${trackCountLabel(chooseMatchCount)} to make those tracks selectable.${remaining}`;
   } else if (needsMatchCount > 0) {
     const unavailableNote = unavailableCount > 0
       ? `; ${unavailableTrackCountLabel(unavailableCount)} will be omitted`
@@ -999,26 +1044,34 @@ function TrackSelectionScreen({
       unavailableCount > 0 ? unavailableTrackCountLabel(unavailableCount) : "",
     ].filter(Boolean).join("; ");
     reviewSummary = `${trackCountLabel(selectable.length)} matched. Omitted: ${omissions}.`;
+  } else if (requestedTrackCount && selectable.length > requestedTrackCount) {
+    reviewSummary = `${trackCountLabel(selected.length)} selected from ${trackCountLabel(selectable.length)} matched. Additional matches are available as replacements.`;
   } else {
     reviewSummary = `${trackCountLabel(selectable.length)} matched. Uncheck any you do not want.`;
   }
 
   function setAll(checked: boolean) {
-    setSelectedIds(checked ? new Set(selectable.map((item) => item.candidateId)) : new Set());
+    setSelectedIds(checked ? new Set(selectAllCandidates.map((item) => item.candidateId)) : new Set());
   }
 
   function toggle(candidateId: string, checked: boolean) {
     setSelectedIds((current) => {
       const next = new Set(current);
-      if (checked) next.add(candidateId);
-      else next.delete(candidateId);
+      if (checked) {
+        if (requestedTrackCount && !next.has(candidateId) && next.size >= requestedTrackCount) {
+          const replacement = [...selection.items]
+            .reverse()
+            .find((item) => next.has(item.candidateId));
+          if (replacement) next.delete(replacement.candidateId);
+        }
+        next.add(candidateId);
+      } else next.delete(candidateId);
       return next;
     });
   }
 
   function chooseCatalog(item: SelectableTrack, catalogId: string) {
     setCatalogIds((current) => ({ ...current, [item.candidateId]: catalogId }));
-    toggle(item.candidateId, true);
   }
 
   function generate() {
@@ -1042,7 +1095,9 @@ function TrackSelectionScreen({
     onGenerate(request);
   }
 
-  const allSelected = selectable.length > 0 && selected.length === selectable.length;
+  const allSelected = selectAllCandidates.length > 0
+    && selected.length === selectAllCandidates.length
+    && selectAllCandidates.every((item) => selectedIds.has(item.candidateId));
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
@@ -1074,11 +1129,13 @@ function TrackSelectionScreen({
               {selection.items.map((item, index) => {
                 const choices = trackChoices(item);
                 const checked = selectedIds.has(item.candidateId);
-                const disabled = !item.selectable || choices.length === 0;
+                const needsChoice = manualChoiceCandidateIds.has(item.candidateId);
+                const disabled = !(item.selectable || Boolean(catalogIds[item.candidateId])) || choices.length === 0;
+                const terminallyUnavailable = disabled && !needsChoice;
                 const reviewState = reviewStateByCandidateId.get(item.candidateId) ?? "unavailable";
                 const displayedState = reviewState === "excluded" && checked ? "matched" : reviewState;
                 return (
-                  <li className={`track-selection-row${disabled ? " unavailable" : ""}`} key={item.candidateId}>
+                  <li className={`track-selection-row${terminallyUnavailable ? " unavailable" : ""}${needsChoice ? " needs-choice" : ""}`} key={item.candidateId}>
                     <label>
                       <input
                         type="checkbox"
@@ -1096,14 +1153,15 @@ function TrackSelectionScreen({
                         {trackReviewLabel(displayedState)}
                       </span>
                     </label>
-                    {item.selectable && choices.length > 1 && (
+                    {((item.selectable && choices.length > 1) || needsChoice) && (
                       <label className="match-choice">
                         <span>APPLE MUSIC VERSION</span>
                         <select
-                          value={catalogIds[item.candidateId] ?? choices[0]?.id}
+                          value={catalogIds[item.candidateId] ?? ""}
                           disabled={Boolean(busy)}
                           onChange={(event) => chooseCatalog(item, event.target.value)}
                         >
+                          {needsChoice && <option value="" disabled>CHOOSE A VERSION</option>}
                           {choices.map((song) => (
                             <option value={song.id} key={song.id}>
                               {song.name} — {song.artistName}{song.albumName ? " / " + song.albumName : ""}
@@ -1130,7 +1188,7 @@ function TrackSelectionScreen({
           <strong>{selected.length.toLocaleString()}</strong>
           <span>TRACK{selected.length === 1 ? "" : "S"}</span>
         </div>
-        <button className="action-button step-primary" onClick={generate} disabled={selected.length === 0 || Boolean(busy)}>
+        <button className="action-button step-primary" onClick={generate} disabled={selected.length === 0 || blocksPartialGeneration || Boolean(busy)}>
           {busy === "generate" ? "GENERATING PLAYLIST..." : "GENERATE PLAYLIST →"}
         </button>
       </div>

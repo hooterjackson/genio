@@ -17,6 +17,7 @@ import {
   searchAppleCatalog,
 } from "../server/apple.ts";
 import {
+  catalogLookupTimeoutMs,
   catalogRecoveryDeadlineMs,
   matchResearchRun,
   type MatchingRepository,
@@ -55,7 +56,7 @@ function routeCheckpoint(confirmedAt = new Date()) {
 
 function fastRepository(candidates: Candidate[], confirmedAt = new Date()): MemoryMatchingRepository {
   return new MemoryMatchingRepository(candidates, curatedBrief, new Map([
-    ["fast:route:fast_curated_v1", routeCheckpoint(confirmedAt)],
+    ["fast:route:fast_curated_v2", routeCheckpoint(confirmedAt)],
   ]));
 }
 
@@ -139,6 +140,12 @@ class MemoryMatchingRepository implements MatchingRepository {
   }
   async getResearchCheckpoint(_runId: string, phase: string) { return this.checkpointsByPhase.get(phase) ?? null; }
   async saveResearchCheckpoint(_runId: string, _phase: string, checkpoint: unknown) { this.checkpoints.push(checkpoint); }
+}
+
+function lastMatchingCheckpoint(repository: MemoryMatchingRepository): Record<string, unknown> | undefined {
+  return [...repository.checkpoints].reverse().find((checkpoint): checkpoint is Record<string, unknown> => (
+    typeof checkpoint === "object" && checkpoint !== null && "complete" in checkpoint
+  ));
 }
 
 beforeEach(() => {
@@ -225,8 +232,8 @@ test("catalog reads use bounded concurrency while match decisions stay ordered",
 
   expect(maximumActive).toBe(4);
   expect(repository.matches.map((match) => match.candidateId)).toEqual(candidates.map((item) => item.id));
-  expect((repository.checkpoints.at(-1) as any).complete).toBe(true);
-  expect((repository.checkpoints.at(-1) as any)).toMatchObject({
+  expect(lastMatchingCheckpoint(repository)?.complete).toBe(true);
+  expect(lastMatchingCheckpoint(repository)).toMatchObject({
     startedAt: expect.any(String),
     completedAt: expect.any(String),
   });
@@ -258,7 +265,7 @@ test("fast matching preserves 100 distinct candidates as 100 accepted Apple trac
   });
   const exactCuratedBrief = { ...curatedBrief, targetSize: { min: 100, max: 100 } };
   const repository = new MemoryMatchingRepository(candidates, exactCuratedBrief, new Map([
-    ["fast:route:fast_curated_v1", routeCheckpoint()],
+    ["fast:route:fast_curated_v2", routeCheckpoint()],
   ]));
 
   await matchResearchRun(repository, "run", "us", undefined, { fast: true });
@@ -270,6 +277,33 @@ test("fast matching preserves 100 distinct candidates as 100 accepted Apple trac
   );
   expect(new Set(repository.matches.map((match) => match.song?.id)).size).toBe(100);
   expect(repository.updates.at(-1)).toMatchObject({ status: "visitor_review", phase: "exception_review" });
+});
+
+test("matching records an explicit shortfall instead of presenting a partial requested count as complete", async () => {
+  const exactTargetBrief = { ...curatedBrief, targetSize: { min: 4, max: 4 } };
+  const repository = new MemoryMatchingRepository([], exactTargetBrief, new Map([
+    ["fast:route:fast_curated_v2", routeCheckpoint()],
+  ]));
+  repository.matches.push(
+    { candidateId: "accepted", status: "accepted", basis: "exact", score: 100, song: { ...song, id: "apple-a" }, alternatives: [] },
+    { candidateId: "selectable-review", status: "review", basis: "version review", score: 70, song: { ...song, id: "apple-b" }, alternatives: [] },
+    { candidateId: "wrong-artist", status: "review", basis: "title only", score: 40, song: null, alternatives: [{ ...song, id: "apple-wrong" }] },
+  );
+
+  await matchResearchRun(repository, "run", "us", undefined, { fast: true });
+
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "visitor_review",
+    phase: "catalog_matching_shortfall",
+    error: expect.stringContaining("2 safe catalog matches for the required 4; 2 remain unresolved"),
+  });
+  expect(repository.checkpoints).toContainEqual(expect.objectContaining({
+    storefront: "us",
+    targetMinimum: 4,
+    safePrimaryCount: 2,
+    shortfall: 2,
+    status: "shortfall",
+  }));
 });
 
 test("fast matching converts a transient Apple failure into an explicit review outcome", async () => {
@@ -307,7 +341,7 @@ test("fast matching records a genuine elapsed deadline for later recovery withou
     basis: RETRYABLE_CATALOG_MATCH_BASES[0],
   }]);
   expect(repository.matches).toHaveLength(2);
-  expect((repository.checkpoints.at(-1) as any)).toMatchObject({
+  expect(lastMatchingCheckpoint(repository)).toMatchObject({
     complete: true,
     nextIndex: 2,
     timedOutCandidateCount: 2,
@@ -337,7 +371,7 @@ test("deadline bulk accounting preserves a crash-window match and records only u
     "remaining-a",
     "remaining-b",
   ]);
-  expect((repository.checkpoints.at(-1) as any)).toMatchObject({ complete: true, nextIndex: 3 });
+  expect(lastMatchingCheckpoint(repository)).toMatchObject({ complete: true, nextIndex: 3 });
 });
 
 test("fast matching backfills a legacy route from run creation without resetting the clock", async () => {
@@ -385,11 +419,11 @@ test("catalog recovery retries only prior timeout rows and preserves completed m
     status: "matching",
     phase: "catalog_matching_recovery",
   });
-  expect((repository.checkpoints.at(-1) as any)).toMatchObject({ complete: true, nextIndex: 1 });
+  expect(lastMatchingCheckpoint(repository)).toMatchObject({ complete: true, nextIndex: 1 });
 });
 
 test("catalog recovery stops at its configured deadline and leaves remaining rows retryable", async () => {
-  vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "10000");
+  vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "90000");
   const repository = fastRepository([
     candidate("retry-a", "verified"),
     candidate("retry-b", "verified"),
@@ -401,7 +435,7 @@ test("catalog recovery stops at its configured deadline and leaves remaining row
   const base = Date.now();
   const clock = vi.spyOn(Date, "now")
     .mockReturnValueOnce(base)
-    .mockReturnValue(base + 10_001);
+    .mockReturnValue(base + 90_001);
 
   try {
     await matchResearchRun(repository, "run", "us", undefined, { retryIncomplete: true });
@@ -415,17 +449,27 @@ test("catalog recovery stops at its configured deadline and leaves remaining row
     expect.objectContaining({ candidateId: "retry-a", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0] }),
     expect.objectContaining({ candidateId: "retry-b", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0] }),
   ]);
-  expect(repository.checkpoints.at(-1)).toMatchObject({
+  expect(lastMatchingCheckpoint(repository)).toMatchObject({
     complete: true,
     nextIndex: 2,
     timedOutCandidateCount: 2,
   });
-  expect(repository.updates.at(-1)).toMatchObject({ status: "visitor_review", phase: "exception_review" });
+  expect(repository.updates.at(-1)).toMatchObject({ status: "visitor_review", phase: "catalog_matching_shortfall" });
 });
 
-test("catalog recovery timeout configuration is capped at sixty seconds", () => {
+test("catalog recovery gets a complete medium-playlist window and caps unsafe overrides", () => {
+  vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "45000");
+  expect(catalogRecoveryDeadlineMs()).toBe(90_000);
   vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "90000");
-  expect(catalogRecoveryDeadlineMs()).toBe(60_000);
+  expect(catalogRecoveryDeadlineMs()).toBe(90_000);
+  vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "999999");
+  expect(catalogRecoveryDeadlineMs()).toBe(180_000);
+});
+
+test("catalog recovery permits one bounded provider retry without relaxing the fast lookup window", () => {
+  vi.stubEnv("FAST_MATCH_LOOKUP_TIMEOUT_MS", "7000");
+  expect(catalogLookupTimeoutMs(false)).toBe(7_000);
+  expect(catalogLookupTimeoutMs(true)).toBe(20_000);
 });
 
 test.each([401, 403] as const)("fast matching propagates Apple catalog authentication failure %s", async (status) => {

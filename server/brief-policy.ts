@@ -1,7 +1,8 @@
 import type { PlaylistBrief } from "../shared/types.ts";
+import { PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
 
-const CURATED_MINIMUM = 50;
-const CURATED_MAXIMUM = 100;
+const CURATED_DEFAULT_MINIMUM = 50;
+const CURATED_DEFAULT_MAXIMUM = 100;
 const ABSOLUTE_MAXIMUM = 10_000;
 
 const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u2014]\s*)?(?:(?:[\p{L}][\p{L}'\u2019.-]*|&)\s+){0,8}(?:songs?|tracks?|recordings?|titles?)\b/giu;
@@ -101,9 +102,12 @@ export function normalizeBriefTarget(
 ): PlaylistBrief["targetSize"] {
   if (mode === "exhaustive") return null;
   if (mode === "curated") {
-    if (!target) return { min: CURATED_MINIMUM, max: CURATED_MAXIMUM };
-    const min = Math.min(CURATED_MAXIMUM, Math.max(CURATED_MINIMUM, target.min));
-    const max = Math.min(CURATED_MAXIMUM, Math.max(min, target.max));
+    if (!target) return { min: CURATED_DEFAULT_MINIMUM, max: CURATED_DEFAULT_MAXIMUM };
+    // 50-100 is the adaptive default, not a ceiling on an explicit request.
+    // The deterministic prompt pass below can still restore smaller explicit
+    // counts (for example, "25 tracks") after this model-output normalization.
+    const min = Math.min(ABSOLUTE_MAXIMUM, Math.max(CURATED_DEFAULT_MINIMUM, target.min));
+    const max = Math.min(ABSOLUTE_MAXIMUM, Math.max(min, target.max));
     return { min, max };
   }
   return target;
@@ -130,7 +134,6 @@ export function explicitTrackCount(prompt: string): number | null {
 export function preserveExplicitTrackCount(prompt: string, brief: PlaylistBrief): PlaylistBrief {
   const count = explicitTrackCount(prompt);
   if (count === null || brief.mode === "exhaustive") return brief;
-  if (brief.mode === "curated" && count > CURATED_MAXIMUM) return brief;
   return { ...brief, targetSize: { min: count, max: count } };
 }
 
@@ -145,7 +148,7 @@ export function isValidBriefTarget(
       && Number.isInteger(target.max)
       && target.min >= 1
       && target.max >= target.min
-      && target.max <= CURATED_MAXIMUM;
+      && target.max <= ABSOLUTE_MAXIMUM;
   }
   return target === null || (
     Number.isInteger(target.min)
@@ -168,7 +171,7 @@ export function isPlaylistBrief(value: unknown): value is PlaylistBrief {
   const validTarget = validMode
     && hasTargetSize
     && isValidBriefTarget(brief.mode!, brief.targetSize!);
-  return typeof brief.title === "string" && brief.title.trim().length > 0 && brief.title.length <= 240
+  return typeof brief.title === "string" && brief.title.trim().length > 0 && Array.from(brief.title).length <= PLAYLIST_TITLE_MAX_LENGTH
     && typeof brief.description === "string" && brief.description.trim().length > 0 && brief.description.length <= 2_000 && validMode
     && strings(brief.subjectEntities, 50, 240, 1)
     && typeof brief.relationship === "string" && brief.relationship.trim().length > 0 && brief.relationship.length <= 500

@@ -6,9 +6,47 @@ export function normalizeMusicText(value: string | null | undefined): string {
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/\b(feat|featuring|ft)\.?\b/g, " ")
+    // Catalog punctuation is not stable: Apple may print "UFO's" where a
+    // source prints "UFOs", or curly apostrophes where another source omits
+    // them. Removing apostrophes before tokenization preserves the word.
+    .replace(/['’]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .trim()
     .replace(/\s+/g, " ");
+}
+
+function normalizeMusicCompactTitle(value: string | null | undefined): string {
+  return normalizeMusicText(value).replace(/\s+/g, "");
+}
+
+function normalizeMusicCompactArtist(value: string | null | undefined): string {
+  return normalizeMusicText(value).replace(/\s+/g, "");
+}
+
+function normalizeMusicArtistMember(value: string | null | undefined): string {
+  return normalizeMusicText(value).replace(/^the\s+/u, "");
+}
+
+function normalizeMusicCollaboratorSet(value: string | null | undefined): string[] {
+  return (value ?? "")
+    .split(/\s*(?:&|\band\b)\s*/iu)
+    .map((member) => normalizeMusicArtistMember(member))
+    .filter(Boolean)
+    .sort();
+}
+
+function sameCollaboratorSet(left: string | null | undefined, right: string | null | undefined): boolean {
+  const leftMembers = normalizeMusicCollaboratorSet(left);
+  const rightMembers = normalizeMusicCollaboratorSet(right);
+  return leftMembers.length > 1
+    && leftMembers.length === rightMembers.length
+    && leftMembers.every((member, index) => member === rightMembers[index]);
+}
+
+function normalizeMusicPartStem(value: string | null | undefined): string {
+  return normalizeMusicText(value)
+    .replace(/\s+(?:(?:part|pt)\s+)?(?:\d+|[ivx]{1,4})$/u, "")
+    .trim();
 }
 
 /**
@@ -64,19 +102,43 @@ function hasYearConflict(candidate: TrackCandidateInput, song: CatalogSong): boo
 
 function versionFlags(value: string): Set<string> {
   const normalized = normalizeMusicText(value);
+  const padded = ` ${normalized} `;
   const flags = [
     "live", "remix", "edit", "acoustic", "instrumental", "re recorded",
-    "remaster", "demo", "karaoke", "radio", "mono", "stereo", "extended",
+    "demo", "karaoke", "radio", "extended",
   ];
-  return new Set(flags.filter((flag) => normalized.includes(flag)));
+  // Remasters and mono/stereo presentations generally retain the underlying
+  // performance. They remain review-only through base-title matching instead
+  // of being discarded as a conflicting recording. Match complete tokens so
+  // titles such as "Deliver" do not accidentally acquire a "live" flag.
+  return new Set(flags.filter((flag) => padded.includes(` ${flag} `)));
+}
+
+function masteringFlags(value: string): Set<string> {
+  const padded = ` ${normalizeMusicText(value)} `;
+  const flags = new Set<string>();
+  if (padded.includes(" remaster ") || padded.includes(" remastered ")) flags.add("remaster");
+  if (padded.includes(" mono ")) flags.add("mono");
+  if (padded.includes(" stereo ")) flags.add("stereo");
+  return flags;
 }
 
 function containsConflictingVersion(candidate: TrackCandidateInput, song: CatalogSong): boolean {
-  const candidateFlags = versionFlags(`${candidate.title} ${candidate.album ?? ""} ${candidate.versionLabel ?? ""}`);
-  const catalogText = normalizeMusicText(`${song.name} ${song.albumName} ${song.versionLabel ?? ""}`);
+  // Album editions are poor recording-version signals: a studio track may be
+  // reissued on an album titled "The Remixes" or "Live & Remastered" without
+  // changing the track itself. Song titles and explicit version labels remain
+  // authoritative; album equality is scored separately.
+  const candidateFlags = versionFlags(`${candidate.title} ${candidate.versionLabel ?? ""}`);
+  const catalogText = normalizeMusicText(`${song.name} ${song.versionLabel ?? ""}`);
   const catalogFlags = versionFlags(catalogText);
+  const candidateMasteringFlags = masteringFlags(`${candidate.title} ${candidate.versionLabel ?? ""}`);
+  const catalogMasteringFlags = masteringFlags(catalogText);
   return [...candidateFlags].some((flag) => !catalogFlags.has(flag))
-    || [...catalogFlags].some((flag) => !candidateFlags.has(flag));
+    || [...catalogFlags].some((flag) => !candidateFlags.has(flag))
+    // An unqualified source title may map to Apple's currently available
+    // remaster. The inverse is not safe: when the source explicitly requests
+    // a remaster/mono/stereo presentation, Apple must expose that marker.
+    || [...candidateMasteringFlags].some((flag) => !catalogMasteringFlags.has(flag));
 }
 
 interface CatalogComparison {
@@ -84,8 +146,14 @@ interface CatalogComparison {
   isrcMatch: boolean;
   isrcConflict: boolean;
   artistExact: boolean;
+  artistCompatible: boolean;
+  artistCompactExact: boolean;
+  artistLeadingArticleExact: boolean;
+  artistCollaboratorSetExact: boolean;
   titleExact: boolean;
   baseTitleExact: boolean;
+  compactTitleExact: boolean;
+  partStemExact: boolean;
   albumExact: boolean;
   durationExact: boolean;
   versionConflict: boolean;
@@ -99,14 +167,55 @@ function compareCatalogSong(candidate: TrackCandidateInput, song: CatalogSong): 
   const baseTitle = normalizeMusicBaseTitle(candidate.title);
   const songTitle = normalizeMusicText(song.name);
   const songBaseTitle = normalizeMusicBaseTitle(song.name);
+  const compactTitle = normalizeMusicCompactTitle(candidate.title);
+  const compactBaseTitle = normalizeMusicCompactTitle(normalizeMusicBaseTitle(candidate.title));
+  const songCompactTitle = normalizeMusicCompactTitle(song.name);
+  const songCompactBaseTitle = normalizeMusicCompactTitle(normalizeMusicBaseTitle(song.name));
+  const candidatePartStem = normalizeMusicPartStem(candidate.title);
+  const songPartStem = normalizeMusicPartStem(song.name);
+  const candidateHasPartSuffix = Boolean(candidatePartStem && candidatePartStem !== title);
+  const songHasPartSuffix = Boolean(songPartStem && songPartStem !== songTitle);
   const album = normalizeMusicText(candidate.album);
+  const candidateArtist = normalizeMusicText(candidate.artist);
+  const songArtist = normalizeMusicText(song.artistName);
+  const artistCompactExact = Boolean(
+    candidateArtist
+    && normalizeMusicCompactArtist(song.artistName) === normalizeMusicCompactArtist(candidate.artist)
+  );
+  const artistLeadingArticleExact = Boolean(
+    candidateArtist
+    && songArtist !== candidateArtist
+    && normalizeMusicArtistMember(song.artistName) === normalizeMusicArtistMember(candidate.artist)
+  );
+  const artistCollaboratorSetExact = sameCollaboratorSet(song.artistName, candidate.artist);
   return {
     song,
     isrcMatch: Boolean(candidateIsrc && songIsrc && candidateIsrc === songIsrc),
     isrcConflict: Boolean(candidateIsrc && songIsrc && candidateIsrc !== songIsrc),
-    artistExact: normalizeMusicText(song.artistName) === normalizeMusicText(candidate.artist),
+    artistExact: songArtist === candidateArtist,
+    // Spacing in electronic aliases is inconsistent across catalogs
+    // ("Model500" vs "Model 500"). This compatibility is review-only and is
+    // never sufficient for an automatic metadata match.
+    artistCompatible: artistCompactExact || artistLeadingArticleExact || artistCollaboratorSetExact,
+    artistCompactExact,
+    artistLeadingArticleExact,
+    artistCollaboratorSetExact,
     titleExact: songTitle === title,
     baseTitleExact: Boolean(baseTitle && songBaseTitle === baseTitle),
+    compactTitleExact: Boolean(
+      compactTitle
+      && (songCompactTitle === compactTitle
+        || songCompactBaseTitle === compactTitle
+        || (compactBaseTitle && songCompactTitle === compactBaseTitle)
+        || (compactBaseTitle && songCompactBaseTitle === compactBaseTitle)),
+    ),
+    // A source may cite a parent composition while Apple exposes its numbered
+    // parts as separate songs (for example "Quadrant Dub" versus I/II). This
+    // is deliberately review-only and requires compatible artist metadata.
+    partStemExact: Boolean(
+      (songHasPartSuffix && !candidateHasPartSuffix && songPartStem === title)
+      || (candidateHasPartSuffix && !songHasPartSuffix && candidatePartStem === songTitle),
+    ),
     albumExact: Boolean(album && normalizeMusicText(song.albumName) === album),
     durationExact: exactDuration(candidate.durationMs, song.durationInMillis),
     versionConflict: containsConflictingVersion(candidate, song),
@@ -125,8 +234,9 @@ export function hasDirectCatalogMatch(candidate: TrackCandidateInput, songs: Cat
     const comparison = compareCatalogSong(candidate, song);
     if (comparison.isrcMatch && !comparison.versionConflict) return true;
     if (comparison.isrcConflict || comparison.versionConflict) return false;
-    const titleCompatible = comparison.titleExact || comparison.baseTitleExact;
-    return titleCompatible && (comparison.artistExact || comparison.albumExact);
+    const titleCompatible = comparison.titleExact || comparison.baseTitleExact
+      || comparison.compactTitleExact || comparison.partStemExact;
+    return titleCompatible && (comparison.artistCompatible || comparison.albumExact);
   });
 }
 
@@ -147,6 +257,13 @@ export function rankCatalogMatches(
     if (comparison.artistExact) {
       score += 30;
       basis.push("artist");
+    } else if (comparison.artistCompatible) {
+      score += 18;
+      basis.push(comparison.artistCollaboratorSetExact
+        ? "order-insensitive collaborator set"
+        : comparison.artistLeadingArticleExact
+          ? "leading-article artist variant"
+          : "punctuation-normalized artist");
     }
     if (comparison.titleExact) {
       score += 40;
@@ -154,6 +271,12 @@ export function rankCatalogMatches(
     } else if (comparison.baseTitleExact) {
       score += 28;
       basis.push("base title");
+    } else if (comparison.compactTitleExact) {
+      score += 24;
+      basis.push("punctuation-normalized title");
+    } else if (comparison.partStemExact) {
+      score += 18;
+      basis.push("numbered-part title");
     }
     if (comparison.albumExact) {
       score += 15;
@@ -166,15 +289,16 @@ export function rankCatalogMatches(
     if (comparison.versionConflict) score -= 100;
     if (comparison.yearConflict) score -= 60;
     const identifierCompatible = comparison.isrcMatch && comparison.artistExact
-      && (comparison.titleExact || comparison.baseTitleExact)
+      && (comparison.titleExact || comparison.baseTitleExact || comparison.compactTitleExact)
       && compatibleDuration(candidate.durationMs, song.durationInMillis)
       && !comparison.versionConflict && !comparison.yearConflict;
     const metadataCompatible = !comparison.isrcConflict && comparison.artistExact
       && comparison.titleExact && (!candidate.album || comparison.albumExact)
       && comparison.durationExact && !comparison.versionConflict && !comparison.yearConflict;
     const directReview = !comparison.isrcConflict && !comparison.versionConflict
-      && (comparison.titleExact || comparison.baseTitleExact)
-      && (comparison.artistExact || comparison.albumExact);
+      && (comparison.titleExact || comparison.baseTitleExact
+        || comparison.compactTitleExact || comparison.partStemExact)
+      && (comparison.artistCompatible || comparison.albumExact);
     const titleReview = !comparison.isrcConflict
       && (comparison.titleExact || comparison.baseTitleExact);
     return {
@@ -212,7 +336,13 @@ export function rankCatalogMatches(
 
   const directReview = ranked.find((item) => item.directReview);
   if (directReview) {
-    const qualifier = directReview.titleExact ? "metadata requires review" : "parenthetical title variant requires review";
+    const qualifier = directReview.titleExact
+      ? "metadata requires review"
+      : directReview.baseTitleExact
+        ? "parenthetical title variant requires review"
+        : directReview.compactTitleExact
+          ? "punctuation-normalized title variant requires review"
+          : "numbered-part title variant requires review";
     return {
       candidateId,
       status: "review",
@@ -229,10 +359,14 @@ export function rankCatalogMatches(
     return {
       candidateId,
       status: "review",
-      basis: `${only.basis || "title"}; unique title result but artist or album attribution requires review`,
+      basis: `${only.basis || "title"}; unique title result has unresolved artist or album attribution`,
       score: only.score,
-      song: only.song,
-      alternatives: ranked.filter((item) => item.song.id !== only.song.id).slice(0, 4).map((item) => item.song),
+      // A unique Apple title is not a unique recording. Keeping a wrong-artist
+      // result as the primary made it selectable and could publish a cover or
+      // unrelated recording (the Drexciya failure). Retain it only as an
+      // explicit alternative until artist/album evidence binds it.
+      song: null,
+      alternatives: [only.song, ...ranked.filter((item) => item.song.id !== only.song.id).slice(0, 3).map((item) => item.song)],
     };
   }
   if (titleReviews.length > 0) {

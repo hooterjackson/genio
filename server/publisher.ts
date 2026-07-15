@@ -7,6 +7,7 @@ import {
   authorizedAppleClient,
 } from "./apple.ts";
 import type { PublicationStatus } from "../shared/types.ts";
+import { appendPlaylistTitleSuffix } from "./playlist-title.ts";
 
 const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
@@ -275,7 +276,7 @@ async function observeStablePrefix(
 }
 
 function volumeName(manifest: LockedManifest, index: number, count: number): string {
-  return count === 1 ? manifest.name : `${manifest.name} [${index + 1}/${count}]`;
+  return count === 1 ? manifest.name : appendPlaylistTitleSuffix(manifest.name, `[${index + 1}/${count}]`);
 }
 
 function volumeMarker(volume: PublicationVolume): string {
