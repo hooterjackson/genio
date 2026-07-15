@@ -13,7 +13,9 @@ import {
   libraryPlaylistIsPublic,
   processAppleAuthorizationJob,
   recoverUnverifiedAppleAuthorizationJob,
+  recoverWaitingApplePublicationJobs,
   type AppleAuthorizationJobRepository,
+  type ApplePublicationRecoveryRepository,
   type AppleAuthorizationRecord,
 } from "../server/apple.ts";
 import {
@@ -355,6 +357,31 @@ test("Apple authorization validation updates only the token generation that was 
   expect(repository.updateAppleAuthorizationValidation).toHaveBeenCalledTimes(1);
 });
 
+test("waiting publication recovery is independent, generation-scoped, and requires valid Apple authorization", async () => {
+  const authorization: AppleAuthorizationRecord = {
+    ...validAuthorization,
+    status: "valid",
+  };
+  const repository = {
+    getAppleAuthorization: vi.fn(async () => authorization),
+    listWaitingPublicationManifestIds: vi.fn(async () => ["manifest-waiting"]),
+    getManifestById: vi.fn(async () => ({ runId: "run-waiting" })),
+    enqueueJob: vi.fn(async () => ({ created: true })),
+  };
+
+  await expect(recoverWaitingApplePublicationJobs(repository)).resolves.toBe(1);
+  expect(repository.enqueueJob).toHaveBeenCalledWith({
+    kind: "publication",
+    runId: "run-waiting",
+    payload: { manifestId: "manifest-waiting" },
+    dedupeKey: `publication:manifest-waiting:reauth:${appleAuthorizationGeneration(authorization)}`,
+  });
+
+  repository.getAppleAuthorization.mockResolvedValue({ ...authorization, status: "validation_failed" });
+  await expect(recoverWaitingApplePublicationJobs(repository)).resolves.toBe(0);
+  expect(repository.enqueueJob).toHaveBeenCalledTimes(1);
+});
+
 test("the live smoke CLI requires both explicit test naming and write confirmation", () => {
   expect(() => parseAppleSmokeArgs([
     "--name", "ordinary playlist", "--catalog-id", "123", APPLE_SMOKE_CONFIRMATION_FLAG,
@@ -574,7 +601,7 @@ function durablePublicationHarness(input: {
   repository.enqueueJob.mockResolvedValue({ created: true });
 
   return {
-    repository: repository as PublicationRepository & AppleAuthorizationJobRepository & Record<string, ReturnType<typeof vi.fn>>,
+    repository: repository as PublicationRepository & AppleAuthorizationJobRepository & ApplePublicationRecoveryRepository & Record<string, ReturnType<typeof vi.fn>>,
     volumes,
     get authorization() { return authorization; },
     setAuthorization(next: AppleAuthorizationRecord | null) { authorization = next; },
@@ -885,6 +912,7 @@ test("a production Apple 403 preserves the manifest and resumes it after a repla
     authorizationGeneration: appleAuthorizationGeneration(replacementAuthorization),
   });
   expect(harness.authorization).toMatchObject({ status: "valid", storefront: "us" });
+  await expect(recoverWaitingApplePublicationJobs(harness.repository)).resolves.toBe(1);
   expect(harness.repository.enqueueJob).toHaveBeenCalledWith({
     kind: "publication",
     runId: productionManifest.runId,

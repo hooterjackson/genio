@@ -2183,6 +2183,168 @@ databaseDescribe("hosted backend integration", () => {
     });
   });
 
+  test("completed Apple validation jobs can be revived for the same cached token generation", async () => {
+    const authorization = {
+      ciphertext: "encrypted-cached-authorization",
+      iv: "iv",
+      authTag: "tag",
+      keyVersion: "v1",
+      storefront: "us",
+      status: "unverified",
+      lastValidatedAt: null,
+      lastError: null,
+    };
+    await repository.saveAppleAuthorization(authorization);
+    const authorizationGeneration = appleAuthorizationGeneration(authorization);
+    const dedupeKey = `apple-authorization:${authorizationGeneration}`;
+    const queued = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration },
+      dedupeKey,
+      maxAttempts: 6,
+    });
+    const leased = await repository.leaseNextJob("apple-cached-token-first", 60_000);
+    expect(leased).toMatchObject({ id: queued.id, attempts: 1 });
+    await repository.completeJob(queued.id, "apple-cached-token-first");
+
+    const retried = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration },
+      dedupeKey,
+      maxAttempts: 6,
+    });
+    expect(retried).toEqual({ id: queued.id, created: false });
+    const revived = await repository.pool.query<{
+      status: string;
+      attempts: number;
+      max_attempts: number;
+      completed_at: Date | null;
+    }>("SELECT status,attempts,max_attempts,completed_at FROM job_queue WHERE id=$1", [queued.id]);
+    expect(revived.rows[0]).toMatchObject({
+      status: "queued",
+      attempts: 0,
+      max_attempts: 6,
+      completed_at: null,
+    });
+  });
+
+  test("an expired final Apple validation lease fails only its current authorization generation", async () => {
+    const authorization = {
+      ciphertext: "encrypted-expired-authorization",
+      iv: "iv",
+      authTag: "tag",
+      keyVersion: "v1",
+      storefront: "us",
+      status: "unverified",
+      lastValidatedAt: null,
+      lastError: null,
+    };
+    await repository.saveAppleAuthorization(authorization);
+    const authorizationGeneration = appleAuthorizationGeneration(authorization);
+    const queued = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration },
+      dedupeKey: `apple-authorization:${authorizationGeneration}`,
+      maxAttempts: 1,
+    });
+    expect(await repository.leaseNextJob("apple-expired-validation", 30_000)).toMatchObject({
+      id: queued.id,
+      attempts: 1,
+    });
+    await repository.pool.query("UPDATE job_queue SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [queued.id]);
+    await expect(repository.leaseNextJob("apple-expired-sweeper", 30_000)).resolves.toBeNull();
+    await expect(repository.getAppleAuthorization()).resolves.toMatchObject({
+      status: "validation_failed",
+      lastError: "Apple Music authorization validation failed after the final attempt.",
+    });
+
+    const staleAuthorization = {
+      ...authorization,
+      ciphertext: "encrypted-stale-authorization",
+      status: "unverified",
+    };
+    await repository.saveAppleAuthorization(staleAuthorization);
+    const staleGeneration = appleAuthorizationGeneration(staleAuthorization);
+    const staleJob = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration: staleGeneration },
+      dedupeKey: `apple-authorization:${staleGeneration}`,
+      maxAttempts: 1,
+    });
+    expect(await repository.leaseNextJob("apple-stale-validation", 30_000)).toMatchObject({ id: staleJob.id });
+    await repository.saveAppleAuthorization({
+      ...authorization,
+      ciphertext: "encrypted-current-replacement",
+      status: "unverified",
+    });
+    await repository.pool.query("UPDATE job_queue SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [staleJob.id]);
+    await expect(repository.leaseNextJob("apple-stale-sweeper", 30_000)).resolves.toBeNull();
+    await expect(repository.getAppleAuthorization()).resolves.toMatchObject({
+      ciphertext: "encrypted-current-replacement",
+      status: "unverified",
+      lastError: null,
+    });
+
+    const validatedAuthorization = {
+      ...authorization,
+      ciphertext: "encrypted-validated-before-expiry",
+      status: "unverified",
+    };
+    await repository.saveAppleAuthorization(validatedAuthorization);
+    const validatedGeneration = appleAuthorizationGeneration(validatedAuthorization);
+    const validatedJob = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration: validatedGeneration },
+      dedupeKey: `apple-authorization:${validatedGeneration}`,
+      maxAttempts: 1,
+    });
+    expect(await repository.leaseNextJob("apple-validating-before-expiry", 30_000)).toMatchObject({ id: validatedJob.id });
+    await repository.updateAppleAuthorizationStatus("valid", null);
+    await repository.pool.query("UPDATE job_queue SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [validatedJob.id]);
+    await expect(repository.leaseNextJob("apple-validated-sweeper", 30_000)).resolves.toBeNull();
+    await expect(repository.getAppleAuthorization()).resolves.toMatchObject({
+      ciphertext: "encrypted-validated-before-expiry",
+      status: "valid",
+      lastError: null,
+    });
+  });
+
+  test("a terminal publication-resume failure cannot downgrade a valid Apple authorization", async () => {
+    const authorization = {
+      ciphertext: "encrypted-valid-authorization",
+      iv: "iv",
+      authTag: "tag",
+      keyVersion: "v1",
+      storefront: "us",
+      status: "valid",
+      lastValidatedAt: new Date(),
+      lastError: null,
+    };
+    await repository.saveAppleAuthorization(authorization);
+    const authorizationGeneration = appleAuthorizationGeneration(authorization);
+    const queued = await repository.enqueueJob({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration },
+      dedupeKey: `apple-authorization:${authorizationGeneration}`,
+      maxAttempts: 1,
+    });
+    const leased = await repository.leaseNextJob("apple-publication-resume-failure", 60_000);
+    expect(leased).toMatchObject({ id: queued.id, kind: "apple_authorization", attempts: 1 });
+
+    await repository.failJob(
+      queued.id,
+      "apple-publication-resume-failure",
+      "Publication recovery failed after validation",
+      null,
+    );
+
+    await expect(repository.getAppleAuthorization()).resolves.toMatchObject({
+      status: "valid",
+      storefront: "us",
+      lastError: null,
+    });
+  });
+
   test("terminal publication failures mark only active volumes failed with redacted diagnostics", async () => {
     const runId = await repository.createRun("Terminal publication diagnostics", brief, 0, 1);
     const manifestId = randomUUID();

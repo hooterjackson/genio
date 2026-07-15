@@ -1,5 +1,10 @@
 import { expect, test, vi } from "vitest";
-import type { AppleAuthorizationRecord } from "../server/apple.ts";
+import {
+  AppleApiError,
+  appleAuthorizationGeneration,
+  appleAuthorizationJobDedupeKey,
+  type AppleAuthorizationRecord,
+} from "../server/apple.ts";
 import {
   assertPublicationControl,
   exactOrderedPrefix,
@@ -56,12 +61,12 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("addSources" in publication).toBe(false);
   expect("saveAppleAuthorization" in publication).toBe(false);
   expect("reserveProviderCost" in appleAuthorization).toBe(false);
+  expect("enqueueJob" in appleAuthorization).toBe(false);
+  expect("getManifestById" in appleAuthorization).toBe(false);
   expect(() => research.enqueueJob({ kind: "publication" })).toThrow(/Research cannot enqueue publication/);
-  expect(() => appleAuthorization.enqueueJob({ kind: "research" })).toThrow(/cannot enqueue research/);
 
   await research.enqueueJob({ kind: "research" });
-  await appleAuthorization.enqueueJob({ kind: "publication" });
-  expect(source.enqueueJob).toHaveBeenCalledTimes(2);
+  expect(source.enqueueJob).toHaveBeenCalledTimes(1);
 });
 
 test("production worker refuses startup when provider or encryption secrets are absent", () => {
@@ -103,6 +108,65 @@ test("worker startup durably recovers an unverified Apple authorization", async 
       dedupeKey: expect.stringMatching(/^apple-authorization:[a-f0-9]{20}$/u),
       maxAttempts: 6,
     }));
+  } finally {
+    await runner.stop();
+    await running;
+  }
+});
+
+test("worker heartbeat reconciles an unverified Apple authorization saved after startup", async () => {
+  const harness = runnerHarness();
+  let authorization: AppleAuthorizationRecord = validAuthorization;
+  harness.repository.getAppleAuthorization.mockImplementation(async () => authorization);
+  harness.repository.leaseNextJob.mockResolvedValue(null);
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    heartbeatMs: 10,
+    controlIntervalMs: 60_000,
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.updateWorkerHeartbeat.mock.calls.length >= 1);
+    harness.repository.enqueueJob.mockClear();
+    authorization = { ...validAuthorization, status: "unverified" };
+    await waitFor(() => harness.repository.enqueueJob.mock.calls.some(
+      ([input]: [{ kind?: string }]) => input.kind === "apple_authorization",
+    ));
+    expect(harness.repository.enqueueJob).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "apple_authorization",
+      payload: { authorizationGeneration: appleAuthorizationGeneration(authorization) },
+      dedupeKey: appleAuthorizationJobDedupeKey(authorization),
+      maxAttempts: 6,
+    }));
+  } finally {
+    await runner.stop();
+    await running;
+  }
+});
+
+test("worker heartbeat independently resumes publications after Apple authorization becomes valid", async () => {
+  const harness = runnerHarness();
+  harness.repository.listWaitingPublicationManifestIds.mockResolvedValue(["manifest-waiting"]);
+  harness.repository.getManifestById.mockResolvedValue({ runId: "run-waiting" });
+  harness.repository.leaseNextJob.mockResolvedValue(null);
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    heartbeatMs: 60_000,
+    controlIntervalMs: 60_000,
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.enqueueJob.mock.calls.some(
+      ([input]: [{ kind?: string }]) => input.kind === "publication",
+    ));
+    expect(harness.repository.enqueueJob).toHaveBeenCalledWith({
+      kind: "publication",
+      runId: "run-waiting",
+      payload: { manifestId: "manifest-waiting" },
+      dedupeKey: `publication:manifest-waiting:reauth:${appleAuthorizationGeneration(validAuthorization)}`,
+    });
   } finally {
     await runner.stop();
     await running;
@@ -212,6 +276,7 @@ function runnerHarness(): RunnerHarness {
   repository.renewJobLease.mockResolvedValue(true);
   repository.getSetting.mockImplementation(async (key: string) => key === "research_paused" && researchPaused ? "true" : "false");
   repository.getAppleAuthorization.mockResolvedValue(validAuthorization);
+  repository.listWaitingPublicationManifestIds.mockResolvedValue([]);
   repository.getRunControlState.mockImplementation(async () => run);
   repository.deferJob.mockResolvedValue(undefined);
   repository.cancelLeasedJob.mockResolvedValue(undefined);
@@ -342,6 +407,38 @@ test("terminal worker failures are sanitized before crossing the repository boun
     );
     expect(JSON.stringify(harness.repository.failJob.mock.calls)).not.toContain("sk-proj-PRIVATE");
     expect(JSON.stringify(harness.repository.failJob.mock.calls)).not.toContain("postgres://");
+  } finally {
+    await runner.stop();
+    await running;
+  }
+});
+
+test("non-retriable Apple authorization rejections fail without six delayed attempts", async () => {
+  const harness = runnerHarness();
+  harness.job.kind = "apple_authorization";
+  harness.job.runId = null;
+  harness.job.maxAttempts = 6;
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    controlIntervalMs: 60_000,
+    heartbeatMs: 60_000,
+    renewMs: 60_000,
+    handlers: {
+      apple_authorization: async () => {
+        throw new AppleApiError("private Apple response", 422, false);
+      },
+    },
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.failJob.mock.calls.length === 1);
+    expect(harness.repository.failJob).toHaveBeenCalledWith(
+      harness.job.id,
+      expect.any(String),
+      "Apple Music rejected Needle's authorization validation request (HTTP 422).",
+      null,
+    );
   } finally {
     await runner.stop();
     await running;

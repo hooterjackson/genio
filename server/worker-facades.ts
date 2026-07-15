@@ -73,15 +73,6 @@ export function createAppleAuthorizationRepositoryFacade(source: AppleAuthorizat
     saveAppleAuthorization: (...args: Parameters<AppleAuthorizationJobRepository["saveAppleAuthorization"]>) => source.saveAppleAuthorization(...args),
     updateAppleAuthorizationStatus: (...args: Parameters<AppleAuthorizationJobRepository["updateAppleAuthorizationStatus"]>) => source.updateAppleAuthorizationStatus(...args),
     updateAppleAuthorizationValidation: (...args: Parameters<AppleAuthorizationJobRepository["updateAppleAuthorizationValidation"]>) => source.updateAppleAuthorizationValidation(...args),
-    listWaitingPublicationManifestIds: (...args: Parameters<AppleAuthorizationJobRepository["listWaitingPublicationManifestIds"]>) => source.listWaitingPublicationManifestIds(...args),
-    getManifestById: async (...args: Parameters<AppleAuthorizationJobRepository["getManifestById"]>) => {
-      const manifest = await source.getManifestById(...args);
-      return manifest ? { runId: manifest.runId } : null;
-    },
-    enqueueJob: (input: Parameters<AppleAuthorizationJobRepository["enqueueJob"]>[0]) => {
-      if (input.kind !== "publication") throw new Error(`Apple authorization cannot enqueue ${input.kind} jobs`);
-      return source.enqueueJob(input);
-    },
   });
 }
 

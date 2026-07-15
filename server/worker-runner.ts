@@ -5,9 +5,12 @@ import { processMatchingJob, type MatchingRepository } from "./matching-service.
 import { processPublicationJob, PublicationPausedError, type PublicationRepository } from "./publisher.ts";
 import { processNotificationJob, type NotificationRepository } from "./notifications.ts";
 import {
+  AppleApiError,
   processAppleAuthorizationJob,
   recoverUnverifiedAppleAuthorizationJob,
+  recoverWaitingApplePublicationJobs,
   type AppleAuthorizationJobRepository,
+  type ApplePublicationRecoveryRepository,
 } from "./apple.ts";
 import { Repository } from "./repository.ts";
 import {
@@ -71,6 +74,7 @@ export type WorkerRepository = WorkerQueueRepository
   & MatchingRepository
   & PublicationRepository
   & AppleAuthorizationJobRepository
+  & ApplePublicationRecoveryRepository
   & NotificationRepository;
 
 export type JobHandler = (payload: Record<string, unknown>, signal: AbortSignal) => Promise<void>;
@@ -244,6 +248,11 @@ export class WorkerRunner {
       capacity: this.concurrency,
       activeJobs: this.active.size,
     });
+    // Reconcile the narrow API crash window between persisting a user token
+    // and enqueuing its validation. The generation-scoped queue key keeps
+    // this idempotent, including when a completed validation is retried.
+    await recoverUnverifiedAppleAuthorizationJob(this.repository);
+    await recoverWaitingApplePublicationJobs(this.repository);
     const day = new Intl.DateTimeFormat("en-CA", {
       timeZone: "America/Sao_Paulo",
       year: "numeric",
@@ -350,7 +359,10 @@ export class WorkerRunner {
       const message = job.kind === "apple_authorization"
         ? safeAppleAuthorizationFailure(error)
         : sanitizeFailure(error, failureContextForJob(job.kind));
-      const retryAt = error instanceof NonRetriableJobError ? null : retryAtFor(job);
+      const providerRejectedAuthorization = job.kind === "apple_authorization"
+        && error instanceof AppleApiError
+        && !error.retriable;
+      const retryAt = error instanceof NonRetriableJobError || providerRejectedAuthorization ? null : retryAtFor(job);
       await this.repository.failJob(
         job.id,
         this.workerId,

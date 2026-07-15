@@ -2253,6 +2253,7 @@ export class Repository {
          completed_at=NULL,
          updated_at=now()
        WHERE job_queue.status IN ('failed','cancelled')
+          OR (job_queue.status='complete' AND EXCLUDED.kind='apple_authorization')
        RETURNING id,(xmax=0) AS inserted`,
       [id, input.runId ?? null, input.briefRequestId ?? null, input.kind, dedupeKey.slice(0, 160), input.payload ?? {}, input.availableAt ?? null, input.maxAttempts ?? 3],
     );
@@ -2288,6 +2289,25 @@ export class Repository {
         ],
       );
       for (const job of exhausted.rows) {
+        if (job.kind === "apple_authorization") {
+          const authorization = await client.query<{ ciphertext: string; key_version: string }>(
+            "SELECT ciphertext,key_version FROM apple_authorizations WHERE id='owner' FOR UPDATE",
+          );
+          const row = authorization.rows[0];
+          const expectedGeneration = typeof job.payload_json?.authorizationGeneration === "string"
+            ? job.payload_json.authorizationGeneration
+            : null;
+          if (row && expectedGeneration === appleAuthorizationGeneration({
+            ciphertext: row.ciphertext,
+            keyVersion: row.key_version,
+          })) {
+            await client.query(
+              `UPDATE apple_authorizations SET status='validation_failed',last_error=$1,updated_at=now()
+               WHERE id='owner' AND status<>'valid'`,
+              [sanitizeFailure(null, "apple_authorization")],
+            );
+          }
+        }
         const recoveryFailure = Boolean(job.run_id && job.kind === "matching" && isCatalogRecoveryJob(job.payload_json));
         if (recoveryFailure) {
           await settleCatalogRecoveryFailure(
@@ -2467,7 +2487,7 @@ export class Repository {
         })) {
           await client.query(
             `UPDATE apple_authorizations SET status='validation_failed',last_error=$1,updated_at=now()
-             WHERE id='owner'`,
+             WHERE id='owner' AND status<>'valid'`,
             [persistedError],
           );
         }

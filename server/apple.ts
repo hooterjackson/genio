@@ -483,6 +483,10 @@ export interface AppleAuthorizationJobRepository extends AppleAuthorizationStore
     status: "valid" | "reauthorization_required";
     lastError?: string | null;
   }): Promise<boolean>;
+}
+
+export interface ApplePublicationRecoveryRepository {
+  getAppleAuthorization(): Promise<AppleAuthorizationRecord | null>;
   listWaitingPublicationManifestIds(): Promise<string[]>;
   getManifestById(manifestId: string): Promise<{ runId: string } | null>;
   enqueueJob(input: {
@@ -519,6 +523,37 @@ export async function recoverUnverifiedAppleAuthorizationJob(
   return true;
 }
 
+/**
+ * Reconcile publications that were paused for owner reauthorization.
+ *
+ * This deliberately lives outside the authorization-validation job. A valid
+ * Music User Token must remain valid even when a transient database failure
+ * prevents one of the waiting publication jobs from being queued immediately.
+ */
+export async function recoverWaitingApplePublicationJobs(
+  repository: ApplePublicationRecoveryRepository,
+  signal?: AbortSignal,
+): Promise<number> {
+  signal?.throwIfAborted();
+  const authorization = await repository.getAppleAuthorization();
+  if (!authorization || authorization.status !== "valid") return 0;
+  const authorizationGeneration = appleAuthorizationGeneration(authorization);
+  let queued = 0;
+  for (const manifestId of await repository.listWaitingPublicationManifestIds()) {
+    signal?.throwIfAborted();
+    const manifest = await repository.getManifestById(manifestId);
+    if (!manifest) continue;
+    await repository.enqueueJob({
+      kind: "publication",
+      runId: manifest.runId,
+      payload: { manifestId },
+      dedupeKey: `publication:${manifestId}:reauth:${authorizationGeneration}`,
+    });
+    queued += 1;
+  }
+  return queued;
+}
+
 export async function processAppleAuthorizationJob(
   repository: AppleAuthorizationJobRepository,
   payload: Record<string, unknown>,
@@ -530,28 +565,9 @@ export async function processAppleAuthorizationJob(
   const authorizationGeneration = appleAuthorizationGeneration(authorization);
   if (typeof payload.authorizationGeneration === "string" && payload.authorizationGeneration !== authorizationGeneration) return;
   const token = decryptMusicUserToken(tokenEnvelope(authorization));
+  let storefront: string;
   try {
-    const storefront = await new AppleMusicClient(token).validateAuthorization(signal);
-    signal?.throwIfAborted();
-    const stillCurrent = await repository.updateAppleAuthorizationValidation({
-      expectedCiphertext: authorization.ciphertext,
-      expectedKeyVersion: authorization.keyVersion,
-      storefront,
-      status: "valid",
-      lastError: null,
-    });
-    if (!stillCurrent) return;
-    for (const manifestId of await repository.listWaitingPublicationManifestIds()) {
-      signal?.throwIfAborted();
-      const manifest = await repository.getManifestById(manifestId);
-      if (!manifest) continue;
-      await repository.enqueueJob({
-        kind: "publication",
-        runId: manifest.runId,
-        payload: { manifestId },
-        dedupeKey: `publication:${manifestId}:reauth:${authorizationGeneration}`,
-      });
-    }
+    storefront = await new AppleMusicClient(token).validateAuthorization(signal);
   } catch (error) {
     if (error instanceof AppleAuthorizationRequiredError) {
       await repository.updateAppleAuthorizationValidation({
@@ -564,6 +580,15 @@ export async function processAppleAuthorizationJob(
     }
     throw error;
   }
+  signal?.throwIfAborted();
+  const stillCurrent = await repository.updateAppleAuthorizationValidation({
+    expectedCiphertext: authorization.ciphertext,
+    expectedKeyVersion: authorization.keyVersion,
+    storefront,
+    status: "valid",
+    lastError: null,
+  });
+  if (!stillCurrent) return;
 }
 
 export async function searchAppleCatalog(storefront: string, query: string, signal?: AbortSignal): Promise<CatalogSong[]>;
