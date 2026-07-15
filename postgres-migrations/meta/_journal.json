@@ -43,6 +43,13 @@
       "when": 1784260800000,
       "tag": "0005_candidate_selection_rank",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784347200000,
+      "tag": "0006_capability_session_accesses",
+      "breakpoints": true
     }
   ]
 }

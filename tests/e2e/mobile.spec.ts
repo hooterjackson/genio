@@ -86,9 +86,13 @@ const fastEstimate = {
 
 async function openPrompt(page: Page): Promise<void> {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /go past the first 25/i })).toBeVisible();
-  await page.getByRole("button", { name: /research a playlist/i }).click();
-  await expect(page.getByRole("heading", { name: /what should needle build/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /research a playlist/i })).toBeVisible();
+  await page.getByRole("button", { name: /new playlist/i }).click();
+  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+}
+
+function requestField(page: Page) {
+  return page.getByRole("textbox", { name: /request/i });
 }
 
 test("the request and scope flow remains usable at mobile widths", async ({ page }) => {
@@ -104,16 +108,16 @@ test("the request and scope flow remains usable at mobile widths", async ({ page
   const example = page.getByRole("button", { name: "Paulinho da Costa’s 100 most influential songs" });
   await example.click();
   await expect(example).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByLabel(/playlist request/i)).toHaveValue("Paulinho da Costa’s 100 most influential songs");
+  await expect(requestField(page)).toHaveValue("Paulinho da Costa’s 100 most influential songs");
   await page.getByRole("button", { name: /back/i }).click();
-  await expect(page.getByRole("heading", { name: /go past the first 25/i })).toBeVisible();
-  await page.getByRole("button", { name: /research a playlist/i }).click();
-  await page.getByLabel(/playlist request/i).fill("Every released song Paulinho da Costa performed on");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await expect(page.getByRole("heading", { name: /research a playlist/i })).toBeVisible();
+  await page.getByRole("button", { name: /new playlist/i }).click();
+  await requestField(page).fill("Every released song Paulinho da Costa performed on");
+  await page.getByRole("button", { name: /review request/i }).click();
   await expect(page.getByRole("heading", { name: brief.title })).toBeVisible();
-  await expect(page.getByText("[DEEP · SOURCE FRONTIER]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Source-bounded completeness attempt; unresolved evidence stays visible.")).toBeVisible();
-  await expect(page.getByRole("button", { name: /start deep research/i })).toBeVisible();
+  await expect(page.getByText("[EXHAUSTIVE · LONGER RUN]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Searches the configured sources for all documented matches and reports unresolved gaps.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /start research/i })).toBeVisible();
   await expect(page.getByText("$4.25–$9.50")).toBeVisible();
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -130,12 +134,12 @@ test("curated requests are clearly labeled as the time-boxed fast path", async (
   });
 
   await openPrompt(page);
-  await page.getByLabel(/playlist request/i).fill("Influential Berlin techno");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await requestField(page).fill("Influential Berlin techno");
+  await page.getByRole("button", { name: /review request/i }).click();
 
-  await expect(page.getByText("[FAST · <2 MIN TARGET]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Cited editorial selection; partial results stay visible if the time box closes.")).toBeVisible();
-  await expect(page.getByRole("button", { name: /start fast research/i })).toBeVisible();
+  await expect(page.getByText("[CURATED · UNDER 2 MIN TARGET]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Returns a cited selection within a two-minute target. Partial results remain available if time expires.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /start research/i })).toBeVisible();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
 });
@@ -159,8 +163,63 @@ test("an active fast run keeps its profile and concise phase message visible", a
   });
 
   await page.goto("/#cap=one-time-secret&run=run-fast");
-  await expect(page.getByText("[FAST · RESEARCHING]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Fast mode is building a cited editorial selection inside a fixed research window.")).toBeVisible();
+  await expect(page.getByText("[CURATED · RESEARCHING]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Finding and verifying cited tracks.")).toBeVisible();
+});
+
+test("the jobs screen lists and opens earlier jobs for this browser", async ({ page }) => {
+  const earlierRun = {
+    ...run,
+    id: "run-earlier",
+    status: "researching",
+    phase: "track_verification",
+    createdAt: "2026-07-14T12:00:00.000Z",
+    updatedAt: "2026-07-14T12:05:00.000Z",
+  };
+  await page.route("**/api/v1/runs", async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [earlierRun] }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-earlier", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(earlierRun) });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "JOBS" }).click();
+  await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
+  await expect(page.getByText(brief.title)).toBeVisible();
+  await page.getByRole("button", { name: /open/i }).click();
+  await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => location.search)).toBe("?run=run-earlier");
+});
+
+test("an active job never blocks starting a new request", async ({ page }) => {
+  const activeRun = {
+    ...run,
+    id: "run-active",
+    status: "researching",
+    phase: "track_verification",
+  };
+  const deletes: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "DELETE") deletes.push(request.url());
+  });
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: activeRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-active", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(activeRun) });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-active");
+  await page.getByRole("button", { name: "NEW JOB", exact: true }).click();
+  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  await expect(requestField(page)).toHaveValue("");
+  expect(deletes).toEqual([]);
 });
 
 test("material scope assumptions must be accepted and are preserved in the confirmed brief", async ({ page }) => {
@@ -186,12 +245,12 @@ test("material scope assumptions must be accepted and are preserved in the confi
   });
 
   await openPrompt(page);
-  await page.getByLabel(/playlist request/i).fill("Every released song Paulinho da Costa performed on");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await requestField(page).fill("Every released song Paulinho da Costa performed on");
+  await page.getByRole("button", { name: /review request/i }).click();
 
-  const confirm = page.getByRole("button", { name: /start deep research/i });
+  const confirm = page.getByRole("button", { name: /start research/i });
   await expect(confirm).toBeDisabled();
-  const acceptance = page.getByRole("checkbox", { name: /i accept this scope/i });
+  const acceptance = page.getByRole("checkbox", { name: /i accept these assumptions/i });
   await acceptance.check();
   await expect(confirm).toBeEnabled();
   await confirm.click();
@@ -354,7 +413,7 @@ test("a transient restore failure preserves the durable run URL", async ({ page 
   await expect.poll(() => page.evaluate(() => location.search)).toBe("?run=run-transient");
 });
 
-test("manifest locking waits for the first exception page", async ({ page }) => {
+test("playlist preparation waits for the first exception page", async ({ page }) => {
   await page.route("**/api/v1/capabilities/exchange", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
   });
@@ -374,11 +433,11 @@ test("manifest locking waits for the first exception page", async ({ page }) => 
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await expect(page.getByText("LOADING EXCEPTIONS")).toBeVisible();
-  const lockButton = page.getByRole("button", { name: /lock playlist/i });
-  await expect(lockButton).toBeDisabled();
+  const prepareButton = page.getByRole("button", { name: /prepare playlist/i });
+  await expect(prepareButton).toBeDisabled();
   releaseExceptions();
-  await expect(page.getByText("[NO EXCEPTIONS]")).toBeVisible();
-  await expect(lockButton).toBeEnabled();
+  await expect(page.getByText("[NO REVIEW REQUIRED]")).toBeVisible();
+  await expect(prepareButton).toBeEnabled();
 });
 
 test("interactive controls meet the minimum touch target", async ({ page }) => {
@@ -397,7 +456,7 @@ test("interactive controls meet the minimum touch target", async ({ page }) => {
 
 test("desktop keyboard focus remains visible and primary text meets WCAG AA contrast", async ({ page }, testInfo) => {
   await page.goto("/");
-  const primary = page.getByRole("button", { name: /research a playlist/i });
+  const primary = page.getByRole("button", { name: /new playlist/i });
   await primary.focus();
   await expect(primary).toBeFocused();
 
@@ -422,7 +481,7 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
 
   if (testInfo.project.name === "desktop") {
     await primary.click();
-    const request = page.getByLabel(/playlist request/i);
+    const request = requestField(page);
     await expect(request).toBeFocused();
     await request.fill("Every released song Paulinho da Costa performed on");
     expect(await request.evaluate((element) => getComputedStyle(element).outlineColor)).toBe("rgb(224, 96, 41)");

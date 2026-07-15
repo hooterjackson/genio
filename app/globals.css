@@ -126,13 +126,25 @@ summary:focus-visible {
   letter-spacing: .09em;
 }
 
-.header-meta a {
+.header-meta a,
+.header-action {
   min-width: 44px;
   min-height: 44px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .08em;
   text-underline-offset: 4px;
+}
+
+.header-action:hover {
+  color: var(--ink);
 }
 
 .transfer-button {
@@ -902,18 +914,31 @@ dd {
   letter-spacing: .12em;
 }
 
-.intro-mark a {
+.intro-links {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.intro-mark a,
+.intro-mark button {
   min-width: 44px;
   min-height: 44px;
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
+  padding: 0;
+  border: 0;
   color: var(--muted);
+  background: transparent;
   font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .08em;
   text-underline-offset: 4px;
 }
 
-.intro-mark a:hover {
+.intro-mark a:hover,
+.intro-mark button:hover {
   color: var(--ink);
 }
 
@@ -990,6 +1015,77 @@ dd {
   color: var(--ink);
   font-size: clamp(13px, 1.5vw, 16px);
   line-height: 1.65;
+}
+
+.jobs-body {
+  align-self: start;
+}
+
+.jobs-empty {
+  min-height: 104px;
+  margin-top: 32px;
+  padding: 28px 0;
+  color: var(--muted);
+  border-block: 1px solid var(--line-strong);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .09em;
+}
+
+.jobs-list {
+  margin-top: 32px;
+  border-top: 1px solid var(--line-strong);
+}
+
+.jobs-list button {
+  width: 100%;
+  min-height: 86px;
+  padding: 16px 0;
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "status title open"
+    "status meta open";
+  gap: 4px 18px;
+  align-items: center;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+
+.jobs-list button:hover {
+  background: var(--surface);
+}
+
+.job-status {
+  grid-area: status;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+
+.jobs-list strong {
+  grid-area: title;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobs-list small {
+  grid-area: meta;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.job-open {
+  grid-area: open;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
 }
 
 .profile-tag {
@@ -1605,7 +1701,7 @@ dd {
   }
 
   .header-meta {
-    gap: 12px;
+    gap: 4px;
   }
 
   .header-meta a {
@@ -1613,10 +1709,7 @@ dd {
   }
 
   .transfer-button {
-    max-width: 92px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    display: none;
   }
 
   .screen,
@@ -1964,6 +2057,16 @@ dd {
   .result-actions {
     display: grid;
   }
+
+  .jobs-list button {
+    min-height: 96px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "status open"
+      "title title"
+      "meta meta";
+    gap: 3px 12px;
+  }
 }
 
 @media (max-width: 380px) {
@@ -1978,6 +2081,10 @@ dd {
 
   .flow-screen h1 {
     font-size: 36px;
+  }
+
+  .header-meta > span {
+    display: none;
   }
 
   .scope-footer {

@@ -6,9 +6,9 @@ The anonymous browser is untrusted. Sites is the only browser-facing gateway; Ra
 
 ## Anonymous capabilities
 
-Run creation returns a random capability in a URL fragment. Fragments are not sent in HTTP requests. The client exchanges it once, receives a scoped `HttpOnly`, `Secure`, `SameSite=Strict` cookie, and clears the fragment with `history.replaceState`. The database stores only peppered hashes. A session can mint a one-use transfer capability; deletion revokes all run capabilities.
+Run creation returns a random capability in a URL fragment. Fragments are not sent in HTTP requests. The client exchanges it once, receives a scoped `HttpOnly`, `Secure`, `SameSite=Strict` cookie, and clears the fragment with `history.replaceState`. The database stores only peppered hashes. A browser session may hold access to multiple runs, but every run route verifies its individual session-to-access mapping. A one-use transfer capability adds only its specific run to the receiving session. Deleting one run access preserves the session’s other jobs; an empty session is revoked and its cookie is cleared.
 
-Capabilities authorize one run, not identity. Daily HMAC-derived client buckets enforce abuse limits without storing raw IP addresses. Only trusted Sites/Cloudflare client-IP metadata may be used.
+Capabilities authorize specific run accesses, not identity. Daily HMAC-derived client buckets enforce abuse limits without storing raw IP addresses. Only trusted Sites/Cloudflare client-IP metadata may be used.
 
 ## Signed gateway
 

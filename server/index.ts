@@ -233,7 +233,12 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
 });
 
 app.post<{ Body: { token?: string; capabilityToken?: string } }>("/api/v1/capabilities/exchange", async (request, reply) => {
-  const session = await capabilities.exchange(request.body?.token ?? request.body?.capabilityToken ?? "", reply);
+  const currentSession = await capabilities.authenticateOptional(request);
+  const session = await capabilities.exchange(
+    request.body?.token ?? request.body?.capabilityToken ?? "",
+    reply,
+    currentSession,
+  );
   return { runId: session.accessId, expiresAt: session.expiresAt.toISOString() };
 });
 
@@ -241,10 +246,6 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const caller = identity(request);
-  const currentSession = await capabilities.authenticateOptional(request);
-  if (currentSession && await repository.hasActiveRunForSession(currentSession.id)) {
-    throw new HttpError(409, "Finish or delete the active run before starting another", "active_run_exists");
-  }
   const briefRequestId = uuid(request.body?.briefRequestId, "Brief request ID");
   const interpreted = await repository.getBriefRequest(briefRequestId);
   if (!interpreted || interpreted.status !== "complete" || !isPlaylistBrief(interpreted.brief)) {
@@ -264,6 +265,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   }
   const confirmedEstimateUsd = estimateResearchCost(brief);
   const key = idempotencyKey(request, request.body?.idempotencyKey);
+  const currentSession = await capabilities.authenticateOptional(request);
   const created = await repository.createRunIdempotent({
     prompt: interpreted.prompt,
     brief,
@@ -272,6 +274,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
+    capabilitySessionId: currentSession?.id,
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
@@ -281,6 +284,11 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   const capability = await capabilities.issue(created.runId, created.accessId);
   const run = await repository.getRunByAccess(created.accessId);
   return reply.code(created.created ? 201 : 200).send({ run, capability, reused: created.reused });
+});
+
+app.get("/api/v1/runs", async (request) => {
+  const session = await capabilities.authenticate(request);
+  return { items: await repository.listRunsForCapabilitySession(session.id, 50) };
 });
 
 app.get<{ Params: { id: string } }>("/api/v1/runs/:id", async (request) => {
@@ -380,7 +388,7 @@ app.delete<{ Params: { id: string } }>("/api/v1/runs/:id", async (request, reply
   await sessionForAccess(request, accessId);
   await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
   await repository.deleteRunAccess(accessId);
-  await capabilities.revoke(request, reply);
+  if (!await capabilities.authenticateOptional(request)) await capabilities.revoke(request, reply);
   return reply.code(204).send();
 });
 
