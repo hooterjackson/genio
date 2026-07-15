@@ -1,5 +1,5 @@
 export type MusicKitInstance = {
-  authorize(): Promise<string>;
+  authorize(): Promise<string | void>;
 };
 
 export type MusicKitApi = {
