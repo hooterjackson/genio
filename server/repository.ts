@@ -2879,7 +2879,7 @@ export class Repository {
 
   async updateAppleAuthorizationStatus(status: string, lastError: string | null = null): Promise<void> {
     await this.pool.query(
-      "UPDATE apple_authorizations SET status=$1,last_error=$2,last_validated_at=CASE WHEN $1='valid' THEN now() ELSE last_validated_at END,updated_at=now() WHERE id='owner'",
+      "UPDATE apple_authorizations SET status=$1::varchar,last_error=$2,last_validated_at=CASE WHEN $1::varchar='valid' THEN now() ELSE last_validated_at END,updated_at=now() WHERE id='owner'",
       [status, sanitizeOptionalFailure(lastError, "apple_authorization")],
     );
   }
@@ -2892,8 +2892,8 @@ export class Repository {
     lastError?: string | null;
   }): Promise<boolean> {
     const result = await this.pool.query(
-      `UPDATE apple_authorizations SET storefront=COALESCE($3,storefront),status=$4,last_error=$5,
-       last_validated_at=CASE WHEN $4='valid' THEN now() ELSE last_validated_at END,updated_at=now()
+      `UPDATE apple_authorizations SET storefront=COALESCE($3,storefront),status=$4::varchar,last_error=$5,
+       last_validated_at=CASE WHEN $4::varchar='valid' THEN now() ELSE last_validated_at END,updated_at=now()
        WHERE id='owner' AND ciphertext=$1 AND key_version=$2`,
       [
         input.expectedCiphertext,
