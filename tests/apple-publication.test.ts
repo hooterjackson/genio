@@ -684,6 +684,33 @@ test("publisher replaces a stored Apple playlist ID that remains unavailable aft
   expect(result).toMatchObject({ playlistId: "p.replacement", appendedCount: 2, status: "complete" });
 });
 
+test("publisher accepts Apple catalog-ID normalization only when ordered ISRC identities remain equal", async () => {
+  const repository = publicationRepository();
+  const aliases: Record<string, string> = { "101": "901", "202": "902" };
+  const recordingKeys: Record<string, string> = {
+    "101": "isrc:USAAA0000001",
+    "901": "isrc:USAAA0000001",
+    "202": "isrc:USAAA0000002",
+    "902": "isrc:USAAA0000002",
+  };
+  const state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.normalized", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId: string, ids: readonly string[]) => { state.push(...ids.map((id) => aliases[id] ?? id)); }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => [...state]),
+    getCatalogRecordingKeys: vi.fn(async (ids: readonly string[]) => Object.fromEntries(
+      ids.filter((id) => recordingKeys[id]).map((id) => [id, recordingKeys[id]!]),
+    )),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/normalized/pl.normalized"),
+  };
+
+  const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101", "202"], validAuthorization);
+  expect(result).toMatchObject({ playlistId: "p.normalized", appendedCount: 2, status: "complete" });
+  expect(repository.markPlaylistOrphan).not.toHaveBeenCalled();
+  expect(client.getCatalogRecordingKeys).toHaveBeenCalled();
+});
+
 test("publisher preserves the Apple playlist ID and exact track count when share polling times out", async () => {
   const repository = publicationRepository();
   let state: string[] = [];

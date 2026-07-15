@@ -91,6 +91,7 @@ export interface PublicationAppleClient {
   createLibraryPlaylist(name: string, description: string, signal?: AbortSignal): Promise<{ id: string; url: string | null }>;
   appendCatalogTracks(playlistId: string, catalogIds: readonly string[], signal?: AbortSignal): Promise<void>;
   getOrderedPlaylistCatalogIds(playlistId: string, signal?: AbortSignal): Promise<string[]>;
+  getCatalogRecordingKeys?(catalogIds: readonly string[], signal?: AbortSignal): Promise<Record<string, string>>;
   pollStableShareUrl(playlistId: string, attempts?: number, delayMs?: number, signal?: AbortSignal): Promise<string>;
 }
 
@@ -225,7 +226,17 @@ async function observeStablePrefix(
       }
       throw error;
     }
-    if (!exactOrderedPrefix(ids, expected)) return { ids, diverged: true };
+    if (!exactOrderedPrefix(ids, expected)) {
+      if (!client.getCatalogRecordingKeys || ids.length > expected.length) return { ids, diverged: true };
+      const expectedPrefix = expected.slice(0, ids.length);
+      const keys = await client.getCatalogRecordingKeys([...ids, ...expectedPrefix], signal);
+      const recordingEquivalent = ids.every((catalogId, index) => {
+        const observedKey = keys[catalogId];
+        const expectedKey = keys[expectedPrefix[index]!];
+        return Boolean(observedKey && expectedKey && observedKey === expectedKey);
+      });
+      if (!recordingEquivalent) return { ids, diverged: true };
+    }
     if (previous && ids.length === previous.length && ids.every((id, index) => id === previous![index])) stableReads += 1;
     else stableReads = 1;
     previous = ids;

@@ -317,6 +317,28 @@ export class AppleMusicClient {
     return ids;
   }
 
+  async getCatalogRecordingKeys(catalogIds: readonly string[], signal?: AbortSignal): Promise<Record<string, string>> {
+    if (!this.storefront || !/^[a-z]{2}$/i.test(this.storefront)) return {};
+    const unique = [...new Set(catalogIds.filter((id) => /^[A-Za-z0-9._-]{1,200}$/u.test(id)))];
+    const keys: Record<string, string> = {};
+    for (let offset = 0; offset < unique.length; offset += 100) {
+      signal?.throwIfAborted();
+      const ids = unique.slice(offset, offset + 100);
+      const params = new URLSearchParams({ ids: ids.join(",") });
+      const payload = await this.request(
+        `/v1/catalog/${encodeURIComponent(this.storefront.toLowerCase())}/songs?${params}`,
+        { signal },
+      );
+      for (const item of payload?.data ?? []) {
+        const id = typeof item?.id === "string" ? item.id : "";
+        if (!id) continue;
+        const isrc = typeof item?.attributes?.isrc === "string" ? item.attributes.isrc.trim().toUpperCase() : "";
+        keys[id] = isrc ? `isrc:${isrc}` : `apple:${id}`;
+      }
+    }
+    return keys;
+  }
+
   async getLibraryPlaylist(playlistId: string, signal?: AbortSignal): Promise<any | null> {
     try {
       const payload = await this.request(`/v1/me/library/playlists/${encodeURIComponent(playlistId)}?include=catalog`, { signal });
