@@ -377,8 +377,10 @@ async function abandonDivergedPlaylist(
   const mismatchIndex = observedIds.findIndex((catalogId, index) => catalogId !== expectedIds[index]);
   const position = mismatchIndex >= 0 ? mismatchIndex : Math.min(observedIds.length, expectedIds.length);
   const safeId = (value: string | undefined) => /^[A-Za-z0-9._-]{1,200}$/u.test(value ?? "") ? value : "missing";
+  const reason = `Apple playlist catalog mismatch at position ${position + 1}: expected ${safeId(expectedIds[position])}, observed ${safeId(observedIds[position])} (observed ${observedIds.length} tracks)`;
+  process.stderr.write(`[needle-worker] ${reason}\n`);
   return abandonPlaylist(repository, volume,
-    `Apple playlist catalog mismatch at position ${position + 1}: expected ${safeId(expectedIds[position])}, observed ${safeId(observedIds[position])} (observed ${observedIds.length} tracks)`,
+    reason,
     signal);
 }
 
