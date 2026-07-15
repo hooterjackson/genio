@@ -3,7 +3,7 @@ import { Repository } from "../server/repository.ts";
 
 const usage = [
   "Usage:",
-  "  pnpm smoke:apple -- --confirm-live-write --name \"[NEEDLE TEST] three-track\" \\",
+  "  pnpm smoke:apple -- --confirm-live-write --name \"[GÊNIO TEST] three-track\" \\",
   "    --catalog-id <APPLE_SONG_ID> --catalog-id <APPLE_SONG_ID> --catalog-id <APPLE_SONG_ID>",
   "",
   "This performs a real write to the owner's Apple Music library. It accepts 1-25 ordered song IDs.",
@@ -22,7 +22,7 @@ try {
     playlistId: result.playlistId,
     shareUrl: result.shareUrl,
     orderedCatalogIds: result.orderedCatalogIds,
-    cleanup: `Delete playlists beginning with ${"[NEEDLE TEST]"} after validation.`,
+    cleanup: `Delete playlists beginning with ${"[GÊNIO TEST]"} after validation.`,
   }, null, 2)}\n`);
 } catch (error) {
   const safe = publicAppleSmokeError(error);

@@ -700,7 +700,7 @@ app.setErrorHandler((error, request, reply) => {
   const message = error instanceof HttpError
     ? error.message
     : statusCode >= 500
-      ? "Needle could not complete that request"
+      ? "gênio could not complete that request"
       : "Request rejected";
   reply.code(statusCode).send({ error: message, code });
 });

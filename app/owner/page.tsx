@@ -14,13 +14,13 @@ export default async function OwnerPage() {
     return (
       <main className="app-shell">
         <header className="site-header">
-          <Link className="wordmark" href="/"><span>[N]</span> NEEDLE_</Link>
+          <Link className="wordmark" href="/"><span>[g]</span> gênio_</Link>
           <a href={chatGPTSignOutPath("/")}>SIGN OUT</a>
         </header>
         <section className="owner-shell">
           <div className="screen-index">/ ACCESS DENIED</div>
           <h1>OWNER ONLY.</h1>
-          <p>This ChatGPT identity is not included in Needle’s server-side owner allowlist.</p>
+          <p>This ChatGPT identity is not included in gênio’s server-side owner allowlist.</p>
         </section>
       </main>
     );

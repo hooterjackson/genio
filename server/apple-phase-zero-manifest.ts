@@ -8,6 +8,7 @@ import {
   type ApplePhaseZeroLockedManifest,
   type ApplePhaseZeroManifestInput,
 } from "./apple-phase-zero.ts";
+import { APPLE_SMOKE_NAME_PREFIX, LEGACY_APPLE_SMOKE_NAME_PREFIX } from "./apple-smoke.ts";
 
 function deterministicUuid(value: string): string {
   const bytes = Buffer.from(createHash("sha256").update(value).digest().subarray(0, 16));
@@ -29,8 +30,12 @@ function validateInput(input: ApplePhaseZeroManifestInput): void {
   if (!testCase || input.tracks.length !== testCase.trackCount) {
     throw new Error("phase-zero manifest case has an invalid exact track count");
   }
-  if (!input.name.startsWith("[NEEDLE TEST] ") || input.name.length > 240) {
-    throw new Error("phase-zero manifest name must use the [NEEDLE TEST] namespace");
+  if (
+    ![APPLE_SMOKE_NAME_PREFIX, LEGACY_APPLE_SMOKE_NAME_PREFIX]
+      .some((prefix) => input.name.startsWith(`${prefix} `))
+    || input.name.length > 240
+  ) {
+    throw new Error(`phase-zero manifest name must use the ${APPLE_SMOKE_NAME_PREFIX} namespace`);
   }
   if (!/^[a-z0-9][a-z0-9_-]{2,63}$/u.test(input.suiteId)) throw new Error("phase-zero suite ID is invalid");
   if (!/^[a-f0-9]{64}$/u.test(input.fixtureHash)) throw new Error("phase-zero fixture hash is invalid");

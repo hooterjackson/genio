@@ -279,7 +279,23 @@ function volumeName(manifest: LockedManifest, index: number, count: number): str
 }
 
 function volumeMarker(volume: PublicationVolume): string {
+  return `gênio publication ${volume.id}:${volume.attempt}`;
+}
+
+function legacyVolumeMarker(volume: PublicationVolume): string {
   return `Needle publication ${volume.id}:${volume.attempt}`;
+}
+
+async function findPlaylistForVolume(
+  client: PublicationAppleClient,
+  volume: PublicationVolume,
+  signal?: AbortSignal,
+): Promise<any | null> {
+  for (const marker of [volumeMarker(volume), legacyVolumeMarker(volume)]) {
+    const recovered = await client.findLibraryPlaylistByMarker(marker, signal);
+    if (recovered?.id) return recovered;
+  }
+  return null;
 }
 
 function volumeDescription(manifest: LockedManifest, marker: string): string {
@@ -360,7 +376,7 @@ async function ensureApplePlaylist(
   await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
   if (volume.playlistId) return volume;
   const marker = volumeMarker(volume);
-  const recovered = await client.findLibraryPlaylistByMarker(marker, signal);
+  const recovered = await findPlaylistForVolume(client, volume, signal);
   if (recovered?.id) {
     const playlistId = String(recovered.id);
     signal?.throwIfAborted();
@@ -381,7 +397,7 @@ async function ensureApplePlaylist(
     return { ...volume, playlistId: created.id, shareUrl: created.url, description, status: "appending" };
   } catch (error) {
     if (error instanceof AppleApiError && error.uncertainMutation) {
-      const afterFailure = await client.findLibraryPlaylistByMarker(marker, signal);
+      const afterFailure = await findPlaylistForVolume(client, volume, signal);
       if (afterFailure?.id) {
         const playlistId = String(afterFailure.id);
         signal?.throwIfAborted();

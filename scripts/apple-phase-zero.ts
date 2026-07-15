@@ -37,7 +37,7 @@ const usage = `Usage:
 
   pnpm phase-zero:apple -- inventory --output <inventory.json> --expected-storefront us
 
-The publish command creates nine [NEEDLE TEST] playlists: 3, 100, 500, 1000,
+The publish command creates nine [GÊNIO TEST] playlists: 3, 100, 500, 1000,
 and five 1000-track volumes. Inventory is read-only. Apple does not document a
 library-playlist delete endpoint, so cleanup remains manual in Apple Music.`;
 
@@ -205,7 +205,7 @@ async function runPublish(args: ParsedArgs): Promise<void> {
       reportHash: report.reportHash,
       playlistIds: playlistIdsFromPhaseZeroReport(report),
       output: resolve(required(args, "--output")),
-      cleanup: "Delete only playlists beginning with [NEEDLE TEST] manually in Apple Music after acceptance.",
+      cleanup: "Delete only playlists beginning with [GÊNIO TEST] manually in Apple Music after acceptance.",
     })}\n`);
   } finally {
     await repository.close();
@@ -253,7 +253,7 @@ async function runInventory(args: ParsedArgs): Promise<void> {
       testPlaylistCount: report.items.length,
       reportHash: report.reportHash,
       output: resolve(required(args, "--output")),
-      cleanup: "Delete the listed [NEEDLE TEST] playlists manually in Apple Music.",
+      cleanup: "Delete the listed [GÊNIO TEST] playlists manually in Apple Music. Legacy [NEEDLE TEST] playlists are also inventoried for cleanup.",
     })}\n`);
   } finally {
     await repository.close();

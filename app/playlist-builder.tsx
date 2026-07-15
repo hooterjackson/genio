@@ -285,7 +285,7 @@ function unwrapResult(
         const end = numberValue(volume.endPosition, start + numberValue(volume.appendedCount) - 1);
         return {
           index: index + 1,
-          name: typeof volume.name === "string" ? volume.name : "Needle volume " + (index + 1),
+          name: typeof volume.name === "string" ? volume.name : "gênio volume " + (index + 1),
           url: appleMusicUrl(volume.shareUrl),
           trackCount: Math.max(0, end - start + 1) || numberValue(volume.appendedCount),
           status: typeof volume.status === "string" ? volume.status : undefined,
@@ -301,7 +301,7 @@ function unwrapResult(
   if (Array.isArray(object.volumes)) {
     const manifest = asObject(object.manifest);
     const rawVolumes = object.volumes;
-    const manifestName = typeof manifest.name === "string" ? manifest.name : currentRun?.brief.title ?? "Needle playlist";
+    const manifestName = typeof manifest.name === "string" ? manifest.name : currentRun?.brief.title ?? "gênio playlist";
     const volumeCount = rawVolumes.length;
     return {
       runId: currentRun?.id ?? "",
@@ -340,7 +340,7 @@ function manifestFromResult(payload: unknown, runId: string): PlaylistManifest |
   return {
     id: manifest.id,
     runId,
-    name: typeof manifest.name === "string" ? manifest.name : "Needle playlist",
+    name: typeof manifest.name === "string" ? manifest.name : "gênio playlist",
     contentHash: typeof manifest.contentHash === "string" ? manifest.contentHash : undefined,
     trackCount: numberValue(manifest.trackCount),
     tracks: [],
@@ -562,8 +562,8 @@ function AppHeader({
 }) {
   return (
     <header className="site-header">
-      <button className="wordmark" onClick={onHome} aria-label="Needle home">
-        <span aria-hidden="true">[N]</span> NEEDLE_
+      <button className="wordmark" onClick={onHome} aria-label="gênio home">
+        <span aria-hidden="true">[g]</span> gênio_
       </button>
       <div className="header-meta">
         {onNew && <button className="header-action" onClick={onNew}>NEW JOB</button>}
@@ -601,13 +601,13 @@ function IntroScreen({
 }) {
   if (stage === "reveal") {
     return (
-      <section className="intro-screen intro-reveal" aria-label="Needle loading">
+      <section className="intro-screen intro-reveal" aria-label="gênio loading">
         <pre className="ascii-needle" aria-hidden="true">{String.raw`
 ┌────────────────────┐
-│ [N] NEEDLE_        │
+│ [g] gênio_         │
 │     SOURCE → SONG  │
 └────────────────────┘`}</pre>
-        <span className="sr-only" role="status">Opening Needle</span>
+        <span className="sr-only" role="status">Opening gênio</span>
       </section>
     );
   }
@@ -615,7 +615,7 @@ function IntroScreen({
   return (
     <section className="intro-screen intro-landing" aria-labelledby="intro-title">
       <div className="intro-mark">
-        <span aria-hidden="true">[N] NEEDLE_</span>
+        <span aria-hidden="true">[g] gênio_</span>
         <div className="intro-links">
           <button onClick={onJobs}>JOBS</button>
           <a href="/privacy">PRIVACY</a>
@@ -624,7 +624,7 @@ function IntroScreen({
       <div className="intro-copy">
         <div className="screen-index">/ PLAYLIST RESEARCH</div>
         <h1 id="intro-title">RESEARCH A<br />PLAYLIST.</h1>
-        <p>Enter a request. Needle researches cited tracks and builds the playlist in Apple Music. Sharing starts only after Apple returns a public link.</p>
+        <p>Enter a request. gênio researches cited tracks and builds the playlist in Apple Music. Sharing starts only after Apple returns a public link.</p>
       </div>
       <div className="step-footer intro-footer">
         <button className="action-button step-primary" onClick={onContinue}>
@@ -1608,7 +1608,7 @@ export function PlaylistBuilder() {
         : typeof object.capabilityToken === "string"
           ? object.capabilityToken
           : "";
-      if (!capability) throw new Error("Needle could not establish a private session for this run.");
+      if (!capability) throw new Error("gênio could not establish a private session for this run.");
       const fragment = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(next.id);
       window.history.replaceState(null, "", window.location.pathname + window.location.search + "#" + fragment);
       await exchangeCapability(capability, next.id);
@@ -1724,7 +1724,7 @@ export function PlaylistBuilder() {
   }
 
   async function deleteRun() {
-    if (!run || !window.confirm("Delete this run’s research data from Needle? Published Apple playlists will remain.")) return;
+    if (!run || !window.confirm("Delete this run’s research data from gênio? Published Apple playlists will remain.")) return;
     setBusy("delete");
     try {
       await api("/api/v1/runs/" + encodeURIComponent(run.id), { method: "DELETE" });
@@ -1753,7 +1753,7 @@ export function PlaylistBuilder() {
         : typeof payload.token === "string"
           ? payload.token
           : "";
-      if (!capability) throw new Error("Needle did not return a transfer capability.");
+      if (!capability) throw new Error("gênio did not return a transfer capability.");
       const url = new URL(window.location.pathname, window.location.origin);
       url.hash = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(run.id);
       await copyText(url.toString());

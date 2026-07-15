@@ -201,5 +201,5 @@ export function manifestDescriptionForBrief(brief: PlaylistBrief): string {
     : brief.mode === "hybrid"
       ? "Exhaustive within the confirmed constraints and documented sources completed in this run."
       : "A cited editorial selection from the documented sources completed in this run.";
-  return `Built by Needle. ${brief.description.trim()} ${scope}`.trim();
+  return `Built by gênio. ${brief.description.trim()} ${scope}`.trim();
 }

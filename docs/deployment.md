@@ -85,7 +85,7 @@ Never run an automatic destructive down-migration. A worker refuses an unsupport
 ## Alerts and limits
 
 - Application research ceiling: `$50` per calendar month in `America/Sao_Paulo`.
-- OpenAI project alerts: below `$50`, with the provider project scoped only to Needle.
+- OpenAI project alerts: below `$50`, with the provider project scoped only to gênio.
 - Railway alerts: `$10`, `$20`, owner review at `$25`; do not stop Postgres automatically.
 - Owner notifications: worker stale, database unavailable, budget request, Apple reauthorization, failed/orphaned publication, and outbox backlog.
 - Operational metrics: queue depth/age, expired leases, failed jobs, worker heartbeat, reserved/actual spend, Apple authorization, notification backlog/failures, publication failures, orphan playlists, database readiness, and the last retention sweep.
@@ -110,10 +110,10 @@ Never run an automatic destructive down-migration. A worker refuses an unsupport
 - Rotate gateway keys by deploying the new key as current and the old key as previous on both sides, switch Sites, observe, then remove the previous key.
 - Rotate the Apple-token master key by decrypting with its recorded version and re-encrypting transactionally with the new version.
 - If the capability pepper is lost, invalidate all visitor sessions; published Apple links remain valid.
-- Inventory orphan and `[NEEDLE TEST]` playlists in the owner console; deletion from Apple remains an explicit owner action.
+- Inventory orphan, `[GÊNIO TEST]`, and legacy `[NEEDLE TEST]` playlists in the owner console; deletion from Apple remains an explicit owner action.
 
 ## Owner-only data controls
 
 - The owner console can invalidate a completed run's 30-day reuse window without deleting its evidence or published links; the next equivalent confirmed brief creates fresh work.
-- A specialist CSV/JSON catalogue may be attached only while research is globally paused and the selected run is quiescent before matching. Each row requires an explicit public HTTPS source, but every production import enters as inferred because Needle has not fetched the linked support; visitors must review it or a later research pass must verify it. Even while normalizing reported corroboration, the parser requires one stable ISRC/MusicBrainz recording ID across two distinct provenance roots, and metadata-only rows remain possible duplicates.
+- A specialist CSV/JSON catalogue may be attached only while research is globally paused and the selected run is quiescent before matching. Each row requires an explicit public HTTPS source, but every production import enters as inferred because gênio has not fetched the linked support; visitors must review it or a later research pass must verify it. Even while normalizing reported corroboration, the parser requires one stable ISRC/MusicBrainz recording ID across two distinct provenance roots, and metadata-only rows remain possible duplicates.
 - The browser gateway limits each import batch to 24 KiB. Split larger catalogues into multiple batches and resume research only after the final import succeeds.

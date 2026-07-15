@@ -3,6 +3,7 @@ import type { CatalogSong } from "../shared/types.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
 import {
   APPLE_SMOKE_NAME_PREFIX,
+  LEGACY_APPLE_SMOKE_NAME_PREFIX,
 } from "./apple-smoke.ts";
 import type { PublicationResult } from "./publisher.ts";
 
@@ -357,7 +358,9 @@ export function phaseZeroTestPlaylistName(suite: string, label: string): string 
 }
 
 export function isNeedleTestPlaylistName(name: unknown): name is string {
-  return typeof name === "string" && name.startsWith(`${APPLE_SMOKE_NAME_PREFIX} `) && name.length <= 240;
+  return typeof name === "string"
+    && [APPLE_SMOKE_NAME_PREFIX, LEGACY_APPLE_SMOKE_NAME_PREFIX].some((prefix) => name.startsWith(`${prefix} `))
+    && name.length <= 240;
 }
 
 function catalogIdsHash(ids: readonly string[]): string {
@@ -436,7 +439,7 @@ export async function publishApplePhaseZeroSuite(
         caseId: testCase.id,
         storefront: fixture.storefront,
         name,
-        description: "Temporary Needle Apple Music phase-zero validation. Delete after acceptance.",
+        description: "Temporary gênio Apple Music phase-zero validation. Delete after acceptance.",
         tracks,
       });
       const caseReport: ApplePhaseZeroCaseReport = {

@@ -188,7 +188,7 @@ test("bulk playlist selection has a larger but still bounded signed request limi
   expect(transmittedBody.byteLength).toBeLessThan(BULK_SELECTION_BODY_LIMIT);
 });
 
-test("Sites forwards only Needle's capability cookie across the Railway boundary", () => {
+test("Sites forwards only gênio's capability cookie across the Railway boundary", () => {
   expect(forwardedCapabilityCookie(
     "chatgpt-session=private; __Host-needle-session=capability-token; analytics=tracking",
     true,
@@ -199,7 +199,7 @@ test("Sites forwards only Needle's capability cookie across the Railway boundary
   expect(() => forwardedCapabilityCookie(
     "__Host-needle-session=one; __Host-needle-session=two",
     true,
-  )).toThrow(/Duplicate Needle capability cookies/);
+  )).toThrow(/Duplicate gênio capability cookies/);
 });
 
 test("Railway gateway rejects stale, body-tampered, signature-tampered, and replayed requests", async () => {

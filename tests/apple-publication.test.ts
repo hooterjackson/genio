@@ -634,12 +634,13 @@ function durablePublicationHarness(input: {
 
 test("publisher recovers an uncertain playlist creation by its private marker", async () => {
   const repository = publicationRepository();
-  let markerLookups = 0;
+  let currentMarkerLookups = 0;
   let state: string[] = [];
   const client: PublicationAppleClient = {
-    findLibraryPlaylistByMarker: vi.fn(async () => {
-      markerLookups += 1;
-      return markerLookups === 1 ? null : { id: "p.recovered" };
+    findLibraryPlaylistByMarker: vi.fn(async (marker) => {
+      if (!marker.startsWith("gênio publication ")) return null;
+      currentMarkerLookups += 1;
+      return currentMarkerLookups === 1 ? null : { id: "p.recovered" };
     }),
     createLibraryPlaylist: vi.fn(async () => {
       throw new AppleApiError("Unknown create result", 503, true, true);
@@ -653,6 +654,24 @@ test("publisher recovers an uncertain playlist creation by its private marker", 
   expect(result).toMatchObject({ playlistId: "p.recovered", appendedCount: 1, status: "complete" });
   expect(client.createLibraryPlaylist).toHaveBeenCalledTimes(1);
   expect(client.appendCatalogTracks).toHaveBeenCalledWith("p.recovered", ["101"], undefined);
+});
+
+test("publisher recovers a pre-rename playlist by its legacy private marker", async () => {
+  const repository = publicationRepository();
+  let state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async (marker) => (
+      marker.startsWith("Needle publication ") ? { id: "p.legacy" } : null
+    )),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.unexpected", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => { state = [...state, ...ids]; }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => [...state]),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/legacy/pl.legacy"),
+  };
+
+  const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101"], validAuthorization);
+  expect(result).toMatchObject({ playlistId: "p.legacy", appendedCount: 1, status: "complete" });
+  expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
 });
 
 test("publisher orphans a divergent playlist and creates a clean replacement", async () => {

@@ -173,7 +173,7 @@ async function throttleMusicBrainz(signal?: AbortSignal): Promise<void> {
 
 function musicBrainzHeaders(): Record<string, string> {
   const contact = process.env.MUSICBRAINZ_CONTACT ?? "operator-contact-not-configured.invalid";
-  return { "User-Agent": `Needle/1.0 (${contact})`, Accept: "application/json" };
+  return { "User-Agent": `Genio/1.0 (${contact})`, Accept: "application/json" };
 }
 
 class MusicBrainzAdapter implements SourceAdapter {
@@ -340,7 +340,7 @@ class DiscogsAdapter implements SourceAdapter {
   private headers(): Record<string, string> {
     const token = optionalSecret("DISCOGS_TOKEN");
     if (!token) throw new Error("Discogs token not configured");
-    return { Authorization: `Discogs token=${token}`, "User-Agent": "Needle/1.0", Accept: "application/json" };
+    return { Authorization: `Discogs token=${token}`, "User-Agent": "Genio/1.0", Accept: "application/json" };
   }
 
   async discover(entity: SourceAdapterEntity, query: string, cursor: string | null, signal?: AbortSignal): Promise<SourceAdapterResult> {

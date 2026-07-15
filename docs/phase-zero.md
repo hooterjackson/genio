@@ -7,13 +7,13 @@ These gates require live owner credentials and cannot be replaced by mocks. Stop
 After owner authorization is stored and the worker environment has its Apple and database secrets, run the guarded three-track probe from that environment:
 
 ```sh
-pnpm smoke:apple -- --confirm-live-write --name "[NEEDLE TEST] three-track" \
+pnpm smoke:apple -- --confirm-live-write --name "[GÊNIO TEST] three-track" \
   --catalog-id <APPLE_SONG_ID> \
   --catalog-id <APPLE_SONG_ID> \
   --catalog-id <APPLE_SONG_ID>
 ```
 
-The command refuses names outside the `[NEEDLE TEST]` namespace, refuses more than 25 IDs, verifies exact ordered membership (including duplicate occurrences), and prints only safe playlist metadata. Delete the test playlist manually after the second-account import check.
+The command refuses names outside the `[GÊNIO TEST]` namespace, refuses more than 25 IDs, verifies exact ordered membership (including duplicate occurrences), and prints only safe playlist metadata. Delete the test playlist manually after the second-account import check.
 
 After the three-track probe succeeds, use the comprehensive capacity harness. Create `.artifacts/phase-zero/` (already ignored by Git), then start with a local JSON file there containing 3–25 explicit US Apple song IDs:
 
@@ -36,7 +36,7 @@ pnpm phase-zero:apple -- resolve \
   --confirm-seed-count 3
 ```
 
-The publish command creates nine `[NEEDLE TEST]` playlists containing 6,603 total occurrences: 3, 100, 500, 1,000, and five ordered 1,000-track volumes. Run it only after the owner explicitly approves those live writes and supplies the exact fixture hash printed by `resolve`:
+The publish command creates nine `[GÊNIO TEST]` playlists containing 6,603 total occurrences: 3, 100, 500, 1,000, and five ordered 1,000-track volumes. Run it only after the owner explicitly approves those live writes and supplies the exact fixture hash printed by `resolve`:
 
 ```sh
 pnpm phase-zero:apple -- publish \
@@ -68,12 +68,12 @@ pnpm phase-zero:apple -- inventory \
 - [ ] Restart API and worker; validate that publication still works.
 - [ ] Force an Apple 401/403; verify the manifest remains locked and publication enters `waiting_for_apple_authorization` without repeated retries.
 - [ ] Reauthorize; verify the same publication resumes automatically.
-- [ ] Publish a three-track `[NEEDLE TEST]` playlist and wait for a stable Apple share link.
+- [ ] Publish a three-track `[GÊNIO TEST]` playlist and wait for a stable Apple share link.
 - [ ] From a second paid Apple Music account, open the link and add the playlist to the library.
 - [ ] Record the publisher identity Apple displays and explicitly accept or reject it.
 - [ ] Publish live 100-, 500-, and 1,000-track playlists and compare exact ordered membership to each manifest.
 - [ ] Publish five ordered 1,000-track volumes and verify naming, links, duplicates, and boundaries.
-- [ ] Delete all `[NEEDLE TEST]` playlists manually from the owner account.
+- [ ] Delete all `[GÊNIO TEST]` playlists manually from the owner account. The inventory also reports legacy `[NEEDLE TEST]` playlists so they can be removed.
 
 ## Simulated 6,000-track publication
 

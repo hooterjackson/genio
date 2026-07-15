@@ -55,7 +55,7 @@ function safeMessage(payload: unknown, status: number): string {
     if (typeof object.error === "string") return object.error;
     if (typeof object.message === "string") return object.message;
   }
-  return `Needle returned HTTP ${status}`;
+  return `gênio returned HTTP ${status}`;
 }
 
 function scopedCapabilityCookie(setCookie: string | null, current: string): string {
@@ -121,7 +121,7 @@ async function main(): Promise<void> {
     body: JSON.stringify({ prompt, idempotencyKey: briefKey }),
   });
   const briefRequestId = String(briefStart.payload.requestId ?? "");
-  if (!briefRequestId) throw new Error("Needle did not return a brief request ID");
+  if (!briefRequestId) throw new Error("gênio did not return a brief request ID");
   log("brief_queued", { briefRequestId });
 
   let briefPayload = briefStart.payload;
@@ -138,7 +138,7 @@ async function main(): Promise<void> {
     : [];
   const confirmedBrief = {
     ...interpreted,
-    title: "[NEEDLE TEST] Hosted three-track flow",
+    title: "[GÊNIO TEST] Hosted three-track flow",
     description: "A production smoke test containing exactly three specified original studio recordings.",
     mode: "hybrid",
     subjectEntities: DEFAULT_TRACKS.map((track) => `${track.artist} — ${track.title}`),
@@ -163,14 +163,14 @@ async function main(): Promise<void> {
   const initialRun = asRecord(runStart.payload.run ?? runStart.payload);
   const accessId = String(initialRun.id ?? "");
   const capability = String(runStart.payload.capability ?? runStart.payload.capabilityToken ?? "");
-  if (!accessId || !capability) throw new Error("Needle did not return a run access ID and capability");
+  if (!accessId || !capability) throw new Error("gênio did not return a run access ID and capability");
 
   const exchanged = await request(origin, "/api/v1/capabilities/exchange", {
     method: "POST",
     body: JSON.stringify({ token: capability }),
   });
   let cookie = exchanged.cookie;
-  if (!cookie) throw new Error("Needle did not establish the scoped capability cookie");
+  if (!cookie) throw new Error("gênio did not establish the scoped capability cookie");
   log("run_started", { accessId, status: initialRun.status });
 
   let run = initialRun;

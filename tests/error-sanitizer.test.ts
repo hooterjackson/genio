@@ -77,10 +77,10 @@ describe("durable and public error sanitization", () => {
       "Apple Music authorization validation was temporarily unavailable.",
     );
     expect(safeAppleAuthorizationFailure(unreachable)).toBe(
-      "Needle could not reach Apple Music while validating authorization.",
+      "gênio could not reach Apple Music while validating authorization.",
     );
     expect(safeAppleAuthorizationFailure(rejected)).toBe(
-      "Apple Music rejected Needle's authorization validation request (HTTP 400).",
+      "Apple Music rejected gênio's authorization validation request (HTTP 400).",
     );
     expect(safeAppleAuthorizationFailure(invalidResponse)).toBe(
       "Apple Music returned an invalid authorization-validation response.",

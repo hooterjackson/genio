@@ -10,7 +10,7 @@ export type MusicKitApi = {
 export async function configureFreshMusicKit(MusicKit: MusicKitApi, developerToken: string): Promise<MusicKitInstance> {
   await MusicKit.configure({
     developerToken,
-    app: { name: "Needle", build: "1.0.0" },
+    app: { name: "gênio", build: "1.0.0" },
   });
   return MusicKit.getInstance();
 }

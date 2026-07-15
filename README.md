@@ -1,10 +1,10 @@
-# Needle
+# gênio
 
-Needle turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account creates the playlists. A run exposes a visitor link only after Apple reports the playlist as public and returns an Apple Music catalog URL.
+gênio turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account creates the playlists. A run exposes a visitor link only after Apple reports the playlist as public and returns an Apple Music catalog URL.
 
 Visitors can start multiple jobs, reopen the jobs available to their browser, and let active research continue in the background.
 
-Needle uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
+gênio uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 
 Curated prompts such as “100 most influential…” use a separate **fast** profile: one bounded cited web synthesis, one structured extraction, and concurrent Apple catalog lookup. The product targets confirmation-to-review in under two minutes and reports an explicit partial result when evidence or provider latency prevents the requested count. Exhaustive and hybrid prompts retain the slower source-frontier workflow and make no two-minute promise.
 

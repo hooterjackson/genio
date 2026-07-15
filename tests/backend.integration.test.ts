@@ -2544,7 +2544,7 @@ databaseDescribe("hosted backend integration", () => {
       storedMatchingRun.rows[0]?.error,
     ];
     expect(durableErrors).toEqual([
-      "Needle could not interpret this request after the final attempt.",
+      "gênio could not interpret this request after the final attempt.",
       "Research could not be completed after the final attempt.",
       "Research could not be completed after the final attempt.",
       "Owner notification delivery failed after the final attempt.",
@@ -2558,7 +2558,7 @@ databaseDescribe("hosted backend integration", () => {
       repository.getRunByAccess(created.accessId),
       repository.getPublicResult(created.runId),
     ]);
-    expect(briefView?.error).toBe("Needle could not interpret this request after the final attempt.");
+    expect(briefView?.error).toBe("gênio could not interpret this request after the final attempt.");
     expect(runView?.error).toBe("Research could not be completed after the final attempt.");
     expect(publicResult.error).toBe("Research could not be completed after the final attempt.");
     expect(JSON.stringify({ briefView, runView, publicResult })).not.toContain("sk-proj-PRIVATE");
@@ -2567,7 +2567,7 @@ databaseDescribe("hosted backend integration", () => {
 
   test("a Resend outage keeps the notification outbox pending for a durable retry", async () => {
     vi.stubEnv("RESEND_API_KEY", "offline-resend-integration-key");
-    vi.stubEnv("RESEND_FROM", "Needle <alerts@example.com>");
+    vi.stubEnv("RESEND_FROM", "gênio <alerts@example.com>");
     vi.stubEnv("OWNER_ALERT_EMAIL", "owner@example.com");
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Resend is unavailable"); }));
     const notificationId = await repository.enqueueNotification("worker_stale", {

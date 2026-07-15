@@ -2,17 +2,17 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Needle — Playlist Research",
+  title: "gênio — Playlist Research",
   description: "Research cited tracks and build an Apple Music playlist.",
   openGraph: {
-    title: "Needle — Playlist Research",
+    title: "gênio — Playlist Research",
     description: "Research cited tracks and build an Apple Music playlist.",
     type: "website",
-    images: [{ url: "/og.png", width: 1659, height: 948, alt: "Needle — Playlist Research" }],
+    images: [{ url: "/og.png", width: 1660, height: 948, alt: "gênio — Playlist Research" }],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Needle — Playlist Research",
+    title: "gênio — Playlist Research",
     description: "Research cited tracks and build an Apple Music playlist.",
     images: ["/og.png"],
   },

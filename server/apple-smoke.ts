@@ -11,7 +11,8 @@ import {
 } from "./apple.ts";
 import { exactOrderedPrefix } from "./publisher.ts";
 
-export const APPLE_SMOKE_NAME_PREFIX = "[NEEDLE TEST]";
+export const APPLE_SMOKE_NAME_PREFIX = "[GÊNIO TEST]";
+export const LEGACY_APPLE_SMOKE_NAME_PREFIX = "[NEEDLE TEST]";
 export const APPLE_SMOKE_CONFIRMATION_FLAG = "--confirm-live-write";
 const MAX_SMOKE_TRACKS = 25;
 
@@ -61,7 +62,7 @@ export function validateAppleSmokeInput(input: AppleSmokeInput): AppleSmokeInput
   if (!input.confirmLiveWrite) {
     throw new Error(`Live Apple writes require ${APPLE_SMOKE_CONFIRMATION_FLAG}`);
   }
-  if (!name.startsWith(`${APPLE_SMOKE_NAME_PREFIX} `)) {
+  if (![APPLE_SMOKE_NAME_PREFIX, LEGACY_APPLE_SMOKE_NAME_PREFIX].some((prefix) => name.startsWith(`${prefix} `))) {
     throw new Error(`Smoke playlist names must begin with "${APPLE_SMOKE_NAME_PREFIX} "`);
   }
   if (name.length > 240) throw new Error("Smoke playlist names cannot exceed 240 characters");
@@ -159,7 +160,7 @@ export async function runApplePublicationSmoke(
     throw new Error("The live Apple storefront does not match APPLE_STOREFRONT");
   }
 
-  const marker = `Needle smoke ${randomUUID()}`;
+  const marker = `gênio smoke ${randomUUID()}`;
   const description = `Temporary publication feasibility test. Delete after validation.\n\n${marker}`;
   let playlistId: string;
   try {

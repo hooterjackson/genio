@@ -189,7 +189,7 @@ describe("bounded provider failure behavior", () => {
 
   test("a Resend outage leaves the durable outbox record pending with a bounded retry", async () => {
     vi.stubEnv("RESEND_API_KEY", "offline-resend-key");
-    vi.stubEnv("RESEND_FROM", "Needle <alerts@example.com>");
+    vi.stubEnv("RESEND_FROM", "gênio <alerts@example.com>");
     vi.stubEnv("OWNER_ALERT_EMAIL", "owner@example.com");
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline Resend outage"); }));
     const record: NotificationRecord = {
