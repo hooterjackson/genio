@@ -10,6 +10,9 @@ vi.mock("vinext/server/app-router-entry", () => ({
   default: { fetch: vi.fn() },
 }));
 
+const appRouterModule = await import("vinext/server/app-router-entry");
+const appHandlerFetch = vi.mocked(appRouterModule.default.fetch);
+
 const workerModule = await import("../worker/" + "index.ts") as {
   default: {
     fetch(request: Request, env: unknown, context: unknown): Promise<Response>;
@@ -60,6 +63,10 @@ describe("Sites owner gateway boundary", () => {
 
   beforeEach(() => {
     upstreamFetch.mockClear();
+    appHandlerFetch.mockReset();
+    appHandlerFetch.mockResolvedValue(new Response("<!doctype html><title>Needle</title>", {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    }));
     vi.stubGlobal("fetch", upstreamFetch);
   });
 
@@ -81,6 +88,17 @@ describe("Sites owner gateway boundary", () => {
     expect(upstreamFetch).toHaveBeenCalledOnce();
     expect(forwardedHeaders().get("x-needle-owner-email")).toBe("owner@example.com");
     expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+  });
+
+  test("owner HTML sends origin-only referrer context required by MusicKit authorization", async () => {
+    const response = await worker.fetch(new Request("https://needle.example/owner", {
+      headers: { "OAI-Authenticated-User-Email": "owner@example.com" },
+    }), env as never, ctx);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(appHandlerFetch).toHaveBeenCalledOnce();
   });
 
   test("an exact allowlisted Sites identity is signed into public API requests", async () => {

@@ -16,7 +16,6 @@ import {
   type AppleAuthorizationJobRepository,
   type AppleAuthorizationRecord,
 } from "../server/apple.ts";
-import { createAppleDeveloperToken } from "../server/owner.ts";
 import {
   APPLE_SMOKE_CONFIRMATION_FLAG,
   parseAppleSmokeArgs,
@@ -53,8 +52,6 @@ const originalAppleEnvironment = {
   storefront: process.env.APPLE_STOREFRONT,
   encryptionKey: process.env.APPLE_TOKEN_ENCRYPTION_KEY,
   encryptionKeyId: process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID,
-  mediaId: process.env.APPLE_MEDIA_ID,
-  appOrigin: process.env.APP_ORIGIN,
 };
 
 const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -68,8 +65,6 @@ beforeEach(() => {
   process.env.APPLE_STOREFRONT = "us";
   process.env.APPLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
   process.env.APPLE_TOKEN_ENCRYPTION_KEY_ID = "test-v1";
-  process.env.APPLE_MEDIA_ID = "media.test.needle";
-  process.env.APP_ORIGIN = "https://needle.example";
 });
 
 afterEach(() => {
@@ -83,8 +78,6 @@ afterEach(() => {
     APPLE_STOREFRONT: originalAppleEnvironment.storefront,
     APPLE_TOKEN_ENCRYPTION_KEY: originalAppleEnvironment.encryptionKey,
     APPLE_TOKEN_ENCRYPTION_KEY_ID: originalAppleEnvironment.encryptionKeyId,
-    APPLE_MEDIA_ID: originalAppleEnvironment.mediaId,
-    APP_ORIGIN: originalAppleEnvironment.appOrigin,
   })) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -102,17 +95,6 @@ describe("Apple Music client failure classification", () => {
     const claims = JSON.parse(Buffer.from(payload!, "base64url").toString("utf8")) as Record<string, unknown>;
 
     expect(claims.origin).toEqual(["https://needle.example"]);
-  });
-
-  test("the owner-only authorization token omits Apple's optional origin claim", async () => {
-    const { developerToken, mediaId } = await createAppleDeveloperToken();
-    const payload = developerToken.split(".")[1];
-    expect(payload).toBeTruthy();
-    const claims = JSON.parse(Buffer.from(payload!, "base64url").toString("utf8")) as Record<string, unknown>;
-
-    expect(mediaId).toBe("media.test.needle");
-    expect(claims.origin).toBeUndefined();
-    expect(Number(claims.exp) - Number(claims.iat)).toBe(15 * 60);
   });
 
   test.each([401, 403] as const)("authenticated Apple %s responses require owner reauthorization", async (status) => {

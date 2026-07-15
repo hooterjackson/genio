@@ -134,7 +134,10 @@ function safeResponse(response: Response, isApi = false, isLocal = false): Respo
   const headers = new Headers(response.headers);
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
-  headers.set("Referrer-Policy", "no-referrer");
+  // MusicKit's web authorization popup needs the page origin as cross-origin
+  // referrer context. Keep API responses maximally restrictive, while sending
+  // only the origin (never the path) from HTML pages to Apple.
+  headers.set("Referrer-Policy", isApi ? "no-referrer" : "strict-origin-when-cross-origin");
   headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
   headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
   headers.set(
