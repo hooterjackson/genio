@@ -1681,8 +1681,8 @@ export class Repository {
         if (duplicate.rows[0]) resultingStatus = "duplicate";
       }
       const updated = await client.query(
-        `UPDATE catalog_matches SET status=$1,catalog_id=CASE WHEN $1 IN ('accepted','duplicate') THEN $2 ELSE catalog_id END,
-         song_json=CASE WHEN $1 IN ('accepted','duplicate') THEN $3 ELSE song_json END,reviewed_at=now()
+        `UPDATE catalog_matches SET status=$1::varchar,catalog_id=CASE WHEN $1::varchar IN ('accepted','duplicate') THEN $2 ELSE catalog_id END,
+         song_json=CASE WHEN $1::varchar IN ('accepted','duplicate') THEN $3 ELSE song_json END,reviewed_at=now()
          WHERE candidate_id=$4 AND run_id=$5`,
         [resultingStatus, selectedCatalogId, selectedSong, candidateId, runId],
       );
@@ -1827,7 +1827,7 @@ export class Repository {
            candidate_id uuid,status varchar,basis text,catalog_id text,song_json jsonb
          )
          WHERE m.run_id=$1 AND m.candidate_id=u.candidate_id`,
-        [runId, updates],
+        [runId, JSON.stringify(updates)],
       );
       if (updated.rowCount !== updates.length) {
         throw new HttpError(409, "Playlist selection changed while it was being saved", "selection_conflict");

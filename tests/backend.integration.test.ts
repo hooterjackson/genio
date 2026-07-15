@@ -1825,7 +1825,7 @@ databaseDescribe("hosted backend integration", () => {
       code: "catalog_recovery_not_ready",
     });
     const jobs = await repository.pool.query<{ recovery: boolean }>(
-      `SELECT (payload_json->>'retryIncomplete'='true') recovery
+      `SELECT COALESCE(payload_json->>'retryIncomplete'='true',false) recovery
        FROM job_queue WHERE run_id=$1 AND kind='matching'`,
       [runId],
     );
