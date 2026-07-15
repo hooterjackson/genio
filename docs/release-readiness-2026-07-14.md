@@ -85,8 +85,12 @@ advice.
   subscription. The owner-token/anonymous-visitor model needs written Apple
   confirmation before wider launch:
   <https://developer.apple.com/support/terms/apple-developer-program-license-agreement/>
-- Apple's documented create-playlist request does not document a public/profile
-  visibility mutation, so a live cross-account proof remains mandatory:
+- Apple's create-playlist example sends `isPublic: true`, but its canonical
+  creation-attributes object lists only `name` and `description`, and the same
+  example response reports `isPublic: false`. Apple documents no later
+  visibility-update endpoint. Needle therefore accepts a share URL only after
+  a fresh library read reports `isPublic: true`; live cross-account proof is
+  still mandatory:
   <https://developer.apple.com/documentation/applemusicapi/create-a-new-library-playlist>
 - Discogs remains disabled because the launch retention/report design does not
   satisfy its short freshness and attribution requirements:

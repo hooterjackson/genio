@@ -624,7 +624,7 @@ function IntroScreen({
       <div className="intro-copy">
         <div className="screen-index">/ PLAYLIST RESEARCH</div>
         <h1 id="intro-title">RESEARCH A<br />PLAYLIST.</h1>
-        <p>Enter a request. Needle finds cited tracks, matches them to Apple Music, and publishes a shareable playlist.</p>
+        <p>Enter a request. Needle researches cited tracks and builds the playlist in Apple Music. Sharing starts only after Apple returns a public link.</p>
       </div>
       <div className="step-footer intro-footer">
         <button className="action-button step-primary" onClick={onContinue}>
@@ -1217,7 +1217,7 @@ function ResultScreen({
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
         <h1 id="result-title">{result.status === "partial" ? "PLAYLIST PUBLISHED<br />WITH GAPS." : "PLAYLIST<br />PUBLISHED."}</h1>
         <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
-        <small className="result-note">Share-link access is public; Apple search, profile visibility, and regional availability are not guaranteed.</small>
+        <small className="result-note">Apple reports this playlist as public and returned this link. Search, profile visibility, and regional availability are not guaranteed.</small>
 
         <div className="volume-list">
           {result.volumes.map((volume) => (

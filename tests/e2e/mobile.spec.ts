@@ -294,7 +294,7 @@ test("an explicit 100-track request stays at 100 through research, matching, and
   expect(runBody).toMatchObject({ brief: { targetSize: { min: 100, max: 100 } } });
   expect(selectionBody).toEqual({ useRecommended: true, excludedCandidateIds: [], overrides: [] });
   expect(manifestTracks).toHaveLength(100);
-  expect(publishBody).toEqual({ manifestId: "manifest-100" });
+  await expect.poll(() => publishBody).toEqual({ manifestId: "manifest-100" });
   await expect(page.getByText("Creating the playlist in Apple Music.")).toBeVisible();
 });
 

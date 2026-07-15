@@ -370,6 +370,7 @@ function playlistName(item: any): string {
 }
 
 function playlistShareUrl(item: any): string | null {
+  if (item?.type === "library-playlists" && item?.attributes?.isPublic !== true) return null;
   const value = item?.attributes?.url ?? item?.attributes?.playParams?.shareUrl;
   if (typeof value !== "string") return null;
   try {

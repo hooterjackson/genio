@@ -9,6 +9,7 @@ import {
   appleAuthorizationGeneration,
   appleAuthorizationJobDedupeKey,
   encryptMusicUserToken,
+  libraryPlaylistIsPublic,
   processAppleAuthorizationJob,
   recoverUnverifiedAppleAuthorizationJob,
   type AppleAuthorizationJobRepository,
@@ -126,6 +127,22 @@ describe("Apple Music client failure classification", () => {
     });
   });
 
+  test("playlist creation does not persist a returned URL while Apple still reports the playlist private", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      data: [{
+        id: "p.not-public-yet",
+        type: "library-playlists",
+        attributes: {
+          isPublic: false,
+          url: "https://music.apple.com/us/playlist/not-public-yet/pl.u-not-public-yet",
+        },
+      }],
+    }), { status: 201 })));
+
+    await expect(new AppleMusicClient("private-user-token", "us").createLibraryPlaylist("Needle", "Pending"))
+      .resolves.toEqual({ id: "p.not-public-yet", url: null });
+  });
+
   test("share polling follows a library globalId to the catalog playlist URL", async () => {
     const publicUrl = "https://music.apple.com/us/playlist/needle/pl.u-public";
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
@@ -135,7 +152,7 @@ describe("Apple Music client failure classification", () => {
           data: [{
             id: "p.library",
             type: "library-playlists",
-            attributes: { playParams: { globalId: "pl.u-public" } },
+            attributes: { isPublic: true, playParams: { globalId: "pl.u-public" } },
           }],
         }), { status: 200 });
       }
@@ -162,7 +179,9 @@ describe("Apple Music client failure classification", () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes("/v1/me/library/playlists/p.relationship?include=catalog")) {
-        return new Response(JSON.stringify({ data: [{ id: "p.relationship", type: "library-playlists" }] }), { status: 200 });
+        return new Response(JSON.stringify({
+          data: [{ id: "p.relationship", type: "library-playlists", attributes: { isPublic: true } }],
+        }), { status: 200 });
       }
       if (url.endsWith("/v1/me/library/playlists/p.relationship/catalog")) {
         return new Response(JSON.stringify({
@@ -175,6 +194,33 @@ describe("Apple Music client failure classification", () => {
 
     await expect(new AppleMusicClient("private-user-token", "us").resolveLibraryPlaylistShareUrl("p.relationship"))
       .resolves.toBe(publicUrl);
+  });
+
+  test("a private library playlist never becomes a visitor share link merely because it has a global catalog ID", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/v1/me/library/playlists/p.private?include=catalog")) {
+        return new Response(JSON.stringify({
+          data: [{
+            id: "p.private",
+            type: "library-playlists",
+            attributes: {
+              isPublic: false,
+              url: "https://music.apple.com/us/playlist/private/pl.u-private",
+              playParams: { globalId: "pl.u-private" },
+            },
+          }],
+        }), { status: 200 });
+      }
+      throw new Error(`Private playlist resolution must stop at the library resource: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new AppleMusicClient("private-user-token", "us").resolveLibraryPlaylistShareUrl("p.private"))
+      .resolves.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(libraryPlaylistIsPublic({ type: "library-playlists", attributes: { isPublic: true } })).toBe(true);
+    expect(libraryPlaylistIsPublic({ type: "library-playlists", attributes: { isPublic: false } })).toBe(false);
   });
 
   test("ordered playlist reads retain order across Apple pagination and reject an untrusted next host", async () => {
@@ -624,7 +670,7 @@ test("the production publisher completes a locked manifest through the real Appl
     }
     if (url.pathname === "/v1/me/library/playlists/p.production" && method === "GET") {
       return new Response(JSON.stringify({
-        data: [{ id: "p.production", type: "library-playlists", attributes: { url: shareUrl } }],
+        data: [{ id: "p.production", type: "library-playlists", attributes: { isPublic: true, url: shareUrl } }],
       }), { status: 200 });
     }
     throw new Error(`Unexpected Apple test request: ${method} ${url.pathname}${url.search}`);
@@ -728,7 +774,7 @@ test("the production publisher executes a 6,000-track plan across six exact volu
         data: [{
           id: playlistId,
           type: "library-playlists",
-          attributes: { url: `https://music.apple.com/us/playlist/needle-volume-${number}/pl.volume-${number}` },
+          attributes: { isPublic: true, url: `https://music.apple.com/us/playlist/needle-volume-${number}/pl.volume-${number}` },
         }],
       }), { status: 200 });
     }
@@ -792,7 +838,7 @@ test("a production Apple 403 preserves the manifest and resumes it after a repla
     }
     if (url.pathname === "/v1/me/library/playlists/p.resumed" && method === "GET") {
       return new Response(JSON.stringify({
-        data: [{ id: "p.resumed", type: "library-playlists", attributes: { url: shareUrl } }],
+        data: [{ id: "p.resumed", type: "library-playlists", attributes: { isPublic: true, url: shareUrl } }],
       }), { status: 200 });
     }
     throw new Error(`Unexpected Apple test request: ${method} ${url.pathname}${url.search}`);

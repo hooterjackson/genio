@@ -1,6 +1,6 @@
 # Needle
 
-Needle turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account publishes share-link playlists.
+Needle turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account creates the playlists. A run exposes a visitor link only after Apple reports the playlist as public and returns an Apple Music catalog URL.
 
 Visitors can start multiple jobs, reopen the jobs available to their browser, and let active research continue in the background.
 

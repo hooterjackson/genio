@@ -3,6 +3,12 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { configureFreshMusicKit, type MusicKitApi } from "../music-kit.ts";
+import {
+  appleAuthorizationErrorMessage,
+  durableAppleAuthorizationMessage,
+  requireMusicUserToken,
+  waitForDurableAppleAuthorization,
+} from "./apple-authorization-status.ts";
 
 type OwnerHealth = {
   ok: boolean;
@@ -218,6 +224,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   const [importRunId, setImportRunId] = useState("");
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importStatus, setImportStatus] = useState("");
+  const [appleStatusMessage, setAppleStatusMessage] = useState("CHECKING APPLE MUSIC STATUS");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
 
@@ -232,6 +239,11 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
 
     if (healthResult.status === "fulfilled") {
       setHealth(healthResult.value);
+      setAppleStatusMessage(healthResult.value.apple.authorized
+        ? `APPLE MUSIC CONNECTED · ${healthResult.value.apple.storefront?.toUpperCase() ?? "UNKNOWN STOREFRONT"} · TOKEN SAVED AND VALIDATED`
+        : healthResult.value.apple.needsReauthorization
+          ? "APPLE MUSIC AUTHORIZATION EXPIRED · AUTHORIZE AGAIN"
+          : "APPLE MUSIC IS NOT CONNECTED");
       setError("");
     } else {
       setError(healthResult.reason instanceof Error ? healthResult.reason.message : "Owner status is unavailable.");
@@ -258,11 +270,12 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   async function authorizeApple() {
     setBusy("apple");
     setError("");
+    setAppleStatusMessage("APPLE MUSIC AUTHORIZATION IN PROGRESS");
     try {
       const token = await ownerApi<AppleTokenResponse>("/api/v1/owner/apple/developer-token");
       const MusicKit = await loadMusicKit();
       const music = await configureFreshMusicKit(MusicKit, token.developerToken);
-      const musicUserToken = await music.authorize();
+      const musicUserToken = requireMusicUserToken(await music.authorize());
       const storefrontResponse = await fetch("https://api.music.apple.com/v1/me/storefront", {
         headers: {
           Authorization: "Bearer " + token.developerToken,
@@ -278,14 +291,14 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
         method: "POST",
         body: JSON.stringify({ musicUserToken, storefront }),
       });
-      for (let attempt = 0; attempt < 12; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1_500));
-        const authorization = await ownerApi<Record<string, unknown>>("/api/v1/owner/apple/authorization");
-        if (authorization.status === "valid" || authorization.status === "reauthorization_required") break;
-      }
+      const authorization = await waitForDurableAppleAuthorization(
+        () => ownerApi("/api/v1/owner/apple/authorization"),
+      );
       await refresh();
+      setAppleStatusMessage(durableAppleAuthorizationMessage(authorization));
     } catch (caught) {
-      setError((caught as Error).message);
+      await refresh();
+      setError(appleAuthorizationErrorMessage(caught));
     } finally {
       setBusy("");
     }
@@ -297,6 +310,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     try {
       await ownerApi("/api/v1/owner/apple/authorization", { method: "DELETE" });
       await refresh();
+      setAppleStatusMessage("APPLE MUSIC IS NOT CONNECTED");
     } catch (caught) {
       setError((caught as Error).message);
     } finally {
@@ -448,6 +462,9 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
             {health?.paused ? "RESUME APPLICATION" : "EMERGENCY PAUSE"}
           </button>
         </div>
+        <p className="operator-note" role="status">
+          {appleStatusMessage}
+        </p>
 
         <section className="operator-section" aria-labelledby="budgets-title">
           <div className="operator-section-title"><h2 id="budgets-title">AWAITING BUDGET</h2><span>[{budgets.length}]</span></div>

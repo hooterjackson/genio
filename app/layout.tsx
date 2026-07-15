@@ -3,17 +3,17 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Needle — Playlist Research",
-  description: "Research cited tracks and publish an Apple Music playlist.",
+  description: "Research cited tracks and build an Apple Music playlist.",
   openGraph: {
     title: "Needle — Playlist Research",
-    description: "Research cited tracks and publish an Apple Music playlist.",
+    description: "Research cited tracks and build an Apple Music playlist.",
     type: "website",
     images: [{ url: "/og.png", width: 1659, height: 948, alt: "Needle — Playlist Research" }],
   },
   twitter: {
     card: "summary_large_image",
     title: "Needle — Playlist Research",
-    description: "Research cited tracks and publish an Apple Music playlist.",
+    description: "Research cited tracks and build an Apple Music playlist.",
     images: ["/og.png"],
   },
   robots: {

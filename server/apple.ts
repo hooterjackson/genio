@@ -281,7 +281,10 @@ export class AppleMusicClient {
     });
     const item = payload?.data?.[0];
     if (!item?.id) throw new Error("Apple did not return a playlist ID");
-    return { id: String(item.id), url: playlistShareUrl(item) };
+    // A library resource can expose a catalog-looking URL before it is public.
+    // Never persist that URL until Apple also reports the library playlist as
+    // public; otherwise a link that works for the owner can fail for visitors.
+    return { id: String(item.id), url: libraryPlaylistIsPublic(item) ? playlistShareUrl(item) : null };
   }
 
   async appendCatalogTracks(playlistId: string, catalogIds: readonly string[], signal?: AbortSignal): Promise<void> {
@@ -373,6 +376,7 @@ export class AppleMusicClient {
 
   async resolveLibraryPlaylistShareUrl(playlistId: string, signal?: AbortSignal): Promise<string | null> {
     const libraryPlaylist = await this.getLibraryPlaylist(playlistId, signal);
+    if (!libraryPlaylistIsPublic(libraryPlaylist)) return null;
     const direct = libraryPlaylist ? playlistShareUrl(libraryPlaylist) : null;
     if (direct) return direct;
 
@@ -422,6 +426,10 @@ export function playlistShareUrl(item: any): string | null {
     } catch { /* wait for Apple to provide a valid public URL */ }
   }
   return null;
+}
+
+export function libraryPlaylistIsPublic(item: any): boolean {
+  return item?.type === "library-playlists" && item?.attributes?.isPublic === true;
 }
 
 export function playlistCatalogId(item: any): string | null {
