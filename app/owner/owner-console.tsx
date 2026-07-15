@@ -68,9 +68,10 @@ type AppleTokenResponse = {
 
 // MusicKit v3 currently completes Apple's consent UI and then rejects
 // authorize() with AUTHORIZATION_ERROR/Unauthorized before returning a user
-// token. Keep owner authorization on Apple's stable v1 build; the HTTP Apple
-// Music API used by the server remains unchanged.
-const MUSICKIT_SRC = "https://js-cdn.music.apple.com/musickit/v1/musickit.js";
+// token. Keep owner authorization on Apple's stable v2 build; unlike v1 it
+// requests a token without first preloading the protected audio player. The
+// HTTP Apple Music API used by the server remains unchanged.
+const MUSICKIT_SRC = "https://js-cdn.music.apple.com/musickit/v2/musickit.js";
 let musicKitPromise: Promise<MusicKitApi> | null = null;
 
 function asObject(value: unknown): Record<string, unknown> {
