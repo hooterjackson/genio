@@ -305,7 +305,20 @@ export class AppleMusicClient {
     let path: string | null = `/v1/me/library/playlists/${encodeURIComponent(playlistId)}/tracks?limit=100`;
     for (let page = 0; path && page < 200; page += 1) {
       signal?.throwIfAborted();
-      const payload = await this.request(path, { signal });
+      let payload: any;
+      try {
+        payload = await this.request(path, { signal });
+      } catch (error) {
+        // Apple can expose a newly-created library playlist before its empty
+        // tracks relationship exists. Confirm the parent before interpreting
+        // that first-page 404 as an empty playlist; a missing parent remains a
+        // real 404 so the publisher can replace the stale resource.
+        if (page === 0 && error instanceof AppleApiError && error.status === 404) {
+          const playlist = await this.getLibraryPlaylist(playlistId, signal);
+          if (playlist) return [];
+        }
+        throw error;
+      }
       for (const track of payload?.data ?? []) {
         const catalogId = track.attributes?.playParams?.catalogId ?? track.relationships?.catalog?.data?.[0]?.id;
         if (!catalogId) throw new Error("Apple returned a library track without a catalog identifier");

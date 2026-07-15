@@ -207,22 +207,10 @@ async function markTerminalPublicationVolumes(
   const manifestId = typeof payload?.manifestId === "string" ? payload.manifestId : "";
   if (!manifestId) return;
   const publicError = sanitizeFailure(error, "publication");
-  const stranded = await client.query<{ id: string; apple_playlist_id: string }>(
-    `SELECT id,apple_playlist_id FROM publication_volumes
-     WHERE manifest_id=$1 AND apple_playlist_id IS NOT NULL
-       AND status NOT IN ('complete','waiting_for_owner')`,
-    [manifestId],
-  );
-  for (const volume of stranded.rows) {
-    await client.query(
-      `INSERT INTO orphan_playlists(id,manifest_id,publication_volume_id,apple_playlist_id,reason)
-       SELECT $1,$2,$3,$4::varchar,$5 WHERE NOT EXISTS (
-         SELECT 1 FROM orphan_playlists
-         WHERE publication_volume_id=$3 AND apple_playlist_id=$4::varchar AND cleaned_at IS NULL
-       )`,
-      [randomUUID(), manifestId, volume.id, volume.apple_playlist_id, publicError],
-    );
-  }
+  // A terminal worker failure does not prove that Apple's playlist contents
+  // diverged from the manifest. Preserve the resource ID so an explicit retry
+  // can reconcile it. Confirmed divergence and persistent 404s are orphaned by
+  // the deterministic publisher before they cross this generic failure path.
   await client.query(
     `UPDATE publication_volumes pv SET status='failed',last_error=$2,updated_at=now()
      WHERE pv.manifest_id=$1 AND pv.status NOT IN ('complete','waiting_for_owner')

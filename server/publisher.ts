@@ -211,9 +211,13 @@ async function observeStablePrefix(
   playlistId: string,
   expected: readonly string[],
   signal?: AbortSignal,
+  minimumVisibleCount = 0,
 ): Promise<{ ids: string[]; diverged: boolean }> {
-  let previous: string[] | null = null;
-  let stableReads = 0;
+  const requiredVisibleCount = Math.max(0, Math.min(Math.floor(minimumVisibleCount), expected.length));
+  let previousCompatible: string[] | null = null;
+  let compatibleStableReads = 0;
+  let previousDivergent: string[] | null = null;
+  let divergentStableReads = 0;
   for (let attempt = 0; attempt < 6; attempt += 1) {
     signal?.throwIfAborted();
     let ids: string[];
@@ -226,26 +230,48 @@ async function observeStablePrefix(
       }
       throw error;
     }
-    if (!exactOrderedPrefix(ids, expected)) {
-      if (!client.getCatalogRecordingKeys || ids.length > expected.length) return { ids, diverged: true };
+    let compatible = exactOrderedPrefix(ids, expected);
+    if (!compatible && client.getCatalogRecordingKeys && ids.length <= expected.length) {
       const expectedPrefix = expected.slice(0, ids.length);
       const keys = await client.getCatalogRecordingKeys([...ids, ...expectedPrefix], signal);
-      const recordingEquivalent = ids.every((catalogId, index) => {
+      compatible = ids.every((catalogId, index) => {
         const observedKey = keys[catalogId];
         const expectedKey = keys[expectedPrefix[index]!];
         return Boolean(observedKey && expectedKey && observedKey === expectedKey);
       });
-      if (!recordingEquivalent) return { ids, diverged: true };
     }
-    if (previous && ids.length === previous.length && ids.every((id, index) => id === previous![index])) stableReads += 1;
-    else stableReads = 1;
-    previous = ids;
-    if (ids.length === expected.length || stableReads >= 3) {
-      return { ids, diverged: false };
+
+    if (compatible) {
+      divergentStableReads = 0;
+      previousDivergent = null;
+      if (previousCompatible && ids.length === previousCompatible.length
+        && ids.every((id, index) => id === previousCompatible![index])) compatibleStableReads += 1;
+      else compatibleStableReads = 1;
+      previousCompatible = ids;
+      if (ids.length === expected.length
+        || (requiredVisibleCount > 0 && ids.length >= requiredVisibleCount)
+        || (ids.length >= requiredVisibleCount && compatibleStableReads >= 3)) {
+        return { ids, diverged: false };
+      }
+    } else {
+      compatibleStableReads = 0;
+      previousCompatible = null;
+      if (previousDivergent && ids.length === previousDivergent.length
+        && ids.every((id, index) => id === previousDivergent![index])) divergentStableReads += 1;
+      else divergentStableReads = 1;
+      previousDivergent = ids;
+      if (divergentStableReads >= 3) return { ids, diverged: true };
     }
     await consistencyWait(CONSISTENCY_POLL_MS, signal);
   }
-  throw new AppleApiError("Apple playlist reads did not become stable", null, true, false);
+  throw new AppleApiError(
+    requiredVisibleCount > 0
+      ? "Apple playlist did not expose the submitted prefix before reconciliation timed out"
+      : "Apple playlist reads did not become stable",
+    null,
+    true,
+    false,
+  );
 }
 
 function volumeName(manifest: LockedManifest, index: number, count: number): string {
@@ -434,9 +460,10 @@ export async function appendExactVolume(
     await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
     volume = await ensureApplePlaylist(repository, client, manifest, volume, expectedAuthorization, signal);
     const playlistId = volume.playlistId!;
+    let submittedCount = Math.max(0, Math.min(Math.floor(volume.appendedCount), expected.length));
     let initial: { ids: string[]; diverged: boolean };
     try {
-      initial = await observeStablePrefix(client, playlistId, expected, signal);
+      initial = await observeStablePrefix(client, playlistId, expected, signal, submittedCount);
     } catch (error) {
       if (error instanceof AppleApiError && error.status === 404) {
         volume = await abandonPlaylist(
@@ -449,49 +476,96 @@ export async function appendExactVolume(
       }
       throw error;
     }
-    let existing = initial.ids;
+    let visible = initial.ids;
     if (initial.diverged) {
       volume = await abandonDivergedPlaylist(repository, volume, initial.ids, expected, signal);
       continue;
     }
 
+    const advanceSubmittedCount = async (nextCount: number): Promise<void> => {
+      const boundedCount = Math.max(0, Math.min(Math.floor(nextCount), expected.length));
+      if (boundedCount <= submittedCount) return;
+      await repository.updatePublicationVolume(volume.id, { appendedCount: boundedCount, status: "appending" });
+      submittedCount = boundedCount;
+      volume = { ...volume, appendedCount: boundedCount, status: "appending" };
+    };
+    await advanceSubmittedCount(visible.length);
+
     let stalledAttempts = 0;
-    while (existing.length < expected.length) {
+    while (submittedCount < expected.length) {
       await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
-      const batch = nextPublicationAppendBatch(expected, existing.length);
+      const batch = nextPublicationAppendBatch(expected, submittedCount);
       try {
         await client.appendCatalogTracks(playlistId, batch, signal);
-        signal?.throwIfAborted();
-        existing = [...existing, ...batch];
+        await advanceSubmittedCount(submittedCount + batch.length);
         stalledAttempts = 0;
-        await repository.updatePublicationVolume(volume.id, { appendedCount: existing.length, status: "appending" });
       } catch (error) {
         if (error instanceof AppleAuthorizationRequiredError) throw error;
-        const observation = await observeStablePrefix(client, playlistId, expected, signal);
+
+        // A mutation failure marked uncertain can occur after Apple accepted
+        // the write. Do not reconcile it against the old high-water mark: that
+        // would make a lagging GET look safe to retry and could duplicate the
+        // whole batch.
+        // Require the complete attempted prefix instead. If Apple cannot prove
+        // that outcome within the bounded read window, abandon this playlist
+        // and retry only on a clean replacement resource.
+        if (error instanceof AppleApiError && error.uncertainMutation) {
+          const targetCount = Math.min(submittedCount + batch.length, expected.length);
+          let observation: { ids: string[]; diverged: boolean };
+          try {
+            observation = await observeStablePrefix(client, playlistId, expected, signal, targetCount);
+          } catch (reconciliationError) {
+            if (reconciliationError instanceof AppleAuthorizationRequiredError) throw reconciliationError;
+            signal?.throwIfAborted();
+            volume = await abandonPlaylist(
+              repository,
+              volume,
+              "Apple append outcome remained uncertain after bounded reconciliation",
+              signal,
+            );
+            break;
+          }
+          visible = observation.ids;
+          if (observation.diverged) {
+            volume = await abandonDivergedPlaylist(repository, volume, visible, expected, signal);
+            break;
+          }
+          await advanceSubmittedCount(visible.length);
+          stalledAttempts = 0;
+          continue;
+        }
+
+        const observation = await observeStablePrefix(client, playlistId, expected, signal, submittedCount);
         const reconciled = observation.ids;
         if (observation.diverged) {
           volume = await abandonDivergedPlaylist(repository, volume, reconciled, expected, signal);
           break;
         }
-        if (reconciled.length === existing.length) stalledAttempts += 1;
-        else stalledAttempts = 0;
-        existing = reconciled;
-        await repository.updatePublicationVolume(volume.id, { appendedCount: existing.length });
-        if (stalledAttempts >= 3) throw error;
+        visible = reconciled;
+        if (visible.length > submittedCount) {
+          await advanceSubmittedCount(visible.length);
+          stalledAttempts = 0;
+          continue;
+        }
+        if (error instanceof AppleApiError && error.retriable && error.status !== null) {
+          stalledAttempts += 1;
+          if (stalledAttempts < 3) continue;
+        }
+        throw error;
       }
+
+      const observation = await observeStablePrefix(client, playlistId, expected, signal, submittedCount);
+      visible = observation.ids;
+      if (observation.diverged) {
+        volume = await abandonDivergedPlaylist(repository, volume, visible, expected, signal);
+        break;
+      }
+      await advanceSubmittedCount(visible.length);
     }
 
     if (volume.playlistId !== playlistId) continue;
-    const finalObservation = await observeStablePrefix(client, playlistId, expected, signal);
-    const verified = finalObservation.ids;
-    if (finalObservation.diverged) {
-      volume = await abandonDivergedPlaylist(repository, volume, verified, expected, signal);
-      continue;
-    }
-    if (verified.length < expected.length) {
-      await repository.updatePublicationVolume(volume.id, { appendedCount: verified.length, status: "appending" });
-      volume = { ...volume, appendedCount: verified.length, status: "appending" };
-      continue;
+    if (visible.length < submittedCount || visible.length < expected.length) {
+      throw new AppleApiError("Apple playlist did not expose the submitted prefix before reconciliation timed out", null, true, false);
     }
     await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
     let shareUrl: string;
@@ -499,7 +573,7 @@ export async function appendExactVolume(
       shareUrl = await client.pollStableShareUrl(playlistId, sharePollAttempts(), SHARE_POLL_MS, signal);
     } catch (error) {
       await repository.updatePublicationVolume(volume.id, {
-        appendedCount: verified.length,
+        appendedCount: submittedCount,
         status: "waiting_for_share_url",
         lastError: error instanceof Error ? error.message : "Apple did not expose a stable share link",
       });
@@ -507,13 +581,13 @@ export async function appendExactVolume(
     }
     signal?.throwIfAborted();
     await repository.updatePublicationVolume(volume.id, {
-      appendedCount: verified.length,
+      appendedCount: submittedCount,
       appleShareUrl: shareUrl,
       status: "complete",
       lastError: null,
       publishedAt: new Date(),
     });
-    return { ...volume, appendedCount: verified.length, shareUrl, status: "complete" };
+    return { ...volume, appendedCount: submittedCount, shareUrl, status: "complete" };
   }
 }
 

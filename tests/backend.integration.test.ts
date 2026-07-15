@@ -2382,7 +2382,7 @@ databaseDescribe("hosted backend integration", () => {
       "INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,'Terminal diagnostics','Test manifest',$3)",
       [manifestId, runId, "a".repeat(64)],
     );
-    await repository.createPublicationVolume({
+    const activeVolume = await repository.createPublicationVolume({
       manifestId,
       volumeNumber: 1,
       volumeCount: 2,
@@ -2390,6 +2390,7 @@ databaseDescribe("hosted backend integration", () => {
       endPosition: 24,
       status: "publishing",
     });
+    await repository.updatePublicationVolume(activeVolume.id, { applePlaylistId: "p.retriable-terminal" });
     await repository.createPublicationVolume({
       manifestId,
       volumeNumber: 2,
@@ -2424,8 +2425,13 @@ databaseDescribe("hosted backend integration", () => {
     volumes = await repository.listPublicationVolumes(manifestId);
     expect(volumes[0]).toMatchObject({
       status: "failed",
+      applePlaylistId: "p.retriable-terminal",
       lastError: "Apple publication failed after the final attempt; provider details were redacted.",
     });
+    expect((await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM orphan_playlists WHERE publication_volume_id=$1",
+      [activeVolume.id],
+    )).rows[0]?.count).toBe(0);
     expect(volumes[0].lastError).not.toContain("sk-proj");
     expect(volumes[0].lastError).not.toContain("password");
     expect(volumes[1]).toMatchObject({ status: "complete", lastError: null });

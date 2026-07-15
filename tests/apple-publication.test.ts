@@ -267,6 +267,33 @@ describe("Apple Music client failure classification", () => {
       .rejects.toThrow(/invalid pagination URL/);
   });
 
+  test("an empty tracks-relationship 404 is empty only while the parent playlist still exists", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/v1/me/library/playlists/p.propagating/tracks?")) {
+        return new Response(JSON.stringify({ errors: [{ title: "Relationship not ready" }] }), { status: 404 });
+      }
+      if (url.includes("/v1/me/library/playlists/p.propagating?include=catalog")) {
+        return new Response(JSON.stringify({
+          data: [{ id: "p.propagating", type: "library-playlists", attributes: { isPublic: true } }],
+        }), { status: 200 });
+      }
+      throw new Error(`Unexpected Apple propagation-test URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new AppleMusicClient("private-user-token").getOrderedPlaylistCatalogIds("p.propagating"))
+      .resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fetchMock.mockReset().mockImplementation(async () => new Response(JSON.stringify({
+      errors: [{ title: "Not found" }],
+    }), { status: 404 }));
+    await expect(new AppleMusicClient("private-user-token").getOrderedPlaylistCatalogIds("p.missing"))
+      .rejects.toMatchObject({ name: "AppleApiError", status: 404 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   test("safe Apple GETs honor bounded 429 and 5xx retries", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ errors: [{ title: "Rate limited" }] }), {
@@ -659,6 +686,213 @@ test("publisher orphans a divergent playlist and creates a clean replacement", a
   expect(states.get("p.replacement")).toEqual(["101", "202"]);
 });
 
+test("publisher ignores a transient non-prefix read that converges to a stable valid prefix", async () => {
+  const repository = publicationRepository();
+  let readCount = 0;
+  let state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.transient-read", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => { state = [...state, ...ids]; }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => {
+      readCount += 1;
+      if (readCount === 1) return ["transient-wrong-track"];
+      return [...state];
+    }),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/transient/pl.transient"),
+  };
+
+  const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101", "202"], validAuthorization);
+
+  expect(result).toMatchObject({ playlistId: "p.transient-read", appendedCount: 2, status: "complete" });
+  expect(repository.markPlaylistOrphan).not.toHaveBeenCalled();
+  expect(client.createLibraryPlaylist).toHaveBeenCalledTimes(1);
+  expect(client.getOrderedPlaylistCatalogIds).toHaveBeenCalledTimes(5);
+});
+
+test("publisher declares divergence only after three identical non-prefix reads", async () => {
+  const repository = publicationRepository();
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.unused", url: null })),
+    appendCatalogTracks: vi.fn(async () => undefined),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => ["persistent-wrong-track"]),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/unused/pl.unused"),
+  };
+  const exhausted = {
+    ...pendingVolume(),
+    attempt: 3,
+    playlistId: "p.persistent-divergence",
+    status: "appending" as const,
+  };
+
+  await expect(appendExactVolume(repository, client, manifest, exhausted, ["101"], validAuthorization))
+    .rejects.toThrow(/diverged too many times/);
+
+  expect(client.getOrderedPlaylistCatalogIds).toHaveBeenCalledTimes(3);
+  expect(repository.markPlaylistOrphan).toHaveBeenCalledTimes(1);
+  expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
+});
+
+test("publisher does not resend an acknowledged batch while Apple visibility lags across a retry", async () => {
+  const repository = publicationRepository();
+  const expected = Array.from({ length: 30 }, (_, index) => String(10_000 + index));
+  const volume = {
+    ...pendingVolume(),
+    playlistId: "p.delayed-visibility",
+    status: "appending" as const,
+  };
+  let accepted: string[] = [];
+  let exposeAccepted = false;
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.delayed-visibility", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => { accepted = [...accepted, ...ids]; }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => exposeAccepted ? [...accepted] : []),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/delayed/pl.delayed"),
+  };
+
+  await expect(appendExactVolume(repository, client, manifest, volume, expected, validAuthorization))
+    .rejects.toMatchObject({ name: "AppleApiError", retriable: true });
+
+  expect(client.appendCatalogTracks).toHaveBeenCalledTimes(1);
+  expect(client.appendCatalogTracks).toHaveBeenLastCalledWith(
+    "p.delayed-visibility",
+    expected.slice(0, 25),
+    undefined,
+  );
+  expect(repository.updatePublicationVolume).toHaveBeenCalledWith("volume-id", {
+    appendedCount: 25,
+    status: "appending",
+  });
+
+  exposeAccepted = true;
+  const resumed = await appendExactVolume(
+    repository,
+    client,
+    manifest,
+    { ...volume, appendedCount: 25 },
+    expected,
+    validAuthorization,
+  );
+
+  expect(resumed).toMatchObject({ playlistId: "p.delayed-visibility", appendedCount: 30, status: "complete" });
+  expect(client.appendCatalogTracks).toHaveBeenCalledTimes(2);
+  expect(client.appendCatalogTracks).toHaveBeenLastCalledWith(
+    "p.delayed-visibility",
+    expected.slice(25),
+    undefined,
+  );
+  const updatePublicationVolumeMock = repository.updatePublicationVolume as unknown as ReturnType<typeof vi.fn>;
+  const persistedCounts = updatePublicationVolumeMock.mock.calls
+    .map((call) => (call[1] as { appendedCount?: unknown }).appendedCount)
+    .filter((count): count is number => typeof count === "number");
+  expect(persistedCounts).toEqual([25, 30, 30]);
+});
+
+test("publisher replaces an indeterminate playlist instead of resending an uncertain batch onto it", async () => {
+  const repository = publicationRepository();
+  const expected = Array.from({ length: 30 }, (_, index) => String(15_000 + index));
+  const original = {
+    ...pendingVolume(),
+    playlistId: "p.uncertain-append",
+    status: "appending" as const,
+  };
+  let replacementState: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.clean-replacement", url: null })),
+    appendCatalogTracks: vi.fn(async (playlistId, ids) => {
+      if (playlistId === "p.uncertain-append") {
+        throw new AppleApiError("Connection closed before the append response", null, true, true);
+      }
+      replacementState = [...replacementState, ...ids];
+    }),
+    getOrderedPlaylistCatalogIds: vi.fn(async (playlistId) => (
+      playlistId === "p.clean-replacement" ? [...replacementState] : []
+    )),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/replacement/pl.clean"),
+  };
+
+  const result = await appendExactVolume(repository, client, manifest, original, expected, validAuthorization);
+
+  expect(result).toMatchObject({ playlistId: "p.clean-replacement", appendedCount: 30, status: "complete" });
+  expect(repository.markPlaylistOrphan).toHaveBeenCalledTimes(1);
+  expect(repository.markPlaylistOrphan).toHaveBeenCalledWith({
+    manifestId: manifest.id,
+    publicationVolumeId: "volume-id",
+    applePlaylistId: "p.uncertain-append",
+    reason: "Apple append outcome remained uncertain after bounded reconciliation",
+  });
+  expect(client.createLibraryPlaylist).toHaveBeenCalledTimes(1);
+  expect(client.appendCatalogTracks).toHaveBeenCalledTimes(3);
+  expect(client.appendCatalogTracks).toHaveBeenNthCalledWith(
+    1,
+    "p.uncertain-append",
+    expected.slice(0, 25),
+    undefined,
+  );
+  expect(client.appendCatalogTracks).toHaveBeenNthCalledWith(
+    2,
+    "p.clean-replacement",
+    expected.slice(0, 25),
+    undefined,
+  );
+  expect(client.appendCatalogTracks).toHaveBeenNthCalledWith(
+    3,
+    "p.clean-replacement",
+    expected.slice(25),
+    undefined,
+  );
+  expect(replacementState).toEqual(expected);
+});
+
+test("publisher waits for each submitted prefix to become visible before serially appending the next batch", async () => {
+  const repository = publicationRepository();
+  const expected = Array.from({ length: 60 }, (_, index) => String(20_000 + index));
+  let accepted: string[] = [];
+  let visible: string[] = [];
+  let staleReadsRemaining = 0;
+  let concurrentAppends = 0;
+  let maximumConcurrentAppends = 0;
+  const events: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.serial-batches", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => {
+      events.push(`append:${accepted.length}`);
+      concurrentAppends += 1;
+      maximumConcurrentAppends = Math.max(maximumConcurrentAppends, concurrentAppends);
+      await Promise.resolve();
+      accepted = [...accepted, ...ids];
+      staleReadsRemaining = 1;
+      concurrentAppends -= 1;
+    }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => {
+      if (accepted.length > visible.length) {
+        if (staleReadsRemaining > 0) staleReadsRemaining -= 1;
+        else visible = [...accepted];
+      }
+      events.push(`visible:${visible.length}`);
+      return [...visible];
+    }),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/serial/pl.serial"),
+  };
+
+  const result = await appendExactVolume(repository, client, manifest, pendingVolume(), expected, validAuthorization);
+
+  expect(result).toMatchObject({ playlistId: "p.serial-batches", appendedCount: 60, status: "complete" });
+  expect(maximumConcurrentAppends).toBe(1);
+  expect(client.appendCatalogTracks).toHaveBeenCalledTimes(3);
+  expect(client.appendCatalogTracks).toHaveBeenNthCalledWith(1, "p.serial-batches", expected.slice(0, 25), undefined);
+  expect(client.appendCatalogTracks).toHaveBeenNthCalledWith(2, "p.serial-batches", expected.slice(25, 50), undefined);
+  expect(client.appendCatalogTracks).toHaveBeenNthCalledWith(3, "p.serial-batches", expected.slice(50), undefined);
+  expect(events.indexOf("visible:25")).toBeLessThan(events.indexOf("append:25"));
+  expect(events.indexOf("visible:50")).toBeLessThan(events.indexOf("append:50"));
+  expect(accepted).toEqual(expected);
+  expect(visible).toEqual(expected);
+});
+
 test("publisher replaces a stored Apple playlist ID that remains unavailable after bounded propagation reads", async () => {
   const repository = publicationRepository();
   const state: string[] = [];
@@ -881,18 +1115,30 @@ test("the production publisher executes a 6,000-track plan across six exact volu
   expect(result.volumes).toHaveLength(6);
   expect(result.volumes.every((volume) => volume.trackCount === 1_000)).toBe(true);
   expect(result.volumes.map((volume) => volume.index)).toEqual([0, 1, 2, 3, 4, 5]);
-  expect(createdNames).toEqual(Array.from({ length: 6 }, (_, index) =>
-    `${productionManifest.name} [${index + 1}/6]`));
+  expect(createdNames).toEqual([
+    `${productionManifest.name} [1/6]`,
+    `${productionManifest.name} [2/6]`,
+    `${productionManifest.name} [2/6]`,
+    `${productionManifest.name} [3/6]`,
+    `${productionManifest.name} [4/6]`,
+    `${productionManifest.name} [5/6]`,
+    `${productionManifest.name} [6/6]`,
+  ]);
   expect(harness.volumes.every((volume) => volume.status === "complete" && volume.appendedCount === 1_000)).toBe(true);
   expect(acceptedThenDisconnected).toBe(true);
   expect(rateLimited).toBe(true);
+  expect(harness.repository.markPlaylistOrphan).toHaveBeenCalledWith(expect.objectContaining({
+    applePlaylistId: "p.volume-2",
+    reason: "Apple append outcome remained uncertain after bounded reconciliation",
+  }));
   expect(fetchMock.mock.calls.filter(([input, init]) => (
     /\/tracks$/u.test(new URL(String(input)).pathname)
     && String((init as RequestInit | undefined)?.method ?? "GET").toUpperCase() === "POST"
-  ))).toHaveLength(241); // 240 accepted batches plus one safely reconciled 429.
-  for (let index = 0; index < 6; index += 1) {
-    expect(playlistStates.get(`p.volume-${index + 1}`)).toEqual(
-      productionManifest.tracks.slice(index * 1_000, (index + 1) * 1_000).map((track) => track.catalogId),
+  ))).toHaveLength(241); // 240 accepted batches plus one indeterminate 429 on the abandoned playlist.
+  expect(playlistStates.get("p.volume-2")).toEqual([]);
+  for (const volume of result.volumes) {
+    expect(playlistStates.get(volume.playlistId)).toEqual(
+      productionManifest.tracks.slice(volume.index * 1_000, (volume.index + 1) * 1_000).map((track) => track.catalogId),
     );
   }
 });
