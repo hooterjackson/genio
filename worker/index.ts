@@ -1,7 +1,13 @@
 /** Cloudflare Sites entry point and the only browser-to-Railway gateway. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-import { forwardedCapabilityCookie, isCrossSiteMutation, matchGatewayRoute } from "./gateway-policy.ts";
+import {
+  DEFAULT_GATEWAY_BODY_LIMIT,
+  forwardedCapabilityCookie,
+  gatewayBodyLimit,
+  isCrossSiteMutation,
+  matchGatewayRoute,
+} from "./gateway-policy.ts";
 
 interface Env {
   ASSETS: Fetcher;
@@ -26,7 +32,6 @@ interface ExecutionContext {
   passThroughOnException(): void;
 }
 
-const MAX_BODY_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const encoder = new TextEncoder();
 function jsonError(status: number, message: string): Response {
@@ -85,7 +90,7 @@ async function clientBuckets(request: Request, pepper: string): Promise<string> 
   return currentDate + "." + current + "|" + previousDate + "." + prior;
 }
 
-async function readLimitedBody(request: Request): Promise<Uint8Array> {
+async function readLimitedBody(request: Request, limit = DEFAULT_GATEWAY_BODY_LIMIT): Promise<Uint8Array> {
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -96,9 +101,9 @@ async function readLimitedBody(request: Request): Promise<Uint8Array> {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
+      if (total > limit) {
         await reader.cancel("request body too large");
-        throw new RangeError("request body exceeds 64 KiB");
+        throw new RangeError("request body exceeds the route limit");
       }
       chunks.push(value);
     }
@@ -187,6 +192,7 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
   const method = request.method.toUpperCase();
   const rule = matchGatewayRoute(method, url.pathname);
   if (!rule) return jsonError(404, "Gateway route not found.");
+  const requestBodyLimit = gatewayBodyLimit(method, url.pathname);
 
   if (isCrossSiteMutation({
     method,
@@ -243,13 +249,13 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
   }
 
   const declaredLength = Number(request.headers.get("content-length") || "0");
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
-    return jsonError(413, "Request body exceeds 64 KiB.");
+  if (Number.isFinite(declaredLength) && declaredLength > requestBodyLimit) {
+    return jsonError(413, "Request body exceeds the route limit.");
   }
 
   let body: Uint8Array;
   try {
-    body = await readLimitedBody(request);
+    body = await readLimitedBody(request, requestBodyLimit);
   } catch (caught) {
     if (caught instanceof RangeError) return jsonError(413, caught.message);
     return jsonError(400, "Could not read request body.");

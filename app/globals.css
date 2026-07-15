@@ -41,7 +41,8 @@ body {
 
 button,
 textarea,
-input {
+input,
+select {
   color: inherit;
   font: inherit;
 }
@@ -68,6 +69,7 @@ button:focus-visible,
 a:focus-visible,
 textarea:focus-visible,
 input:focus-visible,
+select:focus-visible,
 summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
@@ -1248,65 +1250,191 @@ dd {
 
 .review-body {
   align-self: start;
+  padding-bottom: 24px;
 }
 
 .review-screen h1 {
-  margin-top: 18px;
-  font-size: clamp(40px, 7vw, 68px);
+  font-size: clamp(42px, 7vw, 64px);
 }
 
-.exception-artist {
-  color: var(--ink) !important;
-  font-size: 14px !important;
+.selection-toolbar {
+  min-height: 60px;
+  margin-top: 34px;
+  padding: 8px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-block: 1px solid var(--line-strong);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .07em;
 }
 
-.exception-basis {
-  margin-top: 10px !important;
-  color: var(--muted) !important;
-  font-size: 11px !important;
-  text-transform: uppercase;
+.selection-toolbar > div {
+  display: flex;
+  gap: 6px;
 }
 
-.exception-choices {
-  margin-top: 30px;
-  padding: 0;
-}
-
-.exception-choices button {
-  min-height: 72px;
-  padding: 12px 14px;
-  display: grid;
-  gap: 2px;
+.selection-toolbar button,
+.matching-retry {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 0;
   color: var(--ink);
-  border-color: var(--line-strong);
-  white-space: normal;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .07em;
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 4px;
 }
 
-.exception-choices button:hover:not(:disabled) {
+.matching-retry {
+  width: 100%;
+  margin-top: 14px;
+  border: 1px solid var(--line-strong);
+  text-align: center;
+  text-decoration: none;
+}
+
+.matching-retry:hover:not(:disabled) {
   border-color: var(--accent);
 }
 
-.exception-choices button span,
-.exception-choices button small {
+.track-selection-list {
+  margin-top: 18px;
+  margin-bottom: 0;
+  padding: 0;
+  border-top: 1px solid var(--line-strong);
+  list-style: none;
+}
+
+.track-selection-row {
+  border-bottom: 1px solid var(--line);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 76px;
+}
+
+.track-selection-row > label:first-child {
+  min-height: 72px;
+  padding: 12px 0;
+  display: grid;
+  grid-template-columns: 24px 42px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  cursor: pointer;
+}
+
+.track-selection-row > label:first-child:hover .track-copy strong {
+  color: var(--accent);
+}
+
+.track-selection-row > label:first-child:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.track-selection-row > label:first-child:has(input:focus-visible) input {
+  outline: 0;
+}
+
+.track-selection-row input[type="checkbox"] {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.track-position,
+.track-match-state,
+.match-choice > span {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .07em;
+}
+
+.track-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.track-copy strong,
+.track-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.track-copy strong {
+  color: var(--ink);
+  font-size: 13px;
+  transition: color .15s ease;
+}
+
+.track-copy small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.track-selection-row.unavailable {
+  background: rgba(5, 6, 5, .12);
+}
+
+.track-selection-row.unavailable > label:first-child {
+  cursor: not-allowed;
+}
+
+.track-selection-row.unavailable .track-copy strong {
+  color: var(--muted);
+}
+
+.match-choice {
+  padding: 0 0 12px 78px;
+  display: grid;
+  gap: 6px;
+}
+
+.match-choice select {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--ink);
+  background: var(--surface-2);
+  font-size: 10px;
+}
+
+.review-footer {
+  justify-content: space-between;
+}
+
+.selection-count {
+  display: grid;
+  line-height: 1;
+}
+
+.selection-count strong {
+  color: var(--ink);
+  font-size: 24px;
+}
+
+.selection-count span {
+  margin-top: 5px;
   color: var(--muted);
   font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .08em;
 }
 
-.exception-choices button strong {
-  font-size: 12px;
-}
-
-.exception-choices .reject {
-  min-height: 48px;
-  display: block;
-  color: var(--muted);
-  text-align: center;
-}
-
-.review-footer .quiet-button {
-  width: 100%;
-  min-height: 52px;
-  white-space: normal;
+.review-footer .step-primary {
+  min-width: min(78%, 360px);
 }
 
 .manifest-details,
@@ -2045,13 +2173,42 @@ dd {
     margin-top: 32px !important;
   }
 
-  .exception-actions.exception-choices {
-    grid-column: auto;
-    padding-left: 0;
+  .selection-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
   }
 
-  .exception-choices button {
-    min-height: 68px;
+  .selection-toolbar > div {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .selection-toolbar button {
+    padding-inline: 0;
+  }
+
+  .track-selection-row > label:first-child {
+    grid-template-columns: 22px 34px minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .track-match-state {
+    grid-column: 3;
+  }
+
+  .match-choice {
+    padding-left: 66px;
+  }
+
+  .review-footer {
+    gap: 10px;
+  }
+
+  .review-footer .step-primary {
+    width: auto;
+    min-width: 0;
+    flex: 1;
   }
 
   .result-actions {
@@ -2093,6 +2250,15 @@ dd {
 
   .scope-footer .step-primary {
     width: 100%;
+  }
+
+  .selection-count strong {
+    font-size: 20px;
+  }
+
+  .review-footer .step-primary {
+    min-height: 54px;
+    font-size: 10px;
   }
 }
 

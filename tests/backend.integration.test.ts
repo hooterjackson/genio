@@ -5,6 +5,10 @@ import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { createDatabase, DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 import { CapabilityService, CAPABILITY_COOKIE } from "../server/capabilities.ts";
+import {
+  CATALOG_RECOVERY_UNRESOLVED_BASIS,
+  RETRYABLE_CATALOG_MATCH_BASES,
+} from "../server/catalog-match-recovery.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { processNotificationJob } from "../server/notifications.ts";
 import { Repository } from "../server/repository.ts";
@@ -1408,6 +1412,353 @@ databaseDescribe("hosted backend integration", () => {
     await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
     const manifest = await repository.createManifest(runId);
     expect(manifest.tracks.map((track) => track.title)).toEqual(["First", "Second", "Third"]);
+  });
+
+  test("lists every catalog row in manifest order and atomically locks a bulk visitor selection", async () => {
+    const selectionBrief: PlaylistBrief = {
+      ...brief,
+      title: "Bulk catalog selection",
+      mode: "curated",
+      orderingPolicy: "influence rank",
+      targetSize: { min: 1, max: 10 },
+    };
+    const runId = await repository.createRun("Bulk catalog selection", selectionBrief, 0, 1);
+    await repository.addCandidates(runId, [
+      { selectionRank: 4, artist: "Bulk Artist", title: "Unavailable", album: "Bulk Album", releaseYear: 2024, durationMs: 180_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 2, artist: "Bulk Artist", title: "Override", album: "Bulk Album", releaseYear: 2024, durationMs: 180_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 1, artist: "Bulk Artist", title: "Recommended", album: "Bulk Album", releaseYear: 2024, durationMs: 180_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 3, artist: "Bulk Artist", title: "Unchecked", album: "Bulk Album", releaseYear: 2024, durationMs: 180_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+    ], new Map(), "unverified");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
+    const catalogSong = (id: string, name: string) => ({
+      id,
+      name,
+      artistName: "Bulk Artist",
+      albumName: "Bulk Album",
+      releaseDate: "2024-01-01",
+      durationInMillis: 180_000,
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Recommended")!.id,
+      status: "accepted",
+      basis: "Unique exact metadata",
+      score: 1,
+      song: catalogSong("catalog-recommended", "Recommended"),
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Override")!.id,
+      status: "review",
+      basis: "Two plausible versions",
+      score: 0.8,
+      song: catalogSong("catalog-override-default", "Override"),
+      alternatives: [catalogSong("catalog-override-selected", "Override (Selected Version)")],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Unchecked")!.id,
+      status: "review",
+      basis: "Visitor decision required",
+      score: 0.7,
+      song: catalogSong("catalog-unchecked", "Unchecked"),
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Unavailable")!.id,
+      status: "unavailable",
+      basis: "No compatible catalog result",
+      score: 0,
+      song: null,
+      alternatives: [catalogSong("catalog-unrelated", "Different Song")],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const page = await repository.listCatalogTracks(runId, 1, 200);
+    expect(page).toMatchObject({
+      total: 4,
+      pageSize: 200,
+      selectableCount: 3,
+      unmatchedCount: 1,
+      retryableCount: 0,
+      matchingComplete: true,
+    });
+    expect(page.items.map((item) => item.title)).toEqual(["Recommended", "Override", "Unchecked", "Unavailable"]);
+    expect(page.items.map((item) => item.position)).toEqual([0, 1, 2, 3]);
+    expect(page.items[1]).toMatchObject({
+      status: "review",
+      catalogId: "catalog-override-default",
+      song: { id: "catalog-override-default" },
+      alternatives: [{ id: "catalog-override-selected" }],
+      selectable: true,
+    });
+    expect(page.items[3]).toMatchObject({
+      status: "unavailable",
+      song: null,
+      alternatives: [{ id: "catalog-unrelated" }],
+      selectable: false,
+    });
+
+    await expect(repository.finalizeCatalogSelection(runId, {
+      selected: [{ candidateId: candidates.get("Override")!.id, catalogId: "catalog-not-returned" }],
+    })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
+    await expect(repository.finalizeCatalogSelection(runId, {
+      selected: [{ candidateId: candidates.get("Unavailable")!.id, catalogId: "catalog-unrelated" }],
+    })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
+    await repository.reviewMatch(runId, candidates.get("Unchecked")!.id, "rejected");
+    const rejectedPage = await repository.listCatalogTracks(runId, 1, 200);
+    expect(rejectedPage.items.find((item) => item.title === "Unchecked")).toMatchObject({
+      status: "rejected",
+      selected: false,
+      selectable: true,
+    });
+    const manifest = await repository.finalizeCatalogSelection(runId, {
+      useRecommended: true,
+      excludedCandidateIds: [],
+      overrides: [{ candidateId: candidates.get("Override")!.id, catalogId: "catalog-override-selected" }],
+    });
+    expect(manifest.tracks.map((track) => [track.title, track.catalogId])).toEqual([
+      ["Recommended", "catalog-recommended"],
+      ["Override", "catalog-override-selected"],
+    ]);
+    const outcomes = await repository.pool.query<{ title: string; status: string; outcome: string }>(
+      `SELECT c.title,m.status,c.outcome FROM track_candidates c
+       JOIN catalog_matches m ON m.candidate_id=c.id WHERE c.run_id=$1 ORDER BY c.selection_rank`,
+      [runId],
+    );
+    expect(outcomes.rows).toEqual([
+      { title: "Recommended", status: "accepted", outcome: "accepted" },
+      { title: "Override", status: "accepted", outcome: "accepted" },
+      { title: "Unchecked", status: "rejected", outcome: "rejected" },
+      { title: "Unavailable", status: "unavailable", outcome: "unavailable" },
+    ]);
+  });
+
+  test("queues one durable recovery job for legacy fast-match timeout rows", async () => {
+    const runId = await repository.createRun("Catalog recovery", brief, 0, 1);
+    await repository.addCandidates(runId, [{
+      artist: "Recovery Artist",
+      title: "Recovery Track",
+      album: null,
+      releaseYear: null,
+      durationMs: null,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveTimeoutMatches(
+      runId,
+      [candidate.id],
+      "Apple catalog lookup did not complete inside the absolute fast-run window",
+    );
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    await expect(repository.listCatalogTracks(runId, 1, 200)).resolves.toMatchObject({
+      retryableCount: 1,
+      unmatchedCount: 1,
+      matchingComplete: false,
+    });
+    await expect(repository.queueCatalogRecovery(runId, "us")).resolves.toEqual({
+      queued: true,
+      state: "queued",
+      retryableCount: 1,
+    });
+    await expect(repository.queueCatalogRecovery(runId, "us")).resolves.toEqual({
+      queued: false,
+      state: "in_flight",
+      retryableCount: 1,
+    });
+    const job = await repository.pool.query<{ payload_json: Record<string, unknown>; status: string; max_attempts: number }>(
+      "SELECT payload_json,status,max_attempts FROM job_queue WHERE run_id=$1 AND kind='matching'",
+      [runId],
+    );
+    expect(job.rows).toEqual([{
+      payload_json: expect.objectContaining({ runId, storefront: "us", retryIncomplete: true, recoveryGeneration: 1 }),
+      status: "queued",
+      max_attempts: 1,
+    }]);
+  });
+
+  test("does not queue recovery while the original matching job is still active", async () => {
+    const runId = await repository.createRun("Concurrent catalog recovery", brief, 0, 1);
+    await repository.addCandidates(runId, [{
+      artist: "Recovery Artist",
+      title: "Still Matching",
+      album: null,
+      releaseYear: null,
+      durationMs: null,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveTimeoutMatches(runId, [candidate.id], RETRYABLE_CATALOG_MATCH_BASES[0]);
+    await repository.enqueueJob({
+      kind: "matching",
+      runId,
+      payload: { runId, storefront: "us" },
+      dedupeKey: `matching-active:${runId}`,
+    });
+    await repository.updateRun(runId, { status: "matching", phase: "catalog_matching" });
+
+    await expect(repository.queueCatalogRecovery(runId, "us")).rejects.toMatchObject({
+      code: "catalog_recovery_not_ready",
+    });
+    const jobs = await repository.pool.query<{ recovery: boolean }>(
+      `SELECT (payload_json->>'retryIncomplete'='true') recovery
+       FROM job_queue WHERE run_id=$1 AND kind='matching'`,
+      [runId],
+    );
+    expect(jobs.rows).toEqual([{ recovery: false }]);
+  });
+
+  test("bulk generation publishes matched tracks even when a bounded recovery leaves timeout rows", async () => {
+    const runId = await repository.createRun("Partial catalog recovery", brief, 0, 1);
+    await repository.addCandidates(runId, [
+      {
+        artist: "Recovery Artist",
+        title: "Matched Track",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      },
+      {
+        artist: "Recovery Artist",
+        title: "Timed-out Track",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      },
+    ], new Map(), "unverified");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Matched Track")!.id,
+      status: "accepted",
+      basis: "Unique exact metadata",
+      score: 1,
+      song: { id: "catalog-matched", name: "Matched Track", artistName: "Recovery Artist", albumName: "" },
+      alternatives: [],
+    });
+    await repository.saveTimeoutMatches(
+      runId,
+      [candidates.get("Timed-out Track")!.id],
+      RETRYABLE_CATALOG_MATCH_BASES[0],
+    );
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.finalizeCatalogSelection(runId, {
+      useRecommended: true,
+      excludedCandidateIds: [],
+      overrides: [],
+    });
+    expect(manifest.tracks).toEqual([
+      expect.objectContaining({ title: "Matched Track", catalogId: "catalog-matched" }),
+    ]);
+    const outcomes = await repository.pool.query<{ title: string; status: string }>(
+      `SELECT c.title,m.status FROM track_candidates c
+       JOIN catalog_matches m ON m.candidate_id=c.id WHERE c.run_id=$1 ORDER BY c.title`,
+      [runId],
+    );
+    expect(outcomes.rows).toEqual([
+      { title: "Matched Track", status: "accepted" },
+      { title: "Timed-out Track", status: "rejected" },
+    ]);
+  });
+
+  test("exhausted catalog recovery returns unresolved rows to review without stranding matched tracks", async () => {
+    const runId = await repository.createRun("Recoverable catalog failure", brief, 0, 1);
+    await repository.addCandidates(runId, [
+      {
+        artist: "Recovery Artist",
+        title: "Already Matched",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      },
+      {
+        artist: "Recovery Artist",
+        title: "Still Unresolved",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      },
+    ], new Map(), "unverified");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Already Matched")!.id,
+      status: "accepted",
+      basis: "Unique exact metadata",
+      score: 1,
+      song: {
+        id: "catalog-ready",
+        name: "Already Matched",
+        artistName: "Recovery Artist",
+        albumName: "",
+      },
+      alternatives: [],
+    });
+    await repository.saveTimeoutMatches(
+      runId,
+      [candidates.get("Still Unresolved")!.id],
+      RETRYABLE_CATALOG_MATCH_BASES[0],
+    );
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+    await repository.queueCatalogRecovery(runId, "us");
+    const job = await repository.pool.query<{ id: string }>(
+      `UPDATE job_queue SET status='leased',lease_owner='recovery-test',attempts=max_attempts,
+         lease_expires_at=now()+interval '5 minutes'
+       WHERE run_id=$1 AND kind='matching' AND payload_json->>'retryIncomplete'='true'
+       RETURNING id`,
+      [runId],
+    );
+    await repository.failJob(
+      job.rows[0]!.id,
+      "recovery-test",
+      "Apple remained unavailable",
+      new Date(Date.now() + 1_000),
+    );
+
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      status: "visitor_review",
+      phase: "exception_review",
+      error: null,
+    });
+    const page = await repository.listCatalogTracks(runId, 1, 200);
+    expect(page).toMatchObject({
+      selectableCount: 1,
+      retryableCount: 0,
+      matchingComplete: true,
+    });
+    expect(page.items.find((item) => item.title === "Still Unresolved")).toMatchObject({
+      status: "review",
+      basis: CATALOG_RECOVERY_UNRESOLVED_BASIS,
+      selectable: false,
+    });
+    const manifest = await repository.finalizeCatalogSelection(runId, {
+      useRecommended: true,
+      excludedCandidateIds: [],
+      overrides: [],
+    });
+    expect(manifest.tracks).toEqual([
+      expect.objectContaining({ title: "Already Matched", catalogId: "catalog-ready" }),
+    ]);
   });
 
   test("catalog matches cannot mutate a candidate owned by another run", async () => {

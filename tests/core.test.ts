@@ -6,7 +6,14 @@ import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gatewa
 import { manifestContentHash } from "../server/publisher.ts";
 import { playlistShareUrl } from "../server/apple.ts";
 import { assertConfiguredAppleStorefront } from "../server/owner.ts";
-import { forwardedCapabilityCookie, isCrossSiteMutation, matchGatewayRoute } from "../worker/gateway-policy.ts";
+import {
+  BULK_SELECTION_BODY_LIMIT,
+  DEFAULT_GATEWAY_BODY_LIMIT,
+  forwardedCapabilityCookie,
+  gatewayBodyLimit,
+  isCrossSiteMutation,
+  matchGatewayRoute,
+} from "../worker/gateway-policy.ts";
 import { manifestOrderSql } from "../server/repository.ts";
 import { readFileSync } from "node:fs";
 
@@ -123,6 +130,9 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   expect(matchGatewayRoute("GET", "/health/live")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/health/live")?.owner).toBeUndefined();
   expect(matchGatewayRoute("GET", "/api/v1/runs")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute("GET", "/api/v1/runs/run-id/tracks")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/matching")).toMatchObject({ method: "POST" });
+  expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/selection")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/owner/runs/run-id/catalog-import")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/api/v1/owner/unknown")).toBeNull();
   expect(matchGatewayRoute("PATCH", "/api/v1/owner/status")).toBeNull();
@@ -138,6 +148,20 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
     expectedOrigin: "https://needle.example",
     fetchSite: "same-origin",
   })).toBe(false);
+});
+
+test("bulk playlist selection has a larger but still bounded signed request limit", () => {
+  expect(gatewayBodyLimit("POST", "/api/v1/runs/run-id/selection")).toBe(BULK_SELECTION_BODY_LIMIT);
+  expect(gatewayBodyLimit("POST", "/api/v1/runs/run-id/publish")).toBe(DEFAULT_GATEWAY_BODY_LIMIT);
+  expect(gatewayBodyLimit("GET", "/api/v1/runs/run-id/selection")).toBe(DEFAULT_GATEWAY_BODY_LIMIT);
+
+  const selected = Array.from({ length: 6_000 }, (_, index) => ({
+    candidateId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    catalogId: String(100_000_000_000 + index),
+  }));
+  const transmittedBody = new TextEncoder().encode(JSON.stringify({ selected }));
+  expect(transmittedBody.byteLength).toBeGreaterThan(DEFAULT_GATEWAY_BODY_LIMIT);
+  expect(transmittedBody.byteLength).toBeLessThan(BULK_SELECTION_BODY_LIMIT);
 });
 
 test("Sites forwards only Needle's capability cookie across the Railway boundary", () => {

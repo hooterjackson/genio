@@ -4,6 +4,16 @@ export type GatewayRouteRule = {
   owner?: boolean;
 };
 
+export const DEFAULT_GATEWAY_BODY_LIMIT = 64 * 1024;
+export const BULK_SELECTION_BODY_LIMIT = 1024 * 1024;
+
+export function gatewayBodyLimit(method: string, pathname: string): number {
+  return method.toUpperCase() === "POST"
+    && /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/selection$/.test(pathname)
+    ? BULK_SELECTION_BODY_LIMIT
+    : DEFAULT_GATEWAY_BODY_LIMIT;
+}
+
 const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/health\/live$/ },
   { method: "POST", path: /^\/api\/v1\/brief$/ },
@@ -15,6 +25,9 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
   { method: "DELETE", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/exceptions$/ },
+  { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/tracks$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/matching$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/selection$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/review$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/manifest$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/publish$/ },

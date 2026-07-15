@@ -24,6 +24,7 @@ import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.t
 import { buildInformation } from "./build-info.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
+const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
 const costConfiguration = readCostConfiguration();
 const repository = new Repository();
 const capabilities = new CapabilityService(repository);
@@ -96,6 +97,27 @@ function idempotencyKey(request: FastifyRequest, bodyKey?: unknown): string {
   if (!/^[A-Za-z0-9._:-]{8,160}$/.test(value)) throw new HttpError(400, "Idempotency-Key is required", "invalid_idempotency_key");
   if (bodyKey != null && String(bodyKey) !== value) throw new HttpError(400, "Idempotency keys do not match", "invalid_idempotency_key");
   return value;
+}
+
+function catalogChoices(value: unknown, label: string): Array<{ candidateId: string; catalogId: string }> | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 10_000) throw new HttpError(400, `${label} is invalid`, "invalid_selection");
+  return value.map((item) => {
+    if (!item || typeof item !== "object") throw new HttpError(400, `${label} is invalid`, "invalid_selection");
+    const row = item as { candidateId?: unknown; catalogId?: unknown };
+    const candidateId = uuid(row.candidateId, "Candidate ID");
+    const catalogId = typeof row.catalogId === "string" ? row.catalogId.trim() : "";
+    if (!catalogId || catalogId.length > 120 || /[\u0000-\u001f\u007f]/u.test(catalogId)) {
+      throw new HttpError(400, "Apple catalog ID is invalid", "invalid_selection");
+    }
+    return { candidateId, catalogId };
+  });
+}
+
+function candidateIds(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 10_000) throw new HttpError(400, "Excluded candidates are invalid", "invalid_selection");
+  return value.map((item) => uuid(item, "Candidate ID"));
 }
 
 async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
@@ -317,6 +339,50 @@ app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: strin
   const accessId = uuid(request.params.id, "Run ID");
   const session = await sessionForAccess(request, accessId);
   return repository.listExceptions(session.runId, Number(request.query.page ?? 1), Number(request.query.pageSize ?? 20));
+});
+
+app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: string } }>("/api/v1/runs/:id/tracks", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  return repository.listCatalogTracks(
+    session.runId,
+    Number(request.query.page ?? 1),
+    Number(request.query.pageSize ?? 200),
+  );
+});
+
+app.post<{ Params: { id: string } }>("/api/v1/runs/:id/matching", async (request, reply) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  const recovery = await repository.queueCatalogRecovery(
+    session.runId,
+    process.env.APPLE_STOREFRONT ?? "us",
+  );
+  return reply.code(recovery.state === "ready" ? 200 : 202).send({
+    ...recovery,
+    run: await repository.getRunByAccess(accessId),
+  });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: {
+    selected?: unknown;
+    useRecommended?: unknown;
+    excludedCandidateIds?: unknown;
+    overrides?: unknown;
+  };
+}>("/api/v1/runs/:id/selection", { bodyLimit: BULK_SELECTION_BODY_BYTES }, async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  return repository.finalizeCatalogSelection(session.runId, {
+    selected: catalogChoices(request.body?.selected, "Selected tracks"),
+    useRecommended: request.body?.useRecommended === true,
+    excludedCandidateIds: candidateIds(request.body?.excludedCandidateIds),
+    overrides: catalogChoices(request.body?.overrides, "Apple match overrides"),
+  });
 });
 
 app.post<{ Params: { id: string }; Body: { candidateId?: string; decision?: "accepted" | "rejected"; catalogId?: string; song?: Record<string, unknown> } }>("/api/v1/runs/:id/review", async (request) => {

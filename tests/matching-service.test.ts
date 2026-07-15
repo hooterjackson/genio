@@ -16,7 +16,12 @@ import {
   lookupAppleCatalogByIsrc,
   searchAppleCatalog,
 } from "../server/apple.ts";
-import { matchResearchRun, type MatchingRepository } from "../server/matching-service.ts";
+import {
+  catalogRecoveryDeadlineMs,
+  matchResearchRun,
+  type MatchingRepository,
+} from "../server/matching-service.ts";
+import { RETRYABLE_CATALOG_MATCH_BASES } from "../server/catalog-match-recovery.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
 
 const brief: PlaylistBrief = {
@@ -121,7 +126,11 @@ class MemoryMatchingRepository implements MatchingRepository {
   async updateRun(_runId: string, patch: Record<string, unknown>) { this.updates.push(patch); }
   async listCandidates() { return this.candidates; }
   async listMatches() { return this.matches; }
-  async saveMatch(_runId: string, match: CatalogMatchResult) { this.matches.push(match); }
+  async saveMatch(_runId: string, match: CatalogMatchResult) {
+    const existing = this.matches.findIndex((item) => item.candidateId === match.candidateId);
+    if (existing >= 0) this.matches[existing] = match;
+    else this.matches.push(match);
+  }
   async saveTimeoutMatches(_runId: string, candidateIds: string[], basis: string) {
     this.bulkTimeoutWrites.push({ candidateIds, basis });
     for (const candidateId of candidateIds) {
@@ -243,7 +252,7 @@ test("fast matching converts a transient Apple failure into an explicit review o
   expect(repository.matches[1]).toMatchObject({ candidateId: "completed", status: "accepted" });
 });
 
-test("fast matching records a genuine elapsed deadline as a review outcome without calling Apple", async () => {
+test("fast matching records a genuine elapsed deadline for later recovery without calling Apple", async () => {
   const repository = fastRepository(
     [candidate("deadline", "verified"), candidate("deadline-two", "verified")],
     new Date(Date.now() - 120_001),
@@ -255,13 +264,17 @@ test("fast matching records a genuine elapsed deadline as a review outcome witho
   expect(searchAppleCatalog).not.toHaveBeenCalled();
   expect(repository.bulkTimeoutWrites).toEqual([{
     candidateIds: ["deadline", "deadline-two"],
-    basis: expect.stringContaining("absolute fast-run window"),
+    basis: RETRYABLE_CATALOG_MATCH_BASES[0],
   }]);
   expect(repository.matches).toHaveLength(2);
-  expect((repository.checkpoints.at(-1) as any)).toMatchObject({ complete: true, nextIndex: 2, timedOutCandidateCount: 2 });
+  expect((repository.checkpoints.at(-1) as any)).toMatchObject({
+    complete: true,
+    nextIndex: 2,
+    timedOutCandidateCount: 2,
+  });
 });
 
-test("deadline bulk accounting preserves a crash-window match and records every unmatched candidate", async () => {
+test("deadline bulk accounting preserves a crash-window match and records only unmatched candidates", async () => {
   const repository = fastRepository(
     [candidate("already-matched", "verified"), candidate("remaining-a", "verified"), candidate("remaining-b", "verified")],
     new Date(Date.now() - 120_001),
@@ -278,6 +291,7 @@ test("deadline bulk accounting preserves a crash-window match and records every 
   await matchResearchRun(repository, "run", "us");
 
   expect(repository.bulkTimeoutWrites[0]?.candidateIds).toEqual(["remaining-a", "remaining-b"]);
+  expect(lookupAppleCatalogByIsrc).not.toHaveBeenCalled();
   expect(repository.matches.map((match) => match.candidateId)).toEqual([
     "already-matched",
     "remaining-a",
@@ -299,10 +313,79 @@ test("fast matching backfills a legacy route from run creation without resetting
 
   expect(lookupAppleCatalogByIsrc).not.toHaveBeenCalled();
   expect(repository.bulkTimeoutWrites[0]?.candidateIds).toEqual(["legacy-deadline"]);
+  expect(repository.matches[0]).toMatchObject({ candidateId: "legacy-deadline", status: "review" });
   expect(repository.checkpoints[0]).toMatchObject({
     confirmedAt: confirmedAt.toISOString(),
     deadlineAt: new Date(confirmedAt.getTime() + 120_000).toISOString(),
   });
+});
+
+test("catalog recovery retries only prior timeout rows and preserves completed matches", async () => {
+  const repository = fastRepository([
+    candidate("completed", "verified"),
+    candidate("retry", "verified"),
+    candidate("manual-review", "inferred"),
+  ]);
+  repository.matches.push(
+    { candidateId: "completed", status: "accepted", basis: "Exact match", score: 1, song: { ...song, id: "apple-complete" }, alternatives: [] },
+    { candidateId: "retry", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0], score: 0, song: null, alternatives: [] },
+    { candidateId: "manual-review", status: "review", basis: "Inferred evidence requires visitor approval", score: 1, song, alternatives: [] },
+  );
+  vi.mocked(lookupAppleCatalogByIsrc).mockResolvedValueOnce([{ ...song, id: "apple-retry" }]);
+
+  await matchResearchRun(repository, "run", "us", undefined, { retryIncomplete: true });
+
+  expect(lookupAppleCatalogByIsrc).toHaveBeenCalledTimes(1);
+  expect(repository.matches).toEqual([
+    expect.objectContaining({ candidateId: "completed", status: "accepted", song: expect.objectContaining({ id: "apple-complete" }) }),
+    expect.objectContaining({ candidateId: "retry", status: "accepted", song: expect.objectContaining({ id: "apple-retry" }) }),
+    expect.objectContaining({ candidateId: "manual-review", status: "review" }),
+  ]);
+  expect(repository.updates[0]).toMatchObject({
+    status: "matching",
+    phase: "catalog_matching_recovery",
+  });
+  expect((repository.checkpoints.at(-1) as any)).toMatchObject({ complete: true, nextIndex: 1 });
+});
+
+test("catalog recovery stops at its configured deadline and leaves remaining rows retryable", async () => {
+  vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "10000");
+  const repository = fastRepository([
+    candidate("retry-a", "verified"),
+    candidate("retry-b", "verified"),
+  ]);
+  repository.matches.push(
+    { candidateId: "retry-a", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0], score: 0, song: null, alternatives: [] },
+    { candidateId: "retry-b", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0], score: 0, song: null, alternatives: [] },
+  );
+  const base = Date.now();
+  const clock = vi.spyOn(Date, "now")
+    .mockReturnValueOnce(base)
+    .mockReturnValue(base + 10_001);
+
+  try {
+    await matchResearchRun(repository, "run", "us", undefined, { retryIncomplete: true });
+  } finally {
+    clock.mockRestore();
+  }
+
+  expect(lookupAppleCatalogByIsrc).not.toHaveBeenCalled();
+  expect(repository.bulkTimeoutWrites).toEqual([]);
+  expect(repository.matches).toEqual([
+    expect.objectContaining({ candidateId: "retry-a", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0] }),
+    expect.objectContaining({ candidateId: "retry-b", status: "review", basis: RETRYABLE_CATALOG_MATCH_BASES[0] }),
+  ]);
+  expect(repository.checkpoints.at(-1)).toMatchObject({
+    complete: true,
+    nextIndex: 2,
+    timedOutCandidateCount: 2,
+  });
+  expect(repository.updates.at(-1)).toMatchObject({ status: "visitor_review", phase: "exception_review" });
+});
+
+test("catalog recovery timeout configuration is capped at sixty seconds", () => {
+  vi.stubEnv("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", "90000");
+  expect(catalogRecoveryDeadlineMs()).toBe(60_000);
 });
 
 test.each([401, 403] as const)("fast matching propagates Apple catalog authentication failure %s", async (status) => {

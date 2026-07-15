@@ -70,26 +70,48 @@ type CatalogSong = {
   isrc?: string;
 };
 
-type ExceptionItem = {
+type SelectableTrack = {
+  position: number;
   candidateId: string;
+  selectionRank: number | null;
   artist: string;
   title: string;
   album?: string | null;
-  basis?: string;
-  evidenceState?: string;
+  releaseYear?: number | null;
+  durationMs?: number | null;
+  isrc?: string | null;
+  versionLabel?: string | null;
+  duplicateClusterKey?: string | null;
   status: string;
+  basis?: string | null;
+  score?: number;
+  catalogId?: string | null;
   song?: CatalogSong | null;
   alternatives: CatalogSong[];
+  evidenceEligible: boolean;
+  selected: boolean;
+  selectable: boolean;
 };
 
-type ExceptionPage = {
-  items: ExceptionItem[];
+type TrackSelection = {
+  items: SelectableTrack[];
   page: number;
   pageSize: number;
   total: number;
   totalPages: number;
-  unresolvedCount: number;
+  selectableCount: number;
+  unmatchedCount: number;
+  retryableCount: number;
+  matchingComplete: boolean;
 };
+
+type TrackSelectionRequest =
+  | { selected: Array<{ candidateId: string; catalogId: string }> }
+  | {
+      useRecommended: true;
+      excludedCandidateIds: string[];
+      overrides: Array<{ candidateId: string; catalogId: string }>;
+    };
 
 type ManifestTrack = {
   candidateId: string;
@@ -324,19 +346,15 @@ function manifestFromResult(payload: unknown, runId: string): PlaylistManifest |
   };
 }
 
-function normalizeExceptionPage(payload: unknown, requestedPage: number): ExceptionPage {
+function normalizeTrackSelection(payload: unknown, requestedPage: number): TrackSelection {
   const object = asObject(payload);
   const rawItems = Array.isArray(payload)
     ? payload
     : Array.isArray(object.items)
       ? object.items
-      : Array.isArray(object.exceptions)
-        ? object.exceptions
-        : Array.isArray(object.matches)
-          ? object.matches
-          : [];
-  const items = rawItems as ExceptionItem[];
-  const pageSize = numberValue(object.pageSize, 20);
+      : [];
+  const items = rawItems as SelectableTrack[];
+  const pageSize = numberValue(object.pageSize, 200);
   const total = numberValue(object.total, items.length);
   const page = numberValue(object.page, requestedPage);
   return {
@@ -345,14 +363,14 @@ function normalizeExceptionPage(payload: unknown, requestedPage: number): Except
     pageSize,
     total,
     totalPages: numberValue(object.totalPages, Math.max(1, Math.ceil(total / pageSize))),
-    unresolvedCount: numberValue(
-      object.unresolvedCount ?? object.unresolved,
-      items.filter((item) => ["review", "unresolved", "inferred"].includes(item.status)).length,
-    ),
+    selectableCount: numberValue(object.selectableCount, items.filter((item) => item.selectable).length),
+    unmatchedCount: numberValue(object.unmatchedCount, items.filter((item) => !item.selectable).length),
+    retryableCount: numberValue(object.retryableCount),
+    matchingComplete: object.matchingComplete !== false,
   };
 }
 
-function exceptionChoices(item: ExceptionItem, limit = 4): CatalogSong[] {
+function trackChoices(item: SelectableTrack, limit = 12): CatalogSong[] {
   const seen = new Set<string>();
   const choices: CatalogSong[] = [];
   for (const song of [item.song, ...(Array.isArray(item.alternatives) ? item.alternatives : [])]) {
@@ -362,6 +380,20 @@ function exceptionChoices(item: ExceptionItem, limit = 4): CatalogSong[] {
     if (choices.length >= limit) break;
   }
   return choices;
+}
+
+function recommendedCatalogId(item: SelectableTrack): string | null {
+  return item.catalogId ?? item.song?.id ?? null;
+}
+
+function recommendedByDefault(item: SelectableTrack): boolean {
+  return item.selectable
+    && Boolean(recommendedCatalogId(item))
+    && (item.status === "accepted" || item.status === "review");
+}
+
+function isAbortError(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && "name" in value && value.name === "AbortError");
 }
 
 function money(value: number): string {
@@ -806,86 +838,188 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   );
 }
 
-function ReviewScreen({
-  page,
-  busy,
-  onDecision,
-  onManifest,
-}: {
-  page: ExceptionPage | null;
+function ReviewScreen(props: {
+  selection: TrackSelection | null;
   busy: string;
-  onDecision: (item: ExceptionItem, decision: "accepted" | "rejected", song?: CatalogSong) => Promise<void>;
-  onManifest: (verifiedOnly: boolean) => void;
+  onRetry: () => void;
+  onGenerate: (request: TrackSelectionRequest) => void;
 }) {
-  const unresolved = page?.unresolvedCount ?? 0;
-  const active = page?.items[0] ?? null;
-  const [reviewedCount, setReviewedCount] = useState(0);
-
-  async function decide(decision: "accepted" | "rejected", song?: CatalogSong) {
-    if (!active) return;
-    try {
-      await onDecision(active, decision, song);
-      setReviewedCount((count) => count + 1);
-    } catch {
-      // The parent surface displays the actionable request error.
-    }
+  if (props.selection) {
+    return <TrackSelectionScreen {...props} selection={props.selection} />;
   }
-
-  const total = page ? Math.max(page.total, page.items.length) : 0;
-  const position = total > 0 ? Math.min(reviewedCount + 1, total) : 0;
-
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ 04 REVIEW MATCHES</div>
-        {!page && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING EXCEPTIONS</div>}
-        {page && !active && (
-          <div className="review-complete">
-            <span className="tag">[NO REVIEW REQUIRED]</span>
-            <h1 id="review-title">TRACKS<br />READY.</h1>
-            <p>Every candidate has a recorded outcome.</p>
-          </div>
-        )}
-        {active && (
-          <>
-            <span className="tag">[{position} OF {total}]</span>
-            <h1 id="review-title">{active.title}</h1>
-            <p className="exception-artist">{active.artist}{active.album ? " / " + active.album : ""}</p>
-            <p className="exception-basis">{active.basis || active.evidenceState || statusLabel(active.status)}</p>
-            <div className="exception-actions exception-choices" aria-label="Apple Music match choices">
-              {exceptionChoices(active).map((song) => (
-                <button
-                  key={song.id}
-                  onClick={() => void decide("accepted", song)}
-                  disabled={Boolean(busy)}
-                >
-                  <span>USE THIS MATCH</span>
-                  <strong>{song.name}</strong>
-                  <small>{song.artistName}{song.albumName ? " / " + song.albumName : ""}</small>
-                </button>
-              ))}
-              <button
-                className="reject"
-                onClick={() => void decide("rejected")}
-                disabled={Boolean(busy)}
-              >
-                EXCLUDE THIS TRACK
-              </button>
+        <div className="screen-index">/ 04 SELECT TRACKS</div>
+        <h1 id="review-title">SELECT TRACKS.</h1>
+        <p>Matched tracks are selected. Uncheck anything you do not want in the playlist.</p>
+        <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING TRACKS</div>
+      </div>
+      <div className="step-footer review-footer">
+        <div className="selection-count"><strong>0</strong><span>TRACKS</span></div>
+        <button className="action-button step-primary" disabled>GENERATE PLAYLIST →</button>
+      </div>
+    </section>
+  );
+}
+
+function TrackSelectionScreen({
+  selection,
+  busy,
+  onRetry,
+  onGenerate,
+}: {
+  selection: TrackSelection;
+  busy: string;
+  onRetry: () => void;
+  onGenerate: (request: TrackSelectionRequest) => void;
+}) {
+  const [catalogIds, setCatalogIds] = useState<Record<string, string>>(() => {
+    const nextCatalogIds: Record<string, string> = {};
+    for (const item of selection.items) {
+      const catalogId = recommendedCatalogId(item);
+      if (!item.selectable || !catalogId) continue;
+      nextCatalogIds[item.candidateId] = catalogId;
+    }
+    return nextCatalogIds;
+  });
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(
+    selection.items
+      .filter(recommendedByDefault)
+      .map((item) => item.candidateId),
+  ));
+
+  const selectable = useMemo(
+    () => selection.items.filter((item) => item.selectable && Boolean(catalogIds[item.candidateId])),
+    [selection, catalogIds],
+  );
+  const selected = useMemo(
+    () => selectable.filter((item) => selectedIds.has(item.candidateId)),
+    [selectable, selectedIds],
+  );
+
+  function setAll(checked: boolean) {
+    setSelectedIds(checked ? new Set(selectable.map((item) => item.candidateId)) : new Set());
+  }
+
+  function toggle(candidateId: string, checked: boolean) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (checked) next.add(candidateId);
+      else next.delete(candidateId);
+      return next;
+    });
+  }
+
+  function chooseCatalog(item: SelectableTrack, catalogId: string) {
+    setCatalogIds((current) => ({ ...current, [item.candidateId]: catalogId }));
+    toggle(item.candidateId, true);
+  }
+
+  function generate() {
+    if (!selection || selected.length === 0) return;
+    const explicit: TrackSelectionRequest = {
+      selected: selected.map((item) => ({
+        candidateId: item.candidateId,
+        catalogId: catalogIds[item.candidateId]!,
+      })),
+    };
+    const recommended: TrackSelectionRequest = {
+      useRecommended: true,
+      excludedCandidateIds: selection.items
+        .filter((item) => recommendedByDefault(item) && !selectedIds.has(item.candidateId))
+        .map((item) => item.candidateId),
+      overrides: selected
+        .filter((item) => !recommendedByDefault(item) || recommendedCatalogId(item) !== catalogIds[item.candidateId])
+        .map((item) => ({ candidateId: item.candidateId, catalogId: catalogIds[item.candidateId]! })),
+    };
+    const request = JSON.stringify(recommended).length <= JSON.stringify(explicit).length ? recommended : explicit;
+    onGenerate(request);
+  }
+
+  const allSelected = selectable.length > 0 && selected.length === selectable.length;
+  return (
+    <section className="screen flow-screen review-screen" aria-labelledby="review-title">
+      <div className="flow-body review-body">
+        <div className="screen-index">/ 04 SELECT TRACKS</div>
+        <h1 id="review-title">SELECT TRACKS.</h1>
+        <p>Matched tracks are selected. Uncheck anything you do not want in the playlist.</p>
+
+            <div className="selection-toolbar" role="group" aria-label="Track selection controls">
+              <span>{selected.length.toLocaleString()} OF {selectable.length.toLocaleString()} MATCHED TRACKS SELECTED</span>
+              <div>
+                <button type="button" onClick={() => setAll(true)} disabled={allSelected || Boolean(busy)}>SELECT ALL</button>
+                <button type="button" onClick={() => setAll(false)} disabled={selected.length === 0 || Boolean(busy)}>CLEAR</button>
+              </div>
             </div>
-          </>
-        )}
+
+            {selection.retryableCount > 0 && (
+              <button className="matching-retry" type="button" onClick={onRetry} disabled={Boolean(busy)}>
+                {busy === "matching" ? "RETRYING APPLE MATCHES..." : `RETRY ${selection.retryableCount.toLocaleString()} UNMATCHED TRACK${selection.retryableCount === 1 ? "" : "S"}`}
+              </button>
+            )}
+
+            <ol className="track-selection-list" aria-label="Playlist tracks">
+              {selection.items.map((item, index) => {
+                const choices = trackChoices(item);
+                const checked = selectedIds.has(item.candidateId);
+                const disabled = !item.selectable || choices.length === 0;
+                return (
+                  <li className={`track-selection-row${disabled ? " unavailable" : ""}`} key={item.candidateId}>
+                    <label>
+                      <input
+                        type="checkbox"
+                        aria-label={`Include ${item.title} by ${item.artist}`}
+                        checked={checked}
+                        disabled={disabled || Boolean(busy)}
+                        onChange={(event) => toggle(item.candidateId, event.target.checked)}
+                      />
+                      <span className="track-position">{String(index + 1).padStart(3, "0")}</span>
+                      <span className="track-copy">
+                        <strong>{item.title}</strong>
+                        <small>{item.artist}{item.album ? " / " + item.album : ""}</small>
+                      </span>
+                      <span className="track-match-state">
+                        {disabled ? "NOT FOUND" : item.status === "rejected" ? "EXCLUDED" : "MATCHED"}
+                      </span>
+                    </label>
+                    {item.selectable && choices.length > 1 && (
+                      <label className="match-choice">
+                        <span>APPLE MUSIC VERSION</span>
+                        <select
+                          value={catalogIds[item.candidateId] ?? choices[0]?.id}
+                          disabled={Boolean(busy)}
+                          onChange={(event) => chooseCatalog(item, event.target.value)}
+                        >
+                          {choices.map((song) => (
+                            <option value={song.id} key={song.id}>
+                              {song.name} — {song.artistName}{song.albumName ? " / " + song.albumName : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+
+            {selection.items.length === 0 && (
+              <div className="review-complete">
+                <span className="tag">[NO TRACKS FOUND]</span>
+                <p>No tracks are available to generate.</p>
+              </div>
+            )}
       </div>
 
       <div className="step-footer review-footer">
-        {unresolved > 0 ? (
-          <button className="quiet-button" onClick={() => onManifest(true)} disabled={!page || Boolean(busy)}>
-            USE VERIFIED TRACKS · SKIP {unresolved}
-          </button>
-        ) : (
-          <button className="action-button step-primary" onClick={() => onManifest(false)} disabled={!page || Boolean(busy)}>
-            {busy === "manifest" ? "PREPARING..." : "PREPARE PLAYLIST →"}
-          </button>
-        )}
+        <div className="selection-count" aria-live="polite">
+          <strong>{selected.length.toLocaleString()}</strong>
+          <span>TRACK{selected.length === 1 ? "" : "S"}</span>
+        </div>
+        <button className="action-button step-primary" onClick={generate} disabled={selected.length === 0 || Boolean(busy)}>
+          {busy === "generate" ? "GENERATING PLAYLIST..." : "GENERATE PLAYLIST →"}
+        </button>
       </div>
     </section>
   );
@@ -910,14 +1044,14 @@ function ManifestScreen({
   return (
     <section className="screen flow-screen manifest-screen" aria-labelledby="manifest-title">
       <div className="flow-body">
-        <div className="screen-index">/ 05 PUBLISH</div>
+        <div className="screen-index">/ 05 GENERATE</div>
         <span className="tag">[{volumeCount} {volumeCount === 1 ? "VOLUME" : "VOLUMES"}]</span>
         <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />READY.</h1>
         <p>{waitingForApple
           ? "Publication will resume after the owner reconnects Apple Music."
-          : publishing
-            ? "Publishing the playlist to Apple Music."
-            : "Review is complete. Publishing will use this exact track order."}</p>
+          : publishing || busy
+            ? "Creating the playlist in Apple Music."
+            : "The selected tracks are ready to generate."}</p>
 
         <details className="terminal-details manifest-details">
           <summary>PREVIEW TRACK LIST</summary>
@@ -944,8 +1078,8 @@ function ManifestScreen({
           {waitingForApple
             ? "WAITING FOR APPLE AUTHORIZATION"
             : publishing || busy
-              ? "PUBLICATION IN PROGRESS..."
-              : "PUBLISH PLAYLIST →"}
+              ? "GENERATING PLAYLIST..."
+              : "GENERATE PLAYLIST →"}
         </button>
       </div>
     </section>
@@ -1019,7 +1153,7 @@ export function PlaylistBuilder() {
   const [ambiguitiesAccepted, setAmbiguitiesAccepted] = useState(false);
   const [cached, setCached] = useState(false);
   const [run, setRun] = useState<ResearchRun | null>(null);
-  const [exceptionPage, setExceptionPage] = useState<ExceptionPage | null>(null);
+  const [trackSelection, setTrackSelection] = useState<TrackSelection | null>(null);
   const [manifest, setManifest] = useState<PlaylistManifest | null>(null);
   const [result, setResult] = useState<RunResult | null>(null);
   const [busy, setBusy] = useState("");
@@ -1032,9 +1166,16 @@ export function PlaylistBuilder() {
   const idempotencyKey = useRef<string | null>(null);
   const briefIdempotencyKey = useRef<string | null>(null);
   const publishingRef = useRef(false);
-  const reviewingRef = useRef(false);
+  const matchingRetryAttempted = useRef<Set<string>>(new Set());
+  const tracksRequestRef = useRef<AbortController | null>(null);
+  const operationRequestRef = useRef<AbortController | null>(null);
+  const restoreStartedRef = useRef(false);
 
   const clearCurrent = useCallback((nextStage: "landing" | "prompt" | "jobs") => {
+    tracksRequestRef.current?.abort();
+    tracksRequestRef.current = null;
+    operationRequestRef.current?.abort();
+    operationRequestRef.current = null;
     setEntryStage(nextStage);
     setPrompt("");
     setBrief(null);
@@ -1044,7 +1185,7 @@ export function PlaylistBuilder() {
     setCached(false);
     setRun(null);
     activeRunId.current = null;
-    setExceptionPage(null);
+    setTrackSelection(null);
     setManifest(null);
     setResult(null);
     setBusy("");
@@ -1053,7 +1194,7 @@ export function PlaylistBuilder() {
     idempotencyKey.current = null;
     briefIdempotencyKey.current = null;
     publishingRef.current = false;
-    reviewingRef.current = false;
+    matchingRetryAttempted.current.clear();
     window.history.replaceState(null, "", window.location.pathname);
   }, []);
 
@@ -1129,6 +1270,8 @@ export function PlaylistBuilder() {
   }, [loadRun]);
 
   useEffect(() => {
+    if (restoreStartedRef.current) return;
+    restoreStartedRef.current = true;
     const restore = async () => {
       const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
       const rawHash = window.location.hash.replace(/^#/, "");
@@ -1166,26 +1309,98 @@ export function PlaylistBuilder() {
     return () => window.clearTimeout(timer);
   }, [restoring, entryStage, brief, run, manifest, result]);
 
-  const loadExceptions = useCallback(async (pageNumber: number) => {
+  const loadTracks = useCallback(async () => {
     if (!run) return;
-    setBusy("exceptions");
+    const runId = run.id;
+    tracksRequestRef.current?.abort();
+    const controller = new AbortController();
+    tracksRequestRef.current = controller;
+    setBusy("tracks");
     try {
-      const payload = await api<unknown>(
-        "/api/v1/runs/" + encodeURIComponent(run.id) + "/exceptions?page=" + pageNumber + "&pageSize=20",
+      const first = normalizeTrackSelection(
+        await api<unknown>(
+          "/api/v1/runs/" + encodeURIComponent(runId) + "/tracks?page=1&pageSize=500",
+          { signal: controller.signal },
+        ),
+        1,
       );
-      setExceptionPage(normalizeExceptionPage(payload, pageNumber));
+      const pagesLoaded = [first];
+      for (let start = 2; start <= first.totalPages; start += 5) {
+        const pages = await Promise.all(
+          Array.from(
+            { length: Math.min(5, first.totalPages - start + 1) },
+            (_, index) => start + index,
+          ).map(async (pageNumber) => normalizeTrackSelection(
+            await api<unknown>(
+              "/api/v1/runs/" + encodeURIComponent(runId) + "/tracks?page=" + pageNumber + "&pageSize=500",
+              { signal: controller.signal },
+            ),
+            pageNumber,
+          )),
+        );
+        pagesLoaded.push(...pages);
+      }
+      if (activeRunId.current !== runId) return;
+
+      const inconsistentPage = pagesLoaded.find((page) => (
+        page.total !== first.total
+        || page.totalPages !== first.totalPages
+        || page.page < 1
+        || page.page > Math.max(1, first.totalPages)
+      ));
+      if (inconsistentPage) {
+        throw new Error("The track list changed while loading. Retry this job before generating the playlist.");
+      }
+
+      const items = pagesLoaded.flatMap((page) => page.items);
+      const candidateIds = new Set<string>();
+      for (const item of items) {
+        if (!item.candidateId || candidateIds.has(item.candidateId)) {
+          throw new Error("The track list is incomplete. Retry this job before generating the playlist.");
+        }
+        candidateIds.add(item.candidateId);
+      }
+      if (items.length !== first.total) {
+        throw new Error(`The track list is incomplete (${items.length.toLocaleString()} of ${first.total.toLocaleString()} loaded). Retry this job before generating the playlist.`);
+      }
+
+      items.sort((left, right) => left.position - right.position || left.candidateId.localeCompare(right.candidateId));
+      if (first.retryableCount > 0 && !matchingRetryAttempted.current.has(runId)) {
+        setBusy("matching");
+        try {
+          const response = await api<JsonObject>("/api/v1/runs/" + encodeURIComponent(runId) + "/matching", {
+            method: "POST",
+            headers: { "Idempotency-Key": "matching-" + runId },
+            body: "{}",
+            signal: controller.signal,
+          });
+          if (activeRunId.current !== runId) return;
+          matchingRetryAttempted.current.add(runId);
+          setTrackSelection(null);
+          setRun(unwrapRun(response as RunResponse));
+          return;
+        } catch (caught) {
+          if (isAbortError(caught) || activeRunId.current !== runId) return;
+          setTrackSelection({ ...first, items, page: 1, pageSize: items.length, totalPages: 1 });
+          throw caught;
+        }
+      }
+      setTrackSelection({ ...first, items, page: 1, pageSize: items.length, totalPages: 1 });
     } catch (caught) {
-      setError((caught as Error).message);
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
     } finally {
-      setBusy("");
+      if (tracksRequestRef.current === controller) {
+        tracksRequestRef.current = null;
+        if (activeRunId.current === runId) setBusy("");
+      }
     }
   }, [run]);
 
   useEffect(() => {
     if (!run || !reviewStatuses.has(run.status)) return;
-    const timer = window.setTimeout(() => void loadExceptions(1), 0);
+    const timer = window.setTimeout(() => void loadTracks(), 0);
     return () => window.clearTimeout(timer);
-  }, [run, loadExceptions]);
+  }, [run, loadTracks]);
 
   useEffect(() => {
     if (!run || run.status !== "manifest_ready" || manifest) return;
@@ -1292,71 +1507,106 @@ export function PlaylistBuilder() {
     }
   }
 
-  async function review(item: ExceptionItem, decision: "accepted" | "rejected", song?: CatalogSong) {
-    if (!run || reviewingRef.current) return;
-    reviewingRef.current = true;
-    setBusy(item.candidateId);
+  async function retryMatching() {
+    if (!run || operationRequestRef.current) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    setBusy("matching");
     setError("");
     try {
-      await api("/api/v1/runs/" + encodeURIComponent(run.id) + "/review", {
+      const response = await api<JsonObject>("/api/v1/runs/" + encodeURIComponent(runId) + "/matching", {
         method: "POST",
-        body: JSON.stringify({
-          candidateId: item.candidateId,
-          decision,
-          catalogId: song?.id,
-          song,
-        }),
+        headers: { "Idempotency-Key": "matching-" + runId },
+        body: "{}",
+        signal: controller.signal,
       });
-      await loadExceptions(exceptionPage?.page ?? 1);
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      const next = unwrapRun(response as RunResponse);
+      matchingRetryAttempted.current.add(runId);
+      setTrackSelection(null);
+      setRun(next);
+      if (reviewStatuses.has(next.status)) await loadTracks();
     } catch (caught) {
-      setError((caught as Error).message);
-      throw caught;
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
     } finally {
-      reviewingRef.current = false;
-      setBusy("");
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        if (activeRunId.current === runId) setBusy("");
+      }
     }
   }
 
-  async function buildManifest(verifiedOnly: boolean) {
-    if (!run) return;
-    setBusy("manifest");
+  async function generatePlaylist(selection: TrackSelectionRequest) {
+    if (!run || publishingRef.current || operationRequestRef.current) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    publishingRef.current = true;
+    setBusy("generate");
     setError("");
     try {
-      const response = await api<PlaylistManifest | { manifest: PlaylistManifest }>(
-        "/api/v1/runs/" + encodeURIComponent(run.id) + "/manifest",
+      const nextManifest = unwrapManifest(await api<PlaylistManifest | { manifest: PlaylistManifest }>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/selection",
         {
           method: "POST",
-          body: JSON.stringify({ mode: verifiedOnly ? "verified_only" : "reviewed" }),
+          headers: { "Idempotency-Key": crypto.randomUUID() },
+          body: JSON.stringify(selection),
+          signal: controller.signal,
+        },
+      ));
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      setManifest(nextManifest);
+      const response = await api<ResearchRun | RunResponse>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/publish",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": "publish-" + nextManifest.id },
+          body: JSON.stringify({ manifestId: nextManifest.id }),
+          signal: controller.signal,
         },
       );
-      setManifest(unwrapManifest(response));
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      setRun(unwrapRun(response));
     } catch (caught) {
-      setError((caught as Error).message);
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
     } finally {
-      setBusy("");
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        publishingRef.current = false;
+        if (activeRunId.current === runId) setBusy("");
+      }
     }
   }
 
   async function publish() {
-    if (!run || !manifest || publishingRef.current) return;
+    if (!run || !manifest || publishingRef.current || operationRequestRef.current) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
     publishingRef.current = true;
     setBusy("publish");
     setError("");
     try {
       const response = await api<ResearchRun | RunResponse>(
-        "/api/v1/runs/" + encodeURIComponent(run.id) + "/publish",
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/publish",
         {
           method: "POST",
           headers: { "Idempotency-Key": "publish-" + manifest.id },
           body: JSON.stringify({ manifestId: manifest.id }),
+          signal: controller.signal,
         },
       );
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
       setRun(unwrapRun(response));
     } catch (caught) {
-      setError((caught as Error).message);
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
     } finally {
-      publishingRef.current = false;
-      setBusy("");
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        publishingRef.current = false;
+        if (activeRunId.current === runId) setBusy("");
+      }
     }
   }
 
@@ -1507,10 +1757,10 @@ export function PlaylistBuilder() {
 
       {run && reviewStatuses.has(run.status) && !manifest && (
         <ReviewScreen
-          page={exceptionPage}
+          selection={trackSelection}
           busy={busy}
-          onDecision={review}
-          onManifest={buildManifest}
+          onRetry={() => void retryMatching()}
+          onGenerate={(selection) => void generatePlaylist(selection)}
         />
       )}
 
@@ -1522,7 +1772,7 @@ export function PlaylistBuilder() {
         <ManifestScreen
           manifest={manifest}
           runStatus={run?.status ?? "manifest_ready"}
-          busy={busy === "publish" || ["publishing", "waiting_for_apple_authorization"].includes(run?.status ?? "")}
+          busy={["generate", "publish"].includes(busy) || ["publishing", "waiting_for_apple_authorization"].includes(run?.status ?? "")}
           onPublish={publish}
         />
       )}

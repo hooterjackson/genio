@@ -8,6 +8,10 @@ import {
 import { rankCatalogMatches } from "../lib/matching.ts";
 import { resolveEvidenceSubjectBinding } from "./evidence-binding.ts";
 import {
+  isRetryableCatalogMatch,
+  RETRYABLE_CATALOG_MATCH_BASES,
+} from "./catalog-match-recovery.ts";
+import {
   createFastRouteCheckpoint,
   FAST_MATCHING_FINALIZATION_RESERVE_MS,
   parseFastRouteCheckpoint,
@@ -23,6 +27,7 @@ interface Candidate extends TrackCandidateInput {
 interface ExistingMatch {
   candidateId: string;
   status: CatalogMatchResult["status"];
+  basis: string;
   song: CatalogMatchResult["song"];
 }
 
@@ -54,6 +59,10 @@ function boundedEnvironmentInteger(name: string, fallback: number, minimum: numb
 
 export function matchingConcurrency(): number {
   return boundedEnvironmentInteger("APPLE_MATCHING_CONCURRENCY", 4, 1, 6);
+}
+
+export function catalogRecoveryDeadlineMs(): number {
+  return boundedEnvironmentInteger("APPLE_CATALOG_RECOVERY_TIMEOUT_MS", 45_000, 10_000, 60_000);
 }
 
 async function lookupCandidateSongs(
@@ -138,13 +147,18 @@ export async function matchResearchRun(
     fastConfirmedAt?: string;
     fastResearchDeadlineAt?: string;
     fastDeadlineAt?: string;
+    retryIncomplete?: boolean;
   } = {},
 ): Promise<void> {
   if (!/^[a-z]{2}$/i.test(storefront)) throw new Error("Apple storefront must be a two-letter code");
   const normalizedStorefront = storefront.toLowerCase();
   const run = await repository.getRun(runId);
-  const checkpoint = await repository.getResearchCheckpoint(runId, "catalog_matching") as MatchingCheckpoint | null;
-  if (checkpoint?.complete && checkpoint.storefront === normalizedStorefront) {
+  const recovery = options.retryIncomplete === true;
+  const checkpointPhase = recovery ? "catalog_matching_recovery" : "catalog_matching";
+  const checkpoint = recovery
+    ? null
+    : await repository.getResearchCheckpoint(runId, checkpointPhase) as MatchingCheckpoint | null;
+  if (!recovery && checkpoint?.complete && checkpoint.storefront === normalizedStorefront) {
     await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review", error: null });
     return;
   }
@@ -181,36 +195,59 @@ export async function matchResearchRun(
     routeDeadlineAt = route.deadlineAt;
   }
   const startedAt = checkpoint?.startedAt ?? new Date().toISOString();
-  const deadlineAt = fast ? routeDeadlineAt : undefined;
+  const deadlineAt = recovery
+    ? new Date(Date.now() + catalogRecoveryDeadlineMs()).toISOString()
+    : fast
+      ? routeDeadlineAt
+      : undefined;
+  let deadlineExhausted = false;
 
   signal?.throwIfAborted();
-  await repository.updateRun(runId, { status: "matching", phase: "catalog_matching", error: null });
-  const candidates = await repository.listCandidates(runId);
+  await repository.updateRun(runId, {
+    status: "matching",
+    phase: recovery ? "catalog_matching_recovery" : "catalog_matching",
+    error: null,
+  });
+  const allCandidates = await repository.listCandidates(runId);
   const existingMatches = await repository.listMatches(runId);
-  const matchedCandidateIds = new Set(existingMatches.map((match) => match.candidateId));
-  const processedCandidateIds = new Set(candidates.slice(0, start).map((candidate) => candidate.id));
+  const retryableCandidateIds = new Set(existingMatches
+    .filter((match) => isRetryableCatalogMatch(match))
+    .map((match) => match.candidateId));
+  const existingCandidateIds = new Set(existingMatches.map((match) => match.candidateId));
+  const work = allCandidates.flatMap((candidate, originalIndex) => {
+    const shouldProcess = recovery
+      ? retryableCandidateIds.has(candidate.id)
+      : originalIndex >= start && !existingCandidateIds.has(candidate.id);
+    return shouldProcess ? [{ candidate, originalIndex }] : [];
+  });
   const acceptedCatalogIds = new Set(existingMatches
-    .filter((match) => processedCandidateIds.has(match.candidateId) && match.status === "accepted" && match.song?.id)
+    .filter((match) => match.status === "accepted" && match.song?.id)
     .map((match) => match.song!.id));
   const clusterCounts = new Map<string, number>();
-  for (const candidate of candidates) {
+  for (const candidate of allCandidates) {
     if (candidate.duplicateClusterKey) {
       clusterCounts.set(candidate.duplicateClusterKey, (clusterCounts.get(candidate.duplicateClusterKey) ?? 0) + 1);
     }
   }
   const concurrency = matchingConcurrency();
-  for (let batchStart = start; batchStart < candidates.length; batchStart += concurrency) {
+  for (let batchStart = 0; batchStart < work.length; batchStart += concurrency) {
     signal?.throwIfAborted();
-    const batch = candidates.slice(batchStart, batchStart + concurrency);
+    const batch = work.slice(batchStart, batchStart + concurrency);
     const remaining = deadlineAt ? Date.parse(deadlineAt) - Date.now() : Number.POSITIVE_INFINITY;
     const lookupBudget = remaining - FAST_MATCHING_FINALIZATION_RESERVE_MS;
     if (lookupBudget <= 0) {
-      const timeoutCandidates = candidates.slice(batchStart)
-        .filter((candidate) => !matchedCandidateIds.has(candidate.id));
-      const basis = "Apple catalog lookup did not complete inside the absolute fast-run window";
-      await repository.saveTimeoutMatches(runId, timeoutCandidates.map((candidate) => candidate.id), basis);
-      await repository.saveResearchCheckpoint(runId, "catalog_matching", {
-        nextIndex: candidates.length,
+      const timeoutCandidates = work.slice(batchStart).map(({ candidate }) => candidate);
+      // Recovery rows already carry an explicit timeout-to-review outcome.
+      // Leave them retryable for the next visitor-requested recovery generation.
+      if (!recovery) {
+        await repository.saveTimeoutMatches(
+          runId,
+          timeoutCandidates.map((candidate) => candidate.id),
+          RETRYABLE_CATALOG_MATCH_BASES[0],
+        );
+      }
+      await repository.saveResearchCheckpoint(runId, checkpointPhase, {
+        nextIndex: recovery ? work.length : allCandidates.length,
         storefront: normalizedStorefront,
         complete: true,
         deadlineAt,
@@ -219,10 +256,12 @@ export async function matchResearchRun(
         timedOutCandidateCount: timeoutCandidates.length,
         updatedAt: new Date().toISOString(),
       });
+      deadlineExhausted = true;
       break;
     }
-    const lookups = await Promise.all(batch.map(async (candidate) => {
-          const lookupSignal = fast
+    const lookups = await Promise.all(batch.map(async ({ candidate }) => {
+          const boundedByDeadline = Boolean(deadlineAt);
+          const lookupSignal = boundedByDeadline
             ? AbortSignal.any([
                 ...(signal ? [signal] : []),
                 AbortSignal.timeout(Math.max(1, Math.min(
@@ -235,7 +274,7 @@ export async function matchResearchRun(
             return { songs: await lookupCandidateSongs(candidate, normalizedStorefront, lookupSignal), failure: null };
           } catch (error) {
             if (signal?.aborted) throw error;
-            if (!fast) throw error;
+            if (!boundedByDeadline) throw error;
             const failure = fastLookupFailure(error, lookupSignal, signal);
             if (!failure) throw error;
             return { songs: [] as CatalogSong[], failure };
@@ -246,16 +285,16 @@ export async function matchResearchRun(
     // stable candidate order even though the independent catalog reads above
     // run concurrently.
     for (let offset = 0; offset < batch.length; offset += 1) {
-      const index = batchStart + offset;
-      const candidate = batch[offset]!;
+      const workIndex = batchStart + offset;
+      const { candidate, originalIndex } = batch[offset]!;
       const lookup = lookups[offset]!;
       let match = lookup.failure
         ? {
             candidateId: candidate.id,
             status: "review" as const,
             basis: lookup.failure === "deadline"
-              ? "Apple catalog lookup did not complete inside the fast matching window"
-              : "Apple catalog was temporarily unavailable during fast matching",
+              ? RETRYABLE_CATALOG_MATCH_BASES[1]
+              : RETRYABLE_CATALOG_MATCH_BASES[2],
             score: 0,
             song: null,
             alternatives: [],
@@ -278,23 +317,20 @@ export async function matchResearchRun(
         match = { ...match, status: "review", basis: ineligibleEvidenceBasis(run.brief, candidate) };
       }
       await repository.saveMatch(runId, match);
-      matchedCandidateIds.add(candidate.id);
       if (match.status === "accepted" && match.song) acceptedCatalogIds.add(match.song.id);
-      await repository.saveResearchCheckpoint(runId, "catalog_matching", {
-        nextIndex: index + 1,
+      await repository.saveResearchCheckpoint(runId, checkpointPhase, {
+        nextIndex: recovery ? workIndex + 1 : originalIndex + 1,
         storefront: normalizedStorefront,
-        complete: index + 1 >= candidates.length,
+        complete: false,
         deadlineAt,
         startedAt,
-        completedAt: index + 1 >= candidates.length ? new Date().toISOString() : undefined,
         updatedAt: new Date().toISOString(),
       });
     }
   }
-
-  if (candidates.length === 0) {
-    await repository.saveResearchCheckpoint(runId, "catalog_matching", {
-      nextIndex: 0,
+  if (!deadlineExhausted) {
+    await repository.saveResearchCheckpoint(runId, checkpointPhase, {
+      nextIndex: recovery ? work.length : allCandidates.length,
       storefront: normalizedStorefront,
       complete: true,
       deadlineAt,
@@ -315,5 +351,6 @@ export async function processMatchingJob(repository: MatchingRepository, payload
     fastConfirmedAt: typeof payload.fastConfirmedAt === "string" ? payload.fastConfirmedAt : undefined,
     fastResearchDeadlineAt: typeof payload.fastResearchDeadlineAt === "string" ? payload.fastResearchDeadlineAt : undefined,
     fastDeadlineAt: typeof payload.fastDeadlineAt === "string" ? payload.fastDeadlineAt : undefined,
+    retryIncomplete: payload.retryIncomplete === true,
   });
 }

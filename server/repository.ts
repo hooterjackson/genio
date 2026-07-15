@@ -5,6 +5,7 @@ import { createDatabase, DATABASE_SCHEMA_VERSION, type DatabaseHandle } from "..
 import { settings } from "../db/schema.ts";
 import type {
   CatalogMatchResult,
+  CatalogSong,
   EvidenceClaimInput,
   PlaylistBrief,
   PlaylistManifest,
@@ -38,6 +39,10 @@ import {
   researchPolicyFingerprint,
 } from "./research-policy.ts";
 import { resolveEvidenceSubjectBinding } from "./evidence-binding.ts";
+import {
+  CATALOG_RECOVERY_UNRESOLVED_BASIS,
+  RETRYABLE_CATALOG_MATCH_BASES,
+} from "./catalog-match-recovery.ts";
 import {
   citationAttestationKey,
   citationTextIsLocalToClaim,
@@ -92,6 +97,48 @@ export interface ResearchRunHistoryItem {
   unresolvedCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CatalogTrackRow {
+  position: number;
+  candidateId: string;
+  selectionRank: number | null;
+  artist: string;
+  title: string;
+  album: string | null;
+  releaseYear: number | null;
+  durationMs: number | null;
+  isrc: string | null;
+  versionLabel: string | null;
+  duplicateClusterKey: string | null;
+  status: CatalogMatchResult["status"] | "pending";
+  basis: string | null;
+  score: number;
+  catalogId: string | null;
+  song: CatalogSong | null;
+  alternatives: CatalogSong[];
+  evidenceEligible: boolean;
+  selected: boolean;
+  selectable: boolean;
+}
+
+export interface CatalogTrackPage {
+  items: CatalogTrackRow[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  selectableCount: number;
+  unmatchedCount: number;
+  retryableCount: number;
+  matchingComplete: boolean;
+}
+
+export interface CatalogSelectionInput {
+  selected?: Array<{ candidateId: string; catalogId: string }>;
+  useRecommended?: boolean;
+  excludedCandidateIds?: string[];
+  overrides?: Array<{ candidateId: string; catalogId: string }>;
 }
 
 export interface PublicationVolumeInput {
@@ -182,6 +229,31 @@ async function markTerminalPublicationVolumes(
          WHERE m.id=pv.manifest_id AND r.status<>'waiting_for_apple_authorization'
        )`,
     [manifestId, publicError],
+  );
+}
+
+function isCatalogRecoveryJob(payload: Record<string, unknown> | null): boolean {
+  return payload?.retryIncomplete === true;
+}
+
+async function settleCatalogRecoveryFailure(
+  client: Pick<PoolClient, "query">,
+  runId: string,
+): Promise<void> {
+  await client.query(
+    `UPDATE catalog_matches SET basis=$3
+     WHERE run_id=$1 AND status='review' AND song_json IS NULL AND basis=ANY($2::text[])
+       AND EXISTS (
+         SELECT 1 FROM research_runs r WHERE r.id=$1
+           AND r.status IN ('matching','review','visitor_review')
+       )`,
+    [runId, [...RETRYABLE_CATALOG_MATCH_BASES], CATALOG_RECOVERY_UNRESOLVED_BASIS],
+  );
+  await client.query(
+    `UPDATE research_runs SET status='visitor_review',phase='exception_review',error=NULL,
+       completed_at=NULL,updated_at=now()
+     WHERE id=$1 AND status IN ('matching','review','visitor_review')`,
+    [runId],
   );
 }
 
@@ -1347,6 +1419,161 @@ export class Repository {
     })), page: safePage, pageSize: size, total, totalPages: Math.ceil(total / size), unresolvedCount: total };
   }
 
+  async listCatalogTracks(runId: string, page = 1, pageSize = 200): Promise<CatalogTrackPage> {
+    const run = await this.getRunRow(runId);
+    if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+    const brief = run.brief_json as PlaylistBrief;
+    const safePage = Math.max(1, Math.floor(page));
+    const size = Math.max(1, Math.min(Math.floor(pageSize), 500));
+    const offset = (safePage - 1) * size;
+    const orderSql = manifestOrderSql(brief);
+    const evidenceStates = brief.mode === "curated"
+      ? ["verified", "corroborated", "editorial"]
+      : ["verified", "corroborated"];
+    // Alternatives are evidence for an ambiguity screen, not proof that a
+    // catalog recording is safe to include. A row is selectable by default
+    // only when matching produced a plausible primary song.
+    const choiceSql = `m.song_json IS NOT NULL AND NULLIF(m.song_json->>'id','') IS NOT NULL`;
+    const retryableSql = `m.status='review' AND m.song_json IS NULL
+      AND m.basis=ANY($2::text[])`;
+    const summary = await this.pool.query<{
+      total: number;
+      selectable_count: number;
+      unmatched_count: number;
+      retryable_count: number;
+      matching_complete: boolean;
+    }>(
+      `SELECT count(*)::int total,
+         count(*) FILTER (WHERE ${choiceSql})::int selectable_count,
+         count(*) FILTER (WHERE NOT (${choiceSql}))::int unmatched_count,
+         count(*) FILTER (WHERE ${retryableSql})::int retryable_count,
+         COALESCE(bool_and(m.status IS NOT NULL AND NOT (${retryableSql})),true) matching_complete
+       FROM track_candidates c
+       LEFT JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+       WHERE c.run_id=$1`,
+      [runId, [...RETRYABLE_CATALOG_MATCH_BASES]],
+    );
+    const rows = await this.pool.query(
+      `SELECT
+         row_number() OVER (ORDER BY ${orderSql})-1 AS position,
+         c.id AS candidate_id,c.selection_rank,c.artist,c.title,c.album,c.release_year,c.duration_ms,
+         c.isrc,c.version_label,c.duplicate_cluster_key,
+         COALESCE(m.status,'pending') AS status,m.basis,m.score,m.catalog_id,m.song_json,m.alternatives_json,
+         (${choiceSql}) AS selectable,
+         EXISTS (
+           SELECT 1 FROM evidence_claims e
+           JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+           JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+             AND ca.run_id=e.run_id AND ca.source_url=es.url
+           WHERE e.candidate_id=c.id AND e.state=ANY($2::text[])
+             AND e.support_scope='track' AND e.verification_phase='track_verification'
+             AND e.subject_entity=ANY($3::text[]) AND e.subject_relationship=$4
+         ) AS evidence_eligible
+       FROM track_candidates c
+       LEFT JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+       WHERE c.run_id=$1
+       ORDER BY ${orderSql}
+       LIMIT $5 OFFSET $6`,
+      [runId, evidenceStates, brief.subjectEntities, brief.relationship, size, offset],
+    );
+    const totals = summary.rows[0] ?? {
+      total: 0,
+      selectable_count: 0,
+      unmatched_count: 0,
+      retryable_count: 0,
+      matching_complete: true,
+    };
+    return {
+      items: rows.rows.map((row): CatalogTrackRow => ({
+        position: Number(row.position),
+        candidateId: row.candidate_id,
+        selectionRank: row.selection_rank == null ? null : Number(row.selection_rank),
+        artist: row.artist,
+        title: row.title,
+        album: row.album,
+        releaseYear: row.release_year == null ? null : Number(row.release_year),
+        durationMs: row.duration_ms == null ? null : Number(row.duration_ms),
+        isrc: row.isrc,
+        versionLabel: row.version_label,
+        duplicateClusterKey: row.duplicate_cluster_key,
+        status: row.status,
+        basis: row.basis,
+        score: Number(row.score ?? 0),
+        catalogId: row.catalog_id,
+        song: row.song_json,
+        alternatives: Array.isArray(row.alternatives_json) ? row.alternatives_json : [],
+        evidenceEligible: Boolean(row.evidence_eligible),
+        selected: row.status === "accepted",
+        selectable: Boolean(row.selectable),
+      })),
+      page: safePage,
+      pageSize: size,
+      total: Number(totals.total),
+      totalPages: Math.ceil(Number(totals.total) / size),
+      selectableCount: Number(totals.selectable_count),
+      unmatchedCount: Number(totals.unmatched_count),
+      retryableCount: Number(totals.retryable_count),
+      matchingComplete: Boolean(totals.matching_complete),
+    };
+  }
+
+  async queueCatalogRecovery(runId: string, storefront: string): Promise<{
+    queued: boolean;
+    state: "queued" | "in_flight" | "ready";
+    retryableCount: number;
+  }> {
+    if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
+    return this.transaction(async (client) => {
+      const run = await client.query<{ status: string }>(
+        "SELECT status FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [runId],
+      );
+      if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      const retryable = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM catalog_matches
+         WHERE run_id=$1 AND status='review' AND song_json IS NULL AND basis=ANY($2::text[])`,
+        [runId, [...RETRYABLE_CATALOG_MATCH_BASES]],
+      );
+      const retryableCount = Number(retryable.rows[0]?.count ?? 0);
+      const active = await client.query<{ id: string; recovery: boolean }>(
+        `SELECT id,(payload_json->>'retryIncomplete'='true') AS recovery
+         FROM job_queue WHERE run_id=$1 AND kind='matching' AND status IN ('queued','leased')
+         ORDER BY created_at DESC LIMIT 1`,
+        [runId],
+      );
+      if (active.rows[0]?.recovery) return { queued: false, state: "in_flight", retryableCount };
+      if (active.rows[0] || !["review", "visitor_review"].includes(run.rows[0].status)) {
+        throw new HttpError(409, "Run is not ready for catalog recovery", "catalog_recovery_not_ready");
+      }
+      if (retryableCount === 0) return { queued: false, state: "ready", retryableCount };
+      const prior = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM job_queue WHERE run_id=$1 AND kind='matching'
+           AND payload_json->>'retryIncomplete'='true'`,
+        [runId],
+      );
+      const generation = Number(prior.rows[0]?.count ?? 0) + 1;
+      if (generation > 3) {
+        await settleCatalogRecoveryFailure(client, runId);
+        return { queued: false, state: "ready", retryableCount: 0 };
+      }
+      await client.query(
+        `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
+         VALUES($1,$2,'matching',$3,$4,1)`,
+        [
+          randomUUID(),
+          runId,
+          `matching-recovery:${runId}:${generation}`,
+          { runId, storefront: storefront.toLowerCase(), retryIncomplete: true, recoveryGeneration: generation },
+        ],
+      );
+      await client.query(
+        "UPDATE research_runs SET status='matching',phase='catalog_matching_recovery',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
+        [runId],
+      );
+      return { queued: true, state: "queued", retryableCount };
+    });
+  }
+
   async reviewMatch(runId: string, candidateId: string, status: "accepted" | "rejected", catalogSong?: unknown): Promise<"accepted" | "rejected" | "duplicate"> {
     const requestedCatalogId = (catalogSong as { id?: string } | undefined)?.id ?? null;
     const result = await this.transaction(async (client) => {
@@ -1389,8 +1616,159 @@ export class Repository {
     return result;
   }
 
-  async createManifest(runId: string, options: { verifiedOnly?: boolean } = {}): Promise<PlaylistManifest & { contentHash: string; lockedAt: string }> {
+  async finalizeCatalogSelection(
+    runId: string,
+    input: CatalogSelectionInput,
+  ): Promise<PlaylistManifest & { contentHash: string; lockedAt: string }> {
     return this.transaction(async (client) => {
+      const runResult = await client.query<{ status: string; brief_json: PlaylistBrief }>(
+        "SELECT status,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [runId],
+      );
+      const run = runResult.rows[0];
+      if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+      const existingManifest = await client.query("SELECT id FROM manifests WHERE run_id=$1 LIMIT 1", [runId]);
+      if (existingManifest.rows[0]) return this.createManifestInTransaction(client, runId);
+      if (!["review", "visitor_review"].includes(run.status)) {
+        throw new HttpError(409, "Run is not ready for playlist selection", "selection_not_ready");
+      }
+      const explicitMode = Array.isArray(input.selected);
+      const recommendedMode = input.useRecommended === true;
+      if (explicitMode === recommendedMode) {
+        throw new HttpError(400, "Choose either explicit tracks or recommended tracks", "invalid_selection");
+      }
+      const selected = explicitMode ? input.selected! : [];
+      const excluded = recommendedMode ? (input.excludedCandidateIds ?? []) : [];
+      const overrides = recommendedMode ? (input.overrides ?? []) : [];
+      if (selected.length > 10_000 || excluded.length > 10_000 || overrides.length > 10_000) {
+        throw new HttpError(413, "Playlist selection is too large", "selection_too_large");
+      }
+      const uniqueValues = (values: string[]) => new Set(values).size === values.length;
+      if (!uniqueValues(selected.map((item) => item.candidateId))
+        || !uniqueValues(excluded)
+        || !uniqueValues(overrides.map((item) => item.candidateId))) {
+        throw new HttpError(400, "Playlist selection contains duplicate candidates", "invalid_selection");
+      }
+      const excludedSet = new Set(excluded);
+      if (overrides.some((item) => excludedSet.has(item.candidateId))) {
+        throw new HttpError(400, "An excluded track cannot also override its Apple match", "invalid_selection");
+      }
+      const orderSql = manifestOrderSql(run.brief_json);
+      const candidates = await client.query(
+        `SELECT c.id,c.artist,c.title,m.status,m.basis,m.song_json,m.alternatives_json
+         FROM track_candidates c
+         JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+         WHERE c.run_id=$1 ORDER BY ${orderSql} FOR UPDATE OF c,m`,
+        [runId],
+      );
+      const candidateCount = await client.query<{ count: number }>(
+        "SELECT count(*)::int count FROM track_candidates WHERE run_id=$1",
+        [runId],
+      );
+      if (candidates.rows.length !== Number(candidateCount.rows[0]?.count ?? 0)) {
+        throw new HttpError(409, "Apple catalog matching is still in progress", "matching_incomplete");
+      }
+      const accountedStatuses = new Set(["accepted", "review", "unavailable", "rejected", "duplicate", "unsupported", "overflow"]);
+      if (candidates.rows.some((row) => !accountedStatuses.has(row.status))) {
+        throw new HttpError(409, "Apple catalog matching is still in progress", "matching_incomplete");
+      }
+      const rowsByCandidate = new Map<string, (typeof candidates.rows)[number]>(
+        candidates.rows.map((row) => [row.id, row]),
+      );
+      for (const candidateId of excluded) {
+        if (!rowsByCandidate.has(candidateId)) throw new HttpError(400, "An excluded track is not part of this run", "invalid_selection");
+      }
+      const choicesByCandidate = new Map<string, Map<string, CatalogSong>>();
+      for (const row of candidates.rows) {
+        const hasPrimary = Boolean(row.song_json && typeof row.song_json === "object" && typeof row.song_json.id === "string");
+        const choices = [
+          row.song_json,
+          ...(hasPrimary && Array.isArray(row.alternatives_json) ? row.alternatives_json : []),
+        ]
+          .filter((song): song is CatalogSong => Boolean(song && typeof song === "object" && typeof song.id === "string"));
+        choicesByCandidate.set(row.id, new Map(choices.map((song) => [song.id, song])));
+      }
+      const requested = new Map<string, string>();
+      if (explicitMode) {
+        for (const item of selected) requested.set(item.candidateId, item.catalogId);
+      } else {
+        for (const row of candidates.rows) {
+          if (!excludedSet.has(row.id)
+            && ["accepted", "review"].includes(row.status)
+            && row.song_json
+            && typeof row.song_json.id === "string") {
+            requested.set(row.id, row.song_json.id);
+          }
+        }
+        for (const item of overrides) requested.set(item.candidateId, item.catalogId);
+      }
+      const selectedSongs = new Map<string, CatalogSong>();
+      for (const [candidateId, catalogId] of requested) {
+        const choice = choicesByCandidate.get(candidateId)?.get(catalogId);
+        if (!choice) {
+          throw new HttpError(400, "A selected Apple recording was not one of the server-provided choices", "catalog_match_not_permitted");
+        }
+        selectedSongs.set(candidateId, choice);
+      }
+      if (selectedSongs.size === 0) throw new HttpError(409, "Select at least one Apple Music track", "empty_selection");
+      const acceptedCatalogIds = new Set<string>();
+      const updates = candidates.rows.map((row) => {
+        const song = selectedSongs.get(row.id) ?? null;
+        if (song) {
+          const status = acceptedCatalogIds.has(song.id) ? "duplicate" : "accepted";
+          acceptedCatalogIds.add(song.id);
+          return {
+            candidate_id: row.id,
+            status,
+            catalog_id: song.id,
+            song_json: song,
+            basis: status === "duplicate"
+              ? `Visitor selection duplicated Apple catalog ID ${song.id}`
+              : `Visitor selected Apple catalog ID ${song.id} in bulk review`,
+          };
+        }
+        const noChoices = (choicesByCandidate.get(row.id)?.size ?? 0) === 0;
+        const status = noChoices && ["unavailable", "unsupported"].includes(row.status)
+          ? row.status
+          : "rejected";
+        return {
+          candidate_id: row.id,
+          status,
+          catalog_id: null,
+          song_json: null,
+          basis: status === row.status ? row.basis : "Visitor excluded this track in bulk review",
+        };
+      });
+      const updated = await client.query(
+        `UPDATE catalog_matches m SET
+           status=u.status,
+           basis=u.basis,
+           catalog_id=CASE WHEN u.status IN ('accepted','duplicate') THEN u.catalog_id ELSE NULL END,
+           song_json=CASE WHEN u.status IN ('accepted','duplicate') THEN u.song_json ELSE m.song_json END,
+           reviewed_at=now()
+         FROM jsonb_to_recordset($2::jsonb) AS u(
+           candidate_id uuid,status varchar,basis text,catalog_id text,song_json jsonb
+         )
+         WHERE m.run_id=$1 AND m.candidate_id=u.candidate_id`,
+        [runId, updates],
+      );
+      if (updated.rowCount !== updates.length) {
+        throw new HttpError(409, "Playlist selection changed while it was being saved", "selection_conflict");
+      }
+      await client.query(
+        `UPDATE track_candidates c SET outcome=m.status FROM catalog_matches m
+         WHERE c.run_id=$1 AND m.run_id=$1 AND m.candidate_id=c.id`,
+        [runId],
+      );
+      return this.createManifestInTransaction(client, runId, { allowUnavailable: true });
+    });
+  }
+
+  private async createManifestInTransaction(
+    client: PoolClient,
+    runId: string,
+    options: { verifiedOnly?: boolean; allowUnavailable?: boolean } = {},
+  ): Promise<PlaylistManifest & { contentHash: string; lockedAt: string }> {
       const runResult = await client.query("SELECT * FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE", [runId]);
       const run = runResult.rows[0];
       if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
@@ -1448,7 +1826,8 @@ export class Repository {
       if (incomplete) {
         throw new HttpError(409, "Catalog matching has not accounted for every candidate", "matching_incomplete");
       }
-      if (!options.verifiedOnly && accounting.rows.some((candidate) => candidate.match_status === "review" || candidate.match_status === "unavailable")) {
+      if (!options.verifiedOnly && accounting.rows.some((candidate) => candidate.match_status === "review"
+        || (!options.allowUnavailable && candidate.match_status === "unavailable"))) {
         throw new HttpError(409, "Resolve every exception or choose Publish verified tracks", "unresolved_exceptions");
       }
       if (options.verifiedOnly) {
@@ -1542,7 +1921,10 @@ export class Repository {
       }
       await client.query("UPDATE research_runs SET status='manifest_ready',phase='manifest',updated_at=now() WHERE id=$1", [runId]);
       return { id, runId, name, description, createdAt: now.toISOString(), tracks, contentHash, lockedAt: now.toISOString() };
-    });
+  }
+
+  async createManifest(runId: string, options: { verifiedOnly?: boolean } = {}): Promise<PlaylistManifest & { contentHash: string; lockedAt: string }> {
+    return this.transaction((client) => this.createManifestInTransaction(client, runId, options));
   }
 
   async getManifestById(id: string): Promise<any | null> {
@@ -1828,7 +2210,10 @@ export class Repository {
         ],
       );
       for (const job of exhausted.rows) {
-        if (job.run_id && ["research", "matching", "publication"].includes(job.kind)) {
+        const recoveryFailure = Boolean(job.run_id && job.kind === "matching" && isCatalogRecoveryJob(job.payload_json));
+        if (recoveryFailure) {
+          await settleCatalogRecoveryFailure(client, job.run_id!);
+        } else if (job.run_id && ["research", "matching", "publication"].includes(job.kind)) {
           await client.query(
             `UPDATE research_runs SET status='failed',phase=$2,error=$3,
              completed_at=COALESCE(completed_at,now()),updated_at=now()
@@ -1971,7 +2356,13 @@ export class Repository {
          WHERE id=$1 AND lease_owner=$2`,
         [jobId, workerId, retry ? "queued" : "failed", retry ? retryAt : null, persistedError],
       );
-      if (!retry && current.rows[0].run_id && ["research", "matching", "publication"].includes(current.rows[0].kind)) {
+      const recoveryFailure = !retry
+        && Boolean(current.rows[0].run_id)
+        && current.rows[0].kind === "matching"
+        && isCatalogRecoveryJob(current.rows[0].payload_json);
+      if (recoveryFailure) {
+        await settleCatalogRecoveryFailure(client, current.rows[0].run_id!);
+      } else if (!retry && current.rows[0].run_id && ["research", "matching", "publication"].includes(current.rows[0].kind)) {
         await client.query(
           `UPDATE research_runs SET status='failed',phase=$2,error=$3,completed_at=COALESCE(completed_at,now()),updated_at=now()
            WHERE id=$1 AND status NOT IN ('complete','partial','failed','expired','deleted','waiting_for_apple_authorization')`,

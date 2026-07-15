@@ -268,89 +268,475 @@ test("capabilities are exchanged and removed from the URL fragment", async ({ pa
   await page.route("**/api/v1/runs/run-1", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
   });
-  await page.route(/.*\/api\/v1\/runs\/run-1\/exceptions.*/, async (route) => {
-    const items = Array.from({ length: 20 }, (_, index) => ({
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    const items = Array.from({ length: 21 }, (_, index) => ({
+      position: index,
       candidateId: `candidate-${index}`,
       artist: "Artist",
-      title: `Uncertain track ${index + 1}`,
+      title: `Matched track ${index + 1}`,
       album: "Album",
-      basis: "version conflict",
-      status: "review",
+      status: "accepted",
+      catalogId: `apple-${index}`,
+      song: { id: `apple-${index}`, name: `Matched track ${index + 1}`, artistName: "Artist", albumName: "Album" },
       alternatives: [],
+      evidenceEligible: true,
+      selected: true,
+      selectable: true,
     }));
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ items, page: 1, pageSize: 20, total: 21, totalPages: 2 }),
+      body: JSON.stringify({
+        items,
+        page: 1,
+        pageSize: 200,
+        total: 21,
+        totalPages: 1,
+        selectableCount: 21,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
     });
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await expect(page.getByRole("heading", { name: "Uncertain track 1" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.hash)).toBe("");
-  await expect(page.getByText("[1 OF 21]", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Uncertain track 2" })).toHaveCount(0);
-  await expect(page.locator(".exception-choices")).toHaveCount(1);
+  await expect(page.getByText("21 OF 21 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+  await expect(page.getByText("Matched track 1", { exact: true })).toBeVisible();
+  await expect(page.getByText("Matched track 21", { exact: true })).toBeVisible();
+  await expect(page.getByRole("checkbox")).toHaveCount(21);
+  expect(await page.getByRole("checkbox").evaluateAll((checkboxes) => checkboxes.every((checkbox) => (checkbox as HTMLInputElement).checked))).toBe(true);
 });
 
-test("the primary Apple match is selectable once even when alternatives repeat it", async ({ page }) => {
+test("the whole list can be cleared, restored, and edited without reviewing tracks one by one", async ({ page }) => {
   await page.route("**/api/v1/capabilities/exchange", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
   });
   await page.route("**/api/v1/runs/run-1", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
   });
-  await page.route(/.*\/api\/v1\/runs\/run-1\/exceptions.*/, async (route) => {
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    const matched = (index: number) => ({
+      position: index,
+      candidateId: `candidate-${index}`,
+      artist: "Artist",
+      title: `Track ${index + 1}`,
+      status: index === 0 ? "review" : "accepted",
+      catalogId: `apple-${index}`,
+      song: { id: `apple-${index}`, name: `Track ${index + 1}`, artistName: "Artist" },
+      alternatives: [],
+      evidenceEligible: true,
+      selected: index !== 0,
+      selectable: true,
+    });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [
+          matched(0),
+          matched(1),
+          {
+            ...matched(2),
+            title: "Previously excluded track",
+            status: "rejected",
+            selected: false,
+          },
+          {
+            position: 3,
+            candidateId: "candidate-unavailable",
+            artist: "Artist",
+            title: "Unavailable track",
+            status: "unavailable",
+            catalogId: null,
+            song: null,
+            alternatives: [],
+            evidenceEligible: true,
+            selected: false,
+            selectable: false,
+          },
+        ],
+        page: 1,
+        pageSize: 200,
+        total: 4,
+        totalPages: 1,
+        selectableCount: 3,
+        unmatchedCount: 1,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  const generate = page.getByRole("button", { name: /generate playlist/i });
+  await expect(page.getByText("2 OF 3 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+  const list = page.getByRole("list", { name: "Playlist tracks" });
+  await expect(list.getByRole("listitem")).toHaveCount(4);
+  await expect(page.getByRole("checkbox", { name: /unavailable track/i })).toBeDisabled();
+  await expect(page.getByRole("checkbox", { name: /previously excluded track/i })).not.toBeChecked();
+  await expect(page.getByText("EXCLUDED", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "CLEAR", exact: true }).click();
+  await expect(generate).toBeDisabled();
+  await page.getByRole("button", { name: "SELECT ALL", exact: true }).click();
+  await expect(generate).toBeEnabled();
+  await page.getByRole("checkbox", { name: /track 2/i }).uncheck();
+  await expect(page.getByText("2 OF 3 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
+
+  const touchTargets = await page.locator(".selection-toolbar button, .review-footer button, .track-selection-row > label:first-child").evaluateAll((elements) =>
+    elements.map((element) => {
+      const rect = element.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    }),
+  );
+  expect(touchTargets.every(({ width, height }) => width >= 44 && height >= 44)).toBe(true);
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("legacy timed-out Apple matches recover automatically before selection", async ({ page }) => {
+  let currentRun = run;
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentRun) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          position: 0,
+          candidateId: "candidate-timeout",
+          artist: "Artist",
+          title: "Timed-out track",
+          status: "review",
+          basis: "Apple catalog lookup did not complete inside the absolute fast-run window",
+          catalogId: null,
+          song: null,
+          alternatives: [],
+          evidenceEligible: true,
+          selected: false,
+          selectable: false,
+        }],
+        page: 1,
+        pageSize: 200,
+        total: 1,
+        totalPages: 1,
+        selectableCount: 0,
+        unmatchedCount: 1,
+        retryableCount: 1,
+        matchingComplete: false,
+      }),
+    });
+  });
+  let matchingRequests = 0;
+  await page.route("**/api/v1/runs/run-1/matching", async (route) => {
+    matchingRequests += 1;
+    currentRun = { ...run, status: "matching", phase: "catalog_matching_recovery" };
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ queued: true, state: "queued", retryableCount: 1, run: currentRun }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
+  expect(matchingRequests).toBe(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("a failed automatic Apple retry leaves the list available for a manual retry", async ({ page }) => {
+  let currentRun = run;
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentRun) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          position: 0,
+          candidateId: "candidate-timeout",
+          artist: "Artist",
+          title: "Timed-out track",
+          status: "review",
+          catalogId: null,
+          song: null,
+          alternatives: [],
+          evidenceEligible: true,
+          selected: false,
+          selectable: false,
+        }],
+        page: 1,
+        pageSize: 200,
+        total: 1,
+        totalPages: 1,
+        selectableCount: 0,
+        unmatchedCount: 1,
+        retryableCount: 1,
+        matchingComplete: false,
+      }),
+    });
+  });
+  let attempts = 0;
+  await page.route("**/api/v1/runs/run-1/matching", async (route) => {
+    attempts += 1;
+    if (attempts === 1) {
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "Apple matching is temporarily unavailable" }) });
+      return;
+    }
+    currentRun = { ...run, status: "matching", phase: "catalog_matching_recovery" };
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ run: currentRun }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await expect(page.getByRole("alert")).toContainText("temporarily unavailable");
+  await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
+  const retry = page.getByRole("button", { name: "RETRY 1 UNMATCHED TRACK" });
+  await expect(retry).toBeEnabled();
+  await retry.click();
+  await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
+  expect(attempts).toBe(2);
+});
+
+test("one Generate playlist action saves the list and starts Apple publication", async ({ page }) => {
+  let currentRun = run;
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentRun) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
     const primary = { id: "apple-primary", name: "Primary recording", artistName: "Artist", albumName: "Album" };
     await route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
         items: [{
+          position: 0,
           candidateId: "candidate-primary",
           artist: "Artist",
           title: "Uncertain track",
           album: "Album",
           basis: "version conflict",
           status: "review",
+          catalogId: null,
           song: primary,
           alternatives: [
             primary,
             { id: "apple-alternative", name: "Alternate recording", artistName: "Artist", albumName: "Album" },
           ],
+          evidenceEligible: true,
+          selected: true,
+          selectable: true,
         }],
         page: 1,
-        pageSize: 20,
+        pageSize: 200,
         total: 1,
         totalPages: 1,
-        unresolvedCount: 1,
+        selectableCount: 1,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
       }),
     });
   });
 
-  let captureReview!: (body: Record<string, unknown>) => void;
-  const reviewRequest = new Promise<Record<string, unknown>>((resolve) => { captureReview = resolve; });
-  await page.route("**/api/v1/runs/run-1/review", async (route) => {
-    captureReview(route.request().postDataJSON() as Record<string, unknown>);
+  let captureSelection!: (body: Record<string, unknown>) => void;
+  const selectionRequest = new Promise<Record<string, unknown>>((resolve) => { captureSelection = resolve; });
+  await page.route("**/api/v1/runs/run-1/selection", async (route) => {
+    captureSelection(route.request().postDataJSON() as Record<string, unknown>);
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ reviewed: true, decision: "accepted" }),
+      body: JSON.stringify({
+        id: "manifest-1",
+        runId: run.id,
+        name: "Result playlist",
+        description: "Selected tracks",
+        contentHash: "abc",
+        tracks: [{ position: 0, candidateId: "candidate-primary", catalogId: "apple-primary", artist: "Artist", title: "Uncertain track" }],
+      }),
+    });
+  });
+  let capturePublish!: (body: Record<string, unknown>) => void;
+  const publishRequest = new Promise<Record<string, unknown>>((resolve) => { capturePublish = resolve; });
+  await page.route("**/api/v1/runs/run-1/publish", async (route) => {
+    capturePublish(route.request().postDataJSON() as Record<string, unknown>);
+    currentRun = { ...run, status: "publishing", phase: "publication" };
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify(currentRun),
     });
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  const primaryChoice = page.getByRole("button", { name: /use this match primary recording/i });
-  await expect(primaryChoice).toHaveCount(1);
-  await expect(page.getByRole("button", { name: /use this match alternate recording/i })).toBeVisible();
-  expect(await page.locator(".exception-actions button").evaluateAll((buttons) => buttons.every((button) => {
-    const rect = button.getBoundingClientRect();
-    return rect.width >= 44 && rect.height >= 44;
-  }))).toBe(true);
-  await primaryChoice.click();
-  const reviewBody = await reviewRequest;
-  expect(reviewBody.catalogId).toBe("apple-primary");
-  expect((reviewBody.song as { id?: string } | undefined)?.id).toBe("apple-primary");
+  const version = page.getByRole("combobox", { name: /apple music version/i });
+  await expect(version.locator("option")).toHaveCount(2);
+  await expect(page.getByRole("checkbox", { name: /uncertain track/i })).toBeChecked();
+  await version.selectOption("apple-alternative");
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+  const selectionBody = await selectionRequest;
+  expect(selectionBody).toEqual({
+    selected: [{ candidateId: "candidate-primary", catalogId: "apple-alternative" }],
+  });
+  expect(await publishRequest).toEqual({ manifestId: "manifest-1" });
+  await expect(page.getByText("Creating the playlist in Apple Music.")).toBeVisible();
+});
+
+test("compact recommended selection preserves a catalog-only deselection", async ({ page }) => {
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    const items = Array.from({ length: 30 }, (_, index) => {
+      const song = { id: `apple-${index}`, name: `Track ${index + 1}`, artistName: "Artist" };
+      return {
+        position: index,
+        candidateId: `candidate-${index}`,
+        artist: "Artist",
+        title: `Track ${index + 1}`,
+        status: "accepted",
+        catalogId: song.id,
+        song: index === 29 ? null : song,
+        alternatives: index === 29 ? [song] : [],
+        evidenceEligible: true,
+        selected: true,
+        selectable: true,
+      };
+    });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items,
+        page: 1,
+        pageSize: 200,
+        total: items.length,
+        totalPages: 1,
+        selectableCount: items.length,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+
+  let selectionBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs/run-1/selection", async (route) => {
+    selectionBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "manifest-compact",
+        runId: run.id,
+        name: "Compact playlist",
+        tracks: [],
+      }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-1/publish", async (route) => {
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ ...run, status: "publishing", phase: "publication" }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await page.getByRole("checkbox", { name: /track 30/i }).uncheck();
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await expect.poll(() => selectionBody).toEqual({
+    useRecommended: true,
+    excludedCandidateIds: ["candidate-29"],
+    overrides: [],
+  });
+});
+
+test("leaving during playlist generation prevents stale publication and state", async ({ page }) => {
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          position: 0,
+          candidateId: "candidate-ready",
+          artist: "Artist",
+          title: "Ready track",
+          status: "accepted",
+          catalogId: "apple-ready",
+          song: { id: "apple-ready", name: "Ready track", artistName: "Artist" },
+          alternatives: [],
+          evidenceEligible: true,
+          selected: true,
+          selectable: true,
+        }],
+        page: 1,
+        pageSize: 200,
+        total: 1,
+        totalPages: 1,
+        selectableCount: 1,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+  let releaseSelection!: () => void;
+  const selectionGate = new Promise<void>((resolve) => { releaseSelection = resolve; });
+  let selectionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { selectionStarted = resolve; });
+  await page.route("**/api/v1/runs/run-1/selection", async (route) => {
+    selectionStarted();
+    await selectionGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "stale-manifest", runId: run.id, name: "Stale", tracks: [] }),
+    }).catch(() => undefined);
+  });
+  let publishRequests = 0;
+  await page.route("**/api/v1/runs/run-1/publish", async (route) => {
+    publishRequests += 1;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ ...run, status: "publishing" }) });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await started;
+  await page.getByRole("button", { name: "NEW JOB", exact: true }).click();
+  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  releaseSelection();
+  await page.waitForTimeout(50);
+  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  expect(publishRequests).toBe(0);
 });
 
 test("the current publication result shape keeps run coverage and evidence context", async ({ page }) => {
@@ -413,36 +799,103 @@ test("a transient restore failure preserves the durable run URL", async ({ page 
   await expect.poll(() => page.evaluate(() => location.search)).toBe("?run=run-transient");
 });
 
-test("playlist preparation waits for the first exception page", async ({ page }) => {
+test("playlist generation waits for the complete track list", async ({ page }) => {
   await page.route("**/api/v1/capabilities/exchange", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
   });
   await page.route("**/api/v1/runs/run-1", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
   });
-  let releaseExceptions!: () => void;
-  const exceptionGate = new Promise<void>((resolve) => { releaseExceptions = resolve; });
-  await page.route(/.*\/api\/v1\/runs\/run-1\/exceptions.*/, async (route) => {
-    await exceptionGate;
+  let releaseTracks!: () => void;
+  const tracksGate = new Promise<void>((resolve) => { releaseTracks = resolve; });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    await tracksGate;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ items: [], page: 1, pageSize: 20, total: 0, totalPages: 0, unresolvedCount: 0 }),
+      body: JSON.stringify({
+        items: [{
+          position: 0,
+          candidateId: "candidate-ready",
+          artist: "Artist",
+          title: "Ready track",
+          status: "accepted",
+          catalogId: "apple-ready",
+          song: { id: "apple-ready", name: "Ready track", artistName: "Artist" },
+          alternatives: [],
+          evidenceEligible: true,
+          selected: true,
+          selectable: true,
+        }],
+        page: 1,
+        pageSize: 200,
+        total: 1,
+        totalPages: 1,
+        selectableCount: 1,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
     });
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await expect(page.getByText("LOADING EXCEPTIONS")).toBeVisible();
-  const prepareButton = page.getByRole("button", { name: /prepare playlist/i });
-  await expect(prepareButton).toBeDisabled();
-  releaseExceptions();
-  await expect(page.getByText("[NO REVIEW REQUIRED]")).toBeVisible();
-  await expect(prepareButton).toBeEnabled();
+  await expect(page.getByText("LOADING TRACKS")).toBeVisible();
+  const generateButton = page.getByRole("button", { name: /generate playlist/i });
+  await expect(generateButton).toBeDisabled();
+  releaseTracks();
+  await expect(page.getByText("Ready track", { exact: true })).toBeVisible();
+  await expect(generateButton).toBeEnabled();
+});
+
+test("duplicate or missing track pages cannot produce a playlist", async ({ page }) => {
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    const pageNumber = Number(new URL(route.request().url()).searchParams.get("page") ?? "1");
+    const item = {
+      position: pageNumber - 1,
+      candidateId: "candidate-duplicate",
+      artist: "Artist",
+      title: `Track page ${pageNumber}`,
+      status: "accepted",
+      catalogId: `apple-${pageNumber}`,
+      song: { id: `apple-${pageNumber}`, name: `Track page ${pageNumber}`, artistName: "Artist" },
+      alternatives: [],
+      evidenceEligible: true,
+      selected: true,
+      selectable: true,
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [item],
+        page: pageNumber,
+        pageSize: 1,
+        total: 2,
+        totalPages: 2,
+        selectableCount: 2,
+        unmatchedCount: 0,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await expect(page.getByRole("alert")).toContainText("track list is incomplete");
+  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+  await expect(page.getByRole("list", { name: "Playlist tracks" })).toHaveCount(0);
 });
 
 test("interactive controls meet the minimum touch target", async ({ page }) => {
   await openPrompt(page);
-  const undersized = await page.locator("button:not([disabled]), a[href], textarea, input, summary").evaluateAll((elements) =>
+  const undersized = await page.locator("button:not([disabled]), a[href], textarea, input, select, summary").evaluateAll((elements) =>
     elements.flatMap((element) => {
       const rect = element.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return [];
