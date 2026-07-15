@@ -120,6 +120,7 @@ export interface CatalogTrackRow {
   evidenceEligible: boolean;
   selected: boolean;
   selectable: boolean;
+  retryable: boolean;
 }
 
 export interface CatalogTrackPage {
@@ -236,19 +237,27 @@ function isCatalogRecoveryJob(payload: Record<string, unknown> | null): boolean 
   return payload?.retryIncomplete === true;
 }
 
+function catalogRecoveryGeneration(payload: Record<string, unknown> | null): number {
+  const value = Number(payload?.recoveryGeneration);
+  return Number.isInteger(value) && value >= 1 && value <= 3 ? value : 3;
+}
+
 async function settleCatalogRecoveryFailure(
   client: Pick<PoolClient, "query">,
   runId: string,
+  generation: number,
 ): Promise<void> {
-  await client.query(
-    `UPDATE catalog_matches SET basis=$3
-     WHERE run_id=$1 AND status='review' AND song_json IS NULL AND basis=ANY($2::text[])
-       AND EXISTS (
-         SELECT 1 FROM research_runs r WHERE r.id=$1
-           AND r.status IN ('matching','review','visitor_review')
-       )`,
-    [runId, [...RETRYABLE_CATALOG_MATCH_BASES], CATALOG_RECOVERY_UNRESOLVED_BASIS],
-  );
+  if (generation >= 3) {
+    await client.query(
+      `UPDATE catalog_matches SET basis=$3
+       WHERE run_id=$1 AND status='review' AND song_json IS NULL AND basis=ANY($2::text[])
+         AND EXISTS (
+           SELECT 1 FROM research_runs r WHERE r.id=$1
+             AND r.status IN ('matching','review','visitor_review')
+         )`,
+      [runId, [...RETRYABLE_CATALOG_MATCH_BASES], CATALOG_RECOVERY_UNRESOLVED_BASIS],
+    );
+  }
   await client.query(
     `UPDATE research_runs SET status='visitor_review',phase='exception_review',error=NULL,
        completed_at=NULL,updated_at=now()
@@ -1322,7 +1331,17 @@ export class Repository {
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$4,$5,$6,$7,$8,now())
          ON CONFLICT(candidate_id) DO UPDATE SET status=EXCLUDED.status,basis=EXCLUDED.basis,score=EXCLUDED.score,
            catalog_id=EXCLUDED.catalog_id,song_json=EXCLUDED.song_json,alternatives_json=EXCLUDED.alternatives_json`,
-        [randomUUID(), runId, match.candidateId, resultingStatus, match.basis, match.score, match.song?.id ?? null, match.song, match.alternatives],
+        [
+          randomUUID(),
+          runId,
+          match.candidateId,
+          resultingStatus,
+          match.basis,
+          match.score,
+          match.song?.id ?? null,
+          match.song ? JSON.stringify(match.song) : null,
+          JSON.stringify(match.alternatives ?? []),
+        ],
       );
       await client.query("UPDATE track_candidates SET outcome=$1 WHERE id=$2 AND run_id=$3", [resultingStatus, match.candidateId, runId]);
     });
@@ -1434,8 +1453,12 @@ export class Repository {
     // catalog recording is safe to include. A row is selectable by default
     // only when matching produced a plausible primary song.
     const choiceSql = `m.song_json IS NOT NULL AND NULLIF(m.song_json->>'id','') IS NOT NULL`;
+    const recoverySlotsSql = `(SELECT count(*) FROM job_queue recovery_jobs
+      WHERE recovery_jobs.run_id=c.run_id AND recovery_jobs.kind='matching'
+        AND recovery_jobs.payload_json->>'retryIncomplete'='true') < 3`;
     const retryableSql = `m.status='review' AND m.song_json IS NULL
-      AND m.basis=ANY($2::text[])`;
+      AND (m.basis=ANY($2::text[]) OR m.basis=$3)
+      AND ${recoverySlotsSql}`;
     const summary = await this.pool.query<{
       total: number;
       selectable_count: number;
@@ -1451,7 +1474,7 @@ export class Repository {
        FROM track_candidates c
        LEFT JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
        WHERE c.run_id=$1`,
-      [runId, [...RETRYABLE_CATALOG_MATCH_BASES]],
+      [runId, [...RETRYABLE_CATALOG_MATCH_BASES], CATALOG_RECOVERY_UNRESOLVED_BASIS],
     );
     const rows = await this.pool.query(
       `SELECT
@@ -1460,6 +1483,9 @@ export class Repository {
          c.isrc,c.version_label,c.duplicate_cluster_key,
          COALESCE(m.status,'pending') AS status,m.basis,m.score,m.catalog_id,m.song_json,m.alternatives_json,
          (${choiceSql}) AS selectable,
+         (m.status='review' AND m.song_json IS NULL
+           AND (m.basis=ANY($5::text[]) OR m.basis=$6)
+           AND ${recoverySlotsSql}) AS retryable,
          EXISTS (
            SELECT 1 FROM evidence_claims e
            JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
@@ -1473,8 +1499,17 @@ export class Repository {
        LEFT JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
        WHERE c.run_id=$1
        ORDER BY ${orderSql}
-       LIMIT $5 OFFSET $6`,
-      [runId, evidenceStates, brief.subjectEntities, brief.relationship, size, offset],
+       LIMIT $7 OFFSET $8`,
+      [
+        runId,
+        evidenceStates,
+        brief.subjectEntities,
+        brief.relationship,
+        [...RETRYABLE_CATALOG_MATCH_BASES],
+        CATALOG_RECOVERY_UNRESOLVED_BASIS,
+        size,
+        offset,
+      ],
     );
     const totals = summary.rows[0] ?? {
       total: 0,
@@ -1505,6 +1540,7 @@ export class Repository {
         evidenceEligible: Boolean(row.evidence_eligible),
         selected: row.status === "accepted",
         selectable: Boolean(row.selectable),
+        retryable: Boolean(row.retryable),
       })),
       page: safePage,
       pageSize: size,
@@ -1529,10 +1565,22 @@ export class Repository {
         [runId],
       );
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      const prior = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM job_queue WHERE run_id=$1 AND kind='matching'
+           AND payload_json->>'retryIncomplete'='true'`,
+        [runId],
+      );
+      const priorGenerationCount = Number(prior.rows[0]?.count ?? 0);
       const retryable = await client.query<{ count: number }>(
         `SELECT count(*)::int count FROM catalog_matches
-         WHERE run_id=$1 AND status='review' AND song_json IS NULL AND basis=ANY($2::text[])`,
-        [runId, [...RETRYABLE_CATALOG_MATCH_BASES]],
+         WHERE run_id=$1 AND status='review' AND song_json IS NULL
+           AND (basis=ANY($2::text[]) OR basis=$3) AND $4::int<3`,
+        [
+          runId,
+          [...RETRYABLE_CATALOG_MATCH_BASES],
+          CATALOG_RECOVERY_UNRESOLVED_BASIS,
+          priorGenerationCount,
+        ],
       );
       const retryableCount = Number(retryable.rows[0]?.count ?? 0);
       const active = await client.query<{ id: string; recovery: boolean }>(
@@ -1545,17 +1593,25 @@ export class Repository {
       if (active.rows[0] || !["review", "visitor_review"].includes(run.rows[0].status)) {
         throw new HttpError(409, "Run is not ready for catalog recovery", "catalog_recovery_not_ready");
       }
-      if (retryableCount === 0) return { queued: false, state: "ready", retryableCount };
-      const prior = await client.query<{ count: number }>(
-        `SELECT count(*)::int count FROM job_queue WHERE run_id=$1 AND kind='matching'
-           AND payload_json->>'retryIncomplete'='true'`,
-        [runId],
-      );
-      const generation = Number(prior.rows[0]?.count ?? 0) + 1;
-      if (generation > 3) {
-        await settleCatalogRecoveryFailure(client, runId);
+      if (priorGenerationCount >= 3) {
+        await settleCatalogRecoveryFailure(client, runId, 3);
         return { queued: false, state: "ready", retryableCount: 0 };
       }
+      if (retryableCount === 0) return { queued: false, state: "ready", retryableCount };
+      const generation = priorGenerationCount + 1;
+      // Builds before bounded generations terminalized every failed recovery.
+      // Reopen those rows only while the run still has a recovery generation
+      // available. Normalize legacy malformed JSON at the same atomic boundary
+      // so the new job can never observe node-postgres' old `{}` encoding.
+      await client.query(
+        `UPDATE catalog_matches SET
+           alternatives_json=CASE WHEN jsonb_typeof(alternatives_json)='array'
+             THEN alternatives_json ELSE '[]'::jsonb END,
+           basis=$3
+         WHERE run_id=$1 AND status='review' AND song_json IS NULL AND basis=$2
+        `,
+        [runId, CATALOG_RECOVERY_UNRESOLVED_BASIS, RETRYABLE_CATALOG_MATCH_BASES[0]],
+      );
       await client.query(
         `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
          VALUES($1,$2,'matching',$3,$4,1)`,
@@ -2212,7 +2268,11 @@ export class Repository {
       for (const job of exhausted.rows) {
         const recoveryFailure = Boolean(job.run_id && job.kind === "matching" && isCatalogRecoveryJob(job.payload_json));
         if (recoveryFailure) {
-          await settleCatalogRecoveryFailure(client, job.run_id!);
+          await settleCatalogRecoveryFailure(
+            client,
+            job.run_id!,
+            catalogRecoveryGeneration(job.payload_json),
+          );
         } else if (job.run_id && ["research", "matching", "publication"].includes(job.kind)) {
           await client.query(
             `UPDATE research_runs SET status='failed',phase=$2,error=$3,
@@ -2332,12 +2392,27 @@ export class Repository {
   }
 
   async completeJob(jobId: string, workerId: string): Promise<void> {
-    const result = await this.pool.query(
-      `UPDATE job_queue SET status='complete',completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
-       WHERE id=$1 AND lease_owner=$2 AND status='leased'`,
-      [jobId, workerId],
-    );
-    if (!result.rowCount) throw new HttpError(409, "Job lease was lost", "job_lease_lost");
+    await this.transaction(async (client) => {
+      const current = await client.query<{
+        run_id: string | null;
+        kind: string;
+        payload_json: Record<string, unknown> | null;
+      }>(
+        "SELECT run_id,kind,payload_json FROM job_queue WHERE id=$1 AND lease_owner=$2 AND status='leased' FOR UPDATE",
+        [jobId, workerId],
+      );
+      if (!current.rows[0]) throw new HttpError(409, "Job lease was lost", "job_lease_lost");
+      const job = current.rows[0];
+      if (job.run_id && job.kind === "matching" && isCatalogRecoveryJob(job.payload_json)
+        && catalogRecoveryGeneration(job.payload_json) >= 3) {
+        await settleCatalogRecoveryFailure(client, job.run_id, 3);
+      }
+      await client.query(
+        `UPDATE job_queue SET status='complete',completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+         WHERE id=$1 AND lease_owner=$2 AND status='leased'`,
+        [jobId, workerId],
+      );
+    });
   }
 
   async failJob(jobId: string, workerId: string, error: string, retryAt: Date | null = null): Promise<void> {
@@ -2361,7 +2436,11 @@ export class Repository {
         && current.rows[0].kind === "matching"
         && isCatalogRecoveryJob(current.rows[0].payload_json);
       if (recoveryFailure) {
-        await settleCatalogRecoveryFailure(client, current.rows[0].run_id!);
+        await settleCatalogRecoveryFailure(
+          client,
+          current.rows[0].run_id!,
+          catalogRecoveryGeneration(current.rows[0].payload_json),
+        );
       } else if (!retry && current.rows[0].run_id && ["research", "matching", "publication"].includes(current.rows[0].kind)) {
         await client.query(
           `UPDATE research_runs SET status='failed',phase=$2,error=$3,completed_at=COALESCE(completed_at,now()),updated_at=now()

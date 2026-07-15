@@ -1579,6 +1579,103 @@ databaseDescribe("hosted backend integration", () => {
     }]);
   });
 
+  test("a failed first recovery remains retryable and queues generation two", async () => {
+    const runId = await repository.createRun("Retry recovery generation", brief, 0, 1);
+    await repository.addCandidates(runId, [{
+      artist: "Recovery Artist", title: "Retry Track", album: null, releaseYear: null,
+      durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveTimeoutMatches(runId, [candidate.id], RETRYABLE_CATALOG_MATCH_BASES[0]);
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+    await repository.queueCatalogRecovery(runId, "us");
+    const leased = await repository.pool.query<{ id: string }>(
+      `UPDATE job_queue SET status='leased',lease_owner='generation-one',attempts=max_attempts,
+         lease_expires_at=now()+interval '5 minutes'
+       WHERE run_id=$1 AND status='queued' AND payload_json->>'recoveryGeneration'='1' RETURNING id`,
+      [runId],
+    );
+    await repository.failJob(leased.rows[0]!.id, "generation-one", "catalog failure", null);
+
+    const afterFailure = await repository.listCatalogTracks(runId, 1, 200);
+    expect(afterFailure).toMatchObject({ retryableCount: 1, matchingComplete: false });
+    expect(afterFailure.items[0]).toMatchObject({ retryable: true, basis: RETRYABLE_CATALOG_MATCH_BASES[0] });
+    await expect(repository.queueCatalogRecovery(runId, "us")).resolves.toEqual({
+      queued: true, state: "queued", retryableCount: 1,
+    });
+    const generations = await repository.pool.query<{ generation: string; status: string }>(
+      `SELECT payload_json->>'recoveryGeneration' generation,status FROM job_queue
+       WHERE run_id=$1 AND payload_json->>'retryIncomplete'='true' ORDER BY created_at`,
+      [runId],
+    );
+    expect(generations.rows).toEqual([
+      { generation: "1", status: "failed" },
+      { generation: "2", status: "queued" },
+    ]);
+  });
+
+  test("reopens a prematurely terminalized generation-one row and normalizes its JSON", async () => {
+    const runId = await repository.createRun("Legacy terminal recovery", brief, 0, 1);
+    await repository.addCandidates(runId, [{
+      artist: "Recovery Artist", title: "Legacy Terminal Track", album: null, releaseYear: null,
+      durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveTimeoutMatches(runId, [candidate.id], RETRYABLE_CATALOG_MATCH_BASES[0]);
+    await repository.pool.query(
+      "UPDATE catalog_matches SET basis=$2,alternatives_json='{}'::jsonb WHERE run_id=$1",
+      [runId, CATALOG_RECOVERY_UNRESOLVED_BASIS],
+    );
+    const prior = await repository.enqueueJob({
+      kind: "matching", runId,
+      payload: { runId, storefront: "us", retryIncomplete: true, recoveryGeneration: 1 },
+      dedupeKey: `matching-recovery:${runId}:1`, maxAttempts: 1,
+    });
+    await repository.pool.query("UPDATE job_queue SET status='failed',completed_at=now() WHERE id=$1", [prior.id]);
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const before = await repository.listCatalogTracks(runId, 1, 200);
+    expect(before).toMatchObject({ retryableCount: 1, matchingComplete: false });
+    expect(before.items[0]).toMatchObject({ retryable: true, basis: CATALOG_RECOVERY_UNRESOLVED_BASIS });
+    await expect(repository.queueCatalogRecovery(runId, "us")).resolves.toMatchObject({ queued: true });
+    const reopened = await repository.pool.query<{ basis: string; kind: string }>(
+      "SELECT basis,jsonb_typeof(alternatives_json) kind FROM catalog_matches WHERE run_id=$1",
+      [runId],
+    );
+    expect(reopened.rows).toEqual([{ basis: RETRYABLE_CATALOG_MATCH_BASES[0], kind: "array" }]);
+  });
+
+  test("generation three terminalizes remaining catalog rows", async () => {
+    const runId = await repository.createRun("Terminal recovery generation", brief, 0, 1);
+    await repository.addCandidates(runId, [{
+      artist: "Recovery Artist", title: "Terminal Track", album: null, releaseYear: null,
+      durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveTimeoutMatches(runId, [candidate.id], RETRYABLE_CATALOG_MATCH_BASES[0]);
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    for (let generation = 1; generation <= 3; generation += 1) {
+      await repository.queueCatalogRecovery(runId, "us");
+      const leased = await repository.pool.query<{ id: string }>(
+        `UPDATE job_queue SET status='leased',lease_owner=$2,attempts=max_attempts,
+           lease_expires_at=now()+interval '5 minutes'
+         WHERE run_id=$1 AND status='queued' AND payload_json->>'recoveryGeneration'=$3 RETURNING id`,
+        [runId, `generation-${generation}`, String(generation)],
+      );
+      await repository.failJob(leased.rows[0]!.id, `generation-${generation}`, "catalog failure", null);
+    }
+    const terminal = await repository.listCatalogTracks(runId, 1, 200);
+    expect(terminal).toMatchObject({ retryableCount: 0, matchingComplete: true });
+    expect(terminal.items[0]).toMatchObject({
+      retryable: false,
+      basis: CATALOG_RECOVERY_UNRESOLVED_BASIS,
+    });
+    await expect(repository.queueCatalogRecovery(runId, "us")).resolves.toEqual({
+      queued: false, state: "ready", retryableCount: 0,
+    });
+  });
+
   test("does not queue recovery while the original matching job is still active", async () => {
     const runId = await repository.createRun("Concurrent catalog recovery", brief, 0, 1);
     await repository.addCandidates(runId, [{
@@ -1720,20 +1817,22 @@ databaseDescribe("hosted backend integration", () => {
       RETRYABLE_CATALOG_MATCH_BASES[0],
     );
     await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
-    await repository.queueCatalogRecovery(runId, "us");
-    const job = await repository.pool.query<{ id: string }>(
-      `UPDATE job_queue SET status='leased',lease_owner='recovery-test',attempts=max_attempts,
-         lease_expires_at=now()+interval '5 minutes'
-       WHERE run_id=$1 AND kind='matching' AND payload_json->>'retryIncomplete'='true'
-       RETURNING id`,
-      [runId],
-    );
-    await repository.failJob(
-      job.rows[0]!.id,
-      "recovery-test",
-      "Apple remained unavailable",
-      new Date(Date.now() + 1_000),
-    );
+    for (let generation = 1; generation <= 3; generation += 1) {
+      await repository.queueCatalogRecovery(runId, "us");
+      const job = await repository.pool.query<{ id: string }>(
+        `UPDATE job_queue SET status='leased',lease_owner=$2,attempts=max_attempts,
+           lease_expires_at=now()+interval '5 minutes'
+         WHERE run_id=$1 AND kind='matching' AND status='queued'
+           AND payload_json->>'recoveryGeneration'=$3 RETURNING id`,
+        [runId, `recovery-test-${generation}`, String(generation)],
+      );
+      await repository.failJob(
+        job.rows[0]!.id,
+        `recovery-test-${generation}`,
+        "Apple remained unavailable",
+        null,
+      );
+    }
 
     await expect(repository.getRun(runId)).resolves.toMatchObject({
       status: "visitor_review",
@@ -1750,6 +1849,7 @@ databaseDescribe("hosted backend integration", () => {
       status: "review",
       basis: CATALOG_RECOVERY_UNRESOLVED_BASIS,
       selectable: false,
+      retryable: false,
     });
     const manifest = await repository.finalizeCatalogSelection(runId, {
       useRecommended: true,

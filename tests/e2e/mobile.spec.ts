@@ -372,10 +372,12 @@ test("the whole list can be cleared, restored, and edited without reviewing trac
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   const generate = page.getByRole("button", { name: /generate playlist/i });
+  await expect(page.getByText("3 tracks matched. Omitted: 1 unavailable track.", { exact: true })).toBeVisible();
   await expect(page.getByText("2 OF 3 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
   const list = page.getByRole("list", { name: "Playlist tracks" });
   await expect(list.getByRole("listitem")).toHaveCount(4);
   await expect(page.getByRole("checkbox", { name: /unavailable track/i })).toBeDisabled();
+  await expect(page.getByText("UNAVAILABLE", { exact: true })).toBeVisible();
   await expect(page.getByRole("checkbox", { name: /previously excluded track/i })).not.toBeChecked();
   await expect(page.getByText("EXCLUDED", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "CLEAR", exact: true }).click();
@@ -470,12 +472,14 @@ test("a failed automatic Apple retry leaves the list available for a manual retr
           artist: "Artist",
           title: "Timed-out track",
           status: "review",
+          basis: "Apple catalog recovery could not resolve this track after retry attempts",
           catalogId: null,
           song: null,
           alternatives: [],
           evidenceEligible: true,
           selected: false,
           selectable: false,
+          retryable: true,
         }],
         page: 1,
         pageSize: 200,
@@ -506,11 +510,79 @@ test("a failed automatic Apple retry leaves the list available for a manual retr
   await page.goto("/#cap=one-time-secret&run=run-1");
   await expect(page.getByRole("alert")).toContainText("temporarily unavailable");
   await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
-  const retry = page.getByRole("button", { name: "RETRY 1 UNMATCHED TRACK" });
+  await expect(page.getByText("Apple Music matching is incomplete for 1 track. Retry matching before generating a playlist.", { exact: true })).toBeVisible();
+  await expect(page.getByText("NEEDS MATCH", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "SELECT ALL", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+  const retry = page.getByRole("button", { name: "Retry Apple Music matching for 1 track" });
   await expect(retry).toBeEnabled();
   await retry.click();
   await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
   expect(attempts).toBe(2);
+});
+
+test("terminal Apple matching failures are distinct from unavailable tracks and expose no inert controls", async ({ page }) => {
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
+  });
+  await page.route("**/api/v1/runs/run-1", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(/.*\/api\/v1\/runs\/run-1\/tracks.*/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          position: 0,
+          candidateId: "candidate-failed",
+          artist: "Artist",
+          title: "Matching failed",
+          status: "review",
+          basis: "Apple catalog recovery could not resolve this track after retry attempts",
+          catalogId: null,
+          song: null,
+          alternatives: [],
+          evidenceEligible: true,
+          selected: false,
+          selectable: false,
+        }, {
+          position: 1,
+          candidateId: "candidate-unavailable",
+          artist: "Artist",
+          title: "Unavailable recording",
+          status: "unavailable",
+          basis: "No compatible catalog result",
+          catalogId: null,
+          song: null,
+          alternatives: [],
+          evidenceEligible: true,
+          selected: false,
+          selectable: false,
+        }],
+        page: 1,
+        pageSize: 200,
+        total: 2,
+        totalPages: 1,
+        selectableCount: 0,
+        unmatchedCount: 2,
+        retryableCount: 0,
+        matchingComplete: true,
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-1");
+  await expect(page.getByText("Apple Music matching failed for 1 track. 1 track is unavailable.", { exact: true })).toBeVisible();
+  await expect(page.getByText("MATCH FAILED", { exact: true })).toBeVisible();
+  await expect(page.getByText("UNAVAILABLE", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "SELECT ALL", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "CLEAR", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /retry apple music matching/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
 });
 
 test("one Generate playlist action saves the list and starts Apple publication", async ({ page }) => {

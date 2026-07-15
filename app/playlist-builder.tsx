@@ -91,6 +91,7 @@ type SelectableTrack = {
   evidenceEligible: boolean;
   selected: boolean;
   selectable: boolean;
+  retryable?: boolean;
 };
 
 type TrackSelection = {
@@ -390,6 +391,35 @@ function recommendedByDefault(item: SelectableTrack): boolean {
   return item.selectable
     && Boolean(recommendedCatalogId(item))
     && (item.status === "accepted" || item.status === "review");
+}
+
+const RETRYABLE_APPLE_MATCH_BASES = new Set([
+  "Apple catalog lookup did not complete inside the absolute fast-run window",
+  "Apple catalog lookup did not complete inside the fast matching window",
+  "Apple catalog was temporarily unavailable during fast matching",
+]);
+
+const FAILED_APPLE_MATCH_BASIS =
+  "Apple catalog recovery could not resolve this track after retry attempts";
+
+type TrackReviewState = "matched" | "needs-match" | "match-failed" | "unavailable" | "excluded";
+
+function trackReviewLabel(state: TrackReviewState): string {
+  switch (state) {
+    case "needs-match": return "NEEDS MATCH";
+    case "match-failed": return "MATCH FAILED";
+    case "unavailable": return "UNAVAILABLE";
+    case "excluded": return "EXCLUDED";
+    default: return "MATCHED";
+  }
+}
+
+function trackCountLabel(count: number): string {
+  return `${count.toLocaleString()} track${count === 1 ? "" : "s"}`;
+}
+
+function unavailableTrackCountLabel(count: number): string {
+  return `${count.toLocaleString()} unavailable track${count === 1 ? "" : "s"}`;
 }
 
 function isAbortError(value: unknown): boolean {
@@ -852,7 +882,7 @@ function ReviewScreen(props: {
       <div className="flow-body review-body">
         <div className="screen-index">/ 04 SELECT TRACKS</div>
         <h1 id="review-title">SELECT TRACKS.</h1>
-        <p>Matched tracks are selected. Uncheck anything you do not want in the playlist.</p>
+        <p>Loading Apple Music matches.</p>
         <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING TRACKS</div>
       </div>
       <div className="step-footer review-footer">
@@ -897,6 +927,81 @@ function TrackSelectionScreen({
     () => selectable.filter((item) => selectedIds.has(item.candidateId)),
     [selectable, selectedIds],
   );
+
+  const retryableCandidateIds = useMemo(() => {
+    const explicit = selection.items.filter((item) => (
+      !item.selectable
+      && item.status === "review"
+      && (typeof item.retryable === "boolean"
+        ? item.retryable
+        : RETRYABLE_APPLE_MATCH_BASES.has(item.basis ?? ""))
+    ));
+    const ids = new Set(explicit.map((item) => item.candidateId));
+    let remaining = Math.max(0, selection.retryableCount - ids.size);
+    if (remaining === 0) return ids;
+
+    // Older API responses did not expose retryability per row. Use the page
+    // total to identify otherwise-unclassified review rows without treating a
+    // completed recovery failure as retryable.
+    for (const item of selection.items) {
+      if (remaining === 0) break;
+      if (item.selectable
+        || item.status !== "review"
+        || item.retryable === false
+        || (item.basis === FAILED_APPLE_MATCH_BASIS && item.retryable !== true)
+        || ids.has(item.candidateId)) continue;
+      ids.add(item.candidateId);
+      remaining -= 1;
+    }
+    return ids;
+  }, [selection]);
+
+  const reviewStateByCandidateId = useMemo(() => new Map(
+    selection.items.map((item): [string, TrackReviewState] => {
+      if (item.selectable && Boolean(recommendedCatalogId(item))) {
+        return [item.candidateId, item.status === "rejected" ? "excluded" : "matched"];
+      }
+      if (retryableCandidateIds.has(item.candidateId)) return [item.candidateId, "needs-match"];
+      if (item.status === "unavailable") return [item.candidateId, "unavailable"];
+      if (item.basis === FAILED_APPLE_MATCH_BASIS || ["review", "pending"].includes(item.status)) {
+        return [item.candidateId, "match-failed"];
+      }
+      return [item.candidateId, "excluded"];
+    }),
+  ), [selection.items, retryableCandidateIds]);
+
+  const needsMatchCount = [...reviewStateByCandidateId.values()].filter((state) => state === "needs-match").length;
+  const matchFailedCount = [...reviewStateByCandidateId.values()].filter((state) => state === "match-failed").length;
+  const unavailableCount = [...reviewStateByCandidateId.values()].filter((state) => state === "unavailable").length;
+
+  let reviewSummary: string;
+  if (selection.items.length === 0) {
+    reviewSummary = "No tracks are available to generate.";
+  } else if (needsMatchCount > 0) {
+    const unavailableNote = unavailableCount > 0
+      ? `; ${unavailableTrackCountLabel(unavailableCount)} will be omitted`
+      : "";
+    reviewSummary = selectable.length > 0
+      ? `${trackCountLabel(selectable.length)} matched. Retry matching for ${trackCountLabel(needsMatchCount)}, or generate the matched tracks now${unavailableNote}.`
+      : `Apple Music matching is incomplete for ${trackCountLabel(needsMatchCount)}. Retry matching${unavailableNote || " before generating a playlist"}.`;
+  } else if (selectable.length === 0 && matchFailedCount > 0) {
+    const unavailableNote = unavailableCount > 0
+      ? ` ${trackCountLabel(unavailableCount)} ${unavailableCount === 1 ? "is" : "are"} unavailable.`
+      : " No playlist can be generated yet.";
+    reviewSummary = `Apple Music matching failed for ${trackCountLabel(matchFailedCount)}.${unavailableNote}`;
+  } else if (selectable.length === 0) {
+    reviewSummary = unavailableCount > 0
+      ? `No tracks matched Apple Music. ${trackCountLabel(unavailableCount)} ${unavailableCount === 1 ? "is" : "are"} unavailable.`
+      : "No tracks can be included in this playlist.";
+  } else if (matchFailedCount > 0 || unavailableCount > 0) {
+    const omissions = [
+      matchFailedCount > 0 ? `${trackCountLabel(matchFailedCount)} failed matching` : "",
+      unavailableCount > 0 ? unavailableTrackCountLabel(unavailableCount) : "",
+    ].filter(Boolean).join("; ");
+    reviewSummary = `${trackCountLabel(selectable.length)} matched. Omitted: ${omissions}.`;
+  } else {
+    reviewSummary = `${trackCountLabel(selectable.length)} matched. Uncheck any you do not want.`;
+  }
 
   function setAll(checked: boolean) {
     setSelectedIds(checked ? new Set(selectable.map((item) => item.candidateId)) : new Set());
@@ -943,19 +1048,25 @@ function TrackSelectionScreen({
       <div className="flow-body review-body">
         <div className="screen-index">/ 04 SELECT TRACKS</div>
         <h1 id="review-title">SELECT TRACKS.</h1>
-        <p>Matched tracks are selected. Uncheck anything you do not want in the playlist.</p>
+        <p aria-live="polite">{reviewSummary}</p>
 
             <div className="selection-toolbar" role="group" aria-label="Track selection controls">
               <span>{selected.length.toLocaleString()} OF {selectable.length.toLocaleString()} MATCHED TRACKS SELECTED</span>
               <div>
-                <button type="button" onClick={() => setAll(true)} disabled={allSelected || Boolean(busy)}>SELECT ALL</button>
+                <button type="button" onClick={() => setAll(true)} disabled={selectable.length === 0 || allSelected || Boolean(busy)}>SELECT ALL</button>
                 <button type="button" onClick={() => setAll(false)} disabled={selected.length === 0 || Boolean(busy)}>CLEAR</button>
               </div>
             </div>
 
-            {selection.retryableCount > 0 && (
-              <button className="matching-retry" type="button" onClick={onRetry} disabled={Boolean(busy)}>
-                {busy === "matching" ? "RETRYING APPLE MATCHES..." : `RETRY ${selection.retryableCount.toLocaleString()} UNMATCHED TRACK${selection.retryableCount === 1 ? "" : "S"}`}
+            {needsMatchCount > 0 && (
+              <button
+                className="matching-retry"
+                type="button"
+                onClick={onRetry}
+                disabled={Boolean(busy)}
+                aria-label={`Retry Apple Music matching for ${trackCountLabel(needsMatchCount)}`}
+              >
+                {busy === "matching" ? "RETRYING APPLE MUSIC..." : `RETRY MATCHING · ${needsMatchCount.toLocaleString()} →`}
               </button>
             )}
 
@@ -964,6 +1075,8 @@ function TrackSelectionScreen({
                 const choices = trackChoices(item);
                 const checked = selectedIds.has(item.candidateId);
                 const disabled = !item.selectable || choices.length === 0;
+                const reviewState = reviewStateByCandidateId.get(item.candidateId) ?? "unavailable";
+                const displayedState = reviewState === "excluded" && checked ? "matched" : reviewState;
                 return (
                   <li className={`track-selection-row${disabled ? " unavailable" : ""}`} key={item.candidateId}>
                     <label>
@@ -980,7 +1093,7 @@ function TrackSelectionScreen({
                         <small>{item.artist}{item.album ? " / " + item.album : ""}</small>
                       </span>
                       <span className="track-match-state">
-                        {disabled ? "NOT FOUND" : item.status === "rejected" ? "EXCLUDED" : "MATCHED"}
+                        {trackReviewLabel(displayedState)}
                       </span>
                     </label>
                     {item.selectable && choices.length > 1 && (
