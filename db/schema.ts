@@ -5,6 +5,7 @@ import {
   jsonb,
   numeric,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -90,6 +91,17 @@ export const runAccesses = pgTable("run_accesses", {
 }, (table) => [
   uniqueIndex("run_access_bucket_idempotency_idx").on(table.clientBucket, table.idempotencyKey),
   index("run_access_run_idx").on(table.runId),
+]);
+
+export const capabilitySessionAccesses = pgTable("capability_session_accesses", {
+  sessionId: uuid("session_id").notNull().references(() => capabilitySessions.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  accessId: uuid("access_id").notNull().references(() => runAccesses.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.sessionId, table.accessId], name: "capability_session_accesses_pkey" }),
+  index("capability_session_access_created_idx").on(table.sessionId, table.createdAt),
+  index("capability_session_access_access_idx").on(table.accessId),
 ]);
 
 export const capabilityTokens = pgTable("capability_tokens", {

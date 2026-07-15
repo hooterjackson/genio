@@ -16,7 +16,7 @@ export default function PrivacyPage() {
         <div className="privacy-grid">
           <article>
             <h2>RUN DATA</h2>
-            <p>We process your prompt, interpreted scope, research evidence, review decisions, and playlist result. A private capability cookie restores the run; visitors do not provide emails or create accounts.</p>
+            <p>We process your prompt, scope, research evidence, review decisions, and playlist result. A private browser cookie keeps your jobs available on this device; visitors do not provide emails or create accounts.</p>
           </article>
           <article>
             <h2>ABUSE CONTROL</h2>

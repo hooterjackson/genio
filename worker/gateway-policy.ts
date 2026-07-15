@@ -11,6 +11,7 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "POST", path: /^\/api\/v1\/capabilities\/exchange$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/capabilities\/transfer$/ },
   { method: "POST", path: /^\/api\/v1\/runs$/ },
+  { method: "GET", path: /^\/api\/v1\/runs$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
   { method: "DELETE", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/exceptions$/ },

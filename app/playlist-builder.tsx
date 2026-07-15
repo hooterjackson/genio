@@ -56,6 +56,8 @@ type ResearchRun = {
   sourceCount: number;
   unresolvedCount: number;
   frontier: FrontierItem[];
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 type CatalogSong = {
@@ -422,16 +424,16 @@ async function copyText(value: string): Promise<void> {
 }
 
 function phaseMessage(run: ResearchRun): string {
-  if (run.status === "awaiting_budget") return "Research is paused while the owner reviews the next spending window.";
-  if (run.status === "waiting_for_apple_authorization") return "The manifest is safe; publication resumes after the owner reconnects Apple Music.";
-  if (run.status === "failed") return run.error || "The run stopped before completion.";
+  if (run.status === "awaiting_budget") return "Paused for owner budget approval.";
+  if (run.status === "waiting_for_apple_authorization") return "Paused until the owner reconnects Apple Music.";
+  if (run.status === "failed") return run.error || "Research failed.";
   if (run.status === "queued") return run.brief.mode === "curated"
-    ? "Fast research is queued inside the under-two-minute run window."
-    : "Deep research is queued and will begin when a research slot opens.";
-  if (run.status === "publishing") return "Needle is publishing the locked manifest in ordered, reconciled Apple Music batches.";
-  if (run.brief.mode === "curated" && run.phase === "fast_research") return "Fast mode is building a cited editorial selection inside a fixed research window.";
-  if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) return "Research is complete. Needle is matching the cited tracks to Apple Music in parallel.";
-  return "Needle is tracing sources, verifying recordings, and preserving every unresolved gap.";
+    ? "Waiting to start. The two-minute target includes queue time."
+    : "Waiting for an available research slot.";
+  if (run.status === "publishing") return "Publishing the approved tracks to Apple Music.";
+  if (run.brief.mode === "curated" && run.phase === "fast_research") return "Finding and verifying cited tracks.";
+  if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) return "Matching verified tracks to Apple Music.";
+  return "Searching sources and verifying recordings.";
 }
 
 function useRunPolling(
@@ -483,36 +485,33 @@ function useRunPolling(
 
 function AppHeader({
   step,
-  hasRun,
   transferState,
   onTransfer,
-  onReset,
+  onHome,
+  onNew,
+  onJobs,
 }: {
-  step: number;
-  hasRun?: boolean;
+  step?: number;
   transferState?: string;
   onTransfer?: () => void;
-  onReset: () => void;
+  onHome: () => void;
+  onNew?: () => void;
+  onJobs?: () => void;
 }) {
   return (
     <header className="site-header">
-      {hasRun ? (
-        <span className="wordmark" aria-label="Needle">
-          <span aria-hidden="true">[N]</span> NEEDLE_
-        </span>
-      ) : (
-        <button className="wordmark" onClick={onReset} aria-label="Needle home">
-          <span aria-hidden="true">[N]</span> NEEDLE_
-        </button>
-      )}
+      <button className="wordmark" onClick={onHome} aria-label="Needle home">
+        <span aria-hidden="true">[N]</span> NEEDLE_
+      </button>
       <div className="header-meta">
-        {hasRun && onTransfer && (
+        {onNew && <button className="header-action" onClick={onNew}>NEW JOB</button>}
+        {onJobs && <button className="header-action" onClick={onJobs}>JOBS</button>}
+        {onTransfer && (
           <button className="transfer-button" onClick={onTransfer} disabled={transferState === "busy"}>
-            {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "TRANSFER RUN"}
+            {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
           </button>
         )}
-        <span aria-label={"Step " + step + " of 6"}>{String(step).padStart(2, "0")}/06</span>
-        <a href="/owner">OWNER</a>
+        {step != null && <span aria-label={"Step " + step + " of 6"}>{String(step).padStart(2, "0")}/06</span>}
       </div>
     </header>
   );
@@ -529,7 +528,15 @@ function ErrorBar({ message, onDismiss }: { message: string; onDismiss: () => vo
   );
 }
 
-function IntroScreen({ stage, onContinue }: { stage: "reveal" | "landing"; onContinue: () => void }) {
+function IntroScreen({
+  stage,
+  onContinue,
+  onJobs,
+}: {
+  stage: "reveal" | "landing";
+  onContinue: () => void;
+  onJobs: () => void;
+}) {
   if (stage === "reveal") {
     return (
       <section className="intro-screen intro-reveal" aria-label="Needle loading">
@@ -547,17 +554,63 @@ function IntroScreen({ stage, onContinue }: { stage: "reveal" | "landing"; onCon
     <section className="intro-screen intro-landing" aria-labelledby="intro-title">
       <div className="intro-mark">
         <span aria-hidden="true">[N] NEEDLE_</span>
-        <a href="/privacy">PRIVACY</a>
+        <div className="intro-links">
+          <button onClick={onJobs}>JOBS</button>
+          <a href="/privacy">PRIVACY</a>
+        </div>
       </div>
       <div className="intro-copy">
-        <div className="screen-index">/ DEEP PLAYLIST RESEARCH</div>
-        <h1 id="intro-title">GO PAST<br />THE FIRST 25.</h1>
-        <p>Apple Music’s Playlist Playground makes a quick mix. Needle follows the sources and builds the deeper playlist.</p>
+        <div className="screen-index">/ PLAYLIST RESEARCH</div>
+        <h1 id="intro-title">RESEARCH A<br />PLAYLIST.</h1>
+        <p>Enter a request. Needle finds cited tracks, matches them to Apple Music, and publishes a shareable playlist.</p>
       </div>
       <div className="step-footer intro-footer">
         <button className="action-button step-primary" onClick={onContinue}>
-          RESEARCH A PLAYLIST →
+          NEW PLAYLIST →
         </button>
+      </div>
+    </section>
+  );
+}
+
+function JobsScreen({
+  jobs,
+  loading,
+  onBack,
+  onNew,
+  onOpen,
+}: {
+  jobs: ResearchRun[];
+  loading: boolean;
+  onBack: () => void;
+  onNew: () => void;
+  onOpen: (runId: string) => void;
+}) {
+  return (
+    <section className="screen flow-screen jobs-screen" aria-labelledby="jobs-title">
+      <div className="flow-body jobs-body">
+        <button className="flow-back" type="button" onClick={onBack}>← HOME</button>
+        <div className="screen-index">/ JOBS</div>
+        <h1 id="jobs-title">JOBS</h1>
+        <p>Open any job available to this browser.</p>
+
+        {loading && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING JOBS</div>}
+        {!loading && jobs.length === 0 && <div className="jobs-empty">NO JOBS FOUND</div>}
+        {!loading && jobs.length > 0 && (
+          <div className="jobs-list">
+            {jobs.map((job) => (
+              <button key={job.id} onClick={() => onOpen(job.id)}>
+                <span className="job-status">{statusLabel(job.status).toUpperCase()}</span>
+                <strong>{job.brief.title}</strong>
+                <small>{job.candidateCount.toLocaleString()} tracks · {job.brief.mode}</small>
+                <span className="job-open">OPEN →</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="step-footer">
+        <button className="action-button step-primary" onClick={onNew}>NEW JOB →</button>
       </div>
     </section>
   );
@@ -586,11 +639,11 @@ function PromptScreen({
       <div className="flow-body">
         <button className="flow-back" type="button" onClick={onBack}>← BACK</button>
         <div className="screen-index">/ 01 REQUEST</div>
-        <h1 id="prompt-title">WHAT SHOULD<br />NEEDLE BUILD?</h1>
-        <p>Describe the playlist in plain language.</p>
+        <h1 id="prompt-title">ENTER A<br />REQUEST.</h1>
+        <p>Describe the tracks you want included.</p>
 
         <form className="command-form prompt-form" onSubmit={submit}>
-        <label htmlFor="playlist-request">&gt; PLAYLIST REQUEST</label>
+        <label htmlFor="playlist-request">&gt; REQUEST</label>
         <div className="command-line">
           <span aria-hidden="true">$</span>
           <textarea
@@ -628,7 +681,7 @@ function PromptScreen({
           onClick={onSubmit}
           disabled={busy || prompt.trim().length < 4}
         >
-          {busy ? "INTERPRETING..." : "CONTINUE →"}
+          {busy ? "CHECKING REQUEST..." : "REVIEW REQUEST →"}
         </button>
       </div>
     </section>
@@ -660,21 +713,21 @@ function BriefScreen({
     <section className="screen flow-screen scope-screen" aria-labelledby="brief-title">
       <div className="flow-body">
         <button className="flow-back" type="button" onClick={onBack}>← EDIT REQUEST</button>
-        <div className="screen-index">/ 02 CHECK THE SCOPE</div>
-        <span className="tag profile-tag">[{isFast ? "FAST · <2 MIN TARGET" : "DEEP · SOURCE FRONTIER"}]</span>
+        <div className="screen-index">/ 02 REVIEW</div>
+        <span className="tag profile-tag">[{isFast ? "CURATED · UNDER 2 MIN TARGET" : "EXHAUSTIVE · LONGER RUN"}]</span>
         <h1 id="brief-title">{brief.title}</h1>
         <p>{brief.description}</p>
         <p className="profile-note">{isFast
-          ? "Cited editorial selection; partial results stay visible if the time box closes."
-          : "Source-bounded completeness attempt; unresolved evidence stays visible."}</p>
+          ? "Returns a cited selection within a two-minute target. Partial results remain available if time expires."
+          : "Searches the configured sources for all documented matches and reports unresolved gaps."}</p>
 
         <div className="scope-snapshot" aria-label="Research scope summary">
-          <div><span>TARGET</span><strong>{brief.targetSize ? brief.targetSize.min + "–" + brief.targetSize.max + " tracks" : "Source-bounded"}</strong></div>
+          <div><span>TARGET</span><strong>{brief.targetSize ? brief.targetSize.min + "–" + brief.targetSize.max + " tracks" : "All documented tracks"}</strong></div>
           <div><span>EVIDENCE</span><strong>{brief.evidencePolicy}</strong></div>
         </div>
 
         <details className="terminal-details scope-details">
-          <summary>REVIEW FULL SCOPE</summary>
+          <summary>FULL SCOPE</summary>
           <dl>
             <div><dt>SUBJECT</dt><dd>{brief.subjectEntities.join(", ") || "—"}</dd></div>
             <div><dt>RELATIONSHIP</dt><dd>{brief.relationship}</dd></div>
@@ -695,7 +748,7 @@ function BriefScreen({
                 checked={ambiguitiesAccepted}
                 onChange={(event) => onAmbiguitiesAccepted(event.target.checked)}
               />
-              <span>I ACCEPT THIS SCOPE.</span>
+              <span>I ACCEPT THESE ASSUMPTIONS.</span>
             </label>
           </div>
         )}
@@ -718,24 +771,24 @@ function BriefScreen({
           onClick={onStart}
           disabled={busy || (needsAmbiguityAcceptance && !ambiguitiesAccepted)}
         >
-          {busy ? "QUEUING..." : isFast ? "START FAST RESEARCH →" : "START DEEP RESEARCH →"}
+          {busy ? "STARTING..." : "START RESEARCH →"}
         </button>
       </div>
     </section>
   );
 }
 
-function RunScreen({ run, onReset }: { run: ResearchRun; onReset: () => void }) {
+function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   const progress = progressByPhase[run.phase] ?? (run.status === "queued" ? 4 : 12);
   const showReset = terminalStatuses.has(run.status);
-  const profile = run.brief.mode === "curated" ? "FAST" : "DEEP";
+  const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
 
   return (
     <section className="screen flow-screen research-screen" aria-labelledby="run-title">
       <div className="flow-body research-body">
         <div className="screen-index">/ 03 RESEARCH</div>
         <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
-        <h1 id="run-title">FOLLOWING<br />THE SOURCES.</h1>
+        <h1 id="run-title">RESEARCH IN<br />PROGRESS.</h1>
         <p className="run-subject">{run.brief.title}</p>
         <p className="research-status" role="status">{phaseMessage(run)}</p>
         <div className="progress research-progress" aria-label={"Research " + progress + "% complete"}>
@@ -746,7 +799,7 @@ function RunScreen({ run, onReset }: { run: ResearchRun; onReset: () => void }) 
 
       {showReset && (
         <div className="step-footer">
-          <button className="action-button step-primary" onClick={onReset}>NEW REQUEST →</button>
+          <button className="action-button step-primary" onClick={onNew}>NEW JOB →</button>
         </div>
       )}
     </section>
@@ -784,13 +837,13 @@ function ReviewScreen({
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ 04 CHECK EXCEPTIONS</div>
+        <div className="screen-index">/ 04 REVIEW MATCHES</div>
         {!page && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING EXCEPTIONS</div>}
         {page && !active && (
           <div className="review-complete">
-            <span className="tag">[NO EXCEPTIONS]</span>
-            <h1 id="review-title">READY TO<br />LOCK.</h1>
-            <p>Every discovered candidate now has an explicit outcome.</p>
+            <span className="tag">[NO REVIEW REQUIRED]</span>
+            <h1 id="review-title">TRACKS<br />READY.</h1>
+            <p>Every candidate has a recorded outcome.</p>
           </div>
         )}
         {active && (
@@ -826,11 +879,11 @@ function ReviewScreen({
       <div className="step-footer review-footer">
         {unresolved > 0 ? (
           <button className="quiet-button" onClick={() => onManifest(true)} disabled={!page || Boolean(busy)}>
-            SKIP {unresolved} OPEN + PUBLISH VERIFIED
+            USE VERIFIED TRACKS · SKIP {unresolved}
           </button>
         ) : (
           <button className="action-button step-primary" onClick={() => onManifest(false)} disabled={!page || Boolean(busy)}>
-            {busy === "manifest" ? "LOCKING..." : "LOCK PLAYLIST →"}
+            {busy === "manifest" ? "PREPARING..." : "PREPARE PLAYLIST →"}
           </button>
         )}
       </div>
@@ -859,15 +912,15 @@ function ManifestScreen({
       <div className="flow-body">
         <div className="screen-index">/ 05 PUBLISH</div>
         <span className="tag">[{volumeCount} {volumeCount === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />LOCKED.</h1>
+        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />READY.</h1>
         <p>{waitingForApple
-          ? "The manifest is safe; publication resumes after the owner reconnects Apple Music."
+          ? "Publication will resume after the owner reconnects Apple Music."
           : publishing
-            ? "Needle is publishing the ordered playlist now."
-            : "Research is locked. Apple Music will receive exactly this ordered manifest."}</p>
+            ? "Publishing the playlist to Apple Music."
+            : "Review is complete. Publishing will use this exact track order."}</p>
 
         <details className="terminal-details manifest-details">
-          <summary>PREVIEW LOCKED MANIFEST</summary>
+          <summary>PREVIEW TRACK LIST</summary>
           {manifest.tracks.length > 0 ? (
             <ol className="manifest-list">
               {manifest.tracks.slice(0, 8).map((track, index) => (
@@ -880,7 +933,7 @@ function ManifestScreen({
               {trackCount > 8 && <li className="manifest-more">… +{trackCount - 8} TRACKS</li>}
             </ol>
           ) : (
-            <div className="empty-state">[ORDERED MANIFEST LOCKED ON SERVER]</div>
+            <div className="empty-state">[TRACK LIST SAVED]</div>
           )}
           {manifest.contentHash && <code className="manifest-hash">SHA256/{manifest.contentHash.slice(0, 20)}…</code>}
         </details>
@@ -892,7 +945,7 @@ function ManifestScreen({
             ? "WAITING FOR APPLE AUTHORIZATION"
             : publishing || busy
               ? "PUBLICATION IN PROGRESS..."
-              : "PUBLISH TO APPLE MUSIC →"}
+              : "PUBLISH PLAYLIST →"}
         </button>
       </div>
     </section>
@@ -915,8 +968,8 @@ function ResultScreen({
       <div className="flow-body">
         <div className="screen-index">/ 06 RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="result-title">{result.status === "partial" ? "PUBLISHED<br />WITH GAPS." : "PUBLISHED."}</h1>
-        <p>{result.coverageSummary || "The Apple Music links and source-bounded coverage report are ready."}</p>
+        <h1 id="result-title">{result.status === "partial" ? "PLAYLIST PUBLISHED<br />WITH GAPS." : "PLAYLIST<br />PUBLISHED."}</h1>
+        <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
         <small className="result-note">Share-link access is public; Apple search, profile visibility, and regional availability are not guaranteed.</small>
 
         <div className="volume-list">
@@ -944,7 +997,7 @@ function ResultScreen({
       </div>
 
       <div className="step-footer result-actions">
-        <button className="quiet-button" onClick={onReset}>← NEW REQUEST</button>
+        <button className="quiet-button" onClick={onReset}>← NEW JOB</button>
         {result.evidenceUrl && <a className="quiet-link" href={result.evidenceUrl} target="_blank" rel="noreferrer">VIEW EVIDENCE ↗</a>}
         <button className="text-danger" onClick={onDelete}>DELETE RUN DATA</button>
       </div>
@@ -953,7 +1006,7 @@ function ResultScreen({
 }
 
 export function PlaylistBuilder() {
-  const [entryStage, setEntryStage] = useState<"reveal" | "landing" | "prompt">("reveal");
+  const [entryStage, setEntryStage] = useState<"reveal" | "landing" | "prompt" | "jobs">("reveal");
   const [prompt, setPrompt] = useState("");
   const [brief, setBrief] = useState<PlaylistBrief | null>(null);
   const [briefRequestId, setBriefRequestId] = useState<string | null>(null);
@@ -973,13 +1026,16 @@ export function PlaylistBuilder() {
   const [error, setError] = useState("");
   const [restoring, setRestoring] = useState(true);
   const [transferState, setTransferState] = useState("");
+  const [jobs, setJobs] = useState<ResearchRun[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const activeRunId = useRef<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
   const briefIdempotencyKey = useRef<string | null>(null);
   const publishingRef = useRef(false);
   const reviewingRef = useRef(false);
 
-  const reset = useCallback(() => {
-    setEntryStage("landing");
+  const clearCurrent = useCallback((nextStage: "landing" | "prompt" | "jobs") => {
+    setEntryStage(nextStage);
     setPrompt("");
     setBrief(null);
     setBriefRequestId(null);
@@ -987,6 +1043,7 @@ export function PlaylistBuilder() {
     setAmbiguitiesAccepted(false);
     setCached(false);
     setRun(null);
+    activeRunId.current = null;
     setExceptionPage(null);
     setManifest(null);
     setResult(null);
@@ -1000,7 +1057,11 @@ export function PlaylistBuilder() {
     window.history.replaceState(null, "", window.location.pathname);
   }, []);
 
+  const reset = useCallback(() => clearCurrent("landing"), [clearCurrent]);
+  const newJob = useCallback(() => clearCurrent("prompt"), [clearCurrent]);
+
   const updateRun = useCallback((next: ResearchRun) => {
+    if (activeRunId.current !== next.id) return;
     setRun(next);
     if (next.status === "failed" && next.error) setError(next.error);
   }, []);
@@ -1008,11 +1069,44 @@ export function PlaylistBuilder() {
   useRunPolling(run?.id ?? null, run?.status ?? null, updateRun, setError);
 
   const loadRun = useCallback(async (runId: string) => {
+    activeRunId.current = runId;
     const next = unwrapRun(await api<ResearchRun | RunResponse>("/api/v1/runs/" + encodeURIComponent(runId)));
+    if (activeRunId.current !== runId) return;
+    activeRunId.current = next.id;
     setRun(next);
     setBrief(next.brief);
     setPrompt(next.prompt);
   }, []);
+
+  const openJobs = useCallback(async () => {
+    clearCurrent("jobs");
+    setJobsLoading(true);
+    try {
+      const payload = await api<{ items?: ResearchRun[] }>("/api/v1/runs");
+      setJobs(Array.isArray(payload.items) ? payload.items : []);
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.status === 401) setJobs([]);
+      else setError((caught as Error).message);
+    } finally {
+      setJobsLoading(false);
+    }
+  }, [clearCurrent]);
+
+  const openJob = useCallback(async (runId: string) => {
+    clearCurrent("landing");
+    setBusy("open-job");
+    try {
+      const query = new URLSearchParams();
+      query.set("run", runId);
+      window.history.replaceState(null, "", window.location.pathname + "?" + query.toString());
+      await loadRun(runId);
+    } catch (caught) {
+      setError((caught as Error).message);
+      setEntryStage("jobs");
+    } finally {
+      setBusy("");
+    }
+  }, [clearCurrent, loadRun]);
 
   const exchangeCapability = useCallback(async (token: string, hintedRunId?: string | null) => {
     const payload = await api<JsonObject>("/api/v1/capabilities/exchange", {
@@ -1099,7 +1193,7 @@ export function PlaylistBuilder() {
       try {
         const payload = await api<unknown>("/api/v1/runs/" + encodeURIComponent(run.id) + "/result");
         const storedManifest = manifestFromResult(payload, run.id);
-        if (!storedManifest) throw new Error("The locked manifest could not be restored.");
+        if (!storedManifest) throw new Error("The playlist details could not be restored.");
         setManifest(storedManifest);
       } catch (caught) {
         setError((caught as Error).message);
@@ -1320,7 +1414,10 @@ export function PlaylistBuilder() {
   if (restoring) {
     return (
       <main className="app-shell">
-        <AppHeader step={1} onReset={reset} />
+        <AppHeader
+          step={1}
+          onHome={reset}
+        />
         <section className="screen restore-screen" role="status">
           <span className="cursor" aria-hidden="true">▋</span>RESTORING RUN
         </section>
@@ -1328,11 +1425,35 @@ export function PlaylistBuilder() {
     );
   }
 
-  if (!brief && !run && !manifest && !result && entryStage !== "prompt") {
+  if (!brief && !run && !manifest && !result && (entryStage === "reveal" || entryStage === "landing")) {
     return (
       <main className="app-shell entry-shell">
         <ErrorBar message={error} onDismiss={() => setError("")} />
-        <IntroScreen stage={entryStage} onContinue={() => setEntryStage("prompt")} />
+        <IntroScreen
+          stage={entryStage}
+          onContinue={newJob}
+          onJobs={() => void openJobs()}
+        />
+      </main>
+    );
+  }
+
+  if (!brief && !run && !manifest && !result && entryStage === "jobs") {
+    return (
+      <main className="app-shell">
+        <AppHeader
+          onHome={reset}
+          onNew={newJob}
+          onJobs={() => void openJobs()}
+        />
+        <ErrorBar message={error} onDismiss={() => setError("")} />
+        <JobsScreen
+          jobs={jobs}
+          loading={jobsLoading}
+          onBack={reset}
+          onNew={newJob}
+          onOpen={(runId) => void openJob(runId)}
+        />
       </main>
     );
   }
@@ -1342,10 +1463,11 @@ export function PlaylistBuilder() {
       {(brief || run || manifest || result) && (
         <AppHeader
           step={step}
-          hasRun={Boolean(run)}
           transferState={transferState}
-          onTransfer={transferRun}
-          onReset={reset}
+          onTransfer={run ? transferRun : undefined}
+          onHome={reset}
+          onNew={newJob}
+          onJobs={() => void openJobs()}
         />
       )}
       <ErrorBar message={error} onDismiss={() => setError("")} />
@@ -1358,7 +1480,7 @@ export function PlaylistBuilder() {
             setPrompt(value);
             briefIdempotencyKey.current = null;
           }}
-          onBack={() => setEntryStage("landing")}
+          onBack={reset}
           onSubmit={interpret}
         />
       )}
@@ -1393,7 +1515,7 @@ export function PlaylistBuilder() {
       )}
 
       {run && !reviewStatuses.has(run.status) && !manifest && !result && (
-        <RunScreen run={run} onReset={reset} />
+        <RunScreen run={run} onNew={newJob} />
       )}
 
       {manifest && !result && (
@@ -1405,7 +1527,7 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {result && <ResultScreen result={result} onReset={reset} onDelete={deleteRun} />}
+      {result && <ResultScreen result={result} onReset={newJob} onDelete={deleteRun} />}
     </main>
   );
 }

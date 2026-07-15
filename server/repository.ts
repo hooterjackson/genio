@@ -81,6 +81,19 @@ export interface JobView {
   leaseExpiresAt: Date | null;
 }
 
+export interface ResearchRunHistoryItem {
+  id: string;
+  prompt: string;
+  brief: PlaylistBrief;
+  status: string;
+  phase: string;
+  candidateCount: number;
+  sourceCount: number;
+  unresolvedCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface PublicationVolumeInput {
   manifestId: string;
   volumeNumber: number;
@@ -345,6 +358,29 @@ export class Repository {
     );
   }
 
+  private async attachCapabilitySessionAccess(
+    client: PoolClient,
+    sessionId: string,
+    runId: string,
+    accessId: string,
+  ): Promise<void> {
+    const attached = await client.query(
+      `INSERT INTO capability_session_accesses(session_id,run_id,access_id)
+       SELECT s.id,a.run_id,a.id
+       FROM capability_sessions s
+       JOIN run_accesses a ON a.id=$3 AND a.run_id=$2
+       JOIN research_runs r ON r.id=a.run_id AND r.deleted_at IS NULL
+       WHERE s.id=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+         AND a.deleted_at IS NULL AND a.expires_at>now()
+       ON CONFLICT(session_id,access_id) DO UPDATE SET run_id=EXCLUDED.run_id
+       RETURNING access_id`,
+      [sessionId, runId, accessId],
+    );
+    if (!attached.rows[0]) {
+      throw new HttpError(401, "Session has expired", "capability_required");
+    }
+  }
+
   async createRunIdempotent(input: {
     prompt: string;
     brief: PlaylistBrief;
@@ -356,6 +392,7 @@ export class Repository {
     reuseDays?: number;
     rateLimit?: number;
     globalLimit?: number;
+    capabilitySessionId?: string;
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
@@ -372,13 +409,23 @@ export class Repository {
          WHERE a.client_bucket=ANY($1::text[]) AND a.idempotency_key=$2 AND a.deleted_at IS NULL ORDER BY a.created_at DESC LIMIT 1`,
         [input.clientBucketAliases, input.idempotencyKey],
       );
-      if (existing.rows[0]) return {
-        runId: existing.rows[0].run_id,
-        accessId: existing.rows[0].access_id,
-        status: existing.rows[0].status,
-        created: false,
-        reused: false,
-      };
+      if (existing.rows[0]) {
+        if (input.capabilitySessionId) {
+          await this.attachCapabilitySessionAccess(
+            client,
+            input.capabilitySessionId,
+            existing.rows[0].run_id,
+            existing.rows[0].access_id,
+          );
+        }
+        return {
+          runId: existing.rows[0].run_id,
+          accessId: existing.rows[0].access_id,
+          status: existing.rows[0].status,
+          created: false,
+          reused: false,
+        };
+      }
 
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:run:${input.clientBucketAliases.join(":")}`]);
       const rate = await client.query<{ count: number }>(
@@ -446,6 +493,9 @@ export class Repository {
          VALUES($1,$2,$3,$4,$5,now()+interval '90 days')`,
         [accessId, runId, input.prompt.slice(0, 2_000), input.clientBucket, input.idempotencyKey],
       );
+      if (input.capabilitySessionId) {
+        await this.attachCapabilitySessionAccess(client, input.capabilitySessionId, runId, accessId);
+      }
       await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'run')", [input.clientBucket]);
       return { runId, accessId, status, created: !reused, reused };
     });
@@ -593,6 +643,50 @@ export class Repository {
     return { ...run, id: accessId, canonicalRunId: result.rows[0].run_id, prompt: result.rows[0].prompt ?? run.prompt };
   }
 
+  async listRunsForCapabilitySession(sessionId: string, limit = 50): Promise<ResearchRunHistoryItem[]> {
+    const boundedLimit = Math.max(1, Math.min(Math.floor(limit), 50));
+    const result = await this.pool.query(
+      `SELECT
+         a.id AS access_id,
+         COALESCE(a.prompt,r.prompt) AS prompt,
+         r.brief_json,
+         r.status,
+         r.phase,
+         a.created_at,
+         r.updated_at,
+         (SELECT count(*)::int FROM track_candidates tc WHERE tc.run_id=r.id) AS candidate_count,
+         (SELECT count(*)::int FROM source_records sr WHERE sr.run_id=r.id) AS source_count,
+         ((SELECT count(*)::int FROM source_frontier sf
+            WHERE sf.run_id=r.id AND sf.status IN ('pending','unresolved','inaccessible'))
+          +
+          (SELECT count(*)::int FROM research_containers rc
+            WHERE rc.run_id=r.id AND rc.status IN ('discovered','enumerating','inaccessible','unresolved'))) AS unresolved_count
+       FROM capability_session_accesses csa
+       JOIN capability_sessions s ON s.id=csa.session_id
+       JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+       JOIN research_runs r ON r.id=csa.run_id
+       WHERE csa.session_id=$1
+         AND s.revoked_at IS NULL AND s.expires_at>now()
+         AND a.deleted_at IS NULL AND a.expires_at>now()
+         AND r.deleted_at IS NULL
+       ORDER BY a.created_at DESC,a.id DESC
+       LIMIT $2`,
+      [sessionId, boundedLimit],
+    );
+    return result.rows.map((row) => ({
+      id: row.access_id,
+      prompt: row.prompt,
+      brief: row.brief_json,
+      status: row.status,
+      phase: row.phase,
+      candidateCount: Number(row.candidate_count),
+      sourceCount: Number(row.source_count),
+      unresolvedCount: Number(row.unresolved_count),
+      createdAt: date(row.created_at)!.toISOString(),
+      updatedAt: date(row.updated_at)!.toISOString(),
+    }));
+  }
+
   async getCanonicalRunId(accessId: string): Promise<string | null> {
     const result = await this.pool.query<{ run_id: string }>(
       "SELECT run_id FROM run_accesses WHERE id=$1 AND deleted_at IS NULL AND expires_at>now()",
@@ -607,7 +701,20 @@ export class Repository {
       if (!access.rows[0]) return false;
       const runId = access.rows[0].run_id;
       await client.query("UPDATE run_accesses SET prompt=NULL,deleted_at=now(),updated_at=now() WHERE id=$1", [accessId]);
-      await client.query("UPDATE capability_sessions SET revoked_at=now(),updated_at=now() WHERE access_id=$1", [accessId]);
+      const affectedSessions = await client.query<{ session_id: string }>(
+        "DELETE FROM capability_session_accesses WHERE access_id=$1 RETURNING session_id",
+        [accessId],
+      );
+      if (affectedSessions.rows.length > 0) await client.query(
+        `UPDATE capability_sessions s SET revoked_at=now(),updated_at=now()
+         WHERE s.id=ANY($1::uuid[])
+           AND NOT EXISTS (
+             SELECT 1 FROM capability_session_accesses csa
+             JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+             WHERE csa.session_id=s.id AND a.deleted_at IS NULL AND a.expires_at>now()
+           )`,
+        [affectedSessions.rows.map((row) => row.session_id)],
+      );
       await client.query("DELETE FROM capability_tokens WHERE access_id=$1", [accessId]);
       const remaining = await client.query<{ count: number }>("SELECT count(*)::int count FROM run_accesses WHERE run_id=$1 AND deleted_at IS NULL", [runId]);
       if (remaining.rows[0]!.count === 0) {
@@ -1936,15 +2043,6 @@ export class Repository {
     if (result.rows[0]!.count >= limit) throw new HttpError(503, "Needle is at capacity; try again soon", "global_capacity_reached");
   }
 
-  async hasActiveRunForSession(sessionId: string): Promise<boolean> {
-    const result = await this.pool.query<{ active: boolean }>(
-      `SELECT EXISTS(SELECT 1 FROM capability_sessions s JOIN research_runs r ON r.id=s.run_id
-       WHERE s.id=$1 AND s.revoked_at IS NULL AND r.status=ANY($2::text[]) AND r.deleted_at IS NULL) active`,
-      [sessionId, ACTIVE_RUN_STATUSES],
-    );
-    return Boolean(result.rows[0]?.active);
-  }
-
   async claimGatewayNonce(keyId: string, nonce: string, expiresAt: Date): Promise<boolean> {
     const result = await this.transaction(async (client) => {
       await client.query("DELETE FROM gateway_nonces WHERE expires_at<now()");
@@ -1963,34 +2061,99 @@ export class Repository {
     );
   }
 
-  async exchangeCapabilityToken(tokenHash: string, session: { id: string; tokenHash: string; expiresAt: Date }): Promise<any | null> {
+  async exchangeCapabilityToken(tokenHash: string, session: {
+    id: string;
+    tokenHash?: string;
+    expiresAt?: Date;
+    reuseExisting?: boolean;
+  }): Promise<any | null> {
     return this.transaction(async (client) => {
       const token = await client.query<{ id: string; run_id: string; access_id: string }>(
         `SELECT id,run_id,access_id FROM capability_tokens WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`,
         [tokenHash],
       );
       if (!token.rows[0]) return null;
-      const access = await client.query("SELECT 1 FROM run_accesses WHERE id=$1 AND deleted_at IS NULL AND expires_at>now()", [token.rows[0].access_id]);
-      if (!access.rows[0]) return null;
-      await client.query("UPDATE capability_tokens SET consumed_at=now() WHERE id=$1", [token.rows[0].id]);
-      await client.query(
-        "INSERT INTO capability_sessions(id,run_id,access_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
-        [session.id, token.rows[0].run_id, token.rows[0].access_id, session.tokenHash, session.expiresAt],
+      const access = await client.query(
+        "SELECT 1 FROM run_accesses WHERE id=$1 AND deleted_at IS NULL AND expires_at>now() FOR KEY SHARE",
+        [token.rows[0].access_id],
       );
-      return { id: session.id, runId: token.rows[0].run_id, accessId: token.rows[0].access_id, expiresAt: session.expiresAt };
+      if (!access.rows[0]) return null;
+      let expiresAt: Date;
+      if (session.reuseExisting) {
+        const existing = await client.query<{ expires_at: Date }>(
+          `SELECT s.expires_at FROM capability_sessions s
+           WHERE s.id=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+             AND EXISTS (
+               SELECT 1 FROM capability_session_accesses csa
+               JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+               WHERE csa.session_id=s.id AND a.deleted_at IS NULL AND a.expires_at>now()
+             )
+           FOR UPDATE`,
+          [session.id],
+        );
+        if (!existing.rows[0]) return null;
+        expiresAt = date(existing.rows[0].expires_at)!;
+      } else {
+        if (!session.tokenHash || !session.expiresAt) throw new Error("New capability sessions require a token and expiry");
+        expiresAt = session.expiresAt;
+        await client.query(
+          "INSERT INTO capability_sessions(id,run_id,access_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
+          [session.id, token.rows[0].run_id, token.rows[0].access_id, session.tokenHash, expiresAt],
+        );
+      }
+      await client.query("UPDATE capability_tokens SET consumed_at=now() WHERE id=$1", [token.rows[0].id]);
+      await this.attachCapabilitySessionAccess(client, session.id, token.rows[0].run_id, token.rows[0].access_id);
+      return { id: session.id, runId: token.rows[0].run_id, accessId: token.rows[0].access_id, expiresAt };
     });
   }
 
   async getCapabilitySession(tokenHash: string): Promise<any | null> {
     const result = await this.pool.query(
-      `UPDATE capability_sessions s SET last_seen_at=now(),updated_at=now()
-       FROM run_accesses a WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
-       AND a.id=s.access_id AND a.deleted_at IS NULL AND a.expires_at>now()
-       RETURNING s.id,s.run_id,s.access_id,s.expires_at`,
+      `WITH live_session AS (
+         UPDATE capability_sessions s SET last_seen_at=now(),updated_at=now()
+         WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+           AND EXISTS (
+             SELECT 1 FROM capability_session_accesses csa
+             JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+             JOIN research_runs r ON r.id=csa.run_id
+             WHERE csa.session_id=s.id
+               AND a.deleted_at IS NULL AND a.expires_at>now() AND r.deleted_at IS NULL
+           )
+         RETURNING s.id,s.expires_at
+       )
+       SELECT ls.id,aa.run_id,aa.access_id,ls.expires_at
+       FROM live_session ls
+       JOIN LATERAL (
+         SELECT csa.run_id,csa.access_id
+         FROM capability_session_accesses csa
+         JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+         JOIN research_runs r ON r.id=csa.run_id
+         WHERE csa.session_id=ls.id
+           AND a.deleted_at IS NULL AND a.expires_at>now() AND r.deleted_at IS NULL
+         ORDER BY csa.created_at DESC,csa.access_id DESC LIMIT 1
+       ) aa ON true`,
       [tokenHash],
     );
     const row = result.rows[0];
     return row ? { id: row.id, runId: row.run_id, accessId: row.access_id, expiresAt: date(row.expires_at)! } : null;
+  }
+
+  async getCapabilitySessionAccess(sessionId: string, accessId: string): Promise<{ runId: string; accessId: string } | null> {
+    const result = await this.pool.query<{ run_id: string; access_id: string }>(
+      `SELECT csa.run_id,csa.access_id
+       FROM capability_session_accesses csa
+       JOIN capability_sessions s ON s.id=csa.session_id
+       JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+       JOIN research_runs r ON r.id=csa.run_id
+       WHERE csa.session_id=$1 AND csa.access_id=$2
+         AND s.revoked_at IS NULL AND s.expires_at>now()
+         AND a.deleted_at IS NULL AND a.expires_at>now()
+         AND r.deleted_at IS NULL`,
+      [sessionId, accessId],
+    );
+    return result.rows[0]
+      ? { runId: result.rows[0].run_id, accessId: result.rows[0].access_id }
+      : null;
   }
 
   async revokeCapabilitySession(sessionId: string): Promise<void> {

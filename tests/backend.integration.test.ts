@@ -21,6 +21,7 @@ const migrationSql = [
   "0003_match_initial_snapshot.sql",
   "0004_citation_attestation.sql",
   "0005_candidate_selection_rank.sql",
+  "0006_capability_session_accesses.sql",
 ]
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
@@ -177,6 +178,7 @@ databaseDescribe("hosted backend integration", () => {
         to_regclass('cost_reservations')::text,
         to_regclass('gateway_nonces')::text,
         to_regclass('capability_sessions')::text,
+        to_regclass('capability_session_accesses')::text,
         to_regclass('citation_attestations')::text
       ]) AS name`,
     );
@@ -187,6 +189,7 @@ databaseDescribe("hosted backend integration", () => {
       "cost_reservations",
       "gateway_nonces",
       "capability_sessions",
+      "capability_session_accesses",
       "citation_attestations",
     ]);
     const evidenceColumns = await repository.pool.query<{ column_name: string }>(
@@ -1821,10 +1824,10 @@ databaseDescribe("hosted backend integration", () => {
     await expect(capabilities.authenticate(request)).rejects.toMatchObject({ statusCode: 401, code: "capability_required" });
   });
 
-  test("keeps capability sessions isolated to their own run access", async () => {
+  test("allows multiple active runs from one anonymous bucket while preserving capability isolation and rate limits", async () => {
     vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
-    const create = (label: string) => {
-      const clientBucket = `capability-scope-${label}-${randomUUID()}`;
+    const clientBucket = `capability-multi-run-${randomUUID()}`;
+    const create = (label: string, capabilitySessionId?: string) => {
       return repository.createRunIdempotent({
         prompt: `Capability scope ${label}`,
         brief: { ...brief, title: `Capability scope ${label}` },
@@ -1834,27 +1837,152 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [clientBucket],
         idempotencyKey: randomUUID(),
         reuseDays: 0,
-        rateLimit: 100,
+        rateLimit: 2,
         globalLimit: 100,
+        capabilitySessionId,
       });
     };
-    const [left, right] = await Promise.all([create("left"), create("right")]);
+    const left = await create("left");
+    expect(left).toMatchObject({ created: true, status: "queued" });
     const capabilities = new CapabilityService(repository);
     const reply = new ReplyStub();
-    await capabilities.exchange(
+    const session = await capabilities.exchange(
       await capabilities.issue(left.runId, left.accessId),
       reply as unknown as FastifyReply,
     );
     const request = cookieRequest(reply.headers.get("set-cookie")!.split(";")[0]!);
+    const right = await create("right", session.id);
+    expect(right).toMatchObject({ created: true, status: "queued" });
+    expect(left.runId).not.toBe(right.runId);
+    await expect(create("third", session.id)).rejects.toMatchObject({ statusCode: 429, code: "rate_limited" });
 
     await expect(capabilities.authenticateForAccess(request, left.accessId)).resolves.toMatchObject({
       runId: left.runId,
       accessId: left.accessId,
     });
-    await expect(capabilities.authenticateForAccess(request, right.accessId)).rejects.toMatchObject({
+    await expect(capabilities.authenticateForAccess(request, right.accessId)).resolves.toMatchObject({
+      runId: right.runId,
+      accessId: right.accessId,
+    });
+    const history = await repository.listRunsForCapabilitySession(session.id);
+    expect(history.map((item) => item.id)).toEqual([right.accessId, left.accessId]);
+    expect(history[0]).toMatchObject({
+      prompt: "Capability scope right",
+      status: "queued",
+      phase: "queued",
+      candidateCount: 0,
+      sourceCount: 0,
+      unresolvedCount: 0,
+      brief: { title: "Capability scope right" },
+    });
+
+    const mergeReply = new ReplyStub();
+    await expect(capabilities.exchange(
+      await capabilities.issue(right.runId, right.accessId),
+      mergeReply as unknown as FastifyReply,
+      session,
+    )).resolves.toMatchObject({ id: session.id, runId: right.runId, accessId: right.accessId });
+    expect(mergeReply.headers.get("set-cookie")).toBeUndefined();
+    await expect(capabilities.authenticate(request)).resolves.toMatchObject({ id: session.id });
+
+    const isolatedBucket = `capability-isolated-${randomUUID()}`;
+    const isolated = await repository.createRunIdempotent({
+      prompt: "Capability scope isolated",
+      brief: { ...brief, title: "Capability scope isolated" },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: isolatedBucket,
+      clientBucketAliases: [isolatedBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    await expect(capabilities.authenticateForAccess(request, isolated.accessId)).rejects.toMatchObject({
       statusCode: 403,
       code: "capability_scope_mismatch",
     });
+
+    await expect(repository.deleteRunAccess(left.accessId)).resolves.toBe(true);
+    await expect(capabilities.authenticate(request)).resolves.toMatchObject({
+      id: session.id,
+      runId: right.runId,
+      accessId: right.accessId,
+    });
+    await expect(repository.listRunsForCapabilitySession(session.id)).resolves.toMatchObject([
+      { id: right.accessId },
+    ]);
+  });
+
+  test("deleting a secondary run keeps the original run in the same capability session", async () => {
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const clientBucket = `capability-secondary-delete-${randomUUID()}`;
+    const create = (label: string, capabilitySessionId?: string) => repository.createRunIdempotent({
+      prompt: `Secondary deletion ${label}`,
+      brief: { ...brief, title: `Secondary deletion ${label}` },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+      capabilitySessionId,
+    });
+    const original = await create("original");
+    const capabilities = new CapabilityService(repository);
+    const reply = new ReplyStub();
+    const session = await capabilities.exchange(
+      await capabilities.issue(original.runId, original.accessId),
+      reply as unknown as FastifyReply,
+    );
+    const request = cookieRequest(reply.headers.get("set-cookie")!.split(";")[0]!);
+    const secondary = await create("secondary", session.id);
+
+    await expect(repository.deleteRunAccess(secondary.accessId)).resolves.toBe(true);
+    await expect(capabilities.authenticate(request)).resolves.toMatchObject({
+      id: session.id,
+      runId: original.runId,
+      accessId: original.accessId,
+    });
+    await expect(capabilities.authenticateForAccess(request, secondary.accessId)).rejects.toMatchObject({
+      statusCode: 403,
+      code: "capability_scope_mismatch",
+    });
+    await expect(repository.listRunsForCapabilitySession(session.id)).resolves.toMatchObject([
+      { id: original.accessId },
+    ]);
+  });
+
+  test("backfills existing single-run capability sessions into run history", async () => {
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const clientBucket = `capability-backfill-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Capability migration backfill",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const capabilities = new CapabilityService(repository);
+    const session = await capabilities.exchange(
+      await capabilities.issue(created.runId, created.accessId),
+      new ReplyStub() as unknown as FastifyReply,
+    );
+    await repository.pool.query("DELETE FROM capability_session_accesses WHERE session_id=$1", [session.id]);
+    await expect(repository.listRunsForCapabilitySession(session.id)).resolves.toEqual([]);
+
+    await applyMigration(repository.pool);
+
+    await expect(repository.listRunsForCapabilitySession(session.id)).resolves.toMatchObject([
+      { id: created.accessId, prompt: "Capability migration backfill" },
+    ]);
   });
 
   test("allows exactly one concurrent exchange of a one-time capability", async () => {

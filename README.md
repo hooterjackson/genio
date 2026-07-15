@@ -2,7 +2,7 @@
 
 Needle turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account publishes share-link playlists.
 
-> Apple Music's Playlist Playground suggests 25 tracks. Needle is for deeper work: Paulinho da Costa's biography credits him on more than 6,000 songs, so Needle researches the evidence and assembles the source-backed playlist.
+Visitors can start multiple jobs, reopen the jobs available to their browser, and let active research continue in the background.
 
 Needle uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 

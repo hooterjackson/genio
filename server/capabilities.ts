@@ -13,8 +13,14 @@ export interface CapabilitySessionView {
 
 export interface CapabilityRepository {
   createCapabilityToken(runId: string, accessId: string, tokenHash: string, expiresAt: Date): Promise<void>;
-  exchangeCapabilityToken(tokenHash: string, session: { id: string; tokenHash: string; expiresAt: Date }): Promise<CapabilitySessionView | null>;
+  exchangeCapabilityToken(tokenHash: string, session: {
+    id: string;
+    tokenHash?: string;
+    expiresAt?: Date;
+    reuseExisting?: boolean;
+  }): Promise<CapabilitySessionView | null>;
   getCapabilitySession(tokenHash: string): Promise<CapabilitySessionView | null>;
+  getCapabilitySessionAccess(sessionId: string, accessId: string): Promise<{ runId: string; accessId: string } | null>;
   revokeCapabilitySession(sessionId: string): Promise<void>;
 }
 
@@ -50,34 +56,25 @@ export class CapabilityService {
     return token;
   }
 
-  async exchange(token: string, reply: FastifyReply): Promise<CapabilitySessionView> {
+  async exchange(
+    token: string,
+    reply: FastifyReply,
+    existingSession: CapabilitySessionView | null = null,
+  ): Promise<CapabilitySessionView> {
     if (!/^[A-Za-z0-9_-]{40,100}$/.test(token)) throw new HttpError(400, "Capability token is invalid", "invalid_capability");
-    const sessionToken = randomToken();
-    const expiresAt = new Date(Date.now() + Number(process.env.CAPABILITY_SESSION_TTL_DAYS ?? 90) * 86_400_000);
-    const session = await this.repository.exchangeCapabilityToken(capabilityHash(token), {
-      id: randomUUID(),
-      tokenHash: capabilityHash(sessionToken),
-      expiresAt,
-    });
+    const sessionToken = existingSession ? null : randomToken();
+    const expiresAt = existingSession
+      ? existingSession.expiresAt
+      : new Date(Date.now() + Number(process.env.CAPABILITY_SESSION_TTL_DAYS ?? 90) * 86_400_000);
+    const session = await this.repository.exchangeCapabilityToken(
+      capabilityHash(token),
+      existingSession
+        ? { id: existingSession.id, reuseExisting: true }
+        : { id: randomUUID(), tokenHash: capabilityHash(sessionToken!), expiresAt },
+    );
     if (!session) throw new HttpError(401, "Capability token is invalid or expired", "invalid_capability");
-    reply.header("Set-Cookie", `${CAPABILITY_COOKIE}=${sessionToken}; ${cookieAttributes(expiresAt)}`);
+    if (sessionToken) reply.header("Set-Cookie", `${CAPABILITY_COOKIE}=${sessionToken}; ${cookieAttributes(expiresAt)}`);
     reply.header("Cache-Control", "no-store");
-    return session;
-  }
-
-  async authenticate(request: FastifyRequest): Promise<CapabilitySessionView> {
-    const token = getCookie(request, CAPABILITY_COOKIE);
-    if (!token) throw new HttpError(401, "Open the private resume link for this run", "capability_required");
-    const session = await this.repository.getCapabilitySession(capabilityHash(token));
-    if (!session) throw new HttpError(401, "Session has expired", "capability_required");
-    return session;
-  }
-
-  async authenticateForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
-    const session = await this.authenticate(request);
-    if (session.accessId !== accessId) {
-      throw new HttpError(403, "This session cannot access that run", "capability_scope_mismatch");
-    }
     return session;
   }
 
@@ -85,6 +82,21 @@ export class CapabilityService {
     const token = getCookie(request, CAPABILITY_COOKIE);
     if (!token) return null;
     return this.repository.getCapabilitySession(capabilityHash(token));
+  }
+
+  async authenticate(request: FastifyRequest): Promise<CapabilitySessionView> {
+    const session = await this.authenticateOptional(request);
+    if (!session) throw new HttpError(401, "Session has expired", "capability_required");
+    return session;
+  }
+
+  async authenticateForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
+    const session = await this.authenticate(request);
+    const mapping = await this.repository.getCapabilitySessionAccess(session.id, accessId);
+    if (!mapping) {
+      throw new HttpError(403, "This session cannot access that run", "capability_scope_mismatch");
+    }
+    return { ...session, ...mapping };
   }
 
   async revoke(request: FastifyRequest, reply: FastifyReply): Promise<void> {
