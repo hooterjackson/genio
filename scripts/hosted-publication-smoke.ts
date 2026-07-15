@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 const CONFIRMATION_FLAG = "--confirm-live-write";
-const DEFAULT_ORIGIN = "https://needle.hooterjackson.chatgpt.site";
+const DEFAULT_ORIGIN = "https://genio.engineered.lighting";
 const TERMINAL_RUN_STATUSES = new Set(["complete", "partial", "failed", "expired", "deleted"]);
 const REVIEW_RUN_STATUSES = new Set(["review", "visitor_review"]);
 const DEFAULT_TRACKS = [
