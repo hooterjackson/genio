@@ -215,7 +215,16 @@ async function observeStablePrefix(
   let stableReads = 0;
   for (let attempt = 0; attempt < 6; attempt += 1) {
     signal?.throwIfAborted();
-    const ids = await client.getOrderedPlaylistCatalogIds(playlistId, signal);
+    let ids: string[];
+    try {
+      ids = await client.getOrderedPlaylistCatalogIds(playlistId, signal);
+    } catch (error) {
+      if (error instanceof AppleApiError && error.status === 404 && attempt < 5) {
+        await consistencyWait(CONSISTENCY_POLL_MS, signal);
+        continue;
+      }
+      throw error;
+    }
     if (!exactOrderedPrefix(ids, expected)) return { ids, diverged: true };
     if (previous && ids.length === previous.length && ids.every((id, index) => id === previous![index])) stableReads += 1;
     else stableReads = 1;
@@ -353,13 +362,24 @@ async function abandonDivergedPlaylist(
   observedCount: number,
   signal?: AbortSignal,
 ): Promise<PublicationVolume> {
+  return abandonPlaylist(repository, volume,
+    `The Apple playlist was not an exact ordered prefix of the immutable manifest volume (observed ${observedCount} tracks)`,
+    signal);
+}
+
+async function abandonPlaylist(
+  repository: PublicationRepository,
+  volume: PublicationVolume,
+  reason: string,
+  signal?: AbortSignal,
+): Promise<PublicationVolume> {
   signal?.throwIfAborted();
   if (!volume.playlistId) throw new Error("Cannot orphan a publication without an Apple playlist ID");
   const orphanId = await repository.markPlaylistOrphan({
     manifestId: volume.manifestId,
     publicationVolumeId: volume.id,
     applePlaylistId: volume.playlistId,
-    reason: `The Apple playlist was not an exact ordered prefix of the immutable manifest volume (observed ${observedCount} tracks)`,
+    reason,
   });
   await repository.enqueueNotification("publication_orphaned", {
     deduplicationKey: `publication-orphaned:${volume.playlistId}`,
@@ -397,7 +417,21 @@ export async function appendExactVolume(
     await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
     volume = await ensureApplePlaylist(repository, client, manifest, volume, expectedAuthorization, signal);
     const playlistId = volume.playlistId!;
-    const initial = await observeStablePrefix(client, playlistId, expected, signal);
+    let initial: { ids: string[]; diverged: boolean };
+    try {
+      initial = await observeStablePrefix(client, playlistId, expected, signal);
+    } catch (error) {
+      if (error instanceof AppleApiError && error.status === 404) {
+        volume = await abandonPlaylist(
+          repository,
+          volume,
+          "Apple no longer returned the stored library playlist resource",
+          signal,
+        );
+        continue;
+      }
+      throw error;
+    }
     let existing = initial.ids;
     if (initial.diverged) {
       volume = await abandonDivergedPlaylist(repository, volume, initial.ids.length, signal);

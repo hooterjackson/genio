@@ -656,6 +656,34 @@ test("publisher orphans a divergent playlist and creates a clean replacement", a
   expect(states.get("p.replacement")).toEqual(["101", "202"]);
 });
 
+test("publisher replaces a stored Apple playlist ID that remains unavailable after bounded propagation reads", async () => {
+  const repository = publicationRepository();
+  const state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.replacement", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => { state.push(...ids); }),
+    getOrderedPlaylistCatalogIds: vi.fn(async (playlistId) => {
+      if (playlistId === "p.missing") throw new AppleApiError("private missing resource detail", 404, false);
+      return [...state];
+    }),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/replacement/pl.replacement"),
+  };
+  const unavailable = { ...pendingVolume(), playlistId: "p.missing", status: "appending" as const };
+
+  const result = await appendExactVolume(repository, client, manifest, unavailable, ["101", "202"], validAuthorization);
+  expect(repository.markPlaylistOrphan).toHaveBeenCalledWith(expect.objectContaining({
+    applePlaylistId: "p.missing",
+    reason: "Apple no longer returned the stored library playlist resource",
+  }));
+  expect(repository.updatePublicationVolume).toHaveBeenCalledWith("volume-id", expect.objectContaining({
+    attemptDelta: 1,
+    applePlaylistId: null,
+    status: "queued",
+  }));
+  expect(result).toMatchObject({ playlistId: "p.replacement", appendedCount: 2, status: "complete" });
+});
+
 test("publisher preserves the Apple playlist ID and exact track count when share polling times out", async () => {
   const repository = publicationRepository();
   let state: string[] = [];
