@@ -1,3 +1,49 @@
+## 9ênio animated intro — current gate
+
+**Comparison Target**
+
+- Source visual truth: `/Users/mlima/Downloads/ascii-art-text.png`
+- Browser-rendered implementation: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-mobile-v3.png`
+- 320-pixel implementation: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-mobile-320-v3.png`
+- Desktop implementation: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-desktop-v3.png`
+- Combined source/implementation evidence: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-comparison-v3.png`
+- Primary viewport and state: 390 × 844 CSS pixels; local `/`; dark theme; 430 ms into the stepped reveal
+
+**Findings**
+
+- No actionable P0, P1, or P2 differences remain.
+- Fonts and typography: the implementation uses the same slanted FIGlet construction as the supplied reference. The first glyph is generated from the digit `9`; a separate `/\` visibly preserves the circumflex over the `e`. The browser mono stack is slightly finer than the raster reference, which keeps the mark sharp at responsive sizes and is acceptable.
+- Spacing and layout rhythm: the mark is centered and nearly fills the available mobile width like the reference. It remains fully visible at 320, 390, 430, and desktop widths with no clipping or horizontal overflow.
+- Colors and visual tokens: off-white line art on near-black matches the reference. The app’s subtle 24-pixel terminal grid is retained as an intentional brand-system detail.
+- Image quality and asset fidelity: the requested ASCII is rendered as native preformatted text so the stepped draw animation remains crisp rather than scaling a raster screenshot. No unrelated icons or decorative assets were introduced.
+- Copy and content: the artwork itself remains text-free apart from the line glyphs. `SKIP INTRO` is an intentional accessible control outside the artwork.
+- Interaction and accessibility: the reveal runs once per session, completes in 1.42 seconds, supports Escape and a 44-pixel skip target, never traps focus, bypasses query/hash deep links, and is omitted when reduced motion is requested.
+
+**Comparison History**
+
+1. Initial capture
+   - [P1] The fixed intro was nested inside the sticky blurred header, so the browser treated the header as its containing block and exposed the composer below it.
+   - [P2] The artwork occupied only about half the reference width on mobile.
+   - Fixes: moved the intro to the root command screen and increased the responsive mono size to `clamp(16px, 5.4vw, 24px)`.
+2. Post-fix capture
+   - Evidence: `.artifacts/9enio-intro-comparison-v3.png`.
+   - Result: full-screen coverage, mark proportions, line construction, contrast, accent, and centering match the supplied direction without mobile overflow.
+
+**Implementation Checklist**
+
+- [x] Recreate the supplied slanted ASCII construction with a leading digit `9`.
+- [x] Preserve the `ê` circumflex visually.
+- [x] Animate the reveal in discrete left-to-right steps.
+- [x] Verify 320, 390, 430, and desktop breakpoints.
+- [x] Verify one-per-session, skip, Escape, deep-link bypass, and reduced motion.
+- [x] Compare source and implementation in one combined image.
+
+**Current final result: passed**
+
+---
+
+## One-command screen — prior gate
+
 **Comparison Target**
 
 - Source visual truth: `/Users/mlima/.codex/generated_images/019f592d-e692-77a3-9e38-082328ac77d2/exec-17b145d1-7688-4cd8-b73e-0c44d3eb1e58.png`

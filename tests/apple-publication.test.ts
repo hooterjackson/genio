@@ -638,7 +638,7 @@ test("publisher recovers an uncertain playlist creation by its private marker", 
   let state: string[] = [];
   const client: PublicationAppleClient = {
     findLibraryPlaylistByMarker: vi.fn(async (marker) => {
-      if (!marker.startsWith("gênio publication ")) return null;
+      if (!marker.startsWith("9ênio publication ")) return null;
       currentMarkerLookups += 1;
       return currentMarkerLookups === 1 ? null : { id: "p.recovered" };
     }),
@@ -656,7 +656,25 @@ test("publisher recovers an uncertain playlist creation by its private marker", 
   expect(client.appendCatalogTracks).toHaveBeenCalledWith("p.recovered", ["101"], undefined);
 });
 
-test("publisher recovers a pre-rename playlist by its legacy private marker", async () => {
+test("publisher recovers a playlist created under the previous gênio marker", async () => {
+  const repository = publicationRepository();
+  let state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async (marker) => (
+      marker.startsWith("gênio publication ") ? { id: "p.previous" } : null
+    )),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.unexpected", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => { state = [...state, ...ids]; }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => [...state]),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/previous/pl.previous"),
+  };
+
+  const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101"], validAuthorization);
+  expect(result).toMatchObject({ playlistId: "p.previous", appendedCount: 1, status: "complete" });
+  expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
+});
+
+test("publisher recovers a pre-gênio playlist by its legacy Needle marker", async () => {
   const repository = publicationRepository();
   let state: string[] = [];
   const client: PublicationAppleClient = {

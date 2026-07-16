@@ -234,9 +234,36 @@ async function selectGuidedOption(page: Page, label: string): Promise<void> {
   await expect(radio).toBeChecked();
 }
 
+test("the 9ênio intro is brief, skippable, mobile-safe, and shown once per session", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.addInitScript(() => {
+    window.sessionStorage.removeItem("9enio:brand-intro:v1");
+  });
+  await page.goto("/");
+
+  const intro = page.getByTestId("brand-intro");
+  await expect(intro).toBeVisible();
+  await expect(intro.locator(".brand-intro-ascii")).toContainText("/\\");
+  await expect(intro.locator(".brand-intro-ascii")).toContainText("____");
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+
+  const skip = page.getByRole("button", { name: "Skip intro" });
+  const skipBox = await skip.boundingBox();
+  expect(skipBox?.width ?? 0).toBeGreaterThanOrEqual(44);
+  expect(skipBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+  await skip.click();
+  await expect(intro).toHaveCount(0);
+  await expect(requestField(page)).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByTestId("brand-intro")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "9ênio home" })).toBeVisible();
+});
+
 test("the one-command composer remains usable at mobile widths", async ({ page }) => {
   await openPrompt(page);
-  await expect(page.getByText("Describe the playlist and choose its size. gênio will ask only what changes the result.")).toBeVisible();
+  await expect(page.getByText("Describe the playlist and choose its size. 9ênio will ask only what changes the result.")).toBeVisible();
   await expect(trackCountField(page)).toHaveValue("50");
   await expect(page.locator(".one-command-timing strong")).toHaveText("2 MIN");
   for (const [count, windowLabel] of [["100", "2 MIN"], ["200", "4 MIN"], ["300", "6 MIN"]] as const) {

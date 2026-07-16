@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 const CONFIRMATION_FLAG = "--confirm-live-write";
-const DEFAULT_ORIGIN = "https://genio.engineered.lighting";
+const DEFAULT_ORIGIN = "https://9enio.com";
 const TERMINAL_RUN_STATUSES = new Set(["complete", "partial", "failed", "expired", "deleted"]);
 const REVIEW_RUN_STATUSES = new Set(["review", "visitor_review"]);
 const DEFAULT_TRACKS = [
@@ -55,7 +55,7 @@ function safeMessage(payload: unknown, status: number): string {
     if (typeof object.error === "string") return object.error;
     if (typeof object.message === "string") return object.message;
   }
-  return `gênio returned HTTP ${status}`;
+  return `9ênio returned HTTP ${status}`;
 }
 
 function scopedCapabilityCookie(setCookie: string | null, current: string): string {
@@ -121,7 +121,7 @@ async function main(): Promise<void> {
     body: JSON.stringify({ prompt, idempotencyKey: briefKey }),
   });
   const briefRequestId = String(briefStart.payload.requestId ?? "");
-  if (!briefRequestId) throw new Error("gênio did not return a brief request ID");
+  if (!briefRequestId) throw new Error("9ênio did not return a brief request ID");
   log("brief_queued", { briefRequestId });
 
   let briefPayload = briefStart.payload;
@@ -163,14 +163,14 @@ async function main(): Promise<void> {
   const initialRun = asRecord(runStart.payload.run ?? runStart.payload);
   const accessId = String(initialRun.id ?? "");
   const capability = String(runStart.payload.capability ?? runStart.payload.capabilityToken ?? "");
-  if (!accessId || !capability) throw new Error("gênio did not return a run access ID and capability");
+  if (!accessId || !capability) throw new Error("9ênio did not return a run access ID and capability");
 
   const exchanged = await request(origin, "/api/v1/capabilities/exchange", {
     method: "POST",
     body: JSON.stringify({ token: capability }),
   });
   let cookie = exchanged.cookie;
-  if (!cookie) throw new Error("gênio did not establish the scoped capability cookie");
+  if (!cookie) throw new Error("9ênio did not establish the scoped capability cookie");
   log("run_started", { accessId, status: initialRun.status });
 
   let run = initialRun;

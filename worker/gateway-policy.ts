@@ -66,9 +66,9 @@ export function forwardedCapabilityCookie(cookieHeader: string | null, productio
     const name = trimmed.slice(0, separator).trim();
     const value = trimmed.slice(separator + 1).trim();
     if (name !== expectedName) return [];
-    if (!value || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("gênio capability cookie is invalid");
+    if (!value || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("9ênio capability cookie is invalid");
     return [`${expectedName}=${value}`];
   });
-  if (matches.length > 1) throw new Error("Duplicate gênio capability cookies are not allowed");
+  if (matches.length > 1) throw new Error("Duplicate 9ênio capability cookies are not allowed");
   return matches[0] ?? null;
 }

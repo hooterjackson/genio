@@ -35,7 +35,7 @@ export function assertConfiguredAppleStorefront(storefront: string): string {
   if (configured && configured !== normalized) {
     throw new HttpError(
       409,
-      `This Apple account uses the ${normalized.toUpperCase()} storefront, but gênio is configured for ${configured.toUpperCase()}`,
+      `This Apple account uses the ${normalized.toUpperCase()} storefront, but 9ênio is configured for ${configured.toUpperCase()}`,
       "storefront_mismatch",
     );
   }

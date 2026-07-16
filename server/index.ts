@@ -828,7 +828,7 @@ app.setErrorHandler((error, request, reply) => {
   const message = error instanceof HttpError
     ? error.message
     : statusCode >= 500
-      ? "gênio could not complete that request"
+      ? "9ênio could not complete that request"
       : "Request rejected";
   reply.code(statusCode).send({ error: message, code });
 });

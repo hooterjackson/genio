@@ -411,7 +411,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   }
 
   async function revokeApple() {
-    if (!window.confirm("Revoke gênio’s saved Apple Music authorization? Publication will pause.")) return;
+    if (!window.confirm("Revoke 9ênio’s saved Apple Music authorization? Publication will pause.")) return;
     setBusy("apple");
     try {
       await ownerApi("/api/v1/owner/apple/authorization", { method: "DELETE" });
@@ -524,7 +524,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   return (
     <main className="app-shell">
       <header className="site-header">
-        <Link className="wordmark" href="/"><span>[g]</span> gênio_</Link>
+        <Link className="wordmark" href="/"><span>[9]</span> 9ênio_</Link>
         <div className="header-meta"><span>{email}</span><a href={signOutPath}>SIGN OUT</a></div>
       </header>
       <section className="owner-shell">
