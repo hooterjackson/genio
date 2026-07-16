@@ -146,6 +146,7 @@ type RunResult = {
   title?: string;
   status: string;
   volumes: PublishedVolume[];
+  requestedTrackCount?: number | null;
   outcomeCounts?: Record<string, number>;
   sourceCount?: number;
   unresolvedGapCount?: number;
@@ -272,6 +273,9 @@ function unwrapResult(
     const publication = asObject(object.publication);
     const rawVolumes = Array.isArray(publication.volumes) ? publication.volumes : [];
     const runId = typeof run.id === "string" ? run.id : "";
+    const resultBrief = Object.keys(asObject(run.brief)).length > 0
+      ? asObject(run.brief) as PlaylistBrief
+      : currentRun?.brief;
     return {
       runId,
       title: typeof asObject(run.brief).title === "string" ? asObject(run.brief).title as string : undefined,
@@ -292,6 +296,7 @@ function unwrapResult(
           status: typeof volume.status === "string" ? volume.status : undefined,
         };
       }),
+      requestedTrackCount: resultBrief ? exactRequestedTrackCount(resultBrief) : null,
       outcomeCounts: asObject(object.outcomes) as Record<string, number>,
       sourceCount: numberValue(run.sourceCount),
       unresolvedGapCount: numberValue(run.unresolvedCount),
@@ -322,6 +327,7 @@ function unwrapResult(
           status: typeof volume.status === "string" ? volume.status : undefined,
         };
       }),
+      requestedTrackCount: currentRun ? exactRequestedTrackCount(currentRun.brief) : null,
       outcomeCounts: asObject(object.outcomeCounts ?? object.outcomes) as Record<string, number>,
       sourceCount: numberValue(currentRun?.sourceCount),
       unresolvedGapCount: numberValue(currentRun?.unresolvedCount),
@@ -1276,13 +1282,24 @@ function ResultScreen({
   onDelete: () => void;
 }) {
   const outcomes = Object.entries(result.outcomeCounts ?? {});
+  const publishedTrackCount = result.volumes.reduce((total, volume) => total + volume.trackCount, 0);
+  const hasExactTarget = result.requestedTrackCount !== null
+    && result.requestedTrackCount !== undefined
+  const exactTargetSatisfied = hasExactTarget && publishedTrackCount === result.requestedTrackCount;
+  const exactTargetMissed = hasExactTarget && !exactTargetSatisfied;
+  const knownZeroVisibleGaps = result.unresolvedGapCount === 0;
+  const publishedWithGaps = numberValue(result.unresolvedGapCount) > 0
+    || exactTargetMissed
+    || (result.status === "partial" && !(exactTargetSatisfied && knownZeroVisibleGaps));
 
   return (
     <section className="screen flow-screen result-screen" aria-labelledby="result-title">
       <div className="flow-body">
         <div className="screen-index">/ 06 RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="result-title">{result.status === "partial" ? "PLAYLIST PUBLISHED<br />WITH GAPS." : "PLAYLIST<br />PUBLISHED."}</h1>
+        <h1 id="result-title">
+          {publishedWithGaps ? <>PLAYLIST PUBLISHED<br />WITH GAPS.</> : <>PLAYLIST<br />PUBLISHED.</>}
+        </h1>
         <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
         <small className="result-note">Apple reports this playlist as public and returned this link. Search, profile visibility, and regional availability are not guaranteed.</small>
 

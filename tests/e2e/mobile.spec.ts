@@ -1420,13 +1420,60 @@ test("the current publication result shape keeps run coverage and evidence conte
   });
 
   await page.goto("/#cap=one-time-secret&run=run-result");
-  await expect(page.getByRole("heading", { name: "PUBLISHED." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED WITH GAPS." })).toBeVisible();
   await expect(page.getByText("Published from 18 documented sources with 3 visible gaps.")).toBeVisible();
   await expect(page.getByText("2 tracks")).toBeVisible();
   await expect(page.getByRole("link", { name: /view evidence/i })).toHaveAttribute(
     "href",
     "/api/v1/runs/run-result/evidence",
   );
+});
+
+test("an exact curated target is complete even when reserve candidates were omitted", async ({ page }) => {
+  const exactRun = {
+    ...run,
+    id: "run-exact-result",
+    status: "partial",
+    phase: "published_partial",
+    brief: {
+      ...curatedBrief,
+      targetSize: { min: 50, max: 50 },
+    },
+    sourceCount: 10,
+    unresolvedCount: 0,
+  };
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: exactRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-exact-result", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(exactRun) });
+  });
+  await page.route("**/api/v1/runs/run-exact-result/result", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "partial",
+        manifest: { id: "manifest-exact", name: "Berlin Techno Essentials", contentHash: "abc", trackCount: 50 },
+        volumes: [{
+          volumeNumber: 1,
+          volumeCount: 1,
+          startPosition: 0,
+          endPosition: 49,
+          status: "complete",
+          appleShareUrl: "https://music.apple.com/us/playlist/berlin-techno-essentials/pl.test",
+          appendedCount: 50,
+        }],
+        outcomeCounts: { accepted: 50, rejected: 50 },
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-exact-result");
+  await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /with gaps/i })).toHaveCount(0);
+  await expect(page.getByText("Published from 10 documented sources with 0 visible gaps.")).toBeVisible();
+  await expect(page.getByText("50 tracks")).toBeVisible();
 });
 
 test("a transient restore failure preserves the durable run URL", async ({ page }) => {
