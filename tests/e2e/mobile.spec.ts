@@ -1451,7 +1451,10 @@ test("the current publication result shape keeps run coverage and evidence conte
   });
 
   await page.goto("/#cap=one-time-secret&run=run-result");
-  await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED WITH GAPS." })).toBeVisible();
+  const resultHeading = page.getByRole("heading", { name: "PLAYLIST PUBLISHED WITH GAPS." });
+  await expect(resultHeading).toBeVisible();
+  await expect(resultHeading.locator(".result-title-line")).toHaveCount(2);
+  await expect(resultHeading).not.toContainText("<br");
   await expect(page.getByText("Published from 18 documented sources with 3 visible gaps.")).toBeVisible();
   await expect(page.getByText("2 tracks")).toBeVisible();
   await expect(page.getByRole("link", { name: /view evidence/i })).toHaveAttribute(

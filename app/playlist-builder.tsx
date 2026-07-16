@@ -1298,14 +1298,17 @@ function ResultScreen({
   const publishedWithGaps = numberValue(result.unresolvedGapCount) > 0
     || exactTargetMissed
     || (result.status === "partial" && !(exactTargetSatisfied && knownZeroVisibleGaps));
+  const resultTitleLines = publishedWithGaps
+    ? ["PLAYLIST PUBLISHED", "WITH GAPS."]
+    : ["PLAYLIST", "PUBLISHED."];
 
   return (
     <section className="screen flow-screen result-screen" aria-labelledby="result-title">
       <div className="flow-body">
         <div className="screen-index">/ 06 RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="result-title">
-          {publishedWithGaps ? <>PLAYLIST PUBLISHED<br />WITH GAPS.</> : <>PLAYLIST<br />PUBLISHED.</>}
+        <h1 id="result-title" aria-label={resultTitleLines.join(" ")}>
+          {resultTitleLines.map((line) => <span className="result-title-line" key={line}>{line}</span>)}
         </h1>
         <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
         <small className="result-note">Apple reports this playlist as public and returned this link. Search, profile visibility, and regional availability are not guaranteed.</small>

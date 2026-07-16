@@ -854,6 +854,10 @@ dd {
   line-height: 1.6;
 }
 
+.result-title-line {
+  display: block;
+}
+
 .result-actions {
   justify-content: flex-start;
 }
