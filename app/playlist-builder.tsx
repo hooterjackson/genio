@@ -1,6 +1,15 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+  PUBLIC_PLAYLIST_MINIMUM_TRACKS,
+} from "../shared/product-policy.ts";
+import {
+  fastRunWindowLabel,
+  fastRunWindowPhrase,
+} from "../shared/fast-run-sla.ts";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
 
@@ -152,7 +161,28 @@ type BriefResponse = {
   requestId?: string;
   status?: string;
   pollAfterMs?: number;
+  questions?: GuidedQuestion[];
   error?: string;
+};
+
+type GuidedQuestionOption = {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+};
+
+type GuidedQuestion = {
+  id: string;
+  header?: string;
+  question: string;
+  options: GuidedQuestionOption[];
+};
+
+type GuidedAnswer = {
+  questionId: string;
+  optionId?: string;
+  customText?: string;
 };
 
 type RunResponse = {
@@ -252,10 +282,11 @@ async function waitForBrief(requestId: string, initialDelayMs = 1_500, signal?: 
     await abortableDelay(delayMs, signal);
     const response = await api<BriefResponse>("/api/v1/brief/" + encodeURIComponent(requestId), { signal });
     if (response.status === "failed") throw new BriefInterpretationError(response.error || "Scope interpretation failed.");
-    if (response.brief) return response;
+    if (response.status === "awaiting_answers" && response.questions?.length) return response;
+    if (response.brief && (!response.status || response.status === "complete")) return response;
     if (attempt >= 15) delayMs = 5_000;
   }
-  throw new Error("Scope interpretation is taking longer than expected. Reload this private request URL to continue.");
+  throw new Error("Your playlist request is still being prepared. Reload this private request URL to continue.");
 }
 
 function unwrapRun(payload: ResearchRun | RunResponse): ResearchRun {
@@ -539,12 +570,18 @@ function phaseMessage(run: ResearchRun): string {
   if (run.status === "awaiting_budget") return "Paused for owner budget approval.";
   if (run.status === "waiting_for_apple_authorization") return "Paused until the owner reconnects Apple Music.";
   if (run.status === "failed") return run.error || "Research failed.";
+  const requestedTracks = run.brief.targetSize?.min ?? PUBLIC_PLAYLIST_DEFAULT_TRACKS;
+  const windowPhrase = fastRunWindowPhrase(requestedTracks);
   if (run.status === "queued") return run.brief.mode === "curated"
-    ? "Waiting to start. The two-minute target includes queue time."
+    ? `Queued. The ${windowPhrase} research window includes queue time.`
     : "Waiting for an available research slot.";
   if (run.status === "publishing") return "Publishing matched tracks to Apple Music.";
-  if (run.brief.mode === "curated" && run.phase === "fast_research") return "Finding and verifying cited tracks.";
-  if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) return "Matching verified tracks to Apple Music.";
+  if (run.brief.mode === "curated" && run.phase === "fast_research") {
+    return `Finding and verifying cited tracks within the ${windowPhrase} window.`;
+  }
+  if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) {
+    return `Matching verified tracks within the ${windowPhrase} window.`;
+  }
   return "Searching sources and verifying recordings.";
 }
 
@@ -718,14 +755,18 @@ function OneCommandScreen({
   const [focused, setFocused] = useState(false);
   const [exampleIndex, setExampleIndex] = useState(0);
   const count = Number(trackCount);
-  const validCount = Number.isInteger(count) && count >= 1 && count <= 10_000;
+  const validCount = Number.isInteger(count)
+    && count >= PUBLIC_PLAYLIST_MINIMUM_TRACKS
+    && count <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS;
   const promptInvalid = prompt.length > 0 && prompt.trim().length < 4;
   const countInvalid = trackCount.length > 0 && !validCount;
-  const validationMessage = promptInvalid
+  const timeWindow = fastRunWindowLabel(validCount ? count : PUBLIC_PLAYLIST_DEFAULT_TRACKS);
+  const promptMessage = promptInvalid
     ? "Describe the playlist in at least 4 characters."
-    : countInvalid
-      ? "Choose 1–10,000 tracks."
-      : "The selected track count is exact.";
+    : "Describe what the playlist should contain.";
+  const countMessage = countInvalid
+    ? `Choose ${PUBLIC_PLAYLIST_MINIMUM_TRACKS}–${PUBLIC_PLAYLIST_MAXIMUM_TRACKS} tracks.`
+    : "The selected track count is exact.";
 
   useEffect(() => {
     if (!focused || prompt) return;
@@ -746,9 +787,10 @@ function OneCommandScreen({
     <section className="one-command-screen" aria-labelledby="command-title">
       <div className="one-command-body">
         <h1 className="sr-only" id="command-title">Research a playlist</h1>
-        <p className="one-command-intro">Describe a playlist. gênio researches, matches, and publishes it to Apple Music.</p>
+        <span className="one-command-kicker">/ NEW PLAYLIST</span>
+        <p className="one-command-intro">Describe the playlist and choose its size. gênio will ask only what changes the result.</p>
 
-        <form className="one-command-form" onSubmit={submit}>
+        <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy)}>
           <label className="one-command-request" htmlFor="playlist-request">
             <span>PLAYLIST REQUEST</span>
           <textarea
@@ -760,9 +802,10 @@ function OneCommandScreen({
             rows={5}
             maxLength={2000}
             spellCheck
+            required
             disabled={Boolean(busy)}
             aria-invalid={promptInvalid}
-            aria-describedby="command-note"
+            aria-describedby="playlist-request-note"
             placeholder={focused ? examples[exampleIndex] : "What should the playlist contain?"}
           />
           </label>
@@ -772,27 +815,208 @@ function OneCommandScreen({
               id="playlist-track-count"
               type="number"
               inputMode="numeric"
-              min={1}
-              max={10_000}
+              min={PUBLIC_PLAYLIST_MINIMUM_TRACKS}
+              max={PUBLIC_PLAYLIST_MAXIMUM_TRACKS}
               step={1}
               value={trackCount}
               data-digits={Math.min(5, Math.max(1, trackCount.length))}
               onChange={(event) => onTrackCount(event.target.value.replace(/[^0-9]/gu, ""))}
+              required
               disabled={Boolean(busy)}
               aria-invalid={countInvalid}
-              aria-describedby="command-note"
+              aria-describedby="playlist-track-count-note"
             />
+            <small
+              className="one-command-timing"
+              title="Maximum research and catalog-matching window. Queueing and Apple publication can add time."
+            >
+              <span>RESEARCH WINDOW</span>
+              <strong>{timeWindow}</strong>
+            </small>
           </label>
           <button
             className="one-command-submit"
             type="submit"
             disabled={Boolean(busy) || prompt.trim().length < 4 || !validCount}
           >
-            {busy ? "CREATING PLAYLIST..." : "CREATE PLAYLIST →"}
+            {busy ? "UNDERSTANDING REQUEST..." : "CONTINUE →"}
           </button>
         </form>
 
-        <p className="sr-only" id="command-note" aria-live="polite">{validationMessage}</p>
+        <p className="sr-only" id="playlist-request-note" aria-live="polite">{promptMessage}</p>
+        <p className="sr-only" id="playlist-track-count-note" aria-live="polite">{countMessage}</p>
+      </div>
+    </section>
+  );
+}
+
+function GuidedQuestionScreen({
+  questions,
+  currentIndex,
+  answers,
+  busy,
+  locked,
+  onAnswer,
+  onBack,
+  onNext,
+}: {
+  questions: GuidedQuestion[];
+  currentIndex: number;
+  answers: Record<string, GuidedAnswer>;
+  busy: boolean;
+  locked: boolean;
+  onAnswer: (answer: GuidedAnswer) => void;
+  onBack: () => void;
+  onNext: () => void;
+}) {
+  const question = questions[currentIndex];
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const customInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!question) return;
+    const frame = window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+      titleRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [question]);
+
+  if (!question) return null;
+  const currentAnswer = answers[question.id];
+  const customSelected = typeof currentAnswer?.customText === "string";
+  const customText = currentAnswer?.customText ?? "";
+  const orderedOptions = [...question.options]
+    .sort((left, right) => Number(right.recommended) - Number(left.recommended))
+    .slice(0, 3);
+  const validAnswer = Boolean(currentAnswer?.optionId || customText.trim());
+  const lastQuestion = currentIndex === questions.length - 1;
+  const groupName = "guidance-" + question.id;
+  const progress = ((currentIndex + 1) / questions.length) * 100;
+
+  return (
+    <section className="guided-question-screen" aria-labelledby={"guidance-title-" + question.id}>
+      <div className="guided-question-body">
+        <div className="guided-question-progress">
+          <span>QUESTION {currentIndex + 1} OF {questions.length}</span>
+          <span aria-hidden="true">{currentIndex + 1}/{questions.length}</span>
+        </div>
+        <div
+          className="guided-progress-rail"
+          role="progressbar"
+          aria-label="Playlist preferences"
+          aria-valuemin={1}
+          aria-valuemax={questions.length}
+          aria-valuenow={currentIndex + 1}
+        >
+          <span style={{ width: progress + "%" }} />
+        </div>
+
+        <p className="guided-question-kicker">{question.header || "REFINE THE PLAYLIST"}</p>
+        <h1
+          id={"guidance-title-" + question.id}
+          ref={titleRef}
+          tabIndex={-1}
+        >
+          {question.question}
+        </h1>
+
+        <fieldset className="guided-options" disabled={busy || locked}>
+          <legend className="sr-only">{question.question}</legend>
+          {orderedOptions.map((option, index) => {
+            const selected = currentAnswer?.optionId === option.id;
+            const inputId = `${groupName}-option-${index}`;
+            const descriptionId = option.description ? inputId + "-description" : undefined;
+            return (
+              <label
+                className="guided-option-card"
+                data-selected={selected || undefined}
+                key={option.id}
+                htmlFor={inputId}
+              >
+                <input
+                  id={inputId}
+                  type="radio"
+                  name={groupName}
+                  value={option.id}
+                  checked={selected}
+                  onChange={() => onAnswer({ questionId: question.id, optionId: option.id })}
+                  aria-describedby={descriptionId}
+                />
+                <span className="guided-radio" aria-hidden="true" />
+                <span className="guided-option-copy">
+                  <strong>
+                    {option.label}
+                    {option.recommended && <small>RECOMMENDED</small>}
+                  </strong>
+                  {option.description && <span id={descriptionId}>{option.description}</span>}
+                </span>
+              </label>
+            );
+          })}
+
+          <div className="guided-custom-card" data-selected={customSelected || undefined}>
+            <label htmlFor={groupName + "-custom-choice"}>
+              <input
+                id={groupName + "-custom-choice"}
+                type="radio"
+                name={groupName}
+                checked={customSelected}
+                onChange={() => {
+                  onAnswer({ questionId: question.id, customText });
+                  window.requestAnimationFrame(() => customInputRef.current?.focus());
+                }}
+              />
+              <span className="guided-radio" aria-hidden="true" />
+              <strong>SOMETHING ELSE</strong>
+            </label>
+            <input
+              ref={customInputRef}
+              type="text"
+              value={customText}
+              maxLength={300}
+              placeholder="Type your answer"
+              aria-label="Something else"
+              onFocus={() => {
+                if (!customSelected) onAnswer({ questionId: question.id, customText });
+              }}
+              onChange={(event) => onAnswer({ questionId: question.id, customText: event.target.value })}
+            />
+          </div>
+        </fieldset>
+      </div>
+
+      <div className="guided-question-footer">
+        <button className="guided-back" type="button" onClick={onBack} disabled={busy}>
+          ← {locked || currentIndex === 0 ? "EDIT REQUEST" : "BACK"}
+        </button>
+        <button
+          className="guided-next"
+          type="button"
+          onClick={onNext}
+          disabled={busy || !validAnswer}
+        >
+          {busy
+            ? "FINALIZING..."
+            : locked
+              ? "RETRY CREATE →"
+              : lastQuestion
+                ? "CREATE PLAYLIST →"
+                : "NEXT →"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function FinalizingBriefScreen() {
+  return (
+    <section className="guided-question-screen guided-finalizing-screen" role="status" aria-live="polite">
+      <div className="guided-question-body">
+        <span className="one-command-kicker">/ BUILDING THE PLAN</span>
+        <h1>PREPARING<br />YOUR PLAYLIST.</h1>
+        <p>Applying your answers before research begins.</p>
+        <div className="guided-finalizing-line"><span aria-hidden="true">▋</span>FINALIZING REQUEST</div>
       </div>
     </section>
   );
@@ -1283,9 +1507,14 @@ function ResultScreen({
 export function PlaylistBuilder() {
   const [entryStage, setEntryStage] = useState<"command" | "jobs">("command");
   const [prompt, setPrompt] = useState("");
-  const [trackCount, setTrackCount] = useState("50");
+  const [trackCount, setTrackCount] = useState(String(PUBLIC_PLAYLIST_DEFAULT_TRACKS));
   const [brief, setBrief] = useState<PlaylistBrief | null>(null);
   const [briefRequestId, setBriefRequestId] = useState<string | null>(null);
+  const [guidanceQuestions, setGuidanceQuestions] = useState<GuidedQuestion[]>([]);
+  const [guidanceAnswers, setGuidanceAnswers] = useState<Record<string, GuidedAnswer>>({});
+  const [guidanceIndex, setGuidanceIndex] = useState(0);
+  const [guidanceSubmission, setGuidanceSubmission] = useState<GuidedAnswer[] | null>(null);
+  const [briefFinalizing, setBriefFinalizing] = useState(false);
   const [run, setRun] = useState<ResearchRun | null>(null);
   const [trackSelection, setTrackSelection] = useState<TrackSelection | null>(null);
   const [manifest, setManifest] = useState<PlaylistManifest | null>(null);
@@ -1299,6 +1528,7 @@ export function PlaylistBuilder() {
   const activeRunId = useRef<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
   const briefIdempotencyKey = useRef<string | null>(null);
+  const guidanceIdempotencyKey = useRef<string | null>(null);
   const publishingRef = useRef(false);
   const matchingRetryAttempted = useRef<Set<string>>(new Set());
   const briefRequestRef = useRef<AbortController | null>(null);
@@ -1306,7 +1536,19 @@ export function PlaylistBuilder() {
   const operationRequestRef = useRef<AbortController | null>(null);
   const restoreStartedRef = useRef(false);
 
+  const deleteAbandonedBrief = useCallback((requestId: string) => {
+    void api<void>("/api/v1/brief/" + encodeURIComponent(requestId), {
+      method: "DELETE",
+    }).catch(() => {
+      // This is best-effort cleanup. The server retention sweep remains the
+      // fallback when a browser closes or loses connectivity.
+    });
+  }, []);
+
   const clearCurrent = useCallback((nextStage: "command" | "jobs") => {
+    if (briefRequestId && !run && !manifest && !result) {
+      deleteAbandonedBrief(briefRequestId);
+    }
     briefRequestRef.current?.abort();
     briefRequestRef.current = null;
     tracksRequestRef.current?.abort();
@@ -1315,9 +1557,14 @@ export function PlaylistBuilder() {
     operationRequestRef.current = null;
     setEntryStage(nextStage);
     setPrompt("");
-    setTrackCount("50");
+    setTrackCount(String(PUBLIC_PLAYLIST_DEFAULT_TRACKS));
     setBrief(null);
     setBriefRequestId(null);
+    setGuidanceQuestions([]);
+    setGuidanceAnswers({});
+    setGuidanceIndex(0);
+    setGuidanceSubmission(null);
+    setBriefFinalizing(false);
     setRun(null);
     activeRunId.current = null;
     setTrackSelection(null);
@@ -1328,10 +1575,11 @@ export function PlaylistBuilder() {
     setTransferState("");
     idempotencyKey.current = null;
     briefIdempotencyKey.current = null;
+    guidanceIdempotencyKey.current = null;
     publishingRef.current = false;
     matchingRetryAttempted.current.clear();
     window.history.replaceState(null, "", window.location.pathname);
-  }, []);
+  }, [briefRequestId, deleteAbandonedBrief, manifest, result, run]);
 
   const reset = useCallback(() => clearCurrent("command"), [clearCurrent]);
   const newJob = useCallback(() => clearCurrent("command"), [clearCurrent]);
@@ -1458,6 +1706,8 @@ export function PlaylistBuilder() {
         if (token) await exchangeCapability(token, runId);
         else if (runId) await loadRun(runId);
         else if (queuedBriefId) {
+          setBriefRequestId(queuedBriefId);
+          setBriefFinalizing(true);
           const response = await waitForBrief(queuedBriefId);
           if (!response.brief) throw new Error("The playlist request could not be restored.");
           setPrompt(response.prompt ?? "");
@@ -1465,7 +1715,15 @@ export function PlaylistBuilder() {
           if (restoredCount) setTrackCount(String(restoredCount));
           setBrief(response.brief);
           setBriefRequestId(queuedBriefId);
-          await startResearchFromBrief(response.brief, queuedBriefId);
+          if (response.status === "awaiting_answers" && response.questions?.length) {
+            setGuidanceQuestions(response.questions);
+            setGuidanceAnswers({});
+            setGuidanceIndex(0);
+            setGuidanceSubmission(null);
+            setBriefFinalizing(false);
+          } else {
+            await startResearchFromBrief(response.brief, queuedBriefId);
+          }
         }
       } catch (caught) {
         setError((caught as Error).message);
@@ -1474,6 +1732,7 @@ export function PlaylistBuilder() {
           window.history.replaceState(null, "", window.location.pathname);
         }
       } finally {
+        setBriefFinalizing(false);
         setRestoring(false);
       }
     };
@@ -1616,8 +1875,8 @@ export function PlaylistBuilder() {
     const requestedTrackCount = Number(trackCount);
     if (prompt.trim().length < 4
       || !Number.isInteger(requestedTrackCount)
-      || requestedTrackCount < 1
-      || requestedTrackCount > 10_000) return;
+      || requestedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+      || requestedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS) return;
     briefRequestRef.current?.abort();
     const controller = new AbortController();
     briefRequestRef.current = controller;
@@ -1625,6 +1884,7 @@ export function PlaylistBuilder() {
     setError("");
     try {
       if (brief && briefRequestId) {
+        setBriefFinalizing(true);
         await startResearchFromBrief(brief, briefRequestId, controller.signal);
         return;
       }
@@ -1640,23 +1900,140 @@ export function PlaylistBuilder() {
         signal: controller.signal,
       });
       if (controller.signal.aborted) return;
-      if (!response.brief && response.requestId) {
-        const requestId = response.requestId;
+      const initialRequestId = response.requestId;
+      if (initialRequestId) {
+        setBriefRequestId(initialRequestId);
         const query = new URLSearchParams();
-        query.set("brief", requestId);
+        query.set("brief", initialRequestId);
         window.history.replaceState(null, "", window.location.pathname + "?" + query.toString());
-        response = await waitForBrief(requestId, numberValue(response.pollAfterMs, 1_500), controller.signal);
+      }
+      if (
+        initialRequestId
+        && !response.brief
+        && !(response.status === "awaiting_answers" && response.questions?.length)
+      ) {
+        setBriefFinalizing(true);
+        response = await waitForBrief(initialRequestId, numberValue(response.pollAfterMs, 1_500), controller.signal);
       }
       if (controller.signal.aborted) return;
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
-      const requestId = response.requestId;
+      const requestId = response.requestId ?? initialRequestId;
       if (!requestId) throw new Error("gênio could not resume this playlist request.");
       setBrief(response.brief);
       setBriefRequestId(requestId);
-      await startResearchFromBrief(response.brief, requestId, controller.signal);
+      if (response.status === "awaiting_answers" && response.questions?.length) {
+        setGuidanceQuestions(response.questions);
+        setGuidanceAnswers({});
+        setGuidanceIndex(0);
+        setGuidanceSubmission(null);
+        setBriefFinalizing(false);
+      } else {
+        setBriefFinalizing(true);
+        await startResearchFromBrief(response.brief, requestId, controller.signal);
+      }
     } catch (caught) {
       if (isAbortError(caught)) return;
       if (caught instanceof BriefInterpretationError) briefIdempotencyKey.current = null;
+      setError((caught as Error).message);
+    } finally {
+      if (briefRequestRef.current === controller) {
+        briefRequestRef.current = null;
+        setBriefFinalizing(false);
+        setBusy("");
+      }
+    }
+  }
+
+  function editPlaylistRequest() {
+    briefRequestRef.current?.abort();
+    briefRequestRef.current = null;
+    if (briefRequestId && !run && !manifest && !result) {
+      deleteAbandonedBrief(briefRequestId);
+    }
+    setGuidanceQuestions([]);
+    setGuidanceAnswers({});
+    setGuidanceIndex(0);
+    setGuidanceSubmission(null);
+    setBriefFinalizing(false);
+    setBrief(null);
+    setBriefRequestId(null);
+    setBusy("");
+    setError("");
+    briefIdempotencyKey.current = null;
+    guidanceIdempotencyKey.current = null;
+    idempotencyKey.current = null;
+    window.history.replaceState(null, "", window.location.pathname);
+  }
+
+  function answerGuidance(answer: GuidedAnswer) {
+    if (guidanceSubmission) return;
+    setGuidanceAnswers((current) => ({ ...current, [answer.questionId]: answer }));
+  }
+
+  async function continueGuidance() {
+    const question = guidanceQuestions[guidanceIndex];
+    if (!question || !briefRequestId) return;
+    const answer = guidanceAnswers[question.id];
+    if (!answer?.optionId && !answer?.customText?.trim()) return;
+    if (guidanceIndex < guidanceQuestions.length - 1) {
+      setGuidanceIndex((current) => Math.min(guidanceQuestions.length - 1, current + 1));
+      return;
+    }
+
+    const answers = guidanceSubmission
+      ?? guidanceQuestions.map((item) => guidanceAnswers[item.id]).filter(Boolean);
+    if (answers.length !== guidanceQuestions.length) return;
+    if (!guidanceSubmission) {
+      setGuidanceSubmission(answers.map((item) => ({ ...item })));
+    }
+    if (!guidanceIdempotencyKey.current) guidanceIdempotencyKey.current = crypto.randomUUID();
+
+    briefRequestRef.current?.abort();
+    const controller = new AbortController();
+    briefRequestRef.current = controller;
+    setBusy("guidance");
+    setBriefFinalizing(true);
+    setError("");
+    try {
+      const response = await api<BriefResponse>(
+        "/api/v1/brief/" + encodeURIComponent(briefRequestId) + "/answers",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": guidanceIdempotencyKey.current },
+          body: JSON.stringify({
+            answers,
+            idempotencyKey: guidanceIdempotencyKey.current,
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted) return;
+      if (response.status === "failed") {
+        throw new BriefInterpretationError(response.error || "The playlist request could not be finalized.");
+      }
+
+      const finalized = await waitForBrief(
+        briefRequestId,
+        numberValue(response.pollAfterMs, 1_500),
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      if (finalized.status === "awaiting_answers" && finalized.questions?.length) {
+        setBrief(finalized.brief ?? brief);
+        setGuidanceQuestions(finalized.questions);
+        setGuidanceAnswers({});
+        setGuidanceIndex(0);
+        setGuidanceSubmission(null);
+        setBriefFinalizing(false);
+        guidanceIdempotencyKey.current = null;
+        return;
+      }
+      if (!finalized.brief) throw new Error("The playlist request could not be finalized.");
+      setBrief(finalized.brief);
+      await startResearchFromBrief(finalized.brief, briefRequestId, controller.signal);
+    } catch (caught) {
+      if (isAbortError(caught)) return;
+      setBriefFinalizing(false);
       setError((caught as Error).message);
     } finally {
       if (briefRequestRef.current === controller) {
@@ -1830,6 +2207,38 @@ export function PlaylistBuilder() {
         <section className="screen restore-screen" role="status">
           <span className="cursor" aria-hidden="true">▋</span>RESTORING RUN
         </section>
+      </main>
+    );
+  }
+
+  if (!run && !manifest && !result && entryStage === "command" && briefFinalizing) {
+    return (
+      <main className="app-shell one-command-shell guided-shell">
+        <AppHeader onHome={reset} />
+        <ErrorBar message={error} onDismiss={() => setError("")} />
+        <FinalizingBriefScreen />
+      </main>
+    );
+  }
+
+  if (!run && !manifest && !result && entryStage === "command" && guidanceQuestions.length > 0) {
+    return (
+      <main className="app-shell one-command-shell guided-shell">
+        <AppHeader onHome={reset} />
+        <ErrorBar message={error} onDismiss={() => setError("")} />
+        <GuidedQuestionScreen
+          questions={guidanceQuestions}
+          currentIndex={guidanceIndex}
+          answers={guidanceAnswers}
+          busy={Boolean(busy)}
+          locked={guidanceSubmission !== null}
+          onAnswer={answerGuidance}
+          onBack={() => {
+            if (guidanceSubmission || guidanceIndex === 0) editPlaylistRequest();
+            else setGuidanceIndex((current) => Math.max(0, current - 1));
+          }}
+          onNext={() => void continueGuidance()}
+        />
       </main>
     );
   }

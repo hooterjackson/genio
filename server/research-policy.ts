@@ -1,4 +1,8 @@
 import type { PlaylistBrief } from "../shared/types.ts";
+import {
+  fastRunServiceLevel,
+  isSupportedFastRouteTiming,
+} from "../shared/fast-run-sla.ts";
 import { stableStringify } from "./security.ts";
 
 type Environment = Record<string, string | undefined>;
@@ -28,13 +32,16 @@ export interface DeepResearchPolicy {
 
 export type ResearchExecutionPolicy = FastResearchPolicy | DeepResearchPolicy;
 
+// Small curated requests keep the original two-minute route. Larger requests
+// use the size-tiered service levels in shared/fast-run-sla.ts; they are never
+// advertised as two-minute work.
 export const FAST_RUN_DEADLINE_MS = 120_000;
 // Catalog lookup now uses a precision-preserving query ladder. Reserve enough
 // of the same two-minute route to finish that work instead of turning the tail
 // of every medium playlist into timeout placeholders.
 export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
-export const FAST_CURATED_TARGET_MAXIMUM = 200;
+export const FAST_CURATED_TARGET_MAXIMUM = 300;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
 export const FAST_POST_MATCH_REFILL_LIMIT = 2;
 export const FAST_MINIMUM_RESERVE_CANDIDATES = 50;
@@ -138,10 +145,11 @@ export function parseFastRouteCheckpoint(
   const researchDeadlineMs = typeof row.researchDeadlineAt === "string" ? Date.parse(row.researchDeadlineAt) : Number.NaN;
   const deadlineMs = typeof row.deadlineAt === "string" ? Date.parse(row.deadlineAt) : Number.NaN;
   if (!Number.isFinite(confirmedMs) || !Number.isFinite(researchDeadlineMs) || !Number.isFinite(deadlineMs)) return null;
-  if (deadlineMs - confirmedMs !== FAST_RUN_DEADLINE_MS) return null;
+  const runDeadlineMs = deadlineMs - confirmedMs;
+  const matchingReserveMs = deadlineMs - researchDeadlineMs;
   if (researchDeadlineMs <= confirmedMs || researchDeadlineMs >= deadlineMs) return null;
-  if (row.matchingReserveMs !== deadlineMs - researchDeadlineMs
-    || row.matchingReserveMs !== FAST_MATCHING_RESERVE_MS) return null;
+  if (row.matchingReserveMs !== matchingReserveMs
+    || !isSupportedFastRouteTiming(runDeadlineMs, matchingReserveMs)) return null;
   return {
     status: "queued",
     profile: expectedVersion,
@@ -165,12 +173,14 @@ export function fastResearchModel(environment: Environment = process.env): strin
 
 export function deepResearchModel(environment: Environment = process.env): string {
   return environment.OPENAI_DEEP_MODEL?.trim()
-    || environment.OPENAI_MODEL?.trim()
     || "gpt-5.6-terra";
 }
 
 export function briefInterpretationModel(environment: Environment = process.env): string {
-  return environment.OPENAI_BRIEF_MODEL?.trim() || fastResearchModel(environment);
+  // Brief interpretation is a short, schema-constrained classification task.
+  // GPT-5.4 mini is faster and 25% cheaper than Luna at the published rates;
+  // cited web synthesis stays on Luna.
+  return environment.OPENAI_BRIEF_MODEL?.trim() || "gpt-5.4-mini";
 }
 
 /**
@@ -191,16 +201,17 @@ export function researchExecutionPolicy(
   const targetMaximum = Math.max(50, requestedMaximum);
   const targetMinimum = requestedMinimum;
   const candidateGoal = catalogMatchingCandidateGoal(targetMinimum);
+  const serviceLevel = fastRunServiceLevel(targetMinimum);
 
   return {
     kind: "fast_curated",
     version: "fast_curated_v3",
     model: fastResearchModel(environment),
-    // One immutable wall-clock budget begins when the run is confirmed. The
-    // research cutoff leaves a fixed tail for Apple catalog matching; phases
-    // never start independent countdowns.
-    runDeadlineMs: FAST_RUN_DEADLINE_MS,
-    matchingReserveMs: FAST_MATCHING_RESERVE_MS,
+    // One immutable, size-tiered wall-clock budget begins when the run is
+    // confirmed. The research cutoff leaves a fixed tail for Apple catalog
+    // matching; phases never start independent countdowns.
+    runDeadlineMs: serviceLevel.runDeadlineMs,
+    matchingReserveMs: serviceLevel.matchingReserveMs,
     targetMinimum,
     targetMaximum,
     // Research a reserve so catalog misses can be backfilled while the

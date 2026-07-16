@@ -4,9 +4,11 @@ gênio turns a plain-language request into a cited, reviewable Apple Music playl
 
 Visitors can start multiple jobs, reopen the jobs available to their browser, and let active research continue in the background.
 
+The public flow starts with one prompt and an explicit track count. A small structured preflight then generates two or three request-specific questions—three choices plus a custom answer, one screen at a time—before research begins. Answers are applied through a frozen-scope allowlist, so they can tune selection and playlist flow without changing the subject, exact count, evidence boundary, or cost class.
+
 gênio uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 
-Curated prompts such as “100 most influential…” use a separate **fast** profile: bounded cited web synthesis, structured extraction, and concurrent Apple catalog lookup. The product targets a research-to-matching handoff in under two minutes for requests of up to 200 tracks, researches extra candidates to absorb catalog misses, and never silently publishes fewer tracks than requested. Exhaustive, hybrid, and larger curated prompts retain the slower source-frontier workflow and make no two-minute promise.
+Curated prompts such as “100 most influential…” use a separate **fast** profile: bounded cited web synthesis, structured extraction, and concurrent Apple catalog lookup. The public One Command surface accepts 1–300 tracks, researches extra candidates to absorb catalog misses, and never silently publishes fewer tracks than requested. Its immutable research-and-matching windows are size-tiered: two minutes for 1–100 tracks, four minutes for 101–200, and six minutes for 201–300. Queueing and Apple publication can add time. Explicit factual enumeration without a track-count control retains the slower source-frontier workflow.
 
 ## Architecture
 
@@ -43,7 +45,9 @@ After staging, use `pnpm benchmark:export -- prepare ...`, complete the independ
 
 Local requests use the same gateway signature and capability flow as production. A real research run additionally requires `OPENAI_API_KEY`; Apple publication requires the owner MusicKit credentials and a stored owner user token.
 
-The default model split is Luna for brief interpretation and fast curated research, and Terra for deep research. Configure the three profiles independently with `OPENAI_BRIEF_MODEL`, `OPENAI_FAST_MODEL`, and `OPENAI_DEEP_MODEL`; `OPENAI_MODEL` remains a legacy deep-only override.
+The default model split is GPT-5.4 mini for short structured brief interpretation, GPT-5.6 Luna for cited fast research, and GPT-5.6 Terra for explicit deep research. Configure the profiles independently with `OPENAI_BRIEF_MODEL`, `OPENAI_FAST_MODEL`, and `OPENAI_DEEP_MODEL`; the unsuffixed legacy `OPENAI_MODEL` is deliberately ignored so it cannot silently route deep work to Sol.
+
+Before a release, export the retained 90-day attempt history with `pnpm qa:scenarios:export`, redact it, and promote every new case into `tests/fixtures/production-search-scenarios.json`. `pnpm qa:scenarios:check` replays every archived request against deterministic under-yield and Apple-recovery tapes and gates exact count, candidate and catalog yield, latency, combined spend, and candidate accounting. Failed, truncated, and budget-gated attempts count just as much as successful ones. See [`docs/release-scenario-qa.md`](docs/release-scenario-qa.md).
 
 ## Production
 

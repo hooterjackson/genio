@@ -1,0 +1,233 @@
+{
+  "schemaVersion": 2,
+  "source": "production audit captured 2026-07-16",
+  "replayProfiles": {
+    "nominal": {
+      "candidateYieldRate": 0.9,
+      "initialStrictMatchRate": 0.75,
+      "retryableCatalogRate": 0.05,
+      "recoverySuccessRate": 0.8
+    },
+    "research-under-yield": {
+      "candidateYieldRate": 0.85,
+      "initialStrictMatchRate": 0.72,
+      "retryableCatalogRate": 0.08,
+      "recoverySuccessRate": 0.75
+    },
+    "catalog-shortfall": {
+      "candidateYieldRate": 0.85,
+      "initialStrictMatchRate": 0.55,
+      "retryableCatalogRate": 0.2,
+      "recoverySuccessRate": 0.75
+    },
+    "large-target": {
+      "candidateYieldRate": 0.85,
+      "initialStrictMatchRate": 0.62,
+      "retryableCatalogRate": 0.12,
+      "recoverySuccessRate": 0.75
+    }
+  },
+  "scenarioCount": 25,
+  "scenarios": [
+    {
+      "id": "2026-07-16-01",
+      "prompt": "Glitch hop adjacent to prefuse 73, warp records etc - 100 songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "research-under-yield",
+      "failureClasses": []
+    },
+    {
+      "id": "2026-07-16-02",
+      "prompt": "Glitch hop adjacent to prefuse 73, warp records etc - long playlist for studying",
+      "expectedTrackCount": null,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "research-under-yield",
+      "failureClasses": ["cost_explosion"]
+    },
+    {
+      "id": "2026-07-16-03",
+      "prompt": "I got interested in a genre that at the time was called glitch hop and was represented by an artist named Prefuse 73 and I’m interested in other artists that might’ve been operating in a similar mode maybe on warp records and stuff like that don’t just give me a prefuse 73 songs as I know those. Looking for a long playlist I could put on while I’m working or studying.",
+      "expectedTrackCount": null,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "research-under-yield",
+      "failureClasses": ["cost_explosion"]
+    },
+    {
+      "id": "2026-07-16-04",
+      "prompt": "playlist for a churrasco for 20 people in rio de janeiro 30 songs long",
+      "expectedTrackCount": 30,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "nominal",
+      "failureClasses": []
+    },
+    {
+      "id": "2026-07-16-05",
+      "prompt": "playlist for a churrasco for 20 people and roughly 4h long",
+      "expectedTrackCount": null,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "research-under-yield",
+      "failureClasses": ["cost_explosion"]
+    },
+    {
+      "id": "2026-07-16-06",
+      "prompt": "a playlist for a churrasco in Urca for 20 people 4h",
+      "expectedTrackCount": null,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "research-under-yield",
+      "failureClasses": ["cost_explosion"]
+    },
+    {
+      "id": "2026-07-16-07",
+      "prompt": "Create a good playlist for a churrasco at Rio de Janeiro with 300 songs",
+      "expectedTrackCount": 300,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "large-target",
+      "failureClasses": ["target_truncation"]
+    },
+    {
+      "id": "2026-07-16-08",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-09",
+      "prompt": "300 influential techno tracks",
+      "expectedTrackCount": 300,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "large-target",
+      "failureClasses": ["target_truncation"]
+    },
+    {
+      "id": "2026-07-16-10",
+      "prompt": "300 influential techno tracks",
+      "expectedTrackCount": 300,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "large-target",
+      "failureClasses": ["target_truncation"]
+    },
+    {
+      "id": "2026-07-16-11",
+      "prompt": "Paulinho da Costa’s 200 most influential songs",
+      "expectedTrackCount": 200,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-12",
+      "prompt": "50 influential Berlin techno tracks",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-13",
+      "prompt": "50 influential Berlin techno tracks",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-14",
+      "prompt": "300 of the most influential techno songs",
+      "expectedTrackCount": 300,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "large-target",
+      "failureClasses": ["target_truncation"]
+    },
+    {
+      "id": "2026-07-16-15",
+      "prompt": "Paulinho da Costa’s 300 most influential songs",
+      "expectedTrackCount": 300,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall", "target_truncation"]
+    },
+    {
+      "id": "2026-07-16-16",
+      "prompt": "I’m interested in that genre of alternative 90s rock that’s perhaps best defined by pavement and Steven Malcolm S and bands like that can you make me a playlist like that?",
+      "expectedTrackCount": null,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "research-under-yield",
+      "failureClasses": []
+    },
+    {
+      "id": "2026-07-16-17",
+      "prompt": "50 influential Berlin techno tracks",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-18",
+      "prompt": "Paulinho da Costa’s 200 most influential songs",
+      "expectedTrackCount": 200,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-19",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-16-20",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-15-21",
+      "prompt": "50 influential Berlin techno tracks",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-15-22",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-15-23",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-15-24",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-15-25",
+      "prompt": "Paulinho da Costa’s 100 most influential songs",
+      "expectedTrackCount": 100,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
+      "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 import Fastify, { type FastifyRequest } from "fastify";
-import { CapabilityService, type CapabilitySessionView } from "./capabilities.ts";
+import { CapabilityService, type RunCapabilitySessionView } from "./capabilities.ts";
 import { createGatewayVerifier, type GatewayIdentity } from "./gateway-auth.ts";
 import {
   createAppleDeveloperToken,
@@ -12,6 +12,13 @@ import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog
 import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
+import {
+  PUBLIC_FAST_RESEARCH_BUDGET_USD,
+  PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+  PUBLIC_PLAYLIST_MINIMUM_TRACKS,
+  publicRunBudgetUsd,
+} from "../shared/product-policy.ts";
 import {
   canonicalBriefForRequest,
   estimateResearchCost,
@@ -128,7 +135,7 @@ function candidateIds(value: unknown): string[] | undefined {
   return value.map((item) => uuid(item, "Candidate ID"));
 }
 
-async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<CapabilitySessionView> {
+async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<RunCapabilitySessionView> {
   return capabilities.authenticateForAccess(request, accessId);
 }
 
@@ -243,9 +250,20 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
   await requireWorkerForNewWork();
   const caller = identity(request);
   const prompt = request.body?.prompt?.trim() ?? "";
-  const targetTrackCount = request.body?.targetTrackCount;
-  if (targetTrackCount !== undefined && (!Number.isInteger(targetTrackCount) || targetTrackCount < 1 || targetTrackCount > 10_000)) {
-    throw new HttpError(400, "Track count must be an integer from 1 to 10,000", "invalid_track_count");
+  // Anonymous work is always an exact bounded One Command request. An owner
+  // may intentionally omit the control to enter the explicit deep path.
+  const targetTrackCount = request.body?.targetTrackCount
+    ?? (isOwner(caller) ? undefined : PUBLIC_PLAYLIST_DEFAULT_TRACKS);
+  if (targetTrackCount !== undefined && (
+    !Number.isInteger(targetTrackCount)
+    || targetTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+    || targetTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+  )) {
+    throw new HttpError(
+      400,
+      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`,
+      "invalid_track_count",
+    );
   }
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
   const created = await repository.createBriefRequest({
@@ -257,6 +275,7 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
     idempotencyKey: key,
     bypassVisitorRateLimit: isOwner(caller),
   });
+  await capabilities.authorizeBrief(request, reply, created.id);
   if (created.status === "queued") {
     await repository.enqueueJob({ kind: "brief", briefRequestId: created.id, payload: { briefRequestId: created.id }, dedupeKey: `brief:${created.id}` });
   }
@@ -264,13 +283,14 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
 });
 
 app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) => {
-  const brief = await repository.getBriefRequest(uuid(request.params.id, "Brief request ID"));
+  const briefRequestId = uuid(request.params.id, "Brief request ID");
+  await capabilities.authenticateForBrief(request, briefRequestId);
+  const brief = await repository.getBriefRequest(briefRequestId);
   if (!brief) return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
-  if (!identity(request).clientBucketAliases.includes(brief.clientBucket)) {
-    return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
-  }
   const canonicalBrief = brief.status === "complete" && isPlaylistBrief(brief.brief)
     ? canonicalBriefForRequest(brief, brief.brief)
+    : ["awaiting_answers", "finalizing"].includes(brief.status) && isPlaylistBrief(brief.brief)
+      ? canonicalBriefForRequest(brief, brief.brief)
     : undefined;
   return {
     requestId: brief.id,
@@ -278,10 +298,62 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     requestedTrackCount: brief.requestedTrackCount,
     status: brief.status,
     brief: canonicalBrief,
+    questions: Array.isArray(brief.questions) ? brief.questions : [],
+    answers: Array.isArray(brief.answers) && brief.answers.length > 0 ? brief.answers : undefined,
     estimateUsd: canonicalBrief ? estimateResearchCost(canonicalBrief) : undefined,
     estimate: canonicalBrief ? estimateResearchCostRange(canonicalBrief) : undefined,
     error: brief.status === "failed" ? brief.error : undefined,
   };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: {
+    answers?: Array<{ questionId?: string; optionId?: string; customText?: string }>;
+    idempotencyKey?: string;
+  };
+}>("/api/v1/brief/:id/answers", async (request, reply) => {
+  const briefRequestId = uuid(request.params.id, "Brief request ID");
+  await capabilities.authenticateForBrief(request, briefRequestId);
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  if (!Array.isArray(request.body?.answers)) {
+    throw new HttpError(400, "Playlist answers are required", "invalid_guidance_answers");
+  }
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  const submitted = await repository.submitBriefAnswers({
+    briefRequestId,
+    idempotencyKey: key,
+    answers: request.body.answers.map((answer) => ({
+      questionId: typeof answer.questionId === "string" ? answer.questionId : "",
+      ...(typeof answer.optionId === "string" ? { optionId: answer.optionId } : {}),
+      ...(typeof answer.customText === "string" ? { customText: answer.customText } : {}),
+    })),
+  });
+  if (submitted.status === "finalizing") {
+    // Also repair a crash after the durable answer transaction but before the
+    // queue handoff when an identical idempotent request is repeated.
+    await repository.enqueueJob({
+      kind: "brief",
+      briefRequestId,
+      payload: { briefRequestId },
+      dedupeKey: `brief-finalize:${briefRequestId}`,
+    });
+  }
+  return reply.code(submitted.created ? 202 : 200).send({
+    requestId: briefRequestId,
+    status: submitted.status,
+    pollAfterMs: submitted.status === "finalizing" ? 1_500 : undefined,
+  });
+});
+
+app.delete<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) => {
+  const briefRequestId = uuid(request.params.id, "Brief request ID");
+  await capabilities.authenticateForBrief(request, briefRequestId);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  await repository.deleteBriefRequest(briefRequestId);
+  if (!await capabilities.authenticateOptional(request)) await capabilities.revoke(request, reply);
+  return reply.code(204).send();
 });
 
 app.post<{ Body: { token?: string; capabilityToken?: string } }>("/api/v1/capabilities/exchange", async (request, reply) => {
@@ -299,18 +371,31 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   await requireWorkerForNewWork();
   const caller = identity(request);
   const briefRequestId = uuid(request.body?.briefRequestId, "Brief request ID");
+  const briefSession = await capabilities.authenticateForBrief(request, briefRequestId);
   const interpreted = await repository.getBriefRequest(briefRequestId);
   if (!interpreted || interpreted.status !== "complete" || !isPlaylistBrief(interpreted.brief)) {
     throw new HttpError(409, "Playlist scope is not ready to confirm", "brief_not_ready");
-  }
-  if (!caller.clientBucketAliases.includes(interpreted.clientBucket)) {
-    throw new HttpError(404, "Brief request not found", "brief_not_found");
   }
   const submittedBrief = request.body?.brief;
   if (submittedBrief !== undefined && !isPlaylistBrief(submittedBrief)) {
     throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
   }
   const brief = canonicalBriefForRequest(interpreted, interpreted.brief, submittedBrief);
+  const confirmedEstimateUsd = estimateResearchCost(brief);
+  if (!isOwner(caller)) {
+    if (interpreted.requestedTrackCount === null) {
+      throw new HttpError(409, "A public playlist requires an exact track count", "brief_not_ready");
+    }
+    const policy = researchExecutionPolicy(brief);
+    if (
+      policy.kind !== "fast_curated"
+      || brief.targetSize?.min !== interpreted.requestedTrackCount
+      || brief.targetSize?.max !== interpreted.requestedTrackCount
+      || confirmedEstimateUsd > PUBLIC_FAST_RESEARCH_BUDGET_USD
+    ) {
+      throw new HttpError(409, "The public playlist scope exceeds the bounded research profile", "brief_not_ready");
+    }
+  }
   const automaticOneCommand = interpreted.requestedTrackCount !== null;
   if (!automaticOneCommand && !materialAmbiguitiesAccepted(brief, interpreted.brief.ambiguities)) {
     throw new HttpError(
@@ -319,19 +404,30 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
       "ambiguities_unresolved",
     );
   }
-  const confirmedEstimateUsd = estimateResearchCost(brief);
   const key = idempotencyKey(request, request.body?.idempotencyKey);
-  const currentSession = await capabilities.authenticateOptional(request);
+  const briefActualCostUsd = await repository.getBriefActualCostUsd(briefRequestId);
+  const publicRunBudget = publicRunBudgetUsd(confirmedEstimateUsd, briefActualCostUsd);
+  if (!isOwner(caller) && publicRunBudget <= 0) {
+    throw new HttpError(
+      402,
+      "Playlist guidance used the available research budget",
+      "brief_budget_reached",
+    );
+  }
+  const runBudgetUsd = isOwner(caller) ? confirmedEstimateUsd : publicRunBudget;
   const created = await repository.createRunIdempotent({
     prompt: interpreted.prompt,
+    briefRequestId,
     brief,
-    estimateUsd: confirmedEstimateUsd,
-    approvedBudgetUsd: initialApprovedBudgetUsd(confirmedEstimateUsd),
+    estimateUsd: runBudgetUsd,
+    approvedBudgetUsd: isOwner(caller)
+      ? initialApprovedBudgetUsd(confirmedEstimateUsd)
+      : runBudgetUsd,
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
     autoPublish: interpreted.requestedTrackCount !== null,
-    capabilitySessionId: currentSession?.id,
+    capabilitySessionId: briefSession.id,
     bypassVisitorRateLimit: isOwner(caller),
   });
   // A repeated idempotent request repairs a crash between the committed run

@@ -57,6 +57,20 @@
       "when": 1784433600000,
       "tag": "0007_brief_requested_track_count",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1784520000000,
+      "tag": "0008_guided_brief_questions",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1784606400000,
+      "tag": "0009_brief_capabilities",
+      "breakpoints": true
     }
   ]
 }

@@ -40,6 +40,33 @@ export interface PlaylistBrief {
   ambiguityAcceptance?: string[];
 }
 
+export interface PlaylistGuidanceOption {
+  /** Stable server-owned identifier. */
+  id: string;
+  label: string;
+  description: string;
+  /** Exactly the first option is recommended. */
+  recommended: boolean;
+}
+
+export interface PlaylistGuidanceQuestion {
+  /** Stable server-owned identifier. */
+  id: string;
+  /** Short mobile-screen label. */
+  header: string;
+  question: string;
+  /** The API always returns exactly three mutually exclusive options. */
+  options: PlaylistGuidanceOption[];
+}
+
+export interface PlaylistGuidanceAnswer {
+  questionId: string;
+  /** Select one returned option, or omit this and provide customText. */
+  optionId?: string;
+  /** A bounded custom answer, mutually exclusive with optionId. */
+  customText?: string;
+}
+
 export interface SourceRecordInput {
   url: string;
   title: string;
@@ -127,6 +154,7 @@ export interface CatalogSong {
   name: string;
   artistName: string;
   albumName: string;
+  genreNames?: string[];
   releaseDate?: string;
   durationInMillis?: number;
   isrc?: string;

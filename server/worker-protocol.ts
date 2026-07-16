@@ -3,7 +3,7 @@
  * worker that consumes it. Increment this only when a rollout changes the
  * meaning or shape of queued playlist-pipeline work.
  */
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v2";
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v3";
 
 export function workerPipelineProtocolVersion(metadata: unknown): string | null {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;

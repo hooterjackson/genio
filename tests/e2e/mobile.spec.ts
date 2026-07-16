@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import type { PlaylistBrief } from "../../shared/types";
 
 function srgbChannel(value: number): number {
   const normalized = value / 255;
@@ -20,7 +21,7 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-const brief = {
+const brief: PlaylistBrief = {
   title: "Paulinho da Costa — released performances",
   description: "Released recordings with evidence that Paulinho da Costa performed on the track.",
   mode: "exhaustive",
@@ -51,18 +52,7 @@ const run = {
   frontier: [],
 };
 
-const estimate = {
-  minimumUsd: 4.25,
-  maximumUsd: 9.5,
-  approvalUsd: 9.5,
-  factors: [
-    { label: "open-ended exhaustive research", minimumUsd: 2.5, maximumUsd: 4 },
-    { label: "unbounded source frontier", minimumUsd: 1.5, maximumUsd: 3 },
-    { label: "track-level relationship verification", minimumUsd: 0.25, maximumUsd: 2.5 },
-  ],
-};
-
-const curatedBrief = {
+const curatedBrief: PlaylistBrief = {
   ...brief,
   title: "Influential Berlin techno",
   description: "A cited editorial selection of historically influential Berlin techno.",
@@ -77,18 +67,89 @@ const curatedBrief = {
   targetSize: { min: 50, max: 100 },
 };
 
-const fastEstimate = {
-  minimumUsd: 0.1,
-  maximumUsd: 0.5,
-  approvalUsd: 0.5,
-  factors: [{ label: "time-boxed curated research", minimumUsd: 0.1, maximumUsd: 0.5 }],
+const scopeQuestion = {
+  id: "scope-focus",
+  header: "SELECTION",
+  question: "What should lead the selection?",
+  options: [
+    {
+      id: "historical-impact",
+      label: "Historical impact",
+      description: "Prioritize tracks with documented influence.",
+      recommended: true,
+    },
+    {
+      id: "deep-cuts",
+      label: "Deep cuts",
+      description: "Favor less obvious discoveries.",
+      recommended: false,
+    },
+    {
+      id: "balanced",
+      label: "A balanced mix",
+      description: "Combine recognized tracks and discoveries.",
+      recommended: false,
+    },
+  ],
+};
+
+const eraQuestion = {
+  id: "era-balance",
+  header: "TIME",
+  question: "How should the eras be balanced?",
+  options: [
+    {
+      id: "full-history",
+      label: "Across the full history",
+      description: "Represent each important period.",
+      recommended: true,
+    },
+    {
+      id: "early-years",
+      label: "Emphasize the early years",
+      description: "Give foundational recordings more space.",
+      recommended: false,
+    },
+    {
+      id: "recent-work",
+      label: "Emphasize recent work",
+      description: "Give later recordings more space.",
+      recommended: false,
+    },
+  ],
+};
+
+const flowQuestion = {
+  id: "playlist-flow",
+  header: "FLOW",
+  question: "How should the playlist move?",
+  options: [
+    {
+      id: "smooth-arc",
+      label: "A smooth arc",
+      description: "Intermix artists and build natural transitions.",
+      recommended: true,
+    },
+    {
+      id: "chronological",
+      label: "Chronologically",
+      description: "Move through the music by release date.",
+      recommended: false,
+    },
+    {
+      id: "high-contrast",
+      label: "With contrast",
+      description: "Alternate moods and energy more aggressively.",
+      recommended: false,
+    },
+  ],
 };
 
 async function openPrompt(page: Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByRole("textbox", { name: /playlist request/i })).toBeVisible();
   await expect(page.getByRole("spinbutton", { name: /tracks/i })).toBeVisible();
-  await expect(page.getByRole("button", { name: /create playlist/i })).toBeVisible();
+  await expect(page.getByRole("button", { name: /continue/i })).toBeVisible();
 }
 
 function requestField(page: Page) {
@@ -99,10 +160,106 @@ function trackCountField(page: Page) {
   return page.getByRole("spinbutton", { name: /tracks/i });
 }
 
+async function mockGuidedBrief(
+  page: Page,
+  {
+    requestId,
+    initialBrief,
+    finalBrief = initialBrief,
+    questions,
+    onAnswers,
+    answerFailures = 0,
+  }: {
+    requestId: string;
+    initialBrief: PlaylistBrief;
+    finalBrief?: PlaylistBrief;
+    questions: Array<typeof scopeQuestion>;
+    onAnswers?: (body: Record<string, unknown>, idempotencyKey: string) => void;
+    answerFailures?: number;
+  },
+): Promise<void> {
+  let remainingAnswerFailures = answerFailures;
+  await page.route("**/api/v1/brief**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === `/api/v1/brief/${requestId}/answers`) {
+      onAnswers?.(
+        request.postDataJSON() as Record<string, unknown>,
+        request.headers()["idempotency-key"] ?? "",
+      );
+      if (remainingAnswerFailures > 0) {
+        remainingAnswerFailures -= 1;
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "Temporary guided-finalization failure" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({ requestId, status: "finalizing", pollAfterMs: 1 }),
+      });
+      return;
+    }
+    if (pathname === `/api/v1/brief/${requestId}`) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ requestId, status: "complete", brief: finalBrief }),
+      });
+      return;
+    }
+    if (pathname === "/api/v1/brief" && request.method() === "POST") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          requestId,
+          status: "awaiting_answers",
+          brief: initialBrief,
+          questions,
+        }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+}
+
+async function selectGuidedOption(page: Page, label: string): Promise<void> {
+  const radio = page.getByRole("radio", { name: new RegExp(label, "i") });
+  await radio.locator("..").click();
+  await expect(radio).toBeChecked();
+}
+
 test("the one-command composer remains usable at mobile widths", async ({ page }) => {
   await openPrompt(page);
-  await expect(page.getByText("Describe a playlist. gênio researches, matches, and publishes it to Apple Music.")).toBeVisible();
+  await expect(page.getByText("Describe the playlist and choose its size. gênio will ask only what changes the result.")).toBeVisible();
   await expect(trackCountField(page)).toHaveValue("50");
+  await expect(page.locator(".one-command-timing strong")).toHaveText("2 MIN");
+  for (const [count, windowLabel] of [["100", "2 MIN"], ["200", "4 MIN"], ["300", "6 MIN"]] as const) {
+    await trackCountField(page).fill(count);
+    await expect(page.locator(".one-command-timing strong")).toHaveText(windowLabel);
+    const textFits = await trackCountField(page).evaluate((element) => {
+      const input = element as HTMLInputElement;
+      const style = window.getComputedStyle(input);
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      if (!context) return false;
+      context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+      const textWidth = context.measureText(input.value).width;
+      const horizontalPadding = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+      return textWidth + horizontalPadding <= input.clientWidth + 1;
+    });
+    expect(textFits).toBe(true);
+    const overflowAtCount = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflowAtCount).toBeLessThanOrEqual(1);
+  }
+  await trackCountField(page).fill("50");
   const example = "Paulinho da Costa’s most influential recordings";
   await requestField(page).focus();
   await expect(requestField(page)).toHaveAttribute("placeholder", example);
@@ -114,12 +271,12 @@ test("the one-command composer remains usable at mobile widths", async ({ page }
   const sizes = await Promise.all([
     requestField(page).boundingBox(),
     trackCountField(page).boundingBox(),
-    page.getByRole("button", { name: /create playlist/i }).boundingBox(),
+    page.getByRole("button", { name: /continue/i }).boundingBox(),
   ]);
   expect(sizes.every((box) => box && box.height >= 44)).toBe(true);
 });
 
-test("the selected count is authoritative and one action starts research", async ({ page }) => {
+test("the selected count stays authoritative through guided questions", async ({ page }) => {
   const selectedBrief = { ...curatedBrief, targetSize: { min: 50, max: 50 } };
   const startedRun = {
     ...run,
@@ -131,13 +288,15 @@ test("the selected count is authoritative and one action starts research", async
     autoPublish: true,
   };
   let briefBody: Record<string, unknown> | null = null;
-  await page.route("**/api/v1/brief", async (route) => {
-    briefBody = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ requestId: "brief-one-command", brief: selectedBrief }),
-    });
+  await mockGuidedBrief(page, {
+    requestId: "brief-one-command",
+    initialBrief: selectedBrief,
+    questions: [scopeQuestion, flowQuestion],
+  });
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/v1/brief" && request.method() === "POST") {
+      briefBody = request.postDataJSON() as Record<string, unknown>;
+    }
   });
   let runBody: Record<string, unknown> | null = null;
   await page.route("**/api/v1/runs", async (route) => {
@@ -158,6 +317,10 @@ test("the selected count is authoritative and one action starts research", async
   await openPrompt(page);
   await requestField(page).fill("300 influential techno tracks");
   await trackCountField(page).fill("50");
+  await page.getByRole("button", { name: /continue/i }).click();
+  await selectGuidedOption(page, "Historical impact");
+  await page.getByRole("button", { name: /next/i }).click();
+  await selectGuidedOption(page, "A smooth arc");
   await page.getByRole("button", { name: /create playlist/i }).click();
   await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
   expect(briefBody).toMatchObject({ prompt: "300 influential techno tracks", targetTrackCount: 50 });
@@ -168,7 +331,197 @@ test("the selected count is authoritative and one action starts research", async
   await expect(page.getByRole("button", { name: /review request/i })).toHaveCount(0);
 });
 
-test("leaving the composer cancels a pending One Command request", async ({ page }) => {
+test("a two-question guided flow accepts a custom fourth answer before creating the run", async ({ page }) => {
+  const selectedBrief = {
+    ...curatedBrief,
+    title: "Berlin Techno Foundations",
+    targetSize: { min: 50, max: 50 },
+    orderingPolicy: "smooth energy arc with artist intermixing",
+  };
+  const startedRun = {
+    ...run,
+    id: "run-guided-custom",
+    prompt: "Berlin techno foundations",
+    brief: selectedBrief,
+    status: "researching",
+    phase: "fast_research",
+    autoPublish: true,
+  };
+  let answersBody: Record<string, unknown> | null = null;
+  await mockGuidedBrief(page, {
+    requestId: "brief-guided-custom",
+    initialBrief: selectedBrief,
+    finalBrief: selectedBrief,
+    questions: [scopeQuestion, flowQuestion],
+    onAnswers: (body) => { answersBody = body; },
+  });
+  let runCreates = 0;
+  let runBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs", async (route) => {
+    runCreates += 1;
+    runBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ run: startedRun, capability: "guided-custom-capability" }),
+    });
+  });
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: startedRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-guided-custom", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(startedRun) });
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill("Berlin techno foundations");
+  await page.getByRole("button", { name: /continue/i }).click();
+
+  await expect(page.getByText("QUESTION 1 OF 2", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: scopeQuestion.question })).toBeVisible();
+  expect(runCreates).toBe(0);
+  await selectGuidedOption(page, "Historical impact");
+  await page.getByRole("button", { name: /next/i }).click();
+
+  await expect(page.getByText("QUESTION 2 OF 2", { exact: true })).toBeVisible();
+  const custom = page.getByRole("textbox", { name: "Something else" });
+  await custom.fill("Start sparse, then build toward peak-time tracks");
+  await expect(page.getByRole("radio", { name: /something else/i })).toBeChecked();
+  expect(runCreates).toBe(0);
+  await page.getByRole("button", { name: /create playlist/i }).click();
+
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  expect(answersBody).toMatchObject({
+    answers: [
+      { questionId: scopeQuestion.id, optionId: "historical-impact" },
+      {
+        questionId: flowQuestion.id,
+        customText: "Start sparse, then build toward peak-time tracks",
+      },
+    ],
+  });
+  expect(runCreates).toBe(1);
+  expect(runBody).toMatchObject({
+    briefRequestId: "brief-guided-custom",
+    brief: { targetSize: { min: 50, max: 50 } },
+  });
+});
+
+test("three guided screens preserve earlier answers and remain usable at mobile widths", async ({ page }, testInfo) => {
+  const selectedBrief = {
+    ...curatedBrief,
+    targetSize: { min: 75, max: 75 },
+  };
+  await mockGuidedBrief(page, {
+    requestId: "brief-guided-three",
+    initialBrief: selectedBrief,
+    questions: [scopeQuestion, eraQuestion, flowQuestion],
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill("A deep history of influential Berlin techno");
+  await trackCountField(page).fill("75");
+  await page.getByRole("button", { name: /continue/i }).click();
+
+  await expect(page.getByText("QUESTION 1 OF 3", { exact: true })).toBeVisible();
+  await expect(page.getByRole("radio")).toHaveCount(4);
+  await selectGuidedOption(page, "Deep cuts");
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await page.getByRole("button", { name: /next/i }).click();
+  await expect(page.getByRole("heading", { name: eraQuestion.question })).toBeFocused();
+  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(1);
+  await selectGuidedOption(page, "Across the full history");
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await page.getByRole("button", { name: /next/i }).click();
+  await expect(page.getByText("QUESTION 3 OF 3", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: flowQuestion.question })).toBeFocused();
+  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(1);
+
+  await page.getByRole("button", { name: /back/i }).click();
+  await expect(page.getByRole("heading", { name: eraQuestion.question })).toBeFocused();
+  await expect(page.getByRole("radio", { name: /across the full history/i })).toBeChecked();
+  await page.getByRole("button", { name: /back/i }).click();
+  await expect(page.getByRole("radio", { name: /deep cuts/i })).toBeChecked();
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+  const targets = await page.locator(".guided-option-card, .guided-custom-card, .guided-question-footer button").evaluateAll((elements) =>
+    elements.map((element) => {
+      const rect = element.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    }),
+  );
+  expect(targets.every(({ width, height }) => width >= 44 && height >= 44)).toBe(true);
+  if (testInfo.project.name.startsWith("mobile-")) {
+    expect(["mobile-320", "mobile-390", "mobile-430"]).toContain(testInfo.project.name);
+  }
+});
+
+test("a failed guided finalization retries the identical frozen submission", async ({ page }) => {
+  const selectedBrief = {
+    ...curatedBrief,
+    targetSize: { min: 50, max: 50 },
+  };
+  const startedRun = {
+    ...run,
+    id: "run-guided-retry",
+    prompt: "Berlin techno foundations",
+    brief: selectedBrief,
+    status: "researching",
+    phase: "fast_research",
+    autoPublish: true,
+  };
+  const attempts: Array<{ body: Record<string, unknown>; key: string }> = [];
+  await mockGuidedBrief(page, {
+    requestId: "brief-guided-retry",
+    initialBrief: selectedBrief,
+    questions: [scopeQuestion, flowQuestion],
+    answerFailures: 1,
+    onAnswers: (body, key) => attempts.push({ body, key }),
+  });
+  await page.route("**/api/v1/runs", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ run: startedRun, capability: "guided-retry-capability" }),
+    });
+  });
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ runId: startedRun.id }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-guided-retry", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(startedRun),
+    });
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill("Berlin techno foundations");
+  await page.getByRole("button", { name: /continue/i }).click();
+  await selectGuidedOption(page, "Historical impact");
+  await page.getByRole("button", { name: /next/i }).click();
+  await selectGuidedOption(page, "A smooth arc");
+  await page.getByRole("button", { name: /create playlist/i }).click();
+
+  await expect(page.getByText("Temporary guided-finalization failure")).toBeVisible();
+  await expect(page.getByRole("radio", { name: /a smooth arc/i })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /retry create/i })).toBeVisible();
+  await page.getByRole("button", { name: /retry create/i }).click();
+
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  expect(attempts).toHaveLength(2);
+  expect(attempts[0]!.key).not.toBe("");
+  expect(attempts[1]!.key).toBe(attempts[0]!.key);
+  expect(attempts[1]!.body).toEqual(attempts[0]!.body);
+});
+
+test("leaving the composer cancels a pending guided request", async ({ page }) => {
   let runCreates = 0;
   await page.route("**/api/v1/brief", async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -189,7 +542,7 @@ test("leaving the composer cancels a pending One Command request", async ({ page
 
   await openPrompt(page);
   await requestField(page).fill("Berlin techno foundations");
-  await page.getByRole("button", { name: /create playlist/i }).click();
+  await page.getByRole("button", { name: /continue/i }).click();
   await page.getByRole("button", { name: "JOBS", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
@@ -229,13 +582,15 @@ test("an explicit 100-track request stays at 100 through research, matching, and
   const completeRun = { ...publishingRun, status: "complete", phase: "published" };
 
   let briefBody: Record<string, unknown> | null = null;
-  await page.route("**/api/v1/brief", async (route) => {
-    briefBody = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ requestId: "brief-100", brief: exactBrief, estimateUsd: fastEstimate.approvalUsd, estimate: fastEstimate, cached: false }),
-    });
+  await mockGuidedBrief(page, {
+    requestId: "brief-100",
+    initialBrief: exactBrief,
+    questions: [scopeQuestion, flowQuestion],
+  });
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/v1/brief" && request.method() === "POST") {
+      briefBody = request.postDataJSON() as Record<string, unknown>;
+    }
   });
 
   let runBody: Record<string, unknown> | null = null;
@@ -289,6 +644,10 @@ test("an explicit 100-track request stays at 100 through research, matching, and
   await openPrompt(page);
   await requestField(page).fill(prompt);
   await trackCountField(page).fill("100");
+  await page.getByRole("button", { name: /continue/i }).click();
+  await selectGuidedOption(page, "Historical impact");
+  await page.getByRole("button", { name: /next/i }).click();
+  await selectGuidedOption(page, "A smooth arc");
   await page.getByRole("button", { name: /create playlist/i }).click();
 
   await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED." })).toBeVisible({ timeout: 15_000 });
@@ -528,7 +887,7 @@ test("an active fast run keeps its profile and concise phase message visible", a
 
   await page.goto("/#cap=one-time-secret&run=run-fast");
   await expect(page.getByText("[CURATED · RESEARCHING]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Finding and verifying cited tracks.")).toBeVisible();
+  await expect(page.getByText("Finding and verifying cited tracks within the 2-minute window.")).toBeVisible();
 });
 
 test("the jobs screen lists and opens earlier jobs for this browser", async ({ page }) => {
@@ -590,12 +949,11 @@ test("an active job never blocks starting a new request", async ({ page }) => {
 test("the optimistic flow preserves material assumptions without claiming user acceptance", async ({ page }) => {
   const ambiguities = ["Include credited guest appearances", "Use the first released studio version"];
   const ambiguousBrief = { ...curatedBrief, targetSize: { min: 50, max: 50 }, ambiguities };
-  await page.route("**/api/v1/brief", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ requestId: "brief-ambiguous", brief: ambiguousBrief, estimateUsd: estimate.approvalUsd, estimate, cached: false }),
-    });
+  await mockGuidedBrief(page, {
+    requestId: "brief-ambiguous",
+    initialBrief: ambiguousBrief,
+    finalBrief: ambiguousBrief,
+    questions: [scopeQuestion, flowQuestion],
   });
 
   let captureRun!: (body: Record<string, unknown>) => void;
@@ -611,6 +969,10 @@ test("the optimistic flow preserves material assumptions without claiming user a
 
   await openPrompt(page);
   await requestField(page).fill("Every released song Paulinho da Costa performed on");
+  await page.getByRole("button", { name: /continue/i }).click();
+  await selectGuidedOption(page, "Historical impact");
+  await page.getByRole("button", { name: /next/i }).click();
+  await selectGuidedOption(page, "Chronologically");
   await page.getByRole("button", { name: /create playlist/i }).click();
 
   const body = await runRequest;
@@ -1600,7 +1962,7 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   await page.goto("/");
   const request = requestField(page);
   await request.fill("Every released song Paulinho da Costa performed on");
-  const primary = page.getByRole("button", { name: /create playlist/i });
+  const primary = page.getByRole("button", { name: /continue/i });
   await primary.focus();
   await expect(primary).toBeFocused();
 

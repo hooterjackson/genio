@@ -3,6 +3,7 @@ import type { HostedCitationAttestation } from "./citation-attestation.ts";
 import { citationTextIsLocalToClaim } from "./citation-attestation.ts";
 import { extractOutputText } from "./openai.ts";
 import { assertPublicHttpsUrl, compactEvidenceNote } from "./security.ts";
+import { isExcludedReferenceArtist } from "./similarity-policy.ts";
 
 export const FAST_RESEARCH_CHECKPOINT_VERSION = "fast_curated_v3";
 
@@ -249,6 +250,10 @@ export function validateFastCandidates(
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const row = rows[rowIndex]!;
+    if (isExcludedReferenceArtist(brief, row.artist)) {
+      rejectedCandidateCount += 1;
+      continue;
+    }
     const evidence: TrackCandidateInput["evidence"] = [];
     for (const index of row.citationIndexes) {
       const attestation = synthesis.citationAttestations[index];

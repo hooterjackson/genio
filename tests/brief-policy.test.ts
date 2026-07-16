@@ -14,6 +14,13 @@ import {
   explicitTrackCount,
   preserveExplicitTrackCount,
 } from "../server/brief-policy.ts";
+import { researchExecutionPolicy } from "../server/research-policy.ts";
+import {
+  GUIDED_BRIEF_BUDGET_USD,
+  PUBLIC_FAST_RESEARCH_BUDGET_USD,
+  PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+  publicRunBudgetUsd,
+} from "../shared/product-policy.ts";
 
 function brief(mode: PlaylistBrief["mode"]): PlaylistBrief {
   return {
@@ -87,10 +94,49 @@ describe("playlist brief policy", () => {
     });
   });
 
+  test("a public default count neutralizes exhaustive prompt/model drift and stays on the capped fast path", () => {
+    const interpreted = {
+      ...brief("exhaustive"),
+      title: "Every Ambient Recording",
+      description: "An adversarial unbounded model interpretation.",
+      targetSize: null,
+    };
+    const canonical = canonicalBriefForRequest({
+      prompt: "Give me every ambient recording in a very long playlist with 1000 songs",
+      requestedTrackCount: PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+    }, interpreted);
+
+    expect(canonical).toMatchObject({
+      mode: "curated",
+      targetSize: {
+        min: PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+        max: PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+      },
+    });
+    expect(researchExecutionPolicy(canonical)).toMatchObject({
+      kind: "fast_curated",
+      targetMinimum: PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+      targetMaximum: PUBLIC_PLAYLIST_DEFAULT_TRACKS,
+    });
+    expect(estimateResearchCost(canonical)).toBeLessThanOrEqual(PUBLIC_FAST_RESEARCH_BUDGET_USD);
+  });
+
+  test("shares one hard ceiling between guided preflight and public research", () => {
+    expect(publicRunBudgetUsd(0.75, 0.1)).toBe(0.75);
+    expect(publicRunBudgetUsd(1.5, GUIDED_BRIEF_BUDGET_USD)).toBe(1.25);
+    expect(
+      GUIDED_BRIEF_BUDGET_USD + publicRunBudgetUsd(1.5, GUIDED_BRIEF_BUDGET_USD),
+    ).toBe(PUBLIC_FAST_RESEARCH_BUDGET_USD);
+    expect(publicRunBudgetUsd(1.5, PUBLIC_FAST_RESEARCH_BUDGET_USD)).toBe(0);
+    expect(publicRunBudgetUsd(1.5, PUBLIC_FAST_RESEARCH_BUDGET_USD + 0.01)).toBe(0);
+    expect(publicRunBudgetUsd(Number.NaN, 0)).toBe(0);
+    expect(publicRunBudgetUsd(1.5, -0.01)).toBe(0);
+  });
+
   test("validates the server-owned requested track count", () => {
     expect(applyRequestedTrackCount(brief("curated"), 200).targetSize).toEqual({ min: 200, max: 200 });
-    expect(() => applyRequestedTrackCount(brief("curated"), 0)).toThrow(/1 to 10,000/u);
-    expect(() => applyRequestedTrackCount(brief("curated"), 10_001)).toThrow(/1 to 10,000/u);
+    expect(() => applyRequestedTrackCount(brief("curated"), 0)).toThrow(/1 to 300/u);
+    expect(() => applyRequestedTrackCount(brief("curated"), 301)).toThrow(/1 to 300/u);
   });
 
   test("keeps stored scope authoritative while accepting only ambiguity acknowledgement", () => {
@@ -127,9 +173,39 @@ describe("playlist brief policy", () => {
     }).ambiguityAcceptance).toBeUndefined();
   });
 
+  test("normalizes adversarial model interpretations of the same missing-count prompt", () => {
+    const prompt = "Glitch hop adjacent to Prefuse 73 — long playlist for studying";
+    const variants: PlaylistBrief[] = [
+      { ...brief("hybrid"), targetSize: { min: 73, max: 73 } },
+      { ...brief("hybrid"), targetSize: { min: 75, max: 150 } },
+      { ...brief("curated"), targetSize: { min: 50, max: 100 } },
+    ];
+    const normalized = variants.map((variant) => canonicalBriefForRequest({ prompt }, variant));
+
+    expect(normalized.map((value) => ({ mode: value.mode, targetSize: value.targetSize })))
+      .toEqual([
+        { mode: "curated", targetSize: { min: 100, max: 100 } },
+        { mode: "curated", targetSize: { min: 100, max: 100 } },
+        { mode: "curated", targetSize: { min: 100, max: 100 } },
+      ]);
+    expect(new Set(normalized.map(estimateResearchCost))).toEqual(new Set([0.75]));
+  });
+
+  test("keeps explicit factual enumeration on the deep path when no count control is present", () => {
+    const exhaustive = canonicalBriefForRequest(
+      { prompt: "Every released song by Michael Jackson" },
+      brief("exhaustive"),
+    );
+    expect(exhaustive).toMatchObject({ mode: "exhaustive", targetSize: null });
+  });
+
   test("does not confuse music years or unrelated numbers with a track count", () => {
     expect(explicitTrackCount("Influential Berlin techno songs from 1990 to 1999")).toBeNull();
     expect(explicitTrackCount("Songs by artists with more than 100 releases")).toBeNull();
+    expect(explicitTrackCount(
+      "Don't give me Prefuse 73 songs",
+      ["Prefuse 73"],
+    )).toBeNull();
   });
 
   test("prevents target caps from silently weakening exhaustive prompts", () => {
@@ -209,22 +285,25 @@ describe("playlist brief policy", () => {
       versionPolicy: "all remixes, live versions, and edits",
     })).toEqual({
       minimumUsd: 0.15,
-      maximumUsd: 0.5,
-      approvalUsd: 0.5,
-      factors: [{ label: "fast cited editorial research", minimumUsd: 0.15, maximumUsd: 0.5 }],
+      maximumUsd: 0.75,
+      approvalUsd: 0.75,
+      factors: [{ label: "bounded fast cited research", minimumUsd: 0.15, maximumUsd: 0.75 }],
     });
   });
 
-  test("prices curated requests above the fast-route ceiling as larger research", () => {
+  test("gives 201–300 track curated requests a fixed larger fast budget", () => {
     const estimate = estimateResearchCostRange({
       ...brief("curated"),
       relationship: "historically influential within techno",
       targetSize: { min: 300, max: 300 },
     });
 
-    expect(estimate.maximumUsd).toBeGreaterThan(0.5);
-    expect(estimate.factors[0]?.label).toBe("large cited editorial research");
-    expect(estimate.factors.map((factor) => factor.label)).not.toContain("fast cited editorial research");
+    expect(estimate).toEqual({
+      minimumUsd: 0.35,
+      maximumUsd: 1.5,
+      approvalUsd: 1.5,
+      factors: [{ label: "large bounded fast cited research", minimumUsd: 0.35, maximumUsd: 1.5 }],
+    });
   });
 
   test("uses the pessimistic edge of the range for the approval gate", () => {

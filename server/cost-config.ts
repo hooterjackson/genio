@@ -1,6 +1,7 @@
 const MAX_CONFIGURED_BUDGET_USD = 10_000;
 const MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION = 10_000;
 const MAX_WEB_SEARCH_PRICE_USD = 100;
+export const OPENAI_PRICING_VERSION = "2026-07-16";
 
 export interface CostConfiguration {
   autoRunCostLimitUsd: number;
@@ -12,6 +13,7 @@ export interface CostConfiguration {
 
 export interface OpenAITokenPricing {
   inputUsdPerMillion: number;
+  cachedInputUsdPerMillion: number;
   outputUsdPerMillion: number;
 }
 
@@ -97,22 +99,49 @@ export function readOpenAITokenPricing(
 ): OpenAITokenPricing {
   const base = readCostConfiguration(environment);
   const normalized = model.trim().toLowerCase();
+  if (normalized.includes("gpt-5.4-mini")) {
+    return {
+      inputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_GPT_5_4_MINI_INPUT_USD_PER_MILLION", 0.75, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+      cachedInputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_GPT_5_4_MINI_CACHED_INPUT_USD_PER_MILLION", 0.075, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+      outputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_GPT_5_4_MINI_OUTPUT_USD_PER_MILLION", 4.5, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+    };
+  }
   if (normalized.includes("luna")) {
     return {
       inputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_LUNA_INPUT_USD_PER_MILLION", base.openAIInputUsdPerMillion * 0.2, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+      cachedInputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_LUNA_CACHED_INPUT_USD_PER_MILLION", base.openAIInputUsdPerMillion * 0.02, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
       outputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_LUNA_OUTPUT_USD_PER_MILLION", base.openAIOutputUsdPerMillion * 0.2, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
     };
   }
   if (normalized.includes("terra")) {
     return {
       inputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_TERRA_INPUT_USD_PER_MILLION", base.openAIInputUsdPerMillion * 0.5, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
+      cachedInputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_TERRA_CACHED_INPUT_USD_PER_MILLION", base.openAIInputUsdPerMillion * 0.05, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
       outputUsdPerMillion: positiveBoundedNumber(environment, "OPENAI_TERRA_OUTPUT_USD_PER_MILLION", base.openAIOutputUsdPerMillion * 0.5, MAX_INPUT_OUTPUT_PRICE_USD_PER_MILLION),
     };
   }
   return {
     inputUsdPerMillion: base.openAIInputUsdPerMillion,
+    cachedInputUsdPerMillion: base.openAIInputUsdPerMillion * 0.1,
     outputUsdPerMillion: base.openAIOutputUsdPerMillion,
   };
+}
+
+/**
+ * GPT-5.6 Sol and Terra apply long-context multipliers above 272K input
+ * tokens. Luna and GPT-5.4 mini do not advertise that surcharge.
+ */
+export function openAIContextPriceMultipliers(
+  model: string,
+  inputTokens: number,
+): { input: number; output: number } {
+  const normalized = model.trim().toLowerCase();
+  const longContextModel = normalized === "gpt-5.6"
+    || normalized.includes("gpt-5.6-sol")
+    || normalized.includes("gpt-5.6-terra");
+  return longContextModel && inputTokens > 272_000
+    ? { input: 2, output: 1.5 }
+    : { input: 1, output: 1 };
 }
 
 export function initialApprovedBudgetUsd(

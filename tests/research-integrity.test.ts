@@ -69,6 +69,52 @@ function extractedCitation(sourceUrl: string, excerpt: string, id = "resp-citati
   return collectHostedCitationAttestations(response)[0]!;
 }
 
+test("deep candidate validation enforces a reference-artist exclusion", () => {
+  const sourceUrl = "https://musicbrainz.org/ws/2/recording?query=radiohead";
+  const similarityBrief: PlaylistBrief = {
+    ...brief("curated", { min: 50, max: 50 }),
+    subjectEntities: ["Radiohead"],
+    relationship: "stylistically similar to the reference artist",
+    exclude: ["Reference artist is a style seed; exclude recordings by: Radiohead"],
+  };
+  const candidate = (artist: string, title: string) => ({
+    artist,
+    title,
+    album: null,
+    releaseYear: null,
+    durationMs: null,
+    isrc: null,
+    musicbrainzId: null,
+    versionLabel: null,
+    evidence: [{
+      sourceUrl,
+      state: "inferred",
+      supportScope: "track",
+      subjectEntity: "Radiohead",
+      subjectRelationship: similarityBrief.relationship,
+      relationship: "stylistically similar",
+      note: "Structured discovery candidate awaiting editorial verification.",
+      supportExcerpt: null,
+    }],
+  });
+  const result = validateCandidateBatch({
+    sources: [{
+      url: sourceUrl,
+      title: "MusicBrainz recording search",
+      sourceClass: "musicbrainz",
+      provenanceRoot: "musicbrainz.org",
+      note: "Structured recording metadata.",
+    }],
+    candidates: [
+      candidate("Radiohead", "Weird Fishes/Arpeggi"),
+      candidate("Other Lives", "Tamer Animals"),
+    ],
+  }, new Set([sourceUrl]), "track_verification", similarityBrief);
+
+  expect(result.candidates.map((item) => `${item.artist} — ${item.title}`))
+    .toEqual(["Other Lives — Tamer Animals"]);
+});
+
 function candidateArgs(input: {
   sourceUrl?: string;
   sourceClass?: "web" | "musicbrainz" | "discogs" | "apple";

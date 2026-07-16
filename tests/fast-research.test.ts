@@ -192,6 +192,38 @@ describe("fast curated research", () => {
     expect(result.rejectedCandidateCount).toBe(2);
   });
 
+  test("deterministically rejects tracks by an excluded reference artist", () => {
+    const similarityBrief: PlaylistBrief = {
+      ...brief,
+      subjectEntities: ["Radiohead"],
+      relationship: "stylistically similar to the reference artist",
+      exclude: ["Reference artist is a style seed; exclude recordings by: Radiohead"],
+    };
+    const source = synthesisResponse(evidenceGroup({
+      subject: "Radiohead",
+      relationship: "stylistically similar to the reference artist",
+      tracks: [
+        "Radiohead — Weird Fishes/Arpeggi",
+        "Other Lives — Tamer Animals",
+      ],
+    }));
+    const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
+    const rows = parseFastExtraction({
+      output_text: JSON.stringify({
+        candidates: [
+          { artist: "Radiohead", title: "Weird Fishes/Arpeggi", album: null, releaseYear: null, versionLabel: null, relationship: "stylistically similar", citationIndexes: [0] },
+          { artist: "Other Lives", title: "Tamer Animals", album: null, releaseYear: null, versionLabel: null, relationship: "stylistically similar", citationIndexes: [0] },
+        ],
+      }),
+    }, 120);
+
+    const result = validateFastCandidates(rows, similarityBrief, synthesis);
+
+    expect(result.candidates.map((candidate) => `${candidate.artist} — ${candidate.title}`))
+      .toEqual(["Other Lives — Tamer Animals"]);
+    expect(result.rejectedCandidateCount).toBe(1);
+  });
+
   test("bounds the extraction schema to the server candidate ceiling", () => {
     const schema = fastExtractionSchema(999) as any;
     expect(schema.properties.candidates.maxItems).toBe(120);

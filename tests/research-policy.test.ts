@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  fastRunServiceLevel,
+  fastRunWindowLabel,
+} from "../shared/fast-run-sla.ts";
+import {
   briefInterpretationModel,
   createFastRouteCheckpoint,
   FAST_MATCHING_RESERVE_MS,
@@ -91,18 +95,32 @@ describe("research execution policy", () => {
       candidateGoal: 300,
       candidateLimit: 120,
       maxPasses: 4,
+      runDeadlineMs: 240_000,
+      matchingReserveMs: 60_000,
     });
-    expect(researchExecutionPolicy({ ...exact200, targetSize: { min: 201, max: 201 } }, {})).toEqual({
-      kind: "deep",
-      version: "deep_v1",
-      model: "gpt-5.6-terra",
-    });
+    expect(researchExecutionPolicy({ ...exact200, targetSize: { min: 201, max: 201 } }, {}))
+      .toMatchObject({
+        kind: "fast_curated",
+        targetMinimum: 201,
+        targetMaximum: 201,
+        runDeadlineMs: 360_000,
+        matchingReserveMs: 90_000,
+      });
   });
 
-  test("routes an explicit 300-track curated request through deep research", () => {
+  test("keeps 300-track curated requests bounded and routes only larger work to deep research", () => {
     const exact300 = { ...brief("curated", 300), targetSize: { min: 300, max: 300 } };
 
-    expect(researchExecutionPolicy(exact300, {})).toEqual({
+    expect(researchExecutionPolicy(exact300, {})).toMatchObject({
+      kind: "fast_curated",
+      targetMinimum: 300,
+      targetMaximum: 300,
+      candidateGoal: 450,
+      maxPasses: 5,
+      runDeadlineMs: 360_000,
+      matchingReserveMs: 90_000,
+    });
+    expect(researchExecutionPolicy({ ...exact300, targetSize: { min: 301, max: 301 } }, {})).toEqual({
       kind: "deep",
       version: "deep_v1",
       model: "gpt-5.6-terra",
@@ -156,7 +174,7 @@ describe("research execution policy", () => {
 
     const deepBaseline = researchPolicyFingerprint(brief("exhaustive"), {});
     expect(researchPolicyFingerprint(brief("exhaustive"), { OPENAI_DEEP_MODEL: "deep-snapshot" })).not.toBe(deepBaseline);
-    expect(researchPolicyFingerprint(brief("exhaustive"), { OPENAI_MODEL: "legacy-deep-snapshot" })).not.toBe(deepBaseline);
+    expect(researchPolicyFingerprint(brief("exhaustive"), { OPENAI_MODEL: "legacy-deep-snapshot" })).toBe(deepBaseline);
     expect(researchPolicyFingerprint(brief("exhaustive"), { UNRELATED_SETTING: "changed" })).toBe(deepBaseline);
     expect(researchPolicyFingerprint(brief("exhaustive"), { OPENAI_FAST_MODEL: "fast-only" })).toBe(deepBaseline);
     expect(researchPolicyFingerprint(brief("exhaustive"), {
@@ -165,13 +183,15 @@ describe("research execution policy", () => {
     })).toBe(researchPolicyFingerprint(brief("exhaustive"), { OPENAI_DEEP_MODEL: "deep-snapshot" }));
   });
 
-  test("bounds operator overrides and uses the fast model for brief interpretation", () => {
+  test("bounds operator overrides and keeps brief interpretation on its cheaper model", () => {
     const environment = {
       OPENAI_FAST_MODEL: "fast-snapshot",
       FAST_RESEARCH_MAX_WEB_CALLS: "99",
       FAST_RESEARCH_SEARCH_CONTEXT: "medium",
     };
-    expect(briefInterpretationModel(environment)).toBe("fast-snapshot");
+    expect(briefInterpretationModel(environment)).toBe("gpt-5.4-mini");
+    expect(briefInterpretationModel({ ...environment, OPENAI_BRIEF_MODEL: "brief-snapshot" }))
+      .toBe("brief-snapshot");
     expect(researchExecutionPolicy(brief("curated", 50), environment)).toMatchObject({
       model: "fast-snapshot",
       runDeadlineMs: 120_000,
@@ -193,6 +213,63 @@ describe("research execution policy", () => {
     expect(parseFastRouteCheckpoint({
       ...route,
       deadlineAt: new Date(confirmedAt.getTime() + FAST_RUN_DEADLINE_MS + 1).toISOString(),
+    })).toBeNull();
+  });
+
+  test("uses honest size-tiered windows without weakening the exact requested minimum", () => {
+    expect(fastRunServiceLevel(1)).toMatchObject({
+      tier: "standard",
+      windowMinutes: 2,
+      runDeadlineMs: 120_000,
+      matchingReserveMs: 40_000,
+    });
+    expect(fastRunServiceLevel(100)).toEqual(fastRunServiceLevel(1));
+    expect(fastRunServiceLevel(101)).toMatchObject({
+      tier: "extended",
+      windowMinutes: 4,
+      runDeadlineMs: 240_000,
+      matchingReserveMs: 60_000,
+    });
+    expect(fastRunServiceLevel(200)).toEqual(fastRunServiceLevel(101));
+    expect(fastRunServiceLevel(201)).toMatchObject({
+      tier: "large",
+      windowMinutes: 6,
+      runDeadlineMs: 360_000,
+      matchingReserveMs: 90_000,
+    });
+    expect(fastRunWindowLabel(300)).toBe("6 MIN");
+
+    for (const count of [100, 101, 200, 201, 300]) {
+      const exact = { ...brief("curated", count), targetSize: { min: count, max: count } };
+      const policy = researchExecutionPolicy(exact, {});
+      expect(policy).toMatchObject({
+        kind: "fast_curated",
+        targetMinimum: count,
+        targetMaximum: count,
+      });
+    }
+  });
+
+  test("accepts every server-owned timing tier and rejects mismatched deadline/reserve pairs", () => {
+    const confirmedAt = new Date("2026-07-14T12:00:00.000Z");
+    for (const count of [100, 200, 300]) {
+      const exact = { ...brief("curated", count), targetSize: { min: count, max: count } };
+      const policy = researchExecutionPolicy(exact, {});
+      if (policy.kind !== "fast_curated") throw new Error("Fixture policy must be fast");
+      const route = createFastRouteCheckpoint(policy, confirmedAt);
+      expect(parseFastRouteCheckpoint(route)).toEqual(route);
+    }
+
+    const largePolicy = researchExecutionPolicy(
+      { ...brief("curated", 300), targetSize: { min: 300, max: 300 } },
+      {},
+    );
+    if (largePolicy.kind !== "fast_curated") throw new Error("Fixture policy must be fast");
+    const largeRoute = createFastRouteCheckpoint(largePolicy, confirmedAt);
+    expect(parseFastRouteCheckpoint({
+      ...largeRoute,
+      researchDeadlineAt: new Date(Date.parse(largeRoute.deadlineAt) - 60_000).toISOString(),
+      matchingReserveMs: 60_000,
     })).toBeNull();
   });
 });

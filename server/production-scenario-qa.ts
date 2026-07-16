@@ -1,0 +1,260 @@
+import type { PlaylistBrief } from "../shared/types.ts";
+import { fastRunServiceLevel } from "../shared/fast-run-sla.ts";
+import {
+  PUBLIC_FAST_RESEARCH_BUDGET_USD,
+} from "../shared/product-policy.ts";
+import {
+  researchExecutionPolicy,
+  type FastResearchPolicy,
+} from "./research-policy.ts";
+
+export type ProductionScenarioExpectedOutcome = "exact_playlist" | "explicit_failure";
+
+export type ProductionScenarioFailureClass =
+  | "catalog_shortfall"
+  | "cost_explosion"
+  | "research_under_yield"
+  | "target_truncation"
+  | "latency_regression";
+
+export interface ProductionScenarioReplayProfile {
+  candidateYieldRate: number;
+  initialStrictMatchRate: number;
+  retryableCatalogRate: number;
+  recoverySuccessRate: number;
+}
+
+export interface ProductionScenarioObservation {
+  requestedTrackCount: number;
+  candidateCount: number;
+  strictMatchedCount: number;
+  accountedCandidateCount: number;
+  manifestTrackCount: number;
+  publishedTrackCount: number;
+  totalCostUsd: number;
+  activeWorkDurationMs: number;
+  terminalStatus: string;
+  terminalPhase: string;
+}
+
+export interface ProductionScenarioAssessment {
+  releaseReady: boolean;
+  failClosed: boolean;
+  violations: string[];
+}
+
+export interface ProductionScenarioReplay {
+  observation: ProductionScenarioObservation;
+  policy: FastResearchPolicy;
+  researchPasses: number;
+  candidateGoal: number;
+  initialStrictMatchedCount: number;
+  retryableCatalogCount: number;
+  recoveredCatalogCount: number;
+  unavailableCatalogCount: number;
+  candidateYieldRate: number;
+  finalCatalogYieldRate: number;
+}
+
+/**
+ * Frozen deterministic provider tape. These values are deliberately
+ * conservative enough to exercise multi-pass research, Apple timeout
+ * recovery, cost accounting, and the public latency contract without making
+ * a paid or networked provider call in CI.
+ */
+export const PRODUCTION_SCENARIO_REPLAY_TAPE = Object.freeze({
+  guidedBriefCostUsd: 0.12,
+  researchPassCostUsd: 0.10,
+  researchPassDurationMs: 12_000,
+  initialCatalogBaseDurationMs: 3_000,
+  initialCatalogCandidateDurationMs: 45,
+  recoveryCatalogBaseDurationMs: 4_000,
+  recoveryCatalogCandidateDurationMs: 90,
+});
+
+function boundedRate(value: number, label: string): number {
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${label} must be a finite rate from 0 through 1`);
+  }
+  return value;
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isInteger(value) || value < 1) throw new Error(`${label} must be a positive integer`);
+  return value;
+}
+
+function fastPolicy(brief: PlaylistBrief): FastResearchPolicy {
+  const policy = researchExecutionPolicy(brief, {});
+  if (policy.kind !== "fast_curated") {
+    throw new Error("Production scenario replay requires the public fast-curated policy");
+  }
+  return policy;
+}
+
+function simulateCandidateResearch(
+  policy: FastResearchPolicy,
+  candidateYieldRate: number,
+): { candidateCount: number; passes: number } {
+  let candidateCount = 0;
+  let passes = 0;
+  while (candidateCount < policy.candidateGoal && passes < policy.maxPasses) {
+    const remainingNeeded = policy.candidateGoal - candidateCount;
+    // Mirrors processFastCuratedJob: the model may see a slightly larger
+    // extraction ceiling, but the authoritative minimum remains the remaining
+    // candidate shortfall.
+    const passCandidateLimit = Math.min(
+      policy.candidateLimit,
+      Math.max(remainingNeeded, Math.ceil(remainingNeeded * 1.25)),
+    );
+    const passMinimumCandidateCount = Math.min(remainingNeeded, passCandidateLimit);
+    const returned = Math.min(
+      passCandidateLimit,
+      Math.floor(passMinimumCandidateCount * candidateYieldRate),
+    );
+    candidateCount += returned;
+    passes += 1;
+    if (returned === 0) break;
+  }
+  return { candidateCount, passes };
+}
+
+export function maximumScenarioActiveDurationMs(requestedTrackCount: number): number {
+  return fastRunServiceLevel(
+    positiveInteger(requestedTrackCount, "requestedTrackCount"),
+  ).runDeadlineMs;
+}
+
+/**
+ * Replay an archived request against the actual deterministic fast-route
+ * policy. This intentionally models only behavior that production implements:
+ * pre-match evidence oversampling, strict unique Apple matches, and bounded
+ * recovery of retryable Apple lookups. It does not invent a post-match
+ * evidence-research refill.
+ */
+export function replayProductionScenario(
+  brief: PlaylistBrief,
+  profile: ProductionScenarioReplayProfile,
+): ProductionScenarioReplay {
+  const policy = fastPolicy(brief);
+  const requestedTrackCount = positiveInteger(
+    brief.targetSize?.min ?? 0,
+    "brief.targetSize.min",
+  );
+  if (brief.targetSize?.max !== requestedTrackCount) {
+    throw new Error("Production scenario replay requires an exact track target");
+  }
+
+  const candidateYieldRate = boundedRate(profile.candidateYieldRate, "candidateYieldRate");
+  const initialStrictMatchRate = boundedRate(profile.initialStrictMatchRate, "initialStrictMatchRate");
+  const retryableCatalogRate = boundedRate(profile.retryableCatalogRate, "retryableCatalogRate");
+  const recoverySuccessRate = boundedRate(profile.recoverySuccessRate, "recoverySuccessRate");
+  if (initialStrictMatchRate + retryableCatalogRate > 1) {
+    throw new Error("Initial strict and retryable catalog rates cannot exceed 1 in total");
+  }
+
+  const research = simulateCandidateResearch(policy, candidateYieldRate);
+  const initialStrictMatchedCount = Math.floor(research.candidateCount * initialStrictMatchRate);
+  const retryableCatalogCount = Math.min(
+    research.candidateCount - initialStrictMatchedCount,
+    Math.floor(research.candidateCount * retryableCatalogRate),
+  );
+  const recoveredCatalogCount = Math.floor(retryableCatalogCount * recoverySuccessRate);
+  const strictMatchedCount = Math.min(
+    research.candidateCount,
+    initialStrictMatchedCount + recoveredCatalogCount,
+  );
+  const unavailableCatalogCount = Math.max(0, research.candidateCount - strictMatchedCount);
+  const manifestTrackCount = Math.min(requestedTrackCount, strictMatchedCount);
+  const complete = manifestTrackCount === requestedTrackCount;
+
+  const researchDurationMs = research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassDurationMs;
+  const initialCatalogDurationMs = PRODUCTION_SCENARIO_REPLAY_TAPE.initialCatalogBaseDurationMs
+    + research.candidateCount * PRODUCTION_SCENARIO_REPLAY_TAPE.initialCatalogCandidateDurationMs;
+  const recoveryDurationMs = retryableCatalogCount === 0
+    ? 0
+    : PRODUCTION_SCENARIO_REPLAY_TAPE.recoveryCatalogBaseDurationMs
+      + retryableCatalogCount * PRODUCTION_SCENARIO_REPLAY_TAPE.recoveryCatalogCandidateDurationMs;
+
+  const observation: ProductionScenarioObservation = {
+    requestedTrackCount,
+    candidateCount: research.candidateCount,
+    strictMatchedCount,
+    accountedCandidateCount: research.candidateCount,
+    manifestTrackCount,
+    publishedTrackCount: manifestTrackCount,
+    totalCostUsd: PRODUCTION_SCENARIO_REPLAY_TAPE.guidedBriefCostUsd
+      + research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassCostUsd,
+    activeWorkDurationMs: researchDurationMs + initialCatalogDurationMs + recoveryDurationMs,
+    terminalStatus: complete ? "complete" : "failed",
+    terminalPhase: complete ? "publication_complete" : "catalog_matching_shortfall",
+  };
+
+  return {
+    observation,
+    policy,
+    researchPasses: research.passes,
+    candidateGoal: policy.candidateGoal,
+    initialStrictMatchedCount,
+    retryableCatalogCount,
+    recoveredCatalogCount,
+    unavailableCatalogCount,
+    candidateYieldRate: policy.candidateGoal === 0 ? 0 : research.candidateCount / policy.candidateGoal,
+    finalCatalogYieldRate: research.candidateCount === 0 ? 0 : strictMatchedCount / research.candidateCount,
+  };
+}
+
+/**
+ * Release gate for a promoted production observation or deterministic replay.
+ * A catalog shortfall is fail-closed only when it produced no manifest or
+ * published tracks. Fail-closed is safe, but it is not release-ready for an
+ * archived scenario whose expected outcome is an exact playlist.
+ */
+export function assessProductionScenario(
+  observation: ProductionScenarioObservation,
+  expectedOutcome: ProductionScenarioExpectedOutcome,
+): ProductionScenarioAssessment {
+  const requested = positiveInteger(observation.requestedTrackCount, "requestedTrackCount");
+  const violations: string[] = [];
+  const failClosed = observation.terminalPhase === "catalog_matching_shortfall"
+    && observation.terminalStatus === "failed"
+    && observation.manifestTrackCount === 0
+    && observation.publishedTrackCount === 0;
+
+  if (observation.candidateCount < requested) {
+    violations.push(`research_under_yield:${observation.candidateCount}/${requested}`);
+  }
+  if (observation.accountedCandidateCount !== observation.candidateCount) {
+    violations.push(`candidate_accounting:${observation.accountedCandidateCount}/${observation.candidateCount}`);
+  }
+  if (observation.totalCostUsd > PUBLIC_FAST_RESEARCH_BUDGET_USD + Number.EPSILON) {
+    violations.push(`cost_explosion:${observation.totalCostUsd.toFixed(6)}`);
+  }
+  const latencyLimit = maximumScenarioActiveDurationMs(requested);
+  if (observation.activeWorkDurationMs > latencyLimit) {
+    violations.push(`latency_regression:${observation.activeWorkDurationMs}/${latencyLimit}`);
+  }
+
+  if (expectedOutcome === "exact_playlist") {
+    if (observation.strictMatchedCount < requested) {
+      violations.push(`catalog_shortfall:${observation.strictMatchedCount}/${requested}`);
+    }
+    if (observation.manifestTrackCount !== requested) {
+      violations.push(`manifest_count:${observation.manifestTrackCount}/${requested}`);
+    }
+    if (observation.publishedTrackCount !== requested) {
+      violations.push(`published_count:${observation.publishedTrackCount}/${requested}`);
+    }
+    if (observation.terminalStatus !== "complete") {
+      violations.push(`terminal_status:${observation.terminalStatus}`);
+    }
+  } else if (!failClosed) {
+    violations.push("failure_not_fail_closed");
+  }
+
+  return {
+    releaseReady: violations.length === 0,
+    failClosed,
+    violations,
+  };
+}

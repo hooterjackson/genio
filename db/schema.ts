@@ -32,6 +32,10 @@ export const briefRequests = pgTable("brief_requests", {
   model: varchar("model", { length: 120 }).notNull(),
   status: varchar("status", { length: 40 }).notNull().default("queued"),
   briefJson: jsonb("brief_json"),
+  questionsJson: jsonb("questions_json"),
+  answersJson: jsonb("answers_json"),
+  answersIdempotencyKey: varchar("answers_idempotency_key", { length: 160 }),
+  answersHash: varchar("answers_hash", { length: 64 }),
   estimateUsd: numeric("estimate_usd", { precision: 12, scale: 6, mode: "number" }),
   error: text("error"),
   clientBucket: varchar("client_bucket", { length: 160 }).notNull(),
@@ -85,6 +89,7 @@ export const researchRuns = pgTable("research_runs", {
 export const runAccesses = pgTable("run_accesses", {
   id: uuid("id").primaryKey(),
   runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "set null" }),
   prompt: text("prompt"),
   clientBucket: varchar("client_bucket", { length: 160 }).notNull(),
   idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
@@ -94,6 +99,7 @@ export const runAccesses = pgTable("run_accesses", {
 }, (table) => [
   uniqueIndex("run_access_bucket_idempotency_idx").on(table.clientBucket, table.idempotencyKey),
   index("run_access_run_idx").on(table.runId),
+  index("run_access_brief_request_idx").on(table.briefRequestId),
 ]);
 
 export const capabilitySessionAccesses = pgTable("capability_session_accesses", {
@@ -105,6 +111,15 @@ export const capabilitySessionAccesses = pgTable("capability_session_accesses", 
   primaryKey({ columns: [table.sessionId, table.accessId], name: "capability_session_accesses_pkey" }),
   index("capability_session_access_created_idx").on(table.sessionId, table.createdAt),
   index("capability_session_access_access_idx").on(table.accessId),
+]);
+
+export const capabilitySessionBriefs = pgTable("capability_session_briefs", {
+  sessionId: uuid("session_id").notNull().references(() => capabilitySessions.id, { onDelete: "cascade" }),
+  briefRequestId: uuid("brief_request_id").notNull().references(() => briefRequests.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.sessionId, table.briefRequestId], name: "capability_session_briefs_pkey" }),
+  index("capability_session_brief_request_idx").on(table.briefRequestId),
 ]);
 
 export const capabilityTokens = pgTable("capability_tokens", {

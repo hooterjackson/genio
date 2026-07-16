@@ -8,12 +8,19 @@ import type {
   CatalogSong,
   EvidenceClaimInput,
   PlaylistBrief,
+  PlaylistGuidanceAnswer,
+  PlaylistGuidanceQuestion,
   PlaylistManifest,
   ResearchRunView,
   SourceFrontierItem,
   SourceRecordInput,
   TrackCandidateInput,
 } from "../shared/types.ts";
+import {
+  GUIDED_BRIEF_BUDGET_USD,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+  PUBLIC_PLAYLIST_MINIMUM_TRACKS,
+} from "../shared/product-policy.ts";
 import {
   candidateIdentityKey,
   compactEvidenceNote,
@@ -24,6 +31,7 @@ import {
   stableStringify,
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
+import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
 import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
 import {
@@ -205,6 +213,44 @@ function date(value: unknown): Date | null {
   return value instanceof Date ? value : new Date(String(value));
 }
 
+function normalizedGuidanceAnswers(
+  questions: readonly PlaylistGuidanceQuestion[],
+  submitted: readonly PlaylistGuidanceAnswer[],
+): PlaylistGuidanceAnswer[] {
+  if (questions.length < 2 || questions.length > 3 || submitted.length !== questions.length) {
+    throw new HttpError(400, "Answer every playlist question", "invalid_guidance_answers");
+  }
+  const submittedByQuestion = new Map<string, PlaylistGuidanceAnswer>();
+  for (const answer of submitted) {
+    if (!answer || typeof answer !== "object" || typeof answer.questionId !== "string") {
+      throw new HttpError(400, "Playlist answers are invalid", "invalid_guidance_answers");
+    }
+    if (submittedByQuestion.has(answer.questionId)) {
+      throw new HttpError(400, "Each playlist question can be answered once", "invalid_guidance_answers");
+    }
+    submittedByQuestion.set(answer.questionId, answer);
+  }
+  return questions.map((question) => {
+    const answer = submittedByQuestion.get(question.id);
+    if (!answer) throw new HttpError(400, "Answer every playlist question", "invalid_guidance_answers");
+    const optionId = typeof answer.optionId === "string" ? answer.optionId.trim() : "";
+    const customText = typeof answer.customText === "string" ? answer.customText.trim() : "";
+    if (Boolean(optionId) === Boolean(customText)) {
+      throw new HttpError(400, "Choose one option or enter one custom answer", "invalid_guidance_answers");
+    }
+    if (optionId) {
+      if (!question.options.some((option) => option.id === optionId)) {
+        throw new HttpError(400, "A selected playlist option is invalid", "invalid_guidance_answers");
+      }
+      return { questionId: question.id, optionId };
+    }
+    if (Array.from(customText).length > 500 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(customText)) {
+      throw new HttpError(400, "Custom playlist answers must be 1–500 characters", "invalid_guidance_answers");
+    }
+    return { questionId: question.id, customText };
+  });
+}
+
 async function markTerminalPublicationVolumes(
   client: Pick<PoolClient, "query">,
   payload: Record<string, unknown> | null,
@@ -286,6 +332,38 @@ export function manifestOrderSql(brief: Pick<PlaylistBrief, "mode" | "orderingPo
   }
   if (normalized.startsWith("title") || normalized.includes("title first")) return "c.title,c.artist,c.id";
   return "c.artist,c.title,c.release_year NULLS LAST,c.album NULLS LAST,c.id";
+}
+
+function fixedPlaylistOrder<T extends {
+  candidate_id: string;
+  artist: string;
+  title: string;
+  album: string | null;
+  releaseYear: number | null;
+}>(rows: readonly T[], orderingPolicy: string): T[] {
+  const policy = orderingPolicy.toLocaleLowerCase();
+  const ordered = [...rows];
+  const text = (value: string | null) => (value ?? "").toLocaleLowerCase();
+  const stable = (left: T, right: T) => left.candidate_id.localeCompare(right.candidate_id);
+  if (policy.includes("chronolog") || policy.includes("release year") || policy.includes("release date")) {
+    return ordered.sort((left, right) => (
+      (left.releaseYear ?? Number.MAX_SAFE_INTEGER) - (right.releaseYear ?? Number.MAX_SAFE_INTEGER)
+      || text(left.artist).localeCompare(text(right.artist))
+      || text(left.album).localeCompare(text(right.album))
+      || text(left.title).localeCompare(text(right.title))
+      || stable(left, right)
+    ));
+  }
+  if (policy.includes("alphabet") || policy.includes("by title") || policy.includes("title order")) {
+    return ordered.sort((left, right) => (
+      text(left.title).localeCompare(text(right.title))
+      || text(left.artist).localeCompare(text(right.artist))
+      || stable(left, right)
+    ));
+  }
+  // Rank, evidence, source, and explicitly preserved orders already arrived in
+  // the deterministic membership order used to choose the top N.
+  return ordered;
 }
 
 export class Repository {
@@ -370,8 +448,16 @@ export class Repository {
     const prompt = input.prompt.trim();
     if (prompt.length < 4 || prompt.length > 2_000) throw new HttpError(400, "Describe the playlist in 4–2,000 characters", "invalid_prompt");
     const requestedTrackCount = input.requestedTrackCount ?? null;
-    if (requestedTrackCount !== null && (!Number.isInteger(requestedTrackCount) || requestedTrackCount < 1 || requestedTrackCount > 10_000)) {
-      throw new HttpError(400, "Track count must be an integer from 1 to 10,000", "invalid_track_count");
+    if (requestedTrackCount !== null && (
+      !Number.isInteger(requestedTrackCount)
+      || requestedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+      || requestedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+    )) {
+      throw new HttpError(
+        400,
+        `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`,
+        "invalid_track_count",
+      );
     }
     return this.transaction(async (client) => {
       if (input.idempotencyKey) {
@@ -414,7 +500,8 @@ export class Repository {
 
   async getBriefRequest(id: string): Promise<any | null> {
     const result = await this.pool.query(
-      `SELECT id,prompt,requested_track_count,model,status,brief_json,estimate_usd,error,client_bucket,expires_at,created_at,updated_at
+      `SELECT id,prompt,requested_track_count,model,status,brief_json,questions_json,answers_json,
+              estimate_usd,error,client_bucket,expires_at,created_at,updated_at
        FROM brief_requests WHERE id=$1 AND expires_at>now()`,
       [id],
     );
@@ -427,6 +514,8 @@ export class Repository {
       model: row.model,
       status: row.status,
       brief: row.brief_json,
+      questions: row.questions_json ?? [],
+      answers: row.answers_json ?? [],
       estimateUsd: row.estimate_usd == null ? null : Number(row.estimate_usd),
       error: sanitizeOptionalFailure(row.error, "brief"),
       clientBucket: row.client_bucket,
@@ -436,9 +525,67 @@ export class Repository {
     };
   }
 
+  async getBriefActualCostUsd(id: string): Promise<number> {
+    const result = await this.pool.query<{ actual: number }>(
+      `SELECT COALESCE(sum(amount_usd),0)::float8 actual
+       FROM cost_ledger
+       WHERE brief_request_id=$1`,
+      [id],
+    );
+    return Number(result.rows[0]?.actual ?? 0);
+  }
+
+  async deleteBriefRequest(id: string): Promise<boolean> {
+    return this.transaction(async (client) => {
+      const selected = await client.query(
+        "SELECT 1 FROM brief_requests WHERE id=$1 FOR UPDATE",
+        [id],
+      );
+      if (!selected.rows[0]) return false;
+      const activeReservations = await client.query<{ count: number }>(
+        `SELECT count(*)::int count
+         FROM cost_reservations
+         WHERE brief_request_id=$1 AND status='reserved'`,
+        [id],
+      );
+      if ((activeReservations.rows[0]?.count ?? 0) > 0) {
+        // The provider call may already be billable. Scrub visitor content and
+        // revoke access immediately, but retain only the opaque brief row until
+        // reconciliation can write the aggregate charge. A late worker result
+        // cannot restore content because saveBriefResult requires live expiry.
+        await client.query(
+          `UPDATE brief_requests SET prompt='',status='failed',brief_json=NULL,
+             questions_json=NULL,answers_json=NULL,answers_idempotency_key=NULL,
+             answers_hash=NULL,estimate_usd=NULL,error=NULL,expires_at=now(),updated_at=now()
+           WHERE id=$1`,
+          [id],
+        );
+        await client.query("DELETE FROM capability_session_briefs WHERE brief_request_id=$1", [id]);
+        await client.query(
+          `UPDATE job_queue SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,
+             last_error=NULL,completed_at=now(),updated_at=now()
+           WHERE brief_request_id=$1 AND status IN ('queued','leased')`,
+          [id],
+        );
+        return true;
+      }
+      // Preserve only aggregate billing amounts so visitor deletion cannot
+      // reset application spend accounting. The brief FK and request-specific
+      // usage detail are removed.
+      await client.query(
+        "UPDATE cost_ledger SET brief_request_id=NULL,usage_json=NULL WHERE brief_request_id=$1",
+        [id],
+      );
+      await client.query("DELETE FROM brief_requests WHERE id=$1", [id]);
+      return true;
+    });
+  }
+
   async saveBriefResult(id: string, result: {
-    status: "complete" | "failed";
+    status: "awaiting_answers" | "complete" | "failed";
+    expectedStatus?: "queued" | "finalizing";
     brief?: PlaylistBrief;
+    questions?: PlaylistGuidanceQuestion[];
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void> {
@@ -446,10 +593,69 @@ export class Repository {
       ? sanitizeFailure(result.error, "brief")
       : null;
     await this.pool.query(
-      `UPDATE brief_requests SET status=$2,brief_json=$3,estimate_usd=$4,error=$5,updated_at=now()
-       WHERE id=$1`,
-      [id, result.status, result.brief ?? null, result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"), persistedError],
+      `UPDATE brief_requests SET status=$2,brief_json=$3,questions_json=COALESCE($4,questions_json),
+              estimate_usd=$5,error=$6,updated_at=now()
+       WHERE id=$1 AND expires_at>now() AND ($7::varchar IS NULL OR status=$7::varchar)`,
+      [
+        id,
+        result.status,
+        result.brief ?? null,
+        result.questions === undefined ? null : JSON.stringify(result.questions),
+        result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"),
+        persistedError,
+        result.expectedStatus ?? null,
+      ],
     );
+  }
+
+  async submitBriefAnswers(input: {
+    briefRequestId: string;
+    idempotencyKey: string;
+    answers: PlaylistGuidanceAnswer[];
+  }): Promise<{ status: "finalizing" | "complete"; created: boolean }> {
+    return this.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`brief-answers:${input.briefRequestId}`]);
+      const selected = await client.query<{
+        status: string;
+        questions_json: PlaylistGuidanceQuestion[] | null;
+        answers_idempotency_key: string | null;
+        answers_hash: string | null;
+      }>(
+        `SELECT status,questions_json,answers_idempotency_key,answers_hash
+         FROM brief_requests
+         WHERE id=$1 AND expires_at>now()
+         FOR UPDATE`,
+        [input.briefRequestId],
+      );
+      const brief = selected.rows[0];
+      if (!brief) throw new HttpError(404, "Brief request not found", "brief_not_found");
+      const questions = Array.isArray(brief.questions_json) ? brief.questions_json : [];
+      const answers = normalizedGuidanceAnswers(questions, input.answers);
+      const answersHash = sha256Hex(stableStringify(answers));
+      if (brief.answers_idempotency_key !== null) {
+        if (brief.answers_idempotency_key !== input.idempotencyKey || brief.answers_hash !== answersHash) {
+          throw new HttpError(
+            409,
+            "Idempotency key was already used for different playlist answers",
+            "idempotency_conflict",
+          );
+        }
+        if (brief.status !== "finalizing" && brief.status !== "complete") {
+          throw new HttpError(409, "Playlist answers cannot be submitted in this state", "brief_not_ready");
+        }
+        return { status: brief.status, created: false };
+      }
+      if (brief.status !== "awaiting_answers") {
+        throw new HttpError(409, "Playlist questions are not ready for answers", "brief_not_ready");
+      }
+      await client.query(
+        `UPDATE brief_requests SET status='finalizing',answers_json=$2,
+             answers_idempotency_key=$3,answers_hash=$4,error=NULL,updated_at=now()
+         WHERE id=$1`,
+        [input.briefRequestId, JSON.stringify(answers), input.idempotencyKey, answersHash],
+      );
+      return { status: "finalizing", created: true };
+    });
   }
 
   private async attachCapabilitySessionAccess(
@@ -477,6 +683,7 @@ export class Repository {
 
   async createRunIdempotent(input: {
     prompt: string;
+    briefRequestId?: string | null;
     brief: PlaylistBrief;
     estimateUsd: number;
     approvedBudgetUsd: number;
@@ -511,8 +718,9 @@ export class Repository {
         prompt: string | null;
         brief_hash: string;
         auto_publish: boolean;
+        brief_request_id: string | null;
       }>(
-        `SELECT a.id AS access_id,a.run_id,a.prompt,r.status,r.brief_hash,r.auto_publish
+        `SELECT a.id AS access_id,a.run_id,a.prompt,a.brief_request_id,r.status,r.brief_hash,r.auto_publish
          FROM run_accesses a JOIN research_runs r ON r.id=a.run_id
          WHERE a.client_bucket=ANY($1::text[]) AND a.idempotency_key=$2 AND a.deleted_at IS NULL ORDER BY a.created_at DESC LIMIT 1`,
         [input.clientBucketAliases, input.idempotencyKey],
@@ -521,7 +729,8 @@ export class Repository {
         const prior = existing.rows[0];
         if (prior.prompt !== input.prompt
           || prior.brief_hash !== briefHash
-          || prior.auto_publish !== (input.autoPublish === true)) {
+          || prior.auto_publish !== (input.autoPublish === true)
+          || prior.brief_request_id !== (input.briefRequestId ?? null)) {
           throw new HttpError(
             409,
             "Idempotency key was already used for a different playlist run",
@@ -616,9 +825,9 @@ export class Repository {
 
       const accessId = randomUUID();
       await client.query(
-        `INSERT INTO run_accesses(id,run_id,prompt,client_bucket,idempotency_key,expires_at)
-         VALUES($1,$2,$3,$4,$5,now()+interval '90 days')`,
-        [accessId, runId, input.prompt.slice(0, 2_000), input.clientBucket, input.idempotencyKey],
+        `INSERT INTO run_accesses(id,run_id,brief_request_id,prompt,client_bucket,idempotency_key,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,now()+interval '90 days')`,
+        [accessId, runId, input.briefRequestId ?? null, input.prompt.slice(0, 2_000), input.clientBucket, input.idempotencyKey],
       );
       if (input.capabilitySessionId) {
         await this.attachCapabilitySessionAccess(client, input.capabilitySessionId, runId, accessId);
@@ -827,7 +1036,10 @@ export class Repository {
 
   async deleteRunAccess(accessId: string): Promise<boolean> {
     return this.transaction(async (client) => {
-      const access = await client.query<{ run_id: string }>("SELECT run_id FROM run_accesses WHERE id=$1 AND deleted_at IS NULL FOR UPDATE", [accessId]);
+      const access = await client.query<{ run_id: string; brief_request_id: string | null }>(
+        "SELECT run_id,brief_request_id FROM run_accesses WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [accessId],
+      );
       if (!access.rows[0]) return false;
       const runId = access.rows[0].run_id;
       await client.query("UPDATE run_accesses SET prompt=NULL,deleted_at=now(),updated_at=now() WHERE id=$1", [accessId]);
@@ -842,10 +1054,22 @@ export class Repository {
              SELECT 1 FROM capability_session_accesses csa
              JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
              WHERE csa.session_id=s.id AND a.deleted_at IS NULL AND a.expires_at>now()
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM capability_session_briefs csb
+             JOIN brief_requests b ON b.id=csb.brief_request_id
+             WHERE csb.session_id=s.id AND b.expires_at>now()
            )`,
         [affectedSessions.rows.map((row) => row.session_id)],
       );
+      await client.query(
+        "UPDATE capability_sessions SET access_id=NULL,updated_at=now() WHERE access_id=$1",
+        [accessId],
+      );
       await client.query("DELETE FROM capability_tokens WHERE access_id=$1", [accessId]);
+      if (access.rows[0].brief_request_id) {
+        await client.query("DELETE FROM brief_requests WHERE id=$1", [access.rows[0].brief_request_id]);
+      }
       const remaining = await client.query<{ count: number }>("SELECT count(*)::int count FROM run_accesses WHERE run_id=$1 AND deleted_at IS NULL", [runId]);
       if (remaining.rows[0]!.count === 0) {
         const run = await client.query<{ status: string; actual_cost_usd: string }>("SELECT status,actual_cost_usd FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
@@ -882,6 +1106,10 @@ export class Repository {
           }
           await client.query("DELETE FROM cost_ledger WHERE run_id=$1", [runId]);
           await client.query("DELETE FROM audit_events WHERE run_id=$1", [runId]);
+          await client.query(
+            "UPDATE capability_sessions SET run_id=NULL,access_id=NULL,updated_at=now() WHERE run_id=$1",
+            [runId],
+          );
           await client.query("DELETE FROM research_runs WHERE id=$1", [runId]);
         }
       }
@@ -1877,9 +2105,16 @@ export class Repository {
       }
       const choicesByCandidate = new Map<string, Map<string, CatalogSong>>();
       for (const row of candidates.rows) {
+        const hasPrimary = Boolean(
+          row.song_json
+          && typeof row.song_json === "object"
+          && typeof row.song_json.id === "string",
+        );
         const choices = [
           row.song_json,
-          ...(Array.isArray(row.alternatives_json) ? row.alternatives_json : []),
+          ...((hasPrimary || row.status === "review") && Array.isArray(row.alternatives_json)
+            ? row.alternatives_json
+            : []),
         ]
           .filter((song): song is CatalogSong => Boolean(song && typeof song === "object" && typeof song.id === "string"));
         choicesByCandidate.set(row.id, new Map(choices.map((song) => [song.id, song])));
@@ -1945,8 +2180,9 @@ export class Repository {
                 : `Visitor selected Apple catalog ID ${song.id} in bulk review`,
           };
         }
-        const noChoices = (choicesByCandidate.get(row.id)?.size ?? 0) === 0;
-        const status = noChoices && ["unavailable", "unsupported"].includes(row.status)
+        // Alternatives remain review aids; their presence does not make a
+        // track available or supported when no Apple recording was selected.
+        const status = ["unavailable", "unsupported"].includes(row.status)
           ? row.status
           : "rejected";
         return {
@@ -2093,7 +2329,8 @@ export class Repository {
         : "";
       const orderSql = manifestOrderSql(brief);
       const matches = await client.query(
-        `SELECT m.candidate_id,m.catalog_id,m.song_json,c.artist,c.title FROM catalog_matches m
+        `SELECT m.candidate_id,m.catalog_id,m.song_json,c.artist,c.title,c.album,c.release_year,c.duration_ms
+         FROM catalog_matches m
          JOIN track_candidates c ON c.id=m.candidate_id
          WHERE m.run_id=$1 AND m.status='accepted' AND m.catalog_id IS NOT NULL ${verifiedClause}
          ORDER BY ${orderSql}`,
@@ -2121,7 +2358,31 @@ export class Repository {
           [runId, overflowIds],
         );
       }
-      const tracks = selectedMatches.map((match, index) => ({
+      const sequencingRows = selectedMatches.map((match) => {
+        const song = match.song_json && typeof match.song_json === "object"
+          ? match.song_json as Partial<CatalogSong>
+          : null;
+        const appleYear = typeof song?.releaseDate === "string"
+          ? Number.parseInt(song.releaseDate.slice(0, 4), 10)
+          : null;
+        return {
+          ...match,
+          artist: match.artist,
+          album: song?.albumName || match.album,
+          genre: song?.genreNames,
+          releaseYear: Number.isInteger(appleYear) ? appleYear : match.release_year,
+          durationMs: song?.durationInMillis ?? match.duration_ms,
+        };
+      });
+      const sequencedMatches = shouldSequencePlaylist(brief.orderingPolicy, brief.mode)
+        ? sequencePlaylist(sequencingRows, {
+          transitionPreference: /\b(?:high[- ]?contrast|contrast|surpris|eclectic)\b/iu
+            .test(brief.orderingPolicy)
+            ? "contrast"
+            : "smooth",
+        })
+        : fixedPlaylistOrder(sequencingRows, brief.orderingPolicy);
+      const tracks = sequencedMatches.map((match, index) => ({
         position: index,
         candidateId: match.candidate_id,
         catalogId: match.catalog_id,
@@ -2795,6 +3056,64 @@ export class Repository {
     );
   }
 
+  async attachCapabilitySessionToBrief(briefRequestId: string, session: {
+    id: string;
+    tokenHash?: string;
+    expiresAt?: Date;
+    reuseExisting?: boolean;
+  }): Promise<any | null> {
+    return this.transaction(async (client) => {
+      const brief = await client.query(
+        "SELECT 1 FROM brief_requests WHERE id=$1 AND expires_at>now() FOR KEY SHARE",
+        [briefRequestId],
+      );
+      if (!brief.rows[0]) return null;
+
+      let expiresAt: Date;
+      if (session.reuseExisting) {
+        const existing = await client.query<{ expires_at: Date }>(
+          `SELECT expires_at FROM capability_sessions
+           WHERE id=$1 AND revoked_at IS NULL AND expires_at>now()
+           FOR UPDATE`,
+          [session.id],
+        );
+        if (!existing.rows[0]) return null;
+        expiresAt = date(existing.rows[0].expires_at)!;
+      } else {
+        if (!session.tokenHash || !session.expiresAt) {
+          throw new Error("New capability sessions require a token and expiry");
+        }
+        expiresAt = session.expiresAt;
+        await client.query(
+          `INSERT INTO capability_sessions(id,run_id,access_id,token_hash,expires_at)
+           VALUES($1,NULL,NULL,$2,$3)`,
+          [session.id, session.tokenHash, expiresAt],
+        );
+      }
+      await client.query(
+        `INSERT INTO capability_session_briefs(session_id,brief_request_id)
+         VALUES($1,$2) ON CONFLICT(session_id,brief_request_id) DO NOTHING`,
+        [session.id, briefRequestId],
+      );
+      const latestRun = await client.query<{ run_id: string; access_id: string }>(
+        `SELECT csa.run_id,csa.access_id
+         FROM capability_session_accesses csa
+         JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+         JOIN research_runs r ON r.id=csa.run_id
+         WHERE csa.session_id=$1
+           AND a.deleted_at IS NULL AND a.expires_at>now() AND r.deleted_at IS NULL
+         ORDER BY csa.created_at DESC,csa.access_id DESC LIMIT 1`,
+        [session.id],
+      );
+      return {
+        id: session.id,
+        runId: latestRun.rows[0]?.run_id ?? null,
+        accessId: latestRun.rows[0]?.access_id ?? null,
+        expiresAt,
+      };
+    });
+  }
+
   async exchangeCapabilityToken(tokenHash: string, session: {
     id: string;
     tokenHash?: string;
@@ -2817,10 +3136,17 @@ export class Repository {
         const existing = await client.query<{ expires_at: Date }>(
           `SELECT s.expires_at FROM capability_sessions s
            WHERE s.id=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
-             AND EXISTS (
-               SELECT 1 FROM capability_session_accesses csa
-               JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
-               WHERE csa.session_id=s.id AND a.deleted_at IS NULL AND a.expires_at>now()
+             AND (
+               EXISTS (
+                 SELECT 1 FROM capability_session_accesses csa
+                 JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+                 WHERE csa.session_id=s.id AND a.deleted_at IS NULL AND a.expires_at>now()
+               )
+               OR EXISTS (
+                 SELECT 1 FROM capability_session_briefs csb
+                 JOIN brief_requests b ON b.id=csb.brief_request_id
+                 WHERE csb.session_id=s.id AND b.expires_at>now()
+               )
              )
            FOR UPDATE`,
           [session.id],
@@ -2846,18 +3172,25 @@ export class Repository {
       `WITH live_session AS (
          UPDATE capability_sessions s SET last_seen_at=now(),updated_at=now()
          WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
-           AND EXISTS (
-             SELECT 1 FROM capability_session_accesses csa
-             JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
-             JOIN research_runs r ON r.id=csa.run_id
-             WHERE csa.session_id=s.id
-               AND a.deleted_at IS NULL AND a.expires_at>now() AND r.deleted_at IS NULL
+           AND (
+             EXISTS (
+               SELECT 1 FROM capability_session_accesses csa
+               JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
+               JOIN research_runs r ON r.id=csa.run_id
+               WHERE csa.session_id=s.id
+                 AND a.deleted_at IS NULL AND a.expires_at>now() AND r.deleted_at IS NULL
+             )
+             OR EXISTS (
+               SELECT 1 FROM capability_session_briefs csb
+               JOIN brief_requests b ON b.id=csb.brief_request_id
+               WHERE csb.session_id=s.id AND b.expires_at>now()
+             )
            )
          RETURNING s.id,s.expires_at
        )
        SELECT ls.id,aa.run_id,aa.access_id,ls.expires_at
        FROM live_session ls
-       JOIN LATERAL (
+       LEFT JOIN LATERAL (
          SELECT csa.run_id,csa.access_id
          FROM capability_session_accesses csa
          JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
@@ -2869,7 +3202,12 @@ export class Repository {
       [tokenHash],
     );
     const row = result.rows[0];
-    return row ? { id: row.id, runId: row.run_id, accessId: row.access_id, expiresAt: date(row.expires_at)! } : null;
+    return row ? {
+      id: row.id,
+      runId: row.run_id ?? null,
+      accessId: row.access_id ?? null,
+      expiresAt: date(row.expires_at)!,
+    } : null;
   }
 
   async getCapabilitySessionAccess(sessionId: string, accessId: string): Promise<{ runId: string; accessId: string } | null> {
@@ -2888,6 +3226,20 @@ export class Repository {
     return result.rows[0]
       ? { runId: result.rows[0].run_id, accessId: result.rows[0].access_id }
       : null;
+  }
+
+  async getCapabilitySessionBrief(sessionId: string, briefRequestId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1
+       FROM capability_session_briefs csb
+       JOIN capability_sessions s ON s.id=csb.session_id
+       JOIN brief_requests b ON b.id=csb.brief_request_id
+       WHERE csb.session_id=$1 AND csb.brief_request_id=$2
+         AND s.revoked_at IS NULL AND s.expires_at>now()
+         AND b.expires_at>now()`,
+      [sessionId, briefRequestId],
+    );
+    return Boolean(result.rows[0]);
   }
 
   async revokeCapabilitySession(sessionId: string): Promise<void> {
@@ -2909,6 +3261,30 @@ export class Repository {
       }
       const existing = await client.query<{ id: string; status: string }>("SELECT id,status FROM cost_reservations WHERE idempotency_key=$1 FOR UPDATE", [idempotencyKey]);
       if (existing.rows[0] && existing.rows[0].status !== "released") return { reservationId: existing.rows[0].id };
+      if (subject.briefRequestId) {
+        const briefBudget = await client.query<{ spent: number; reserved: number; exists: boolean }>(
+          `SELECT
+             EXISTS(SELECT 1 FROM brief_requests WHERE id=$1 AND expires_at>now()) exists,
+             COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE brief_request_id=$1),0)::float8 spent,
+             COALESCE((
+               SELECT sum(reserved_usd)
+               FROM cost_reservations
+               WHERE brief_request_id=$1 AND status='reserved' AND expires_at>now()
+             ),0)::float8 reserved`,
+          [subject.briefRequestId],
+        );
+        if (!briefBudget.rows[0]?.exists) {
+          throw new HttpError(404, "Brief request not found", "brief_not_found");
+        }
+        const projected = briefBudget.rows[0].spent + briefBudget.rows[0].reserved + amount;
+        if (projected > GUIDED_BRIEF_BUDGET_USD + 0.000001) {
+          throw new HttpError(
+            402,
+            "Playlist guidance reached its cost limit",
+            "brief_budget_reached",
+          );
+        }
+      }
       const monthly = await client.query<{ spent: number; reserved: number }>(
         `SELECT
           COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE occurred_at >= date_trunc('month',now() AT TIME ZONE 'America/Sao_Paulo') AT TIME ZONE 'America/Sao_Paulo'),0)::float8 spent,
@@ -2960,6 +3336,7 @@ export class Repository {
       const monthlyCeiling = readCostConfiguration().monthlyCostLimitUsd;
       const monthlyProjected = monthly.rows[0]!.spent + Math.max(0, monthly.rows[0]!.reserved - reserved) + actual;
       let runCeilingExceeded = false;
+      let briefCeilingExceeded = false;
       if (row.run_id) {
         const run = await client.query(
           "SELECT actual_cost_usd,reserved_cost_usd,approved_budget_usd FROM research_runs WHERE id=$1 FOR UPDATE",
@@ -2971,7 +3348,25 @@ export class Repository {
           + actual;
         runCeilingExceeded = projected > Number(run.rows[0].approved_budget_usd) + 0.000001;
       }
-      const exceededCeiling = monthlyProjected > monthlyCeiling + 0.000001 || runCeilingExceeded;
+      if (row.brief_request_id) {
+        const brief = await client.query<{ spent: number; reserved: number }>(
+          `SELECT
+             COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE brief_request_id=$1),0)::float8 spent,
+             COALESCE((
+               SELECT sum(reserved_usd)
+               FROM cost_reservations
+               WHERE brief_request_id=$1 AND status='reserved' AND expires_at>now() AND id<>$2
+             ),0)::float8 reserved`,
+          [row.brief_request_id, reservationId],
+        );
+        const projected = (brief.rows[0]?.spent ?? 0)
+          + (brief.rows[0]?.reserved ?? 0)
+          + actual;
+        briefCeilingExceeded = projected > GUIDED_BRIEF_BUDGET_USD + 0.000001;
+      }
+      const exceededCeiling = monthlyProjected > monthlyCeiling + 0.000001
+        || runCeilingExceeded
+        || briefCeilingExceeded;
       await client.query(
         "UPDATE cost_reservations SET status=$2,actual_usd=$3,usage_json=$4,reconciled_at=now() WHERE id=$1",
         [reservationId, exceededCeiling ? "reconciled_overrun" : "reconciled", actual, usage],
@@ -3488,10 +3883,14 @@ export class Repository {
       [Math.max(1, Math.min(limit, 500))],
     );
     for (const row of expired.rows) await this.purgeRunToTombstone(row.id);
+    // A brief's 24-hour expiry controls visitor access and idempotent reuse,
+    // not operational retention. Keep every attempt—including abandoned and
+    // budget-gated ones—for the same 90-day QA window as detailed run data.
     await this.pool.query(
-      "DELETE FROM cost_ledger WHERE brief_request_id IN (SELECT id FROM brief_requests WHERE expires_at<=now())",
+      "DELETE FROM cost_ledger WHERE brief_request_id IN (SELECT id FROM brief_requests WHERE created_at<=$1)",
+      [detailCutoff],
     );
-    await this.pool.query("DELETE FROM brief_requests WHERE expires_at<=now()");
+    await this.pool.query("DELETE FROM brief_requests WHERE created_at<=$1", [detailCutoff]);
     await this.pool.query(
       `DELETE FROM job_queue j USING notification_outbox n
        WHERE j.kind='notification' AND j.payload_json->>'notificationId'=n.id::text AND n.created_at<=$1`,

@@ -2,7 +2,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool, type PoolConfig } from "pg";
 import * as schema from "./schema.ts";
 
-export const DATABASE_SCHEMA_VERSION = "8";
+export const DATABASE_SCHEMA_VERSION = "10";
 
 export interface DatabaseHandle {
   pool: Pool;

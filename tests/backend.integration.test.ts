@@ -16,7 +16,13 @@ import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
 import { hmacBase64Url, sha256Hex } from "../server/security.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
-import type { CitationAttestationInput, PlaylistBrief } from "../shared/types.ts";
+import { GUIDED_BRIEF_BUDGET_USD } from "../shared/product-policy.ts";
+import type {
+  CitationAttestationInput,
+  PlaylistBrief,
+  PlaylistGuidanceAnswer,
+  PlaylistGuidanceQuestion,
+} from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
@@ -28,6 +34,9 @@ const migrationSql = [
   "0004_citation_attestation.sql",
   "0005_candidate_selection_rank.sql",
   "0006_capability_session_accesses.sql",
+  "0007_brief_requested_track_count.sql",
+  "0008_guided_brief_questions.sql",
+  "0009_brief_capabilities.sql",
 ]
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
@@ -50,6 +59,31 @@ const evidenceBinding = {
   subjectEntity: brief.subjectEntities[0]!,
   subjectRelationship: brief.relationship,
 };
+
+function guidanceQuestions(count: 2 | 3 = 2): PlaylistGuidanceQuestion[] {
+  return Array.from({ length: count }, (_, questionIndex) => {
+    const questionId = `q${questionIndex + 1}`;
+    return {
+      id: questionId,
+      header: questionIndex === count - 1 ? "Flow" : `Scope ${questionIndex + 1}`,
+      question: questionIndex === count - 1
+        ? "How should the playlist move?"
+        : `Which selection scope should guide question ${questionIndex + 1}?`,
+      options: Array.from({ length: 3 }, (_unused, optionIndex) => ({
+        id: `${questionId}-o${optionIndex + 1}`,
+        label: `Option ${optionIndex + 1}`,
+        description: `Question ${questionIndex + 1}, option ${optionIndex + 1}.`,
+        recommended: optionIndex === 0,
+      })),
+    };
+  });
+}
+
+function guidanceAnswers(questions: readonly PlaylistGuidanceQuestion[]): PlaylistGuidanceAnswer[] {
+  return questions.map((question, index) => index === 0
+    ? { questionId: question.id, optionId: question.options[0]!.id }
+    : { questionId: question.id, customText: `Custom answer ${index + 1}` });
+}
 
 function citationFixture(
   sourceUrl: string,
@@ -185,6 +219,7 @@ databaseDescribe("hosted backend integration", () => {
         to_regclass('gateway_nonces')::text,
         to_regclass('capability_sessions')::text,
         to_regclass('capability_session_accesses')::text,
+        to_regclass('capability_session_briefs')::text,
         to_regclass('citation_attestations')::text
       ]) AS name`,
     );
@@ -196,6 +231,7 @@ databaseDescribe("hosted backend integration", () => {
       "gateway_nonces",
       "capability_sessions",
       "capability_session_accesses",
+      "capability_session_briefs",
       "citation_attestations",
     ]);
     const evidenceColumns = await repository.pool.query<{ column_name: string }>(
@@ -760,17 +796,17 @@ databaseDescribe("hosted backend integration", () => {
     const first = await createBrief("idempotent");
     vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "5");
     const sameReservation = await Promise.all([
-      repository.reserveProviderCost({ briefRequestId: first.id }, "same-operation", 0.5),
-      repository.reserveProviderCost({ briefRequestId: first.id }, "same-operation", 0.5),
+      repository.reserveProviderCost({ briefRequestId: first.id }, "same-operation", 0.2),
+      repository.reserveProviderCost({ briefRequestId: first.id }, "same-operation", 0.2),
     ]);
     expect(new Set(sameReservation.map((item) => item.reservationId)).size).toBe(1);
     await repository.releaseProviderCost(sameReservation[0]!.reservationId);
 
-    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "1");
+    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "0.3");
     const [left, right] = await Promise.all([createBrief("left"), createBrief("right")]);
     const results = await Promise.allSettled([
-      repository.reserveProviderCost({ briefRequestId: left.id }, "left-call", 0.75),
-      repository.reserveProviderCost({ briefRequestId: right.id }, "right-call", 0.75),
+      repository.reserveProviderCost({ briefRequestId: left.id }, "left-call", 0.2),
+      repository.reserveProviderCost({ briefRequestId: right.id }, "right-call", 0.2),
     ]);
     const fulfilled = results.filter((result): result is PromiseFulfilledResult<{ reservationId: string }> => result.status === "fulfilled");
     const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -778,6 +814,186 @@ databaseDescribe("hosted backend integration", () => {
     expect(rejected).toHaveLength(1);
     expect(rejected[0]!.reason).toMatchObject({ statusCode: 402, code: "monthly_budget_reached" });
     await repository.releaseProviderCost(fulfilled[0]!.value.reservationId);
+  });
+
+  test("caps each guided brief across actual spend, active reservations, and the next call", async () => {
+    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
+    const clientBucket = `guided-cost-cap-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Guided cost cap",
+      requestedTrackCount: 300,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+
+    const first = await repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-preflight",
+      0.1,
+    );
+    await repository.reconcileProviderCost(first.reservationId, 0.1);
+    await expect(repository.getBriefActualCostUsd(request.id)).resolves.toBeCloseTo(0.1, 6);
+
+    const active = await repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-refinement",
+      0.1,
+    );
+    await expect(repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-third-call",
+      GUIDED_BRIEF_BUDGET_USD - 0.2 + 0.001,
+    )).rejects.toMatchObject({ statusCode: 402, code: "brief_budget_reached" });
+
+    await repository.releaseProviderCost(active.reservationId);
+    await expect(repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-boundary-call",
+      GUIDED_BRIEF_BUDGET_USD - 0.1,
+    )).resolves.toMatchObject({ reservationId: expect.any(String) });
+  });
+
+  test("serializes concurrent guided reservations against one brief budget", async () => {
+    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
+    const clientBucket = `guided-cost-concurrent-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Concurrent guided cost cap",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+
+    const results = await Promise.allSettled([
+      repository.reserveProviderCost({ briefRequestId: request.id }, "guided-left", 0.15),
+      repository.reserveProviderCost({ briefRequestId: request.id }, "guided-right", 0.15),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 402, code: "brief_budget_reached" },
+    });
+  });
+
+  test("records and blocks further work after a guided provider cost overrun", async () => {
+    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
+    const clientBucket = `guided-cost-overrun-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Guided provider overrun",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const reservation = await repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-overrun",
+      0.1,
+    );
+
+    await expect(repository.reconcileProviderCost(
+      reservation.reservationId,
+      GUIDED_BRIEF_BUDGET_USD + 0.01,
+      { total_tokens: 1 },
+    )).rejects.toMatchObject({ statusCode: 402, code: "provider_cost_overrun" });
+    await expect(repository.getBriefActualCostUsd(request.id))
+      .resolves.toBeCloseTo(GUIDED_BRIEF_BUDGET_USD + 0.01, 6);
+    await expect(repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-after-overrun",
+      0.001,
+    )).rejects.toMatchObject({ statusCode: 402, code: "brief_budget_reached" });
+    const persisted = await repository.pool.query<{ status: string; count: number }>(
+      `SELECT r.status,
+         (SELECT count(*)::int FROM cost_ledger l WHERE l.reservation_id=r.id) count
+       FROM cost_reservations r WHERE r.id=$1`,
+      [reservation.reservationId],
+    );
+    expect(persisted.rows[0]).toEqual({ status: "reconciled_overrun", count: 1 });
+  });
+
+  test("deleting a guided brief revokes access and preserves active provider accounting", async () => {
+    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
+    vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    const clientBucket = `guided-delete-active-cost-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Private visitor prompt that must be deleted",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const capabilities = new CapabilityService(repository);
+    const reply = new ReplyStub();
+    await capabilities.authorizeBrief(
+      cookieRequest(""),
+      reply as unknown as FastifyReply,
+      request.id,
+    );
+    const authorizedRequest = cookieRequest(reply.headers.get("set-cookie")!.split(";")[0]!);
+    await expect(capabilities.authenticateForBrief(authorizedRequest, request.id))
+      .resolves.toMatchObject({ runId: null, accessId: null });
+    const reservation = await repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "guided-delete-in-flight",
+      0.1,
+    );
+
+    await expect(repository.deleteBriefRequest(request.id)).resolves.toBe(true);
+    await expect(repository.getBriefRequest(request.id)).resolves.toBeNull();
+    await expect(capabilities.authenticate(authorizedRequest))
+      .rejects.toMatchObject({ statusCode: 401, code: "capability_required" });
+    const retained = await repository.pool.query<{
+      brief_request_id: string | null;
+      status: string;
+    }>(
+      "SELECT brief_request_id,status FROM cost_reservations WHERE id=$1",
+      [reservation.reservationId],
+    );
+    expect(retained.rows[0]).toEqual({ brief_request_id: request.id, status: "reserved" });
+    const scrubbed = await repository.pool.query<{
+      prompt: string;
+      brief_json: unknown;
+      questions_json: unknown;
+      answers_json: unknown;
+      status: string;
+      expired: boolean;
+    }>(
+      `SELECT prompt,brief_json,questions_json,answers_json,status,(expires_at<=now()) expired
+       FROM brief_requests WHERE id=$1`,
+      [request.id],
+    );
+    expect(scrubbed.rows[0]).toEqual({
+      prompt: "",
+      brief_json: null,
+      questions_json: null,
+      answers_json: null,
+      status: "failed",
+      expired: true,
+    });
+
+    await expect(repository.reconcileProviderCost(
+      reservation.reservationId,
+      0.08,
+      { total_tokens: 1 },
+    )).resolves.toBeUndefined();
+    const accounted = await repository.pool.query<{
+      amount_usd: string;
+      brief_request_id: string | null;
+    }>(
+      "SELECT amount_usd,brief_request_id FROM cost_ledger WHERE reservation_id=$1",
+      [reservation.reservationId],
+    );
+    expect(Number(accounted.rows[0]!.amount_usd)).toBeCloseTo(0.08, 6);
+    expect(accounted.rows[0]!.brief_request_id).toBe(request.id);
   });
 
   test("monthly cost accounting switches at midnight in America/Sao_Paulo", async () => {
@@ -1074,6 +1290,303 @@ databaseDescribe("hosted backend integration", () => {
       idempotencyKey: key,
       rateLimit: 10,
     })).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+  });
+
+  test.each([2, 3] as const)(
+    "accepts one option or one custom answer for each of %i guided questions",
+    async (questionCount) => {
+      const clientBucket = `guided-${questionCount}-${randomUUID()}`;
+      const request = await repository.createBriefRequest({
+        prompt: `${questionCount} guided questions`,
+        requestedTrackCount: 50,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        rateLimit: 10,
+      });
+      const questions = guidanceQuestions(questionCount);
+      await repository.saveBriefResult(request.id, {
+        status: "awaiting_answers",
+        brief: { ...brief, mode: "curated", targetSize: { min: 50, max: 50 } },
+        questions,
+      });
+
+      await expect(repository.submitBriefAnswers({
+        briefRequestId: request.id,
+        idempotencyKey: `answers-${randomUUID()}`,
+        answers: guidanceAnswers(questions),
+      })).resolves.toEqual({ status: "finalizing", created: true });
+      await expect(repository.getBriefRequest(request.id)).resolves.toMatchObject({
+        status: "finalizing",
+        answers: guidanceAnswers(questions),
+      });
+    },
+  );
+
+  test.each([
+    {
+      label: "missing answer",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id, optionId: questions[0]!.options[0]!.id },
+      ],
+    },
+    {
+      label: "duplicate question",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id, optionId: questions[0]!.options[0]!.id },
+        { questionId: questions[0]!.id, customText: "Second answer to the same question" },
+      ],
+    },
+    {
+      label: "unknown question",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id, optionId: questions[0]!.options[0]!.id },
+        { questionId: "unknown-question", customText: "Unknown" },
+      ],
+    },
+    {
+      label: "option and custom answer together",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        {
+          questionId: questions[0]!.id,
+          optionId: questions[0]!.options[0]!.id,
+          customText: "Also custom",
+        },
+        { questionId: questions[1]!.id, optionId: questions[1]!.options[0]!.id },
+      ],
+    },
+    {
+      label: "neither option nor custom answer",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id },
+        { questionId: questions[1]!.id, optionId: questions[1]!.options[0]!.id },
+      ],
+    },
+    {
+      label: "unknown option",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id, optionId: "unknown-option" },
+        { questionId: questions[1]!.id, optionId: questions[1]!.options[0]!.id },
+      ],
+    },
+    {
+      label: "oversized custom answer",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id, customText: "x".repeat(501) },
+        { questionId: questions[1]!.id, optionId: questions[1]!.options[0]!.id },
+      ],
+    },
+    {
+      label: "control character in custom answer",
+      answers: (questions: PlaylistGuidanceQuestion[]) => [
+        { questionId: questions[0]!.id, customText: "invalid\u0000answer" },
+        { questionId: questions[1]!.id, optionId: questions[1]!.options[0]!.id },
+      ],
+    },
+  ])("rejects a guided submission with $label without mutating it", async ({ answers }) => {
+    const clientBucket = `guided-invalid-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Invalid guided answer",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const questions = guidanceQuestions(2);
+    await repository.saveBriefResult(request.id, {
+      status: "awaiting_answers",
+      brief: { ...brief, mode: "curated", targetSize: { min: 50, max: 50 } },
+      questions,
+    });
+
+    await expect(repository.submitBriefAnswers({
+      briefRequestId: request.id,
+      idempotencyKey: `invalid-answers-${randomUUID()}`,
+      answers: answers(questions),
+    })).rejects.toMatchObject({ statusCode: 400, code: "invalid_guidance_answers" });
+    await expect(repository.getBriefRequest(request.id)).resolves.toMatchObject({
+      status: "awaiting_answers",
+      answers: [],
+    });
+  });
+
+  test.each([1, 4])("rejects a stored guided flow with %i questions", async (questionCount) => {
+    const clientBucket = `guided-count-invalid-${questionCount}-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Invalid guided question count",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const questions = Array.from({ length: questionCount }, (_unused, index) =>
+      guidanceQuestions(2)[index % 2]!).map((question, index) => ({
+        ...question,
+        id: `stored-q${index + 1}`,
+        options: question.options.map((option, optionIndex) => ({
+          ...option,
+          id: `stored-q${index + 1}-o${optionIndex + 1}`,
+        })),
+      }));
+    await repository.saveBriefResult(request.id, {
+      status: "awaiting_answers",
+      brief: { ...brief, mode: "curated", targetSize: { min: 50, max: 50 } },
+      questions,
+    });
+
+    await expect(repository.submitBriefAnswers({
+      briefRequestId: request.id,
+      idempotencyKey: `invalid-count-${randomUUID()}`,
+      answers: guidanceAnswers(questions),
+    })).rejects.toMatchObject({ statusCode: 400, code: "invalid_guidance_answers" });
+  });
+
+  test("makes guided answer replay single-effect and rejects key or payload drift", async () => {
+    const clientBucket = `guided-replay-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Guided replay",
+      requestedTrackCount: 75,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const questions = guidanceQuestions(2);
+    const answers = guidanceAnswers(questions);
+    await repository.saveBriefResult(request.id, {
+      status: "awaiting_answers",
+      brief: { ...brief, mode: "curated", targetSize: { min: 75, max: 75 } },
+      questions,
+    });
+    const idempotencyKey = `guided-replay-${randomUUID()}`;
+    const submit = (submittedAnswers = answers, key = idempotencyKey) =>
+      repository.submitBriefAnswers({
+        briefRequestId: request.id,
+        idempotencyKey: key,
+        answers: submittedAnswers,
+      });
+
+    await expect(submit()).resolves.toEqual({ status: "finalizing", created: true });
+    await expect(submit()).resolves.toEqual({ status: "finalizing", created: false });
+    await expect(submit([
+      answers[0]!,
+      { questionId: questions[1]!.id, optionId: questions[1]!.options[1]!.id },
+    ])).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+    await expect(submit(answers, `different-key-${randomUUID()}`))
+      .rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+  });
+
+  test("serializes concurrent identical guided answer submissions", async () => {
+    const clientBucket = `guided-concurrent-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Concurrent guided submission",
+      requestedTrackCount: 100,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const questions = guidanceQuestions(3);
+    const answers = guidanceAnswers(questions);
+    await repository.saveBriefResult(request.id, {
+      status: "awaiting_answers",
+      brief: { ...brief, mode: "curated", targetSize: { min: 100, max: 100 } },
+      questions,
+    });
+    const idempotencyKey = `guided-concurrent-${randomUUID()}`;
+    const submit = () => repository.submitBriefAnswers({
+      briefRequestId: request.id,
+      idempotencyKey,
+      answers,
+    });
+
+    const results = await Promise.all([submit(), submit()]);
+    expect(results).toEqual(expect.arrayContaining([
+      { status: "finalizing", created: true },
+      { status: "finalizing", created: false },
+    ]));
+    const stored = await repository.pool.query<{
+      status: string;
+      answers_json: PlaylistGuidanceAnswer[];
+      answers_idempotency_key: string;
+      answers_hash: string;
+    }>(
+      `SELECT status,answers_json,answers_idempotency_key,answers_hash
+       FROM brief_requests WHERE id=$1`,
+      [request.id],
+    );
+    expect(stored.rows[0]).toMatchObject({
+      status: "finalizing",
+      answers_json: answers,
+      answers_idempotency_key: idempotencyKey,
+    });
+    expect(stored.rows[0]!.answers_hash).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  test("a stale preflight completion cannot overwrite durably submitted guided answers", async () => {
+    const clientBucket = `guided-stale-preflight-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Stale guided preflight",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    });
+    const questions = guidanceQuestions(2);
+    const answers = guidanceAnswers(questions);
+    const canonicalBrief: PlaylistBrief = {
+      ...brief,
+      mode: "curated",
+      targetSize: { min: 50, max: 50 },
+    };
+    await repository.saveBriefResult(request.id, {
+      status: "awaiting_answers",
+      brief: canonicalBrief,
+      questions,
+    });
+    await repository.submitBriefAnswers({
+      briefRequestId: request.id,
+      idempotencyKey: `guided-stale-preflight-${randomUUID()}`,
+      answers,
+    });
+
+    // Simulate a reclaimed preflight worker completing after the answer
+    // transaction. This write must be ignored rather than reverting the state.
+    await repository.saveBriefResult(request.id, {
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      brief: { ...canonicalBrief, title: "Stale model result" },
+      questions: guidanceQuestions(3),
+    });
+
+    await expect(repository.getBriefRequest(request.id)).resolves.toMatchObject({
+      status: "finalizing",
+      brief: canonicalBrief,
+      questions,
+      answers,
+    });
+  });
+
+  test("rejects public playlist sizes above the bounded fast-path maximum", async () => {
+    const clientBucket = `brief-count-limit-${randomUUID()}`;
+    await expect(repository.createBriefRequest({
+      prompt: "An oversized playlist",
+      requestedTrackCount: 301,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      rateLimit: 10,
+    })).rejects.toMatchObject({ statusCode: 400, code: "invalid_track_count" });
   });
 
   test("persists the durable automatic-publication intent on One Command runs", async () => {
@@ -1640,6 +2153,116 @@ databaseDescribe("hosted backend integration", () => {
     expect(manifest.tracks.map((track) => track.title)).toEqual(["First", "Second", "Third"]);
   });
 
+  test("guided chronological order reorders the highest-ranked curated membership without changing it", async () => {
+    const chronologicalBrief: PlaylistBrief = {
+      ...brief,
+      title: "Chronological guided mix",
+      mode: "curated",
+      orderingPolicy: "chronological by release date",
+      targetSize: { min: 1, max: 3 },
+    };
+    const runId = await repository.createRun("Chronological guided mix", chronologicalBrief, 0, 1);
+    await repository.addCandidates(runId, [
+      { selectionRank: 1, artist: "Artist A", title: "Selected Newest", album: "Album A", releaseYear: 2005, durationMs: 180_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 2, artist: "Artist B", title: "Selected Oldest", album: "Album B", releaseYear: 1990, durationMs: 181_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 3, artist: "Artist C", title: "Selected Middle", album: "Album C", releaseYear: 2000, durationMs: 182_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 4, artist: "Artist D", title: "Unselected Earliest", album: "Album D", releaseYear: 1980, durationMs: 183_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+    ], new Map(), "unverified");
+    const candidates = await repository.listCandidates(runId);
+    for (const candidate of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible match",
+        score: 1,
+        song: {
+          id: `catalog-${candidate.title.toLowerCase().replaceAll(" ", "-")}`,
+          name: candidate.title,
+          artistName: candidate.artist,
+          albumName: candidate.album ?? "",
+          releaseDate: `${candidate.releaseYear}-01-01`,
+          durationInMillis: candidate.durationMs ?? undefined,
+        },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => track.title)).toEqual([
+      "Selected Oldest",
+      "Selected Middle",
+      "Selected Newest",
+    ]);
+    const excluded = await repository.pool.query<{ outcome: string; status: string }>(
+      `SELECT c.outcome,m.status
+       FROM track_candidates c
+       JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+       WHERE c.run_id=$1 AND c.title='Unselected Earliest'`,
+      [runId],
+    );
+    expect(excluded.rows[0]).toEqual({ outcome: "overflow", status: "overflow" });
+  });
+
+  test.each(["smooth listening flow", "high-contrast flow"])(
+    "manifests interleave artists and albums after selecting the highest-ranked tracks for %s",
+    async (orderingPolicy) => {
+    const sequencedBrief: PlaylistBrief = {
+      ...brief,
+      title: "Sequenced mix",
+      mode: "curated",
+      orderingPolicy,
+      targetSize: { min: 1, max: 6 },
+    };
+    const runId = await repository.createRun("Sequenced mix", sequencedBrief, 0, 1);
+    await repository.addCandidates(runId, [
+      { selectionRank: 1, artist: "Artist A", title: "A1", album: "Album A", releaseYear: 2001, durationMs: 180_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 2, artist: "Artist A", title: "A2", album: "Album A", releaseYear: 2002, durationMs: 181_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 3, artist: "Artist A", title: "A3", album: "Album A", releaseYear: 2003, durationMs: 182_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 4, artist: "Artist B", title: "B1", album: "Album B", releaseYear: 2004, durationMs: 183_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 5, artist: "Artist B", title: "B2", album: "Album B", releaseYear: 2005, durationMs: 184_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 6, artist: "Artist C", title: "C1", album: "Album C", releaseYear: 2006, durationMs: 185_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 7, artist: "Artist D", title: "D0", album: "Album D", releaseYear: 1990, durationMs: 179_000, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+    ], new Map(), "unverified");
+    const candidates = await repository.listCandidates(runId);
+    for (const candidate of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible match",
+        score: 1,
+        song: {
+          id: `catalog-${candidate.title.toLowerCase()}`,
+          name: candidate.title,
+          artistName: candidate.artist,
+          albumName: candidate.album ?? "",
+          genreNames: ["Electronic"],
+          releaseDate: `${candidate.releaseYear}-01-01`,
+          durationInMillis: candidate.durationMs ?? undefined,
+        },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(new Set(manifest.tracks.map((track) => track.title)))
+      .toEqual(new Set(["A1", "A2", "A3", "B1", "B2", "C1"]));
+    expect(manifest.tracks.map((track) => track.title)).not.toContain("D0");
+    for (let index = 1; index < manifest.tracks.length; index += 1) {
+      expect(manifest.tracks[index]?.artist).not.toBe(manifest.tracks[index - 1]?.artist);
+    }
+    const overflow = await repository.pool.query<{ outcome: string; status: string }>(
+      `SELECT c.outcome,m.status
+       FROM track_candidates c
+       JOIN catalog_matches m ON m.candidate_id=c.id AND m.run_id=c.run_id
+       WHERE c.run_id=$1 AND c.title='D0'`,
+      [runId],
+    );
+    expect(overflow.rows[0]).toEqual({ outcome: "overflow", status: "overflow" });
+    },
+  );
+
   test("lists every catalog row in manifest order and atomically locks a bulk visitor selection", async () => {
     const selectionBrief: PlaylistBrief = {
       ...brief,
@@ -1725,6 +2348,9 @@ databaseDescribe("hosted backend integration", () => {
 
     await expect(repository.finalizeCatalogSelection(runId, {
       selected: [{ candidateId: candidates.get("Override")!.id, catalogId: "catalog-not-returned" }],
+    })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
+    await expect(repository.finalizeCatalogSelection(runId, {
+      selected: [{ candidateId: candidates.get("Unavailable")!.id, catalogId: "catalog-unrelated" }],
     })).rejects.toMatchObject({ code: "catalog_match_not_permitted" });
     await repository.reviewMatch(runId, candidates.get("Unchecked")!.id, "rejected");
     const rejectedPage = await repository.listCatalogTracks(runId, 1, 200);

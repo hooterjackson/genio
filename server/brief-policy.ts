@@ -1,6 +1,13 @@
 import type { PlaylistBrief } from "../shared/types.ts";
+import {
+  PUBLIC_FAST_RESEARCH_BUDGET_USD,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+  PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS,
+  PUBLIC_PLAYLIST_MINIMUM_TRACKS,
+} from "../shared/product-policy.ts";
 import { normalizePlaylistTitle, PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
 import { FAST_CURATED_TARGET_MAXIMUM } from "./research-policy.ts";
+import { applySimilaritySeedPolicy } from "./similarity-policy.ts";
 
 const CURATED_DEFAULT_MINIMUM = 50;
 const CURATED_DEFAULT_MAXIMUM = 100;
@@ -12,6 +19,8 @@ export interface PlaylistBriefRequestContext {
 }
 
 const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u2014]\s*)?(?:(?:[\p{L}][\p{L}'\u2019.-]*|&)\s+){0,8}(?:songs?|tracks?|recordings?|titles?)\b/giu;
+const SUBJECTIVE_PLAYLIST_INTENT = /\b(?:playlist|mix|mixtape|best|essential|influential|important|representative|favorite|favourite|similar|resembl|sounds?\s+like|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|adjacent|mood|vibe|party|study|studying|work|working|background|churrasco|gathering|dinner|road\s+trip|workout)\b/iu;
+const EXPLICIT_FACTUAL_EXHAUSTIVE_INTENT = /(?:\b(?:every|all)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|versions?)\b|\b(?:complete|entire|full|exhaustive)\b.{0,60}\b(?:discograph(?:y|ies)|catalog(?:ue)?|recordings?|credits?|releases?)\b)/iu;
 
 export interface ResearchCostFactor {
   label: string;
@@ -43,8 +52,17 @@ export function estimateResearchCostRange(brief: PlaylistBrief): ResearchCostEst
     // passes, low-context hosted search, and no exhaustive frontier passes.
     // Keep this estimate aligned with researchExecutionPolicy rather than the
     // semantic complexity table used by open-ended deep research.
-    add("fast cited editorial research", 0.15, 0.5);
-    return { minimumUsd: 0.15, maximumUsd: 0.5, approvalUsd: 0.5, factors };
+    if (maximumTracks <= 200) {
+      add("bounded fast cited research", 0.15, 0.75);
+      return { minimumUsd: 0.15, maximumUsd: 0.75, approvalUsd: 0.75, factors };
+    }
+    add("large bounded fast cited research", 0.35, PUBLIC_FAST_RESEARCH_BUDGET_USD);
+    return {
+      minimumUsd: 0.35,
+      maximumUsd: PUBLIC_FAST_RESEARCH_BUDGET_USD,
+      approvalUsd: PUBLIC_FAST_RESEARCH_BUDGET_USD,
+      factors,
+    };
   }
 
   if (brief.mode === "curated") add("large cited editorial research", 0.75, 1.5);
@@ -126,12 +144,40 @@ export function normalizeBriefTarget(
  * product's broad 50-100 default. Four-digit years are deliberately ignored
  * unless they are outside the plausible year range.
  */
-export function explicitTrackCount(prompt: string): number | null {
+function countIsPartOfSubjectEntity(
+  prompt: string,
+  countIndex: number,
+  countText: string,
+  subjectEntities: readonly string[],
+): boolean {
+  const normalizedPrompt = prompt.toLocaleLowerCase();
+  return subjectEntities.some((entity) => {
+    const normalizedEntity = entity.toLocaleLowerCase().trim();
+    if (!normalizedEntity.includes(countText)) return false;
+    let entityIndex = normalizedPrompt.indexOf(normalizedEntity);
+    while (entityIndex >= 0) {
+      if (countIndex >= entityIndex && countIndex + countText.length <= entityIndex + normalizedEntity.length) {
+        return true;
+      }
+      entityIndex = normalizedPrompt.indexOf(normalizedEntity, entityIndex + normalizedEntity.length);
+    }
+    return false;
+  });
+}
+
+export function explicitTrackCount(
+  prompt: string,
+  subjectEntities: readonly string[] = [],
+): number | null {
   TRACK_COUNT_PATTERN.lastIndex = 0;
   for (const match of prompt.matchAll(TRACK_COUNT_PATTERN)) {
-    const value = Number(match[1]!.replaceAll(",", ""));
+    const rawCount = match[1]!;
+    const value = Number(rawCount.replaceAll(",", ""));
     if (!Number.isInteger(value) || value < 1 || value > ABSOLUTE_MAXIMUM) continue;
     if (value >= 1900 && value <= 2099) continue;
+    const countOffset = match[0].indexOf(rawCount);
+    const countIndex = (match.index ?? 0) + Math.max(0, countOffset);
+    if (countIsPartOfSubjectEntity(prompt, countIndex, rawCount.toLocaleLowerCase(), subjectEntities)) continue;
     return value;
   }
   return null;
@@ -139,15 +185,28 @@ export function explicitTrackCount(prompt: string): number | null {
 
 /** Preserve an explicit supported quantity after model-output normalization. */
 export function preserveExplicitTrackCount(prompt: string, brief: PlaylistBrief): PlaylistBrief {
-  const count = explicitTrackCount(prompt);
-  if (count === null || brief.mode === "exhaustive") return brief;
-  return { ...brief, targetSize: { min: count, max: count } };
+  const count = explicitTrackCount(prompt, brief.subjectEntities);
+  if (count === null) return brief;
+  return {
+    ...brief,
+    // A finite public target is a bounded selection. Model wording such as
+    // "hybrid" must not turn the same numeric request into a different cost
+    // profile.
+    mode: count <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS ? "curated" : brief.mode,
+    targetSize: { min: count, max: count },
+  };
 }
 
 /** Apply the explicit size control. It wins over the model and prompt text. */
 export function applyRequestedTrackCount(brief: PlaylistBrief, count: number): PlaylistBrief {
-  if (!Number.isInteger(count) || count < 1 || count > ABSOLUTE_MAXIMUM) {
-    throw new Error("Requested track count must be an integer from 1 to 10,000");
+  if (
+    !Number.isInteger(count)
+    || count < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+    || count > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+  ) {
+    throw new Error(
+      `Requested track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`,
+    );
   }
   const constrained: PlaylistBrief = {
     ...brief,
@@ -162,14 +221,38 @@ export function applyRequestedTrackCount(brief: PlaylistBrief, count: number): P
   };
 }
 
+function boundedSubjectiveBrief(prompt: string, brief: PlaylistBrief): PlaylistBrief {
+  // Explicit factual enumeration is the only prose-only route into the deep
+  // source-frontier workflow. Adjectives such as "long" never qualify.
+  if (EXPLICIT_FACTUAL_EXHAUSTIVE_INTENT.test(prompt)) return brief;
+  if (explicitTrackCount(prompt, brief.subjectEntities) !== null) return brief;
+  if (brief.mode !== "curated" && !SUBJECTIVE_PLAYLIST_INTENT.test(prompt)) return brief;
+  // This path exists for stale clients and prose-only API callers. Never let
+  // model-invented target ranges decide workload or spend.
+  const targetMinimum = PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS;
+  const targetMaximum = PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS;
+  return {
+    ...brief,
+    mode: "curated",
+    targetSize: { min: targetMinimum, max: targetMaximum },
+  };
+}
+
 export function canonicalBriefForRequest(
   request: PlaylistBriefRequestContext,
   interpreted: PlaylistBrief,
   confirmation?: Pick<PlaylistBrief, "ambiguityAcceptance"> | null,
 ): PlaylistBrief {
-  const canonical = request.requestedTrackCount == null
-    ? preserveExplicitTrackCount(request.prompt, interpreted)
+  const workloadScoped = request.requestedTrackCount == null
+    ? boundedSubjectiveBrief(
+      request.prompt,
+      preserveExplicitTrackCount(request.prompt, interpreted),
+    )
     : applyRequestedTrackCount(interpreted, request.requestedTrackCount);
+  // Similarity semantics depend on the final workload mode. Apply them after
+  // exact-count/default normalization so a model's incorrect "exhaustive"
+  // label cannot bypass reference-artist exclusion.
+  const canonical = applySimilaritySeedPolicy(request.prompt, workloadScoped);
   // One Command has no scope-confirmation screen. Never copy browser-supplied
   // ambiguity acknowledgements into an automatic run; the interpreted scope
   // remains server-authoritative and the automatic policy decides whether it

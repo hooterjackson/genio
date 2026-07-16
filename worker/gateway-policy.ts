@@ -18,6 +18,8 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/health\/live$/ },
   { method: "POST", path: /^\/api\/v1\/brief$/ },
   { method: "GET", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },
+  { method: "POST", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+\/answers$/ },
+  { method: "DELETE", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },
   { method: "POST", path: /^\/api\/v1\/capabilities\/exchange$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/capabilities\/transfer$/ },
   { method: "POST", path: /^\/api\/v1\/runs$/ },

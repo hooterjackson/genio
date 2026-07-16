@@ -640,6 +640,9 @@ function appleSongs(items: unknown): CatalogSong[] {
     name: item.attributes?.name ?? "",
     artistName: item.attributes?.artistName ?? "",
     albumName: item.attributes?.albumName ?? "",
+    genreNames: Array.isArray(item.attributes?.genreNames)
+      ? item.attributes.genreNames.filter((genre: unknown): genre is string => typeof genre === "string").slice(0, 20)
+      : undefined,
     releaseDate: item.attributes?.releaseDate,
     durationInMillis: item.attributes?.durationInMillis,
     isrc: item.attributes?.isrc,

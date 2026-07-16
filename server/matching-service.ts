@@ -179,7 +179,7 @@ export function matchingConcurrency(): number {
 }
 
 export function catalogRecoveryDeadlineMs(): number {
-  // Recovery is the accuracy path after the two-minute fast route.  The old
+  // Recovery is the accuracy path after the bounded fast route. The old
   // 45-second ceiling could repeatedly time out the same tail of a 100-track
   // run before Apple's broader searches had a chance to complete.  Keep the
   // fast route bounded, but give one recovery generation enough time to
