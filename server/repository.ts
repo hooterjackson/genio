@@ -52,17 +52,16 @@ import {
 } from "./citation-attestation.ts";
 import { appleAuthorizationGeneration } from "./apple.ts";
 
-const ACTIVE_RUN_STATUSES = [
+// Global capacity protects paid/worker work, not saved visitor state. A run
+// waiting on scope review, budget approval, track selection, or Apple
+// reauthorization consumes no worker slot and must not prevent another
+// anonymous visitor from starting research.
+const CAPACITY_RUN_STATUSES = [
   "queued",
-  "awaiting_budget",
   "researching",
   "ready_for_matching",
   "matching",
-  "review",
-  "visitor_review",
-  "manifest_ready",
   "publishing",
-  "waiting_for_apple_authorization",
 ];
 const TERMINAL_RUN_STATUSES = ["complete", "partial", "failed", "expired", "deleted"];
 const JOB_ADVISORY_LOCK = 694_207_551;
@@ -549,7 +548,7 @@ export class Repository {
         await client.query("SELECT pg_advisory_xact_lock($1)", [RUN_CAPACITY_ADVISORY_LOCK]);
         const active = await client.query<{ count: number }>(
           "SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL",
-          [ACTIVE_RUN_STATUSES],
+          [CAPACITY_RUN_STATUSES],
         );
         if (active.rows[0]!.count >= (input.globalLimit ?? 10)) throw new HttpError(503, "gênio is at capacity; try again soon", "global_capacity_reached");
         runId = randomUUID();
@@ -2603,7 +2602,7 @@ export class Repository {
   }
 
   async assertGlobalRunCapacity(limit = 10): Promise<void> {
-    const result = await this.pool.query<{ count: number }>("SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL", [ACTIVE_RUN_STATUSES]);
+    const result = await this.pool.query<{ count: number }>("SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL", [CAPACITY_RUN_STATUSES]);
     if (result.rows[0]!.count >= limit) throw new HttpError(503, "gênio is at capacity; try again soon", "global_capacity_reached");
   }
 

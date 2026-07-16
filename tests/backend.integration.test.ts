@@ -1113,10 +1113,32 @@ databaseDescribe("hosted backend integration", () => {
     });
     const active = await repository.pool.query<{ count: number }>(
       `SELECT count(*)::int count FROM research_runs
-       WHERE status IN ('queued','awaiting_budget','researching','ready_for_matching','matching','review','visitor_review','manifest_ready','publishing','waiting_for_apple_authorization')
+       WHERE status IN ('queued','researching','ready_for_matching','matching','publishing')
          AND deleted_at IS NULL`,
     );
     expect(active.rows[0]?.count).toBe(1);
+  });
+
+  test("saved review jobs do not consume global research capacity", async () => {
+    const create = (label: string) => {
+      const bucket = `review-capacity-${label}-${randomUUID()}`;
+      return repository.createRunIdempotent({
+        prompt: `Review capacity request ${label}`,
+        brief: { ...brief, title: `Review capacity ${label}` },
+        estimateUsd: 0,
+        approvedBudgetUsd: 1,
+        clientBucket: bucket,
+        clientBucketAliases: [bucket],
+        idempotencyKey: `review-capacity-${label}-${randomUUID()}`,
+        reuseDays: 0,
+        rateLimit: 10,
+        globalLimit: 1,
+      });
+    };
+
+    const first = await create("first");
+    await repository.updateRun(first.runId, { status: "visitor_review", phase: "exception_review" });
+    await expect(create("second")).resolves.toMatchObject({ created: true });
   });
 
   test("reconciliation expands within ceilings and durably pauses a true provider overrun", async () => {
