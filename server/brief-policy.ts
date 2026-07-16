@@ -1,10 +1,15 @@
 import type { PlaylistBrief } from "../shared/types.ts";
-import { PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
+import { normalizePlaylistTitle, PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
 import { FAST_CURATED_TARGET_MAXIMUM } from "./research-policy.ts";
 
 const CURATED_DEFAULT_MINIMUM = 50;
 const CURATED_DEFAULT_MAXIMUM = 100;
 const ABSOLUTE_MAXIMUM = 10_000;
+
+export interface PlaylistBriefRequestContext {
+  prompt: string;
+  requestedTrackCount?: number | null;
+}
 
 const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u2014]\s*)?(?:(?:[\p{L}][\p{L}'\u2019.-]*|&)\s+){0,8}(?:songs?|tracks?|recordings?|titles?)\b/giu;
 
@@ -139,6 +144,43 @@ export function preserveExplicitTrackCount(prompt: string, brief: PlaylistBrief)
   return { ...brief, targetSize: { min: count, max: count } };
 }
 
+/** Apply the explicit size control. It wins over the model and prompt text. */
+export function applyRequestedTrackCount(brief: PlaylistBrief, count: number): PlaylistBrief {
+  if (!Number.isInteger(count) || count < 1 || count > ABSOLUTE_MAXIMUM) {
+    throw new Error("Requested track count must be an integer from 1 to 10,000");
+  }
+  const constrained: PlaylistBrief = {
+    ...brief,
+    // A fixed result size is a curated selection, even when the prose uses
+    // exhaustive language. Omitting this control remains the exhaustive path.
+    mode: "curated",
+    targetSize: { min: count, max: count },
+  };
+  return {
+    ...constrained,
+    title: normalizePlaylistTitle(constrained.title, constrained),
+  };
+}
+
+export function canonicalBriefForRequest(
+  request: PlaylistBriefRequestContext,
+  interpreted: PlaylistBrief,
+  confirmation?: Pick<PlaylistBrief, "ambiguityAcceptance"> | null,
+): PlaylistBrief {
+  const canonical = request.requestedTrackCount == null
+    ? preserveExplicitTrackCount(request.prompt, interpreted)
+    : applyRequestedTrackCount(interpreted, request.requestedTrackCount);
+  // One Command has no scope-confirmation screen. Never copy browser-supplied
+  // ambiguity acknowledgements into an automatic run; the interpreted scope
+  // remains server-authoritative and the automatic policy decides whether it
+  // can proceed.
+  if (request.requestedTrackCount != null || confirmation?.ambiguityAcceptance === undefined) return canonical;
+  return {
+    ...canonical,
+    ambiguityAcceptance: [...confirmation.ambiguityAcceptance],
+  };
+}
+
 /**
  * Rebuild the server-authoritative brief at an API boundary.
  *
@@ -152,12 +194,7 @@ export function canonicalBriefForPrompt(
   interpreted: PlaylistBrief,
   confirmation?: Pick<PlaylistBrief, "ambiguityAcceptance"> | null,
 ): PlaylistBrief {
-  const canonical = preserveExplicitTrackCount(prompt, interpreted);
-  if (confirmation?.ambiguityAcceptance === undefined) return canonical;
-  return {
-    ...canonical,
-    ambiguityAcceptance: [...confirmation.ambiguityAcceptance],
-  };
+  return canonicalBriefForRequest({ prompt }, interpreted, confirmation);
 }
 
 export function isValidBriefTarget(
@@ -227,5 +264,8 @@ export function manifestDescriptionForBrief(brief: PlaylistBrief): string {
     : brief.mode === "hybrid"
       ? "Exhaustive within the confirmed constraints and documented sources completed in this run."
       : "A cited editorial selection from the documented sources completed in this run.";
-  return `Built by gênio. ${brief.description.trim()} ${scope}`.trim();
+  const exactCount = brief.targetSize && brief.targetSize.min === brief.targetSize.max
+    ? `${brief.targetSize.min.toLocaleString("en-US")} source-backed tracks`
+    : "Source-backed tracks";
+  return `Built by gênio. ${exactCount} for “${brief.title}.” ${scope}`.trim();
 }

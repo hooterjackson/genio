@@ -40,6 +40,22 @@ export const FAST_POST_MATCH_REFILL_LIMIT = 2;
 export const FAST_MINIMUM_RESERVE_CANDIDATES = 50;
 export const FAST_RESERVE_RATIO = 0.5;
 
+/**
+ * Build a source-backed reserve before Apple matching. Exact requests above
+ * the fast-path ceiling still need spare candidates: otherwise one catalog
+ * miss makes the requested count impossible even when more supported tracks
+ * exist. The reserve is capped so very large requests remain bounded.
+ */
+export function catalogMatchingCandidateGoal(requestedMinimum: number): number {
+  const minimum = Math.max(1, Math.floor(requestedMinimum));
+  if (minimum < 20) return minimum;
+  const reserve = Math.min(
+    1_000,
+    Math.max(FAST_MINIMUM_RESERVE_CANDIDATES, Math.ceil(minimum * FAST_RESERVE_RATIO)),
+  );
+  return minimum + reserve;
+}
+
 export interface FastPostMatchRefillPlan {
   state: "satisfied" | "refill" | "shortfall";
   requestedMinimum: number;
@@ -174,10 +190,7 @@ export function researchExecutionPolicy(
 
   const targetMaximum = Math.max(50, requestedMaximum);
   const targetMinimum = requestedMinimum;
-  const reserve = targetMinimum >= 20
-    ? Math.max(FAST_MINIMUM_RESERVE_CANDIDATES, Math.ceil(targetMinimum * FAST_RESERVE_RATIO))
-    : 0;
-  const candidateGoal = targetMinimum + reserve;
+  const candidateGoal = catalogMatchingCandidateGoal(targetMinimum);
 
   return {
     kind: "fast_curated",

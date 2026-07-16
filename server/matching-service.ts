@@ -56,8 +56,16 @@ interface MatchingOutcomeCheckpoint {
   updatedAt: string;
 }
 
+type AutomaticCatalogRecoveryState = "queued" | "in_flight" | "not_needed" | "exhausted";
+
 export interface MatchingRepository {
-  getRun(runId: string): Promise<{ brief: PlaylistBrief; createdAt?: string }>;
+  getRun(runId: string): Promise<{
+    brief: PlaylistBrief;
+    status: string;
+    phase?: string;
+    autoPublish?: boolean;
+    createdAt?: string;
+  }>;
   updateRun(runId: string, patch: { status?: string; phase?: string; error?: string | null }): Promise<void>;
   listCandidates(runId: string): Promise<Candidate[]>;
   listMatches(runId: string): Promise<ExistingMatch[]>;
@@ -65,27 +73,65 @@ export interface MatchingRepository {
   saveTimeoutMatches(runId: string, candidateIds: string[], basis: string): Promise<void>;
   getResearchCheckpoint(runId: string, phase: string): Promise<unknown | null>;
   saveResearchCheckpoint(runId: string, phase: string, checkpoint: unknown): Promise<void>;
+  queueAutomaticCatalogRecovery(
+    runId: string,
+    storefront: string,
+    currentGeneration: number,
+  ): Promise<AutomaticCatalogRecoveryState>;
+  queueAutomaticPublication(runId: string): Promise<void>;
 }
 
 const MATCHING_OUTCOME_CHECKPOINT = "catalog_matching_outcome";
+const AUTOMATIC_HANDOFF_TERMINAL_STATUSES = new Set([
+  "publishing",
+  "waiting_for_apple_authorization",
+  "complete",
+  "partial",
+  "failed",
+  "expired",
+  "deleted",
+]);
 
-function isSafePrimaryMatch(match: ExistingMatch): boolean {
-  // A review row with a concrete Apple ID is intentionally selectable: it
-  // represents a plausible catalog version that still needs a visitor choice.
-  // Duplicate/unavailable rows and title-only alternatives have no safe
-  // primary and therefore cannot satisfy the confirmed requested count.
-  return (match.status === "accepted" || match.status === "review")
+function isSafePrimaryMatch(match: ExistingMatch, automatic: boolean): boolean {
+  // One Command has no visitor review step, so only strict accepted matches
+  // are safe to publish automatically. Manual bulk review may still present a
+  // concrete review-row primary as a selectable visitor choice.
+  return (match.status === "accepted" || (!automatic && match.status === "review"))
     && Boolean(match.song?.id);
+}
+
+async function resumeOrIgnoreAutomaticHandoff(
+  repository: MatchingRepository,
+  runId: string,
+  run: { status: string; autoPublish?: boolean },
+): Promise<boolean> {
+  if (!run.autoPublish) return false;
+  if (AUTOMATIC_HANDOFF_TERMINAL_STATUSES.has(run.status)) return true;
+  if (run.status === "manifest_ready") {
+    await repository.queueAutomaticPublication(runId);
+    return true;
+  }
+  return false;
 }
 
 async function finalizeMatchingOutcome(
   repository: MatchingRepository,
   runId: string,
-  brief: PlaylistBrief,
+  run: { brief: PlaylistBrief; status: string; autoPublish?: boolean },
   storefront: string,
+  currentRecoveryGeneration = 0,
 ): Promise<void> {
+  // A matching lease may be replayed after its automatic handoff committed.
+  // Re-read state before any mutation so the replay can never regress a
+  // publishing or completed playlist back into visitor review.
+  const latest = run.autoPublish ? await repository.getRun(runId) : run;
+  if (await resumeOrIgnoreAutomaticHandoff(repository, runId, latest)) return;
+  const brief = latest.brief;
   const matches = await repository.listMatches(runId);
-  const safePrimaryCount = matches.filter(isSafePrimaryMatch).length;
+  const safePrimaryIds = matches
+    .filter((match) => isSafePrimaryMatch(match, latest.autoPublish === true))
+    .map((match) => match.song!.id);
+  const safePrimaryCount = new Set(safePrimaryIds).size;
   const configuredMinimum = Number(brief.targetSize?.min);
   const targetMinimum = brief.targetSize && Number.isFinite(configuredMinimum)
     ? Math.max(0, Math.floor(configuredMinimum))
@@ -102,14 +148,25 @@ async function finalizeMatchingOutcome(
   await repository.saveResearchCheckpoint(runId, MATCHING_OUTCOME_CHECKPOINT, checkpoint);
 
   if (shortfall > 0) {
+    if (latest.autoPublish) {
+      const recovery = await repository.queueAutomaticCatalogRecovery(
+        runId,
+        storefront,
+        currentRecoveryGeneration,
+      );
+      if (recovery === "queued" || recovery === "in_flight") return;
+    }
     await repository.updateRun(runId, {
-      status: "visitor_review",
+      status: latest.autoPublish ? "failed" : "visitor_review",
       phase: "catalog_matching_shortfall",
-      error: `Apple Music matching found ${safePrimaryCount} safe catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}; ${shortfall} remain unresolved.`,
+      error: latest.autoPublish
+        ? `Apple Music matching found ${safePrimaryCount} strict unique catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}. No playlist was published because the exact count could not be met safely.`
+        : `Apple Music matching found ${safePrimaryCount} safe unique catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}; ${shortfall} remain unresolved.`,
     });
     return;
   }
   await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review", error: null });
+  if (latest.autoPublish) await repository.queueAutomaticPublication(runId);
 }
 
 function boundedEnvironmentInteger(name: string, fallback: number, minimum: number, maximum: number): number {
@@ -267,18 +324,26 @@ export async function matchResearchRun(
     fastResearchDeadlineAt?: string;
     fastDeadlineAt?: string;
     retryIncomplete?: boolean;
+    recoveryGeneration?: number;
   } = {},
 ): Promise<void> {
   if (!/^[a-z]{2}$/i.test(storefront)) throw new Error("Apple storefront must be a two-letter code");
   const normalizedStorefront = storefront.toLowerCase();
   const run = await repository.getRun(runId);
+  if (await resumeOrIgnoreAutomaticHandoff(repository, runId, run)) return;
   const recovery = options.retryIncomplete === true;
   const checkpointPhase = recovery ? "catalog_matching_recovery" : "catalog_matching";
   const checkpoint = recovery
     ? null
     : await repository.getResearchCheckpoint(runId, checkpointPhase) as MatchingCheckpoint | null;
   if (!recovery && checkpoint?.complete && checkpoint.storefront === normalizedStorefront) {
-    await finalizeMatchingOutcome(repository, runId, run.brief, normalizedStorefront);
+    await finalizeMatchingOutcome(
+      repository,
+      runId,
+      run,
+      normalizedStorefront,
+      options.recoveryGeneration,
+    );
     return;
   }
   const start = checkpoint?.storefront === normalizedStorefront ? checkpoint.nextIndex : 0;
@@ -458,7 +523,13 @@ export async function matchResearchRun(
       updatedAt: new Date().toISOString(),
     });
   }
-  await finalizeMatchingOutcome(repository, runId, run.brief, normalizedStorefront);
+  await finalizeMatchingOutcome(
+    repository,
+    runId,
+    run,
+    normalizedStorefront,
+    options.recoveryGeneration,
+  );
 }
 
 export async function processMatchingJob(repository: MatchingRepository, payload: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
@@ -471,5 +542,8 @@ export async function processMatchingJob(repository: MatchingRepository, payload
     fastResearchDeadlineAt: typeof payload.fastResearchDeadlineAt === "string" ? payload.fastResearchDeadlineAt : undefined,
     fastDeadlineAt: typeof payload.fastDeadlineAt === "string" ? payload.fastDeadlineAt : undefined,
     retryIncomplete: payload.retryIncomplete === true,
+    recoveryGeneration: Number.isInteger(payload.recoveryGeneration)
+      ? Math.max(0, Math.min(3, Number(payload.recoveryGeneration)))
+      : 0,
   });
 }

@@ -1039,6 +1039,86 @@ databaseDescribe("hosted backend integration", () => {
     ]));
   });
 
+  test("persists the requested track count and rejects idempotent payload drift", async () => {
+    const clientBucket = `brief-count-${randomUUID()}`;
+    const key = `brief-count-${randomUUID()}`;
+    const first = await repository.createBriefRequest({
+      prompt: "Influential techno",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: key,
+      rateLimit: 10,
+    });
+
+    await expect(repository.getBriefRequest(first.id)).resolves.toMatchObject({
+      prompt: "Influential techno",
+      requestedTrackCount: 50,
+    });
+    await expect(repository.createBriefRequest({
+      prompt: "Influential techno",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: key,
+      rateLimit: 10,
+    })).resolves.toMatchObject({ id: first.id, created: false });
+    await expect(repository.createBriefRequest({
+      prompt: "Influential techno",
+      requestedTrackCount: 100,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: key,
+      rateLimit: 10,
+    })).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+  });
+
+  test("persists the durable automatic-publication intent on One Command runs", async () => {
+    const clientBucket = `auto-publish-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "One Command playlist",
+      brief: { ...brief, mode: "curated", targetSize: { min: 50, max: 50 } },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: `auto-publish-${randomUUID()}`,
+      autoPublish: true,
+      reuseDays: 0,
+      rateLimit: 10,
+      globalLimit: 100,
+    });
+
+    await expect(repository.getRun(created.runId)).resolves.toMatchObject({ autoPublish: true });
+  });
+
+  test("rejects a reused run idempotency key when the confirmed count or prompt changed", async () => {
+    const clientBucket = `run-idempotency-${randomUUID()}`;
+    const idempotencyKey = `run-idempotency-${randomUUID()}`;
+    const create = (prompt: string, count: number) => repository.createRunIdempotent({
+      prompt,
+      brief: { ...brief, mode: "curated", targetSize: { min: count, max: count } },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey,
+      autoPublish: true,
+      reuseDays: 0,
+      rateLimit: 10,
+      globalLimit: 100,
+    });
+
+    await expect(create("Fifty influential tracks", 50)).resolves.toMatchObject({ created: true });
+    await expect(create("One hundred influential tracks", 100)).rejects.toMatchObject({
+      statusCode: 409,
+      code: "idempotency_conflict",
+    });
+  });
+
   test("atomically records a new fast route without reclassifying an unmarked idempotent retry", async () => {
     const clientBucket = `fast-route-${randomUUID()}`;
     const idempotencyKey = `fast-route-${randomUUID()}`;
@@ -1790,6 +1870,55 @@ databaseDescribe("hosted backend integration", () => {
       status: "queued",
       max_attempts: 1,
     }]);
+  });
+
+  test("One Command queues the next bounded recovery from inside the current matching lease", async () => {
+    const runId = await repository.createRun(
+      "Automatic catalog recovery",
+      { ...brief, mode: "curated", targetSize: { min: 2, max: 2 } },
+      0,
+      1,
+    );
+    await repository.pool.query("UPDATE research_runs SET auto_publish=true WHERE id=$1", [runId]);
+    await repository.addCandidates(runId, [{
+      artist: "Recovery Artist", title: "Automatic Retry", album: null, releaseYear: null,
+      durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [],
+    }], new Map(), "unverified");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveTimeoutMatches(runId, [candidate.id], RETRYABLE_CATALOG_MATCH_BASES[0]);
+    await repository.enqueueJob({
+      kind: "matching",
+      runId,
+      payload: { runId, storefront: "us" },
+      dedupeKey: `matching:${runId}`,
+    });
+    await repository.pool.query(
+      `UPDATE job_queue SET status='leased',lease_owner='original-matching',
+         lease_expires_at=now()+interval '5 minutes'
+       WHERE run_id=$1 AND kind='matching' AND payload_json->>'retryIncomplete' IS NULL`,
+      [runId],
+    );
+
+    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 0)).resolves.toBe("queued");
+    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 0)).resolves.toBe("in_flight");
+    await repository.pool.query(
+      `UPDATE job_queue SET status='leased',lease_owner='recovery-one',
+         lease_expires_at=now()+interval '5 minutes'
+       WHERE run_id=$1 AND payload_json->>'recoveryGeneration'='1'`,
+      [runId],
+    );
+    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 1)).resolves.toBe("queued");
+
+    const generations = await repository.pool.query<{ generation: string; status: string }>(
+      `SELECT payload_json->>'recoveryGeneration' generation,status
+       FROM job_queue WHERE run_id=$1 AND payload_json->>'retryIncomplete'='true'
+       ORDER BY payload_json->>'recoveryGeneration'`,
+      [runId],
+    );
+    expect(generations.rows).toEqual([
+      { generation: "1", status: "leased" },
+      { generation: "2", status: "queued" },
+    ]);
   });
 
   test("a failed first recovery remains retryable and queues generation two", async () => {

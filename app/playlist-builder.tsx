@@ -20,19 +20,6 @@ type PlaylistBrief = {
   ambiguityAcceptance?: string[];
 };
 
-type ResearchCostFactor = {
-  label: string;
-  minimumUsd: number;
-  maximumUsd: number;
-};
-
-type ResearchCostEstimate = {
-  minimumUsd: number;
-  maximumUsd: number;
-  approvalUsd: number;
-  factors: ResearchCostFactor[];
-};
-
 type FrontierItem = {
   sourceClass: string;
   strategy: string;
@@ -51,6 +38,7 @@ type ResearchRun = {
   actualCostUsd: number;
   approvedBudgetUsd?: number;
   phase: string;
+  autoPublish?: boolean;
   error?: string | null;
   candidateCount: number;
   sourceCount: number;
@@ -156,9 +144,10 @@ type RunResult = {
 
 type BriefResponse = {
   brief?: PlaylistBrief;
+  prompt?: string;
+  requestedTrackCount?: number | null;
   estimateUsd?: number;
   estimatedCostUsd?: number;
-  estimate?: ResearchCostEstimate;
   cached?: boolean;
   requestId?: string;
   status?: string;
@@ -175,9 +164,9 @@ type RunResponse = {
 type JsonObject = Record<string, unknown>;
 
 const examples = [
-  "Paulinho da Costa’s 100 most influential songs",
-  "Every Michael Jackson song",
-  "50 influential Berlin techno tracks",
+  "Paulinho da Costa’s most influential recordings",
+  "Tracks that shaped Berlin techno",
+  "Songs built around the Amen break",
 ];
 
 const terminalStatuses = new Set(["complete", "partial", "failed", "expired", "deleted"]);
@@ -205,6 +194,8 @@ class ApiError extends Error {
     this.status = status;
   }
 }
+
+class BriefInterpretationError extends Error {}
 
 function asObject(value: unknown): JsonObject {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
@@ -241,12 +232,26 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
-async function waitForBrief(requestId: string, initialDelayMs = 1_500): Promise<BriefResponse> {
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(resolve, delayMs);
+    signal?.addEventListener("abort", () => {
+      window.clearTimeout(timer);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  });
+}
+
+async function waitForBrief(requestId: string, initialDelayMs = 1_500, signal?: AbortSignal): Promise<BriefResponse> {
   let delayMs = Math.max(500, Math.min(initialDelayMs, 5_000));
   for (let attempt = 0; attempt < 90; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    const response = await api<BriefResponse>("/api/v1/brief/" + encodeURIComponent(requestId));
-    if (response.status === "failed") throw new Error(response.error || "Scope interpretation failed.");
+    await abortableDelay(delayMs, signal);
+    const response = await api<BriefResponse>("/api/v1/brief/" + encodeURIComponent(requestId), { signal });
+    if (response.status === "failed") throw new BriefInterpretationError(response.error || "Scope interpretation failed.");
     if (response.brief) return response;
     if (attempt >= 15) delayMs = 5_000;
   }
@@ -302,6 +307,52 @@ function unwrapResult(
       unresolvedGapCount: numberValue(run.unresolvedCount),
       evidenceUrl: runId ? "/api/v1/runs/" + encodeURIComponent(runId) + "/evidence" : null,
       coverageSummary: "Published from " + numberValue(run.sourceCount) + " documented sources with " + numberValue(run.unresolvedCount) + " visible gaps.",
+    };
+  }
+  const directVolumeRows = Array.isArray(object.volumes) ? object.volumes : null;
+  const directVolumes = directVolumeRows
+    && directVolumeRows.every((raw) => {
+      const volume = asObject(raw);
+      return typeof volume.trackCount === "number"
+        && typeof volume.name === "string";
+    });
+  if (directVolumes && directVolumeRows) {
+    const runId = typeof object.runId === "string" ? object.runId : currentRun?.id ?? "";
+    const sourceCount = numberValue(object.sourceCount, numberValue(currentRun?.sourceCount));
+    const unresolvedGapCount = numberValue(
+      object.unresolvedGapCount,
+      numberValue(currentRun?.unresolvedCount),
+    );
+    return {
+      runId,
+      title: typeof object.title === "string" ? object.title : currentRun?.brief.title,
+      status: typeof object.status === "string" ? object.status : currentRun?.status ?? "complete",
+      volumes: directVolumeRows.map((raw, index) => {
+        const volume = asObject(raw);
+        return {
+          index: numberValue(volume.index, index + 1),
+          name: typeof volume.name === "string" ? volume.name : "gênio volume " + (index + 1),
+          url: appleMusicUrl(volume.url),
+          trackCount: numberValue(volume.trackCount),
+          status: typeof volume.status === "string" ? volume.status : undefined,
+        };
+      }),
+      requestedTrackCount: typeof object.requestedTrackCount === "number"
+        ? object.requestedTrackCount
+        : currentRun
+          ? exactRequestedTrackCount(currentRun.brief)
+          : null,
+      outcomeCounts: asObject(object.outcomeCounts ?? object.outcomes) as Record<string, number>,
+      sourceCount,
+      unresolvedGapCount,
+      evidenceUrl: typeof object.evidenceUrl === "string"
+        ? object.evidenceUrl
+        : runId
+          ? "/api/v1/runs/" + encodeURIComponent(runId) + "/evidence"
+          : null,
+      coverageSummary: typeof object.coverageSummary === "string"
+        ? object.coverageSummary
+        : "Published from " + sourceCount + " documented sources with " + unresolvedGapCount + " visible gaps.",
     };
   }
   if (Array.isArray(object.volumes)) {
@@ -446,27 +497,6 @@ function isAbortError(value: unknown): boolean {
   return Boolean(value && typeof value === "object" && "name" in value && value.name === "AbortError");
 }
 
-function money(value: number): string {
-  return "$" + numberValue(value).toFixed(2);
-}
-
-function normalizeCostEstimate(response: BriefResponse): ResearchCostEstimate {
-  const legacy = numberValue(response.estimateUsd ?? response.estimatedCostUsd);
-  const minimumUsd = numberValue(response.estimate?.minimumUsd, legacy);
-  const maximumUsd = numberValue(response.estimate?.maximumUsd, legacy);
-  return {
-    minimumUsd: Math.min(minimumUsd, maximumUsd),
-    maximumUsd: Math.max(minimumUsd, maximumUsd),
-    approvalUsd: numberValue(response.estimate?.approvalUsd, maximumUsd),
-    factors: Array.isArray(response.estimate?.factors) ? response.estimate.factors : [],
-  };
-}
-
-function moneyRange(estimate: ResearchCostEstimate): string {
-  if (estimate.minimumUsd === estimate.maximumUsd) return money(estimate.maximumUsd);
-  return money(estimate.minimumUsd) + "–" + money(estimate.maximumUsd);
-}
-
 function statusLabel(status: string): string {
   return status.replaceAll("_", " ");
 }
@@ -512,7 +542,7 @@ function phaseMessage(run: ResearchRun): string {
   if (run.status === "queued") return run.brief.mode === "curated"
     ? "Waiting to start. The two-minute target includes queue time."
     : "Waiting for an available research slot.";
-  if (run.status === "publishing") return "Publishing the approved tracks to Apple Music.";
+  if (run.status === "publishing") return "Publishing matched tracks to Apple Music.";
   if (run.brief.mode === "curated" && run.phase === "fast_research") return "Finding and verifying cited tracks.";
   if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) return "Matching verified tracks to Apple Music.";
   return "Searching sources and verifying recordings.";
@@ -521,6 +551,7 @@ function phaseMessage(run: ResearchRun): string {
 function useRunPolling(
   runId: string | null,
   runStatus: string | null,
+  autoPublish: boolean,
   onRun: (run: ResearchRun) => void,
   onError: (message: string) => void,
 ) {
@@ -532,7 +563,11 @@ function useRunPolling(
 
   useEffect(() => {
     if (!runId) return;
-    if (runStatus && (terminalStatuses.has(runStatus) || reviewStatuses.has(runStatus) || runStatus === "manifest_ready")) return;
+    const automaticHandoff = autoPublish && Boolean(
+      runStatus && (reviewStatuses.has(runStatus) || runStatus === "manifest_ready"),
+    );
+    if (runStatus && !automaticHandoff
+      && (terminalStatuses.has(runStatus) || reviewStatuses.has(runStatus) || runStatus === "manifest_ready")) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let pollCount = 0;
@@ -542,7 +577,10 @@ function useRunPolling(
         const next = unwrapRun(await api<ResearchRun | RunResponse>("/api/v1/runs/" + encodeURIComponent(runId)));
         if (cancelled) return;
         onRunRef.current(next);
-        if (terminalStatuses.has(next.status) || reviewStatuses.has(next.status) || next.status === "manifest_ready") return;
+        const nextAutomaticHandoff = next.autoPublish === true
+          && (reviewStatuses.has(next.status) || next.status === "manifest_ready");
+        if (!nextAutomaticHandoff
+          && (terminalStatuses.has(next.status) || reviewStatuses.has(next.status) || next.status === "manifest_ready")) return;
         pollCount += 1;
         timer = setTimeout(poll, pollCount < 60 ? 2000 : 5000);
       } catch (caught) {
@@ -562,23 +600,27 @@ function useRunPolling(
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [runId, runStatus]);
+  }, [runId, runStatus, autoPublish]);
 }
 
 function AppHeader({
   step,
+  total = 5,
   transferState,
   onTransfer,
   onHome,
   onNew,
   onJobs,
+  showPrivacy = false,
 }: {
   step?: number;
+  total?: number;
   transferState?: string;
   onTransfer?: () => void;
   onHome: () => void;
   onNew?: () => void;
   onJobs?: () => void;
+  showPrivacy?: boolean;
 }) {
   return (
     <header className="site-header">
@@ -588,12 +630,17 @@ function AppHeader({
       <div className="header-meta">
         {onNew && <button className="header-action" onClick={onNew}>NEW JOB</button>}
         {onJobs && <button className="header-action" onClick={onJobs}>JOBS</button>}
+        {showPrivacy && <a href="/privacy">PRIVACY</a>}
         {onTransfer && (
           <button className="transfer-button" onClick={onTransfer} disabled={transferState === "busy"}>
             {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
           </button>
         )}
-        {step != null && <span aria-label={"Step " + step + " of 6"}>{String(step).padStart(2, "0")}/06</span>}
+        {step != null && (
+          <span aria-label={"Step " + step + " of " + total}>
+            {String(step).padStart(2, "0")}/{String(total).padStart(2, "0")}
+          </span>
+        )}
       </div>
     </header>
   );
@@ -607,51 +654,6 @@ function ErrorBar({ message, onDismiss }: { message: string; onDismiss: () => vo
       <p>{message}</p>
       <button onClick={onDismiss} aria-label="Dismiss error">×</button>
     </div>
-  );
-}
-
-function IntroScreen({
-  stage,
-  onContinue,
-  onJobs,
-}: {
-  stage: "reveal" | "landing";
-  onContinue: () => void;
-  onJobs: () => void;
-}) {
-  if (stage === "reveal") {
-    return (
-      <section className="intro-screen intro-reveal" aria-label="gênio loading">
-        <pre className="ascii-needle" aria-hidden="true">{String.raw`
-┌────────────────────┐
-│ [g] gênio_         │
-│     SOURCE → SONG  │
-└────────────────────┘`}</pre>
-        <span className="sr-only" role="status">Opening gênio</span>
-      </section>
-    );
-  }
-
-  return (
-    <section className="intro-screen intro-landing" aria-labelledby="intro-title">
-      <div className="intro-mark">
-        <span aria-hidden="true">[g] gênio_</span>
-        <div className="intro-links">
-          <button onClick={onJobs}>JOBS</button>
-          <a href="/privacy">PRIVACY</a>
-        </div>
-      </div>
-      <div className="intro-copy">
-        <div className="screen-index">/ PLAYLIST RESEARCH</div>
-        <h1 id="intro-title">RESEARCH A<br />PLAYLIST.</h1>
-        <p>Enter a request. gênio researches cited tracks and builds the playlist in Apple Music. Sharing starts only after Apple returns a public link.</p>
-      </div>
-      <div className="step-footer intro-footer">
-        <button className="action-button step-primary" onClick={onContinue}>
-          NEW PLAYLIST →
-        </button>
-      </div>
-    </section>
   );
 }
 
@@ -698,170 +700,99 @@ function JobsScreen({
   );
 }
 
-function PromptScreen({
+function OneCommandScreen({
   prompt,
+  trackCount,
   busy,
   onPrompt,
-  onBack,
+  onTrackCount,
   onSubmit,
 }: {
   prompt: string;
-  busy: boolean;
+  trackCount: string;
+  busy: string;
   onPrompt: (value: string) => void;
-  onBack: () => void;
+  onTrackCount: (value: string) => void;
   onSubmit: () => void;
 }) {
+  const [focused, setFocused] = useState(false);
+  const [exampleIndex, setExampleIndex] = useState(0);
+  const count = Number(trackCount);
+  const validCount = Number.isInteger(count) && count >= 1 && count <= 10_000;
+  const promptInvalid = prompt.length > 0 && prompt.trim().length < 4;
+  const countInvalid = trackCount.length > 0 && !validCount;
+  const validationMessage = promptInvalid
+    ? "Describe the playlist in at least 4 characters."
+    : countInvalid
+      ? "Choose 1–10,000 tracks."
+      : "The selected track count is exact.";
+
+  useEffect(() => {
+    if (!focused || prompt) return;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion) return;
+    const timer = window.setInterval(() => {
+      setExampleIndex((current) => (current + 1) % examples.length);
+    }, 2_800);
+    return () => window.clearInterval(timer);
+  }, [focused, prompt]);
+
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     onSubmit();
   }
 
   return (
-    <section className="screen flow-screen prompt-screen" aria-labelledby="prompt-title">
-      <div className="flow-body">
-        <button className="flow-back" type="button" onClick={onBack}>← BACK</button>
-        <div className="screen-index">/ 01 REQUEST</div>
-        <h1 id="prompt-title">ENTER A<br />REQUEST.</h1>
-        <p>Describe the tracks you want included.</p>
+    <section className="one-command-screen" aria-labelledby="command-title">
+      <div className="one-command-body">
+        <h1 className="sr-only" id="command-title">Research a playlist</h1>
+        <p className="one-command-intro">Describe a playlist. gênio researches, matches, and publishes it to Apple Music.</p>
 
-        <form className="command-form prompt-form" onSubmit={submit}>
-        <label htmlFor="playlist-request">&gt; REQUEST</label>
-        <div className="command-line">
-          <span aria-hidden="true">$</span>
+        <form className="one-command-form" onSubmit={submit}>
+          <label className="one-command-request" htmlFor="playlist-request">
+            <span>PLAYLIST REQUEST</span>
           <textarea
             id="playlist-request"
             value={prompt}
             onChange={(event) => onPrompt(event.target.value)}
-            rows={3}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            rows={5}
             maxLength={2000}
-            autoFocus
             spellCheck
-            placeholder="e.g. every released song..."
+            disabled={Boolean(busy)}
+            aria-invalid={promptInvalid}
+            aria-describedby="command-note"
+            placeholder={focused ? examples[exampleIndex] : "What should the playlist contain?"}
           />
-        </div>
+          </label>
+          <label className="one-command-count" htmlFor="playlist-track-count">
+            <span>TRACKS</span>
+            <input
+              id="playlist-track-count"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={10_000}
+              step={1}
+              value={trackCount}
+              data-digits={Math.min(5, Math.max(1, trackCount.length))}
+              onChange={(event) => onTrackCount(event.target.value.replace(/[^0-9]/gu, ""))}
+              disabled={Boolean(busy)}
+              aria-invalid={countInvalid}
+              aria-describedby="command-note"
+            />
+          </label>
+          <button
+            className="one-command-submit"
+            type="submit"
+            disabled={Boolean(busy) || prompt.trim().length < 4 || !validCount}
+          >
+            {busy ? "CREATING PLAYLIST..." : "CREATE PLAYLIST →"}
+          </button>
         </form>
 
-        <div className="examples" aria-label="Example requests">
-        <span>TRY ONE</span>
-        {examples.map((example) => (
-          <button
-            key={example}
-            className={prompt === example ? "selected" : ""}
-            aria-pressed={prompt === example}
-            onClick={() => onPrompt(example)}
-          >
-            {example}
-          </button>
-        ))}
-        </div>
-      </div>
-
-      <div className="step-footer">
-        <button
-          className="action-button step-primary"
-          type="button"
-          onClick={onSubmit}
-          disabled={busy || prompt.trim().length < 4}
-        >
-          {busy ? "CHECKING REQUEST..." : "REVIEW REQUEST →"}
-        </button>
-      </div>
-    </section>
-  );
-}
-
-function BriefScreen({
-  brief,
-  estimate,
-  cached,
-  busy,
-  ambiguitiesAccepted,
-  onBack,
-  onAmbiguitiesAccepted,
-  onStart,
-}: {
-  brief: PlaylistBrief;
-  estimate: ResearchCostEstimate;
-  cached: boolean;
-  busy: boolean;
-  ambiguitiesAccepted: boolean;
-  onBack: () => void;
-  onAmbiguitiesAccepted: (accepted: boolean) => void;
-  onStart: () => void;
-}) {
-  const needsAmbiguityAcceptance = brief.ambiguities.length > 0;
-  const isFast = brief.mode === "curated" && (brief.targetSize?.max ?? 100) <= 200;
-  const profileLabel = isFast
-    ? "CURATED · UNDER 2 MIN TARGET"
-    : brief.mode === "curated"
-      ? "CURATED · LARGER RUN"
-      : "EXHAUSTIVE · LONGER RUN";
-  return (
-    <section className="screen flow-screen scope-screen" aria-labelledby="brief-title">
-      <div className="flow-body">
-        <button className="flow-back" type="button" onClick={onBack}>← EDIT REQUEST</button>
-        <div className="screen-index">/ 02 REVIEW</div>
-        <span className="tag profile-tag">[{profileLabel}]</span>
-        <h1 id="brief-title">{brief.title}</h1>
-        <p>{brief.description}</p>
-        <p className="profile-note">{isFast
-          ? "Returns a cited selection within a two-minute target. Partial results remain available if time expires."
-          : brief.mode === "curated"
-            ? "Researches the larger cited selection without the two-minute deadline."
-            : "Searches the configured sources for all documented matches and reports unresolved gaps."}</p>
-
-        <div className="scope-snapshot" aria-label="Research scope summary">
-          <div><span>TARGET</span><strong>{brief.targetSize ? brief.targetSize.min + "–" + brief.targetSize.max + " tracks" : "All documented tracks"}</strong></div>
-          <div><span>EVIDENCE</span><strong>{brief.evidencePolicy}</strong></div>
-        </div>
-
-        <details className="terminal-details scope-details">
-          <summary>FULL SCOPE</summary>
-          <dl>
-            <div><dt>SUBJECT</dt><dd>{brief.subjectEntities.join(", ") || "—"}</dd></div>
-            <div><dt>RELATIONSHIP</dt><dd>{brief.relationship}</dd></div>
-            <div><dt>VERSIONS</dt><dd>{brief.versionPolicy}</dd></div>
-            <div><dt>ORDER</dt><dd>{brief.orderingPolicy || "Evidence confidence, then release date"}</dd></div>
-            <div><dt>INCLUDE</dt><dd>{brief.include.join(" / ") || "All qualifying recordings"}</dd></div>
-            <div><dt>EXCLUDE</dt><dd>{brief.exclude.join(" / ") || "Nothing beyond the stated scope"}</dd></div>
-          </dl>
-        </details>
-
-        {needsAmbiguityAcceptance && (
-          <div className="assumption-block">
-            <strong>CONFIRM {brief.ambiguities.length} ASSUMPTION{brief.ambiguities.length === 1 ? "" : "S"}</strong>
-            <ul>{brief.ambiguities.map((item) => <li key={item}>{item}</li>)}</ul>
-            <label className="ambiguity-confirmation">
-              <input
-                type="checkbox"
-                checked={ambiguitiesAccepted}
-                onChange={(event) => onAmbiguitiesAccepted(event.target.checked)}
-              />
-              <span>I ACCEPT THESE ASSUMPTIONS.</span>
-            </label>
-          </div>
-        )}
-
-        {!cached && estimate.factors.length > 0 && (
-          <details className="terminal-details cost-details">
-            <summary>COST BASIS [{estimate.factors.length}]</summary>
-            <ul>{estimate.factors.map((factor) => <li key={factor.label}>{factor.label}</li>)}</ul>
-          </details>
-        )}
-      </div>
-
-      <div className="step-footer scope-footer">
-        <div className="estimate">
-          <span>{cached ? "CACHED" : "ESTIMATE"}</span>
-          <strong>{cached ? "$0.00" : moneyRange(estimate)}</strong>
-        </div>
-        <button
-          className="action-button step-primary"
-          onClick={onStart}
-          disabled={busy || (needsAmbiguityAcceptance && !ambiguitiesAccepted)}
-        >
-          {busy ? "STARTING..." : "START RESEARCH →"}
-        </button>
+        <p className="sr-only" id="command-note" aria-live="polite">{validationMessage}</p>
       </div>
     </section>
   );
@@ -871,13 +802,14 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   const progress = progressByPhase[run.phase] ?? (run.status === "queued" ? 4 : 12);
   const showReset = terminalStatuses.has(run.status);
   const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
+  const publishing = ["publishing", "waiting_for_apple_authorization", "manifest_ready"].includes(run.status);
 
   return (
     <section className="screen flow-screen research-screen" aria-labelledby="run-title">
       <div className="flow-body research-body">
-        <div className="screen-index">/ 03 RESEARCH</div>
+        <div className="screen-index">/ 02 CREATE</div>
         <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
-        <h1 id="run-title">RESEARCH IN<br />PROGRESS.</h1>
+        <h1 id="run-title">{publishing ? <>CREATING<br />PLAYLIST.</> : "RESEARCHING."}</h1>
         <p className="run-subject">{run.brief.title}</p>
         <p className="research-status" role="status">{phaseMessage(run)}</p>
         <div className="progress research-progress" aria-label={"Research " + progress + "% complete"}>
@@ -907,7 +839,7 @@ function ReviewScreen(props: {
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ 04 SELECT TRACKS</div>
+        <div className="screen-index">/ 03 SELECT TRACKS</div>
         <h1 id="review-title">SELECT TRACKS.</h1>
         <p>Loading Apple Music matches.</p>
         <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING TRACKS</div>
@@ -1123,7 +1055,7 @@ function TrackSelectionScreen({
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ 04 SELECT TRACKS</div>
+        <div className="screen-index">/ 03 SELECT TRACKS</div>
         <h1 id="review-title">SELECT TRACKS.</h1>
         <p aria-live="polite">{reviewSummary}</p>
 
@@ -1237,7 +1169,7 @@ function ManifestScreen({
   return (
     <section className="screen flow-screen manifest-screen" aria-labelledby="manifest-title">
       <div className="flow-body">
-        <div className="screen-index">/ 05 GENERATE</div>
+        <div className="screen-index">/ 04 GENERATE</div>
         <span className="tag">[{volumeCount} {volumeCount === 1 ? "VOLUME" : "VOLUMES"}]</span>
         <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />READY.</h1>
         <p>{waitingForApple
@@ -1281,10 +1213,12 @@ function ManifestScreen({
 
 function ResultScreen({
   result,
+  automatic = false,
   onReset,
   onDelete,
 }: {
   result: RunResult;
+  automatic?: boolean;
   onReset: () => void;
   onDelete: () => void;
 }) {
@@ -1305,7 +1239,7 @@ function ResultScreen({
   return (
     <section className="screen flow-screen result-screen" aria-labelledby="result-title">
       <div className="flow-body">
-        <div className="screen-index">/ 06 RESULT</div>
+        <div className="screen-index">/ {automatic ? "03" : "05"} RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
         <h1 id="result-title" aria-label={resultTitleLines.join(" ")}>
           {resultTitleLines.map((line) => <span className="result-title-line" key={line}>{line}</span>)}
@@ -1347,18 +1281,11 @@ function ResultScreen({
 }
 
 export function PlaylistBuilder() {
-  const [entryStage, setEntryStage] = useState<"reveal" | "landing" | "prompt" | "jobs">("reveal");
+  const [entryStage, setEntryStage] = useState<"command" | "jobs">("command");
   const [prompt, setPrompt] = useState("");
+  const [trackCount, setTrackCount] = useState("50");
   const [brief, setBrief] = useState<PlaylistBrief | null>(null);
   const [briefRequestId, setBriefRequestId] = useState<string | null>(null);
-  const [estimate, setEstimate] = useState<ResearchCostEstimate>({
-    minimumUsd: 0,
-    maximumUsd: 0,
-    approvalUsd: 0,
-    factors: [],
-  });
-  const [ambiguitiesAccepted, setAmbiguitiesAccepted] = useState(false);
-  const [cached, setCached] = useState(false);
   const [run, setRun] = useState<ResearchRun | null>(null);
   const [trackSelection, setTrackSelection] = useState<TrackSelection | null>(null);
   const [manifest, setManifest] = useState<PlaylistManifest | null>(null);
@@ -1374,22 +1301,23 @@ export function PlaylistBuilder() {
   const briefIdempotencyKey = useRef<string | null>(null);
   const publishingRef = useRef(false);
   const matchingRetryAttempted = useRef<Set<string>>(new Set());
+  const briefRequestRef = useRef<AbortController | null>(null);
   const tracksRequestRef = useRef<AbortController | null>(null);
   const operationRequestRef = useRef<AbortController | null>(null);
   const restoreStartedRef = useRef(false);
 
-  const clearCurrent = useCallback((nextStage: "landing" | "prompt" | "jobs") => {
+  const clearCurrent = useCallback((nextStage: "command" | "jobs") => {
+    briefRequestRef.current?.abort();
+    briefRequestRef.current = null;
     tracksRequestRef.current?.abort();
     tracksRequestRef.current = null;
     operationRequestRef.current?.abort();
     operationRequestRef.current = null;
     setEntryStage(nextStage);
     setPrompt("");
+    setTrackCount("50");
     setBrief(null);
     setBriefRequestId(null);
-    setEstimate({ minimumUsd: 0, maximumUsd: 0, approvalUsd: 0, factors: [] });
-    setAmbiguitiesAccepted(false);
-    setCached(false);
     setRun(null);
     activeRunId.current = null;
     setTrackSelection(null);
@@ -1405,8 +1333,8 @@ export function PlaylistBuilder() {
     window.history.replaceState(null, "", window.location.pathname);
   }, []);
 
-  const reset = useCallback(() => clearCurrent("landing"), [clearCurrent]);
-  const newJob = useCallback(() => clearCurrent("prompt"), [clearCurrent]);
+  const reset = useCallback(() => clearCurrent("command"), [clearCurrent]);
+  const newJob = useCallback(() => clearCurrent("command"), [clearCurrent]);
 
   const updateRun = useCallback((next: ResearchRun) => {
     if (activeRunId.current !== next.id) return;
@@ -1414,16 +1342,22 @@ export function PlaylistBuilder() {
     if (next.status === "failed" && next.error) setError(next.error);
   }, []);
 
-  useRunPolling(run?.id ?? null, run?.status ?? null, updateRun, setError);
+  useRunPolling(run?.id ?? null, run?.status ?? null, run?.autoPublish === true, updateRun, setError);
 
-  const loadRun = useCallback(async (runId: string) => {
+  const loadRun = useCallback(async (runId: string, signal?: AbortSignal) => {
     activeRunId.current = runId;
-    const next = unwrapRun(await api<ResearchRun | RunResponse>("/api/v1/runs/" + encodeURIComponent(runId)));
+    const next = unwrapRun(await api<ResearchRun | RunResponse>(
+      "/api/v1/runs/" + encodeURIComponent(runId),
+      { signal },
+    ));
+    if (signal?.aborted) return;
     if (activeRunId.current !== runId) return;
     activeRunId.current = next.id;
     setRun(next);
     setBrief(next.brief);
     setPrompt(next.prompt);
+    const requestedCount = exactRequestedTrackCount(next.brief);
+    if (requestedCount) setTrackCount(String(requestedCount));
   }, []);
 
   const openJobs = useCallback(async () => {
@@ -1441,7 +1375,7 @@ export function PlaylistBuilder() {
   }, [clearCurrent]);
 
   const openJob = useCallback(async (runId: string) => {
-    clearCurrent("landing");
+    clearCurrent("command");
     setBusy("open-job");
     try {
       const query = new URLSearchParams();
@@ -1456,11 +1390,13 @@ export function PlaylistBuilder() {
     }
   }, [clearCurrent, loadRun]);
 
-  const exchangeCapability = useCallback(async (token: string, hintedRunId?: string | null) => {
+  const exchangeCapability = useCallback(async (token: string, hintedRunId?: string | null, signal?: AbortSignal) => {
     const payload = await api<JsonObject>("/api/v1/capabilities/exchange", {
       method: "POST",
       body: JSON.stringify({ token }),
+      signal,
     });
+    if (signal?.aborted) return;
     const runId = typeof payload.runId === "string"
       ? payload.runId
       : typeof payload.id === "string"
@@ -1470,11 +1406,43 @@ export function PlaylistBuilder() {
       const query = new URLSearchParams();
       query.set("run", runId);
       window.history.replaceState(null, "", window.location.pathname + "?" + query.toString());
-      await loadRun(runId);
+      await loadRun(runId, signal);
     } else {
       window.history.replaceState(null, "", window.location.pathname);
     }
   }, [loadRun]);
+
+  const startResearchFromBrief = useCallback(async (
+    nextBrief: PlaylistBrief,
+    nextBriefRequestId: string,
+    signal?: AbortSignal,
+  ) => {
+    if (!idempotencyKey.current) idempotencyKey.current = "run-" + nextBriefRequestId;
+    const response = await api<ResearchRun | RunResponse>("/api/v1/runs", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey.current },
+      body: JSON.stringify({
+        briefRequestId: nextBriefRequestId,
+        brief: nextBrief,
+      }),
+      signal,
+    });
+    if (signal?.aborted) return;
+    const next = unwrapRun(response);
+    const object = asObject(response);
+    const capability = typeof object.capability === "string"
+      ? object.capability
+      : typeof object.capabilityToken === "string"
+        ? object.capabilityToken
+        : "";
+    if (!capability) throw new Error("gênio could not establish a private session for this run.");
+    const fragment = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(next.id);
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + "#" + fragment);
+    await exchangeCapability(capability, next.id, signal);
+    if (signal?.aborted) return;
+    idempotencyKey.current = null;
+    briefIdempotencyKey.current = null;
+  }, [exchangeCapability]);
 
   useEffect(() => {
     if (restoreStartedRef.current) return;
@@ -1491,10 +1459,13 @@ export function PlaylistBuilder() {
         else if (runId) await loadRun(runId);
         else if (queuedBriefId) {
           const response = await waitForBrief(queuedBriefId);
-          setBrief(response.brief ?? null);
+          if (!response.brief) throw new Error("The playlist request could not be restored.");
+          setPrompt(response.prompt ?? "");
+          const restoredCount = response.requestedTrackCount ?? exactRequestedTrackCount(response.brief);
+          if (restoredCount) setTrackCount(String(restoredCount));
+          setBrief(response.brief);
           setBriefRequestId(queuedBriefId);
-          setEstimate(normalizeCostEstimate(response));
-          setAmbiguitiesAccepted(false);
+          await startResearchFromBrief(response.brief, queuedBriefId);
         }
       } catch (caught) {
         setError((caught as Error).message);
@@ -1507,14 +1478,7 @@ export function PlaylistBuilder() {
       }
     };
     void restore();
-  }, [exchangeCapability, loadRun]);
-
-  useEffect(() => {
-    if (restoring || entryStage !== "reveal" || brief || run || manifest || result) return;
-    const delay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 1_350;
-    const timer = window.setTimeout(() => setEntryStage("landing"), delay);
-    return () => window.clearTimeout(timer);
-  }, [restoring, entryStage, brief, run, manifest, result]);
+  }, [exchangeCapability, loadRun, startResearchFromBrief]);
 
   const loadTracks = useCallback(async () => {
     if (!run) return;
@@ -1613,13 +1577,13 @@ export function PlaylistBuilder() {
   }, [run]);
 
   useEffect(() => {
-    if (!run || !reviewStatuses.has(run.status)) return;
+    if (!run || run.autoPublish || !reviewStatuses.has(run.status)) return;
     const timer = window.setTimeout(() => void loadTracks(), 0);
     return () => window.clearTimeout(timer);
   }, [run, loadTracks]);
 
   useEffect(() => {
-    if (!run || run.status !== "manifest_ready" || manifest) return;
+    if (!run || run.autoPublish || run.status !== "manifest_ready" || manifest) return;
     void (async () => {
       try {
         const payload = await api<unknown>("/api/v1/runs/" + encodeURIComponent(run.id) + "/result");
@@ -1648,78 +1612,57 @@ export function PlaylistBuilder() {
     })();
   }, [run, result]);
 
-  async function interpret() {
-    if (prompt.trim().length < 4) return;
-    setBusy("brief");
+  async function createPlaylist() {
+    const requestedTrackCount = Number(trackCount);
+    if (prompt.trim().length < 4
+      || !Number.isInteger(requestedTrackCount)
+      || requestedTrackCount < 1
+      || requestedTrackCount > 10_000) return;
+    briefRequestRef.current?.abort();
+    const controller = new AbortController();
+    briefRequestRef.current = controller;
+    setBusy("create");
     setError("");
-    if (!briefIdempotencyKey.current) briefIdempotencyKey.current = crypto.randomUUID();
     try {
+      if (brief && briefRequestId) {
+        await startResearchFromBrief(brief, briefRequestId, controller.signal);
+        return;
+      }
+      if (!briefIdempotencyKey.current) briefIdempotencyKey.current = crypto.randomUUID();
       let response = await api<BriefResponse>("/api/v1/brief", {
         method: "POST",
         headers: { "Idempotency-Key": briefIdempotencyKey.current },
         body: JSON.stringify({
           prompt: prompt.trim(),
+          targetTrackCount: requestedTrackCount,
           idempotencyKey: briefIdempotencyKey.current,
         }),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       if (!response.brief && response.requestId) {
         const requestId = response.requestId;
         const query = new URLSearchParams();
         query.set("brief", requestId);
         window.history.replaceState(null, "", window.location.pathname + "?" + query.toString());
-        response = await waitForBrief(requestId, numberValue(response.pollAfterMs, 1_500));
+        response = await waitForBrief(requestId, numberValue(response.pollAfterMs, 1_500), controller.signal);
       }
+      if (controller.signal.aborted) return;
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
+      const requestId = response.requestId;
+      if (!requestId) throw new Error("gênio could not resume this playlist request.");
       setBrief(response.brief);
-      setBriefRequestId(response.requestId ?? null);
-      setEstimate(normalizeCostEstimate(response));
-      setAmbiguitiesAccepted(false);
-      setCached(Boolean(response.cached));
-      briefIdempotencyKey.current = null;
+      setBriefRequestId(requestId);
+      await startResearchFromBrief(response.brief, requestId, controller.signal);
     } catch (caught) {
+      if (isAbortError(caught)) return;
+      if (caught instanceof BriefInterpretationError) briefIdempotencyKey.current = null;
       setError((caught as Error).message);
     } finally {
-      setBusy("");
-    }
-  }
-
-  async function startResearch() {
-    if (!brief) return;
-    if (brief.ambiguities.length > 0 && !ambiguitiesAccepted) {
-      setError("Accept every material scope assumption before research.");
-      return;
-    }
-    setBusy("run");
-    setError("");
-    if (!idempotencyKey.current) idempotencyKey.current = crypto.randomUUID();
-    try {
-      const confirmedBrief: PlaylistBrief = brief.ambiguities.length > 0
-        ? { ...brief, ambiguityAcceptance: [...brief.ambiguities] }
-        : brief;
-      const response = await api<ResearchRun | RunResponse>("/api/v1/runs", {
-        method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey.current },
-        body: JSON.stringify({
-          briefRequestId,
-          brief: confirmedBrief,
-        }),
-      });
-      const next = unwrapRun(response);
-      const object = asObject(response);
-      const capability = typeof object.capability === "string"
-        ? object.capability
-        : typeof object.capabilityToken === "string"
-          ? object.capabilityToken
-          : "";
-      if (!capability) throw new Error("gênio could not establish a private session for this run.");
-      const fragment = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(next.id);
-      window.history.replaceState(null, "", window.location.pathname + window.location.search + "#" + fragment);
-      await exchangeCapability(capability, next.id);
-      idempotencyKey.current = null;
-    } catch (caught) {
-      setError((caught as Error).message);
-    } finally {
-      setBusy("");
+      if (briefRequestRef.current === controller) {
+        briefRequestRef.current = null;
+        setBusy("");
+      }
     }
   }
 
@@ -1869,13 +1812,13 @@ export function PlaylistBuilder() {
   }
 
   const step = useMemo(() => {
-    if (result) return 6;
-    if (manifest) return 5;
-    if (run && reviewStatuses.has(run.status)) return 4;
-    if (run) return 3;
-    if (brief) return 2;
+    if (run?.autoPublish) return result ? 3 : 2;
+    if (result) return 5;
+    if (manifest) return 4;
+    if (run && reviewStatuses.has(run.status)) return 3;
+    if (run) return 2;
     return 1;
-  }, [brief, run, manifest, result]);
+  }, [run, manifest, result]);
 
   if (restoring) {
     return (
@@ -1891,14 +1834,30 @@ export function PlaylistBuilder() {
     );
   }
 
-  if (!brief && !run && !manifest && !result && (entryStage === "reveal" || entryStage === "landing")) {
+  if (!run && !manifest && !result && entryStage === "command") {
     return (
-      <main className="app-shell entry-shell">
+      <main className="app-shell one-command-shell">
+        <AppHeader onHome={reset} onJobs={() => void openJobs()} showPrivacy />
         <ErrorBar message={error} onDismiss={() => setError("")} />
-        <IntroScreen
-          stage={entryStage}
-          onContinue={newJob}
-          onJobs={() => void openJobs()}
+        <OneCommandScreen
+          prompt={prompt}
+          trackCount={trackCount}
+          busy={busy}
+          onPrompt={(value) => {
+            setPrompt(value);
+            setBrief(null);
+            setBriefRequestId(null);
+            briefIdempotencyKey.current = null;
+            idempotencyKey.current = null;
+          }}
+          onTrackCount={(value) => {
+            setTrackCount(value);
+            setBrief(null);
+            setBriefRequestId(null);
+            briefIdempotencyKey.current = null;
+            idempotencyKey.current = null;
+          }}
+          onSubmit={() => void createPlaylist()}
         />
       </main>
     );
@@ -1926,9 +1885,10 @@ export function PlaylistBuilder() {
 
   return (
     <main className="app-shell">
-      {(brief || run || manifest || result) && (
+      {(run || manifest || result) && (
         <AppHeader
           step={step}
+          total={run?.autoPublish ? 3 : 5}
           transferState={transferState}
           onTransfer={run ? transferRun : undefined}
           onHome={reset}
@@ -1938,40 +1898,7 @@ export function PlaylistBuilder() {
       )}
       <ErrorBar message={error} onDismiss={() => setError("")} />
 
-      {!brief && entryStage === "prompt" && (
-        <PromptScreen
-          prompt={prompt}
-          busy={busy === "brief"}
-          onPrompt={(value) => {
-            setPrompt(value);
-            briefIdempotencyKey.current = null;
-          }}
-          onBack={reset}
-          onSubmit={interpret}
-        />
-      )}
-
-      {brief && !run && (
-        <BriefScreen
-          brief={brief}
-          estimate={estimate}
-          cached={cached}
-          busy={busy === "run"}
-          ambiguitiesAccepted={ambiguitiesAccepted}
-          onBack={() => {
-            setBrief(null);
-            setBriefRequestId(null);
-            setAmbiguitiesAccepted(false);
-            setEntryStage("prompt");
-            idempotencyKey.current = null;
-            window.history.replaceState(null, "", window.location.pathname);
-          }}
-          onAmbiguitiesAccepted={setAmbiguitiesAccepted}
-          onStart={startResearch}
-        />
-      )}
-
-      {run && reviewStatuses.has(run.status) && !manifest && (
+      {run && !run.autoPublish && reviewStatuses.has(run.status) && !manifest && (
         <ReviewScreen
           selection={trackSelection}
           busy={busy}
@@ -1980,7 +1907,7 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {run && !reviewStatuses.has(run.status) && !manifest && !result && (
+      {run && (run.autoPublish || !reviewStatuses.has(run.status)) && !manifest && !result && (
         <RunScreen run={run} onNew={newJob} />
       )}
 
@@ -1993,7 +1920,7 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {result && <ResultScreen result={result} onReset={newJob} onDelete={deleteRun} />}
+      {result && <ResultScreen result={result} automatic={run?.autoPublish === true} onReset={newJob} onDelete={deleteRun} />}
     </main>
   );
 }

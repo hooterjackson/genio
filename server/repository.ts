@@ -146,6 +146,7 @@ export interface CatalogSelectionInput {
   useRecommended?: boolean;
   excludedCandidateIds?: string[];
   overrides?: Array<{ candidateId: string; catalogId: string }>;
+  automatic?: boolean;
 }
 
 export interface PublicationVolumeInput {
@@ -358,6 +359,7 @@ export class Repository {
 
   async createBriefRequest(input: {
     prompt: string;
+    requestedTrackCount?: number | null;
     model: string;
     clientBucket: string;
     clientBucketAliases: string[];
@@ -367,16 +369,27 @@ export class Repository {
   }): Promise<{ id: string; status: string; created: boolean }> {
     const prompt = input.prompt.trim();
     if (prompt.length < 4 || prompt.length > 2_000) throw new HttpError(400, "Describe the playlist in 4–2,000 characters", "invalid_prompt");
+    const requestedTrackCount = input.requestedTrackCount ?? null;
+    if (requestedTrackCount !== null && (!Number.isInteger(requestedTrackCount) || requestedTrackCount < 1 || requestedTrackCount > 10_000)) {
+      throw new HttpError(400, "Track count must be an integer from 1 to 10,000", "invalid_track_count");
+    }
     return this.transaction(async (client) => {
       if (input.idempotencyKey) {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
           `brief:${[...new Set(input.clientBucketAliases)].sort().join(":")}:${input.idempotencyKey}`,
         ]);
-        const existing = await client.query<{ id: string; status: string }>(
-          "SELECT id, status FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
+        const existing = await client.query<{ id: string; status: string; prompt: string; requested_track_count: number | null }>(
+          "SELECT id,status,prompt,requested_track_count FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
           [input.clientBucketAliases, input.idempotencyKey],
         );
-        if (existing.rows[0]) return { ...existing.rows[0], created: false };
+        if (existing.rows[0]) {
+          const prior = existing.rows[0];
+          const priorTrackCount = prior.requested_track_count == null ? null : Number(prior.requested_track_count);
+          if (prior.prompt !== prompt || priorTrackCount !== requestedTrackCount) {
+            throw new HttpError(409, "Idempotency key was already used for a different playlist request", "idempotency_conflict");
+          }
+          return { id: prior.id, status: prior.status, created: false };
+        }
       }
       if (!input.bypassVisitorRateLimit) {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:brief:${input.clientBucketAliases.join(":")}`]);
@@ -388,9 +401,9 @@ export class Repository {
       }
       const id = randomUUID();
       await client.query(
-        `INSERT INTO brief_requests(id,prompt,model,status,client_bucket,idempotency_key,expires_at)
-         VALUES($1,$2,$3,'queued',$4,$5,now()+interval '24 hours')`,
-        [id, prompt, input.model, input.clientBucket, input.idempotencyKey ?? null],
+        `INSERT INTO brief_requests(id,prompt,requested_track_count,model,status,client_bucket,idempotency_key,expires_at)
+         VALUES($1,$2,$3,$4,'queued',$5,$6,now()+interval '24 hours')`,
+        [id, prompt, requestedTrackCount, input.model, input.clientBucket, input.idempotencyKey ?? null],
       );
       if (!input.bypassVisitorRateLimit) {
         await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'brief')", [input.clientBucket]);
@@ -401,7 +414,7 @@ export class Repository {
 
   async getBriefRequest(id: string): Promise<any | null> {
     const result = await this.pool.query(
-      `SELECT id,prompt,model,status,brief_json,estimate_usd,error,client_bucket,expires_at,created_at,updated_at
+      `SELECT id,prompt,requested_track_count,model,status,brief_json,estimate_usd,error,client_bucket,expires_at,created_at,updated_at
        FROM brief_requests WHERE id=$1 AND expires_at>now()`,
       [id],
     );
@@ -410,6 +423,7 @@ export class Repository {
     return {
       id: row.id,
       prompt: row.prompt,
+      requestedTrackCount: row.requested_track_count == null ? null : Number(row.requested_track_count),
       model: row.model,
       status: row.status,
       brief: row.brief_json,
@@ -469,6 +483,7 @@ export class Repository {
     clientBucket: string;
     clientBucketAliases: string[];
     idempotencyKey: string;
+    autoPublish?: boolean;
     reuseDays?: number;
     rateLimit?: number;
     globalLimit?: number;
@@ -489,24 +504,42 @@ export class Repository {
       : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`run:${input.clientBucket}:${input.idempotencyKey}`]);
-      const existing = await client.query(
-        `SELECT a.id AS access_id,a.run_id,r.status FROM run_accesses a JOIN research_runs r ON r.id=a.run_id
+      const existing = await client.query<{
+        access_id: string;
+        run_id: string;
+        status: string;
+        prompt: string | null;
+        brief_hash: string;
+        auto_publish: boolean;
+      }>(
+        `SELECT a.id AS access_id,a.run_id,a.prompt,r.status,r.brief_hash,r.auto_publish
+         FROM run_accesses a JOIN research_runs r ON r.id=a.run_id
          WHERE a.client_bucket=ANY($1::text[]) AND a.idempotency_key=$2 AND a.deleted_at IS NULL ORDER BY a.created_at DESC LIMIT 1`,
         [input.clientBucketAliases, input.idempotencyKey],
       );
       if (existing.rows[0]) {
+        const prior = existing.rows[0];
+        if (prior.prompt !== input.prompt
+          || prior.brief_hash !== briefHash
+          || prior.auto_publish !== (input.autoPublish === true)) {
+          throw new HttpError(
+            409,
+            "Idempotency key was already used for a different playlist run",
+            "idempotency_conflict",
+          );
+        }
         if (input.capabilitySessionId) {
           await this.attachCapabilitySessionAccess(
             client,
             input.capabilitySessionId,
-            existing.rows[0].run_id,
-            existing.rows[0].access_id,
+            prior.run_id,
+            prior.access_id,
           );
         }
         return {
-          runId: existing.rows[0].run_id,
-          accessId: existing.rows[0].access_id,
-          status: existing.rows[0].status,
+          runId: prior.run_id,
+          accessId: prior.access_id,
+          status: prior.status,
           created: false,
           reused: false,
         };
@@ -562,11 +595,11 @@ export class Repository {
         const canonicalPrompt = `${input.brief.title}: ${input.brief.description}`.slice(0, 2_000);
         const insertedRun = await client.query<{ created_at: Date }>(
           `INSERT INTO research_runs(
-             id,prompt,brief_json,brief_hash,status,phase,client_bucket,idempotency_key,
+             id,prompt,brief_json,brief_hash,status,phase,client_bucket,idempotency_key,auto_publish,
              estimated_cost_usd,approved_budget_usd,budget_approval_expires_at,retention_expires_at)
-           VALUES($1,$2,$3,$4,$5::varchar,$6,$7,$8,$9,$10,CASE WHEN $5::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,now()+interval '90 days')
+           VALUES($1,$2,$3,$4,$5::varchar,$6,$7,$8,$9,$10,$11,CASE WHEN $5::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,now()+interval '90 days')
            RETURNING created_at`,
-          [runId, canonicalPrompt, input.brief, briefHash, status, phase, input.clientBucket, input.idempotencyKey, estimate, Math.max(approved, status === "queued" ? estimate : 0)],
+          [runId, canonicalPrompt, input.brief, briefHash, status, phase, input.clientBucket, input.idempotencyKey, input.autoPublish === true, estimate, Math.max(approved, status === "queued" ? estimate : 0)],
         );
         if (executionPolicy.kind === "fast_curated") {
           const route = createFastRouteCheckpoint(executionPolicy, insertedRun.rows[0]!.created_at);
@@ -712,6 +745,7 @@ export class Repository {
       brief: row.brief_json,
       status: row.status,
       phase: row.phase,
+      autoPublish: row.auto_publish === true,
       estimatedCostUsd: Number(row.estimated_cost_usd),
       actualCostUsd: Number(row.actual_cost_usd),
       approvedBudgetUsd: Number(row.approved_budget_usd),
@@ -1656,6 +1690,87 @@ export class Repository {
     });
   }
 
+  /**
+   * Schedules the next bounded retry generation from inside the currently
+   * leased One Command matching job. Unlike the visitor endpoint, this method
+   * intentionally ignores the current recovery lease while preventing a
+   * later generation from being queued twice.
+   */
+  async queueAutomaticCatalogRecovery(
+    runId: string,
+    storefront: string,
+    currentGeneration: number,
+  ): Promise<"queued" | "in_flight" | "not_needed" | "exhausted"> {
+    if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
+    const generation = Number.isInteger(currentGeneration)
+      ? Math.max(0, Math.min(3, currentGeneration))
+      : 0;
+    return this.transaction(async (client) => {
+      const run = await client.query<{ auto_publish: boolean }>(
+        "SELECT auto_publish FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [runId],
+      );
+      if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      if (!run.rows[0].auto_publish) return "not_needed";
+
+      const laterActive = await client.query<{ id: string }>(
+        `SELECT id FROM job_queue
+         WHERE run_id=$1 AND kind='matching' AND status IN ('queued','leased')
+           AND payload_json->>'retryIncomplete'='true'
+           AND CASE
+             WHEN COALESCE(payload_json->>'recoveryGeneration','') ~ '^[0-9]+$'
+             THEN (payload_json->>'recoveryGeneration')::int
+             ELSE 0
+           END > $2
+         LIMIT 1`,
+        [runId, generation],
+      );
+      if (laterActive.rows[0]) return "in_flight";
+
+      const prior = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM job_queue
+         WHERE run_id=$1 AND kind='matching' AND payload_json->>'retryIncomplete'='true'`,
+        [runId],
+      );
+      const priorGenerationCount = Number(prior.rows[0]?.count ?? 0);
+      if (priorGenerationCount >= 3) return "exhausted";
+
+      const retryable = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM catalog_matches
+         WHERE run_id=$1 AND status='review' AND song_json IS NULL
+           AND (basis=ANY($2::text[]) OR basis=$3)`,
+        [runId, [...RETRYABLE_CATALOG_MATCH_BASES], CATALOG_RECOVERY_UNRESOLVED_BASIS],
+      );
+      if (Number(retryable.rows[0]?.count ?? 0) === 0) return "not_needed";
+
+      const nextGeneration = priorGenerationCount + 1;
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
+         VALUES($1,$2,'matching',$3,$4,1)
+         ON CONFLICT(kind,dedupe_key) DO NOTHING
+         RETURNING id`,
+        [
+          randomUUID(),
+          runId,
+          `matching-recovery:${runId}:${nextGeneration}`,
+          {
+            runId,
+            storefront: storefront.toLowerCase(),
+            retryIncomplete: true,
+            recoveryGeneration: nextGeneration,
+            automatic: true,
+          },
+        ],
+      );
+      if (!inserted.rows[0]) return "in_flight";
+      await client.query(
+        "UPDATE research_runs SET status='matching',phase='catalog_matching_recovery',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
+        [runId],
+      );
+      return "queued";
+    });
+  }
+
   async reviewMatch(runId: string, candidateId: string, status: "accepted" | "rejected", catalogSong?: unknown): Promise<"accepted" | "rejected" | "duplicate"> {
     const requestedCatalogId = (catalogSong as { id?: string } | undefined)?.id ?? null;
     const result = await this.transaction(async (client) => {
@@ -1775,7 +1890,7 @@ export class Repository {
       } else {
         for (const row of candidates.rows) {
           if (!excludedSet.has(row.id)
-            && ["accepted", "review"].includes(row.status)
+            && (input.automatic === true ? row.status === "accepted" : ["accepted", "review"].includes(row.status))
             && row.song_json
             && typeof row.song_json.id === "string") {
             requested.set(row.id, row.song_json.id);
@@ -1792,7 +1907,14 @@ export class Repository {
         selectedSongs.set(candidateId, choice);
       }
       const requestedMinimum = run.brief_json.targetSize?.min;
-      if (run.phase === "catalog_matching_shortfall"
+      const initiallySelectableCatalogIds = new Set(candidates.rows
+        .filter((row) => ["accepted", "review"].includes(row.status)
+          && row.song_json
+          && typeof row.song_json.id === "string")
+        .map((row) => row.song_json.id));
+      const initialRequestSatisfied = typeof requestedMinimum !== "number"
+        || initiallySelectableCatalogIds.size >= requestedMinimum;
+      if ((input.automatic === true || !initialRequestSatisfied)
         && typeof requestedMinimum === "number"
         && new Set([...selectedSongs.values()].map((song) => song.id)).size < requestedMinimum) {
         throw new HttpError(
@@ -1803,6 +1925,7 @@ export class Repository {
       }
       if (selectedSongs.size === 0) throw new HttpError(409, "Select at least one Apple Music track", "empty_selection");
       const acceptedCatalogIds = new Set<string>();
+      const automaticSelection = input.automatic === true;
       const updates = candidates.rows.map((row) => {
         const song = selectedSongs.get(row.id) ?? null;
         if (song) {
@@ -1814,8 +1937,12 @@ export class Repository {
             catalog_id: song.id,
             song_json: song,
             basis: status === "duplicate"
-              ? `Visitor selection duplicated Apple catalog ID ${song.id}`
-              : `Visitor selected Apple catalog ID ${song.id} in bulk review`,
+              ? automaticSelection
+                ? `One Command primary match duplicated Apple catalog ID ${song.id}`
+                : `Visitor selection duplicated Apple catalog ID ${song.id}`
+              : automaticSelection
+                ? `One Command selected the primary Apple catalog match ${song.id}`
+                : `Visitor selected Apple catalog ID ${song.id} in bulk review`,
           };
         }
         const noChoices = (choicesByCandidate.get(row.id)?.size ?? 0) === 0;
@@ -1827,7 +1954,11 @@ export class Repository {
           status,
           catalog_id: null,
           song_json: null,
-          basis: status === row.status ? row.basis : "Visitor excluded this track in bulk review",
+          basis: status === row.status
+            ? row.basis
+            : automaticSelection
+              ? "One Command omitted this track because no primary Apple catalog match was selected"
+              : "Visitor excluded this track in bulk review",
         };
       });
       const updated = await client.query(
@@ -2259,6 +2390,42 @@ export class Repository {
       );
       return { queued: true, state: "queued", runStatus: "publishing", jobId };
     });
+  }
+
+  /**
+   * Deterministically accepts the primary Apple match for every recommended
+   * candidate, locks the exact manifest, and hands only that manifest to the
+   * isolated publication worker. This is the durable server-side continuation
+   * for One Command runs, so closing the browser cannot interrupt publication.
+   */
+  async queueAutomaticPublication(runId: string): Promise<void> {
+    const manifest = await this.finalizeCatalogSelection(runId, {
+      useRecommended: true,
+      excludedCandidateIds: [],
+      overrides: [],
+      automatic: true,
+    });
+    const run = await this.getRunRow(runId);
+    if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+    const apple = await this.getAppleAuthorization();
+    const publication = await this.queueManifestPublication({
+      runId,
+      manifestId: manifest.id,
+      appleAuthorized: apple?.status === "valid",
+      clientBucket: run.client_bucket,
+      clientBucketAliases: [run.client_bucket],
+      // Automatic runs are already admitted by the stricter run-rate and
+      // global-capacity gates. Reapplying the manual 10/day publication bucket
+      // strands owner testing after manifest lock without adding abuse value.
+      rateLimit: Number.POSITIVE_INFINITY,
+    });
+    if (publication.state === "waiting_for_apple_authorization") {
+      await this.enqueueNotification("apple_reauthorization_required", {
+        deduplicationKey: `apple-reauthorization:${manifest.id}`,
+        runId,
+        manifestId: manifest.id,
+      });
+    }
   }
 
   async enqueueJob(input: {

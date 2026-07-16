@@ -13,7 +13,7 @@ import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
-  canonicalBriefForPrompt,
+  canonicalBriefForRequest,
   estimateResearchCost,
   estimateResearchCostRange,
   isPlaylistBrief,
@@ -238,21 +238,26 @@ app.get("/api/v1/system/health", async () => {
   };
 });
 
-app.post<{ Body: { prompt?: string; idempotencyKey?: string } }>("/api/v1/brief", async (request, reply) => {
+app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: string } }>("/api/v1/brief", async (request, reply) => {
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const caller = identity(request);
   const prompt = request.body?.prompt?.trim() ?? "";
+  const targetTrackCount = request.body?.targetTrackCount;
+  if (targetTrackCount !== undefined && (!Number.isInteger(targetTrackCount) || targetTrackCount < 1 || targetTrackCount > 10_000)) {
+    throw new HttpError(400, "Track count must be an integer from 1 to 10,000", "invalid_track_count");
+  }
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
   const created = await repository.createBriefRequest({
     prompt,
+    requestedTrackCount: targetTrackCount ?? null,
     model: briefInterpretationModel(),
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
     bypassVisitorRateLimit: isOwner(caller),
   });
-  if (created.created) {
+  if (created.status === "queued") {
     await repository.enqueueJob({ kind: "brief", briefRequestId: created.id, payload: { briefRequestId: created.id }, dedupeKey: `brief:${created.id}` });
   }
   return reply.code(created.created ? 202 : 200).send({ requestId: created.id, status: created.status, pollAfterMs: 1_500 });
@@ -265,10 +270,12 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
   }
   const canonicalBrief = brief.status === "complete" && isPlaylistBrief(brief.brief)
-    ? canonicalBriefForPrompt(brief.prompt, brief.brief)
+    ? canonicalBriefForRequest(brief, brief.brief)
     : undefined;
   return {
     requestId: brief.id,
+    prompt: brief.prompt,
+    requestedTrackCount: brief.requestedTrackCount,
     status: brief.status,
     brief: canonicalBrief,
     estimateUsd: canonicalBrief ? estimateResearchCost(canonicalBrief) : undefined,
@@ -303,8 +310,9 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   if (submittedBrief !== undefined && !isPlaylistBrief(submittedBrief)) {
     throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
   }
-  const brief = canonicalBriefForPrompt(interpreted.prompt, interpreted.brief, submittedBrief);
-  if (!materialAmbiguitiesAccepted(brief, interpreted.brief.ambiguities)) {
+  const brief = canonicalBriefForRequest(interpreted, interpreted.brief, submittedBrief);
+  const automaticOneCommand = interpreted.requestedTrackCount !== null;
+  if (!automaticOneCommand && !materialAmbiguitiesAccepted(brief, interpreted.brief.ambiguities)) {
     throw new HttpError(
       409,
       "Accept every material scope assumption before research",
@@ -322,6 +330,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
+    autoPublish: interpreted.requestedTrackCount !== null,
     capabilitySessionId: currentSession?.id,
     bypassVisitorRateLimit: isOwner(caller),
   });

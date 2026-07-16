@@ -50,6 +50,13 @@
       "when": 1784347200000,
       "tag": "0006_capability_session_accesses",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1784433600000,
+      "tag": "0007_brief_requested_track_count",
+      "breakpoints": true
     }
   ]
 }

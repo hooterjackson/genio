@@ -115,15 +115,27 @@ class MemoryMatchingRepository implements MatchingRepository {
   readonly updates: Array<Record<string, unknown>> = [];
 
   readonly bulkTimeoutWrites: Array<{ candidateIds: string[]; basis: string }> = [];
+  readonly automaticRecoveries: Array<{ runId: string; storefront: string; currentGeneration: number }> = [];
+  readonly automaticPublications: string[] = [];
+  automaticRecoveryState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
 
   constructor(
     readonly candidates: Candidate[],
     readonly runBrief: PlaylistBrief = brief,
     readonly checkpointsByPhase: Map<string, unknown> = new Map(),
     readonly runCreatedAt?: string,
+    readonly autoPublish = false,
+    readonly runStatus = "matching",
   ) {}
 
-  async getRun() { return { brief: this.runBrief, createdAt: this.runCreatedAt }; }
+  async getRun() {
+    return {
+      brief: this.runBrief,
+      status: this.runStatus,
+      autoPublish: this.autoPublish,
+      createdAt: this.runCreatedAt,
+    };
+  }
   async updateRun(_runId: string, patch: Record<string, unknown>) { this.updates.push(patch); }
   async listCandidates() { return this.candidates; }
   async listMatches() { return this.matches; }
@@ -140,6 +152,11 @@ class MemoryMatchingRepository implements MatchingRepository {
   }
   async getResearchCheckpoint(_runId: string, phase: string) { return this.checkpointsByPhase.get(phase) ?? null; }
   async saveResearchCheckpoint(_runId: string, _phase: string, checkpoint: unknown) { this.checkpoints.push(checkpoint); }
+  async queueAutomaticCatalogRecovery(runId: string, storefront: string, currentGeneration: number) {
+    this.automaticRecoveries.push({ runId, storefront, currentGeneration });
+    return this.automaticRecoveryState;
+  }
+  async queueAutomaticPublication(runId: string) { this.automaticPublications.push(runId); }
 }
 
 function lastMatchingCheckpoint(repository: MemoryMatchingRepository): Record<string, unknown> | undefined {
@@ -295,7 +312,7 @@ test("matching records an explicit shortfall instead of presenting a partial req
   expect(repository.updates.at(-1)).toMatchObject({
     status: "visitor_review",
     phase: "catalog_matching_shortfall",
-    error: expect.stringContaining("2 safe catalog matches for the required 4; 2 remain unresolved"),
+    error: expect.stringContaining("2 safe unique catalog matches for the required 4; 2 remain unresolved"),
   });
   expect(repository.checkpoints).toContainEqual(expect.objectContaining({
     storefront: "us",
@@ -304,6 +321,156 @@ test("matching records an explicit shortfall instead of presenting a partial req
     shortfall: 2,
     status: "shortfall",
   }));
+});
+
+test("One Command shortfalls fail clearly instead of polling an unowned review state", async () => {
+  const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
+  const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
+  repository.matches.push({
+    candidateId: "candidate-1",
+    status: "accepted",
+    basis: "exact",
+    score: 1,
+    song,
+    alternatives: [],
+  });
+
+  await matchResearchRun(repository, "run-1", "us");
+
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "failed",
+    phase: "catalog_matching_shortfall",
+  });
+  expect(repository.automaticRecoveries).toEqual([{
+    runId: "run-1",
+    storefront: "us",
+    currentGeneration: 0,
+  }]);
+  expect(repository.automaticPublications).toEqual([]);
+});
+
+test("One Command queues bounded Apple recovery before terminalizing a retryable shortfall", async () => {
+  const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
+  const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
+  repository.automaticRecoveryState = "queued";
+  repository.matches.push(
+    {
+      candidateId: "candidate-1",
+      status: "accepted",
+      basis: "exact",
+      score: 1,
+      song,
+      alternatives: [],
+    },
+    {
+      candidateId: "candidate-2",
+      status: "review",
+      basis: RETRYABLE_CATALOG_MATCH_BASES[0],
+      score: 0,
+      song: null,
+      alternatives: [],
+    },
+  );
+
+  await matchResearchRun(repository, "run-1", "us", undefined, {
+    retryIncomplete: true,
+    recoveryGeneration: 1,
+  });
+
+  expect(repository.automaticRecoveries).toEqual([{
+    runId: "run-1",
+    storefront: "us",
+    currentGeneration: 1,
+  }]);
+  expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
+  expect(repository.automaticPublications).toEqual([]);
+});
+
+test("One Command counts only strict unique Apple matches toward an exact target", async () => {
+  const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
+  const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
+  repository.matches.push(
+    {
+      candidateId: "candidate-1",
+      status: "accepted",
+      basis: "exact",
+      score: 1,
+      song,
+      alternatives: [],
+    },
+    {
+      candidateId: "candidate-2",
+      status: "review",
+      basis: "visitor choice required",
+      score: 0.8,
+      song,
+      alternatives: [],
+    },
+  );
+
+  await matchResearchRun(repository, "run-1", "us");
+
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "failed",
+    phase: "catalog_matching_shortfall",
+  });
+  expect(repository.checkpoints).toContainEqual(expect.objectContaining({
+    safePrimaryCount: 1,
+    shortfall: 1,
+  }));
+  expect(repository.automaticPublications).toEqual([]);
+});
+
+test("One Command matching durably hands a satisfied run to automatic publication", async () => {
+  const exactTargetBrief = { ...curatedBrief, targetSize: { min: 1, max: 1 } };
+  const repository = new MemoryMatchingRepository(
+    [candidate("automatic", "verified")],
+    exactTargetBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+    undefined,
+    true,
+  );
+
+  await matchResearchRun(repository, "run", "us", undefined, { fast: true });
+
+  expect(repository.updates.at(-1)).toMatchObject({ status: "visitor_review", phase: "exception_review" });
+  expect(repository.automaticPublications).toEqual(["run"]);
+});
+
+test.each(["publishing", "waiting_for_apple_authorization", "complete", "partial"])(
+  "a replayed One Command matching lease never regresses a %s run",
+  async (status) => {
+    const repository = new MemoryMatchingRepository(
+      [candidate("already-handed-off", "verified")],
+      { ...curatedBrief, targetSize: { min: 1, max: 1 } },
+      new Map(),
+      undefined,
+      true,
+      status,
+    );
+
+    await matchResearchRun(repository, "run", "us");
+
+    expect(repository.updates).toEqual([]);
+    expect(repository.automaticPublications).toEqual([]);
+    expect(lookupAppleCatalogByIsrc).not.toHaveBeenCalled();
+  },
+);
+
+test("a replayed One Command matching lease resumes a locked manifest without regressing state", async () => {
+  const repository = new MemoryMatchingRepository(
+    [],
+    { ...curatedBrief, targetSize: { min: 1, max: 1 } },
+    new Map(),
+    undefined,
+    true,
+    "manifest_ready",
+  );
+
+  await matchResearchRun(repository, "run", "us");
+
+  expect(repository.updates).toEqual([]);
+  expect(repository.automaticPublications).toEqual(["run"]);
 });
 
 test("fast matching converts a transient Apple failure into an explicit review outcome", async () => {

@@ -667,6 +667,22 @@ describe("research completion policy", () => {
     expect(researchCompletionReadiness(brief("hybrid", { min: 2, max: 5 }), { candidateCount: 100, eligibleCandidateCount: 2, sourceCount: 1 }, []).ready).toBe(true);
   });
 
+  test("large exact curated requests require an Apple matching reserve before handoff", () => {
+    const exact300 = brief("curated", { min: 300, max: 300 });
+    const short = researchCompletionReadiness(
+      exact300,
+      { candidateCount: 450, eligibleCandidateCount: 300, sourceCount: 4 },
+      [],
+    );
+    expect(short.ready).toBe(false);
+    expect(short.reasons[0]).toContain("450 evidence-eligible candidates");
+    expect(researchCompletionReadiness(
+      exact300,
+      { candidateCount: 450, eligibleCandidateCount: 450, sourceCount: 4 },
+      [],
+    ).ready).toBe(true);
+  });
+
   test("exhaustive runs require completed web, structured discovery, and container enumeration", () => {
     expect(researchCompletionReadiness(brief("exhaustive", null), { candidateCount: 100, eligibleCandidateCount: 0, sourceCount: 1 }, observedFrontier).ready).toBe(false);
     expect(researchCompletionReadiness(brief("exhaustive", null), { candidateCount: 1, eligibleCandidateCount: 1, sourceCount: 1 }, []).ready).toBe(false);
@@ -1530,6 +1546,49 @@ describe("fast curated orchestration", () => {
 });
 
 describe("durable research segmentation", () => {
+  test("hands a deep 300-track curated request to gap analysis with its 450-candidate matching reserve", async () => {
+    const state = segmentedRepository();
+    state.run.brief = brief("curated", { min: 300, max: 300 });
+    state.run.phase = "gap_analysis";
+    state.coverage.candidateCount = 320;
+    state.coverage.eligibleCandidateCount = 320;
+    state.coverage.sourceCount = 4;
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      completionResponse("deep-exact-gap", "gap_analysis"),
+    ]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "gap_analysis",
+      gapAttempt: 0,
+      generation: 0,
+      segment: 0,
+    });
+
+    expect(orchestrator.calls).toHaveLength(1);
+    const call = orchestrator.calls[0]!;
+    expect(call.body.instructions).toContain(
+      "publishes 300 tracks, but research must build an internal pool of 450 evidence-eligible candidates",
+    );
+    expect(call.body.instructions).toContain(
+      "brief.targetSize is the user-visible publication count, not a research cap",
+    );
+    expect(JSON.parse(String(call.body.input))).toMatchObject({
+      phase: "gap_analysis",
+      brief: {
+        mode: "curated",
+        targetSize: { min: 300, max: 300 },
+      },
+      publicationTrackCount: 300,
+      internalCandidateGoal: 450,
+      internalCandidateShortfall: 130,
+      coverage: {
+        eligibleCandidateCount: 320,
+      },
+    });
+    expect(state.run.brief.targetSize).toEqual({ min: 300, max: 300 });
+  });
+
   test("archives the boundary response, starts fresh context, and advances after continuation", async () => {
     vi.stubEnv("RESEARCH_TURNS_PER_SEGMENT", "1");
     vi.stubEnv("RESEARCH_MAX_SEGMENTS_PER_PASS", "3");

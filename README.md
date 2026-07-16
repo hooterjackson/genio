@@ -6,7 +6,7 @@ Visitors can start multiple jobs, reopen the jobs available to their browser, an
 
 gênio uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 
-Curated prompts such as “100 most influential…” use a separate **fast** profile: one bounded cited web synthesis, one structured extraction, and concurrent Apple catalog lookup. The product targets confirmation-to-review in under two minutes and reports an explicit partial result when evidence or provider latency prevents the requested count. Exhaustive and hybrid prompts retain the slower source-frontier workflow and make no two-minute promise.
+Curated prompts such as “100 most influential…” use a separate **fast** profile: bounded cited web synthesis, structured extraction, and concurrent Apple catalog lookup. The product targets a research-to-matching handoff in under two minutes for requests of up to 200 tracks, researches extra candidates to absorb catalog misses, and never silently publishes fewer tracks than requested. Exhaustive, hybrid, and larger curated prompts retain the slower source-frontier workflow and make no two-minute promise.
 
 ## Architecture
 

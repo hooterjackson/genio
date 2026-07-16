@@ -115,11 +115,9 @@ function fallbackTitle(context: PlaylistTitleContext): string {
   return `${truncateTitle(primarySubject, available)}${suffix}`;
 }
 
-function beginsWithRequestedCount(value: string, context: PlaylistTitleContext): boolean {
-  const expected = exactTargetCount(context);
-  if (expected === null) return false;
-  const match = value.match(/^(?:the\s+)?([\d,]+)\b/iu);
-  return match ? Number(match[1]!.replaceAll(",", "")) === expected : false;
+function beginsWithScopeCount(value: string, context: PlaylistTitleContext): boolean {
+  if (exactTargetCount(context) === null) return false;
+  return /^(?:the\s+)?[\d,]+\b/iu.test(value);
 }
 
 /**
@@ -142,7 +140,7 @@ export function normalizePlaylistTitle(value: string, context: PlaylistTitleCont
   const unsuitable = !candidate
     || GENERIC_TITLE.test(candidate)
     || GENERIC_OR_SCOPE_LEAD.test(candidate)
-    || beginsWithRequestedCount(candidate, context)
+    || beginsWithScopeCount(candidate, context)
     || editorialPromptTitle
     || codePointLength(candidate) > PLAYLIST_TITLE_MAX_LENGTH
     || wordCount(candidate) > MAX_EDITORIAL_WORDS

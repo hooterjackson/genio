@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  applyRequestedTrackCount,
+  canonicalBriefForRequest,
   canonicalBriefForPrompt,
   estimateResearchCost,
   estimateResearchCostRange,
@@ -67,6 +69,30 @@ describe("playlist brief policy", () => {
     ).targetSize).toEqual({ min: 300, max: 300 });
   });
 
+  test("the explicit size control overrides both prompt text and model scope", () => {
+    const interpreted = {
+      ...brief("exhaustive"),
+      title: "Every released recording",
+      relationship: "released by",
+      targetSize: null,
+    };
+
+    expect(canonicalBriefForRequest({
+      prompt: "Give me 300 influential techno tracks",
+      requestedTrackCount: 50,
+    }, interpreted)).toMatchObject({
+      mode: "curated",
+      title: "Test: 50 Essential Tracks",
+      targetSize: { min: 50, max: 50 },
+    });
+  });
+
+  test("validates the server-owned requested track count", () => {
+    expect(applyRequestedTrackCount(brief("curated"), 200).targetSize).toEqual({ min: 200, max: 200 });
+    expect(() => applyRequestedTrackCount(brief("curated"), 0)).toThrow(/1 to 10,000/u);
+    expect(() => applyRequestedTrackCount(brief("curated"), 10_001)).toThrow(/1 to 10,000/u);
+  });
+
   test("keeps stored scope authoritative while accepting only ambiguity acknowledgement", () => {
     const storedBrief = {
       ...brief("curated"),
@@ -85,6 +111,20 @@ describe("playlist brief policy", () => {
       ambiguities: ["Use one canonical version"],
       ambiguityAcceptance: ["Use one canonical version"],
     });
+  });
+
+  test("ignores browser-supplied ambiguity acknowledgement for One Command", () => {
+    const storedBrief = {
+      ...brief("curated"),
+      ambiguities: ["Use one canonical version"],
+    };
+
+    expect(canonicalBriefForRequest({
+      prompt: "Influential techno",
+      requestedTrackCount: 50,
+    }, storedBrief, {
+      ambiguityAcceptance: ["An invented browser acknowledgement"],
+    }).ambiguityAcceptance).toBeUndefined();
   });
 
   test("does not confuse music years or unrelated numbers with a track count", () => {
@@ -129,6 +169,14 @@ describe("playlist brief policy", () => {
     expect(manifestDescriptionForBrief(brief("hybrid"))).toContain("within the confirmed constraints");
     expect(manifestDescriptionForBrief(brief("curated"))).toContain("editorial selection");
     expect(manifestDescriptionForBrief(brief("curated"))).not.toContain("Exhaustive across");
+    const repaired = manifestDescriptionForBrief({
+      ...brief("curated"),
+      title: "Berlin techno: 50 Influential Tracks",
+      description: "A stale request for 300 tracks.",
+      targetSize: { min: 50, max: 50 },
+    });
+    expect(repaired).toContain("50 source-backed tracks");
+    expect(repaired).not.toContain("300");
   });
 
   test("derives a transparent range from mode, size, breadth, relationship, and version complexity", () => {

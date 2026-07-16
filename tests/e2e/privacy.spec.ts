@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("the public footer opens the complete minimal privacy notice", async ({ page }) => {
+test("the public header opens the complete minimal privacy notice", async ({ page }) => {
   await page.goto("/");
   const privacyLink = page.getByRole("link", { name: /privacy/i });
   await expect(privacyLink).toBeVisible();

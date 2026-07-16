@@ -86,93 +86,115 @@ const fastEstimate = {
 
 async function openPrompt(page: Page): Promise<void> {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /research a playlist/i })).toBeVisible();
-  await page.getByRole("button", { name: /new playlist/i }).click();
-  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: /playlist request/i })).toBeVisible();
+  await expect(page.getByRole("spinbutton", { name: /tracks/i })).toBeVisible();
+  await expect(page.getByRole("button", { name: /create playlist/i })).toBeVisible();
 }
 
 function requestField(page: Page) {
-  return page.getByRole("textbox", { name: /request/i });
+  return page.getByRole("textbox", { name: /playlist request/i });
 }
 
-test("the request and scope flow remains usable at mobile widths", async ({ page }) => {
-  await page.route("**/api/v1/brief", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ brief, estimateUsd: estimate.approvalUsd, estimate, cached: false }),
-    });
-  });
+function trackCountField(page: Page) {
+  return page.getByRole("spinbutton", { name: /tracks/i });
+}
 
+test("the one-command composer remains usable at mobile widths", async ({ page }) => {
   await openPrompt(page);
-  const example = page.getByRole("button", { name: "Paulinho da Costa’s 100 most influential songs" });
-  await example.click();
-  await expect(example).toHaveAttribute("aria-pressed", "true");
-  await expect(requestField(page)).toHaveValue("Paulinho da Costa’s 100 most influential songs");
-  await page.getByRole("button", { name: /back/i }).click();
-  await expect(page.getByRole("heading", { name: /research a playlist/i })).toBeVisible();
-  await page.getByRole("button", { name: /new playlist/i }).click();
-  await requestField(page).fill("Every released song Paulinho da Costa performed on");
-  await page.getByRole("button", { name: /review request/i }).click();
-  await expect(page.getByRole("heading", { name: brief.title })).toBeVisible();
-  await expect(page.getByText("[EXHAUSTIVE · LONGER RUN]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Searches the configured sources for all documented matches and reports unresolved gaps.")).toBeVisible();
-  await expect(page.getByRole("button", { name: /start research/i })).toBeVisible();
-  await expect(page.getByText("$4.25–$9.50")).toBeVisible();
+  await expect(page.getByText("Describe a playlist. gênio researches, matches, and publishes it to Apple Music.")).toBeVisible();
+  await expect(trackCountField(page)).toHaveValue("50");
+  const example = "Paulinho da Costa’s most influential recordings";
+  await requestField(page).focus();
+  await expect(requestField(page)).toHaveAttribute("placeholder", example);
+  await requestField(page).fill(example);
+  await expect(requestField(page)).toHaveValue("Paulinho da Costa’s most influential recordings");
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
+  const sizes = await Promise.all([
+    requestField(page).boundingBox(),
+    trackCountField(page).boundingBox(),
+    page.getByRole("button", { name: /create playlist/i }).boundingBox(),
+  ]);
+  expect(sizes.every((box) => box && box.height >= 44)).toBe(true);
 });
 
-test("curated requests are clearly labeled as the time-boxed fast path", async ({ page }) => {
+test("the selected count is authoritative and one action starts research", async ({ page }) => {
+  const selectedBrief = { ...curatedBrief, targetSize: { min: 50, max: 50 } };
+  const startedRun = {
+    ...run,
+    id: "run-one-command",
+    prompt: "300 influential techno tracks",
+    brief: selectedBrief,
+    status: "researching",
+    phase: "fast_research",
+    autoPublish: true,
+  };
+  let briefBody: Record<string, unknown> | null = null;
   await page.route("**/api/v1/brief", async (route) => {
+    briefBody = route.request().postDataJSON() as Record<string, unknown>;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ brief: curatedBrief, estimateUsd: fastEstimate.approvalUsd, estimate: fastEstimate, cached: false }),
+      body: JSON.stringify({ requestId: "brief-one-command", brief: selectedBrief }),
     });
   });
-
-  await openPrompt(page);
-  await requestField(page).fill("Influential Berlin techno");
-  await page.getByRole("button", { name: /review request/i }).click();
-
-  await expect(page.getByText("[CURATED · UNDER 2 MIN TARGET]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Returns a cited selection within a two-minute target. Partial results remain available if time expires.")).toBeVisible();
-  await expect(page.getByRole("button", { name: /start research/i })).toBeVisible();
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
-  expect(overflow).toBeLessThanOrEqual(1);
-});
-
-test("a 300-track request stays exact and is not presented as a two-minute fast run", async ({ page }) => {
-  const largeBrief = {
-    ...curatedBrief,
-    title: "Techno: 300 Influential Tracks",
-    description: "A cited editorial selection of 300 influential techno tracks.",
-    targetSize: { min: 300, max: 300 },
-  };
-  const largeEstimate = {
-    minimumUsd: 2,
-    maximumUsd: 4.5,
-    approvalUsd: 4.5,
-    factors: [{ label: "large cited editorial research", minimumUsd: 0.75, maximumUsd: 1.5 }],
-  };
-  await page.route("**/api/v1/brief", async (route) => {
+  let runBody: Record<string, unknown> | null = null;
+  await page.route("**/api/v1/runs", async (route) => {
+    runBody = route.request().postDataJSON() as Record<string, unknown>;
     await route.fulfill({
-      status: 200,
+      status: 201,
       contentType: "application/json",
-      body: JSON.stringify({ brief: largeBrief, estimateUsd: largeEstimate.approvalUsd, estimate: largeEstimate, cached: false }),
+      body: JSON.stringify({ run: startedRun, capability: "one-command-capability" }),
     });
+  });
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: startedRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-one-command", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(startedRun) });
   });
 
   await openPrompt(page);
   await requestField(page).fill("300 influential techno tracks");
-  await page.getByRole("button", { name: /review request/i }).click();
+  await trackCountField(page).fill("50");
+  await page.getByRole("button", { name: /create playlist/i }).click();
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  expect(briefBody).toMatchObject({ prompt: "300 influential techno tracks", targetTrackCount: 50 });
+  expect(runBody).toMatchObject({
+    briefRequestId: "brief-one-command",
+    brief: { targetSize: { min: 50, max: 50 } },
+  });
+  await expect(page.getByRole("button", { name: /review request/i })).toHaveCount(0);
+});
 
-  await expect(page.getByRole("heading", { name: "Techno: 300 Influential Tracks" })).toBeVisible();
-  await expect(page.getByText("300–300 tracks", { exact: true })).toBeVisible();
-  await expect(page.getByText("[CURATED · LARGER RUN]", { exact: true })).toBeVisible();
-  await expect(page.getByText("Researches the larger cited selection without the two-minute deadline.")).toBeVisible();
+test("leaving the composer cancels a pending One Command request", async ({ page }) => {
+  let runCreates = 0;
+  await page.route("**/api/v1/brief", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ requestId: "stale-brief", brief: curatedBrief }),
+    }).catch(() => undefined);
+  });
+  await page.route("**/api/v1/runs", async (route) => {
+    if (route.request().method() === "POST") {
+      runCreates += 1;
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "stale run" }) });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [] }) });
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill("Berlin techno foundations");
+  await page.getByRole("button", { name: /create playlist/i }).click();
+  await page.getByRole("button", { name: "JOBS", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
+  await page.waitForTimeout(650);
+  expect(runCreates).toBe(0);
 });
 
 test("an explicit 100-track request stays at 100 through research, matching, and publication", async ({ page }) => {
@@ -195,38 +217,16 @@ test("an explicit 100-track request stays at 100 through research, matching, and
     candidateCount: 0,
     sourceCount: 0,
     unresolvedCount: 0,
+    autoPublish: true,
   };
-  const matchingRun = {
+  const publishingRun = {
     ...fastRun,
-    status: "matching",
-    phase: "catalog_matching",
+    status: "publishing",
+    phase: "publication_queued",
     candidateCount: 100,
     sourceCount: 10,
   };
-  const reviewRun = {
-    ...matchingRun,
-    status: "visitor_review",
-    phase: "exception_review",
-  };
-  const tracks = Array.from({ length: 100 }, (_, index) => ({
-    position: index,
-    candidateId: `candidate-100-${index}`,
-    artist: `Artist ${index + 1}`,
-    title: `Influential track ${index + 1}`,
-    album: `Album ${index + 1}`,
-    status: "accepted",
-    catalogId: `apple-100-${index}`,
-    song: {
-      id: `apple-100-${index}`,
-      name: `Influential track ${index + 1}`,
-      artistName: `Artist ${index + 1}`,
-      albumName: `Album ${index + 1}`,
-    },
-    alternatives: [],
-    evidenceEligible: true,
-    selected: true,
-    selectable: true,
-  }));
+  const completeRun = { ...publishingRun, status: "complete", phase: "published" };
 
   let briefBody: Record<string, unknown> | null = null;
   await page.route("**/api/v1/brief", async (route) => {
@@ -234,7 +234,7 @@ test("an explicit 100-track request stays at 100 through research, matching, and
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ brief: exactBrief, estimateUsd: fastEstimate.approvalUsd, estimate: fastEstimate, cached: false }),
+      body: JSON.stringify({ requestId: "brief-100", brief: exactBrief, estimateUsd: fastEstimate.approvalUsd, estimate: fastEstimate, cached: false }),
     });
   });
 
@@ -252,81 +252,51 @@ test("an explicit 100-track request stays at 100 through research, matching, and
   });
 
   let statusRead = 0;
-  await page.route("**/api/v1/runs/run-100", async (route) => {
-    const states = [fastRun, matchingRun, reviewRun];
+  await page.route(/.*\/api\/v1\/runs\/run-100(?:\?.*)?$/, async (route) => {
+    const states = [publishingRun, completeRun];
     const next = states[Math.min(statusRead, states.length - 1)]!;
     statusRead += 1;
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(next) });
   });
-  await page.route(/.*\/api\/v1\/runs\/run-100\/tracks.*/, async (route) => {
+  await page.route(/.*\/api\/v1\/runs\/run-100\/result(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        items: tracks,
-        page: 1,
-        pageSize: 500,
-        total: 100,
-        totalPages: 1,
-        selectableCount: 100,
-        unmatchedCount: 0,
-        retryableCount: 0,
-        matchingComplete: true,
+        runId: fastRun.id,
+        status: "complete",
+        requestedTrackCount: 100,
+        sourceCount: 10,
+        unresolvedGapCount: 0,
+        coverageSummary: "Published from 10 documented sources with 0 visible gaps.",
+        outcomeCounts: { accepted: 100 },
+        volumes: [{
+          index: 1,
+          name: exactBrief.title,
+          url: "https://music.apple.com/us/playlist/test/pl.u-test",
+          trackCount: 100,
+          status: "complete",
+        }],
       }),
     });
   });
 
-  let selectionBody: Record<string, unknown> | null = null;
-  const manifestTracks = tracks.map((track) => ({
-    position: track.position,
-    candidateId: track.candidateId,
-    catalogId: track.catalogId,
-    artist: track.artist,
-    title: track.title,
-  }));
-  await page.route("**/api/v1/runs/run-100/selection", async (route) => {
-    selectionBody = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        id: "manifest-100",
-        runId: fastRun.id,
-        name: exactBrief.title,
-        contentHash: "manifest-hash-100",
-        trackCount: 100,
-        tracks: manifestTracks,
-      }),
-    });
-  });
-  let publishBody: Record<string, unknown> | null = null;
-  await page.route("**/api/v1/runs/run-100/publish", async (route) => {
-    publishBody = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({
-      status: 202,
-      contentType: "application/json",
-      body: JSON.stringify({ ...reviewRun, status: "publishing", phase: "publication" }),
-    });
+  let browserMutationCount = 0;
+  page.on("request", (request) => {
+    if (/\/runs\/run-100\/(?:selection|publish)$/u.test(new URL(request.url()).pathname)) browserMutationCount += 1;
   });
 
   await openPrompt(page);
   await requestField(page).fill(prompt);
-  await page.getByRole("button", { name: /review request/i }).click();
-  await expect(page.getByText("100–100 tracks", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /start research/i }).click();
+  await trackCountField(page).fill("100");
+  await page.getByRole("button", { name: /create playlist/i }).click();
 
-  await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
-  await expect(page.getByText("100 OF 100 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
-  await expect(page.getByRole("checkbox")).toHaveCount(100);
-  await expect(page.getByText("Influential track 100", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED." })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("100 tracks", { exact: true })).toBeVisible();
 
-  expect(briefBody).toMatchObject({ prompt });
+  expect(briefBody).toMatchObject({ prompt, targetTrackCount: 100 });
   expect(runBody).toMatchObject({ brief: { targetSize: { min: 100, max: 100 } } });
-  expect(selectionBody).toEqual({ useRecommended: true, excludedCandidateIds: [], overrides: [] });
-  expect(manifestTracks).toHaveLength(100);
-  await expect.poll(() => publishBody).toEqual({ manifestId: "manifest-100" });
-  await expect(page.getByText("Creating the playlist in Apple Music.")).toBeVisible();
+  expect(browserMutationCount).toBe(0);
 });
 
 test("a 50-track request uses reserve matches but generates exactly 50 tracks", async ({ page }) => {
@@ -587,7 +557,7 @@ test("the jobs screen lists and opens earlier jobs for this browser", async ({ p
   await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
   await expect(page.getByText(brief.title)).toBeVisible();
   await page.getByRole("button", { name: /open/i }).click();
-  await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.search)).toBe("?run=run-earlier");
 });
 
@@ -611,19 +581,20 @@ test("an active job never blocks starting a new request", async ({ page }) => {
 
   await page.goto("/#cap=one-time-secret&run=run-active");
   await page.getByRole("button", { name: "NEW JOB", exact: true }).click();
-  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  await expect(requestField(page)).toBeVisible();
+  await expect(trackCountField(page)).toHaveValue("50");
   await expect(requestField(page)).toHaveValue("");
   expect(deletes).toEqual([]);
 });
 
-test("material scope assumptions must be accepted and are preserved in the confirmed brief", async ({ page }) => {
+test("the optimistic flow preserves material assumptions without claiming user acceptance", async ({ page }) => {
   const ambiguities = ["Include credited guest appearances", "Use the first released studio version"];
-  const ambiguousBrief = { ...brief, ambiguities };
+  const ambiguousBrief = { ...curatedBrief, targetSize: { min: 50, max: 50 }, ambiguities };
   await page.route("**/api/v1/brief", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ brief: ambiguousBrief, estimateUsd: estimate.approvalUsd, estimate, cached: false }),
+      body: JSON.stringify({ requestId: "brief-ambiguous", brief: ambiguousBrief, estimateUsd: estimate.approvalUsd, estimate, cached: false }),
     });
   });
 
@@ -640,19 +611,12 @@ test("material scope assumptions must be accepted and are preserved in the confi
 
   await openPrompt(page);
   await requestField(page).fill("Every released song Paulinho da Costa performed on");
-  await page.getByRole("button", { name: /review request/i }).click();
-
-  const confirm = page.getByRole("button", { name: /start research/i });
-  await expect(confirm).toBeDisabled();
-  const acceptance = page.getByRole("checkbox", { name: /i accept these assumptions/i });
-  await acceptance.check();
-  await expect(confirm).toBeEnabled();
-  await confirm.click();
+  await page.getByRole("button", { name: /create playlist/i }).click();
 
   const body = await runRequest;
   const confirmed = body.brief as typeof ambiguousBrief & { ambiguityAcceptance?: string[] };
   expect(confirmed.ambiguities).toEqual(ambiguities);
-  expect(confirmed.ambiguityAcceptance).toEqual(ambiguities);
+  expect(confirmed.ambiguityAcceptance).toBeUndefined();
 });
 
 test("capabilities are exchanged and removed from the URL fragment", async ({ page }) => {
@@ -967,7 +931,7 @@ test("legacy timed-out Apple matches recover automatically before selection", as
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
   expect(matchingRequests).toBe(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
@@ -1036,7 +1000,7 @@ test("a failed automatic Apple retry leaves the list available for a manual retr
   const retry = page.getByRole("button", { name: "Retry Apple Music matching for 1 track" });
   await expect(retry).toBeEnabled();
   await retry.click();
-  await expect(page.getByRole("heading", { name: /research in progress/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
   expect(attempts).toBe(2);
 });
 
@@ -1407,10 +1371,10 @@ test("leaving during playlist generation prevents stale publication and state", 
   await page.getByRole("button", { name: /generate playlist/i }).click();
   await started;
   await page.getByRole("button", { name: "NEW JOB", exact: true }).click();
-  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  await expect(requestField(page)).toBeVisible();
   releaseSelection();
   await page.waitForTimeout(50);
-  await expect(page.getByRole("heading", { name: /enter a request/i })).toBeVisible();
+  await expect(requestField(page)).toBeVisible();
   expect(publishRequests).toBe(0);
 });
 
@@ -1634,15 +1598,17 @@ test("interactive controls meet the minimum touch target", async ({ page }) => {
 
 test("desktop keyboard focus remains visible and primary text meets WCAG AA contrast", async ({ page }, testInfo) => {
   await page.goto("/");
-  const primary = page.getByRole("button", { name: /new playlist/i });
+  const request = requestField(page);
+  await request.fill("Every released song Paulinho da Costa performed on");
+  const primary = page.getByRole("button", { name: /create playlist/i });
   await primary.focus();
   await expect(primary).toBeFocused();
 
   for (const locator of [
     page.locator("body"),
-    page.locator(".intro-copy p"),
-    page.locator(".screen-index"),
-    page.locator(".intro-mark"),
+    page.locator(".one-command-intro"),
+    page.locator(".header-meta"),
+    page.locator(".wordmark"),
   ]) {
     const colors = await locator.evaluate((element) => {
       const foreground = getComputedStyle(element).color;
@@ -1658,10 +1624,8 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   }
 
   if (testInfo.project.name === "desktop") {
-    await primary.click();
-    const request = requestField(page);
-    await expect(request).toBeFocused();
-    await request.fill("Every released song Paulinho da Costa performed on");
-    expect(await request.evaluate((element) => getComputedStyle(element).outlineColor)).toBe("rgb(224, 96, 41)");
+    await primary.focus();
+    await expect(primary).toBeFocused();
+    expect(await primary.evaluate((element) => getComputedStyle(element).outlineColor)).toBe("rgb(224, 96, 41)");
   }
 });

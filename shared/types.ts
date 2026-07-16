@@ -199,6 +199,7 @@ export interface ResearchRunView {
   actualCostUsd: number;
   approvedBudgetUsd: number;
   phase: string;
+  autoPublish?: boolean;
   error: string | null;
   candidateCount: number;
   sourceCount: number;

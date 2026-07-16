@@ -65,6 +65,13 @@ describe("playlist title normalization", () => {
     )).toBe("Paulinho da Costa: 200 Performance Credits");
   });
 
+  test("replaces a conflicting model count with the server-selected count", () => {
+    expect(normalizePlaylistTitle(
+      "300 Influential Techno Tracks",
+      context({ targetSize: { min: 50, max: 50 } }),
+    )).toBe("Berlin techno: 50 Influential Tracks");
+  });
+
   test("rejects generic model titles while preserving specific editorial titles", () => {
     expect(normalizePlaylistTitle("The Essentials", context()))
       .toBe("Berlin techno: 50 Influential Tracks");

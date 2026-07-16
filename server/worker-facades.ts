@@ -47,6 +47,8 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
     saveTimeoutMatches: (...args: Parameters<MatchingRepository["saveTimeoutMatches"]>) => source.saveTimeoutMatches(...args),
     getResearchCheckpoint: (...args: Parameters<MatchingRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<MatchingRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
+    queueAutomaticCatalogRecovery: (...args: Parameters<MatchingRepository["queueAutomaticCatalogRecovery"]>) => source.queueAutomaticCatalogRecovery(...args),
+    queueAutomaticPublication: (...args: Parameters<MatchingRepository["queueAutomaticPublication"]>) => source.queueAutomaticPublication(...args),
   });
 }
 

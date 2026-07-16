@@ -1,5 +1,6 @@
 import {
   bigint,
+  boolean,
   index,
   integer,
   jsonb,
@@ -27,6 +28,7 @@ export const settings = pgTable("settings", {
 export const briefRequests = pgTable("brief_requests", {
   id: uuid("id").primaryKey(),
   prompt: text("prompt").notNull(),
+  requestedTrackCount: integer("requested_track_count"),
   model: varchar("model", { length: 120 }).notNull(),
   status: varchar("status", { length: 40 }).notNull().default("queued"),
   briefJson: jsonb("brief_json"),
@@ -61,6 +63,7 @@ export const researchRuns = pgTable("research_runs", {
   phase: varchar("phase", { length: 80 }).notNull(),
   clientBucket: varchar("client_bucket", { length: 160 }).notNull(),
   idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
+  autoPublish: boolean("auto_publish").notNull().default(false),
   estimatedCostUsd: numeric("estimated_cost_usd", { precision: 12, scale: 6, mode: "number" }).notNull().default(0),
   actualCostUsd: numeric("actual_cost_usd", { precision: 12, scale: 6, mode: "number" }).notNull().default(0),
   reservedCostUsd: numeric("reserved_cost_usd", { precision: 12, scale: 6, mode: "number" }).notNull().default(0),
