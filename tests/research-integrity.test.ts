@@ -969,37 +969,17 @@ describe("fast curated orchestration", () => {
         }] },
       ],
     };
-    const extraction = {
-      id: "fast-extract",
-      model: "gpt-5.6-luna",
-      usage: { input_tokens: 100, output_tokens: 100 },
-      output_text: JSON.stringify({ candidates: [{
-        artist: "Fixture Performer",
-        title: "Test Song",
-        album: null,
-        releaseYear: 2020,
-        versionLabel: null,
-        relationship: "performed on",
-        citationIndexes: [0],
-      }] }),
-    };
-    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [synthesis, extraction]);
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [synthesis]);
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
 
-    expect(orchestrator.calls).toHaveLength(2);
+    expect(orchestrator.calls).toHaveLength(1);
     expect(orchestrator.calls[0]!.body).toMatchObject({
       model: "gpt-5.6-luna",
       reasoning: { effort: "low" },
       max_tool_calls: 5,
       tools: [{ type: "web_search", search_context_size: "low" }],
     });
-    expect(orchestrator.calls[1]!.body).toMatchObject({
-      model: "gpt-5.6-luna",
-      reasoning: { effort: "none" },
-      text: { format: { type: "json_schema", strict: true } },
-    });
-    expect(orchestrator.calls[1]!.body).not.toHaveProperty("tools");
     expect(persistedCandidates).toHaveLength(1);
     expect(frontier).toContainEqual(expect.objectContaining({
       sourceClass: "fast_policy",
@@ -1010,7 +990,7 @@ describe("fast curated orchestration", () => {
     expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
       status: "complete",
       hostedWebSearchCalls: 1,
-      modelCallCount: 2,
+      modelCallCount: 1,
     });
     expect(state.run).toMatchObject({ status: "ready_for_matching", phase: "research_complete" });
     expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
@@ -1080,24 +1060,6 @@ describe("fast curated orchestration", () => {
         }] },
       ],
     };
-    const extractedCandidates = Array.from({ length: 120 }, (_, index) => {
-      const suffix = String(index + 1).padStart(3, "0");
-      return {
-        artist: `Performer ${suffix}`,
-        title: `Track ${suffix}`,
-        album: null,
-        releaseYear: null,
-        versionLabel: null,
-        relationship: "influential recording featuring",
-        citationIndexes: [Math.floor(index / 10)],
-      };
-    });
-    const extraction = {
-      id: "fast-extract-100",
-      model: "gpt-5.6-luna",
-      usage: { input_tokens: 2_000, output_tokens: 4_000 },
-      output_text: JSON.stringify({ candidates: extractedCandidates }),
-    };
     const refillPairs = Array.from({ length: 30 }, (_, index) => {
       const suffix = String(index + 121).padStart(3, "0");
       return `Performer ${suffix} — Track ${suffix}`;
@@ -1127,35 +1089,14 @@ describe("fast curated orchestration", () => {
         }] },
       ],
     };
-    const refillExtraction = {
-      id: "fast-extract-100-refill",
-      model: "gpt-5.6-luna",
-      usage: { input_tokens: 500, output_tokens: 500 },
-      output_text: JSON.stringify({
-        candidates: Array.from({ length: 30 }, (_, index) => {
-          const suffix = String(index + 121).padStart(3, "0");
-          return {
-            artist: `Performer ${suffix}`,
-            title: `Track ${suffix}`,
-            album: null,
-            releaseYear: null,
-            versionLabel: null,
-            relationship: "influential recording featuring",
-            citationIndexes: [0],
-          };
-        }),
-      }),
-    };
     const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
       synthesis,
-      extraction,
       refillSynthesis,
-      refillExtraction,
     ]);
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
 
-    expect(orchestrator.calls).toHaveLength(4);
+    expect(orchestrator.calls).toHaveLength(2);
     expect(persistedCandidates).toHaveLength(150);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
       Array.from({ length: 150 }, (_, index) => index + 1),
@@ -1248,25 +1189,6 @@ describe("fast curated orchestration", () => {
             annotations,
           }] },
         ],
-      }, {
-        id: `${id}-extract`,
-        model: "gpt-5.6-luna",
-        usage: { input_tokens: 2_000, output_tokens: 4_000 },
-        output_text: JSON.stringify({
-          candidates: Array.from({ length: count }, (_, index) => {
-            const ordinal = start + index;
-            const suffix = String(ordinal).padStart(3, "0");
-            return {
-              artist: `Performer ${suffix}`,
-              title: `Track ${suffix}`,
-              album: null,
-              releaseYear: null,
-              versionLabel: null,
-              relationship: "influential recording featuring",
-              citationIndexes: [Math.floor(index / 10)],
-            };
-          }),
-        }),
       }];
     }
 
@@ -1278,16 +1200,16 @@ describe("fast curated orchestration", () => {
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
 
-    expect(orchestrator.calls).toHaveLength(6);
+    expect(orchestrator.calls).toHaveLength(3);
     expect(JSON.parse(String(orchestrator.calls[0]!.body.input))).toMatchObject({
       minimumCandidateCount: 120,
       candidateLimit: 120,
     });
-    expect(JSON.parse(String(orchestrator.calls[2]!.body.input))).toMatchObject({
+    expect(JSON.parse(String(orchestrator.calls[1]!.body.input))).toMatchObject({
       minimumCandidateCount: 120,
       candidateLimit: 120,
     });
-    expect(JSON.parse(String(orchestrator.calls[4]!.body.input))).toMatchObject({
+    expect(JSON.parse(String(orchestrator.calls[2]!.body.input))).toMatchObject({
       minimumCandidateCount: 60,
       candidateLimit: 75,
     });
@@ -1381,59 +1303,17 @@ describe("fast curated orchestration", () => {
       };
     }
 
-    function extractedRow(ordinal: number, citationIndex: number) {
-      const suffix = String(ordinal).padStart(3, "0");
-      return {
-        artist: `Performer ${suffix}`,
-        title: `Track ${suffix}`,
-        album: null,
-        releaseYear: null,
-        versionLabel: null,
-        relationship: "historically influential in the scene",
-        citationIndexes: [citationIndex],
-      };
-    }
-
     const initialSynthesis = synthesisFixture(1, 28, "fast-web-initial");
-    const initialExtraction = {
-      id: "fast-extract-initial",
-      model: "gpt-5.6-luna",
-      usage: { input_tokens: 2_000, output_tokens: 3_000 },
-      output_text: JSON.stringify({
-        candidates: [
-          ...Array.from({ length: 28 }, (_, index) => extractedRow(index + 1, Math.floor(index / 10))),
-          {
-            artist: "Rejected Artist",
-            title: "Rejected Container",
-            album: null,
-            releaseYear: null,
-            versionLabel: null,
-            relationship: "historically influential in the scene",
-            citationIndexes: [0],
-          },
-        ],
-      }),
-    };
     const refillSynthesis = synthesisFixture(29, 72, "fast-web-refill");
-    const refillExtraction = {
-      id: "fast-extract-refill",
-      model: "gpt-5.6-luna",
-      usage: { input_tokens: 2_000, output_tokens: 5_000 },
-      output_text: JSON.stringify({
-        candidates: Array.from({ length: 72 }, (_, index) => extractedRow(index + 29, Math.floor(index / 10))),
-      }),
-    };
     const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
       initialSynthesis,
-      initialExtraction,
       refillSynthesis,
-      refillExtraction,
     ]);
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
 
     expect(orchestrator.calls.filter((call) => call.operation.includes(".web"))).toHaveLength(2);
-    expect(orchestrator.calls.filter((call) => call.operation.includes(".extract"))).toHaveLength(2);
+    expect(orchestrator.calls.filter((call) => call.operation.includes(".extract"))).toHaveLength(0);
     const initialResearchInput = JSON.parse(String(orchestrator.calls[0]!.body.input));
     expect(initialResearchInput).toMatchObject({
       researchScope: {
@@ -1452,20 +1332,7 @@ describe("fast curated orchestration", () => {
     expect(initialResearchInput.researchScope).not.toHaveProperty("description");
     expect(initialResearchInput.researchScope).not.toHaveProperty("targetSize");
 
-    const initialExtractionInput = JSON.parse(String(orchestrator.calls[1]!.body.input));
-    expect(initialExtractionInput).toMatchObject({
-      researchScope: { subjectEntities: ["Berlin techno"] },
-      publicationTrackCount: 50,
-      internalCandidateGoal: 100,
-      minimumCandidateCount: 100,
-      candidateLimit: 100,
-    });
-    expect(initialExtractionInput).not.toHaveProperty("brief");
-    expect(initialExtractionInput.researchScope).not.toHaveProperty("title");
-    expect(initialExtractionInput.researchScope).not.toHaveProperty("description");
-    expect(initialExtractionInput.researchScope).not.toHaveProperty("targetSize");
-
-    const refillResearchInput = JSON.parse(String(orchestrator.calls[2]!.body.input));
+    const refillResearchInput = JSON.parse(String(orchestrator.calls[1]!.body.input));
     expect(refillResearchInput).toMatchObject({
       researchScope: { subjectEntities: ["Berlin techno"] },
       publicationTrackCount: 50,
@@ -1531,19 +1398,11 @@ describe("fast curated orchestration", () => {
       state.coverage.eligibleCandidateCount = 1;
       return 1;
     };
-    const extraction = {
-      id: "only-extract",
-      output_text: JSON.stringify({ candidates: [{
-        artist: "Fixture Performer", title: "Test Song", album: null, releaseYear: null,
-        versionLabel: null, relationship: "performed on", citationIndexes: [0],
-      }] }),
-    };
-    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [extraction]);
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, []);
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0 });
 
-    expect(orchestrator.calls).toHaveLength(1);
-    expect(orchestrator.calls[0]!.operation).toBe("research.fast.extract");
+    expect(orchestrator.calls).toHaveLength(0);
     expect(state.jobs.at(-1)).toMatchObject({
       kind: "matching",
       payload: expect.objectContaining({ fastDeadlineAt: route.deadlineAt }),

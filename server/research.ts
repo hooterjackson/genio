@@ -44,6 +44,7 @@ import {
   type FastRouteCheckpoint,
 } from "./research-policy.ts";
 import {
+  extractFastCandidatesFromSynthesis,
   fastExtractionSchema,
   fastSynthesisCheckpoint,
   parseFastExtraction,
@@ -1248,6 +1249,7 @@ export class ResearchOrchestrator {
       let totalSearchCalls = 0;
       let newlyAdded = 0;
       let completedPasses = 0;
+      let modelCallCount = 0;
       const excludedPairs = new Set<string>();
 
       for (let pass = 0; pass < policy.maxPasses; pass += 1) {
@@ -1297,6 +1299,7 @@ export class ResearchOrchestrator {
             pass,
             0.05,
           );
+          modelCallCount += 1;
           const attestations = collectHostedCitationAttestations(response);
           await this.repository.addCitationAttestations(runId, attestations);
           synthesis = fastSynthesisCheckpoint(response, attestations);
@@ -1311,48 +1314,63 @@ export class ResearchOrchestrator {
           candidates?: RawFastCandidate[];
         } | null;
         if (!extraction || extraction.status !== "complete" || !Array.isArray(extraction.candidates)) {
-          const response = await this.callModel(
-            runId,
-            "research.fast.extract",
-            stableRequestKey(runId, extractionKey, 0),
-            {
-              model: executionModel,
-              reasoning: { effort: "none" },
-              max_output_tokens: policy.maxExtractionTokens,
-              instructions: "Extract only explicit Artist — Track pairs from the TRACKS field of strict EVIDENCE GROUP lines. minimumCandidateCount and candidateLimit are the authoritative counts for this pass; publicationTrackCount is context only and must never cap extraction. Never extract a value from CONTAINERS, even when it resembles a track title. Copy SUBJECT and RELATIONSHIP wording exactly from the same cited line and preserve editorial order. Each candidate must reference the zero-based citation indexes whose excerpt contains its exact pair. Never invent a URL, citation index, track, credit, influence claim, recording artist, album, year, or version. Set album, releaseYear, and versionLabel to null unless that exact metadata occurs in the cited excerpt. Omit anything that cannot be bound to the provider-attested evidence line.",
-              input: JSON.stringify({
-                researchScope,
-                publicationTrackCount: requestedMinimum,
-                internalCandidateGoal: candidateGoal,
-                minimumCandidateCount: passMinimumCandidateCount,
-                evidenceText: synthesis.outputText,
-                citations: synthesis.citationAttestations.map((attestation, index) => ({
-                  index,
-                  url: attestation.sourceUrl,
-                  excerpt: attestation.excerpt,
-                })),
-                candidateLimit: passCandidateLimit,
-              }),
-              text: {
-                format: {
-                  type: "json_schema",
-                  name: "fast_playlist_candidates",
-                  strict: true,
-                  schema: fastExtractionSchema(passCandidateLimit),
+          const deterministicCandidates = extractFastCandidatesFromSynthesis(synthesis, passCandidateLimit);
+          if (deterministicCandidates.length > 0) {
+            extraction = { status: "complete", candidates: deterministicCandidates };
+            await this.repository.saveResearchCheckpoint(runId, extractionKey, {
+              ...extraction,
+              extractor: "deterministic-evidence-group-v1",
+              updatedAt: new Date().toISOString(),
+            });
+          } else {
+            // Compatibility path for a persisted synthesis created before the
+            // strict EVIDENCE GROUP protocol. New production responses should
+            // always take the deterministic path above.
+            const response = await this.callModel(
+              runId,
+              "research.fast.extract",
+              stableRequestKey(runId, extractionKey, 0),
+              {
+                model: executionModel,
+                reasoning: { effort: "none" },
+                max_output_tokens: policy.maxExtractionTokens,
+                instructions: "Extract only explicit Artist — Track pairs from the TRACKS field of strict EVIDENCE GROUP lines. minimumCandidateCount and candidateLimit are the authoritative counts for this pass; publicationTrackCount is context only and must never cap extraction. Never extract a value from CONTAINERS, even when it resembles a track title. Copy SUBJECT and RELATIONSHIP wording exactly from the same cited line and preserve editorial order. Each candidate must reference the zero-based citation indexes whose excerpt contains its exact pair. Never invent a URL, citation index, track, credit, influence claim, recording artist, album, year, or version. Set album, releaseYear, and versionLabel to null unless that exact metadata occurs in the cited excerpt. Omit anything that cannot be bound to the provider-attested evidence line.",
+                input: JSON.stringify({
+                  researchScope,
+                  publicationTrackCount: requestedMinimum,
+                  internalCandidateGoal: candidateGoal,
+                  minimumCandidateCount: passMinimumCandidateCount,
+                  evidenceText: synthesis.outputText,
+                  citations: synthesis.citationAttestations.map((attestation, index) => ({
+                    index,
+                    url: attestation.sourceUrl,
+                    excerpt: attestation.excerpt,
+                  })),
+                  candidateLimit: passCandidateLimit,
+                }),
+                text: {
+                  format: {
+                    type: "json_schema",
+                    name: "fast_playlist_candidates",
+                    strict: true,
+                    schema: fastExtractionSchema(passCandidateLimit),
+                  },
                 },
               },
-            },
-            boundedSignal(),
-            pass,
-            0.05,
-          );
-          const candidates = parseFastExtraction(response, passCandidateLimit);
-          extraction = { status: "complete", candidates };
-          await this.repository.saveResearchCheckpoint(runId, extractionKey, {
-            ...extraction,
-            responseId: response.id,
-            updatedAt: new Date().toISOString(),
-          });
+              boundedSignal(),
+              pass,
+              0.05,
+            );
+            modelCallCount += 1;
+            const candidates = parseFastExtraction(response, passCandidateLimit);
+            extraction = { status: "complete", candidates };
+            await this.repository.saveResearchCheckpoint(runId, extractionKey, {
+              ...extraction,
+              responseId: response.id,
+              extractor: "model-compatibility-fallback",
+              updatedAt: new Date().toISOString(),
+            });
+          }
         }
 
         const validated = validateFastCandidates(extraction.candidates!, brief, synthesis);
@@ -1438,7 +1456,7 @@ export class ResearchOrchestrator {
           citationEligibleCandidateCount: eligibleCount,
           rejectedCandidateCount: totalRejected,
           hostedWebSearchCalls: totalSearchCalls,
-          modelCallCount: completedPasses * 2,
+          modelCallCount,
           newlyAdded,
           shortfall,
           candidateGoal,
@@ -1472,7 +1490,7 @@ export class ResearchOrchestrator {
         citationEligibleCandidateCount: eligibleCount,
         rejectedCandidateCount: totalRejected,
         hostedWebSearchCalls: totalSearchCalls,
-        modelCallCount: completedPasses * 2,
+        modelCallCount,
         newlyAdded,
         shortfall,
         candidateGoal,
