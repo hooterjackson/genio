@@ -796,7 +796,7 @@ export class Repository {
           "SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL",
           [CAPACITY_RUN_STATUSES],
         );
-        if (active.rows[0]!.count >= (input.globalLimit ?? 10)) throw new HttpError(503, "gênio is at capacity; try again soon", "global_capacity_reached");
+        if (active.rows[0]!.count >= (input.globalLimit ?? 10)) throw new HttpError(503, "9ênio is at capacity; try again soon", "global_capacity_reached");
         runId = randomUUID();
         const gate = readCostConfiguration().autoRunCostLimitUsd;
         status = estimate > gate && approved < estimate ? "awaiting_budget" : "queued";
@@ -3035,7 +3035,7 @@ export class Repository {
 
   async assertGlobalRunCapacity(limit = 10): Promise<void> {
     const result = await this.pool.query<{ count: number }>("SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL", [CAPACITY_RUN_STATUSES]);
-    if (result.rows[0]!.count >= limit) throw new HttpError(503, "gênio is at capacity; try again soon", "global_capacity_reached");
+    if (result.rows[0]!.count >= limit) throw new HttpError(503, "9ênio is at capacity; try again soon", "global_capacity_reached");
   }
 
   async claimGatewayNonce(keyId: string, nonce: string, expiresAt: Date): Promise<boolean> {

@@ -1,12 +1,12 @@
-# gênio
+# 9ênio
 
-gênio turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account creates the playlists. A run exposes a visitor link only after Apple reports the playlist as public and returns an Apple Music catalog URL.
+9ênio turns a plain-language request into a cited, reviewable Apple Music playlist. The public site is anonymous and mobile-first; one owner-funded OpenAI project performs research and one owner-authorized Apple Music account creates the playlists. A run exposes a visitor link only after Apple reports the playlist as public and returns an Apple Music catalog URL.
 
 Visitors can start multiple jobs, reopen the jobs available to their browser, and let active research continue in the background.
 
 The public flow starts with one prompt and an explicit track count. A small structured preflight then generates two or three request-specific questions—three choices plus a custom answer, one screen at a time—before research begins. Answers are applied through a frozen-scope allowlist, so they can tune selection and playlist flow without changing the subject, exact count, evidence boundary, or cost class.
 
-gênio uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
+9ênio uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 
 Curated prompts such as “100 most influential…” use a separate **fast** profile: bounded cited web synthesis, structured extraction, and concurrent Apple catalog lookup. The public One Command surface accepts 1–300 tracks, researches extra candidates to absorb catalog misses, and never silently publishes fewer tracks than requested. Its immutable research-and-matching windows are size-tiered: two minutes for 1–100 tracks, four minutes for 101–200, and six minutes for 201–300. Queueing and Apple publication can add time. Explicit factual enumeration without a track-count control retains the slower source-frontier workflow.
 

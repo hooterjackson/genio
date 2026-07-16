@@ -1346,28 +1346,77 @@ dd {
   display: block;
 }
 
+.brand-intro {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  padding:
+    max(12px, env(safe-area-inset-top))
+    max(12px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom))
+    max(12px, env(safe-area-inset-left));
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  color: var(--ink);
+  background:
+    linear-gradient(rgba(230, 230, 232, .03) 1px, transparent 1px),
+    #050605;
+  background-size: 100% 24px;
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity .18s ease;
+}
+
+.brand-intro[data-phase="leaving"] {
+  opacity: 0;
+}
+
+.brand-intro-lockup {
+  max-width: 100%;
+  display: grid;
+  justify-items: start;
+}
+
+.brand-intro-ascii {
+  width: max-content;
+  max-width: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 800 clamp(16px, 5.4vw, 24px)/1.2 "SFMono-Regular", "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+  letter-spacing: 0;
+  white-space: pre;
+  clip-path: inset(0 100% 0 0);
+  animation: brand-intro-reveal .72s steps(28, end) .08s forwards;
+}
+
+.brand-intro-skip {
+  min-width: 44px;
+  min-height: 44px;
+  position: fixed;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(12px, env(safe-area-inset-bottom));
+  padding: 0 12px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .1em;
+  pointer-events: auto;
+}
+
+.brand-intro-skip:hover {
+  color: var(--ink);
+}
+
 .intro-screen {
   width: min(820px, calc(100% - 40px));
   min-height: 100dvh;
   margin: 0 auto;
   padding: clamp(28px, 6vw, 64px) 0;
   display: grid;
-}
-
-.intro-reveal {
-  place-items: center;
-  animation: intro-exit 1.35s ease both;
-}
-
-.ascii-needle {
-  max-width: 100%;
-  margin: 0;
-  overflow: hidden;
-  color: var(--accent);
-  font: 800 clamp(13px, 3vw, 22px)/1.45 "SFMono-Regular", "Cascadia Mono", "Roboto Mono", monospace;
-  letter-spacing: .06em;
-  white-space: pre;
-  animation: ascii-reveal 1s steps(16, end) both;
 }
 
 .intro-landing {
@@ -1934,15 +1983,8 @@ dd {
   border-right: 0;
 }
 
-@keyframes ascii-reveal {
-  0% { max-width: 0; opacity: 0; }
-  18% { opacity: 1; }
-  100% { max-width: 34ch; opacity: 1; }
-}
-
-@keyframes intro-exit {
-  0%, 72% { opacity: 1; }
-  100% { opacity: 0; }
+@keyframes brand-intro-reveal {
+  to { clip-path: inset(0 0 0 0); }
 }
 
 @keyframes screen-enter {
@@ -2572,10 +2614,6 @@ dd {
   .intro-copy p {
     margin-top: 24px;
     font-size: 14px;
-  }
-
-  .ascii-needle {
-    font-size: clamp(11px, 3.5vw, 15px);
   }
 
   .flow-screen {

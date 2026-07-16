@@ -310,7 +310,7 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
   try {
     cookie = forwardedCapabilityCookie(request.headers.get("cookie"), !isLocal);
   } catch (caught) {
-    return jsonError(400, caught instanceof Error ? caught.message : "gênio capability cookie is invalid.");
+    return jsonError(400, caught instanceof Error ? caught.message : "9ênio capability cookie is invalid.");
   }
   const idempotencyKey = request.headers.get("idempotency-key");
   if (contentType && body.byteLength > 0) headers.set("Content-Type", contentType);
@@ -326,15 +326,15 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
       redirect: "manual",
     });
   } catch {
-    return jsonError(502, "gênio is temporarily unavailable.");
+    return jsonError(502, "9ênio is temporarily unavailable.");
   }
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel("upstream redirects are not allowed");
-    return jsonError(502, "gênio returned an unexpected redirect.");
+    return jsonError(502, "9ênio returned an unexpected redirect.");
   }
 
   const responseBody = await readLimitedResponse(response);
-  if (responseBody === null) return jsonError(502, "gênio returned an oversized response.");
+  if (responseBody === null) return jsonError(502, "9ênio returned an oversized response.");
   const responseHeaders = new Headers(response.headers);
   for (const name of [
     "connection",

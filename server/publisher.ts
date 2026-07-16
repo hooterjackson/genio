@@ -280,6 +280,10 @@ function volumeName(manifest: LockedManifest, index: number, count: number): str
 }
 
 function volumeMarker(volume: PublicationVolume): string {
+  return `9ênio publication ${volume.id}:${volume.attempt}`;
+}
+
+function previousVolumeMarker(volume: PublicationVolume): string {
   return `gênio publication ${volume.id}:${volume.attempt}`;
 }
 
@@ -292,7 +296,7 @@ async function findPlaylistForVolume(
   volume: PublicationVolume,
   signal?: AbortSignal,
 ): Promise<any | null> {
-  for (const marker of [volumeMarker(volume), legacyVolumeMarker(volume)]) {
+  for (const marker of [volumeMarker(volume), previousVolumeMarker(volume), legacyVolumeMarker(volume)]) {
     const recovered = await client.findLibraryPlaylistByMarker(marker, signal);
     if (recovered?.id) return recovered;
   }

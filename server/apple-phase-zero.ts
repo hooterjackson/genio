@@ -439,7 +439,7 @@ export async function publishApplePhaseZeroSuite(
         caseId: testCase.id,
         storefront: fixture.storefront,
         name,
-        description: "Temporary gênio Apple Music phase-zero validation. Delete after acceptance.",
+        description: "Temporary 9ênio Apple Music phase-zero validation. Delete after acceptance.",
         tracks,
       });
       const caseReport: ApplePhaseZeroCaseReport = {

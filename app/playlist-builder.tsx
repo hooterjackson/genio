@@ -10,6 +10,7 @@ import {
   fastRunWindowLabel,
   fastRunWindowPhrase,
 } from "../shared/fast-run-sla.ts";
+import { BrandIntro } from "./brand-intro";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
 
@@ -326,7 +327,7 @@ function unwrapResult(
         const end = numberValue(volume.endPosition, start + numberValue(volume.appendedCount) - 1);
         return {
           index: index + 1,
-          name: typeof volume.name === "string" ? volume.name : "gênio volume " + (index + 1),
+          name: typeof volume.name === "string" ? volume.name : "9ênio volume " + (index + 1),
           url: appleMusicUrl(volume.shareUrl),
           trackCount: Math.max(0, end - start + 1) || numberValue(volume.appendedCount),
           status: typeof volume.status === "string" ? volume.status : undefined,
@@ -362,7 +363,7 @@ function unwrapResult(
         const volume = asObject(raw);
         return {
           index: numberValue(volume.index, index + 1),
-          name: typeof volume.name === "string" ? volume.name : "gênio volume " + (index + 1),
+          name: typeof volume.name === "string" ? volume.name : "9ênio volume " + (index + 1),
           url: appleMusicUrl(volume.url),
           trackCount: numberValue(volume.trackCount),
           status: typeof volume.status === "string" ? volume.status : undefined,
@@ -389,7 +390,7 @@ function unwrapResult(
   if (Array.isArray(object.volumes)) {
     const manifest = asObject(object.manifest);
     const rawVolumes = object.volumes;
-    const manifestName = typeof manifest.name === "string" ? manifest.name : currentRun?.brief.title ?? "gênio playlist";
+    const manifestName = typeof manifest.name === "string" ? manifest.name : currentRun?.brief.title ?? "9ênio playlist";
     const volumeCount = rawVolumes.length;
     return {
       runId: currentRun?.id ?? "",
@@ -429,7 +430,7 @@ function manifestFromResult(payload: unknown, runId: string): PlaylistManifest |
   return {
     id: manifest.id,
     runId,
-    name: typeof manifest.name === "string" ? manifest.name : "gênio playlist",
+    name: typeof manifest.name === "string" ? manifest.name : "9ênio playlist",
     contentHash: typeof manifest.contentHash === "string" ? manifest.contentHash : undefined,
     trackCount: numberValue(manifest.trackCount),
     tracks: [],
@@ -661,8 +662,8 @@ function AppHeader({
 }) {
   return (
     <header className="site-header">
-      <button className="wordmark" onClick={onHome} aria-label="gênio home">
-        <span aria-hidden="true">[g]</span> gênio_
+      <button className="wordmark" onClick={onHome} aria-label="9ênio home">
+        <span aria-hidden="true">[9]</span> 9ênio_
       </button>
       <div className="header-meta">
         {onNew && <button className="header-action" onClick={onNew}>NEW JOB</button>}
@@ -788,7 +789,7 @@ function OneCommandScreen({
       <div className="one-command-body">
         <h1 className="sr-only" id="command-title">Research a playlist</h1>
         <span className="one-command-kicker">/ NEW PLAYLIST</span>
-        <p className="one-command-intro">Describe the playlist and choose its size. gênio will ask only what changes the result.</p>
+        <p className="one-command-intro">Describe the playlist and choose its size. 9ênio will ask only what changes the result.</p>
 
         <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy)}>
           <label className="one-command-request" htmlFor="playlist-request">
@@ -1683,7 +1684,7 @@ export function PlaylistBuilder() {
       : typeof object.capabilityToken === "string"
         ? object.capabilityToken
         : "";
-    if (!capability) throw new Error("gênio could not establish a private session for this run.");
+    if (!capability) throw new Error("9ênio could not establish a private session for this run.");
     const fragment = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(next.id);
     window.history.replaceState(null, "", window.location.pathname + window.location.search + "#" + fragment);
     await exchangeCapability(capability, next.id, signal);
@@ -1918,7 +1919,7 @@ export function PlaylistBuilder() {
       if (controller.signal.aborted) return;
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
       const requestId = response.requestId ?? initialRequestId;
-      if (!requestId) throw new Error("gênio could not resume this playlist request.");
+      if (!requestId) throw new Error("9ênio could not resume this playlist request.");
       setBrief(response.brief);
       setBriefRequestId(requestId);
       if (response.status === "awaiting_answers" && response.questions?.length) {
@@ -2147,7 +2148,7 @@ export function PlaylistBuilder() {
   }
 
   async function deleteRun() {
-    if (!run || !window.confirm("Delete this run’s research data from gênio? Published Apple playlists will remain.")) return;
+    if (!run || !window.confirm("Delete this run’s research data from 9ênio? Published Apple playlists will remain.")) return;
     setBusy("delete");
     try {
       await api("/api/v1/runs/" + encodeURIComponent(run.id), { method: "DELETE" });
@@ -2176,7 +2177,7 @@ export function PlaylistBuilder() {
         : typeof payload.token === "string"
           ? payload.token
           : "";
-      if (!capability) throw new Error("gênio did not return a transfer capability.");
+      if (!capability) throw new Error("9ênio did not return a transfer capability.");
       const url = new URL(window.location.pathname, window.location.origin);
       url.hash = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(run.id);
       await copyText(url.toString());
@@ -2246,6 +2247,7 @@ export function PlaylistBuilder() {
   if (!run && !manifest && !result && entryStage === "command") {
     return (
       <main className="app-shell one-command-shell">
+        <BrandIntro />
         <AppHeader onHome={reset} onJobs={() => void openJobs()} showPrivacy />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <OneCommandScreen

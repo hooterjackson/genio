@@ -2,17 +2,23 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "gênio — Playlist Research",
+  metadataBase: new URL("https://9enio.com"),
+  title: "9ênio — Playlist Research",
   description: "Research cited tracks and build an Apple Music playlist.",
+  alternates: {
+    canonical: "/",
+  },
   openGraph: {
-    title: "gênio — Playlist Research",
+    title: "9ênio — Playlist Research",
     description: "Research cited tracks and build an Apple Music playlist.",
+    url: "/",
+    siteName: "9ênio",
     type: "website",
-    images: [{ url: "/og.png", width: 1660, height: 948, alt: "gênio — Playlist Research" }],
+    images: [{ url: "/og.png", width: 1659, height: 948, alt: "9ênio — Playlist Research" }],
   },
   twitter: {
     card: "summary_large_image",
-    title: "gênio — Playlist Research",
+    title: "9ênio — Playlist Research",
     description: "Research cited tracks and build an Apple Music playlist.",
     images: ["/og.png"],
   },
