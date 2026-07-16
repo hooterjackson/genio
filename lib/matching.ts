@@ -93,20 +93,112 @@ function isSparseEditorialCandidate(candidate: TrackCandidateInput): boolean {
   return !candidate.isrc && !candidate.album && !candidate.durationMs && !candidate.versionLabel;
 }
 
-function catalogResultsDescribeOneRecording(
-  matches: readonly { song: CatalogSong }[],
-): boolean {
-  if (matches.length <= 1) return true;
+interface SparseCatalogMatch {
+  song: CatalogSong;
+  sourceIndex: number;
+}
 
-  const isrcs = new Set(matches
-    .map(({ song }) => song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "")
-    .filter(Boolean));
-  if (isrcs.size === 1) return true;
+function isDerivedCatalogContext(song: CatalogSong): boolean {
+  const album = ` ${normalizeMusicText(song.albumName)} `;
+  const derivedMarkers = [
+    " live ", " remix ", " remixes ", " cirque ", " immortal ",
+    " karaoke ", " tribute ", " acappella ", " a cappella ",
+  ];
+  return derivedMarkers.some((marker) => album.includes(marker));
+}
 
-  const durations = matches.map(({ song }) => song.durationInMillis)
-    .filter((duration): duration is number => typeof duration === "number" && duration > 0);
-  return durations.length === matches.length
-    && Math.max(...durations) - Math.min(...durations) <= 3_000;
+function catalogAlbumPenalty(song: CatalogSong): number {
+  const album = ` ${normalizeMusicText(song.albumName)} `;
+  if (isDerivedCatalogContext(song)) return 1_000;
+  const collectionMarkers = [
+    " best of ", " greatest hits ", " collection ", " essential ",
+    " anthology ", " indispensable ", " millennium ",
+  ];
+  return collectionMarkers.some((marker) => album.includes(marker)) ? 20 : 0;
+}
+
+function normalizedCatalogIsrc(song: CatalogSong): string | null {
+  const value = song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "";
+  return value || null;
+}
+
+function durationClusters<T extends SparseCatalogMatch>(matches: readonly T[]): T[][] {
+  const withDuration = matches
+    .filter((item) => Boolean(item.song.durationInMillis && item.song.durationInMillis > 0))
+    .sort((left, right) => (left.song.durationInMillis ?? 0) - (right.song.durationInMillis ?? 0));
+  const clusters: T[][] = [];
+  for (const item of withDuration) {
+    const duration = item.song.durationInMillis ?? 0;
+    const cluster = clusters.find((group) => {
+      const durations = group.map((member) => member.song.durationInMillis ?? duration);
+      return Math.max(...durations, duration) - Math.min(...durations, duration) <= 3_000;
+    });
+    if (cluster) cluster.push(item);
+    else clusters.push([item]);
+  }
+  return clusters;
+}
+
+/**
+ * Sparse editorial research often identifies a song without its ISRC, album,
+ * or duration. Apple can then return many releases of the same recording plus
+ * a shorter compilation edit or a later live/remix treatment. Requiring every
+ * result to agree made common catalog abundance look like a failed match.
+ *
+ * Accept only a corroborated exact artist/title family: a unique result, two
+ * or more results within a three-second duration window, or two or more copies
+ * sharing an ISRC with compatible durations. Obvious derived album contexts
+ * are excluded whenever a studio/catalog alternative exists. Two materially
+ * different singleton recordings still remain review-only.
+ */
+function selectCanonicalSparseMatch<T extends SparseCatalogMatch>(matches: readonly T[]): T | null {
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+
+  const nonDerived = matches.filter((item) => !isDerivedCatalogContext(item.song));
+  const pool = nonDerived.length > 0 ? nonDerived : [...matches];
+  const families: T[][] = durationClusters(pool).filter((cluster) => cluster.length >= 2);
+
+  const byIsrc = new Map<string, T[]>();
+  for (const item of pool) {
+    const isrc = normalizedCatalogIsrc(item.song);
+    if (!isrc) continue;
+    const group = byIsrc.get(isrc) ?? [];
+    group.push(item);
+    byIsrc.set(isrc, group);
+  }
+  for (const group of byIsrc.values()) {
+    if (group.length < 2) continue;
+    const durations = group
+      .map((item) => item.song.durationInMillis)
+      .filter((value): value is number => Boolean(value && value > 0));
+    if (durations.length > 1 && Math.max(...durations) - Math.min(...durations) > 10_000) continue;
+    families.push(group);
+  }
+
+  const uniqueFamilies = [...new Map(families.map((family) => [
+    family.map((item) => item.song.id).sort().join("|"),
+    family,
+  ])).values()];
+  const strongest = uniqueFamilies.sort((left, right) => {
+    const sizeDifference = right.length - left.length;
+    if (sizeDifference !== 0) return sizeDifference;
+    const leftPenalty = Math.min(...left.map((item) => catalogAlbumPenalty(item.song)));
+    const rightPenalty = Math.min(...right.map((item) => catalogAlbumPenalty(item.song)));
+    if (leftPenalty !== rightPenalty) return leftPenalty - rightPenalty;
+    const leftDuration = Math.max(...left.map((item) => item.song.durationInMillis ?? 0));
+    const rightDuration = Math.max(...right.map((item) => item.song.durationInMillis ?? 0));
+    if (leftDuration !== rightDuration) return rightDuration - leftDuration;
+    return Math.min(...left.map((item) => item.sourceIndex))
+      - Math.min(...right.map((item) => item.sourceIndex));
+  })[0];
+  if (!strongest) return null;
+
+  return [...strongest].sort((left, right) => {
+    const penaltyDifference = catalogAlbumPenalty(left.song) - catalogAlbumPenalty(right.song);
+    if (penaltyDifference !== 0) return penaltyDifference;
+    return left.sourceIndex - right.sourceIndex;
+  })[0];
 }
 
 function releaseYear(song: CatalogSong): number | null {
@@ -351,21 +443,22 @@ export function rankCatalogMatches(
     : [];
   const exactIdentifier = identifierMatches.length === 1 && identifierMatches[0].song.id === best.song.id;
   const exactMetadata = metadataMatches.length === 1 && metadataMatches[0].song.id === best.song.id;
-  const equivalentSparseMetadata = sparseExactMatches.length > 0
-    && sparseExactMatches[0].song.id === best.song.id
-    && catalogResultsDescribeOneRecording(sparseExactMatches);
-  if (exactIdentifier || exactMetadata || equivalentSparseMetadata) {
+  const canonicalSparseMetadata = selectCanonicalSparseMatch(sparseExactMatches);
+  const acceptedMatch = exactIdentifier || exactMetadata
+    ? best
+    : canonicalSparseMetadata;
+  if (acceptedMatch) {
     return {
       candidateId,
       status: "accepted",
       basis: exactIdentifier
-        ? `${best.basis}; unique compatible identifier`
+        ? `${acceptedMatch.basis}; unique compatible identifier`
         : exactMetadata
-          ? `${best.basis}; unique exact metadata`
-          : `${best.basis}; exact sparse metadata resolves to one recording`,
-      score: best.score,
-      song: best.song,
-      alternatives: ranked.slice(1, 5).map((item) => item.song),
+          ? `${acceptedMatch.basis}; unique exact metadata`
+          : `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`,
+      score: acceptedMatch.score,
+      song: acceptedMatch.song,
+      alternatives: ranked.filter((item) => item.song.id !== acceptedMatch.song.id).slice(0, 4).map((item) => item.song),
     };
   }
 

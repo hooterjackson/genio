@@ -203,7 +203,7 @@ test("a sparse cited candidate accepts a unique exact Apple artist and title", (
     status: "accepted",
     song: { id: "apple-billie-jean" },
   });
-  expect(result.basis).toContain("exact sparse metadata resolves to one recording");
+  expect(result.basis).toContain("exact sparse metadata selects a corroborated recording family");
 });
 
 test("equivalent Apple reissues of a sparse exact track do not force manual review", () => {
@@ -237,6 +237,107 @@ test("materially different exact recordings remain review-only for sparse candid
   const result = rankCatalogMatches(input.id, input, [
     { ...exactSong, id: "apple-original", durationInMillis: 240_000 },
     { ...exactSong, id: "apple-rerecording", albumName: "Later Sessions", durationInMillis: 260_000 },
+  ]);
+
+  expect(result.status).toBe("review");
+});
+
+test("a repeated original recording family wins over a derived Cirque version", () => {
+  const input = candidate({ artist: "Michael Jackson", title: "Man in the Mirror", album: null });
+  const result = rankCatalogMatches(input.id, input, [
+    {
+      id: "apple-cirque",
+      name: "Man in the Mirror",
+      artistName: "Michael Jackson",
+      albumName: "Immortal (Music from the Cirque du Soleil Show)",
+      releaseDate: "2011-11-17",
+      durationInMillis: 254_560,
+      isrc: "USSM11105977",
+    },
+    {
+      id: "apple-history",
+      name: "Man in the Mirror",
+      artistName: "Michael Jackson",
+      albumName: "HIStory",
+      releaseDate: "1987-08-31",
+      durationInMillis: 318_688,
+      isrc: "USSM18700004",
+    },
+    {
+      id: "apple-essential",
+      name: "Man in the Mirror",
+      artistName: "Michael Jackson",
+      albumName: "The Essential Michael Jackson",
+      releaseDate: "1987-08-31",
+      durationInMillis: 320_905,
+      isrc: "USSM19909070",
+    },
+    {
+      id: "apple-this-is-it",
+      name: "Man in the Mirror",
+      artistName: "Michael Jackson",
+      albumName: "Michael Jackson's This Is It",
+      releaseDate: "1987-08-31",
+      durationInMillis: 319_480,
+      isrc: "USSM10905828",
+    },
+  ]);
+
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-history" },
+  });
+});
+
+test("a repeated full-length recording family wins over a shorter compilation edit", () => {
+  const input = candidate({ artist: "Madonna", title: "Express Yourself", album: null });
+  const result = rankCatalogMatches(input.id, input, [
+    {
+      id: "apple-edit-one",
+      name: "Express Yourself",
+      artistName: "Madonna",
+      albumName: "Celebration",
+      durationInMillis: 239_093,
+      isrc: "USWB10903609",
+    },
+    {
+      id: "apple-original",
+      name: "Express Yourself",
+      artistName: "Madonna",
+      albumName: "Like a Prayer",
+      durationInMillis: 279_133,
+      isrc: "USWB10002776",
+    },
+    {
+      id: "apple-original-reissue",
+      name: "Express Yourself",
+      artistName: "Madonna",
+      albumName: "80s Album Collection",
+      durationInMillis: 279_400,
+      isrc: "USWB10002776",
+    },
+    {
+      id: "apple-edit-two",
+      name: "Express Yourself",
+      artistName: "Madonna",
+      albumName: "Celebration (Deluxe Video Edition)",
+      durationInMillis: 239_093,
+      isrc: "USWB10903609",
+    },
+  ]);
+
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-original" },
+  });
+});
+
+test("duplicate live-only results cannot override a unique studio catalog result", () => {
+  const input = candidate({ artist: "Test Artist", title: "Test Song", album: null });
+  const result = rankCatalogMatches(input.id, input, [
+    { ...exactSong, id: "apple-studio", durationInMillis: 240_000 },
+    { ...exactSong, id: "apple-live-one", albumName: "Live at Wembley", durationInMillis: 260_000 },
+    { ...exactSong, id: "apple-live-two", albumName: "Best Live Performances", durationInMillis: 260_500 },
   ]);
 
   expect(result.status).toBe("review");
