@@ -26,6 +26,7 @@ import {
   sanitizeFailure,
 } from "./error-sanitizer.ts";
 import { readCostConfiguration } from "./cost-config.ts";
+import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_RENEW_MS = 60_000;
@@ -61,6 +62,7 @@ export interface WorkerQueueRepository {
     seenAt: string;
     activeJobIds: string[];
     version: string;
+    protocolVersion: string;
     capacity?: number;
     activeJobs?: number;
   }): Promise<void>;
@@ -244,6 +246,7 @@ export class WorkerRunner {
       seenAt: new Date().toISOString(),
       activeJobIds: [...this.active.keys()],
       version: this.version,
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
       capacity: this.concurrency,
       activeJobs: this.active.size,
     });

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  canonicalBriefForPrompt,
   estimateResearchCost,
   estimateResearchCostRange,
   isPlaylistBrief,
@@ -55,6 +56,35 @@ describe("playlist brief policy", () => {
       "Paulinho da Costa's 200 most influential songs",
       interpreted,
     ).targetSize).toEqual({ min: 200, max: 200 });
+  });
+
+  test("repairs a stale 100-track brief when the original prompt explicitly requests 300", () => {
+    const storedBrief = { ...brief("curated"), targetSize: { min: 100, max: 100 } };
+
+    expect(preserveExplicitTrackCount(
+      "300 influential techno tracks",
+      storedBrief,
+    ).targetSize).toEqual({ min: 300, max: 300 });
+  });
+
+  test("keeps stored scope authoritative while accepting only ambiguity acknowledgement", () => {
+    const storedBrief = {
+      ...brief("curated"),
+      title: "Techno",
+      targetSize: { min: 100, max: 100 },
+      ambiguities: ["Use one canonical version"],
+    };
+
+    expect(canonicalBriefForPrompt(
+      "300 influential techno tracks",
+      storedBrief,
+      { ambiguityAcceptance: ["Use one canonical version"] },
+    )).toMatchObject({
+      title: "Techno",
+      targetSize: { min: 300, max: 300 },
+      ambiguities: ["Use one canonical version"],
+      ambiguityAcceptance: ["Use one canonical version"],
+    });
   });
 
   test("does not confuse music years or unrelated numbers with a track count", () => {
@@ -135,6 +165,18 @@ describe("playlist brief policy", () => {
       approvalUsd: 0.5,
       factors: [{ label: "fast cited editorial research", minimumUsd: 0.15, maximumUsd: 0.5 }],
     });
+  });
+
+  test("prices curated requests above the fast-route ceiling as larger research", () => {
+    const estimate = estimateResearchCostRange({
+      ...brief("curated"),
+      relationship: "historically influential within techno",
+      targetSize: { min: 300, max: 300 },
+    });
+
+    expect(estimate.maximumUsd).toBeGreaterThan(0.5);
+    expect(estimate.factors[0]?.label).toBe("large cited editorial research");
+    expect(estimate.factors.map((factor) => factor.label)).not.toContain("fast cited editorial research");
   });
 
   test("uses the pessimistic edge of the range for the approval gate", () => {

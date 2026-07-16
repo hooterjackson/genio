@@ -27,6 +27,7 @@ import {
   WorkerRunner,
   type DurableJob,
 } from "../server/worker-runner.ts";
+import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
 
 const validAuthorization: AppleAuthorizationRecord = {
   ciphertext: "encrypted-token-generation-one",
@@ -102,6 +103,10 @@ test("worker startup durably recovers an unverified Apple authorization", async 
     await waitFor(() => harness.repository.enqueueJob.mock.calls.some(
       ([input]: [{ kind?: string }]) => input.kind === "apple_authorization",
     ));
+    expect(harness.repository.updateWorkerHeartbeat).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION }),
+    );
     expect(harness.repository.enqueueJob).toHaveBeenCalledWith(expect.objectContaining({
       kind: "apple_authorization",
       payload: { authorizationGeneration: expect.stringMatching(/^[a-f0-9]{20}$/u) },

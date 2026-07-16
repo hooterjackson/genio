@@ -144,6 +144,37 @@ test("curated requests are clearly labeled as the time-boxed fast path", async (
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
+test("a 300-track request stays exact and is not presented as a two-minute fast run", async ({ page }) => {
+  const largeBrief = {
+    ...curatedBrief,
+    title: "Techno: 300 Influential Tracks",
+    description: "A cited editorial selection of 300 influential techno tracks.",
+    targetSize: { min: 300, max: 300 },
+  };
+  const largeEstimate = {
+    minimumUsd: 2,
+    maximumUsd: 4.5,
+    approvalUsd: 4.5,
+    factors: [{ label: "large cited editorial research", minimumUsd: 0.75, maximumUsd: 1.5 }],
+  };
+  await page.route("**/api/v1/brief", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ brief: largeBrief, estimateUsd: largeEstimate.approvalUsd, estimate: largeEstimate, cached: false }),
+    });
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill("300 influential techno tracks");
+  await page.getByRole("button", { name: /review request/i }).click();
+
+  await expect(page.getByRole("heading", { name: "Techno: 300 Influential Tracks" })).toBeVisible();
+  await expect(page.getByText("300–300 tracks", { exact: true })).toBeVisible();
+  await expect(page.getByText("[CURATED · LARGER RUN]", { exact: true })).toBeVisible();
+  await expect(page.getByText("Researches the larger cited selection without the two-minute deadline.")).toBeVisible();
+});
+
 test("an explicit 100-track request stays at 100 through research, matching, and publication", async ({ page }) => {
   const prompt = "Paulinho da Costa’s 100 most influential songs";
   const exactBrief = {

@@ -790,18 +790,25 @@ function BriefScreen({
   onStart: () => void;
 }) {
   const needsAmbiguityAcceptance = brief.ambiguities.length > 0;
-  const isFast = brief.mode === "curated";
+  const isFast = brief.mode === "curated" && (brief.targetSize?.max ?? 100) <= 200;
+  const profileLabel = isFast
+    ? "CURATED · UNDER 2 MIN TARGET"
+    : brief.mode === "curated"
+      ? "CURATED · LARGER RUN"
+      : "EXHAUSTIVE · LONGER RUN";
   return (
     <section className="screen flow-screen scope-screen" aria-labelledby="brief-title">
       <div className="flow-body">
         <button className="flow-back" type="button" onClick={onBack}>← EDIT REQUEST</button>
         <div className="screen-index">/ 02 REVIEW</div>
-        <span className="tag profile-tag">[{isFast ? "CURATED · UNDER 2 MIN TARGET" : "EXHAUSTIVE · LONGER RUN"}]</span>
+        <span className="tag profile-tag">[{profileLabel}]</span>
         <h1 id="brief-title">{brief.title}</h1>
         <p>{brief.description}</p>
         <p className="profile-note">{isFast
           ? "Returns a cited selection within a two-minute target. Partial results remain available if time expires."
-          : "Searches the configured sources for all documented matches and reports unresolved gaps."}</p>
+          : brief.mode === "curated"
+            ? "Researches the larger cited selection without the two-minute deadline."
+            : "Searches the configured sources for all documented matches and reports unresolved gaps."}</p>
 
         <div className="scope-snapshot" aria-label="Research scope summary">
           <div><span>TARGET</span><strong>{brief.targetSize ? brief.targetSize.min + "–" + brief.targetSize.max + " tracks" : "All documented tracks"}</strong></div>

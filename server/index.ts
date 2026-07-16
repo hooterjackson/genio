@@ -13,6 +13,7 @@ import { Repository } from "./repository.ts";
 import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  canonicalBriefForPrompt,
   estimateResearchCost,
   estimateResearchCostRange,
   isPlaylistBrief,
@@ -28,6 +29,7 @@ import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 import { buildInformation } from "./build-info.ts";
+import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -134,7 +136,7 @@ async function requireWorkerForNewWork(): Promise<void> {
   const required = process.env.REQUIRE_WORKER_HEARTBEAT === "true" || process.env.NODE_ENV === "production";
   if (!required) return;
   const health = await repository.getSystemHealth();
-  if (health.worker.stale || !health.worker.schemaCompatible) {
+  if (health.worker.stale || !health.worker.schemaCompatible || !health.worker.protocolCompatible) {
     throw new HttpError(503, "Research worker is temporarily unavailable", "worker_unavailable");
   }
 }
@@ -182,17 +184,24 @@ app.get("/health/system", async (_request, reply) => {
     const schemaVersion = health.database.schemaVersion;
     const ok = schemaVersion === DATABASE_SCHEMA_VERSION
       && !health.worker.stale
-      && health.worker.schemaCompatible;
+      && health.worker.schemaCompatible
+      && health.worker.protocolCompatible;
     return reply.code(ok ? 200 : 503).send({
       ok,
       database: schemaVersion === DATABASE_SCHEMA_VERSION ? "ready" : "schema_mismatch",
       worker: health.worker.worker_id
         ? health.worker.stale
           ? "stale"
-          : health.worker.schemaCompatible
-            ? "healthy"
-            : "schema_mismatch"
+          : !health.worker.schemaCompatible
+            ? "schema_mismatch"
+            : health.worker.protocolCompatible
+              ? "healthy"
+              : "protocol_mismatch"
         : "missing",
+      workerProtocol: {
+        expected: WORKER_PIPELINE_PROTOCOL_VERSION,
+        actual: health.worker.protocolVersion ?? null,
+      },
       paused: health.paused.research || health.paused.publishing,
       queue: health.queue,
       notifications: {
@@ -213,8 +222,14 @@ app.get("/api/health", async () => ({ ok: await repository.ping(), service: "nee
 app.get("/api/v1/system/health", async () => {
   const health = await repository.getSystemHealth();
   return {
-    ok: !health.worker.stale && health.worker.schemaCompatible,
-    worker: { stale: health.worker.stale, schemaCompatible: health.worker.schemaCompatible },
+    ok: !health.worker.stale && health.worker.schemaCompatible && health.worker.protocolCompatible,
+    worker: {
+      stale: health.worker.stale,
+      schemaCompatible: health.worker.schemaCompatible,
+      protocolCompatible: health.worker.protocolCompatible,
+      protocolVersion: health.worker.protocolVersion ?? null,
+      expectedProtocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+    },
     paused: health.paused,
     queue: health.queue,
     notifications: { pending: health.notificationBacklog, failed: health.notificationFailures },
@@ -249,14 +264,15 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
   if (!identity(request).clientBucketAliases.includes(brief.clientBucket)) {
     return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
   }
+  const canonicalBrief = brief.status === "complete" && isPlaylistBrief(brief.brief)
+    ? canonicalBriefForPrompt(brief.prompt, brief.brief)
+    : undefined;
   return {
     requestId: brief.id,
     status: brief.status,
-    brief: brief.status === "complete" ? brief.brief : undefined,
-    estimateUsd: brief.status === "complete" ? brief.estimateUsd : undefined,
-    estimate: brief.status === "complete" && isPlaylistBrief(brief.brief)
-      ? estimateResearchCostRange(brief.brief)
-      : undefined,
+    brief: canonicalBrief,
+    estimateUsd: canonicalBrief ? estimateResearchCost(canonicalBrief) : undefined,
+    estimate: canonicalBrief ? estimateResearchCostRange(canonicalBrief) : undefined,
     error: brief.status === "failed" ? brief.error : undefined,
   };
 });
@@ -283,8 +299,11 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   if (!caller.clientBucketAliases.includes(interpreted.clientBucket)) {
     throw new HttpError(404, "Brief request not found", "brief_not_found");
   }
-  const brief = request.body?.brief ?? interpreted.brief;
-  if (!isPlaylistBrief(brief)) throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
+  const submittedBrief = request.body?.brief;
+  if (submittedBrief !== undefined && !isPlaylistBrief(submittedBrief)) {
+    throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
+  }
+  const brief = canonicalBriefForPrompt(interpreted.prompt, interpreted.brief, submittedBrief);
   if (!materialAmbiguitiesAccepted(brief, interpreted.brief.ambiguities)) {
     throw new HttpError(
       409,
@@ -474,10 +493,14 @@ app.get("/api/v1/owner/status", async (request) => {
   owner(request);
   const health = await repository.getSystemHealth();
   return {
-    ok: !health.worker.stale,
+    ok: !health.worker.stale && health.worker.schemaCompatible && health.worker.protocolCompatible,
     paused: health.paused.research || health.paused.publishing,
     database: "ready",
-    worker: health.worker.worker_id ? health.worker.stale ? "stale" : "healthy" : "missing",
+    worker: health.worker.worker_id
+      ? health.worker.stale || !health.worker.schemaCompatible || !health.worker.protocolCompatible
+        ? "stale"
+        : "healthy"
+      : "missing",
     apple: {
       configured: health.apple.status !== "missing",
       authorized: health.apple.status === "valid",

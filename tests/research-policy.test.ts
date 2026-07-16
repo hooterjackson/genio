@@ -99,6 +99,16 @@ describe("research execution policy", () => {
     });
   });
 
+  test("routes an explicit 300-track curated request through deep research", () => {
+    const exact300 = { ...brief("curated", 300), targetSize: { min: 300, max: 300 } };
+
+    expect(researchExecutionPolicy(exact300, {})).toEqual({
+      kind: "deep",
+      version: "deep_v1",
+      model: "gpt-5.6-terra",
+    });
+  });
+
   test("binds cache identity to the complete effective fast and deep policies", () => {
     expect(JSON.parse(researchPolicyFingerprint(brief("curated"), {}))).toEqual({
       fingerprintVersion: 2,

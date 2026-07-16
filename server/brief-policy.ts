@@ -1,5 +1,6 @@
 import type { PlaylistBrief } from "../shared/types.ts";
 import { PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
+import { FAST_CURATED_TARGET_MAXIMUM } from "./research-policy.ts";
 
 const CURATED_DEFAULT_MINIMUM = 50;
 const CURATED_DEFAULT_MAXIMUM = 100;
@@ -30,8 +31,9 @@ export function estimateResearchCostRange(brief: PlaylistBrief): ResearchCostEst
   const add = (label: string, minimumUsd: number, maximumUsd: number) => {
     factors.push({ label, minimumUsd, maximumUsd });
   };
+  const maximumTracks = brief.targetSize?.max ?? null;
 
-  if (brief.mode === "curated") {
+  if (brief.mode === "curated" && maximumTracks !== null && maximumTracks <= FAST_CURATED_TARGET_MAXIMUM) {
     // Curated requests use the fixed fast profile: bounded Luna research
     // passes, low-context hosted search, and no exhaustive frontier passes.
     // Keep this estimate aligned with researchExecutionPolicy rather than the
@@ -40,10 +42,10 @@ export function estimateResearchCostRange(brief: PlaylistBrief): ResearchCostEst
     return { minimumUsd: 0.15, maximumUsd: 0.5, approvalUsd: 0.5, factors };
   }
 
-  if (brief.mode === "hybrid") add("bounded exhaustive research", 1.5, 2.5);
+  if (brief.mode === "curated") add("large cited editorial research", 0.75, 1.5);
+  else if (brief.mode === "hybrid") add("bounded exhaustive research", 1.5, 2.5);
   else add("open-ended exhaustive research", 2.5, 4);
 
-  const maximumTracks = brief.targetSize?.max ?? null;
   if (maximumTracks === null) add("unbounded source frontier", 1.5, 3);
   else if (maximumTracks <= 25) add("up to 25 requested tracks", 0, 0.25);
   else if (maximumTracks <= 100) add("up to 100 requested tracks", 0.25, 0.75);
@@ -135,6 +137,27 @@ export function preserveExplicitTrackCount(prompt: string, brief: PlaylistBrief)
   const count = explicitTrackCount(prompt);
   if (count === null || brief.mode === "exhaustive") return brief;
   return { ...brief, targetSize: { min: count, max: count } };
+}
+
+/**
+ * Rebuild the server-authoritative brief at an API boundary.
+ *
+ * Brief results live for 24 hours, so a result produced by an older worker can
+ * survive a rollout. Reapplying deterministic prompt policy here repairs those
+ * stored results. The browser may acknowledge the interpreted ambiguities, but
+ * it cannot replace the title, scope, relationship, or requested track count.
+ */
+export function canonicalBriefForPrompt(
+  prompt: string,
+  interpreted: PlaylistBrief,
+  confirmation?: Pick<PlaylistBrief, "ambiguityAcceptance"> | null,
+): PlaylistBrief {
+  const canonical = preserveExplicitTrackCount(prompt, interpreted);
+  if (confirmation?.ambiguityAcceptance === undefined) return canonical;
+  return {
+    ...canonical,
+    ambiguityAcceptance: [...confirmation.ambiguityAcceptance],
+  };
 }
 
 export function isValidBriefTarget(

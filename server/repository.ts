@@ -51,6 +51,10 @@ import {
   type HostedCitationAttestation,
 } from "./citation-attestation.ts";
 import { appleAuthorizationGeneration } from "./apple.ts";
+import {
+  isWorkerPipelineProtocolCompatible,
+  workerPipelineProtocolVersion,
+} from "./worker-protocol.ts";
 
 // Global capacity protects paid/worker work, not saved visitor state. A run
 // waiting on scope review, budget approval, track selection, or Apple
@@ -3145,7 +3149,7 @@ export class Repository {
 
   async getSystemHealth(): Promise<any> {
     const [worker, queue, costs, apple, notifications, publications, orphans, retention, researchPaused, publishingPaused] = await Promise.all([
-      this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1"),
+      this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1"),
       this.pool.query(
         `SELECT
           count(*) FILTER (WHERE status='queued')::int queued,
@@ -3198,7 +3202,14 @@ export class Repository {
         lastSeenAt: lastSeenAt?.toISOString(),
         stale: !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs,
         schemaCompatible: heartbeat.schema_version === DATABASE_SCHEMA_VERSION,
-      } : { stale: true, schemaCompatible: false },
+        protocolVersion: workerPipelineProtocolVersion(heartbeat.metadata_json),
+        protocolCompatible: isWorkerPipelineProtocolCompatible(heartbeat.metadata_json),
+      } : {
+        stale: true,
+        schemaCompatible: false,
+        protocolVersion: null,
+        protocolCompatible: false,
+      },
       queue: {
         queued: Number(queueRow.queued ?? 0),
         leased: Number(queueRow.leased ?? 0),

@@ -82,6 +82,42 @@ test("an explicit 200-track editorial request is not silently clamped to the def
   });
 });
 
+test("an explicit 300-track request overrides the model default and receives a short count-specific title", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-prompt-interpretation");
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    id: "response-explicit-300",
+    model: "test-model",
+    usage: { input_tokens: 100, output_tokens: 100 },
+    output_text: JSON.stringify({
+      title: "300 Most Influential Techno Tracks",
+      description: "A cited editorial ranking of influential techno recordings.",
+      mode: "curated",
+      subjectEntities: ["Techno"],
+      relationship: "historically influential within techno",
+      include: ["released recordings"],
+      exclude: ["unsupported selections"],
+      versionPolicy: "one canonical recording",
+      evidencePolicy: "cited editorial sources",
+      orderingPolicy: "influence rank",
+      // Reproduce the stale/default model response seen in production.
+      targetSize: { min: 50, max: 100 },
+      ambiguities: [],
+    }),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+
+  const result = await interpretPrompt("300 influential techno tracks", "test-model");
+
+  expect(result.brief).toMatchObject({
+    title: "Techno: 300 Influential Tracks",
+    mode: "curated",
+    targetSize: { min: 300, max: 300 },
+  });
+  expect(Array.from(result.brief.title)).toHaveLength(30);
+});
+
 test("the structured brief requests and enforces a short publication title", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-prompt-interpretation");
   let requestBody: any;

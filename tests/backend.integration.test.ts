@@ -15,6 +15,7 @@ import { Repository } from "../server/repository.ts";
 import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
 import { hmacBase64Url, sha256Hex } from "../server/security.ts";
+import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
 import type { CitationAttestationInput, PlaylistBrief } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -3144,18 +3145,58 @@ databaseDescribe("hosted backend integration", () => {
     );
     expect((await repository.getSystemHealth()).worker).toMatchObject({ worker_id: "stale-worker", stale: true });
 
-    await repository.updateWorkerHeartbeat("fresh-worker", { schemaVersion: DATABASE_SCHEMA_VERSION, capacity: 2, activeJobs: 0 });
+    await repository.updateWorkerHeartbeat("legacy-worker", {
+      schemaVersion: DATABASE_SCHEMA_VERSION,
+      capacity: 2,
+      activeJobs: 0,
+    });
+    expect((await repository.getSystemHealth()).worker).toMatchObject({
+      worker_id: "legacy-worker",
+      stale: false,
+      schemaCompatible: true,
+      protocolCompatible: false,
+      protocolVersion: null,
+    });
+
+    await repository.updateWorkerHeartbeat("fresh-worker", {
+      schemaVersion: DATABASE_SCHEMA_VERSION,
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      capacity: 2,
+      activeJobs: 0,
+    });
     expect((await repository.getSystemHealth()).worker).toMatchObject({
       worker_id: "fresh-worker",
       stale: false,
       schemaCompatible: true,
+      protocolCompatible: true,
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
     });
 
-    await repository.updateWorkerHeartbeat("wrong-schema-worker", { schemaVersion: "1", capacity: 2, activeJobs: 0 });
+    await repository.updateWorkerHeartbeat("wrong-schema-worker", {
+      schemaVersion: "1",
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      capacity: 2,
+      activeJobs: 0,
+    });
     expect((await repository.getSystemHealth()).worker).toMatchObject({
       worker_id: "wrong-schema-worker",
       stale: false,
       schemaCompatible: false,
+      protocolCompatible: true,
+    });
+
+    await repository.updateWorkerHeartbeat("wrong-protocol-worker", {
+      schemaVersion: DATABASE_SCHEMA_VERSION,
+      protocolVersion: "playlist-pipeline-v1",
+      capacity: 2,
+      activeJobs: 0,
+    });
+    expect((await repository.getSystemHealth()).worker).toMatchObject({
+      worker_id: "wrong-protocol-worker",
+      stale: false,
+      schemaCompatible: true,
+      protocolCompatible: false,
+      protocolVersion: "playlist-pipeline-v1",
     });
   });
 });
