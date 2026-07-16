@@ -43,6 +43,55 @@ describe("reference-artist similarity policy", () => {
     );
   });
 
+  test("removes filler entities and unwraps repeated similarity-query fragments", () => {
+    const result = applySimilaritySeedPolicy(
+      "12 tracks that sound like Radiohead but are by other artists",
+      brief({
+        subjectEntities: [
+          "Radiohead",
+          "other artists",
+          "tracks that sound like Radiohead",
+        ],
+      }),
+    );
+
+    expect(result.subjectEntities).toEqual(["Radiohead"]);
+    expect(excludedReferenceArtists(result)).toEqual(["Radiohead"]);
+    expect(result.exclude).toEqual([
+      "Reference artist is a style seed; exclude recordings by: Radiohead",
+    ]);
+    expect(result.include).toContain(
+      "Recordings by other artists that are stylistically similar to Radiohead",
+    );
+  });
+
+  test("unwraps title-cased similarity fragments without losing artist casing", () => {
+    const result = applySimilaritySeedPolicy(
+      "Tracks that sound like Radiohead but are by other artists",
+      brief({
+        subjectEntities: [
+          "Tracks That Sound Like Radiohead But Are By Other Artists",
+          "Other Artists",
+        ],
+      }),
+    );
+
+    expect(result.subjectEntities).toEqual(["Radiohead"]);
+    expect(excludedReferenceArtists(result)).toEqual(["Radiohead"]);
+  });
+
+  test("keeps multiple real references while ignoring a later filler clause", () => {
+    const result = applySimilaritySeedPolicy(
+      "Music for fans of Radiohead and Björk, but by other artists",
+      brief({
+        subjectEntities: ["Radiohead", "Björk", "other artists"],
+      }),
+    );
+
+    expect(result.subjectEntities).toEqual(["Radiohead", "Björk"]);
+    expect(excludedReferenceArtists(result)).toEqual(["Radiohead", "Björk"]);
+  });
+
   test("excludes only the artist used after the similarity relationship", () => {
     const result = applySimilaritySeedPolicy(
       "Indie rock that sounds like Radiohead",

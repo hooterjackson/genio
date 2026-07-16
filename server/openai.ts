@@ -13,7 +13,10 @@ import {
   readOpenAITokenPricing,
 } from "./cost-config.ts";
 import { boundedResponseText } from "./bounded-response.ts";
-import { applySimilaritySeedPolicy } from "./similarity-policy.ts";
+import {
+  applySimilaritySeedPolicy,
+  excludedReferenceArtists,
+} from "./similarity-policy.ts";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -430,6 +433,14 @@ function questionIsPromptSpecific(
   return false;
 }
 
+function hasContaminatedSimilarityWording(
+  value: string,
+  brief: PlaylistBrief,
+): boolean {
+  if (excludedReferenceArtists(brief).length === 0) return false;
+  return /\b(?:(?:other|similar|related|different)\s+(?:artists?|bands?|acts?|musicians?)|(?:songs?|tracks?|recordings?|music)\s+(?:that\s+|which\s+)?(?:sounds?\s+like|similar\s+to|resembl(?:e|es|ing)|adjacent\s+to))\b/iu.test(value);
+}
+
 function compactGuidanceSubject(brief: PlaylistBrief): string {
   const source = brief.subjectEntities.slice(0, 2).join(" and ").replace(/\s+/gu, " ").trim()
     || "this playlist";
@@ -450,7 +461,7 @@ function fallbackScopeQuestion(
   if (similarityRequest && !guidanceCategoryAlreadySpecified("familiarity", prompt)) {
     return {
       header: "Similarity",
-      question: `How far should ${subject} reach beyond the reference sound?`,
+      question: `How closely should this selection resemble ${subject}?`,
       options: [
         { id: "", label: "Close matches", description: "Prioritize the strongest sonic and stylistic parallels.", recommended: true },
         { id: "", label: "Balanced discovery", description: "Mix close matches with adjacent artists and scenes.", recommended: false },
@@ -508,11 +519,15 @@ function fallbackScopeQuestion(
 
 function fallbackGuidanceQuestions(prompt: string, brief: PlaylistBrief): PlaylistGuidanceQuestion[] {
   const subject = compactGuidanceSubject(brief);
+  const referenceArtists = excludedReferenceArtists(brief);
+  const flowSubject = referenceArtists.length > 0
+    ? `${referenceArtists.slice(0, 2).join(" and ")}-inspired selection`
+    : `${subject} selection`;
   const scope = fallbackScopeQuestion(prompt, brief);
   const editorialThird = /\b(?:influential|important|essential|definitive|best|greatest)\b/iu.test(prompt);
   const flow: Omit<PlaylistGuidanceQuestion, "id"> = {
     header: "Flow",
-    question: `How should ${subject} move from track to track?`,
+    question: `How should the ${flowSubject} move from track to track?`,
     options: [
       {
         id: "",
@@ -592,6 +607,9 @@ function strictlyValidatedGuidanceQuestions(
     }
     if (!questionIsPromptSpecific(questionPrompt, header, prompt, brief)) {
       throw new Error("OpenAI returned a generic guided question");
+    }
+    if (hasContaminatedSimilarityWording(`${header} ${questionPrompt}`, brief)) {
+      throw new Error("OpenAI returned a guided question containing a non-entity similarity phrase");
     }
     if (!Array.isArray(question.options) || question.options.length !== 3) {
       throw new Error("OpenAI returned an invalid number of guided options");
@@ -744,7 +762,7 @@ function safelyApplyGuidance(
   };
 }
 
-const BRIEF_INTERPRETATION_INSTRUCTIONS = "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, representative, or music similar to a reference artist, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. For requests such as 'sounds like X', 'similar to X', 'artists like X', or 'for fans of X', treat X as a style reference rather than the requested recording artist: select tracks by other artists and exclude recordings by X unless the requester explicitly asks to include X. Do not apply this reference-artist rule to requests for X's own songs, discography, credits, or exhaustive catalog. Default subjective playlists to 50-100 tracks. Set title to a short, specific Apple Music playlist name of at most 60 characters, not a restatement of the request: remove command phrases such as 'give me' or 'create a playlist of', prefer the key artist, topic, or scene plus a compact qualifier, and include a requested count only when it helps distinguish the playlist. Preserve the complete requested scope in description and the structured scope fields. Explicitly surface only ambiguity that materially changes scope.";
+const BRIEF_INTERPRETATION_INSTRUCTIONS = "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, representative, or music similar to a reference artist, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. subjectEntities must contain only canonical named people, artists, groups, genres, scenes, places, or concepts that define the research scope; never emit filler phrases such as 'other artists' or repeat query fragments such as 'tracks that sound like X' as entities. For requests such as 'sounds like X', 'similar to X', 'artists like X', or 'for fans of X', treat X as a style reference rather than the requested recording artist: select tracks by other artists and exclude recordings by X unless the requester explicitly asks to include X. Do not apply this reference-artist rule to requests for X's own songs, discography, credits, or exhaustive catalog. Default subjective playlists to 50-100 tracks. Set title to a short, specific Apple Music playlist name of at most 60 characters, not a restatement of the request: remove command phrases such as 'give me' or 'create a playlist of', prefer the key artist, topic, or scene plus a compact qualifier, and include a requested count only when it helps distinguish the playlist. Preserve the complete requested scope in description and the structured scope fields. Explicitly surface only ambiguity that materially changes scope.";
 
 export async function interpretPrompt(
   prompt: string,

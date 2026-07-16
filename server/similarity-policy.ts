@@ -6,6 +6,18 @@ export const REFERENCE_ARTIST_EXCLUSION_PREFIX =
 const SIMILARITY_INTENT =
   /\b(?:sounds?\s+(?:a\s+lot\s+)?like|similar\s+to|similar\s+(?:mode|sound|music|artists?)|resembl(?:e|es|ing)|adjacent\s+to|in\s+(?:the\s+)?(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like|music\s+like)\b/gu;
 
+const GENERIC_ENTITY =
+  /^(?:(?:the|some|any)\s+)?(?:(?:other|similar|related|adjacent|different|new|more|these|those)\s+)?(?:artists?|bands?|acts?|musicians?|songs?|tracks?|recordings?|music|playlists?)$/u;
+
+const QUERY_FRAGMENT_PREFIX =
+  /^(?:\d+\s+)?(?:songs?|tracks?|recordings?|music|playlists?|artists?|bands?|acts?)\s+(?:(?:that|which)\s+)?(?:sounds?\s+(?:a\s+lot\s+)?like|similar\s+to|resembl(?:e|es|ing)|adjacent\s+to|in\s+(?:the\s+)?(?:style|vein)\s+of|for\s+fans\s+of|like)\s+/iu;
+
+const COMPLEMENT_BOUNDARY =
+  /\s+\b(?:but|except|excluding|without|rather\s+than|instead\s+of|while)\b.*$/iu;
+
+const CONTEXT_BOUNDARY =
+  /\b(?:but|except|excluding|without|rather\s+than|instead\s+of|while)\b/u;
+
 function normalized(value: string): string {
   return value.normalize("NFKD")
     .replace(/[\u0300-\u036f]/gu, "")
@@ -23,6 +35,31 @@ function uniqueRules(values: readonly string[]): string[] {
     seen.add(key);
     return true;
   });
+}
+
+/**
+ * Structured model output can occasionally repeat request syntax as an
+ * entity (for example, “tracks that sound like Radiohead”) or promote a
+ * quantifier such as “other artists” to an entity. Similarity research needs
+ * canonical references, so repair those shapes before selecting style seeds
+ * or exposing the brief to downstream prompts.
+ */
+function cleanSimilaritySubjectEntities(entities: readonly string[]): string[] {
+  const repaired = entities.flatMap((entity) => {
+    const trimmed = entity.trim();
+    const entityText = normalized(trimmed);
+    if (!entityText || GENERIC_ENTITY.test(entityText)) return [];
+    if (!QUERY_FRAGMENT_PREFIX.test(entityText)) return [trimmed];
+
+    const complement = trimmed
+      .normalize("NFKC")
+      .replace(QUERY_FRAGMENT_PREFIX, "")
+      .replace(COMPLEMENT_BOUNDARY, "")
+      .replace(/[.,;:!?]+$/u, "")
+      .trim();
+    return complement && !GENERIC_ENTITY.test(normalized(complement)) ? [complement] : [];
+  });
+  return uniqueRules(repaired);
 }
 
 function similaritySeedEntities(prompt: string, brief: PlaylistBrief): string[] {
@@ -46,7 +83,8 @@ function similaritySeedEntities(prompt: string, brief: PlaylistBrief): string[] 
     return matches.some((match) => {
       const relationEnd = (match.index ?? 0) + match[0].length;
       const entityIndex = normalizedPrompt.indexOf(entityText, relationEnd);
-      return entityIndex >= relationEnd && entityIndex - relationEnd <= 160;
+      if (entityIndex < relationEnd || entityIndex - relationEnd > 160) return false;
+      return !CONTEXT_BOUNDARY.test(normalizedPrompt.slice(relationEnd, entityIndex));
     });
   });
   if (contextualSeeds.length > 0) return contextualSeeds;
@@ -126,18 +164,26 @@ function normalizedArtistCredits(value: string): string[] {
  */
 export function applySimilaritySeedPolicy(prompt: string, brief: PlaylistBrief): PlaylistBrief {
   if (brief.mode === "exhaustive") return brief;
-  const seeds = similaritySeedEntities(prompt, brief);
-  if (seeds.length === 0) return brief;
+  const hasSimilarityIntent = [...normalized(prompt).matchAll(SIMILARITY_INTENT)].length > 0
+    || brief.subjectEntities.some((entity) => normalized(prompt).includes(`${normalized(entity)} style`));
+  if (!hasSimilarityIntent) return brief;
+
+  const subjectEntities = cleanSimilaritySubjectEntities(brief.subjectEntities);
+  const scopedBrief = subjectEntities.length > 0
+    ? { ...brief, subjectEntities }
+    : brief;
+  const seeds = similaritySeedEntities(prompt, scopedBrief);
+  if (seeds.length === 0) return scopedBrief;
   const excludedSeeds = seeds.filter((seed) => (
     explicitlyExcludesSeed(prompt, seed) || !explicitlyIncludesSeed(prompt, seed)
   ));
-  if (excludedSeeds.length === 0) return brief;
+  if (excludedSeeds.length === 0) return scopedBrief;
 
   return {
-    ...brief,
+    ...scopedBrief,
     relationship: "stylistically similar to the reference artist",
     include: uniqueRules([
-      ...brief.include.filter((rule) => !excludedSeeds.some((seed) => {
+      ...scopedBrief.include.filter((rule) => !excludedSeeds.some((seed) => {
         const ruleText = normalized(rule);
         const seedText = normalized(seed);
         return ruleText.includes(`${seedText} recordings`)
@@ -148,7 +194,7 @@ export function applySimilaritySeedPolicy(prompt: string, brief: PlaylistBrief):
       `Recordings by other artists that are stylistically similar to ${excludedSeeds.join(", ")}`,
     ]),
     exclude: uniqueRules([
-      ...brief.exclude,
+      ...scopedBrief.exclude,
       ...excludedSeeds.map((seed) => `${REFERENCE_ARTIST_EXCLUSION_PREFIX}${seed}`),
     ]),
   };

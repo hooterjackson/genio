@@ -295,6 +295,75 @@ test("repairs a loose similar-artist brief into an other-artists scope", async (
   );
 });
 
+test("repairs contaminated similarity entities and replaces awkward guided wording", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-similarity-repair");
+  let requestBody: any;
+  vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return hostedResponse({
+      brief: {
+        title: "Radiohead Adjacent",
+        description: "Music resembling Radiohead by different performers.",
+        mode: "curated",
+        subjectEntities: [
+          "Radiohead",
+          "other artists",
+          "tracks that sound like Radiohead",
+        ],
+        relationship: "recorded by",
+        include: ["released recordings"],
+        exclude: [],
+        versionPolicy: "one canonical recording",
+        evidencePolicy: "cited editorial sources",
+        orderingPolicy: "editorial flow",
+        targetSize: { min: 50, max: 50 },
+        ambiguities: [],
+      },
+      scopeQuestions: [{
+        category: "familiarity",
+        header: "Similarity",
+        question: "How far should other artists and tracks that sound like Radiohead reach?",
+        options: [
+          { label: "Close", description: "Prioritize close stylistic parallels." },
+          { label: "Balanced", description: "Balance close and adjacent discoveries." },
+          { label: "Broad", description: "Explore a wider stylistic orbit." },
+        ],
+      }],
+      flowQuestion: {
+        header: "Flow",
+        question: "How should tracks that sound like Radiohead move?",
+        options: [
+          { label: "Smooth arc", description: "Use compatible metadata and gradual transitions." },
+          { label: "High contrast", description: "Use deliberate contrast and sharper shifts." },
+          { label: "Chronological", description: "Order the tracks by release year." },
+        ],
+      },
+    });
+  }));
+
+  const result = await interpretPromptWithGuidance(
+    "12 tracks that sound like Radiohead but are by other artists",
+    "test-model",
+  );
+
+  expect(result.brief.subjectEntities).toEqual(["Radiohead"]);
+  expect(result.brief.exclude).toEqual([
+    "Reference artist is a style seed; exclude recordings by: Radiohead",
+  ]);
+  expect(result.questions).toHaveLength(2);
+  expect(result.questions[0]!.question).toBe(
+    "How closely should this selection resemble Radiohead?",
+  );
+  expect(result.questions[1]!.question).toBe(
+    "How should the Radiohead-inspired selection move from track to track?",
+  );
+  expect(result.questions.map((question) => question.question).join(" "))
+    .not.toMatch(/other artists|tracks that sound like/iu);
+  expect(requestBody.instructions).toContain(
+    "never emit filler phrases such as 'other artists'",
+  );
+});
+
 test.each([
   {
     label: "two",
