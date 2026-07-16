@@ -1115,6 +1115,10 @@ dd {
   z-index: 8;
 }
 
+.intro-footer {
+  border-top: 0;
+}
+
 .step-primary {
   min-width: min(100%, 320px);
   min-height: 58px;
