@@ -236,15 +236,20 @@ async function selectGuidedOption(page: Page, label: string): Promise<void> {
 
 test("the 9ênio intro is brief, skippable, mobile-safe, and shown once per session", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "no-preference" });
-  await page.addInitScript(() => {
-    window.sessionStorage.removeItem("9enio:brand-intro:v1");
-  });
   await page.goto("/");
 
   const intro = page.getByTestId("brand-intro");
   await expect(intro).toBeVisible();
-  await expect(intro.locator(".brand-intro-ascii")).toContainText("/\\");
-  await expect(intro.locator(".brand-intro-ascii")).toContainText("____");
+  const lockup = intro.locator(".brand-intro-lockup");
+  const typedAscii = intro.locator(".brand-intro-typed");
+  await expect.poll(async () => Number(await lockup.getAttribute("data-character-count"))).toBeGreaterThan(0);
+  const partialCharacterCount = Number(await lockup.getAttribute("data-character-count"));
+  const totalCharacterCount = Number(await lockup.getAttribute("data-character-total"));
+  expect(partialCharacterCount).toBeLessThan(totalCharacterCount);
+  await expect.poll(async () => Number(await lockup.getAttribute("data-character-count"))).toBeGreaterThan(partialCharacterCount);
+  await expect(typedAscii).toContainText("/\\");
+  await expect(typedAscii).toContainText("____", { timeout: 3_000 });
+  await expect(intro.locator(".sr-only")).toHaveText("9ênio");
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
 
@@ -254,11 +259,20 @@ test("the 9ênio intro is brief, skippable, mobile-safe, and shown once per sess
   expect(skipBox?.height ?? 0).toBeGreaterThanOrEqual(44);
   await skip.click();
   await expect(intro).toHaveCount(0);
+  await page.waitForTimeout(1_500);
+  await expect(intro).toHaveCount(0);
   await expect(requestField(page)).toBeVisible();
 
   await page.reload();
   await expect(page.getByTestId("brand-intro")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "9ênio home" })).toBeVisible();
+});
+
+test("the 9ênio intro is omitted when reduced motion is requested", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+  await expect(page.getByTestId("brand-intro")).toHaveCount(0);
+  await expect(requestField(page)).toBeVisible();
 });
 
 test("the one-command composer remains usable at mobile widths", async ({ page }) => {

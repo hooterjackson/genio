@@ -1373,6 +1373,8 @@ dd {
 }
 
 .brand-intro-lockup {
+  position: relative;
+  width: max-content;
   max-width: 100%;
   display: grid;
   justify-items: start;
@@ -1387,8 +1389,15 @@ dd {
   font: 800 clamp(16px, 5.4vw, 24px)/1.2 "SFMono-Regular", "Cascadia Mono", "Roboto Mono", Consolas, monospace;
   letter-spacing: 0;
   white-space: pre;
-  clip-path: inset(0 100% 0 0);
-  animation: brand-intro-reveal .72s steps(28, end) .08s forwards;
+}
+
+.brand-intro-measure {
+  visibility: hidden;
+}
+
+.brand-intro-typed {
+  position: absolute;
+  inset: 0 auto auto 0;
 }
 
 .brand-intro-skip {
@@ -1981,10 +1990,6 @@ dd {
 
 .result-details .result-grid > div:last-child {
   border-right: 0;
-}
-
-@keyframes brand-intro-reveal {
-  to { clip-path: inset(0 0 0 0); }
 }
 
 @keyframes screen-enter {

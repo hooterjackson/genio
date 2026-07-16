@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const INTRO_SESSION_KEY = "9enio:brand-intro:v1";
 const ASCII_WORDMARK = [
@@ -11,6 +11,9 @@ const ASCII_WORDMARK = [
   " \\__, /  __/ / / / / /_/ /",
   "/____/\\___/_/ /_/_/\\____/",
 ].join("\n");
+const CHARACTER_INTERVAL_MS = 10;
+const COMPLETION_HOLD_MS = 500;
+const FADE_DURATION_MS = 180;
 
 type IntroPhase = "checking" | "visible" | "leaving" | "hidden";
 
@@ -35,39 +38,63 @@ function rememberIntro(): void {
 
 export function BrandIntro() {
   const [phase, setPhase] = useState<IntroPhase>("checking");
+  const [visibleCharacterCount, setVisibleCharacterCount] = useState(0);
+  const intervalRef = useRef<number | undefined>(undefined);
+  const timeoutRefs = useRef<number[]>([]);
+
+  const clearAnimation = useCallback(() => {
+    if (intervalRef.current !== undefined) {
+      window.clearInterval(intervalRef.current);
+      intervalRef.current = undefined;
+    }
+    for (const timeout of timeoutRefs.current) window.clearTimeout(timeout);
+    timeoutRefs.current = [];
+  }, []);
 
   useEffect(() => {
-    let leaveTimer: number | undefined;
-    let hideTimer: number | undefined;
-    let safetyTimer: number | undefined;
     const startTimer = window.setTimeout(() => {
       if (shouldSkipIntro()) {
         setPhase("hidden");
         return;
       }
       rememberIntro();
+      setVisibleCharacterCount(0);
       setPhase("visible");
-      leaveTimer = window.setTimeout(() => setPhase("leaving"), 1_200);
-      hideTimer = window.setTimeout(() => setPhase("hidden"), 1_420);
-      safetyTimer = window.setTimeout(() => setPhase("hidden"), 2_000);
+      let nextCharacterCount = 0;
+      intervalRef.current = window.setInterval(() => {
+        nextCharacterCount += 1;
+        setVisibleCharacterCount(nextCharacterCount);
+        if (nextCharacterCount < ASCII_WORDMARK.length) return;
+
+        if (intervalRef.current !== undefined) {
+          window.clearInterval(intervalRef.current);
+          intervalRef.current = undefined;
+        }
+        timeoutRefs.current.push(
+          window.setTimeout(() => setPhase("leaving"), COMPLETION_HOLD_MS),
+          window.setTimeout(() => setPhase("hidden"), COMPLETION_HOLD_MS + FADE_DURATION_MS),
+        );
+      }, CHARACTER_INTERVAL_MS);
     }, 0);
+    timeoutRefs.current.push(startTimer);
     const skip = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setPhase("hidden");
+      if (event.key === "Escape") {
+        clearAnimation();
+        setPhase("hidden");
+      }
     };
     window.addEventListener("keydown", skip);
 
     return () => {
-      window.clearTimeout(startTimer);
-      if (leaveTimer) window.clearTimeout(leaveTimer);
-      if (hideTimer) window.clearTimeout(hideTimer);
-      if (safetyTimer) window.clearTimeout(safetyTimer);
+      clearAnimation();
       window.removeEventListener("keydown", skip);
     };
-  }, []);
+  }, [clearAnimation]);
 
   if (phase === "checking" || phase === "hidden") return null;
 
   function dismiss(focusComposer: boolean) {
+    clearAnimation();
     rememberIntro();
     setPhase("hidden");
     if (focusComposer) {
@@ -81,8 +108,13 @@ export function BrandIntro() {
       data-phase={phase}
       data-testid="brand-intro"
     >
-      <div className="brand-intro-lockup">
-        <pre className="brand-intro-ascii" aria-hidden="true">{ASCII_WORDMARK}</pre>
+      <div
+        className="brand-intro-lockup"
+        data-character-count={visibleCharacterCount}
+        data-character-total={ASCII_WORDMARK.length}
+      >
+        <pre className="brand-intro-ascii brand-intro-measure" aria-hidden="true">{ASCII_WORDMARK}</pre>
+        <pre className="brand-intro-ascii brand-intro-typed" aria-hidden="true">{ASCII_WORDMARK.slice(0, visibleCharacterCount)}</pre>
         <span className="sr-only">9ênio</span>
       </div>
       <button
