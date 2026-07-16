@@ -185,6 +185,63 @@ test("a leading article artist variant is selectable for review but not auto-acc
   expect(result.basis).toContain("leading-article artist variant");
 });
 
+test("a sparse cited candidate accepts a unique exact Apple artist and title", () => {
+  const input = candidate({
+    artist: "Michael Jackson",
+    title: "Billie Jean",
+    album: null,
+  });
+  const result = rankCatalogMatches(input.id, input, [{
+    id: "apple-billie-jean",
+    name: "Billie Jean",
+    artistName: "Michael Jackson",
+    albumName: "Thriller",
+    durationInMillis: 294_000,
+  }]);
+
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-billie-jean" },
+  });
+  expect(result.basis).toContain("exact sparse metadata resolves to one recording");
+});
+
+test("equivalent Apple reissues of a sparse exact track do not force manual review", () => {
+  const input = candidate({
+    artist: "Michael Jackson",
+    title: "Billie Jean",
+    album: null,
+  });
+  const result = rankCatalogMatches(input.id, input, [
+    {
+      id: "apple-thriller",
+      name: "Billie Jean",
+      artistName: "Michael Jackson",
+      albumName: "Thriller",
+      durationInMillis: 294_000,
+    },
+    {
+      id: "apple-essential",
+      name: "Billie Jean",
+      artistName: "Michael Jackson",
+      albumName: "The Essential Michael Jackson",
+      durationInMillis: 294_500,
+    },
+  ]);
+
+  expect(result).toMatchObject({ status: "accepted", song: { id: "apple-thriller" } });
+});
+
+test("materially different exact recordings remain review-only for sparse candidates", () => {
+  const input = candidate({ artist: "Test Artist", title: "Test Song", album: null });
+  const result = rankCatalogMatches(input.id, input, [
+    { ...exactSong, id: "apple-original", durationInMillis: 240_000 },
+    { ...exactSong, id: "apple-rerecording", albumName: "Later Sessions", durationInMillis: 260_000 },
+  ]);
+
+  expect(result.status).toBe("review");
+});
+
 test("an order-insensitive collaborator set is selectable for review but not auto-accepted", () => {
   const input = candidate({
     artist: "Paulinho da Costa & Joe Pass",

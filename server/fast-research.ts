@@ -139,6 +139,51 @@ function parseFastEvidenceGroup(excerpt: string): FastEvidenceGroup | null {
   return { subjectEntity, relationship, tracks, containers };
 }
 
+/**
+ * Recover candidates directly from the rigid synthesis protocol. The hosted
+ * response has already emitted explicit Artist — Track pairs inside
+ * provider-attested citation windows, so sending the same text through a
+ * second model only adds latency and another failure boundary. Keep the model
+ * extractor as a compatibility fallback for older/non-conforming checkpoints.
+ */
+export function extractFastCandidatesFromSynthesis(
+  synthesis: FastSynthesisCheckpoint,
+  candidateLimit: number,
+): RawFastCandidate[] {
+  const limit = Math.max(1, Math.min(120, Math.floor(candidateLimit)));
+  const candidates = new Map<string, RawFastCandidate>();
+
+  for (let citationIndex = 0; citationIndex < synthesis.citationAttestations.length; citationIndex += 1) {
+    const attestation = synthesis.citationAttestations[citationIndex]!;
+    if (!Object.hasOwn(synthesis.sourceTitles, attestation.sourceUrl)) continue;
+    const group = parseFastEvidenceGroup(attestation.excerpt);
+    if (!group) continue;
+
+    for (const track of group.tracks) {
+      const key = `${normalizeEvidencePhrase(track.artist)}\u0000${normalizeEvidencePhrase(track.title)}`;
+      const existing = candidates.get(key);
+      if (existing) {
+        if (!existing.citationIndexes.includes(citationIndex) && existing.citationIndexes.length < 5) {
+          existing.citationIndexes.push(citationIndex);
+        }
+        continue;
+      }
+      candidates.set(key, {
+        artist: track.artist,
+        title: track.title,
+        album: null,
+        releaseYear: null,
+        versionLabel: null,
+        relationship: group.relationship,
+        citationIndexes: [citationIndex],
+      });
+      if (candidates.size >= limit) return [...candidates.values()];
+    }
+  }
+
+  return [...candidates.values()];
+}
+
 function evidencePairEquals(left: FastEvidencePair, right: FastEvidencePair): boolean {
   return normalizeEvidencePhrase(left.artist) === normalizeEvidencePhrase(right.artist)
     && normalizeEvidencePhrase(left.title) === normalizeEvidencePhrase(right.title);

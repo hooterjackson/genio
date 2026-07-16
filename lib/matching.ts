@@ -89,6 +89,26 @@ function exactDuration(candidateMs: number | null, songMs?: number): boolean {
   return Boolean(candidateMs && songMs && compatibleDuration(candidateMs, songMs));
 }
 
+function isSparseEditorialCandidate(candidate: TrackCandidateInput): boolean {
+  return !candidate.isrc && !candidate.album && !candidate.durationMs && !candidate.versionLabel;
+}
+
+function catalogResultsDescribeOneRecording(
+  matches: readonly { song: CatalogSong }[],
+): boolean {
+  if (matches.length <= 1) return true;
+
+  const isrcs = new Set(matches
+    .map(({ song }) => song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "")
+    .filter(Boolean));
+  if (isrcs.size === 1) return true;
+
+  const durations = matches.map(({ song }) => song.durationInMillis)
+    .filter((duration): duration is number => typeof duration === "number" && duration > 0);
+  return durations.length === matches.length
+    && Math.max(...durations) - Math.min(...durations) <= 3_000;
+}
+
 function releaseYear(song: CatalogSong): number | null {
   const value = song.releaseDate?.slice(0, 4);
   const year = value ? Number(value) : NaN;
@@ -325,13 +345,24 @@ export function rankCatalogMatches(
 
   const identifierMatches = ranked.filter((item) => item.identifierCompatible);
   const metadataMatches = ranked.filter((item) => item.metadataCompatible);
+  const sparseExactMatches = isSparseEditorialCandidate(candidate)
+    ? ranked.filter((item) => !item.isrcConflict && item.artistExact && item.titleExact
+      && !item.versionConflict && !item.yearConflict)
+    : [];
   const exactIdentifier = identifierMatches.length === 1 && identifierMatches[0].song.id === best.song.id;
   const exactMetadata = metadataMatches.length === 1 && metadataMatches[0].song.id === best.song.id;
-  if (exactIdentifier || exactMetadata) {
+  const equivalentSparseMetadata = sparseExactMatches.length > 0
+    && sparseExactMatches[0].song.id === best.song.id
+    && catalogResultsDescribeOneRecording(sparseExactMatches);
+  if (exactIdentifier || exactMetadata || equivalentSparseMetadata) {
     return {
       candidateId,
       status: "accepted",
-      basis: exactIdentifier ? `${best.basis}; unique compatible identifier` : `${best.basis}; unique exact metadata`,
+      basis: exactIdentifier
+        ? `${best.basis}; unique compatible identifier`
+        : exactMetadata
+          ? `${best.basis}; unique exact metadata`
+          : `${best.basis}; exact sparse metadata resolves to one recording`,
       score: best.score,
       song: best.song,
       alternatives: ranked.slice(1, 5).map((item) => item.song),

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  extractFastCandidatesFromSynthesis,
   fastExtractionSchema,
   fastSynthesisCheckpoint,
   parseFastExtraction,
@@ -69,6 +70,35 @@ describe("fast curated research", () => {
       sourceTitles: { "https://history.example/berlin-techno": "Berlin techno history" },
     });
     expect(checkpoint.citationAttestations[0]!.excerpt).toContain("Signal One");
+  });
+
+  test("deterministically extracts cited Artist — Track pairs without a second model call", () => {
+    const source = synthesisResponse(evidenceGroup({
+      tracks: ["Fixture Artist — Signal One", "Second Artist — Signal Two"],
+      containers: ["Fixture Artist — Album Alpha"],
+    }));
+    const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
+
+    expect(extractFastCandidatesFromSynthesis(synthesis, 120)).toEqual([
+      {
+        artist: "Fixture Artist",
+        title: "Signal One",
+        album: null,
+        releaseYear: null,
+        versionLabel: null,
+        relationship: "historically influential in the scene",
+        citationIndexes: [0],
+      },
+      {
+        artist: "Second Artist",
+        title: "Signal Two",
+        album: null,
+        releaseYear: null,
+        versionLabel: null,
+        relationship: "historically influential in the scene",
+        citationIndexes: [0],
+      },
+    ]);
   });
 
   test("accepts only extracted tracks that bind to a cited local evidence group", () => {
