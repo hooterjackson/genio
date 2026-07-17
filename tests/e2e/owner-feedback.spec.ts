@@ -106,7 +106,7 @@ test("the owner can page through the private feedback inbox and see attachments"
   await page.goto("/owner");
   await expect(page.getByText("Owner allowlist is not configured.")).toHaveCount(0);
 
-  await expect(page.getByRole("heading", { name: "SYSTEM CONTROL." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "System control" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "BUGS + IMPROVEMENTS" })).toBeVisible();
   await expect(page.getByText("[50/55]", { exact: true })).toBeVisible();
   await expect(page.locator(".operator-feedback")).toHaveCount(50);

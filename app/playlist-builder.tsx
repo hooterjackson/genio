@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
@@ -13,6 +12,7 @@ import {
 } from "../shared/fast-run-sla.ts";
 import { BrandIntro } from "./brand-intro";
 import { BrandWordmark } from "./brand-wordmark";
+import { PrimaryNav, type PrimaryNavItem } from "./primary-nav";
 import { SiteMenu } from "./site-menu";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
@@ -649,20 +649,21 @@ function AppHeader({
   onTransfer,
   onHome,
   onJobs,
+  active = "create",
 }: {
   transferState?: string;
   onTransfer?: () => void;
   onHome: () => void;
   onJobs?: () => void;
+  active?: PrimaryNavItem;
 }) {
   return (
-    <header className="site-header">
+    <header className={`site-header${onTransfer ? " has-transfer" : ""}`}>
       <button className="wordmark ascii-wordmark" onClick={onHome} aria-label="gênio home">
         <BrandWordmark />
       </button>
       <div className="header-meta">
-        {!onTransfer && <Link className="header-action" href="/playlists">PLAYLISTS</Link>}
-        {onJobs && <button className="header-action" onClick={onJobs}>JOBS</button>}
+        <PrimaryNav active={active} onCreate={onHome} onJobs={onJobs} />
         {onTransfer && (
           <button className="transfer-button" onClick={onTransfer} disabled={transferState === "busy"}>
             {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
@@ -701,10 +702,9 @@ function JobsScreen({
   return (
     <section className="screen flow-screen jobs-screen" aria-labelledby="jobs-title">
       <div className="flow-body jobs-body">
-        <button className="flow-back" type="button" onClick={onBack}>← HOME</button>
-        <div className="screen-index">/ JOBS</div>
-        <h1 id="jobs-title">JOBS</h1>
-        <p>Open a playlist job saved in this browser.</p>
+        <button className="flow-back" type="button" onClick={onBack}>← CREATE</button>
+        <h1 id="jobs-title">Your jobs</h1>
+        <p>Open or continue a playlist saved in this browser.</p>
 
         {loading && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING JOBS</div>}
         {!loading && jobs.length === 0 && <div className="jobs-empty">NO JOBS FOUND</div>}
@@ -793,21 +793,23 @@ function OneCommandScreen({
   return (
     <section className="one-command-screen" aria-labelledby="command-title">
       <div className="one-command-body">
-        <h1 className="sr-only" id="command-title">Research a playlist</h1>
+        <header className="command-hero">
+          <h1 id="command-title">Create a playlist</h1>
+          <p className="command-lead">Describe what you want to hear.</p>
+          <p>gênio researches the music, finds the tracks, and builds it in Apple Music.</p>
+        </header>
         <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy)}>
-          <section className="command-section command-request-section" aria-labelledby="request-step-title">
-            <span className="command-step-index">/01 REQUEST</span>
-            <h2 id="request-step-title">Describe the playlist.</h2>
-            <p>gênio asks only what would materially change the result.</p>
+          <section className="command-request-section" aria-labelledby="request-step-title">
+            <h2 className="sr-only" id="request-step-title">Playlist request</h2>
             <label className="one-command-request" htmlFor="playlist-request">
-              <span>PLAYLIST REQUEST</span>
+              <span className="sr-only">PLAYLIST REQUEST</span>
               <textarea
                 id="playlist-request"
                 value={prompt}
                 onChange={(event) => onPrompt(event.target.value)}
                 onFocus={() => setFocused(true)}
                 onBlur={() => setFocused(false)}
-                rows={5}
+                rows={9}
                 maxLength={2000}
                 spellCheck
                 required
@@ -820,9 +822,8 @@ function OneCommandScreen({
             </label>
           </section>
 
-          <section className="command-section command-size-section" aria-labelledby="size-step-title">
-            <span className="command-step-index">/02 SIZE</span>
-            <h2 id="size-step-title">Choose how many tracks.</h2>
+          <section className="command-size-section" aria-labelledby="size-step-title">
+            <h2 id="size-step-title">CHOOSE PLAYLIST SIZE</h2>
             {!customCount ? (
               <fieldset className="count-presets">
                 <legend className="sr-only">Playlist size</legend>
@@ -846,7 +847,7 @@ function OneCommandScreen({
                   onClick={chooseCustom}
                   disabled={Boolean(busy)}
                 >
-                  CUSTOM
+                  Custom
                 </button>
               </fieldset>
             ) : (
@@ -879,7 +880,7 @@ function OneCommandScreen({
                 </button>
               </div>
             )}
-            <div className="count-meta" aria-live="polite">
+            <div className="count-meta sr-only" aria-live="polite">
               <span>{validCount ? `${count.toLocaleString()} TRACKS` : `LIMIT ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`}</span>
               <span>{validCount ? `${timeWindow} TARGET` : `${PUBLIC_PLAYLIST_MINIMUM_TRACKS}–${PUBLIC_PLAYLIST_MAXIMUM_TRACKS} TRACKS`}</span>
             </div>
@@ -890,18 +891,14 @@ function OneCommandScreen({
             )}
           </section>
 
-          <section className="command-section command-create-section" aria-labelledby="create-step-title">
-            <div>
-              <span className="command-step-index">/03 CREATE</span>
-              <h2 id="create-step-title">Build the playlist.</h2>
-              <p>{validCount ? `${timeWindow} research target.` : "Choose a valid size to continue."}</p>
-            </div>
+          <section className="command-create-section" aria-labelledby="create-step-title">
+            <h2 className="sr-only" id="create-step-title">Build the playlist</h2>
             <button
               className="one-command-submit"
               type="submit"
               disabled={Boolean(busy) || prompt.trim().length < 4 || !validCount}
             >
-              {busy ? "STARTING..." : "CREATE PLAYLIST →"}
+              {busy ? "STARTING..." : "CREATE PLAYLIST"}
             </button>
           </section>
         </form>
@@ -1076,8 +1073,8 @@ function FinalizingBriefScreen() {
   return (
     <section className="guided-question-screen guided-finalizing-screen" role="status" aria-live="polite">
       <div className="guided-question-body">
-        <span className="guided-question-kicker">/ PREPARING</span>
-        <h1>PREPARING YOUR PLAYLIST.</h1>
+        <span className="guided-question-kicker">PREPARING</span>
+        <h1>Preparing your playlist</h1>
         <p>Applying your answers before research begins.</p>
         <div className="guided-finalizing-line"><span aria-hidden="true">▋</span>FINALIZING REQUEST</div>
       </div>
@@ -1094,9 +1091,8 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   return (
     <section className="screen flow-screen research-screen" aria-labelledby="run-title">
       <div className="flow-body research-body">
-        <div className="screen-index">/ RESEARCH</div>
         <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
-        <h1 id="run-title">{publishing ? "CREATING PLAYLIST." : "RESEARCHING."}</h1>
+        <h1 id="run-title">{publishing ? "Creating your playlist" : "Researching your playlist"}</h1>
         <p className="run-subject">{run.brief.title}</p>
         <p className="research-status" role="status">{phaseMessage(run)}</p>
         <div className="progress research-progress" aria-label={"Research " + progress + "% complete"}>
@@ -1126,8 +1122,7 @@ function ReviewScreen(props: {
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ TRACKS</div>
-        <h1 id="review-title">SELECT TRACKS.</h1>
+        <h1 id="review-title">Choose tracks</h1>
         <p>Loading Apple Music matches.</p>
         <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING TRACKS</div>
       </div>
@@ -1342,8 +1337,7 @@ function TrackSelectionScreen({
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ TRACKS</div>
-        <h1 id="review-title">SELECT TRACKS.</h1>
+        <h1 id="review-title">Choose tracks</h1>
         <p aria-live="polite">{reviewSummary}</p>
 
             <div className="selection-toolbar" role="group" aria-label="Track selection controls">
@@ -1456,9 +1450,8 @@ function ManifestScreen({
   return (
     <section className="screen flow-screen manifest-screen" aria-labelledby="manifest-title">
       <div className="flow-body">
-        <div className="screen-index">/ PUBLISH</div>
         <span className="tag">[{volumeCount} {volumeCount === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS READY.</h1>
+        <h1 id="manifest-title">{trackCount.toLocaleString()} tracks ready</h1>
         <p>{waitingForApple
           ? "Publication will resume after the owner reconnects Apple Music."
           : publishing || busy
@@ -1518,13 +1511,12 @@ function ResultScreen({
     || exactTargetMissed
     || (result.status === "partial" && !(exactTargetSatisfied && knownZeroVisibleGaps));
   const resultTitle = publishedWithGaps
-    ? "PLAYLIST PUBLISHED WITH GAPS."
-    : "PLAYLIST PUBLISHED.";
+    ? "Playlist published with gaps"
+    : "Playlist published";
 
   return (
     <section className="screen flow-screen result-screen" aria-labelledby="result-title">
       <div className="flow-body">
-        <div className="screen-index">/ RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
         <h1 id="result-title">{resultTitle}</h1>
         <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
@@ -1669,6 +1661,9 @@ export function PlaylistBuilder() {
 
   const openJobs = useCallback(async () => {
     clearCurrent("jobs");
+    const query = new URLSearchParams();
+    query.set("view", "jobs");
+    window.history.replaceState(null, "", window.location.pathname + "?" + query.toString());
     setJobsLoading(true);
     try {
       const payload = await api<{ items?: ResearchRun[] }>("/api/v1/runs");
@@ -1764,6 +1759,7 @@ export function PlaylistBuilder() {
       try {
         if (token) await exchangeCapability(token, runId);
         else if (runId) await loadRun(runId);
+        else if (search.get("view") === "jobs") await openJobs();
         else if (queuedBriefId) {
           setBriefRequestId(queuedBriefId);
           setBriefFinalizing(true);
@@ -1796,7 +1792,7 @@ export function PlaylistBuilder() {
       }
     };
     void restore();
-  }, [exchangeCapability, loadRun, startResearchFromBrief]);
+  }, [exchangeCapability, loadRun, openJobs, startResearchFromBrief]);
 
   const loadTracks = useCallback(async () => {
     if (!run) return;
@@ -2252,7 +2248,7 @@ export function PlaylistBuilder() {
   if (restoring) {
     return (
       <main className="app-shell">
-        <AppHeader onHome={reset} />
+        <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <section className="screen restore-screen" role="status">
           <span className="cursor" aria-hidden="true">▋</span>RESTORING RUN
         </section>
@@ -2263,7 +2259,7 @@ export function PlaylistBuilder() {
   if (!run && !manifest && !result && entryStage === "command" && briefFinalizing) {
     return (
       <main className="app-shell one-command-shell guided-shell">
-        <AppHeader onHome={reset} />
+        <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <FinalizingBriefScreen />
       </main>
@@ -2273,7 +2269,7 @@ export function PlaylistBuilder() {
   if (!run && !manifest && !result && entryStage === "command" && guidanceQuestions.length > 0) {
     return (
       <main className="app-shell one-command-shell guided-shell">
-        <AppHeader onHome={reset} />
+        <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <GuidedQuestionScreen
           questions={guidanceQuestions}
@@ -2328,6 +2324,7 @@ export function PlaylistBuilder() {
         <AppHeader
           onHome={reset}
           onJobs={() => void openJobs()}
+          active="jobs"
         />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <JobsScreen
@@ -2349,6 +2346,7 @@ export function PlaylistBuilder() {
           onTransfer={run ? transferRun : undefined}
           onHome={reset}
           onJobs={() => void openJobs()}
+          active="jobs"
         />
       )}
       <ErrorBar message={error} onDismiss={() => setError("")} />

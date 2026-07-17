@@ -141,11 +141,18 @@ export function FeedbackForm() {
   const [received, setReceived] = useState(false);
   const idempotencyKey = useRef(crypto.randomUUID());
   const fileInput = useRef<HTMLInputElement>(null);
+  const successHeading = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => setHydrated(true));
     return () => window.cancelAnimationFrame(frame);
   }, []);
+
+  useEffect(() => {
+    if (!received) return;
+    const frame = window.requestAnimationFrame(() => successHeading.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [received]);
 
   async function chooseImage(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -206,9 +213,8 @@ export function FeedbackForm() {
 
   if (received) {
     return (
-      <section className="feedback-shell feedback-success" aria-labelledby="feedback-received-title">
-        <div className="screen-index">/ FEEDBACK RECEIVED</div>
-        <h1 id="feedback-received-title">THANK YOU.</h1>
+      <section className="feedback-shell feedback-success" aria-labelledby="feedback-received-title" role="status" aria-live="polite">
+        <h1 id="feedback-received-title" ref={successHeading} tabIndex={-1}>Thank you</h1>
         <p>Your note is now in the private owner inbox.</p>
         <Link className="action-button" href="/">RETURN HOME →</Link>
       </section>
@@ -217,8 +223,7 @@ export function FeedbackForm() {
 
   return (
     <section className="feedback-shell" aria-labelledby="feedback-title">
-      <div className="screen-index">/ BUGS + IMPROVEMENTS</div>
-      <h1 id="feedback-title">SEND FEEDBACK.</h1>
+      <h1 id="feedback-title">Send feedback</h1>
       <p>Describe what happened or what should change. Only the gênio owner can view submissions.</p>
 
       {error && <div className="feedback-error" role="alert">[ERROR] {error}</div>}
@@ -243,7 +248,6 @@ export function FeedbackForm() {
             minLength={10}
             maxLength={4000}
             required
-            autoFocus
             disabled={!hydrated || submitting || preparingImage}
             placeholder="What happened? What would make it better?"
             onChange={(event) => setMessage(event.target.value)}

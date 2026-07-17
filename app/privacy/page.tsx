@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { SiteMenu } from "../site-menu";
 import { BrandWordmark } from "../brand-wordmark";
+import { PrimaryNav } from "../primary-nav";
 
 export default function PrivacyPage() {
   return (
@@ -8,14 +9,13 @@ export default function PrivacyPage() {
       <header className="site-header">
         <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home"><BrandWordmark /></Link>
         <div className="header-meta">
-          <Link className="privacy-back" href="/">BACK</Link>
+          <PrimaryNav />
           <SiteMenu />
         </div>
       </header>
 
       <section className="privacy-shell" aria-labelledby="privacy-title">
-        <div className="screen-index">/ PRIVACY · EFFECTIVE 2026-07-14</div>
-        <h1 id="privacy-title">PRIVACY_</h1>
+        <h1 id="privacy-title">Privacy</h1>
         <p className="privacy-intro">gênio uses the minimum data needed to research and publish a requested playlist.</p>
 
         <div className="privacy-grid">

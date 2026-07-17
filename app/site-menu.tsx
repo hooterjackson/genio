@@ -9,6 +9,7 @@ export function SiteMenu() {
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
+  const restoreTriggerFocusRef = useRef(false);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => setHydrated(true));
@@ -22,8 +23,11 @@ export function SiteMenu() {
     };
     const closeFromKeyboard = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || !open) return;
+      event.preventDefault();
+      restoreTriggerFocusRef.current = true;
       setOpen(false);
-      triggerRef.current?.focus();
+      triggerRef.current?.focus({ preventScroll: true });
+      window.requestAnimationFrame(() => triggerRef.current?.focus({ preventScroll: true }));
     };
 
     document.addEventListener("pointerdown", closeFromOutside);
@@ -32,6 +36,12 @@ export function SiteMenu() {
       document.removeEventListener("pointerdown", closeFromOutside);
       document.removeEventListener("keydown", closeFromKeyboard);
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (open || !restoreTriggerFocusRef.current) return;
+    restoreTriggerFocusRef.current = false;
+    triggerRef.current?.focus();
   }, [open]);
 
   useEffect(() => {
@@ -78,7 +88,6 @@ export function SiteMenu() {
       </button>
       {open && (
         <nav ref={panelRef} id="site-menu-panel" className="site-menu-panel" aria-label="Site menu">
-          <a href="/playlists" onClick={() => setOpen(false)}>EXPLORE PLAYLISTS</a>
           <Link href="/feedback" onClick={preserveSourcePage}>SUBMIT BUG OR IMPROVEMENT</Link>
           <Link href="/privacy" onClick={() => setOpen(false)}>PRIVACY</Link>
         </nav>

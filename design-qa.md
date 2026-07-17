@@ -1,51 +1,44 @@
-# gênio minimalist composer — design QA
+# Option 1 design QA
 
-## Comparison target
+## Source and implementation
 
-- User-selected source: `/Users/mlima/Desktop/Screenshot 2026-07-16 at 11.30.08 PM.png`
-- Desktop implementation: `/tmp/genio-composer-752-v2.png`
-- Mobile implementation: `/tmp/genio-composer-320-v2.png`
-- Custom-size implementation: `/tmp/genio-custom-390.png`
-- Side-by-side evidence: `/tmp/genio-design-comparison.png`
-- Viewports: 752 × 1628, 390 × 844, and 320 × 720 CSS pixels
-- Route/state: local `/`; dark theme; empty request; default 50-track preset; custom 275-track state
+- Reference: `/var/folders/dy/fl46t519257556qw_g6l7tgw0000gp/T/codex-clipboard-a9dd7950-0b55-4647-8cbb-84ac12864377.png`
+- Reference viewport: 726 × 1536
+- Final implementation capture: `design-qa-option1-final-2.png`
+- Matching viewport and state: 726 × 1536, create screen after the character-by-character intro completed
+- Responsive create capture: `design-qa-mobile-390-final.png` at 390 × 844
+- Supporting full-page captures:
+  - `design-qa-feedback-final.png`
+  - `design-qa-explore-final.png`
+  - `design-qa-privacy-final.png`
 
-## Findings
+The source and final implementation were opened together in the same visual comparison input. The create screen is a single-column composition, and the matching 726 × 1536 capture shows its complete meaningful area at readable scale, so a separate cropped region would duplicate rather than clarify the comparison. The route-level full-page captures cover the longer supporting screens.
 
-- No actionable P0, P1, or P2 differences remain.
-- The unused vertical rail is gone. Request, size, and create remain one calm, linear screen without sacrificing the source hierarchy.
-- The top-left mark and animated introduction share one native ASCII `gênio` wordmark. The visible circumflex is built into the ASCII art, while accessible text reads `gênio`.
-- Product copy uses `gênio`; `9enio.com` remains only the web address and technical namespace.
-- Track quantity is reduced to three useful presets—25, 50, and 100—plus Custom. Custom replaces the preset row with an exact numeric field and a clear route back to presets.
-- Custom quantities accept whole numbers from 1 through 300. The visible validation message, timing estimate, and create control update together without coercing malformed values.
-- The later research, track-selection, publish, and result screens use the same near-black surfaces, hairline borders, compact labels, restrained orange, and narrower type hierarchy.
-- Desktop and mobile captures show no horizontal overflow, clipping, or abandoned rail space. Header controls remain usable at 320 pixels.
-- Focus states, touch targets, reduced motion, intro skip, keyboard navigation, and the custom-count transition are covered by responsive browser tests.
+## Visual comparison
 
-## Comparison history
+- Composition: matched the reference's centered narrow column, large opening whitespace, restrained header, oversized mono headline, large prompt field, four inline size choices, and single orange action.
+- Brand: retained the supplied ASCII gênio mark, monochrome surfaces, hairline borders, and the orange selection/action language.
+- Hierarchy: removed redundant numbered section labels and converted the product to the same direct title → explanation → action rhythm on every screen.
+- Navigation: established one consistent CREATE / EXPLORE / JOBS structure, with a separate utility menu for feedback and privacy.
+- Responsive behavior: preserved the same hierarchy at 390 px without horizontal overflow; touch targets remain at least 44 × 44 px.
+- Supporting screens: Explore, Jobs, guided questions, research progress, track selection, publishing, results, feedback, privacy, and the owner console use the same typography, spacing, borders, status colors, and button treatment.
 
-1. Initial source review
-   - [P1] The left progress rail consumed substantial mobile space without enabling an action.
-   - [P1] The text mark mixed `9ênio` and `gênio`, while the supplied ASCII asset was not consistently reused.
-   - [P2] Four fixed quantity choices did not expose arbitrary playlist sizes.
-   - [P2] Later screens retained a larger, noisier hierarchy than the simplified composer.
-2. Implementation pass
-   - Removed the rail and re-centered the workflow.
-   - Introduced one shared ASCII wordmark for the header and typed intro.
-   - Replaced the quantity row with 25 / 50 / 100 / Custom and a validated 1–300 exact input.
-   - Simplified subsequent screen labels, headings, CTAs, and result copy.
-3. Responsive QA pass
-   - Increased small-screen ASCII legibility, preserved Share Job in active runs, blocked intro pointer leakage, normalized focus behavior, and replaced the stale social image.
+## Iteration history
 
-## Implementation checklist
+1. Initial implementation matched the visual language but sat too high, used an undersized wordmark/navigation, and allowed the selected-size underline to span the full cell.
+2. Increased the reference-viewport top rhythm, scaled the official ASCII mark and nav, narrowed the selection underline, enlarged the primary action, and restored 44 px control targets.
+3. Raised low-contrast secondary text, added visible orange focus treatment, repaired focus transfer after the intro and feedback submission, prevented feedback auto-focus from skipping the page header, and clarified partial Apple-link gaps in Explore.
 
-- [x] Remove the left rail.
-- [x] Use the official ASCII-style `gênio` logo consistently.
-- [x] Reserve `9enio` for the domain and technical keys.
-- [x] Offer three presets plus a morphing Custom control.
-- [x] Enforce and explain a 1–300 playlist-size limit.
-- [x] Redesign the downstream research, review, publish, and result states.
-- [x] Verify 320, 390, 430, and desktop layouts.
-- [x] Verify keyboard, touch, reduced-motion, and intro behavior.
+## Interaction and accessibility checks
 
-final result: passed
+- Create, Explore, and Jobs navigation are distinct and expose the current location.
+- `/?view=jobs` is reloadable; CREATE resets the builder and returns to `/`.
+- Preset and custom track counts remain keyboard-operable and preserve exact-count validation.
+- The prompt receives focus when the intro finishes; reduced-motion visitors skip the animation.
+- Guided choices, track checkboxes, matching alternatives, publication actions, feedback upload, and owner controls retain their existing functionality.
+- Visible keyboard focus, WCAG-AA text contrast, reduced-motion behavior, and 44 px mobile targets are preserved.
+- Local API-dependent Explore correctly rendered its designed recoverable error state while the local gateway was unavailable; no render or navigation failure occurred.
+
+## Final result
+
+`passed`

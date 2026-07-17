@@ -44,7 +44,7 @@ test("visitors can open the mobile-safe menu and submit private feedback", async
   await expect(page.getByRole("img", { name: /screenshot ready/i })).toBeVisible();
   await page.getByRole("button", { name: /submit feedback/i }).click();
 
-  await expect(page.getByRole("heading", { name: "THANK YOU." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Thank you" })).toBeVisible();
   expect(idempotencyKey.length).toBeGreaterThan(8);
   expect(submitted).toMatchObject({
     kind: "improvement",
@@ -60,6 +60,10 @@ test("visitors can open the mobile-safe menu and submit private feedback", async
 
 test("the site menu is keyboard-operable and Escape restores focus", async ({ page }) => {
   await page.goto("/");
+  const skipIntro = page.getByRole("button", { name: /skip intro/i });
+  await expect(skipIntro).toBeVisible();
+  await skipIntro.click();
+  await expect(skipIntro).toHaveCount(0);
 
   const menu = page.getByRole("button", { name: /open menu/i });
   await expect(menu).toBeEnabled();
@@ -119,7 +123,7 @@ test("a temporary feedback failure can be retried with the same idempotency key"
   await expect(page.getByRole("alert")).toContainText("Feedback is temporarily unavailable.");
   await submit.click();
 
-  await expect(page.getByRole("heading", { name: "THANK YOU." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Thank you" })).toBeVisible();
   expect(attempts).toHaveLength(2);
   expect(attempts[0]).not.toBe("");
   expect(attempts[1]).toBe(attempts[0]);

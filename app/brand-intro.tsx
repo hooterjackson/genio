@@ -36,6 +36,14 @@ export function BrandIntro() {
   const timeoutRefs = useRef<number[]>([]);
   const skipRef = useRef<HTMLButtonElement>(null);
 
+  const focusComposer = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      const active = document.activeElement;
+      if (active && active !== document.body && active !== document.documentElement) return;
+      document.querySelector<HTMLTextAreaElement>("#playlist-request")?.focus();
+    });
+  }, []);
+
   const clearAnimation = useCallback(() => {
     if (intervalRef.current !== undefined) {
       window.clearInterval(intervalRef.current);
@@ -66,7 +74,10 @@ export function BrandIntro() {
         }
         timeoutRefs.current.push(
           window.setTimeout(() => setPhase("leaving"), COMPLETION_HOLD_MS),
-          window.setTimeout(() => setPhase("hidden"), COMPLETION_HOLD_MS + FADE_DURATION_MS),
+          window.setTimeout(() => {
+            setPhase("hidden");
+            focusComposer();
+          }, COMPLETION_HOLD_MS + FADE_DURATION_MS),
         );
       }, CHARACTER_INTERVAL_MS);
     }, 0);
@@ -75,6 +86,7 @@ export function BrandIntro() {
       if (event.key === "Escape") {
         clearAnimation();
         setPhase("hidden");
+        focusComposer();
       }
     };
     window.addEventListener("keydown", skip);
@@ -83,7 +95,7 @@ export function BrandIntro() {
       clearAnimation();
       window.removeEventListener("keydown", skip);
     };
-  }, [clearAnimation]);
+  }, [clearAnimation, focusComposer]);
 
   useEffect(() => {
     if (phase !== "visible") return;
@@ -97,9 +109,7 @@ export function BrandIntro() {
     clearAnimation();
     rememberIntro();
     setPhase("hidden");
-    if (focusComposer) {
-      window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#playlist-request")?.focus());
-    }
+    if (focusComposer) window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#playlist-request")?.focus());
   }
 
   return (

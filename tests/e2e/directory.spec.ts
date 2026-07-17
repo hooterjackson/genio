@@ -67,7 +67,7 @@ test("the public playlist library is responsive, ordered, and opens only Apple M
 
   await page.goto("/playlists");
 
-  await expect(page.getByRole("heading", { name: "LISTEN." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Explore playlists" })).toBeVisible();
   await expect(page.getByText("Explore playlists researched and published by gênio.")).toBeVisible();
   await expect(page.getByText("3 PUBLIC PLAYLISTS")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Paulinho da Costa Essentials" })).toBeVisible();
@@ -97,20 +97,22 @@ test("the public playlist library is responsive, ordered, and opens only Apple M
   expect(undersized).toEqual([]);
 });
 
-test("the public header and menu both provide clear routes into the playlist library", async ({ page }) => {
+test("the primary Create, Explore, and Jobs navigation remains clear across public screens", async ({ page }) => {
   await page.route("**/api/v1/playlists?*", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(pageOne) });
   });
 
   await page.goto("/");
-  await expect(page.getByRole("link", { name: "PLAYLISTS" })).toHaveAttribute("href", "/playlists");
-
-  await page.getByRole("button", { name: /open menu/i }).click();
-  const directoryLink = page.getByRole("link", { name: "EXPLORE PLAYLISTS" });
-  await expect(directoryLink).toHaveAttribute("href", "/playlists");
-  await directoryLink.click();
+  await expect(page.getByRole("link", { name: "CREATE", exact: true })).toHaveAttribute("aria-current", "page");
+  const exploreLink = page.getByRole("link", { name: "EXPLORE", exact: true });
+  await expect(exploreLink).toHaveAttribute("href", "/playlists");
+  await expect(page.getByRole("button", { name: "JOBS", exact: true })).toBeVisible();
+  await exploreLink.click();
   await expect(page).toHaveURL(/\/playlists$/u);
-  await expect(page.getByRole("heading", { name: "LISTEN." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Explore playlists" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "EXPLORE", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("link", { name: "CREATE", exact: true })).toHaveAttribute("href", "/");
+  await expect(page.getByRole("link", { name: "JOBS", exact: true })).toHaveAttribute("href", "/?view=jobs");
 });
 
 test("directory pagination updates the public URL and loads the selected page", async ({ page }) => {

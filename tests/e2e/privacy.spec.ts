@@ -10,7 +10,7 @@ test("the public header opens the complete minimal privacy notice", async ({ pag
   await privacyLink.click();
 
   await expect(page).toHaveURL(/\/privacy$/u);
-  await expect(page.getByRole("heading", { name: "PRIVACY_" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Privacy" })).toBeVisible();
   await expect(page.getByText(/browser cookie keeps your jobs available on this device/i)).toBeVisible();
   await expect(page.getByText(/visitors do not provide emails or create accounts/i)).toBeVisible();
   await expect(page.getByText(/daily HMAC-derived network buckets/i)).toBeVisible();

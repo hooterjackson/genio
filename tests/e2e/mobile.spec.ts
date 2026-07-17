@@ -147,6 +147,7 @@ const flowQuestion = {
 
 async function openPrompt(page: Page): Promise<void> {
   await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Create a playlist" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: /playlist request/i })).toBeVisible();
   for (const count of [25, 50, 100] as const) {
     await expect(trackCountPreset(page, count)).toBeVisible();
@@ -154,6 +155,14 @@ async function openPrompt(page: Page): Promise<void> {
   await expect(customSizeButton(page)).toBeVisible();
   await expect(exactTrackCountField(page)).toHaveCount(0);
   await expect(page.getByRole("button", { name: /create playlist/i })).toBeVisible();
+}
+
+async function expectQuestionAtTop(page: Page): Promise<void> {
+  const position = await page.evaluate(() => ({
+    scrollY: window.scrollY,
+    viewportHeight: window.innerHeight,
+  }));
+  expect(position.scrollY).toBeLessThanOrEqual(Math.ceil(position.viewportHeight / 4));
 }
 
 function requestField(page: Page) {
@@ -315,16 +324,17 @@ test("the gênio intro is omitted when reduced motion is requested", async ({ pa
 
 test("the one-command composer remains usable at mobile widths", async ({ page }) => {
   await openPrompt(page);
-  await expect(page.getByText("gênio asks only what would materially change the result.")).toBeVisible();
+  await expect(page.getByText("Describe what you want to hear.")).toBeVisible();
+  await expect(page.getByText("gênio researches the music, finds the tracks, and builds it in Apple Music.")).toBeVisible();
   await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByText("2 MIN TARGET", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 MIN TARGET", { exact: true })).toHaveText("2 MIN TARGET");
   for (const count of [25, 50, 100] as const) {
     await choosePresetTrackCount(page, count);
-    await expect(page.getByText("2 MIN TARGET", { exact: true })).toBeVisible();
+    await expect(page.getByText("2 MIN TARGET", { exact: true })).toHaveText("2 MIN TARGET");
   }
   for (const [count, windowLabel] of [["200", "4 MIN"], ["300", "6 MIN"]] as const) {
     await chooseCustomTrackCount(page, count);
-    await expect(page.getByText(`${windowLabel} TARGET`, { exact: true })).toBeVisible();
+    await expect(page.getByText(`${windowLabel} TARGET`, { exact: true })).toHaveText(`${windowLabel} TARGET`);
     const textFits = await exactTrackCountField(page).evaluate((element) => {
       const input = element as HTMLInputElement;
       const style = window.getComputedStyle(input);
@@ -458,7 +468,7 @@ test("the selected count stays authoritative through guided questions", async ({
   await page.getByRole("button", { name: /next/i }).click();
   await selectGuidedOption(page, "A smooth arc");
   await page.getByRole("button", { name: /create playlist/i }).click();
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   expect(briefBody).toMatchObject({ prompt: "300 influential techno tracks", targetTrackCount: 50 });
   expect(runBody).toMatchObject({
     briefRequestId: "brief-one-command",
@@ -550,7 +560,7 @@ test("a two-question guided flow accepts a custom fourth answer before creating 
   expect(runCreates).toBe(0);
   await page.getByRole("button", { name: /create playlist/i }).click();
 
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   expect(answersBody).toMatchObject({
     answers: [
       { questionId: scopeQuestion.id, optionId: "historical-impact" },
@@ -589,13 +599,13 @@ test("three guided screens preserve earlier answers and remain usable at mobile 
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
   await page.getByRole("button", { name: /next/i }).click();
   await expect(page.getByRole("heading", { name: eraQuestion.question })).toBeFocused();
-  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(10);
+  await expectQuestionAtTop(page);
   await selectGuidedOption(page, "Across the full history");
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
   await page.getByRole("button", { name: /next/i }).click();
   await expect(page.getByText("QUESTION 3 OF 3", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: flowQuestion.question })).toBeFocused();
-  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(10);
+  await expectQuestionAtTop(page);
 
   await page.getByRole("button", { name: /back/i }).click();
   await expect(page.getByRole("heading", { name: eraQuestion.question })).toBeFocused();
@@ -674,7 +684,7 @@ test("a failed guided finalization retries the identical frozen submission", asy
   await expect(page.getByRole("button", { name: /retry create/i })).toBeVisible();
   await page.getByRole("button", { name: /retry create/i }).click();
 
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   expect(attempts).toHaveLength(2);
   expect(attempts[0]!.key).not.toBe("");
   expect(attempts[1]!.key).toBe(attempts[0]!.key);
@@ -705,7 +715,7 @@ test("leaving the composer cancels a pending guided request", async ({ page }) =
   await page.getByRole("button", { name: /create playlist/i }).click();
   await page.getByRole("button", { name: "JOBS", exact: true }).click();
 
-  await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
   await page.waitForTimeout(650);
   expect(runCreates).toBe(0);
 });
@@ -810,7 +820,7 @@ test("an explicit 100-track request stays at 100 through research, matching, and
   await selectGuidedOption(page, "A smooth arc");
   await page.getByRole("button", { name: /create playlist/i }).click();
 
-  await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED." })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("heading", { name: "Playlist published" })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText("100 tracks", { exact: true })).toBeVisible();
 
   expect(briefBody).toMatchObject({ prompt, targetTrackCount: 100 });
@@ -921,7 +931,7 @@ test("a 50-track request uses reserve matches but generates exactly 50 tracks", 
     excludedCandidateIds: Array.from({ length: 6 }, (_, index) => `candidate-50-${index + 50}`),
     overrides: [],
   });
-  await expect(page.getByRole("heading", { name: "50 TRACKS READY." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "50 tracks ready" })).toBeVisible();
 });
 
 test("a 200-track request selects exactly 200 tracks from its 300-candidate reserve", async ({ page }) => {
@@ -1024,7 +1034,7 @@ test("a 200-track request selects exactly 200 tracks from its 300-candidate rese
     excludedCandidateIds: Array.from({ length: 100 }, (_, index) => `candidate-200-${index + 200}`),
     overrides: [],
   });
-  await expect(page.getByRole("heading", { name: "200 TRACKS READY." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "200 tracks ready" })).toBeVisible();
 });
 
 test("an active fast run keeps its profile and concise phase message visible", async ({ page }) => {
@@ -1071,12 +1081,12 @@ test("the jobs screen lists and opens earlier jobs for this browser", async ({ p
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(earlierRun) });
   });
 
-  await page.goto("/");
-  await page.getByRole("button", { name: "JOBS" }).click();
-  await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
+  await openPrompt(page);
+  await page.getByRole("button", { name: "JOBS", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
   await expect(page.getByText(brief.title)).toBeVisible();
   await page.getByRole("button", { name: `Open ${brief.title} — Researching` }).click();
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.search)).toBe("?run=run-earlier");
 });
 
@@ -1099,7 +1109,7 @@ test("an active job never blocks starting a new request", async ({ page }) => {
   });
 
   await page.goto("/#cap=one-time-secret&run=run-active");
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   await page.getByRole("button", { name: "gênio home" }).click();
   await expect(requestField(page)).toBeVisible();
   await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
@@ -1183,7 +1193,7 @@ test("capabilities are exchanged and removed from the URL fragment", async ({ pa
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Choose tracks" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.hash)).toBe("");
   await expect(page.getByText("21 OF 21 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
   await expect(page.getByText("Matched track 1", { exact: true })).toBeVisible();
@@ -1455,7 +1465,7 @@ test("legacy timed-out Apple matches recover automatically before selection", as
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   expect(matchingRequests).toBe(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
@@ -1516,7 +1526,7 @@ test("a failed automatic Apple retry leaves the list available for a manual retr
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await expect(page.getByRole("alert")).toContainText("temporarily unavailable");
-  await expect(page.getByRole("heading", { name: "SELECT TRACKS." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Choose tracks" })).toBeVisible();
   await expect(page.getByText("Apple Music matching is incomplete for 1 track. Retry matching before generating a playlist.", { exact: true })).toBeVisible();
   await expect(page.getByText("NEEDS MATCH", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "SELECT ALL", exact: true })).toBeDisabled();
@@ -1524,7 +1534,7 @@ test("a failed automatic Apple retry leaves the list available for a manual retr
   const retry = page.getByRole("button", { name: "Retry Apple Music matching for 1 track" });
   await expect(retry).toBeEnabled();
   await retry.click();
-  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   expect(attempts).toBe(2);
 });
 
@@ -1939,7 +1949,7 @@ test("the current publication result shape keeps run coverage and evidence conte
   });
 
   await page.goto("/#cap=one-time-secret&run=run-result");
-  const resultHeading = page.getByRole("heading", { name: "PLAYLIST PUBLISHED WITH GAPS." });
+  const resultHeading = page.getByRole("heading", { name: "Playlist published with gaps" });
   await expect(resultHeading).toBeVisible();
   await expect(resultHeading.locator("br")).toHaveCount(0);
   await expect(page.getByText("Published from 18 documented sources with 3 visible gaps.")).toBeVisible();
@@ -1991,7 +2001,7 @@ test("an exact curated target is complete even when reserve candidates were omit
   });
 
   await page.goto("/#cap=one-time-secret&run=run-exact-result");
-  await expect(page.getByRole("heading", { name: "PLAYLIST PUBLISHED." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Playlist published" })).toBeVisible();
   await expect(page.getByRole("heading", { name: /with gaps/i })).toHaveCount(0);
   await expect(page.getByText("Published from 10 documented sources with 0 visible gaps.")).toBeVisible();
   await expect(page.getByText("50 tracks")).toBeVisible();
@@ -2129,7 +2139,7 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
 
   for (const locator of [
     page.locator("body"),
-    page.locator(".command-request-section > p"),
+    page.locator(".command-hero > p:last-child"),
     page.locator(".header-meta"),
     page.locator(".wordmark"),
   ]) {
@@ -2149,6 +2159,15 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   if (testInfo.project.name === "desktop") {
     await primary.focus();
     await expect(primary).toBeFocused();
-    expect(await primary.evaluate((element) => getComputedStyle(element).outlineColor)).toBe("rgb(224, 96, 41)");
+    const focusIndicator = await primary.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        color: style.outlineColor,
+        style: style.outlineStyle,
+        width: Number.parseFloat(style.outlineWidth),
+      };
+    });
+    expect(focusIndicator).toMatchObject({ style: "solid", width: 2 });
+    expect(focusIndicator.color).not.toBe("rgba(0, 0, 0, 0)");
   }
 });

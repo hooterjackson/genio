@@ -2,6 +2,7 @@ import Link from "next/link";
 import { FeedbackForm } from "./feedback-form";
 import { SiteMenu } from "../site-menu";
 import { BrandWordmark } from "../brand-wordmark";
+import { PrimaryNav } from "../primary-nav";
 
 export default function FeedbackPage() {
   return (
@@ -9,7 +10,7 @@ export default function FeedbackPage() {
       <header className="site-header">
         <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home"><BrandWordmark /></Link>
         <div className="header-meta">
-          <Link className="header-action" href="/">BACK</Link>
+          <PrimaryNav />
           <SiteMenu />
         </div>
       </header>

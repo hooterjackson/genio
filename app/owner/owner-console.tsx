@@ -697,8 +697,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
         <div className="header-meta"><span>{email}</span><a href={signOutPath}>SIGN OUT</a></div>
       </header>
       <section className="owner-shell">
-        <div className="screen-index">/ OWNER CONSOLE</div>
-        <h1>SYSTEM<br />CONTROL.</h1>
+        <h1>System control</h1>
         <p>Apple authorization, spending, and worker health are controlled here; visitor publication never waits for owner approval.</p>
         <Link className="quiet-link" href="/">TEST PLAYLIST FLOW →</Link>
 

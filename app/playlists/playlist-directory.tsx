@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { BrandWordmark } from "../brand-wordmark";
+import { PrimaryNav } from "../primary-nav";
 import { SiteMenu } from "../site-menu";
 
 type PublicPlaylistVolume = {
@@ -72,8 +73,7 @@ function DirectoryHeader() {
         <BrandWordmark />
       </Link>
       <div className="header-meta">
-        <span className="header-current" aria-current="page">PLAYLISTS</span>
-        <Link className="header-action" href="/">CREATE</Link>
+        <PrimaryNav active="explore" />
         <SiteMenu />
       </div>
     </header>
@@ -114,6 +114,11 @@ export function PlaylistDirectory() {
       .then((payload) => {
         if (!Array.isArray(payload.items)) throw new Error("Directory response was invalid");
         const totalPages = Math.max(1, Number.isFinite(payload.totalPages) ? payload.totalPages : 1);
+        if (page > totalPages && payload.total > 0) {
+          setLoading(true);
+          setPage(totalPages);
+          return;
+        }
         setDirectory({
           ...payload,
           page,
@@ -162,8 +167,7 @@ export function PlaylistDirectory() {
       <DirectoryHeader />
       <section className="directory-screen" aria-labelledby="directory-title">
         <header className="directory-intro">
-          <span className="screen-index">/ PUBLIC LIBRARY</span>
-          <h1 id="directory-title">LISTEN.</h1>
+          <h1 id="directory-title">Explore playlists</h1>
           <p>Explore playlists researched and published by gênio.</p>
           <small>{playlistCount}</small>
         </header>
@@ -194,6 +198,7 @@ export function PlaylistDirectory() {
                   .map((volume) => ({ ...volume, safeUrl: applePlaylistUrl(volume.shareUrl) }))
                   .filter((volume) => volume.safeUrl !== null)
                   .sort((left, right) => left.volumeNumber - right.volumeNumber);
+                const missingVolumeCount = Math.max(0, playlist.volumes.length - validVolumes.length);
                 return (
                   <li key={playlist.id}>
                     <article className="directory-playlist">
@@ -222,6 +227,11 @@ export function PlaylistDirectory() {
                           </a>
                         ))}
                         {validVolumes.length === 0 && <span className="directory-link-missing">APPLE LINK UNAVAILABLE</span>}
+                        {validVolumes.length > 0 && missingVolumeCount > 0 && (
+                          <span className="directory-link-missing">
+                            {missingVolumeCount} APPLE {missingVolumeCount === 1 ? "LINK" : "LINKS"} UNAVAILABLE
+                          </span>
+                        )}
                       </div>
                     </article>
                   </li>
