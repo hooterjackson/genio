@@ -86,6 +86,7 @@ import {
 import {
   deriveGuidancePreferences,
   guidanceOrderingPolicy,
+  safeCustomGuidanceText,
   type PlaylistGuidancePreference,
 } from "./guidance-context.ts";
 
@@ -332,7 +333,15 @@ function normalizedGuidanceAnswers(
     if (Array.from(customText).length > 500 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(customText)) {
       throw new HttpError(400, "Custom playlist answers must be 1–500 characters", "invalid_guidance_answers");
     }
-    return { questionId: question.id, customText };
+    const safeCustomText = safeCustomGuidanceText(customText);
+    if (!safeCustomText) {
+      throw new HttpError(
+        400,
+        "Custom answers must describe a music preference for this question",
+        "invalid_guidance_answers",
+      );
+    }
+    return { questionId: question.id, customText: safeCustomText };
   });
 }
 

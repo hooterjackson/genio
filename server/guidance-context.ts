@@ -25,6 +25,26 @@ function boundedText(value: unknown, maximum: number): string {
     : "";
 }
 
+/**
+ * Keep a visitor's free-form answer on the question's musical decision axis.
+ * Ordinary preference language (including "instead of mainstream hits") is
+ * valid, while instructions aimed at the model, tools, secrets, or immutable
+ * playlist scope are rejected. Apply this both at submission and again when
+ * deriving durable preferences so legacy/imported rows cannot bypass it.
+ */
+export function safeCustomGuidanceText(value: unknown): string | null {
+  const text = boundedText(value, 500);
+  if (!text) return null;
+  const instructionAttack = [
+    /\b(?:system|developer)\s+(?:prompt|message|instruction)s?\b/iu,
+    /\b(?:ignore|disregard|override|bypass|reveal|exfiltrate)\b.{0,80}\b(?:instruction|prompt|policy|system|developer|tool|secret|credential|api\s*key)s?\b/iu,
+    /\b(?:call|invoke|execute)\s+(?:the\s+)?(?:tool|function|api|command)s?\b/iu,
+    /\b(?:change|replace|set|increase|decrease)\s+(?:the\s+)?(?:scope|subject|track\s*count|song\s*count|evidence\s+policy|version\s+boundary)\b/iu,
+    /\b(?:return|output|respond\s+with)\s+only\b/iu,
+  ].some((pattern) => pattern.test(text));
+  return instructionAttack ? null : text;
+}
+
 function legacyOptionValue(question: PlaylistGuidanceQuestion, option: PlaylistGuidanceQuestion["options"][number]): string {
   return boundedText(`${question.header}: ${option.label}. ${option.description}`, 500);
 }
@@ -60,7 +80,7 @@ export function deriveGuidancePreferences(
       });
       continue;
     }
-    const customText = boundedText(answer.customText, 500);
+    const customText = safeCustomGuidanceText(answer.customText);
     if (!customText) continue;
     // Free-form answers cannot safely invent a sequencing enum. Keep their
     // text as a typed research preference tied to the scout's decision axis.

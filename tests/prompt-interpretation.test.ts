@@ -346,6 +346,7 @@ test("runs brief interpretation and grounded question scouting as separate bound
     sourceUrl,
     effectKind: "familiarity_bias",
   });
+  question.question = "Which documented side of Radiohead's sound should guide discovery of other artists?";
   const requestBodies: any[] = [];
   const fetchMock = vi.fn(async (_url, init) => {
     requestBodies.push(JSON.parse(String(init?.body)));
@@ -391,7 +392,7 @@ test("runs brief interpretation and grounded question scouting as separate bound
   expect(result.guidanceTelemetry.generationMode).toBe("grounded_scout");
   expect(requestBodies[0].text.format.name).toBe("playlist_brief");
   expect(requestBodies[1]).toMatchObject({
-    max_output_tokens: 1_200,
+    max_output_tokens: 1_800,
     max_tool_calls: 2,
     reasoning: { effort: "low" },
     parallel_tool_calls: false,
@@ -407,8 +408,69 @@ test("runs brief interpretation and grounded question scouting as separate bound
     minItems: 0,
     maxItems: 3,
   });
-  expect(requestBodies[1].instructions).toContain("Zero is correct");
+  expect(requestBodies[1].text.format.schema.properties.questions.items.properties.sourceUrls.items)
+    .toEqual({ type: "string" });
+  expect(requestBodies[1].text.format.schema.properties.questions.items.properties.sourceUrls.items)
+    .not.toHaveProperty("format");
+  expect(requestBodies[1].instructions).toContain("Return one to three questions for a broad or underspecified request");
+  expect(requestBodies[1].instructions).toContain("defaults inferred into the brief do not count as user choices");
+  expect(requestBodies[1].instructions).toContain("materially different candidate sets");
+  expect(requestBodies[1].instructions).toContain("same effect kind for all three options");
   expect(requestBodies[1].instructions).toContain("Do not ask a mandatory ordering question");
+});
+
+test("accepts a grounded geographic relationship fork for an underspecified place request", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-rio-guidance");
+  const sourceUrl = "https://example.org/rio-music-history";
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    sourceUrl,
+    sourceTitle: "Rio de Janeiro music history",
+    questions: [{
+      decisionKey: "rio_geographic_relationship",
+      header: "RIO CONNECTION",
+      question: "What relationship to Rio de Janeiro should define the playlist?",
+      whyMaterial: "Songs about Rio, recordings by artists from its scenes, and music recorded there create different candidate pools.",
+      groundingSummary: "The source documents Rio as a subject, a home for musical scenes, and a recording center.",
+      sourceUrls: [sourceUrl],
+      options: [
+        {
+          label: "Songs about Rio",
+          description: "Select recordings whose lyrics or documented subject is Rio de Janeiro.",
+          effect: { kind: "research_preference", value: "require Rio de Janeiro as the documented song subject", orderingBehavior: null },
+        },
+        {
+          label: "Rio artists and scenes",
+          description: "Select recordings by artists documented within Rio's musical scenes.",
+          effect: { kind: "research_preference", value: "require a documented artist or scene relationship to Rio de Janeiro", orderingBehavior: null },
+        },
+        {
+          label: "Recorded in Rio",
+          description: "Select recordings documented as made in Rio de Janeiro studios or venues.",
+          effect: { kind: "research_preference", value: "require a documented recording-location relationship to Rio de Janeiro", orderingBehavior: null },
+        },
+      ],
+    }],
+  })));
+
+  const result = await scoutPlaylistGuidance(
+    "50 Rio de Janeiro songs",
+    {
+      ...guidedDraftBrief,
+      title: "Rio de Janeiro",
+      subjectEntities: ["Rio de Janeiro"],
+      relationship: "associated with",
+      targetSize: { min: 50, max: 50 },
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]).toMatchObject({
+    decisionKey: "rio_geographic_relationship",
+    question: expect.stringContaining("Rio de Janeiro"),
+    grounding: { sourceUrls: [sourceUrl] },
+  });
+  expect(new Set(result.questions[0]!.options.map((option) => option.effect?.value)).size).toBe(3);
 });
 
 test("unrelated prompts receive different subject-specific grounded decisions", async () => {
@@ -545,6 +607,50 @@ test("salvages valid grounded questions independently and rejects invented sourc
   expect(result.telemetry.validationIssues).toContain("q2:unattested_sources");
   expect(result.questions.flatMap((question) => question.grounding!.sourceUrls))
     .not.toContain("https://invented.invalid/not-returned");
+});
+
+test("salvages attested citations while recording drops and normalizing mixed selection effects", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-salvage");
+  const sourceUrl = "https://example.org/berlin-lineages";
+  const question = groundedScoutQuestion({
+    decisionKey: "berlin_lineage_emphasis",
+    subject: "Berlin techno lineages",
+    sourceUrl,
+    effectKind: "subscene_focus",
+  });
+  question.sourceUrls = [sourceUrl, "https://invented.invalid/not-attested"];
+  question.options[1]!.effect = {
+    kind: "research_preference",
+    value: "prioritize documented Berlin dub-techno development",
+    orderingBehavior: null,
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [question],
+    sourceUrl,
+    sourceTitle: "Berlin techno lineages",
+  })));
+
+  const result = await scoutPlaylistGuidance(
+    "50 influential Berlin techno tracks",
+    {
+      ...guidedDraftBrief,
+      title: "Berlin Techno",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential within",
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]!.grounding!.sourceUrls).toEqual([sourceUrl]);
+  expect(new Set(result.questions[0]!.options.map((option) => option.effect?.kind))).toEqual(
+    new Set(["research_preference"]),
+  );
+  expect(result.questions[0]!.grounding!.sourceUrls).not.toContain("https://invented.invalid/not-attested");
+  expect(result.telemetry.validationIssues).toEqual(expect.arrayContaining([
+    "q1:dropped_unattested_source",
+    "q1:normalized_mixed_selection_effects",
+  ]));
 });
 
 test("enforces the scout cost cap by returning zero questions", async () => {

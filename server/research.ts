@@ -19,6 +19,7 @@ import {
   GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS,
   GUIDANCE_SCOUT_MAX_TOOL_CALLS,
   interpretPrompt,
+  ProviderRequestError,
   responseCostUsd,
   scoutPlaylistGuidance,
 } from "./openai.ts";
@@ -510,6 +511,19 @@ function isBudgetError(error: unknown): boolean {
     || value.code === "run_budget_reached"
     || value.code === "monthly_budget_reached"
     || value.code === "provider_cost_overrun";
+}
+
+function guidanceScoutFailureIssue(error: unknown): string {
+  if (isBudgetError(error)) return "scout:budget_unavailable";
+  if (error instanceof ProviderRequestError && error.status !== null) {
+    return `scout:provider_http_${Math.floor(error.status)}`;
+  }
+  const name = error && typeof error === "object" && typeof (error as { name?: unknown }).name === "string"
+    ? (error as { name: string }).name
+    : "";
+  if (name === "TimeoutError") return "scout:timeout";
+  if (name === "AbortError") return "scout:aborted";
+  return "scout:provider_unavailable";
 }
 
 function nonNegativeNumber(value: unknown, fallback: number): number {
@@ -2755,7 +2769,9 @@ export async function processBriefInterpretationJob(
           proposedQuestionCount: 0,
           acceptedQuestionCount: 0,
           webSearchCalls: 0,
-          validationIssues: [isBudgetError(error) ? "scout:budget_unavailable" : "scout:provider_unavailable"],
+          // Persist only a bounded diagnostic class. Raw provider bodies may
+          // contain request content and never cross the durable boundary.
+          validationIssues: [guidanceScoutFailureIssue(error)],
         },
       };
     }

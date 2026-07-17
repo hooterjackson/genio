@@ -20,7 +20,6 @@ import {
 import { boundedResponseText } from "./bounded-response.ts";
 import {
   applySimilaritySeedPolicy,
-  excludedReferenceArtists,
 } from "./similarity-policy.ts";
 import { assertPublicHttpsUrl, collectKnownUrls } from "./security.ts";
 import { citationSupportWindow } from "./citation-attestation.ts";
@@ -30,8 +29,8 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 export const GUIDANCE_SCOUT_MAX_TOOL_CALLS = 2;
-export const GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS = 1_200;
-export const GUIDANCE_SCOUT_TIMEOUT_MS = 9_000;
+export const GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS = 1_800;
+export const GUIDANCE_SCOUT_TIMEOUT_MS = 15_000;
 export const GUIDANCE_SCOUT_MAX_COST_USD = 0.05;
 
 export interface ProviderUsageEvent {
@@ -234,7 +233,6 @@ const guidanceEffectSchema = {
       type: "string",
       enum: [
         "research_preference",
-        "version_preference",
         "familiarity_bias",
         "subscene_focus",
         "ordering_behavior",
@@ -269,15 +267,19 @@ const guidanceScoutSchema = {
             maxLength: 80,
             pattern: "^[a-z0-9]+(?:_[a-z0-9]+)*$",
           },
-          header: { type: "string", minLength: 1, maxLength: 28 },
-          question: { type: "string", minLength: 1, maxLength: 180 },
-          whyMaterial: { type: "string", minLength: 1, maxLength: 240 },
-          groundingSummary: { type: "string", minLength: 1, maxLength: 320 },
+          header: { type: "string", minLength: 1, maxLength: 60 },
+          question: { type: "string", minLength: 1, maxLength: 240 },
+          whyMaterial: { type: "string", minLength: 1, maxLength: 480 },
+          groundingSummary: { type: "string", minLength: 1, maxLength: 420 },
           sourceUrls: {
             type: "array",
             minItems: 1,
             maxItems: 3,
-            items: { type: "string", format: "uri" },
+            // OpenAI Structured Outputs supports only a documented subset of
+            // JSON Schema. URL formats are therefore enforced by
+            // normalizedSourceUrl/assertPublicHttpsUrl after generation rather
+            // than sent as an unsupported `format: uri` schema keyword.
+            items: { type: "string" },
           },
           options: {
             type: "array",
@@ -451,18 +453,8 @@ function questionIsPromptSpecific(
   return false;
 }
 
-function hasContaminatedSimilarityWording(
-  value: string,
-  brief: PlaylistBrief,
-): boolean {
-  if (excludedReferenceArtists(brief).length === 0) return false;
-  return /\b(?:(?:other|similar|related|different)\s+(?:artists?|bands?|acts?|musicians?)|(?:songs?|tracks?|recordings?|music)\s+(?:that\s+|which\s+)?(?:sounds?\s+like|similar\s+to|resembl(?:e|es|ing)|adjacent\s+to))\b/iu.test(value);
-}
-
-
 const GUIDANCE_EFFECT_KINDS = new Set<PlaylistGuidanceEffectKind>([
   "research_preference",
-  "version_preference",
   "familiarity_bias",
   "subscene_focus",
   "ordering_behavior",
@@ -547,7 +539,10 @@ function guidanceSourceHints(response: any): PlaylistGuidanceSourceHint[] {
       title: titles.get(url) || new URL(url).hostname,
       excerpt: excerpts.get(url) ?? "",
     }))
-    .slice(0, 12);
+    // Two bounded search calls can legitimately return more than twelve
+    // sources. Preserve enough provider-attested URLs that a model-selected
+    // source near the end of the result set is not mistaken for an invention.
+    .slice(0, 30);
 }
 
 function validatedGuidanceEffect(value: unknown): PlaylistGuidanceEffect {
@@ -601,24 +596,27 @@ function salvagedGuidanceQuestions(
       if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/u.test(decisionKey)) throw new Error("invalid_decision_key");
       if (GENERIC_GUIDANCE_DECISION_KEYS.has(decisionKey)) throw new Error("generic_decision_key");
       if (decisionKeys.has(decisionKey)) throw new Error("duplicate_decision_key");
-      const header = boundedGuidanceText(raw.header, "question header", 28);
-      const question = boundedGuidanceText(raw.question, "question", 180);
-      const whyMaterial = boundedGuidanceText(raw.whyMaterial, "materiality", 240);
-      const groundingSummary = boundedGuidanceText(raw.groundingSummary, "grounding", 320);
+      const header = boundedGuidanceText(raw.header, "question header", 60);
+      const question = boundedGuidanceText(raw.question, "question", 240);
+      const whyMaterial = boundedGuidanceText(raw.whyMaterial, "materiality", 480);
+      const groundingSummary = boundedGuidanceText(raw.groundingSummary, "grounding", 420);
       const requestedUrls = Array.isArray(raw.sourceUrls)
         ? [...new Set(raw.sourceUrls.map(normalizedSourceUrl).filter((url): url is string => Boolean(url)))].slice(0, 3)
         : [];
-      if (requestedUrls.length === 0 || requestedUrls.some((url) => !sourceUrls.has(url))) {
-        throw new Error("unattested_sources");
+      const attestedRequestedUrls = requestedUrls.filter((url) => sourceUrls.has(url));
+      if (attestedRequestedUrls.length === 0) throw new Error("unattested_sources");
+      if (attestedRequestedUrls.length !== requestedUrls.length) {
+        issues.push(`q${index + 1}:dropped_unattested_source`);
       }
       const candidateText = `${decisionKey} ${header} ${question} ${whyMaterial} ${groundingSummary}`;
       if (isTrackCountQuestion(candidateText)) throw new Error("track_count_question");
       if (!questionIsPromptSpecific(`${header} ${question}`, prompt, brief)) {
         throw new Error("generic_question");
       }
-      if (hasContaminatedSimilarityWording(`${header} ${question}`, brief)) {
-        throw new Error("contaminated_similarity_wording");
-      }
+      // Similarity requests should explicitly discuss which facet of the
+      // reference artist guides discovery of other artists. The immutable
+      // similarity policy still excludes the seed artist downstream, so that
+      // correct wording must not be mistaken for candidate contamination.
       if (accepted.some((existing) =>
         tokenSimilarity(
           `${existing.decisionKey} ${existing.header} ${existing.question}`,
@@ -631,7 +629,7 @@ function salvagedGuidanceQuestions(
       const optionTexts: string[] = [];
       const effectKeys = new Set<string>();
       const questionId = `q${accepted.length + 1}`;
-      const options = raw.options.map((candidateOption, optionIndex) => {
+      let options = raw.options.map((candidateOption, optionIndex) => {
         if (!candidateOption || typeof candidateOption !== "object") throw new Error("invalid_option");
         const option = candidateOption as Record<string, unknown>;
         const label = boundedGuidanceText(option.label, "option label", 60);
@@ -657,7 +655,26 @@ function salvagedGuidanceQuestions(
         };
       });
       const effectKinds = new Set(options.map((option) => option.effect.kind));
-      if (effectKinds.size !== 1) throw new Error("mixed_effect_kinds");
+      // Research, familiarity, and subscene effects all change the candidate
+      // set. Ordering is incompatible because it changes sequence rather than
+      // membership.
+      if (effectKinds.has("ordering_behavior") && effectKinds.size !== 1) {
+        throw new Error("mixed_ordering_and_selection_effects");
+      }
+      if (!effectKinds.has("ordering_behavior") && effectKinds.size > 1) {
+        // These effect kinds all change candidate membership. Normalize a
+        // model's mixed labels to one deterministic research directive so a
+        // single decision axis cannot acquire inconsistent downstream
+        // semantics merely because the labels differed.
+        options = options.map((option) => ({
+          ...option,
+          effect: {
+            ...option.effect,
+            kind: "research_preference" as const,
+          },
+        }));
+        issues.push(`q${index + 1}:normalized_mixed_selection_effects`);
+      }
       if (effectKinds.has("ordering_behavior")) {
         const behaviors = options.map((option) => option.effect.orderingBehavior);
         if (new Set(behaviors).size !== 3) throw new Error("overlapping_ordering_behaviors");
@@ -669,7 +686,7 @@ function salvagedGuidanceQuestions(
         header,
         question,
         whyMaterial,
-        grounding: { summary: groundingSummary, sourceUrls: requestedUrls },
+        grounding: { summary: groundingSummary, sourceUrls: attestedRequestedUrls },
         options,
       });
     } catch (error) {
@@ -825,16 +842,20 @@ export async function interpretPrompt(
 
 const GUIDANCE_SCOUT_INSTRUCTIONS = `You are a bounded playlist question scout. The playlist request has already been interpreted into a strict brief. Search only enough to discover subject-specific forks that would materially change which recordings are selected.
 
-Return zero to three questions. Zero is correct when the request and brief already determine the result. Never invent a question merely to create a multi-step flow. Do not ask about track count, cost, generic mood, generic variety, or any preference already explicit in the request or brief. Do not ask a mandatory ordering question. Prefer documented, subject-specific decisions such as a real historical split, subscene boundary, contested canon, performance-versus-composition credit boundary, release-version distinction, or an artist's materially different periods.
+Return one to three questions for a broad or underspecified request. Return zero only when the ORIGINAL USER REQUEST explicitly resolves every meaningful selection fork; defaults inferred into the brief do not count as user choices. Most short requests have at least one material fork. For a broad request with multiple documented axes, prefer two or three independent high-impact questions. Ask one excellent question only when one answer truly resolves the meaningful ambiguity, and three only when all three decisions are orthogonal. Never invent filler merely to create a multi-step flow.
 
-Every question must be supported by URLs from your hosted web-search results. Explain the documented fork briefly in groundingSummary and why the answer changes the track set in whyMaterial. Copy source URLs exactly. Each question must have exactly three mutually exclusive options, with the broadly safest default first. Options must describe concrete consequences, not synonyms.
+Questions must demonstrate knowledge of the actual subject. Name the subject in each question and distinguish documented branches that lead to different candidate pools. Useful axes include a real historical split, geographic or relationship boundary, subscene lineage, contested canon, performance-versus-composition credit boundary, an artist's materially different periods, or a reference artist's distinct sonic languages. For requests about a place, distinguish songs about the place, artists from its scenes, and recordings made there when that relationship is unstated. For "music like X", ask which documented side of X's sound should guide OTHER artists and never offer X's own recordings unless explicitly requested. For session-player or contributor requests, distinguish landmark impact, audible/prominent contribution, and representative career breadth when sources support those forks. For factual "every" requests, ask only a missing factual scope boundary such as solo/group/features or original/posthumous release scope.
 
-Every option must include one typed effect. Use research_preference for a documented selection criterion, version_preference for released-version scope, familiarity_bias for canonical-versus-discovery weighting, subscene_focus for a documented era/scene/period fork, and ordering_behavior only when sequence itself is genuinely material. orderingBehavior must be null except for ordering_behavior, where it must be smooth, contrast, chronological, or editorial. Never claim BPM, key, or harmonic analysis. Use a concise snake_case decisionKey that names the actual subject-specific choice.`;
+Do not ask about track count, cost, generic mood, generic variety, recording-version policy, or any preference already explicit in the original request. The confirmed brief already owns recording-version scope. Do not treat model-authored brief defaults as explicit preferences. Do not ask a mandatory ordering question. Reject an axis whose options would mostly produce the same recordings. The question, options, and typed effects must be concrete enough that a researcher could issue three different discovery queries and obtain materially different candidate sets.
+
+Every question must be supported by URLs from your hosted web-search results. Explain the documented fork briefly in groundingSummary and why the answer changes the track set in whyMaterial. Copy source URLs exactly. Each question must have exactly three mutually exclusive options, with the broadly safest default first. All three options must be coordinates on the same decision axis; never mix two category choices with an unrelated inclusion toggle. Options must describe concrete consequences, not synonyms. Use a two-to-five-word header, a single complete question, one or two short sentences for whyMaterial, and one or two short sentences for groundingSummary. Keep every field concise and always finish complete sentences well before its length limit; never truncate a word or sentence.
+
+Every option must include one typed effect. Use research_preference for a documented selection criterion, familiarity_bias for canonical-versus-discovery weighting, subscene_focus for a documented era/scene/period fork, and ordering_behavior only when sequence itself is genuinely material. Use the same effect kind for all three options on one decision axis. orderingBehavior must be null except for ordering_behavior, where it must be smooth, contrast, chronological, or editorial. Never claim BPM, key, or harmonic analysis. Use a concise snake_case decisionKey that names the actual subject-specific choice.`;
 
 function guidanceScoutTimeoutMs(): number {
   const configured = Number(process.env.GUIDANCE_SCOUT_TIMEOUT_MS ?? GUIDANCE_SCOUT_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return GUIDANCE_SCOUT_TIMEOUT_MS;
-  return Math.min(10_000, Math.max(5_000, Math.round(configured)));
+  return Math.min(20_000, Math.max(5_000, Math.round(configured)));
 }
 
 function guidanceScoutSignal(external?: AbortSignal): AbortSignal {
