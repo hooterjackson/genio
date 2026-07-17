@@ -44,6 +44,16 @@ export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
 export const FAST_CURATED_TARGET_MAXIMUM = 300;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
 export const FAST_POST_MATCH_REFILL_LIMIT = 2;
+// A refill is an accuracy recovery path after the original fast route has
+// already finished, so it owns a separate, short durable deadline. Each
+// generation performs at most one cited synthesis call and then matches only
+// the newly saved candidates.
+export const FAST_POST_MATCH_REFILL_RESEARCH_MS = 30_000;
+export const FAST_POST_MATCH_REFILL_MINIMUM_MATCHING_RESERVE_MS = 60_000;
+export const FAST_POST_MATCH_REFILL_MATCHING_RESERVE_MS = 120_000;
+export const FAST_POST_MATCH_REFILL_RUN_MS = FAST_POST_MATCH_REFILL_RESEARCH_MS
+  + FAST_POST_MATCH_REFILL_MATCHING_RESERVE_MS;
+export const FAST_POST_MATCH_REFILL_MAX_COST_USD = 0.35;
 // Production catalog yield is intentionally strict: ambiguous versions stay
 // out of automatic playlists. A 50% reserve left exact curated requests one
 // safe match short at an observed 63% yield. Research 75% extra candidates so
@@ -75,6 +85,110 @@ export interface FastPostMatchRefillPlan {
   selectableCount: number;
   shortfall: number;
   additionalCandidateGoal: number;
+}
+
+export interface FastPostMatchRefillRouteCheckpoint {
+  status: "queued";
+  profile: "fast_post_match_refill_v1";
+  generation: number;
+  model: string;
+  confirmedAt: string;
+  researchDeadlineAt: string;
+  deadlineAt: string;
+  matchingReserveMs: number;
+  additionalCandidateGoal: number;
+  storefront: string;
+  baselineEligibleCount: number;
+  targetEligibleCount: number;
+  baselineSelectionRank: number;
+}
+
+export function fastPostMatchRefillMatchingReserveMs(additionalCandidateGoal: number): number {
+  const goal = Math.max(1, Math.min(FAST_EXTRACTION_CANDIDATE_LIMIT, Math.floor(additionalCandidateGoal)));
+  // Matching runs eight candidates concurrently in production. Budget one
+  // bounded seven-second lookup window per batch plus finalization headroom.
+  return Math.min(
+    FAST_POST_MATCH_REFILL_MATCHING_RESERVE_MS,
+    Math.max(FAST_POST_MATCH_REFILL_MINIMUM_MATCHING_RESERVE_MS, Math.ceil(goal / 8) * 8_000 + 10_000),
+  );
+}
+
+export function createFastPostMatchRefillRouteCheckpoint(
+  generation: number,
+  additionalCandidateGoal: number,
+  storefront: string,
+  confirmedAt = new Date(),
+  environment: Environment = process.env,
+  baseline: { eligibleCount?: number; selectionRank?: number } = {},
+): FastPostMatchRefillRouteCheckpoint {
+  const confirmedMs = confirmedAt.getTime();
+  if (!Number.isFinite(confirmedMs)) throw new Error("Catalog refill confirmation time is invalid");
+  const boundedGeneration = Math.max(1, Math.min(FAST_POST_MATCH_REFILL_LIMIT, Math.floor(generation)));
+  const boundedGoal = Math.max(1, Math.min(FAST_EXTRACTION_CANDIDATE_LIMIT, Math.floor(additionalCandidateGoal)));
+  const normalizedStorefront = storefront.toLowerCase();
+  if (!/^[a-z]{2}$/u.test(normalizedStorefront)) throw new Error("Apple storefront must be a two-letter code");
+  const matchingReserveMs = fastPostMatchRefillMatchingReserveMs(boundedGoal);
+  const deadlineMs = confirmedMs + FAST_POST_MATCH_REFILL_RESEARCH_MS + matchingReserveMs;
+  const baselineEligibleCount = Math.max(0, Math.floor(baseline.eligibleCount ?? 0));
+  const baselineSelectionRank = Math.max(0, Math.floor(baseline.selectionRank ?? 0));
+  return {
+    status: "queued",
+    profile: "fast_post_match_refill_v1",
+    generation: boundedGeneration,
+    model: fastResearchModel(environment),
+    confirmedAt: new Date(confirmedMs).toISOString(),
+    researchDeadlineAt: new Date(deadlineMs - matchingReserveMs).toISOString(),
+    deadlineAt: new Date(deadlineMs).toISOString(),
+    matchingReserveMs,
+    additionalCandidateGoal: boundedGoal,
+    storefront: normalizedStorefront,
+    baselineEligibleCount,
+    targetEligibleCount: baselineEligibleCount + boundedGoal,
+    baselineSelectionRank,
+  };
+}
+
+export function parseFastPostMatchRefillRouteCheckpoint(
+  value: unknown,
+  expectedGeneration?: number,
+): FastPostMatchRefillRouteCheckpoint | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Partial<FastPostMatchRefillRouteCheckpoint>;
+  const confirmedMs = typeof row.confirmedAt === "string" ? Date.parse(row.confirmedAt) : Number.NaN;
+  const researchDeadlineMs = typeof row.researchDeadlineAt === "string" ? Date.parse(row.researchDeadlineAt) : Number.NaN;
+  const deadlineMs = typeof row.deadlineAt === "string" ? Date.parse(row.deadlineAt) : Number.NaN;
+  if (row.status !== "queued" || row.profile !== "fast_post_match_refill_v1") return null;
+  if (!Number.isInteger(row.generation) || Number(row.generation) < 1 || Number(row.generation) > FAST_POST_MATCH_REFILL_LIMIT) return null;
+  if (expectedGeneration !== undefined && row.generation !== expectedGeneration) return null;
+  if (!Number.isFinite(confirmedMs) || !Number.isFinite(researchDeadlineMs) || !Number.isFinite(deadlineMs)) return null;
+  if (!Number.isInteger(row.additionalCandidateGoal)
+    || Number(row.additionalCandidateGoal) < 1
+    || Number(row.additionalCandidateGoal) > FAST_EXTRACTION_CANDIDATE_LIMIT) return null;
+  if (typeof row.model !== "string" || !row.model.trim()) return null;
+  if (typeof row.storefront !== "string" || !/^[a-z]{2}$/u.test(row.storefront)) return null;
+  if (!Number.isInteger(row.baselineEligibleCount) || Number(row.baselineEligibleCount) < 0) return null;
+  if (!Number.isInteger(row.targetEligibleCount)
+    || Number(row.targetEligibleCount) !== Number(row.baselineEligibleCount) + Number(row.additionalCandidateGoal)) return null;
+  if (!Number.isInteger(row.baselineSelectionRank) || Number(row.baselineSelectionRank) < 0) return null;
+  const expectedMatchingReserveMs = fastPostMatchRefillMatchingReserveMs(Number(row.additionalCandidateGoal));
+  if (deadlineMs - confirmedMs !== FAST_POST_MATCH_REFILL_RESEARCH_MS + expectedMatchingReserveMs
+    || deadlineMs - researchDeadlineMs !== expectedMatchingReserveMs
+    || row.matchingReserveMs !== expectedMatchingReserveMs) return null;
+  return {
+    status: "queued",
+    profile: "fast_post_match_refill_v1",
+    generation: Number(row.generation),
+    model: row.model,
+    confirmedAt: new Date(confirmedMs).toISOString(),
+    researchDeadlineAt: new Date(researchDeadlineMs).toISOString(),
+    deadlineAt: new Date(deadlineMs).toISOString(),
+    matchingReserveMs: expectedMatchingReserveMs,
+    additionalCandidateGoal: Number(row.additionalCandidateGoal),
+    storefront: row.storefront,
+    baselineEligibleCount: Number(row.baselineEligibleCount),
+    targetEligibleCount: Number(row.targetEligibleCount),
+    baselineSelectionRank: Number(row.baselineSelectionRank),
+  };
 }
 
 /**

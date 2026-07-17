@@ -42,3 +42,37 @@ The source and final implementation were opened together in the same visual comp
 ## Final result
 
 `passed`
+
+---
+
+## Mobile header alignment regression — 2026-07-17
+
+- Source visual truth: `/Users/mlima/Downloads/Screenshot 2026-07-17 at 1.35.32 PM.png`
+- Implementation screenshot: `/private/tmp/genio-header-430-after.png`
+- Viewport: 430 × 932 for the focused visual comparison; exact browser geometry was also tested at 320 × 720 and 390 × 844.
+- State: public create screen after the intro, with the same shared header used by Explore, Jobs, and active-run screens.
+- Full-view evidence: the supplied production screenshot and the final 430 px implementation capture were opened in the same comparison input.
+- Focused-region evidence: the full screenshots expose the complete header at readable scale, so no separate crop was needed.
+
+### Findings and fixes
+
+1. P2 — the earlier regression suite aligned only the navigation and menu; it did not measure the visible ASCII art. The wordmark could therefore change size or appear off-center without failing QA.
+2. The mobile wordmark now uses the same fixed 44 px vertical alignment box as the navigation and menu, with fluid ASCII sizing from 320–430 px and disabled font ligatures/text autosizing for stable iOS metrics.
+3. Post-fix geometry at 430 px: header center 38 px, wordmark-art center 37.996 px, navigation center 38 px, menu center 38 px. The visible wordmark stays left of the navigation and inside the viewport.
+4. Exact Playwright assertions passed on Create, Explore, Jobs, and active-run states at 320, 390, and 430 px. They cover art/header/nav/menu centerlines, non-overlap, minimum visible logo height, touch targets, consistent route geometry, and horizontal overflow.
+
+### Required fidelity surfaces
+
+- Fonts and typography: the existing monospaced family and ASCII content are unchanged; ligatures and iOS text enlargement are disabled only to preserve the source geometry.
+- Spacing and layout rhythm: header height is fixed at 76 px on phones and each primary header control shares a 44 px centerline.
+- Colors and visual tokens: unchanged.
+- Image quality and asset fidelity: the official code-native ASCII wordmark remains the source asset; no substitution or raster scaling was introduced.
+- Copy and content: unchanged.
+
+### Comparison history
+
+- Before: the 320 px wordmark collapsed to 19.34 px high, and no visual-art alignment assertion existed.
+- Fix: replaced the smallest breakpoint override with fluid sizing and a shared 44 px alignment box; added route- and breakpoint-level visible-art assertions.
+- After: the 320 px wordmark is 23.98 px high and centered at 38 px; the 430 px wordmark is 30.98 px high and centered at 37.996 px. No P0/P1/P2 issues remain.
+
+final result: passed

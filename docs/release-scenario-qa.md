@@ -32,15 +32,20 @@ exercises:
 - The real pre-match Apple matching reserve.
 - Strict unique Apple matches and bounded recovery of retryable lookup
   failures.
+- Up to two bounded post-match evidence-research refills when strict matching
+  still leaves an exact-count shortfall, including their candidate yield,
+  strict Apple yield, fixed cost ceiling, and immutable timing windows.
 - Exact manifest and publication counts.
 - Explicit outcome accounting for every candidate.
 - The combined public preflight-and-research spend ceiling.
 - The same immutable size-tiered research-and-matching windows used by the
   product: two minutes for 1–100 tracks, four for 101–200, and six for 201–300.
 
-The replay deliberately does **not** assume a post-match evidence-research
-refill. Production does not currently implement that handoff; a test-only
-refill would make a catalog-shortfall regression appear fixed when it is not.
+The replay calls the same post-match refill planner used by production. It
+fails closed after the same two-generation ceiling and never creates a smaller
+manifest. A release is blocked unless the promoted Rio regression reproduces
+the observed 88 initial candidates and 42 strict matches, then reaches exactly
+50 publishable tracks through the bounded refill path.
 
 ## Exported observations
 

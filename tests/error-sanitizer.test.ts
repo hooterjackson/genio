@@ -14,6 +14,13 @@ const privateFailure = new Error(
 );
 
 describe("durable and public error sanitization", () => {
+  test("preserves only a bounded count-specific matching shortfall", () => {
+    const shortfall = "Apple Music matching found 42 strict unique catalog matches for the required 50. No playlist was published because the exact count could not be met safely.";
+    expect(sanitizeFailure(shortfall, "matching")).toBe(shortfall);
+    expect(sanitizeFailure(`${shortfall} provider=private`, "matching"))
+      .toBe("Apple Music matching could not be completed after the final attempt.");
+  });
+
   test.each<FailureContext>([
     "brief",
     "research",

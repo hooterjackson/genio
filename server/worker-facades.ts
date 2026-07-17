@@ -20,6 +20,10 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
     addSources: (...args: Parameters<ResearchRepository["addSources"]>) => source.addSources(...args),
     addCitationAttestations: (...args: Parameters<ResearchRepository["addCitationAttestations"]>) => source.addCitationAttestations(...args),
     addCandidates: (...args: Parameters<ResearchRepository["addCandidates"]>) => source.addCandidates(...args),
+    listCandidates: (runId: string) => {
+      if (!source.listCandidates) throw new Error("Research candidate inventory is unavailable");
+      return source.listCandidates(runId);
+    },
     upsertFrontier: (...args: Parameters<ResearchRepository["upsertFrontier"]>) => source.upsertFrontier(...args),
     upsertResearchContainers: (...args: Parameters<ResearchRepository["upsertResearchContainers"]>) => source.upsertResearchContainers(...args),
     listResearchContainers: (...args: Parameters<ResearchRepository["listResearchContainers"]>) => source.listResearchContainers(...args),
@@ -48,6 +52,7 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
     getResearchCheckpoint: (...args: Parameters<MatchingRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<MatchingRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
     queueAutomaticCatalogRecovery: (...args: Parameters<MatchingRepository["queueAutomaticCatalogRecovery"]>) => source.queueAutomaticCatalogRecovery(...args),
+    queueAutomaticCandidateRefill: (...args: Parameters<MatchingRepository["queueAutomaticCandidateRefill"]>) => source.queueAutomaticCandidateRefill(...args),
     queueAutomaticPublication: (...args: Parameters<MatchingRepository["queueAutomaticPublication"]>) => source.queueAutomaticPublication(...args),
   });
 }

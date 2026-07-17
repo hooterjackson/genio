@@ -47,6 +47,38 @@ export interface PlaylistGuidanceOption {
   description: string;
   /** Exactly the first option is recommended. */
   recommended: boolean;
+  /**
+   * Machine-readable effect of selecting this answer. Optional only so runs
+   * created before the grounded question scout remain readable.
+   */
+  effect?: PlaylistGuidanceEffect;
+}
+
+export type PlaylistGuidanceEffectKind =
+  | "research_preference"
+  | "version_preference"
+  | "familiarity_bias"
+  | "subscene_focus"
+  | "ordering_behavior";
+
+export type PlaylistGuidanceOrderingBehavior =
+  | "smooth"
+  | "contrast"
+  | "chronological"
+  | "editorial";
+
+export interface PlaylistGuidanceEffect {
+  kind: PlaylistGuidanceEffectKind;
+  value: string;
+  /** Non-null only when kind is ordering_behavior. */
+  orderingBehavior: PlaylistGuidanceOrderingBehavior | null;
+}
+
+export interface PlaylistGuidanceGrounding {
+  /** Short model-written explanation of the documented fork in the subject. */
+  summary: string;
+  /** URLs must also appear in the provider-returned scout sources. */
+  sourceUrls: string[];
 }
 
 export interface PlaylistGuidanceQuestion {
@@ -55,8 +87,42 @@ export interface PlaylistGuidanceQuestion {
   /** Short mobile-screen label. */
   header: string;
   question: string;
+  /** Stable semantic axis, for example `detroit_second_wave_emphasis`. */
+  decisionKey?: string;
+  /** Why selecting an answer will materially change the resulting tracks. */
+  whyMaterial?: string;
+  /** Provider-attested web grounding. Optional only for legacy saved runs. */
+  grounding?: PlaylistGuidanceGrounding;
   /** The API always returns exactly three mutually exclusive options. */
   options: PlaylistGuidanceOption[];
+}
+
+export interface PlaylistGuidanceSourceHint {
+  url: string;
+  title: string;
+  /** A short provider-attested excerpt when one is available. */
+  excerpt: string;
+}
+
+export type PlaylistGuidanceGenerationMode =
+  | "grounded_scout"
+  | "no_material_questions"
+  | "scout_unavailable";
+
+export interface PlaylistGuidanceTelemetry {
+  generationMode: PlaylistGuidanceGenerationMode;
+  proposedQuestionCount: number;
+  acceptedQuestionCount: number;
+  webSearchCalls: number;
+  validationIssues: string[];
+}
+
+export interface PlaylistGuidanceScoutResult {
+  questions: PlaylistGuidanceQuestion[];
+  sourceHints: PlaylistGuidanceSourceHint[];
+  telemetry: PlaylistGuidanceTelemetry;
+  usage: Record<string, unknown>;
+  costUsd: number;
 }
 
 export interface PlaylistGuidanceAnswer {

@@ -21,6 +21,12 @@ export const PUBLIC_FAST_RESEARCH_BUDGET_USD = 1.5;
 export const GUIDED_BRIEF_BUDGET_USD = 0.25;
 
 /**
+ * Grounded follow-up discovery has an independent ceiling. Its spend remains
+ * visible in the owner ledger, but never consumes the track-research allowance.
+ */
+export const GUIDED_SCOUT_BUDGET_USD = 0.05;
+
+/**
  * A public playlist's preflight and research share one $1.50 ceiling. Passing
  * this reduced value as both the estimate and approved run budget also keeps
  * the repository's queued-run budget normalization from restoring a larger
