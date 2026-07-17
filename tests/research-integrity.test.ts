@@ -717,14 +717,14 @@ describe("research completion policy", () => {
     const exact300 = brief("curated", { min: 300, max: 300 });
     const short = researchCompletionReadiness(
       exact300,
-      { candidateCount: 450, eligibleCandidateCount: 300, sourceCount: 4 },
+      { candidateCount: 525, eligibleCandidateCount: 300, sourceCount: 4 },
       [],
     );
     expect(short.ready).toBe(false);
-    expect(short.reasons[0]).toContain("450 evidence-eligible candidates");
+    expect(short.reasons[0]).toContain("525 evidence-eligible candidates");
     expect(researchCompletionReadiness(
       exact300,
-      { candidateCount: 450, eligibleCandidateCount: 450, sourceCount: 4 },
+      { candidateCount: 525, eligibleCandidateCount: 525, sourceCount: 4 },
       [],
     ).ready).toBe(true);
   });
@@ -1001,7 +1001,7 @@ describe("fast curated orchestration", () => {
     expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
   });
 
-  test("an exact 100-track curated target persists a 50-track catalog reserve before matching", async () => {
+  test("an exact 100-track curated target persists a 75-track catalog reserve before matching", async () => {
     const state = segmentedRepository();
     state.run.brief = {
       ...brief("curated", { min: 100, max: 100 }),
@@ -1065,16 +1065,32 @@ describe("fast curated orchestration", () => {
         }] },
       ],
     };
-    const refillPairs = Array.from({ length: 30 }, (_, index) => {
-      const suffix = String(index + 121).padStart(3, "0");
-      return `Performer ${suffix} — Track ${suffix}`;
-    });
-    const refillSupport = fastEvidenceGroup(
-      "Paulinho da Costa",
-      "influential recording featuring",
-      refillPairs,
-    );
-    const refillMarker = "[refill-source]";
+    const refillAnnotations: Array<Record<string, unknown>> = [];
+    const refillLines: string[] = [];
+    let refillOffset = 0;
+    for (let groupStart = 0; groupStart < 55; groupStart += 10) {
+      const groupCount = Math.min(10, 55 - groupStart);
+      const refillPairs = Array.from({ length: groupCount }, (_, index) => {
+        const suffix = String(groupStart + index + 121).padStart(3, "0");
+        return `Performer ${suffix} — Track ${suffix}`;
+      });
+      const refillSupport = fastEvidenceGroup(
+        "Paulinho da Costa",
+        "influential recording featuring",
+        refillPairs,
+      );
+      const refillMarker = `[refill-source-${groupStart / 10 + 1}]`;
+      const refillLine = `${refillSupport} ${refillMarker}`;
+      refillAnnotations.push({
+        type: "url_citation",
+        url: `https://evidence.example/paulinho/refill/${groupStart / 10 + 1}`,
+        title: `Paulinho refill source ${groupStart / 10 + 1}`,
+        start_index: refillOffset + refillSupport.length + 1,
+        end_index: refillOffset + refillSupport.length + 1 + refillMarker.length,
+      });
+      refillLines.push(refillLine);
+      refillOffset += refillLine.length + 1;
+    }
     const refillSynthesis = {
       id: "fast-web-100-refill",
       model: "gpt-5.6-luna",
@@ -1083,14 +1099,8 @@ describe("fast curated orchestration", () => {
         { type: "web_search_call", action: { type: "search", query: "Paulinho da Costa refill" } },
         { id: "fast-message-100-refill", type: "message", content: [{
           type: "output_text",
-          text: `${refillSupport} ${refillMarker}`,
-          annotations: [{
-            type: "url_citation",
-            url: "https://evidence.example/paulinho/refill",
-            title: "Paulinho refill source",
-            start_index: refillSupport.length + 1,
-            end_index: refillSupport.length + 1 + refillMarker.length,
-          }],
+          text: refillLines.join("\n"),
+          annotations: refillAnnotations,
         }] },
       ],
     };
@@ -1102,30 +1112,30 @@ describe("fast curated orchestration", () => {
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
 
     expect(orchestrator.calls).toHaveLength(2);
-    expect(persistedCandidates).toHaveLength(150);
+    expect(persistedCandidates).toHaveLength(175);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
-      Array.from({ length: 150 }, (_, index) => index + 1),
+      Array.from({ length: 175 }, (_, index) => index + 1),
     );
-    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(150);
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(175);
     expect(frontier).toContainEqual(expect.objectContaining({
       sourceClass: "fast_policy",
       status: "complete",
-      discoveredCount: 150,
-      recoveredCount: 150,
+      discoveredCount: 175,
+      recoveredCount: 175,
     }));
     expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
       status: "complete",
-      extractedCandidateCount: 150,
-      citationEligibleCandidateCount: 150,
+      extractedCandidateCount: 175,
+      citationEligibleCandidateCount: 175,
       rejectedCandidateCount: 0,
-      candidateGoal: 150,
+      candidateGoal: 175,
       reserveShortfall: 0,
       shortfall: 0,
     });
     expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
   });
 
-  test("an exact 200-track curated target spans bounded passes and persists a catalog reserve before matching", async () => {
+  test("an exact 200-track curated target spans bounded passes and persists a 75% catalog reserve before matching", async () => {
     const state = segmentedRepository();
     state.run.brief = {
       ...brief("curated", { min: 200, max: 200 }),
@@ -1200,7 +1210,7 @@ describe("fast curated orchestration", () => {
     const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
       ...citedPass(1, 120, "first-120"),
       ...citedPass(121, 120, "second-120"),
-      ...citedPass(241, 60, "final-60"),
+      ...citedPass(241, 110, "final-110"),
     ]);
 
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
@@ -1215,21 +1225,21 @@ describe("fast curated orchestration", () => {
       candidateLimit: 120,
     });
     expect(JSON.parse(String(orchestrator.calls[2]!.body.input))).toMatchObject({
-      minimumCandidateCount: 60,
-      candidateLimit: 75,
+      minimumCandidateCount: 110,
+      candidateLimit: 120,
     });
-    expect(persistedCandidates).toHaveLength(300);
+    expect(persistedCandidates).toHaveLength(350);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
-      Array.from({ length: 300 }, (_, index) => index + 1),
+      Array.from({ length: 350 }, (_, index) => index + 1),
     );
-    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(300);
-    expect(matchingCandidateCounts).toEqual([300]);
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(350);
+    expect(matchingCandidateCounts).toEqual([350]);
     expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
       status: "complete",
-      extractedCandidateCount: 300,
-      citationEligibleCandidateCount: 300,
+      extractedCandidateCount: 350,
+      citationEligibleCandidateCount: 350,
       rejectedCandidateCount: 0,
-      candidateGoal: 300,
+      candidateGoal: 350,
       reserveShortfall: 0,
       shortfall: 0,
     });
@@ -1327,9 +1337,9 @@ describe("fast curated orchestration", () => {
         relationship: "historically influential in the scene",
       },
       publicationTrackCount: 50,
-      internalCandidateGoal: 75,
-      minimumCandidateCount: 75,
-      candidateLimit: 75,
+      internalCandidateGoal: 88,
+      minimumCandidateCount: 88,
+      candidateLimit: 88,
     });
     expect(initialResearchInput).not.toHaveProperty("brief");
     expect(initialResearchInput).not.toHaveProperty("finalPlaylistTargetSize");
@@ -1341,27 +1351,27 @@ describe("fast curated orchestration", () => {
     expect(refillResearchInput).toMatchObject({
       researchScope: { subjectEntities: ["Berlin techno"] },
       publicationTrackCount: 50,
-      internalCandidateGoal: 75,
-      minimumCandidateCount: 47,
-      candidateLimit: 59,
+      internalCandidateGoal: 88,
+      minimumCandidateCount: 60,
+      candidateLimit: 75,
     });
     expect(refillResearchInput.excludedPairs).toContain("Performer 001 — Track 001");
     expect(refillResearchInput.excludedPairs).not.toContain("Rejected Artist — Rejected Container");
-    expect(persistedCandidates).toHaveLength(75);
+    expect(persistedCandidates).toHaveLength(88);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
-      Array.from({ length: 75 }, (_, index) => index + 1),
+      Array.from({ length: 88 }, (_, index) => index + 1),
     );
-    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(75);
-    expect(matchingCandidateCounts).toEqual([75]);
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(88);
+    expect(matchingCandidateCounts).toEqual([88]);
     expect(frontier.filter((item) => item.sourceClass === "fast_policy").at(-1)).toMatchObject({
       status: "complete",
-      discoveredCount: 75,
-      recoveredCount: 75,
+      discoveredCount: 88,
+      recoveredCount: 88,
     });
     expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
       status: "complete",
-      citationEligibleCandidateCount: 75,
-      candidateGoal: 75,
+      citationEligibleCandidateCount: 88,
+      candidateGoal: 88,
       reserveShortfall: 0,
       shortfall: 0,
     });
@@ -1461,7 +1471,7 @@ describe("fast curated orchestration", () => {
 });
 
 describe("durable research segmentation", () => {
-  test("hands a deep 300-track curated request to gap analysis with its 450-candidate matching reserve", async () => {
+  test("hands a deep 300-track curated request to gap analysis with its 525-candidate matching reserve", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("curated", { min: 300, max: 300 });
     state.run.phase = "gap_analysis";
@@ -1483,7 +1493,7 @@ describe("durable research segmentation", () => {
     expect(orchestrator.calls).toHaveLength(1);
     const call = orchestrator.calls[0]!;
     expect(call.body.instructions).toContain(
-      "publishes 300 tracks, but research must build an internal pool of 450 evidence-eligible candidates",
+      "publishes 300 tracks, but research must build an internal pool of 525 evidence-eligible candidates",
     );
     expect(call.body.instructions).toContain(
       "brief.targetSize is the user-visible publication count, not a research cap",
@@ -1495,8 +1505,8 @@ describe("durable research segmentation", () => {
         targetSize: { min: 300, max: 300 },
       },
       publicationTrackCount: 300,
-      internalCandidateGoal: 450,
-      internalCandidateShortfall: 130,
+      internalCandidateGoal: 525,
+      internalCandidateShortfall: 205,
       coverage: {
         eligibleCandidateCount: 320,
       },
