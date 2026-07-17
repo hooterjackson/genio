@@ -3,7 +3,15 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
-export function SiteMenu() {
+export function SiteMenu({
+  action,
+}: {
+  action?: {
+    label: string;
+    onClick: () => void;
+    disabled?: boolean;
+  };
+} = {}) {
   const [hydrated, setHydrated] = useState(false);
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -88,6 +96,19 @@ export function SiteMenu() {
       </button>
       {open && (
         <nav ref={panelRef} id="site-menu-panel" className="site-menu-panel" aria-label="Site menu">
+          {action && (
+            <button
+              type="button"
+              className="site-menu-mobile-action"
+              disabled={action.disabled}
+              onClick={() => {
+                setOpen(false);
+                action.onClick();
+              }}
+            >
+              {action.label}
+            </button>
+          )}
           <Link href="/feedback" onClick={preserveSourcePage}>SUBMIT BUG OR IMPROVEMENT</Link>
           <Link href="/privacy" onClick={() => setOpen(false)}>PRIVACY</Link>
         </nav>

@@ -4,9 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GENIO_ASCII_WORDMARK } from "./brand-wordmark";
 
 const INTRO_SESSION_KEY = "9enio:brand-intro:v2";
-const CHARACTER_INTERVAL_MS = 10;
-const COMPLETION_HOLD_MS = 500;
-const FADE_DURATION_MS = 180;
+const CHARACTER_INTERVAL_MS = 22;
+const COMPLETION_HOLD_MS = 700;
+const FADE_DURATION_MS = 240;
 
 type IntroPhase = "checking" | "visible" | "leaving" | "hidden";
 

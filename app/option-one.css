@@ -98,6 +98,7 @@ summary:focus-visible {
   min-width: 0;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 18px;
   color: var(--muted);
 }
@@ -106,7 +107,13 @@ summary:focus-visible {
   min-width: 0;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: clamp(18px, 3vw, 38px);
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  transform: translate(-50%, -50%);
 }
 
 .primary-nav a,
@@ -116,6 +123,7 @@ summary:focus-visible {
   padding: 0 0 3px;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   border: 0;
   border-bottom: 3px solid transparent;
   color: var(--faint);
@@ -123,8 +131,10 @@ summary:focus-visible {
   font-size: 12px;
   font-weight: 800;
   letter-spacing: .09em;
+  line-height: 1;
   text-decoration: none;
   white-space: nowrap;
+  pointer-events: auto;
 }
 
 .primary-nav a:hover,
@@ -169,17 +179,32 @@ summary:focus-visible {
   top: calc(100% + 10px);
 }
 
-.site-menu-panel a {
+.site-menu-panel a,
+.site-menu-panel button {
   min-height: 54px;
   padding: 0 16px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
   color: var(--muted);
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
   border-bottom-color: var(--line);
   font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-align: left;
 }
 
-.site-menu-panel a:hover {
+.site-menu-panel a:hover,
+.site-menu-panel button:hover:not(:disabled) {
   color: var(--ink);
   background: var(--surface-2);
+}
+
+.site-menu-mobile-action {
+  display: none !important;
 }
 
 .transfer-button {
@@ -1299,6 +1324,7 @@ summary:focus-visible {
 
   .primary-nav a,
   .primary-nav button {
+    min-width: 44px;
     font-size: 12px;
   }
 
@@ -1364,9 +1390,12 @@ summary:focus-visible {
     height: 44px;
   }
 
-  .site-header.has-transfer .primary-nav a:first-child,
-  .site-header.has-transfer .primary-nav a:nth-child(2) {
+  .site-header.has-transfer .transfer-button {
     display: none;
+  }
+
+  .site-menu-panel .site-menu-mobile-action {
+    display: flex !important;
   }
 
   .one-command-screen,
@@ -1391,37 +1420,48 @@ summary:focus-visible {
   }
 
   .one-command-body {
-    padding: 62px 0 max(64px, env(safe-area-inset-bottom));
+    padding: 20px 0 calc(92px + env(safe-area-inset-bottom));
   }
 
   .command-hero h1 {
-    font-size: clamp(34px, 10vw, 44px);
+    font-size: clamp(31px, 9vw, 38px);
+    line-height: 1.02;
   }
 
   .command-hero .command-lead {
-    font-size: 19px;
+    margin-top: 12px;
+    font-size: 16px;
+    line-height: 1.35;
   }
 
-  .command-hero p {
-    margin-top: 22px;
-    font-size: 14px;
+  .command-hero p:not(.command-lead) {
+    display: none;
   }
 
   .one-command-form {
-    margin-top: 44px;
+    margin-top: 20px;
   }
 
   .one-command-request {
-    min-height: 280px;
+    height: 124px;
+    min-height: 124px;
+    grid-template-rows: minmax(0, 1fr) auto;
   }
 
   .one-command-request textarea {
-    padding: 24px 20px;
-    font-size: 17px;
+    height: 100%;
+    min-height: 0;
+    padding: 16px 18px 8px;
+    font-size: 16px;
+    line-height: 1.45;
+  }
+
+  .one-command-request > small {
+    padding: 0 14px 8px;
   }
 
   .command-size-section {
-    margin-top: 48px;
+    margin-top: 18px;
   }
 
   .command-size-section > h2 {
@@ -1429,13 +1469,13 @@ summary:focus-visible {
   }
 
   .count-presets {
-    margin-top: 14px;
+    margin-top: 8px;
   }
 
   .count-presets button {
-    min-height: 62px;
-    padding-bottom: 8px;
-    font-size: 20px;
+    min-height: 48px;
+    padding-bottom: 6px;
+    font-size: 18px;
   }
 
   .count-presets .custom-count-trigger {
@@ -1443,7 +1483,15 @@ summary:focus-visible {
   }
 
   .command-create-section {
-    margin-top: 52px;
+    margin: 0;
+    padding: 10px 16px max(10px, env(safe-area-inset-bottom));
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 24;
+    border-top: 1px solid var(--line);
+    background: var(--bg);
   }
 
   .one-command-submit,
@@ -1453,6 +1501,10 @@ summary:focus-visible {
   .feedback-submit {
     min-height: 64px;
     font-size: 12px;
+  }
+
+  .one-command-submit {
+    min-height: 56px;
   }
 
   .guided-question-body {
@@ -1591,15 +1643,15 @@ summary:focus-visible {
 
 @media (max-width: 360px) {
   .wordmark {
-    min-width: 88px;
+    min-width: 70px;
   }
 
   .brand-wordmark-art {
-    font-size: 4.5px;
+    font-size: 3.8px;
   }
 
   .primary-nav {
-    gap: 7px;
+    gap: 2px;
   }
 
   .primary-nav a,

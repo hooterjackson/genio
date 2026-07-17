@@ -16,6 +16,7 @@ export function PrimaryNav({
   return (
     <nav className="primary-nav" aria-label="Primary navigation">
       <Link
+        data-nav-item="create"
         className={active === "create" ? "is-current" : undefined}
         href="/"
         aria-current={active === "create" ? "page" : undefined}
@@ -27,15 +28,20 @@ export function PrimaryNav({
       >
         CREATE
       </Link>
-      <Link className={active === "explore" ? "is-current" : undefined} href="/playlists" aria-current={active === "explore" ? "page" : undefined}>
+      <Link
+        data-nav-item="explore"
+        className={active === "explore" ? "is-current" : undefined}
+        href="/playlists"
+        aria-current={active === "explore" ? "page" : undefined}
+      >
         EXPLORE
       </Link>
       {onJobs ? (
-        <button className={active === "jobs" ? "is-current" : undefined} type="button" onClick={onJobs} aria-current={active === "jobs" ? "page" : undefined}>
+        <button data-nav-item="jobs" className={active === "jobs" ? "is-current" : undefined} type="button" onClick={onJobs} aria-current={active === "jobs" ? "page" : undefined}>
           JOBS
         </button>
       ) : (
-        <Link className={active === "jobs" ? "is-current" : undefined} href="/?view=jobs" aria-current={active === "jobs" ? "page" : undefined}>
+        <Link data-nav-item="jobs" className={active === "jobs" ? "is-current" : undefined} href="/?view=jobs" aria-current={active === "jobs" ? "page" : undefined}>
           JOBS
         </Link>
       )}

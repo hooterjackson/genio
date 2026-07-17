@@ -669,7 +669,13 @@ function AppHeader({
             {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
           </button>
         )}
-        <SiteMenu />
+        <SiteMenu
+          action={onTransfer ? {
+            label: transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB",
+            onClick: onTransfer,
+            disabled: transferState === "busy",
+          } : undefined}
+        />
       </div>
     </header>
   );
@@ -809,7 +815,7 @@ function OneCommandScreen({
                 onChange={(event) => onPrompt(event.target.value)}
                 onFocus={() => setFocused(true)}
                 onBlur={() => setFocused(false)}
-                rows={9}
+                rows={5}
                 maxLength={2000}
                 spellCheck
                 required
