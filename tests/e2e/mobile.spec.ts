@@ -322,6 +322,14 @@ test("the gênio intro is omitted when reduced motion is requested", async ({ pa
   await expect(requestField(page)).toBeVisible();
 });
 
+test("the gênio intro returns keyboard focus to the composer after automatic completion", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.goto("/");
+  await expect(page.getByTestId("brand-intro")).toBeVisible();
+  await expect(page.getByTestId("brand-intro")).toHaveCount(0, { timeout: 5_000 });
+  await expect(requestField(page)).toBeFocused();
+});
+
 test("the one-command composer remains usable at mobile widths", async ({ page }) => {
   await openPrompt(page);
   await expect(page.getByText("Describe what you want to hear.")).toBeVisible();

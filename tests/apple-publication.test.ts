@@ -1078,7 +1078,7 @@ test("the production publisher completes a locked manifest through the real Appl
   }));
 });
 
-test("the production publisher executes a 6,000-track plan across six exact volumes", async () => {
+test("the production publisher executes a 6,000-track plan across six exact volumes", { timeout: 30_000 }, async () => {
   const base = lockedManifest(6_000, "manifest-six-thousand");
   const tracks = base.tracks.map((track) => ({ ...track }));
   tracks[24]!.catalogId = "777777";
@@ -1184,6 +1184,15 @@ test("the production publisher executes a 6,000-track plan across six exact volu
     /\/tracks$/u.test(new URL(String(input)).pathname)
     && String((init as RequestInit | undefined)?.method ?? "GET").toUpperCase() === "POST"
   ))).toHaveLength(241); // 240 accepted batches plus one indeterminate 429 on the abandoned playlist.
+  const orderedTrackReads = fetchMock.mock.calls.filter(([input, init]) => (
+    /\/tracks$/u.test(new URL(String(input)).pathname)
+    && String((init as RequestInit | undefined)?.method ?? "GET").toUpperCase() === "GET"
+  )).length;
+  // Keep the scale test's timeout isolated from ordinary unit tests while
+  // retaining a deterministic performance guard. Wall-clock timing becomes
+  // noisy under V8 coverage and shared CI runners; bounded Apple reads catch
+  // reconciliation or pagination regressions without depending on host speed.
+  expect(orderedTrackReads).toBeLessThanOrEqual(1_350);
   expect(playlistStates.get("p.volume-2")).toEqual([]);
   for (const volume of result.volumes) {
     expect(playlistStates.get(volume.playlistId)).toEqual(

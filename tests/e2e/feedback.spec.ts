@@ -44,7 +44,11 @@ test("visitors can open the mobile-safe menu and submit private feedback", async
   await expect(page.getByRole("img", { name: /screenshot ready/i })).toBeVisible();
   await page.getByRole("button", { name: /submit feedback/i }).click();
 
-  await expect(page.getByRole("heading", { name: "Thank you" })).toBeVisible();
+  const confirmation = page.getByRole("status");
+  const confirmationHeading = page.getByRole("heading", { name: "Thank you" });
+  await expect(confirmation).toContainText("private owner inbox");
+  await expect(confirmationHeading).toBeVisible();
+  await expect(confirmationHeading).toBeFocused();
   expect(idempotencyKey.length).toBeGreaterThan(8);
   expect(submitted).toMatchObject({
     kind: "improvement",

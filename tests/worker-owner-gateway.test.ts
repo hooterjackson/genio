@@ -91,6 +91,40 @@ describe("Sites owner gateway boundary", () => {
     expect(response.headers.get("referrer-policy")).toBe("no-referrer");
   });
 
+  test("a Node preview without the explicit local-QA opt-in cannot consume process gateway secrets", async () => {
+    const names = [
+      "GENIO_QA_LOCAL_PREVIEW",
+      "RAILWAY_API_BASE",
+      "GATEWAY_KEY_ID",
+      "GATEWAY_HMAC_SECRET",
+      "IP_HASH_SECRET",
+      "OWNER_EMAIL",
+    ] as const;
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      delete process.env.GENIO_QA_LOCAL_PREVIEW;
+      process.env.RAILWAY_API_BASE = env.RAILWAY_API_BASE;
+      process.env.GATEWAY_KEY_ID = env.GATEWAY_KEY_ID;
+      process.env.GATEWAY_HMAC_SECRET = env.GATEWAY_HMAC_SECRET;
+      process.env.IP_HASH_SECRET = env.IP_HASH_SECRET;
+      process.env.OWNER_EMAIL = env.OWNER_EMAIL;
+
+      const response = await worker.fetch(apiRequest("/api/v1/owner/apple/authorization/validate", {
+        "OAI-Authenticated-User-Email": "owner@example.com",
+      }), undefined, ctx);
+
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({ error: "Owner allowlist is not configured." });
+      expect(upstreamFetch).not.toHaveBeenCalled();
+    } finally {
+      for (const name of names) {
+        const value = original[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   test("the owner can retry the saved Apple authorization through the signed gateway", async () => {
     const response = await worker.fetch(apiRequest("/api/v1/owner/apple/authorization/validate", {
       "OAI-Authenticated-User-Email": "owner@example.com",

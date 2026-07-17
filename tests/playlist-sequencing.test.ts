@@ -5,6 +5,7 @@ import {
   shouldSequencePlaylist,
   type PlaylistSequenceTrack,
 } from "../lib/playlist-sequencing.ts";
+import { selectRankedPlaylistRows } from "../lib/playlist-selection.ts";
 
 interface FixtureTrack extends PlaylistSequenceTrack {
   rowId: string;
@@ -32,6 +33,48 @@ function adjacentMatches(
 }
 
 describe("deterministic playlist sequencing", () => {
+  test("uses the accepted reserve to diversify similar-to playlists before sequencing", () => {
+    const ranked = [
+      ...Array.from({ length: 30 }, (_, index) => track(`a-${index}`, "Adjacent Artist A", `A-${index % 3}`)),
+      ...Array.from({ length: 10 }, (_, index) => track(`b-${index}`, "Adjacent Artist B", `B-${index % 2}`)),
+      ...Array.from({ length: 10 }, (_, index) => track(`c-${index}`, "Adjacent Artist C", `C-${index % 2}`)),
+      ...Array.from({ length: 25 }, (_, index) => track(`other-${index}`, `Discovery ${index}`, `D-${index}`)),
+    ];
+
+    const selection = selectRankedPlaylistRows(ranked, 50, { diversifyArtists: true });
+    const output = sequencePlaylist(selection.selected);
+    const counts = output.reduce<Map<string, number>>((result, row) => {
+      result.set(row.artist, (result.get(row.artist) ?? 0) + 1);
+      return result;
+    }, new Map());
+
+    expect(selection.selected).toHaveLength(50);
+    expect(selection.overflow).toHaveLength(25);
+    expect(new Set([...selection.selected, ...selection.overflow].map((row) => row.rowId)).size)
+      .toBe(ranked.length);
+    expect(counts.get("Adjacent Artist A")).toBeLessThan(30);
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(9);
+    expect(adjacentMatches(output, "artist")).toBe(0);
+  });
+
+  test("does not diversify a direct-artist catalogue and still fills sparse similarity pools exactly", () => {
+    const direct = Array.from({ length: 75 }, (_, index) => track(
+      `direct-${index}`,
+      "One Requested Artist",
+      `Album ${Math.floor(index / 10)}`,
+    ));
+    expect(selectRankedPlaylistRows(direct, 50).selected.map((row) => row.rowId))
+      .toEqual(direct.slice(0, 50).map((row) => row.rowId));
+
+    const sparse = [
+      ...Array.from({ length: 60 }, (_, index) => track(`dominant-${index}`, "Only Deep Catalogue", "Archive")),
+      ...Array.from({ length: 15 }, (_, index) => track(`other-${index}`, `Other ${index}`, "Compilation")),
+    ];
+    const result = selectRankedPlaylistRows(sparse, 50, { diversifyArtists: true });
+    expect(result.selected).toHaveLength(50);
+    expect(result.overflow).toHaveLength(25);
+  });
+
   test("sequences listening-flow policies while preserving explicit fixed orders", () => {
     expect(shouldSequencePlaylist("editorial flow", "curated")).toBe(true);
     expect(shouldSequencePlaylist("smooth energy arc", "curated")).toBe(true);

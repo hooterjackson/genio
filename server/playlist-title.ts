@@ -1,10 +1,11 @@
 import type { PlaylistBrief } from "../shared/types.ts";
+import { excludedReferenceArtists } from "./similarity-policy.ts";
 
 export const PLAYLIST_TITLE_MAX_LENGTH = 60;
 
 type PlaylistTitleContext = Pick<
   PlaylistBrief,
-  "mode" | "subjectEntities" | "relationship" | "targetSize"
+  "mode" | "subjectEntities" | "relationship" | "targetSize" | "exclude"
 >;
 
 const PROMPT_LEAD = /^(?:(?:please|can you|could you|would you|i want you to|i(?:'|’)d like you to)\s+)*(?:(?:give|show|find|make|build|create|generate|assemble|compile|research|put together)\s+(?:me\s+)?)?/iu;
@@ -73,8 +74,53 @@ function exactTargetCount(context: PlaylistTitleContext): number | null {
   return target && target.min === target.max ? target.max : null;
 }
 
+function isSimilarityContext(context: PlaylistTitleContext): boolean {
+  return /stylistically similar|sounds? like|similar to|in (?:the )?(?:style|vein) of|for fans of|adjacent/iu
+    .test(context.relationship);
+}
+
+function normalizedTitleIdentity(value: string): string {
+  return cleanInlineText(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+function similarityReferenceSubjects(context: PlaylistTitleContext): string[] {
+  const references = excludedReferenceArtists(context);
+  const source = references.length > 0 ? references : context.subjectEntities;
+  return source
+    .map(cleanInlineText)
+    .filter(Boolean)
+    .filter((subject, index, all) => all.findIndex(
+      (other) => normalizedTitleIdentity(other) === normalizedTitleIdentity(subject),
+    ) === index);
+}
+
+function isMisleadingSimilarityTitle(candidate: string, context: PlaylistTitleContext): boolean {
+  if (!isSimilarityContext(context)) return false;
+  const candidateIdentity = normalizedTitleIdentity(candidate);
+  if (!candidateIdentity) return true;
+  if (/\b(?:sounds? like|similar to|in (?:the )?(?:style|vein) of|for fans of)\b/iu.test(candidate)) {
+    return true;
+  }
+  return similarityReferenceSubjects(context).some((subject) => {
+    const subjectIdentity = normalizedTitleIdentity(subject);
+    if (!subjectIdentity) return false;
+    if (candidateIdentity === subjectIdentity) return true;
+    if (!candidateIdentity.startsWith(`${subjectIdentity} `)) return false;
+    const remainder = candidateIdentity.slice(subjectIdentity.length).trim();
+    return /^(?:\d+\s+)?(?:essentials?|essential tracks|selected tracks|songs|tracks|playlist|mix)$/u
+      .test(remainder);
+  });
+}
+
 function fallbackDescriptor(context: PlaylistTitleContext): string {
   const relationship = context.relationship.toLocaleLowerCase();
+  if (isSimilarityContext(context)) return "Similar Tracks";
   if (/influen|important|landmark/u.test(relationship)) return "Influential Tracks";
   if (/essential|representative|canonical/u.test(relationship)) return "Essential Tracks";
   if (/collab|duet|recorded together|performed together/u.test(relationship)) return "Collaborations";
@@ -93,7 +139,9 @@ function fallbackDescriptor(context: PlaylistTitleContext): string {
 }
 
 function fallbackTitle(context: PlaylistTitleContext): string {
-  const subjects = context.subjectEntities
+  const subjects = (isSimilarityContext(context)
+    ? similarityReferenceSubjects(context)
+    : context.subjectEntities)
     .map(cleanInlineText)
     .filter(Boolean)
     .filter((subject, index, all) => all.findIndex((other) => other.toLocaleLowerCase() === subject.toLocaleLowerCase()) === index);
@@ -103,16 +151,18 @@ function fallbackTitle(context: PlaylistTitleContext): string {
   // Two named subjects are material for comparisons and collaborations. Keep
   // both when they fit; broader entity lists fall back to the primary subject.
   const joinedSubject = subjects.length === 2 ? `${subjects[0]} + ${subjects[1]}` : primarySubject;
-  const complete = `${joinedSubject}: ${qualifier}`;
+  const displaySubject = isSimilarityContext(context) ? `Beyond ${joinedSubject}` : joinedSubject;
+  const complete = `${displaySubject}: ${qualifier}`;
   if (codePointLength(complete) <= PLAYLIST_TITLE_MAX_LENGTH) return complete;
 
-  const primaryComplete = `${primarySubject}: ${qualifier}`;
+  const primaryDisplaySubject = isSimilarityContext(context) ? `Beyond ${primarySubject}` : primarySubject;
+  const primaryComplete = `${primaryDisplaySubject}: ${qualifier}`;
   if (codePointLength(primaryComplete) <= PLAYLIST_TITLE_MAX_LENGTH) return primaryComplete;
 
   const shortQualifier = `${count === null ? "" : `${count} `}Tracks`;
   const suffix = `: ${shortQualifier}`;
   const available = Math.max(8, PLAYLIST_TITLE_MAX_LENGTH - codePointLength(suffix));
-  return `${truncateTitle(primarySubject, available)}${suffix}`;
+  return `${truncateTitle(primaryDisplaySubject, available)}${suffix}`;
 }
 
 function beginsWithScopeCount(value: string, context: PlaylistTitleContext): boolean {
@@ -142,6 +192,7 @@ export function normalizePlaylistTitle(value: string, context: PlaylistTitleCont
     || GENERIC_OR_SCOPE_LEAD.test(candidate)
     || beginsWithScopeCount(candidate, context)
     || editorialPromptTitle
+    || isMisleadingSimilarityTitle(candidate, context)
     || codePointLength(candidate) > PLAYLIST_TITLE_MAX_LENGTH
     || wordCount(candidate) > MAX_EDITORIAL_WORDS
     || (hadCommandLead && /\b(?:that|which|whose|where)\b/iu.test(candidate));

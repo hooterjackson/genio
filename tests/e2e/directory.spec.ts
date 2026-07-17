@@ -115,6 +115,29 @@ test("the primary Create, Explore, and Jobs navigation remains clear across publ
   await expect(page.getByRole("link", { name: "JOBS", exact: true })).toHaveAttribute("href", "/?view=jobs");
 });
 
+test("the public navigation restores the Jobs view from its URL and returns to Create", async ({ page }) => {
+  await page.route("**/api/v1/runs", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    });
+  });
+
+  await page.goto("/?view=jobs");
+  await expect(page).toHaveURL(/\?view=jobs$/u);
+  await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "JOBS", exact: true })).toHaveAttribute("aria-current", "page");
+
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "JOBS", exact: true })).toHaveAttribute("aria-current", "page");
+
+  await page.getByRole("link", { name: "CREATE", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByRole("textbox", { name: /playlist request/i })).toBeVisible();
+});
+
 test("directory pagination updates the public URL and loads the selected page", async ({ page }) => {
   await page.route("**/api/v1/playlists?*", async (route) => {
     const requestedPage = Number.parseInt(new URL(route.request().url()).searchParams.get("page") ?? "1", 10);
@@ -144,6 +167,64 @@ test("directory pagination updates the public URL and loads the selected page", 
   await expect(page.getByRole("button", { name: "NEXT →" })).toBeDisabled();
   await page.getByRole("button", { name: "← PREVIOUS" }).click();
   await expect(page).toHaveURL(/\/playlists$/u);
+});
+
+test("an out-of-range public directory URL is clamped to the last available page", async ({ page }) => {
+  await page.route("**/api/v1/playlists?*", async (route) => {
+    const requestedPage = Number.parseInt(new URL(route.request().url()).searchParams.get("page") ?? "1", 10);
+    const payload = requestedPage === 2
+      ? {
+          items: [{
+            ...pageOne.items[0],
+            id: "playlist-last-page",
+            title: "Last Available Page",
+          }],
+          page: 2,
+          pageSize: 12,
+          total: 13,
+          totalPages: 2,
+        }
+      : {
+          items: [],
+          page: requestedPage,
+          pageSize: 12,
+          total: 13,
+          totalPages: 2,
+        };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(payload) });
+  });
+
+  await page.goto("/playlists?page=99");
+  await expect(page).toHaveURL(/\/playlists\?page=2$/u);
+  await expect(page.getByText("PAGE 2 / 2")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Last Available Page" })).toBeVisible();
+  await expect(page.getByText("NO PLAYLISTS YET.")).toHaveCount(0);
+});
+
+test("a partially published multi-volume playlist reports every unavailable Apple link", async ({ page }) => {
+  await page.route("**/api/v1/playlists?*", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          ...pageOne.items[0],
+          id: "playlist-partial",
+          title: "Partially Published Playlist",
+          volumeCount: 2,
+          volumes: [pageOne.items[0].volumes[0]],
+        }],
+        page: 1,
+        pageSize: 12,
+        total: 1,
+        totalPages: 1,
+      }),
+    });
+  });
+
+  await page.goto("/playlists");
+  await expect(page.getByRole("link", { name: /open .* in apple music/i })).toHaveCount(1);
+  await expect(page.getByText("1 APPLE LINK UNAVAILABLE")).toBeVisible();
 });
 
 test("directory loading, empty, and retry states remain explicit", async ({ page }) => {

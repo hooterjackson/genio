@@ -1118,6 +1118,29 @@ databaseDescribe("hosted backend integration", () => {
     ]));
   });
 
+  test("serializes rolling rate limits when daily client-bucket alias sets overlap", async () => {
+    const sharedBucket = `shared-rate-limit-${randomUUID()}`;
+    const olderBucket = `older-rate-limit-${randomUUID()}`;
+    const newerBucket = `newer-rate-limit-${randomUUID()}`;
+    const attempts = await Promise.allSettled([
+      repository.consumeRateLimit([sharedBucket, olderBucket], "mutation", 1, 24),
+      repository.consumeRateLimit([sharedBucket, newerBucket], "mutation", 1, 24),
+    ]);
+
+    expect(attempts.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(attempts.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(attempts.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { statusCode: 429, code: "rate_limited" },
+    });
+
+    const count = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) AND action='mutation'`,
+      [[sharedBucket, olderBucket, newerBucket]],
+    );
+    expect(count.rows[0]!.count).toBe(1);
+  });
+
   test("owner brief and run requests bypass visitor quotas without consuming visitor events", async () => {
     const briefBucket = `owner-brief-limit-${randomUUID()}`;
     const createBrief = (label: string, bypassVisitorRateLimit?: boolean) => repository.createBriefRequest({

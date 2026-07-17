@@ -43,9 +43,31 @@
       "expectedExcludedReferenceArtists": ["Prefuse 73"]
     },
     {
+      "id": "RC-P05",
+      "category": "count_control",
+      "prompt": "A very long six-hour playlist for a 2027 reunion with 80 guests and music spanning 1965 to 2025.",
+      "requestedTrackCount": null,
+      "subjectEntities": ["reunion music"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 100,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-P06",
+      "category": "count_control",
+      "prompt": "A 12-hour ambient set for 40 people, drawing on recordings from 1978 to 1994.",
+      "requestedTrackCount": 75,
+      "subjectEntities": ["ambient music"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 75,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
       "id": "RC-S01",
       "category": "similarity",
       "prompt": "Music that sounds like Radiohead.",
+      "proposedTitle": "Radiohead Essentials",
+      "expectedTitle": "Beyond Radiohead: 50 Similar Tracks",
       "requestedTrackCount": 50,
       "subjectEntities": ["Radiohead"],
       "expectedMode": "curated",
@@ -61,6 +83,18 @@
       "expectedMode": "curated",
       "expectedTrackCount": 50,
       "expectedExcludedReferenceArtists": ["Jorge Ben Jor"]
+    },
+    {
+      "id": "RC-S03",
+      "category": "similarity",
+      "prompt": "Music for fans of Radiohead and Björk, but only by other artists.",
+      "proposedTitle": "The Essentials",
+      "expectedTitle": "Beyond Radiohead + Björk: 40 Similar Tracks",
+      "requestedTrackCount": 40,
+      "subjectEntities": ["Radiohead", "Björk", "other artists"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 40,
+      "expectedExcludedReferenceArtists": ["Radiohead", "Björk"]
     },
     {
       "id": "RC-E01",
@@ -160,6 +194,26 @@
       "subjectEntities": ["North American minimal synth"],
       "expectedMode": "curated",
       "expectedTrackCount": 30,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E11",
+      "category": "esoteric_similarity",
+      "prompt": "808 State-adjacent acid house, but no 808 State — 35 tracks.",
+      "requestedTrackCount": 35,
+      "subjectEntities": ["808 State", "acid house"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 35,
+      "expectedExcludedReferenceArtists": ["808 State"]
+    },
+    {
+      "id": "RC-E12",
+      "category": "esoteric_editorial",
+      "prompt": "A two-hour survey of Sahrawi electric-guitar recordings from 1975 to 1995 for 12 listeners.",
+      "requestedTrackCount": 40,
+      "subjectEntities": ["Sahrawi electric-guitar music"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 40,
       "expectedExcludedReferenceArtists": []
     },
     {

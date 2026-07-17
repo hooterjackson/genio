@@ -20,6 +20,8 @@ interface PromptCorpusScenario {
   expectedMode: ExpectedMode;
   expectedTrackCount: number | null;
   expectedExcludedReferenceArtists: string[];
+  proposedTitle?: string;
+  expectedTitle?: string;
 }
 
 const fixture = corpus as unknown as {
@@ -31,7 +33,7 @@ const fixture = corpus as unknown as {
 function interpretedBrief(scenario: PromptCorpusScenario): PlaylistBrief {
   const exhaustive = scenario.requestedTrackCount === null;
   return {
-    title: "Offline QA fixture",
+    title: scenario.proposedTitle ?? "Offline QA fixture",
     description: "A deliberately adversarial model interpretation for offline policy QA.",
     mode: exhaustive ? "exhaustive" : "hybrid",
     subjectEntities: scenario.subjectEntities,
@@ -83,10 +85,32 @@ describe("release-candidate esoteric prompt policy corpus", () => {
     }
     expect(excludedReferenceArtists(canonical))
       .toEqual(expect.arrayContaining(scenario.expectedExcludedReferenceArtists));
+    if (scenario.expectedTitle) expect(canonical.title).toBe(scenario.expectedTitle);
   });
 
   test("the UI size control wins over prompt prose and unrelated numbers", () => {
-    for (const id of ["RC-P01", "RC-P02", "RC-P03", "RC-P04"]) {
+    for (const id of ["RC-P01", "RC-P02", "RC-P03", "RC-P04", "RC-P06", "RC-E12"]) {
+      const scenario = fixture.scenarios.find((row) => row.id === id)!;
+      const canonical = canonicalBriefForRequest({
+        prompt: scenario.prompt,
+        requestedTrackCount: scenario.requestedTrackCount,
+      }, interpretedBrief(scenario));
+      expect(canonical.targetSize).toEqual({
+        min: scenario.expectedTrackCount,
+        max: scenario.expectedTrackCount,
+      });
+    }
+  });
+
+  test("duration, year, audience-size, and numeric artist names never become track counts", () => {
+    const missingCount = fixture.scenarios.find((row) => row.id === "RC-P05")!;
+    const missingCountBrief = canonicalBriefForRequest(
+      { prompt: missingCount.prompt },
+      interpretedBrief(missingCount),
+    );
+    expect(missingCountBrief.targetSize).toEqual({ min: 100, max: 100 });
+
+    for (const id of ["RC-P06", "RC-E11", "RC-E12"]) {
       const scenario = fixture.scenarios.find((row) => row.id === id)!;
       const canonical = canonicalBriefForRequest({
         prompt: scenario.prompt,

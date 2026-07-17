@@ -198,7 +198,8 @@ export function PlaylistDirectory() {
                   .map((volume) => ({ ...volume, safeUrl: applePlaylistUrl(volume.shareUrl) }))
                   .filter((volume) => volume.safeUrl !== null)
                   .sort((left, right) => left.volumeNumber - right.volumeNumber);
-                const missingVolumeCount = Math.max(0, playlist.volumes.length - validVolumes.length);
+                const expectedVolumeCount = Math.max(playlist.volumeCount, playlist.volumes.length);
+                const missingVolumeCount = Math.max(0, expectedVolumeCount - validVolumes.length);
                 return (
                   <li key={playlist.id}>
                     <article className="directory-playlist">

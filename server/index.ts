@@ -43,6 +43,7 @@ import {
   parseFeedbackStatus,
   parseFeedbackSubmission,
 } from "./feedback.ts";
+import { positiveIntegerQuery } from "./api-validation.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -112,18 +113,6 @@ function uuid(value: unknown, label = "ID"): string {
     throw new HttpError(400, `${label} is invalid`, "invalid_id");
   }
   return value;
-}
-
-function positiveIntegerQuery(value: unknown, fallback: number, label: string, maximum: number): number {
-  if (value === undefined) return fallback;
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) {
-    throw new HttpError(400, `${label} is invalid`, "invalid_pagination");
-  }
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed > maximum) {
-    throw new HttpError(400, `${label} is invalid`, "invalid_pagination");
-  }
-  return parsed;
 }
 
 function idempotencyKey(request: FastifyRequest, bodyKey?: unknown): string {
@@ -512,16 +501,20 @@ app.post<{ Params: { id: string } }>("/api/v1/runs/:id/capabilities/transfer", a
 app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: string } }>("/api/v1/runs/:id/exceptions", async (request) => {
   const accessId = uuid(request.params.id, "Run ID");
   const session = await sessionForAccess(request, accessId);
-  return repository.listExceptions(session.runId, Number(request.query.page ?? 1), Number(request.query.pageSize ?? 20));
+  const page = positiveIntegerQuery(request.query.page, 1, "Page", 1_000_000);
+  const pageSize = positiveIntegerQuery(request.query.pageSize, 20, "Page size", 20);
+  return repository.listExceptions(session.runId, page, pageSize);
 });
 
 app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: string } }>("/api/v1/runs/:id/tracks", async (request) => {
   const accessId = uuid(request.params.id, "Run ID");
   const session = await sessionForAccess(request, accessId);
+  const page = positiveIntegerQuery(request.query.page, 1, "Page", 1_000_000);
+  const pageSize = positiveIntegerQuery(request.query.pageSize, 200, "Page size", 500);
   return repository.listCatalogTracks(
     session.runId,
-    Number(request.query.page ?? 1),
-    Number(request.query.pageSize ?? 200),
+    page,
+    pageSize,
   );
 });
 
@@ -620,7 +613,9 @@ app.get<{ Params: { id: string } }>("/api/v1/runs/:id/result", async (request) =
 app.get<{ Params: { id: string }; Querystring: { page?: string; pageSize?: string } }>("/api/v1/runs/:id/evidence", async (request) => {
   const accessId = uuid(request.params.id, "Run ID");
   const session = await sessionForAccess(request, accessId);
-  return repository.getEvidenceReport(session.runId, Number(request.query.page ?? 1), Number(request.query.pageSize ?? 50));
+  const page = positiveIntegerQuery(request.query.page, 1, "Page", 1_000_000);
+  const pageSize = positiveIntegerQuery(request.query.pageSize, 50, "Page size", 100);
+  return repository.getEvidenceReport(session.runId, page, pageSize);
 });
 
 app.delete<{ Params: { id: string } }>("/api/v1/runs/:id", async (request, reply) => {

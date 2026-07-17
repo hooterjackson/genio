@@ -192,6 +192,25 @@ describe("retained production searches", () => {
     });
   });
 
+  test("a failed retry can never relabel a partially assembled playlist as fail-closed", () => {
+    const result = assessProductionScenario({
+      requestedTrackCount: 100,
+      candidateCount: 150,
+      strictMatchedCount: 78,
+      accountedCandidateCount: 150,
+      manifestTrackCount: 78,
+      publishedTrackCount: 25,
+      totalCostUsd: 0.75,
+      activeWorkDurationMs: 150_000,
+      terminalStatus: "failed",
+      terminalPhase: "catalog_matching_shortfall",
+    }, "explicit_failure");
+
+    expect(result.releaseReady).toBe(false);
+    expect(result.failClosed).toBe(false);
+    expect(result.violations).toContain("failure_not_fail_closed");
+  });
+
   test("the release gate rejects prior cost, target-truncation, latency, and accounting failures", () => {
     const base = {
       requestedTrackCount: 300,
