@@ -304,7 +304,6 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
-    bypassVisitorRateLimit: isOwner(caller),
   });
   await capabilities.authorizeBrief(request, reply, created.id);
   if (created.status === "queued") {
@@ -459,7 +458,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     idempotencyKey: key,
     autoPublish: interpreted.requestedTrackCount !== null,
     capabilitySessionId: briefSession.id,
-    bypassVisitorRateLimit: isOwner(caller),
+    forceFreshResearch: isOwner(caller),
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
