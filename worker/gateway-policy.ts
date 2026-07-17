@@ -6,16 +6,18 @@ export type GatewayRouteRule = {
 
 export const DEFAULT_GATEWAY_BODY_LIMIT = 64 * 1024;
 export const BULK_SELECTION_BODY_LIMIT = 1024 * 1024;
+export const FEEDBACK_GATEWAY_BODY_LIMIT = 2 * 1024 * 1024;
 
 export function gatewayBodyLimit(method: string, pathname: string): number {
-  return method.toUpperCase() === "POST"
-    && /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/selection$/.test(pathname)
-    ? BULK_SELECTION_BODY_LIMIT
-    : DEFAULT_GATEWAY_BODY_LIMIT;
+  if (method.toUpperCase() !== "POST") return DEFAULT_GATEWAY_BODY_LIMIT;
+  if (/^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/selection$/.test(pathname)) return BULK_SELECTION_BODY_LIMIT;
+  if (pathname === "/api/v1/feedback") return FEEDBACK_GATEWAY_BODY_LIMIT;
+  return DEFAULT_GATEWAY_BODY_LIMIT;
 }
 
 const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/health\/live$/ },
+  { method: "POST", path: /^\/api\/v1\/feedback$/ },
   { method: "POST", path: /^\/api\/v1\/brief$/ },
   { method: "GET", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },
   { method: "POST", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+\/answers$/ },
@@ -36,9 +38,13 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/result$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/evidence$/ },
   { method: "GET", path: /^\/api\/v1\/owner\/(?:status|budgets|runs|apple\/developer-token|apple\/authorization|publications\/orphans)$/, owner: true },
+  { method: "GET", path: /^\/api\/v1\/owner\/feedback$/, owner: true },
+  { method: "GET", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+\/image$/, owner: true },
   { method: "POST", path: /^\/api\/v1\/owner\/(?:emergency-pause|retention\/run|apple\/authorization(?:\/validate)?)$/, owner: true },
+  { method: "POST", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+\/status$/, owner: true },
   { method: "POST", path: /^\/api\/v1\/owner\/runs\/[A-Za-z0-9_-]+\/(?:refresh|catalog-import|budget)$/, owner: true },
   { method: "DELETE", path: /^\/api\/v1\/owner\/apple\/authorization$/, owner: true },
+  { method: "DELETE", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+$/, owner: true },
 ];
 
 export function matchGatewayRoute(method: string, pathname: string): GatewayRouteRule | null {

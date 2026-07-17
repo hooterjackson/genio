@@ -11,6 +11,7 @@ import {
   fastRunWindowPhrase,
 } from "../shared/fast-run-sla.ts";
 import { BrandIntro } from "./brand-intro";
+import { SiteMenu } from "./site-menu";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
 
@@ -649,7 +650,6 @@ function AppHeader({
   onHome,
   onNew,
   onJobs,
-  showPrivacy = false,
 }: {
   step?: number;
   total?: number;
@@ -658,7 +658,6 @@ function AppHeader({
   onHome: () => void;
   onNew?: () => void;
   onJobs?: () => void;
-  showPrivacy?: boolean;
 }) {
   return (
     <header className="site-header">
@@ -668,7 +667,6 @@ function AppHeader({
       <div className="header-meta">
         {onNew && <button className="header-action" onClick={onNew}>NEW JOB</button>}
         {onJobs && <button className="header-action" onClick={onJobs}>JOBS</button>}
-        {showPrivacy && <a href="/privacy">PRIVACY</a>}
         {onTransfer && (
           <button className="transfer-button" onClick={onTransfer} disabled={transferState === "busy"}>
             {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
@@ -679,6 +677,7 @@ function AppHeader({
             {String(step).padStart(2, "0")}/{String(total).padStart(2, "0")}
           </span>
         )}
+        <SiteMenu />
       </div>
     </header>
   );
@@ -2248,7 +2247,7 @@ export function PlaylistBuilder() {
     return (
       <main className="app-shell one-command-shell">
         <BrandIntro />
-        <AppHeader onHome={reset} onJobs={() => void openJobs()} showPrivacy />
+        <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <OneCommandScreen
           prompt={prompt}

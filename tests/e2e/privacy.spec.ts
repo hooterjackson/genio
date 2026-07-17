@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 
 test("the public header opens the complete minimal privacy notice", async ({ page }) => {
   await page.goto("/");
+  await page.waitForTimeout(200);
+  await page.getByRole("button", { name: /open menu/i }).click();
   const privacyLink = page.getByRole("link", { name: /privacy/i });
   await expect(privacyLink).toBeVisible();
   await privacyLink.click();
@@ -17,6 +19,8 @@ test("the public header opens the complete minimal privacy notice", async ({ pag
   await expect(page.getByText(/OpenAI Sites serves the interface/i)).toBeVisible();
   await expect(page.getByText(/Railway runs and stores the service/i)).toBeVisible();
   await expect(page.getByText(/Resend alerts only the owner/i)).toBeVisible();
+  await expect(page.getByText(/submissions are private to the owner/i)).toBeVisible();
+  await expect(page.getByText(/not automatically sent to OpenAI/i)).toBeVisible();
   await expect(page.getByText(/Detailed run data is kept for 90 days/i)).toBeVisible();
   await expect(page.getByText(/cannot remove a playlist already published/i)).toBeVisible();
   await expect(page.getByText(/not directed to children/i)).toBeVisible();

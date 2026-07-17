@@ -14,6 +14,7 @@ import {
 import {
   BULK_SELECTION_BODY_LIMIT,
   DEFAULT_GATEWAY_BODY_LIMIT,
+  FEEDBACK_GATEWAY_BODY_LIMIT,
   forwardedCapabilityCookie,
   gatewayBodyLimit,
   isCrossSiteMutation,
@@ -158,6 +159,12 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/matching")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/selection")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/owner/runs/run-id/catalog-import")).toMatchObject({ owner: true });
+  expect(matchGatewayRoute("POST", "/api/v1/feedback")).toMatchObject({ method: "POST" });
+  expect(matchGatewayRoute("POST", "/api/v1/feedback")?.owner).toBeUndefined();
+  expect(matchGatewayRoute("GET", "/api/v1/owner/feedback")).toMatchObject({ owner: true });
+  expect(matchGatewayRoute("GET", "/api/v1/owner/feedback/report-id/image")).toMatchObject({ owner: true });
+  expect(matchGatewayRoute("POST", "/api/v1/owner/feedback/report-id/status")).toMatchObject({ owner: true });
+  expect(matchGatewayRoute("DELETE", "/api/v1/owner/feedback/report-id")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/api/v1/owner/unknown")).toBeNull();
   expect(matchGatewayRoute("PATCH", "/api/v1/owner/status")).toBeNull();
   expect(isCrossSiteMutation({
@@ -176,6 +183,7 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
 
 test("bulk playlist selection has a larger but still bounded signed request limit", () => {
   expect(gatewayBodyLimit("POST", "/api/v1/runs/run-id/selection")).toBe(BULK_SELECTION_BODY_LIMIT);
+  expect(gatewayBodyLimit("POST", "/api/v1/feedback")).toBe(FEEDBACK_GATEWAY_BODY_LIMIT);
   expect(gatewayBodyLimit("POST", "/api/v1/runs/run-id/publish")).toBe(DEFAULT_GATEWAY_BODY_LIMIT);
   expect(gatewayBodyLimit("GET", "/api/v1/runs/run-id/selection")).toBe(DEFAULT_GATEWAY_BODY_LIMIT);
 
