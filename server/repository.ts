@@ -40,6 +40,7 @@ import { selectRankedPlaylistRows } from "../lib/playlist-selection.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
 import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
+import { resolvePublicationCompleteness } from "./publication-completeness.ts";
 import {
   failureContextForJob,
   failureContextForRun,
@@ -1271,10 +1272,17 @@ export class Repository {
     unresolvedCoverageCount: number;
   }> {
     const result = await this.pool.query<{
+      mode: string;
+      target_minimum: number | null;
+      manifest_track_count: number;
       omitted_candidate_count: number;
       unresolved_coverage_count: number;
     }>(
       `SELECT
+         r.brief_json->>'mode' AS mode,
+         NULLIF(r.brief_json #>> '{targetSize,min}','')::int AS target_minimum,
+         (SELECT count(*)::int FROM manifest_tracks mt
+          WHERE mt.manifest_id=$2) AS manifest_track_count,
          (SELECT count(*)::int FROM track_candidates c
           WHERE c.run_id=$1 AND c.outcome<>'duplicate'
             AND NOT EXISTS (
@@ -1289,13 +1297,22 @@ export class Repository {
            WHERE c.run_id=$1 AND (
              c.status IN ('discovered','enumerating','inaccessible','unresolved')
              OR (c.advertised_total IS NOT NULL AND c.advertised_total>c.recovered_total)
-           ))) AS unresolved_coverage_count`,
+           ))) AS unresolved_coverage_count
+       FROM research_runs r
+       WHERE r.id=$1`,
       [runId, manifestId],
     );
-    return {
-      omittedCandidateCount: Number(result.rows[0]?.omitted_candidate_count ?? 0),
-      unresolvedCoverageCount: Number(result.rows[0]?.unresolved_coverage_count ?? 0),
-    };
+    const row = result.rows[0];
+    const mode = row?.mode === "curated" || row?.mode === "hybrid"
+      ? row.mode
+      : "exhaustive";
+    return resolvePublicationCompleteness({
+      mode,
+      targetMinimum: row?.target_minimum == null ? null : Number(row.target_minimum),
+      manifestTrackCount: Number(row?.manifest_track_count ?? 0),
+      omittedCandidateCount: Number(row?.omitted_candidate_count ?? 0),
+      unresolvedCoverageCount: Number(row?.unresolved_coverage_count ?? 0),
+    });
   }
 
   async getRun(id: string): Promise<ResearchRunView & Record<string, unknown>> {

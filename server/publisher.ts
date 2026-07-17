@@ -8,6 +8,7 @@ import {
 } from "./apple.ts";
 import type { PublicationStatus } from "../shared/types.ts";
 import { appendPlaylistTitleSuffix } from "./playlist-title.ts";
+import type { PublicationCompleteness } from "./publication-completeness.ts";
 
 const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
@@ -149,11 +150,6 @@ export interface PublicationResult {
   status: "complete" | "partial" | "waiting_for_apple_authorization";
   manifestId: string;
   volumes: Array<{ index: number; playlistId: string; shareUrl: string; trackCount: number }>;
-}
-
-export interface PublicationCompleteness {
-  omittedCandidateCount: number;
-  unresolvedCoverageCount: number;
 }
 
 export function publicationTerminalStatus(completeness: PublicationCompleteness): "complete" | "partial" {
