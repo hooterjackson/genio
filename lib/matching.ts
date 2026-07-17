@@ -347,12 +347,14 @@ export function hasDirectCatalogMatch(candidate: TrackCandidateInput, songs: Cat
     const comparison = compareCatalogSong(candidate, song);
     if (comparison.isrcMatch && !comparison.versionConflict) return true;
     if (comparison.isrcConflict || comparison.versionConflict) return false;
-    const titleCompatible = comparison.titleExact || comparison.baseTitleExact
-      || comparison.compactTitleExact || comparison.partStemExact;
-    // Album/title agreement alone cannot bind a recording to a different
-    // credited artist. Compilations, covers, and similarly named releases are
-    // common, so keep searching for an artist-compatible result.
-    return titleCompatible && comparison.artistCompatible;
+    // Compatible punctuation, collaborator-order, and leading-article forms
+    // remain useful review candidates, but must not stop the ladder before an
+    // exact artist/title result can be found by a broader query. When research
+    // supplied an album, an exact title on a compilation or reissue is not
+    // enough either: keep going so the album-bound queries can recover the
+    // intended release instead of leaving an available track in review.
+    return comparison.titleExact && comparison.artistExact
+      && (!candidate.album || comparison.albumExact);
   });
 }
 
@@ -409,8 +411,16 @@ export function rankCatalogMatches(
       && compatibleDuration(candidate.durationMs, song.durationInMillis)
       && !comparison.versionConflict && !comparison.yearConflict;
     const metadataCompatible = !comparison.isrcConflict && comparison.artistExact
-      && comparison.titleExact && (!candidate.album || comparison.albumExact)
-      && comparison.durationExact && !comparison.versionConflict && !comparison.yearConflict;
+      && comparison.titleExact
+      // Fast cited research frequently has authoritative album metadata but
+      // no duration. A unique exact artist/title/album is safe to accept, and
+      // a duration can serve as the disambiguator when no album was supplied.
+      // With neither field, only the stricter sparse-family path below may
+      // auto-accept; version-labeled candidates must remain review-only.
+      && Boolean(candidate.album || candidate.durationMs)
+      && (!candidate.album || comparison.albumExact)
+      && (!candidate.durationMs || comparison.durationExact)
+      && !comparison.versionConflict && !comparison.yearConflict;
     const directReview = !comparison.isrcConflict && !comparison.versionConflict
       && (comparison.titleExact || comparison.baseTitleExact
         || comparison.compactTitleExact || comparison.partStemExact)
@@ -444,18 +454,18 @@ export function rankCatalogMatches(
   const exactIdentifier = identifierMatches.length === 1 && identifierMatches[0].song.id === best.song.id;
   const exactMetadata = metadataMatches.length === 1 && metadataMatches[0].song.id === best.song.id;
   const canonicalSparseMetadata = selectCanonicalSparseMatch(sparseExactMatches);
-  const acceptedMatch = exactIdentifier || exactMetadata
-    ? best
-    : canonicalSparseMetadata;
+  const acceptedMatch = canonicalSparseMetadata ?? (exactIdentifier || exactMetadata ? best : null);
   if (acceptedMatch) {
     return {
       candidateId,
       status: "accepted",
-      basis: exactIdentifier
+      basis: canonicalSparseMetadata
+        ? `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`
+        : exactIdentifier
         ? `${acceptedMatch.basis}; unique compatible identifier`
         : exactMetadata
           ? `${acceptedMatch.basis}; unique exact metadata`
-          : `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`,
+          : acceptedMatch.basis,
       score: acceptedMatch.score,
       song: acceptedMatch.song,
       alternatives: ranked.filter((item) => item.song.id !== acceptedMatch.song.id).slice(0, 4).map((item) => item.song),

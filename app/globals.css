@@ -620,14 +620,6 @@ summary:focus-visible {
   position: relative;
 }
 
-.site-menu > summary {
-  list-style: none;
-}
-
-.site-menu > summary::-webkit-details-marker {
-  display: none;
-}
-
 .site-menu-trigger {
   width: 44px;
   height: 44px;
@@ -647,15 +639,15 @@ summary:focus-visible {
   transition: transform 140ms ease, opacity 140ms ease;
 }
 
-.site-menu[open] .site-menu-trigger span:first-child {
+.site-menu.is-open .site-menu-trigger span:first-child {
   transform: translateY(5px) rotate(45deg);
 }
 
-.site-menu[open] .site-menu-trigger span:nth-child(2) {
+.site-menu.is-open .site-menu-trigger span:nth-child(2) {
   opacity: 0;
 }
 
-.site-menu[open] .site-menu-trigger span:last-child {
+.site-menu.is-open .site-menu-trigger span:last-child {
   transform: translateY(-5px) rotate(-45deg);
 }
 
@@ -2761,7 +2753,7 @@ dd {
   }
 
   .header-action {
-    min-width: auto;
+    min-width: 44px;
     padding: 0 7px;
   }
 

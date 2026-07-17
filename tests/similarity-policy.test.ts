@@ -137,6 +137,16 @@ describe("reference-artist similarity policy", () => {
     expect(excludedReferenceArtists(shorthand)).toEqual(["Radiohead"]);
   });
 
+  test("treats hyphenated artist-adjacent shorthand as a reference exclusion", () => {
+    const result = applySimilaritySeedPolicy(
+      "100 gecs-adjacent hyperpop, but no 100 gecs — 50 tracks",
+      brief({ subjectEntities: ["100 gecs", "hyperpop"] }),
+    );
+
+    expect(excludedReferenceArtists(result)).toEqual(["100 gecs"]);
+    expect(isExcludedReferenceArtist(result, "100 gecs")).toBe(true);
+  });
+
   test("excludes collaborations credited to the reference artist without excluding tribute names", () => {
     const scoped = applySimilaritySeedPolicy(
       "Music that sounds like Radiohead",
@@ -146,6 +156,23 @@ describe("reference-artist similarity policy", () => {
     expect(isExcludedReferenceArtist(scoped, "Radiohead feat. Other Artist")).toBe(true);
     expect(isExcludedReferenceArtist(scoped, "Other Artist & Radiohead")).toBe(true);
     expect(isExcludedReferenceArtist(scoped, "Radiohead Tribute Band")).toBe(false);
+  });
+
+  test("does not erase artists named X or punctuation-only artist names", () => {
+    const xScoped = applySimilaritySeedPolicy(
+      "50 tracks adjacent to X",
+      brief({ subjectEntities: ["X"] }),
+    );
+    expect(excludedReferenceArtists(xScoped)).toEqual(["X"]);
+    expect(isExcludedReferenceArtist(xScoped, "X")).toBe(true);
+    expect(isExcludedReferenceArtist(xScoped, "Other Artist x X")).toBe(true);
+
+    const punctuationScoped = applySimilaritySeedPolicy(
+      "Dance-punk that sounds like !!!",
+      brief({ subjectEntities: ["!!!"] }),
+    );
+    expect(excludedReferenceArtists(punctuationScoped)).toEqual(["!!!"]);
+    expect(isExcludedReferenceArtist(punctuationScoped, "!!! feat. Guest")).toBe(true);
   });
 
   test("excludes every artist in a multi-seed similarity request", () => {

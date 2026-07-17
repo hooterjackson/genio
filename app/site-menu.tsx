@@ -1,20 +1,27 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export function SiteMenu() {
-  const rootRef = useRef<HTMLDetailsElement>(null);
-  const triggerRef = useRef<HTMLElement>(null);
+  const [hydrated, setHydrated] = useState(false);
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setHydrated(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   useEffect(() => {
     const closeFromOutside = (event: PointerEvent) => {
       const root = rootRef.current;
-      if (root?.open && !root.contains(event.target as Node)) root.open = false;
+      if (open && root && !root.contains(event.target as Node)) setOpen(false);
     };
     const closeFromKeyboard = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || !rootRef.current?.open) return;
-      rootRef.current.open = false;
+      if (event.key !== "Escape" || !open) return;
+      setOpen(false);
       triggerRef.current?.focus();
     };
 
@@ -24,7 +31,7 @@ export function SiteMenu() {
       document.removeEventListener("pointerdown", closeFromOutside);
       document.removeEventListener("keydown", closeFromKeyboard);
     };
-  }, []);
+  }, [open]);
 
   function preserveSourcePage() {
     try {
@@ -32,25 +39,31 @@ export function SiteMenu() {
     } catch {
       // Feedback still works when browser storage is unavailable.
     }
-    if (rootRef.current) rootRef.current.open = false;
+    setOpen(false);
   }
 
   return (
-    <details className="site-menu" ref={rootRef} suppressHydrationWarning>
-      <summary
+    <div className={`site-menu${open ? " is-open" : ""}`} ref={rootRef}>
+      <button
         ref={triggerRef}
+        type="button"
         className="site-menu-trigger"
-        role="button"
-        aria-label="Open menu"
+        aria-label={open ? "Close menu" : "Open menu"}
+        aria-expanded={open}
+        aria-controls="site-menu-panel"
+        disabled={!hydrated}
+        onClick={() => setOpen((current) => !current)}
       >
         <span aria-hidden="true" />
         <span aria-hidden="true" />
         <span aria-hidden="true" />
-      </summary>
-      <nav className="site-menu-panel" aria-label="Site menu">
-        <Link href="/feedback" onClick={preserveSourcePage}>SUBMIT BUG OR IMPROVEMENT</Link>
-        <Link href="/privacy" onClick={() => { if (rootRef.current) rootRef.current.open = false; }}>PRIVACY</Link>
-      </nav>
-    </details>
+      </button>
+      {open && (
+        <nav id="site-menu-panel" className="site-menu-panel" aria-label="Site menu">
+          <Link href="/feedback" onClick={preserveSourcePage}>SUBMIT BUG OR IMPROVEMENT</Link>
+          <Link href="/privacy" onClick={() => setOpen(false)}>PRIVACY</Link>
+        </nav>
+      )}
+    </div>
   );
 }

@@ -44,7 +44,6 @@ export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
 export const FAST_CURATED_TARGET_MAXIMUM = 300;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
 export const FAST_POST_MATCH_REFILL_LIMIT = 2;
-export const FAST_MINIMUM_RESERVE_CANDIDATES = 50;
 export const FAST_RESERVE_RATIO = 0.5;
 
 /**
@@ -55,10 +54,12 @@ export const FAST_RESERVE_RATIO = 0.5;
  */
 export function catalogMatchingCandidateGoal(requestedMinimum: number): number {
   const minimum = Math.max(1, Math.floor(requestedMinimum));
-  if (minimum < 20) return minimum;
+  // Every size needs a reserve, but a one-track increase must not cause a
+  // discontinuous jump in research volume. A smooth 50% curve preserves the
+  // exact-count backfill margin while keeping tiny prompts cheap.
   const reserve = Math.min(
     1_000,
-    Math.max(FAST_MINIMUM_RESERVE_CANDIDATES, Math.ceil(minimum * FAST_RESERVE_RATIO)),
+    Math.max(3, Math.ceil(minimum * FAST_RESERVE_RATIO)),
   );
   return minimum + reserve;
 }

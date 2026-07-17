@@ -6,6 +6,7 @@ import {
 } from "../shared/fast-run-sla.ts";
 import {
   briefInterpretationModel,
+  catalogMatchingCandidateGoal,
   createFastRouteCheckpoint,
   FAST_MATCHING_RESERVE_MS,
   fastPostMatchRefillPlan,
@@ -33,6 +34,22 @@ function brief(mode: PlaylistBrief["mode"], maximum = 100): PlaylistBrief {
 }
 
 describe("research execution policy", () => {
+  test("keeps a bounded Apple-matching reserve even for very short playlists", () => {
+    expect(catalogMatchingCandidateGoal(1)).toBe(4);
+    expect(catalogMatchingCandidateGoal(10)).toBe(15);
+    expect(catalogMatchingCandidateGoal(19)).toBe(29);
+    expect(catalogMatchingCandidateGoal(20)).toBe(30);
+    expect(catalogMatchingCandidateGoal(50)).toBe(75);
+  });
+
+  test("grows the catalog reserve smoothly without a small-playlist cost cliff", () => {
+    const goals = Array.from({ length: 300 }, (_, index) => catalogMatchingCandidateGoal(index + 1));
+    for (let index = 1; index < goals.length; index += 1) {
+      expect(goals[index]).toBeGreaterThanOrEqual(goals[index - 1]!);
+      expect(goals[index]! - goals[index - 1]!).toBeLessThanOrEqual(2);
+    }
+  });
+
   test("uses Luna and a bounded parallel fast path for curated prompts", () => {
     const policy = researchExecutionPolicy(brief("curated"), {});
     expect(policy).toMatchObject({
@@ -43,8 +60,8 @@ describe("research execution policy", () => {
       matchingReserveMs: 40_000,
       targetMinimum: 50,
       targetMaximum: 100,
-      candidateGoal: 100,
-      candidateLimit: 100,
+      candidateGoal: 75,
+      candidateLimit: 75,
       maxPasses: 3,
       maxWebToolCalls: 5,
       maxSynthesisTokens: 6_000,
@@ -137,8 +154,8 @@ describe("research execution policy", () => {
       matchingReserveMs: 40_000,
       targetMinimum: 50,
       targetMaximum: 100,
-      candidateGoal: 100,
-      candidateLimit: 100,
+      candidateGoal: 75,
+      candidateLimit: 75,
       maxPasses: 3,
       maxWebToolCalls: 5,
       maxSynthesisTokens: 6_000,

@@ -65,6 +65,14 @@ describe("playlist brief policy", () => {
       "Paulinho da Costa's 200 most influential songs",
       interpreted,
     ).targetSize).toEqual({ min: 200, max: 200 });
+    expect(preserveExplicitTrackCount(
+      "40 Buchla tape works",
+      interpreted,
+    ).targetSize).toEqual({ min: 40, max: 40 });
+    expect(preserveExplicitTrackCount(
+      "35 Japanese environmental music pieces",
+      interpreted,
+    ).targetSize).toEqual({ min: 35, max: 35 });
   });
 
   test("repairs a stale 100-track brief when the original prompt explicitly requests 300", () => {
@@ -202,6 +210,11 @@ describe("playlist brief policy", () => {
   test("does not confuse music years or unrelated numbers with a track count", () => {
     expect(explicitTrackCount("Influential Berlin techno songs from 1990 to 1999")).toBeNull();
     expect(explicitTrackCount("Songs by artists with more than 100 releases")).toBeNull();
+    expect(explicitTrackCount("A survey of 20 years of influential techno tracks")).toBeNull();
+    expect(explicitTrackCount("Explore 12-tone serialist works")).toBeNull();
+    expect(explicitTrackCount("A 60-minute arc of Japanese ambient tracks")).toBeNull();
+    expect(explicitTrackCount("Recordings for a 30-piece chamber orchestra")).toBeNull();
+    expect(explicitTrackCount("12 serialist works")).toBe(12);
     expect(explicitTrackCount(
       "Don't give me Prefuse 73 songs",
       ["Prefuse 73"],

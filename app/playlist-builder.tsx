@@ -720,7 +720,11 @@ function JobsScreen({
         {!loading && jobs.length > 0 && (
           <div className="jobs-list">
             {jobs.map((job) => (
-              <button key={job.id} onClick={() => onOpen(job.id)}>
+              <button
+                key={job.id}
+                onClick={() => onOpen(job.id)}
+                aria-label={`Open ${job.brief.title} — ${statusLabel(job.status)}`}
+              >
                 <span className="job-status">{statusLabel(job.status).toUpperCase()}</span>
                 <strong>{job.brief.title}</strong>
                 <small>{job.candidateCount.toLocaleString()} tracks · {job.brief.mode}</small>

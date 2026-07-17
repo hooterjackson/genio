@@ -317,6 +317,26 @@ test("the one-command composer remains usable at mobile widths", async ({ page }
   expect(sizes.every((box) => box && box.height >= 44)).toBe(true);
 });
 
+test("the one-command composer exposes invalid counts and blocks accidental submission", async ({ page }) => {
+  await openPrompt(page);
+  await requestField(page).fill("Esoteric electroacoustic recordings made with bowed cymbals");
+  const submit = page.getByRole("button", { name: /continue/i });
+
+  await trackCountField(page).fill("0");
+  await expect(trackCountField(page)).toHaveAttribute("aria-invalid", "true");
+  await expect(page.locator("#playlist-track-count-note")).toContainText("Choose 1–300 tracks.");
+  await expect(submit).toBeDisabled();
+
+  await trackCountField(page).fill("301");
+  await expect(trackCountField(page)).toHaveAttribute("aria-invalid", "true");
+  await expect(submit).toBeDisabled();
+
+  await trackCountField(page).fill("37");
+  await expect(trackCountField(page)).toHaveAttribute("aria-invalid", "false");
+  await expect(page.locator("#playlist-track-count-note")).toContainText("selected track count is exact");
+  await expect(submit).toBeEnabled();
+});
+
 test("the selected count stays authoritative through guided questions", async ({ page }) => {
   const selectedBrief = { ...curatedBrief, targetSize: { min: 50, max: 50 } };
   const startedRun = {
@@ -956,7 +976,7 @@ test("the jobs screen lists and opens earlier jobs for this browser", async ({ p
   await page.getByRole("button", { name: "JOBS" }).click();
   await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
   await expect(page.getByText(brief.title)).toBeVisible();
-  await page.getByRole("button", { name: /open/i }).click();
+  await page.getByRole("button", { name: `Open ${brief.title} — Researching` }).click();
   await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.search)).toBe("?run=run-earlier");
 });

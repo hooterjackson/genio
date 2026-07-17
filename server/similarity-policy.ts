@@ -27,6 +27,19 @@ function normalized(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+function shorthandSimilaritySeeds(prompt: string, brief: PlaylistBrief): string[] {
+  const normalizedPrompt = normalized(prompt);
+  return brief.subjectEntities.filter((entity) => {
+    const entityText = normalized(entity);
+    if (!entityText) return false;
+    // Punctuation normalization turns both “X-style” and “X-adjacent” into
+    // whitespace. “X adjacent to Y” is not shorthand: Y is the reference.
+    return normalizedPrompt.includes(`${entityText} style`)
+      || (normalizedPrompt.includes(`${entityText} adjacent`)
+        && !normalizedPrompt.includes(`${entityText} adjacent to`));
+  });
+}
+
 function uniqueRules(values: readonly string[]): string[] {
   const seen = new Set<string>();
   return values.filter((value) => {
@@ -69,10 +82,7 @@ function similaritySeedEntities(prompt: string, brief: PlaylistBrief): string[] 
     // Hyphenated shorthand such as “Radiohead-style” loses its punctuation
     // during normalization, so detect the confirmed entity immediately
     // followed by “style” as the same reference-artist intent.
-    return brief.subjectEntities.filter((entity) => {
-      const entityText = normalized(entity);
-      return Boolean(entityText && normalizedPrompt.includes(`${entityText} style`));
-    });
+    return shorthandSimilaritySeeds(prompt, brief);
   }
   const explicitlyExcluded = brief.subjectEntities.filter((entity) => explicitlyExcludesSeed(prompt, entity));
   if (explicitlyExcluded.length > 0) return explicitlyExcluded;
@@ -150,10 +160,14 @@ function normalizedArtistCredits(value: string): string[] {
   return value.normalize("NFKD")
     .replace(/[\u0300-\u036f]/gu, "")
     .toLocaleLowerCase("en-US")
-    .replace(/\b(?:feat(?:uring)?|ft|with|and|x)\.?\b/gu, "|")
+    .replace(/\b(?:feat(?:uring)?|ft|with|and)\.?\b/gu, "|")
     .replace(/[&,/+]/gu, "|")
     .split("|")
-    .map((credit) => normalized(credit))
+    // Treat a spaced “x” as a collaboration delimiter without erasing the
+    // real artist named X. This also preserves punctuation-only artist names
+    // such as !!! long enough for the exact-identity fallback below.
+    .flatMap((credit) => credit.split(/\s+x\s+/gu))
+    .map((credit) => normalized(credit) || credit.normalize("NFKC").trim().replace(/\s+/gu, " "))
     .filter(Boolean);
 }
 
@@ -165,7 +179,7 @@ function normalizedArtistCredits(value: string): string[] {
 export function applySimilaritySeedPolicy(prompt: string, brief: PlaylistBrief): PlaylistBrief {
   if (brief.mode === "exhaustive") return brief;
   const hasSimilarityIntent = [...normalized(prompt).matchAll(SIMILARITY_INTENT)].length > 0
-    || brief.subjectEntities.some((entity) => normalized(prompt).includes(`${normalized(entity)} style`));
+    || shorthandSimilaritySeeds(prompt, brief).length > 0;
   if (!hasSimilarityIntent) return brief;
 
   const subjectEntities = cleanSimilaritySubjectEntities(brief.subjectEntities);
@@ -214,8 +228,15 @@ export function isExcludedReferenceArtist(
   artist: string,
 ): boolean {
   const candidateCredits = normalizedArtistCredits(artist);
+  const candidateIdentity = normalized(artist)
+    || artist.normalize("NFKC").toLocaleLowerCase("en-US").trim().replace(/\s+/gu, " ");
   return candidateCredits.length > 0 && excludedReferenceArtists(brief)
-    .some((seed) => candidateCredits.includes(normalized(seed)));
+    .some((seed) => {
+      const seedIdentity = normalized(seed)
+        || seed.normalize("NFKC").toLocaleLowerCase("en-US").trim().replace(/\s+/gu, " ");
+      return Boolean(seedIdentity
+        && (candidateIdentity === seedIdentity || candidateCredits.includes(seedIdentity)));
+    });
 }
 
 export function similarityResearchInstruction(

@@ -2,8 +2,9 @@ import { expect, test } from "@playwright/test";
 
 test("the public header opens the complete minimal privacy notice", async ({ page }) => {
   await page.goto("/");
-  await page.waitForTimeout(200);
-  await page.getByRole("button", { name: /open menu/i }).click();
+  const menu = page.getByRole("button", { name: /open menu/i });
+  await expect(menu).toBeEnabled();
+  await menu.click();
   const privacyLink = page.getByRole("link", { name: /privacy/i });
   await expect(privacyLink).toBeVisible();
   await privacyLink.click();

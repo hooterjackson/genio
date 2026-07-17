@@ -18,7 +18,8 @@ export interface PlaylistBriefRequestContext {
   requestedTrackCount?: number | null;
 }
 
-const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u2014]\s*)?(?:(?:[\p{L}][\p{L}'\u2019.-]*|&)\s+){0,8}(?:songs?|tracks?|recordings?|titles?)\b/giu;
+const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u2014]\s*)?(?:(?:[\p{L}][\p{L}'\u2019.-]*|&)\s+){0,8}(?:songs?|tracks?|recordings?|titles?|pieces?|works?|compositions?|cuts?|selections?|collaborations?)\b/giu;
+const NON_TRACK_QUANTITY_SUFFIX = /^(?:\s*[-\u2013\u2014]\s*pieces?\b|\s*(?:[-\u2013\u2014]\s*)?(?:years?|months?|weeks?|days?|hours?|minutes?|seconds?|decades?|centur(?:y|ies)|people|persons?|listeners?|artists?|albums?|releases?|records?|discs?|volumes?|tones?|bars?|beats?|bpm|rpm|hertz|hz|khz|bits?|strings?|members?)\b)/iu;
 const SUBJECTIVE_PLAYLIST_INTENT = /\b(?:playlist|mix|mixtape|best|essential|influential|important|representative|favorite|favourite|similar|resembl|sounds?\s+like|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|adjacent|mood|vibe|party|study|studying|work|working|background|churrasco|gathering|dinner|road\s+trip|workout)\b/iu;
 const EXPLICIT_FACTUAL_EXHAUSTIVE_INTENT = /(?:\b(?:every|all)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|versions?)\b|\b(?:complete|entire|full|exhaustive)\b.{0,60}\b(?:discograph(?:y|ies)|catalog(?:ue)?|recordings?|credits?|releases?)\b)/iu;
 
@@ -165,6 +166,10 @@ function countIsPartOfSubjectEntity(
   });
 }
 
+function countDescribesSomethingElse(prompt: string, countIndex: number, countText: string): boolean {
+  return NON_TRACK_QUANTITY_SUFFIX.test(prompt.slice(countIndex + countText.length));
+}
+
 export function explicitTrackCount(
   prompt: string,
   subjectEntities: readonly string[] = [],
@@ -177,6 +182,7 @@ export function explicitTrackCount(
     if (value >= 1900 && value <= 2099) continue;
     const countOffset = match[0].indexOf(rawCount);
     const countIndex = (match.index ?? 0) + Math.max(0, countOffset);
+    if (countDescribesSomethingElse(prompt, countIndex, rawCount)) continue;
     if (countIsPartOfSubjectEntity(prompt, countIndex, rawCount.toLocaleLowerCase(), subjectEntities)) continue;
     return value;
   }

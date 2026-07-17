@@ -2,7 +2,7 @@
 
 /* eslint-disable @next/next/no-img-element -- previews use prepared data URLs that Next Image cannot optimize */
 import Link from "next/link";
-import { ChangeEvent, FormEvent, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 
 type FeedbackKind = "bug" | "improvement";
 
@@ -130,6 +130,7 @@ function sourcePath(): string {
 }
 
 export function FeedbackForm() {
+  const [hydrated, setHydrated] = useState(false);
   const [kind, setKind] = useState<FeedbackKind>("bug");
   const [message, setMessage] = useState("");
   const [image, setImage] = useState<PreparedImage | null>(null);
@@ -140,6 +141,11 @@ export function FeedbackForm() {
   const [received, setReceived] = useState(false);
   const idempotencyKey = useRef(crypto.randomUUID());
   const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setHydrated(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   async function chooseImage(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -217,8 +223,8 @@ export function FeedbackForm() {
 
       {error && <div className="feedback-error" role="alert">[ERROR] {error}</div>}
 
-      <form className="feedback-form" onSubmit={submit}>
-        <fieldset className="feedback-kind">
+      <form className="feedback-form" onSubmit={submit} aria-busy={!hydrated || submitting || preparingImage}>
+        <fieldset className="feedback-kind" disabled={!hydrated || submitting || preparingImage}>
           <legend>TYPE</legend>
           <label>
             <input type="radio" name="feedback-kind" value="bug" checked={kind === "bug"} onChange={() => setKind("bug")} />
@@ -238,6 +244,7 @@ export function FeedbackForm() {
             maxLength={4000}
             required
             autoFocus
+            disabled={!hydrated || submitting || preparingImage}
             placeholder="What happened? What would make it better?"
             onChange={(event) => setMessage(event.target.value)}
           />
@@ -256,7 +263,7 @@ export function FeedbackForm() {
                 ref={fileInput}
                 type="file"
                 accept="image/png,image/jpeg"
-                disabled={preparingImage || submitting}
+                disabled={!hydrated || preparingImage || submitting}
                 onChange={(event) => void chooseImage(event)}
               />
             </label>
@@ -269,7 +276,7 @@ export function FeedbackForm() {
           )}
         </div>
 
-        <button className="action-button feedback-submit" type="submit" disabled={submitting || preparingImage || message.trim().length < 10}>
+        <button className="action-button feedback-submit" type="submit" disabled={!hydrated || submitting || preparingImage || message.trim().length < 10}>
           {submitting ? "SENDING…" : "SUBMIT FEEDBACK →"}
         </button>
       </form>
