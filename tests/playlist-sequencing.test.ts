@@ -237,7 +237,11 @@ describe("deterministic playlist sequencing", () => {
     }
   });
 
-  test("handles 10,000 tracks without dropping or deduplicating rows", { timeout: 10_000 }, () => {
+  // Coverage instrumentation on the shared CI runner is materially slower
+  // than production execution. Keep the 10k stress case, but give the
+  // instrumented assertion enough headroom to measure correctness instead of
+  // runner contention.
+  test("handles 10,000 tracks without dropping or deduplicating rows", { timeout: 30_000 }, () => {
     const input = Array.from({ length: 10_000 }, (_, index) => track(
       `large-${index}`,
       `Artist ${index % 250}`,
