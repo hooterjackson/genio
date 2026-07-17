@@ -11,6 +11,7 @@ import {
 } from "../server/catalog-match-recovery.ts";
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { processNotificationJob } from "../server/notifications.ts";
+import { publicationTerminalStatus } from "../server/publisher.ts";
 import { Repository } from "../server/repository.ts";
 import {
   FAST_POST_MATCH_REFILL_LIMIT,
@@ -523,6 +524,96 @@ databaseDescribe("hosted backend integration", () => {
     );
     const run = await repository.getRun(runId);
     expect(run.unresolvedCount).toBe(2);
+  });
+
+  test("publication completeness follows curated targets while exhaustive and hybrid runs remain strict", async () => {
+    const createFixture = async (input: {
+      mode: PlaylistBrief["mode"];
+      targetMinimum: number | null;
+      manifestTrackCount: number;
+      reserveOutcomes: string[];
+    }) => {
+      const scopedBrief: PlaylistBrief = {
+        ...brief,
+        mode: input.mode,
+        targetSize: input.mode === "exhaustive"
+          ? null
+          : { min: input.targetMinimum!, max: input.targetMinimum! },
+      };
+      const runId = await repository.createRun(
+        `Publication completeness ${input.mode} ${randomUUID()}`,
+        scopedBrief,
+        0,
+        1,
+      );
+      const manifestId = randomUUID();
+      const manifestCandidateIds = Array.from(
+        { length: input.manifestTrackCount },
+        () => randomUUID(),
+      );
+      const reserveCandidateIds = input.reserveOutcomes.map(() => randomUUID());
+      const allCandidates = [
+        ...manifestCandidateIds.map((id) => ({ id, outcome: "accepted" })),
+        ...reserveCandidateIds.map((id, index) => ({
+          id,
+          outcome: input.reserveOutcomes[index]!,
+        })),
+      ];
+      for (const [index, candidate] of allCandidates.entries()) {
+        await repository.pool.query(
+          `INSERT INTO track_candidates(id,run_id,canonical_key,artist,title,outcome)
+           VALUES($1,$2,$3,'Completeness Artist',$4,$5)`,
+          [candidate.id, runId, `completeness:${index}:${randomUUID()}`, `Track ${index + 1}`, candidate.outcome],
+        );
+      }
+      await repository.pool.query(
+        `INSERT INTO manifests(id,run_id,name,description,content_hash)
+         VALUES($1,$2,'Completeness fixture','Integration fixture',$3)`,
+        [manifestId, runId, sha256Hex(`${runId}:${manifestId}`)],
+      );
+      for (const [position, candidateId] of manifestCandidateIds.entries()) {
+        await repository.pool.query(
+          `INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title)
+           VALUES($1,$2,$3,$4,'Completeness Artist',$5)`,
+          [manifestId, position, candidateId, `catalog-${position}`, `Track ${position + 1}`],
+        );
+      }
+      await repository.pool.query(
+        `INSERT INTO source_frontier(id,run_id,source_class,strategy,status,discovered_count,recovered_count,note)
+         VALUES($1,$2,'web','publication completeness frontier','unresolved',2,1,'One documented gap')`,
+        [randomUUID(), runId],
+      );
+      return repository.getPublicationCompleteness(runId, manifestId);
+    };
+
+    const curatedExact = await createFixture({
+      mode: "curated",
+      targetMinimum: 3,
+      manifestTrackCount: 3,
+      reserveOutcomes: ["overflow", "unavailable"],
+    });
+    expect(curatedExact).toEqual({ omittedCandidateCount: 0, unresolvedCoverageCount: 0 });
+    expect(publicationTerminalStatus(curatedExact)).toBe("complete");
+
+    const curatedShortfall = await createFixture({
+      mode: "curated",
+      targetMinimum: 3,
+      manifestTrackCount: 2,
+      reserveOutcomes: ["unavailable"],
+    });
+    expect(curatedShortfall).toEqual({ omittedCandidateCount: 1, unresolvedCoverageCount: 0 });
+    expect(publicationTerminalStatus(curatedShortfall)).toBe("partial");
+
+    for (const mode of ["exhaustive", "hybrid"] as const) {
+      const strict = await createFixture({
+        mode,
+        targetMinimum: mode === "exhaustive" ? null : 2,
+        manifestTrackCount: 2,
+        reserveOutcomes: ["unavailable"],
+      });
+      expect(strict).toEqual({ omittedCandidateCount: 1, unresolvedCoverageCount: 1 });
+      expect(publicationTerminalStatus(strict)).toBe("partial");
+    }
   });
 
   test("container rediscovery preserves enumeration progress while later enumeration can advance it", async () => {
