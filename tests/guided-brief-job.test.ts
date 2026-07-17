@@ -305,7 +305,7 @@ test("a question-scout provider failure releases only the scout reservation and 
       guidanceTelemetry: expect.objectContaining({
         generationMode: "scout_unavailable",
         acceptedQuestionCount: 0,
-        validationIssues: ["scout:provider_unavailable"],
+        validationIssues: ["scout:provider_http_400"],
       }),
       estimateUsd: expect.any(Number),
       error: null,
