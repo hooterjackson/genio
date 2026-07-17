@@ -751,8 +751,6 @@ export class Repository {
     clientBucket: string;
     clientBucketAliases: string[];
     idempotencyKey?: string | null;
-    rateLimit?: number;
-    bypassVisitorRateLimit?: boolean;
   }): Promise<{ id: string; status: string; created: boolean }> {
     const prompt = input.prompt.trim();
     if (prompt.length < 4 || prompt.length > 2_000) throw new HttpError(400, "Describe the playlist in 4–2,000 characters", "invalid_prompt");
@@ -784,23 +782,12 @@ export class Repository {
           return { id: prior.id, status: prior.status, created: false };
         }
       }
-      if (!input.bypassVisitorRateLimit) {
-        await lockClientAliases(client, "rate:brief", input.clientBucketAliases);
-        const rate = await client.query<{ count: number }>(
-          "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='brief' AND occurred_at>now()-interval '24 hours'",
-          [input.clientBucketAliases],
-        );
-        if (rate.rows[0]!.count >= (input.rateLimit ?? 10)) throw new HttpError(429, "Brief limit reached; try again later", "rate_limited");
-      }
       const id = randomUUID();
       await client.query(
         `INSERT INTO brief_requests(id,prompt,requested_track_count,model,status,client_bucket,idempotency_key,expires_at)
          VALUES($1,$2,$3,$4,'queued',$5,$6,now()+interval '24 hours')`,
         [id, prompt, requestedTrackCount, input.model, input.clientBucket, input.idempotencyKey ?? null],
       );
-      if (!input.bypassVisitorRateLimit) {
-        await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'brief')", [input.clientBucket]);
-      }
       return { id, status: "queued", created: true };
     });
   }
@@ -999,10 +986,9 @@ export class Repository {
     idempotencyKey: string;
     autoPublish?: boolean;
     reuseDays?: number;
-    rateLimit?: number;
     globalLimit?: number;
     capabilitySessionId?: string;
-    bypassVisitorRateLimit?: boolean;
+    forceFreshResearch?: boolean;
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
@@ -1013,7 +999,7 @@ export class Repository {
     const executionPolicy = researchExecutionPolicy(input.brief);
     // Owner requests are deliberate test/refresh runs. Never attach them to a
     // prior visitor result, even when the confirmed brief hashes identically.
-    const reuseDays = input.bypassVisitorRateLimit
+    const reuseDays = input.forceFreshResearch
       ? 0
       : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
@@ -1061,14 +1047,6 @@ export class Repository {
         };
       }
 
-      if (!input.bypassVisitorRateLimit) {
-        await lockClientAliases(client, "rate:run", input.clientBucketAliases);
-        const rate = await client.query<{ count: number }>(
-          "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='run' AND occurred_at>now()-interval '24 hours'",
-          [input.clientBucketAliases],
-        );
-        if (rate.rows[0]!.count >= (input.rateLimit ?? 3)) throw new HttpError(429, "Research-run limit reached; try again later", "rate_limited");
-      }
       let runId: string | null = null;
       if (reuseDays > 0) {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`brief:${briefHash}`]);
@@ -1138,9 +1116,6 @@ export class Repository {
       );
       if (input.capabilitySessionId) {
         await this.attachCapabilitySessionAccess(client, input.capabilitySessionId, runId, accessId);
-      }
-      if (!input.bypassVisitorRateLimit) {
-        await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'run')", [input.clientBucket]);
       }
       return { runId, accessId, status, created: !reused, reused };
     });
@@ -3187,9 +3162,9 @@ export class Repository {
       appleAuthorized: apple?.status === "valid",
       clientBucket: run.client_bucket,
       clientBucketAliases: [run.client_bucket],
-      // Automatic runs are already admitted by the stricter run-rate and
-      // global-capacity gates. Reapplying the manual 10/day publication bucket
-      // strands owner testing after manifest lock without adding abuse value.
+      // Automatic runs are already admitted by the global-capacity and budget
+      // gates. Reapplying the manual 10/day publication bucket would strand a
+      // completed research run after manifest lock without adding abuse value.
       rateLimit: Number.POSITIVE_INFINITY,
     });
     if (publication.state === "waiting_for_apple_authorization") {

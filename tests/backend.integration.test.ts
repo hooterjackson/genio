@@ -683,7 +683,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket: bucket,
       clientBucketAliases: [bucket],
       idempotencyKey: key,
-      rateLimit: 10,
       reuseDays: 30,
     });
     const first = await create(`first-${randomUUID()}`);
@@ -716,9 +715,8 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket: bucket,
       clientBucketAliases: [bucket],
       idempotencyKey: key,
-      rateLimit: 20,
       reuseDays: 30,
-      bypassVisitorRateLimit: owner,
+      forceFreshResearch: owner,
     });
 
     const partial = await create(`partial-${randomUUID()}`);
@@ -786,7 +784,6 @@ databaseDescribe("hosted backend integration", () => {
         model: "test-model",
         clientBucket,
         clientBucketAliases: [clientBucket],
-        rateLimit: 100,
       });
     };
     const first = await createBrief("idempotent");
@@ -822,7 +819,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
 
     const first = await repository.reserveProviderCost(
@@ -862,7 +858,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
 
     const results = await Promise.allSettled([
@@ -885,7 +880,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const reservation = await repository.reserveProviderCost(
       { briefRequestId: request.id },
@@ -925,7 +919,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const capabilities = new CapabilityService(repository);
     const reply = new ReplyStub();
@@ -1027,7 +1020,6 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [clientBucket],
         idempotencyKey: `cost-gate-${label}-${randomUUID()}`,
         reuseDays: 0,
-        rateLimit: 100,
         globalLimit: 100,
       });
     };
@@ -1049,41 +1041,31 @@ databaseDescribe("hosted backend integration", () => {
     await expect(create("invalid", 5, 5)).rejects.toThrow(/AUTO_RUN_COST_LIMIT_USD/u);
   });
 
-  test("atomically enforces brief, run, mutation, and publish limits", async () => {
-    const briefBucket = `brief-limit-${randomUUID()}`;
-    const briefAttempts = await Promise.allSettled(Array.from({ length: 3 }, (_, index) =>
+  test("allows repeated brief and run creation while preserving mutation and publication burst limits", async () => {
+    const briefBucket = `unlimited-brief-${randomUUID()}`;
+    const briefAttempts = await Promise.allSettled(Array.from({ length: 12 }, (_, index) =>
       repository.createBriefRequest({
-        prompt: `Brief rate-limit request ${index}`,
+        prompt: `Repeated brief request ${index}`,
         model: "test-model",
         clientBucket: briefBucket,
         clientBucketAliases: [briefBucket],
-        rateLimit: 2,
       })));
-    expect(briefAttempts.filter((result) => result.status === "fulfilled")).toHaveLength(2);
-    expect(briefAttempts.filter((result) => result.status === "rejected")).toHaveLength(1);
-    expect(briefAttempts.find((result) => result.status === "rejected")).toMatchObject({
-      reason: { statusCode: 429, code: "rate_limited" },
-    });
+    expect(briefAttempts.every((result) => result.status === "fulfilled")).toBe(true);
 
-    const runBucket = `run-limit-${randomUUID()}`;
-    const runAttempts = await Promise.allSettled(Array.from({ length: 3 }, (_, index) =>
+    const runBucket = `unlimited-run-${randomUUID()}`;
+    const runAttempts = await Promise.allSettled(Array.from({ length: 6 }, (_, index) =>
       repository.createRunIdempotent({
-        prompt: `Run rate-limit request ${index}`,
-        brief,
+        prompt: `Repeated run request ${index}`,
+        brief: { ...brief, title: `Repeated run ${index}` },
         estimateUsd: 0,
         approvedBudgetUsd: 1,
         clientBucket: runBucket,
         clientBucketAliases: [runBucket],
-        idempotencyKey: `run-limit-${index}-${randomUUID()}`,
+        idempotencyKey: `unlimited-run-${index}-${randomUUID()}`,
         reuseDays: 0,
-        rateLimit: 2,
         globalLimit: 100,
       })));
-    expect(runAttempts.filter((result) => result.status === "fulfilled")).toHaveLength(2);
-    expect(runAttempts.filter((result) => result.status === "rejected")).toHaveLength(1);
-    expect(runAttempts.find((result) => result.status === "rejected")).toMatchObject({
-      reason: { statusCode: 429, code: "rate_limited" },
-    });
+    expect(runAttempts.every((result) => result.status === "fulfilled")).toBe(true);
 
     const mutationBucket = `mutation-limit-${randomUUID()}`;
     const mutationAttempts = await Promise.allSettled([
@@ -1111,11 +1093,10 @@ databaseDescribe("hosted backend integration", () => {
       [[briefBucket, runBucket, mutationBucket, publishBucket]],
     );
     expect(counts.rows).toEqual(expect.arrayContaining([
-      { client_bucket: briefBucket, action: "brief", count: 2 },
-      { client_bucket: runBucket, action: "run", count: 2 },
       { client_bucket: mutationBucket, action: "mutation", count: 1 },
       { client_bucket: publishBucket, action: "publish", count: 1 },
     ]));
+    expect(counts.rows).toHaveLength(2);
   });
 
   test("serializes rolling rate limits when daily client-bucket alias sets overlap", async () => {
@@ -1141,67 +1122,43 @@ databaseDescribe("hosted backend integration", () => {
     expect(count.rows[0]!.count).toBe(1);
   });
 
-  test("owner brief and run requests bypass visitor quotas without consuming visitor events", async () => {
-    const briefBucket = `owner-brief-limit-${randomUUID()}`;
-    const createBrief = (label: string, bypassVisitorRateLimit?: boolean) => repository.createBriefRequest({
-      prompt: `Owner brief quota request ${label}`,
+  test("anonymous brief and run requests do not consume daily quota events", async () => {
+    const briefBucket = `anonymous-brief-unlimited-${randomUUID()}`;
+    const createBrief = (label: string) => repository.createBriefRequest({
+      prompt: `Anonymous brief request ${label}`,
       model: "test-model",
       clientBucket: briefBucket,
       clientBucketAliases: [briefBucket],
-      rateLimit: 1,
-      bypassVisitorRateLimit,
     });
-    await expect(createBrief("visitor")).resolves.toMatchObject({ created: true });
-    await expect(createBrief("wrong-identity", false)).rejects.toMatchObject({
-      statusCode: 429,
-      code: "rate_limited",
-    });
-    await expect(createBrief("anonymous")).rejects.toMatchObject({
-      statusCode: 429,
-      code: "rate_limited",
-    });
-    await expect(createBrief("owner-one", true)).resolves.toMatchObject({ created: true });
-    await expect(createBrief("owner-two", true)).resolves.toMatchObject({ created: true });
+    for (const label of ["one", "two", "three", "four"]) {
+      await expect(createBrief(label)).resolves.toMatchObject({ created: true });
+    }
 
-    const runBucket = `owner-run-limit-${randomUUID()}`;
-    const createRun = (label: string, bypassVisitorRateLimit?: boolean) => repository.createRunIdempotent({
-      prompt: `Owner run quota request ${label}`,
-      brief: { ...brief, title: `Owner quota ${label}` },
+    const runBucket = `anonymous-run-unlimited-${randomUUID()}`;
+    const createRun = (label: string) => repository.createRunIdempotent({
+      prompt: `Anonymous run request ${label}`,
+      brief: { ...brief, title: `Anonymous run ${label}` },
       estimateUsd: 0,
       approvedBudgetUsd: 1,
       clientBucket: runBucket,
       clientBucketAliases: [runBucket],
-      idempotencyKey: `owner-run-${label}-${randomUUID()}`,
+      idempotencyKey: `anonymous-run-${label}-${randomUUID()}`,
       reuseDays: 0,
-      rateLimit: 1,
       globalLimit: 100,
-      bypassVisitorRateLimit,
     });
-    await expect(createRun("visitor")).resolves.toMatchObject({ created: true });
-    await expect(createRun("wrong-identity", false)).rejects.toMatchObject({
-      statusCode: 429,
-      code: "rate_limited",
-    });
-    await expect(createRun("anonymous")).rejects.toMatchObject({
-      statusCode: 429,
-      code: "rate_limited",
-    });
-    await expect(createRun("owner-one", true)).resolves.toMatchObject({ created: true });
-    await expect(createRun("owner-two", true)).resolves.toMatchObject({ created: true });
+    for (const label of ["one", "two", "three", "four"]) {
+      await expect(createRun(label)).resolves.toMatchObject({ created: true });
+    }
 
-    const events = await repository.pool.query<{ client_bucket: string; action: string; count: number }>(
-      `SELECT client_bucket,action,count(*)::int count FROM rate_limit_events
-       WHERE client_bucket=ANY($1::text[]) GROUP BY client_bucket,action ORDER BY client_bucket,action`,
-      [[briefBucket, runBucket]],
+    const events = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) AND action=ANY($2::text[])`,
+      [[briefBucket, runBucket], ["brief", "run"]],
     );
-    expect(events.rows).toEqual(expect.arrayContaining([
-      { client_bucket: briefBucket, action: "brief", count: 1 },
-      { client_bucket: runBucket, action: "run", count: 1 },
-    ]));
-    expect(events.rows).toHaveLength(2);
+    expect(events.rows[0]?.count).toBe(0);
   });
 
-  test("owner visitor-rate bypass never bypasses global run capacity", async () => {
+  test("owner force-refresh never bypasses global run capacity", async () => {
     const create = (label: string) => {
       const bucket = `owner-global-capacity-${label}-${randomUUID()}`;
       return repository.createRunIdempotent({
@@ -1213,9 +1170,8 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [bucket],
         idempotencyKey: `owner-global-${label}-${randomUUID()}`,
         reuseDays: 0,
-        rateLimit: 0,
         globalLimit: 1,
-        bypassVisitorRateLimit: true,
+        forceFreshResearch: true,
       });
     };
     await expect(create("first")).resolves.toMatchObject({ created: true });
@@ -1238,7 +1194,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket: briefBucket,
       clientBucketAliases: [briefBucket],
       idempotencyKey: briefKey,
-      rateLimit: 1,
     });
     const briefResults = await Promise.all([createBrief(), createBrief()]);
     expect(new Set(briefResults.map((result) => result.id)).size).toBe(1);
@@ -1255,7 +1210,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [runBucket],
       idempotencyKey: runKey,
       reuseDays: 0,
-      rateLimit: 1,
       globalLimit: 100,
     });
     const runResults = await Promise.all([createRun(), createRun()]);
@@ -1263,15 +1217,12 @@ databaseDescribe("hosted backend integration", () => {
     expect(new Set(runResults.map((result) => result.accessId)).size).toBe(1);
     expect(runResults.filter((result) => result.created)).toHaveLength(1);
 
-    const eventCounts = await repository.pool.query<{ client_bucket: string; count: number }>(
-      `SELECT client_bucket,count(*)::int count FROM rate_limit_events
-       WHERE client_bucket=ANY($1::text[]) GROUP BY client_bucket`,
-      [[briefBucket, runBucket]],
+    const eventCounts = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) AND action=ANY($2::text[])`,
+      [[briefBucket, runBucket], ["brief", "run"]],
     );
-    expect(eventCounts.rows).toEqual(expect.arrayContaining([
-      { client_bucket: briefBucket, count: 1 },
-      { client_bucket: runBucket, count: 1 },
-    ]));
+    expect(eventCounts.rows[0]?.count).toBe(0);
   });
 
   test("persists the requested track count and rejects idempotent payload drift", async () => {
@@ -1284,7 +1235,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: key,
-      rateLimit: 10,
     });
 
     await expect(repository.getBriefRequest(first.id)).resolves.toMatchObject({
@@ -1298,7 +1248,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: key,
-      rateLimit: 10,
     })).resolves.toMatchObject({ id: first.id, created: false });
     await expect(repository.createBriefRequest({
       prompt: "Influential techno",
@@ -1307,7 +1256,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: key,
-      rateLimit: 10,
     })).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
   });
 
@@ -1322,7 +1270,6 @@ databaseDescribe("hosted backend integration", () => {
         clientBucket,
         clientBucketAliases: [clientBucket],
         idempotencyKey: randomUUID(),
-        rateLimit: 10,
       });
       const questions = guidanceQuestions(questionCount);
       await repository.saveBriefResult(request.id, {
@@ -1412,7 +1359,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const questions = guidanceQuestions(2);
     await repository.saveBriefResult(request.id, {
@@ -1441,7 +1387,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const questions = Array.from({ length: questionCount }, (_unused, index) =>
       guidanceQuestions(2)[index % 2]!).map((question, index) => ({
@@ -1474,7 +1419,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const questions = guidanceQuestions(2);
     const answers = guidanceAnswers(questions);
@@ -1510,7 +1454,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const questions = guidanceQuestions(3);
     const answers = guidanceAnswers(questions);
@@ -1558,7 +1501,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     });
     const questions = guidanceQuestions(2);
     const answers = guidanceAnswers(questions);
@@ -1604,7 +1546,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
-      rateLimit: 10,
     })).rejects.toMatchObject({ statusCode: 400, code: "invalid_track_count" });
   });
 
@@ -1620,7 +1561,6 @@ databaseDescribe("hosted backend integration", () => {
       idempotencyKey: `auto-publish-${randomUUID()}`,
       autoPublish: true,
       reuseDays: 0,
-      rateLimit: 10,
       globalLimit: 100,
     });
 
@@ -1640,7 +1580,6 @@ databaseDescribe("hosted backend integration", () => {
       idempotencyKey,
       autoPublish: true,
       reuseDays: 0,
-      rateLimit: 10,
       globalLimit: 100,
     });
 
@@ -1669,7 +1608,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey,
       reuseDays: 0,
-      rateLimit: 10,
       globalLimit: 100,
     });
 
@@ -1715,7 +1653,6 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [bucket],
         idempotencyKey: `global-${label}-${randomUUID()}`,
         reuseDays: 0,
-        rateLimit: 10,
         globalLimit: 1,
       });
     };
@@ -1744,7 +1681,6 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [bucket],
         idempotencyKey: `review-capacity-${label}-${randomUUID()}`,
         reuseDays: 0,
-        rateLimit: 10,
         globalLimit: 1,
       });
     };
@@ -3355,7 +3291,6 @@ databaseDescribe("hosted backend integration", () => {
       model: "test-model",
       clientBucket: briefBucket,
       clientBucketAliases: [briefBucket],
-      rateLimit: 100,
     });
     await repository.saveBriefResult(briefRequest.id, { status: "failed", error: privateFailure });
 
@@ -3369,7 +3304,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const researchJob = await repository.enqueueJob({
@@ -3471,7 +3405,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const capabilities = new CapabilityService(repository);
@@ -3493,7 +3426,7 @@ databaseDescribe("hosted backend integration", () => {
     await expect(capabilities.authenticate(request)).rejects.toMatchObject({ statusCode: 401, code: "capability_required" });
   });
 
-  test("allows multiple active runs from one anonymous bucket while preserving capability isolation and rate limits", async () => {
+  test("allows repeated active runs from one anonymous bucket while preserving capability isolation", async () => {
     vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
     const clientBucket = `capability-multi-run-${randomUUID()}`;
     const create = (label: string, capabilitySessionId?: string) => {
@@ -3506,7 +3439,6 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [clientBucket],
         idempotencyKey: randomUUID(),
         reuseDays: 0,
-        rateLimit: 2,
         globalLimit: 100,
         capabilitySessionId,
       });
@@ -3523,7 +3455,8 @@ databaseDescribe("hosted backend integration", () => {
     const right = await create("right", session.id);
     expect(right).toMatchObject({ created: true, status: "queued" });
     expect(left.runId).not.toBe(right.runId);
-    await expect(create("third", session.id)).rejects.toMatchObject({ statusCode: 429, code: "rate_limited" });
+    const third = await create("third", session.id);
+    expect(third).toMatchObject({ created: true, status: "queued" });
 
     await expect(capabilities.authenticateForAccess(request, left.accessId)).resolves.toMatchObject({
       runId: left.runId,
@@ -3533,16 +3466,20 @@ databaseDescribe("hosted backend integration", () => {
       runId: right.runId,
       accessId: right.accessId,
     });
+    await expect(capabilities.authenticateForAccess(request, third.accessId)).resolves.toMatchObject({
+      runId: third.runId,
+      accessId: third.accessId,
+    });
     const history = await repository.listRunsForCapabilitySession(session.id);
-    expect(history.map((item) => item.id)).toEqual([right.accessId, left.accessId]);
+    expect(history.map((item) => item.id)).toEqual([third.accessId, right.accessId, left.accessId]);
     expect(history[0]).toMatchObject({
-      prompt: "Capability scope right",
+      prompt: "Capability scope third",
       status: "queued",
       phase: "queued",
       candidateCount: 0,
       sourceCount: 0,
       unresolvedCount: 0,
-      brief: { title: "Capability scope right" },
+      brief: { title: "Capability scope third" },
     });
 
     const mergeReply = new ReplyStub();
@@ -3564,7 +3501,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [isolatedBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     await expect(capabilities.authenticateForAccess(request, isolated.accessId)).rejects.toMatchObject({
@@ -3575,10 +3511,11 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.deleteRunAccess(left.accessId)).resolves.toBe(true);
     await expect(capabilities.authenticate(request)).resolves.toMatchObject({
       id: session.id,
-      runId: right.runId,
-      accessId: right.accessId,
+      runId: third.runId,
+      accessId: third.accessId,
     });
     await expect(repository.listRunsForCapabilitySession(session.id)).resolves.toMatchObject([
+      { id: third.accessId },
       { id: right.accessId },
     ]);
   });
@@ -3595,7 +3532,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
       capabilitySessionId,
     });
@@ -3636,7 +3572,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const capabilities = new CapabilityService(repository);
@@ -3666,7 +3601,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const capabilities = new CapabilityService(repository);
@@ -3699,7 +3633,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const capabilities = new CapabilityService(repository);
@@ -3736,7 +3669,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const capabilities = new CapabilityService(repository);
@@ -3781,7 +3713,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const manifestId = randomUUID();
@@ -3906,7 +3837,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const manifestId = randomUUID();
@@ -3990,7 +3920,6 @@ databaseDescribe("hosted backend integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       reuseDays: 0,
-      rateLimit: 100,
       globalLimit: 100,
     });
     const capabilities = new productionModule.CapabilityService(repository);
