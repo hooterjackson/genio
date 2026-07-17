@@ -219,7 +219,7 @@ export function FeedbackForm() {
     <section className="feedback-shell" aria-labelledby="feedback-title">
       <div className="screen-index">/ BUGS + IMPROVEMENTS</div>
       <h1 id="feedback-title">SEND FEEDBACK.</h1>
-      <p>Describe what happened or what should change. Only the 9ênio owner can view submissions.</p>
+      <p>Describe what happened or what should change. Only the gênio owner can view submissions.</p>
 
       {error && <div className="feedback-error" role="alert">[ERROR] {error}</div>}
 

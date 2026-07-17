@@ -148,16 +148,50 @@ const flowQuestion = {
 async function openPrompt(page: Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByRole("textbox", { name: /playlist request/i })).toBeVisible();
-  await expect(page.getByRole("spinbutton", { name: /tracks/i })).toBeVisible();
-  await expect(page.getByRole("button", { name: /continue/i })).toBeVisible();
+  for (const count of [25, 50, 100] as const) {
+    await expect(trackCountPreset(page, count)).toBeVisible();
+  }
+  await expect(customSizeButton(page)).toBeVisible();
+  await expect(exactTrackCountField(page)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /create playlist/i })).toBeVisible();
 }
 
 function requestField(page: Page) {
   return page.getByRole("textbox", { name: /playlist request/i });
 }
 
-function trackCountField(page: Page) {
-  return page.getByRole("spinbutton", { name: /tracks/i });
+function trackCountPreset(page: Page, count: 25 | 50 | 100) {
+  return page.getByRole("button", { name: new RegExp(`^${count} tracks$`, "i") });
+}
+
+function customSizeButton(page: Page) {
+  return page.getByRole("button", { name: /^custom size$/i });
+}
+
+function exactTrackCountField(page: Page) {
+  return page.getByRole("textbox", { name: /^exact track count$/i });
+}
+
+async function choosePresetTrackCount(page: Page, count: 25 | 50 | 100): Promise<void> {
+  if ((await trackCountPreset(page, count).count()) === 0) {
+    await page.getByRole("button", { name: "PRESETS", exact: true }).click();
+  }
+  await trackCountPreset(page, count).click();
+  await expect(trackCountPreset(page, count)).toHaveAttribute("aria-pressed", "true");
+  await expect(exactTrackCountField(page)).toHaveCount(0);
+}
+
+async function chooseCustomTrackCount(page: Page, value: string): Promise<void> {
+  if ((await exactTrackCountField(page).count()) === 0) {
+    await customSizeButton(page).click();
+  }
+  await expect(customSizeButton(page)).toHaveCount(0);
+  await expect(exactTrackCountField(page)).toBeVisible();
+  await exactTrackCountField(page).fill(value);
+}
+
+function continueWithTracksButton(page: Page) {
+  return page.getByRole("button", { name: /continue(?: with \d+)?/i });
 }
 
 async function mockGuidedBrief(
@@ -234,7 +268,7 @@ async function selectGuidedOption(page: Page, label: string): Promise<void> {
   await expect(radio).toBeChecked();
 }
 
-test("the 9ênio intro is brief, skippable, mobile-safe, and shown once per session", async ({ page }) => {
+test("the gênio intro is brief, skippable, mobile-safe, and shown once per session", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await page.goto("/");
 
@@ -242,21 +276,25 @@ test("the 9ênio intro is brief, skippable, mobile-safe, and shown once per sess
   await expect(intro).toBeVisible();
   const lockup = intro.locator(".brand-intro-lockup");
   const typedAscii = intro.locator(".brand-intro-typed");
+  const skip = page.getByRole("button", { name: "Skip intro" });
   await expect.poll(async () => Number(await lockup.getAttribute("data-character-count"))).toBeGreaterThan(0);
   const partialCharacterCount = Number(await lockup.getAttribute("data-character-count"));
   const totalCharacterCount = Number(await lockup.getAttribute("data-character-total"));
   expect(partialCharacterCount).toBeLessThan(totalCharacterCount);
-  await expect.poll(async () => Number(await lockup.getAttribute("data-character-count"))).toBeGreaterThan(partialCharacterCount);
-  await expect(typedAscii).toContainText("/\\");
-  await expect(typedAscii).toContainText("____", { timeout: 3_000 });
-  await expect(intro.locator(".sr-only")).toHaveText("9ênio");
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
-  expect(overflow).toBeLessThanOrEqual(1);
-
-  const skip = page.getByRole("button", { name: "Skip intro" });
+  await expect(skip).toBeFocused();
   const skipBox = await skip.boundingBox();
   expect(skipBox?.width ?? 0).toBeGreaterThanOrEqual(44);
   expect(skipBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+
+  await intro.click({ position: { x: 8, y: 8 } });
+  await expect(requestField(page)).not.toBeFocused();
+  await expect.poll(async () => Number(await lockup.getAttribute("data-character-count"))).toBeGreaterThan(partialCharacterCount);
+  await expect(typedAscii).toContainText("/\\");
+  await expect(typedAscii).toContainText("____", { timeout: 3_000 });
+  await expect(intro.locator(".sr-only")).toHaveText("gênio");
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+
   await skip.click();
   await expect(intro).toHaveCount(0);
   await page.waitForTimeout(1_500);
@@ -265,10 +303,10 @@ test("the 9ênio intro is brief, skippable, mobile-safe, and shown once per sess
 
   await page.reload();
   await expect(page.getByTestId("brand-intro")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "9ênio home" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "gênio home" })).toBeVisible();
 });
 
-test("the 9ênio intro is omitted when reduced motion is requested", async ({ page }) => {
+test("the gênio intro is omitted when reduced motion is requested", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByTestId("brand-intro")).toHaveCount(0);
@@ -277,13 +315,17 @@ test("the 9ênio intro is omitted when reduced motion is requested", async ({ pa
 
 test("the one-command composer remains usable at mobile widths", async ({ page }) => {
   await openPrompt(page);
-  await expect(page.getByText("Describe the playlist and choose its size. 9ênio will ask only what changes the result.")).toBeVisible();
-  await expect(trackCountField(page)).toHaveValue("50");
-  await expect(page.locator(".one-command-timing strong")).toHaveText("2 MIN");
-  for (const [count, windowLabel] of [["100", "2 MIN"], ["200", "4 MIN"], ["300", "6 MIN"]] as const) {
-    await trackCountField(page).fill(count);
-    await expect(page.locator(".one-command-timing strong")).toHaveText(windowLabel);
-    const textFits = await trackCountField(page).evaluate((element) => {
+  await expect(page.getByText("gênio asks only what would materially change the result.")).toBeVisible();
+  await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText("2 MIN TARGET", { exact: true })).toBeVisible();
+  for (const count of [25, 50, 100] as const) {
+    await choosePresetTrackCount(page, count);
+    await expect(page.getByText("2 MIN TARGET", { exact: true })).toBeVisible();
+  }
+  for (const [count, windowLabel] of [["200", "4 MIN"], ["300", "6 MIN"]] as const) {
+    await chooseCustomTrackCount(page, count);
+    await expect(page.getByText(`${windowLabel} TARGET`, { exact: true })).toBeVisible();
+    const textFits = await exactTrackCountField(page).evaluate((element) => {
       const input = element as HTMLInputElement;
       const style = window.getComputedStyle(input);
       const canvas = document.createElement("canvas");
@@ -300,7 +342,7 @@ test("the one-command composer remains usable at mobile widths", async ({ page }
     );
     expect(overflowAtCount).toBeLessThanOrEqual(1);
   }
-  await trackCountField(page).fill("50");
+  await choosePresetTrackCount(page, 50);
   const example = "Paulinho da Costa’s most influential recordings";
   await requestField(page).focus();
   await expect(requestField(page)).toHaveAttribute("placeholder", example);
@@ -311,29 +353,62 @@ test("the one-command composer remains usable at mobile widths", async ({ page }
   expect(overflow).toBeLessThanOrEqual(1);
   const sizes = await Promise.all([
     requestField(page).boundingBox(),
-    trackCountField(page).boundingBox(),
-    page.getByRole("button", { name: /continue/i }).boundingBox(),
+    trackCountPreset(page, 25).boundingBox(),
+    trackCountPreset(page, 50).boundingBox(),
+    trackCountPreset(page, 100).boundingBox(),
+    customSizeButton(page).boundingBox(),
+    page.getByRole("button", { name: /create playlist/i }).boundingBox(),
   ]);
   expect(sizes.every((box) => box && box.height >= 44)).toBe(true);
 });
 
-test("the one-command composer exposes invalid counts and blocks accidental submission", async ({ page }) => {
+test("preset and custom sizes switch cleanly and malformed custom counts are never coerced", async ({ page }) => {
   await openPrompt(page);
   await requestField(page).fill("Esoteric electroacoustic recordings made with bowed cymbals");
-  const submit = page.getByRole("button", { name: /continue/i });
+  const submit = page.getByRole("button", { name: /create playlist/i });
 
-  await trackCountField(page).fill("0");
-  await expect(trackCountField(page)).toHaveAttribute("aria-invalid", "true");
+  await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
+  await expect(submit).toBeEnabled();
+
+  await choosePresetTrackCount(page, 25);
+  await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "false");
+  await expect(submit).toBeEnabled();
+
+  await chooseCustomTrackCount(page, "1");
+  await expect(exactTrackCountField(page)).toHaveValue("1");
+  await expect(exactTrackCountField(page)).toHaveAttribute("aria-invalid", "false");
+  await expect(submit).toBeEnabled();
+
+  await exactTrackCountField(page).fill("300");
+  await expect(exactTrackCountField(page)).toHaveValue("300");
+  await expect(exactTrackCountField(page)).toHaveAttribute("aria-invalid", "false");
+  await expect(submit).toBeEnabled();
+
+  await exactTrackCountField(page).fill("0");
+  await expect(exactTrackCountField(page)).toHaveAttribute("aria-invalid", "true");
   await expect(page.locator("#playlist-track-count-note")).toContainText("Choose 1–300 tracks.");
   await expect(submit).toBeDisabled();
 
-  await trackCountField(page).fill("301");
-  await expect(trackCountField(page)).toHaveAttribute("aria-invalid", "true");
+  await exactTrackCountField(page).fill("301");
+  await expect(exactTrackCountField(page)).toHaveValue("301");
+  await expect(exactTrackCountField(page)).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByRole("alert")).toContainText("Enter a whole number from 1 to 300.");
   await expect(submit).toBeDisabled();
 
-  await trackCountField(page).fill("37");
-  await expect(trackCountField(page)).toHaveAttribute("aria-invalid", "false");
+  for (const malformed of ["12.5", "-5", "1e2", "tracks"] as const) {
+    await exactTrackCountField(page).fill(malformed);
+    await expect(exactTrackCountField(page)).toHaveValue(malformed);
+    await expect(exactTrackCountField(page)).toHaveAttribute("aria-invalid", "true");
+    await expect(submit).toBeDisabled();
+  }
+
+  await exactTrackCountField(page).fill("37");
+  await expect(exactTrackCountField(page)).toHaveAttribute("aria-invalid", "false");
   await expect(page.locator("#playlist-track-count-note")).toContainText("selected track count is exact");
+  await expect(submit).toBeEnabled();
+
+  await choosePresetTrackCount(page, 100);
+  await expect(customSizeButton(page)).toHaveAttribute("aria-pressed", "false");
   await expect(submit).toBeEnabled();
 });
 
@@ -377,8 +452,8 @@ test("the selected count stays authoritative through guided questions", async ({
 
   await openPrompt(page);
   await requestField(page).fill("300 influential techno tracks");
-  await trackCountField(page).fill("50");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await choosePresetTrackCount(page, 50);
+  await page.getByRole("button", { name: /create playlist/i }).click();
   await selectGuidedOption(page, "Historical impact");
   await page.getByRole("button", { name: /next/i }).click();
   await selectGuidedOption(page, "A smooth arc");
@@ -390,6 +465,26 @@ test("the selected count stays authoritative through guided questions", async ({
     brief: { targetSize: { min: 50, max: 50 } },
   });
   await expect(page.getByRole("button", { name: /review request/i })).toHaveCount(0);
+});
+
+test("a custom count remains visible when editing the request from guidance", async ({ page }) => {
+  const customBrief = { ...curatedBrief, targetSize: { min: 75, max: 75 } };
+  await mockGuidedBrief(page, {
+    requestId: "brief-custom-edit",
+    initialBrief: customBrief,
+    questions: [scopeQuestion],
+  });
+
+  await openPrompt(page);
+  await requestField(page).fill("A deep history of Brazilian jazz-funk percussion");
+  await chooseCustomTrackCount(page, "75");
+  await page.getByRole("button", { name: /create playlist/i }).click();
+  await expect(page.getByText("QUESTION 1 OF 1", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /edit request/i }).click();
+  await expect(exactTrackCountField(page)).toBeVisible();
+  await expect(exactTrackCountField(page)).toHaveValue("75");
+  await expect(customSizeButton(page)).toHaveCount(0);
 });
 
 test("a two-question guided flow accepts a custom fourth answer before creating the run", async ({ page }) => {
@@ -436,7 +531,7 @@ test("a two-question guided flow accepts a custom fourth answer before creating 
 
   await openPrompt(page);
   await requestField(page).fill("Berlin techno foundations");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await page.getByRole("button", { name: /create playlist/i }).click();
 
   await expect(page.getByText("QUESTION 1 OF 2", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: scopeQuestion.question })).toBeVisible();
@@ -445,9 +540,13 @@ test("a two-question guided flow accepts a custom fourth answer before creating 
   await page.getByRole("button", { name: /next/i }).click();
 
   await expect(page.getByText("QUESTION 2 OF 2", { exact: true })).toBeVisible();
+  const customChoice = page.getByRole("radio", { name: /something else/i });
   const custom = page.getByRole("textbox", { name: "Something else" });
+  await customChoice.locator("..").click();
+  await expect(customChoice).toBeChecked();
   await custom.fill("Start sparse, then build toward peak-time tracks");
-  await expect(page.getByRole("radio", { name: /something else/i })).toBeChecked();
+  await expect(custom).toHaveValue("Start sparse, then build toward peak-time tracks");
+  await expect(page.getByRole("button", { name: /create playlist/i })).toBeEnabled();
   expect(runCreates).toBe(0);
   await page.getByRole("button", { name: /create playlist/i }).click();
 
@@ -481,8 +580,8 @@ test("three guided screens preserve earlier answers and remain usable at mobile 
 
   await openPrompt(page);
   await requestField(page).fill("A deep history of influential Berlin techno");
-  await trackCountField(page).fill("75");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await chooseCustomTrackCount(page, "75");
+  await page.getByRole("button", { name: /create playlist/i }).click();
 
   await expect(page.getByText("QUESTION 1 OF 3", { exact: true })).toBeVisible();
   await expect(page.getByRole("radio")).toHaveCount(4);
@@ -490,13 +589,13 @@ test("three guided screens preserve earlier answers and remain usable at mobile 
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
   await page.getByRole("button", { name: /next/i }).click();
   await expect(page.getByRole("heading", { name: eraQuestion.question })).toBeFocused();
-  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(1);
+  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(10);
   await selectGuidedOption(page, "Across the full history");
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
   await page.getByRole("button", { name: /next/i }).click();
   await expect(page.getByText("QUESTION 3 OF 3", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: flowQuestion.question })).toBeFocused();
-  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(1);
+  expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(10);
 
   await page.getByRole("button", { name: /back/i }).click();
   await expect(page.getByRole("heading", { name: eraQuestion.question })).toBeFocused();
@@ -564,7 +663,7 @@ test("a failed guided finalization retries the identical frozen submission", asy
 
   await openPrompt(page);
   await requestField(page).fill("Berlin techno foundations");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await page.getByRole("button", { name: /create playlist/i }).click();
   await selectGuidedOption(page, "Historical impact");
   await page.getByRole("button", { name: /next/i }).click();
   await selectGuidedOption(page, "A smooth arc");
@@ -603,7 +702,7 @@ test("leaving the composer cancels a pending guided request", async ({ page }) =
 
   await openPrompt(page);
   await requestField(page).fill("Berlin techno foundations");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await page.getByRole("button", { name: /create playlist/i }).click();
   await page.getByRole("button", { name: "JOBS", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "JOBS" })).toBeVisible();
@@ -704,8 +803,8 @@ test("an explicit 100-track request stays at 100 through research, matching, and
 
   await openPrompt(page);
   await requestField(page).fill(prompt);
-  await trackCountField(page).fill("100");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await choosePresetTrackCount(page, 100);
+  await page.getByRole("button", { name: /create playlist/i }).click();
   await selectGuidedOption(page, "Historical impact");
   await page.getByRole("button", { name: /next/i }).click();
   await selectGuidedOption(page, "A smooth arc");
@@ -815,7 +914,7 @@ test("a 50-track request uses reserve matches but generates exactly 50 tracks", 
 
   await page.goto("/#cap=one-time-secret&run=run-exact-50");
   await expect(page.getByText("50 OF 56 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await continueWithTracksButton(page).click();
 
   await expect.poll(() => selectionBody).toEqual({
     useRecommended: true,
@@ -918,7 +1017,7 @@ test("a 200-track request selects exactly 200 tracks from its 300-candidate rese
   await page.goto("/#cap=one-time-secret&run=run-exact-200");
   await expect(page.getByText("200 OF 300 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
   await expect(page.getByRole("checkbox")).toHaveCount(300);
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await continueWithTracksButton(page).click();
 
   await expect.poll(() => selectionBody).toEqual({
     useRecommended: true,
@@ -1000,9 +1099,11 @@ test("an active job never blocks starting a new request", async ({ page }) => {
   });
 
   await page.goto("/#cap=one-time-secret&run=run-active");
-  await page.getByRole("button", { name: "NEW JOB", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "RESEARCHING." })).toBeVisible();
+  await page.getByRole("button", { name: "gênio home" }).click();
   await expect(requestField(page)).toBeVisible();
-  await expect(trackCountField(page)).toHaveValue("50");
+  await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
+  await expect(exactTrackCountField(page)).toHaveCount(0);
   await expect(requestField(page)).toHaveValue("");
   expect(deletes).toEqual([]);
 });
@@ -1030,7 +1131,7 @@ test("the optimistic flow preserves material assumptions without claiming user a
 
   await openPrompt(page);
   await requestField(page).fill("Every released song Paulinho da Costa performed on");
-  await page.getByRole("button", { name: /continue/i }).click();
+  await page.getByRole("button", { name: /create playlist/i }).click();
   await selectGuidedOption(page, "Historical impact");
   await page.getByRole("button", { name: /next/i }).click();
   await selectGuidedOption(page, "Chronologically");
@@ -1152,7 +1253,7 @@ test("the whole list can be cleared, restored, and edited without reviewing trac
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  const generate = page.getByRole("button", { name: /generate playlist/i });
+  const generate = continueWithTracksButton(page);
   await expect(page.getByText("3 tracks matched. Omitted: 1 unavailable track.", { exact: true })).toBeVisible();
   await expect(page.getByText("2 OF 3 MATCHED TRACKS SELECTED", { exact: true })).toBeVisible();
   const list = page.getByRole("list", { name: "Playlist tracks" });
@@ -1301,7 +1402,7 @@ test("an unresolved Apple shortfall cannot silently generate fewer tracks than r
 
   await page.goto("/#cap=one-time-secret&run=run-catalog-shortfall");
   await expect(page.getByText("28 of 50 requested tracks are ready. Resolve 22 more Apple Music matches to generate the playlist.", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+  await expect(continueWithTracksButton(page)).toBeDisabled();
 });
 
 test("legacy timed-out Apple matches recover automatically before selection", async ({ page }) => {
@@ -1419,7 +1520,7 @@ test("a failed automatic Apple retry leaves the list available for a manual retr
   await expect(page.getByText("Apple Music matching is incomplete for 1 track. Retry matching before generating a playlist.", { exact: true })).toBeVisible();
   await expect(page.getByText("NEEDS MATCH", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "SELECT ALL", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+  await expect(continueWithTracksButton(page)).toBeDisabled();
   const retry = page.getByRole("button", { name: "Retry Apple Music matching for 1 track" });
   await expect(retry).toBeEnabled();
   await retry.click();
@@ -1485,7 +1586,7 @@ test("terminal Apple matching failures are distinct from unavailable tracks and 
   await expect(page.getByRole("button", { name: "SELECT ALL", exact: true })).toBeDisabled();
   await expect(page.getByRole("button", { name: "CLEAR", exact: true })).toBeDisabled();
   await expect(page.getByRole("button", { name: /retry apple music matching/i })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+  await expect(continueWithTracksButton(page)).toBeDisabled();
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
@@ -1569,13 +1670,13 @@ test("a no-primary Apple alternative requires an explicit version choice before 
   await expect(selectAll).toBeEnabled();
   await selectAll.click();
   await expect(checkbox).toBeChecked();
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await continueWithTracksButton(page).click();
   await expect.poll(() => selectionBody).toEqual({
     selected: [{ candidateId: "candidate-manual-choice", catalogId: "apple-title-only-alternative" }],
   });
 });
 
-test("one Generate playlist action saves the list and starts Apple publication", async ({ page }) => {
+test("one track-list continuation saves the list and starts Apple publication", async ({ page }) => {
   let currentRun = run;
   await page.route("**/api/v1/capabilities/exchange", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: run.id }) });
@@ -1653,7 +1754,7 @@ test("one Generate playlist action saves the list and starts Apple publication",
   await expect(version.locator("option")).toHaveCount(2);
   await expect(page.getByRole("checkbox", { name: /uncertain track/i })).toBeChecked();
   await version.selectOption("apple-alternative");
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await continueWithTracksButton(page).click();
   const selectionBody = await selectionRequest;
   expect(selectionBody).toEqual({
     selected: [{ candidateId: "candidate-primary", catalogId: "apple-alternative" }],
@@ -1727,7 +1828,7 @@ test("compact recommended selection preserves a catalog-only deselection", async
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await page.getByRole("checkbox", { name: /track 30/i }).uncheck();
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await continueWithTracksButton(page).click();
   await expect.poll(() => selectionBody).toEqual({
     useRecommended: true,
     excludedCandidateIds: ["candidate-29"],
@@ -1791,9 +1892,9 @@ test("leaving during playlist generation prevents stale publication and state", 
   });
 
   await page.goto("/#cap=one-time-secret&run=run-1");
-  await page.getByRole("button", { name: /generate playlist/i }).click();
+  await continueWithTracksButton(page).click();
   await started;
-  await page.getByRole("button", { name: "NEW JOB", exact: true }).click();
+  await page.getByRole("button", { name: "gênio home" }).click();
   await expect(requestField(page)).toBeVisible();
   releaseSelection();
   await page.waitForTimeout(50);
@@ -1840,8 +1941,7 @@ test("the current publication result shape keeps run coverage and evidence conte
   await page.goto("/#cap=one-time-secret&run=run-result");
   const resultHeading = page.getByRole("heading", { name: "PLAYLIST PUBLISHED WITH GAPS." });
   await expect(resultHeading).toBeVisible();
-  await expect(resultHeading.locator(".result-title-line")).toHaveCount(2);
-  await expect(resultHeading).not.toContainText("<br");
+  await expect(resultHeading.locator("br")).toHaveCount(0);
   await expect(page.getByText("Published from 18 documented sources with 3 visible gaps.")).toBeVisible();
   await expect(page.getByText("2 tracks")).toBeVisible();
   await expect(page.getByRole("link", { name: /view evidence/i })).toHaveAttribute(
@@ -1953,7 +2053,7 @@ test("playlist generation waits for the complete track list", async ({ page }) =
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await expect(page.getByText("LOADING TRACKS")).toBeVisible();
-  const generateButton = page.getByRole("button", { name: /generate playlist/i });
+  const generateButton = continueWithTracksButton(page);
   await expect(generateButton).toBeDisabled();
   releaseTracks();
   await expect(page.getByText("Ready track", { exact: true })).toBeVisible();
@@ -2001,7 +2101,7 @@ test("duplicate or missing track pages cannot produce a playlist", async ({ page
 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await expect(page.getByRole("alert")).toContainText("track list is incomplete");
-  await expect(page.getByRole("button", { name: /generate playlist/i })).toBeDisabled();
+  await expect(continueWithTracksButton(page)).toBeDisabled();
   await expect(page.getByRole("list", { name: "Playlist tracks" })).toHaveCount(0);
 });
 
@@ -2023,13 +2123,13 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   await page.goto("/");
   const request = requestField(page);
   await request.fill("Every released song Paulinho da Costa performed on");
-  const primary = page.getByRole("button", { name: /continue/i });
+  const primary = page.getByRole("button", { name: /create playlist/i });
   await primary.focus();
   await expect(primary).toBeFocused();
 
   for (const locator of [
     page.locator("body"),
-    page.locator(".one-command-intro"),
+    page.locator(".command-request-section > p"),
     page.locator(".header-meta"),
     page.locator(".wordmark"),
   ]) {

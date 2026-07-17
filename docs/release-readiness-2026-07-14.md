@@ -88,7 +88,7 @@ advice.
 - Apple's create-playlist example sends `isPublic: true`, but its canonical
   creation-attributes object lists only `name` and `description`, and the same
   example response reports `isPublic: false`. Apple documents no later
-  visibility-update endpoint. Needle therefore accepts a share URL only after
+  visibility-update endpoint. gênio therefore accepts a share URL only after
   a fresh library read reports `isPublic: true`; live cross-account proof is
   still mandatory:
   <https://developer.apple.com/documentation/applemusicapi/create-a-new-library-playlist>

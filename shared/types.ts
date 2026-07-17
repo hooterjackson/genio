@@ -212,6 +212,31 @@ export interface PublicationResult {
   volumes: PublicationVolume[];
 }
 
+/** Public-safe Apple Music metadata retained independently of a research run. */
+export interface PublicPlaylistDirectoryVolume {
+  volumeNumber: number;
+  name: string;
+  trackCount: number;
+  shareUrl: string;
+}
+
+export interface PublicPlaylistDirectoryItem {
+  id: string;
+  title: string;
+  trackCount: number;
+  volumeCount: number;
+  publishedAt: string;
+  volumes: PublicPlaylistDirectoryVolume[];
+}
+
+export interface PublicPlaylistDirectoryPage {
+  items: PublicPlaylistDirectoryItem[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
 export interface SetupStatus {
   openai: { connected: boolean; model: string };
   apple: { configured: boolean; authorized: boolean; storefront: string };

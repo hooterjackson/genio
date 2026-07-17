@@ -463,7 +463,7 @@ test("non-retriable Apple authorization rejections fail without six delayed atte
     expect(harness.repository.failJob).toHaveBeenCalledWith(
       harness.job.id,
       expect.any(String),
-      "Apple Music rejected 9ênio's authorization validation request (HTTP 422).",
+      "Apple Music rejected gênio's authorization validation request (HTTP 422).",
       null,
     );
   } finally {

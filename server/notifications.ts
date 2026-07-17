@@ -19,14 +19,14 @@ function renderNotification(record: NotificationRecord): { subject: string; text
   const runId = typeof record.payload.runId === "string" ? record.payload.runId : "unknown";
   if (record.kind === "apple_reauthorization_required") {
     return {
-      subject: "9ênio needs Apple Music reauthorization",
-      text: `Publication paused safely. Reauthorize the owner Apple Music account in 9ênio to resume manifest ${manifestId}. Run: ${runId}.`,
+      subject: "gênio needs Apple Music reauthorization",
+      text: `Publication paused safely. Reauthorize the owner Apple Music account in gênio to resume manifest ${manifestId}. Run: ${runId}.`,
     };
   }
   if (record.kind === "publication_complete") {
     const partial = record.payload.status === "partial";
     return {
-      subject: partial ? "9ênio publication complete with documented gaps" : "9ênio publication complete",
+      subject: partial ? "gênio publication complete with documented gaps" : "gênio publication complete",
       text: partial
         ? `Manifest ${manifestId} was published in ${Number(record.payload.volumeCount ?? 1)} volume(s), with ${Number(record.payload.omittedCandidateCount ?? 0)} non-duplicate candidate omission(s) and ${Number(record.payload.unresolvedCoverageCount ?? 0)} unresolved coverage item(s). Run: ${runId}.`
         : `Manifest ${manifestId} was published successfully in ${Number(record.payload.volumeCount ?? 1)} volume(s). Run: ${runId}.`,
@@ -34,17 +34,17 @@ function renderNotification(record: NotificationRecord): { subject: string; text
   }
   if (record.kind === "publication_orphaned") {
     return {
-      subject: "9ênio orphaned a divergent Apple playlist",
-      text: `9ênio stopped using Apple playlist ${String(record.payload.applePlaylistId ?? "unknown")} because its order diverged from manifest ${manifestId}. Run: ${runId}. Open the owner dashboard for cleanup instructions.`,
+      subject: "gênio orphaned a divergent Apple playlist",
+      text: `gênio stopped using Apple playlist ${String(record.payload.applePlaylistId ?? "unknown")} because its order diverged from manifest ${manifestId}. Run: ${runId}. Open the owner dashboard for cleanup instructions.`,
     };
   }
   if (record.kind === "worker_stale" || record.kind === "budget_threshold") {
     return {
-      subject: `9ênio alert: ${record.kind.replaceAll("_", " ")}`,
-      text: `9ênio recorded ${record.kind}. Open the owner dashboard for current state.`,
+      subject: `gênio alert: ${record.kind.replaceAll("_", " ")}`,
+      text: `gênio recorded ${record.kind}. Open the owner dashboard for current state.`,
     };
   }
-  return { subject: "9ênio operator alert", text: `9ênio recorded ${record.kind}. Open the owner dashboard for details.` };
+  return { subject: "gênio operator alert", text: `gênio recorded ${record.kind}. Open the owner dashboard for details.` };
 }
 
 export async function deliverNotification(record: NotificationRecord, signal?: AbortSignal): Promise<string> {

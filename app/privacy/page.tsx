@@ -1,11 +1,12 @@
 import Link from "next/link";
 import { SiteMenu } from "../site-menu";
+import { BrandWordmark } from "../brand-wordmark";
 
 export default function PrivacyPage() {
   return (
     <main className="app-shell">
       <header className="site-header">
-        <Link className="wordmark" href="/" aria-label="9ênio home"><span>[9]</span> 9ênio_</Link>
+        <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home"><BrandWordmark /></Link>
         <div className="header-meta">
           <Link className="privacy-back" href="/">BACK</Link>
           <SiteMenu />
@@ -15,7 +16,7 @@ export default function PrivacyPage() {
       <section className="privacy-shell" aria-labelledby="privacy-title">
         <div className="screen-index">/ PRIVACY · EFFECTIVE 2026-07-14</div>
         <h1 id="privacy-title">PRIVACY_</h1>
-        <p className="privacy-intro">9ênio uses the minimum data needed to research and publish a requested playlist.</p>
+        <p className="privacy-intro">gênio uses the minimum data needed to research and publish a requested playlist.</p>
 
         <div className="privacy-grid">
           <article>
@@ -36,11 +37,11 @@ export default function PrivacyPage() {
           </article>
           <article>
             <h2>RETENTION + DELETE</h2>
-            <p>Detailed run data is kept for 90 days; after that, only Apple links, playlist title, manifest hash, outcome counts, aggregate cost, and minimal operational records remain. Deleting a run removes its detailed 9ênio data, but cannot remove a playlist already published through the owner&apos;s Apple Music account.</p>
+            <p>Detailed run data is kept for 90 days; after that, only Apple links, playlist title, manifest hash, outcome counts, aggregate cost, and minimal operational records remain. Deleting a run removes its detailed gênio data, but cannot remove a playlist already published through the owner&apos;s Apple Music account.</p>
           </article>
           <article>
             <h2>CONTACT + AGE</h2>
-            <p>9ênio is not directed to children and does not knowingly solicit their data. Privacy questions: <a href="mailto:mrcloblima@gmail.com">mrcloblima@gmail.com</a>.</p>
+            <p>gênio is not directed to children and does not knowingly solicit their data. Privacy questions: <a href="mailto:mrcloblima@gmail.com">mrcloblima@gmail.com</a>.</p>
           </article>
         </div>
       </section>

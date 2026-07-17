@@ -37,7 +37,7 @@ describe("independently frozen acceptance holdouts", () => {
   test("declares a dated, non-runtime methodology and honest coverage limits", () => {
     expect(fixture.version).toBe("2026-07-14");
     expect(fixture.methodology.frozenAt).toBe(fixture.version);
-    expect(fixture.note).toMatch(/not from Needle research output/i);
+    expect(fixture.note).toMatch(/not from gênio research output/i);
     expect(fixture.methodology.independence).toMatch(/must never be used/i);
     expect(fixture.methodology.paulinho_da_costa.classification).toMatch(/not a complete career catalogue/i);
     expect(fixture.methodology.paulinho_da_costa.coverageLimit).toMatch(/do not prove recovery of all/i);

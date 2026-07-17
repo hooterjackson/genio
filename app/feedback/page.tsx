@@ -1,12 +1,13 @@
 import Link from "next/link";
 import { FeedbackForm } from "./feedback-form";
 import { SiteMenu } from "../site-menu";
+import { BrandWordmark } from "../brand-wordmark";
 
 export default function FeedbackPage() {
   return (
     <main className="app-shell feedback-page">
       <header className="site-header">
-        <Link className="wordmark" href="/" aria-label="9ênio home"><span>[9]</span> 9ênio_</Link>
+        <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home"><BrandWordmark /></Link>
         <div className="header-meta">
           <Link className="header-action" href="/">BACK</Link>
           <SiteMenu />

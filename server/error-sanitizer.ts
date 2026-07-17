@@ -1,5 +1,5 @@
 /**
- * Errors cross several durable and public boundaries in 9ênio. Provider,
+ * Errors cross several durable and public boundaries in gênio. Provider,
  * database, and network messages can contain credentials, connection strings,
  * request data, or upstream implementation details, so none of those messages
  * are suitable for persistence or a visitor response.
@@ -19,7 +19,7 @@ export type FailureContext =
   | "background";
 
 const FAILURE_MESSAGES: Record<FailureContext, string> = {
-  brief: "9ênio could not interpret this request after the final attempt.",
+  brief: "gênio could not interpret this request after the final attempt.",
   research: "Research could not be completed after the final attempt.",
   matching: "Apple Music matching could not be completed after the final attempt.",
   publication: "Apple publication failed after the final attempt; provider details were redacted.",
@@ -30,11 +30,11 @@ const FAILURE_MESSAGES: Record<FailureContext, string> = {
 
 const APPLE_AUTHORIZATION_RATE_LIMITED = "Apple Music temporarily rate-limited authorization validation (HTTP 429).";
 const APPLE_AUTHORIZATION_UNAVAILABLE = "Apple Music authorization validation was temporarily unavailable.";
-const APPLE_AUTHORIZATION_UNREACHABLE = "9ênio could not reach Apple Music while validating authorization.";
-const PREVIOUS_APPLE_AUTHORIZATION_UNREACHABLE = "gênio could not reach Apple Music while validating authorization.";
+const APPLE_AUTHORIZATION_UNREACHABLE = "gênio could not reach Apple Music while validating authorization.";
+const PREVIOUS_APPLE_AUTHORIZATION_UNREACHABLE = "9ênio could not reach Apple Music while validating authorization.";
 const LEGACY_APPLE_AUTHORIZATION_UNREACHABLE = "Needle could not reach Apple Music while validating authorization.";
 const APPLE_AUTHORIZATION_INVALID_RESPONSE = "Apple Music returned an invalid authorization-validation response.";
-const APPLE_AUTHORIZATION_CLIENT_REJECTION = /^Apple Music rejected (?:9ênio|gênio|Needle)'s authorization validation request \(HTTP 4\d\d\)\.$/u;
+const APPLE_AUTHORIZATION_CLIENT_REJECTION = /^Apple Music rejected (?:gênio|9ênio|Needle)'s authorization validation request \(HTTP 4\d\d\)\.$/u;
 const SAFE_APPLE_AUTHORIZATION_MESSAGES = new Set([
   FAILURE_MESSAGES.apple_authorization,
   APPLE_AUTHORIZATION_RATE_LIMITED,
@@ -83,7 +83,7 @@ export function sanitizeFailure(error: unknown, context: FailureContext = "backg
       return APPLE_AUTHORIZATION_UNREACHABLE;
     }
     if (APPLE_AUTHORIZATION_CLIENT_REJECTION.test(suppliedMessage)) {
-      return suppliedMessage.replace(/(?:Needle|gênio)'s/u, "9ênio's");
+      return suppliedMessage.replace(/(?:9ênio|Needle)'s/u, "gênio's");
     }
     return SAFE_APPLE_AUTHORIZATION_MESSAGES.has(suppliedMessage)
       ? suppliedMessage
@@ -132,7 +132,7 @@ export function safeAppleAuthorizationFailure(error: unknown): string {
   const status = typeof value.status === "number" ? value.status : null;
   if (status === 429) return APPLE_AUTHORIZATION_RATE_LIMITED;
   if (status !== null && status >= 400 && status < 500) {
-    return `Apple Music rejected 9ênio's authorization validation request (HTTP ${Math.floor(status)}).`;
+    return `Apple Music rejected gênio's authorization validation request (HTTP ${Math.floor(status)}).`;
   }
   if (status !== null && status >= 500) return APPLE_AUTHORIZATION_UNAVAILABLE;
   if (error instanceof Error && [

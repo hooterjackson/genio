@@ -1,16 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { GENIO_ASCII_WORDMARK } from "./brand-wordmark";
 
-const INTRO_SESSION_KEY = "9enio:brand-intro:v1";
-const ASCII_WORDMARK = [
-  "         /\\",
-  "   ____             _",
-  "  / __ \\___  ____  (_)___",
-  " / /_/ / _ \\/ __ \\/ / __ \\",
-  " \\__, /  __/ / / / / /_/ /",
-  "/____/\\___/_/ /_/_/\\____/",
-].join("\n");
+const INTRO_SESSION_KEY = "9enio:brand-intro:v2";
 const CHARACTER_INTERVAL_MS = 10;
 const COMPLETION_HOLD_MS = 500;
 const FADE_DURATION_MS = 180;
@@ -41,6 +34,7 @@ export function BrandIntro() {
   const [visibleCharacterCount, setVisibleCharacterCount] = useState(0);
   const intervalRef = useRef<number | undefined>(undefined);
   const timeoutRefs = useRef<number[]>([]);
+  const skipRef = useRef<HTMLButtonElement>(null);
 
   const clearAnimation = useCallback(() => {
     if (intervalRef.current !== undefined) {
@@ -64,7 +58,7 @@ export function BrandIntro() {
       intervalRef.current = window.setInterval(() => {
         nextCharacterCount += 1;
         setVisibleCharacterCount(nextCharacterCount);
-        if (nextCharacterCount < ASCII_WORDMARK.length) return;
+        if (nextCharacterCount < GENIO_ASCII_WORDMARK.length) return;
 
         if (intervalRef.current !== undefined) {
           window.clearInterval(intervalRef.current);
@@ -91,6 +85,12 @@ export function BrandIntro() {
     };
   }, [clearAnimation]);
 
+  useEffect(() => {
+    if (phase !== "visible") return;
+    const frame = window.requestAnimationFrame(() => skipRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [phase]);
+
   if (phase === "checking" || phase === "hidden") return null;
 
   function dismiss(focusComposer: boolean) {
@@ -107,17 +107,26 @@ export function BrandIntro() {
       className="brand-intro"
       data-phase={phase}
       data-testid="brand-intro"
+      role="dialog"
+      aria-modal="true"
+      aria-label="gênio introduction"
+      onKeyDown={(event) => {
+        if (event.key !== "Tab") return;
+        event.preventDefault();
+        skipRef.current?.focus();
+      }}
     >
       <div
         className="brand-intro-lockup"
         data-character-count={visibleCharacterCount}
-        data-character-total={ASCII_WORDMARK.length}
+        data-character-total={GENIO_ASCII_WORDMARK.length}
       >
-        <pre className="brand-intro-ascii brand-intro-measure" aria-hidden="true">{ASCII_WORDMARK}</pre>
-        <pre className="brand-intro-ascii brand-intro-typed" aria-hidden="true">{ASCII_WORDMARK.slice(0, visibleCharacterCount)}</pre>
-        <span className="sr-only">9ênio</span>
+        <pre className="brand-intro-ascii brand-intro-measure" aria-hidden="true">{GENIO_ASCII_WORDMARK}</pre>
+        <pre className="brand-intro-ascii brand-intro-typed" aria-hidden="true">{GENIO_ASCII_WORDMARK.slice(0, visibleCharacterCount)}</pre>
+        <span className="sr-only">gênio</span>
       </div>
       <button
+        ref={skipRef}
         className="brand-intro-skip"
         type="button"
         onClick={(event) => dismiss(document.activeElement === event.currentTarget)}

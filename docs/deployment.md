@@ -26,11 +26,18 @@ Sites cannot address Railway's private network, so only the API receives a Railw
 
 The Sites artifact contains only Sites metadata. Postgres migrations live in `postgres-migrations/` so Sites cannot mistake them for D1 migrations; Railway applies them through Drizzle before the API deploy.
 
+The public `/playlists` page is backed by a dedicated Postgres projection, not
+by direct reads of private run state. Migration `0010_public_playlist_directory.sql`
+creates the projection and backfills only internally consistent terminal
+publications with stable Apple share links. The application schema version is
+`11`; API and worker readiness must report that version before Sites exposes
+the directory revision.
+
 ## `9enio.com` cutover
 
 `https://9enio.com` is the canonical public origin. Connect it without interrupting Apple publication:
 
-1. Publish the current `9ênio` frontend revision to the existing Sites project.
+1. Publish the current `gênio` frontend revision to the existing Sites project.
 2. Add the apex domain in Sites and copy the exact verification and routing records Sites returns.
 3. Replace only the conflicting Squarespace parking records with those exact values. Preserve unrelated mail, ownership, and security records.
 4. Wait for Sites verification and valid HTTPS before changing Railway.
@@ -87,7 +94,12 @@ Back up the Apple `.p8`, Apple-token encryption key, capability pepper, and both
 5. Deploy API; verify liveness, readiness, schema compatibility, and replay rejection.
 6. Deploy worker; verify heartbeat and a reclaimed test lease.
 7. Deploy Sites last and run custom-domain and owner-authorization smoke tests.
-8. Promote manually. Keep one-release backward compatibility before contract migrations.
+8. Open `/playlists` anonymously and verify pagination, newest-first ordering,
+   ordered volume links, an empty/error-safe response, and the absence of
+   prompt, run, capability, evidence, cost, manifest-description, and Apple
+   library-ID fields. Hide and relist one entry from the owner control and
+   confirm both changes are audited.
+9. Promote manually. Keep one-release backward compatibility before contract migrations.
 
 `GET /health/live` exposes only the package version and a validated Git commit
 revision from the deployment environment. Record its `build.identifier` beside
@@ -99,7 +111,7 @@ Never run an automatic destructive down-migration. A worker refuses an unsupport
 ## Alerts and limits
 
 - Application research ceiling: `$50` per calendar month in `America/Sao_Paulo`.
-- OpenAI project alerts: below `$50`, with the provider project scoped only to 9ênio.
+- OpenAI project alerts: below `$50`, with the provider project scoped only to gênio.
 - Railway alerts: `$10`, `$20`, owner review at `$25`; do not stop Postgres automatically.
 - Owner notifications: worker stale, database unavailable, budget request, Apple reauthorization, failed/orphaned publication, and outbox backlog.
 - Operational metrics: queue depth/age, expired leases, failed jobs, worker heartbeat, reserved/actual spend, Apple authorization, notification backlog/failures, publication failures, orphan playlists, database readiness, and the last retention sweep.
@@ -129,5 +141,5 @@ Never run an automatic destructive down-migration. A worker refuses an unsupport
 ## Owner-only data controls
 
 - The owner console can invalidate a completed run's 30-day reuse window without deleting its evidence or published links; the next equivalent confirmed brief creates fresh work.
-- A specialist CSV/JSON catalogue may be attached only while research is globally paused and the selected run is quiescent before matching. Each row requires an explicit public HTTPS source, but every production import enters as inferred because 9ênio has not fetched the linked support; visitors must review it or a later research pass must verify it. Even while normalizing reported corroboration, the parser requires one stable ISRC/MusicBrainz recording ID across two distinct provenance roots, and metadata-only rows remain possible duplicates.
+- A specialist CSV/JSON catalogue may be attached only while research is globally paused and the selected run is quiescent before matching. Each row requires an explicit public HTTPS source, but every production import enters as inferred because gênio has not fetched the linked support; visitors must review it or a later research pass must verify it. Even while normalizing reported corroboration, the parser requires one stable ISRC/MusicBrainz recording ID across two distinct provenance roots, and metadata-only rows remain possible duplicates.
 - The browser gateway limits each import batch to 24 KiB. Split larger catalogues into multiple batches and resume research only after the final import succeeds.

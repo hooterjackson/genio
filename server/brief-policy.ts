@@ -356,5 +356,5 @@ export function manifestDescriptionForBrief(brief: PlaylistBrief): string {
   const exactCount = brief.targetSize && brief.targetSize.min === brief.targetSize.max
     ? `${brief.targetSize.min.toLocaleString("en-US")} source-backed tracks`
     : "Source-backed tracks";
-  return `Built by 9ênio. ${exactCount} for “${brief.title}.” ${scope}`.trim();
+  return `Built by gênio. ${exactCount} for “${brief.title}.” ${scope}`.trim();
 }

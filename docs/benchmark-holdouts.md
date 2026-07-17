@@ -2,7 +2,7 @@
 
 Frozen: 2026-07-14
 
-These fixtures are expected results for staging evaluation, not research inputs. They were transcribed from the sources below without consulting Needle runtime output or the prior ChatGPT-generated song list. A future fixture change requires a new dated version, a human source review, and an explanation in the commit; staging output must never be used to fill a missing expected row.
+These fixtures are expected results for staging evaluation, not research inputs. They were transcribed from the sources below without consulting gênio runtime output or the prior ChatGPT-generated song list. A future fixture change requires a new dated version, a human source review, and an explanation in the commit; staging output must never be used to fill a missing expected row.
 
 ## Paulinho da Costa
 

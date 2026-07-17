@@ -114,6 +114,18 @@ function uuid(value: unknown, label = "ID"): string {
   return value;
 }
 
+function positiveIntegerQuery(value: unknown, fallback: number, label: string, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) {
+    throw new HttpError(400, `${label} is invalid`, "invalid_pagination");
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > maximum) {
+    throw new HttpError(400, `${label} is invalid`, "invalid_pagination");
+  }
+  return parsed;
+}
+
 function idempotencyKey(request: FastifyRequest, bodyKey?: unknown): string {
   const header = request.headers["idempotency-key"];
   if (Array.isArray(header)) throw new HttpError(400, "Duplicate Idempotency-Key header", "invalid_idempotency_key");
@@ -253,6 +265,12 @@ app.get("/api/v1/system/health", async () => {
     publicationFailures: health.publicationFailures,
     retention: health.retention,
   };
+});
+
+app.get<{ Querystring: { page?: string; pageSize?: string } }>("/api/v1/playlists", async (request) => {
+  const page = positiveIntegerQuery(request.query.page, 1, "Page", 1_000_000);
+  const pageSize = positiveIntegerQuery(request.query.pageSize, 24, "Page size", 100);
+  return repository.listPublicPlaylists(page, pageSize);
 });
 
 app.post<{ Body: unknown }>("/api/v1/feedback", { bodyLimit: FEEDBACK_BODY_BYTES }, async (request, reply) => {
@@ -891,6 +909,25 @@ app.get("/api/v1/owner/publications/orphans", async (request) => {
   return { items: await repository.listOrphanPlaylists() };
 });
 
+app.post<{
+  Params: { id: string };
+  Body: { listed?: unknown };
+}>("/api/v1/owner/playlists/:id/visibility", async (request) => {
+  const email = owner(request);
+  const playlistId = uuid(request.params.id, "Playlist ID");
+  if (typeof request.body?.listed !== "boolean") {
+    throw new HttpError(400, "Playlist visibility is invalid", "invalid_playlist_visibility");
+  }
+  if (!await repository.setPublicPlaylistVisibility(playlistId, request.body.listed)) {
+    throw new HttpError(404, "Public playlist was not found", "public_playlist_not_found");
+  }
+  await repository.recordAudit(email, "public_playlist.visibility_changed", {
+    playlistId,
+    listed: request.body.listed,
+  });
+  return { id: playlistId, listed: request.body.listed };
+});
+
 app.post<{ Body: { limit?: number } }>("/api/v1/owner/retention/run", async (request) => {
   const email = owner(request);
   const purged = await repository.runRetentionSweep(Number(request.body?.limit ?? 50));
@@ -912,7 +949,7 @@ app.setErrorHandler((error, request, reply) => {
   const message = error instanceof HttpError
     ? error.message
     : statusCode >= 500
-      ? "9ênio could not complete that request"
+      ? "gênio could not complete that request"
       : "Request rejected";
   reply.code(statusCode).send({ error: message, code });
 });

@@ -315,6 +315,37 @@ export const publicationVolumes = pgTable("publication_volumes", {
   ...timestamps,
 }, (table) => [uniqueIndex("publication_manifest_volume_idx").on(table.manifestId, table.volumeNumber)]);
 
+/**
+ * A deliberately small, public-safe projection of successfully published
+ * playlists. Operational run data is deleted after the retention window, but
+ * this projection keeps the Apple links browseable without exposing prompts,
+ * evidence, costs, client buckets, or provider diagnostics.
+ */
+export const publicPlaylists = pgTable("public_playlists", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "set null" }),
+  manifestHash: varchar("manifest_hash", { length: 64 }).notNull().unique(),
+  title: varchar("title", { length: 240 }).notNull(),
+  trackCount: integer("track_count").notNull(),
+  volumeCount: integer("volume_count").notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("listed"),
+  publishedAt: timestamp("published_at", { withTimezone: true }).notNull(),
+  hiddenAt: timestamp("hidden_at", { withTimezone: true }),
+  ...timestamps,
+}, (table) => [
+  index("public_playlist_status_published_idx").on(table.status, table.publishedAt.desc(), table.id.desc()),
+]);
+
+export const publicPlaylistVolumes = pgTable("public_playlist_volumes", {
+  publicPlaylistId: uuid("public_playlist_id").notNull().references(() => publicPlaylists.id, { onDelete: "cascade" }),
+  volumeNumber: integer("volume_number").notNull(),
+  name: varchar("name", { length: 240 }).notNull(),
+  trackCount: integer("track_count").notNull(),
+  shareUrl: text("share_url").notNull().unique(),
+}, (table) => [
+  primaryKey({ columns: [table.publicPlaylistId, table.volumeNumber], name: "public_playlist_volumes_pkey" }),
+]);
+
 export const orphanPlaylists = pgTable("orphan_playlists", {
   id: uuid("id").primaryKey(),
   manifestId: uuid("manifest_id").references(() => manifests.id, { onDelete: "set null" }),

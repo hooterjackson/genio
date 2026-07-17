@@ -77,10 +77,10 @@ describe("durable and public error sanitization", () => {
       "Apple Music authorization validation was temporarily unavailable.",
     );
     expect(safeAppleAuthorizationFailure(unreachable)).toBe(
-      "9ênio could not reach Apple Music while validating authorization.",
+      "gênio could not reach Apple Music while validating authorization.",
     );
     expect(safeAppleAuthorizationFailure(rejected)).toBe(
-      "Apple Music rejected 9ênio's authorization validation request (HTTP 400).",
+      "Apple Music rejected gênio's authorization validation request (HTTP 400).",
     );
     expect(safeAppleAuthorizationFailure(invalidResponse)).toBe(
       "Apple Music returned an invalid authorization-validation response.",
@@ -90,6 +90,22 @@ describe("durable and public error sanitization", () => {
       expect(result).not.toContain("private");
       expect(result).not.toContain("sk-proj");
     }
+    expect(sanitizeFailure(
+      "9ênio could not reach Apple Music while validating authorization.",
+      "apple_authorization",
+    )).toBe("gênio could not reach Apple Music while validating authorization.");
+    expect(sanitizeFailure(
+      "Needle could not reach Apple Music while validating authorization.",
+      "apple_authorization",
+    )).toBe("gênio could not reach Apple Music while validating authorization.");
+    expect(sanitizeFailure(
+      "Apple Music rejected 9ênio's authorization validation request (HTTP 400).",
+      "apple_authorization",
+    )).toBe("Apple Music rejected gênio's authorization validation request (HTTP 400).");
+    expect(sanitizeFailure(
+      "Apple Music rejected Needle's authorization validation request (HTTP 422).",
+      "apple_authorization",
+    )).toBe("Apple Music rejected gênio's authorization validation request (HTTP 422).");
   });
 
   test("job and run phases select fixed public contexts", () => {

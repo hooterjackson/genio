@@ -8,6 +8,7 @@ export function SiteMenu() {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => setHydrated(true));
@@ -33,6 +34,14 @@ export function SiteMenu() {
     };
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => {
+      panelRef.current?.querySelector<HTMLAnchorElement>("a")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open]);
+
   function preserveSourcePage() {
     try {
       window.sessionStorage.setItem("9enio.feedback.sourcePath", window.location.pathname);
@@ -43,7 +52,16 @@ export function SiteMenu() {
   }
 
   return (
-    <div className={`site-menu${open ? " is-open" : ""}`} ref={rootRef}>
+    <div
+      className={`site-menu${open ? " is-open" : ""}`}
+      ref={rootRef}
+      onBlur={() => {
+        window.requestAnimationFrame(() => {
+          const root = rootRef.current;
+          if (root && !root.contains(document.activeElement)) setOpen(false);
+        });
+      }}
+    >
       <button
         ref={triggerRef}
         type="button"
@@ -59,7 +77,8 @@ export function SiteMenu() {
         <span aria-hidden="true" />
       </button>
       {open && (
-        <nav id="site-menu-panel" className="site-menu-panel" aria-label="Site menu">
+        <nav ref={panelRef} id="site-menu-panel" className="site-menu-panel" aria-label="Site menu">
+          <a href="/playlists" onClick={() => setOpen(false)}>EXPLORE PLAYLISTS</a>
           <Link href="/feedback" onClick={preserveSourcePage}>SUBMIT BUG OR IMPROVEMENT</Link>
           <Link href="/privacy" onClick={() => setOpen(false)}>PRIVACY</Link>
         </nav>

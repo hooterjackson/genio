@@ -28,4 +28,22 @@ Version one still co-locates these handlers in one private worker process. The f
 
 The owner OpenAI key exists only in Railway worker secrets. Apple developer credentials and the Apple-token encryption key exist in both Railway services: the API issues a short-lived developer token and encrypts the browser-returned user token, while only the private worker can decrypt that token and import the deterministic Apple write path. The Apple Music user token is stored as an AES-256-GCM envelope with a recorded key version. Secrets, capabilities, authorization headers, prompts, private keys, and tokens are redacted from logs.
 
-Prompts, evidence, candidates, capability sessions, and detailed audit events expire after 90 days. Retained publication metadata is limited to Apple links, titles, manifest hashes, outcome counts, aggregate cost, and operational state. Visitor deletion removes 9ênio data but cannot remove a playlist already published in the owner's Apple account.
+Prompts, evidence, candidates, capability sessions, and detailed audit events expire after 90 days. Retained publication metadata is limited to Apple links, titles, manifest hashes, outcome counts, aggregate cost, and operational state. Visitor deletion removes gênio data but cannot remove a playlist already published in the owner's Apple account.
+
+## Public playlist directory
+
+`GET /api/v1/playlists` reads from dedicated `public_playlists` and
+`public_playlist_volumes` projection tables; it never serializes a research run
+or manifest directly. A publication enters that projection only after every
+volume is complete, its appended count matches its locked manifest range, the
+volume sequence is contiguous, the volume totals equal the manifest track
+count, and every share URL is a stable HTTPS `music.apple.com` playlist URL.
+
+The public response is intentionally limited to a generated directory ID,
+playlist and volume names, track and volume counts, publication time, ordered
+volume numbers, and Apple share URLs. It excludes prompts, run IDs, capability
+tokens, evidence and candidate data, costs, manifest descriptions, owner
+controls, and private Apple library playlist IDs. Run deletion severs the
+projection's run reference and deletes the private run data while retaining the
+already-public Apple metadata. The exact owner allowlist may list or hide that
+projection through an audited owner-only route.
