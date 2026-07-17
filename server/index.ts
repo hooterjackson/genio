@@ -272,6 +272,7 @@ app.post<{ Body: unknown }>("/api/v1/feedback", { bodyLimit: FEEDBACK_BODY_BYTES
     idempotencyKey: key,
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
+    ownerRateLimitExempt: isOwner(caller),
   });
   return reply.code(result.created ? 201 : 200).send({ received: true, id: result.id });
 });

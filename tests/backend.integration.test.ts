@@ -22,6 +22,7 @@ import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
 import { capabilityHash, hmacBase64Url, sha256Hex } from "../server/security.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
+import { parseFeedbackSubmission } from "../server/feedback.ts";
 import { GUIDED_BRIEF_BUDGET_USD, GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import type {
   CitationAttestationInput,
@@ -1326,6 +1327,119 @@ databaseDescribe("hosted backend integration", () => {
       [[sharedBucket, olderBucket, newerBucket]],
     );
     expect(count.rows[0]!.count).toBe(1);
+  });
+
+  test("exempts only owner feedback from client limits while retaining anonymous and global limits", async () => {
+    const feedback = parseFeedbackSubmission({
+      kind: "bug",
+      message: "The owner needs to submit another private regression report.",
+      pagePath: "/feedback",
+    });
+    const ownerBucket = `owner-feedback-${randomUUID()}`;
+    await repository.pool.query(
+      `INSERT INTO rate_limit_events(client_bucket,action)
+       SELECT $1,action FROM (VALUES
+         ('feedback_hour'),('feedback_hour'),
+         ('feedback_day'),('feedback_day'),('feedback_day'),('feedback_day'),('feedback_day')
+       ) events(action)`,
+      [ownerBucket],
+    );
+    await expect(repository.createFeedbackSubmission({
+      submission: feedback,
+      idempotencyKey: `owner-feedback-${randomUUID()}`,
+      clientBucket: ownerBucket,
+      clientBucketAliases: [ownerBucket],
+      ownerRateLimitExempt: true,
+    })).resolves.toMatchObject({ created: true });
+
+    const ownerEvents = await repository.pool.query<{ action: string; count: number }>(
+      `SELECT action,count(*)::int count FROM rate_limit_events
+       WHERE client_bucket=ANY($1::text[]) OR client_bucket='feedback-global'
+       GROUP BY action ORDER BY action`,
+      [[ownerBucket]],
+    );
+    expect(ownerEvents.rows).toEqual([
+      { action: "feedback_day", count: 5 },
+      { action: "feedback_global_day", count: 1 },
+      { action: "feedback_hour", count: 2 },
+    ]);
+
+    const anonymousBucket = `anonymous-feedback-${randomUUID()}`;
+    await repository.pool.query(
+      "INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'feedback_hour'),($1,'feedback_hour')",
+      [anonymousBucket],
+    );
+    await expect(repository.createFeedbackSubmission({
+      submission: feedback,
+      idempotencyKey: `anonymous-feedback-${randomUUID()}`,
+      clientBucket: anonymousBucket,
+      clientBucketAliases: [anonymousBucket],
+      ownerRateLimitExempt: false,
+    })).rejects.toMatchObject({ statusCode: 429, code: "feedback_rate_limited" });
+
+    await repository.pool.query(
+      `INSERT INTO rate_limit_events(client_bucket,action)
+       SELECT 'feedback-global','feedback_global_day' FROM generate_series(1,99)`,
+    );
+    await expect(repository.createFeedbackSubmission({
+      submission: feedback,
+      idempotencyKey: `owner-global-feedback-${randomUUID()}`,
+      clientBucket: ownerBucket,
+      clientBucketAliases: [ownerBucket],
+      ownerRateLimitExempt: true,
+    })).rejects.toMatchObject({ statusCode: 503, code: "feedback_global_limit" });
+  });
+
+  test("round-trips private feedback screenshots without exposing bytes in owner lists", async () => {
+    // A valid 3x2 RGBA PNG with six distinct pixels exercises real binary
+    // persistence rather than the one-pixel parser fixture used by unit tests.
+    const screenshotBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAFklEQVR4nGP4z8DwHwwZ/v+HIAjBAACvag7y13hP6QAAAABJRU5ErkJggg==";
+    const feedback = parseFeedbackSubmission({
+      kind: "bug",
+      message: "The attached screenshot captures a reproducible mobile layout failure.",
+      pagePath: "/jobs",
+      appVersion: "feedback-round-trip-test",
+      image: {
+        mimeType: "image/png",
+        dataBase64: screenshotBase64,
+        width: 3,
+        height: 2,
+      },
+    });
+    const bucket = `feedback-image-${randomUUID()}`;
+    const created = await repository.createFeedbackSubmission({
+      submission: feedback,
+      idempotencyKey: `feedback-image-${randomUUID()}`,
+      clientBucket: bucket,
+      clientBucketAliases: [bucket],
+      ownerRateLimitExempt: false,
+    });
+
+    const listed = await repository.listFeedbackSubmissions();
+    expect(listed).toMatchObject({ total: 1, counts: { new: 1, reviewed: 0, resolved: 0 } });
+    expect(listed.items[0]).toMatchObject({
+      id: created.id,
+      status: "new",
+      image: {
+        mimeType: "image/png",
+        byteSize: Buffer.from(screenshotBase64, "base64").length,
+        width: 3,
+        height: 2,
+        sha256: feedback.image?.sha256,
+      },
+    });
+    expect(listed.items[0]?.image).not.toHaveProperty("dataBase64");
+    expect(JSON.stringify(listed.items)).not.toContain(screenshotBase64);
+
+    const storedImage = await repository.getFeedbackImage(created.id);
+    expect(storedImage?.mimeType).toBe("image/png");
+    expect(storedImage?.data.equals(Buffer.from(screenshotBase64, "base64"))).toBe(true);
+
+    await expect(repository.updateFeedbackStatus(created.id, "reviewed", "owner@example.com"))
+      .resolves.toMatchObject({ id: created.id, status: "reviewed" });
+    await expect(repository.deleteFeedbackSubmission(created.id, "owner@example.com")).resolves.toBe(true);
+    await expect(repository.getFeedbackImage(created.id)).resolves.toBeNull();
+    await expect(repository.deleteFeedbackSubmission(created.id, "owner@example.com")).resolves.toBe(false);
   });
 
   test("anonymous brief and run requests do not consume daily quota events", async () => {

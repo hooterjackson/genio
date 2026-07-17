@@ -95,7 +95,7 @@ export default defineRailway(() => {
     sizeMB: 500,
   });
   const needleWorker = service("needle-worker", {
-    source: github("hooterjackson/needle", { branch: "main" }),
+    source: github("hooterjackson/genio", { branch: "main" }),
     build: "pnpm run build:server",
     start: "pnpm run start:worker",
     deploy: {
@@ -109,7 +109,7 @@ export default defineRailway(() => {
     },
   });
   const needleApi = service("needle-api", {
-    source: github("hooterjackson/needle", { branch: "main" }),
+    source: github("hooterjackson/genio", { branch: "main" }),
     build: "pnpm run build:server",
     preDeploy: "pnpm run db:migrate",
     start: "pnpm run start:api",

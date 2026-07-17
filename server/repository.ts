@@ -525,6 +525,7 @@ export class Repository {
     idempotencyKey: string;
     clientBucket: string;
     clientBucketAliases: string[];
+    ownerRateLimitExempt: boolean;
   }): Promise<{ id: string; created: boolean }> {
     const aliases = [...new Set(input.clientBucketAliases.map((value) => value.trim()).filter(Boolean))];
     const primary = input.clientBucket.trim();
@@ -578,16 +579,18 @@ export class Repository {
         if (submission.rows[0]) return { id: mappedId, created: false };
       }
 
-      const rateCounts = await client.query<{ hourly: number; daily: number }>(
-        `SELECT
-           count(*) FILTER (WHERE action='feedback_hour' AND occurred_at>now()-interval '1 hour')::int hourly,
-           count(*) FILTER (WHERE action='feedback_day' AND occurred_at>now()-interval '24 hours')::int daily
-         FROM rate_limit_events
-         WHERE client_bucket=ANY($1::text[]) AND action=ANY($2::text[])`,
-        [aliases, ["feedback_hour", "feedback_day"]],
-      );
-      if ((rateCounts.rows[0]?.hourly ?? 0) >= 2 || (rateCounts.rows[0]?.daily ?? 0) >= 5) {
-        throw new HttpError(429, "Feedback limit reached; try again later", "feedback_rate_limited");
+      if (!input.ownerRateLimitExempt) {
+        const rateCounts = await client.query<{ hourly: number; daily: number }>(
+          `SELECT
+             count(*) FILTER (WHERE action='feedback_hour' AND occurred_at>now()-interval '1 hour')::int hourly,
+             count(*) FILTER (WHERE action='feedback_day' AND occurred_at>now()-interval '24 hours')::int daily
+           FROM rate_limit_events
+           WHERE client_bucket=ANY($1::text[]) AND action=ANY($2::text[])`,
+          [aliases, ["feedback_hour", "feedback_day"]],
+        );
+        if ((rateCounts.rows[0]?.hourly ?? 0) >= 2 || (rateCounts.rows[0]?.daily ?? 0) >= 5) {
+          throw new HttpError(429, "Feedback limit reached; try again later", "feedback_rate_limited");
+        }
       }
 
       const globalCapacity = await client.query<{ daily: number; stored_bytes: string }>(
@@ -641,11 +644,21 @@ export class Repository {
           [key, mappingValue],
         );
       }
-      await client.query(
-        `INSERT INTO rate_limit_events(client_bucket,action)
-         VALUES($1,'feedback_hour'),($1,'feedback_day'),($2,'feedback_global_day')`,
-        [primary, FEEDBACK_GLOBAL_BUCKET],
-      );
+      if (input.ownerRateLimitExempt) {
+        // Owner submissions are exempt only from the per-client convenience
+        // limits. They still consume the application-wide daily ceiling so a
+        // signed-in owner cannot bypass operational capacity safeguards.
+        await client.query(
+          "INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'feedback_global_day')",
+          [FEEDBACK_GLOBAL_BUCKET],
+        );
+      } else {
+        await client.query(
+          `INSERT INTO rate_limit_events(client_bucket,action)
+           VALUES($1,'feedback_hour'),($1,'feedback_day'),($2,'feedback_global_day')`,
+          [primary, FEEDBACK_GLOBAL_BUCKET],
+        );
+      }
       return { id, created: true };
     });
   }
