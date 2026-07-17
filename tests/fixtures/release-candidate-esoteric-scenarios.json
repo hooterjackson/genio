@@ -1,0 +1,206 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Offline release-candidate policy corpus. These cases test deterministic scope, exact-count, cost, and similarity invariants without evaluating live research quality or calling providers.",
+  "scenarios": [
+    {
+      "id": "RC-P01",
+      "category": "count_control",
+      "prompt": "Give me 300 of the most influential techno tracks.",
+      "requestedTrackCount": 50,
+      "subjectEntities": ["techno"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 50,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-P02",
+      "category": "count_control",
+      "prompt": "A very long four-hour playlist for a churrasco in Urca for 20 people.",
+      "requestedTrackCount": 100,
+      "subjectEntities": ["churrasco music", "Rio de Janeiro"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 100,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-P03",
+      "category": "count_control",
+      "prompt": "Influential Berlin techno from 1990 to 1999.",
+      "requestedTrackCount": 50,
+      "subjectEntities": ["Berlin techno"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 50,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-P04",
+      "category": "similarity",
+      "prompt": "Glitch hop adjacent to Prefuse 73 and Warp Records, but no Prefuse 73 tracks.",
+      "requestedTrackCount": 100,
+      "subjectEntities": ["glitch hop", "Prefuse 73", "Warp Records"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 100,
+      "expectedExcludedReferenceArtists": ["Prefuse 73"]
+    },
+    {
+      "id": "RC-S01",
+      "category": "similarity",
+      "prompt": "Music that sounds like Radiohead.",
+      "requestedTrackCount": 50,
+      "subjectEntities": ["Radiohead"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 50,
+      "expectedExcludedReferenceArtists": ["Radiohead"]
+    },
+    {
+      "id": "RC-S02",
+      "category": "similarity",
+      "prompt": "Other artists in the vein of Jorge Ben Jor, excluding Jorge Ben Jor and Tim Maia.",
+      "requestedTrackCount": 50,
+      "subjectEntities": ["Jorge Ben Jor"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 50,
+      "expectedExcludedReferenceArtists": ["Jorge Ben Jor"]
+    },
+    {
+      "id": "RC-E01",
+      "category": "esoteric_similarity",
+      "prompt": "Lowercase improvisation recordings adjacent to Wandelweiser; exclude Eva-Maria Houben and Michael Pisaro.",
+      "requestedTrackCount": 40,
+      "subjectEntities": ["Wandelweiser", "Eva-Maria Houben", "Michael Pisaro"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 40,
+      "expectedExcludedReferenceArtists": ["Wandelweiser"]
+    },
+    {
+      "id": "RC-E02",
+      "category": "esoteric_editorial",
+      "prompt": "Guadeloupean gwo ka moderne and cadence-lypso crossover from 1975 to 1992; no Kassav’.",
+      "requestedTrackCount": 35,
+      "subjectEntities": ["gwo ka moderne", "cadence-lypso", "Guadeloupe"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 35,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E03",
+      "category": "esoteric_similarity",
+      "prompt": "Japanese environmental-music-adjacent recordings from 1980 to 1989; exclude Hiroshi Yoshimura.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Japanese environmental music", "Hiroshi Yoshimura"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 25,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E04",
+      "category": "esoteric_editorial",
+      "prompt": "Pre-1990 Cape Verdean funaná recordings, no morna and no Cesária Évora.",
+      "requestedTrackCount": 30,
+      "subjectEntities": ["Cape Verdean funaná"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 30,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E05",
+      "category": "esoteric_editorial",
+      "prompt": "South African bubblegum and Shangaan disco before 1994; no Brenda Fassie.",
+      "requestedTrackCount": 40,
+      "subjectEntities": ["South African bubblegum", "Shangaan disco"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 40,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E06",
+      "category": "esoteric_instrumentation",
+      "prompt": "Tamil film songs from 1960 to 1985 where nadaswaram is a featured lead instrument, not merely named in the title.",
+      "requestedTrackCount": 30,
+      "subjectEntities": ["Tamil film music", "nadaswaram"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 30,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E07",
+      "category": "esoteric_instrumentation",
+      "prompt": "Electroacoustic works prominently using daxophone, glass harmonica, or prepared zither.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["electroacoustic music", "daxophone", "glass harmonica", "prepared zither"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 25,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E08",
+      "category": "esoteric_editorial",
+      "prompt": "Belgian new beat released from 1987 to 1990, one canonical original mix per recording.",
+      "requestedTrackCount": 50,
+      "subjectEntities": ["Belgian new beat"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 50,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E09",
+      "category": "esoteric_similarity",
+      "prompt": "Tracks tracing the Bristol–Berlin dub-techno exchange, excluding Basic Channel and Massive Attack.",
+      "requestedTrackCount": 35,
+      "subjectEntities": ["Bristol dub", "Berlin dub techno", "Basic Channel", "Massive Attack"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 35,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-E10",
+      "category": "esoteric_editorial",
+      "prompt": "Privately issued North American minimal-synth tracks from 1978 to 1985, no later re-recordings.",
+      "requestedTrackCount": 30,
+      "subjectEntities": ["North American minimal synth"],
+      "expectedMode": "curated",
+      "expectedTrackCount": 30,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-X01",
+      "category": "exhaustive_credit",
+      "prompt": "Every track explicitly crediting Paulinho da Costa with percussion, with no whole-album expansion.",
+      "requestedTrackCount": null,
+      "subjectEntities": ["Paulinho da Costa"],
+      "expectedMode": "exhaustive",
+      "expectedTrackCount": null,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-X02",
+      "category": "exhaustive_credit",
+      "prompt": "Every released recording with Hal Blaine explicitly credited as drummer.",
+      "requestedTrackCount": null,
+      "subjectEntities": ["Hal Blaine"],
+      "expectedMode": "exhaustive",
+      "expectedTrackCount": null,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-X03",
+      "category": "exhaustive_credit",
+      "prompt": "Every Alice Coltrane track featuring Pharoah Sanders.",
+      "requestedTrackCount": null,
+      "subjectEntities": ["Alice Coltrane", "Pharoah Sanders"],
+      "expectedMode": "exhaustive",
+      "expectedTrackCount": null,
+      "expectedExcludedReferenceArtists": []
+    },
+    {
+      "id": "RC-X04",
+      "category": "exhaustive_credit",
+      "prompt": "Every song where Prince is explicitly credited with guitar but is not the primary artist.",
+      "requestedTrackCount": null,
+      "subjectEntities": ["Prince"],
+      "expectedMode": "exhaustive",
+      "expectedTrackCount": null,
+      "expectedExcludedReferenceArtists": []
+    }
+  ]
+}

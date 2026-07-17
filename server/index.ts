@@ -37,6 +37,12 @@ import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 import { buildInformation } from "./build-info.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
+import {
+  FEEDBACK_BODY_BYTES,
+  parseFeedbackKind,
+  parseFeedbackStatus,
+  parseFeedbackSubmission,
+} from "./feedback.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -60,6 +66,9 @@ const app = Fastify({
         "body.token",
         "body.musicUserToken",
         "body.privateKey",
+        "body.message",
+        "body.image",
+        "body.image.dataBase64",
         "res.headers.set-cookie",
       ],
       censor: "[REDACTED]",
@@ -148,9 +157,10 @@ async function requireWorkerForNewWork(): Promise<void> {
   }
 }
 
-async function assertNotPaused(kind: "research" | "publishing"): Promise<void> {
+async function assertNotPaused(kind: "research" | "publishing" | "feedback"): Promise<void> {
   if (await repository.getSetting(`${kind}_paused`) === "true") {
-    throw new HttpError(503, `${kind === "research" ? "Research" : "Publishing"} is temporarily paused`, `${kind}_paused`);
+    const label = kind === "research" ? "Research" : kind === "publishing" ? "Publishing" : "Feedback";
+    throw new HttpError(503, `${label} is temporarily paused`, `${kind}_paused`);
   }
 }
 
@@ -243,6 +253,20 @@ app.get("/api/v1/system/health", async () => {
     publicationFailures: health.publicationFailures,
     retention: health.retention,
   };
+});
+
+app.post<{ Body: unknown }>("/api/v1/feedback", { bodyLimit: FEEDBACK_BODY_BYTES }, async (request, reply) => {
+  await assertNotPaused("feedback");
+  const caller = identity(request);
+  const key = idempotencyKey(request);
+  const submission = parseFeedbackSubmission(request.body);
+  const result = await repository.createFeedbackSubmission({
+    submission,
+    idempotencyKey: key,
+    clientBucket: caller.clientBucket,
+    clientBucketAliases: caller.clientBucketAliases,
+  });
+  return reply.code(result.created ? 201 : 200).send({ received: true, id: result.id });
 });
 
 app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: string } }>("/api/v1/brief", async (request, reply) => {
@@ -599,7 +623,7 @@ app.get("/api/v1/owner/status", async (request) => {
   const health = await repository.getSystemHealth();
   return {
     ok: !health.worker.stale && health.worker.schemaCompatible && health.worker.protocolCompatible,
-    paused: health.paused.research || health.paused.publishing,
+    paused: health.paused.research || health.paused.publishing || health.paused.feedback,
     database: "ready",
     worker: health.worker.worker_id
       ? health.worker.stale || !health.worker.schemaCompatible || !health.worker.protocolCompatible
@@ -644,6 +668,60 @@ app.get("/api/v1/owner/budgets", async (request) => {
 app.get<{ Querystring: { limit?: string } }>("/api/v1/owner/runs", async (request) => {
   owner(request);
   return { runs: await repository.listRecentRuns(Number(request.query.limit ?? 50)) };
+});
+
+app.get<{
+  Querystring: { limit?: string; offset?: string; kind?: string; status?: string };
+}>("/api/v1/owner/feedback", async (request) => {
+  owner(request);
+  const kind = request.query.kind ? parseFeedbackKind(request.query.kind) : null;
+  const status = request.query.status ? parseFeedbackStatus(request.query.status) : null;
+  const result = await repository.listFeedbackSubmissions({
+    limit: Number(request.query.limit ?? 50),
+    offset: Number(request.query.offset ?? 0),
+    kind,
+    status,
+  });
+  return {
+    items: result.items.map((item) => ({
+      ...item,
+      imageUrl: item.image ? `/api/v1/owner/feedback/${item.id}/image` : null,
+    })),
+    total: result.total,
+    counts: result.counts,
+  };
+});
+
+app.get<{ Params: { id: string } }>("/api/v1/owner/feedback/:id/image", async (request, reply) => {
+  owner(request);
+  const feedbackId = uuid(request.params.id, "Feedback ID");
+  const image = await repository.getFeedbackImage(feedbackId);
+  if (!image) throw new HttpError(404, "Feedback screenshot was not found", "feedback_image_not_found");
+  return reply
+    .header("Content-Type", image.mimeType)
+    .header("Cache-Control", "private, no-store, max-age=0")
+    .header("X-Content-Type-Options", "nosniff")
+    .header("Content-Disposition", "inline")
+    .send(image.data);
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { status?: unknown };
+}>("/api/v1/owner/feedback/:id/status", async (request) => {
+  const email = owner(request);
+  const feedbackId = uuid(request.params.id, "Feedback ID");
+  const status = parseFeedbackStatus(request.body?.status);
+  return { item: await repository.updateFeedbackStatus(feedbackId, status, email) };
+});
+
+app.delete<{ Params: { id: string } }>("/api/v1/owner/feedback/:id", async (request, reply) => {
+  const email = owner(request);
+  const feedbackId = uuid(request.params.id, "Feedback ID");
+  if (!await repository.deleteFeedbackSubmission(feedbackId, email)) {
+    throw new HttpError(404, "Feedback was not found", "feedback_not_found");
+  }
+  return reply.code(204).send();
 });
 
 app.post<{ Params: { id: string } }>("/api/v1/owner/runs/:id/refresh", async (request) => {
@@ -697,15 +775,21 @@ app.post<{ Params: { id: string }; Body: { decision?: "approve" | "cancel"; appr
   return { approved: true, run: await repository.getRun(runId) };
 });
 
-app.post<{ Body: { paused?: boolean; researchPaused?: boolean; publishingPaused?: boolean } }>("/api/v1/owner/emergency-pause", async (request) => {
+app.post<{ Body: { paused?: boolean; researchPaused?: boolean; publishingPaused?: boolean; feedbackPaused?: boolean } }>("/api/v1/owner/emergency-pause", async (request) => {
   const email = owner(request);
   const fallback = Boolean(request.body?.paused);
   const researchPaused = request.body?.researchPaused ?? fallback;
   const publishingPaused = request.body?.publishingPaused ?? fallback;
+  const feedbackPaused = request.body?.feedbackPaused ?? fallback;
   await repository.setSetting("research_paused", String(Boolean(researchPaused)));
   await repository.setSetting("publishing_paused", String(Boolean(publishingPaused)));
-  await repository.recordAudit(email, "system.pause_changed", { researchPaused, publishingPaused });
-  return { researchPaused: Boolean(researchPaused), publishingPaused: Boolean(publishingPaused) };
+  await repository.setSetting("feedback_paused", String(Boolean(feedbackPaused)));
+  await repository.recordAudit(email, "system.pause_changed", { researchPaused, publishingPaused, feedbackPaused });
+  return {
+    researchPaused: Boolean(researchPaused),
+    publishingPaused: Boolean(publishingPaused),
+    feedbackPaused: Boolean(feedbackPaused),
+  };
 });
 
 app.get("/api/v1/owner/apple/developer-token", async (request) => {

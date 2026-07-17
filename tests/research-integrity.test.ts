@@ -924,7 +924,7 @@ describe("fast curated orchestration", () => {
     });
   });
 
-  test("uses one bounded web synthesis when the confirmed minimum is met, then matches", async () => {
+  test("uses one bounded web synthesis when the short-playlist reserve is met, then matches", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("curated", { min: 1, max: 50 });
     state.run.status = "queued";
@@ -945,7 +945,12 @@ describe("fast curated orchestration", () => {
     const support = fastEvidenceGroup(
       "Test Artist",
       "performed on",
-      ["Fixture Performer — Test Song"],
+      [
+        "Fixture Performer — Test Song",
+        "Fixture Performer — Test Song Two",
+        "Fixture Performer — Test Song Three",
+        "Fixture Performer — Test Song Four",
+      ],
       ["Fixture Performer — Fixture Album (2020)"],
     );
     const marker = "[source]";
@@ -980,12 +985,12 @@ describe("fast curated orchestration", () => {
       max_tool_calls: 5,
       tools: [{ type: "web_search", search_context_size: "low" }],
     });
-    expect(persistedCandidates).toHaveLength(1);
+    expect(persistedCandidates).toHaveLength(4);
     expect(frontier).toContainEqual(expect.objectContaining({
       sourceClass: "fast_policy",
       status: "complete",
-      discoveredCount: 1,
-      recoveredCount: 1,
+      discoveredCount: 4,
+      recoveredCount: 4,
     }));
     expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
       status: "complete",
@@ -1322,9 +1327,9 @@ describe("fast curated orchestration", () => {
         relationship: "historically influential in the scene",
       },
       publicationTrackCount: 50,
-      internalCandidateGoal: 100,
-      minimumCandidateCount: 100,
-      candidateLimit: 100,
+      internalCandidateGoal: 75,
+      minimumCandidateCount: 75,
+      candidateLimit: 75,
     });
     expect(initialResearchInput).not.toHaveProperty("brief");
     expect(initialResearchInput).not.toHaveProperty("finalPlaylistTargetSize");
@@ -1336,27 +1341,27 @@ describe("fast curated orchestration", () => {
     expect(refillResearchInput).toMatchObject({
       researchScope: { subjectEntities: ["Berlin techno"] },
       publicationTrackCount: 50,
-      internalCandidateGoal: 100,
-      minimumCandidateCount: 72,
-      candidateLimit: 90,
+      internalCandidateGoal: 75,
+      minimumCandidateCount: 47,
+      candidateLimit: 59,
     });
     expect(refillResearchInput.excludedPairs).toContain("Performer 001 — Track 001");
     expect(refillResearchInput.excludedPairs).not.toContain("Rejected Artist — Rejected Container");
-    expect(persistedCandidates).toHaveLength(100);
+    expect(persistedCandidates).toHaveLength(75);
     expect(persistedCandidates.map((candidate) => candidate.selectionRank)).toEqual(
-      Array.from({ length: 100 }, (_, index) => index + 1),
+      Array.from({ length: 75 }, (_, index) => index + 1),
     );
-    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(100);
-    expect(matchingCandidateCounts).toEqual([100]);
+    expect(new Set(persistedCandidates.map((candidate) => `${candidate.artist}\u0000${candidate.title}`)).size).toBe(75);
+    expect(matchingCandidateCounts).toEqual([75]);
     expect(frontier.filter((item) => item.sourceClass === "fast_policy").at(-1)).toMatchObject({
       status: "complete",
-      discoveredCount: 100,
-      recoveredCount: 100,
+      discoveredCount: 75,
+      recoveredCount: 75,
     });
     expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
       status: "complete",
-      citationEligibleCandidateCount: 100,
-      candidateGoal: 100,
+      citationEligibleCandidateCount: 75,
+      candidateGoal: 75,
       reserveShortfall: 0,
       shortfall: 0,
     });
@@ -1368,7 +1373,12 @@ describe("fast curated orchestration", () => {
     state.run.status = "queued";
     state.run.phase = "queued";
     const route = installFastRoute(state);
-    const support = `${fastEvidenceGroup("Test Artist", "performed on", ["Fixture Performer — Test Song"])} [source]`;
+    const support = `${fastEvidenceGroup("Test Artist", "performed on", [
+      "Fixture Performer — Test Song",
+      "Fixture Performer — Test Song Two",
+      "Fixture Performer — Test Song Three",
+      "Fixture Performer — Test Song Four",
+    ])} [source]`;
     state.checkpoints.set("fast:policy:fast_curated_v3", {
       status: "active",
       startedAt: new Date().toISOString(),
@@ -1393,10 +1403,10 @@ describe("fast curated orchestration", () => {
       updatedAt: new Date().toISOString(),
     });
     state.repository.addSources = async () => new Map([["https://evidence.example/saved", "source-saved"]]);
-    state.repository.addCandidates = async () => {
-      state.coverage.candidateCount = 1;
-      state.coverage.eligibleCandidateCount = 1;
-      return 1;
+    state.repository.addCandidates = async (_runId?: string, candidates?: any[]) => {
+      state.coverage.candidateCount = candidates?.length ?? 0;
+      state.coverage.eligibleCandidateCount = candidates?.length ?? 0;
+      return candidates?.length ?? 0;
     };
     const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, []);
 

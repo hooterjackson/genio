@@ -63,6 +63,15 @@ import {
   isWorkerPipelineProtocolCompatible,
   workerPipelineProtocolVersion,
 } from "./worker-protocol.ts";
+import {
+  feedbackListItem,
+  feedbackPayloadHash,
+  type FeedbackKind,
+  type FeedbackListItem,
+  type FeedbackStatus,
+  type FeedbackSubmissionInput,
+  type FeedbackSubmissionRecord,
+} from "./feedback.ts";
 
 // Global capacity protects paid/worker work, not saved visitor state. A run
 // waiting on scope review, budget approval, track selection, or Apple
@@ -79,6 +88,14 @@ const TERMINAL_RUN_STATUSES = ["complete", "partial", "failed", "expired", "dele
 const JOB_ADVISORY_LOCK = 694_207_551;
 const BUDGET_ADVISORY_LOCK = 694_207_552;
 const RUN_CAPACITY_ADVISORY_LOCK = 694_207_553;
+const FEEDBACK_SUBMISSION_PREFIX = "feedback-submission:";
+const FEEDBACK_IDEMPOTENCY_PREFIX = "feedback-idempotency:";
+const FEEDBACK_GLOBAL_BUCKET = "feedback-global";
+const FEEDBACK_GLOBAL_DAILY_LIMIT = Math.max(1, Math.min(1_000, Number(process.env.FEEDBACK_GLOBAL_DAILY_LIMIT ?? 100) || 100));
+const FEEDBACK_STORAGE_LIMIT_BYTES = Math.max(
+  5 * 1024 * 1024,
+  Math.min(1024 * 1024 * 1024, Number(process.env.FEEDBACK_STORAGE_LIMIT_BYTES ?? 100 * 1024 * 1024) || 100 * 1024 * 1024),
+);
 
 type CandidateRow = TrackCandidateInput & {
   id: string;
@@ -433,6 +450,250 @@ export class Repository {
 
   async deleteSetting(key: string): Promise<void> {
     await this.db.delete(settings).where(eq(settings.key, key));
+  }
+
+  async createFeedbackSubmission(input: {
+    submission: FeedbackSubmissionInput;
+    idempotencyKey: string;
+    clientBucket: string;
+    clientBucketAliases: string[];
+  }): Promise<{ id: string; created: boolean }> {
+    const aliases = [...new Set(input.clientBucketAliases.map((value) => value.trim()).filter(Boolean))];
+    const primary = input.clientBucket.trim();
+    if (!primary || aliases.length === 0 || !aliases.includes(primary)) {
+      throw new HttpError(401, "Client bucket is required", "invalid_gateway_identity");
+    }
+    const payloadHash = feedbackPayloadHash(input.submission);
+    const mappingKeys = aliases.map((alias) => `${FEEDBACK_IDEMPOTENCY_PREFIX}${sha256Hex(`${alias}:${input.idempotencyKey}`)}`);
+    return this.transaction(async (client) => {
+      // The global lock makes the application-wide daily and storage ceilings
+      // atomic even when submissions arrive from unrelated client buckets.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", ["feedback:global"]);
+      // Lock every HMAC-derived alias in a stable order. This keeps both the
+      // current and previous daily bucket safe across the midnight rollover.
+      for (const alias of [...aliases].sort()) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`feedback:${alias}`]);
+      }
+      const pause = await client.query<{ paused: boolean }>(
+        "SELECT COALESCE((SELECT value='true' FROM settings WHERE key='feedback_paused'),false) paused",
+      );
+      if (pause.rows[0]?.paused) {
+        throw new HttpError(503, "Feedback is temporarily paused", "feedback_paused");
+      }
+      const existingMappings = await client.query<{ value: string }>(
+        "SELECT value FROM settings WHERE key=ANY($1::text[]) FOR UPDATE",
+        [mappingKeys],
+      );
+      let mappedId: string | null = null;
+      for (const row of existingMappings.rows) {
+        let mapping: { id?: unknown; payloadHash?: unknown } = {};
+        try {
+          mapping = JSON.parse(row.value) as { id?: unknown; payloadHash?: unknown };
+        } catch {
+          // A malformed internal mapping is unusable and will be replaced
+          // while this transaction holds every relevant advisory lock.
+        }
+        if (typeof mapping.id !== "string") continue;
+        if (mapping.payloadHash !== payloadHash) {
+          throw new HttpError(409, "Idempotency key was already used for different feedback", "idempotency_conflict");
+        }
+        if (mappedId && mappedId !== mapping.id) {
+          throw new HttpError(409, "Idempotency mappings disagree", "idempotency_conflict");
+        }
+        mappedId = mapping.id;
+      }
+      if (mappedId) {
+        const submission = await client.query(
+          "SELECT 1 FROM settings WHERE key=$1",
+          [`${FEEDBACK_SUBMISSION_PREFIX}${mappedId}`],
+        );
+        if (submission.rows[0]) return { id: mappedId, created: false };
+      }
+
+      const rateCounts = await client.query<{ hourly: number; daily: number }>(
+        `SELECT
+           count(*) FILTER (WHERE action='feedback_hour' AND occurred_at>now()-interval '1 hour')::int hourly,
+           count(*) FILTER (WHERE action='feedback_day' AND occurred_at>now()-interval '24 hours')::int daily
+         FROM rate_limit_events
+         WHERE client_bucket=ANY($1::text[]) AND action=ANY($2::text[])`,
+        [aliases, ["feedback_hour", "feedback_day"]],
+      );
+      if ((rateCounts.rows[0]?.hourly ?? 0) >= 2 || (rateCounts.rows[0]?.daily ?? 0) >= 5) {
+        throw new HttpError(429, "Feedback limit reached; try again later", "feedback_rate_limited");
+      }
+
+      const globalCapacity = await client.query<{ daily: number; stored_bytes: string }>(
+        `SELECT
+           (SELECT count(*)::int
+              FROM rate_limit_events
+             WHERE client_bucket=$1 AND action='feedback_global_day'
+               AND occurred_at>now()-interval '24 hours') daily,
+           (SELECT COALESCE(sum(
+             CASE
+               WHEN jsonb_typeof(value::jsonb->'image'->'byteSize')='number'
+               THEN (value::jsonb->'image'->>'byteSize')::bigint
+               ELSE 0
+             END
+           ),0)::text
+              FROM settings
+             WHERE key LIKE 'feedback-submission:%') stored_bytes`,
+        [FEEDBACK_GLOBAL_BUCKET],
+      );
+      if ((globalCapacity.rows[0]?.daily ?? 0) >= FEEDBACK_GLOBAL_DAILY_LIMIT) {
+        throw new HttpError(503, "Feedback is temporarily at capacity", "feedback_global_limit");
+      }
+      const storedBytes = Number(globalCapacity.rows[0]?.stored_bytes ?? 0);
+      const incomingBytes = input.submission.image?.byteSize ?? 0;
+      if (incomingBytes > 0 && (!Number.isFinite(storedBytes) || storedBytes + incomingBytes > FEEDBACK_STORAGE_LIMIT_BYTES)) {
+        throw new HttpError(503, "Screenshot storage is temporarily at capacity; submit without an image", "feedback_storage_limit");
+      }
+
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      const record: FeedbackSubmissionRecord = {
+        id,
+        kind: input.submission.kind,
+        message: input.submission.message,
+        pagePath: input.submission.pagePath,
+        appVersion: input.submission.appVersion,
+        image: input.submission.image,
+        status: "new",
+        createdAt: now,
+        updatedAt: now,
+      };
+      await client.query(
+        "INSERT INTO settings(key,value) VALUES($1,$2)",
+        [`${FEEDBACK_SUBMISSION_PREFIX}${id}`, JSON.stringify(record)],
+      );
+      const mappingValue = JSON.stringify({ id, payloadHash });
+      for (const key of mappingKeys) {
+        await client.query(
+          `INSERT INTO settings(key,value) VALUES($1,$2)
+           ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+          [key, mappingValue],
+        );
+      }
+      await client.query(
+        `INSERT INTO rate_limit_events(client_bucket,action)
+         VALUES($1,'feedback_hour'),($1,'feedback_day'),($2,'feedback_global_day')`,
+        [primary, FEEDBACK_GLOBAL_BUCKET],
+      );
+      return { id, created: true };
+    });
+  }
+
+  async listFeedbackSubmissions(input: {
+    limit?: number;
+    offset?: number;
+    kind?: FeedbackKind | null;
+    status?: FeedbackStatus | null;
+  } = {}): Promise<{
+    items: FeedbackListItem[];
+    total: number;
+    counts: { new: number; reviewed: number; resolved: number };
+  }> {
+    const limit = Number.isFinite(input.limit) ? Math.max(1, Math.min(Math.floor(input.limit as number), 100)) : 50;
+    const offset = Number.isFinite(input.offset) ? Math.max(0, Math.min(Math.floor(input.offset as number), 1_000_000)) : 0;
+    const [result, summary] = await Promise.all([
+      this.pool.query<{ value: string; total: number }>(
+        `SELECT value,count(*) OVER()::int total FROM settings
+         WHERE key LIKE 'feedback-submission:%'
+           AND ($1::text IS NULL OR value::jsonb->>'kind'=$1)
+           AND ($2::text IS NULL OR value::jsonb->>'status'=$2)
+         ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
+        [input.kind ?? null, input.status ?? null, limit, offset],
+      ),
+      this.pool.query<{ new: number; reviewed: number; resolved: number; filtered_total: number }>(
+        `SELECT
+           count(*) FILTER (WHERE value::jsonb->>'status'='new')::int new,
+           count(*) FILTER (WHERE value::jsonb->>'status'='reviewed')::int reviewed,
+           count(*) FILTER (WHERE value::jsonb->>'status'='resolved')::int resolved,
+           count(*) FILTER (WHERE ($1::text IS NULL OR value::jsonb->>'kind'=$1)
+                              AND ($2::text IS NULL OR value::jsonb->>'status'=$2))::int filtered_total
+         FROM settings WHERE key LIKE 'feedback-submission:%'`,
+        [input.kind ?? null, input.status ?? null],
+      ),
+    ]);
+    const items = result.rows.flatMap((row) => {
+      try {
+        return [feedbackListItem(JSON.parse(row.value) as FeedbackSubmissionRecord)];
+      } catch {
+        return [];
+      }
+    });
+    const counts = summary.rows[0] ?? { new: 0, reviewed: 0, resolved: 0 };
+    return {
+      items,
+      total: result.rows[0]?.total ?? Number(counts.filtered_total ?? 0),
+      counts: {
+        new: Number(counts.new ?? 0),
+        reviewed: Number(counts.reviewed ?? 0),
+        resolved: Number(counts.resolved ?? 0),
+      },
+    };
+  }
+
+  async getFeedbackImage(id: string): Promise<{ mimeType: "image/png" | "image/jpeg"; data: Buffer } | null> {
+    const result = await this.pool.query<{ value: string }>(
+      "SELECT value FROM settings WHERE key=$1",
+      [`${FEEDBACK_SUBMISSION_PREFIX}${id}`],
+    );
+    if (!result.rows[0]) return null;
+    try {
+      const record = JSON.parse(result.rows[0].value) as FeedbackSubmissionRecord;
+      if (!record.image || !["image/png", "image/jpeg"].includes(record.image.mimeType)) return null;
+      const data = Buffer.from(record.image.dataBase64, "base64");
+      if (data.length !== record.image.byteSize || sha256Hex(data) !== record.image.sha256) return null;
+      return { mimeType: record.image.mimeType, data };
+    } catch {
+      return null;
+    }
+  }
+
+  async updateFeedbackStatus(id: string, status: FeedbackStatus, actor: string): Promise<FeedbackListItem> {
+    return this.transaction(async (client) => {
+      const result = await client.query<{ value: string }>(
+        "SELECT value FROM settings WHERE key=$1 FOR UPDATE",
+        [`${FEEDBACK_SUBMISSION_PREFIX}${id}`],
+      );
+      if (!result.rows[0]) throw new HttpError(404, "Feedback was not found", "feedback_not_found");
+      let record: FeedbackSubmissionRecord;
+      try {
+        record = JSON.parse(result.rows[0].value) as FeedbackSubmissionRecord;
+      } catch {
+        throw new HttpError(500, "Feedback record is invalid", "feedback_record_invalid");
+      }
+      record = { ...record, status, updatedAt: new Date().toISOString() };
+      await client.query(
+        "UPDATE settings SET value=$2,updated_at=now() WHERE key=$1",
+        [`${FEEDBACK_SUBMISSION_PREFIX}${id}`, JSON.stringify(record)],
+      );
+      await client.query(
+        "INSERT INTO audit_events(actor,action,detail_json) VALUES($1,'feedback.status_changed',$2)",
+        [actor.slice(0, 80), { feedbackId: id, status }],
+      );
+      return feedbackListItem(record);
+    });
+  }
+
+  async deleteFeedbackSubmission(id: string, actor: string): Promise<boolean> {
+    return this.transaction(async (client) => {
+      const deleted = await client.query(
+        "DELETE FROM settings WHERE key=$1 RETURNING key",
+        [`${FEEDBACK_SUBMISSION_PREFIX}${id}`],
+      );
+      if (!deleted.rows[0]) return false;
+      await client.query(
+        `DELETE FROM settings
+         WHERE key LIKE 'feedback-idempotency:%' AND value::jsonb->>'id'=$1`,
+        [id],
+      );
+      await client.query(
+        "INSERT INTO audit_events(actor,action,detail_json) VALUES($1,'feedback.deleted',$2)",
+        [actor.slice(0, 80), { feedbackId: id }],
+      );
+      return true;
+    });
   }
 
   async createBriefRequest(input: {
@@ -3710,7 +3971,7 @@ export class Repository {
   }
 
   async getSystemHealth(): Promise<any> {
-    const [worker, queue, costs, apple, notifications, publications, orphans, retention, researchPaused, publishingPaused] = await Promise.all([
+    const [worker, queue, costs, apple, notifications, publications, orphans, retention, researchPaused, publishingPaused, feedbackPaused] = await Promise.all([
       this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1"),
       this.pool.query(
         `SELECT
@@ -3748,6 +4009,7 @@ export class Repository {
       ),
       this.getSetting("research_paused"),
       this.getSetting("publishing_paused"),
+      this.getSetting("feedback_paused"),
     ]);
     const heartbeat = worker.rows[0];
     const queueRow = queue.rows[0] ?? {};
@@ -3796,7 +4058,11 @@ export class Repository {
         lastRunAt: typeof retentionRow.last_run_at === "string" ? retentionRow.last_run_at : null,
         lastPurged: Number(retentionRow.last_purged ?? 0),
       },
-      paused: { research: researchPaused === "true", publishing: publishingPaused === "true" },
+      paused: {
+        research: researchPaused === "true",
+        publishing: publishingPaused === "true",
+        feedback: feedbackPaused === "true",
+      },
     };
   }
 
@@ -3901,6 +4167,23 @@ export class Repository {
     await this.pool.query("DELETE FROM audit_events WHERE occurred_at<=$1", [detailCutoff]);
     await this.pool.query("DELETE FROM rate_limit_events WHERE occurred_at<now()-interval '48 hours'");
     await this.pool.query("DELETE FROM gateway_nonces WHERE expires_at<=now()");
+    // Open feedback remains available to the owner. Once resolved, both its
+    // text and private screenshot are removed after the normal 90-day window.
+    await this.pool.query(
+      `DELETE FROM settings
+       WHERE key LIKE 'feedback-submission:%'
+         AND value::jsonb->>'status'='resolved'
+         AND updated_at<=$1`,
+      [detailCutoff],
+    );
+    await this.pool.query(
+      `DELETE FROM settings mapping
+       WHERE mapping.key LIKE 'feedback-idempotency:%'
+         AND NOT EXISTS (
+           SELECT 1 FROM settings report
+           WHERE report.key='feedback-submission:' || (mapping.value::jsonb->>'id')
+         )`,
+    );
     await this.pool.query(
       `INSERT INTO settings(key,value) VALUES
          ('retention_last_run_at',$1),('retention_last_purged',$2)

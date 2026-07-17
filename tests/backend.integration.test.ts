@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
@@ -14,7 +14,7 @@ import { processNotificationJob } from "../server/notifications.ts";
 import { Repository } from "../server/repository.ts";
 import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
-import { hmacBase64Url, sha256Hex } from "../server/security.ts";
+import { capabilityHash, hmacBase64Url, sha256Hex } from "../server/security.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
 import { GUIDED_BRIEF_BUDGET_USD } from "../shared/product-policy.ts";
 import type {
@@ -26,18 +26,10 @@ import type {
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
-const migrationSql = [
-  "0000_needle_initial.sql",
-  "0001_evidence_scope.sql",
-  "0002_research_integrity.sql",
-  "0003_match_initial_snapshot.sql",
-  "0004_citation_attestation.sql",
-  "0005_candidate_selection_rank.sql",
-  "0006_capability_session_accesses.sql",
-  "0007_brief_requested_track_count.sql",
-  "0008_guided_brief_questions.sql",
-  "0009_brief_capabilities.sql",
-]
+const migrationDirectory = new URL("../postgres-migrations/", import.meta.url);
+const migrationSql = readdirSync(migrationDirectory)
+  .filter((file) => /^\d+_.+\.sql$/u.test(file))
+  .sort()
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
 
@@ -3684,7 +3676,11 @@ databaseDescribe("hosted backend integration", () => {
       globalLimit: 100,
     });
     const capabilities = new CapabilityService(repository);
-    const expired = await capabilities.issue(created.runId, created.accessId, -1);
+    const expired = await capabilities.issue(created.runId, created.accessId, 60_000);
+    await repository.pool.query(
+      "UPDATE capability_tokens SET expires_at=now()-interval '1 second' WHERE token_hash=$1",
+      [capabilityHash(expired)],
+    );
     await expect(capabilities.exchange(expired, new ReplyStub() as unknown as FastifyReply)).rejects.toMatchObject({
       statusCode: 401,
       code: "invalid_capability",

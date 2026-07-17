@@ -102,14 +102,23 @@ test("a direct artist/title/album result stops the query ladder after one reques
   expect(searchAppleCatalog).toHaveBeenCalledWith("us", "Test Song Test Artist", undefined);
 });
 
-test("an exact artist and title do not spend a second request on an Apple album edition", async () => {
-  const appleEdition = { ...exactSong, albumName: "Test Album (Deluxe Edition)" };
-  vi.mocked(searchAppleCatalog).mockResolvedValueOnce([appleEdition]);
+test("an exact artist and title on a different edition keep searching for the requested album", async () => {
+  const appleEdition = { ...exactSong, id: "apple-deluxe", albumName: "Test Album (Deluxe Edition)" };
+  vi.mocked(searchAppleCatalog).mockImplementation(async (_storefront, query) => {
+    if (query === "Test Song Test Artist") return [appleEdition];
+    if (query === "Test Artist Test Song") return [exactSong];
+    return [];
+  });
 
   const songs = await lookupCandidateSongs(candidate(), "us");
+  const result = rankCatalogMatches("candidate-1", candidate(), songs);
 
-  expect(songs).toEqual([appleEdition]);
-  expect(searchAppleCatalog).toHaveBeenCalledTimes(1);
+  expect(songs).toEqual([appleEdition, exactSong]);
+  expect(searchAppleCatalog).toHaveBeenCalledTimes(2);
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-exact", albumName: "Test Album" },
+  });
 });
 
 test("a unique exact Apple title with the wrong artist remains an unselected alternative", async () => {
@@ -140,7 +149,7 @@ test("a unique exact Apple title with the wrong artist remains an unselected alt
   expect(result.basis).toContain("unresolved artist or album attribution");
 });
 
-test("a wrong artist on the same album cannot stop the ladder before a compatible artist result", async () => {
+test("a wrong artist on the same album cannot stop the ladder before an exact artist result", async () => {
   const wrongArtist: CatalogSong = {
     id: "apple-wrong-artist",
     name: "Test Song",
@@ -163,10 +172,72 @@ test("a wrong artist on the same album cannot stop the ladder before a compatibl
 
   expect(searchAppleCatalog).toHaveBeenCalledTimes(2);
   expect(result).toMatchObject({
-    status: "review",
+    status: "accepted",
     song: { id: "apple-compatible-artist", artistName: "Test Artist" },
   });
   expect(result.alternatives).toContainEqual(expect.objectContaining({ id: "apple-wrong-artist" }));
+});
+
+test("a leading-article review result does not hide a later exact artist match", async () => {
+  const articleVariant: CatalogSong = {
+    id: "apple-article-variant",
+    name: "Nightshift",
+    artistName: "The Commodores",
+    albumName: "Nightshift",
+  };
+  const exactArtist: CatalogSong = {
+    ...articleVariant,
+    id: "apple-exact-commodores",
+    artistName: "Commodores",
+  };
+  vi.mocked(searchAppleCatalog).mockImplementation(async (_storefront, query) => {
+    if (query === "Nightshift Commodores") return [articleVariant];
+    if (query === "Commodores Nightshift") return [exactArtist];
+    return [];
+  });
+  const input = candidate({ artist: "Commodores", title: "Nightshift", album: null });
+
+  const songs = await lookupCandidateSongs(input, "us");
+  const result = rankCatalogMatches(input.id, input, songs);
+
+  expect(searchAppleCatalog).toHaveBeenCalledTimes(2);
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-exact-commodores", artistName: "Commodores" },
+  });
+});
+
+test("unique exact artist, title, and album metadata is accepted without a source duration", () => {
+  const input = candidate({ durationMs: null });
+  const result = rankCatalogMatches(input.id, input, [exactSong]);
+
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-exact" },
+  });
+  expect(result.basis).toContain("unique exact metadata");
+});
+
+test("a supplied source duration must still agree before exact metadata is accepted", () => {
+  const input = candidate({ durationMs: 240_000 });
+  const result = rankCatalogMatches(input.id, input, [{
+    ...exactSong,
+    durationInMillis: 270_000,
+  }]);
+
+  expect(result.status).toBe("review");
+});
+
+test("a version-labeled candidate without album or duration cannot auto-accept a title-only identity", () => {
+  const input = candidate({
+    album: null,
+    durationMs: null,
+    versionLabel: "Original Mix",
+  });
+  const result = rankCatalogMatches(input.id, input, [exactSong]);
+
+  expect(result).toMatchObject({ status: "review", song: { id: "apple-exact" } });
+  expect(result.basis).toContain("requires review");
 });
 
 test("a leading article artist variant is selectable for review but not auto-accepted", () => {

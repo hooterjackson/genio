@@ -7,7 +7,7 @@
 - 320-pixel implementation: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-mobile-320-v3.png`
 - Desktop implementation: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-desktop-v3.png`
 - Combined source/implementation evidence: `/Users/mlima/Documents/Codex/2026-07-12/paulinho-da-costa-songs-chatgpt-conversation/.artifacts/9enio-intro-comparison-v3.png`
-- Primary viewport and state: 390 × 844 CSS pixels; local `/`; dark theme; 430 ms into the stepped reveal
+- Primary viewport and state: 390 × 844 CSS pixels; local `/`; dark theme; character-by-character typing in progress
 
 **Findings**
 
@@ -17,7 +17,7 @@
 - Colors and visual tokens: off-white line art on near-black matches the reference. The app’s subtle 24-pixel terminal grid is retained as an intentional brand-system detail.
 - Image quality and asset fidelity: the requested ASCII is rendered as native preformatted text so the stepped draw animation remains crisp rather than scaling a raster screenshot. No unrelated icons or decorative assets were introduced.
 - Copy and content: the artwork itself remains text-free apart from the line glyphs. `SKIP INTRO` is an intentional accessible control outside the artwork.
-- Interaction and accessibility: the reveal runs once per session, completes in 1.42 seconds, supports Escape and a 44-pixel skip target, never traps focus, bypasses query/hash deep links, and is omitted when reduced motion is requested.
+- Interaction and accessibility: the wordmark is rendered as a true character stream at 10 ms per character, then held briefly before fading. It runs once per session, supports Escape and a 44-pixel skip target, never traps focus, bypasses query/hash deep links, and is omitted when reduced motion is requested.
 
 **Comparison History**
 
@@ -33,7 +33,7 @@
 
 - [x] Recreate the supplied slanted ASCII construction with a leading digit `9`.
 - [x] Preserve the `ê` circumflex visually.
-- [x] Animate the reveal in discrete left-to-right steps.
+- [x] Render every ASCII character sequentially instead of revealing the completed artwork with a mask.
 - [x] Verify 320, 390, 430, and desktop breakpoints.
 - [x] Verify one-per-session, skip, Escape, deep-link bypass, and reduced motion.
 - [x] Compare source and implementation in one combined image.

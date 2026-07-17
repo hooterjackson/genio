@@ -1,11 +1,15 @@
 import Link from "next/link";
+import { SiteMenu } from "../site-menu";
 
 export default function PrivacyPage() {
   return (
     <main className="app-shell">
       <header className="site-header">
         <Link className="wordmark" href="/" aria-label="9ênio home"><span>[9]</span> 9ênio_</Link>
-        <Link className="privacy-back" href="/">BACK</Link>
+        <div className="header-meta">
+          <Link className="privacy-back" href="/">BACK</Link>
+          <SiteMenu />
+        </div>
       </header>
 
       <section className="privacy-shell" aria-labelledby="privacy-title">
@@ -25,6 +29,10 @@ export default function PrivacyPage() {
           <article>
             <h2>AI + PROVIDERS</h2>
             <p>OpenAI processes prompts and web research with AI. OpenAI Sites serves the interface, Railway runs and stores the service, Resend alerts only the owner, and Apple Music receives the final playlist publication request.</p>
+          </article>
+          <article>
+            <h2>FEEDBACK</h2>
+            <p>If you submit feedback, we store your message, its type, the page where you opened the form, and any optional screenshot. Submissions are private to the owner and are not automatically sent to OpenAI. Unresolved reports remain in the owner inbox; resolved reports and attached images are deleted after 90 days.</p>
           </article>
           <article>
             <h2>RETENTION + DELETE</h2>

@@ -14,6 +14,12 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
+  // Miniflare does not automatically expose process variables as Worker
+  // bindings. Forward only the local owner identity needed by authenticated
+  // browser QA; production Sites variables remain managed by Sites.
+  vars: process.env.OWNER_EMAIL
+    ? { OWNER_EMAIL: process.env.OWNER_EMAIL }
+    : {},
   d1_databases: d1
     ? [
         {
