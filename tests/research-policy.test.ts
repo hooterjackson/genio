@@ -36,10 +36,10 @@ function brief(mode: PlaylistBrief["mode"], maximum = 100): PlaylistBrief {
 describe("research execution policy", () => {
   test("keeps a bounded Apple-matching reserve even for very short playlists", () => {
     expect(catalogMatchingCandidateGoal(1)).toBe(4);
-    expect(catalogMatchingCandidateGoal(10)).toBe(15);
-    expect(catalogMatchingCandidateGoal(19)).toBe(29);
-    expect(catalogMatchingCandidateGoal(20)).toBe(30);
-    expect(catalogMatchingCandidateGoal(50)).toBe(75);
+    expect(catalogMatchingCandidateGoal(10)).toBe(18);
+    expect(catalogMatchingCandidateGoal(19)).toBe(34);
+    expect(catalogMatchingCandidateGoal(20)).toBe(35);
+    expect(catalogMatchingCandidateGoal(50)).toBe(88);
   });
 
   test("grows the catalog reserve smoothly without a small-playlist cost cliff", () => {
@@ -60,8 +60,8 @@ describe("research execution policy", () => {
       matchingReserveMs: 40_000,
       targetMinimum: 50,
       targetMaximum: 100,
-      candidateGoal: 75,
-      candidateLimit: 75,
+      candidateGoal: 88,
+      candidateLimit: 88,
       maxPasses: 3,
       maxWebToolCalls: 5,
       maxSynthesisTokens: 6_000,
@@ -109,7 +109,7 @@ describe("research execution policy", () => {
       kind: "fast_curated",
       targetMinimum: 200,
       targetMaximum: 200,
-      candidateGoal: 300,
+      candidateGoal: 350,
       candidateLimit: 120,
       maxPasses: 4,
       runDeadlineMs: 240_000,
@@ -132,8 +132,8 @@ describe("research execution policy", () => {
       kind: "fast_curated",
       targetMinimum: 300,
       targetMaximum: 300,
-      candidateGoal: 450,
-      maxPasses: 5,
+      candidateGoal: 525,
+      maxPasses: 6,
       runDeadlineMs: 360_000,
       matchingReserveMs: 90_000,
     });
@@ -154,8 +154,8 @@ describe("research execution policy", () => {
       matchingReserveMs: 40_000,
       targetMinimum: 50,
       targetMaximum: 100,
-      candidateGoal: 75,
-      candidateLimit: 75,
+      candidateGoal: 88,
+      candidateLimit: 88,
       maxPasses: 3,
       maxWebToolCalls: 5,
       maxSynthesisTokens: 6_000,
