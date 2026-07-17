@@ -32,6 +32,28 @@ interface ExecutionContext {
   passThroughOnException(): void;
 }
 
+/**
+ * Sites and Miniflare always supply Worker bindings. Vinext's production Node
+ * preview currently omits that argument, so the local QA launcher explicitly
+ * opts into the narrow process-variable fallback. Without that opt-in, fail
+ * closed: a mistakenly exposed Node preview must not trust a browser-supplied
+ * owner header and sign it with real gateway credentials from process.env.
+ */
+function localPreviewEnvironment(environment: Env | undefined): Env {
+  if (environment) return environment;
+  const variables = typeof process === "undefined" ? {} : process.env;
+  if (variables.GENIO_QA_LOCAL_PREVIEW !== "1") return {} as Env;
+  return {
+    RAILWAY_API_BASE: variables.RAILWAY_API_BASE,
+    GATEWAY_KEY_ID: variables.GATEWAY_KEY_ID,
+    GATEWAY_HMAC_SECRET: variables.GATEWAY_HMAC_SECRET,
+    GATEWAY_PREVIOUS_KEY_ID: variables.GATEWAY_PREVIOUS_KEY_ID,
+    GATEWAY_PREVIOUS_HMAC_SECRET: variables.GATEWAY_PREVIOUS_HMAC_SECRET,
+    IP_HASH_SECRET: variables.IP_HASH_SECRET,
+    OWNER_EMAIL: variables.OWNER_EMAIL,
+  } as Env;
+}
+
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const encoder = new TextEncoder();
 function jsonError(status: number, message: string): Response {
@@ -359,7 +381,8 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
 }
 
 const worker = {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, suppliedEnvironment: Env | undefined, ctx: ExecutionContext): Promise<Response> {
+    const env = localPreviewEnvironment(suppliedEnvironment);
     const url = new URL(request.url);
 
     if (url.pathname === "/_vinext/image") {

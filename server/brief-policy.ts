@@ -259,13 +259,21 @@ export function canonicalBriefForRequest(
   // exact-count/default normalization so a model's incorrect "exhaustive"
   // label cannot bypass reference-artist exclusion.
   const canonical = applySimilaritySeedPolicy(request.prompt, workloadScoped);
+  const titledCanonical = {
+    ...canonical,
+    // Similarity repair can change the relationship and add a hard reference-
+    // artist exclusion after an older/stale brief was named. Re-normalize
+    // against the final scope so “music like X” cannot publish as “X
+    // Essentials,” which incorrectly implies a playlist of X recordings.
+    title: normalizePlaylistTitle(canonical.title, canonical),
+  };
   // One Command has no scope-confirmation screen. Never copy browser-supplied
   // ambiguity acknowledgements into an automatic run; the interpreted scope
   // remains server-authoritative and the automatic policy decides whether it
   // can proceed.
-  if (request.requestedTrackCount != null || confirmation?.ambiguityAcceptance === undefined) return canonical;
+  if (request.requestedTrackCount != null || confirmation?.ambiguityAcceptance === undefined) return titledCanonical;
   return {
-    ...canonical,
+    ...titledCanonical,
     ambiguityAcceptance: [...confirmation.ambiguityAcceptance],
   };
 }

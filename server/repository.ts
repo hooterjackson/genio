@@ -33,6 +33,7 @@ import {
   stableStringify,
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
+import { selectRankedPlaylistRows } from "../lib/playlist-selection.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
 import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
@@ -61,6 +62,7 @@ import {
   type HostedCitationAttestation,
 } from "./citation-attestation.ts";
 import { appleAuthorizationGeneration } from "./apple.ts";
+import { excludedReferenceArtists } from "./similarity-policy.ts";
 import {
   isWorkerPipelineProtocolCompatible,
   workerPipelineProtocolVersion,
@@ -98,6 +100,29 @@ const FEEDBACK_STORAGE_LIMIT_BYTES = Math.max(
   5 * 1024 * 1024,
   Math.min(1024 * 1024 * 1024, Number(process.env.FEEDBACK_STORAGE_LIMIT_BYTES ?? 100 * 1024 * 1024) || 100 * 1024 * 1024),
 );
+
+/**
+ * Serialize operations that inspect all aliases for one client identity.
+ *
+ * Daily privacy buckets overlap during rotation (current + previous). A
+ * single advisory key made from the whole alias list does not protect two
+ * requests whose lists merely overlap, for example [today, yesterday] and
+ * [yesterday, two-days-ago]. Locking each alias in stable order preserves the
+ * rolling limit and idempotency boundary without introducing deadlocks.
+ */
+async function lockClientAliases(
+  client: PoolClient,
+  scope: string,
+  clientBucketAliases: readonly string[],
+): Promise<void> {
+  const aliases = [...new Set(clientBucketAliases.map((value) => value.trim()).filter(Boolean))].sort();
+  if (aliases.length === 0) {
+    throw new HttpError(401, "Client bucket is required", "invalid_gateway_identity");
+  }
+  for (const alias of aliases) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${scope}:${alias}`]);
+  }
+}
 
 export function isStableApplePlaylistShareUrl(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 2_000) return false;
@@ -745,9 +770,7 @@ export class Repository {
     }
     return this.transaction(async (client) => {
       if (input.idempotencyKey) {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-          `brief:${[...new Set(input.clientBucketAliases)].sort().join(":")}:${input.idempotencyKey}`,
-        ]);
+        await lockClientAliases(client, `brief:${input.idempotencyKey}`, input.clientBucketAliases);
         const existing = await client.query<{ id: string; status: string; prompt: string; requested_track_count: number | null }>(
           "SELECT id,status,prompt,requested_track_count FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
           [input.clientBucketAliases, input.idempotencyKey],
@@ -762,7 +785,7 @@ export class Repository {
         }
       }
       if (!input.bypassVisitorRateLimit) {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:brief:${input.clientBucketAliases.join(":")}`]);
+        await lockClientAliases(client, "rate:brief", input.clientBucketAliases);
         const rate = await client.query<{ count: number }>(
           "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='brief' AND occurred_at>now()-interval '24 hours'",
           [input.clientBucketAliases],
@@ -994,7 +1017,7 @@ export class Repository {
       ? 0
       : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`run:${input.clientBucket}:${input.idempotencyKey}`]);
+      await lockClientAliases(client, `run:${input.idempotencyKey}`, input.clientBucketAliases);
       const existing = await client.query<{
         access_id: string;
         run_id: string;
@@ -1039,7 +1062,7 @@ export class Repository {
       }
 
       if (!input.bypassVisitorRateLimit) {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:run:${input.clientBucketAliases.join(":")}`]);
+        await lockClientAliases(client, "rate:run", input.clientBucketAliases);
         const rate = await client.query<{ count: number }>(
           "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='run' AND occurred_at>now()-interval '24 hours'",
           [input.clientBucketAliases],
@@ -2634,8 +2657,16 @@ export class Repository {
       const maximumTracks = brief.mode === "curated"
         ? Math.max(1, Math.floor(brief.targetSize?.max ?? 100))
         : Number.POSITIVE_INFINITY;
-      const selectedMatches = matches.rows.slice(0, maximumTracks);
-      const overflowMatches = matches.rows.slice(maximumTracks);
+      const selection = selectRankedPlaylistRows(matches.rows, maximumTracks, {
+        // “Sounds like X” uses X only as a reference. Prefer a genuinely
+        // exploratory set from the accepted reserve instead of allowing the
+        // first adjacent artist returned by research to dominate the result.
+        // The progressive cap still fills the exact target when the available
+        // catalog has only a few qualifying artists.
+        diversifyArtists: excludedReferenceArtists(brief).length > 0,
+      });
+      const selectedMatches = selection.selected;
+      const overflowMatches = selection.overflow;
       if (overflowMatches.length > 0) {
         const overflowIds = overflowMatches.map((match) => match.candidate_id);
         await client.query(
@@ -3101,7 +3132,7 @@ export class Repository {
       }
 
       const aliases = [...new Set(input.clientBucketAliases)].sort();
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:publish:${aliases.join(":")}`]);
+      await lockClientAliases(client, "rate:publish", aliases);
       const rate = await client.query<{ count: number }>(
         "SELECT count(*)::int count FROM rate_limit_events WHERE client_bucket=ANY($1::text[]) AND action='publish' AND occurred_at>now()-interval '24 hours'",
         [aliases],
@@ -3502,7 +3533,7 @@ export class Repository {
     const primary = clientBucketAliases[0];
     if (!primary) throw new HttpError(401, "Client bucket is required", "invalid_gateway_identity");
     return this.transaction(async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rate:${action}:${clientBucketAliases.join(":")}`]);
+      await lockClientAliases(client, `rate:${action}`, clientBucketAliases);
       const count = await client.query<{ count: number }>(
         `SELECT count(*)::int count FROM rate_limit_events
          WHERE client_bucket=ANY($1::text[]) AND action=$2 AND occurred_at>now()-($3::text || ' hours')::interval`,

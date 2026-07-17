@@ -4,9 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GENIO_ASCII_WORDMARK } from "./brand-wordmark";
 
 const INTRO_SESSION_KEY = "9enio:brand-intro:v2";
-const CHARACTER_INTERVAL_MS = 10;
-const COMPLETION_HOLD_MS = 500;
-const FADE_DURATION_MS = 180;
+const CHARACTER_INTERVAL_MS = 22;
+const COMPLETION_HOLD_MS = 700;
+const FADE_DURATION_MS = 240;
 
 type IntroPhase = "checking" | "visible" | "leaving" | "hidden";
 
@@ -35,13 +35,10 @@ export function BrandIntro() {
   const intervalRef = useRef<number | undefined>(undefined);
   const timeoutRefs = useRef<number[]>([]);
   const skipRef = useRef<HTMLButtonElement>(null);
+  const restoreComposerFocusRef = useRef(false);
 
-  const focusComposer = useCallback(() => {
-    window.requestAnimationFrame(() => {
-      const active = document.activeElement;
-      if (active && active !== document.body && active !== document.documentElement) return;
-      document.querySelector<HTMLTextAreaElement>("#playlist-request")?.focus();
-    });
+  const requestComposerFocus = useCallback(() => {
+    restoreComposerFocusRef.current = true;
   }, []);
 
   const clearAnimation = useCallback(() => {
@@ -75,8 +72,8 @@ export function BrandIntro() {
         timeoutRefs.current.push(
           window.setTimeout(() => setPhase("leaving"), COMPLETION_HOLD_MS),
           window.setTimeout(() => {
+            requestComposerFocus();
             setPhase("hidden");
-            focusComposer();
           }, COMPLETION_HOLD_MS + FADE_DURATION_MS),
         );
       }, CHARACTER_INTERVAL_MS);
@@ -85,8 +82,8 @@ export function BrandIntro() {
     const skip = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         clearAnimation();
+        requestComposerFocus();
         setPhase("hidden");
-        focusComposer();
       }
     };
     window.addEventListener("keydown", skip);
@@ -95,7 +92,20 @@ export function BrandIntro() {
       clearAnimation();
       window.removeEventListener("keydown", skip);
     };
-  }, [clearAnimation, focusComposer]);
+  }, [clearAnimation, requestComposerFocus]);
+
+  useEffect(() => {
+    if (phase !== "hidden" || !restoreComposerFocusRef.current) return;
+    restoreComposerFocusRef.current = false;
+    // The hidden phase has committed, so the focused intro control is no
+    // longer in the document and focus can be restored without racing React.
+    const frame = window.requestAnimationFrame(() => {
+      const active = document.activeElement;
+      if (active && active !== document.body && active !== document.documentElement) return;
+      document.querySelector<HTMLTextAreaElement>("#playlist-request")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [phase]);
 
   useEffect(() => {
     if (phase !== "visible") return;
@@ -105,11 +115,11 @@ export function BrandIntro() {
 
   if (phase === "checking" || phase === "hidden") return null;
 
-  function dismiss(focusComposer: boolean) {
+  function dismiss(shouldFocusComposer: boolean) {
     clearAnimation();
     rememberIntro();
+    if (shouldFocusComposer) requestComposerFocus();
     setPhase("hidden");
-    if (focusComposer) window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#playlist-request")?.focus());
   }
 
   return (

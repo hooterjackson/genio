@@ -232,51 +232,69 @@ describe("worker fail-closed behavior", () => {
   });
 
   test("a lost lease aborts work and prevents the stale worker from finalizing the job", async () => {
-    const repository = methodProxy();
-    const job: DurableJob = {
-      id: "lease-loss-job",
-      runId: "lease-loss-run",
-      briefRequestId: null,
-      kind: "research",
-      payload: {},
-      attempts: 1,
-      maxAttempts: 3,
-    };
-    repository.ensureSchemaVersion.mockResolvedValue(undefined);
-    repository.getAppleAuthorization.mockResolvedValue(null);
-    repository.updateWorkerHeartbeat.mockResolvedValue(undefined);
-    repository.enqueueJob.mockResolvedValue({});
-    repository.getSetting.mockResolvedValue("false");
-    repository.getRunControlState.mockResolvedValue({ status: "researching", phase: "source_discovery" });
-    repository.leaseNextJob.mockResolvedValueOnce(job).mockResolvedValue(null);
-    repository.renewJobLease.mockResolvedValue(false);
-    let aborted = false;
-    const handler = vi.fn(async (_payload: Record<string, unknown>, signal: AbortSignal) => {
-      await new Promise<void>((_resolve, reject) => {
-        signal.addEventListener("abort", () => {
-          aborted = true;
-          reject(signal.reason);
-        }, { once: true });
+    vi.useFakeTimers();
+    let runner: WorkerRunner | null = null;
+    let running: Promise<void> | null = null;
+    try {
+      const repository = methodProxy();
+      const job: DurableJob = {
+        id: "lease-loss-job",
+        runId: "lease-loss-run",
+        briefRequestId: null,
+        kind: "research",
+        payload: {},
+        attempts: 1,
+        maxAttempts: 3,
+      };
+      repository.ensureSchemaVersion.mockResolvedValue(undefined);
+      repository.getAppleAuthorization.mockResolvedValue(null);
+      repository.updateWorkerHeartbeat.mockResolvedValue(undefined);
+      repository.enqueueJob.mockResolvedValue({});
+      repository.getSetting.mockResolvedValue("false");
+      repository.getRunControlState.mockResolvedValue({ status: "researching", phase: "source_discovery" });
+      repository.leaseNextJob.mockResolvedValueOnce(job).mockResolvedValue(null);
+      repository.renewJobLease.mockResolvedValue(false);
+      let markHandlerStarted!: () => void;
+      const handlerStarted = new Promise<void>((resolve) => { markHandlerStarted = resolve; });
+      let markAborted!: () => void;
+      const abortObserved = new Promise<void>((resolve) => { markAborted = resolve; });
+      const handler = vi.fn(async (_payload: Record<string, unknown>, signal: AbortSignal) => {
+        await new Promise<void>((_resolve, reject) => {
+          markHandlerStarted();
+          signal.addEventListener("abort", () => {
+            markAborted();
+            reject(signal.reason);
+          }, { once: true });
+        });
       });
-    });
-    const runner = new WorkerRunner(repository, {
-      concurrency: 1,
-      leaseMs: 100,
-      renewMs: 5,
-      heartbeatMs: 60_000,
-      controlIntervalMs: 60_000,
-      pollMs: 5,
-      handlers: { research: handler },
-    });
-    const running = runner.run();
-    const deadline = Date.now() + 2_000;
-    while (!aborted && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
-    await runner.stop();
-    await running;
+      runner = new WorkerRunner(repository, {
+        concurrency: 1,
+        leaseMs: 100,
+        renewMs: 5,
+        heartbeatMs: 60_000,
+        controlIntervalMs: 60_000,
+        pollMs: 5,
+        handlers: { research: handler },
+      });
+      running = runner.run();
+      // Synchronize on the handler rather than a wall-clock deadline. Coverage
+      // instrumentation can delay worker startup long enough that stop() becomes
+      // the observed abort and masks whether lease renewal ever ran.
+      await handlerStarted;
+      await vi.advanceTimersByTimeAsync(5);
+      await abortObserved;
+      await runner.stop();
+      await running;
 
-    expect(aborted).toBe(true);
-    expect(repository.renewJobLease).toHaveBeenCalled();
-    expect(repository.completeJob).not.toHaveBeenCalled();
-    expect(repository.failJob).not.toHaveBeenCalled();
+      expect(repository.renewJobLease).toHaveBeenCalled();
+      expect(repository.completeJob).not.toHaveBeenCalled();
+      expect(repository.failJob).not.toHaveBeenCalled();
+    } finally {
+      await Promise.allSettled([
+        ...(runner ? [runner.stop()] : []),
+        ...(running ? [running] : []),
+      ]);
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  canonicalFastResearchSubject,
   extractFastCandidatesFromSynthesis,
   fastExtractionSchema,
   fastSynthesisCheckpoint,
@@ -8,6 +9,7 @@ import {
   validateFastCandidates,
 } from "../server/fast-research.ts";
 import { collectHostedCitationAttestations } from "../server/research.ts";
+import { resolveEvidenceSubjectBinding } from "../server/evidence-binding.ts";
 
 const brief: PlaylistBrief = {
   title: "Influential fixture",
@@ -197,6 +199,51 @@ describe("fast curated research", () => {
 
     expect(result.rejectedCandidateCount).toBe(0);
     expect(result.candidates).toHaveLength(1);
+  });
+
+  test("accepts only the exact ordered aggregate for a multi-entity brief and stores a canonical individual subject", () => {
+    const movieBrief: PlaylistBrief = {
+      ...brief,
+      subjectEntities: ["films", "soundtracks", "popular music"],
+      relationship: "songs strongly associated with movies",
+    };
+    expect(canonicalFastResearchSubject(movieBrief.subjectEntities))
+      .toBe("films, soundtracks, popular music");
+
+    const validateSubject = (subject: string) => {
+      const source = synthesisResponse(evidenceGroup({
+        subject,
+        relationship: movieBrief.relationship,
+        tracks: ["Judy Garland — Over the Rainbow"],
+      }));
+      const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
+      return validateFastCandidates(
+        extractFastCandidatesFromSynthesis(synthesis, 120),
+        movieBrief,
+        synthesis,
+      );
+    };
+
+    const accepted = validateSubject("films, soundtracks, popular music");
+    expect(accepted.rejectedCandidateCount).toBe(0);
+    expect(accepted.candidates).toHaveLength(1);
+    expect(accepted.candidates[0]!.evidence[0]).toMatchObject({
+      subjectEntity: "films",
+      subjectRelationship: "songs strongly associated with movies",
+    });
+    expect(resolveEvidenceSubjectBinding(
+      movieBrief,
+      accepted.candidates[0]!.evidence[0]!.subjectEntity,
+      accepted.candidates[0]!.evidence[0]!.subjectRelationship,
+    )).toEqual({
+      subjectEntity: "films",
+      subjectRelationship: "songs strongly associated with movies",
+    });
+
+    expect(validateSubject("films, soundtracks").candidates).toHaveLength(0);
+    expect(validateSubject("popular music, soundtracks, films").candidates).toHaveLength(0);
+    expect(validateSubject("films / soundtracks / popular music").candidates).toHaveLength(0);
+    expect(validateSubject("films, soundtracks, popular music, movie culture").candidates).toHaveLength(0);
   });
 
   test("rejects release and album titles tagged as containers instead of tracks", () => {

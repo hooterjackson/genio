@@ -52,6 +52,37 @@ describe("playlist title normalization", () => {
       .toBe("Berlin Techno Foundations");
   });
 
+  test("names reference-artist discovery without implying it contains the reference artist", () => {
+    const brief = context({
+      subjectEntities: ["Radiohead"],
+      relationship: "stylistically similar to the reference artist",
+      exclude: ["Reference artist is a style seed; exclude recordings by: Radiohead"],
+      targetSize: { min: 50, max: 50 },
+    });
+
+    expect(normalizePlaylistTitle("Radiohead Essentials", brief))
+      .toBe("Beyond Radiohead: 50 Similar Tracks");
+    expect(normalizePlaylistTitle("Music that sounds like Radiohead", brief))
+      .toBe("Beyond Radiohead: 50 Similar Tracks");
+    expect(normalizePlaylistTitle("Everything in Its Right Orbit", brief))
+      .toBe("Everything in Its Right Orbit");
+  });
+
+  test("uses all confirmed reference artists in a multi-seed fallback", () => {
+    const brief = context({
+      subjectEntities: ["Radiohead", "Björk"],
+      relationship: "stylistically similar to the reference artist",
+      exclude: [
+        "Reference artist is a style seed; exclude recordings by: Radiohead",
+        "Reference artist is a style seed; exclude recordings by: Björk",
+      ],
+      targetSize: { min: 40, max: 40 },
+    });
+
+    expect(normalizePlaylistTitle("The Essentials", brief))
+      .toBe("Beyond Radiohead + Björk: 40 Similar Tracks");
+  });
+
   test("rejects an under-limit request restatement that starts with the requested count", () => {
     const brief = context({
       subjectEntities: ["Paulinho da Costa"],

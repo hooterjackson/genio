@@ -290,6 +290,10 @@ test("the gênio intro is brief, skippable, mobile-safe, and shown once per sess
   const partialCharacterCount = Number(await lockup.getAttribute("data-character-count"));
   const totalCharacterCount = Number(await lockup.getAttribute("data-character-total"));
   expect(partialCharacterCount).toBeLessThan(totalCharacterCount);
+  await page.waitForTimeout(650);
+  const laterCharacterCount = Number(await lockup.getAttribute("data-character-count"));
+  expect(laterCharacterCount).toBeGreaterThan(partialCharacterCount);
+  expect(laterCharacterCount).toBeLessThan(totalCharacterCount);
   await expect(skip).toBeFocused();
   const skipBox = await skip.boundingBox();
   expect(skipBox?.width ?? 0).toBeGreaterThanOrEqual(44);
@@ -322,10 +326,20 @@ test("the gênio intro is omitted when reduced motion is requested", async ({ pa
   await expect(requestField(page)).toBeVisible();
 });
 
-test("the one-command composer remains usable at mobile widths", async ({ page }) => {
+test("the gênio intro returns keyboard focus to the composer after automatic completion", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.goto("/");
+  await expect(page.getByTestId("brand-intro")).toBeVisible();
+  await expect(page.getByTestId("brand-intro")).toHaveCount(0, { timeout: 5_000 });
+  await expect(requestField(page)).toBeFocused();
+});
+
+test("the one-command composer remains usable at mobile widths", async ({ page }, testInfo) => {
   await openPrompt(page);
   await expect(page.getByText("Describe what you want to hear.")).toBeVisible();
-  await expect(page.getByText("gênio researches the music, finds the tracks, and builds it in Apple Music.")).toBeVisible();
+  const supportingCopy = page.getByText("gênio researches the music, finds the tracks, and builds it in Apple Music.");
+  if (testInfo.project.name === "desktop") await expect(supportingCopy).toBeVisible();
+  else await expect(supportingCopy).toBeHidden();
   await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByText("2 MIN TARGET", { exact: true })).toHaveText("2 MIN TARGET");
   for (const count of [25, 50, 100] as const) {
@@ -370,6 +384,44 @@ test("the one-command composer remains usable at mobile widths", async ({ page }
     page.getByRole("button", { name: /create playlist/i }).boundingBox(),
   ]);
   expect(sizes.every((box) => box && box.height >= 44)).toBe(true);
+});
+
+test("mobile create keeps playlist size above the fold and pins the primary action safely", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "desktop", "The persistent action is intentionally mobile-only.");
+  await openPrompt(page);
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  const request = await requestField(page).boundingBox();
+  const sizeHeading = await page.getByRole("heading", { name: "CHOOSE PLAYLIST SIZE" }).boundingBox();
+  const selectedSize = await trackCountPreset(page, 50).boundingBox();
+  const submit = page.getByRole("button", { name: /create playlist/i });
+  const submitBox = await submit.boundingBox();
+  const actionTray = submit.locator("..");
+  const trayBox = await actionTray.boundingBox();
+
+  expect(request).not.toBeNull();
+  expect(sizeHeading).not.toBeNull();
+  expect(selectedSize).not.toBeNull();
+  expect(submitBox).not.toBeNull();
+  expect(trayBox).not.toBeNull();
+  expect(request!.height).toBeLessThanOrEqual(132);
+  expect(sizeHeading!.y).toBeGreaterThanOrEqual(request!.y + request!.height);
+  expect(selectedSize!.y + selectedSize!.height).toBeLessThan(trayBox!.y);
+  expect(selectedSize!.y + selectedSize!.height).toBeLessThanOrEqual(viewport!.height);
+  expect(submitBox!.y + submitBox!.height).toBeLessThanOrEqual(viewport!.height);
+  await expect(actionTray).toHaveCSS("position", "fixed");
+
+  const reservedBottomSpace = await page.locator(".one-command-body").evaluate((element) =>
+    Number.parseFloat(window.getComputedStyle(element).paddingBottom),
+  );
+  expect(reservedBottomSpace).toBeGreaterThanOrEqual(trayBox!.height);
+
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  const pinnedAfterScroll = await submit.boundingBox();
+  expect(Math.abs(pinnedAfterScroll!.y - submitBox!.y)).toBeLessThanOrEqual(1);
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
 });
 
 test("preset and custom sizes switch cleanly and malformed custom counts are never coerced", async ({ page }) => {

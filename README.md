@@ -38,10 +38,18 @@ Useful checks:
 
 ```sh
 pnpm test
+pnpm qa:policy:check
+pnpm qa:scenarios:check
 pnpm build
 pnpm lint
 pnpm test:e2e
 ```
+
+`pnpm test` without `DATABASE_URL` is the credential-free deterministic suite.
+Postgres integration requires a disposable Postgres 17 database, migration,
+and `pnpm test:coverage`; browser QA runs through an isolated preview. The
+current harness, covered scenarios, and remaining live-provider gates are
+documented in [`docs/qa-sweep-2026-07-17.md`](docs/qa-sweep-2026-07-17.md).
 
 After staging, use `pnpm benchmark:export -- prepare ...`, complete the independent review, then use `pnpm benchmark:export -- finalize ...` and `pnpm benchmark -- <artifact.json>`. The evaluator accepts only a hash-bound Postgres export and fails unless the factual holdouts reach 100% recovery, at least 100 factual matches reach 99.5% auto-match precision and 95% storefront-available resolvability, and the 50–100-track curated result passes citation, uniqueness, concentration, and seven-dimension human review gates. See [`docs/benchmark-holdouts.md`](docs/benchmark-holdouts.md).
 

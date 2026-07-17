@@ -79,6 +79,42 @@ function normalizeEvidencePhrase(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+/**
+ * The synthesis protocol needs one scalar SUBJECT field, while a confirmed
+ * brief may contain several ordered subject entities.  Render that field in a
+ * deterministic form so the validator can distinguish the complete confirmed
+ * subject from a model-invented paraphrase or a partial subject list.
+ */
+export function canonicalFastResearchSubject(subjectEntities: readonly string[]): string {
+  return subjectEntities.map((entity) => safeText(entity, 240)).filter(Boolean).join(", ");
+}
+
+function canonicalEvidenceSubject(
+  evidenceSubject: string,
+  subjectEntities: readonly string[],
+): string | null {
+  const canonicalSubjects = subjectEntities.map((entity) => safeText(entity, 240)).filter(Boolean);
+  if (canonicalSubjects.length === 0) return null;
+  const normalizedEvidenceSubject = normalizeEvidencePhrase(evidenceSubject);
+
+  // A single confirmed entity remains the canonical stored claim subject.
+  const individual = canonicalSubjects.find((entity) => (
+    normalizeEvidencePhrase(entity) === normalizedEvidenceSubject
+  ));
+  if (individual) return individual;
+
+  // A multi-entity brief is represented by the complete ordered set.  Accept
+  // only that exact aggregate; subsets, reordered entities, and prose added by
+  // the model remain unsupported.  Persist the first confirmed entity because
+  // evidence eligibility intentionally binds claims to one of the original
+  // brief.subjectEntities values.
+  const aggregate = canonicalFastResearchSubject(canonicalSubjects);
+  return canonicalSubjects.length > 1
+    && evidenceSubject === aggregate
+    ? canonicalSubjects[0]!
+    : null;
+}
+
 function evidenceContainsExactPhrase(excerpt: string, phrase: string): boolean {
   const normalizedExcerpt = normalizeEvidencePhrase(excerpt);
   const normalizedPhrase = normalizeEvidencePhrase(phrase);
@@ -305,20 +341,21 @@ export function validateFastCandidates(
       if (!attestation || !Object.hasOwn(synthesis.sourceTitles, attestation.sourceUrl)) continue;
       const evidenceGroup = parseFastEvidenceGroup(attestation.excerpt);
       if (!evidenceGroup || !groupExplicitlySupportsTrack(evidenceGroup, row)) continue;
-      const subjectEntity = brief.subjectEntities.find((entity) => (
-        normalizeEvidencePhrase(entity) === normalizeEvidencePhrase(evidenceGroup.subjectEntity)
-        && citationTextIsLocalToClaim(
+      const subjectEntity = canonicalEvidenceSubject(
+        evidenceGroup.subjectEntity,
+        brief.subjectEntities,
+      );
+      if (!subjectEntity
+        || !citationTextIsLocalToClaim(
           attestation.excerpt,
           row.title,
-          entity,
+          subjectEntity,
           // The provider-attested EVIDENCE GROUP owns the source wording.
           // Recover it deterministically instead of trusting a paraphrase in
           // the separate extraction response.
           evidenceGroup.relationship,
         )
-        && citationSupportsExtractedMetadata(attestation.excerpt, row, entity)
-      ));
-      if (!subjectEntity) continue;
+        || !citationSupportsExtractedMetadata(attestation.excerpt, row, subjectEntity)) continue;
       sourcesByUrl.set(attestation.sourceUrl, {
         url: attestation.sourceUrl,
         title: synthesis.sourceTitles[attestation.sourceUrl]!,
