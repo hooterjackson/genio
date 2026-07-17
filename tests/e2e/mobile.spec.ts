@@ -2186,6 +2186,9 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   const request = requestField(page);
   await request.fill("Every released song Paulinho da Costa performed on");
   const primary = page.getByRole("button", { name: /create playlist/i });
+  // The enabled state is derived from React state. Under parallel responsive
+  // coverage, the input event can commit one frame after Playwright's fill.
+  await expect(primary).toBeEnabled();
   await primary.focus();
   await expect(primary).toBeFocused();
 
