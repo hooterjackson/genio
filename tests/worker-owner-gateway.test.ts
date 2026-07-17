@@ -64,7 +64,7 @@ describe("Sites owner gateway boundary", () => {
   beforeEach(() => {
     upstreamFetch.mockClear();
     appHandlerFetch.mockReset();
-    appHandlerFetch.mockResolvedValue(new Response("<!doctype html><title>Needle</title>", {
+    appHandlerFetch.mockResolvedValue(new Response("<!doctype html><title>gênio</title>", {
       headers: { "Content-Type": "text/html; charset=utf-8" },
     }));
     vi.stubGlobal("fetch", upstreamFetch);
@@ -119,6 +119,22 @@ describe("Sites owner gateway boundary", () => {
     expect(response.status).toBe(200);
     expect(upstreamFetch).toHaveBeenCalledOnce();
     expect(forwardedHeaders().get("x-needle-owner-email")).toBe("owner@example.com");
+    expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  });
+
+  test("the paginated public playlist directory crosses the signed gateway without visitor identity", async () => {
+    const response = await worker.fetch(new Request(
+      "https://needle.example/api/v1/playlists?page=2&pageSize=12",
+      { headers: { "CF-Connecting-IP": "203.0.113.10" } },
+    ), env as never, ctx);
+
+    expect(response.status).toBe(200);
+    expect(upstreamFetch).toHaveBeenCalledOnce();
+    expect(String(upstreamFetch.mock.calls[0]?.[0])).toBe(
+      "https://railway.example/api/v1/playlists?page=2&pageSize=12",
+    );
+    expect(upstreamFetch.mock.calls[0]?.[1]?.method).toBe("GET");
+    expect(forwardedHeaders().has("x-needle-owner-email")).toBe(false);
     expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
   });
 

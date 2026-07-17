@@ -71,6 +71,13 @@
       "when": 1784606400000,
       "tag": "0009_brief_capabilities",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1784692800000,
+      "tag": "0010_public_playlist_directory",
+      "breakpoints": true
     }
   ]
 }

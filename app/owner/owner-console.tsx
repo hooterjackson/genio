@@ -3,6 +3,7 @@
 /* eslint-disable @next/next/no-img-element -- private authenticated feedback images cannot use the Next image optimizer */
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { BrandWordmark } from "../brand-wordmark";
 import { configureFreshMusicKit, type MusicKitApi, type MusicKitInstance } from "../music-kit.ts";
 import {
   appleAuthorizationErrorMessage,
@@ -486,7 +487,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   }
 
   async function revokeApple() {
-    if (!window.confirm("Revoke 9ênio’s saved Apple Music authorization? Publication will pause.")) return;
+    if (!window.confirm("Revoke gênio’s saved Apple Music authorization? Publication will pause.")) return;
     setBusy("apple");
     try {
       await ownerApi("/api/v1/owner/apple/authorization", { method: "DELETE" });
@@ -690,9 +691,9 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell owner-page">
       <header className="site-header">
-        <Link className="wordmark" href="/"><span>[9]</span> 9ênio_</Link>
+        <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home"><BrandWordmark /></Link>
         <div className="header-meta"><span>{email}</span><a href={signOutPath}>SIGN OUT</a></div>
       </header>
       <section className="owner-shell">

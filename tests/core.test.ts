@@ -20,7 +20,7 @@ import {
   isCrossSiteMutation,
   matchGatewayRoute,
 } from "../worker/gateway-policy.ts";
-import { manifestOrderSql } from "../server/repository.ts";
+import { isStableApplePlaylistShareUrl, manifestOrderSql } from "../server/repository.ts";
 import { readFileSync } from "node:fs";
 
 test("normalizes accents, punctuation, and featured artist markers", () => {
@@ -155,6 +155,7 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   expect(matchGatewayRoute("GET", "/health/live")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/health/live")?.owner).toBeUndefined();
   expect(matchGatewayRoute("GET", "/api/v1/runs")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute("GET", "/api/v1/playlists")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/api/v1/runs/run-id/tracks")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/matching")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/selection")).toMatchObject({ method: "POST" });
@@ -164,6 +165,7 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   expect(matchGatewayRoute("GET", "/api/v1/owner/feedback")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/api/v1/owner/feedback/report-id/image")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("POST", "/api/v1/owner/feedback/report-id/status")).toMatchObject({ owner: true });
+  expect(matchGatewayRoute("POST", "/api/v1/owner/playlists/playlist-id/visibility")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("DELETE", "/api/v1/owner/feedback/report-id")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/api/v1/owner/unknown")).toBeNull();
   expect(matchGatewayRoute("PATCH", "/api/v1/owner/status")).toBeNull();
@@ -181,6 +183,20 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   })).toBe(false);
 });
 
+test("public directory accepts only stable Apple Music playlist share URLs", () => {
+  expect(isStableApplePlaylistShareUrl(
+    "https://music.apple.com/us/playlist/a-public-playlist/pl.u-abc_123?l=en-US",
+  )).toBe(true);
+  for (const unsafe of [
+    "http://music.apple.com/us/playlist/name/pl.u-abc",
+    "https://music.apple.com.evil.example/us/playlist/name/pl.u-abc",
+    "https://music.apple.com/us/album/name/123",
+    "https://music.apple.com/us/playlist/name/not-a-playlist-id",
+    "https://music.apple.com/us/playlist/name/pl.u-abc#private-fragment",
+    "https://127.0.0.1/us/playlist/name/pl.u-abc",
+  ]) expect(isStableApplePlaylistShareUrl(unsafe)).toBe(false);
+});
+
 test("bulk playlist selection has a larger but still bounded signed request limit", () => {
   expect(gatewayBodyLimit("POST", "/api/v1/runs/run-id/selection")).toBe(BULK_SELECTION_BODY_LIMIT);
   expect(gatewayBodyLimit("POST", "/api/v1/feedback")).toBe(FEEDBACK_GATEWAY_BODY_LIMIT);
@@ -196,7 +212,7 @@ test("bulk playlist selection has a larger but still bounded signed request limi
   expect(transmittedBody.byteLength).toBeLessThan(BULK_SELECTION_BODY_LIMIT);
 });
 
-test("Sites forwards only 9ênio's capability cookie across the Railway boundary", () => {
+test("Sites forwards only gênio's capability cookie across the Railway boundary", () => {
   expect(forwardedCapabilityCookie(
     "chatgpt-session=private; __Host-needle-session=capability-token; analytics=tracking",
     true,
@@ -207,7 +223,7 @@ test("Sites forwards only 9ênio's capability cookie across the Railway boundary
   expect(() => forwardedCapabilityCookie(
     "__Host-needle-session=one; __Host-needle-session=two",
     true,
-  )).toThrow(/Duplicate 9ênio capability cookies/);
+  )).toThrow(/Duplicate gênio capability cookies/);
 });
 
 test("Railway gateway rejects stale, body-tampered, signature-tampered, and replayed requests", async () => {

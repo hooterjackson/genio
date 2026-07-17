@@ -123,7 +123,7 @@ export default defineRailway(() => {
     replicas: { "us-west2": 1 },
     variables: {
       ...apiVariables,
-      APP_ORIGIN: "https://genio.engineered.lighting",
+      APP_ORIGIN: "https://9enio.com",
       DATABASE_URL: Postgres.env.DATABASE_URL,
     },
   });

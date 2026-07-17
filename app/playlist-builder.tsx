@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
@@ -11,6 +12,7 @@ import {
   fastRunWindowPhrase,
 } from "../shared/fast-run-sla.ts";
 import { BrandIntro } from "./brand-intro";
+import { BrandWordmark } from "./brand-wordmark";
 import { SiteMenu } from "./site-menu";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
@@ -328,7 +330,7 @@ function unwrapResult(
         const end = numberValue(volume.endPosition, start + numberValue(volume.appendedCount) - 1);
         return {
           index: index + 1,
-          name: typeof volume.name === "string" ? volume.name : "9ênio volume " + (index + 1),
+          name: typeof volume.name === "string" ? volume.name : "gênio volume " + (index + 1),
           url: appleMusicUrl(volume.shareUrl),
           trackCount: Math.max(0, end - start + 1) || numberValue(volume.appendedCount),
           status: typeof volume.status === "string" ? volume.status : undefined,
@@ -364,7 +366,7 @@ function unwrapResult(
         const volume = asObject(raw);
         return {
           index: numberValue(volume.index, index + 1),
-          name: typeof volume.name === "string" ? volume.name : "9ênio volume " + (index + 1),
+          name: typeof volume.name === "string" ? volume.name : "gênio volume " + (index + 1),
           url: appleMusicUrl(volume.url),
           trackCount: numberValue(volume.trackCount),
           status: typeof volume.status === "string" ? volume.status : undefined,
@@ -391,7 +393,7 @@ function unwrapResult(
   if (Array.isArray(object.volumes)) {
     const manifest = asObject(object.manifest);
     const rawVolumes = object.volumes;
-    const manifestName = typeof manifest.name === "string" ? manifest.name : currentRun?.brief.title ?? "9ênio playlist";
+    const manifestName = typeof manifest.name === "string" ? manifest.name : currentRun?.brief.title ?? "gênio playlist";
     const volumeCount = rawVolumes.length;
     return {
       runId: currentRun?.id ?? "",
@@ -431,7 +433,7 @@ function manifestFromResult(payload: unknown, runId: string): PlaylistManifest |
   return {
     id: manifest.id,
     runId,
-    name: typeof manifest.name === "string" ? manifest.name : "9ênio playlist",
+    name: typeof manifest.name === "string" ? manifest.name : "gênio playlist",
     contentHash: typeof manifest.contentHash === "string" ? manifest.contentHash : undefined,
     trackCount: numberValue(manifest.trackCount),
     tracks: [],
@@ -643,39 +645,28 @@ function useRunPolling(
 }
 
 function AppHeader({
-  step,
-  total = 5,
   transferState,
   onTransfer,
   onHome,
-  onNew,
   onJobs,
 }: {
-  step?: number;
-  total?: number;
   transferState?: string;
   onTransfer?: () => void;
   onHome: () => void;
-  onNew?: () => void;
   onJobs?: () => void;
 }) {
   return (
     <header className="site-header">
-      <button className="wordmark" onClick={onHome} aria-label="9ênio home">
-        <span aria-hidden="true">[9]</span> 9ênio_
+      <button className="wordmark ascii-wordmark" onClick={onHome} aria-label="gênio home">
+        <BrandWordmark />
       </button>
       <div className="header-meta">
-        {onNew && <button className="header-action" onClick={onNew}>NEW JOB</button>}
+        {!onTransfer && <Link className="header-action" href="/playlists">PLAYLISTS</Link>}
         {onJobs && <button className="header-action" onClick={onJobs}>JOBS</button>}
         {onTransfer && (
           <button className="transfer-button" onClick={onTransfer} disabled={transferState === "busy"}>
             {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
           </button>
-        )}
-        {step != null && (
-          <span aria-label={"Step " + step + " of " + total}>
-            {String(step).padStart(2, "0")}/{String(total).padStart(2, "0")}
-          </span>
         )}
         <SiteMenu />
       </div>
@@ -713,7 +704,7 @@ function JobsScreen({
         <button className="flow-back" type="button" onClick={onBack}>← HOME</button>
         <div className="screen-index">/ JOBS</div>
         <h1 id="jobs-title">JOBS</h1>
-        <p>Open any job available to this browser.</p>
+        <p>Open a playlist job saved in this browser.</p>
 
         {loading && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING JOBS</div>}
         {!loading && jobs.length === 0 && <div className="jobs-empty">NO JOBS FOUND</div>}
@@ -758,8 +749,11 @@ function OneCommandScreen({
 }) {
   const [focused, setFocused] = useState(false);
   const [exampleIndex, setExampleIndex] = useState(0);
-  const count = Number(trackCount);
-  const validCount = Number.isInteger(count)
+  const customInputRef = useRef<HTMLInputElement>(null);
+  const countIsDigits = /^[0-9]+$/u.test(trackCount);
+  const count = countIsDigits ? Number.parseInt(trackCount, 10) : Number.NaN;
+  const customCount = trackCount.length === 0 || ![25, 50, 100].includes(count);
+  const validCount = countIsDigits && Number.isInteger(count)
     && count >= PUBLIC_PLAYLIST_MINIMUM_TRACKS
     && count <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS;
   const promptInvalid = prompt.length > 0 && prompt.trim().length < 4;
@@ -768,7 +762,7 @@ function OneCommandScreen({
   const promptMessage = promptInvalid
     ? "Describe the playlist in at least 4 characters."
     : "Describe what the playlist should contain.";
-  const countMessage = countInvalid
+  const countMessage = !validCount
     ? `Choose ${PUBLIC_PLAYLIST_MINIMUM_TRACKS}–${PUBLIC_PLAYLIST_MAXIMUM_TRACKS} tracks.`
     : "The selected track count is exact.";
 
@@ -787,68 +781,133 @@ function OneCommandScreen({
     onSubmit();
   }
 
+  function choosePreset(value: number) {
+    onTrackCount(String(value));
+  }
+
+  function chooseCustom() {
+    onTrackCount("");
+    window.requestAnimationFrame(() => customInputRef.current?.focus());
+  }
+
   return (
     <section className="one-command-screen" aria-labelledby="command-title">
       <div className="one-command-body">
         <h1 className="sr-only" id="command-title">Research a playlist</h1>
-        <span className="one-command-kicker">/ NEW PLAYLIST</span>
-        <p className="one-command-intro">Describe the playlist and choose its size. 9ênio will ask only what changes the result.</p>
-
         <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy)}>
-          <label className="one-command-request" htmlFor="playlist-request">
-            <span>PLAYLIST REQUEST</span>
-          <textarea
-            id="playlist-request"
-            value={prompt}
-            onChange={(event) => onPrompt(event.target.value)}
-            onFocus={() => setFocused(true)}
-            onBlur={() => setFocused(false)}
-            rows={5}
-            maxLength={2000}
-            spellCheck
-            required
-            disabled={Boolean(busy)}
-            aria-invalid={promptInvalid}
-            aria-describedby="playlist-request-note"
-            placeholder={focused ? examples[exampleIndex] : "What should the playlist contain?"}
-          />
-          </label>
-          <label className="one-command-count" htmlFor="playlist-track-count">
-            <span>TRACKS</span>
-            <input
-              id="playlist-track-count"
-              type="number"
-              inputMode="numeric"
-              min={PUBLIC_PLAYLIST_MINIMUM_TRACKS}
-              max={PUBLIC_PLAYLIST_MAXIMUM_TRACKS}
-              step={1}
-              value={trackCount}
-              data-digits={Math.min(5, Math.max(1, trackCount.length))}
-              onChange={(event) => onTrackCount(event.target.value.replace(/[^0-9]/gu, ""))}
-              required
-              disabled={Boolean(busy)}
-              aria-invalid={countInvalid}
-              aria-describedby="playlist-track-count-note"
-            />
-            <small
-              className="one-command-timing"
-              title="Maximum research and catalog-matching window. Queueing and Apple publication can add time."
+          <section className="command-section command-request-section" aria-labelledby="request-step-title">
+            <span className="command-step-index">/01 REQUEST</span>
+            <h2 id="request-step-title">Describe the playlist.</h2>
+            <p>gênio asks only what would materially change the result.</p>
+            <label className="one-command-request" htmlFor="playlist-request">
+              <span>PLAYLIST REQUEST</span>
+              <textarea
+                id="playlist-request"
+                value={prompt}
+                onChange={(event) => onPrompt(event.target.value)}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                rows={5}
+                maxLength={2000}
+                spellCheck
+                required
+                disabled={Boolean(busy)}
+                aria-invalid={promptInvalid}
+                aria-describedby="playlist-request-note"
+                placeholder={focused ? examples[exampleIndex] : "What should the playlist contain?"}
+              />
+              <small>{prompt.length.toLocaleString()} / 2,000</small>
+            </label>
+          </section>
+
+          <section className="command-section command-size-section" aria-labelledby="size-step-title">
+            <span className="command-step-index">/02 SIZE</span>
+            <h2 id="size-step-title">Choose how many tracks.</h2>
+            {!customCount ? (
+              <fieldset className="count-presets">
+                <legend className="sr-only">Playlist size</legend>
+                {[25, 50, 100].map((value) => (
+                  <button
+                    type="button"
+                    key={value}
+                    aria-label={`${value} tracks`}
+                    aria-pressed={count === value}
+                    onClick={() => choosePreset(value)}
+                    disabled={Boolean(busy)}
+                  >
+                    {value}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  className="custom-count-trigger"
+                  aria-label="Custom size"
+                  aria-pressed={false}
+                  onClick={chooseCustom}
+                  disabled={Boolean(busy)}
+                >
+                  CUSTOM
+                </button>
+              </fieldset>
+            ) : (
+              <div className="custom-count-editor">
+                <label htmlFor="playlist-track-count">
+                  <span>EXACT TRACK COUNT</span>
+                  <input
+                    ref={customInputRef}
+                    id="playlist-track-count"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    autoComplete="off"
+                    value={trackCount}
+                    onChange={(event) => onTrackCount(event.target.value)}
+                    required
+                    disabled={Boolean(busy)}
+                    aria-invalid={countInvalid || trackCount.length === 0}
+                    aria-describedby="playlist-track-count-note"
+                    aria-label="Exact track count"
+                    placeholder="1–300"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => choosePreset(PUBLIC_PLAYLIST_DEFAULT_TRACKS)}
+                  disabled={Boolean(busy)}
+                >
+                  PRESETS
+                </button>
+              </div>
+            )}
+            <div className="count-meta" aria-live="polite">
+              <span>{validCount ? `${count.toLocaleString()} TRACKS` : `LIMIT ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`}</span>
+              <span>{validCount ? `${timeWindow} TARGET` : `${PUBLIC_PLAYLIST_MINIMUM_TRACKS}–${PUBLIC_PLAYLIST_MAXIMUM_TRACKS} TRACKS`}</span>
+            </div>
+            {customCount && !validCount && (
+              <p className="count-validation" role="alert">
+                Enter a whole number from {PUBLIC_PLAYLIST_MINIMUM_TRACKS} to {PUBLIC_PLAYLIST_MAXIMUM_TRACKS}.
+              </p>
+            )}
+          </section>
+
+          <section className="command-section command-create-section" aria-labelledby="create-step-title">
+            <div>
+              <span className="command-step-index">/03 CREATE</span>
+              <h2 id="create-step-title">Build the playlist.</h2>
+              <p>{validCount ? `${timeWindow} research target.` : "Choose a valid size to continue."}</p>
+            </div>
+            <button
+              className="one-command-submit"
+              type="submit"
+              disabled={Boolean(busy) || prompt.trim().length < 4 || !validCount}
             >
-              <span>RESEARCH WINDOW</span>
-              <strong>{timeWindow}</strong>
-            </small>
-          </label>
-          <button
-            className="one-command-submit"
-            type="submit"
-            disabled={Boolean(busy) || prompt.trim().length < 4 || !validCount}
-          >
-            {busy ? "UNDERSTANDING REQUEST..." : "CONTINUE →"}
-          </button>
+              {busy ? "STARTING..." : "CREATE PLAYLIST →"}
+            </button>
+          </section>
         </form>
 
-        <p className="sr-only" id="playlist-request-note" aria-live="polite">{promptMessage}</p>
-        <p className="sr-only" id="playlist-track-count-note" aria-live="polite">{countMessage}</p>
+        <p className="sr-only" id="playlist-request-note">{promptMessage}</p>
+        <p className="sr-only" id="playlist-track-count-note">{countMessage}</p>
       </div>
     </section>
   );
@@ -1017,8 +1076,8 @@ function FinalizingBriefScreen() {
   return (
     <section className="guided-question-screen guided-finalizing-screen" role="status" aria-live="polite">
       <div className="guided-question-body">
-        <span className="one-command-kicker">/ BUILDING THE PLAN</span>
-        <h1>PREPARING<br />YOUR PLAYLIST.</h1>
+        <span className="guided-question-kicker">/ PREPARING</span>
+        <h1>PREPARING YOUR PLAYLIST.</h1>
         <p>Applying your answers before research begins.</p>
         <div className="guided-finalizing-line"><span aria-hidden="true">▋</span>FINALIZING REQUEST</div>
       </div>
@@ -1035,9 +1094,9 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   return (
     <section className="screen flow-screen research-screen" aria-labelledby="run-title">
       <div className="flow-body research-body">
-        <div className="screen-index">/ 02 CREATE</div>
+        <div className="screen-index">/ RESEARCH</div>
         <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
-        <h1 id="run-title">{publishing ? <>CREATING<br />PLAYLIST.</> : "RESEARCHING."}</h1>
+        <h1 id="run-title">{publishing ? "CREATING PLAYLIST." : "RESEARCHING."}</h1>
         <p className="run-subject">{run.brief.title}</p>
         <p className="research-status" role="status">{phaseMessage(run)}</p>
         <div className="progress research-progress" aria-label={"Research " + progress + "% complete"}>
@@ -1067,14 +1126,14 @@ function ReviewScreen(props: {
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ 03 SELECT TRACKS</div>
+        <div className="screen-index">/ TRACKS</div>
         <h1 id="review-title">SELECT TRACKS.</h1>
         <p>Loading Apple Music matches.</p>
         <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING TRACKS</div>
       </div>
       <div className="step-footer review-footer">
         <div className="selection-count"><strong>0</strong><span>TRACKS</span></div>
-        <button className="action-button step-primary" disabled>GENERATE PLAYLIST →</button>
+        <button className="action-button step-primary" disabled>CONTINUE →</button>
       </div>
     </section>
   );
@@ -1283,7 +1342,7 @@ function TrackSelectionScreen({
   return (
     <section className="screen flow-screen review-screen" aria-labelledby="review-title">
       <div className="flow-body review-body">
-        <div className="screen-index">/ 03 SELECT TRACKS</div>
+        <div className="screen-index">/ TRACKS</div>
         <h1 id="review-title">SELECT TRACKS.</h1>
         <p aria-live="polite">{reviewSummary}</p>
 
@@ -1371,7 +1430,7 @@ function TrackSelectionScreen({
           <span>TRACK{selected.length === 1 ? "" : "S"}</span>
         </div>
         <button className="action-button step-primary" onClick={generate} disabled={selected.length === 0 || blocksPartialGeneration || Boolean(busy)}>
-          {busy === "generate" ? "GENERATING PLAYLIST..." : "GENERATE PLAYLIST →"}
+          {busy === "generate" ? "PREPARING..." : `CONTINUE WITH ${selected.length.toLocaleString()} →`}
         </button>
       </div>
     </section>
@@ -1397,14 +1456,14 @@ function ManifestScreen({
   return (
     <section className="screen flow-screen manifest-screen" aria-labelledby="manifest-title">
       <div className="flow-body">
-        <div className="screen-index">/ 04 GENERATE</div>
+        <div className="screen-index">/ PUBLISH</div>
         <span className="tag">[{volumeCount} {volumeCount === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS<br />READY.</h1>
+        <h1 id="manifest-title">{trackCount.toLocaleString()} TRACKS READY.</h1>
         <p>{waitingForApple
           ? "Publication will resume after the owner reconnects Apple Music."
           : publishing || busy
             ? "Creating the playlist in Apple Music."
-            : "The selected tracks are ready to generate."}</p>
+            : "Review the final count, then publish to Apple Music."}</p>
 
         <details className="terminal-details manifest-details">
           <summary>PREVIEW TRACK LIST</summary>
@@ -1432,7 +1491,7 @@ function ManifestScreen({
             ? "WAITING FOR APPLE AUTHORIZATION"
             : publishing || busy
               ? "GENERATING PLAYLIST..."
-              : "GENERATE PLAYLIST →"}
+              : "PUBLISH TO APPLE MUSIC →"}
         </button>
       </div>
     </section>
@@ -1441,12 +1500,10 @@ function ManifestScreen({
 
 function ResultScreen({
   result,
-  automatic = false,
   onReset,
   onDelete,
 }: {
   result: RunResult;
-  automatic?: boolean;
   onReset: () => void;
   onDelete: () => void;
 }) {
@@ -1460,18 +1517,16 @@ function ResultScreen({
   const publishedWithGaps = numberValue(result.unresolvedGapCount) > 0
     || exactTargetMissed
     || (result.status === "partial" && !(exactTargetSatisfied && knownZeroVisibleGaps));
-  const resultTitleLines = publishedWithGaps
-    ? ["PLAYLIST PUBLISHED", "WITH GAPS."]
-    : ["PLAYLIST", "PUBLISHED."];
+  const resultTitle = publishedWithGaps
+    ? "PLAYLIST PUBLISHED WITH GAPS."
+    : "PLAYLIST PUBLISHED.";
 
   return (
     <section className="screen flow-screen result-screen" aria-labelledby="result-title">
       <div className="flow-body">
-        <div className="screen-index">/ {automatic ? "03" : "05"} RESULT</div>
+        <div className="screen-index">/ RESULT</div>
         <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
-        <h1 id="result-title" aria-label={resultTitleLines.join(" ")}>
-          {resultTitleLines.map((line) => <span className="result-title-line" key={line}>{line}</span>)}
-        </h1>
+        <h1 id="result-title">{resultTitle}</h1>
         <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
         <small className="result-note">Apple reports this playlist as public and returned this link. Search, profile visibility, and regional availability are not guaranteed.</small>
 
@@ -1687,7 +1742,7 @@ export function PlaylistBuilder() {
       : typeof object.capabilityToken === "string"
         ? object.capabilityToken
         : "";
-    if (!capability) throw new Error("9ênio could not establish a private session for this run.");
+    if (!capability) throw new Error("gênio could not establish a private session for this run.");
     const fragment = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(next.id);
     window.history.replaceState(null, "", window.location.pathname + window.location.search + "#" + fragment);
     await exchangeCapability(capability, next.id, signal);
@@ -1876,7 +1931,9 @@ export function PlaylistBuilder() {
   }, [run, result]);
 
   async function createPlaylist() {
-    const requestedTrackCount = Number(trackCount);
+    const requestedTrackCount = /^[0-9]+$/u.test(trackCount)
+      ? Number.parseInt(trackCount, 10)
+      : Number.NaN;
     if (prompt.trim().length < 4
       || !Number.isInteger(requestedTrackCount)
       || requestedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
@@ -1922,7 +1979,7 @@ export function PlaylistBuilder() {
       if (controller.signal.aborted) return;
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
       const requestId = response.requestId ?? initialRequestId;
-      if (!requestId) throw new Error("9ênio could not resume this playlist request.");
+      if (!requestId) throw new Error("gênio could not resume this playlist request.");
       setBrief(response.brief);
       setBriefRequestId(requestId);
       if (response.status === "awaiting_answers" && response.questions?.length) {
@@ -2151,7 +2208,7 @@ export function PlaylistBuilder() {
   }
 
   async function deleteRun() {
-    if (!run || !window.confirm("Delete this run’s research data from 9ênio? Published Apple playlists will remain.")) return;
+    if (!run || !window.confirm("Delete this run’s research data from gênio? Published Apple playlists will remain.")) return;
     setBusy("delete");
     try {
       await api("/api/v1/runs/" + encodeURIComponent(run.id), { method: "DELETE" });
@@ -2180,7 +2237,7 @@ export function PlaylistBuilder() {
         : typeof payload.token === "string"
           ? payload.token
           : "";
-      if (!capability) throw new Error("9ênio did not return a transfer capability.");
+      if (!capability) throw new Error("gênio did not return a transfer capability.");
       const url = new URL(window.location.pathname, window.location.origin);
       url.hash = "cap=" + encodeURIComponent(capability) + "&run=" + encodeURIComponent(run.id);
       await copyText(url.toString());
@@ -2192,22 +2249,10 @@ export function PlaylistBuilder() {
     }
   }
 
-  const step = useMemo(() => {
-    if (run?.autoPublish) return result ? 3 : 2;
-    if (result) return 5;
-    if (manifest) return 4;
-    if (run && reviewStatuses.has(run.status)) return 3;
-    if (run) return 2;
-    return 1;
-  }, [run, manifest, result]);
-
   if (restoring) {
     return (
       <main className="app-shell">
-        <AppHeader
-          step={1}
-          onHome={reset}
-        />
+        <AppHeader onHome={reset} />
         <section className="screen restore-screen" role="status">
           <span className="cursor" aria-hidden="true">▋</span>RESTORING RUN
         </section>
@@ -2282,7 +2327,6 @@ export function PlaylistBuilder() {
       <main className="app-shell">
         <AppHeader
           onHome={reset}
-          onNew={newJob}
           onJobs={() => void openJobs()}
         />
         <ErrorBar message={error} onDismiss={() => setError("")} />
@@ -2301,12 +2345,9 @@ export function PlaylistBuilder() {
     <main className="app-shell">
       {(run || manifest || result) && (
         <AppHeader
-          step={step}
-          total={run?.autoPublish ? 3 : 5}
           transferState={transferState}
           onTransfer={run ? transferRun : undefined}
           onHome={reset}
-          onNew={newJob}
           onJobs={() => void openJobs()}
         />
       )}
@@ -2334,7 +2375,7 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {result && <ResultScreen result={result} automatic={run?.autoPublish === true} onReset={newJob} onDelete={deleteRun} />}
+      {result && <ResultScreen result={result} onReset={newJob} onDelete={deleteRun} />}
     </main>
   );
 }

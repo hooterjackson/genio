@@ -638,7 +638,7 @@ test("publisher recovers an uncertain playlist creation by its private marker", 
   let state: string[] = [];
   const client: PublicationAppleClient = {
     findLibraryPlaylistByMarker: vi.fn(async (marker) => {
-      if (!marker.startsWith("9ênio publication ")) return null;
+      if (!marker.startsWith("gênio publication ")) return null;
       currentMarkerLookups += 1;
       return currentMarkerLookups === 1 ? null : { id: "p.recovered" };
     }),
@@ -654,14 +654,18 @@ test("publisher recovers an uncertain playlist creation by its private marker", 
   expect(result).toMatchObject({ playlistId: "p.recovered", appendedCount: 1, status: "complete" });
   expect(client.createLibraryPlaylist).toHaveBeenCalledTimes(1);
   expect(client.appendCatalogTracks).toHaveBeenCalledWith("p.recovered", ["101"], undefined);
+  expect(client.findLibraryPlaylistByMarker).toHaveBeenCalledWith(
+    "gênio publication volume-id:0",
+    undefined,
+  );
 });
 
-test("publisher recovers a playlist created under the previous gênio marker", async () => {
+test("publisher recovers a playlist created under the previous 9ênio marker", async () => {
   const repository = publicationRepository();
   let state: string[] = [];
   const client: PublicationAppleClient = {
     findLibraryPlaylistByMarker: vi.fn(async (marker) => (
-      marker.startsWith("gênio publication ") ? { id: "p.previous" } : null
+      marker.startsWith("9ênio publication ") ? { id: "p.previous" } : null
     )),
     createLibraryPlaylist: vi.fn(async () => ({ id: "p.unexpected", url: null })),
     appendCatalogTracks: vi.fn(async (_playlistId, ids) => { state = [...state, ...ids]; }),
@@ -672,6 +676,10 @@ test("publisher recovers a playlist created under the previous gênio marker", a
   const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101"], validAuthorization);
   expect(result).toMatchObject({ playlistId: "p.previous", appendedCount: 1, status: "complete" });
   expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
+  expect(client.findLibraryPlaylistByMarker).toHaveBeenCalledWith(
+    "9ênio publication volume-id:0",
+    undefined,
+  );
 });
 
 test("publisher recovers a pre-gênio playlist by its legacy Needle marker", async () => {
@@ -690,6 +698,10 @@ test("publisher recovers a pre-gênio playlist by its legacy Needle marker", asy
   const result = await appendExactVolume(repository, client, manifest, pendingVolume(), ["101"], validAuthorization);
   expect(result).toMatchObject({ playlistId: "p.legacy", appendedCount: 1, status: "complete" });
   expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
+  expect(client.findLibraryPlaylistByMarker).toHaveBeenCalledWith(
+    "Needle publication volume-id:0",
+    undefined,
+  );
 });
 
 test("publisher orphans a divergent playlist and creates a clean replacement", async () => {

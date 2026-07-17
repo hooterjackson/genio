@@ -280,11 +280,11 @@ function volumeName(manifest: LockedManifest, index: number, count: number): str
 }
 
 function volumeMarker(volume: PublicationVolume): string {
-  return `9ênio publication ${volume.id}:${volume.attempt}`;
+  return `gênio publication ${volume.id}:${volume.attempt}`;
 }
 
 function previousVolumeMarker(volume: PublicationVolume): string {
-  return `gênio publication ${volume.id}:${volume.attempt}`;
+  return `9ênio publication ${volume.id}:${volume.attempt}`;
 }
 
 function legacyVolumeMarker(volume: PublicationVolume): string {

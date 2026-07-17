@@ -1,6 +1,6 @@
 {
   "version": "2026-07-14",
-  "note": "Independently frozen acceptance holdouts. These rows were compiled from the cited sources, not from Needle research output or a model-generated song list.",
+  "note": "Independently frozen acceptance holdouts. These rows were compiled from the cited sources, not from gênio research output or a model-generated song list.",
   "methodology": {
     "frozenAt": "2026-07-14",
     "independence": "Expected tracks were transcribed from the cited public sources before staging evaluation. Runtime research output must never be used to amend expected results.",

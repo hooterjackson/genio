@@ -11,6 +11,8 @@ import type {
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
   PlaylistManifest,
+  PublicPlaylistDirectoryItem,
+  PublicPlaylistDirectoryPage,
   ResearchRunView,
   SourceFrontierItem,
   SourceRecordInput,
@@ -96,6 +98,27 @@ const FEEDBACK_STORAGE_LIMIT_BYTES = Math.max(
   5 * 1024 * 1024,
   Math.min(1024 * 1024 * 1024, Number(process.env.FEEDBACK_STORAGE_LIMIT_BYTES ?? 100 * 1024 * 1024) || 100 * 1024 * 1024),
 );
+
+export function isStableApplePlaylistShareUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2_000) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.hostname === "music.apple.com"
+      && url.port === ""
+      && url.username === ""
+      && url.password === ""
+      && url.hash === ""
+      && /^\/[a-z]{2}\/playlist\/[^/]+\/pl\.[A-Za-z0-9._-]+$/iu.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function canonicalApplePlaylistShareUrl(value: string): string {
+  const url = new URL(value);
+  return `${url.origin}${url.pathname}`;
+}
 
 type CandidateRow = TrackCandidateInput & {
   id: string;
@@ -1057,7 +1080,7 @@ export class Repository {
           "SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL",
           [CAPACITY_RUN_STATUSES],
         );
-        if (active.rows[0]!.count >= (input.globalLimit ?? 10)) throw new HttpError(503, "9ênio is at capacity; try again soon", "global_capacity_reached");
+        if (active.rows[0]!.count >= (input.globalLimit ?? 10)) throw new HttpError(503, "gênio is at capacity; try again soon", "global_capacity_reached");
         runId = randomUUID();
         const gate = readCostConfiguration().autoRunCostLimitUsd;
         status = estimate > gate && approved < estimate ? "awaiting_budget" : "queued";
@@ -1145,6 +1168,13 @@ export class Repository {
       [id, values.status ?? null, values.phase ?? null, costDelta, values.approvedBudget ?? null, values.noNewGapPasses ?? null, values.error !== undefined, persistedError ?? null],
     );
     if (result.rowCount === 0) throw new HttpError(404, "Research run not found", "run_not_found");
+    if (values.status === "complete" || values.status === "partial") {
+      // Publication is already durable at this point. Project only a complete,
+      // stable, public-safe subset into the browseable directory. A failure to
+      // satisfy every invariant returns null and leaves any prior listing
+      // untouched; no operational run fields cross this boundary.
+      await this.upsertPublicPlaylistDirectoryForRun(id);
+    }
   }
 
   private async getRunRow(id: string): Promise<any | null> {
@@ -2746,6 +2776,189 @@ export class Repository {
     }));
   }
 
+  async upsertPublicPlaylistDirectoryForRun(runId: string): Promise<PublicPlaylistDirectoryItem | null> {
+    return this.transaction(async (client) => {
+      const manifest = await client.query<{
+        id: string;
+        run_id: string;
+        content_hash: string;
+        name: string;
+        run_status: string;
+        track_count: number;
+      }>(
+        `SELECT m.id,m.run_id,m.content_hash,m.name,r.status run_status,
+           (SELECT count(*)::int FROM manifest_tracks mt WHERE mt.manifest_id=m.id) track_count
+         FROM manifests m JOIN research_runs r ON r.id=m.run_id
+         WHERE m.run_id=$1
+         ORDER BY m.created_at DESC,m.id DESC LIMIT 1
+         FOR UPDATE OF m,r`,
+        [runId],
+      );
+      const source = manifest.rows[0];
+      if (!source || !["complete", "partial"].includes(source.run_status)) return null;
+
+      const title = source.name
+        .normalize("NFKC")
+        .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+        .replace(/\s+/gu, " ")
+        .trim()
+        .slice(0, 240);
+      const manifestTrackCount = Number(source.track_count);
+      if (!title || !/^[a-f0-9]{64}$/iu.test(source.content_hash) || manifestTrackCount < 1) return null;
+
+      const volumeResult = await client.query<{
+        volume_number: number;
+        volume_count: number;
+        start_position: number;
+        end_position: number;
+        status: string;
+        apple_share_url: string | null;
+        appended_count: number;
+        published_at: Date | string | null;
+      }>(
+        `SELECT volume_number,volume_count,start_position,end_position,status,
+           apple_share_url,appended_count,published_at
+         FROM publication_volumes WHERE manifest_id=$1
+         ORDER BY volume_number FOR UPDATE`,
+        [source.id],
+      );
+      const volumes = volumeResult.rows;
+      const volumeCount = volumes[0]?.volume_count ?? 0;
+      const stable = volumeCount > 0
+        && volumes.length === volumeCount
+        && volumes.every((volume, index) => {
+          const expectedTrackCount = volume.end_position - volume.start_position + 1;
+          const volumePublishedAt = date(volume.published_at);
+          return volume.volume_number === index + 1
+            && volume.volume_count === volumeCount
+            && expectedTrackCount > 0
+            && volume.status === "complete"
+            && volume.appended_count === expectedTrackCount
+            && volumePublishedAt !== null
+            && Number.isFinite(volumePublishedAt.getTime())
+            && isStableApplePlaylistShareUrl(volume.apple_share_url);
+        })
+        && volumes.reduce((sum, volume) => sum + volume.end_position - volume.start_position + 1, 0) === manifestTrackCount;
+      if (!stable) return null;
+
+      const publishedAt = new Date(Math.max(...volumes.map((volume) => date(volume.published_at)!.getTime())));
+      const shareUrls = volumes.map((volume) => canonicalApplePlaylistShareUrl(volume.apple_share_url!));
+      const collision = await client.query(
+        `SELECT 1 FROM public_playlist_volumes v
+         JOIN public_playlists p ON p.id=v.public_playlist_id
+         WHERE v.share_url=ANY($1::text[]) AND p.manifest_hash<>$2 LIMIT 1`,
+        [shareUrls, source.content_hash],
+      );
+      if (collision.rows[0]) return null;
+      const directoryId = randomUUID();
+      const inserted = await client.query<{ id: string; status: string; hidden_at: Date | string | null }>(
+        `INSERT INTO public_playlists(
+           id,run_id,manifest_hash,title,track_count,volume_count,status,published_at
+         ) VALUES($1,$2,$3,$4,$5,$6,'listed',$7)
+         ON CONFLICT(manifest_hash) DO UPDATE SET
+           run_id=EXCLUDED.run_id,title=EXCLUDED.title,track_count=EXCLUDED.track_count,
+           volume_count=EXCLUDED.volume_count,published_at=EXCLUDED.published_at,updated_at=now()
+         RETURNING id,status,hidden_at`,
+        [directoryId, source.run_id, source.content_hash, title, manifestTrackCount, volumeCount, publishedAt],
+      );
+      const publicPlaylistId = inserted.rows[0]!.id;
+      await client.query("DELETE FROM public_playlist_volumes WHERE public_playlist_id=$1", [publicPlaylistId]);
+      const directoryVolumes = [];
+      for (const [index, volume] of volumes.entries()) {
+        const trackCount = volume.end_position - volume.start_position + 1;
+        const shareUrl = shareUrls[index]!;
+        const name = volumeCount === 1
+          ? title
+          : appendPlaylistTitleSuffix(title, `[${volume.volume_number}/${volumeCount}]`);
+        await client.query(
+          `INSERT INTO public_playlist_volumes(public_playlist_id,volume_number,name,track_count,share_url)
+           VALUES($1,$2,$3,$4,$5)`,
+          [publicPlaylistId, volume.volume_number, name, trackCount, shareUrl],
+        );
+        directoryVolumes.push({
+          volumeNumber: volume.volume_number,
+          name,
+          trackCount,
+          shareUrl,
+        });
+      }
+      return {
+        id: publicPlaylistId,
+        title,
+        trackCount: manifestTrackCount,
+        volumeCount,
+        publishedAt: publishedAt.toISOString(),
+        volumes: directoryVolumes,
+      };
+    });
+  }
+
+  async listPublicPlaylists(page = 1, pageSize = 24): Promise<PublicPlaylistDirectoryPage> {
+    const safePage = Number.isInteger(page) ? Math.max(1, page) : 1;
+    const safePageSize = Number.isInteger(pageSize) ? Math.max(1, Math.min(pageSize, 100)) : 24;
+    const eligibleSql = `
+      FROM public_playlists p JOIN public_playlist_volumes v ON v.public_playlist_id=p.id
+      WHERE p.status='listed' AND p.hidden_at IS NULL
+      GROUP BY p.id
+      HAVING count(*)=p.volume_count
+         AND min(v.volume_number)=1
+         AND max(v.volume_number)=p.volume_count
+         AND count(DISTINCT v.volume_number)=count(*)
+         AND sum(v.track_count)=p.track_count
+         AND bool_and(v.share_url ~ '^https://music[.]apple[.]com/[A-Za-z]{2}/playlist/.+/pl[.][A-Za-z0-9._-]+$')`;
+    const [countResult, itemResult] = await Promise.all([
+      this.pool.query<{ count: number }>(`SELECT count(*)::int count FROM (SELECT p.id ${eligibleSql}) eligible`),
+      this.pool.query<{
+        id: string;
+        title: string;
+        track_count: number;
+        volume_count: number;
+        published_at: Date | string;
+        volumes: Array<{ volumeNumber: number; name: string; trackCount: number; shareUrl: string }>;
+      }>(
+        `SELECT p.id,p.title,p.track_count,p.volume_count,p.published_at,
+           json_agg(json_build_object(
+             'volumeNumber',v.volume_number,
+             'name',v.name,
+             'trackCount',v.track_count,
+             'shareUrl',v.share_url
+           ) ORDER BY v.volume_number) volumes
+         ${eligibleSql}
+         ORDER BY p.published_at DESC,p.id DESC LIMIT $1 OFFSET $2`,
+        [safePageSize, (safePage - 1) * safePageSize],
+      ),
+    ]);
+    const total = Number(countResult.rows[0]?.count ?? 0);
+    return {
+      items: itemResult.rows.map((row) => ({
+        id: row.id,
+        title: row.title,
+        trackCount: Number(row.track_count),
+        volumeCount: Number(row.volume_count),
+        publishedAt: date(row.published_at)!.toISOString(),
+        volumes: row.volumes.map((volume) => ({
+          volumeNumber: Number(volume.volumeNumber),
+          name: String(volume.name),
+          trackCount: Number(volume.trackCount),
+          shareUrl: String(volume.shareUrl),
+        })),
+      })),
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages: Math.ceil(total / safePageSize),
+    };
+  }
+
+  async setPublicPlaylistVisibility(id: string, listed: boolean): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE public_playlists SET status=$2,hidden_at=CASE WHEN $2='listed' THEN NULL ELSE now() END,updated_at=now()
+       WHERE id=$1`,
+      [id, listed ? "listed" : "hidden"],
+    );
+    return Boolean(result.rowCount);
+  }
+
   async markPlaylistOrphan(input: { manifestId?: string | null; publicationVolumeId?: string | null; applePlaylistId: string; reason: string }): Promise<string> {
     const id = randomUUID();
     await this.pool.query(
@@ -3296,7 +3509,7 @@ export class Repository {
 
   async assertGlobalRunCapacity(limit = 10): Promise<void> {
     const result = await this.pool.query<{ count: number }>("SELECT count(*)::int count FROM research_runs WHERE status=ANY($1::text[]) AND deleted_at IS NULL", [CAPACITY_RUN_STATUSES]);
-    if (result.rows[0]!.count >= limit) throw new HttpError(503, "9ênio is at capacity; try again soon", "global_capacity_reached");
+    if (result.rows[0]!.count >= limit) throw new HttpError(503, "gênio is at capacity; try again soon", "global_capacity_reached");
   }
 
   async claimGatewayNonce(keyId: string, nonce: string, expiresAt: Date): Promise<boolean> {

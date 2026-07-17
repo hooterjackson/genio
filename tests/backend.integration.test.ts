@@ -212,7 +212,9 @@ databaseDescribe("hosted backend integration", () => {
         to_regclass('capability_sessions')::text,
         to_regclass('capability_session_accesses')::text,
         to_regclass('capability_session_briefs')::text,
-        to_regclass('citation_attestations')::text
+        to_regclass('citation_attestations')::text,
+        to_regclass('public_playlists')::text,
+        to_regclass('public_playlist_volumes')::text
       ]) AS name`,
     );
     expect(result.rows.map((row) => row.name)).toEqual([
@@ -225,6 +227,8 @@ databaseDescribe("hosted backend integration", () => {
       "capability_session_accesses",
       "capability_session_briefs",
       "citation_attestations",
+      "public_playlists",
+      "public_playlist_volumes",
     ]);
     const evidenceColumns = await repository.pool.query<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
@@ -3381,7 +3385,7 @@ databaseDescribe("hosted backend integration", () => {
       storedMatchingRun.rows[0]?.error,
     ];
     expect(durableErrors).toEqual([
-      "9ênio could not interpret this request after the final attempt.",
+      "gênio could not interpret this request after the final attempt.",
       "Research could not be completed after the final attempt.",
       "Research could not be completed after the final attempt.",
       "Owner notification delivery failed after the final attempt.",
@@ -3395,7 +3399,7 @@ databaseDescribe("hosted backend integration", () => {
       repository.getRunByAccess(created.accessId),
       repository.getPublicResult(created.runId),
     ]);
-    expect(briefView?.error).toBe("9ênio could not interpret this request after the final attempt.");
+    expect(briefView?.error).toBe("gênio could not interpret this request after the final attempt.");
     expect(runView?.error).toBe("Research could not be completed after the final attempt.");
     expect(publicResult.error).toBe("Research could not be completed after the final attempt.");
     expect(JSON.stringify({ briefView, runView, publicResult })).not.toContain("sk-proj-PRIVATE");
@@ -3404,7 +3408,7 @@ databaseDescribe("hosted backend integration", () => {
 
   test("a Resend outage keeps the notification outbox pending for a durable retry", async () => {
     vi.stubEnv("RESEND_API_KEY", "offline-resend-integration-key");
-    vi.stubEnv("RESEND_FROM", "9ênio <alerts@example.com>");
+    vi.stubEnv("RESEND_FROM", "gênio <alerts@example.com>");
     vi.stubEnv("OWNER_ALERT_EMAIL", "owner@example.com");
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Resend is unavailable"); }));
     const notificationId = await repository.enqueueNotification("worker_stale", {
@@ -3743,7 +3747,132 @@ databaseDescribe("hosted backend integration", () => {
     expect(remaining.rows[0]).toEqual({ tokens: 0, active_sessions: 0 });
   });
 
-  test("post-publication deletion removes Needle detail but preserves the public Apple links in a tombstone", async () => {
+  test("projects only stable completed Apple publications into the privacy-safe directory", async () => {
+    const clientBucket = `public-directory-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "A private prompt that must never enter the directory",
+      brief: { ...brief, title: "Directory fixture" },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      rateLimit: 100,
+      globalLimit: 100,
+    });
+    const manifestId = randomUUID();
+    const candidateId = randomUUID();
+    const shareUrl = "https://music.apple.com/us/playlist/directory-fixture/pl.u-directory123";
+    await repository.pool.query(
+      `INSERT INTO track_candidates(id,run_id,canonical_key,artist,title,outcome)
+       VALUES($1,$2,'directory-track','Directory Artist','Directory Track','accepted')`,
+      [candidateId, created.runId],
+    );
+    await repository.pool.query(
+      `INSERT INTO manifests(id,run_id,name,description,content_hash)
+       VALUES($1,$2,'Directory fixture','Private operational description',$3)`,
+      [manifestId, created.runId, "a".repeat(64)],
+    );
+    await repository.pool.query(
+      `INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title)
+       VALUES($1,0,$2,'catalog-directory','Directory Artist','Directory Track')`,
+      [manifestId, candidateId],
+    );
+    await repository.pool.query(
+      `INSERT INTO publication_volumes(
+         id,manifest_id,volume_number,volume_count,start_position,end_position,status,
+         apple_playlist_id,apple_share_url,appended_count,published_at
+       ) VALUES($1,$2,1,1,0,0,'complete','p.private-library-id',$3,1,now())`,
+      [randomUUID(), manifestId, shareUrl],
+    );
+
+    await repository.updateRun(created.runId, { status: "complete", phase: "published" });
+    const listed = await repository.listPublicPlaylists(1, 24);
+    expect(listed).toMatchObject({ page: 1, pageSize: 24, total: 1, totalPages: 1 });
+    expect(listed.items).toEqual([{
+      id: expect.any(String),
+      title: "Directory fixture",
+      trackCount: 1,
+      volumeCount: 1,
+      publishedAt: expect.any(String),
+      volumes: [{
+        volumeNumber: 1,
+        name: "Directory fixture",
+        trackCount: 1,
+        shareUrl,
+      }],
+    }]);
+    expect(JSON.stringify(listed)).not.toContain("private prompt");
+    expect(JSON.stringify(listed)).not.toContain("Private operational description");
+    expect(JSON.stringify(listed)).not.toContain("p.private-library-id");
+    expect(JSON.stringify(listed)).not.toContain(created.runId);
+
+    const directoryId = listed.items[0]!.id;
+    await expect(repository.setPublicPlaylistVisibility(directoryId, false)).resolves.toBe(true);
+    await expect(repository.listPublicPlaylists()).resolves.toMatchObject({ items: [], total: 0 });
+    // Re-projecting identical content must not undo an explicit owner hide.
+    await repository.updateRun(created.runId, { status: "complete", phase: "published" });
+    await expect(repository.listPublicPlaylists()).resolves.toMatchObject({ items: [], total: 0 });
+    await expect(repository.setPublicPlaylistVisibility(directoryId, true)).resolves.toBe(true);
+    await expect(repository.listPublicPlaylists()).resolves.toMatchObject({ total: 1 });
+  });
+
+  test("migration backfill rejects incomplete or unstable legacy publications", async () => {
+    const createLegacyPublication = async (suffix: string, shareUrl: string, appendedCount: number) => {
+      const runId = await repository.createRun(`Legacy ${suffix}`, { ...brief, title: `Legacy ${suffix}` }, 0, 1);
+      const candidateId = randomUUID();
+      const manifestId = randomUUID();
+      await repository.pool.query(
+        `INSERT INTO track_candidates(id,run_id,canonical_key,artist,title,outcome)
+         VALUES($1,$2,$3,'Legacy Artist','Legacy Track','accepted')`,
+        [candidateId, runId, `legacy-${suffix}`],
+      );
+      await repository.pool.query(
+        `INSERT INTO manifests(id,run_id,name,description,content_hash)
+         VALUES($1,$2,$3,'Legacy private description',$4)`,
+        [manifestId, runId, `Legacy ${suffix}`, suffix.repeat(64).slice(0, 64)],
+      );
+      await repository.pool.query(
+        `INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title)
+         VALUES($1,0,$2,$3,'Legacy Artist','Legacy Track')`,
+        [manifestId, candidateId, `catalog-${suffix}`],
+      );
+      await repository.pool.query(
+        `INSERT INTO publication_volumes(
+           id,manifest_id,volume_number,volume_count,start_position,end_position,status,
+           apple_playlist_id,apple_share_url,appended_count,published_at
+         ) VALUES($1,$2,1,1,0,0,'complete',$3,$4,$5,now())`,
+        [randomUUID(), manifestId, `p.${suffix}`, shareUrl, appendedCount],
+      );
+      await repository.pool.query(
+        "UPDATE research_runs SET status='complete',phase='published',completed_at=now() WHERE id=$1",
+        [runId],
+      );
+    };
+    await createLegacyPublication(
+      "b",
+      "https://music.apple.com/us/playlist/legacy-stable/pl.u-legacystable",
+      1,
+    );
+    await createLegacyPublication("c", "https://attacker.example/not-apple", 1);
+    await createLegacyPublication(
+      "d",
+      "https://music.apple.com/us/playlist/legacy-short/pl.u-legacyshort",
+      0,
+    );
+
+    await applyMigration(repository.pool);
+    const directory = await repository.listPublicPlaylists();
+    expect(directory.total).toBe(1);
+    expect(directory.items[0]).toMatchObject({
+      title: "Legacy b",
+      trackCount: 1,
+      volumes: [{ shareUrl: "https://music.apple.com/us/playlist/legacy-stable/pl.u-legacystable" }],
+    });
+  });
+
+  test("post-publication deletion removes gênio detail but preserves the public Apple links in a tombstone", async () => {
     const clientBucket = `published-delete-${randomUUID()}`;
     const created = await repository.createRunIdempotent({
       prompt: "Published playlist deletion",
@@ -3758,12 +3887,23 @@ databaseDescribe("hosted backend integration", () => {
       globalLimit: 100,
     });
     const manifestId = randomUUID();
+    const candidateId = randomUUID();
     const contentHash = "d".repeat(64);
     const shareUrl = "https://music.apple.com/us/playlist/needle-published-deletion/pl.u-test123";
+    await repository.pool.query(
+      `INSERT INTO track_candidates(id,run_id,canonical_key,artist,title,outcome)
+       VALUES($1,$2,'published-deletion-track','Deletion Artist','Deletion Track','accepted')`,
+      [candidateId, created.runId],
+    );
     await repository.pool.query(
       `INSERT INTO manifests(id,run_id,name,description,content_hash)
        VALUES($1,$2,'Published deletion fixture','A published fixture',$3)`,
       [manifestId, created.runId, contentHash],
+    );
+    await repository.pool.query(
+      `INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title)
+       VALUES($1,0,$2,'catalog-deletion','Deletion Artist','Deletion Track')`,
+      [manifestId, candidateId],
     );
     await repository.pool.query(
       `INSERT INTO publication_volumes(
@@ -3773,6 +3913,7 @@ databaseDescribe("hosted backend integration", () => {
       [randomUUID(), manifestId, shareUrl],
     );
     await repository.updateRun(created.runId, { status: "complete", phase: "publication_complete" });
+    await expect(repository.listPublicPlaylists()).resolves.toMatchObject({ total: 1 });
 
     await expect(repository.deleteRunAccess(created.accessId)).resolves.toBe(true);
     await expect(repository.getRun(created.runId)).rejects.toMatchObject({ statusCode: 404, code: "run_not_found" });
@@ -3795,6 +3936,18 @@ databaseDescribe("hosted backend integration", () => {
     });
     expect(manifestCount.rows[0]?.count).toBe(0);
     expect(volumeCount.rows[0]?.count).toBe(0);
+    await expect(repository.listPublicPlaylists()).resolves.toMatchObject({
+      total: 1,
+      items: [{
+        title: "Published deletion fixture",
+        volumes: [{ shareUrl }],
+      }],
+    });
+    const projection = await repository.pool.query<{ run_id: string | null }>(
+      "SELECT run_id FROM public_playlists WHERE manifest_hash=$1",
+      [contentHash],
+    );
+    expect(projection.rows[0]?.run_id).toBeNull();
   });
 
   test("sets host-only production capability cookies with strict security attributes", async () => {

@@ -272,12 +272,15 @@ gaining access to another visitor's private run or capability.
 
 Acceptance criteria:
 
-- The directory exposes only completed playlists with stable Apple share URLs
-  and intentionally public title/description/count metadata.
+- The directory exposes only terminal publications whose volumes are complete,
+  contiguous, count-consistent, and backed by stable Apple share URLs. Public
+  metadata is limited to titles, publication time, counts, ordered volume
+  numbers, and Apple share URLs.
 - Prompts, capability tokens, evidence notes, costs, owner controls, incomplete
   jobs, orphaned playlists, and deleted runs are never exposed.
-- Deleted Needle data can remove a directory entry but cannot promise deletion
-  of an already-created Apple playlist.
+- Deleting private run data preserves the already-public Apple projection with
+  its run reference removed. The owner can hide or relist a directory entry
+  independently through an audited owner-only control.
 
 ## Scenario-test matrix
 
@@ -467,7 +470,7 @@ reviewed holdout, or live Apple/operations evidence; it is not a passing claim.
 | US-09 | Immutable manifest, batch/prefix reconciliation, divergence and UI publication tests | Partial: stable share URL and cross-account Add to Library pending |
 | US-10 | Database-backed leases, retry, capability and authorization-state tests | Partial: real token persistence/reauthorization canary pending |
 | US-11 | Owner allowlist, cost ledger, feedback privacy, upload and owner-inbox browser tests | Automated complete |
-| US-12 | Public-directory story and schema | Pending: repository/API/UI implementation and privacy tests are not yet present |
+| US-12 | Privacy-safe projection/backfill, repository pagination and owner visibility, signed public API route, responsive `/playlists` UI, and negative privacy tests | Automated complete; production directory smoke test pending |
 
 ## Exit criteria and evidence
 
@@ -514,5 +517,7 @@ reviewed holdout, or live Apple/operations evidence; it is not a passing claim.
    guided-answer immutability and safe flow mechanics, not that Air, X,
    Phoenix, Berlin, Jungle, or a misspelled name will always receive the ideal
    entity question.
-8. The public playlist directory is a planned story, not a shipped surface in
-   this release candidate.
+8. The public playlist directory is implemented and automated. Production
+   release verification must still confirm the migration backfill, anonymous
+   pagination through the signed Sites gateway, ordered multi-volume links,
+   and owner hide/relist behavior on the deployed revision.

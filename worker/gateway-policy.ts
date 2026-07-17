@@ -25,6 +25,7 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "POST", path: /^\/api\/v1\/capabilities\/exchange$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/capabilities\/transfer$/ },
   { method: "POST", path: /^\/api\/v1\/runs$/ },
+  { method: "GET", path: /^\/api\/v1\/playlists$/ },
   { method: "GET", path: /^\/api\/v1\/runs$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
   { method: "DELETE", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
@@ -42,6 +43,7 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+\/image$/, owner: true },
   { method: "POST", path: /^\/api\/v1\/owner\/(?:emergency-pause|retention\/run|apple\/authorization(?:\/validate)?)$/, owner: true },
   { method: "POST", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+\/status$/, owner: true },
+  { method: "POST", path: /^\/api\/v1\/owner\/playlists\/[A-Za-z0-9_-]+\/visibility$/, owner: true },
   { method: "POST", path: /^\/api\/v1\/owner\/runs\/[A-Za-z0-9_-]+\/(?:refresh|catalog-import|budget)$/, owner: true },
   { method: "DELETE", path: /^\/api\/v1\/owner\/apple\/authorization$/, owner: true },
   { method: "DELETE", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+$/, owner: true },
@@ -72,9 +74,9 @@ export function forwardedCapabilityCookie(cookieHeader: string | null, productio
     const name = trimmed.slice(0, separator).trim();
     const value = trimmed.slice(separator + 1).trim();
     if (name !== expectedName) return [];
-    if (!value || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("9ênio capability cookie is invalid");
+    if (!value || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("gênio capability cookie is invalid");
     return [`${expectedName}=${value}`];
   });
-  if (matches.length > 1) throw new Error("Duplicate 9ênio capability cookies are not allowed");
+  if (matches.length > 1) throw new Error("Duplicate gênio capability cookies are not allowed");
   return matches[0] ?? null;
 }
