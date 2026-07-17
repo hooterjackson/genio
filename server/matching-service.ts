@@ -19,7 +19,9 @@ import {
 } from "./catalog-match-recovery.ts";
 import {
   createFastRouteCheckpoint,
+  fastPostMatchRefillPlan,
   FAST_MATCHING_FINALIZATION_RESERVE_MS,
+  parseFastPostMatchRefillRouteCheckpoint,
   parseFastRouteCheckpoint,
   researchExecutionPolicy,
 } from "./research-policy.ts";
@@ -57,6 +59,7 @@ interface MatchingOutcomeCheckpoint {
 }
 
 type AutomaticCatalogRecoveryState = "queued" | "in_flight" | "not_needed" | "exhausted";
+type AutomaticCandidateRefillState = "queued" | "in_flight" | "not_needed" | "exhausted";
 
 export interface MatchingRepository {
   getRun(runId: string): Promise<{
@@ -77,7 +80,14 @@ export interface MatchingRepository {
     runId: string,
     storefront: string,
     currentGeneration: number,
+    currentRefillGeneration?: number,
   ): Promise<AutomaticCatalogRecoveryState>;
+  queueAutomaticCandidateRefill(
+    runId: string,
+    storefront: string,
+    additionalCandidateGoal: number,
+    currentRefillGeneration: number,
+  ): Promise<AutomaticCandidateRefillState>;
   queueAutomaticPublication(runId: string): Promise<void>;
 }
 
@@ -120,6 +130,7 @@ async function finalizeMatchingOutcome(
   run: { brief: PlaylistBrief; status: string; autoPublish?: boolean },
   storefront: string,
   currentRecoveryGeneration = 0,
+  currentRefillGeneration = 0,
 ): Promise<void> {
   // A matching lease may be replayed after its automatic handoff committed.
   // Re-read state before any mutation so the replay can never regress a
@@ -153,8 +164,29 @@ async function finalizeMatchingOutcome(
         runId,
         storefront,
         currentRecoveryGeneration,
+        currentRefillGeneration,
       );
       if (recovery === "queued" || recovery === "in_flight") return;
+      const exactTarget = targetMinimum !== null
+        && Number(brief.targetSize?.max) === targetMinimum;
+      const policy = researchExecutionPolicy(brief);
+      if (exactTarget && brief.mode === "curated" && policy.kind === "fast_curated") {
+        const refillPlan = fastPostMatchRefillPlan({
+          requestedMinimum: targetMinimum,
+          selectableCount: safePrimaryCount,
+          attemptedCandidateCount: matches.length,
+          refillAttempts: currentRefillGeneration,
+        });
+        if (refillPlan.state === "refill") {
+          const refill = await repository.queueAutomaticCandidateRefill(
+            runId,
+            storefront,
+            refillPlan.additionalCandidateGoal,
+            currentRefillGeneration,
+          );
+          if (refill === "queued" || refill === "in_flight") return;
+        }
+      }
     }
     await repository.updateRun(runId, {
       status: latest.autoPublish ? "failed" : "visitor_review",
@@ -251,7 +283,7 @@ export async function lookupCandidateSongs(
   return songs;
 }
 
-type FastLookupFailure = "deadline" | "transient";
+type FastLookupFailure = "deadline" | "transient" | "permanent";
 
 function fastLookupFailure(
   error: unknown,
@@ -265,6 +297,10 @@ function fastLookupFailure(
   const abortReason = lookupSignal?.reason as { name?: unknown } | undefined;
   if (lookupSignal?.aborted && abortReason?.name === "TimeoutError") return "deadline";
   if (error instanceof AppleApiError && error.retriable) return "transient";
+  // A malformed query or missing catalog resource is local to one candidate.
+  // Persist it as an explicit unavailable outcome and keep matching the rest
+  // of the playlist. Authentication/configuration failures still propagate.
+  if (error instanceof AppleApiError && [400, 404, 422].includes(error.status ?? 0)) return "permanent";
   return null;
 }
 
@@ -325,6 +361,7 @@ export async function matchResearchRun(
     fastDeadlineAt?: string;
     retryIncomplete?: boolean;
     recoveryGeneration?: number;
+    refillGeneration?: number;
   } = {},
 ): Promise<void> {
   if (!/^[a-z]{2}$/i.test(storefront)) throw new Error("Apple storefront must be a two-letter code");
@@ -332,7 +369,15 @@ export async function matchResearchRun(
   const run = await repository.getRun(runId);
   if (await resumeOrIgnoreAutomaticHandoff(repository, runId, run)) return;
   const recovery = options.retryIncomplete === true;
-  const checkpointPhase = recovery ? "catalog_matching_recovery" : "catalog_matching";
+  const refillGeneration = Number.isInteger(options.refillGeneration)
+    ? Math.max(0, Math.min(2, Number(options.refillGeneration)))
+    : 0;
+  const refill = refillGeneration > 0;
+  const checkpointPhase = recovery
+    ? "catalog_matching_recovery"
+    : refill
+      ? `catalog_matching_refill:${refillGeneration}`
+      : "catalog_matching";
   const checkpoint = recovery
     ? null
     : await repository.getResearchCheckpoint(runId, checkpointPhase) as MatchingCheckpoint | null;
@@ -343,6 +388,7 @@ export async function matchResearchRun(
       run,
       normalizedStorefront,
       options.recoveryGeneration,
+      refillGeneration,
     );
     return;
   }
@@ -350,17 +396,28 @@ export async function matchResearchRun(
   const executionPolicy = researchExecutionPolicy(run.brief);
   let routeKey: string | null = null;
   let route = null;
-  if (executionPolicy.kind === "fast_curated") {
+  if (executionPolicy.kind === "fast_curated" && !refill) {
     routeKey = `fast:route:${executionPolicy.version}`;
     route = parseFastRouteCheckpoint(
       await repository.getResearchCheckpoint(runId, routeKey),
       executionPolicy.version,
     );
   }
-  const fast = options.fast === true || Boolean(route);
+  const fast = options.fast === true || refill || Boolean(route);
   let routeDeadlineAt: string | undefined;
   if (fast) {
-    if (executionPolicy.kind !== "fast_curated" || !routeKey) throw new Error("Fast matching requires a curated brief");
+    if (executionPolicy.kind !== "fast_curated") throw new Error("Fast matching requires a curated brief");
+    if (refill) {
+      const refillRoute = parseFastPostMatchRefillRouteCheckpoint(
+        await repository.getResearchCheckpoint(runId, `fast:post-match-refill:${refillGeneration}:route`),
+        refillGeneration,
+      );
+      if (!refillRoute || refillRoute.storefront !== normalizedStorefront) {
+        throw new Error("Catalog refill matching is missing its durable route");
+      }
+      routeDeadlineAt = refillRoute.deadlineAt;
+    } else {
+      if (!routeKey) throw new Error("Fast matching requires a curated route");
     if (!route && run.createdAt) {
       const confirmedAt = new Date(run.createdAt);
       if (Number.isFinite(confirmedAt.getTime())) {
@@ -376,7 +433,8 @@ export async function matchResearchRun(
     ] as const) {
       if (provided && provided !== expected) throw new Error("Fast matching job deadline does not match its durable route");
     }
-    routeDeadlineAt = route.deadlineAt;
+      routeDeadlineAt = route.deadlineAt;
+    }
   }
   const startedAt = checkpoint?.startedAt ?? new Date().toISOString();
   const deadlineAt = recovery
@@ -458,7 +516,6 @@ export async function matchResearchRun(
             return { songs: await lookupCandidateSongs(candidate, normalizedStorefront, lookupSignal), failure: null };
           } catch (error) {
             if (signal?.aborted) throw error;
-            if (!boundedByDeadline) throw error;
             const failure = fastLookupFailure(error, lookupSignal, signal);
             if (!failure) throw error;
             return { songs: [] as CatalogSong[], failure };
@@ -475,10 +532,12 @@ export async function matchResearchRun(
       let match = lookup.failure
         ? {
             candidateId: candidate.id,
-            status: "review" as const,
+            status: lookup.failure === "permanent" ? "unavailable" as const : "review" as const,
             basis: lookup.failure === "deadline"
               ? RETRYABLE_CATALOG_MATCH_BASES[1]
-              : RETRYABLE_CATALOG_MATCH_BASES[2],
+              : lookup.failure === "transient"
+                ? RETRYABLE_CATALOG_MATCH_BASES[2]
+                : "Apple Music rejected this candidate lookup; the remaining candidates were still matched",
             score: 0,
             song: null,
             alternatives: [],
@@ -529,6 +588,7 @@ export async function matchResearchRun(
     run,
     normalizedStorefront,
     options.recoveryGeneration,
+    refillGeneration,
   );
 }
 
@@ -544,6 +604,9 @@ export async function processMatchingJob(repository: MatchingRepository, payload
     retryIncomplete: payload.retryIncomplete === true,
     recoveryGeneration: Number.isInteger(payload.recoveryGeneration)
       ? Math.max(0, Math.min(3, Number(payload.recoveryGeneration)))
+      : 0,
+    refillGeneration: Number.isInteger(payload.refillGeneration)
+      ? Math.max(0, Math.min(2, Number(payload.refillGeneration)))
       : 0,
   });
 }

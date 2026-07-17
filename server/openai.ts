@@ -2,7 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   PlaylistBrief,
   PlaylistGuidanceAnswer,
+  PlaylistGuidanceEffect,
+  PlaylistGuidanceEffectKind,
+  PlaylistGuidanceOrderingBehavior,
   PlaylistGuidanceQuestion,
+  PlaylistGuidanceScoutResult,
+  PlaylistGuidanceSourceHint,
 } from "../shared/types.ts";
 import { normalizeBriefTarget, preserveExplicitTrackCount } from "./brief-policy.ts";
 import { normalizePlaylistTitle, PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
@@ -17,10 +22,17 @@ import {
   applySimilaritySeedPolicy,
   excludedReferenceArtists,
 } from "./similarity-policy.ts";
+import { assertPublicHttpsUrl, collectKnownUrls } from "./security.ts";
+import { citationSupportWindow } from "./citation-attestation.ts";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+export const GUIDANCE_SCOUT_MAX_TOOL_CALLS = 2;
+export const GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS = 1_200;
+export const GUIDANCE_SCOUT_TIMEOUT_MS = 9_000;
+export const GUIDANCE_SCOUT_MAX_COST_USD = 0.05;
 
 export interface ProviderUsageEvent {
   provider: "openai";
@@ -214,57 +226,88 @@ const briefSchema = {
   required: ["title", "description", "mode", "subjectEntities", "relationship", "include", "exclude", "versionPolicy", "evidencePolicy", "orderingPolicy", "targetSize", "ambiguities"],
 };
 
-const guidanceOptionSchema = {
+const guidanceEffectSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    label: { type: "string", minLength: 1, maxLength: 60 },
-    description: { type: "string", minLength: 1, maxLength: 180 },
+    kind: {
+      type: "string",
+      enum: [
+        "research_preference",
+        "version_preference",
+        "familiarity_bias",
+        "subscene_focus",
+        "ordering_behavior",
+      ],
+    },
+    value: { type: "string", minLength: 1, maxLength: 240 },
+    orderingBehavior: {
+      anyOf: [
+        { type: "null" },
+        { type: "string", enum: ["smooth", "contrast", "chronological", "editorial"] },
+      ],
+    },
   },
-  required: ["label", "description"],
+  required: ["kind", "value", "orderingBehavior"],
 };
 
-const guidanceQuestionProperties = {
-  header: { type: "string", minLength: 1, maxLength: 28 },
-  question: { type: "string", minLength: 1, maxLength: 180 },
-  options: {
-    type: "array",
-    minItems: 3,
-    maxItems: 3,
-    items: guidanceOptionSchema,
-  },
-};
-
-const preflightSchema = {
+const guidanceScoutSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    brief: briefSchema,
-    scopeQuestions: {
+    questions: {
       type: "array",
-      minItems: 1,
-      maxItems: 2,
+      minItems: 0,
+      maxItems: 3,
       items: {
         type: "object",
         additionalProperties: false,
         properties: {
-          category: {
+          decisionKey: {
             type: "string",
-            enum: ["selection_scope", "era", "mood", "versions", "geography", "familiarity", "energy"],
+            minLength: 3,
+            maxLength: 80,
+            pattern: "^[a-z0-9]+(?:_[a-z0-9]+)*$",
           },
-          ...guidanceQuestionProperties,
+          header: { type: "string", minLength: 1, maxLength: 28 },
+          question: { type: "string", minLength: 1, maxLength: 180 },
+          whyMaterial: { type: "string", minLength: 1, maxLength: 240 },
+          groundingSummary: { type: "string", minLength: 1, maxLength: 320 },
+          sourceUrls: {
+            type: "array",
+            minItems: 1,
+            maxItems: 3,
+            items: { type: "string", format: "uri" },
+          },
+          options: {
+            type: "array",
+            minItems: 3,
+            maxItems: 3,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                label: { type: "string", minLength: 1, maxLength: 60 },
+                description: { type: "string", minLength: 1, maxLength: 180 },
+                effect: guidanceEffectSchema,
+              },
+              required: ["label", "description", "effect"],
+            },
+          },
         },
-        required: ["category", "header", "question", "options"],
+        required: [
+          "decisionKey",
+          "header",
+          "question",
+          "whyMaterial",
+          "groundingSummary",
+          "sourceUrls",
+          "options",
+        ],
       },
     },
-    flowQuestion: {
-      type: "object",
-      additionalProperties: false,
-      properties: guidanceQuestionProperties,
-      required: ["header", "question", "options"],
-    },
   },
-  required: ["brief", "scopeQuestions", "flowQuestion"],
+  required: ["questions"],
 };
 
 function validatedBrief(value: unknown): PlaylistBrief {
@@ -318,17 +361,6 @@ function boundedGuidanceText(value: unknown, label: string, maximum: number): st
   }
   return text;
 }
-
-type GuidanceCategory =
-  | "selection_scope"
-  | "era"
-  | "mood"
-  | "versions"
-  | "geography"
-  | "familiarity"
-  | "energy";
-
-type GuidanceOrderingBehavior = "smooth" | "contrast" | "chronological" | "editorial";
 
 const GUIDANCE_STOP_WORDS = new Set([
   "about",
@@ -386,7 +418,7 @@ function tokenSimilarity(left: string, right: string): number {
   return intersection / (leftTokens.size + rightTokens.size - intersection);
 }
 
-function guidanceOrderingBehavior(value: string): GuidanceOrderingBehavior | null {
+function guidanceOrderingBehavior(value: string): PlaylistGuidanceOrderingBehavior | null {
   if (/\b(?:chronolog|release\s+(?:date|year)|by\s+year|through\s+time)\b/iu.test(value)) {
     return "chronological";
   }
@@ -402,30 +434,16 @@ function guidanceOrderingBehavior(value: string): GuidanceOrderingBehavior | nul
   return null;
 }
 
-function guidanceCategoryAlreadySpecified(category: GuidanceCategory, prompt: string): boolean {
-  const checks: Record<GuidanceCategory, RegExp> = {
-    selection_scope: /\b(?:commercial|chart|critical(?:ly)?|historical\s+(?:impact|importance)|cultural\s+impact|innovation|scene\s+foundation)\b/iu,
-    era: /\b(?:(?:19|20)\d{2}s?|['’]\d{2}s|early|mid|late)[ -]?(?:\d{2}s|century|era)?\b|\b(?:classic|current|modern|recent|contemporary)\b/iu,
-    mood: /\b(?:mood|vibe|rainy|romantic|melanchol|happy|sad|dark|dreamy|relax|atmospher)\w*\b/iu,
-    versions: /\b(?:album|single|studio|live|remix(?:es)?|edit(?:s)?|original|alternate|acoustic|demo)\s+(?:cut|mix|recording|release|version)?s?\b/iu,
-    geography: /\b(?:berlin|detroit|chicago|brazil(?:ian)?|german(?:y)?|uk|british|japan(?:ese)?|new\s+york|los\s+angeles|west\s+coast|east\s+coast)\b/iu,
-    familiarity: /\b(?:hit|famous|popular|mainstream|underground|obscure|deep\s+cut|discovery|discoveries|essential|canonical)\w*\b/iu,
-    energy: /\b(?:energy|energetic|mellow|calm|upbeat|dancefloor|ambient|intense|driving|peak[- ]time)\b/iu,
-  };
-  return checks[category].test(prompt);
-}
-
 function isTrackCountQuestion(value: string): boolean {
   return /\b(?:how\s+(?:many|long|large)|number\s+of|track\s*count|song\s*count|playlist\s+(?:length|size)|target\s+(?:length|size)|\d{1,4}\s*(?:songs?|tracks?|recordings?))\b/iu.test(value);
 }
 
 function questionIsPromptSpecific(
-  question: string,
-  header: string,
+  candidateText: string,
   prompt: string,
   brief: PlaylistBrief,
 ): boolean {
-  const questionTokens = guidanceTokens(`${header} ${question}`);
+  const questionTokens = guidanceTokens(candidateText);
   const contextTokens = guidanceTokens(`${prompt} ${brief.subjectEntities.join(" ")}`);
   for (const token of questionTokens) {
     if (contextTokens.has(token)) return true;
@@ -441,235 +459,229 @@ function hasContaminatedSimilarityWording(
   return /\b(?:(?:other|similar|related|different)\s+(?:artists?|bands?|acts?|musicians?)|(?:songs?|tracks?|recordings?|music)\s+(?:that\s+|which\s+)?(?:sounds?\s+like|similar\s+to|resembl(?:e|es|ing)|adjacent\s+to))\b/iu.test(value);
 }
 
-function compactGuidanceSubject(brief: PlaylistBrief): string {
-  const source = brief.subjectEntities.slice(0, 2).join(" and ").replace(/\s+/gu, " ").trim()
-    || "this playlist";
-  const characters = Array.from(source);
-  return characters.length <= 72 ? source : `${characters.slice(0, 69).join("").trim()}…`;
+
+const GUIDANCE_EFFECT_KINDS = new Set<PlaylistGuidanceEffectKind>([
+  "research_preference",
+  "version_preference",
+  "familiarity_bias",
+  "subscene_focus",
+  "ordering_behavior",
+]);
+
+const GUIDANCE_ORDERING_BEHAVIORS = new Set<PlaylistGuidanceOrderingBehavior>([
+  "smooth",
+  "contrast",
+  "chronological",
+  "editorial",
+]);
+
+const GENERIC_GUIDANCE_DECISION_KEYS = new Set([
+  "discovery",
+  "emphasis",
+  "energy",
+  "era",
+  "familiarity",
+  "flow",
+  "mood",
+  "ordering",
+  "ordering_behavior",
+  "scope",
+  "selection_scope",
+  "versions",
+]);
+
+function normalizedSourceUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try { return assertPublicHttpsUrl(value).toString(); } catch { return null; }
 }
 
-function fallbackScopeQuestion(
-  prompt: string,
-  brief: PlaylistBrief,
-): Omit<PlaylistGuidanceQuestion, "id"> {
-  const subject = compactGuidanceSubject(brief);
-  const similarityRequest = /\b(?:sounds?\s+like|similar\s+to|artists?\s+like|for\s+fans?\s+of|in\s+the\s+style\s+of)\b/iu.test(prompt);
-  const influenceRequest = /\b(?:influential|important|essential|definitive|best|greatest)\b/iu.test(prompt);
-  const factualCredits = brief.mode !== "curated"
-    || /\b(?:performed|played|credited|discograph|catalog|every|all)\w*\b/iu.test(prompt);
+function guidanceSourceHints(response: any): PlaylistGuidanceSourceHint[] {
+  const titles = new Map<string, string>();
+  const excerpts = new Map<string, string>();
+  const knownUrls = collectKnownUrls(response);
 
-  if (similarityRequest && !guidanceCategoryAlreadySpecified("familiarity", prompt)) {
-    return {
-      header: "Similarity",
-      question: `How closely should this selection resemble ${subject}?`,
-      options: [
-        { id: "", label: "Close matches", description: "Prioritize the strongest sonic and stylistic parallels.", recommended: true },
-        { id: "", label: "Balanced discovery", description: "Mix close matches with adjacent artists and scenes.", recommended: false },
-        { id: "", label: "Wider orbit", description: "Explore looser connections while preserving the core character.", recommended: false },
-      ],
-    };
-  }
-
-  if (influenceRequest && !guidanceCategoryAlreadySpecified("selection_scope", prompt)) {
-    return {
-      header: "Influence",
-      question: `What kind of influence should matter most for ${subject}?`,
-      options: [
-        { id: "", label: "Lasting impact", description: "Balance innovation, historical importance, and later influence.", recommended: true },
-        { id: "", label: "Scene foundations", description: "Favor recordings that shaped the originating artists and scene.", recommended: false },
-        { id: "", label: "Cultural reach", description: "Favor recordings whose impact traveled beyond the original scene.", recommended: false },
-      ],
-    };
-  }
-
-  if (factualCredits && !guidanceCategoryAlreadySpecified("versions", prompt)) {
-    return {
-      header: "Versions",
-      question: `Which released versions should represent ${subject}?`,
-      options: [
-        { id: "", label: "Canonical releases", description: "Use one principal released recording of each song.", recommended: true },
-        { id: "", label: "Distinct versions", description: "Include materially different released versions when separately supported.", recommended: false },
-        { id: "", label: "Expanded releases", description: "Also consider supported live, remix, and alternate releases.", recommended: false },
-      ],
-    };
-  }
-
-  if (!guidanceCategoryAlreadySpecified("familiarity", prompt)) {
-    return {
-      header: "Discovery",
-      question: `How familiar should the ${subject} selection feel?`,
-      options: [
-        { id: "", label: "Known and discovered", description: "Balance defining recordings with well-supported discoveries.", recommended: true },
-        { id: "", label: "Defining tracks", description: "Favor established, widely recognized recordings.", recommended: false },
-        { id: "", label: "Deeper exploration", description: "Favor less obvious recordings without weakening the evidence bar.", recommended: false },
-      ],
-    };
-  }
-
-  return {
-    header: "Emphasis",
-    question: `What should lead the ${subject} selection?`,
-    options: [
-      { id: "", label: "Balanced view", description: "Balance historical relevance, musical fit, and variety.", recommended: true },
-      { id: "", label: "Historical weight", description: "Favor documented importance and lasting influence.", recommended: false },
-      { id: "", label: "Musical range", description: "Favor stylistic breadth within the confirmed request.", recommended: false },
-    ],
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const url = normalizedSourceUrl(record.url);
+    if (url && typeof record.title === "string") {
+      titles.set(url, record.title.replace(/\s+/gu, " ").trim().slice(0, 200));
+    }
+    const providerExcerpt = [record.excerpt, record.snippet, record.description]
+      .find((candidate): candidate is string => typeof candidate === "string" && candidate.trim().length >= 8);
+    if (url && providerExcerpt) {
+      excerpts.set(url, providerExcerpt.replace(/\s+/gu, " ").trim().slice(0, 500));
+    }
+    Object.values(record).forEach(visit);
   };
+  visit(response.output);
+
+  for (const item of response.output ?? []) {
+    if (item?.type !== "message") continue;
+    for (const content of item.content ?? []) {
+      if (content?.type !== "output_text" || typeof content.text !== "string") continue;
+      for (const annotation of content.annotations ?? []) {
+        if (annotation?.type !== "url_citation") continue;
+        const url = normalizedSourceUrl(annotation.url);
+        if (!url) continue;
+        if (typeof annotation.title === "string" && annotation.title.trim()) {
+          titles.set(url, annotation.title.replace(/\s+/gu, " ").trim().slice(0, 200));
+        }
+        const support = citationSupportWindow(
+          content.text,
+          Number(annotation.start_index),
+          Number(annotation.end_index),
+        );
+        if (support) excerpts.set(url, support.excerpt.slice(0, 500));
+      }
+    }
+  }
+
+  return [...knownUrls]
+    .map((url) => ({
+      url,
+      title: titles.get(url) || new URL(url).hostname,
+      excerpt: excerpts.get(url) ?? "",
+    }))
+    .slice(0, 12);
 }
 
-function fallbackGuidanceQuestions(prompt: string, brief: PlaylistBrief): PlaylistGuidanceQuestion[] {
-  const subject = compactGuidanceSubject(brief);
-  const referenceArtists = excludedReferenceArtists(brief);
-  const flowSubject = referenceArtists.length > 0
-    ? `${referenceArtists.slice(0, 2).join(" and ")}-inspired selection`
-    : `${subject} selection`;
-  const scope = fallbackScopeQuestion(prompt, brief);
-  const editorialThird = /\b(?:influential|important|essential|definitive|best|greatest)\b/iu.test(prompt);
-  const flow: Omit<PlaylistGuidanceQuestion, "id"> = {
-    header: "Flow",
-    question: `How should the ${flowSubject} move from track to track?`,
-    options: [
-      {
-        id: "",
-        label: "Smooth arc",
-        description: "Intermix artists and albums while favoring compatible metadata.",
-        recommended: true,
-      },
-      {
-        id: "",
-        label: "Contrasting arc",
-        description: "Intermix artists and albums while favoring deliberate contrast.",
-        recommended: false,
-      },
-      editorialThird
-        ? {
-            id: "",
-            label: "Influence first",
-            description: "Follow the editorial research rank from most to least influential.",
-            recommended: false,
-          }
-        : {
-            id: "",
-            label: "Chronological arc",
-            description: "Order the recordings chronologically by release year.",
-            recommended: false,
-          },
-    ],
-  };
-  return [scope, flow].map((question, questionIndex) => {
-    const questionId = `q${questionIndex + 1}`;
-    return {
-      ...question,
-      id: questionId,
-      options: question.options.map((option, optionIndex) => ({
-        ...option,
-        id: `${questionId}-o${optionIndex + 1}`,
-        recommended: optionIndex === 0,
-      })),
-    };
-  });
-}
-
-function strictlyValidatedGuidanceQuestions(
-  value: unknown,
-  prompt: string,
-  brief: PlaylistBrief,
-): PlaylistGuidanceQuestion[] {
-  if (!value || typeof value !== "object") throw new Error("OpenAI returned invalid guided questions");
+function validatedGuidanceEffect(value: unknown): PlaylistGuidanceEffect {
+  if (!value || typeof value !== "object") throw new Error("invalid_effect");
   const raw = value as Record<string, unknown>;
-  const scopeQuestions = raw.scopeQuestions;
-  if (!Array.isArray(scopeQuestions) || scopeQuestions.length < 1 || scopeQuestions.length > 2) {
-    throw new Error("OpenAI returned an invalid number of guided scope questions");
+  const kind = boundedGuidanceText(raw.kind, "effect kind", 40) as PlaylistGuidanceEffectKind;
+  if (!GUIDANCE_EFFECT_KINDS.has(kind)) throw new Error("invalid_effect_kind");
+  const effectValue = boundedGuidanceText(raw.value, "effect value", 240);
+  const orderingBehavior = raw.orderingBehavior === null
+    ? null
+    : boundedGuidanceText(raw.orderingBehavior, "ordering behavior", 32) as PlaylistGuidanceOrderingBehavior;
+  if (kind === "ordering_behavior") {
+    if (!orderingBehavior || !GUIDANCE_ORDERING_BEHAVIORS.has(orderingBehavior)) {
+      throw new Error("invalid_ordering_behavior");
+    }
+  } else if (orderingBehavior !== null) {
+    throw new Error("unexpected_ordering_behavior");
   }
-  const scopeCategories = new Set<string>();
-  const rawQuestions = [...scopeQuestions, raw.flowQuestion] as unknown[];
-  const questions = rawQuestions.map((candidate, questionIndex): PlaylistGuidanceQuestion => {
-    if (!candidate || typeof candidate !== "object") throw new Error("OpenAI returned an invalid guided question");
-    const question = candidate as Record<string, unknown>;
-    if (questionIndex < scopeQuestions.length) {
-      const category = boundedGuidanceText(question.category, "question category", 40);
-      if (scopeCategories.has(category)) throw new Error("OpenAI returned overlapping guided questions");
-      if (guidanceCategoryAlreadySpecified(category as GuidanceCategory, prompt)) {
-        throw new Error("OpenAI returned a guided question already answered by the request");
-      }
-      scopeCategories.add(category);
-    }
-    const questionPrompt = boundedGuidanceText(question.question, "question", 180);
-    const header = boundedGuidanceText(question.header, "question header", 28);
-    if (isTrackCountQuestion(`${header} ${questionPrompt}`)) {
-      throw new Error("OpenAI returned a track-count guidance question");
-    }
-    if (
-      questionIndex < scopeQuestions.length
-      && /\b(?:flow|order|sequence|from\s+(?:start|beginning)\s+to\s+(?:finish|end)|track\s+to\s+track)\b/iu.test(`${header} ${questionPrompt}`)
-    ) {
-      throw new Error("OpenAI returned more than one guided flow question");
-    }
-    if (!questionIsPromptSpecific(questionPrompt, header, prompt, brief)) {
-      throw new Error("OpenAI returned a generic guided question");
-    }
-    if (hasContaminatedSimilarityWording(`${header} ${questionPrompt}`, brief)) {
-      throw new Error("OpenAI returned a guided question containing a non-entity similarity phrase");
-    }
-    if (!Array.isArray(question.options) || question.options.length !== 3) {
-      throw new Error("OpenAI returned an invalid number of guided options");
-    }
-    const optionLabels = new Set<string>();
-    const optionTexts: string[] = [];
-    const questionId = `q${questionIndex + 1}`;
-    const options = question.options.map((candidateOption, optionIndex) => {
-      if (!candidateOption || typeof candidateOption !== "object") throw new Error("OpenAI returned an invalid guided option");
-      const option = candidateOption as Record<string, unknown>;
-      const label = boundedGuidanceText(option.label, "option label", 60);
-      const normalizedLabel = label.toLocaleLowerCase();
-      if (optionLabels.has(normalizedLabel)) throw new Error("OpenAI returned duplicate guided options");
-      optionLabels.add(normalizedLabel);
-      const description = boundedGuidanceText(option.description, "option description", 180);
-      const optionText = `${label} ${description}`;
-      if (optionTexts.some((existing) => tokenSimilarity(existing, optionText) >= 0.72)) {
-        throw new Error("OpenAI returned overlapping guided options");
-      }
-      optionTexts.push(optionText);
-      return {
-        id: `${questionId}-o${optionIndex + 1}`,
-        label,
-        description,
-        recommended: optionIndex === 0,
-      };
-    });
-    if (questionIndex === rawQuestions.length - 1) {
-      const behaviors = options.map((option) =>
-        guidanceOrderingBehavior(`${option.label}: ${option.description}`));
-      if (behaviors.some((behavior) => behavior === null) || new Set(behaviors).size !== 3) {
-        throw new Error("OpenAI returned unsupported or overlapping guided flow options");
-      }
-    }
-    return {
-      id: questionId,
-      header,
-      question: questionPrompt,
-      options,
-    };
-  });
-  for (const [questionIndex, question] of questions.entries()) {
-    if (questions.slice(0, questionIndex).some((existing) =>
-      tokenSimilarity(`${existing.header} ${existing.question}`, `${question.header} ${question.question}`) >= 0.72)) {
-      throw new Error("OpenAI returned overlapping guided questions");
-    }
-  }
-  return questions;
+  return { kind, value: effectValue, orderingBehavior };
 }
 
-function validatedGuidanceQuestions(
+function salvagedGuidanceQuestions(
   value: unknown,
   prompt: string,
   brief: PlaylistBrief,
-): PlaylistGuidanceQuestion[] {
-  try {
-    return strictlyValidatedGuidanceQuestions(value, prompt, brief);
-  } catch {
-    return fallbackGuidanceQuestions(prompt, brief);
+  sourceHints: readonly PlaylistGuidanceSourceHint[],
+): {
+  questions: PlaylistGuidanceQuestion[];
+  proposedQuestionCount: number;
+  validationIssues: string[];
+} {
+  const issues: string[] = [];
+  if (!value || typeof value !== "object") {
+    return { questions: [], proposedQuestionCount: 0, validationIssues: ["response:invalid_object"] };
   }
+  const rawQuestions = Array.isArray((value as Record<string, unknown>).questions)
+    ? ((value as Record<string, unknown>).questions as unknown[]).slice(0, 3)
+    : [];
+  if (!Array.isArray((value as Record<string, unknown>).questions)) {
+    issues.push("response:invalid_questions");
+  }
+  const sourceUrls = new Set(sourceHints.map((source) => source.url));
+  const accepted: PlaylistGuidanceQuestion[] = [];
+  const decisionKeys = new Set<string>();
+
+  for (const [index, candidate] of rawQuestions.entries()) {
+    try {
+      if (!candidate || typeof candidate !== "object") throw new Error("invalid_question");
+      const raw = candidate as Record<string, unknown>;
+      const decisionKey = boundedGuidanceText(raw.decisionKey, "decision key", 80);
+      if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/u.test(decisionKey)) throw new Error("invalid_decision_key");
+      if (GENERIC_GUIDANCE_DECISION_KEYS.has(decisionKey)) throw new Error("generic_decision_key");
+      if (decisionKeys.has(decisionKey)) throw new Error("duplicate_decision_key");
+      const header = boundedGuidanceText(raw.header, "question header", 28);
+      const question = boundedGuidanceText(raw.question, "question", 180);
+      const whyMaterial = boundedGuidanceText(raw.whyMaterial, "materiality", 240);
+      const groundingSummary = boundedGuidanceText(raw.groundingSummary, "grounding", 320);
+      const requestedUrls = Array.isArray(raw.sourceUrls)
+        ? [...new Set(raw.sourceUrls.map(normalizedSourceUrl).filter((url): url is string => Boolean(url)))].slice(0, 3)
+        : [];
+      if (requestedUrls.length === 0 || requestedUrls.some((url) => !sourceUrls.has(url))) {
+        throw new Error("unattested_sources");
+      }
+      const candidateText = `${decisionKey} ${header} ${question} ${whyMaterial} ${groundingSummary}`;
+      if (isTrackCountQuestion(candidateText)) throw new Error("track_count_question");
+      if (!questionIsPromptSpecific(`${header} ${question}`, prompt, brief)) {
+        throw new Error("generic_question");
+      }
+      if (hasContaminatedSimilarityWording(`${header} ${question}`, brief)) {
+        throw new Error("contaminated_similarity_wording");
+      }
+      if (accepted.some((existing) =>
+        tokenSimilarity(
+          `${existing.decisionKey} ${existing.header} ${existing.question}`,
+          `${decisionKey} ${header} ${question}`,
+        ) >= 0.72)) {
+        throw new Error("overlapping_question");
+      }
+      if (!Array.isArray(raw.options) || raw.options.length !== 3) throw new Error("invalid_option_count");
+      const optionLabels = new Set<string>();
+      const optionTexts: string[] = [];
+      const effectKeys = new Set<string>();
+      const questionId = `q${accepted.length + 1}`;
+      const options = raw.options.map((candidateOption, optionIndex) => {
+        if (!candidateOption || typeof candidateOption !== "object") throw new Error("invalid_option");
+        const option = candidateOption as Record<string, unknown>;
+        const label = boundedGuidanceText(option.label, "option label", 60);
+        const labelKey = label.toLocaleLowerCase();
+        if (optionLabels.has(labelKey)) throw new Error("duplicate_option");
+        optionLabels.add(labelKey);
+        const description = boundedGuidanceText(option.description, "option description", 180);
+        const optionText = `${label} ${description}`;
+        if (optionTexts.some((existing) => tokenSimilarity(existing, optionText) >= 0.72)) {
+          throw new Error("overlapping_option");
+        }
+        optionTexts.push(optionText);
+        const effect = validatedGuidanceEffect(option.effect);
+        const effectKey = `${effect.kind}:${effect.orderingBehavior ?? ""}:${effect.value.toLocaleLowerCase()}`;
+        if (effectKeys.has(effectKey)) throw new Error("duplicate_effect");
+        effectKeys.add(effectKey);
+        return {
+          id: `${questionId}-o${optionIndex + 1}`,
+          label,
+          description,
+          recommended: optionIndex === 0,
+          effect,
+        };
+      });
+      const effectKinds = new Set(options.map((option) => option.effect.kind));
+      if (effectKinds.size !== 1) throw new Error("mixed_effect_kinds");
+      if (effectKinds.has("ordering_behavior")) {
+        const behaviors = options.map((option) => option.effect.orderingBehavior);
+        if (new Set(behaviors).size !== 3) throw new Error("overlapping_ordering_behaviors");
+      }
+      decisionKeys.add(decisionKey);
+      accepted.push({
+        id: questionId,
+        decisionKey,
+        header,
+        question,
+        whyMaterial,
+        grounding: { summary: groundingSummary, sourceUrls: requestedUrls },
+        options,
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message.replace(/\s+/gu, "_").slice(0, 80) : "invalid";
+      issues.push(`q${index + 1}:${reason}`);
+    }
+  }
+  return {
+    questions: accepted,
+    proposedQuestionCount: rawQuestions.length,
+    validationIssues: issues.slice(0, 12),
+  };
 }
 
 function uniqueGuidanceRules(values: readonly string[]): string[] {
@@ -699,7 +711,21 @@ function guidanceOrderingPolicy(
   answers: readonly PlaylistGuidanceAnswer[],
   fallback: string,
 ): string {
-  const flowQuestion = questions.at(-1);
+  const typedSelection = questions.flatMap((question) => {
+    const answer = answers.find((item) => item.questionId === question.id);
+    const option = question.options.find((item) => item.id === answer?.optionId);
+    return option?.effect?.kind === "ordering_behavior" ? [option.effect] : [];
+  }).at(0);
+  if (typedSelection?.orderingBehavior === "chronological") return "chronological by release year";
+  if (typedSelection?.orderingBehavior === "editorial") return "editorial progression by research rank";
+  if (typedSelection?.orderingBehavior === "contrast") return "high-contrast metadata-aware flow with artist and album intermixing";
+  if (typedSelection?.orderingBehavior === "smooth") return "smooth metadata-aware flow with artist and album intermixing";
+
+  const typedFlowQuestion = questions.find((question) =>
+    question.options.some((option) => option.effect?.kind === "ordering_behavior"));
+  const hasTypedQuestion = questions.some((question) =>
+    question.options.some((option) => Boolean(option.effect)));
+  const flowQuestion = typedFlowQuestion ?? (hasTypedQuestion ? undefined : questions.at(-1));
   if (!flowQuestion) return fallback;
   const answer = answers.find((item) => item.questionId === flowQuestion.id);
   const option = flowQuestion.options.find((item) => item.id === answer?.optionId);
@@ -732,16 +758,23 @@ function safelyApplyGuidance(
   },
 ): PlaylistBrief {
   const scopeDirectives: string[] = [];
-  for (const question of input.questions.slice(0, -1)) {
+  for (const [questionIndex, question] of input.questions.entries()) {
     const answer = input.answers.find((item) => item.questionId === question.id);
     const option = question.options.find((item) => item.id === answer?.optionId);
+    const typedOrderingQuestion = question.options.some((item) => item.effect?.kind === "ordering_behavior");
+    if (typedOrderingQuestion) continue;
+    // Legacy saved questions have no typed effect and historically treated
+    // the final question as the flow control.
+    const legacyQuestion = question.options.every((item) => !item.effect);
+    if (legacyQuestion && questionIndex === input.questions.length - 1) continue;
     const preference = safeGuidancePreference(
-      option ? `${option.label}: ${option.description}` : answer?.customText ?? "",
+      option?.effect?.value ?? (option ? `${option.label}: ${option.description}` : answer?.customText ?? ""),
       !option,
     );
     if (!preference) continue;
+    const decision = option?.effect?.kind ?? question.decisionKey ?? question.header.toLocaleLowerCase();
     scopeDirectives.push(
-      `Guided ${question.header.toLocaleLowerCase()} preference within the confirmed scope: ${preference}`,
+      `Guided ${decision.replace(/_/gu, " ")} preference within the confirmed scope: ${preference}`,
     );
   }
   return {
@@ -790,35 +823,172 @@ export async function interpretPrompt(
   return { brief, usage: response.usage ?? {}, costUsd: responseCostUsd(response) };
 }
 
+const GUIDANCE_SCOUT_INSTRUCTIONS = `You are a bounded playlist question scout. The playlist request has already been interpreted into a strict brief. Search only enough to discover subject-specific forks that would materially change which recordings are selected.
+
+Return zero to three questions. Zero is correct when the request and brief already determine the result. Never invent a question merely to create a multi-step flow. Do not ask about track count, cost, generic mood, generic variety, or any preference already explicit in the request or brief. Do not ask a mandatory ordering question. Prefer documented, subject-specific decisions such as a real historical split, subscene boundary, contested canon, performance-versus-composition credit boundary, release-version distinction, or an artist's materially different periods.
+
+Every question must be supported by URLs from your hosted web-search results. Explain the documented fork briefly in groundingSummary and why the answer changes the track set in whyMaterial. Copy source URLs exactly. Each question must have exactly three mutually exclusive options, with the broadly safest default first. Options must describe concrete consequences, not synonyms.
+
+Every option must include one typed effect. Use research_preference for a documented selection criterion, version_preference for released-version scope, familiarity_bias for canonical-versus-discovery weighting, subscene_focus for a documented era/scene/period fork, and ordering_behavior only when sequence itself is genuinely material. orderingBehavior must be null except for ordering_behavior, where it must be smooth, contrast, chronological, or editorial. Never claim BPM, key, or harmonic analysis. Use a concise snake_case decisionKey that names the actual subject-specific choice.`;
+
+function guidanceScoutTimeoutMs(): number {
+  const configured = Number(process.env.GUIDANCE_SCOUT_TIMEOUT_MS ?? GUIDANCE_SCOUT_TIMEOUT_MS);
+  if (!Number.isFinite(configured)) return GUIDANCE_SCOUT_TIMEOUT_MS;
+  return Math.min(10_000, Math.max(5_000, Math.round(configured)));
+}
+
+function guidanceScoutSignal(external?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(guidanceScoutTimeoutMs());
+  return external ? AbortSignal.any([external, timeout]) : timeout;
+}
+
+/**
+ * Researches only the material choices left open by an already interpreted
+ * brief. This is a separate billable seam so the worker can reserve and
+ * reconcile `brief.interpret` and `brief.question_scout` independently.
+ */
+export async function scoutPlaylistGuidance(
+  prompt: string,
+  brief: PlaylistBrief,
+  model: string,
+  context: OpenAIRequestContext = {},
+): Promise<PlaylistGuidanceScoutResult> {
+  const stableKey = context.idempotencyKey
+    ?? createHash("sha256")
+      .update(`question-scout:${model}:${prompt}:${JSON.stringify(brief)}`)
+      .digest("hex");
+  const response = await createOpenAIResponse({
+    model,
+    reasoning: { effort: "low" },
+    max_output_tokens: GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS,
+    max_tool_calls: GUIDANCE_SCOUT_MAX_TOOL_CALLS,
+    include: ["web_search_call.action.sources"],
+    parallel_tool_calls: false,
+    tools: [{ type: "web_search", search_context_size: "low" }],
+    instructions: GUIDANCE_SCOUT_INSTRUCTIONS,
+    input: JSON.stringify({
+      request: prompt.slice(0, 4_000),
+      confirmedBrief: {
+        title: brief.title,
+        description: brief.description,
+        mode: brief.mode,
+        subjectEntities: brief.subjectEntities,
+        relationship: brief.relationship,
+        include: brief.include,
+        exclude: brief.exclude,
+        versionPolicy: brief.versionPolicy,
+        evidencePolicy: brief.evidencePolicy,
+        orderingPolicy: brief.orderingPolicy,
+        targetSize: brief.targetSize,
+        ambiguities: brief.ambiguities,
+      },
+    }),
+    text: {
+      format: {
+        type: "json_schema",
+        name: "grounded_playlist_question_scout",
+        strict: true,
+        schema: guidanceScoutSchema,
+      },
+    },
+  }, {
+    ...context,
+    operation: context.operation ?? "brief.question_scout",
+    idempotencyKey: stableKey,
+    signal: guidanceScoutSignal(context.signal),
+  });
+  const sourceHints = guidanceSourceHints(response);
+  const webSearchCalls = (response.output ?? [])
+    .filter((item: any) => item?.type === "web_search_call")
+    .length;
+  const costUsd = responseCostUsd(response);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extractOutputText(response));
+  } catch {
+    return {
+      questions: [],
+      sourceHints,
+      telemetry: {
+        generationMode: "scout_unavailable",
+        proposedQuestionCount: 0,
+        acceptedQuestionCount: 0,
+        webSearchCalls,
+        validationIssues: ["response:invalid_json"],
+      },
+      usage: response.usage ?? {},
+      costUsd,
+    };
+  }
+  const salvaged = salvagedGuidanceQuestions(parsed, prompt, brief, sourceHints);
+  const overBudget = costUsd > GUIDANCE_SCOUT_MAX_COST_USD;
+  const questions = overBudget ? [] : salvaged.questions;
+  const validationIssues = overBudget
+    ? [...salvaged.validationIssues, "response:cost_cap_exceeded"].slice(0, 12)
+    : salvaged.validationIssues;
+  return {
+    questions,
+    sourceHints,
+    telemetry: {
+      generationMode: questions.length > 0
+        ? "grounded_scout"
+        : salvaged.proposedQuestionCount === 0 && !overBudget
+          ? "no_material_questions"
+          : "scout_unavailable",
+      proposedQuestionCount: salvaged.proposedQuestionCount,
+      acceptedQuestionCount: questions.length,
+      webSearchCalls,
+      validationIssues,
+    },
+    usage: response.usage ?? {},
+    costUsd,
+  };
+}
+
+/**
+ * Compatibility wrapper. New worker code should call interpretPrompt and
+ * scoutPlaylistGuidance separately so each provider request has a distinct
+ * cost reservation and onUsage reconciliation.
+ */
 export async function interpretPromptWithGuidance(
   prompt: string,
   model: string,
   context: OpenAIRequestContext = {},
-): Promise<{ brief: PlaylistBrief; questions: PlaylistGuidanceQuestion[]; usage: any; costUsd: number }> {
-  const stableKey = context.idempotencyKey
+): Promise<{
+  brief: PlaylistBrief;
+  questions: PlaylistGuidanceQuestion[];
+  sourceHints: PlaylistGuidanceSourceHint[];
+  guidanceTelemetry: PlaylistGuidanceScoutResult["telemetry"];
+  briefUsage: Record<string, unknown>;
+  scoutUsage: Record<string, unknown>;
+  briefCostUsd: number;
+  scoutCostUsd: number;
+  usage: Record<string, unknown>;
+  costUsd: number;
+}> {
+  const baseKey = context.idempotencyKey
     ?? createHash("sha256").update(`brief-guided:${model}:${prompt}`).digest("hex");
-  const response = await createOpenAIResponse({
-    model,
-    reasoning: { effort: "none" },
-    max_output_tokens: 2_000,
-    instructions: `${BRIEF_INTERPRETATION_INSTRUCTIONS}
-
-In the same response, create exactly two or three concise guided questions that materially improve this specific playlist. Generate one or two non-overlapping scope questions plus exactly one playlist-flow question. Each question must have exactly three mutually exclusive options. Put the broadly best default first; the client labels it recommended. Do not ask for track count. Do not ask for information already explicit in the request. Do not ask generic filler questions. The required flow question must choose among implemented behaviors: smooth metadata-aware artist/album intermixing, high-contrast metadata-aware intermixing, chronological release order, or editorial research-rank progression. Adapt the labels and descriptions to the request, choose three distinct behaviors, and never claim BPM or harmonic-key analysis unless that metadata is available. Keep labels short enough for a mobile choice card. A visitor may also type a custom fourth answer, so the three supplied choices should cover distinct useful defaults.`,
-    input: prompt.slice(0, 4_000),
-    text: { format: { type: "json_schema", name: "guided_playlist_preflight", strict: true, schema: preflightSchema } },
-  }, { ...context, operation: context.operation ?? "brief.preflight", idempotencyKey: stableKey });
-  const parsed = JSON.parse(extractOutputText(response)) as Record<string, unknown>;
-  const countScopedBrief = preserveExplicitTrackCount(prompt, validatedBrief(parsed.brief));
-  const scopedBrief = applySimilaritySeedPolicy(prompt, countScopedBrief);
-  const brief = {
-    ...scopedBrief,
-    title: normalizePlaylistTitle(scopedBrief.title, scopedBrief),
-  };
+  const interpreted = await interpretPrompt(prompt, model, {
+    ...context,
+    operation: "brief.interpret",
+    idempotencyKey: `${baseKey}:brief`,
+  });
+  const scout = await scoutPlaylistGuidance(prompt, interpreted.brief, model, {
+    ...context,
+    operation: "brief.question_scout",
+    idempotencyKey: `${baseKey}:scout`,
+  });
   return {
-    brief,
-    questions: validatedGuidanceQuestions(parsed, prompt, brief),
-    usage: response.usage ?? {},
-    costUsd: responseCostUsd(response),
+    brief: interpreted.brief,
+    questions: scout.questions,
+    sourceHints: scout.sourceHints,
+    guidanceTelemetry: scout.telemetry,
+    briefUsage: interpreted.usage,
+    scoutUsage: scout.usage,
+    briefCostUsd: interpreted.costUsd,
+    scoutCostUsd: scout.costUsd,
+    usage: { brief: interpreted.usage, scout: scout.usage },
+    costUsd: interpreted.costUsd + scout.costUsd,
   };
 }
 

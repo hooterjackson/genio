@@ -58,6 +58,7 @@ const SAFE_PUBLICATION_MESSAGES = new Set([
   PUBLICATION_AVAILABILITY_FAILURE,
   PUBLICATION_RATE_LIMITED,
 ]);
+const MATCHING_COUNT_SHORTFALL = /^Apple Music matching found \d+ strict unique catalog match(?:es)? for the required \d+\. No playlist was published because the exact count could not be met safely\.$/u;
 
 export function failureContextForJob(kind: string): FailureContext {
   if (kind === "brief") return "brief";
@@ -88,6 +89,12 @@ export function sanitizeFailure(error: unknown, context: FailureContext = "backg
     return SAFE_APPLE_AUTHORIZATION_MESSAGES.has(suppliedMessage)
       ? suppliedMessage
       : FAILURE_MESSAGES.apple_authorization;
+  }
+  if (context === "matching") {
+    const suppliedMessage = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    return MATCHING_COUNT_SHORTFALL.test(suppliedMessage)
+      ? suppliedMessage
+      : FAILURE_MESSAGES.matching;
   }
   if (context !== "publication") return FAILURE_MESSAGES[context];
 

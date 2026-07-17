@@ -22,6 +22,11 @@ body {
   background: var(--bg);
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 body {
   color: var(--ink);
   background-image: none;
@@ -503,8 +508,43 @@ summary:focus-visible {
   line-height: 1.06;
 }
 
+.guided-question-reason,
+.guided-question-sources {
+  max-width: 680px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.guided-question-reason {
+  margin-top: 22px;
+}
+
+.guided-question-sources {
+  margin-top: 8px;
+  color: var(--faint);
+}
+
+.guided-question-reason > span,
+.guided-question-sources > span:first-child {
+  margin-right: 10px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .1em;
+}
+
+.guided-question-sources a {
+  color: inherit;
+  text-underline-offset: 3px;
+}
+
+.guided-question-sources a:hover {
+  color: var(--ink);
+}
+
 .guided-options {
-  margin-top: 46px;
+  margin-top: 34px;
   gap: 12px;
 }
 
@@ -1356,18 +1396,28 @@ summary:focus-visible {
 
 @media (max-width: 600px) {
   .site-header {
+    height: 76px;
     min-height: 76px;
-    padding: 10px 14px;
+    padding: 0 14px;
     gap: 8px;
   }
 
   .wordmark {
-    min-width: 102px;
-    min-height: 50px;
+    width: clamp(76px, 23.7vw, 102px);
+    min-width: 0;
+    height: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
   }
 
   .brand-wordmark-art {
-    font-size: 6.2px;
+    display: block;
+    font-size: clamp(4.8px, 1.44vw, 6.2px);
+    line-height: 1;
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "calt" 0;
   }
 
   .header-meta {
@@ -1642,14 +1692,6 @@ summary:focus-visible {
 }
 
 @media (max-width: 360px) {
-  .wordmark {
-    min-width: 70px;
-  }
-
-  .brand-wordmark-art {
-    font-size: 3.8px;
-  }
-
   .primary-nav {
     gap: 2px;
   }

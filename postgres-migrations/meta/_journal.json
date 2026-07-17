@@ -78,6 +78,13 @@
       "when": 1784692800000,
       "tag": "0010_public_playlist_directory",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1784779200000,
+      "tag": "0011_guidance_scout_context",
+      "breakpoints": true
     }
   ]
 }

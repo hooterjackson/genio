@@ -3,6 +3,7 @@ import {
   interpretPrompt,
   interpretPromptWithGuidance,
   refineBriefWithGuidance,
+  scoutPlaylistGuidance,
 } from "../server/openai.ts";
 import { canonicalBriefForRequest, estimateResearchCost } from "../server/brief-policy.ts";
 import { researchExecutionPolicy } from "../server/research-policy.ts";
@@ -31,60 +32,101 @@ const guidedDraftBrief: PlaylistBrief = {
   ambiguities: [],
 };
 
-function guidedQuestion(
-  header: string,
-  question: string,
-  prefix: string,
-): {
-  header: string;
-  question: string;
-  options: Array<{ label: string; description: string }>;
-} {
-  return {
-    header,
-    question,
-    options: [1, 2, 3].map((index) => ({
-      label: `${prefix} ${index}`,
-      description: `${prefix} choice ${index}.`,
-    })),
-  };
-}
-
-function specificScopeQuestion(
-  category: "selection_scope" | "era",
-  header: string,
-  question: string,
-) {
-  return {
-    category,
-    header,
-    question,
-    options: [
-      { label: "Foundations", description: "Prioritize formative recordings and scene foundations." },
-      { label: "Breakthroughs", description: "Emphasize recognized turning points and wider impact." },
-      { label: "Discoveries", description: "Favor less obvious recordings with strong support." },
-    ],
-  };
-}
-
-function supportedFlowQuestion() {
-  return {
-    header: "Flow",
-    question: "How should rainy-night music move from beginning to end?",
-    options: [
-      { label: "Smooth arc", description: "Use compatible metadata and gradual transitions." },
-      { label: "High contrast", description: "Use deliberate contrast and sharper shifts." },
-      { label: "Chronological", description: "Order the tracks by release year." },
-    ],
-  };
-}
-
-function hostedResponse(output: unknown, id = "response-guided"): Response {
+function hostedResponse(output: unknown, id = "response-guided", model = "gpt-5.4-mini"): Response {
   return new Response(JSON.stringify({
     id,
-    model: "test-model",
+    model,
     usage: { input_tokens: 100, output_tokens: 100 },
     output_text: JSON.stringify(output),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function groundedScoutQuestion(input: {
+  decisionKey: string;
+  subject: string;
+  sourceUrl: string;
+  effectKind?: "research_preference" | "version_preference" | "familiarity_bias" | "subscene_focus";
+}) {
+  const effectKind = input.effectKind ?? "subscene_focus";
+  return {
+    decisionKey: input.decisionKey,
+    header: "DOCUMENTED FORK",
+    question: `Which documented ${input.subject} branch should carry the most weight?`,
+    whyMaterial: `The documented branches of ${input.subject} lead to materially different recordings and candidate pools.`,
+    groundingSummary: `The provider-attested source documents a real historical split within ${input.subject}.`,
+    sourceUrls: [input.sourceUrl],
+    options: [
+      {
+        label: "Foundations",
+        description: "Prioritize formative recordings and the earliest documented network.",
+        effect: { kind: effectKind, value: `prioritize formative ${input.subject} recordings`, orderingBehavior: null },
+      },
+      {
+        label: "Turning points",
+        description: "Emphasize later breakthroughs that changed the documented field.",
+        effect: { kind: effectKind, value: `prioritize breakthrough ${input.subject} recordings`, orderingBehavior: null },
+      },
+      {
+        label: "Deep branches",
+        description: "Favor well-supported but less canonical branches of the subject.",
+        effect: { kind: effectKind, value: `prioritize less canonical ${input.subject} branches`, orderingBehavior: null },
+      },
+    ],
+  };
+}
+
+function scoutResponse(input: {
+  questions: unknown[];
+  sourceUrl?: string;
+  sourceTitle?: string;
+  id?: string;
+  usage?: { input_tokens: number; output_tokens: number };
+}): Response {
+  const sourceUrl = input.sourceUrl ?? "https://example.org/documented-subject-history";
+  const sourceTitle = input.sourceTitle ?? "Documented subject history";
+  const outputText = JSON.stringify({ questions: input.questions });
+  const output = input.sourceUrl === undefined && input.questions.length === 0
+    ? [{
+        type: "message",
+        id: "msg-scout-zero",
+        content: [{ type: "output_text", text: outputText, annotations: [] }],
+      }]
+    : [
+        {
+          type: "web_search_call",
+          id: "search-scout",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "documented music history",
+            sources: [{ type: "url", url: sourceUrl, title: sourceTitle }],
+          },
+        },
+        {
+          type: "message",
+          id: "msg-scout",
+          content: [{
+            type: "output_text",
+            text: outputText,
+            annotations: [{
+              type: "url_citation",
+              start_index: 0,
+              end_index: Math.min(80, outputText.length),
+              url: sourceUrl,
+              title: sourceTitle,
+            }],
+          }],
+        },
+      ];
+  return new Response(JSON.stringify({
+    id: input.id ?? "response-guidance-scout",
+    model: "gpt-5.4-mini",
+    usage: input.usage ?? { input_tokens: 100, output_tokens: 100 },
+    output_text: outputText,
+    output,
   }), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -295,21 +337,24 @@ test("repairs a loose similar-artist brief into an other-artists scope", async (
   );
 });
 
-test("repairs contaminated similarity entities and replaces awkward guided wording", async () => {
+test("runs brief interpretation and grounded question scouting as separate bounded calls", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-similarity-repair");
-  let requestBody: any;
-  vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
-    requestBody = JSON.parse(String(init?.body));
-    return hostedResponse({
-      brief: {
+  const sourceUrl = "https://example.org/radiohead-periods";
+  const question = groundedScoutQuestion({
+    decisionKey: "radiohead_similarity_axis",
+    subject: "Radiohead's multi-period musical language",
+    sourceUrl,
+    effectKind: "familiarity_bias",
+  });
+  const requestBodies: any[] = [];
+  const fetchMock = vi.fn(async (_url, init) => {
+    requestBodies.push(JSON.parse(String(init?.body)));
+    if (requestBodies.length === 1) {
+      return hostedResponse({
         title: "Radiohead Adjacent",
         description: "Music resembling Radiohead by different performers.",
         mode: "curated",
-        subjectEntities: [
-          "Radiohead",
-          "other artists",
-          "tracks that sound like Radiohead",
-        ],
+        subjectEntities: ["Radiohead", "other artists", "tracks that sound like Radiohead"],
         relationship: "recorded by",
         include: ["released recordings"],
         exclude: [],
@@ -318,185 +363,252 @@ test("repairs contaminated similarity entities and replaces awkward guided wordi
         orderingPolicy: "editorial flow",
         targetSize: { min: 50, max: 50 },
         ambiguities: [],
-      },
-      scopeQuestions: [{
-        category: "familiarity",
-        header: "Similarity",
-        question: "How far should other artists and tracks that sound like Radiohead reach?",
-        options: [
-          { label: "Close", description: "Prioritize close stylistic parallels." },
-          { label: "Balanced", description: "Balance close and adjacent discoveries." },
-          { label: "Broad", description: "Explore a wider stylistic orbit." },
-        ],
-      }],
-      flowQuestion: {
-        header: "Flow",
-        question: "How should tracks that sound like Radiohead move?",
-        options: [
-          { label: "Smooth arc", description: "Use compatible metadata and gradual transitions." },
-          { label: "High contrast", description: "Use deliberate contrast and sharper shifts." },
-          { label: "Chronological", description: "Order the tracks by release year." },
-        ],
-      },
+      }, "response-radiohead-brief");
+    }
+    return scoutResponse({
+      questions: [question],
+      sourceUrl,
+      sourceTitle: "Radiohead period history",
     });
-  }));
+  });
+  vi.stubGlobal("fetch", fetchMock);
 
   const result = await interpretPromptWithGuidance(
     "12 tracks that sound like Radiohead but are by other artists",
-    "test-model",
+    "gpt-5.4-mini",
   );
 
+  expect(fetchMock).toHaveBeenCalledTimes(2);
   expect(result.brief.subjectEntities).toEqual(["Radiohead"]);
   expect(result.brief.exclude).toEqual([
     "Reference artist is a style seed; exclude recordings by: Radiohead",
   ]);
-  expect(result.questions).toHaveLength(2);
-  expect(result.questions[0]!.question).toBe(
-    "How closely should this selection resemble Radiohead?",
-  );
-  expect(result.questions[1]!.question).toBe(
-    "How should the Radiohead-inspired selection move from track to track?",
-  );
-  expect(result.questions.map((question) => question.question).join(" "))
-    .not.toMatch(/other artists|tracks that sound like/iu);
-  expect(requestBody.instructions).toContain(
-    "never emit filler phrases such as 'other artists'",
-  );
-});
-
-test.each([
-  {
-    label: "two",
-    scopeQuestions: [
-      specificScopeQuestion(
-        "selection_scope",
-        "Selection",
-        "What should define the rainy-night music selection?",
-      ),
-    ],
-    expectedCount: 2,
-  },
-  {
-    label: "three",
-    scopeQuestions: [
-      specificScopeQuestion(
-        "selection_scope",
-        "Selection",
-        "What should define the rainy-night music selection?",
-      ),
-      specificScopeQuestion(
-        "era",
-        "Era",
-        "Which eras of rainy-night music should lead?",
-      ),
-    ],
-    expectedCount: 3,
-  },
-])("creates $label specific guided questions in one structured preflight call", async ({
-  scopeQuestions,
-  expectedCount,
-}) => {
-  vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-preflight");
-  let requestBody: any;
-  vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
-    requestBody = JSON.parse(String(init?.body));
-    return hostedResponse({
-      brief: guidedDraftBrief,
-      scopeQuestions,
-      flowQuestion: supportedFlowQuestion(),
-    });
-  }));
-
-  const result = await interpretPromptWithGuidance(
-    "Create 50 songs for a rainy night",
-    "test-model",
-  );
-
-  expect(result.brief).toMatchObject({
-    mode: "curated",
-    targetSize: { min: 50, max: 50 },
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]).toMatchObject({
+    decisionKey: "radiohead_similarity_axis",
+    grounding: { sourceUrls: [sourceUrl] },
   });
-  expect(result.questions).toHaveLength(expectedCount);
-  expect(result.questions.at(-1)).toMatchObject({
-    id: `q${expectedCount}`,
-    header: "Flow",
+  expect(result.guidanceTelemetry.generationMode).toBe("grounded_scout");
+  expect(requestBodies[0].text.format.name).toBe("playlist_brief");
+  expect(requestBodies[1]).toMatchObject({
+    max_output_tokens: 1_200,
+    max_tool_calls: 2,
+    reasoning: { effort: "low" },
+    parallel_tool_calls: false,
+    include: ["web_search_call.action.sources"],
+    tools: [{ type: "web_search", search_context_size: "low" }],
   });
-  for (const [questionIndex, question] of result.questions.entries()) {
-    expect(question.options).toHaveLength(3);
-    expect(question.options.map((option) => option.id)).toEqual([
-      `q${questionIndex + 1}-o1`,
-      `q${questionIndex + 1}-o2`,
-      `q${questionIndex + 1}-o3`,
-    ]);
-    expect(question.options.map((option) => option.recommended)).toEqual([true, false, false]);
-  }
-  expect(requestBody.text.format).toMatchObject({
+  expect(requestBodies[1].text.format).toMatchObject({
     type: "json_schema",
-    name: "guided_playlist_preflight",
+    name: "grounded_playlist_question_scout",
     strict: true,
   });
-  expect(requestBody.text.format.schema.properties.scopeQuestions).toMatchObject({
-    minItems: 1,
-    maxItems: 2,
-  });
-  expect(requestBody.text.format.schema.properties.flowQuestion.properties.options).toMatchObject({
-    minItems: 3,
+  expect(requestBodies[1].text.format.schema.properties.questions).toMatchObject({
+    minItems: 0,
     maxItems: 3,
   });
-  expect(requestBody.instructions).toContain("Do not ask for track count");
-  expect(requestBody.instructions).toContain("exactly one playlist-flow question");
+  expect(requestBodies[1].instructions).toContain("Zero is correct");
+  expect(requestBodies[1].instructions).toContain("Do not ask a mandatory ordering question");
 });
 
-test.each([
-  {
-    label: "no scope question",
-    scopeQuestions: [],
-    flowQuestion: guidedQuestion("Flow", "How should the playlist flow?", "Flow"),
-  },
-  {
-    label: "three scope questions",
-    scopeQuestions: [
-      { category: "mood", ...guidedQuestion("Mood", "Choose the mood.", "Mood") },
-      { category: "era", ...guidedQuestion("Era", "Choose the era.", "Era") },
-      { category: "energy", ...guidedQuestion("Energy", "Choose the energy.", "Energy") },
-    ],
-    flowQuestion: guidedQuestion("Flow", "How should the playlist flow?", "Flow"),
-  },
-  {
-    label: "only two options",
-    scopeQuestions: [{
-      category: "mood",
-      ...guidedQuestion("Mood", "Choose the mood.", "Mood"),
-      options: guidedQuestion("Mood", "Choose the mood.", "Mood").options.slice(0, 2),
-    }],
-    flowQuestion: guidedQuestion("Flow", "How should the playlist flow?", "Flow"),
-  },
-  {
-    label: "a track-count question",
-    scopeQuestions: [{
-      category: "selection_scope",
-      ...guidedQuestion("Length", "How many songs should this playlist contain?", "Length"),
-    }],
-    flowQuestion: guidedQuestion("Flow", "How should the playlist flow?", "Flow"),
-  },
-])("replaces guided model output with $label with a safe prompt-specific fallback", async ({
-  scopeQuestions,
-  flowQuestion,
-}) => {
-  vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-validation");
-  vi.stubGlobal("fetch", vi.fn(async () => hostedResponse({
-    brief: guidedDraftBrief,
-    scopeQuestions,
-    flowQuestion,
+test("unrelated prompts receive different subject-specific grounded decisions", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-subject-specific-guidance");
+  const scenarios = [
+    {
+      prompt: "50 influential Berlin techno tracks",
+      brief: {
+        ...guidedDraftBrief,
+        title: "Berlin Techno",
+        subjectEntities: ["Berlin techno"],
+        relationship: "historically influential within",
+      },
+      decisionKey: "berlin_scene_lineage",
+      subject: "Berlin techno lineage",
+      sourceUrl: "https://example.org/berlin-techno-history",
+    },
+    {
+      prompt: "An introduction to Wandelweiser recordings",
+      brief: {
+        ...guidedDraftBrief,
+        title: "Wandelweiser Introduction",
+        subjectEntities: ["Wandelweiser"],
+        relationship: "representative of",
+      },
+      decisionKey: "wandelweiser_performance_density",
+      subject: "Wandelweiser performance practice",
+      sourceUrl: "https://example.org/wandelweiser-history",
+    },
+  ];
+  const fetchMock = vi.fn();
+  for (const scenario of scenarios) {
+    fetchMock.mockResolvedValueOnce(scoutResponse({
+      questions: [groundedScoutQuestion(scenario)],
+      sourceUrl: scenario.sourceUrl,
+      sourceTitle: `${scenario.subject} history`,
+    }));
+  }
+  vi.stubGlobal("fetch", fetchMock);
+
+  const results = [];
+  for (const scenario of scenarios) {
+    results.push(await scoutPlaylistGuidance(
+      scenario.prompt,
+      scenario.brief,
+      "gpt-5.4-mini",
+    ));
+  }
+
+  const fingerprints = results.map((result) => result.questions.map((question) => [
+    question.decisionKey,
+    question.question,
+    ...question.options.map((option) => option.effect?.value),
+  ].join("|")));
+  expect(new Set(fingerprints).size).toBe(scenarios.length);
+  expect(results.map((result) => result.questions[0]!.decisionKey)).toEqual([
+    "berlin_scene_lineage",
+    "wandelweiser_performance_density",
+  ]);
+  for (const [index, result] of results.entries()) {
+    expect(result.sourceHints).toEqual([expect.objectContaining({
+      url: scenarios[index]!.sourceUrl,
+      title: `${scenarios[index]!.subject} history`,
+    })]);
+    expect(result.questions[0]!.grounding!.sourceUrls).toEqual([scenarios[index]!.sourceUrl]);
+  }
+});
+
+test("a precise prompt can produce zero questions without a generic fallback", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-zero-guidance");
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({ questions: [] })));
+
+  const result = await scoutPlaylistGuidance(
+    "Exactly 25 original studio recordings by Björk, chronological, no remixes or live versions",
+    {
+      ...guidedDraftBrief,
+      title: "Björk Studio Chronology",
+      subjectEntities: ["Björk"],
+      relationship: "recorded by",
+      include: ["original studio recordings"],
+      exclude: ["remixes", "live versions"],
+      orderingPolicy: "chronological by release year",
+      targetSize: { min: 25, max: 25 },
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toEqual([]);
+  expect(result.sourceHints).toEqual([]);
+  expect(result.telemetry).toEqual({
+    generationMode: "no_material_questions",
+    proposedQuestionCount: 0,
+    acceptedQuestionCount: 0,
+    webSearchCalls: 0,
+    validationIssues: [],
+  });
+});
+
+test("salvages valid grounded questions independently and rejects invented sources", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-partial-guidance");
+  const sourceUrl = "https://example.org/funana-history";
+  const valid = groundedScoutQuestion({
+    decisionKey: "funana_era_texture",
+    subject: "funaná era and texture",
+    sourceUrl,
+  });
+  const invalid = {
+    ...groundedScoutQuestion({
+      decisionKey: "invented_axis",
+      subject: "generic playlist mood",
+      sourceUrl: "https://invented.invalid/not-returned",
+    }),
+    sourceUrls: ["https://invented.invalid/not-returned"],
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [valid, invalid],
+    sourceUrl,
+    sourceTitle: "Funaná history",
   })));
 
-  const result = await interpretPromptWithGuidance("A rainy-night playlist", "test-model");
-  expect(result.questions).toHaveLength(2);
-  expect(result.questions.map((question) => question.options.length)).toEqual([3, 3]);
-  expect(result.questions[0]!.question).toMatch(/rainy-night music/iu);
-  expect(result.questions[1]!.header).toBe("Flow");
-  expect(result.questions.map((question) => `${question.header} ${question.question}`).join(" "))
-    .not.toMatch(/how many|track count|playlist size/iu);
+  const result = await scoutPlaylistGuidance(
+    "An introduction to funaná across eras",
+    { ...guidedDraftBrief, subjectEntities: ["funaná"], relationship: "representative of" },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]!.decisionKey).toBe("funana_era_texture");
+  expect(result.telemetry).toMatchObject({
+    generationMode: "grounded_scout",
+    proposedQuestionCount: 2,
+    acceptedQuestionCount: 1,
+  });
+  expect(result.telemetry.validationIssues).toContain("q2:unattested_sources");
+  expect(result.questions.flatMap((question) => question.grounding!.sourceUrls))
+    .not.toContain("https://invented.invalid/not-returned");
+});
+
+test("enforces the scout cost cap by returning zero questions", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-budget-cap");
+  const sourceUrl = "https://example.org/tamil-nadaswaram";
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [groundedScoutQuestion({
+      decisionKey: "nadaswaram_context",
+      subject: "Tamil nadaswaram performance context",
+      sourceUrl,
+    })],
+    sourceUrl,
+    usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+  })));
+
+  const result = await scoutPlaylistGuidance(
+    "Tamil nadaswaram recordings across temple and concert contexts",
+    { ...guidedDraftBrief, subjectEntities: ["Tamil nadaswaram"], relationship: "representative of" },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.costUsd).toBeGreaterThan(0.05);
+  expect(result.questions).toEqual([]);
+  expect(result.telemetry).toMatchObject({
+    generationMode: "scout_unavailable",
+    proposedQuestionCount: 1,
+    acceptedQuestionCount: 0,
+  });
+  expect(result.telemetry.validationIssues).toContain("response:cost_cap_exceeded");
+});
+
+test("typed scout answers produce distinct downstream research directives", async () => {
+  const sourceUrl = "https://example.org/paulinho-credits";
+  const rawQuestion = groundedScoutQuestion({
+    decisionKey: "paulinho_credit_emphasis",
+    subject: "Paulinho da Costa's documented credits",
+    sourceUrl,
+    effectKind: "research_preference",
+  });
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-effects");
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [rawQuestion],
+    sourceUrl,
+    sourceTitle: "Paulinho da Costa credits",
+  })));
+  const scout = await scoutPlaylistGuidance(
+    "Build a deep Paulinho da Costa playlist",
+    { ...guidedDraftBrief, subjectEntities: ["Paulinho da Costa"], relationship: "performed on" },
+    "gpt-5.4-mini",
+  );
+  const question = scout.questions[0]!;
+  const directives: string[] = [];
+  for (const option of question.options) {
+    const refined = await refineBriefWithGuidance({
+      prompt: "Build a deep Paulinho da Costa playlist",
+      brief: { ...guidedDraftBrief, subjectEntities: ["Paulinho da Costa"], relationship: "performed on" },
+      questions: [question],
+      answers: [{ questionId: question.id, optionId: option.id }],
+    });
+    const directive = refined.brief.include.find((item) => item.startsWith("Guided "));
+    expect(directive).toContain(option.effect!.value);
+    directives.push(directive!);
+  }
+  expect(new Set(directives).size).toBe(3);
 });
 
 test("applies guided answers without a second model call while preserving the requested scope and cost cap", async () => {

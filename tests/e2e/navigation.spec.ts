@@ -43,6 +43,8 @@ const activeRun = {
 
 type HeaderGeometry = {
   centers: number[];
+  artCenterY: number;
+  headerCenterY: number;
   menuCenterY: number;
   navCenterY: number;
 };
@@ -65,9 +67,20 @@ async function expectStableHeader(page: Page): Promise<HeaderGeometry> {
     if (!navElement || !menu || !wordmark || controls.length !== 3) throw new Error("Shared header controls are incomplete");
     const wordmarkBox = wordmark.getBoundingClientRect();
     const menuBox = menu.getBoundingClientRect();
+    const art = header.querySelector<HTMLElement>(".brand-wordmark-art");
+    if (!art) throw new Error("Shared header wordmark art is missing");
+    const artBox = art.getBoundingClientRect();
     return {
       header: { top: headerBox.top, right: headerBox.right, bottom: headerBox.bottom, left: headerBox.left },
       wordmark: { left: wordmarkBox.left, right: wordmarkBox.right },
+      art: {
+        left: artBox.left,
+        right: artBox.right,
+        top: artBox.top,
+        bottom: artBox.bottom,
+        width: artBox.width,
+        height: artBox.height,
+      },
       menu: { left: menuBox.left, right: menuBox.right },
       controls: controls.map((control) => {
         const box = control.getBoundingClientRect();
@@ -97,13 +110,26 @@ async function expectStableHeader(page: Page): Promise<HeaderGeometry> {
     expect(sorted[index]!.left).toBeGreaterThanOrEqual(sorted[index - 1]!.right);
   }
   expect(sorted[0]!.left).toBeGreaterThanOrEqual(geometry.wordmark.right);
+  expect(sorted[0]!.left).toBeGreaterThanOrEqual(geometry.art.right);
   expect(sorted.at(-1)!.right).toBeLessThanOrEqual(geometry.menu.left);
   const centers = geometry.controls.map((control) => control.left + control.width / 2);
+  const headerCenterY = (geometry.header.top + geometry.header.bottom) / 2;
+  const artCenterY = (geometry.art.top + geometry.art.bottom) / 2;
   expect(Math.max(...geometry.controls.map((control) => control.top + control.height / 2))
     - Math.min(...geometry.controls.map((control) => control.top + control.height / 2))).toBeLessThanOrEqual(1);
   expect(Math.abs(geometry.navCenterY - geometry.menuCenterY)).toBeLessThanOrEqual(1);
+  expect(Math.abs(artCenterY - geometry.navCenterY)).toBeLessThanOrEqual(1);
+  expect(Math.abs(artCenterY - headerCenterY)).toBeLessThanOrEqual(1);
+  expect(geometry.art.height).toBeGreaterThanOrEqual(23);
+  expect(geometry.art.left).toBeGreaterThanOrEqual(geometry.header.left);
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
-  return { centers, navCenterY: geometry.navCenterY, menuCenterY: geometry.menuCenterY };
+  return {
+    centers,
+    artCenterY,
+    headerCenterY,
+    navCenterY: geometry.navCenterY,
+    menuCenterY: geometry.menuCenterY,
+  };
 }
 
 async function expectSameHorizontalNavigation(left: HeaderGeometry, right: HeaderGeometry): Promise<void> {
@@ -111,6 +137,8 @@ async function expectSameHorizontalNavigation(left: HeaderGeometry, right: Heade
   for (let index = 0; index < left.centers.length; index += 1) {
     expect(Math.abs(left.centers[index]! - right.centers[index]!)).toBeLessThanOrEqual(1);
   }
+  expect(Math.abs(left.artCenterY - right.artCenterY)).toBeLessThanOrEqual(1);
+  expect(Math.abs(left.headerCenterY - right.headerCenterY)).toBeLessThanOrEqual(1);
 }
 
 test.beforeEach(async ({ page }) => {

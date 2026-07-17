@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
@@ -176,12 +176,27 @@ type GuidedQuestionOption = {
   recommended?: boolean;
 };
 
+type GuidedQuestionGrounding = {
+  summary?: string;
+  sourceUrls?: string[];
+};
+
 type GuidedQuestion = {
   id: string;
   header?: string;
   question: string;
+  whyMaterial?: string;
+  grounding?: GuidedQuestionGrounding;
   options: GuidedQuestionOption[];
 };
+
+function guidanceSourceLabel(value: string): string {
+  try {
+    return new URL(value).hostname.replace(/^www\./u, "");
+  } catch {
+    return "source";
+  }
+}
 
 type GuidedAnswer = {
   questionId: string;
@@ -986,6 +1001,23 @@ function GuidedQuestionScreen({
         >
           {question.question}
         </h1>
+        {question.whyMaterial && (
+          <p className="guided-question-reason">
+            <span>WHY THIS MATTERS</span>
+            {question.whyMaterial}
+          </p>
+        )}
+        {question.grounding?.sourceUrls?.length ? (
+          <p className="guided-question-sources" aria-label="Sources for this question">
+            <span>SCOUTED FROM</span>
+            {question.grounding.sourceUrls.slice(0, 2).map((sourceUrl, index) => (
+              <Fragment key={sourceUrl}>
+                {index > 0 && <span aria-hidden="true"> · </span>}
+                <a href={sourceUrl} target="_blank" rel="noreferrer">{guidanceSourceLabel(sourceUrl)}</a>
+              </Fragment>
+            ))}
+          </p>
+        ) : null}
 
         <fieldset className="guided-options" disabled={busy || locked}>
           <legend className="sr-only">{question.question}</legend>

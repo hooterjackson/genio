@@ -12,11 +12,16 @@ import {
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { processNotificationJob } from "../server/notifications.ts";
 import { Repository } from "../server/repository.ts";
+import {
+  FAST_POST_MATCH_REFILL_LIMIT,
+  FAST_POST_MATCH_REFILL_MAX_COST_USD,
+  parseFastPostMatchRefillRouteCheckpoint,
+} from "../server/research-policy.ts";
 import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
 import { capabilityHash, hmacBase64Url, sha256Hex } from "../server/security.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
-import { GUIDED_BRIEF_BUDGET_USD } from "../shared/product-policy.ts";
+import { GUIDED_BRIEF_BUDGET_USD, GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import type {
   CitationAttestationInput,
   PlaylistBrief,
@@ -52,7 +57,7 @@ const evidenceBinding = {
   subjectRelationship: brief.relationship,
 };
 
-function guidanceQuestions(count: 2 | 3 = 2): PlaylistGuidanceQuestion[] {
+function guidanceQuestions(count: 1 | 2 | 3 = 2): PlaylistGuidanceQuestion[] {
   return Array.from({ length: count }, (_, questionIndex) => {
     const questionId = `q${questionIndex + 1}`;
     return {
@@ -182,6 +187,77 @@ databaseDescribe("hosted backend integration", () => {
       await adminPool.end();
     }
   }, 30_000);
+
+  async function createAutomaticRefillRun(
+    label: string,
+    status = "matching",
+  ): Promise<string> {
+    const runId = await repository.createRun(label, {
+      ...brief,
+      mode: "curated",
+      targetSize: { min: 50, max: 50 },
+    }, 0, 0.4);
+    await repository.pool.query(
+      `UPDATE research_runs SET auto_publish=true,status=$2,phase=$3,
+         actual_cost_usd=1.1,reserved_cost_usd=0.2,approved_budget_usd=0.4
+       WHERE id=$1`,
+      [runId, status, status === "matching" ? "catalog_matching" : status],
+    );
+    return runId;
+  }
+
+  async function seedRefillBaseline(runId: string): Promise<void> {
+    const sourceUrl = `https://music-history.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Refill baseline source",
+      sourceClass: "web",
+      provenanceRoot: "music-history.example",
+      note: "A cited integration-test source for the immutable refill baseline.",
+    }]);
+    const supported = [
+      { title: "Baseline Song One", selectionRank: 4 },
+      { title: "Baseline Song Two", selectionRank: 9 },
+    ].map(({ title, selectionRank }) => {
+      const citation = citationFixture(sourceUrl, title, "primary artist");
+      return { title, selectionRank, citation };
+    });
+    await repository.addCitationAttestations(runId, supported.map(({ citation }) => citation.attestation));
+    await repository.addCandidates(runId, [
+      ...supported.map(({ title, selectionRank, citation }) => ({
+        artist: "Integration Test Artist",
+        title,
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        selectionRank,
+        evidence: [{
+          sourceUrl,
+          state: "editorial" as const,
+          supportScope: "track" as const,
+          ...evidenceBinding,
+          relationship: "primary artist",
+          note: `${title} is supported by the cited editorial source.`,
+          citationSupport: citation.support,
+        }],
+      })),
+      {
+        artist: "Unverified Artist",
+        title: "Unverified Baseline Candidate",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        selectionRank: 17,
+        evidence: [],
+      },
+    ], sourceIds, "track_verification");
+  }
 
   test("applies the Postgres migration idempotently and reports schema readiness", async () => {
     const constraintBefore = await repository.pool.query<{ oid: string; convalidated: boolean }>(
@@ -848,6 +924,45 @@ databaseDescribe("hosted backend integration", () => {
     )).resolves.toMatchObject({ reservationId: expect.any(String) });
   });
 
+  test("accounts the canonical question scout against its own ceiling without reducing research allowance", async () => {
+    vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
+    const clientBucket = `guided-scout-partition-${randomUUID()}`;
+    const request = await repository.createBriefRequest({
+      prompt: "Canonical question scout accounting",
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+    });
+
+    const interpretation = await repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "brief.interpret:primary",
+      0.1,
+    );
+    await repository.reconcileProviderCost(interpretation.reservationId, 0.1);
+
+    const scout = await repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "brief.question_scout:primary",
+      GUIDED_SCOUT_BUDGET_USD,
+    );
+    await repository.reconcileProviderCost(scout.reservationId, GUIDED_SCOUT_BUDGET_USD);
+
+    await expect(repository.getBriefActualCostUsd(request.id)).resolves.toBeCloseTo(0.1, 6);
+    await expect(repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "brief.question_scout:overflow",
+      0.001,
+    )).rejects.toMatchObject({ statusCode: 402, code: "brief_budget_reached" });
+    await expect(repository.reserveProviderCost(
+      { briefRequestId: request.id },
+      "brief.interpret:remaining",
+      GUIDED_BRIEF_BUDGET_USD - 0.1,
+    )).resolves.toMatchObject({ reservationId: expect.any(String) });
+  });
+
   test("serializes concurrent guided reservations against one brief budget", async () => {
     vi.stubEnv("APP_MONTHLY_COST_LIMIT_USD", "100");
     const clientBucket = `guided-cost-concurrent-${randomUUID()}`;
@@ -1259,7 +1374,7 @@ databaseDescribe("hosted backend integration", () => {
     })).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
   });
 
-  test.each([2, 3] as const)(
+  test.each([1, 2, 3] as const)(
     "accepts one option or one custom answer for each of %i guided questions",
     async (questionCount) => {
       const clientBucket = `guided-${questionCount}-${randomUUID()}`;
@@ -1378,7 +1493,7 @@ databaseDescribe("hosted backend integration", () => {
     });
   });
 
-  test.each([1, 4])("rejects a stored guided flow with %i questions", async (questionCount) => {
+  test.each([0, 4])("rejects a stored guided flow with %i questions", async (questionCount) => {
     const clientBucket = `guided-count-invalid-${questionCount}-${randomUUID()}`;
     const request = await repository.createBriefRequest({
       prompt: "Invalid guided question count",
@@ -2449,8 +2564,192 @@ databaseDescribe("hosted backend integration", () => {
     expect(job.rows).toEqual([{
       payload_json: expect.objectContaining({ runId, storefront: "us", retryIncomplete: true, recoveryGeneration: 1 }),
       status: "queued",
-      max_attempts: 1,
+      max_attempts: 2,
     }]);
+  });
+
+  test("candidate-refill generation CAS is replay-safe and freezes its baseline, target, rank, and budget", async () => {
+    const runId = await createAutomaticRefillRun("Candidate refill generation CAS");
+    await seedRefillBaseline(runId);
+
+    const concurrent = await Promise.all([
+      repository.queueAutomaticCandidateRefill(runId, "US", 7, 0),
+      repository.queueAutomaticCandidateRefill(runId, "US", 7, 0),
+    ]);
+    expect(concurrent.sort()).toEqual(["in_flight", "queued"]);
+
+    const checkpointBefore = await repository.getResearchCheckpoint(
+      runId,
+      "fast:post-match-refill:1:route",
+    );
+    const route = parseFastPostMatchRefillRouteCheckpoint(checkpointBefore, 1);
+    expect(route).toMatchObject({
+      generation: 1,
+      additionalCandidateGoal: 7,
+      storefront: "us",
+      baselineEligibleCount: 2,
+      targetEligibleCount: 9,
+      baselineSelectionRank: 17,
+    });
+    const queued = await repository.pool.query<{
+      dedupe_key: string;
+      payload_json: Record<string, unknown>;
+      max_attempts: number;
+    }>(
+      `SELECT dedupe_key,payload_json,max_attempts FROM job_queue
+       WHERE run_id=$1 AND kind='research' AND payload_json->>'postMatchRefill'='true'`,
+      [runId],
+    );
+    expect(queued.rows).toEqual([{
+      dedupe_key: `research-refill:${runId}:1`,
+      payload_json: expect.objectContaining({
+        runId,
+        fast: true,
+        postMatchRefill: true,
+        refillGeneration: 1,
+        additionalCandidateGoal: 7,
+        storefront: "us",
+      }),
+      max_attempts: 2,
+    }]);
+    const runAfterQueue = await repository.pool.query<{
+      status: string;
+      phase: string;
+      actual_cost_usd: string;
+      reserved_cost_usd: string;
+      approved_budget_usd: string;
+    }>(
+      `SELECT status,phase,actual_cost_usd,reserved_cost_usd,approved_budget_usd
+       FROM research_runs WHERE id=$1`,
+      [runId],
+    );
+    expect(runAfterQueue.rows[0]).toMatchObject({
+      status: "researching",
+      phase: "catalog_refill_research",
+    });
+    expect(Number(runAfterQueue.rows[0]!.approved_budget_usd)).toBeCloseTo(
+      Number(runAfterQueue.rows[0]!.actual_cost_usd)
+        + Number(runAfterQueue.rows[0]!.reserved_cost_usd)
+        + FAST_POST_MATCH_REFILL_MAX_COST_USD,
+      6,
+    );
+
+    await repository.addCandidates(runId, [{
+      artist: "Later Artist",
+      title: "Later Candidate Must Not Move Baseline",
+      album: null,
+      releaseYear: null,
+      durationMs: null,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      selectionRank: 25,
+      evidence: [],
+    }], new Map(), "unverified");
+    await expect(repository.queueAutomaticCandidateRefill(runId, "us", 120, 0))
+      .resolves.toBe("in_flight");
+    expect(await repository.getResearchCheckpoint(runId, "fast:post-match-refill:1:route"))
+      .toEqual(checkpointBefore);
+    expect(Number((await repository.pool.query<{ approved_budget_usd: string }>(
+      "SELECT approved_budget_usd FROM research_runs WHERE id=$1",
+      [runId],
+    )).rows[0]!.approved_budget_usd)).toBeCloseTo(1.65, 6);
+  });
+
+  test("candidate refill refuses terminal runs without mutating jobs, checkpoints, or budget", async () => {
+    for (const status of ["complete", "publishing", "failed"] as const) {
+      const runId = await createAutomaticRefillRun(`Terminal candidate refill ${status}`, status);
+      await expect(repository.queueAutomaticCandidateRefill(runId, "us", 8, 0))
+        .resolves.toBe("not_needed");
+      const state = await repository.pool.query<{
+        jobs: number;
+        checkpoints: number;
+        approved_budget_usd: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::int FROM job_queue WHERE run_id=$1) jobs,
+           (SELECT count(*)::int FROM research_checkpoints
+             WHERE run_id=$1 AND phase LIKE 'fast:post-match-refill:%') checkpoints,
+           approved_budget_usd
+         FROM research_runs WHERE id=$1`,
+        [runId],
+      );
+      expect(state.rows[0]).toEqual({ jobs: 0, checkpoints: 0, approved_budget_usd: "0.400000" });
+    }
+  });
+
+  test("candidate refill caps at two generations and treats an older-generation replay as in flight", async () => {
+    const runId = await createAutomaticRefillRun("Candidate refill generation ceiling");
+    await expect(repository.queueAutomaticCandidateRefill(runId, "us", 8, 0)).resolves.toBe("queued");
+    await repository.pool.query(
+      `UPDATE job_queue SET status='complete',completed_at=now()
+       WHERE run_id=$1 AND dedupe_key=$2`,
+      [runId, `research-refill:${runId}:1`],
+    );
+    await expect(repository.queueAutomaticCandidateRefill(runId, "us", 8, 1)).resolves.toBe("queued");
+
+    // A generation-one matching lease may replay after generation two was
+    // committed but before its own completion was acknowledged. It must see
+    // the later durable handoff, not terminalize the run as exhausted.
+    await expect(repository.queueAutomaticCandidateRefill(runId, "us", 8, 1))
+      .resolves.toBe("in_flight");
+    await expect(repository.queueAutomaticCandidateRefill(runId, "us", 8, FAST_POST_MATCH_REFILL_LIMIT))
+      .resolves.toBe("exhausted");
+
+    const generations = await repository.pool.query<{
+      generation: string;
+      dedupe_key: string;
+    }>(
+      `SELECT payload_json->>'refillGeneration' generation,dedupe_key
+       FROM job_queue WHERE run_id=$1 AND kind='research'
+         AND payload_json->>'postMatchRefill'='true'
+       ORDER BY payload_json->>'refillGeneration'`,
+      [runId],
+    );
+    expect(generations.rows).toEqual([
+      { generation: "1", dedupe_key: `research-refill:${runId}:1` },
+      { generation: "2", dedupe_key: `research-refill:${runId}:2` },
+    ]);
+    expect(await repository.getResearchCheckpoint(runId, "fast:post-match-refill:3:route"))
+      .toBeNull();
+  });
+
+  test("candidate-refill research survives one expired lease before terminal failure", async () => {
+    const runId = await createAutomaticRefillRun("Candidate refill lease replay");
+    await expect(repository.queueAutomaticCandidateRefill(runId, "us", 8, 0)).resolves.toBe("queued");
+
+    const firstLease = await repository.leaseNextJob("refill-worker-one", 30_000);
+    expect(firstLease).toMatchObject({
+      runId,
+      kind: "research",
+      attempts: 1,
+      maxAttempts: 2,
+      payload: expect.objectContaining({ postMatchRefill: true, refillGeneration: 1 }),
+    });
+    await repository.pool.query(
+      "UPDATE job_queue SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [firstLease!.id],
+    );
+    const replayLease = await repository.leaseNextJob("refill-worker-two", 30_000);
+    expect(replayLease).toMatchObject({
+      id: firstLease!.id,
+      runId,
+      attempts: 2,
+      maxAttempts: 2,
+    });
+    expect((await repository.getRun(runId)).status).toBe("researching");
+
+    await repository.pool.query(
+      "UPDATE job_queue SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [firstLease!.id],
+    );
+    await expect(repository.leaseNextJob("refill-worker-final", 30_000)).resolves.toBeNull();
+    const terminal = await repository.pool.query<{ status: string; attempts: number }>(
+      "SELECT status,attempts FROM job_queue WHERE id=$1",
+      [firstLease!.id],
+    );
+    expect(terminal.rows[0]).toEqual({ status: "failed", attempts: 2 });
+    expect((await repository.getRun(runId)).status).toBe("failed");
   });
 
   test("One Command queues the next bounded recovery from inside the current matching lease", async () => {
@@ -2460,7 +2759,10 @@ databaseDescribe("hosted backend integration", () => {
       0,
       1,
     );
-    await repository.pool.query("UPDATE research_runs SET auto_publish=true WHERE id=$1", [runId]);
+    await repository.pool.query(
+      "UPDATE research_runs SET auto_publish=true,status='matching',phase='catalog_matching' WHERE id=$1",
+      [runId],
+    );
     await repository.addCandidates(runId, [{
       artist: "Recovery Artist", title: "Automatic Retry", album: null, releaseYear: null,
       durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [],
@@ -2480,25 +2782,41 @@ databaseDescribe("hosted backend integration", () => {
       [runId],
     );
 
-    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 0)).resolves.toBe("queued");
-    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 0)).resolves.toBe("in_flight");
+    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 0, 1)).resolves.toBe("queued");
+    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 0, 1)).resolves.toBe("in_flight");
     await repository.pool.query(
       `UPDATE job_queue SET status='leased',lease_owner='recovery-one',
          lease_expires_at=now()+interval '5 minutes'
        WHERE run_id=$1 AND payload_json->>'recoveryGeneration'='1'`,
       [runId],
     );
-    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 1)).resolves.toBe("queued");
+    await expect(repository.queueAutomaticCatalogRecovery(runId, "us", 1, 1)).resolves.toBe("queued");
 
-    const generations = await repository.pool.query<{ generation: string; status: string }>(
-      `SELECT payload_json->>'recoveryGeneration' generation,status
+    const generations = await repository.pool.query<{
+      generation: string;
+      refill_generation: string;
+      dedupe_key: string;
+      status: string;
+    }>(
+      `SELECT payload_json->>'recoveryGeneration' generation,
+              payload_json->>'refillGeneration' refill_generation,dedupe_key,status
        FROM job_queue WHERE run_id=$1 AND payload_json->>'retryIncomplete'='true'
        ORDER BY payload_json->>'recoveryGeneration'`,
       [runId],
     );
     expect(generations.rows).toEqual([
-      { generation: "1", status: "leased" },
-      { generation: "2", status: "queued" },
+      {
+        generation: "1",
+        refill_generation: "1",
+        dedupe_key: `matching-recovery:${runId}:1:refill:1`,
+        status: "leased",
+      },
+      {
+        generation: "2",
+        refill_generation: "1",
+        dedupe_key: `matching-recovery:${runId}:2:refill:1`,
+        status: "queued",
+      },
     ]);
   });
 

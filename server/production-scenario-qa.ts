@@ -4,6 +4,11 @@ import {
   PUBLIC_FAST_RESEARCH_BUDGET_USD,
 } from "../shared/product-policy.ts";
 import {
+  FAST_POST_MATCH_REFILL_LIMIT,
+  FAST_POST_MATCH_REFILL_MAX_COST_USD,
+  FAST_POST_MATCH_REFILL_RESEARCH_MS,
+  fastPostMatchRefillMatchingReserveMs,
+  fastPostMatchRefillPlan,
   researchExecutionPolicy,
   type FastResearchPolicy,
 } from "./research-policy.ts";
@@ -22,6 +27,10 @@ export interface ProductionScenarioReplayProfile {
   initialStrictMatchRate: number;
   retryableCatalogRate: number;
   recoverySuccessRate: number;
+  /** Yield from each bounded evidence-research refill request. */
+  refillCandidateYieldRate?: number;
+  /** Aggregate strict Apple yield for candidates added by a refill. */
+  refillStrictMatchRate?: number;
 }
 
 export interface ProductionScenarioObservation {
@@ -35,6 +44,7 @@ export interface ProductionScenarioObservation {
   activeWorkDurationMs: number;
   terminalStatus: string;
   terminalPhase: string;
+  postMatchRefillGenerations?: number;
 }
 
 export interface ProductionScenarioAssessment {
@@ -52,6 +62,12 @@ export interface ProductionScenarioReplay {
   retryableCatalogCount: number;
   recoveredCatalogCount: number;
   unavailableCatalogCount: number;
+  postMatchRefillGenerations: number;
+  refillCandidateGoals: number[];
+  refillCandidateCount: number;
+  refillStrictMatchedCount: number;
+  refillCostUsd: number;
+  refillDurationMs: number;
   candidateYieldRate: number;
   finalCatalogYieldRate: number;
 }
@@ -119,18 +135,28 @@ function simulateCandidateResearch(
   return { candidateCount, passes };
 }
 
-export function maximumScenarioActiveDurationMs(requestedTrackCount: number): number {
+export function maximumScenarioActiveDurationMs(
+  requestedTrackCount: number,
+  postMatchRefillGenerations = 0,
+): number {
+  const boundedRefillGenerations = Math.max(
+    0,
+    Math.min(FAST_POST_MATCH_REFILL_LIMIT, Math.floor(postMatchRefillGenerations)),
+  );
   return fastRunServiceLevel(
     positiveInteger(requestedTrackCount, "requestedTrackCount"),
-  ).runDeadlineMs;
+  ).runDeadlineMs + boundedRefillGenerations * (
+    FAST_POST_MATCH_REFILL_RESEARCH_MS + fastPostMatchRefillMatchingReserveMs(120)
+  );
 }
 
 /**
  * Replay an archived request against the actual deterministic fast-route
- * policy. This intentionally models only behavior that production implements:
- * pre-match evidence oversampling, strict unique Apple matches, and bounded
- * recovery of retryable Apple lookups. It does not invent a post-match
- * evidence-research refill.
+ * policy. This models pre-match evidence oversampling, strict unique Apple
+ * matches, bounded recovery of retryable Apple lookups, and the implemented
+ * post-match evidence-research refill. The refill uses the same planner,
+ * generation ceiling, cost ceiling, and immutable research/matching windows
+ * as production.
  */
 export function replayProductionScenario(
   brief: PlaylistBrief,
@@ -149,6 +175,14 @@ export function replayProductionScenario(
   const initialStrictMatchRate = boundedRate(profile.initialStrictMatchRate, "initialStrictMatchRate");
   const retryableCatalogRate = boundedRate(profile.retryableCatalogRate, "retryableCatalogRate");
   const recoverySuccessRate = boundedRate(profile.recoverySuccessRate, "recoverySuccessRate");
+  const refillCandidateYieldRate = boundedRate(
+    profile.refillCandidateYieldRate ?? profile.candidateYieldRate,
+    "refillCandidateYieldRate",
+  );
+  const refillStrictMatchRate = boundedRate(
+    profile.refillStrictMatchRate ?? profile.initialStrictMatchRate,
+    "refillStrictMatchRate",
+  );
   if (initialStrictMatchRate + retryableCatalogRate > 1) {
     throw new Error("Initial strict and retryable catalog rates cannot exceed 1 in total");
   }
@@ -160,13 +194,45 @@ export function replayProductionScenario(
     Math.floor(research.candidateCount * retryableCatalogRate),
   );
   const recoveredCatalogCount = Math.floor(retryableCatalogCount * recoverySuccessRate);
-  const strictMatchedCount = Math.min(
+  let strictMatchedCount = Math.min(
     research.candidateCount,
     initialStrictMatchedCount + recoveredCatalogCount,
   );
-  const unavailableCatalogCount = Math.max(0, research.candidateCount - strictMatchedCount);
-  const manifestTrackCount = Math.min(requestedTrackCount, strictMatchedCount);
-  const complete = manifestTrackCount === requestedTrackCount;
+  let candidateCount = research.candidateCount;
+  let refillCandidateCount = 0;
+  let refillStrictMatchedCount = 0;
+  let refillDurationMs = 0;
+  let refillCostUsd = 0;
+  const refillCandidateGoals: number[] = [];
+
+  for (let refillAttempts = 0; refillAttempts < FAST_POST_MATCH_REFILL_LIMIT; refillAttempts += 1) {
+    const refillPlan = fastPostMatchRefillPlan({
+      requestedMinimum: requestedTrackCount,
+      selectableCount: strictMatchedCount,
+      attemptedCandidateCount: candidateCount,
+      refillAttempts,
+    });
+    if (refillPlan.state !== "refill") break;
+    const goal = refillPlan.additionalCandidateGoal;
+    refillCandidateGoals.push(goal);
+    const returnedCandidates = Math.min(goal, Math.floor(goal * refillCandidateYieldRate));
+    const newStrictMatches = Math.min(
+      returnedCandidates,
+      Math.floor(returnedCandidates * refillStrictMatchRate),
+    );
+    candidateCount += returnedCandidates;
+    strictMatchedCount += newStrictMatches;
+    refillCandidateCount += returnedCandidates;
+    refillStrictMatchedCount += newStrictMatches;
+    refillCostUsd += FAST_POST_MATCH_REFILL_MAX_COST_USD;
+    refillDurationMs += FAST_POST_MATCH_REFILL_RESEARCH_MS
+      + fastPostMatchRefillMatchingReserveMs(goal);
+  }
+
+  const unavailableCatalogCount = Math.max(0, candidateCount - strictMatchedCount);
+  const complete = strictMatchedCount >= requestedTrackCount;
+  // Production locks no manifest when the exact count cannot be met safely.
+  const manifestTrackCount = complete ? requestedTrackCount : 0;
 
   const researchDurationMs = research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassDurationMs;
   const initialCatalogDurationMs = PRODUCTION_SCENARIO_REPLAY_TAPE.initialCatalogBaseDurationMs
@@ -178,16 +244,18 @@ export function replayProductionScenario(
 
   const observation: ProductionScenarioObservation = {
     requestedTrackCount,
-    candidateCount: research.candidateCount,
+    candidateCount,
     strictMatchedCount,
-    accountedCandidateCount: research.candidateCount,
+    accountedCandidateCount: candidateCount,
     manifestTrackCount,
     publishedTrackCount: manifestTrackCount,
     totalCostUsd: PRODUCTION_SCENARIO_REPLAY_TAPE.guidedBriefCostUsd
-      + research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassCostUsd,
-    activeWorkDurationMs: researchDurationMs + initialCatalogDurationMs + recoveryDurationMs,
+      + research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassCostUsd
+      + refillCostUsd,
+    activeWorkDurationMs: researchDurationMs + initialCatalogDurationMs + recoveryDurationMs + refillDurationMs,
     terminalStatus: complete ? "complete" : "failed",
     terminalPhase: complete ? "publication_complete" : "catalog_matching_shortfall",
+    postMatchRefillGenerations: refillCandidateGoals.length,
   };
 
   return {
@@ -199,8 +267,14 @@ export function replayProductionScenario(
     retryableCatalogCount,
     recoveredCatalogCount,
     unavailableCatalogCount,
+    postMatchRefillGenerations: refillCandidateGoals.length,
+    refillCandidateGoals,
+    refillCandidateCount,
+    refillStrictMatchedCount,
+    refillCostUsd,
+    refillDurationMs,
     candidateYieldRate: policy.candidateGoal === 0 ? 0 : research.candidateCount / policy.candidateGoal,
-    finalCatalogYieldRate: research.candidateCount === 0 ? 0 : strictMatchedCount / research.candidateCount,
+    finalCatalogYieldRate: candidateCount === 0 ? 0 : strictMatchedCount / candidateCount,
   };
 }
 
@@ -230,7 +304,10 @@ export function assessProductionScenario(
   if (observation.totalCostUsd > PUBLIC_FAST_RESEARCH_BUDGET_USD + Number.EPSILON) {
     violations.push(`cost_explosion:${observation.totalCostUsd.toFixed(6)}`);
   }
-  const latencyLimit = maximumScenarioActiveDurationMs(requested);
+  const latencyLimit = maximumScenarioActiveDurationMs(
+    requested,
+    observation.postMatchRefillGenerations ?? 0,
+  );
   if (observation.activeWorkDurationMs > latencyLimit) {
     violations.push(`latency_regression:${observation.activeWorkDurationMs}/${latencyLimit}`);
   }

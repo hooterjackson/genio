@@ -1,0 +1,443 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "paulinho-da-costa-credit-scope",
+      "prompt": "Build a deep Paulinho da Costa playlist",
+      "brief": {
+        "title": "Paulinho da Costa: Deep Credits",
+        "description": "Documented recordings featuring Paulinho da Costa.",
+        "mode": "curated",
+        "subjectEntities": ["Paulinho da Costa"],
+        "relationship": "performed on",
+        "include": ["released recordings"],
+        "exclude": ["unsupported album-wide expansion"],
+        "versionPolicy": "one canonical released recording",
+        "evidencePolicy": "track-level cited evidence",
+        "orderingPolicy": "editorial research rank",
+        "targetSize": { "min": 50, "max": 50 },
+        "ambiguities": []
+      },
+      "scout": {
+        "status": "complete",
+        "sourceHints": [
+          {
+            "url": "https://paulinho.com/about/",
+            "title": "Paulinho da Costa biography",
+            "excerpt": "Official biography context attesting the breadth and cross-genre character of the documented catalogue.",
+            "providerAttested": true
+          }
+        ]
+      },
+      "questions": [
+        {
+          "id": "q-credit-emphasis",
+          "decisionKey": "credit_emphasis",
+          "header": "CREDITS",
+          "question": "Which part of Paulinho da Costa's documented career should lead?",
+          "whyMaterial": "The subject's documented credits span landmark pop sessions, Brazilian collaborations, and many other genres; the emphasis changes the candidate pool.",
+          "grounding": { "summary": "The official biography attests an unusually broad, cross-genre credits catalogue.", "sourceUrls": ["https://paulinho.com/about/"] },
+          "options": [
+            {
+              "id": "hits-and-landmarks",
+              "label": "Landmark sessions",
+              "description": "Lead with widely recognized recordings whose credits are documented.",
+              "recommended": true,
+              "effect": { "kind": "research_preference", "value": "prioritize documented landmark sessions", "orderingBehavior": null }
+            },
+            {
+              "id": "brazilian-collaborations",
+              "label": "Brazilian collaborations",
+              "description": "Give Brazilian artists and repertoire greater representation.",
+              "recommended": false,
+              "effect": { "kind": "research_preference", "value": "prioritize documented Brazilian collaborations", "orderingBehavior": null }
+            },
+            {
+              "id": "cross-genre-range",
+              "label": "Cross-genre range",
+              "description": "Show the breadth of pop, jazz, soul, soundtrack, and Brazilian work.",
+              "recommended": false,
+              "effect": { "kind": "research_preference", "value": "maximize cross-genre representation among documented credits", "orderingBehavior": null }
+            }
+          ],
+          "candidatePoolProbe": {
+            "hits-and-landmarks": ["Michael Jackson — Don't Stop 'Til You Get Enough", "Lionel Richie — All Night Long"],
+            "brazilian-collaborations": ["João Gilberto — Aquarela do Brasil", "Djavan — Lilás"],
+            "cross-genre-range": ["George Benson — Give Me the Night", "Ella Fitzgerald — Vivo Sonhando"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "berlin-techno-scene-lineage",
+      "prompt": "50 influential Berlin techno tracks",
+      "brief": {
+        "title": "Berlin Techno: 50 Influential Tracks",
+        "description": "A documented history of influential Berlin techno recordings.",
+        "mode": "curated",
+        "subjectEntities": ["Berlin techno"],
+        "relationship": "historically influential within",
+        "include": ["released techno recordings associated with Berlin"],
+        "exclude": ["unsupported geographic associations"],
+        "versionPolicy": "one canonical version per track",
+        "evidencePolicy": "cited scene-history and editorial evidence",
+        "orderingPolicy": "editorial research rank",
+        "targetSize": { "min": 50, "max": 50 },
+        "ambiguities": []
+      },
+      "scout": {
+        "status": "complete",
+        "sourceHints": [
+          {
+            "url": "https://tresorberlin.com/",
+            "title": "Tresor Berlin",
+            "excerpt": "Provider-attested source context connecting Tresor's club and label history with Berlin techno.",
+            "providerAttested": true
+          }
+        ]
+      },
+      "questions": [
+        {
+          "id": "q-berlin-lineage",
+          "decisionKey": "scene_lineage",
+          "header": "LINEAGE",
+          "question": "Which Berlin techno lineage should carry the most weight?",
+          "whyMaterial": "Berlin techno contains distinct foundational, minimal/dub, and contemporary lineages that produce materially different selections.",
+          "grounding": { "summary": "Tresor's official history grounds a specific foundational axis within the wider Berlin scene.", "sourceUrls": ["https://tresorberlin.com/"] },
+          "options": [
+            {
+              "id": "reunification-foundations",
+              "label": "Reunification foundations",
+              "description": "Emphasize the early club and label network that defined the scene.",
+              "recommended": true,
+              "effect": { "kind": "subscene_focus", "value": "weight early post-reunification Berlin foundations", "orderingBehavior": null }
+            },
+            {
+              "id": "minimal-and-dub",
+              "label": "Minimal and dub continuum",
+              "description": "Give Berlin's minimal and dub-techno developments more space.",
+              "recommended": false,
+              "effect": { "kind": "subscene_focus", "value": "weight Berlin minimal and dub-techno lineages", "orderingBehavior": null }
+            },
+            {
+              "id": "contemporary-expansion",
+              "label": "Contemporary expansion",
+              "description": "Emphasize later artists who broadened the scene's sound and audience.",
+              "recommended": false,
+              "effect": { "kind": "subscene_focus", "value": "weight later Berlin techno expansion", "orderingBehavior": null }
+            }
+          ],
+          "candidatePoolProbe": {
+            "reunification-foundations": ["3 Phase feat. Dr. Motte — Der Klang der Familie", "Basic Channel — Phylyps Trak"],
+            "minimal-and-dub": ["Rhythm & Sound — Carrier", "Monolake — Cyan"],
+            "contemporary-expansion": ["Ellen Allien — Stadtkind", "Ben Klock — Subzero"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "radiohead-adjacent-discovery",
+      "prompt": "Songs that sound like Radiohead by other artists",
+      "brief": {
+        "title": "Beyond Radiohead",
+        "description": "Stylistically related recordings by artists other than Radiohead.",
+        "mode": "curated",
+        "subjectEntities": ["Radiohead"],
+        "relationship": "stylistically similar to the reference artist",
+        "include": ["recordings by other artists that are stylistically similar to Radiohead"],
+        "exclude": ["recordings by Radiohead"],
+        "versionPolicy": "one canonical version per track",
+        "evidencePolicy": "cited stylistic and editorial evidence",
+        "orderingPolicy": "smooth metadata-aware flow with artist and album intermixing",
+        "targetSize": { "min": 50, "max": 50 },
+        "ambiguities": []
+      },
+      "scout": {
+        "status": "complete",
+        "sourceHints": [
+          {
+            "url": "https://www.allmusic.com/artist/radiohead-mn0000326249/related",
+            "title": "Radiohead related artists",
+            "excerpt": "Related-artist source context attesting multiple stylistic branches around the reference artist.",
+            "providerAttested": true
+          }
+        ]
+      },
+      "questions": [
+        {
+          "id": "q-radiohead-axis",
+          "decisionKey": "similarity_axis",
+          "header": "SIMILARITY",
+          "question": "Which side of Radiohead's musical language should guide the discoveries?",
+          "whyMaterial": "Radiohead is a multi-period reference artist; choosing the art-rock, electronic, or hushed axis changes which other artists qualify.",
+          "grounding": { "summary": "The provider-attested related-artist source supports multiple stylistic branches around the seed artist.", "sourceUrls": ["https://www.allmusic.com/artist/radiohead-mn0000326249/related"] },
+          "options": [
+            {
+              "id": "art-rock-tension",
+              "label": "Art-rock tension",
+              "description": "Favor uneasy guitars, dynamic arrangements, and expressive vocals.",
+              "recommended": true,
+              "effect": { "kind": "familiarity_bias", "value": "favor art-rock tension and dynamic guitar arrangements", "orderingBehavior": null }
+            },
+            {
+              "id": "electronic-abstraction",
+              "label": "Electronic abstraction",
+              "description": "Favor fractured rhythm, electronics, and studio experimentation.",
+              "recommended": false,
+              "effect": { "kind": "familiarity_bias", "value": "favor electronic abstraction and fractured rhythm", "orderingBehavior": null }
+            },
+            {
+              "id": "hushed-melancholy",
+              "label": "Hushed melancholy",
+              "description": "Favor intimate, spacious, and emotionally restrained recordings.",
+              "recommended": false,
+              "effect": { "kind": "familiarity_bias", "value": "favor hushed spacious melancholy", "orderingBehavior": null }
+            }
+          ],
+          "candidatePoolProbe": {
+            "art-rock-tension": ["The Notwist — Pilot", "Everything Everything — Duet"],
+            "electronic-abstraction": ["Autechre — Bike", "Apparat — Arcadia"],
+            "hushed-melancholy": ["Low — Lullaby", "Grizzly Bear — Foreground"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "wandelweiser-listening-mode",
+      "prompt": "An introduction to Wandelweiser recordings",
+      "brief": {
+        "title": "Wandelweiser Introduction",
+        "description": "An introductory selection from the Wandelweiser compositional community.",
+        "mode": "curated",
+        "subjectEntities": ["Wandelweiser"],
+        "relationship": "representative of",
+        "include": ["released Wandelweiser-associated recordings"],
+        "exclude": ["unsupported stylistic lookalikes"],
+        "versionPolicy": "one representative released performance per work",
+        "evidencePolicy": "composer, label, or specialist-source evidence",
+        "orderingPolicy": "editorial progression",
+        "targetSize": { "min": 25, "max": 25 },
+        "ambiguities": []
+      },
+      "scout": {
+        "status": "complete",
+        "sourceHints": [
+          {
+            "url": "https://www.wandelweiser.de/",
+            "title": "Wandelweiser composers ensemble",
+            "excerpt": "Official collective context attesting the range of composers and approaches represented by Wandelweiser.",
+            "providerAttested": true
+          }
+        ]
+      },
+      "questions": [
+        {
+          "id": "q-wandelweiser-entry",
+          "decisionKey": "listening_mode",
+          "header": "ENTRY POINT",
+          "question": "What should make the Wandelweiser introduction approachable?",
+          "whyMaterial": "Instrumental detail, silence/duration, and text/environment are meaningfully different entry points into this specialist catalogue.",
+          "grounding": { "summary": "The collective's official catalogue attests multiple composers and approaches within Wandelweiser.", "sourceUrls": ["https://www.wandelweiser.de/"] },
+          "options": [
+            {
+              "id": "instrumental-detail",
+              "label": "Instrumental detail",
+              "description": "Lead with sparse works whose instrumental events remain easy to follow.",
+              "recommended": true,
+              "effect": { "kind": "research_preference", "value": "lead with sparse, instrumentally legible Wandelweiser works", "orderingBehavior": null }
+            },
+            {
+              "id": "silence-and-duration",
+              "label": "Silence and duration",
+              "description": "Center long durations, silence, and very low event density.",
+              "recommended": false,
+              "effect": { "kind": "research_preference", "value": "center silence, duration, and low event density", "orderingBehavior": null }
+            },
+            {
+              "id": "text-and-environment",
+              "label": "Text and environment",
+              "description": "Favor works involving text, place, field sound, or environmental listening.",
+              "recommended": false,
+              "effect": { "kind": "research_preference", "value": "favor text, place, and environmental listening", "orderingBehavior": null }
+            }
+          ],
+          "candidatePoolProbe": {
+            "instrumental-detail": ["Jürg Frey — String Quartet No. 2"],
+            "silence-and-duration": ["Antoine Beuger — calme étendue (spinoza)"],
+            "text-and-environment": ["Manfred Werder — 2005/1"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "funana-era-and-texture",
+      "prompt": "A deep playlist of Cape Verdean funaná",
+      "brief": {
+        "title": "Deep Funaná",
+        "description": "A cross-era selection of Cape Verdean funaná.",
+        "mode": "curated",
+        "subjectEntities": ["funaná", "Cape Verde"],
+        "relationship": "representative of",
+        "include": ["released Cape Verdean funaná recordings"],
+        "exclude": ["unrelated lusophone dance music"],
+        "versionPolicy": "one canonical version per track",
+        "evidencePolicy": "cited cultural, label, or specialist evidence",
+        "orderingPolicy": "editorial progression",
+        "targetSize": { "min": 50, "max": 50 },
+        "ambiguities": []
+      },
+      "scout": {
+        "status": "complete",
+        "sourceHints": [
+          {
+            "url": "https://folkways.si.edu/",
+            "title": "Smithsonian Folkways",
+            "excerpt": "Cultural-source context attesting acoustic instrumentation and later transformations in Cape Verdean funaná.",
+            "providerAttested": true
+          }
+        ]
+      },
+      "questions": [
+        {
+          "id": "q-funana-texture",
+          "decisionKey": "era_texture",
+          "header": "TEXTURE",
+          "question": "Which funaná texture should anchor the playlist?",
+          "whyMaterial": "Acoustic roots, electrified classics, and revival recordings lead to different eras, instrumentation, and artists.",
+          "grounding": { "summary": "The cultural source grounds the distinction between acoustic instrumentation and later transformations.", "sourceUrls": ["https://folkways.si.edu/"] },
+          "options": [
+            {
+              "id": "acoustic-roots",
+              "label": "Acoustic roots",
+              "description": "Prioritize gaita-and-ferrinho recordings and foundational performers.",
+              "recommended": true,
+              "effect": { "kind": "subscene_focus", "value": "prioritize acoustic gaita-and-ferrinho funaná", "orderingBehavior": null }
+            },
+            {
+              "id": "electrified-classics",
+              "label": "Electrified classics",
+              "description": "Emphasize the amplified and band-led recordings that broadened the genre.",
+              "recommended": false,
+              "effect": { "kind": "subscene_focus", "value": "prioritize electrified band-led funaná classics", "orderingBehavior": null }
+            },
+            {
+              "id": "modern-revival",
+              "label": "Modern revival",
+              "description": "Give contemporary reinterpretations and diaspora recordings more room.",
+              "recommended": false,
+              "effect": { "kind": "subscene_focus", "value": "prioritize contemporary and diaspora funaná revival", "orderingBehavior": null }
+            }
+          ],
+          "candidatePoolProbe": {
+            "acoustic-roots": ["Bitori — Munana"],
+            "electrified-classics": ["Bulimundo — Bulimundo"],
+            "modern-revival": ["Ferro Gaita — Rei di Tabanka"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "tamil-nadaswaram-context",
+      "prompt": "Tamil nadaswaram recordings for someone new to the tradition",
+      "brief": {
+        "title": "Tamil Nadaswaram Introduction",
+        "description": "An introductory selection of Tamil nadaswaram recordings.",
+        "mode": "curated",
+        "subjectEntities": ["nadaswaram", "Tamil music"],
+        "relationship": "representative of",
+        "include": ["released recordings centered on nadaswaram"],
+        "exclude": ["recordings where nadaswaram is incidental"],
+        "versionPolicy": "one representative released performance",
+        "evidencePolicy": "cited artist, institution, or specialist evidence",
+        "orderingPolicy": "editorial progression",
+        "targetSize": { "min": 25, "max": 25 },
+        "ambiguities": []
+      },
+      "scout": {
+        "status": "complete",
+        "sourceHints": [
+          {
+            "url": "https://www.sangeetnatak.gov.in/",
+            "title": "Sangeet Natak Akademi",
+            "excerpt": "Institutional source context attesting performance traditions and recognized nadaswaram artists.",
+            "providerAttested": true
+          }
+        ]
+      },
+      "questions": [
+        {
+          "id": "q-nadaswaram-context",
+          "decisionKey": "performance_context",
+          "header": "CONTEXT",
+          "question": "Which nadaswaram performance context should be the main entry point?",
+          "whyMaterial": "Concert raga, ceremonial repertoire, and virtuoso lineages lead to materially different works and recordings.",
+          "grounding": { "summary": "The institutional source grounds recognized artists and multiple performance contexts for nadaswaram.", "sourceUrls": ["https://www.sangeetnatak.gov.in/"] },
+          "options": [
+            {
+              "id": "concert-raga",
+              "label": "Concert raga",
+              "description": "Lead with sustained raga development and major concert performers.",
+              "recommended": true,
+              "effect": { "kind": "research_preference", "value": "prioritize concert raga development on nadaswaram", "orderingBehavior": null }
+            },
+            {
+              "id": "ceremonial-repertoire",
+              "label": "Ceremonial repertoire",
+              "description": "Emphasize processional, temple, and wedding-associated repertoire.",
+              "recommended": false,
+              "effect": { "kind": "research_preference", "value": "prioritize ceremonial and temple nadaswaram repertoire", "orderingBehavior": null }
+            },
+            {
+              "id": "virtuoso-lineages",
+              "label": "Virtuoso lineages",
+              "description": "Organize discoveries around major players and documented stylistic lineages.",
+              "recommended": false,
+              "effect": { "kind": "research_preference", "value": "prioritize documented nadaswaram virtuoso lineages", "orderingBehavior": null }
+            }
+          ],
+          "candidatePoolProbe": {
+            "concert-raga": ["T. N. Rajarathinam Pillai — Thodi"],
+            "ceremonial-repertoire": ["Sheik Chinna Moulana — Mallari"],
+            "virtuoso-lineages": ["Namagiripettai Krishnan — Kambhoji"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "precise-no-followup",
+      "prompt": "25 tracks by artists other than Radiohead, from 1995 through 2010, emphasizing electronic abstraction rather than guitar rock, ordered chronologically",
+      "brief": {
+        "title": "Radiohead-Adjacent Electronics: 1995–2010",
+        "description": "A precise chronological electronic-art-rock discovery request.",
+        "mode": "curated",
+        "subjectEntities": ["Radiohead"],
+        "relationship": "stylistically similar to the reference artist",
+        "include": ["1995–2010 recordings by other artists emphasizing electronic abstraction"],
+        "exclude": ["recordings by Radiohead", "guitar-led art rock"],
+        "versionPolicy": "one canonical version per track",
+        "evidencePolicy": "cited stylistic evidence",
+        "orderingPolicy": "chronological by release year",
+        "targetSize": { "min": 25, "max": 25 },
+        "ambiguities": []
+      },
+      "scout": { "status": "skipped_precise", "sourceHints": [] },
+      "questions": []
+    }
+  ],
+  "degradationCases": [
+    { "id": "scout-timeout", "failure": "timeout", "availableQuestions": [], "expectedQuestionCount": 0 },
+    { "id": "scout-budget-exhausted", "failure": "budget", "availableQuestions": [], "expectedQuestionCount": 0 },
+    { "id": "scout-provider-failure", "failure": "provider", "availableQuestions": [], "expectedQuestionCount": 0 },
+    {
+      "id": "partial-question-validation",
+      "failure": "invalid_question",
+      "availableQuestions": [
+        { "id": "valid-subject-question", "valid": true },
+        { "id": "generic-flow-question", "valid": false },
+        { "id": "duplicate-options-question", "valid": false }
+      ],
+      "expectedSalvagedQuestionIds": ["valid-subject-question"],
+      "expectedQuestionCount": 1
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 2,
-  "source": "production audit captured 2026-07-16",
+  "schemaVersion": 3,
+  "source": "production audits captured 2026-07-16 through 2026-07-17",
   "replayProfiles": {
     "nominal": {
       "candidateYieldRate": 0.9,
@@ -25,9 +25,17 @@
       "initialStrictMatchRate": 0.62,
       "retryableCatalogRate": 0.12,
       "recoverySuccessRate": 0.75
+    },
+    "rio-88-to-42-refill": {
+      "candidateYieldRate": 1,
+      "initialStrictMatchRate": 0.4772727272727273,
+      "retryableCatalogRate": 0,
+      "recoverySuccessRate": 0,
+      "refillCandidateYieldRate": 1,
+      "refillStrictMatchRate": 0.4
     }
   },
-  "scenarioCount": 25,
+  "scenarioCount": 26,
   "scenarios": [
     {
       "id": "2026-07-16-01",
@@ -228,6 +236,14 @@
       "expectedOutcome": "exact_playlist",
       "replayProfile": "catalog-shortfall",
       "failureClasses": ["research_under_yield", "catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-17-26",
+      "prompt": "50 Rio de Janeiro songs",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "rio-88-to-42-refill",
+      "failureClasses": ["catalog_shortfall"]
     }
   ]
 }

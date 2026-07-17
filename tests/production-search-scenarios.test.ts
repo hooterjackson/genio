@@ -62,15 +62,16 @@ function canonicalScenarioBrief(scenario: ArchivedScenario): PlaylistBrief {
 
 describe("retained production searches", () => {
   test("contains every retained brief attempt from the production audit", () => {
-    expect(fixture.schemaVersion).toBe(2);
+    expect(fixture.schemaVersion).toBe(3);
     expect(fixture.scenarios).toHaveLength(fixture.scenarioCount);
-    expect(fixture.scenarioCount).toBe(25);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(25);
+    expect(fixture.scenarioCount).toBe(26);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(26);
     expect(Object.keys(fixture.replayProfiles).sort()).toEqual([
       "catalog-shortfall",
       "large-target",
       "nominal",
       "research-under-yield",
+      "rio-88-to-42-refill",
     ]);
     for (const scenario of fixture.scenarios) {
       expect(scenario.expectedOutcome).toBe("exact_playlist");
@@ -107,7 +108,7 @@ describe("retained production searches", () => {
       const assessment = assessProductionScenario(replay.observation, scenario.expectedOutcome);
       const requested = replay.observation.requestedTrackCount;
 
-      expect(profile.candidateYieldRate).toBeLessThan(1);
+      expect(profile.candidateYieldRate).toBeLessThanOrEqual(1);
       expect(replay.observation.candidateCount).toBeGreaterThanOrEqual(requested);
       expect(replay.observation.strictMatchedCount).toBeGreaterThanOrEqual(requested);
       expect(replay.observation.manifestTrackCount).toBe(requested);
@@ -115,7 +116,7 @@ describe("retained production searches", () => {
       expect(replay.observation.accountedCandidateCount).toBe(replay.observation.candidateCount);
       expect(replay.observation.totalCostUsd).toBeLessThanOrEqual(PUBLIC_FAST_RESEARCH_BUDGET_USD);
       expect(replay.observation.activeWorkDurationMs).toBeLessThanOrEqual(
-        maximumScenarioActiveDurationMs(requested),
+        maximumScenarioActiveDurationMs(requested, replay.postMatchRefillGenerations),
       );
       expect(assessment).toEqual({
         releaseReady: true,
@@ -145,6 +146,72 @@ describe("retained production searches", () => {
     expect(exercised.length).toBeGreaterThan(0);
     expect(exercised.every((row) => row.reserveWasNecessary)).toBe(true);
     expect(exercised.some((row) => row.recoveryWasUsed)).toBe(true);
+  });
+
+  test("the promoted Rio regression recovers 88 candidates and 42 strict matches to an exact 50-track playlist", () => {
+    const scenario = fixture.scenarios.find((row) => row.id === "2026-07-17-26");
+    expect(scenario).toBeDefined();
+    const replay = replayProductionScenario(
+      canonicalScenarioBrief(scenario!),
+      fixture.replayProfiles[scenario!.replayProfile]!,
+    );
+
+    expect(replay.candidateGoal).toBe(88);
+    expect(replay.initialStrictMatchedCount).toBe(42);
+    expect(replay.recoveredCatalogCount).toBe(0);
+    expect(replay.postMatchRefillGenerations).toBe(1);
+    expect(replay.refillCandidateGoals).toEqual([21]);
+    expect(replay.refillCandidateCount).toBe(21);
+    expect(replay.refillStrictMatchedCount).toBe(8);
+    expect(replay.observation).toMatchObject({
+      requestedTrackCount: 50,
+      strictMatchedCount: 50,
+      manifestTrackCount: 50,
+      publishedTrackCount: 50,
+      terminalStatus: "complete",
+      terminalPhase: "publication_complete",
+      postMatchRefillGenerations: 1,
+    });
+    expect(assessProductionScenario(replay.observation, "exact_playlist")).toEqual({
+      releaseReady: true,
+      failClosed: false,
+      violations: [],
+    });
+  });
+
+  test("post-match refill stops after two bounded generations and fails closed", () => {
+    const brief = canonicalScenarioBrief({
+      id: "bounded-refill-failure",
+      prompt: "50 impossibly obscure recordings",
+      expectedTrackCount: 50,
+      expectedOutcome: "explicit_failure",
+      replayProfile: "bounded-refill-failure",
+      failureClasses: ["catalog_shortfall"],
+    });
+    const replay = replayProductionScenario(brief, {
+      candidateYieldRate: 1,
+      initialStrictMatchRate: 0.25,
+      retryableCatalogRate: 0,
+      recoverySuccessRate: 0,
+      refillCandidateYieldRate: 1,
+      refillStrictMatchRate: 0,
+    });
+
+    expect(replay.postMatchRefillGenerations).toBe(2);
+    expect(replay.refillCandidateGoals).toHaveLength(2);
+    expect(replay.refillCostUsd).toBe(0.7);
+    expect(replay.observation).toMatchObject({
+      manifestTrackCount: 0,
+      publishedTrackCount: 0,
+      terminalStatus: "failed",
+      terminalPhase: "catalog_matching_shortfall",
+      postMatchRefillGenerations: 2,
+    });
+    expect(assessProductionScenario(replay.observation, "explicit_failure")).toEqual({
+      releaseReady: true,
+      failClosed: true,
+      violations: [],
+    });
   });
 
   test("a historical 50-to-28 result is a visible release failure, never a smaller success", () => {

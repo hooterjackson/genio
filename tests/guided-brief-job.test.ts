@@ -176,28 +176,25 @@ test("guided finalization cannot turn a similarity seed into the playlist's reco
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
-test("a billed preflight response is reconciled when invalid questions are replaced by safe fallbacks", async () => {
+test("a billed but invalid question-scout response degrades to a completed brief", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-invalid-response");
-  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
-    id: "response-guided-invalid",
-    model: "test-model",
-    usage: { input_tokens: 500, output_tokens: 200 },
-    output_text: JSON.stringify({
-      brief: draftBrief,
-      // Reproduce a provider/schema failure after OpenAI has already billed
-      // and returned usage. The application must not release that spend.
-      scopeQuestions: [],
-      flowQuestion: {
-        header: "Flow",
-        question: "How should the playlist move?",
-        options: [
-          { label: "Gentle", description: "Build gradually." },
-          { label: "Energetic", description: "Stay energetic." },
-          { label: "Surprising", description: "Use contrast." },
-        ],
-      },
-    }),
-  }), {
+  const providerResponses = [
+    {
+      id: "response-guided-brief",
+      model: "test-model",
+      usage: { input_tokens: 500, output_tokens: 200 },
+      output_text: JSON.stringify(draftBrief),
+    },
+    {
+      id: "response-guided-invalid-scout",
+      model: "test-model",
+      usage: { input_tokens: 400, output_tokens: 80 },
+      // Reproduce a semantic failure after the optional scout has already
+      // returned billable usage. The playlist brief must still proceed.
+      output_text: "not-json",
+    },
+  ];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(providerResponses.shift()), {
     status: 200,
     headers: { "content-type": "application/json" },
   })));
@@ -213,7 +210,7 @@ test("a billed preflight response is reconciled when invalid questions are repla
       model: "test-model",
       status: "queued" as const,
     })),
-    reserveProviderCost: vi.fn(async () => ({ reservationId: "reservation-guided-invalid" })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({ reservationId: `reservation-${operation}` })),
     reconcileProviderCost,
     releaseProviderCost,
     saveBriefResult,
@@ -223,27 +220,159 @@ test("a billed preflight response is reconciled when invalid questions are repla
     briefRequestId: "brief-guided-invalid",
   })).resolves.toBeUndefined();
 
-  expect(reconcileProviderCost).toHaveBeenCalledOnce();
+  expect(reconcileProviderCost).toHaveBeenCalledTimes(2);
   expect(reconcileProviderCost).toHaveBeenCalledWith(
-    "reservation-guided-invalid",
+    expect.stringContaining("brief.interpret"),
     expect.any(Number),
-    expect.objectContaining({
-      input_tokens: 500,
-      output_tokens: 200,
-      model: "test-model",
-    }),
+    expect.objectContaining({ input_tokens: 500, output_tokens: 200, model: "test-model" }),
+  );
+  expect(reconcileProviderCost).toHaveBeenCalledWith(
+    expect.stringContaining("brief.question_scout"),
+    expect.any(Number),
+    expect.objectContaining({ input_tokens: 400, output_tokens: 80, model: "test-model" }),
   );
   expect(releaseProviderCost).not.toHaveBeenCalled();
   expect(saveBriefResult).toHaveBeenCalledWith(
     "brief-guided-invalid",
     expect.objectContaining({
-      status: "awaiting_answers",
+      status: "complete",
       expectedStatus: "queued",
       brief: expect.objectContaining({ title: draftBrief.title }),
-      questions: expect.arrayContaining([
-        expect.objectContaining({ id: "q1", options: expect.any(Array) }),
-        expect.objectContaining({ id: "q2", header: "Flow", options: expect.any(Array) }),
-      ]),
+      questions: [],
+      guidanceSourceHints: [],
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "scout_unavailable",
+        acceptedQuestionCount: 0,
+      }),
+      estimateUsd: expect.any(Number),
+      error: null,
+    }),
+  );
+});
+
+test("a question-scout provider failure releases only the scout reservation and completes without questions", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-provider-failure");
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      id: "response-guided-provider-brief",
+      model: "test-model",
+      usage: { input_tokens: 500, output_tokens: 200 },
+      output_text: JSON.stringify(draftBrief),
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      error: { message: "Question scout is temporarily unavailable" },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const reconcileProviderCost = vi.fn(async () => undefined);
+  const releaseProviderCost = vi.fn(async () => undefined);
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-guided-provider-failure",
+      prompt: "An introduction to Wandelweiser recordings",
+      requestedTrackCount: 25,
+      model: "test-model",
+      status: "queued" as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({ reservationId: `reservation-${operation}` })),
+    reconcileProviderCost,
+    releaseProviderCost,
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await expect(processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-guided-provider-failure",
+  })).resolves.toBeUndefined();
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(reconcileProviderCost).toHaveBeenCalledTimes(1);
+  expect(releaseProviderCost).toHaveBeenCalledOnce();
+  expect(releaseProviderCost).toHaveBeenCalledWith(expect.stringContaining("brief.question_scout"));
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-guided-provider-failure",
+    expect.objectContaining({
+      status: "complete",
+      expectedStatus: "queued",
+      questions: [],
+      guidanceSourceHints: [],
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "scout_unavailable",
+        acceptedQuestionCount: 0,
+        validationIssues: ["scout:provider_unavailable"],
+      }),
+      estimateUsd: expect.any(Number),
+      error: null,
+    }),
+  );
+});
+
+test("an exhausted scout-only budget skips follow-up questions without failing the brief", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-scout-budget");
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    id: "response-guided-budget-brief",
+    model: "test-model",
+    usage: { input_tokens: 500, output_tokens: 200 },
+    output_text: JSON.stringify(draftBrief),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const reconcileProviderCost = vi.fn(async () => undefined);
+  const releaseProviderCost = vi.fn(async () => undefined);
+  const saveBriefResult = vi.fn(async () => undefined);
+  let reservationCall = 0;
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-guided-scout-budget",
+      prompt: "An introduction to Tamil nadaswaram recordings",
+      requestedTrackCount: 25,
+      model: "test-model",
+      status: "queued" as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => {
+      reservationCall += 1;
+      if (reservationCall === 2) {
+        throw Object.assign(new Error("Playlist guidance reached its cost limit"), {
+          statusCode: 402,
+          code: "brief_budget_reached",
+        });
+      }
+      return { reservationId: `reservation-${operation}` };
+    }),
+    reconcileProviderCost,
+    releaseProviderCost,
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await expect(processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-guided-scout-budget",
+  })).resolves.toBeUndefined();
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(reconcileProviderCost).toHaveBeenCalledTimes(1);
+  expect(releaseProviderCost).not.toHaveBeenCalled();
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-guided-scout-budget",
+    expect.objectContaining({
+      status: "complete",
+      expectedStatus: "queued",
+      questions: [],
+      guidanceSourceHints: [],
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "scout_unavailable",
+        acceptedQuestionCount: 0,
+        validationIssues: ["scout:budget_unavailable"],
+      }),
+      estimateUsd: expect.any(Number),
       error: null,
     }),
   );

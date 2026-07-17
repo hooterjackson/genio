@@ -115,9 +115,16 @@ class MemoryMatchingRepository implements MatchingRepository {
   readonly updates: Array<Record<string, unknown>> = [];
 
   readonly bulkTimeoutWrites: Array<{ candidateIds: string[]; basis: string }> = [];
-  readonly automaticRecoveries: Array<{ runId: string; storefront: string; currentGeneration: number }> = [];
+  readonly automaticRecoveries: Array<{
+    runId: string;
+    storefront: string;
+    currentGeneration: number;
+    currentRefillGeneration: number;
+  }> = [];
+  readonly automaticRefills: Array<{ runId: string; storefront: string; additionalCandidateGoal: number; currentGeneration: number }> = [];
   readonly automaticPublications: string[] = [];
   automaticRecoveryState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
+  automaticRefillState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
 
   constructor(
     readonly candidates: Candidate[],
@@ -152,9 +159,18 @@ class MemoryMatchingRepository implements MatchingRepository {
   }
   async getResearchCheckpoint(_runId: string, phase: string) { return this.checkpointsByPhase.get(phase) ?? null; }
   async saveResearchCheckpoint(_runId: string, _phase: string, checkpoint: unknown) { this.checkpoints.push(checkpoint); }
-  async queueAutomaticCatalogRecovery(runId: string, storefront: string, currentGeneration: number) {
-    this.automaticRecoveries.push({ runId, storefront, currentGeneration });
+  async queueAutomaticCatalogRecovery(
+    runId: string,
+    storefront: string,
+    currentGeneration: number,
+    currentRefillGeneration = 0,
+  ) {
+    this.automaticRecoveries.push({ runId, storefront, currentGeneration, currentRefillGeneration });
     return this.automaticRecoveryState;
+  }
+  async queueAutomaticCandidateRefill(runId: string, storefront: string, additionalCandidateGoal: number, currentGeneration: number) {
+    this.automaticRefills.push({ runId, storefront, additionalCandidateGoal, currentGeneration });
+    return this.automaticRefillState;
   }
   async queueAutomaticPublication(runId: string) { this.automaticPublications.push(runId); }
 }
@@ -345,6 +361,7 @@ test("One Command shortfalls fail clearly instead of polling an unowned review s
     runId: "run-1",
     storefront: "us",
     currentGeneration: 0,
+    currentRefillGeneration: 0,
   }]);
   expect(repository.automaticPublications).toEqual([]);
 });
@@ -381,6 +398,7 @@ test("One Command queues bounded Apple recovery before terminalizing a retryable
     runId: "run-1",
     storefront: "us",
     currentGeneration: 1,
+    currentRefillGeneration: 0,
   }]);
   expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
   expect(repository.automaticPublications).toEqual([]);
@@ -657,12 +675,21 @@ test("fast matching propagates the authorization-required sentinel for durable h
   expect(repository.matches).toHaveLength(0);
 });
 
-test.each([
-  new AppleApiError("Invalid catalog request", 400, false),
-  new Error("catalog response mapper crashed"),
-])("fast matching fails rather than relabeling non-transient errors: $message", async (error) => {
+test("fast matching isolates a candidate-specific Apple 400 and continues", async () => {
+  const error = new AppleApiError("Invalid catalog request", 400, false);
   vi.mocked(lookupAppleCatalogByIsrc).mockRejectedValueOnce(error);
   const repository = fastRepository([candidate("non-transient", "verified")]);
+
+  await expect(matchResearchRun(repository, "run", "us", undefined, { fast: true })).resolves.toBeUndefined();
+  expect(repository.matches).toEqual([
+    expect.objectContaining({ candidateId: "non-transient", status: "unavailable", song: null }),
+  ]);
+});
+
+test("fast matching still propagates a non-Apple mapper failure", async () => {
+  const error = new Error("catalog response mapper crashed");
+  vi.mocked(lookupAppleCatalogByIsrc).mockRejectedValueOnce(error);
+  const repository = fastRepository([candidate("mapper-error", "verified")]);
 
   await expect(matchResearchRun(repository, "run", "us", undefined, { fast: true })).rejects.toBe(error);
   expect(repository.matches).toHaveLength(0);

@@ -10,6 +10,8 @@ import type {
   PlaylistBrief,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
+  PlaylistGuidanceSourceHint,
+  PlaylistGuidanceTelemetry,
   PlaylistManifest,
   PublicPlaylistDirectoryItem,
   PublicPlaylistDirectoryPage,
@@ -20,6 +22,7 @@ import type {
 } from "../shared/types.ts";
 import {
   GUIDED_BRIEF_BUDGET_USD,
+  GUIDED_SCOUT_BUDGET_USD,
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
 } from "../shared/product-policy.ts";
@@ -46,7 +49,10 @@ import {
 import { readCostConfiguration } from "./cost-config.ts";
 import { resolveEvidenceIntegrity } from "./evidence-integrity.ts";
 import {
+  createFastPostMatchRefillRouteCheckpoint,
+  FAST_POST_MATCH_REFILL_MAX_COST_USD,
   createFastRouteCheckpoint,
+  FAST_POST_MATCH_REFILL_LIMIT,
   researchExecutionPolicy,
   researchPolicyFingerprint,
 } from "./research-policy.ts";
@@ -76,6 +82,11 @@ import {
   type FeedbackSubmissionInput,
   type FeedbackSubmissionRecord,
 } from "./feedback.ts";
+import {
+  deriveGuidancePreferences,
+  guidanceOrderingPolicy,
+  type PlaylistGuidancePreference,
+} from "./guidance-context.ts";
 
 // Global capacity protects paid/worker work, not saved visitor state. A run
 // waiting on scope review, budget approval, track selection, or Apple
@@ -88,6 +99,14 @@ const CAPACITY_RUN_STATUSES = [
   "matching",
   "publishing",
 ];
+
+export function isGuidanceScoutOperation(operation: string): boolean {
+  return operation === "brief.question_scout"
+    || operation.startsWith("brief.question_scout:")
+    // Read legacy development reservations safely during rollout.
+    || operation === "brief.scout"
+    || operation.startsWith("brief.scout:");
+}
 const TERMINAL_RUN_STATUSES = ["complete", "partial", "failed", "expired", "deleted"];
 const JOB_ADVISORY_LOCK = 694_207_551;
 const BUDGET_ADVISORY_LOCK = 694_207_552;
@@ -282,7 +301,7 @@ function normalizedGuidanceAnswers(
   questions: readonly PlaylistGuidanceQuestion[],
   submitted: readonly PlaylistGuidanceAnswer[],
 ): PlaylistGuidanceAnswer[] {
-  if (questions.length < 2 || questions.length > 3 || submitted.length !== questions.length) {
+  if (questions.length < 1 || questions.length > 3 || submitted.length !== questions.length) {
     throw new HttpError(400, "Answer every playlist question", "invalid_guidance_answers");
   }
   const submittedByQuestion = new Map<string, PlaylistGuidanceAnswer>();
@@ -795,6 +814,7 @@ export class Repository {
   async getBriefRequest(id: string): Promise<any | null> {
     const result = await this.pool.query(
       `SELECT id,prompt,requested_track_count,model,status,brief_json,questions_json,answers_json,
+              guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
               estimate_usd,error,client_bucket,expires_at,created_at,updated_at
        FROM brief_requests WHERE id=$1 AND expires_at>now()`,
       [id],
@@ -810,6 +830,9 @@ export class Repository {
       brief: row.brief_json,
       questions: row.questions_json ?? [],
       answers: row.answers_json ?? [],
+      guidanceSourceHints: row.guidance_source_hints_json ?? [],
+      guidanceTelemetry: row.guidance_telemetry_json ?? null,
+      guidancePreferences: row.guidance_preferences_json ?? [],
       estimateUsd: row.estimate_usd == null ? null : Number(row.estimate_usd),
       error: sanitizeOptionalFailure(row.error, "brief"),
       clientBucket: row.client_bucket,
@@ -823,7 +846,9 @@ export class Repository {
     const result = await this.pool.query<{ actual: number }>(
       `SELECT COALESCE(sum(amount_usd),0)::float8 actual
        FROM cost_ledger
-       WHERE brief_request_id=$1`,
+       WHERE brief_request_id=$1
+         AND operation NOT LIKE 'brief.question_scout%'
+         AND operation NOT LIKE 'brief.scout%'`,
       [id],
     );
     return Number(result.rows[0]?.actual ?? 0);
@@ -850,7 +875,9 @@ export class Repository {
         await client.query(
           `UPDATE brief_requests SET prompt='',status='failed',brief_json=NULL,
              questions_json=NULL,answers_json=NULL,answers_idempotency_key=NULL,
-             answers_hash=NULL,estimate_usd=NULL,error=NULL,expires_at=now(),updated_at=now()
+             answers_hash=NULL,guidance_source_hints_json='[]'::jsonb,
+             guidance_telemetry_json=NULL,guidance_preferences_json='[]'::jsonb,
+             estimate_usd=NULL,error=NULL,expires_at=now(),updated_at=now()
            WHERE id=$1`,
           [id],
         );
@@ -880,6 +907,8 @@ export class Repository {
     expectedStatus?: "queued" | "finalizing";
     brief?: PlaylistBrief;
     questions?: PlaylistGuidanceQuestion[];
+    guidanceSourceHints?: PlaylistGuidanceSourceHint[];
+    guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void> {
@@ -888,13 +917,18 @@ export class Repository {
       : null;
     await this.pool.query(
       `UPDATE brief_requests SET status=$2,brief_json=$3,questions_json=COALESCE($4,questions_json),
-              estimate_usd=$5,error=$6,updated_at=now()
-       WHERE id=$1 AND expires_at>now() AND ($7::varchar IS NULL OR status=$7::varchar)`,
+              guidance_source_hints_json=COALESCE($5,guidance_source_hints_json),
+              guidance_telemetry_json=CASE WHEN $6::boolean THEN $7 ELSE guidance_telemetry_json END,
+              estimate_usd=$8,error=$9,updated_at=now()
+       WHERE id=$1 AND expires_at>now() AND ($10::varchar IS NULL OR status=$10::varchar)`,
       [
         id,
         result.status,
         result.brief ?? null,
         result.questions === undefined ? null : JSON.stringify(result.questions),
+        result.guidanceSourceHints === undefined ? null : JSON.stringify(result.guidanceSourceHints),
+        result.guidanceTelemetry !== undefined,
+        result.guidanceTelemetry === undefined ? null : JSON.stringify(result.guidanceTelemetry),
         result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"),
         persistedError,
         result.expectedStatus ?? null,
@@ -925,6 +959,7 @@ export class Repository {
       if (!brief) throw new HttpError(404, "Brief request not found", "brief_not_found");
       const questions = Array.isArray(brief.questions_json) ? brief.questions_json : [];
       const answers = normalizedGuidanceAnswers(questions, input.answers);
+      const guidancePreferences = deriveGuidancePreferences(questions, answers);
       const answersHash = sha256Hex(stableStringify(answers));
       if (brief.answers_idempotency_key !== null) {
         if (brief.answers_idempotency_key !== input.idempotencyKey || brief.answers_hash !== answersHash) {
@@ -944,9 +979,10 @@ export class Repository {
       }
       await client.query(
         `UPDATE brief_requests SET status='finalizing',answers_json=$2,
-             answers_idempotency_key=$3,answers_hash=$4,error=NULL,updated_at=now()
+             guidance_preferences_json=$3,answers_idempotency_key=$4,answers_hash=$5,
+             error=NULL,updated_at=now()
          WHERE id=$1`,
-        [input.briefRequestId, JSON.stringify(answers), input.idempotencyKey, answersHash],
+        [input.briefRequestId, JSON.stringify(answers), JSON.stringify(guidancePreferences), input.idempotencyKey, answersHash],
       );
       return { status: "finalizing", created: true };
     });
@@ -992,8 +1028,32 @@ export class Repository {
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
+    let guidanceSourceHints: PlaylistGuidanceSourceHint[] = [];
+    let guidanceTelemetry: PlaylistGuidanceTelemetry | null = null;
+    let guidancePreferences: PlaylistGuidancePreference[] = [];
+    if (input.briefRequestId) {
+      const context = await this.pool.query<{
+        guidance_source_hints_json: PlaylistGuidanceSourceHint[] | null;
+        guidance_telemetry_json: PlaylistGuidanceTelemetry | null;
+        guidance_preferences_json: PlaylistGuidancePreference[] | null;
+      }>(
+        `SELECT guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json
+         FROM brief_requests WHERE id=$1 AND expires_at>now()`,
+        [input.briefRequestId],
+      );
+      const row = context.rows[0];
+      if (!row) throw new HttpError(404, "Brief request not found", "brief_not_found");
+      guidanceSourceHints = Array.isArray(row.guidance_source_hints_json)
+        ? row.guidance_source_hints_json
+        : [];
+      guidanceTelemetry = row.guidance_telemetry_json ?? null;
+      guidancePreferences = Array.isArray(row.guidance_preferences_json)
+        ? row.guidance_preferences_json
+        : [];
+    }
     const briefHash = sha256Hex(stableStringify({
       brief: input.brief,
+      guidancePreferences,
       researchPolicy: researchPolicyFingerprint(input.brief),
     }));
     const executionPolicy = researchExecutionPolicy(input.brief);
@@ -1089,11 +1149,29 @@ export class Repository {
         const canonicalPrompt = `${input.brief.title}: ${input.brief.description}`.slice(0, 2_000);
         const insertedRun = await client.query<{ created_at: Date }>(
           `INSERT INTO research_runs(
-             id,prompt,brief_json,brief_hash,status,phase,client_bucket,idempotency_key,auto_publish,
+             id,prompt,brief_json,guidance_source_hints_json,guidance_telemetry_json,
+             guidance_preferences_json,brief_hash,status,phase,client_bucket,idempotency_key,auto_publish,
              estimated_cost_usd,approved_budget_usd,budget_approval_expires_at,retention_expires_at)
-           VALUES($1,$2,$3,$4,$5::varchar,$6,$7,$8,$9,$10,$11,CASE WHEN $5::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,now()+interval '90 days')
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::varchar,$9,$10,$11,$12,$13,$14,
+             CASE WHEN $8::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,
+             now()+interval '90 days')
            RETURNING created_at`,
-          [runId, canonicalPrompt, input.brief, briefHash, status, phase, input.clientBucket, input.idempotencyKey, input.autoPublish === true, estimate, Math.max(approved, status === "queued" ? estimate : 0)],
+          [
+            runId,
+            canonicalPrompt,
+            input.brief,
+            JSON.stringify(guidanceSourceHints),
+            guidanceTelemetry == null ? null : JSON.stringify(guidanceTelemetry),
+            JSON.stringify(guidancePreferences),
+            briefHash,
+            status,
+            phase,
+            input.clientBucket,
+            input.idempotencyKey,
+            input.autoPublish === true,
+            estimate,
+            Math.max(approved, status === "queued" ? estimate : 0),
+          ],
         );
         if (executionPolicy.kind === "fast_curated") {
           const route = createFastRouteCheckpoint(executionPolicy, insertedRun.rows[0]!.created_at);
@@ -1241,6 +1319,9 @@ export class Repository {
       id: row.id,
       prompt: row.prompt,
       brief: row.brief_json,
+      guidanceSourceHints: row.guidance_source_hints_json ?? [],
+      guidanceTelemetry: row.guidance_telemetry_json ?? null,
+      guidancePreferences: row.guidance_preferences_json ?? [],
       status: row.status,
       phase: row.phase,
       autoPublish: row.auto_publish === true,
@@ -2195,7 +2276,7 @@ export class Repository {
       );
       await client.query(
         `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
-         VALUES($1,$2,'matching',$3,$4,1)`,
+         VALUES($1,$2,'matching',$3,$4,2)`,
         [
           randomUUID(),
           runId,
@@ -2221,37 +2302,53 @@ export class Repository {
     runId: string,
     storefront: string,
     currentGeneration: number,
+    currentRefillGeneration = 0,
   ): Promise<"queued" | "in_flight" | "not_needed" | "exhausted"> {
     if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
     const generation = Number.isInteger(currentGeneration)
       ? Math.max(0, Math.min(3, currentGeneration))
       : 0;
+    const refillGeneration = Number.isInteger(currentRefillGeneration)
+      ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, currentRefillGeneration))
+      : 0;
     return this.transaction(async (client) => {
-      const run = await client.query<{ auto_publish: boolean }>(
-        "SELECT auto_publish FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+      const run = await client.query<{ auto_publish: boolean; status: string; brief_json: PlaylistBrief }>(
+        "SELECT auto_publish,status,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
       );
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
       if (!run.rows[0].auto_publish) return "not_needed";
+      if (!["matching", "researching", "ready_for_matching"].includes(run.rows[0].status)) return "not_needed";
 
       const laterActive = await client.query<{ id: string }>(
         `SELECT id FROM job_queue
          WHERE run_id=$1 AND kind='matching' AND status IN ('queued','leased')
            AND payload_json->>'retryIncomplete'='true'
-           AND CASE
-             WHEN COALESCE(payload_json->>'recoveryGeneration','') ~ '^[0-9]+$'
-             THEN (payload_json->>'recoveryGeneration')::int
-             ELSE 0
-           END > $2
+           AND (
+             CASE
+               WHEN COALESCE(payload_json->>'refillGeneration','') ~ '^[0-9]+$'
+               THEN (payload_json->>'refillGeneration')::int ELSE 0 END > $3
+             OR (
+               CASE
+                 WHEN COALESCE(payload_json->>'refillGeneration','') ~ '^[0-9]+$'
+                 THEN (payload_json->>'refillGeneration')::int ELSE 0 END = $3
+               AND CASE
+                 WHEN COALESCE(payload_json->>'recoveryGeneration','') ~ '^[0-9]+$'
+                 THEN (payload_json->>'recoveryGeneration')::int ELSE 0 END > $2
+             )
+           )
          LIMIT 1`,
-        [runId, generation],
+        [runId, generation, refillGeneration],
       );
       if (laterActive.rows[0]) return "in_flight";
 
       const prior = await client.query<{ count: number }>(
         `SELECT count(*)::int count FROM job_queue
-         WHERE run_id=$1 AND kind='matching' AND payload_json->>'retryIncomplete'='true'`,
-        [runId],
+         WHERE run_id=$1 AND kind='matching' AND payload_json->>'retryIncomplete'='true'
+           AND CASE
+             WHEN COALESCE(payload_json->>'refillGeneration','') ~ '^[0-9]+$'
+             THEN (payload_json->>'refillGeneration')::int ELSE 0 END = $2`,
+        [runId, refillGeneration],
       );
       const priorGenerationCount = Number(prior.rows[0]?.count ?? 0);
       if (priorGenerationCount >= 3) return "exhausted";
@@ -2267,18 +2364,19 @@ export class Repository {
       const nextGeneration = priorGenerationCount + 1;
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
-         VALUES($1,$2,'matching',$3,$4,1)
+         VALUES($1,$2,'matching',$3,$4,2)
          ON CONFLICT(kind,dedupe_key) DO NOTHING
          RETURNING id`,
         [
           randomUUID(),
           runId,
-          `matching-recovery:${runId}:${nextGeneration}`,
+          `matching-recovery:${runId}:${nextGeneration}:refill:${refillGeneration}`,
           {
             runId,
             storefront: storefront.toLowerCase(),
             retryIncomplete: true,
             recoveryGeneration: nextGeneration,
+            refillGeneration,
             automatic: true,
           },
         ],
@@ -2287,6 +2385,127 @@ export class Repository {
       await client.query(
         "UPDATE research_runs SET status='matching',phase='catalog_matching_recovery',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
         [runId],
+      );
+      return "queued";
+    });
+  }
+
+  /**
+   * Queue a bounded evidence-backed candidate refill when strict Apple
+   * matching leaves an exact curated playlist short. The durable route and
+   * job are committed together so a worker restart cannot reset the clock or
+   * enqueue an unbounded loop.
+   */
+  async queueAutomaticCandidateRefill(
+    runId: string,
+    storefront: string,
+    additionalCandidateGoal: number,
+    currentRefillGeneration: number,
+  ): Promise<"queued" | "in_flight" | "not_needed" | "exhausted"> {
+    if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
+    const boundedGoal = Math.max(1, Math.min(120, Math.floor(additionalCandidateGoal)));
+    const suppliedGeneration = Number.isInteger(currentRefillGeneration)
+      ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, currentRefillGeneration))
+      : 0;
+    return this.transaction(async (client) => {
+      const run = await client.query<{ auto_publish: boolean; status: string; brief_json: PlaylistBrief }>(
+        "SELECT auto_publish,status,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [runId],
+      );
+      if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      if (!run.rows[0].auto_publish) return "not_needed";
+      if (!["matching", "researching", "ready_for_matching"].includes(run.rows[0].status)) return "not_needed";
+
+      const prior = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM job_queue
+         WHERE run_id=$1 AND kind='research' AND payload_json->>'postMatchRefill'='true'`,
+        [runId],
+      );
+      const priorCount = Number(prior.rows[0]?.count ?? 0);
+      // Exact-generation CAS: a replay of generation zero must not queue
+      // generation two merely because generation one already exists.
+      if (priorCount !== suppliedGeneration) return "in_flight";
+      if (priorCount >= FAST_POST_MATCH_REFILL_LIMIT) return "exhausted";
+      const generation = suppliedGeneration + 1;
+      if (generation > FAST_POST_MATCH_REFILL_LIMIT) return "exhausted";
+
+      const active = await client.query<{ id: string }>(
+        `SELECT id FROM job_queue
+         WHERE run_id=$1 AND status IN ('queued','leased')
+           AND (
+             (kind='research' AND payload_json->>'postMatchRefill'='true' AND CASE
+               WHEN COALESCE(payload_json->>'refillGeneration','') ~ '^[0-9]+$'
+               THEN (payload_json->>'refillGeneration')::int ELSE 0 END > $2)
+             OR (kind='matching' AND CASE
+               WHEN COALESCE(payload_json->>'refillGeneration','') ~ '^[0-9]+$'
+               THEN (payload_json->>'refillGeneration')::int ELSE 0 END > $2)
+           )
+         LIMIT 1`,
+        [runId, suppliedGeneration],
+      );
+      if (active.rows[0]) return "in_flight";
+
+      const brief = run.rows[0].brief_json;
+      const baseline = await client.query<{ eligible_count: number; selection_rank: number }>(
+        `SELECT
+           count(*) FILTER (WHERE EXISTS (
+             SELECT 1 FROM evidence_claims e
+             JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
+             JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+               AND ca.run_id=e.run_id AND ca.source_url=es.url
+             WHERE e.candidate_id=c.id
+               AND ((e.state IN ('verified','corroborated') AND e.support_scope='track' AND e.verification_phase='track_verification')
+                 OR e.state='editorial')
+               AND e.subject_entity=ANY($2::text[]) AND e.subject_relationship=$3
+           ))::int eligible_count,
+           COALESCE(max(c.selection_rank),0)::int selection_rank
+         FROM track_candidates c WHERE c.run_id=$1`,
+        [runId, brief.subjectEntities, brief.relationship],
+      );
+      const route = createFastPostMatchRefillRouteCheckpoint(
+        generation,
+        boundedGoal,
+        storefront,
+        new Date(),
+        process.env,
+        {
+          eligibleCount: Number(baseline.rows[0]?.eligible_count ?? 0),
+          selectionRank: Number(baseline.rows[0]?.selection_rank ?? 0),
+        },
+      );
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json) VALUES($1,$2,$3)
+         ON CONFLICT(run_id,phase) DO UPDATE SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [runId, `fast:post-match-refill:${generation}:route`, route],
+      );
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
+         VALUES($1,$2,'research',$3,$4,2)
+         ON CONFLICT(kind,dedupe_key) DO NOTHING
+         RETURNING id`,
+        [
+          randomUUID(),
+          runId,
+          `research-refill:${runId}:${generation}`,
+          {
+            runId,
+            fast: true,
+            postMatchRefill: true,
+            refillGeneration: generation,
+            additionalCandidateGoal: route.additionalCandidateGoal,
+            storefront: route.storefront,
+            refillConfirmedAt: route.confirmedAt,
+            refillResearchDeadlineAt: route.researchDeadlineAt,
+            refillDeadlineAt: route.deadlineAt,
+          },
+        ],
+      );
+      if (!inserted.rows[0]) return "in_flight";
+      await client.query(
+        `UPDATE research_runs SET status='researching',phase='catalog_refill_research',error=NULL,
+           approved_budget_usd=GREATEST(approved_budget_usd,actual_cost_usd+reserved_cost_usd+$2),
+           completed_at=NULL,updated_at=now() WHERE id=$1`,
+        [runId, FAST_POST_MATCH_REFILL_MAX_COST_USD],
       );
       return "queued";
     });
@@ -2543,6 +2762,13 @@ export class Repository {
       }
       if (!["review", "visitor_review"].includes(run.status)) throw new HttpError(409, "Run is not ready for a manifest", "manifest_not_ready");
       const brief = run.brief_json as PlaylistBrief;
+      const guidancePreferences = Array.isArray(run.guidance_preferences_json)
+        ? run.guidance_preferences_json as PlaylistGuidancePreference[]
+        : [];
+      const effectiveOrderingPolicy = guidanceOrderingPolicy(
+        brief.orderingPolicy,
+        guidancePreferences,
+      );
       const accounting = await client.query<{
         id: string;
         outcome: string;
@@ -2620,7 +2846,7 @@ export class Repository {
                AND e.subject_entity=ANY($2::text[]) AND e.subject_relationship=$3
            )`
         : "";
-      const orderSql = manifestOrderSql(brief);
+      const orderSql = manifestOrderSql({ ...brief, orderingPolicy: effectiveOrderingPolicy });
       const matches = await client.query(
         `SELECT m.candidate_id,m.catalog_id,m.song_json,c.artist,c.title,c.album,c.release_year,c.duration_ms
          FROM catalog_matches m
@@ -2675,14 +2901,14 @@ export class Repository {
           durationMs: song?.durationInMillis ?? match.duration_ms,
         };
       });
-      const sequencedMatches = shouldSequencePlaylist(brief.orderingPolicy, brief.mode)
+      const sequencedMatches = shouldSequencePlaylist(effectiveOrderingPolicy, brief.mode)
         ? sequencePlaylist(sequencingRows, {
           transitionPreference: /\b(?:high[- ]?contrast|contrast|surpris|eclectic)\b/iu
-            .test(brief.orderingPolicy)
+            .test(effectiveOrderingPolicy)
             ? "contrast"
             : "smooth",
         })
-        : fixedPlaylistOrder(sequencingRows, brief.orderingPolicy);
+        : fixedPlaylistOrder(sequencingRows, effectiveOrderingPolicy);
       const tracks = sequencedMatches.map((match, index) => ({
         position: index,
         candidateId: match.candidate_id,
@@ -3749,22 +3975,31 @@ export class Repository {
       const existing = await client.query<{ id: string; status: string }>("SELECT id,status FROM cost_reservations WHERE idempotency_key=$1 FOR UPDATE", [idempotencyKey]);
       if (existing.rows[0] && existing.rows[0].status !== "released") return { reservationId: existing.rows[0].id };
       if (subject.briefRequestId) {
+        const scoutOperation = isGuidanceScoutOperation(operation);
+        const briefCeiling = scoutOperation ? GUIDED_SCOUT_BUDGET_USD : GUIDED_BRIEF_BUDGET_USD;
         const briefBudget = await client.query<{ spent: number; reserved: number; exists: boolean }>(
           `SELECT
              EXISTS(SELECT 1 FROM brief_requests WHERE id=$1 AND expires_at>now()) exists,
-             COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE brief_request_id=$1),0)::float8 spent,
+             COALESCE((
+               SELECT sum(amount_usd) FROM cost_ledger
+               WHERE brief_request_id=$1
+                 AND (($2::boolean AND (operation LIKE 'brief.question_scout%' OR operation LIKE 'brief.scout%'))
+                   OR (NOT $2::boolean AND operation NOT LIKE 'brief.question_scout%' AND operation NOT LIKE 'brief.scout%'))
+             ),0)::float8 spent,
              COALESCE((
                SELECT sum(reserved_usd)
                FROM cost_reservations
                WHERE brief_request_id=$1 AND status='reserved' AND expires_at>now()
+                 AND (($2::boolean AND (operation LIKE 'brief.question_scout%' OR operation LIKE 'brief.scout%'))
+                   OR (NOT $2::boolean AND operation NOT LIKE 'brief.question_scout%' AND operation NOT LIKE 'brief.scout%'))
              ),0)::float8 reserved`,
-          [subject.briefRequestId],
+          [subject.briefRequestId, scoutOperation],
         );
         if (!briefBudget.rows[0]?.exists) {
           throw new HttpError(404, "Brief request not found", "brief_not_found");
         }
         const projected = briefBudget.rows[0].spent + briefBudget.rows[0].reserved + amount;
-        if (projected > GUIDED_BRIEF_BUDGET_USD + 0.000001) {
+        if (projected > briefCeiling + 0.000001) {
           throw new HttpError(
             402,
             "Playlist guidance reached its cost limit",
@@ -3836,20 +4071,29 @@ export class Repository {
         runCeilingExceeded = projected > Number(run.rows[0].approved_budget_usd) + 0.000001;
       }
       if (row.brief_request_id) {
+        const scoutOperation = isGuidanceScoutOperation(row.operation);
+        const briefCeiling = scoutOperation ? GUIDED_SCOUT_BUDGET_USD : GUIDED_BRIEF_BUDGET_USD;
         const brief = await client.query<{ spent: number; reserved: number }>(
           `SELECT
-             COALESCE((SELECT sum(amount_usd) FROM cost_ledger WHERE brief_request_id=$1),0)::float8 spent,
+             COALESCE((
+               SELECT sum(amount_usd) FROM cost_ledger
+               WHERE brief_request_id=$1
+                 AND (($3::boolean AND (operation LIKE 'brief.question_scout%' OR operation LIKE 'brief.scout%'))
+                   OR (NOT $3::boolean AND operation NOT LIKE 'brief.question_scout%' AND operation NOT LIKE 'brief.scout%'))
+             ),0)::float8 spent,
              COALESCE((
                SELECT sum(reserved_usd)
                FROM cost_reservations
                WHERE brief_request_id=$1 AND status='reserved' AND expires_at>now() AND id<>$2
+                 AND (($3::boolean AND (operation LIKE 'brief.question_scout%' OR operation LIKE 'brief.scout%'))
+                   OR (NOT $3::boolean AND operation NOT LIKE 'brief.question_scout%' AND operation NOT LIKE 'brief.scout%'))
              ),0)::float8 reserved`,
-          [row.brief_request_id, reservationId],
+          [row.brief_request_id, reservationId, scoutOperation],
         );
         const projected = (brief.rows[0]?.spent ?? 0)
           + (brief.rows[0]?.reserved ?? 0)
           + actual;
-        briefCeilingExceeded = projected > GUIDED_BRIEF_BUDGET_USD + 0.000001;
+        briefCeilingExceeded = projected > briefCeiling + 0.000001;
       }
       const exceededCeiling = monthlyProjected > monthlyCeiling + 0.000001
         || runCeilingExceeded

@@ -813,6 +813,15 @@ function segmentedRepository() {
     actualCostUsd: 0,
     approvedBudgetUsd: 5,
     noNewGapPasses: 0,
+    guidanceSourceHints: [] as Array<{ url: string; title: string; excerpt: string }>,
+    guidancePreferences: [] as Array<{
+      questionId: string;
+      decisionKey: string;
+      kind: "research_preference" | "version_preference" | "familiarity_bias" | "subscene_focus" | "ordering_behavior";
+      value: string;
+      orderingBehavior: "smooth" | "contrast" | "chronological" | "editorial" | null;
+      source: "option" | "custom";
+    }>,
   };
   const coverage = {
     candidateCount: 0,
@@ -929,6 +938,19 @@ describe("fast curated orchestration", () => {
     state.run.brief = brief("curated", { min: 1, max: 50 });
     state.run.status = "queued";
     state.run.phase = "queued";
+    state.run.guidanceSourceHints = [{
+      url: "https://scout.example/documented-scene-fork",
+      title: "Documented scene fork",
+      excerpt: "A provider-attested lead that must be retrieved again before use as evidence.",
+    }];
+    state.run.guidancePreferences = [{
+      questionId: "scene-focus",
+      decisionKey: "documented_scene_fork",
+      kind: "subscene_focus",
+      value: "Prioritize the documented second-wave scene.",
+      orderingBehavior: null,
+      source: "option",
+    }];
     const persistedCandidates: any[] = [];
     const frontier: any[] = [];
     state.repository.addSources = async (_runId?: string, sources?: any[]) => new Map(
@@ -984,6 +1006,24 @@ describe("fast curated orchestration", () => {
       reasoning: { effort: "low" },
       max_tool_calls: 5,
       tools: [{ type: "web_search", search_context_size: "low" }],
+    });
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "sourceDiscoveryHints are discovery leads only",
+    );
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "re-retrieve them with hosted search",
+    );
+    expect(JSON.parse(String(orchestrator.calls[0]!.body.input))).toMatchObject({
+      researchScope: {
+        guidancePreferences: [
+          "Scene/geographic focus for discovery and candidate selection: Prioritize the documented second-wave scene.",
+        ],
+      },
+      sourceDiscoveryHints: [{
+        url: "https://scout.example/documented-scene-fork",
+        title: "Documented scene fork",
+        excerpt: "A provider-attested lead that must be retrieved again before use as evidence.",
+      }],
     });
     expect(persistedCandidates).toHaveLength(4);
     expect(frontier).toContainEqual(expect.objectContaining({
@@ -1579,6 +1619,52 @@ describe("durable research segmentation", () => {
     ]);
     expect(state.citations).toEqual([expect.objectContaining({ responseId: "segment-0", excerpt })]);
     expect(state.jobs.at(-1)).toMatchObject({ payload: { phase: "source_discovery", generation: 0, segment: 0 } });
+  });
+
+  test("passes typed guidance and scout sources to full research as discovery-only context", async () => {
+    const state = segmentedRepository();
+    state.run.guidanceSourceHints = [{
+      url: "https://scout.example/version-history",
+      title: "Version history",
+      excerpt: "A documented recording-version fork.",
+    }];
+    state.run.guidancePreferences = [{
+      questionId: "versions",
+      decisionKey: "recording_versions",
+      kind: "version_preference",
+      value: "Prefer original studio recordings over later live versions.",
+      orderingBehavior: null,
+      source: "option",
+    }];
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      completionResponse("guided-full-research"),
+    ]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "scope_resolution",
+      gapAttempt: 0,
+      generation: 0,
+      segment: 0,
+    });
+
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "sourceDiscoveryHints are discovery leads only",
+    );
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "re-retrieve them through an approved tool",
+    );
+    expect(JSON.parse(String(orchestrator.calls[0]!.body.input))).toMatchObject({
+      guidancePreferences: [
+        "Recording/version selection: Prefer original studio recordings over later live versions.",
+      ],
+      sourceDiscoveryHints: [{
+        url: "https://scout.example/version-history",
+        title: "Version history",
+        excerpt: "A documented recording-version fork.",
+      }],
+    });
   });
 
   test("a stale generation repairs a checkpointed but potentially missed queue handoff", async () => {
