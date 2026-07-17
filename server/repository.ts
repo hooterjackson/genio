@@ -1401,6 +1401,10 @@ export class Repository {
             "UPDATE capability_sessions SET run_id=NULL,access_id=NULL,updated_at=now() WHERE run_id=$1",
             [runId],
           );
+          // Remove the manifest graph before the run cascade deletes its candidates.
+          // manifest_tracks intentionally protects candidate references, so relying on
+          // the two independent research_runs cascades can violate that foreign key.
+          await client.query("DELETE FROM manifests WHERE run_id=$1", [runId]);
           await client.query("DELETE FROM research_runs WHERE id=$1", [runId]);
         }
       }
@@ -2952,9 +2956,12 @@ export class Repository {
 
   async setPublicPlaylistVisibility(id: string, listed: boolean): Promise<boolean> {
     const result = await this.pool.query(
-      `UPDATE public_playlists SET status=$2,hidden_at=CASE WHEN $2='listed' THEN NULL ELSE now() END,updated_at=now()
+      `UPDATE public_playlists SET
+         status=CASE WHEN $2::boolean THEN 'listed' ELSE 'hidden' END,
+         hidden_at=CASE WHEN $2::boolean THEN NULL ELSE now() END,
+         updated_at=now()
        WHERE id=$1`,
-      [id, listed ? "listed" : "hidden"],
+      [id, listed],
     );
     return Boolean(result.rowCount);
   }
