@@ -349,8 +349,13 @@ function refillProviderResponse(count = 8) {
   const pairs = Array.from({ length: count }, (_, index) => (
     `Refill Artist ${String(index + 1).padStart(2, "0")} — Refill Track ${String(index + 1).padStart(2, "0")}`
   ));
-  const evidenceLine = `EVIDENCE GROUP | SUBJECT: ${brief.subjectEntities[0]} | RELATIONSHIP: ${brief.relationship} | TRACKS: ${pairs.join("; ")} | CONTAINERS: NONE`;
-  const marker = "[Rio source]";
+  const containers = Array.from({ length: count }, (_, index) => (
+    `Refill Artist ${String(index + 1).padStart(2, "0")} — Rio music-history fixture`
+  ));
+  const evidenceLine = `EVIDENCE GROUP | SUBJECT: ${brief.subjectEntities[0]} | RELATIONSHIP: ${brief.relationship} | TRACKS: ${pairs.join("; ")} | CONTAINERS: ${containers.join("; ")}`;
+  // Responses renders the citation annotation as trailing Markdown inside the
+  // attested evidence excerpt. It must not become part of the last album name.
+  const marker = "([Rio source](https://history.example/rio/catalog-ready-refill))";
   const text = `${evidenceLine} ${marker}`;
   return {
     id: "refill-provider-response",
@@ -444,6 +449,8 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
     expect(providerInput.excludedPairs).toHaveLength(88);
     expect(providerInput.excludedPairs[0]).toContain("Existing Rio Artist");
     expect(repository.candidates).toHaveLength(96);
+    expect(repository.candidates.slice(-8).map((candidate) => candidate.album))
+      .toEqual(Array.from({ length: 8 }, () => "Rio music-history fixture"));
     expect(repository.checkpoints.get("fast:post-match-refill:1:complete")).toMatchObject({
       status: "complete",
       newlyAdded: 8,

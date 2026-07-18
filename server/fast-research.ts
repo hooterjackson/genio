@@ -152,7 +152,10 @@ function withoutTrailingCitationMarkers(value: string): string {
   let previous = "";
   while (current !== previous) {
     previous = current;
-    current = current.replace(/\s*(?:\[[^\]]+\]|【[^】]+】|cite[^]*)\s*$/u, "").trim();
+    current = current.replace(
+      /\s*(?:\(\[[^\]\r\n]+\]\(https?:\/\/[^)\s]+\)\)|\[[^\]\r\n]+\]\(https?:\/\/[^)\s]+\)|\[[^\]]+\]|【[^】]+】|cite[^]*)\s*$/iu,
+      "",
+    ).trim();
   }
   return current;
 }

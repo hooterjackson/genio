@@ -129,6 +129,23 @@ describe("fast curated research", () => {
     ]);
   });
 
+  test("does not persist a trailing hosted Markdown citation as part of a release title", () => {
+    const evidence = `${evidenceGroup({
+      tracks: ["Fixture Artist — Signal One"],
+      containers: ["Fixture Artist — Album Alpha"],
+    })} ([history.example](https://history.example/berlin-techno))`;
+    const source = synthesisResponse(evidence);
+    const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
+
+    expect(extractFastCandidatesFromSynthesis(synthesis, 120)).toEqual([
+      expect.objectContaining({
+        artist: "Fixture Artist",
+        title: "Signal One",
+        album: "Album Alpha",
+      }),
+    ]);
+  });
+
   test("does not guess a container when one artist has multiple tracks or releases", () => {
     const source = synthesisResponse(evidenceGroup({
       tracks: ["Fixture Artist — Signal One", "Fixture Artist — Signal Two"],
