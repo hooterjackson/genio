@@ -24,7 +24,10 @@ export const GUIDED_BRIEF_BUDGET_USD = 0.25;
  * Grounded follow-up discovery has an independent ceiling. Its spend remains
  * visible in the owner ledger, but never consumes the track-research allowance.
  */
-export const GUIDED_SCOUT_BUDGET_USD = 0.05;
+// Covers the normal researched scout and one rare no-search structured repair
+// without letting a truncated first response strand an otherwise useful set
+// of questions at reconciliation time.
+export const GUIDED_SCOUT_BUDGET_USD = 0.075;
 
 /**
  * A public playlist's preflight and research share one $1.50 ceiling. Passing

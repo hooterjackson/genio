@@ -17,6 +17,7 @@ import {
   createOpenAIResponse,
   GUIDANCE_SCOUT_MAX_COST_USD,
   GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS,
+  GUIDANCE_SCOUT_REPAIR_MAX_OUTPUT_TOKENS,
   GUIDANCE_SCOUT_MAX_TOOL_CALLS,
   interpretPrompt,
   ProviderRequestError,
@@ -2739,9 +2740,12 @@ export async function processBriefInterpretationJob(
           GUIDANCE_SCOUT_MAX_COST_USD,
           maximumOpenAICallCostUsd({
             model: request.model,
-            max_output_tokens: GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS,
+            // One reservation covers the primary scout and its single
+            // no-search structured repair, if the provider truncates JSON.
+            max_output_tokens: GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS
+              + GUIDANCE_SCOUT_REPAIR_MAX_OUTPUT_TOKENS,
             max_tool_calls: GUIDANCE_SCOUT_MAX_TOOL_CALLS,
-            reasoning: { effort: "low" },
+            reasoning: { effort: "none" },
             input: providerInput,
           }, 0, 0.01),
         ),
