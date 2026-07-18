@@ -133,6 +133,36 @@ function scoutResponse(input: {
   });
 }
 
+function researchedZeroScoutResponse(sourceUrl: string, sourceTitle: string): Response {
+  const outputText = JSON.stringify({ questions: [] });
+  return new Response(JSON.stringify({
+    id: "response-guidance-researched-zero",
+    model: "gpt-5.4-mini",
+    usage: { input_tokens: 100, output_tokens: 30 },
+    output_text: outputText,
+    output: [
+      {
+        type: "web_search_call",
+        id: "search-guidance-researched-zero",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "documented playlist subject forks",
+          sources: [{ type: "url", url: sourceUrl, title: sourceTitle }],
+        },
+      },
+      {
+        type: "message",
+        id: "message-guidance-researched-zero",
+        content: [{ type: "output_text", text: outputText, annotations: [] }],
+      },
+    ],
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 test("an explicit 100-track editorial request overrides a generic model range", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-prompt-interpretation");
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
@@ -419,6 +449,192 @@ test("runs brief interpretation and grounded question scouting as separate bound
   expect(requestBodies[1].instructions).toContain("Do not ask a mandatory ordering question");
 });
 
+test("repairs a truncated researched scout once without another web search", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-structured-repair");
+  const sourceUrl = "https://example.org/berlin-techno-lineages";
+  const question = groundedScoutQuestion({
+    decisionKey: "berlin_scene_lineage",
+    subject: "Berlin techno's documented scene lineages",
+    sourceUrl,
+  });
+  const partialDraft = '{"questions":[{"decisionKey":"berlin_scene_lineage","header":"BERLIN LINEAGES"';
+  const requestBodies: any[] = [];
+  const fetchMock = vi.fn(async (_url, init) => {
+    requestBodies.push(JSON.parse(String(init?.body)));
+    if (requestBodies.length === 1) {
+      return new Response(JSON.stringify({
+        id: "response-guidance-primary-incomplete",
+        model: "gpt-5.4-mini",
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        usage: { input_tokens: 120, output_tokens: 130, total_tokens: 250 },
+        output_text: partialDraft,
+        output: [
+          {
+            type: "web_search_call",
+            id: "search-berlin-lineages",
+            status: "completed",
+            action: {
+              type: "search",
+              query: "Berlin techno documented scene lineages",
+              sources: [{ type: "url", url: sourceUrl, title: "Berlin techno lineages" }],
+            },
+          },
+          {
+            type: "message",
+            id: "message-guidance-primary-incomplete",
+            content: [{ type: "output_text", text: partialDraft, annotations: [] }],
+          },
+        ],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json", "x-request-id": "request-primary" },
+      });
+    }
+    return hostedResponse({ questions: [question] }, "response-guidance-repair");
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const onUsage = vi.fn(async () => undefined);
+
+  const result = await scoutPlaylistGuidance(
+    "50 influential Berlin techno tracks",
+    {
+      ...guidedDraftBrief,
+      title: "Berlin Techno",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential within",
+    },
+    "gpt-5.4-mini",
+    { onUsage },
+  );
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(requestBodies[0]).toMatchObject({
+    reasoning: { effort: "none" },
+    max_output_tokens: 2_600,
+    tools: [{ type: "web_search", search_context_size: "low" }],
+  });
+  expect(requestBodies[1]).toMatchObject({
+    reasoning: { effort: "none" },
+    max_output_tokens: 2_200,
+  });
+  expect(requestBodies[1]).not.toHaveProperty("tools");
+  expect(requestBodies[1]).not.toHaveProperty("max_tool_calls");
+  expect(requestBodies[1].text.format).toMatchObject({
+    type: "json_schema",
+    name: "repaired_playlist_question_scout",
+    strict: true,
+  });
+  const repairInput = JSON.parse(requestBodies[1].input);
+  expect(repairInput).toMatchObject({
+    request: "50 influential Berlin techno tracks",
+    incompleteDraft: partialDraft,
+    allowedSources: [expect.objectContaining({ url: sourceUrl })],
+  });
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]).toMatchObject({
+    decisionKey: "berlin_scene_lineage",
+    grounding: { sourceUrls: [sourceUrl] },
+  });
+  expect(result.telemetry).toMatchObject({
+    generationMode: "grounded_scout",
+    proposedQuestionCount: 1,
+    acceptedQuestionCount: 1,
+    webSearchCalls: 1,
+  });
+  expect(result.telemetry.validationIssues).toEqual(expect.arrayContaining([
+    "response:primary_incomplete_max_output_tokens",
+    "response:repaired_structured_output",
+  ]));
+  expect(result.usage).toMatchObject({
+    input_tokens: 220,
+    output_tokens: 230,
+    total_tokens: 450,
+    provider_calls: 2,
+  });
+  expect(onUsage).toHaveBeenCalledOnce();
+  expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({
+    operation: "brief.question_scout",
+    usage: expect.objectContaining({
+      input_tokens: 220,
+      output_tokens: 230,
+      provider_calls: 2,
+    }),
+    costUsd: result.costUsd,
+  }));
+});
+
+test("accounts both billable calls once when the bounded scout repair is unavailable", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-repair-failure-accounting");
+  const sourceUrl = "https://example.org/wandelweiser-practice";
+  const partialDraft = '{"questions":[{"decisionKey":"wandelweiser_performance_density"';
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      id: "response-guidance-primary-malformed",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 100, output_tokens: 100 },
+      output_text: partialDraft,
+      output: [{
+        type: "web_search_call",
+        id: "search-wandelweiser-practice",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "Wandelweiser documented performance practice",
+          sources: [{ type: "url", url: sourceUrl, title: "Wandelweiser performance practice" }],
+        },
+      }],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      id: "response-guidance-repair-malformed",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 40, output_tokens: 50 },
+      output_text: "still-not-json",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+  vi.stubGlobal("fetch", fetchMock);
+  const onUsage = vi.fn(async () => undefined);
+
+  const result = await scoutPlaylistGuidance(
+    "An introduction to Wandelweiser recordings",
+    {
+      ...guidedDraftBrief,
+      title: "Wandelweiser Introduction",
+      subjectEntities: ["Wandelweiser"],
+      relationship: "representative of",
+    },
+    "gpt-5.4-mini",
+    { onUsage },
+  );
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(result.questions).toEqual([]);
+  expect(result.sourceHints).toEqual([expect.objectContaining({ url: sourceUrl })]);
+  expect(result.usage).toMatchObject({
+    input_tokens: 140,
+    output_tokens: 150,
+    provider_calls: 2,
+  });
+  expect(result.telemetry.validationIssues).toEqual([
+    "response:primary_invalid_json",
+    "response:repair_invalid_json",
+  ]);
+  expect(onUsage).toHaveBeenCalledOnce();
+  expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({
+    usage: expect.objectContaining({
+      input_tokens: 140,
+      output_tokens: 150,
+      provider_calls: 2,
+    }),
+    costUsd: result.costUsd,
+  }));
+});
+
 test("accepts a grounded geographic relationship fork for an underspecified place request", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-rio-guidance");
   const sourceUrl = "https://example.org/rio-music-history";
@@ -567,6 +783,73 @@ test("a precise prompt can produce zero questions without a generic fallback", a
     webSearchCalls: 0,
     validationIssues: [],
   });
+});
+
+test("repairs an empty researched scout for a broad request", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-broad-zero-guidance-repair");
+  const sourceUrl = "https://example.org/berlin-techno-continuums";
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(researchedZeroScoutResponse(sourceUrl, "Berlin techno continuums"))
+    .mockResolvedValueOnce(hostedResponse({
+      questions: [groundedScoutQuestion({
+        decisionKey: "berlin_continuum_emphasis",
+        subject: "Berlin techno's documented historical continuums",
+        sourceUrl,
+      })],
+    }, "response-guidance-broad-zero-repair"));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await scoutPlaylistGuidance(
+    "50 influential Berlin techno tracks",
+    {
+      ...guidedDraftBrief,
+      title: "Berlin Techno",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential within",
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]).toMatchObject({
+    decisionKey: "berlin_continuum_emphasis",
+    grounding: { sourceUrls: [sourceUrl] },
+  });
+  expect(result.telemetry).toMatchObject({
+    generationMode: "grounded_scout",
+    proposedQuestionCount: 1,
+    acceptedQuestionCount: 1,
+  });
+  expect(result.telemetry.validationIssues).toContain("response:repaired_structured_output");
+});
+
+test("does not repair a researched zero for a request that explicitly closes the scope", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-precise-researched-zero-guidance");
+  const fetchMock = vi.fn(async () => researchedZeroScoutResponse(
+    "https://example.org/bjork-discography",
+    "Björk discography",
+  ));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await scoutPlaylistGuidance(
+    "Exactly 25 original studio recordings by Björk, chronological, no remixes or live versions",
+    {
+      ...guidedDraftBrief,
+      title: "Björk Studio Chronology",
+      subjectEntities: ["Björk"],
+      relationship: "recorded by",
+      include: ["original studio recordings"],
+      exclude: ["remixes", "live versions"],
+      orderingPolicy: "chronological by release year",
+      targetSize: { min: 25, max: 25 },
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(result.questions).toEqual([]);
+  expect(result.telemetry.generationMode).toBe("no_material_questions");
 });
 
 test("salvages valid grounded questions independently and rejects invented sources", async () => {
