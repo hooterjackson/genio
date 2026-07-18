@@ -221,7 +221,7 @@ describe("retained production searches", () => {
     });
   });
 
-  test("post-match refill stops after two bounded generations and publishes a transparent partial", () => {
+  test("post-match refill stops after three bounded generations and publishes a transparent partial", () => {
     const brief = canonicalScenarioBrief({
       id: "bounded-refill-failure",
       prompt: "50 impossibly obscure recordings",
@@ -239,15 +239,15 @@ describe("retained production searches", () => {
       refillStrictMatchRate: 0,
     });
 
-    expect(replay.postMatchRefillGenerations).toBe(2);
-    expect(replay.refillCandidateGoals).toHaveLength(2);
-    expect(replay.refillCostUsd).toBe(0.7);
+    expect(replay.postMatchRefillGenerations).toBe(3);
+    expect(replay.refillCandidateGoals).toHaveLength(3);
+    expect(replay.refillCostUsd).toBeCloseTo(1.05, 10);
     expect(replay.observation).toMatchObject({
       manifestTrackCount: replay.observation.strictMatchedCount,
       publishedTrackCount: replay.observation.strictMatchedCount,
       terminalStatus: "partial",
       terminalPhase: "publication_partial",
-      postMatchRefillGenerations: 2,
+      postMatchRefillGenerations: 3,
     });
     const assessment = assessProductionScenario(replay.observation, "exact_playlist");
     expect(assessment.releaseReady).toBe(false);
@@ -282,7 +282,7 @@ describe("retained production searches", () => {
       terminalStatus: "partial",
       terminalPhase: "catalog_matching_empty",
     });
-    expect(replay.postMatchRefillGenerations).toBe(2);
+    expect(replay.postMatchRefillGenerations).toBe(3);
     expect(replay.observation.totalCostUsd).toBeLessThanOrEqual(PUBLIC_FAST_RESEARCH_BUDGET_USD);
     expect(assessProductionScenario(replay.observation, "exact_playlist")).toMatchObject({
       releaseReady: false,

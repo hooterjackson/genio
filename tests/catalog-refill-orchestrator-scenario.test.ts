@@ -28,6 +28,7 @@ import {
 import {
   createFastPostMatchRefillRouteCheckpoint,
   createFastRouteCheckpoint,
+  FAST_POST_MATCH_REFILL_LIMIT,
   researchExecutionPolicy,
 } from "../server/research-policy.ts";
 
@@ -281,7 +282,7 @@ class PipelineRepository {
     currentRefillGeneration: number,
   ) {
     this.candidateRefillRequests.push({ storefront, additionalCandidateGoal, currentRefillGeneration });
-    if (currentRefillGeneration >= 2) return "exhausted" as const;
+    if (currentRefillGeneration >= FAST_POST_MATCH_REFILL_LIMIT) return "exhausted" as const;
     const generation = currentRefillGeneration + 1;
     if (this.jobs.some((job) => job.dedupeKey === `research-refill:${RUN_ID}:${generation}`)) {
       return "in_flight" as const;
@@ -456,15 +457,17 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
     expect(vi.mocked(searchAppleCatalog).mock.calls.every(([, query]) => query.includes("Refill"))).toBe(true);
   });
 
-  test("two pre-deadline provider failures publish the maximum strict matches as partial", async () => {
+  test("bounded provider failures publish the maximum strict matches as partial", async () => {
     const repository = new PipelineRepository();
-    const orchestrator = new ScriptedRefillOrchestrator(repository, [
-      new Error("fixture provider transport failure"),
-      new Error("fixture provider transport failure"),
-    ]);
+    const orchestrator = new ScriptedRefillOrchestrator(
+      repository,
+      Array.from({ length: FAST_POST_MATCH_REFILL_LIMIT }, () => (
+        new Error("fixture provider transport failure")
+      )),
+    );
 
     await runInitialMatching(repository);
-    for (let generation = 1; generation <= 2; generation += 1) {
+    for (let generation = 1; generation <= FAST_POST_MATCH_REFILL_LIMIT; generation += 1) {
       const researchJob = repository.takeJob("research");
       await orchestrator.processJob(researchJob.payload);
       expect(repository.checkpoints.get(`fast:post-match-refill:${generation}:complete`)).toMatchObject({
@@ -477,7 +480,8 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
       await processMatchingJob(repository, matchingJob.payload);
     }
 
-    expect(repository.candidateRefillRequests.map((request) => request.currentRefillGeneration)).toEqual([0, 1]);
+    expect(repository.candidateRefillRequests.map((request) => request.currentRefillGeneration))
+      .toEqual(Array.from({ length: FAST_POST_MATCH_REFILL_LIMIT }, (_, index) => index));
     expect(repository.publicationHandoffs).toEqual([RUN_ID]);
     expect(repository.run).toMatchObject({
       status: "visitor_review",

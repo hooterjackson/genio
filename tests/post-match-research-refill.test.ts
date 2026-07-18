@@ -85,8 +85,8 @@ describe("post-match research-refill policy", () => {
     },
   );
 
-  test("never silently accepts a smaller playlist after the two-refill ceiling", () => {
-    expect(FAST_POST_MATCH_REFILL_LIMIT).toBe(2);
+  test("never silently accepts a smaller playlist after the three-refill ceiling", () => {
+    expect(FAST_POST_MATCH_REFILL_LIMIT).toBe(3);
     expect(fastPostMatchRefillPlan({
       requestedMinimum: 50,
       selectableCount: 49,
@@ -462,7 +462,7 @@ describe("matching after a research refill", () => {
     expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
   });
 
-  test("generation two publishes an unresolved shortfall as partial without queuing a third refill", async () => {
+  test("generation three publishes an unresolved shortfall as partial without queuing a fourth refill", async () => {
     const candidates = Array.from({ length: 50 }, (_, index) => candidate(`candidate-${index + 1}`));
     const matches: CatalogMatchResult[] = candidates.map((item, index) => index < 49
       ? {
@@ -489,12 +489,12 @@ describe("matching after a research refill", () => {
       "queued",
     );
     repository.checkpoints.set(
-      "fast:post-match-refill:2:route",
-      createFastPostMatchRefillRouteCheckpoint(2, 1, "us"),
+      "fast:post-match-refill:3:route",
+      createFastPostMatchRefillRouteCheckpoint(3, 1, "us"),
     );
 
     await matchResearchRun(repository, "rio-terminal-shortfall", "us", undefined, {
-      refillGeneration: 2,
+      refillGeneration: 3,
     });
 
     expect(repository.automaticCandidateRefills).toEqual([]);

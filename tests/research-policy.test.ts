@@ -99,7 +99,7 @@ describe("research execution policy", () => {
       requestedMinimum: 50,
       selectableCount: 49,
       attemptedCandidateCount: 120,
-      refillAttempts: 2,
+      refillAttempts: 3,
     })).toMatchObject({ state: "shortfall", shortfall: 1, additionalCandidateGoal: 0 });
   });
 

@@ -50,6 +50,7 @@ import {
   catalogMatchingCandidateGoal,
   createFastRouteCheckpoint,
   deepResearchModel,
+  FAST_POST_MATCH_REFILL_LIMIT,
   FAST_POST_MATCH_REFILL_MAX_COST_USD,
   parseFastPostMatchRefillRouteCheckpoint,
   parseFastRouteCheckpoint,
@@ -1241,7 +1242,7 @@ export class ResearchOrchestrator {
     const policy = researchExecutionPolicy(run.brief);
     if (policy.kind !== "fast_curated") throw new Error("Catalog refill requires a curated brief");
     const generation = Number.isInteger(payload.refillGeneration)
-      ? Math.max(1, Math.min(2, Number(payload.refillGeneration)))
+      ? Math.max(1, Math.min(FAST_POST_MATCH_REFILL_LIMIT, Number(payload.refillGeneration)))
       : 0;
     if (generation === 0) throw new Error("Catalog refill generation is invalid");
     const routeKey = `fast:post-match-refill:${generation}:route`;

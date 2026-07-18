@@ -21,6 +21,7 @@ import {
   createFastRouteCheckpoint,
   fastPostMatchRefillPlan,
   FAST_MATCHING_FINALIZATION_RESERVE_MS,
+  FAST_POST_MATCH_REFILL_LIMIT,
   parseFastPostMatchRefillRouteCheckpoint,
   parseFastRouteCheckpoint,
   researchExecutionPolicy,
@@ -395,7 +396,7 @@ export async function matchResearchRun(
   if (await resumeOrIgnoreAutomaticHandoff(repository, runId, run)) return;
   const recovery = options.retryIncomplete === true;
   const refillGeneration = Number.isInteger(options.refillGeneration)
-    ? Math.max(0, Math.min(2, Number(options.refillGeneration)))
+    ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, Number(options.refillGeneration)))
     : 0;
   const refill = refillGeneration > 0;
   const checkpointPhase = recovery
@@ -631,7 +632,7 @@ export async function processMatchingJob(repository: MatchingRepository, payload
       ? Math.max(0, Math.min(3, Number(payload.recoveryGeneration)))
       : 0,
     refillGeneration: Number.isInteger(payload.refillGeneration)
-      ? Math.max(0, Math.min(2, Number(payload.refillGeneration)))
+      ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, Number(payload.refillGeneration)))
       : 0,
   });
 }

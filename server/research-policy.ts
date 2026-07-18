@@ -43,7 +43,13 @@ export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
 export const FAST_CURATED_TARGET_MAXIMUM = 300;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
-export const FAST_POST_MATCH_REFILL_LIMIT = 2;
+// A third bounded generation is a resilience allowance, not an invitation to
+// loosen matching. Production canaries showed that one transient provider
+// failure otherwise consumed half of the two-pass budget and forced a broad,
+// evidence-rich request to publish 18/25. Every generation still has its own
+// fixed time, candidate, and $0.35 ceilings; publication remains partial when
+// all three safe recovery attempts are exhausted.
+export const FAST_POST_MATCH_REFILL_LIMIT = 3;
 // A refill is an accuracy recovery path after the original fast route has
 // already finished, so it owns a separate, short durable deadline. Each
 // generation performs at most one cited synthesis call and then matches only
