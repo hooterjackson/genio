@@ -364,6 +364,34 @@ function boundedGuidanceText(value: unknown, label: string, maximum: number): st
   return text;
 }
 
+/**
+ * Structured Outputs normally enforces prose limits for us, but provider
+ * length accounting and JavaScript code-point accounting can disagree around
+ * composed Unicode. A useful, source-grounded question must not be discarded
+ * merely because an explanatory sentence is a few characters too long.
+ * Normalize and shorten prose at a sentence or word boundary while keeping
+ * identifiers and enums on the stricter boundedGuidanceText path.
+ */
+function boundedGuidanceProse(value: unknown, label: string, maximum: number): string {
+  const text = typeof value === "string"
+    ? value.normalize("NFC").trim().replace(/\s+/gu, " ")
+    : "";
+  if (!text) throw new Error(`OpenAI returned an invalid guided ${label}`);
+  const characters = Array.from(text);
+  if (characters.length <= maximum) return text;
+
+  const prefix = characters.slice(0, maximum).join("");
+  const minimumCompleteSentence = Math.floor(maximum * 0.55);
+  const sentenceEnds = [...prefix.matchAll(/[.!?](?=(?:["')\]]|\s|$))/gu)];
+  const finalSentence = sentenceEnds.at(-1);
+  if (finalSentence?.index !== undefined && finalSentence.index + 1 >= minimumCompleteSentence) {
+    return prefix.slice(0, finalSentence.index + 1).trim();
+  }
+
+  const withoutPartialWord = prefix.slice(0, Math.max(1, maximum - 1)).replace(/\s+\S*$/u, "").trim();
+  return `${withoutPartialWord || characters.slice(0, Math.max(1, maximum - 1)).join("")}…`;
+}
+
 const GUIDANCE_STOP_WORDS = new Set([
   "about",
   "after",
@@ -550,7 +578,7 @@ function validatedGuidanceEffect(value: unknown): PlaylistGuidanceEffect {
   const raw = value as Record<string, unknown>;
   const kind = boundedGuidanceText(raw.kind, "effect kind", 40) as PlaylistGuidanceEffectKind;
   if (!GUIDANCE_EFFECT_KINDS.has(kind)) throw new Error("invalid_effect_kind");
-  const effectValue = boundedGuidanceText(raw.value, "effect value", 240);
+  const effectValue = boundedGuidanceProse(raw.value, "effect value", 240);
   const orderingBehavior = raw.orderingBehavior === null
     ? null
     : boundedGuidanceText(raw.orderingBehavior, "ordering behavior", 32) as PlaylistGuidanceOrderingBehavior;
@@ -596,10 +624,13 @@ function salvagedGuidanceQuestions(
       if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/u.test(decisionKey)) throw new Error("invalid_decision_key");
       if (GENERIC_GUIDANCE_DECISION_KEYS.has(decisionKey)) throw new Error("generic_decision_key");
       if (decisionKeys.has(decisionKey)) throw new Error("duplicate_decision_key");
-      const header = boundedGuidanceText(raw.header, "question header", 60);
-      const question = boundedGuidanceText(raw.question, "question", 240);
-      const whyMaterial = boundedGuidanceText(raw.whyMaterial, "materiality", 480);
-      const groundingSummary = boundedGuidanceText(raw.groundingSummary, "grounding", 420);
+      const header = boundedGuidanceProse(raw.header, "question header", 60);
+      const question = boundedGuidanceProse(raw.question, "question", 240);
+      const rawWhyMaterial = typeof raw.whyMaterial === "string" && raw.whyMaterial.trim()
+        ? raw.whyMaterial
+        : `Each answer changes which documented ${brief.subjectEntities.join(", ")} recordings qualify for the playlist.`;
+      const whyMaterial = boundedGuidanceProse(rawWhyMaterial, "materiality", 480);
+      if (rawWhyMaterial !== raw.whyMaterial) issues.push(`q${index + 1}:repaired_missing_materiality`);
       const requestedUrls = Array.isArray(raw.sourceUrls)
         ? [...new Set(raw.sourceUrls.map(normalizedSourceUrl).filter((url): url is string => Boolean(url)))].slice(0, 3)
         : [];
@@ -608,6 +639,16 @@ function salvagedGuidanceQuestions(
       if (attestedRequestedUrls.length !== requestedUrls.length) {
         issues.push(`q${index + 1}:dropped_unattested_source`);
       }
+      const groundingFallback = attestedRequestedUrls
+        .map((url) => sourceHints.find((source) => source.url === url))
+        .flatMap((source) => source ? [source.excerpt, source.title] : [])
+        .find((value) => value.trim().length > 0)
+        ?? whyMaterial;
+      const rawGroundingSummary = typeof raw.groundingSummary === "string" && raw.groundingSummary.trim()
+        ? raw.groundingSummary
+        : groundingFallback;
+      const groundingSummary = boundedGuidanceProse(rawGroundingSummary, "grounding", 420);
+      if (rawGroundingSummary !== raw.groundingSummary) issues.push(`q${index + 1}:repaired_missing_grounding`);
       const candidateText = `${decisionKey} ${header} ${question} ${whyMaterial} ${groundingSummary}`;
       if (isTrackCountQuestion(candidateText)) throw new Error("track_count_question");
       if (!questionIsPromptSpecific(`${header} ${question}`, prompt, brief)) {
@@ -632,11 +673,11 @@ function salvagedGuidanceQuestions(
       let options = raw.options.map((candidateOption, optionIndex) => {
         if (!candidateOption || typeof candidateOption !== "object") throw new Error("invalid_option");
         const option = candidateOption as Record<string, unknown>;
-        const label = boundedGuidanceText(option.label, "option label", 60);
+        const label = boundedGuidanceProse(option.label, "option label", 60);
         const labelKey = label.toLocaleLowerCase();
         if (optionLabels.has(labelKey)) throw new Error("duplicate_option");
         optionLabels.add(labelKey);
-        const description = boundedGuidanceText(option.description, "option description", 180);
+        const description = boundedGuidanceProse(option.description, "option description", 180);
         const optionText = `${label} ${description}`;
         if (optionTexts.some((existing) => tokenSimilarity(existing, optionText) >= 0.72)) {
           throw new Error("overlapping_option");

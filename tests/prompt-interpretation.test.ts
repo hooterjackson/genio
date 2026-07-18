@@ -653,6 +653,81 @@ test("salvages attested citations while recording drops and normalizing mixed se
   ]));
 });
 
+test("keeps an otherwise valid grounded question when provider prose slightly exceeds a field limit", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-prose-boundary");
+  const sourceUrl = "https://example.org/berlin-techno-periods";
+  const question = groundedScoutQuestion({
+    decisionKey: "berlin_period_emphasis",
+    subject: "Berlin techno history",
+    sourceUrl,
+  });
+  question.groundingSummary = `${"The source documents distinct Berlin techno institutions and periods. ".repeat(8)}This final sentence exceeds the display boundary.`;
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [question],
+    sourceUrl,
+    sourceTitle: "Berlin techno periods",
+  })));
+
+  const result = await scoutPlaylistGuidance(
+    "50 influential Berlin techno tracks",
+    {
+      ...guidedDraftBrief,
+      title: "Berlin Techno",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential within",
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toHaveLength(1);
+  expect(Array.from(result.questions[0]!.grounding!.summary).length).toBeLessThanOrEqual(420);
+  expect(result.questions[0]!.grounding!.summary).toMatch(/[.!?]$/u);
+  expect(result.telemetry).toMatchObject({
+    generationMode: "grounded_scout",
+    proposedQuestionCount: 1,
+    acceptedQuestionCount: 1,
+  });
+});
+
+test("repairs blank optional grounding instead of skipping an intelligent question", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-grounding-repair");
+  const sourceUrl = "https://example.org/berlin-techno-institutions";
+  const question = groundedScoutQuestion({
+    decisionKey: "berlin_institutional_lineage",
+    subject: "Berlin techno institutions",
+    sourceUrl,
+  });
+  question.groundingSummary = "   ";
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [question],
+    sourceUrl,
+    sourceTitle: "Berlin techno institutions and periods",
+  })));
+
+  const result = await scoutPlaylistGuidance(
+    "50 influential Berlin techno tracks",
+    {
+      ...guidedDraftBrief,
+      title: "Berlin Techno",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential within",
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]!.grounding).toMatchObject({
+    summary: expect.stringContaining("Berlin techno institutions"),
+    sourceUrls: [sourceUrl],
+  });
+  expect(result.telemetry).toMatchObject({
+    generationMode: "grounded_scout",
+    proposedQuestionCount: 1,
+    acceptedQuestionCount: 1,
+  });
+  expect(result.telemetry.validationIssues).toContain("q1:repaired_missing_grounding");
+});
+
 test("enforces the scout cost cap by returning zero questions", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-budget-cap");
   const sourceUrl = "https://example.org/tamil-nadaswaram";
