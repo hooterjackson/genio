@@ -26,7 +26,11 @@ import {
 } from "./openai.ts";
 import { assertPublicHttpsUrl, collectKnownUrls, compactEvidenceNote } from "./security.ts";
 import { bestAdapters, createAdapterRegistry } from "./adapters.ts";
-import { canonicalBriefForRequest, estimateResearchCost } from "./brief-policy.ts";
+import {
+  canonicalBriefForRequest,
+  deterministicBriefFallback,
+  estimateResearchCost,
+} from "./brief-policy.ts";
 import { publicToolFailure } from "./error-sanitizer.ts";
 import {
   OPENAI_PRICING_VERSION,
@@ -525,6 +529,24 @@ function guidanceScoutFailureIssue(error: unknown): string {
   if (name === "TimeoutError") return "scout:timeout";
   if (name === "AbortError") return "scout:aborted";
   return "scout:provider_unavailable";
+}
+
+function briefInterpretationCanFailOpen(error: unknown): boolean {
+  if (isBudgetError(error) || error instanceof ProviderRequestError || error instanceof SyntaxError) return true;
+  const message = error instanceof Error ? error.message : "";
+  return /^OpenAI returned\b/u.test(message);
+}
+
+function briefInterpretationFailureIssue(error: unknown): string {
+  if (isBudgetError(error)) return "interpretation:budget_unavailable";
+  if (error instanceof ProviderRequestError && error.status !== null) {
+    return `interpretation:provider_http_${Math.floor(error.status)}`;
+  }
+  if (error instanceof ProviderRequestError) return "interpretation:provider_unavailable";
+  if (error instanceof SyntaxError || /^OpenAI returned\b/u.test(error instanceof Error ? error.message : "")) {
+    return "interpretation:invalid_structured_output";
+  }
+  return "interpretation:unavailable";
 }
 
 function nonNegativeNumber(value: unknown, fallback: number): number {
@@ -1093,6 +1115,45 @@ export class ResearchOrchestrator {
     void this.enqueue(runId).catch(() => undefined);
   }
 
+  private async handoffBestEffortResearch(
+    runId: string,
+    eligibleCandidateCount: number,
+    options: {
+      readyPhase: string;
+      emptyPhase: string;
+      matchingPayload?: Record<string, unknown>;
+      matchingDedupeKey?: string;
+    },
+  ): Promise<"matching" | "partial"> {
+    const eligibleCount = Math.max(0, Math.floor(eligibleCandidateCount));
+    if (eligibleCount === 0) {
+      // An empty Apple playlist cannot be published. A bounded research
+      // shortfall is still a valid, transparent outcome rather than a task
+      // failure: preserve the frontier/checkpoint report and finish without a
+      // user-facing error. Provider, persistence, and integrity failures still
+      // throw through their normal worker path.
+      await this.repository.updateRun(runId, {
+        status: "partial",
+        phase: options.emptyPhase,
+        error: null,
+      });
+      return "partial";
+    }
+
+    await this.repository.updateRun(runId, {
+      status: "ready_for_matching",
+      phase: options.readyPhase,
+      error: null,
+    });
+    await this.repository.enqueueJob({
+      kind: "matching",
+      runId,
+      payload: { runId, storefront: process.env.APPLE_STOREFRONT ?? "br", ...(options.matchingPayload ?? {}) },
+      dedupeKey: options.matchingDedupeKey ?? `matching:${runId}`,
+    });
+    return "matching";
+  }
+
   async enqueue(runId: string): Promise<void> {
     const run = await this.repository.getRun(runId);
     const resume = await this.repository.getResearchCheckpoint(runId, "resume") as { phase?: ResearchPhase; gapAttempt?: number; generation?: number; segment?: number } | null;
@@ -1438,21 +1499,25 @@ export class ResearchOrchestrator {
       }
     }
     const executionModel = route.model;
-    const completed = await this.repository.getResearchCheckpoint(runId, completionKey) as { status?: string } | null;
-    if (completed?.status === "complete") {
-      await this.repository.enqueueJob({
-        kind: "matching",
+    const completed = await this.repository.getResearchCheckpoint(runId, completionKey) as {
+      status?: string;
+      citationEligibleCandidateCount?: number;
+    } | null;
+    if (completed?.status === "complete" || completed?.status === "shortfall") {
+      await this.handoffBestEffortResearch(
         runId,
-        payload: {
-          runId,
-          storefront: process.env.APPLE_STOREFRONT ?? "br",
-          fast: true,
-          fastConfirmedAt: route.confirmedAt,
-          fastResearchDeadlineAt: route.researchDeadlineAt,
-          fastDeadlineAt: route.deadlineAt,
+        Math.max(0, Number(completed.citationEligibleCandidateCount ?? (completed.status === "complete" ? 1 : 0))),
+        {
+          readyPhase: completed.status === "shortfall" ? "research_shortfall_handoff" : "research_complete",
+          emptyPhase: "research_empty",
+          matchingPayload: {
+            fast: true,
+            fastConfirmedAt: route.confirmedAt,
+            fastResearchDeadlineAt: route.researchDeadlineAt,
+            fastDeadlineAt: route.deadlineAt,
+          },
         },
-        dedupeKey: `matching:${runId}`,
-      });
+      );
       return;
     }
 
@@ -1714,9 +1779,10 @@ export class ResearchOrchestrator {
         },
       ]);
       if (shortfall > 0) {
-        const message = `Research found ${eligibleCount} of the required ${requestedMinimum} citation-eligible tracks. The playlist was not advanced with a silent shortfall.`;
+        const outcome = eligibleCount > 0 ? "matching" : "partial";
         await this.repository.saveResearchCheckpoint(runId, completionKey, {
           status: "shortfall",
+          next: outcome,
           profile: policy.version,
           model: executionModel,
           confirmedAt: route.confirmedAt,
@@ -1744,9 +1810,20 @@ export class ResearchOrchestrator {
           researchDeadlineAt,
           deadlineAt,
           completedAt: new Date().toISOString(),
-          error: message,
+          shortfall,
+          citationEligibleCandidateCount: eligibleCount,
+          next: outcome,
         });
-        await this.repository.updateRun(runId, { status: "failed", phase: "fast_research_shortfall", error: message });
+        await this.handoffBestEffortResearch(runId, eligibleCount, {
+          readyPhase: "research_shortfall_handoff",
+          emptyPhase: "research_empty",
+          matchingPayload: {
+            fast: true,
+            fastConfirmedAt: route.confirmedAt,
+            fastResearchDeadlineAt: route.researchDeadlineAt,
+            fastDeadlineAt: route.deadlineAt,
+          },
+        });
         return;
       }
       await this.repository.saveResearchCheckpoint(runId, completionKey, {
@@ -1779,19 +1856,15 @@ export class ResearchOrchestrator {
         deadlineAt,
         completedAt: new Date().toISOString(),
       });
-      await this.repository.updateRun(runId, { status: "ready_for_matching", phase: "research_complete", error: null });
-      await this.repository.enqueueJob({
-        kind: "matching",
-        runId,
-        payload: {
-          runId,
-          storefront: process.env.APPLE_STOREFRONT ?? "br",
+      await this.handoffBestEffortResearch(runId, eligibleCount, {
+        readyPhase: "research_complete",
+        emptyPhase: "research_empty",
+        matchingPayload: {
           fast: true,
           fastConfirmedAt: route.confirmedAt,
           fastResearchDeadlineAt: route.researchDeadlineAt,
           fastDeadlineAt: route.deadlineAt,
         },
-        dedupeKey: `matching:${runId}`,
       });
     } catch (error) {
       if (signal?.aborted) throw error;
@@ -1799,6 +1872,10 @@ export class ResearchOrchestrator {
         const coverage = await this.repository.getCoverage(runId);
         const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? 0));
         const requestedMinimum = Math.max(1, brief.targetSize?.min ?? 50);
+        const candidateGoal = Math.max(requestedMinimum, policy.candidateGoal);
+        const shortfall = Math.max(0, requestedMinimum - eligibleCount);
+        const reserveShortfall = Math.max(0, candidateGoal - eligibleCount);
+        const outcome = eligibleCount > 0 ? "matching" : "partial";
         const message = "Fast research reached its matching reserve; no additional paid calls will run.";
         await this.repository.upsertFrontier(runId, [{
           sourceClass: "fast_policy",
@@ -1820,27 +1897,32 @@ export class ResearchOrchestrator {
           error: message,
           updatedAt: new Date().toISOString(),
         });
-        if (eligibleCount < requestedMinimum) {
-          await this.repository.updateRun(runId, {
-            status: "failed",
-            phase: "fast_research_shortfall",
-            error: `Research reached its cutoff with ${eligibleCount} of the required ${requestedMinimum} citation-eligible tracks. No partial playlist was advanced.`,
-          });
-          return;
-        }
-        await this.repository.updateRun(runId, { status: "ready_for_matching", phase: "research_deadline_handoff", error: null });
-        await this.repository.enqueueJob({
-          kind: "matching",
-          runId,
-          payload: {
-            runId,
-            storefront: process.env.APPLE_STOREFRONT ?? "br",
+        await this.repository.saveResearchCheckpoint(runId, completionKey, {
+          status: shortfall > 0 ? "shortfall" : "complete",
+          next: outcome,
+          boundary: "deadline",
+          profile: policy.version,
+          model: executionModel,
+          confirmedAt: route.confirmedAt,
+          startedAt,
+          researchDeadlineAt,
+          deadlineAt,
+          completedAt: new Date().toISOString(),
+          sourceCount: Math.max(0, Number(coverage.sourceCount ?? 0)),
+          citationEligibleCandidateCount: eligibleCount,
+          shortfall,
+          candidateGoal,
+          reserveShortfall,
+        });
+        await this.handoffBestEffortResearch(runId, eligibleCount, {
+          readyPhase: shortfall > 0 ? "research_shortfall_handoff" : "research_deadline_handoff",
+          emptyPhase: "research_empty",
+          matchingPayload: {
             fast: true,
             fastConfirmedAt: route.confirmedAt,
             fastResearchDeadlineAt: route.researchDeadlineAt,
             fastDeadlineAt: route.deadlineAt,
           },
-          dedupeKey: `matching:${runId}`,
         });
         return;
       }
@@ -1914,6 +1996,8 @@ export class ResearchOrchestrator {
       if (phase === "gap_analysis" && gapAttempt >= researchGapPassLimit()) {
         const run = await this.repository.getRun(runId);
         if (["ready_for_matching", "matching", "review", "visitor_review", "manifest_ready", "publishing", "complete", "partial", "failed", "expired", "deleted"].includes(run.status)) return;
+        const coverage = await this.repository.getCoverage(runId);
+        const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? coverage.candidateCount ?? 0));
         const message = `Research stopped before gap pass ${gapAttempt + 1}: the configured gap-analysis limit was already exhausted.`;
         await this.repository.saveResearchCheckpoint(runId, "resume", {
           phase,
@@ -1922,12 +2006,18 @@ export class ResearchOrchestrator {
           segment,
           status: "complete",
           completionBlockers: [message],
+          next: eligibleCount > 0 ? "matching" : "partial",
           updatedAt: new Date().toISOString(),
         });
-        await this.repository.updateRun(runId, { status: "failed", phase: "research_incomplete", error: message });
+        await this.handoffBestEffortResearch(runId, eligibleCount, {
+          readyPhase: "research_limit_handoff",
+          emptyPhase: "research_empty",
+        });
         return;
       }
       if (segment >= researchSegmentLimit()) {
+        const coverage = await this.repository.getCoverage(runId);
+        const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? coverage.candidateCount ?? 0));
         const message = `Research refused segment ${segment + 1} in ${phase}: the configured ${researchSegmentLimit()}-segment ceiling was already exhausted.`;
         await this.repository.saveResearchCheckpoint(runId, "resume", {
           phase,
@@ -1936,9 +2026,13 @@ export class ResearchOrchestrator {
           segment,
           status: "complete",
           completionBlockers: [message],
+          next: eligibleCount > 0 ? "matching" : "partial",
           updatedAt: new Date().toISOString(),
         });
-        await this.repository.updateRun(runId, { status: "failed", phase: "research_incomplete", error: message });
+        await this.handoffBestEffortResearch(runId, eligibleCount, {
+          readyPhase: "research_limit_handoff",
+          emptyPhase: "research_empty",
+        });
         return;
       }
       await this.repository.saveResearchCheckpoint(runId, "resume", {
@@ -1955,6 +2049,7 @@ export class ResearchOrchestrator {
         const nextGeneration = generation + 1;
         if (outcome.nextSegment >= researchSegmentLimit()) {
           const coverage = await this.repository.getCoverage(runId);
+          const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? coverage.candidateCount ?? 0));
           const containers = Array.isArray(coverage.containers) ? coverage.containers as ResearchContainerView[] : [];
           const openContainerCount = unresolvedContainers(containers).length;
           const frontier = Array.isArray(coverage.frontier) ? coverage.frontier as SourceFrontierItem[] : [];
@@ -1968,6 +2063,7 @@ export class ResearchOrchestrator {
             segment: outcome.nextSegment,
             status: "complete",
             completionBlockers: [message],
+            next: eligibleCount > 0 ? "matching" : "partial",
             updatedAt: new Date().toISOString(),
           });
           await this.repository.saveResearchCheckpoint(runId, `${checkpointKey(phase, gapAttempt)}:segment-limit`, {
@@ -1975,9 +2071,13 @@ export class ResearchOrchestrator {
             phase,
             segment: outcome.nextSegment,
             completionBlockers: [message],
+            next: eligibleCount > 0 ? "matching" : "partial",
             updatedAt: new Date().toISOString(),
           });
-          await this.repository.updateRun(runId, { status: "failed", phase: "research_incomplete", error: message });
+          await this.handoffBestEffortResearch(runId, eligibleCount, {
+            readyPhase: "research_limit_handoff",
+            emptyPhase: "research_empty",
+          });
           return;
         }
         await this.repository.saveResearchCheckpoint(runId, "resume", {
@@ -2092,23 +2192,27 @@ export class ResearchOrchestrator {
     ];
     const maximumGapPasses = researchGapPassLimit();
     if (gapAttempt + 1 >= maximumGapPasses) {
-      const message = `Research stopped after ${maximumGapPasses} gap-analysis passes: ${completionBlockers.join("; ") || "completion criteria were not satisfied"}.`.slice(0, 2_000);
+      const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? coverage.candidateCount ?? 0));
       await this.repository.saveResearchCheckpoint(runId, "resume", {
         phase,
         gapAttempt,
         generation: 0,
         status: "complete",
         completionBlockers,
+        next: eligibleCount > 0 ? "matching" : "partial",
         updatedAt: new Date().toISOString(),
       });
       await this.repository.saveResearchCheckpoint(runId, advanceKey, {
         state: "complete",
         noNewGapPasses: noNew,
-        next: "research_incomplete",
+        next: eligibleCount > 0 ? "matching" : "partial",
         completionBlockers,
         updatedAt: new Date().toISOString(),
       });
-      await this.repository.updateRun(runId, { status: "failed", phase: "research_incomplete", error: message });
+      await this.handoffBestEffortResearch(runId, eligibleCount, {
+        readyPhase: "research_limit_handoff",
+        emptyPhase: "research_empty",
+      });
       return;
     }
 
@@ -2713,27 +2817,60 @@ export async function processBriefInterpretationJob(
   };
 
   try {
-    const interpreted = await meteredBriefCall({
-      operation: "brief.interpret",
-      maximumCostUsd: maximumOpenAICallCostUsd({
-        model: request.model,
-        max_output_tokens: 1_200,
-        reasoning: { effort: "none" },
-        input: providerInput,
-      }, 0, nonNegativeNumber(
-        process.env.OPENAI_MIN_BRIEF_RESERVATION_USD ?? process.env.OPENAI_MAX_BRIEF_RESERVATION_USD,
-        0.05,
-      )),
-      invoke: (context) => interpretPrompt(interpretationPrompt, request.model, context),
-    });
-    const canonicalBrief = canonicalBriefForRequest(request, interpreted.brief);
+    let canonicalBrief: PlaylistBrief;
+    let interpretationFallbackIssue: string | null = null;
+    try {
+      const interpreted = await meteredBriefCall({
+        operation: "brief.interpret",
+        maximumCostUsd: maximumOpenAICallCostUsd({
+          model: request.model,
+          max_output_tokens: 1_200,
+          reasoning: { effort: "none" },
+          input: providerInput,
+        }, 0, nonNegativeNumber(
+          process.env.OPENAI_MIN_BRIEF_RESERVATION_USD ?? process.env.OPENAI_MAX_BRIEF_RESERVATION_USD,
+          0.05,
+        )),
+        invoke: (context) => interpretPrompt(interpretationPrompt, request.model, context),
+      });
+      canonicalBrief = canonicalBriefForRequest(request, interpreted.brief);
+    } catch (error) {
+      // A visitor request is still researchable when the provider is
+      // temporarily unavailable or violates its strict output schema. Preserve
+      // cancellation and accounting failures, but use the server-owned brief
+      // for provider/schema/budget degradation instead of exhausting the
+      // durable job's retries and showing a terminal interpretation error.
+      assertActive(signal);
+      if (!briefInterpretationCanFailOpen(error)) throw error;
+      canonicalBrief = deterministicBriefFallback(request);
+      interpretationFallbackIssue = briefInterpretationFailureIssue(error);
+    }
 
     let scout: {
       questions: PlaylistGuidanceQuestion[];
       sourceHints: PlaylistGuidanceSourceHint[];
       telemetry: PlaylistGuidanceTelemetry;
     };
-    try {
+    const canScout = interpretationFallbackIssue === null
+      || interpretationFallbackIssue === "interpretation:invalid_structured_output";
+    if (!canScout) {
+      // A clear provider outage, quota rejection, or unavailable brief budget
+      // would make an immediate second call both slow and predictably useless.
+      // Continue directly with the deterministic brief. Malformed structured
+      // output still scouts because the provider itself was reachable and may
+      // return useful subject-grounded questions on the independent call.
+      scout = {
+        questions: [],
+        sourceHints: [],
+        telemetry: {
+          generationMode: "scout_unavailable",
+          proposedQuestionCount: 0,
+          acceptedQuestionCount: 0,
+          webSearchCalls: 0,
+          validationIssues: [interpretationFallbackIssue!],
+        },
+      };
+    } else try {
       const scoutResult = await meteredBriefCall({
         operation: "brief.question_scout",
         maximumCostUsd: Math.min(
@@ -2759,7 +2896,15 @@ export async function processBriefInterpretationJob(
       scout = {
         questions: scoutResult.questions,
         sourceHints: scoutResult.sourceHints,
-        telemetry: scoutResult.telemetry,
+        telemetry: interpretationFallbackIssue
+          ? {
+            ...scoutResult.telemetry,
+            validationIssues: [
+              interpretationFallbackIssue,
+              ...scoutResult.telemetry.validationIssues,
+            ].slice(0, 12),
+          }
+          : scoutResult.telemetry,
       };
     } catch (error) {
       // Follow-up discovery is optional. A timeout, provider degradation, or
@@ -2775,7 +2920,10 @@ export async function processBriefInterpretationJob(
           webSearchCalls: 0,
           // Persist only a bounded diagnostic class. Raw provider bodies may
           // contain request content and never cross the durable boundary.
-          validationIssues: [guidanceScoutFailureIssue(error)],
+          validationIssues: [
+            ...(interpretationFallbackIssue ? [interpretationFallbackIssue] : []),
+            guidanceScoutFailureIssue(error),
+          ].slice(0, 12),
         },
       };
     }

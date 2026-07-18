@@ -4,6 +4,7 @@ import {
   applyRequestedTrackCount,
   canonicalBriefForRequest,
   canonicalBriefForPrompt,
+  deterministicBriefFallback,
   estimateResearchCost,
   estimateResearchCostRange,
   isPlaylistBrief,
@@ -100,6 +101,46 @@ describe("playlist brief policy", () => {
       title: "Test: 50 Essential Tracks",
       targetSize: { min: 50, max: 50 },
     });
+  });
+
+  test("builds a bounded researchable brief for the exact baile-funk failure prompt", () => {
+    const fallback = deterministicBriefFallback({
+      prompt: "Iconic baile funk songs with drill inspiration",
+      requestedTrackCount: 25,
+    });
+
+    expect(fallback).toMatchObject({
+      mode: "curated",
+      targetSize: { min: 25, max: 25 },
+      subjectEntities: ["Iconic baile funk songs with drill inspiration"],
+      relationship: "is an editorially significant example of the requested musical scope",
+      ambiguities: [],
+    });
+    expect(fallback.title).toMatch(/baile funk/iu);
+    expect(fallback.include.join(" ")).toMatch(/drill inspiration/iu);
+    expect(isPlaylistBrief(fallback)).toBe(true);
+  });
+
+  test("keeps exhaustive intent and similarity exclusions in deterministic fallback briefs", () => {
+    expect(deterministicBriefFallback({
+      prompt: "Every released song by Michael Jackson",
+    })).toMatchObject({
+      mode: "exhaustive",
+      targetSize: null,
+    });
+
+    const similarity = deterministicBriefFallback({
+      prompt: "Music like Radiohead, but by other artists",
+      requestedTrackCount: 50,
+    });
+    expect(similarity).toMatchObject({
+      mode: "curated",
+      relationship: "stylistically similar to the reference artist",
+      subjectEntities: ["Radiohead"],
+      targetSize: { min: 50, max: 50 },
+    });
+    expect(similarity.exclude.join(" ")).toMatch(/exclude recordings by: Radiohead/iu);
+    expect(isPlaylistBrief(similarity)).toBe(true);
   });
 
   test("a public default count neutralizes exhaustive prompt/model drift and stays on the capped fast path", () => {

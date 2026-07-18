@@ -22,6 +22,9 @@ const TRACK_COUNT_PATTERN = /\b(\d{1,5}|\d{1,3}(?:,\d{3})+)\+?\s*(?:[-\u2013\u20
 const NON_TRACK_QUANTITY_SUFFIX = /^(?:\s*[-\u2013\u2014]\s*pieces?\b|\s*(?:[-\u2013\u2014]\s*)?(?:years?|months?|weeks?|days?|hours?|minutes?|seconds?|decades?|centur(?:y|ies)|people|persons?|listeners?|artists?|albums?|releases?|records?|discs?|volumes?|tones?|bars?|beats?|bpm|rpm|hertz|hz|khz|bits?|strings?|members?)\b)/iu;
 const SUBJECTIVE_PLAYLIST_INTENT = /\b(?:playlist|mix|mixtape|best|essential|influential|important|representative|favorite|favourite|similar|resembl|sounds?\s+like|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|adjacent|mood|vibe|party|study|studying|work|working|background|churrasco|gathering|dinner|road\s+trip|workout)\b/iu;
 const EXPLICIT_FACTUAL_EXHAUSTIVE_INTENT = /(?:\b(?:every|all)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|versions?)\b|\b(?:complete|entire|full|exhaustive)\b.{0,60}\b(?:discograph(?:y|ies)|catalog(?:ue)?|recordings?|credits?|releases?)\b)/iu;
+const FALLBACK_REQUEST_LEAD = /^(?:(?:please|can you|could you|would you|i want you to|i(?:'|’)d like you to)\s+)*(?:(?:give|show|find|make|build|create|generate|assemble|compile|research|put together)\s+(?:me\s+)?)?/iu;
+const FALLBACK_PLAYLIST_WRAPPER = /^(?:(?:a|an|the)\s+)?(?:apple music\s+)?playlist(?:\s+(?:of|with|for|containing))?\s*/iu;
+const FALLBACK_TRACK_COUNT_LEAD = /^\s*(?:exactly\s+)?\d{1,5}\+?\s+(?:songs?|tracks?|recordings?|titles?|pieces?|works?|compositions?|cuts?|selections?)\s*(?:of|with|from|by|for)?\s*/iu;
 
 export interface ResearchCostFactor {
   label: string;
@@ -276,6 +279,96 @@ export function canonicalBriefForRequest(
     ...titledCanonical,
     ambiguityAcceptance: [...confirmation.ambiguityAcceptance],
   };
+}
+
+function fallbackPromptText(prompt: string): string {
+  return prompt
+    .normalize("NFKC")
+    .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+    .replace(/[*_`]+/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 500);
+}
+
+function fallbackSubject(prompt: string): string {
+  const cleaned = fallbackPromptText(prompt);
+  const withoutCommand = cleaned.replace(FALLBACK_REQUEST_LEAD, "").trim();
+  const withoutWrapper = withoutCommand.replace(FALLBACK_PLAYLIST_WRAPPER, "").trim();
+  const withoutCount = withoutWrapper.replace(FALLBACK_TRACK_COUNT_LEAD, "").trim();
+  return (withoutCount || withoutWrapper || cleaned || "Music")
+    .replace(/[\s:;,.!?\-\u2013\u2014]+$/gu, "")
+    .trim()
+    .slice(0, 240) || "Music";
+}
+
+function fallbackVersionPolicy(prompt: string): string {
+  if (/\b(?:live|concert|in concert)\b/iu.test(prompt)) {
+    return "Prefer the requested live performance; keep one canonical catalog version of each performance.";
+  }
+  if (/\b(?:remix|mixes|rework|edit)\b/iu.test(prompt)) {
+    return "Include the requested remix or edit versions; deduplicate identical catalog recordings.";
+  }
+  return "Prefer one canonical released recording per song; exclude duplicate editions, live versions, remixes, karaoke, and tribute recordings unless explicitly requested.";
+}
+
+function fallbackRelationship(prompt: string): string {
+  if (/\b(?:sounds?\s+(?:a\s+lot\s+)?like|similar\s+to|resembl(?:e|es|ing)|adjacent\s+to|in\s+(?:the\s+)?(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like|music\s+like)\b/iu.test(prompt)) {
+    return "is stylistically similar to the requested reference and musical criteria";
+  }
+  if (/\b(?:influential|important|iconic|essential|canonical|landmark|best|greatest)\b/iu.test(prompt)) {
+    return "is an editorially significant example of the requested musical scope";
+  }
+  if (/\b(?:played\s+on|performed\s+on|session|credit(?:ed|s)?|contribut(?:ed|ion)|produced|wrote|written|composed)\b/iu.test(prompt)) {
+    return "satisfies the requested documented artist-to-recording credit relationship";
+  }
+  if (/\b(?:songs?|tracks?|music|recordings?)\s+about\b/iu.test(prompt)) {
+    return "satisfies the requested lyrical, geographic, or thematic relationship";
+  }
+  return "directly matches the requested musical scope";
+}
+
+/**
+ * Construct a safe, useful brief when the provider cannot return valid
+ * structured interpretation. This is deliberately conservative: it preserves
+ * the visitor's request verbatim as a bounded inclusion rule, never invents
+ * artist-specific facts, and leaves source-backed research to the normal
+ * pipeline. Provider or schema degradation must not make playlist creation a
+ * dead end.
+ */
+export function deterministicBriefFallback(
+  request: PlaylistBriefRequestContext,
+): PlaylistBrief {
+  const prompt = fallbackPromptText(request.prompt);
+  const subject = fallbackSubject(prompt);
+  const exhaustive = request.requestedTrackCount == null
+    && EXPLICIT_FACTUAL_EXHAUSTIVE_INTENT.test(prompt);
+  const selectedCount = request.requestedTrackCount
+    ?? explicitTrackCount(prompt, [subject])
+    ?? PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS;
+  const mode: PlaylistBrief["mode"] = exhaustive ? "exhaustive" : "curated";
+  const targetSize = exhaustive ? null : { min: selectedCount, max: selectedCount };
+  const relationship = fallbackRelationship(prompt);
+  const draft: PlaylistBrief = {
+    title: subject,
+    description: `A source-backed playlist matching the request: ${prompt || subject}.`.slice(0, 2_000),
+    mode,
+    subjectEntities: [subject],
+    relationship,
+    include: [`Recordings that directly satisfy this request: ${prompt || subject}`.slice(0, 500)],
+    exclude: [],
+    versionPolicy: fallbackVersionPolicy(prompt),
+    evidencePolicy: exhaustive
+      ? "Require source-backed recording-level evidence for the requested factual relationship."
+      : "Use reputable cited editorial, historical, artist, label, and catalog sources appropriate to the requested relationship.",
+    orderingPolicy: "Use an editorial sequence that interleaves artists and albums and avoids repetitive blocks.",
+    targetSize,
+    ambiguities: [],
+  };
+  return canonicalBriefForRequest(request, {
+    ...draft,
+    title: normalizePlaylistTitle(draft.title, draft),
+  });
 }
 
 /**

@@ -2004,8 +2004,9 @@ test("the current publication result shape keeps run coverage and evidence conte
   const resultHeading = page.getByRole("heading", { name: "Playlist published with gaps" });
   await expect(resultHeading).toBeVisible();
   await expect(resultHeading.locator("br")).toHaveCount(0);
-  await expect(page.getByText("Published from 18 documented sources with 3 visible gaps.")).toBeVisible();
-  await expect(page.getByText("2 tracks")).toBeVisible();
+  await expect(page.getByText("2 tracks published.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Evidence: 18 documented sources; 3 open gaps.", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 tracks", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: /view evidence/i })).toHaveAttribute(
     "href",
     "/api/v1/runs/run-result/evidence",
@@ -2055,8 +2056,102 @@ test("an exact curated target is complete even when reserve candidates were omit
   await page.goto("/#cap=one-time-secret&run=run-exact-result");
   await expect(page.getByRole("heading", { name: "Playlist published" })).toBeVisible();
   await expect(page.getByRole("heading", { name: /with gaps/i })).toHaveCount(0);
-  await expect(page.getByText("Published from 10 documented sources with 0 visible gaps.")).toBeVisible();
-  await expect(page.getByText("50 tracks")).toBeVisible();
+  await expect(page.getByText("50 tracks published.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Evidence: 10 documented sources; 0 open gaps.", { exact: true })).toBeVisible();
+  await expect(page.getByText("50 tracks", { exact: true })).toBeVisible();
+});
+
+test("a below-target automatic playlist renders as a published partial result, never a failed task", async ({ page }) => {
+  const partialRun = {
+    ...run,
+    id: "run-partial-shortfall-result",
+    status: "partial",
+    phase: "published_partial",
+    error: null,
+    brief: {
+      ...curatedBrief,
+      title: "Baile Funk Icons",
+      targetSize: { min: 50, max: 50 },
+    },
+    sourceCount: 12,
+    unresolvedCount: 0,
+  };
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: partialRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-partial-shortfall-result", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(partialRun) });
+  });
+  await page.route("**/api/v1/runs/run-partial-shortfall-result/result", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "partial",
+        manifest: { id: "manifest-partial", name: "Baile Funk Icons", contentHash: "partial", trackCount: 23 },
+        volumes: [{
+          volumeNumber: 1,
+          volumeCount: 1,
+          startPosition: 0,
+          endPosition: 22,
+          status: "complete",
+          appleShareUrl: "https://music.apple.com/us/playlist/baile-funk-icons/pl.partial",
+          appendedCount: 23,
+        }],
+        outcomeCounts: { accepted: 23, unavailable: 27 },
+      }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-partial-shortfall-result");
+
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Playlist published with gaps" })).toBeVisible();
+  await expect(page.getByText("23 of 50 requested tracks published.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Evidence: 12 documented sources; 0 open gaps.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: /open in apple music/i })).toHaveAttribute(
+    "href",
+    "https://music.apple.com/us/playlist/baile-funk-icons/pl.partial",
+  );
+  await expect(page.getByText(/failed task|no playlist was published/i)).toHaveCount(0);
+});
+
+test("a zero-match bounded search ends neutrally without claiming a playlist was published", async ({ page }) => {
+  const emptyRun = {
+    ...run,
+    id: "run-empty-partial-result",
+    status: "partial",
+    phase: "catalog_matching_empty",
+    error: null,
+    brief: {
+      ...curatedBrief,
+      title: "Extremely obscure recordings",
+      targetSize: { min: 25, max: 25 },
+    },
+    sourceCount: 2,
+    unresolvedCount: 4,
+  };
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: emptyRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-empty-partial-result", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(emptyRun) });
+  });
+  await page.route("**/api/v1/runs/run-empty-partial-result/result", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "partial", manifest: null, volumes: [], outcomeCounts: {} }),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-empty-partial-result");
+
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "No compatible tracks found" })).toBeVisible();
+  await expect(page.getByText("0 of 25 requested tracks published.", { exact: true })).toBeVisible();
+  await expect(page.getByText("[NO PLAYLIST]", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: /open in apple music/i })).toHaveCount(0);
 });
 
 test("a transient restore failure preserves the durable run URL", async ({ page }) => {
@@ -2182,7 +2277,10 @@ test("interactive controls meet the minimum touch target", async ({ page }) => {
 });
 
 test("desktop keyboard focus remains visible and primary text meets WCAG AA contrast", async ({ page }, testInfo) => {
-  await page.goto("/");
+  // Wait for the one-time intro to finish before editing the controlled field.
+  // Otherwise the intro can replace the composer after `fill`, discarding the
+  // value and leaving the CTA disabled on slower mobile projects.
+  await openPrompt(page);
   const request = requestField(page);
   await request.fill("Every released song Paulinho da Costa performed on");
   const primary = page.getByRole("button", { name: /create playlist/i });

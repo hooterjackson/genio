@@ -339,7 +339,7 @@ test("matching records an explicit shortfall instead of presenting a partial req
   }));
 });
 
-test("One Command shortfalls fail clearly instead of polling an unowned review state", async () => {
+test("One Command publishes the maximum strict matches after bounded shortfall recovery", async () => {
   const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
   const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
   repository.matches.push({
@@ -354,8 +354,9 @@ test("One Command shortfalls fail clearly instead of polling an unowned review s
   await matchResearchRun(repository, "run-1", "us");
 
   expect(repository.updates.at(-1)).toMatchObject({
-    status: "failed",
-    phase: "catalog_matching_shortfall",
+    status: "visitor_review",
+    phase: "exception_review",
+    error: null,
   });
   expect(repository.automaticRecoveries).toEqual([{
     runId: "run-1",
@@ -363,7 +364,7 @@ test("One Command shortfalls fail clearly instead of polling an unowned review s
     currentGeneration: 0,
     currentRefillGeneration: 0,
   }]);
-  expect(repository.automaticPublications).toEqual([]);
+  expect(repository.automaticPublications).toEqual(["run-1"]);
 });
 
 test("One Command queues bounded Apple recovery before terminalizing a retryable shortfall", async () => {
@@ -429,13 +430,28 @@ test("One Command counts only strict unique Apple matches toward an exact target
   await matchResearchRun(repository, "run-1", "us");
 
   expect(repository.updates.at(-1)).toMatchObject({
-    status: "failed",
-    phase: "catalog_matching_shortfall",
+    status: "visitor_review",
+    phase: "exception_review",
+    error: null,
   });
   expect(repository.checkpoints).toContainEqual(expect.objectContaining({
     safePrimaryCount: 1,
     shortfall: 1,
   }));
+  expect(repository.automaticPublications).toEqual(["run-1"]);
+});
+
+test("One Command records a zero-match shortfall as partial instead of failed", async () => {
+  const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
+  const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
+
+  await matchResearchRun(repository, "run-1", "us");
+
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "partial",
+    phase: "catalog_matching_empty",
+    error: null,
+  });
   expect(repository.automaticPublications).toEqual([]);
 });
 

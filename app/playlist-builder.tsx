@@ -13,6 +13,13 @@ import {
 import { BrandIntro } from "./brand-intro";
 import { type PrimaryNavItem } from "./primary-nav";
 import { PublicSiteHeader } from "./public-site-header";
+import {
+  apiErrorCode,
+  evidenceCountSummary,
+  publishedTrackCountSummary,
+  publishedResultHeading,
+  shouldQuietlyClearInitialRunRestore,
+} from "./playlist-builder-ui-policy";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
 
@@ -236,10 +243,12 @@ const progressByPhase: Record<string, number> = {
 
 class ApiError extends Error {
   status: number;
+  code: string | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string | null = null) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -276,7 +285,9 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     ? await response.json().catch(() => ({}))
     : await response.text().catch(() => "");
 
-  if (!response.ok) throw new ApiError(extractError(payload, response.status), response.status);
+  if (!response.ok) {
+    throw new ApiError(extractError(payload, response.status), response.status, apiErrorCode(payload));
+  }
   return payload as T;
 }
 
@@ -1527,24 +1538,28 @@ function ResultScreen({
   const outcomes = Object.entries(result.outcomeCounts ?? {});
   const publishedTrackCount = result.volumes.reduce((total, volume) => total + volume.trackCount, 0);
   const hasExactTarget = result.requestedTrackCount !== null
-    && result.requestedTrackCount !== undefined
+    && result.requestedTrackCount !== undefined;
   const exactTargetSatisfied = hasExactTarget && publishedTrackCount === result.requestedTrackCount;
   const exactTargetMissed = hasExactTarget && !exactTargetSatisfied;
   const knownZeroVisibleGaps = result.unresolvedGapCount === 0;
   const publishedWithGaps = numberValue(result.unresolvedGapCount) > 0
     || exactTargetMissed
     || (result.status === "partial" && !(exactTargetSatisfied && knownZeroVisibleGaps));
-  const resultTitle = publishedWithGaps
-    ? "Playlist published with gaps"
-    : "Playlist published";
+  const resultTitle = publishedResultHeading(publishedTrackCount, publishedWithGaps);
+  const hasPublishedPlaylist = publishedTrackCount > 0 && result.volumes.length > 0;
 
   return (
     <section className="screen flow-screen result-screen" aria-labelledby="result-title">
       <div className="flow-body">
-        <span className="tag">[{result.volumes.length} {result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]</span>
+        <span className="tag">{hasPublishedPlaylist
+          ? `[${result.volumes.length} ${result.volumes.length === 1 ? "VOLUME" : "VOLUMES"}]`
+          : "[NO PLAYLIST]"}</span>
         <h1 id="result-title">{resultTitle}</h1>
-        <p>{result.coverageSummary || "The Apple Music links and coverage report are ready."}</p>
-        <small className="result-note">Apple reports this playlist as public and returned this link. Search, profile visibility, and regional availability are not guaranteed.</small>
+        <p className="result-track-count">{publishedTrackCountSummary(publishedTrackCount, result.requestedTrackCount)}</p>
+        <p className="result-coverage-summary">
+          {evidenceCountSummary(numberValue(result.sourceCount), numberValue(result.unresolvedGapCount))}
+        </p>
+        {hasPublishedPlaylist && <small className="result-note">Apple reports this playlist as public and returned this link. Search, profile visibility, and regional availability are not guaranteed.</small>}
 
         <div className="volume-list">
           {result.volumes.map((volume) => (
@@ -1805,10 +1820,30 @@ export function PlaylistBuilder() {
           }
         }
       } catch (caught) {
-        setError((caught as Error).message);
         const status = caught instanceof ApiError ? caught.status : 0;
-        if ([400, 401, 404, 410].includes(status)) {
+        const quietRunReset = shouldQuietlyClearInitialRunRestore({
+          hasRunId: Boolean(runId),
+          status,
+          code: caught instanceof ApiError ? caught.code : null,
+        });
+        if (quietRunReset) {
+          activeRunId.current = null;
+          setEntryStage("command");
+          setRun(null);
+          setBrief(null);
+          setPrompt("");
+          setTrackCount(String(PUBLIC_PLAYLIST_DEFAULT_TRACKS));
+          setTrackSelection(null);
+          setManifest(null);
+          setResult(null);
+          setBusy("");
+          setError("");
           window.history.replaceState(null, "", window.location.pathname);
+        } else {
+          setError((caught as Error).message);
+          if ([400, 401, 404, 410].includes(status)) {
+            window.history.replaceState(null, "", window.location.pathname);
+          }
         }
       } finally {
         setBriefFinalizing(false);

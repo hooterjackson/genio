@@ -199,6 +199,7 @@ class RefillMatchingRepository implements MatchingRepository {
     currentRecoveryGeneration: number;
     currentRefillGeneration: number;
   }> = [];
+  readonly automaticPublications: string[] = [];
   automaticRecoveryState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
 
   constructor(
@@ -283,7 +284,9 @@ class RefillMatchingRepository implements MatchingRepository {
     return this.candidateRefillState;
   }
 
-  async queueAutomaticPublication() {}
+  async queueAutomaticPublication(runId: string) {
+    this.automaticPublications.push(runId);
+  }
 }
 
 describe("matching after a research refill", () => {
@@ -372,7 +375,7 @@ describe("matching after a research refill", () => {
     expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
   });
 
-  test("generation two terminalizes an unresolved exact-count shortfall without queuing a third refill", async () => {
+  test("generation two publishes an unresolved shortfall as partial without queuing a third refill", async () => {
     const candidates = Array.from({ length: 50 }, (_, index) => candidate(`candidate-${index + 1}`));
     const matches: CatalogMatchResult[] = candidates.map((item, index) => index < 49
       ? {
@@ -409,10 +412,11 @@ describe("matching after a research refill", () => {
 
     expect(repository.automaticCandidateRefills).toEqual([]);
     expect(repository.updates.at(-1)).toMatchObject({
-      status: "failed",
-      phase: "catalog_matching_shortfall",
-      error: expect.stringContaining("49 strict unique catalog matches for the required 50"),
+      status: "visitor_review",
+      phase: "exception_review",
+      error: null,
     });
+    expect(repository.automaticPublications).toEqual(["rio-terminal-shortfall"]);
   });
 
   test("refill generation survives exhausted catalog recovery and queues generation two instead of stranding matching", async () => {

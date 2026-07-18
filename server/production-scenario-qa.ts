@@ -231,8 +231,12 @@ export function replayProductionScenario(
 
   const unavailableCatalogCount = Math.max(0, candidateCount - strictMatchedCount);
   const complete = strictMatchedCount >= requestedTrackCount;
-  // Production locks no manifest when the exact count cannot be met safely.
-  const manifestTrackCount = complete ? requestedTrackCount : 0;
+  // After bounded research and catalog recovery, production publishes every
+  // strict unique match it safely found. Missing the requested count is a
+  // transparent partial outcome, never a count-driven task failure.
+  const manifestTrackCount = complete
+    ? requestedTrackCount
+    : Math.max(0, strictMatchedCount);
 
   const researchDurationMs = research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassDurationMs;
   const initialCatalogDurationMs = PRODUCTION_SCENARIO_REPLAY_TAPE.initialCatalogBaseDurationMs
@@ -253,8 +257,12 @@ export function replayProductionScenario(
       + research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassCostUsd
       + refillCostUsd,
     activeWorkDurationMs: researchDurationMs + initialCatalogDurationMs + recoveryDurationMs + refillDurationMs,
-    terminalStatus: complete ? "complete" : "failed",
-    terminalPhase: complete ? "publication_complete" : "catalog_matching_shortfall",
+    terminalStatus: complete ? "complete" : "partial",
+    terminalPhase: complete
+      ? "publication_complete"
+      : manifestTrackCount > 0
+        ? "publication_partial"
+        : "catalog_matching_empty",
     postMatchRefillGenerations: refillCandidateGoals.length,
   };
 
@@ -280,9 +288,10 @@ export function replayProductionScenario(
 
 /**
  * Release gate for a promoted production observation or deterministic replay.
- * A catalog shortfall is fail-closed only when it produced no manifest or
- * published tracks. Fail-closed is safe, but it is not release-ready for an
- * archived scenario whose expected outcome is an exact playlist.
+ * Genuine terminal failures are fail-closed only when they produced no
+ * manifest or published tracks. Count shortfalls are modeled as partial
+ * outcomes and remain visible quality violations for scenarios that expect an
+ * exact playlist.
  */
 export function assessProductionScenario(
   observation: ProductionScenarioObservation,
@@ -290,8 +299,7 @@ export function assessProductionScenario(
 ): ProductionScenarioAssessment {
   const requested = positiveInteger(observation.requestedTrackCount, "requestedTrackCount");
   const violations: string[] = [];
-  const failClosed = observation.terminalPhase === "catalog_matching_shortfall"
-    && observation.terminalStatus === "failed"
+  const failClosed = observation.terminalStatus === "failed"
     && observation.manifestTrackCount === 0
     && observation.publishedTrackCount === 0;
 

@@ -748,7 +748,7 @@ describe("research completion policy", () => {
     expect(researchCompletionReadiness(brief("hybrid", null), { candidateCount: 1, eligibleCandidateCount: 1, sourceCount: 1 }, []).ready).toBe(true);
   });
 
-  test("gap-pass bounds are configurable and stale excess work fails durably", async () => {
+  test("gap-pass bounds are configurable and stale excess work finishes partial without candidates", async () => {
     vi.stubEnv("RESEARCH_MAX_GAP_PASSES", "2");
     expect(researchGapPassLimit()).toBe(2);
     expect(researchGapPassLimit("1")).toBe(2);
@@ -759,12 +759,13 @@ describe("research completion policy", () => {
     const orchestrator = new ResearchOrchestrator({
       async getResearchCheckpoint() { return null; },
       async getRun() { return { status: "researching", phase: "gap_analysis", brief: brief("exhaustive", null) }; },
+      async getCoverage() { return { candidateCount: 0, eligibleCandidateCount: 0 }; },
       async saveResearchCheckpoint(_runId: string, _key: string, value: unknown) { checkpoints.push(value); },
       async updateRun(_runId: string, value: unknown) { updates.push(value); },
     } as any);
     await orchestrator.processJob({ runId: "run-1", phase: "gap_analysis", gapAttempt: 2 });
-    expect(checkpoints).toContainEqual(expect.objectContaining({ status: "complete" }));
-    expect(updates).toContainEqual(expect.objectContaining({ status: "failed", phase: "research_incomplete" }));
+    expect(checkpoints).toContainEqual(expect.objectContaining({ status: "complete", next: "partial" }));
+    expect(updates).toContainEqual(expect.objectContaining({ status: "partial", phase: "research_empty", error: null }));
   });
 });
 
@@ -1470,7 +1471,78 @@ describe("fast curated orchestration", () => {
     expect(state.checkpoints.get("fast:route:fast_curated_v3")).toEqual(route);
   });
 
-  test("delayed pickup performs no paid call and fails honestly when no candidate exists", async () => {
+  test("hands citation-eligible under-yield to matching instead of failing the task", async () => {
+    const state = segmentedRepository();
+    state.run.brief = brief("curated", { min: 50, max: 50 });
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    const persistedCandidates: any[] = [];
+    state.repository.addSources = async (_runId?: string, sources?: any[]) => new Map(
+      (sources ?? []).map((source: any, index: number) => [source.url, `source-${index}`]),
+    );
+    state.repository.addCandidates = async (_runId?: string, candidates?: any[]) => {
+      persistedCandidates.push(...(candidates ?? []));
+      state.coverage.candidateCount = persistedCandidates.length;
+      state.coverage.eligibleCandidateCount = persistedCandidates.length;
+      return candidates?.length ?? 0;
+    };
+
+    const synthesis = (ordinal: number) => {
+      const support = fastEvidenceGroup(
+        "Test Artist",
+        "performed on",
+        [`Fixture Performer ${ordinal} — Test Song ${ordinal}`],
+      );
+      const marker = `[source-${ordinal}]`;
+      const text = `${support} ${marker}`;
+      return {
+        id: `under-yield-${ordinal}`,
+        model: "gpt-5.6-luna",
+        output: [
+          { type: "web_search_call", action: { type: "search", query: `fixture ${ordinal}` } },
+          { id: `message-${ordinal}`, type: "message", content: [{
+            type: "output_text",
+            text,
+            annotations: [{
+              type: "url_citation",
+              url: `https://evidence.example/under-yield/${ordinal}`,
+              title: `Under-yield source ${ordinal}`,
+              start_index: support.length + 1,
+              end_index: text.length,
+            }],
+          }] },
+        ],
+      };
+    };
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      synthesis(1),
+      synthesis(2),
+      synthesis(3),
+    ]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "scope_resolution",
+      gapAttempt: 0,
+      fast: true,
+    });
+
+    expect(persistedCandidates).toHaveLength(3);
+    expect(state.run).toMatchObject({
+      status: "ready_for_matching",
+      phase: "research_shortfall_handoff",
+      error: null,
+    });
+    expect(state.jobs.at(-1)).toMatchObject({ kind: "matching", payload: expect.objectContaining({ fast: true }) });
+    expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
+      status: "shortfall",
+      citationEligibleCandidateCount: 3,
+      shortfall: 47,
+      next: "matching",
+    });
+  });
+
+  test("delayed pickup performs no paid call and records a transparent partial when no candidate exists", async () => {
     vi.useFakeTimers();
     const confirmedAt = new Date("2026-07-14T12:00:00.000Z");
     vi.setSystemTime(confirmedAt);
@@ -1486,11 +1558,17 @@ describe("fast curated orchestration", () => {
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", fast: true });
 
     expect(orchestrator.calls).toHaveLength(0);
-    expect(state.run).toMatchObject({ status: "failed", phase: "fast_research_shortfall" });
+    expect(state.run).toMatchObject({ status: "partial", phase: "research_empty" });
     expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(false);
     expect(state.checkpoints.get("fast:policy:fast_curated_v3")).toMatchObject({
       status: "deadline",
       deadlineAt: route.deadlineAt,
+    });
+    expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
+      status: "shortfall",
+      boundary: "deadline",
+      citationEligibleCandidateCount: 0,
+      next: "partial",
     });
   });
 
@@ -1769,7 +1847,7 @@ describe("durable research segmentation", () => {
     }));
   });
 
-  test("fails transparently at the segment ceiling without making an extra provider call", async () => {
+  test("finishes partial at the segment ceiling without making an extra provider call", async () => {
     vi.stubEnv("RESEARCH_TURNS_PER_SEGMENT", "1");
     vi.stubEnv("RESEARCH_MAX_SEGMENTS_PER_PASS", "1");
     const state = segmentedRepository();
@@ -1778,10 +1856,35 @@ describe("durable research segmentation", () => {
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, generation: 0, segment: 0 });
 
     expect(orchestrator.calls).toHaveLength(1);
-    expect(state.run).toMatchObject({ status: "failed", phase: "research_incomplete" });
-    expect(state.checkpoints.get("resume")).toMatchObject({ status: "complete", segment: 1 });
+    expect(state.run).toMatchObject({ status: "partial", phase: "research_empty" });
+    expect(state.checkpoints.get("resume")).toMatchObject({ status: "complete", segment: 1, next: "partial" });
     expect(state.checkpoints.get("scope_resolution:segment-limit").completionBlockers[0]).toMatch(/1 durable segments/);
     expect(state.jobs).toHaveLength(0);
+  });
+
+  test("hands durable candidates to matching when the segment ceiling ends research", async () => {
+    vi.stubEnv("RESEARCH_TURNS_PER_SEGMENT", "1");
+    vi.stubEnv("RESEARCH_MAX_SEGMENTS_PER_PASS", "1");
+    const state = segmentedRepository();
+    state.coverage.candidateCount = 2;
+    state.coverage.eligibleCandidateCount = 2;
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [coverageToolResponse("candidate-segment")]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "scope_resolution",
+      gapAttempt: 0,
+      generation: 0,
+      segment: 0,
+    });
+
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(state.run).toMatchObject({ status: "ready_for_matching", phase: "research_limit_handoff", error: null });
+    expect(state.checkpoints.get("resume")).toMatchObject({ status: "complete", segment: 1, next: "matching" });
+    expect(state.jobs.at(-1)).toMatchObject({
+      kind: "matching",
+      payload: { runId: state.run.id, storefront: "br" },
+    });
   });
 
   test("budget pause increments generation and resumes pending outputs in the same context segment", async () => {

@@ -2726,6 +2726,71 @@ databaseDescribe("hosted backend integration", () => {
     })]);
   });
 
+  test("automatic publication locks a safe partial manifest below the requested count", async () => {
+    const clientBucket = `partial.${randomUUID()}`;
+    const partialBrief: PlaylistBrief = {
+      ...brief,
+      title: "Safe partial automatic playlist",
+      mode: "curated",
+      targetSize: { min: 2, max: 2 },
+    };
+    const created = await repository.createRunIdempotent({
+      prompt: "Safe partial automatic playlist",
+      brief: partialBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      autoPublish: true,
+      reuseDays: 0,
+    });
+    const runId = created.runId;
+    await repository.addCandidates(runId, [
+      { selectionRank: 1, artist: "Partial Artist", title: "Matched", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+      { selectionRank: 2, artist: "Partial Artist", title: "Unavailable", album: null, releaseYear: null, durationMs: null, isrc: null, musicbrainzId: null, versionLabel: null, evidence: [] },
+    ], new Map(), "unverified");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Matched")!.id,
+      status: "accepted",
+      basis: "Unique exact metadata",
+      score: 1,
+      song: {
+        id: "catalog-partial-matched",
+        name: "Matched",
+        artistName: "Partial Artist",
+        albumName: "Partial Album",
+      },
+      alternatives: [],
+    });
+    await repository.saveMatch(runId, {
+      candidateId: candidates.get("Unavailable")!.id,
+      status: "unavailable",
+      basis: "No compatible Apple recording",
+      score: 0,
+      song: null,
+      alternatives: [],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.finalizeCatalogSelection(runId, {
+      useRecommended: true,
+      excludedCandidateIds: [],
+      overrides: [],
+      automatic: true,
+    });
+
+    expect(manifest.tracks).toEqual([expect.objectContaining({
+      title: "Matched",
+      catalogId: "catalog-partial-matched",
+    })]);
+    await expect(repository.getPublicationCompleteness(runId, manifest.id)).resolves.toEqual({
+      omittedCandidateCount: 1,
+      unresolvedCoverageCount: 0,
+    });
+  });
+
   test("queues one durable recovery job for legacy fast-match timeout rows", async () => {
     const runId = await repository.createRun("Catalog recovery", brief, 0, 1);
     await repository.addCandidates(runId, [{

@@ -41,6 +41,8 @@ interface ArchivedScenario {
   id: string;
   prompt: string;
   expectedTrackCount: number | null;
+  /** Explicit size chosen in the UI when the prose itself contains no count. */
+  requestedTrackCount?: number | null;
   expectedOutcome: ProductionScenarioExpectedOutcome;
   replayProfile: string;
   failureClasses: ProductionScenarioFailureClass[];
@@ -55,18 +57,23 @@ const fixture = scenarios as unknown as {
 
 function canonicalScenarioBrief(scenario: ArchivedScenario): PlaylistBrief {
   return canonicalBriefForRequest(
-    { prompt: scenario.prompt },
+    {
+      prompt: scenario.prompt,
+      requestedTrackCount: scenario.requestedTrackCount,
+    },
     adversarialModelBrief,
   );
 }
 
 describe("retained production searches", () => {
   test("contains every retained brief attempt from the production audit", () => {
-    expect(fixture.schemaVersion).toBe(3);
+    expect(fixture.schemaVersion).toBe(4);
     expect(fixture.scenarios).toHaveLength(fixture.scenarioCount);
-    expect(fixture.scenarioCount).toBe(26);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(26);
+    expect(fixture.scenarioCount).toBe(28);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(28);
     expect(Object.keys(fixture.replayProfiles).sort()).toEqual([
+      "baile-funk-19-of-25",
+      "baile-funk-23-of-50",
       "catalog-shortfall",
       "large-target",
       "nominal",
@@ -87,7 +94,12 @@ describe("retained production searches", () => {
     expect(canonical.targetSize).not.toBeNull();
     expect(canonical.targetSize!.max).toBeLessThanOrEqual(PUBLIC_PLAYLIST_MAXIMUM_TRACKS);
     if (expectedCount !== null) {
-      expect(explicitTrackCount(scenario.prompt)).toBe(expectedCount);
+      if (scenario.requestedTrackCount == null) {
+        expect(explicitTrackCount(scenario.prompt)).toBe(expectedCount);
+      } else {
+        expect(explicitTrackCount(scenario.prompt)).toBeNull();
+        expect(scenario.requestedTrackCount).toBe(expectedCount);
+      }
       expect(canonical.targetSize).toEqual({ min: expectedCount, max: expectedCount });
     } else {
       expect(canonical.targetSize).toEqual({
@@ -179,7 +191,36 @@ describe("retained production searches", () => {
     });
   });
 
-  test("post-match refill stops after two bounded generations and fails closed", () => {
+  test.each([
+    ["2026-07-17-27", 25],
+    ["2026-07-17-28", 50],
+  ] as const)("visitor-submitted Baile funk regression %s recovers to exactly %i tracks", (id, expectedCount) => {
+    const scenario = fixture.scenarios.find((row) => row.id === id);
+    expect(scenario).toBeDefined();
+    expect(scenario?.failureClasses).toContain("catalog_shortfall");
+
+    const replay = replayProductionScenario(
+      canonicalScenarioBrief(scenario!),
+      fixture.replayProfiles[scenario!.replayProfile]!,
+    );
+
+    expect(replay.initialStrictMatchedCount).toBeLessThan(expectedCount);
+    expect(replay.postMatchRefillGenerations).toBeGreaterThan(0);
+    expect(replay.observation).toMatchObject({
+      requestedTrackCount: expectedCount,
+      manifestTrackCount: expectedCount,
+      publishedTrackCount: expectedCount,
+      terminalStatus: "complete",
+      terminalPhase: "publication_complete",
+    });
+    expect(assessProductionScenario(replay.observation, "exact_playlist")).toEqual({
+      releaseReady: true,
+      failClosed: false,
+      violations: [],
+    });
+  });
+
+  test("post-match refill stops after two bounded generations and publishes a transparent partial", () => {
     const brief = canonicalScenarioBrief({
       id: "bounded-refill-failure",
       prompt: "50 impossibly obscure recordings",
@@ -201,17 +242,21 @@ describe("retained production searches", () => {
     expect(replay.refillCandidateGoals).toHaveLength(2);
     expect(replay.refillCostUsd).toBe(0.7);
     expect(replay.observation).toMatchObject({
-      manifestTrackCount: 0,
-      publishedTrackCount: 0,
-      terminalStatus: "failed",
-      terminalPhase: "catalog_matching_shortfall",
+      manifestTrackCount: replay.observation.strictMatchedCount,
+      publishedTrackCount: replay.observation.strictMatchedCount,
+      terminalStatus: "partial",
+      terminalPhase: "publication_partial",
       postMatchRefillGenerations: 2,
     });
-    expect(assessProductionScenario(replay.observation, "explicit_failure")).toEqual({
-      releaseReady: true,
-      failClosed: true,
-      violations: [],
-    });
+    const assessment = assessProductionScenario(replay.observation, "exact_playlist");
+    expect(assessment.releaseReady).toBe(false);
+    expect(assessment.failClosed).toBe(false);
+    expect(assessment.violations).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^catalog_shortfall:/u),
+      expect.stringMatching(/^manifest_count:/u),
+      expect.stringMatching(/^published_count:/u),
+      "terminal_status:partial",
+    ]));
   });
 
   test("a historical 50-to-28 result is a visible release failure, never a smaller success", () => {
@@ -238,7 +283,7 @@ describe("retained production searches", () => {
     ]));
   });
 
-  test("an explicit catalog shortfall is safe only when it fails closed without a playlist", () => {
+  test("a genuine provider failure is safe only when it fails closed without a playlist", () => {
     const result = assessProductionScenario({
       requestedTrackCount: 50,
       candidateCount: 50,
@@ -249,7 +294,7 @@ describe("retained production searches", () => {
       totalCostUsd: 0.40,
       activeWorkDurationMs: 70_000,
       terminalStatus: "failed",
-      terminalPhase: "catalog_matching_shortfall",
+      terminalPhase: "provider_failure",
     }, "explicit_failure");
 
     expect(result).toEqual({
@@ -270,7 +315,7 @@ describe("retained production searches", () => {
       totalCostUsd: 0.75,
       activeWorkDurationMs: 150_000,
       terminalStatus: "failed",
-      terminalPhase: "catalog_matching_shortfall",
+      terminalPhase: "provider_failure",
     }, "explicit_failure");
 
     expect(result.releaseReady).toBe(false);

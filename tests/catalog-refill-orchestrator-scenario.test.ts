@@ -456,7 +456,7 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
     expect(vi.mocked(searchAppleCatalog).mock.calls.every(([, query]) => query.includes("Refill"))).toBe(true);
   });
 
-  test("two pre-deadline provider failures degrade into bounded matching and a count-specific shortfall", async () => {
+  test("two pre-deadline provider failures publish the maximum strict matches as partial", async () => {
     const repository = new PipelineRepository();
     const orchestrator = new ScriptedRefillOrchestrator(repository, [
       new Error("fixture provider transport failure"),
@@ -478,13 +478,13 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
     }
 
     expect(repository.candidateRefillRequests.map((request) => request.currentRefillGeneration)).toEqual([0, 1]);
-    expect(repository.publicationHandoffs).toEqual([]);
+    expect(repository.publicationHandoffs).toEqual([RUN_ID]);
     expect(repository.run).toMatchObject({
-      status: "failed",
-      phase: "catalog_matching_shortfall",
-      error: expect.stringContaining("42 strict unique catalog matches for the required 50"),
+      status: "visitor_review",
+      phase: "exception_review",
+      error: null,
     });
-    expect(repository.run.error).not.toMatch(/research could not be completed|final attempt/iu);
+    expect(repository.run.error).toBeNull();
     expect(repository.updates.some((patch) => patch.phase === "research_failed")).toBe(false);
     expect(searchAppleCatalog).not.toHaveBeenCalled();
   });

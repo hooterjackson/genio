@@ -138,7 +138,17 @@ async function openAIRequest(
       if (response.ok) return { payload, requestId: response.headers.get("x-request-id") ?? undefined };
 
       const message = payload.error?.message ?? `OpenAI request failed (${response.status})`;
-      const retriable = response.status === 429 || response.status >= 500;
+      const providerCode = typeof payload.error?.code === "string"
+        ? payload.error.code
+        : typeof payload.error?.type === "string"
+          ? payload.error.type
+          : "";
+      // `insufficient_quota` is a billing/credit rejection, not a burst rate
+      // limit. Retrying the identical call only delays the visitor and burns
+      // worker capacity; fail immediately so the deterministic brief fallback
+      // can take over. Ordinary 429s retain bounded exponential retry.
+      const quotaUnavailable = response.status === 429 && providerCode === "insufficient_quota";
+      const retriable = !quotaUnavailable && (response.status === 429 || response.status >= 500);
       const error = new ProviderRequestError(message, "openai", response.status, retriable, retriable ? retryDelay(response, attempt) : null);
       if (!retriable || attempt === 2) throw error;
       lastError = error;

@@ -246,6 +246,76 @@ test("an active job keeps all primary destinations and exposes Share Job without
   await expect(page.getByRole("heading", { name: "Create a playlist" })).toBeVisible();
 });
 
+test("a stale inaccessible run URL quietly returns to Create", async ({ page }) => {
+  await page.route("**/api/v1/runs/stale-run", async (route) => {
+    await route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: "This session cannot access that run.",
+        code: "capability_scope_mismatch",
+      }),
+    });
+  });
+
+  await page.goto("/?run=stale-run");
+
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByRole("heading", { name: "Create a playlist" })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("a published result foregrounds tracks and labels evidence separately", async ({ page }) => {
+  const completeRun = {
+    ...activeRun,
+    id: "run-result-copy",
+    status: "complete",
+    phase: "complete",
+    candidateCount: 50,
+    sourceCount: 8,
+  };
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ runId: completeRun.id }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-result-copy/result", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        runId: completeRun.id,
+        status: "complete",
+        requestedTrackCount: 50,
+        sourceCount: 8,
+        unresolvedGapCount: 0,
+        coverageSummary: "Published from 8 documented sources with 0 visible gaps.",
+        volumes: [{
+          index: 1,
+          name: "Result copy regression",
+          url: "https://music.apple.com/us/playlist/result-copy/pl.u-test",
+          trackCount: 50,
+        }],
+      }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-result-copy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(completeRun),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-result-copy");
+
+  await expect(page.getByRole("heading", { name: "Playlist published" })).toBeVisible();
+  await expect(page.getByText("50 tracks published.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Evidence: 8 documented sources; 0 open gaps.", { exact: true })).toBeVisible();
+});
+
 test("guided questions and finalization preserve the exact shared header and ASCII wordmark", async ({ page }) => {
   let releaseAnswerRequest: (() => void) | undefined;
   const holdAnswerRequest = new Promise<void>((resolve) => {

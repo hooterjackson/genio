@@ -411,7 +411,10 @@ test("duplicate live-only results cannot override a unique studio catalog result
     { ...exactSong, id: "apple-live-two", albumName: "Best Live Performances", durationInMillis: 260_500 },
   ]);
 
-  expect(result.status).toBe("review");
+  expect(result).toMatchObject({
+    status: "accepted",
+    song: { id: "apple-studio" },
+  });
 });
 
 test("an order-insensitive collaborator set is selectable for review but not auto-accepted", () => {

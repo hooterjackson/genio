@@ -187,13 +187,38 @@ async function finalizeMatchingOutcome(
           if (refill === "queued" || refill === "in_flight") return;
         }
       }
+
+      // Count recovery is deliberately bounded, but exhausting that budget is
+      // not a publication failure. Lock and publish every strict, unique Apple
+      // match we did find; publication completeness will record the missing
+      // target count and finish the run as `partial`. This keeps the exact-count
+      // target as a recovery goal without turning an otherwise useful playlist
+      // into a terminal error.
+      if (safePrimaryCount > 0) {
+        await repository.updateRun(runId, {
+          status: "visitor_review",
+          phase: "exception_review",
+          error: null,
+        });
+        await repository.queueAutomaticPublication(runId);
+        return;
+      }
+
+      // Apple cannot publish a zero-track manifest. Still do not classify an
+      // empty catalog result as a failed task solely because it missed the
+      // requested count; preserve the outcome checkpoint and complete it as a
+      // transparent partial result with no playlist volume.
+      await repository.updateRun(runId, {
+        status: "partial",
+        phase: "catalog_matching_empty",
+        error: null,
+      });
+      return;
     }
     await repository.updateRun(runId, {
-      status: latest.autoPublish ? "failed" : "visitor_review",
+      status: "visitor_review",
       phase: "catalog_matching_shortfall",
-      error: latest.autoPublish
-        ? `Apple Music matching found ${safePrimaryCount} strict unique catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}. No playlist was published because the exact count could not be met safely.`
-        : `Apple Music matching found ${safePrimaryCount} safe unique catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}; ${shortfall} remain unresolved.`,
+      error: `Apple Music matching found ${safePrimaryCount} safe unique catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}; ${shortfall} remain unresolved.`,
     });
     return;
   }

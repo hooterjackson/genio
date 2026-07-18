@@ -377,3 +377,264 @@ test("an exhausted scout-only budget skips follow-up questions without failing t
     }),
   );
 });
+
+test("the exact baile-funk screenshot request completes when the primary structured output is malformed", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-brief-fallback-malformed");
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      id: "response-malformed-baile-brief",
+      model: "test-model",
+      usage: { input_tokens: 420, output_tokens: 63 },
+      output_text: "{\"title\":\"Baile Funk x Drill\",\"mode\":\"curated\"",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }))
+    // A degraded optional scout must not obscure the primary fail-open
+    // contract. This also proves malformed interpretation still attempts the
+    // subject scout rather than silently bypassing guidance every time.
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      error: { message: "Question scout temporarily unavailable" },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const reconcileProviderCost = vi.fn(async () => undefined);
+  const releaseProviderCost = vi.fn(async () => undefined);
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-baile-drill-malformed",
+      prompt: "Iconic baile funk songs with drill inspiration",
+      requestedTrackCount: 25,
+      model: "test-model",
+      status: "queued" as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+      reservationId: `reservation-${operation}`,
+    })),
+    reconcileProviderCost,
+    releaseProviderCost,
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await expect(processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-baile-drill-malformed",
+  })).resolves.toBeUndefined();
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(reconcileProviderCost).toHaveBeenCalledTimes(1);
+  expect(releaseProviderCost).toHaveBeenCalledTimes(1);
+  expect(saveBriefResult).not.toHaveBeenCalledWith(
+    "brief-baile-drill-malformed",
+    expect.objectContaining({ status: "failed" }),
+  );
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-baile-drill-malformed",
+    expect.objectContaining({
+      status: "complete",
+      expectedStatus: "queued",
+      brief: expect.objectContaining({
+        mode: "curated",
+        targetSize: { min: 25, max: 25 },
+        subjectEntities: expect.arrayContaining([expect.stringMatching(/baile funk/iu)]),
+        versionPolicy: expect.any(String),
+        evidencePolicy: expect.any(String),
+        orderingPolicy: expect.any(String),
+      }),
+      questions: [],
+      estimateUsd: expect.any(Number),
+      error: null,
+    }),
+  );
+});
+
+test("a non-retriable primary provider error falls back without making a scout call", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-brief-fallback-provider-error");
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    error: { message: "Provider rejected this request" },
+  }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const reconcileProviderCost = vi.fn(async () => undefined);
+  const releaseProviderCost = vi.fn(async () => undefined);
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-provider-unavailable",
+      prompt: "Twenty-five esoteric recordings from the Wandelweiser collective",
+      requestedTrackCount: 25,
+      model: "test-model",
+      status: "queued" as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+      reservationId: `reservation-${operation}`,
+    })),
+    reconcileProviderCost,
+    releaseProviderCost,
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await expect(processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-provider-unavailable",
+  })).resolves.toBeUndefined();
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(reconcileProviderCost).not.toHaveBeenCalled();
+  expect(releaseProviderCost).toHaveBeenCalledOnce();
+  expect(saveBriefResult).not.toHaveBeenCalledWith(
+    "brief-provider-unavailable",
+    expect.objectContaining({ status: "failed" }),
+  );
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-provider-unavailable",
+    expect.objectContaining({
+      status: "complete",
+      expectedStatus: "queued",
+      brief: expect.objectContaining({
+        mode: "curated",
+        targetSize: { min: 25, max: 25 },
+        subjectEntities: expect.arrayContaining([expect.stringMatching(/Wandelweiser/iu)]),
+      }),
+      questions: [],
+      estimateUsd: expect.any(Number),
+      error: null,
+    }),
+  );
+});
+
+test("the production 429 insufficient-quota response falls back without pointless retries", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.stubEnv("OPENAI_API_KEY", "sk-test-brief-fallback-quota");
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      error: {
+        message: "You exceeded your current quota, please check your plan and billing details.",
+        type: "insufficient_quota",
+        code: "insufficient_quota",
+      },
+    }), {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "0" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const releaseProviderCost = vi.fn(async () => undefined);
+    const saveBriefResult = vi.fn(async () => undefined);
+    const repository = {
+      getBriefRequest: vi.fn(async () => ({
+        id: "brief-production-quota-fallback",
+        prompt: "Iconic baile funk songs with drill inspiration",
+        requestedTrackCount: 25,
+        model: "test-model",
+        status: "queued" as const,
+      })),
+      reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+        reservationId: `reservation-${operation}`,
+      })),
+      reconcileProviderCost: vi.fn(async () => undefined),
+      releaseProviderCost,
+      saveBriefResult,
+    } as unknown as ResearchRepository;
+
+    const processing = processBriefInterpretationJob(repository, {
+      briefRequestId: "brief-production-quota-fallback",
+    });
+    const completion = expect(processing).resolves.toBeUndefined();
+    await vi.runAllTimersAsync();
+    await completion;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(releaseProviderCost).toHaveBeenCalledOnce();
+    expect(saveBriefResult).not.toHaveBeenCalledWith(
+      "brief-production-quota-fallback",
+      expect.objectContaining({ status: "failed" }),
+    );
+    expect(saveBriefResult).toHaveBeenCalledWith(
+      "brief-production-quota-fallback",
+      expect.objectContaining({
+        status: "complete",
+        expectedStatus: "queued",
+        brief: expect.objectContaining({
+          mode: "curated",
+          targetSize: { min: 25, max: 25 },
+          subjectEntities: expect.arrayContaining([expect.stringMatching(/baile funk/iu)]),
+        }),
+        questions: [],
+        estimateUsd: expect.any(Number),
+        error: null,
+      }),
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("an exhausted primary transport timeout falls back instead of exposing a terminal brief error", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.stubEnv("OPENAI_API_KEY", "sk-test-brief-fallback-timeout");
+    const fetchMock = vi.fn(async () => {
+      const error = new Error("fixture transport timeout");
+      error.name = "TimeoutError";
+      throw error;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const releaseProviderCost = vi.fn(async () => undefined);
+    const saveBriefResult = vi.fn(async () => undefined);
+    const repository = {
+      getBriefRequest: vi.fn(async () => ({
+        id: "brief-timeout-fallback",
+        prompt: "Deep listening in the spectralist tradition",
+        requestedTrackCount: 50,
+        model: "test-model",
+        status: "queued" as const,
+      })),
+      reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+        reservationId: `reservation-${operation}`,
+      })),
+      reconcileProviderCost: vi.fn(async () => undefined),
+      releaseProviderCost,
+      saveBriefResult,
+    } as unknown as ResearchRepository;
+
+    const processing = processBriefInterpretationJob(repository, {
+      briefRequestId: "brief-timeout-fallback",
+    });
+    // Attach the rejection handler before advancing fake retry timers so a
+    // broken implementation is reported as this assertion rather than an
+    // unrelated unhandled-rejection warning from Vitest.
+    const completion = expect(processing).resolves.toBeUndefined();
+    await vi.runAllTimersAsync();
+    await completion;
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(releaseProviderCost).toHaveBeenCalledOnce();
+    expect(saveBriefResult).not.toHaveBeenCalledWith(
+      "brief-timeout-fallback",
+      expect.objectContaining({ status: "failed" }),
+    );
+    expect(saveBriefResult).toHaveBeenCalledWith(
+      "brief-timeout-fallback",
+      expect.objectContaining({
+        status: "complete",
+        expectedStatus: "queued",
+        brief: expect.objectContaining({
+          mode: "curated",
+          targetSize: { min: 50, max: 50 },
+        }),
+        questions: [],
+        estimateUsd: expect.any(Number),
+        error: null,
+      }),
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});

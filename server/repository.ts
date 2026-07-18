@@ -41,6 +41,7 @@ import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequen
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
 import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
 import { resolvePublicationCompleteness } from "./publication-completeness.ts";
+import { selectionFallsBelowRequiredMinimum } from "./catalog-selection-policy.ts";
 import {
   failureContextForJob,
   failureContextForRun,
@@ -2700,9 +2701,17 @@ export class Repository {
         .map((row) => row.song_json.id));
       const initialRequestSatisfied = typeof requestedMinimum !== "number"
         || initiallySelectableCatalogIds.size >= requestedMinimum;
-      if ((input.automatic === true || !initialRequestSatisfied)
-        && typeof requestedMinimum === "number"
-        && new Set([...selectedSongs.values()].map((song) => song.id)).size < requestedMinimum) {
+      // Automatic One Command publication may deliberately proceed below the
+      // requested minimum after bounded catalog recovery and evidence refill
+      // are exhausted. The immutable manifest still contains only strict,
+      // unique accepted Apple IDs; publication completeness records the count
+      // deficit and terminalizes the published run as `partial`.
+      if (selectionFallsBelowRequiredMinimum({
+        automatic: input.automatic === true,
+        initialRequestSatisfied: initialRequestSatisfied,
+        requestedMinimum: typeof requestedMinimum === "number" ? requestedMinimum : null,
+        selectedUniqueCount: new Set([...selectedSongs.values()].map((song) => song.id)).size,
+      })) {
         throw new HttpError(
           409,
           `Resolve enough Apple Music matches to reach the requested ${requestedMinimum} tracks before generating the playlist`,

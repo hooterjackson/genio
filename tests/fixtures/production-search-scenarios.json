@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 3,
-  "source": "production audits captured 2026-07-16 through 2026-07-17",
+  "schemaVersion": 4,
+  "source": "production audits and visitor-submitted regressions captured 2026-07-16 through 2026-07-17",
   "replayProfiles": {
     "nominal": {
       "candidateYieldRate": 0.9,
@@ -33,9 +33,25 @@
       "recoverySuccessRate": 0,
       "refillCandidateYieldRate": 1,
       "refillStrictMatchRate": 0.4
+    },
+    "baile-funk-19-of-25": {
+      "candidateYieldRate": 1,
+      "initialStrictMatchRate": 0.43,
+      "retryableCatalogRate": 0.1,
+      "recoverySuccessRate": 0.75,
+      "refillCandidateYieldRate": 1,
+      "refillStrictMatchRate": 0.5
+    },
+    "baile-funk-23-of-50": {
+      "candidateYieldRate": 1,
+      "initialStrictMatchRate": 0.26,
+      "retryableCatalogRate": 0.02,
+      "recoverySuccessRate": 1,
+      "refillCandidateYieldRate": 1,
+      "refillStrictMatchRate": 0.7
     }
   },
-  "scenarioCount": 26,
+  "scenarioCount": 28,
   "scenarios": [
     {
       "id": "2026-07-16-01",
@@ -243,6 +259,24 @@
       "expectedTrackCount": 50,
       "expectedOutcome": "exact_playlist",
       "replayProfile": "rio-88-to-42-refill",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-17-27",
+      "prompt": "Baile funk icons",
+      "expectedTrackCount": 25,
+      "requestedTrackCount": 25,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "baile-funk-19-of-25",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-17-28",
+      "prompt": "Baile funk icons",
+      "expectedTrackCount": 50,
+      "requestedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "baile-funk-23-of-50",
       "failureClasses": ["catalog_shortfall"]
     }
   ]

@@ -90,7 +90,12 @@ function exactDuration(candidateMs: number | null, songMs?: number): boolean {
 }
 
 function isSparseEditorialCandidate(candidate: TrackCandidateInput): boolean {
-  return !candidate.isrc && !candidate.album && !candidate.durationMs && !candidate.versionLabel;
+  // Album/container metadata does not identify a recording. Editorial
+  // sources commonly cite an original album while Apple returns the same
+  // recording from a compilation or reissue. Keep those candidates eligible
+  // for the corroborated-family resolver; stable identifiers, duration, and
+  // an explicit version label still take the stricter paths below.
+  return !candidate.isrc && !candidate.durationMs && !candidate.versionLabel;
 }
 
 interface SparseCatalogMatch {
@@ -101,7 +106,7 @@ interface SparseCatalogMatch {
 function isDerivedCatalogContext(song: CatalogSong): boolean {
   const album = ` ${normalizeMusicText(song.albumName)} `;
   const derivedMarkers = [
-    " live ", " remix ", " remixes ", " cirque ", " immortal ",
+    " live ", " ao vivo ", " en vivo ", " remix ", " remixes ", " cirque ", " immortal ",
     " karaoke ", " tribute ", " acappella ", " a cappella ",
   ];
   return derivedMarkers.some((marker) => album.includes(marker));
@@ -151,12 +156,20 @@ function durationClusters<T extends SparseCatalogMatch>(matches: readonly T[]): 
  * are excluded whenever a studio/catalog alternative exists. Two materially
  * different singleton recordings still remain review-only.
  */
-function selectCanonicalSparseMatch<T extends SparseCatalogMatch>(matches: readonly T[]): T | null {
+function selectCanonicalSparseMatch<T extends SparseCatalogMatch>(
+  matches: readonly T[],
+  allowUncorroboratedSingleton = true,
+): T | null {
   if (matches.length === 0) return null;
-  if (matches.length === 1) return matches[0];
+  if (matches.length === 1) return allowUncorroboratedSingleton ? matches[0] : null;
 
   const nonDerived = matches.filter((item) => !isDerivedCatalogContext(item.song));
   const pool = nonDerived.length > 0 ? nonDerived : [...matches];
+  // Several exact results may consist of one studio/catalog recording plus
+  // live, remix, karaoke, or tribute containers whose track title itself is
+  // unqualified. Once those derived containers are excluded, the remaining
+  // exact studio result is unambiguous without weakening title/version rules.
+  if (pool.length === 1) return pool[0];
   const families: T[][] = durationClusters(pool).filter((cluster) => cluster.length >= 2);
 
   const byIsrc = new Map<string, T[]>();
@@ -223,7 +236,12 @@ function versionFlags(value: string): Set<string> {
   // performance. They remain review-only through base-title matching instead
   // of being discarded as a conflicting recording. Match complete tokens so
   // titles such as "Deliver" do not accidentally acquire a "live" flag.
-  return new Set(flags.filter((flag) => padded.includes(` ${flag} `)));
+  const found = new Set(flags.filter((flag) => padded.includes(` ${flag} `)));
+  // Apple localizes common recording qualifiers. Normalize them to the same
+  // semantic flag so Portuguese/Spanish live recordings cannot bypass the
+  // unqualified-versus-live conflict check.
+  if (padded.includes(" ao vivo ") || padded.includes(" en vivo ")) found.add("live");
+  return found;
 }
 
 function masteringFlags(value: string): Set<string> {
@@ -453,19 +471,35 @@ export function rankCatalogMatches(
     : [];
   const exactIdentifier = identifierMatches.length === 1 && identifierMatches[0].song.id === best.song.id;
   const exactMetadata = metadataMatches.length === 1 && metadataMatches[0].song.id === best.song.id;
-  const canonicalSparseMetadata = selectCanonicalSparseMatch(sparseExactMatches);
-  const acceptedMatch = canonicalSparseMetadata ?? (exactIdentifier || exactMetadata ? best : null);
+  // If research supplied an album, prefer exact matches on that container.
+  // When Apple exposes only reissues/compilations, accept a different album
+  // only when multiple exact results corroborate one recording family. A
+  // single exact title on an unrelated album remains review-only.
+  const sparseAlbumMatches = candidate.album
+    ? sparseExactMatches.filter((item) => item.albumExact)
+    : sparseExactMatches;
+  const canonicalSparseMetadata = selectCanonicalSparseMatch(sparseAlbumMatches)
+    ?? (candidate.album
+      ? selectCanonicalSparseMatch(sparseExactMatches, false)
+      : null);
+  // Preserve the strongest existing stable-identifier / unique exact-metadata
+  // path before consulting the broader sparse recording-family resolver. The
+  // selected song is normally the same, but the stronger basis remains
+  // explicit in evidence and regression reports.
+  const acceptedMatch = exactIdentifier || exactMetadata
+    ? best
+    : canonicalSparseMetadata;
   if (acceptedMatch) {
     return {
       candidateId,
       status: "accepted",
-      basis: canonicalSparseMetadata
-        ? `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`
-        : exactIdentifier
+      basis: exactIdentifier
         ? `${acceptedMatch.basis}; unique compatible identifier`
         : exactMetadata
           ? `${acceptedMatch.basis}; unique exact metadata`
-          : acceptedMatch.basis,
+          : canonicalSparseMetadata
+            ? `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`
+            : acceptedMatch.basis,
       score: acceptedMatch.score,
       song: acceptedMatch.song,
       alternatives: ranked.filter((item) => item.song.id !== acceptedMatch.song.id).slice(0, 4).map((item) => item.song),
