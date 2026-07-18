@@ -417,7 +417,7 @@ test("duplicate live-only results cannot override a unique studio catalog result
   });
 });
 
-test("an order-insensitive collaborator set is selectable for review but not auto-accepted", () => {
+test("an exact order-insensitive collaborator set is auto-accepted for a sparse candidate", () => {
   const input = candidate({
     artist: "Paulinho da Costa & Joe Pass",
     title: "Corcovado",
@@ -431,13 +431,13 @@ test("an order-insensitive collaborator set is selectable for review but not aut
   }]);
 
   expect(result).toMatchObject({
-    status: "review",
+    status: "accepted",
     song: { id: "apple-corcovado-duo", artistName: "Joe Pass & Paulinho Da Costa" },
   });
   expect(result.basis).toContain("order-insensitive collaborator set");
 });
 
-test("a catalog credit that adds or omits one collaborator remains alternatives-only", () => {
+test("a derived catalog credit that adds or omits one collaborator remains alternatives-only", () => {
   const addedProject = candidate({ artist: "Juan Atkins", title: "Skyway", album: null });
   const addedProjectResult = rankCatalogMatches(addedProject.id, addedProject, [{
     id: "apple-skyway",
@@ -447,9 +447,9 @@ test("a catalog credit that adds or omits one collaborator remains alternatives-
   }]);
   expect(addedProjectResult).toMatchObject({
     status: "review",
-    song: null,
+    song: { id: "apple-skyway", artistName: "Infiniti & Juan Atkins" },
   });
-  expect(addedProjectResult.alternatives).toEqual([expect.objectContaining({ id: "apple-skyway" })]);
+  expect(addedProjectResult.basis).toContain("catalog collaborator credit contains cited artist");
 
   const omittedCollaborator = candidate({
     artist: "Paulinho da Costa & Joe Pass",

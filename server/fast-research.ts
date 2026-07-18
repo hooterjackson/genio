@@ -163,9 +163,27 @@ function withoutTrailingCitationMarkers(value: string): string {
  * turning a cited album, EP, compilation, or release title into a recording.
  */
 function parseFastEvidenceGroup(excerpt: string): FastEvidenceGroup | null {
-  const match = excerpt.match(
+  const strictMatch = excerpt.match(
     /^\s*EVIDENCE GROUP\s*\|\s*SUBJECT:\s*([^|]+?)\s*\|\s*RELATIONSHIP:\s*([^|]+?)\s*\|\s*TRACKS:\s*([^|]+?)\s*\|\s*CONTAINERS:\s*(.+?)\s*$/iu,
   );
+  // Hosted synthesis occasionally repeats the exact subject in place of the
+  // literal `EVIDENCE GROUP` prefix. Recover only that narrow formatting
+  // drift: the repeated prefix must normalize to the tagged SUBJECT value.
+  // A mismatched prefix remains rejected so unrelated prose cannot become a
+  // candidate-bearing evidence group.
+  const repeatedSubjectMatch = strictMatch ? null : excerpt.match(
+    /^\s*([^|]+?)\s*\|\s*SUBJECT:\s*([^|]+?)\s*\|\s*RELATIONSHIP:\s*([^|]+?)\s*\|\s*TRACKS:\s*([^|]+?)\s*\|\s*CONTAINERS:\s*(.+?)\s*$/iu,
+  );
+  if (repeatedSubjectMatch
+    && normalizeEvidencePhrase(repeatedSubjectMatch[1] ?? "")
+      !== normalizeEvidencePhrase(repeatedSubjectMatch[2] ?? "")) return null;
+  const match = strictMatch ?? (repeatedSubjectMatch ? [
+    repeatedSubjectMatch[0],
+    repeatedSubjectMatch[2],
+    repeatedSubjectMatch[3],
+    repeatedSubjectMatch[4],
+    repeatedSubjectMatch[5],
+  ] : null);
   if (!match) return null;
   const subjectEntity = safeText(match[1], 240);
   const relationship = safeText(match[2], 240);
@@ -173,6 +191,18 @@ function parseFastEvidenceGroup(excerpt: string): FastEvidenceGroup | null {
   const containers = evidencePairs(withoutTrailingCitationMarkers(match[4] ?? ""));
   if (!subjectEntity || !relationship || tracks.length === 0) return null;
   return { subjectEntity, relationship, tracks, containers };
+}
+
+function unambiguousTrackAlbum(group: FastEvidenceGroup, track: FastEvidencePair): string | null {
+  const artistKey = normalizeEvidencePhrase(track.artist);
+  const artistTracks = group.tracks.filter(
+    (candidate) => normalizeEvidencePhrase(candidate.artist) === artistKey,
+  );
+  if (artistTracks.length !== 1) return null;
+  const albums = [...new Map(group.containers
+    .filter((container) => normalizeEvidencePhrase(container.artist) === artistKey)
+    .map((container) => [normalizeEvidencePhrase(container.title), container.title])).values()];
+  return albums.length === 1 ? albums[0]! : null;
 }
 
 /**
@@ -207,7 +237,11 @@ export function extractFastCandidatesFromSynthesis(
       candidates.set(key, {
         artist: track.artist,
         title: track.title,
-        album: null,
+        // CONTAINERS are never extracted as songs. When a cited evidence line
+        // contains exactly one track and one release for the same artist, the
+        // association is unambiguous enough to preserve as Apple-match
+        // metadata. Ambiguous multi-track/multi-release groups remain null.
+        album: unambiguousTrackAlbum(group, track),
         releaseYear: null,
         versionLabel: null,
         relationship: group.relationship,

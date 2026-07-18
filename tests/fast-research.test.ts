@@ -85,7 +85,7 @@ describe("fast curated research", () => {
       {
         artist: "Fixture Artist",
         title: "Signal One",
-        album: null,
+        album: "Album Alpha",
         releaseYear: null,
         versionLabel: null,
         relationship: "historically influential in the scene",
@@ -101,6 +101,47 @@ describe("fast curated research", () => {
         citationIndexes: [0],
       },
     ]);
+  });
+
+  test("does not guess a container when one artist has multiple tracks or releases", () => {
+    const source = synthesisResponse(evidenceGroup({
+      tracks: ["Fixture Artist — Signal One", "Fixture Artist — Signal Two"],
+      containers: ["Fixture Artist — Album Alpha", "Fixture Artist — Album Beta"],
+    }));
+    const synthesis = fastSynthesisCheckpoint(source, collectHostedCitationAttestations(source));
+
+    expect(extractFastCandidatesFromSynthesis(synthesis, 120).map((row) => row.album))
+      .toEqual([null, null]);
+  });
+
+  test("recovers a repeated exact subject prefix without weakening subject binding", () => {
+    const acceptedSupport = evidenceGroup({
+      tracks: ["Fixture Artist — Signal One", "Second Artist — Signal Two"],
+    }).replace(/^EVIDENCE GROUP/u, "Berlin techno");
+    const accepted = fastSynthesisCheckpoint(
+      synthesisResponse(acceptedSupport),
+      collectHostedCitationAttestations(synthesisResponse(acceptedSupport)),
+    );
+    expect(extractFastCandidatesFromSynthesis(accepted, 120).map((row) => row.title))
+      .toEqual(["Signal One", "Signal Two"]);
+
+    const mismatchedSupport = acceptedSupport.replace(/^Berlin techno/u, "Detroit techno");
+    const rejected = fastSynthesisCheckpoint(
+      synthesisResponse(mismatchedSupport),
+      collectHostedCitationAttestations(synthesisResponse(mismatchedSupport)),
+    );
+    expect(extractFastCandidatesFromSynthesis(rejected, 120)).toEqual([]);
+  });
+
+  test("recovers a production-shaped dense repeated-subject evidence group", () => {
+    const tracks = Array.from({ length: 10 }, (_, index) => (
+      `Fixture Artist ${index + 1} — Signal ${index + 1}`
+    ));
+    const support = evidenceGroup({ tracks }).replace(/^EVIDENCE GROUP/u, "Berlin techno");
+    const response = synthesisResponse(support);
+    const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+
+    expect(extractFastCandidatesFromSynthesis(synthesis, 120)).toHaveLength(10);
   });
 
   test("accepts only extracted tracks that bind to a cited local evidence group", () => {

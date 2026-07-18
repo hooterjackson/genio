@@ -27,20 +27,72 @@ function normalizeMusicArtistMember(value: string | null | undefined): string {
   return normalizeMusicText(value).replace(/^the\s+/u, "");
 }
 
+/**
+ * Recording credits are not printed consistently across editorial sources
+ * and Apple Music. A source may use "A feat. B", while Apple places B in the
+ * song title and exposes "A" as artistName; Brazilian catalog credits also
+ * alternate commas, ampersands, "x", and localized role prefixes.
+ *
+ * Keep this parser deliberately limited to explicit credit separators. It is
+ * used only alongside an exact/base-title comparison and recording-family
+ * checks, never as a freestanding fuzzy artist match.
+ */
 function normalizeMusicCollaboratorSet(value: string | null | undefined): string[] {
-  return (value ?? "")
+  const normalizedSeparators = (value ?? "")
+    .replace(/[()\[\]]/gu, " ")
+    .replace(/\b(?:feat(?:uring)?|ft|with|vs)\.?\b/giu, " & ")
+    .replace(/\s+(?:x|×)\s+/giu, " & ")
+    // Preserve stage names such as "Tyler, The Creator" while still
+    // normalizing comma-separated catalog collaborator lists.
+    .replace(/,(?!\s*the\b)/giu, " & ")
+    .replace(/[;/]+/gu, " & ");
+  return [...new Set(normalizedSeparators
     .split(/\s*(?:&|\band\b)\s*/iu)
     .map((member) => normalizeMusicArtistMember(member))
-    .filter(Boolean)
+    .filter(Boolean))]
     .sort();
 }
 
-function sameCollaboratorSet(left: string | null | undefined, right: string | null | undefined): boolean {
+function sameCollaboratorSet(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
   const leftMembers = normalizeMusicCollaboratorSet(left);
   const rightMembers = normalizeMusicCollaboratorSet(right);
   return leftMembers.length > 1
     && leftMembers.length === rightMembers.length
     && leftMembers.every((member, index) => member === rightMembers[index]);
+}
+
+function catalogMemberMatchesCandidate(candidateMember: string, catalogMember: string): boolean {
+  return catalogMember === candidateMember
+    || catalogMember === `mc ${candidateMember}`
+    || catalogMember === `dj ${candidateMember}`;
+}
+
+function sameCatalogRolePrefixedCollaboratorSet(
+  candidateArtist: string | null | undefined,
+  catalogArtist: string | null | undefined,
+): boolean {
+  const candidateMembers = normalizeMusicCollaboratorSet(candidateArtist);
+  const catalogMembers = normalizeMusicCollaboratorSet(catalogArtist);
+  return candidateMembers.length > 1
+    && candidateMembers.length === catalogMembers.length
+    && candidateMembers.every((candidateMember) => catalogMembers.some(
+      (catalogMember) => catalogMemberMatchesCandidate(candidateMember, catalogMember),
+    ));
+}
+
+function artistCreditContainsCandidate(
+  candidateArtist: string | null | undefined,
+  catalogArtist: string | null | undefined,
+): boolean {
+  const candidateMembers = normalizeMusicCollaboratorSet(candidateArtist);
+  const catalogMembers = normalizeMusicCollaboratorSet(catalogArtist);
+  if (candidateMembers.length === 0 || catalogMembers.length <= candidateMembers.length) return false;
+  return candidateMembers.every((candidateMember) => catalogMembers.some(
+    (catalogMember) => catalogMemberMatchesCandidate(candidateMember, catalogMember),
+  ));
 }
 
 function normalizeMusicPartStem(value: string | null | undefined): string {
@@ -67,6 +119,30 @@ export function normalizeMusicBaseTitle(value: string | null | undefined): strin
     "",
   ).trim();
   return normalizeMusicText(base);
+}
+
+function featureCreditStem(value: string | null | undefined): string | null {
+  const match = (value ?? "").trim().match(
+    /^(.+?)\s*[\[(]\s*(?:feat(?:uring)?|ft)\.?\s+[^\[\]()]{1,120}(?:\)|\])\s*$/iu,
+  );
+  return match ? normalizeMusicText(match[1]) || null : null;
+}
+
+/**
+ * A feature credit may move between a source's artist line and Apple's song
+ * title without changing the recording. Other parenthetical suffixes (part,
+ * bonus, mix, live, edit, etc.) are not equivalent and remain review-only.
+ */
+function isCatalogFeatureCreditTitleVariant(
+  candidateTitle: string | null | undefined,
+  catalogTitle: string | null | undefined,
+): boolean {
+  const normalizedCandidate = normalizeMusicText(candidateTitle);
+  return Boolean(
+    normalizedCandidate
+    && !featureCreditStem(candidateTitle)
+    && featureCreditStem(catalogTitle) === normalizedCandidate,
+  );
 }
 
 export function mergeCatalogSongs(...groups: readonly CatalogSong[][]): CatalogSong[] {
@@ -107,9 +183,20 @@ function isDerivedCatalogContext(song: CatalogSong): boolean {
   const album = ` ${normalizeMusicText(song.albumName)} `;
   const derivedMarkers = [
     " live ", " ao vivo ", " en vivo ", " remix ", " remixes ", " cirque ", " immortal ",
-    " karaoke ", " tribute ", " acappella ", " a cappella ",
+    " karaoke ", " tribute ", " acappella ", " a cappella ", " sped up ",
+    " slowed down ", " slowed reverb ", " nightcore ", " mixed ",
   ];
   return derivedMarkers.some((marker) => album.includes(marker));
+}
+
+function isUnsafeLooseCreditContext(song: CatalogSong): boolean {
+  if (isDerivedCatalogContext(song)) return true;
+  const album = ` ${normalizeMusicText(song.albumName)} `;
+  const additionalMarkers = [
+    " cover ", " covers ", " re recorded ", " new recording ", " demo ", " demos ",
+    " acoustic ", " instrumental ", " clean ", " unplugged ", " session ", " sessions ",
+  ];
+  return additionalMarkers.some((marker) => album.includes(marker));
 }
 
 function catalogAlbumPenalty(song: CatalogSong): number {
@@ -230,7 +317,8 @@ function versionFlags(value: string): Set<string> {
   const padded = ` ${normalized} `;
   const flags = [
     "live", "remix", "edit", "acoustic", "instrumental", "re recorded",
-    "demo", "karaoke", "radio", "extended",
+    "demo", "karaoke", "radio", "extended", "sped up", "slowed down",
+    "slowed reverb", "nightcore", "mixed",
   ];
   // Remasters and mono/stereo presentations generally retain the underlying
   // performance. They remain review-only through base-title matching instead
@@ -280,8 +368,11 @@ interface CatalogComparison {
   artistCompactExact: boolean;
   artistLeadingArticleExact: boolean;
   artistCollaboratorSetExact: boolean;
+  artistCatalogRolePrefixedSetExact: boolean;
+  artistCreditContainsCandidate: boolean;
   titleExact: boolean;
   baseTitleExact: boolean;
+  catalogFeatureCreditTitleVariant: boolean;
   compactTitleExact: boolean;
   partStemExact: boolean;
   albumExact: boolean;
@@ -318,6 +409,14 @@ function compareCatalogSong(candidate: TrackCandidateInput, song: CatalogSong): 
     && normalizeMusicArtistMember(song.artistName) === normalizeMusicArtistMember(candidate.artist)
   );
   const artistCollaboratorSetExact = sameCollaboratorSet(song.artistName, candidate.artist);
+  const artistCatalogRolePrefixedSetExact = sameCatalogRolePrefixedCollaboratorSet(
+    candidate.artist,
+    song.artistName,
+  );
+  const artistCreditContainsCandidateMatch = artistCreditContainsCandidate(
+    candidate.artist,
+    song.artistName,
+  );
   return {
     song,
     isrcMatch: Boolean(candidateIsrc && songIsrc && candidateIsrc === songIsrc),
@@ -327,12 +426,16 @@ function compareCatalogSong(candidate: TrackCandidateInput, song: CatalogSong): 
     // ("Model500" vs "Model 500"). This compatibility is review-only and is
     // never sufficient for an automatic metadata match.
     artistCompatible: artistCompactExact || artistLeadingArticleExact
-      || artistCollaboratorSetExact,
+      || artistCollaboratorSetExact || artistCatalogRolePrefixedSetExact
+      || artistCreditContainsCandidateMatch,
     artistCompactExact,
     artistLeadingArticleExact,
     artistCollaboratorSetExact,
+    artistCatalogRolePrefixedSetExact,
+    artistCreditContainsCandidate: artistCreditContainsCandidateMatch,
     titleExact: songTitle === title,
     baseTitleExact: Boolean(baseTitle && songBaseTitle === baseTitle),
+    catalogFeatureCreditTitleVariant: isCatalogFeatureCreditTitleVariant(candidate.title, song.name),
     compactTitleExact: Boolean(
       compactTitle
       && (songCompactTitle === compactTitle
@@ -397,6 +500,10 @@ export function rankCatalogMatches(
       score += 18;
       basis.push(comparison.artistCollaboratorSetExact
         ? "order-insensitive collaborator set"
+        : comparison.artistCatalogRolePrefixedSetExact
+          ? "catalog role-prefixed collaborator set"
+          : comparison.artistCreditContainsCandidate
+            ? "catalog collaborator credit contains cited artist"
         : comparison.artistLeadingArticleExact
           ? "leading-article artist variant"
           : "punctuation-normalized artist");
@@ -469,6 +576,19 @@ export function rankCatalogMatches(
     ? ranked.filter((item) => !item.isrcConflict && item.artistExact && item.titleExact
       && !item.versionConflict && !item.yearConflict)
     : [];
+  const sparseStrongCreditMatches = isSparseEditorialCandidate(candidate)
+    ? ranked.filter((item) => !item.isrcConflict && !item.versionConflict && !item.yearConflict
+      && (
+        (item.artistCollaboratorSetExact || item.artistCatalogRolePrefixedSetExact) && item.titleExact
+      ))
+    : [];
+  const sparseLooseCreditMatches = isSparseEditorialCandidate(candidate)
+    ? ranked.filter((item) => !item.isrcConflict && !item.versionConflict && !item.yearConflict
+      && (
+        (item.artistExact && item.catalogFeatureCreditTitleVariant)
+        || (item.artistCreditContainsCandidate && item.titleExact)
+      ))
+    : [];
   const exactIdentifier = identifierMatches.length === 1 && identifierMatches[0].song.id === best.song.id;
   const exactMetadata = metadataMatches.length === 1 && metadataMatches[0].song.id === best.song.id;
   // If research supplied an album, prefer exact matches on that container.
@@ -482,13 +602,38 @@ export function rankCatalogMatches(
     ?? (candidate.album
       ? selectCanonicalSparseMatch(sparseExactMatches, false)
       : null);
+  // Apple frequently moves featured performers between artistName and a
+  // parenthetical title credit, or expands a cited primary artist into the
+  // complete catalog collaborator credit. Once exact sparse metadata fails,
+  // resolve those catalog-printing variants through the same ISRC/duration
+  // recording-family guard. Live/remix/edit conflicts were excluded above.
+  const sparseStrongCreditAlbumMatches = candidate.album
+    ? sparseStrongCreditMatches.filter((item) => item.albumExact)
+    : sparseStrongCreditMatches.filter((item) => !isDerivedCatalogContext(item.song));
+  const canonicalSparseStrongCredit = selectCanonicalSparseMatch(sparseStrongCreditAlbumMatches)
+    ?? (candidate.album
+      ? selectCanonicalSparseMatch(sparseStrongCreditMatches, false)
+      : null);
+  const sparseLooseCreditAlbumMatches = candidate.album
+    ? sparseLooseCreditMatches.filter((item) => item.albumExact)
+    : sparseLooseCreditMatches.filter((item) => !isUnsafeLooseCreditContext(item.song));
+  // Feature-title moves and catalog-added collaborators are looser than an
+  // exact credit set. Require two Apple releases to corroborate one ISRC or
+  // duration family unless the source also supplied the exact album.
+  const canonicalSparseLooseCredit = selectCanonicalSparseMatch(
+    sparseLooseCreditAlbumMatches,
+    Boolean(candidate.album),
+  ) ?? (candidate.album
+    ? selectCanonicalSparseMatch(sparseLooseCreditMatches, false)
+    : null);
+  const canonicalSparseCredit = canonicalSparseStrongCredit ?? canonicalSparseLooseCredit;
   // Preserve the strongest existing stable-identifier / unique exact-metadata
   // path before consulting the broader sparse recording-family resolver. The
   // selected song is normally the same, but the stronger basis remains
   // explicit in evidence and regression reports.
   const acceptedMatch = exactIdentifier || exactMetadata
     ? best
-    : canonicalSparseMetadata;
+    : canonicalSparseMetadata ?? canonicalSparseCredit;
   if (acceptedMatch) {
     return {
       candidateId,
@@ -499,6 +644,8 @@ export function rankCatalogMatches(
           ? `${acceptedMatch.basis}; unique exact metadata`
           : canonicalSparseMetadata
             ? `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`
+            : canonicalSparseCredit
+              ? `${acceptedMatch.basis}; compatible sparse catalog credit selects a corroborated recording family`
             : acceptedMatch.basis,
       score: acceptedMatch.score,
       song: acceptedMatch.song,

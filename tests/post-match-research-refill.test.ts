@@ -299,6 +299,93 @@ describe("matching after a research refill", () => {
     vi.mocked(searchAppleCatalog).mockReset().mockResolvedValue([]);
   });
 
+  test("a 50-track sparse research pool reaches the exact target through safe Apple credit variants", async () => {
+    const sparseCandidates = Array.from({ length: 50 }, (_, index): Candidate => {
+      const ordinal = index + 1;
+      const family = index < 18 ? "exact" : index < 34 ? "featured" : "collaborator";
+      const base = candidate(`candidate-${ordinal}`);
+      return {
+        ...base,
+        artist: `${family === "collaborator" ? "Producer" : "Artist"} ${ordinal}`,
+        title: `${family} Track ${ordinal}`,
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        versionLabel: null,
+      };
+    });
+    const repository = new RefillMatchingRepository(
+      sparseCandidates,
+      [],
+      exactBrief("Rio de Janeiro songs", 50),
+      true,
+    );
+    vi.mocked(lookupAppleCatalogByIsrc).mockResolvedValue([]);
+    vi.mocked(searchAppleCatalog).mockImplementation(async (_storefront, query) => {
+      const match = query.match(/(?:exact|featured|collaborator) Track (\d+)/iu);
+      if (!match) return [];
+      const ordinal = Number(match[1]);
+      const source = sparseCandidates[ordinal - 1]!;
+      if (ordinal <= 18) {
+        return [{
+          id: `apple-${ordinal}`,
+          name: source.title,
+          artistName: source.artist,
+          albumName: `Exact Album ${ordinal}`,
+          durationInMillis: 180_000 + ordinal,
+          isrc: `USAAA26${String(ordinal).padStart(5, "0")}`,
+        }];
+      }
+      if (ordinal <= 34) {
+        return [
+          {
+            id: `apple-${ordinal}`,
+            name: `${source.title} (feat. Guest ${ordinal})`,
+            artistName: source.artist,
+            albumName: `Featured Album ${ordinal}`,
+            durationInMillis: 190_000 + ordinal,
+            isrc: `USBBB26${String(ordinal).padStart(5, "0")}`,
+          },
+          {
+            id: `apple-${ordinal}-compilation`,
+            name: `${source.title} (feat. Guest ${ordinal})`,
+            artistName: source.artist,
+            albumName: `Featured Collection ${ordinal}`,
+            durationInMillis: 190_000 + ordinal,
+            isrc: `USBBB26${String(ordinal).padStart(5, "0")}`,
+          },
+        ];
+      }
+      return [
+        {
+          id: `apple-${ordinal}`,
+          name: source.title,
+          artistName: `${source.artist} & Vocalist ${ordinal}`,
+          albumName: `Collaboration Album ${ordinal}`,
+          durationInMillis: 200_000 + ordinal,
+          isrc: `USCCC26${String(ordinal).padStart(5, "0")}`,
+        },
+        {
+          id: `apple-${ordinal}-reissue`,
+          name: source.title,
+          artistName: `${source.artist} & Vocalist ${ordinal}`,
+          albumName: `Collaboration Collection ${ordinal}`,
+          durationInMillis: 200_000 + ordinal,
+          isrc: `USCCC26${String(ordinal).padStart(5, "0")}`,
+        },
+      ];
+    });
+
+    await matchResearchRun(repository, "run", "us");
+
+    expect(repository.matches).toHaveLength(50);
+    expect(repository.matches.every((match) => match.status === "accepted" && match.song?.id)).toBe(true);
+    expect(new Set(repository.matches.map((match) => match.song!.id))).toHaveLength(50);
+    expect(repository.automaticCandidateRefills).toEqual([]);
+    expect(repository.automaticPublications).toEqual(["run"]);
+  });
+
   test("a subsequent matching pass preserves prior matches and calls Apple only for newly researched candidates", async () => {
     const prior = candidate("candidate-1");
     const newCandidates = [candidate("candidate-2"), candidate("candidate-3")];
