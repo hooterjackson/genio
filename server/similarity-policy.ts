@@ -178,15 +178,29 @@ function normalizedArtistCredits(value: string): string[] {
  */
 export function applySimilaritySeedPolicy(prompt: string, brief: PlaylistBrief): PlaylistBrief {
   if (brief.mode === "exhaustive") return brief;
+  const structuredRelationship = normalized(brief.relationship);
+  const structuredExcludedSeeds = /\b(?:style|stylistic)\s+reference\b|\bstylistically\s+similar\b/u
+      .test(structuredRelationship)
+    ? brief.subjectEntities.filter((entity) => explicitlyExcludesSeed(prompt, entity))
+    : [];
   const hasSimilarityIntent = [...normalized(prompt).matchAll(SIMILARITY_INTENT)].length > 0
-    || shorthandSimilaritySeeds(prompt, brief).length > 0;
+    || shorthandSimilaritySeeds(prompt, brief).length > 0
+    // The interpreter can correctly classify natural wording such as
+    // “for listeners who love X, but include no X” as a style reference even
+    // when it does not contain one of the fixed similarity phrases above.
+    // Trust that typed relationship only when the prompt also explicitly
+    // excludes a confirmed entity, so direct artist requests cannot be
+    // reclassified accidentally.
+    || structuredExcludedSeeds.length > 0;
   if (!hasSimilarityIntent) return brief;
 
   const subjectEntities = cleanSimilaritySubjectEntities(brief.subjectEntities);
   const scopedBrief = subjectEntities.length > 0
     ? { ...brief, subjectEntities }
     : brief;
-  const seeds = similaritySeedEntities(prompt, scopedBrief);
+  const seeds = structuredExcludedSeeds.length > 0
+    ? structuredExcludedSeeds
+    : similaritySeedEntities(prompt, scopedBrief);
   if (seeds.length === 0) return scopedBrief;
   const excludedSeeds = seeds.filter((seed) => (
     explicitlyExcludesSeed(prompt, seed) || !explicitlyIncludesSeed(prompt, seed)

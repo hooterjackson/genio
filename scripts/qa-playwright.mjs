@@ -59,10 +59,20 @@ async function acquireSuiteLock() {
 }
 
 function portIsAvailable(port) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = createServer();
     server.unref();
-    server.once("error", () => resolve(false));
+    server.once("error", (error) => {
+      if (error && typeof error === "object" && "code" in error && error.code === "EADDRINUSE") {
+        resolve(false);
+        return;
+      }
+      reject(
+        new Error(`Browser QA cannot bind ${host}:${port} while probing for a preview port`, {
+          cause: error,
+        }),
+      );
+    });
     server.listen(port, host, () => {
       server.close(() => resolve(true));
     });
@@ -73,7 +83,25 @@ async function availablePort() {
   for (let port = 4173; port <= 4199; port += 1) {
     if (await portIsAvailable(port)) return port;
   }
-  throw new Error("Browser QA could not find a free localhost port from 4173 through 4199");
+
+  // A developer may legitimately have the preferred preview range occupied.
+  // Let the OS select an ephemeral port instead of making browser QA fail for
+  // reasons unrelated to the application under test.
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once("error", (error) => {
+      reject(new Error(`Browser QA cannot bind an ephemeral port on ${host}`, { cause: error }));
+    });
+    server.listen(0, host, () => {
+      const address = server.address();
+      server.close((error) => {
+        if (error) reject(error);
+        else if (address && typeof address === "object") resolve(address.port);
+        else reject(new Error("Browser QA could not reserve an ephemeral localhost port"));
+      });
+    });
+  });
 }
 
 const suppliedBaseUrl = process.env.PLAYWRIGHT_BASE_URL?.trim();

@@ -14,10 +14,10 @@ export default defineConfig({
   testDir: "./tests/e2e",
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
-  // Vinext's local RSC worker can lose its connection when every responsive
-  // project starts at once. Keep enough concurrency for fast feedback without
-  // turning browser QA into a dev-server stress test.
-  workers: process.env.CI ? 2 : 4,
+  // Vinext's local RSC worker can lose its connection when too many responsive
+  // projects navigate at once. Match CI's conservative concurrency locally so
+  // browser QA measures the product instead of overloading its preview server.
+  workers: 2,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI
     ? [["github"], ["html", { open: "never" }]]

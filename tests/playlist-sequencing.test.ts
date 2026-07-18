@@ -5,7 +5,10 @@ import {
   shouldSequencePlaylist,
   type PlaylistSequenceTrack,
 } from "../lib/playlist-sequencing.ts";
-import { selectRankedPlaylistRows } from "../lib/playlist-selection.ts";
+import {
+  briefExplicitlyRequestsArtistDiversity,
+  selectRankedPlaylistRows,
+} from "../lib/playlist-selection.ts";
 
 interface FixtureTrack extends PlaylistSequenceTrack {
   rowId: string;
@@ -73,6 +76,55 @@ describe("deterministic playlist sequencing", () => {
     const result = selectRankedPlaylistRows(sparse, 50, { diversifyArtists: true });
     expect(result.selected).toHaveLength(50);
     expect(result.overflow).toHaveLength(25);
+  });
+
+  test("diversifies a 25-track curated brief that explicitly requests diverse artists", () => {
+    const brief = {
+      mode: "curated",
+      relationship: "style reference",
+      description: "A cross-era survey of adjacent dream-pop recordings.",
+      include: ["Use a diverse artist selection across the full period."],
+      orderingPolicy: "editorial flow",
+    };
+    const ranked = [
+      ...Array.from({ length: 12 }, (_, index) => track(`a-${index}`, "Artist A", `A-${index % 3}`)),
+      ...Array.from({ length: 10 }, (_, index) => track(`b-${index}`, "Artist B", `B-${index % 2}`)),
+      ...Array.from({ length: 13 }, (_, index) => track(`other-${index}`, `Discovery ${index}`, `D-${index}`)),
+    ];
+
+    const diversifyArtists = briefExplicitlyRequestsArtistDiversity(brief);
+    const selection = selectRankedPlaylistRows(ranked, 25, { diversifyArtists });
+    const counts = selection.selected.reduce<Map<string, number>>((result, row) => {
+      result.set(row.artist, (result.get(row.artist) ?? 0) + 1);
+      return result;
+    }, new Map());
+
+    expect(diversifyArtists).toBe(true);
+    expect(selection.selected).toHaveLength(25);
+    expect(selection.overflow).toHaveLength(10);
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(6);
+    expect(counts.get("Artist A")).toBeLessThan(12);
+  });
+
+  test("leaves direct-artist catalogues unchanged", () => {
+    const directBrief = {
+      mode: "curated",
+      relationship: "best recordings by",
+      description: "A balanced career survey.",
+      include: ["Use a diverse artist selection across eras and collaborators."],
+      orderingPolicy: "editorial flow",
+    };
+    const ranked = [
+      ...Array.from({ length: 30 }, (_, index) => track(`direct-${index}`, "Requested Artist", `Album ${index % 4}`)),
+      ...Array.from({ length: 5 }, (_, index) => track(`guest-${index}`, `Guest ${index}`, "Collaborations")),
+    ];
+
+    const diversifyArtists = briefExplicitlyRequestsArtistDiversity(directBrief);
+    const selection = selectRankedPlaylistRows(ranked, 25, { diversifyArtists });
+
+    expect(diversifyArtists).toBe(false);
+    expect(selection.selected.map((row) => row.rowId))
+      .toEqual(ranked.slice(0, 25).map((row) => row.rowId));
   });
 
   test("sequences listening-flow policies while preserving explicit fixed orders", () => {

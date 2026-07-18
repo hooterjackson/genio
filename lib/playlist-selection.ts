@@ -12,6 +12,55 @@ export interface PlaylistSelectionOptions {
   maximumInitialArtistShare?: number;
 }
 
+export interface ArtistDiversityBrief {
+  mode: string;
+  relationship: string;
+  description?: string;
+  include?: readonly string[];
+  orderingPolicy?: string;
+}
+
+function normalizedPolicyText(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+/**
+ * Detect a confirmed editorial request for artist breadth without broadening
+ * the policy to ordinary single-artist catalogues. Similarity requests have a
+ * separate, stronger trigger; this predicate covers briefs whose confirmed
+ * inclusion rules explicitly ask for artist diversity.
+ */
+export function briefExplicitlyRequestsArtistDiversity(
+  brief: ArtistDiversityBrief,
+): boolean {
+  if (brief.mode !== "curated") return false;
+
+  const relationship = normalizedPolicyText(brief.relationship);
+  const isDirectArtistCatalogue = relationship === "primary artist"
+    || relationship === "main artist"
+    || /\b(?:songs?|tracks?|recordings?)\s+by\b/u.test(relationship)
+    || /\b(?:recorded|released)\s+by\b/u.test(relationship)
+    || /\b(?:discograph\w*|catalog(?:ue)?)\b/u.test(relationship);
+  if (isDirectArtistCatalogue) return false;
+
+  const policy = normalizedPolicyText([
+    brief.description ?? "",
+    ...(brief.include ?? []),
+    brief.orderingPolicy ?? "",
+  ].join(" "));
+  return /\b(?:diverse|varied|balanced|representative)\s+(?:credited\s+)?artists?\b/u.test(policy)
+    || /\b(?:diverse|varied|balanced|representative)\s+(?:artist|performer|act)\s+(?:selection|mix|set|pool|representation)\b/u.test(policy)
+    || /\b(?:diverse|varied|broad|wide|balanced|representative)\s+(?:range|mix|selection|cross\s+section)\s+of\s+(?:credited\s+)?artists?\b/u.test(policy)
+    || /\b(?:artist|performer|act)\s+(?:diversity|variety|breadth|balance)\b/u.test(policy)
+    || /\b(?:many|multiple|different)\s+(?:credited\s+)?artists?\b/u.test(policy);
+}
+
 function artistKey(value: string): string {
   return value
     .normalize("NFKD")

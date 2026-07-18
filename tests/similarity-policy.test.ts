@@ -123,6 +123,32 @@ describe("reference-artist similarity policy", () => {
     expect(excludedReferenceArtists(result)).toEqual(["Prefuse 73"]);
   });
 
+  test("uses a structured style-reference relationship for natural listener wording", () => {
+    const result = applySimilaritySeedPolicy(
+      "25 tracks for listeners who love Cocteau Twins' weightless guitars, but include no Cocteau Twins recordings.",
+      brief({
+        title: "Dream-Pop Drift",
+        subjectEntities: ["Cocteau Twins", "dream pop", "shoegaze"],
+        relationship: "style reference",
+        exclude: ["All Cocteau Twins recordings"],
+      }),
+    );
+
+    expect(excludedReferenceArtists(result)).toEqual(["Cocteau Twins"]);
+    expect(result.relationship).toBe("stylistically similar to the reference artist");
+    expect(result.include).toContain(
+      "Recordings by other artists that are stylistically similar to Cocteau Twins",
+    );
+  });
+
+  test("does not trust a structured style reference without an explicit seed exclusion", () => {
+    const original = brief({ relationship: "style reference" });
+    expect(applySimilaritySeedPolicy(
+      "A playlist for listeners who love Radiohead",
+      original,
+    )).toEqual(original);
+  });
+
   test("does not mistake a preceding style reference for an inclusion request", () => {
     const result = applySimilaritySeedPolicy(
       "I like Radiohead and want other artists operating in a similar mode",

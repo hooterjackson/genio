@@ -36,7 +36,10 @@ import {
   stableStringify,
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
-import { selectRankedPlaylistRows } from "../lib/playlist-selection.ts";
+import {
+  briefExplicitlyRequestsArtistDiversity,
+  selectRankedPlaylistRows,
+} from "../lib/playlist-selection.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
 import { manifestDescriptionForBrief } from "./brief-policy.ts";
 import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
@@ -2912,7 +2915,8 @@ export class Repository {
         // first adjacent artist returned by research to dominate the result.
         // The progressive cap still fills the exact target when the available
         // catalog has only a few qualifying artists.
-        diversifyArtists: excludedReferenceArtists(brief).length > 0,
+        diversifyArtists: excludedReferenceArtists(brief).length > 0
+          || briefExplicitlyRequestsArtistDiversity(brief),
       });
       const selectedMatches = selection.selected;
       const overflowMatches = selection.overflow;
