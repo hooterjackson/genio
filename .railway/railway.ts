@@ -99,7 +99,6 @@ export default defineRailway(() => {
     build: "pnpm run build:server",
     start: "pnpm run start:worker",
     deploy: {
-      restartPolicyType: "ALWAYS",
       drainingSeconds: 30,
     },
     replicas: { "us-west2": 1 },
@@ -116,7 +115,6 @@ export default defineRailway(() => {
     healthcheck: "/health/ready",
     healthcheckTimeout: 120,
     deploy: {
-      restartPolicyType: "ALWAYS",
       overlapSeconds: 30,
       drainingSeconds: 15,
     },
