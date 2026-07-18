@@ -37,7 +37,7 @@ import {
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
 import {
-  briefExplicitlyRequestsArtistDiversity,
+  briefShouldDiversifyArtists,
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
@@ -2916,7 +2916,7 @@ export class Repository {
         // The progressive cap still fills the exact target when the available
         // catalog has only a few qualifying artists.
         diversifyArtists: excludedReferenceArtists(brief).length > 0
-          || briefExplicitlyRequestsArtistDiversity(brief),
+          || briefShouldDiversifyArtists(brief),
       });
       const selectedMatches = selection.selected;
       const overflowMatches = selection.overflow;

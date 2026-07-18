@@ -27,7 +27,7 @@
     "benchmark:export": "node --experimental-transform-types scripts/export-benchmarks.ts",
     "qa:scenarios:export": "node --experimental-transform-types scripts/export-run-scenarios.ts",
     "qa:scenarios:check": "vitest run tests/production-search-scenarios.test.ts",
-    "qa:policy:check": "vitest run tests/production-search-scenarios.test.ts tests/release-candidate-prompt-corpus.test.ts tests/esoteric-policy-scenarios.test.ts tests/cost-config.test.ts tests/brief-policy.test.ts tests/similarity-policy.test.ts tests/playlist-sequencing.test.ts tests/playlist-title.test.ts",
+    "qa:policy:check": "vitest run tests/production-search-scenarios.test.ts tests/release-candidate-prompt-corpus.test.ts tests/esoteric-policy-scenarios.test.ts tests/ambiguous-genre-breadth-scenarios.test.ts tests/cost-config.test.ts tests/brief-policy.test.ts tests/similarity-policy.test.ts tests/playlist-sequencing.test.ts tests/playlist-title.test.ts",
     "smoke:apple": "node --experimental-transform-types scripts/apple-publication-smoke.ts",
     "smoke:hosted": "node --experimental-transform-types scripts/hosted-publication-smoke.ts",
     "phase-zero:apple": "node --experimental-transform-types scripts/apple-phase-zero.ts",

@@ -6,7 +6,9 @@ import {
   type PlaylistSequenceTrack,
 } from "../lib/playlist-sequencing.ts";
 import {
+  artistDiversityResearchInstruction,
   briefExplicitlyRequestsArtistDiversity,
+  briefShouldDiversifyArtists,
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 
@@ -125,6 +127,82 @@ describe("deterministic playlist sequencing", () => {
     expect(diversifyArtists).toBe(false);
     expect(selection.selected.map((row) => row.rowId))
       .toEqual(ranked.slice(0, 25).map((row) => row.rowId));
+  });
+
+  test("treats an ordinary curated genre request as multi-artist without magic diversity words", () => {
+    const frenchJazzBrief = {
+      mode: "curated",
+      relationship: "representative of",
+      description: "A French jazz playlist.",
+      include: [],
+      orderingPolicy: "editorial flow",
+    };
+    // Production replay: the research pool contained 88 candidates across
+    // ten artists, but the ranked first 50 were 25 Michel Petrucciani, 24
+    // Django Reinhardt, and one Martial Solal. The remaining 38 candidates
+    // already contained seven additional artists; only manifest selection
+    // failed to use them.
+    const ranked = [
+      ...Array.from({ length: 25 }, (_, index) => track(
+        `petrucciani-${index}`,
+        "Michel Petrucciani",
+        `Petrucciani ${index % 4}`,
+      )),
+      ...Array.from({ length: 24 }, (_, index) => track(
+        `django-${index}`,
+        "Django Reinhardt",
+        `Django ${index % 5}`,
+      )),
+      track("solal-0", "Martial Solal", "Solal 1"),
+      ...Array.from({ length: 38 }, (_, index) => track(
+        `reserve-${index}`,
+        `French Jazz Reserve ${index % 7}`,
+        `Reserve ${index}`,
+      )),
+    ];
+
+    const naiveCounts = selectRankedPlaylistRows(ranked, 50).selected
+      .reduce<Map<string, number>>((result, row) => {
+        result.set(row.artist, (result.get(row.artist) ?? 0) + 1);
+        return result;
+      }, new Map());
+    expect([...naiveCounts.values()].sort((left, right) => right - left)).toEqual([25, 24, 1]);
+
+    expect(briefExplicitlyRequestsArtistDiversity(frenchJazzBrief)).toBe(false);
+    expect(briefShouldDiversifyArtists(frenchJazzBrief)).toBe(true);
+    const selection = selectRankedPlaylistRows(ranked, 50, {
+      diversifyArtists: briefShouldDiversifyArtists(frenchJazzBrief),
+    });
+    const counts = selection.selected.reduce<Map<string, number>>((result, row) => {
+      result.set(row.artist, (result.get(row.artist) ?? 0) + 1);
+      return result;
+    }, new Map());
+
+    expect(selection.selected).toHaveLength(50);
+    expect(selection.overflow).toHaveLength(38);
+    expect(counts.size).toBeGreaterThanOrEqual(10);
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(8);
+    expect(artistDiversityResearchInstruction(frenchJazzBrief, 50)).toContain(
+      "at least 10 distinct credited recording artists",
+    );
+  });
+
+  test.each([
+    "primary artist",
+    "released by",
+    "performed by",
+    "best recordings by",
+    "artist's discography",
+  ])("preserves direct-artist selection for relationship: %s", (relationship) => {
+    const brief = {
+      mode: "curated",
+      relationship,
+      description: "A career-spanning selection by one requested artist.",
+      include: ["Balance eras and albums."],
+      orderingPolicy: "editorial flow",
+    };
+    expect(briefShouldDiversifyArtists(brief)).toBe(false);
+    expect(artistDiversityResearchInstruction(brief, 50)).toBe("");
   });
 
   test("sequences listening-flow policies while preserving explicit fixed orders", () => {

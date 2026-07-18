@@ -8,6 +8,7 @@ import {
 import { normalizePlaylistTitle, PLAYLIST_TITLE_MAX_LENGTH } from "./playlist-title.ts";
 import { FAST_CURATED_TARGET_MAXIMUM } from "./research-policy.ts";
 import { applySimilaritySeedPolicy } from "./similarity-policy.ts";
+import { applyMusicIntentPolicy } from "./music-intent-policy.ts";
 
 const CURATED_DEFAULT_MINIMUM = 50;
 const CURATED_DEFAULT_MAXIMUM = 100;
@@ -261,7 +262,11 @@ export function canonicalBriefForRequest(
   // Similarity semantics depend on the final workload mode. Apply them after
   // exact-count/default normalization so a model's incorrect "exhaustive"
   // label cannot bypass reference-artist exclusion.
-  const canonical = applySimilaritySeedPolicy(request.prompt, workloadScoped);
+  // Repair explicit musical-domain semantics before similarity handling. A
+  // stale or malformed interpreted brief must not turn "house music" into a
+  // thematic search for songs about buildings at this durable boundary.
+  const intentScoped = applyMusicIntentPolicy(request.prompt, workloadScoped);
+  const canonical = applySimilaritySeedPolicy(request.prompt, intentScoped);
   const titledCanonical = {
     ...canonical,
     // Similarity repair can change the relationship and add a hard reference-
@@ -321,6 +326,9 @@ function fallbackRelationship(prompt: string): string {
   }
   if (/\b(?:played\s+on|performed\s+on|session|credit(?:ed|s)?|contribut(?:ed|ion)|produced|wrote|written|composed)\b/iu.test(prompt)) {
     return "satisfies the requested documented artist-to-recording credit relationship";
+  }
+  if (/\b(?:songs?|tracks?|music|recordings?)\s+(?:with|containing|whose)\b.{0,80}\b(?:title|lyrics?)\b|\b(?:word|phrase)\b.{0,60}\b(?:in|within)\s+(?:the\s+)?(?:title|lyrics?)\b/iu.test(prompt)) {
+    return "satisfies the requested title, lyrical, or thematic relationship";
   }
   if (/\b(?:songs?|tracks?|music|recordings?)\s+about\b/iu.test(prompt)) {
     return "satisfies the requested lyrical, geographic, or thematic relationship";

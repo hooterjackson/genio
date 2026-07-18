@@ -20,6 +20,17 @@ export interface ArtistDiversityBrief {
   orderingPolicy?: string;
 }
 
+function isDirectRecordingArtistCatalogue(relationship: string): boolean {
+  const normalized = normalizedPolicyText(relationship);
+  return normalized === "primary artist"
+    || normalized === "main artist"
+    || normalized === "recording artist"
+    || /\b(?:songs?|tracks?|recordings?|music|releases?)\s+(?:(?:recorded|released|performed|sung|made)\s+)?by\b/u.test(normalized)
+    || /\b(?:recorded|released|performed|sung)\s+by\b/u.test(normalized)
+    || /\b(?:artist(?:'s)?|performer(?:'s)?)\s+(?:discograph\w*|catalog(?:ue)?|recordings?|songs?|tracks?)\b/u.test(normalized)
+    || /\b(?:discograph\w*|catalog(?:ue)?)\b/u.test(normalized);
+}
+
 function normalizedPolicyText(value: string): string {
   return value
     .normalize("NFKD")
@@ -41,13 +52,7 @@ export function briefExplicitlyRequestsArtistDiversity(
 ): boolean {
   if (brief.mode !== "curated") return false;
 
-  const relationship = normalizedPolicyText(brief.relationship);
-  const isDirectArtistCatalogue = relationship === "primary artist"
-    || relationship === "main artist"
-    || /\b(?:songs?|tracks?|recordings?)\s+by\b/u.test(relationship)
-    || /\b(?:recorded|released)\s+by\b/u.test(relationship)
-    || /\b(?:discograph\w*|catalog(?:ue)?)\b/u.test(relationship);
-  if (isDirectArtistCatalogue) return false;
+  if (isDirectRecordingArtistCatalogue(brief.relationship)) return false;
 
   const policy = normalizedPolicyText([
     brief.description ?? "",
@@ -59,6 +64,38 @@ export function briefExplicitlyRequestsArtistDiversity(
     || /\b(?:diverse|varied|broad|wide|balanced|representative)\s+(?:range|mix|selection|cross\s+section)\s+of\s+(?:credited\s+)?artists?\b/u.test(policy)
     || /\b(?:artist|performer|act)\s+(?:diversity|variety|breadth|balance)\b/u.test(policy)
     || /\b(?:many|multiple|different)\s+(?:credited\s+)?artists?\b/u.test(policy);
+}
+
+/**
+ * Curated genre, scene, place, theme, influence, and recommendation requests
+ * are multi-artist by default. Requiring the model to write the word
+ * "diverse" made an ordinary request such as "French jazz" silently inherit
+ * the first source's artist concentration. Keep direct recording-artist
+ * catalogues unchanged, but make every other curated selection use the
+ * deterministic progressive artist cap.
+ */
+export function briefShouldDiversifyArtists(brief: ArtistDiversityBrief): boolean {
+  return brief.mode === "curated"
+    && !isDirectRecordingArtistCatalogue(brief.relationship);
+}
+
+/**
+ * Give research a measurable breadth target before deterministic selection.
+ * The wording remains conditional because a genuinely narrow documented
+ * scope must never be broadened with unsupported recordings merely to hit a
+ * quota.
+ */
+export function artistDiversityResearchInstruction(
+  brief: ArtistDiversityBrief,
+  requestedTrackCount: number,
+): string {
+  if (!briefShouldDiversifyArtists(brief)) return "";
+  const target = Number.isFinite(requestedTrackCount)
+    ? Math.max(1, Math.floor(requestedTrackCount))
+    : 50;
+  const desiredArtists = Math.min(target, Math.max(5, Math.ceil(target / 5)));
+  const artistCap = Math.max(2, Math.ceil(target * 0.15));
+  return ` This is a multi-artist curated scope. When the documented scope permits, recover candidates from at least ${desiredArtists} distinct credited recording artists and do not let one artist supply more than ${artistCap} of the ${target} publication tracks. Search beyond the first canonical artists and sources; on refill passes prioritize supported artists not yet represented. Never broaden the confirmed scope or weaken evidence merely to satisfy artist breadth.`;
 }
 
 function artistKey(value: string): string {

@@ -22,6 +22,7 @@ import { GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import {
   applySimilaritySeedPolicy,
 } from "./similarity-policy.ts";
+import { applyMusicIntentPolicy } from "./music-intent-policy.ts";
 import { assertPublicHttpsUrl, collectKnownUrls } from "./security.ts";
 import { citationSupportWindow } from "./citation-attestation.ts";
 
@@ -874,7 +875,7 @@ function safelyApplyGuidance(
   };
 }
 
-const BRIEF_INTERPRETATION_INSTRUCTIONS = "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, representative, or music similar to a reference artist, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. subjectEntities must contain only canonical named people, artists, groups, genres, scenes, places, or concepts that define the research scope; never emit filler phrases such as 'other artists' or repeat query fragments such as 'tracks that sound like X' as entities. For requests such as 'sounds like X', 'similar to X', 'artists like X', or 'for fans of X', treat X as a style reference rather than the requested recording artist: select tracks by other artists and exclude recordings by X unless the requester explicitly asks to include X. Do not apply this reference-artist rule to requests for X's own songs, discography, credits, or exhaustive catalog. Default subjective playlists to 50-100 tracks. Set title to a short, specific Apple Music playlist name of at most 60 characters, not a restatement of the request: remove command phrases such as 'give me' or 'create a playlist of', prefer the key artist, topic, or scene plus a compact qualifier, and include a requested count only when it helps distinguish the playlist. Preserve the complete requested scope in description and the structured scope fields. Explicitly surface only ambiguity that materially changes scope.";
+const BRIEF_INTERPRETATION_INSTRUCTIONS = "Convert a playlist request into a neutral research brief. Use exhaustive only for factual enumeration, curated for subjective or ranked requests such as most influential, best, essential, representative, or music similar to a reference artist, and hybrid for constrained factual enumeration. A requested number does not make an editorial ranking exhaustive. Never invent artist-specific rules. Resolve musical polysemy before writing the brief: first determine whether a word names an established genre, style, scene, artist, place, or lyrical theme in the request's musical grammar. A genre name next to words such as music, playlist, mix, DJ, tracks, scene, or a documented subgenre modifier is a musical classification, not a literal keyword theme. For example, 'house music', 'house playlist', 'French house', and 'acid house' refer to the dance-music genre; they never mean songs about physical houses unless the listener explicitly asks for homes, buildings, architecture, or lyrics about houses. Never convert a genre request into title or lyric keyword matching. subjectEntities must contain only canonical named people, artists, groups, genres, scenes, places, or concepts that define the research scope; never emit filler phrases such as 'other artists' or repeat query fragments such as 'tracks that sound like X' as entities. For requests such as 'sounds like X', 'similar to X', 'artists like X', or 'for fans of X', treat X as a style reference rather than the requested recording artist: select tracks by other artists and exclude recordings by X unless the requester explicitly asks to include X. Do not apply this reference-artist rule to requests for X's own songs, discography, credits, or exhaustive catalog. For a broad genre or scene playlist, default to representative artist breadth rather than silently collapsing the result to one or two artists, unless the listener requests an artist-focused scope. Default subjective playlists to 50-100 tracks. Set title to a short, specific Apple Music playlist name of at most 60 characters, not a restatement of the request: remove command phrases such as 'give me' or 'create a playlist of', prefer the key artist, topic, or scene plus a compact qualifier, and include a requested count only when it helps distinguish the playlist. Preserve the complete requested scope in description and the structured scope fields. Explicitly surface only ambiguity that materially changes scope.";
 
 export async function interpretPrompt(
   prompt: string,
@@ -894,7 +895,8 @@ export async function interpretPrompt(
     prompt,
     validatedBrief(JSON.parse(extractOutputText(response))),
   );
-  const scopedBrief = applySimilaritySeedPolicy(prompt, countScopedBrief);
+  const intentScopedBrief = applyMusicIntentPolicy(prompt, countScopedBrief);
+  const scopedBrief = applySimilaritySeedPolicy(prompt, intentScopedBrief);
   const brief = {
     ...scopedBrief,
     title: normalizePlaylistTitle(scopedBrief.title, scopedBrief),
