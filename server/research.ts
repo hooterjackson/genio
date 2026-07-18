@@ -2741,7 +2741,7 @@ export async function processBriefInterpretationJob(
             model: request.model,
             max_output_tokens: GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS,
             max_tool_calls: GUIDANCE_SCOUT_MAX_TOOL_CALLS,
-            reasoning: { effort: "low" },
+            reasoning: { effort: "none" },
             input: providerInput,
           }, 0, 0.01),
         ),

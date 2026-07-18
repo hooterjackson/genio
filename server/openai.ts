@@ -29,7 +29,13 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 export const GUIDANCE_SCOUT_MAX_TOOL_CALLS = 2;
-export const GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS = 1_800;
+// Reasoning tokens count against max_output_tokens in the Responses API. The
+// scout previously used `low` reasoning and could consume roughly half of its
+// 1,800-token allowance before emitting the strict JSON object, leaving a
+// truncated response and silently skipping guidance. The brief and targeted
+// web results already provide the reasoning context, so reserve the entire
+// bounded allowance for complete, source-grounded questions.
+export const GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS = 2_600;
 export const GUIDANCE_SCOUT_TIMEOUT_MS = 15_000;
 export const GUIDANCE_SCOUT_MAX_COST_USD = 0.05;
 
@@ -921,7 +927,7 @@ export async function scoutPlaylistGuidance(
       .digest("hex");
   const response = await createOpenAIResponse({
     model,
-    reasoning: { effort: "low" },
+    reasoning: { effort: "none" },
     max_output_tokens: GUIDANCE_SCOUT_MAX_OUTPUT_TOKENS,
     max_tool_calls: GUIDANCE_SCOUT_MAX_TOOL_CALLS,
     include: ["web_search_call.action.sources"],

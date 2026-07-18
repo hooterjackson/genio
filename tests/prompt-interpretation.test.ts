@@ -392,9 +392,9 @@ test("runs brief interpretation and grounded question scouting as separate bound
   expect(result.guidanceTelemetry.generationMode).toBe("grounded_scout");
   expect(requestBodies[0].text.format.name).toBe("playlist_brief");
   expect(requestBodies[1]).toMatchObject({
-    max_output_tokens: 1_800,
+    max_output_tokens: 2_600,
     max_tool_calls: 2,
-    reasoning: { effort: "low" },
+    reasoning: { effort: "none" },
     parallel_tool_calls: false,
     include: ["web_search_call.action.sources"],
     tools: [{ type: "web_search", search_context_size: "low" }],
