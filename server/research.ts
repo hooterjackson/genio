@@ -1926,6 +1926,69 @@ export class ResearchOrchestrator {
         });
         return;
       }
+      if (error instanceof ProviderRequestError) {
+        // A provider-side rejection (including an exhausted project quota or
+        // an unavailable configured model) is not evidence that the visitor's
+        // playlist request is invalid. Preserve any candidates already saved
+        // by an earlier pass and finish this bounded route as a transparent
+        // best-effort result. Retrying the complete durable job would only
+        // delay the same outcome and eventually turn a provider incident into
+        // a misleading red research failure.
+        const coverage = await this.repository.getCoverage(runId);
+        const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? 0));
+        const requestedMinimum = Math.max(1, brief.targetSize?.min ?? 50);
+        const candidateGoal = Math.max(requestedMinimum, policy.candidateGoal);
+        const shortfall = Math.max(0, requestedMinimum - eligibleCount);
+        const reserveShortfall = Math.max(0, candidateGoal - eligibleCount);
+        const outcome = eligibleCount > 0 ? "matching" : "partial";
+        await this.repository.upsertFrontier(runId, [{
+          sourceClass: "fast_policy",
+          strategy: "bounded provider availability",
+          cursor: null,
+          status: "unresolved",
+          discoveredCount: requestedMinimum,
+          recoveredCount: eligibleCount,
+          note: `${shortfall} tracks remain below the confirmed minimum because the research provider was unavailable`,
+        }]);
+        await this.repository.saveResearchCheckpoint(runId, policyKey, {
+          status: "provider_error",
+          profile: policy.version,
+          model: executionModel,
+          confirmedAt: route.confirmedAt,
+          startedAt,
+          researchDeadlineAt,
+          deadlineAt,
+          updatedAt: new Date().toISOString(),
+        });
+        await this.repository.saveResearchCheckpoint(runId, completionKey, {
+          status: shortfall > 0 ? "shortfall" : "complete",
+          next: outcome,
+          boundary: "provider_error",
+          profile: policy.version,
+          model: executionModel,
+          confirmedAt: route.confirmedAt,
+          startedAt,
+          researchDeadlineAt,
+          deadlineAt,
+          completedAt: new Date().toISOString(),
+          sourceCount: Math.max(0, Number(coverage.sourceCount ?? 0)),
+          citationEligibleCandidateCount: eligibleCount,
+          shortfall,
+          candidateGoal,
+          reserveShortfall,
+        });
+        await this.handoffBestEffortResearch(runId, eligibleCount, {
+          readyPhase: shortfall > 0 ? "research_shortfall_handoff" : "research_complete",
+          emptyPhase: "research_empty",
+          matchingPayload: {
+            fast: true,
+            fastConfirmedAt: route.confirmedAt,
+            fastResearchDeadlineAt: route.researchDeadlineAt,
+            fastDeadlineAt: route.deadlineAt,
+          },
+        });
+        return;
+      }
       throw error;
     }
   }
@@ -2114,6 +2177,40 @@ export class ResearchOrchestrator {
           status: "awaiting_budget",
           phase,
           error: error.isProviderOverrun ? error.message : null,
+        });
+        return;
+      }
+      if (error instanceof ProviderRequestError) {
+        // The deep path has no fixed wall-clock boundary to turn a provider
+        // outage into a natural best-effort handoff. Do that explicitly rather
+        // than retrying the entire pass until the generic worker failure path
+        // marks a valid visitor request as failed. Any durable candidates from
+        // earlier phases remain eligible for Apple matching; an empty run ends
+        // as a transparent partial result.
+        const coverage = await this.repository.getCoverage(runId);
+        const eligibleCount = Math.max(0, Number(coverage.eligibleCandidateCount ?? coverage.candidateCount ?? 0));
+        await this.repository.upsertFrontier(runId, [{
+          sourceClass: "provider",
+          strategy: `provider availability during ${phase}`,
+          cursor: null,
+          status: "unresolved",
+          discoveredCount: 0,
+          recoveredCount: eligibleCount,
+          note: "Research provider was unavailable; preserved all evidence-backed candidates already saved",
+        }]);
+        await this.repository.saveResearchCheckpoint(runId, "resume", {
+          phase,
+          gapAttempt,
+          generation,
+          segment,
+          status: "complete",
+          boundary: "provider_error",
+          next: eligibleCount > 0 ? "matching" : "partial",
+          updatedAt: new Date().toISOString(),
+        });
+        await this.handoffBestEffortResearch(runId, eligibleCount, {
+          readyPhase: "research_provider_handoff",
+          emptyPhase: "research_empty",
         });
         return;
       }

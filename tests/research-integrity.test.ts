@@ -18,6 +18,7 @@ import {
 } from "../server/research.ts";
 import type { PlaylistBrief, SourceAdapterResult } from "../shared/types.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
+import { ProviderRequestError } from "../server/openai.ts";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -1572,6 +1573,38 @@ describe("fast curated orchestration", () => {
     });
   });
 
+  test("a provider quota rejection finishes as a transparent partial without worker retries", async () => {
+    const state = segmentedRepository();
+    state.run.brief = brief("curated", { min: 25, max: 25 });
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    installFastRoute(state);
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      new ProviderRequestError("Current project has no available quota", "openai", 429, false),
+    ]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "scope_resolution",
+      gapAttempt: 0,
+      fast: true,
+    });
+
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(state.run).toMatchObject({ status: "partial", phase: "research_empty", error: null });
+    expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(false);
+    expect(state.checkpoints.get("fast:policy:fast_curated_v3")).toMatchObject({
+      status: "provider_error",
+    });
+    expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
+      status: "shortfall",
+      boundary: "provider_error",
+      citationEligibleCandidateCount: 0,
+      shortfall: 25,
+      next: "partial",
+    });
+  });
+
   test("rejects queue timing that disagrees with the durable route", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("curated", { min: 50, max: 100 });
@@ -1589,6 +1622,37 @@ describe("fast curated orchestration", () => {
 });
 
 describe("durable research segmentation", () => {
+  test("a deep provider rejection preserves candidates and never becomes a failed job", async () => {
+    const state = segmentedRepository();
+    state.run.brief = brief("exhaustive", null);
+    state.run.phase = "source_discovery";
+    state.coverage.candidateCount = 2;
+    state.coverage.eligibleCandidateCount = 2;
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      new ProviderRequestError("Provider is temporarily unavailable", "openai", 503, true),
+    ]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "source_discovery",
+      gapAttempt: 0,
+      generation: 0,
+      segment: 0,
+    });
+
+    expect(state.run).toMatchObject({
+      status: "ready_for_matching",
+      phase: "research_provider_handoff",
+      error: null,
+    });
+    expect(state.jobs.at(-1)).toMatchObject({ kind: "matching" });
+    expect(state.checkpoints.get("resume")).toMatchObject({
+      status: "complete",
+      boundary: "provider_error",
+      next: "matching",
+    });
+  });
+
   test("hands a deep 300-track curated request to gap analysis with its 525-candidate matching reserve", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("curated", { min: 300, max: 300 });

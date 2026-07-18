@@ -1,6 +1,6 @@
 {
   "schemaVersion": 4,
-  "source": "production audits and visitor-submitted regressions captured 2026-07-16 through 2026-07-17",
+  "source": "production audits and visitor-submitted regressions captured 2026-07-16 through 2026-07-18",
   "replayProfiles": {
     "nominal": {
       "candidateYieldRate": 0.9,
@@ -51,7 +51,7 @@
       "refillStrictMatchRate": 0.7
     }
   },
-  "scenarioCount": 28,
+  "scenarioCount": 29,
   "scenarios": [
     {
       "id": "2026-07-16-01",
@@ -277,6 +277,15 @@
       "requestedTrackCount": 50,
       "expectedOutcome": "exact_playlist",
       "replayProfile": "baile-funk-23-of-50",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-18-29",
+      "prompt": "Iconic baile funk songs with drill inspiration",
+      "expectedTrackCount": 25,
+      "requestedTrackCount": 25,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "baile-funk-19-of-25",
       "failureClasses": ["catalog_shortfall"]
     }
   ]

@@ -69,8 +69,8 @@ describe("retained production searches", () => {
   test("contains every retained brief attempt from the production audit", () => {
     expect(fixture.schemaVersion).toBe(4);
     expect(fixture.scenarios).toHaveLength(fixture.scenarioCount);
-    expect(fixture.scenarioCount).toBe(28);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(28);
+    expect(fixture.scenarioCount).toBe(29);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(29);
     expect(Object.keys(fixture.replayProfiles).sort()).toEqual([
       "baile-funk-19-of-25",
       "baile-funk-23-of-50",
@@ -194,6 +194,7 @@ describe("retained production searches", () => {
   test.each([
     ["2026-07-17-27", 25],
     ["2026-07-17-28", 50],
+    ["2026-07-18-29", 25],
   ] as const)("visitor-submitted Baile funk regression %s recovers to exactly %i tracks", (id, expectedCount) => {
     const scenario = fixture.scenarios.find((row) => row.id === id);
     expect(scenario).toBeDefined();
@@ -257,6 +258,43 @@ describe("retained production searches", () => {
       expect.stringMatching(/^published_count:/u),
       "terminal_status:partial",
     ]));
+  });
+
+  test("a zero-yield production replay ends as a neutral partial without inventing a playlist", () => {
+    const screenshotScenario = fixture.scenarios.find((row) => row.id === "2026-07-18-29");
+    expect(screenshotScenario).toBeDefined();
+    const replay = replayProductionScenario(canonicalScenarioBrief(screenshotScenario!), {
+      candidateYieldRate: 0,
+      initialStrictMatchRate: 0,
+      retryableCatalogRate: 0,
+      recoverySuccessRate: 0,
+      refillCandidateYieldRate: 0,
+      refillStrictMatchRate: 0,
+    });
+
+    expect(replay.observation).toMatchObject({
+      requestedTrackCount: 25,
+      candidateCount: 0,
+      strictMatchedCount: 0,
+      accountedCandidateCount: 0,
+      manifestTrackCount: 0,
+      publishedTrackCount: 0,
+      terminalStatus: "partial",
+      terminalPhase: "catalog_matching_empty",
+    });
+    expect(replay.postMatchRefillGenerations).toBe(2);
+    expect(replay.observation.totalCostUsd).toBeLessThanOrEqual(PUBLIC_FAST_RESEARCH_BUDGET_USD);
+    expect(assessProductionScenario(replay.observation, "exact_playlist")).toMatchObject({
+      releaseReady: false,
+      failClosed: false,
+      violations: expect.arrayContaining([
+        "research_under_yield:0/25",
+        "catalog_shortfall:0/25",
+        "manifest_count:0/25",
+        "published_count:0/25",
+        "terminal_status:partial",
+      ]),
+    });
   });
 
   test("a historical 50-to-28 result is a visible release failure, never a smaller success", () => {
