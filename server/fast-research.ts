@@ -320,8 +320,15 @@ export function fastSynthesisCheckpoint(
     outputText,
     citationAttestations: supported,
     sourceTitles,
+    // The Responses API may emit open_page/find_in_page items while following
+    // citations returned by a bounded search. Those are page inspections, not
+    // additional hosted searches, and must not cause a completed cited response
+    // to be discarded as over budget. Unknown action types still count so a
+    // future provider action cannot silently bypass this guard.
     webSearchCalls: (Array.isArray(response?.output) ? response.output : [])
-      .filter((item: any) => item?.type === "web_search_call").length,
+      .filter((item: any) => item?.type === "web_search_call")
+      .filter((item: any) => !["open_page", "find_in_page"].includes(item?.action?.type))
+      .length,
     updatedAt: new Date().toISOString(),
   };
 }

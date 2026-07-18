@@ -358,6 +358,11 @@ function refillProviderResponse(count = 8) {
     usage: { input_tokens: 100, output_tokens: 100, total_tokens: 200 },
     output: [
       { type: "web_search_call", action: { type: "search", query: "catalog-ready Rio songs" } },
+      { type: "web_search_call", action: { type: "search", query: "Rio songs recording discography" } },
+      {
+        type: "web_search_call",
+        action: { type: "open_page", url: "https://history.example/rio/catalog-ready-refill" },
+      },
       {
         id: "refill-provider-message",
         type: "message",
@@ -432,6 +437,9 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
 
     expect(orchestrator.calls).toHaveLength(1);
     expect(orchestrator.calls[0]).toMatchObject({ operation: "research.fast.post_match_refill" });
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "CONTAINERS: <credited recording artist — release title; ... or NONE>",
+    );
     const providerInput = JSON.parse(String(orchestrator.calls[0]!.body.input));
     expect(providerInput.excludedPairs).toHaveLength(88);
     expect(providerInput.excludedPairs[0]).toContain("Existing Rio Artist");
@@ -440,6 +448,7 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
       status: "complete",
       newlyAdded: 8,
       novelCandidateCount: 8,
+      hostedWebSearchCalls: 2,
     });
 
     const refillMatchingJob = repository.takeJob("matching");

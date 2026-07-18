@@ -74,6 +74,32 @@ describe("fast curated research", () => {
     expect(checkpoint.citationAttestations[0]!.excerpt).toContain("Signal One");
   });
 
+  test("counts hosted searches without treating page inspection as another search", () => {
+    const response: any = synthesisResponse();
+    response.output.splice(1, 0,
+      { type: "web_search_call", action: { type: "search", query: "Berlin techno discography" } },
+      { type: "web_search_call", action: { type: "open_page", url: "https://history.example/berlin-techno" } },
+      { type: "web_search_call", action: { type: "find_in_page", pattern: "track" } },
+    );
+
+    const checkpoint = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+
+    expect(checkpoint.webSearchCalls).toBe(2);
+    expect(extractFastCandidatesFromSynthesis(checkpoint, 120)).toHaveLength(2);
+  });
+
+  test("counts unknown hosted-search actions conservatively", () => {
+    const response: any = synthesisResponse();
+    response.output.splice(1, 0, {
+      type: "web_search_call",
+      action: { type: "future_search_action" },
+    });
+
+    const checkpoint = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+
+    expect(checkpoint.webSearchCalls).toBe(2);
+  });
+
   test("deterministically extracts cited Artist — Track pairs without a second model call", () => {
     const source = synthesisResponse(evidenceGroup({
       tracks: ["Fixture Artist — Signal One", "Second Artist — Signal Two"],
