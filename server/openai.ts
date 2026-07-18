@@ -626,8 +626,11 @@ function salvagedGuidanceQuestions(
       if (decisionKeys.has(decisionKey)) throw new Error("duplicate_decision_key");
       const header = boundedGuidanceProse(raw.header, "question header", 60);
       const question = boundedGuidanceProse(raw.question, "question", 240);
-      const whyMaterial = boundedGuidanceProse(raw.whyMaterial, "materiality", 480);
-      const groundingSummary = boundedGuidanceProse(raw.groundingSummary, "grounding", 420);
+      const rawWhyMaterial = typeof raw.whyMaterial === "string" && raw.whyMaterial.trim()
+        ? raw.whyMaterial
+        : `Each answer changes which documented ${brief.subjectEntities.join(", ")} recordings qualify for the playlist.`;
+      const whyMaterial = boundedGuidanceProse(rawWhyMaterial, "materiality", 480);
+      if (rawWhyMaterial !== raw.whyMaterial) issues.push(`q${index + 1}:repaired_missing_materiality`);
       const requestedUrls = Array.isArray(raw.sourceUrls)
         ? [...new Set(raw.sourceUrls.map(normalizedSourceUrl).filter((url): url is string => Boolean(url)))].slice(0, 3)
         : [];
@@ -636,6 +639,16 @@ function salvagedGuidanceQuestions(
       if (attestedRequestedUrls.length !== requestedUrls.length) {
         issues.push(`q${index + 1}:dropped_unattested_source`);
       }
+      const groundingFallback = attestedRequestedUrls
+        .map((url) => sourceHints.find((source) => source.url === url))
+        .flatMap((source) => source ? [source.excerpt, source.title] : [])
+        .find((value) => value.trim().length > 0)
+        ?? whyMaterial;
+      const rawGroundingSummary = typeof raw.groundingSummary === "string" && raw.groundingSummary.trim()
+        ? raw.groundingSummary
+        : groundingFallback;
+      const groundingSummary = boundedGuidanceProse(rawGroundingSummary, "grounding", 420);
+      if (rawGroundingSummary !== raw.groundingSummary) issues.push(`q${index + 1}:repaired_missing_grounding`);
       const candidateText = `${decisionKey} ${header} ${question} ${whyMaterial} ${groundingSummary}`;
       if (isTrackCountQuestion(candidateText)) throw new Error("track_count_question");
       if (!questionIsPromptSpecific(`${header} ${question}`, prompt, brief)) {

@@ -689,6 +689,45 @@ test("keeps an otherwise valid grounded question when provider prose slightly ex
   });
 });
 
+test("repairs blank optional grounding instead of skipping an intelligent question", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-grounding-repair");
+  const sourceUrl = "https://example.org/berlin-techno-institutions";
+  const question = groundedScoutQuestion({
+    decisionKey: "berlin_institutional_lineage",
+    subject: "Berlin techno institutions",
+    sourceUrl,
+  });
+  question.groundingSummary = "   ";
+  vi.stubGlobal("fetch", vi.fn(async () => scoutResponse({
+    questions: [question],
+    sourceUrl,
+    sourceTitle: "Berlin techno institutions and periods",
+  })));
+
+  const result = await scoutPlaylistGuidance(
+    "50 influential Berlin techno tracks",
+    {
+      ...guidedDraftBrief,
+      title: "Berlin Techno",
+      subjectEntities: ["Berlin techno"],
+      relationship: "historically influential within",
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(result.questions).toHaveLength(1);
+  expect(result.questions[0]!.grounding).toMatchObject({
+    summary: expect.stringContaining("Berlin techno institutions"),
+    sourceUrls: [sourceUrl],
+  });
+  expect(result.telemetry).toMatchObject({
+    generationMode: "grounded_scout",
+    proposedQuestionCount: 1,
+    acceptedQuestionCount: 1,
+  });
+  expect(result.telemetry.validationIssues).toContain("q1:repaired_missing_grounding");
+});
+
 test("enforces the scout cost cap by returning zero questions", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-budget-cap");
   const sourceUrl = "https://example.org/tamil-nadaswaram";
