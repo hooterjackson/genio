@@ -426,6 +426,7 @@ test("runs brief interpretation and grounded question scouting as separate bound
     max_tool_calls: 2,
     reasoning: { effort: "none" },
     parallel_tool_calls: false,
+    tool_choice: "required",
     include: ["web_search_call.action.sources"],
     tools: [{ type: "web_search", search_context_size: "low" }],
   });
@@ -827,20 +828,20 @@ test("repairs an empty researched scout for a broad request", async () => {
 test("does not repair a researched zero for a request that explicitly closes the scope", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-precise-researched-zero-guidance");
   const fetchMock = vi.fn(async () => researchedZeroScoutResponse(
-    "https://example.org/bjork-discography",
-    "Björk discography",
+    "https://example.org/radiohead-adjacent-electronic-music",
+    "Radiohead-adjacent electronic music",
   ));
   vi.stubGlobal("fetch", fetchMock);
 
   const result = await scoutPlaylistGuidance(
-    "Exactly 25 original studio recordings by Björk, chronological, no remixes or live versions",
+    "25 tracks by artists other than Radiohead, from 1995 through 2010, emphasizing electronic abstraction rather than guitar rock, ordered chronologically",
     {
       ...guidedDraftBrief,
-      title: "Björk Studio Chronology",
-      subjectEntities: ["Björk"],
-      relationship: "recorded by",
-      include: ["original studio recordings"],
-      exclude: ["remixes", "live versions"],
+      title: "Radiohead-Adjacent Electronic Abstraction",
+      subjectEntities: ["Radiohead"],
+      relationship: "stylistically similar to the reference artist",
+      include: ["1995–2010 recordings by other artists emphasizing electronic abstraction"],
+      exclude: ["Radiohead recordings", "guitar-rock emphasis"],
       orderingPolicy: "chronological by release year",
       targetSize: { min: 25, max: 25 },
     },

@@ -931,7 +931,8 @@ function promptExplicitlyClosesGuidance(prompt: string): boolean {
     /\b(?:exactly\s+)?\d{1,4}\b(?=[^.!?]{0,60}\b(?:songs?|tracks?|recordings?)\b)/iu,
     /\b(?:original|studio|live|remix(?:es)?|solo|group|features?|released|posthumous|instrumental|vocal)\b/iu,
     /\b(?:chronolog|release\s+order|ordered|alphabetic|ranked|sequence)\w*\b/iu,
-    /\b(?:only|without|exclude|excluding|no\s+(?:live|remix(?:es)?|covers?|features?|posthumous))\b/iu,
+    /\b(?:only|without|other\s+than|exclude|excluding|no\s+(?:live|remix(?:es)?|covers?|features?|posthumous))\b/iu,
+    /\b(?:from\s+)?(?:19|20)\d{2}\s*(?:through|to|-|–|—)\s*(?:19|20)\d{2}\b/iu,
   ].filter((pattern) => pattern.test(prompt)).length;
   return signals >= 3;
 }
@@ -1023,6 +1024,7 @@ export async function scoutPlaylistGuidance(
     max_tool_calls: GUIDANCE_SCOUT_MAX_TOOL_CALLS,
     include: ["web_search_call.action.sources"],
     parallel_tool_calls: false,
+    tool_choice: "required",
     tools: [{ type: "web_search", search_context_size: "low" }],
     instructions: GUIDANCE_SCOUT_INSTRUCTIONS,
     input: JSON.stringify({
@@ -1128,6 +1130,7 @@ export async function scoutPlaylistGuidance(
   );
   const shouldRepair = sourceHints.length > 0
     && responseCostUsd(response) < GUIDANCE_SCOUT_MAX_COST_USD
+    && !promptExplicitlyClosesGuidance(prompt)
     && Boolean(primaryIssue || primaryHadRejectedQuestions || broadPrimaryReturnedNothing);
   let repairAttempted = false;
   let repairIssue: string | null = null;
