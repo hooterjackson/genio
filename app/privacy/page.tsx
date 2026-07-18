@@ -1,18 +1,10 @@
 import Link from "next/link";
-import { SiteMenu } from "../site-menu";
-import { BrandWordmark } from "../brand-wordmark";
-import { PrimaryNav } from "../primary-nav";
+import { PublicSiteHeader } from "../public-site-header";
 
 export default function PrivacyPage() {
   return (
     <main className="app-shell">
-      <header className="site-header">
-        <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home"><BrandWordmark /></Link>
-        <div className="header-meta">
-          <PrimaryNav />
-          <SiteMenu />
-        </div>
-      </header>
+      <PublicSiteHeader />
 
       <section className="privacy-shell" aria-labelledby="privacy-title">
         <h1 id="privacy-title">Privacy</h1>

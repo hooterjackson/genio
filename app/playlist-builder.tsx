@@ -11,9 +11,8 @@ import {
   fastRunWindowPhrase,
 } from "../shared/fast-run-sla.ts";
 import { BrandIntro } from "./brand-intro";
-import { BrandWordmark } from "./brand-wordmark";
-import { PrimaryNav, type PrimaryNavItem } from "./primary-nav";
-import { SiteMenu } from "./site-menu";
+import { type PrimaryNavItem } from "./primary-nav";
+import { PublicSiteHeader } from "./public-site-header";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
 
@@ -672,27 +671,14 @@ function AppHeader({
   onJobs?: () => void;
   active?: PrimaryNavItem;
 }) {
+  const action = onTransfer ? {
+    label: transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB",
+    onClick: onTransfer,
+    disabled: transferState === "busy",
+  } : undefined;
+
   return (
-    <header className={`site-header${onTransfer ? " has-transfer" : ""}`}>
-      <button className="wordmark ascii-wordmark" onClick={onHome} aria-label="gênio home">
-        <BrandWordmark />
-      </button>
-      <div className="header-meta">
-        <PrimaryNav active={active} onCreate={onHome} onJobs={onJobs} />
-        {onTransfer && (
-          <button className="transfer-button" onClick={onTransfer} disabled={transferState === "busy"}>
-            {transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB"}
-          </button>
-        )}
-        <SiteMenu
-          action={onTransfer ? {
-            label: transferState === "copied" ? "LINK COPIED" : transferState === "busy" ? "CREATING..." : "SHARE JOB",
-            onClick: onTransfer,
-            disabled: transferState === "busy",
-          } : undefined}
-        />
-      </div>
-    </header>
+    <PublicSiteHeader active={active} onHome={onHome} onJobs={onJobs} action={action} />
   );
 }
 

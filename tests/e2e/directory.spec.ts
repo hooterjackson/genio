@@ -106,7 +106,7 @@ test("the primary Create, Explore, and Jobs navigation remains clear across publ
   await expect(page.getByRole("link", { name: "CREATE", exact: true })).toHaveAttribute("aria-current", "page");
   const exploreLink = page.getByRole("link", { name: "EXPLORE", exact: true });
   await expect(exploreLink).toHaveAttribute("href", "/playlists");
-  await expect(page.getByRole("button", { name: "JOBS", exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "JOBS", exact: true })).toBeVisible();
   await exploreLink.click();
   await expect(page).toHaveURL(/\/playlists$/u);
   await expect(page.getByRole("heading", { name: "Explore playlists" })).toBeVisible();
@@ -127,11 +127,11 @@ test("the public navigation restores the Jobs view from its URL and returns to C
   await page.goto("/?view=jobs");
   await expect(page).toHaveURL(/\?view=jobs$/u);
   await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "JOBS", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("link", { name: "JOBS", exact: true })).toHaveAttribute("aria-current", "page");
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "JOBS", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("link", { name: "JOBS", exact: true })).toHaveAttribute("aria-current", "page");
 
   await page.getByRole("link", { name: "CREATE", exact: true }).click();
   await expect(page).toHaveURL(/\/$/u);

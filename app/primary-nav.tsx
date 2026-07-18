@@ -36,15 +36,19 @@ export function PrimaryNav({
       >
         EXPLORE
       </Link>
-      {onJobs ? (
-        <button data-nav-item="jobs" className={active === "jobs" ? "is-current" : undefined} type="button" onClick={onJobs} aria-current={active === "jobs" ? "page" : undefined}>
-          JOBS
-        </button>
-      ) : (
-        <Link data-nav-item="jobs" className={active === "jobs" ? "is-current" : undefined} href="/?view=jobs" aria-current={active === "jobs" ? "page" : undefined}>
-          JOBS
-        </Link>
-      )}
+      <Link
+        data-nav-item="jobs"
+        className={active === "jobs" ? "is-current" : undefined}
+        href="/?view=jobs"
+        aria-current={active === "jobs" ? "page" : undefined}
+        onClick={(event) => {
+          if (!onJobs) return;
+          event.preventDefault();
+          onJobs();
+        }}
+      >
+        JOBS
+      </Link>
     </nav>
   );
 }

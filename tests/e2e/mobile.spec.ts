@@ -316,7 +316,7 @@ test("the gênio intro is brief, skippable, mobile-safe, and shown once per sess
 
   await page.reload();
   await expect(page.getByTestId("brand-intro")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "gênio home" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "gênio home" })).toBeVisible();
 });
 
 test("the gênio intro is omitted when reduced motion is requested", async ({ page }) => {
@@ -765,7 +765,7 @@ test("leaving the composer cancels a pending guided request", async ({ page }) =
   await openPrompt(page);
   await requestField(page).fill("Berlin techno foundations");
   await page.getByRole("button", { name: /create playlist/i }).click();
-  await page.getByRole("button", { name: "JOBS", exact: true }).click();
+  await page.getByRole("link", { name: "JOBS", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
   await page.waitForTimeout(650);
@@ -1134,7 +1134,7 @@ test("the jobs screen lists and opens earlier jobs for this browser", async ({ p
   });
 
   await openPrompt(page);
-  await page.getByRole("button", { name: "JOBS", exact: true }).click();
+  await page.getByRole("link", { name: "JOBS", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Your jobs" })).toBeVisible();
   await expect(page.getByText(brief.title)).toBeVisible();
   await page.getByRole("button", { name: `Open ${brief.title} — Researching` }).click();
@@ -1162,7 +1162,7 @@ test("an active job never blocks starting a new request", async ({ page }) => {
 
   await page.goto("/#cap=one-time-secret&run=run-active");
   await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
-  await page.getByRole("button", { name: "gênio home" }).click();
+  await page.getByRole("link", { name: "gênio home" }).click();
   await expect(requestField(page)).toBeVisible();
   await expect(trackCountPreset(page, 50)).toHaveAttribute("aria-pressed", "true");
   await expect(exactTrackCountField(page)).toHaveCount(0);
@@ -1956,7 +1956,7 @@ test("leaving during playlist generation prevents stale publication and state", 
   await page.goto("/#cap=one-time-secret&run=run-1");
   await continueWithTracksButton(page).click();
   await started;
-  await page.getByRole("button", { name: "gênio home" }).click();
+  await page.getByRole("link", { name: "gênio home" }).click();
   await expect(requestField(page)).toBeVisible();
   releaseSelection();
   await page.waitForTimeout(50);
@@ -2195,7 +2195,7 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   for (const locator of [
     page.locator("body"),
     page.locator(".command-hero > p:last-child"),
-    page.locator(".header-meta"),
+    page.locator(".header-actions"),
     page.locator(".wordmark"),
   ]) {
     const colors = await locator.evaluate((element) => {

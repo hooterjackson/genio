@@ -2,9 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { BrandWordmark } from "../brand-wordmark";
-import { PrimaryNav } from "../primary-nav";
-import { SiteMenu } from "../site-menu";
+import { PublicSiteHeader } from "../public-site-header";
 
 type PublicPlaylistVolume = {
   volumeNumber: number;
@@ -67,17 +65,7 @@ function countLabel(count: number, singular: string, plural: string): string {
 }
 
 function DirectoryHeader() {
-  return (
-    <header className="site-header directory-header">
-      <Link className="wordmark ascii-wordmark" href="/" aria-label="gênio home">
-        <BrandWordmark />
-      </Link>
-      <div className="header-meta">
-        <PrimaryNav active="explore" />
-        <SiteMenu />
-      </div>
-    </header>
-  );
+  return <PublicSiteHeader active="explore" className="directory-header" />;
 }
 
 function DirectoryLoading() {

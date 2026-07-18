@@ -25,6 +25,7 @@ body {
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -92,11 +93,41 @@ summary:focus-visible {
 }
 
 .brand-wordmark-art {
+  display: block;
   margin: 0;
   color: var(--ink);
-  font: 720 9px/1.02 "SFMono-Regular", "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+  font: 400 9px/1 "SFMono-Regular", "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
   letter-spacing: 0;
   white-space: pre;
+}
+
+.public-site-header {
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  display: grid;
+}
+
+.public-site-header .wordmark {
+  grid-column: 1;
+  justify-self: start;
+}
+
+.public-site-header .primary-nav {
+  grid-column: 2;
+  position: static;
+  transform: none;
+  justify-self: center;
+}
+
+.header-actions {
+  min-width: 0;
+  grid-column: 3;
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  justify-content: flex-end;
+  gap: 18px;
 }
 
 .header-meta {
@@ -123,6 +154,7 @@ summary:focus-visible {
 
 .primary-nav a,
 .primary-nav button {
+  appearance: none;
   min-width: 44px;
   min-height: 44px;
   padding: 0 0 3px;
@@ -138,6 +170,7 @@ summary:focus-visible {
   letter-spacing: .09em;
   line-height: 1;
   text-decoration: none;
+  text-align: center;
   white-space: nowrap;
   pointer-events: auto;
 }
@@ -1358,6 +1391,10 @@ summary:focus-visible {
     gap: 10px;
   }
 
+  .header-actions {
+    gap: 10px;
+  }
+
   .primary-nav {
     gap: clamp(12px, 3vw, 24px);
   }
@@ -1412,6 +1449,10 @@ summary:focus-visible {
     justify-content: flex-start;
   }
 
+  .public-site-header {
+    grid-template-columns: clamp(76px, 23.7vw, 102px) minmax(0, 1fr) 44px;
+  }
+
   .brand-wordmark-art {
     display: block;
     font-size: clamp(4.8px, 1.44vw, 6.2px);
@@ -1424,8 +1465,16 @@ summary:focus-visible {
     gap: 4px;
   }
 
+  .header-actions {
+    gap: 4px;
+  }
+
   .primary-nav {
-    gap: 10px;
+    width: 100%;
+    max-width: 224px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(44px, 1fr));
+    gap: 0;
   }
 
   .primary-nav a,
