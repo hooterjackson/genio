@@ -445,6 +445,12 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
     expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
       "CONTAINERS: <credited recording artist — release title; ... or NONE>",
     );
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "Use 3–5 unique TRACKS per line",
+    );
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "keep each complete line under 1,200 characters",
+    );
     const providerInput = JSON.parse(String(orchestrator.calls[0]!.body.input));
     expect(providerInput.excludedPairs).toHaveLength(88);
     expect(providerInput.excludedPairs[0]).toContain("Existing Rio Artist");

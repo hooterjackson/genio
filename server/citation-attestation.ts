@@ -1,7 +1,7 @@
 import type { CitationAttestationInput } from "../shared/types.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
 
-export const MAX_CITATION_EXCERPT_CHARS = 1_000;
+export const MAX_CITATION_EXCERPT_CHARS = 1_500;
 
 export interface HostedCitationAttestation extends CitationAttestationInput {
   sourceUrl: string;
