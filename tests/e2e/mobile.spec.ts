@@ -1110,6 +1110,41 @@ test("an active fast run keeps its profile and concise phase message visible", a
   await page.goto("/#cap=one-time-secret&run=run-fast");
   await expect(page.getByText("[CURATED · RESEARCHING]", { exact: true })).toBeVisible();
   await expect(page.getByText("Finding and verifying cited tracks within the 2-minute window.")).toBeVisible();
+  const indicator = page.getByTestId("working-indicator");
+  await expect(indicator).toBeVisible();
+  await expect(indicator.getByText("LIVE", { exact: true })).toBeVisible();
+  await expect(indicator.locator("[aria-current='step']")).toContainText("RESEARCH");
+  await expect(indicator.locator(".working-facts")).toContainText("SOURCES4");
+  await expect(indicator.locator(".working-facts")).toContainText("TRACKS FOUND24");
+  await expect(page.locator(".research-progress")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  expect(await indicator.locator(".working-signal-bar").first().evaluate((element) => getComputedStyle(element).animationName)).toBe("none");
+});
+
+test("the active process signal moves when motion is allowed", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const activeRun = {
+    ...run,
+    id: "run-moving-signal",
+    brief: curatedBrief,
+    status: "matching",
+    phase: "catalog_matching",
+    candidateCount: 41,
+    sourceCount: 9,
+  };
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: activeRun.id }) });
+  });
+  await page.route("**/api/v1/runs/run-moving-signal", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(activeRun) });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-moving-signal");
+  const indicator = page.getByTestId("working-indicator");
+  await expect(indicator.locator("[aria-current='step']")).toContainText("MATCH");
+  const animationName = await indicator.locator(".working-signal-bar").first()
+    .evaluate((element) => getComputedStyle(element).animationName);
+  expect(animationName).toContain("working-signal-wave");
 });
 
 test("the jobs screen lists and opens earlier jobs for this browser", async ({ page }) => {

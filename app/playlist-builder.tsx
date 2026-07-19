@@ -13,6 +13,8 @@ import {
 import { BrandIntro } from "./brand-intro";
 import { type PrimaryNavItem } from "./primary-nav";
 import { PublicSiteHeader } from "./public-site-header";
+import { playlistWorkState } from "./playlist-waiting-state";
+import { WorkingIndicator } from "./working-indicator";
 import {
   apiErrorCode,
   evidenceCountSummary,
@@ -226,21 +228,6 @@ const examples = [
 
 const terminalStatuses = new Set(["complete", "partial", "failed", "expired", "deleted"]);
 const reviewStatuses = new Set(["review", "visitor_review"]);
-const progressByPhase: Record<string, number> = {
-  queued: 4,
-  scope: 9,
-  source_discovery: 18,
-  fast_research: 55,
-  container_discovery: 30,
-  container_enumeration: 44,
-  track_verification: 62,
-  catalog_enrichment: 75,
-  gap_analysis: 88,
-  matching: 88,
-  catalog_matching: 88,
-  research_complete: 82,
-};
-
 class ApiError extends Error {
   status: number;
   code: string | null;
@@ -1111,29 +1098,41 @@ function FinalizingBriefScreen() {
         <span className="guided-question-kicker">PREPARING</span>
         <h1>Preparing your playlist</h1>
         <p>Applying your answers before research begins.</p>
-        <div className="guided-finalizing-line"><span aria-hidden="true">▋</span>FINALIZING REQUEST</div>
+        <WorkingIndicator
+          stage="queue"
+          motion="active"
+          phaseLabel="Applying your answers and finalizing the request."
+          compact
+        />
       </div>
     </section>
   );
 }
 
 function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
-  const progress = progressByPhase[run.phase] ?? (run.status === "queued" ? 4 : 12);
   const showReset = terminalStatuses.has(run.status);
   const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
   const publishing = ["publishing", "waiting_for_apple_authorization", "manifest_ready"].includes(run.status);
+  const work = playlistWorkState(run);
 
   return (
-    <section className="screen flow-screen research-screen" aria-labelledby="run-title">
+    <section
+      className="screen flow-screen research-screen"
+      aria-labelledby="run-title"
+      aria-busy={work.motion === "active"}
+    >
       <div className="flow-body research-body">
         <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
         <h1 id="run-title">{publishing ? "Creating your playlist" : "Researching your playlist"}</h1>
         <p className="run-subject">{run.brief.title}</p>
-        <p className="research-status" role="status">{phaseMessage(run)}</p>
-        <div className="progress research-progress" aria-label={"Research " + progress + "% complete"}>
-          <span style={{ width: progress + "%" }} />
-        </div>
-        <div className="phase-line"><span className="cursor" aria-hidden="true">▋</span>{statusLabel(run.phase || run.status)}</div>
+        <WorkingIndicator
+          stage={work.stage}
+          motion={work.motion}
+          phaseLabel={phaseMessage(run)}
+          sourceCount={run.sourceCount}
+          candidateCount={run.candidateCount}
+          note={work.motion === "active" ? "Progress is saved in Jobs. You can leave this page." : undefined}
+        />
       </div>
 
       {showReset && (
@@ -1159,7 +1158,12 @@ function ReviewScreen(props: {
       <div className="flow-body review-body">
         <h1 id="review-title">Choose tracks</h1>
         <p>Loading Apple Music matches.</p>
-        <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING TRACKS</div>
+        <WorkingIndicator
+          stage="match"
+          motion="active"
+          phaseLabel="LOADING TRACKS"
+          compact
+        />
       </div>
       <div className="step-footer review-footer">
         <div className="selection-count"><strong>0</strong><span>TRACKS</span></div>
