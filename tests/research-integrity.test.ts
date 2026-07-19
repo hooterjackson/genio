@@ -21,6 +21,7 @@ import type { PlaylistBrief, SourceAdapterResult } from "../shared/types.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
 import { ProviderRequestError } from "../server/openai.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
+import { resolveEvidenceIntegrity } from "../server/evidence-integrity.ts";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -463,6 +464,41 @@ describe("claim-level evidence integrity", () => {
     const self = validateTestCandidates(candidateArgs({ sourceUrl, state: "corroborated" }), new Set([sourceUrl]), "track_verification");
     expect(self.sources[0]!.provenanceRoot).toBe("unclassified");
     expect(self.candidates[0]!.evidence[0]!.state).toBe("inferred");
+  });
+
+  test("distinct unclassified publishers never masquerade as independent provenance roots", () => {
+    const sources = [
+      {
+        url: "https://publisher-one.example/exact-track",
+        title: "Publisher one",
+        sourceClass: "web" as const,
+        provenanceRoot: "unclassified",
+        note: "Exact-track citation from a source whose upstream lineage is unknown.",
+      },
+      {
+        url: "https://publisher-two.example/exact-track",
+        title: "Publisher two",
+        sourceClass: "web" as const,
+        provenanceRoot: "unclassified",
+        note: "A second exact-track citation with no attested upstream lineage.",
+      },
+    ];
+    const evidence = sources.map((source) => ({
+      sourceUrl: source.url,
+      state: "verified" as const,
+      supportScope: "track" as const,
+      subjectEntity: "Test Artist",
+      subjectRelationship: "performed on",
+      relationship: "performed on",
+      note: "Citation-attested exact-track relationship.",
+    }));
+
+    const integrity = resolveEvidenceIntegrity(evidence, sources);
+    expect(integrity.independentSupportingLineages).toBe(1);
+    expect(integrity.evidence).toEqual([
+      expect.objectContaining({ state: "verified" }),
+      expect.objectContaining({ state: "verified" }),
+    ]);
   });
 });
 

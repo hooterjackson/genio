@@ -2690,7 +2690,7 @@ databaseDescribe("hosted backend integration", () => {
     ]);
   });
 
-  test("Pipeline V2 manifest lock requires authoritative scope provenance and never relaxes hard version policy", async () => {
+  test("Pipeline V2 manifest lock accepts strong attested unknown-lineage claims but never relaxes proof or version policy", async () => {
     const v2Brief: PlaylistBrief = {
       ...brief,
       title: "V2 manifest eligibility",
@@ -2709,8 +2709,12 @@ databaseDescribe("hosted backend integration", () => {
       url: sourceUrl,
       title: "Exact track evidence",
       sourceClass: "web",
-      provenanceRoot: "v2-evidence.example",
-      note: "A track-specific integration fixture.",
+      // Hosted search can attest an exact claim without proving that the
+      // publisher is the independent upstream origin. The unknown lineage
+      // must stay collapsed for corroboration while the strong citation is
+      // still eligible to establish curated scope.
+      provenanceRoot: "unclassified",
+      note: "A citation-attested track-specific integration fixture with unknown lineage.",
     }]);
     const attestedTitles = ["Safe Studio Recording", "Wrong Live Recording"];
     const citations = new Map(attestedTitles.map((title) => [

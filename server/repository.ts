@@ -992,7 +992,7 @@ function authoritativeScopeBinding(
 ): boolean {
   if (storedPipelineVersion !== pipelineVersion || storedPolicyVersion !== policyVersion) return false;
   const root = normalizedPolicyText(binding.provenanceRoot);
-  if (!root || root === "unclassified" || root === "unknown") return false;
+  if (!root || root === "unknown") return false;
   if (!binding.sourceRecordId || !binding.sourceUrl.startsWith("https://")) return false;
   const rootStep = binding.provenancePath.some((step) => (
     step.kind === "provenance_root" && normalizedPolicyText(step.id) === root
@@ -1001,6 +1001,20 @@ function authoritativeScopeBinding(
     step.kind === "source_record" && step.id === binding.sourceRecordId
   ));
   if (!rootStep || !sourceStep) return false;
+  const lineageUnclassified = root === "unclassified";
+  if (lineageUnclassified && (
+    binding.bindingKind !== "track_specific_source"
+    || !binding.citationAttestationId
+    || !Number.isFinite(binding.confidence)
+    || binding.confidence < 0.8
+  )) return false;
+  // `unclassified` is a shared lineage bucket, not automatically an invalid
+  // source. Hosted search often cannot prove an upstream origin independently
+  // of the page carrying an exact track claim. Permit only strong,
+  // citation-attested track-specific bindings in that bucket. Medium claims
+  // and generic container memberships still cannot use unknown lineage, and
+  // all unclassified claims continue to collapse into one provenance root so
+  // they cannot masquerade as independent corroboration.
   // A track-specific hosted-web assertion is authoritative only when its
   // citation attestation survived persistence. Scoped adapter/editorial
   // membership may instead be bound by its stored source/container record.
@@ -5530,9 +5544,11 @@ export class Repository {
           // in V2. An exact Apple match can still fail a non-relaxable scope,
           // evidence, content, or version rule. That is a valid zero-result
           // completeness outcome, not an operational publication failure.
-          const counts = await this.pool.query<{ discovered_count: number }>(
-            "SELECT count(*)::int discovered_count FROM track_candidates WHERE run_id=$1",
-            [runId],
+          const stageCounts = await this.getPipelineStageCounts(runId);
+          const discoveredTrackCount = Number(stageCounts.discovered ?? 0);
+          const qualifiedTrackCount = Math.min(
+            discoveredTrackCount,
+            Number(stageCounts.claim_verified ?? stageCounts.scope_qualified ?? 0),
           );
           await this.pool.query(
             `WITH rejected AS (
@@ -5551,12 +5567,13 @@ export class Repository {
             policyVersion: plan.policyVersion,
             status: "no_compatible_tracks",
             targetTrackCount: plan.requestedTrackCount,
-            discoveredTrackCount: Number(counts.rows[0]?.discovered_count ?? 0),
-            qualifiedTrackCount: 0,
+            discoveredTrackCount,
+            qualifiedTrackCount,
             selectedTrackCount: 0,
             publishedTrackCount: 0,
             frontierExhausted: true,
             reasonCodes: ["manifest_hard_constraints_rejected_all"],
+            stageCounts,
           });
           await this.savePipelineOutcome(runId, outcome);
           await this.savePipelineDeficitLedger(runId, outcome.deficits, {

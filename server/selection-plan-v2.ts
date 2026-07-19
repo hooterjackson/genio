@@ -184,10 +184,17 @@ const ACTIVITY_TERMS: Array<[string, RegExp]> = [
 function eraRules(value: string): ParsedAxisRule[] {
   const range = value.match(/\b((?:19|20)\d{2})\s*(?:-|\u2013|\u2014|to|through)\s*((?:19|20)\d{2})\b/iu);
   if (range) return [{ axis: "era", operator: "between", values: [range[1]!, range[2]!] }];
-  const decade = value.match(/\b(?:(early|mid|late)[ -]?)?((?:19|20)\d0)s\b/iu);
-  if (decade) {
-    const qualifier = decade[1] ? `${decade[1]!.toLocaleLowerCase("en-US")} ` : "";
-    return [{ axis: "era", operator: "within", values: [`${qualifier}${decade[2]}s`] }];
+  const decades = [...value.matchAll(/\b(?:(early|mid|late)[ -]?)?((?:19|20)\d0)s\b/giu)]
+    .map((decade) => {
+      const qualifier = decade[1] ? `${decade[1].toLocaleLowerCase("en-US")} ` : "";
+      return `${qualifier}${decade[2]}s`;
+    });
+  if (decades.length > 0) {
+    // Multiple decades are alternatives inside one constraint. Emitting one
+    // hard rule per decade would require every track to belong to all of them;
+    // retaining only the first silently narrowed prompts such as
+    // "1970s and 1980s" to a single decade.
+    return [{ axis: "era", operator: "within", values: unique(decades) }];
   }
   const year = value.match(/\b(?:19|20)\d{2}\b/u)?.[0];
   if (!year) return [];
@@ -336,7 +343,8 @@ function constraintsForBrief(
         const nonConflictingValues = item.values.filter((value) => {
           const conflictsWithRequiredScope = constraints.some((constraint) => (
             constraint.kind === "hard"
-            && constraint.operator === "require"
+            && constraint.operator !== "exclude"
+            && constraint.operator !== "avoid"
             && constraint.axis === item.axis
             && constraint.values.some((required) => normalized(required) === normalized(value))
           ));

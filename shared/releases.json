@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.2",
+      "releasedAt": "2026-07-19",
+      "title": "Pipeline V2 manifest eligibility hotfix",
+      "notes": [
+        "Fixed manifest locking so strong citation-attested track evidence remains eligible when its upstream provenance lineage cannot be independently classified.",
+        "Kept unknown-lineage sources collapsed into one corroboration bucket, preventing copied pages from appearing independently verified.",
+        "Preserved both decades in multi-era requests and prevented model-authored exclusions from contradicting the visitor's explicit era scope.",
+        "Preserved real candidate-stage counts in zero-result coverage reports instead of replacing resolved catalog stages with zeros.",
+        "Added regression coverage for unknown-lineage evidence, contradictory generated exclusions, and multi-decade selection plans."
+      ]
+    },
+    {
       "version": "1.2.1",
       "releasedAt": "2026-07-19",
       "title": "Curated Pipeline V2 activation",

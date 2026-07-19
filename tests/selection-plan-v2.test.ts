@@ -205,6 +205,64 @@ describe("Pipeline V2 selection plan", () => {
     }));
   });
 
+  test("keeps a two-decade request as one non-relaxable era range", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco, boogie, and disco-funk dance-floor songs from the 1970s and 1980s",
+      brief: brief({
+        title: "Brazilian disco and boogie",
+        description: "A dance-floor survey spanning the 1970s and 1980s.",
+        subjectEntities: ["Brazilian disco", "Brazilian boogie", "Brazilian disco-funk"],
+        relationship: "belongs to the requested Brazilian dance-music scope",
+        include: ["Disco, boogie, and disco-funk from Brazil in the 1970s and 1980s"],
+        exclude: [],
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    const hardEraConstraints = plan.constraints.filter((constraint) => (
+      constraint.kind === "hard" && constraint.axis === "era"
+    ));
+    expect(hardEraConstraints).toEqual([
+      expect.objectContaining({
+        operator: "within",
+        values: ["1970s", "1980s"],
+      }),
+    ]);
+  });
+
+  test("generated exclusions cannot contradict a user-requested two-decade range", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco, boogie, and disco-funk dance-floor songs from the 1970s and 1980s",
+      brief: brief({
+        title: "Brazilian disco and boogie",
+        description: "A dance-floor survey spanning the 1970s and 1980s.",
+        subjectEntities: ["Brazilian disco", "Brazilian boogie", "Brazilian disco-funk"],
+        relationship: "belongs to the requested Brazilian dance-music scope",
+        include: ["Disco, boogie, and disco-funk from Brazil in the 1970s and 1980s"],
+        // These are model-authored mistakes, not visitor exclusions. Neither
+        // may override the explicit positive era scope in the prompt.
+        exclude: ["Avoid recordings from the 1970s", "Avoid recordings from the 1980s"],
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    const requestedDecades = new Set(["1970s", "1980s"]);
+    const contradictory = plan.constraints.filter((constraint) => (
+      constraint.axis === "era"
+      && (constraint.operator === "avoid" || constraint.operator === "exclude")
+      && constraint.values.some((value) => requestedDecades.has(value))
+    ));
+    expect(contradictory).toEqual([]);
+    expect(plan.constraints.filter((constraint) => (
+      constraint.kind === "hard" && constraint.axis === "era"
+    ))).toEqual([
+      expect.objectContaining({
+        operator: "within",
+        values: ["1970s", "1980s"],
+      }),
+    ]);
+  });
+
   test("factual credits route to the claim-first frontier and disable generic caps", () => {
     const plan = createSelectionPlanV2({
       prompt: "Every released song Paulinho da Costa performed on",
