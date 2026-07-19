@@ -51,7 +51,7 @@ describe("post-match research-refill policy", () => {
       initialCandidateCount: 88,
       strictMatchCount: 42,
       expectedShortfall: 8,
-      expectedAdditionalCandidateGoal: 21,
+      expectedAdditionalCandidateGoal: 34,
     },
     {
       label: "25 Wandelweiser-adjacent recordings for late-night listening",
@@ -59,7 +59,7 @@ describe("post-match research-refill policy", () => {
       initialCandidateCount: 44,
       strictMatchCount: 11,
       expectedShortfall: 14,
-      expectedAdditionalCandidateGoal: 70,
+      expectedAdditionalCandidateGoal: 95,
     },
   ])(
     "$label turns a strict Apple shortfall into a bounded evidence-research refill",
@@ -515,7 +515,7 @@ describe("matching after a research refill", () => {
     expect(repository.automaticCandidateRefills).toEqual([{
       runId: "rio-50",
       storefront: "us",
-      additionalCandidateGoal: 21,
+      additionalCandidateGoal: 34,
       currentRefillGeneration: 0,
     }]);
     expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
@@ -739,7 +739,7 @@ describe("matching after a research refill", () => {
     expect(repository.automaticCandidateRefills).toEqual([{
       runId: "rio-refill-recovery",
       storefront: "us",
-      additionalCandidateGoal: 3,
+      additionalCandidateGoal: 24,
       currentRefillGeneration: 1,
     }]);
     expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));

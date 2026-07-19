@@ -245,6 +245,8 @@ describe("worker fail-closed behavior", () => {
         payload: {},
         attempts: 1,
         maxAttempts: 3,
+        pipelineVersion: "legacy_v1",
+        minimumWorkerProtocol: 4,
       };
       repository.ensureSchemaVersion.mockResolvedValue(undefined);
       repository.getAppleAuthorization.mockResolvedValue(null);

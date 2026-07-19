@@ -4,6 +4,7 @@ import {
   BudgetPause,
   collectHostedCitationAttestations,
   maximumOpenAICallCostUsd,
+  recordStructuredSourcePaginationLoop,
   ResearchOrchestrator,
   researchCompletionReadiness,
   researchGapPassLimit,
@@ -25,14 +26,59 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+test("structured pagination loops persist a bounded standardized durable signal", async () => {
+  const saveResearchCheckpoint = vi.fn(async (
+    _runId: string,
+    _phase: string,
+    _state: unknown,
+  ) => {
+    void _runId;
+    void _phase;
+    void _state;
+  });
+  await recordStructuredSourcePaginationLoop({ saveResearchCheckpoint }, {
+    runId: "run-pagination-loop",
+    adapter: "musicbrainz",
+    action: "discover",
+    entity: "release",
+    strategyId: "musicbrainz:discover:release:fixture",
+    violation: "cursor_out_of_order",
+    expectedCursor: "/ws/2/release?offset=25&private=opaque",
+    receivedCursor: "/ws/2/release?offset=0&private=opaque",
+    occurredAt: "2026-07-19T12:00:00.000Z",
+  });
+
+  expect(saveResearchCheckpoint).toHaveBeenCalledWith(
+    "run-pagination-loop",
+    expect.stringMatching(/^pipeline_pagination_loop:[0-9a-f]{16}$/u),
+    expect.objectContaining({
+      status: "contract_error",
+      contractError: true,
+      signal: "pipeline.pagination_loop",
+      reasonCode: "structured_source_pagination_loop",
+      violation: "cursor_out_of_order",
+      adapter: "musicbrainz",
+      action: "discover",
+      entity: "release",
+      occurredAt: "2026-07-19T12:00:00.000Z",
+    }),
+  );
+  const durable = saveResearchCheckpoint.mock.calls[0]?.[2] as Record<string, unknown>;
+  expect(durable).not.toHaveProperty("expectedCursor");
+  expect(durable).not.toHaveProperty("receivedCursor");
+  expect(durable.expectedCursorFingerprint).toMatch(/^[0-9a-f]{16}$/u);
+  expect(durable.receivedCursorFingerprint).toMatch(/^[0-9a-f]{16}$/u);
+});
+
 function brief(mode: PlaylistBrief["mode"], targetSize: PlaylistBrief["targetSize"]): PlaylistBrief {
+  const factual = mode !== "curated";
   return {
     title: "Integrity fixture",
     description: "A deterministic research-integrity fixture.",
     mode,
-    subjectEntities: ["Test Artist"],
-    relationship: "performed on",
-    include: ["released recordings"],
+    subjectEntities: [factual ? "Test Artist" : "Test scene"],
+    relationship: factual ? "performed on" : "represents the Test scene",
+    include: [factual ? "released recordings" : "documented Test scene recordings"],
     exclude: [],
     versionPolicy: "documented versions",
     evidencePolicy: "source-backed",
@@ -707,11 +753,9 @@ describe("research completion policy", () => {
     recoveredTotal: 10,
   }];
 
-  test("curated and hybrid briefs enforce minimums, never maximums", () => {
+  test("relevance-first curated briefs enforce minimums, never maximums", () => {
     expect(researchCompletionReadiness(brief("curated", { min: 3, max: 100 }), { candidateCount: 100, eligibleCandidateCount: 2, sourceCount: 1 }, []).ready).toBe(false);
     expect(researchCompletionReadiness(brief("curated", { min: 3, max: 100 }), { candidateCount: 100, eligibleCandidateCount: 3, sourceCount: 1 }, []).ready).toBe(true);
-    expect(researchCompletionReadiness(brief("hybrid", { min: 2, max: 5 }), { candidateCount: 100, eligibleCandidateCount: 1, sourceCount: 1 }, []).ready).toBe(false);
-    expect(researchCompletionReadiness(brief("hybrid", { min: 2, max: 5 }), { candidateCount: 100, eligibleCandidateCount: 2, sourceCount: 1 }, []).ready).toBe(true);
   });
 
   test("large exact curated requests require an Apple matching reserve before handoff", () => {
@@ -746,7 +790,12 @@ describe("research completion policy", () => {
       completedExhaustiveFrontier,
     ).ready).toBe(true);
     expect(researchCompletionReadiness(brief("hybrid", null), { candidateCount: 100, eligibleCandidateCount: 0, sourceCount: 1 }, []).ready).toBe(false);
-    expect(researchCompletionReadiness(brief("hybrid", null), { candidateCount: 1, eligibleCandidateCount: 1, sourceCount: 1 }, []).ready).toBe(true);
+    expect(researchCompletionReadiness(brief("hybrid", null), { candidateCount: 1, eligibleCandidateCount: 1, sourceCount: 1 }, []).ready).toBe(false);
+    expect(researchCompletionReadiness(
+      brief("hybrid", { min: 1, max: 10 }),
+      { candidateCount: 1, eligibleCandidateCount: 1, sourceCount: 5, containers: completedContainers },
+      completedExhaustiveFrontier,
+    ).ready).toBe(true);
   });
 
   test("gap-pass bounds are configurable and stale excess work finishes partial without candidates", async () => {
@@ -967,8 +1016,8 @@ describe("fast curated orchestration", () => {
     state.repository.upsertFrontier = async (_runId?: string, items?: any[]) => { frontier.push(...(items ?? [])); };
 
     const support = fastEvidenceGroup(
-      "Test Artist",
-      "performed on",
+      state.run.brief.subjectEntities[0]!,
+      state.run.brief.relationship,
       [
         "Fixture Performer — Test Song",
         "Fixture Performer — Test Song Two",
@@ -1434,7 +1483,7 @@ describe("fast curated orchestration", () => {
     state.run.status = "queued";
     state.run.phase = "queued";
     const route = installFastRoute(state);
-    const support = `${fastEvidenceGroup("Test Artist", "performed on", [
+    const support = `${fastEvidenceGroup(state.run.brief.subjectEntities[0]!, state.run.brief.relationship, [
       "Fixture Performer — Test Song",
       "Fixture Performer — Test Song Two",
       "Fixture Performer — Test Song Three",
@@ -1499,8 +1548,8 @@ describe("fast curated orchestration", () => {
 
     const synthesis = (ordinal: number) => {
       const support = fastEvidenceGroup(
-        "Test Artist",
-        "performed on",
+        state.run.brief.subjectEntities[0]!,
+        state.run.brief.relationship,
         [`Fixture Performer ${ordinal} — Test Song ${ordinal}`],
       );
       const marker = `[source-${ordinal}]`;
@@ -1915,7 +1964,7 @@ describe("durable research segmentation", () => {
     expect(orchestrator.calls).toHaveLength(0);
     expect(state.jobs).toContainEqual(expect.objectContaining({
       kind: "matching",
-      payload: { runId: state.run.id, storefront: "br" },
+      payload: { runId: state.run.id, storefront: "us" },
       dedupeKey: `matching:${state.run.id}`,
     }));
   });
@@ -1956,7 +2005,7 @@ describe("durable research segmentation", () => {
     expect(state.checkpoints.get("resume")).toMatchObject({ status: "complete", segment: 1, next: "matching" });
     expect(state.jobs.at(-1)).toMatchObject({
       kind: "matching",
-      payload: { runId: state.run.id, storefront: "br" },
+      payload: { runId: state.run.id, storefront: "us" },
     });
   });
 

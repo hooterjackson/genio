@@ -3,7 +3,9 @@ import type {
   PlaylistGuidanceEffectKind,
   PlaylistGuidanceOrderingBehavior,
   PlaylistGuidanceQuestion,
+  SelectionGeographyConstraint,
 } from "../shared/types.ts";
+import { parseSelectionGeographyConstraints } from "./selection-geography-policy.ts";
 
 export interface PlaylistGuidancePreference {
   questionId: string;
@@ -11,6 +13,7 @@ export interface PlaylistGuidancePreference {
   kind: PlaylistGuidanceEffectKind;
   value: string;
   orderingBehavior: PlaylistGuidanceOrderingBehavior | null;
+  geographyConstraint?: SelectionGeographyConstraint | null;
   source: "option" | "custom";
 }
 
@@ -76,6 +79,7 @@ export function deriveGuidancePreferences(
         orderingBehavior: effect?.kind === "ordering_behavior"
           ? effect.orderingBehavior
           : null,
+        geographyConstraint: effect?.geographyConstraint ?? null,
         source: "option",
       });
       continue;
@@ -84,12 +88,14 @@ export function deriveGuidancePreferences(
     if (!customText) continue;
     // Free-form answers cannot safely invent a sequencing enum. Keep their
     // text as a typed research preference tied to the scout's decision axis.
+    const inferredGeography = parseSelectionGeographyConstraints(customText);
     preferences.push({
       questionId: question.id,
       decisionKey,
       kind: "research_preference",
       value: customText,
       orderingBehavior: null,
+      geographyConstraint: inferredGeography.length === 1 ? inferredGeography[0]! : null,
       source: "custom",
     });
   }
@@ -109,6 +115,12 @@ export function guidanceResearchContext(
   for (const preference of preferences ?? []) {
     const value = boundedText(preference.value, 500);
     if (!value) continue;
+    if (preference.geographyConstraint) {
+      directives.push(
+        `Required ${preference.geographyConstraint.relationship.replace(/_/gu, " ")} relationship to ${preference.geographyConstraint.value}: ${value}`,
+      );
+      continue;
+    }
     switch (preference.kind) {
       case "version_preference":
         directives.push(`Recording/version selection: ${value}`);

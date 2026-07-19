@@ -14,6 +14,7 @@ import {
   processAppleAuthorizationJob,
   recoverUnverifiedAppleAuthorizationJob,
   recoverWaitingApplePublicationJobs,
+  searchAppleCatalog,
   type AppleAuthorizationJobRepository,
   type ApplePublicationRecoveryRepository,
   type AppleAuthorizationRecord,
@@ -30,6 +31,7 @@ import {
   appendExactVolume,
   manifestContentHash,
   planPublicationVolumes,
+  publicationPartialOutcomeStatus,
   publishManifest,
   type LockedManifest,
   type PublicationAppleClient,
@@ -84,6 +86,26 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+});
+
+test("Apple catalog parsing preserves supported clean and explicit ratings", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    results: {
+      songs: {
+        data: [
+          { id: "clean-song", attributes: { name: "Clean Song", artistName: "Artist", albumName: "Album", contentRating: "clean" } },
+          { id: "explicit-song", attributes: { name: "Explicit Song", artistName: "Artist", albumName: "Album", contentRating: "explicit" } },
+          { id: "unknown-song", attributes: { name: "Unknown Song", artistName: "Artist", albumName: "Album", contentRating: "mystery" } },
+        ],
+      },
+    },
+  }), { status: 200 })));
+
+  await expect(searchAppleCatalog("us", "rating test")).resolves.toEqual([
+    expect.objectContaining({ id: "clean-song", contentRating: "clean" }),
+    expect.objectContaining({ id: "explicit-song", contentRating: "explicit" }),
+    expect.not.objectContaining({ contentRating: expect.anything() }),
+  ]);
 });
 
 describe("Apple Music client failure classification", () => {
@@ -315,7 +337,12 @@ describe("Apple Music client failure classification", () => {
       headers: { "retry-after": "0.001" },
     }));
     await expect(new AppleMusicClient("private-user-token").validateAuthorization())
-      .rejects.toMatchObject({ name: "AppleApiError", status: 503, retriable: true });
+      .rejects.toMatchObject({
+        name: "AppleApiError",
+        status: 503,
+        retriable: true,
+        retryAfterMs: 1,
+      });
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
@@ -463,7 +490,8 @@ test("the smoke harness reconciles a server-accepted append timeout before retur
 function methodProxy(): any {
   const methods = new Map<PropertyKey, ReturnType<typeof vi.fn>>();
   return new Proxy({}, {
-    get(_target, property) {
+    get(target, property) {
+      if (Reflect.has(target, property)) return Reflect.get(target, property);
       if (!methods.has(property)) methods.set(property, vi.fn(async () => undefined));
       return methods.get(property);
     },
@@ -599,11 +627,33 @@ function durablePublicationHarness(input: {
       lastError: null,
     };
     const existing = volumes.find((item) => item.manifestId === stored.manifestId && item.volumeNumber === stored.volumeNumber);
-    if (existing) return existing;
+    if (existing) {
+      const sameRevision = (existing.manifestRevisionId ?? null) === (stored.manifestRevisionId ?? null);
+      const sameRange = existing.volumeCount === stored.volumeCount
+        && existing.startPosition === stored.startPosition
+        && existing.endPosition === stored.endPosition;
+      if (!sameRevision || !sameRange) {
+        throw Object.assign(new Error("publication_revision_conflict"), { code: "publication_revision_conflict" });
+      }
+      return existing;
+    }
     volumes.push(stored);
     return stored;
   });
-  repository.listPublicationVolumes.mockImplementation(async () => volumes.map((volume) => ({ ...volume })));
+  repository.listPublicationVolumes.mockImplementation(async (_manifestId: string, revisionId?: string | null) => volumes
+    .filter((volume) => revisionId === undefined || (volume.manifestRevisionId ?? null) === revisionId)
+    .map((volume) => ({ ...volume })));
+  repository.retirePublicationVolume.mockImplementation(async (input: {
+    manifestId: string;
+    publicationVolumeId: string;
+    applePlaylistId?: string | null;
+  }) => {
+    const index = volumes.findIndex((volume) => volume.id === input.publicationVolumeId && volume.manifestId === input.manifestId);
+    if (index < 0) return null;
+    const [retired] = volumes.splice(index, 1);
+    return (input.applePlaylistId ?? retired?.applePlaylistId) ? `orphan-${input.publicationVolumeId}` : null;
+  });
+  repository.hidePublicPlaylistsForRun.mockResolvedValue(1);
   repository.updatePublicationVolume.mockImplementation(async (volumeId: string, patch: Record<string, unknown>) => {
     const volume = volumes.find((item) => item.id === volumeId);
     if (!volume) throw new Error("Publication volume not found in test harness");
@@ -1076,6 +1126,451 @@ test("the production publisher completes a locked manifest through the real Appl
     volumeCount: 1,
     status: "complete",
   }));
+});
+
+test("a safe non-empty manifest publishes as partial instead of failing on a count shortfall", async () => {
+  const productionManifest: LockedManifest = {
+    ...lockedManifest(1, "manifest-safe-partial"),
+    selectionPlan: { requestedTrackCount: 50 } as LockedManifest["selectionPlan"],
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  vi.mocked(harness.repository.getPublicationCompleteness).mockResolvedValue({ omittedCandidateCount: 24, unresolvedCoverageCount: 0 });
+  const playlistState: string[] = [];
+  const shareUrl = "https://music.apple.com/us/playlist/safe-partial/pl.safe-partial";
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (url.pathname === "/v1/me/library/playlists" && method === "GET") return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    if (url.pathname === "/v1/me/library/playlists" && method === "POST") {
+      return new Response(JSON.stringify({ data: [{ id: "p.safe-partial" }] }), { status: 201 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.safe-partial/tracks" && method === "POST") {
+      const body = JSON.parse(String(init?.body)) as { data: Array<{ id: string }> };
+      playlistState.push(...body.data.map((item) => item.id));
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.safe-partial/tracks" && method === "GET") {
+      return new Response(JSON.stringify({ data: playlistState.map((id) => ({ attributes: { playParams: { catalogId: id } } })) }), { status: 200 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.safe-partial" && method === "GET") {
+      return new Response(JSON.stringify({ data: [{
+        id: "p.safe-partial",
+        type: "library-playlists",
+        attributes: { isPublic: true, url: shareUrl },
+      }] }), { status: 200 });
+    }
+    throw new Error(`Unexpected safe-partial Apple request: ${method} ${url.pathname}${url.search}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id)).resolves.toEqual({
+    status: "partial",
+    manifestId: productionManifest.id,
+    volumes: [{ index: 0, playlistId: "p.safe-partial", shareUrl, trackCount: 1 }],
+  });
+  expect(harness.run).toMatchObject({ status: "partial", phase: "published_partial", error: null });
+  expect(harness.repository.savePipelineOutcome).toHaveBeenCalledWith(
+    productionManifest.runId,
+    expect.objectContaining({
+      status: "partial_evidence_shortfall",
+      targetTrackCount: 50,
+      discoveredTrackCount: 25,
+      publishedTrackCount: 1,
+    }),
+  );
+});
+
+test("publication partial outcomes preserve known causes and let catalog preflight take precedence", () => {
+  expect(publicationPartialOutcomeStatus({
+    priorOutcome: { status: "partial_timed_out" } as any,
+    omittedCandidateCount: 10,
+  })).toBe("partial_timed_out");
+  expect(publicationPartialOutcomeStatus({
+    priorOutcome: { status: "partial_policy_conflict" } as any,
+    unresolvedCoverageCount: 1,
+  })).toBe("partial_policy_conflict");
+  expect(publicationPartialOutcomeStatus({
+    priorOutcome: { status: "partial_evidence_shortfall" } as any,
+    preflightOmittedCount: 1,
+    reasonCodes: ["preflight_catalog_identity_unavailable"],
+  })).toBe("partial_catalog_degraded");
+  expect(publicationPartialOutcomeStatus({ unresolvedCoverageCount: 2 }))
+    .toBe("partial_frontier_exhausted");
+});
+
+test("V2 publication fails closed when a required preflight capability is missing", async () => {
+  const base = lockedManifest(1, "manifest-v2-fail-closed");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+    revisionId: "revision-1",
+    revision: 1,
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  (harness.repository as any).getManifestPreflightTracks = undefined;
+  const fetchMock = vi.fn(async () => {
+    throw new Error("V2 fail-closed preflight must not call Apple");
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id))
+    .rejects.toThrow(/Pipeline V2 publication preflight is unavailable.*getManifestPreflightTracks/u);
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+test("a new V2 revision retires every stale volume before publishing and exposing its replacement", async () => {
+  const base = lockedManifest(1, "manifest-v2-revision-safe");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+    revisionId: "revision-2",
+    revision: 2,
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  harness.volumes.push(
+    {
+      id: "old-volume-1",
+      manifestId: productionManifest.id,
+      manifestRevisionId: "revision-1",
+      volumeNumber: 1,
+      volumeCount: 2,
+      startPosition: 0,
+      endPosition: 0,
+      status: "complete",
+      applePlaylistId: "p.old-1",
+      appleShareUrl: "https://music.apple.com/us/playlist/old-1/pl.old1",
+      appendedCount: 1,
+      attempt: 0,
+    },
+    {
+      id: "old-volume-2",
+      manifestId: productionManifest.id,
+      manifestRevisionId: "revision-1",
+      volumeNumber: 2,
+      volumeCount: 2,
+      startPosition: 1,
+      endPosition: 1,
+      status: "complete",
+      applePlaylistId: "p.old-2",
+      appleShareUrl: "https://music.apple.com/us/playlist/old-2/pl.old2",
+      appendedCount: 1,
+      attempt: 0,
+    },
+  );
+  vi.mocked(harness.repository.getManifestPreflightTracks!).mockResolvedValue([{
+    position: 0,
+    candidateId: base.tracks[0]!.candidateId,
+    catalogId: base.tracks[0]!.catalogId,
+    artist: base.tracks[0]!.artist,
+    title: base.tracks[0]!.title,
+    recordingFamilyId: "family-1",
+    catalogIdentityId: "identity-101",
+    alternates: [],
+  }]);
+
+  const playlistState: string[] = [];
+  const shareUrl = "https://music.apple.com/us/playlist/revision-safe/pl.revision-safe";
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (url.pathname === "/v1/catalog/us/songs") {
+      return new Response(JSON.stringify({ data: [{ id: "101", attributes: { isrc: "USAAA2000101" } }] }), { status: 200 });
+    }
+    if (url.pathname === "/v1/me/library/playlists" && method === "GET") {
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    }
+    if (url.pathname === "/v1/me/library/playlists" && method === "POST") {
+      return new Response(JSON.stringify({ data: [{ id: "p.revision-safe" }] }), { status: 201 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.revision-safe/tracks" && method === "POST") {
+      const body = JSON.parse(String(init?.body)) as { data: Array<{ id: string }> };
+      playlistState.push(...body.data.map((item) => item.id));
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.revision-safe/tracks" && method === "GET") {
+      return new Response(JSON.stringify({ data: playlistState.map((id) => ({ attributes: { playParams: { catalogId: id } } })) }), { status: 200 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.revision-safe" && method === "GET") {
+      return new Response(JSON.stringify({ data: [{
+        id: "p.revision-safe",
+        type: "library-playlists",
+        attributes: { isPublic: true, canEdit: true, url: shareUrl },
+      }] }), { status: 200 });
+    }
+    throw new Error(`Unexpected revision-safe Apple request: ${method} ${url.pathname}${url.search}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id)).resolves.toMatchObject({
+    status: "complete",
+    volumes: [{ playlistId: "p.revision-safe", shareUrl, trackCount: 1 }],
+  });
+  expect(harness.repository.hidePublicPlaylistsForRun).toHaveBeenCalledWith(productionManifest.runId);
+  expect(harness.repository.retirePublicationVolume).toHaveBeenCalledTimes(2);
+  expect(harness.volumes).toEqual([
+    expect.objectContaining({
+      manifestRevisionId: "revision-2",
+      volumeNumber: 1,
+      volumeCount: 1,
+      applePlaylistId: "p.revision-safe",
+      appleShareUrl: shareUrl,
+      status: "complete",
+    }),
+  ]);
+  expect(JSON.stringify(harness.volumes)).not.toContain("pl.old");
+});
+
+test("V2 preflight locks a replacement revision before publishing a qualified reserve recording", async () => {
+  const base = lockedManifest(2, "manifest-v2-preflight");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+    revisionId: "revision-1",
+    revision: 1,
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  vi.mocked(harness.repository.getPipelineStageCounts!).mockResolvedValue({
+    discovered: 3,
+    scope_qualified: 3,
+    claim_verified: 3,
+    version_compatible: 3,
+    catalog_resolved: 3,
+    playable: 3,
+    canonicalized: 3,
+    quota_eligible: 3,
+    sequenced: 2,
+    manifested: 2,
+    published: 2,
+  });
+  const replacementTracks = [
+    {
+      position: 0,
+      candidateId: "reserve-candidate-3",
+      catalogId: "303",
+      artist: "Reserve Artist",
+      title: "Reserve Track",
+      recordingFamilyId: "family-3",
+      catalogIdentityId: "identity-303",
+    },
+    {
+      position: 1,
+      candidateId: base.tracks[1]!.candidateId,
+      catalogId: base.tracks[1]!.catalogId,
+      artist: base.tracks[1]!.artist,
+      title: base.tracks[1]!.title,
+      recordingFamilyId: "family-2",
+      catalogIdentityId: "identity-102",
+    },
+  ];
+  vi.mocked(harness.repository.getManifestPreflightTracks!).mockResolvedValue([
+    {
+      position: 0,
+      candidateId: base.tracks[0]!.candidateId,
+      catalogId: base.tracks[0]!.catalogId,
+      artist: base.tracks[0]!.artist,
+      title: base.tracks[0]!.title,
+      recordingFamilyId: "family-1",
+      catalogIdentityId: "identity-101",
+      alternates: [],
+    },
+    { ...replacementTracks[1], alternates: [] },
+  ]);
+  vi.mocked(harness.repository.getManifestPreflightReserveTracks!).mockResolvedValue([{
+    ...replacementTracks[0],
+    alternates: [],
+    evidenceEligible: true,
+    hardConstraintsSatisfied: true,
+    versionCompatible: true,
+    qualified: true,
+  }]);
+  vi.mocked(harness.repository.createManifestRevision!).mockResolvedValue("revision-2");
+  vi.mocked(harness.repository.getManifestRevision!).mockResolvedValue({
+    id: "revision-2",
+    manifestId: productionManifest.id,
+    revision: 2,
+    parentRevisionId: "revision-1",
+    status: "locked",
+    reason: "preflight_qualified_reserve_substituted",
+    contentHash: manifestContentHash(replacementTracks),
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+    selectionPlanSnapshot: null,
+    policySnapshot: null,
+    outcomeSnapshot: null,
+    deficitSnapshot: [],
+    lockedAt: "2026-07-19T12:00:00.000Z",
+    createdAt: "2026-07-19T12:00:00.000Z",
+    tracks: replacementTracks,
+    reserveTracks: [],
+  });
+  const playlistState: string[] = [];
+  const shareUrl = "https://music.apple.com/us/playlist/v2-preflight/pl.v2-preflight";
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (url.pathname === "/v1/catalog/us/songs") {
+      return new Response(JSON.stringify({
+        data: ["102", "303"].map((id) => ({ id, attributes: { isrc: `USAAA2000${id}` } })),
+      }), { status: 200 });
+    }
+    if (url.pathname === "/v1/me/library/playlists" && method === "GET") return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    if (url.pathname === "/v1/me/library/playlists" && method === "POST") {
+      return new Response(JSON.stringify({ data: [{ id: "p.v2-preflight" }] }), { status: 201 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.v2-preflight/tracks" && method === "POST") {
+      const body = JSON.parse(String(init?.body)) as { data: Array<{ id: string }> };
+      playlistState.push(...body.data.map((item) => item.id));
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.v2-preflight/tracks" && method === "GET") {
+      return new Response(JSON.stringify({ data: playlistState.map((id) => ({ attributes: { playParams: { catalogId: id } } })) }), { status: 200 });
+    }
+    if (url.pathname === "/v1/me/library/playlists/p.v2-preflight" && method === "GET") {
+      return new Response(JSON.stringify({ data: [{ id: "p.v2-preflight", type: "library-playlists", attributes: { isPublic: true, canEdit: true, url: shareUrl } }] }), { status: 200 });
+    }
+    throw new Error(`Unexpected V2 Apple request: ${method} ${url.pathname}${url.search}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id)).resolves.toMatchObject({
+    status: "complete",
+    volumes: [{ playlistId: "p.v2-preflight", shareUrl, trackCount: 2 }],
+  });
+  expect(harness.repository.createManifestRevision).toHaveBeenCalledWith(
+    productionManifest.runId,
+    expect.objectContaining({
+      revision: 2,
+      parentRevisionId: "revision-1",
+      status: "locked",
+      tracks: [expect.objectContaining({ candidateId: "reserve-candidate-3", catalogId: "303" }), expect.anything()],
+      reserveTracks: [],
+    }),
+  );
+  expect(harness.repository.markManifestRevisionStatus).toHaveBeenNthCalledWith(1, productionManifest.runId, "revision-1", "superseded");
+  expect(harness.repository.sealManifestRevisionPublication).toHaveBeenCalledWith(
+    productionManifest.runId,
+    "revision-2",
+    expect.objectContaining({ status: "complete", publishedTrackCount: 2 }),
+  );
+  expect(harness.repository.appendCandidateStageEvents).toHaveBeenCalledWith(
+    productionManifest.runId,
+    expect.arrayContaining([
+      expect.objectContaining({
+        candidateId: "reserve-candidate-3",
+        fromStage: "manifested",
+        toStage: "published",
+        reasonCode: "apple_publication_membership_verified",
+      }),
+      expect.objectContaining({
+        candidateId: base.tracks[1]!.candidateId,
+        fromStage: "manifested",
+        toStage: "published",
+        reasonCode: "apple_publication_membership_verified",
+      }),
+    ]),
+    {
+      pipelineVersion: "catalog_first_v2",
+      policyVersion: "relevance_first_2026_07",
+    },
+  );
+  expect(playlistState).toEqual(["303", "102"]);
+});
+
+test("V2 storefront preflight returns no-compatible as a non-error without creating Apple state", async () => {
+  const base = lockedManifest(1, "manifest-v2-empty-preflight");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+    revisionId: "revision-1",
+    revision: 1,
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  vi.mocked(harness.repository.getPipelineStageCounts!).mockResolvedValue({
+    discovered: 1,
+    scope_qualified: 1,
+    claim_verified: 1,
+    version_compatible: 1,
+    catalog_resolved: 1,
+    playable: 1,
+    canonicalized: 1,
+    quota_eligible: 1,
+    sequenced: 1,
+    manifested: 1,
+    published: 0,
+  });
+  harness.volumes.push({
+    id: "previously-published-volume",
+    manifestId: productionManifest.id,
+    manifestRevisionId: "revision-1",
+    volumeNumber: 1,
+    volumeCount: 1,
+    startPosition: 0,
+    endPosition: 0,
+    status: "complete",
+    applePlaylistId: "p.preflight-stale",
+    appleShareUrl: "https://music.apple.com/us/playlist/stale/pl.stale",
+    appendedCount: 1,
+    attempt: 0,
+  });
+  vi.mocked(harness.repository.getManifestPreflightTracks!).mockResolvedValue([{
+    position: 0,
+    candidateId: base.tracks[0]!.candidateId,
+    catalogId: base.tracks[0]!.catalogId,
+    artist: base.tracks[0]!.artist,
+    title: base.tracks[0]!.title,
+    recordingFamilyId: "family-1",
+    catalogIdentityId: "identity-101",
+    alternates: [],
+  }]);
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/catalog/us/songs") {
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    }
+    throw new Error(`No Apple mutation was expected: ${url.pathname}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id)).resolves.toEqual({
+    status: "no_compatible_tracks",
+    manifestId: productionManifest.id,
+    volumes: [],
+  });
+  expect(harness.run).toMatchObject({ status: "partial", phase: "no_compatible_tracks", error: null });
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
+  expect(harness.repository.hidePublicPlaylistsForRun).toHaveBeenCalledWith(productionManifest.runId);
+  expect(harness.repository.retirePublicationVolume).toHaveBeenCalledWith(expect.objectContaining({
+    publicationVolumeId: "previously-published-volume",
+    applePlaylistId: "p.preflight-stale",
+  }));
+  expect(harness.volumes).toEqual([]);
+  expect(harness.repository.markManifestRevisionStatus).toHaveBeenCalledWith(
+    productionManifest.runId,
+    "revision-1",
+    "abandoned",
+  );
+  expect(harness.repository.savePipelineOutcome).toHaveBeenCalledWith(
+    productionManifest.runId,
+    expect.objectContaining({ status: "no_compatible_tracks", publishedTrackCount: 0 }),
+  );
+  expect(harness.repository.appendCandidateStageEvents).toHaveBeenCalledWith(
+    productionManifest.runId,
+    [expect.objectContaining({
+      candidateId: base.tracks[0]!.candidateId,
+      fromStage: "manifested",
+      toStage: "rejected",
+      reasonCode: "publication_preflight_no_compatible_identity",
+    })],
+    {
+      pipelineVersion: "catalog_first_v2",
+      policyVersion: "relevance_first_2026_07",
+    },
+  );
 });
 
 test("the production publisher executes a 6,000-track plan across six exact volumes", { timeout: 30_000 }, async () => {

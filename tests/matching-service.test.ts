@@ -1,5 +1,18 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import type { CatalogMatchResult, CatalogSong, PlaylistBrief, TrackCandidateInput } from "../shared/types.ts";
+import type {
+  AlternateCatalogIdentity,
+  CandidateStageEvent,
+  CatalogDiscoveredCandidateInput,
+  CatalogDiscoveredCandidateResult,
+  CatalogMatchResult,
+  CatalogSong,
+  PipelineDeficitLedgerEntry,
+  PipelineOutcome,
+  PlaylistBrief,
+  SelectionPlan,
+  TrackScopeBinding,
+  TrackCandidateInput,
+} from "../shared/types.ts";
 
 vi.mock("../server/apple.ts", async () => {
   const actual = await vi.importActual<typeof import("../server/apple.ts")>("../server/apple.ts");
@@ -17,13 +30,20 @@ import {
   searchAppleCatalog,
 } from "../server/apple.ts";
 import {
+  catalogDeficitQueries,
   catalogLookupTimeoutMs,
   catalogRecoveryDeadlineMs,
   matchResearchRun,
+  musicScopePhraseMatches,
   type MatchingRepository,
 } from "../server/matching-service.ts";
 import { RETRYABLE_CATALOG_MATCH_BASES } from "../server/catalog-match-recovery.ts";
+import {
+  CATALOG_DISCOVERY_PROGRESS_VERSION,
+  type CatalogDiscoveryProvider,
+} from "../server/catalog-discovery-v2.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
+import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 
 const brief: PlaylistBrief = {
   title: "Matching policy test",
@@ -43,10 +63,30 @@ const brief: PlaylistBrief = {
 const curatedBrief: PlaylistBrief = {
   ...brief,
   mode: "curated",
+  subjectEntities: ["Test scene"],
+  relationship: "represents the Test scene",
+  include: ["documented Test scene recordings"],
   evidencePolicy: "cited editorial sources",
   orderingPolicy: "influence rank",
   targetSize: { min: 50, max: 100 },
 };
+
+function sceneBrief(target: number): PlaylistBrief {
+  return {
+    title: "Test scene essentials",
+    description: "A cited editorial survey of the Test scene.",
+    mode: "curated",
+    subjectEntities: ["Test scene"],
+    relationship: "represents the Test scene",
+    include: ["documented Test scene recordings"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "cited editorial sources",
+    orderingPolicy: "editorial rank",
+    targetSize: { min: target, max: target },
+    ambiguities: [],
+  };
+}
 
 function routeCheckpoint(confirmedAt = new Date()) {
   const policy = researchExecutionPolicy(curatedBrief, {});
@@ -84,6 +124,7 @@ function candidate(id: string, state: "verified" | "corroborated" | "editorial" 
     endIndex: 40,
     excerpt: "Test Artist performed on Test Song.",
   };
+  const sceneExcerpt = "Test Song represents the documented Test scene.";
   return {
     id,
     artist: "Test Artist",
@@ -105,6 +146,23 @@ function candidate(id: string, state: "verified" | "corroborated" | "editorial" 
       note: "credit",
       sourceClass: "web",
       citationSupport,
+    }, {
+      sourceUrl: "https://example.com/scene-source",
+      state,
+      supportScope: "track",
+      subjectEntity: curatedBrief.subjectEntities[0]!,
+      subjectRelationship: curatedBrief.relationship,
+      relationship: curatedBrief.relationship,
+      note: "curated scene evidence",
+      sourceClass: "web",
+      citationSupport: state === "inferred" ? null : {
+        responseId: `scene-resp-${id}`,
+        outputItemId: `scene-msg-${id}`,
+        contentIndex: 0,
+        startIndex: 0,
+        endIndex: sceneExcerpt.length,
+        excerpt: sceneExcerpt,
+      },
     }],
   };
 }
@@ -112,6 +170,7 @@ function candidate(id: string, state: "verified" | "corroborated" | "editorial" 
 class MemoryMatchingRepository implements MatchingRepository {
   readonly matches: CatalogMatchResult[] = [];
   readonly checkpoints: unknown[] = [];
+  readonly checkpointWrites: Array<{ phase: string; checkpoint: unknown }> = [];
   readonly updates: Array<Record<string, unknown>> = [];
 
   readonly bulkTimeoutWrites: Array<{ candidateIds: string[]; basis: string }> = [];
@@ -123,6 +182,7 @@ class MemoryMatchingRepository implements MatchingRepository {
   }> = [];
   readonly automaticRefills: Array<{ runId: string; storefront: string; additionalCandidateGoal: number; currentGeneration: number }> = [];
   readonly automaticPublications: string[] = [];
+  readonly pipelineOutcomes: PipelineOutcome[] = [];
   automaticRecoveryState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
   automaticRefillState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
 
@@ -158,7 +218,11 @@ class MemoryMatchingRepository implements MatchingRepository {
     }
   }
   async getResearchCheckpoint(_runId: string, phase: string) { return this.checkpointsByPhase.get(phase) ?? null; }
-  async saveResearchCheckpoint(_runId: string, _phase: string, checkpoint: unknown) { this.checkpoints.push(checkpoint); }
+  async saveResearchCheckpoint(_runId: string, phase: string, checkpoint: unknown) {
+    this.checkpoints.push(checkpoint);
+    this.checkpointWrites.push({ phase, checkpoint });
+    this.checkpointsByPhase.set(phase, checkpoint);
+  }
   async queueAutomaticCatalogRecovery(
     runId: string,
     storefront: string,
@@ -173,6 +237,107 @@ class MemoryMatchingRepository implements MatchingRepository {
     return this.automaticRefillState;
   }
   async queueAutomaticPublication(runId: string) { this.automaticPublications.push(runId); }
+  async savePipelineOutcome(_runId: string, outcome: PipelineOutcome) { this.pipelineOutcomes.push(outcome); }
+}
+
+class V2MemoryMatchingRepository extends MemoryMatchingRepository {
+  readonly families: Array<Parameters<NonNullable<MatchingRepository["upsertRecordingFamily"]>>[1]> = [];
+  readonly familyAttachments: Array<{ familyId: string; candidateId: string; relationship: string | undefined }> = [];
+  readonly catalogIdentities: AlternateCatalogIdentity[] = [];
+  readonly stageEvents: CandidateStageEvent[] = [];
+  readonly deficits: PipelineDeficitLedgerEntry[] = [];
+  readonly persistedDiscoveries: CatalogDiscoveredCandidateInput[] = [];
+  selectionPlan: SelectionPlan | null = null;
+
+  override async getRun() {
+    return {
+      ...(await super.getRun()),
+      pipelineVersion: "catalog_first_v2" as const,
+      policyVersion: "relevance_first_2026_07" as const,
+      selectionPlan: this.selectionPlan,
+    };
+  }
+
+  async upsertRecordingFamily(
+    _runId: string,
+    input: Parameters<NonNullable<MatchingRepository["upsertRecordingFamily"]>>[1],
+  ) {
+    this.families.push(input);
+    return "00000000-0000-4000-a000-000000000001";
+  }
+
+  async attachCandidateToRecordingFamily(
+    _runId: string,
+    familyId: string,
+    candidateId: string,
+    relationship?: string,
+  ) {
+    this.familyAttachments.push({ familyId, candidateId, relationship });
+  }
+
+  async upsertAlternateCatalogIdentity(_runId: string, input: AlternateCatalogIdentity) {
+    this.catalogIdentities.push(input);
+    return input.id;
+  }
+
+  async appendCandidateStageEvents(
+    _runId: string,
+    events: readonly CandidateStageEvent[],
+    _versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+  ) {
+    void _versions;
+    this.stageEvents.push(...events);
+  }
+
+  async savePipelineDeficitLedger(
+    _runId: string,
+    entries: readonly PipelineDeficitLedgerEntry[],
+    _options: Pick<SelectionPlan, "pipelineVersion" | "policyVersion"> & { mode: "append" | "replace" },
+  ) {
+    void _options;
+    this.deficits.splice(0, this.deficits.length, ...entries);
+  }
+
+  async persistCatalogDiscoveredCandidates(
+    _runId: string,
+    inputs: readonly CatalogDiscoveredCandidateInput[],
+    _versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+  ): Promise<CatalogDiscoveredCandidateResult[]> {
+    void _versions;
+    return inputs.map((input) => {
+      this.persistedDiscoveries.push(input);
+      const existing = this.candidates.find((item) => item.isrc && item.isrc === input.song.isrc);
+      const candidateId = existing?.id ?? `catalog-${input.song.id}`;
+      const scopeBindings: TrackScopeBinding[] = input.bindings.map((binding) => ({
+        ...binding,
+        sourceRecordId: `source-${input.container.providerId}`,
+        researchContainerId: `container-${input.container.providerId}`,
+        citationAttestationId: null,
+        provenancePath: [
+          { kind: "provenance_root", id: input.source.provenanceRoot },
+          { kind: "source_record", id: `source-${input.container.providerId}` },
+          { kind: "research_container", id: `container-${input.container.providerId}` },
+        ],
+      }));
+      if (!existing) {
+        this.candidates.push({
+          id: candidateId,
+          artist: input.song.artistName,
+          title: input.song.name,
+          album: input.song.albumName || null,
+          releaseYear: input.song.releaseDate ? Number.parseInt(input.song.releaseDate.slice(0, 4), 10) : null,
+          durationMs: input.song.durationInMillis ?? null,
+          isrc: input.song.isrc ?? null,
+          musicbrainzId: null,
+          versionLabel: input.song.versionLabel ?? null,
+          candidateStage: "scope_qualified",
+          scopeBindings,
+          evidence: [],
+        });
+      }
+      return { candidateId, appleSongId: input.song.id, inserted: !existing, scopeBindings };
+    });
+  }
 }
 
 function lastMatchingCheckpoint(repository: MemoryMatchingRepository): Record<string, unknown> | undefined {
@@ -227,6 +392,38 @@ test("disputed evidence surfaces source disagreement for visitor review", async 
   expect(repository.matches[0]?.basis).toContain("Sources disagree");
 });
 
+test("Pipeline V2 applies MusicBrainz identity before recording-family canonicalization", async () => {
+  const row = candidate("musicbrainz-family", "verified");
+  row.isrc = null;
+  row.musicbrainzId = null;
+  const catalogSong = { ...song, isrc: undefined };
+  vi.mocked(searchAppleCatalog).mockResolvedValue([catalogSong]);
+  const repository = new V2MemoryMatchingRepository([row]);
+  const musicBrainzEnricher = vi.fn(async () => ({
+    recordingId: "11111111-1111-4111-8111-111111111111",
+    releaseGroupId: "22222222-2222-4222-8222-222222222222",
+    source: "musicbrainz" as const,
+  }));
+
+  await matchResearchRun(repository, "run-musicbrainz-family", "us", undefined, {
+    musicBrainzEnricher,
+  });
+
+  expect(musicBrainzEnricher).toHaveBeenCalledOnce();
+  expect(repository.families).toHaveLength(1);
+  expect(repository.families[0]).toMatchObject({
+    familyKey: "mbid:11111111-1111-4111-8111-111111111111",
+    metadata: {
+      musicbrainzRecordingId: "11111111-1111-4111-8111-111111111111",
+      musicbrainzReleaseGroupId: "22222222-2222-4222-8222-222222222222",
+    },
+  });
+  expect(repository.catalogIdentities[0]).toMatchObject({
+    provider: "apple",
+    musicbrainzId: "11111111-1111-4111-8111-111111111111",
+  });
+});
+
 test("every surviving member of a metadata duplicate cluster requires review", async () => {
   const repository = new MemoryMatchingRepository([
     candidate("cluster-a", "verified", "meta:test-artist|test-song"),
@@ -245,6 +442,816 @@ test("a later exact match to an accepted Apple catalog ID is recorded as duplica
   await matchResearchRun(repository, "run", "us");
   expect(repository.matches.map((match) => match.status)).toEqual(["accepted", "duplicate"]);
   expect(repository.matches[1]?.basis).toContain("already accepted");
+});
+
+test("V2 matching persists recording identity, compatible alternates, stages, and deficits", async () => {
+  const compatible: CatalogSong = {
+    ...song,
+    id: "apple-compatible",
+    albumName: "Test Album (Deluxe)",
+  };
+  const incompatibleIsrc: CatalogSong = {
+    ...song,
+    id: "apple-other-recording",
+    isrc: "USAAA2000999",
+  };
+  const incompatibleLive: CatalogSong = {
+    ...song,
+    id: "apple-live",
+    name: "Test Song (Live)",
+    isrc: "USAAA2000888",
+    versionLabel: "Live",
+  };
+  vi.mocked(lookupAppleCatalogByIsrc).mockResolvedValueOnce([
+    song,
+    compatible,
+    incompatibleIsrc,
+    incompatibleLive,
+  ]);
+  const exactBrief = { ...curatedBrief, targetSize: { min: 2, max: 2 } };
+  const repository = new V2MemoryMatchingRepository(
+    [candidate("v2-candidate", "editorial")],
+    exactBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+
+  await matchResearchRun(repository, "run-v2", "us", undefined, { fast: true });
+
+  expect(repository.families).toEqual([expect.objectContaining({
+    familyKey: "isrc:USAAA2000001",
+    canonicalArtist: "Test Artist",
+    canonicalTitle: "Test Song",
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+  })]);
+  expect(repository.familyAttachments).toEqual([expect.objectContaining({
+    candidateId: "v2-candidate",
+    relationship: "primary_match",
+  })]);
+  expect(repository.catalogIdentities.map((identity) => identity.catalogId)).toEqual([
+    "apple-1",
+    "apple-compatible",
+  ]);
+  expect(repository.catalogIdentities.every((identity) => /^[0-9a-f-]{36}$/u.test(identity.id))).toBe(true);
+  expect(repository.stageEvents
+    .filter((event) => event.candidateId === "v2-candidate")
+    .map((event) => event.toStage)).toEqual([
+      "claim_verified",
+      "version_compatible",
+      "catalog_resolved",
+      "playable",
+      "canonicalized",
+    ]);
+  expect(repository.stageEvents
+    .filter((event) => event.candidateId === "v2-candidate")
+    .map((event) => [event.fromStage, event.toStage])).toEqual([
+      ["scope_qualified", "claim_verified"],
+      ["claim_verified", "version_compatible"],
+      ["version_compatible", "catalog_resolved"],
+      ["catalog_resolved", "playable"],
+      ["playable", "canonicalized"],
+    ]);
+  expect(repository.deficits).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      stage: "catalog_resolved",
+      kind: "catalog_availability",
+      requiredCount: 2,
+      actualCount: 1,
+      deficitCount: 1,
+    }),
+  ]));
+});
+
+test("V2 curated matching invokes bounded discovery and accepts only an exact evidence-bound identity", async () => {
+  const discoveryBrief: PlaylistBrief = {
+    title: "Test scene recordings",
+    description: "A cited survey of the Test scene.",
+    mode: "curated",
+    subjectEntities: ["Test scene"],
+    relationship: "represents the scene",
+    include: ["documented Test scene recordings"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "cited editorial sources",
+    orderingPolicy: "source order",
+    targetSize: { min: 1, max: 1 },
+    ambiguities: [],
+  };
+  const exactCandidate = candidate("v2-discovery-candidate", "editorial");
+  exactCandidate.candidateStage = "scope_qualified";
+  exactCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "scene",
+    scopeValue: "Test scene",
+    relationship: "represents the scene",
+    confidence: 0.96,
+    sourceUrl: "https://example.com/test-scene/test-song",
+    sourceRecordId: "source-record-test-song",
+    researchContainerId: null,
+    citationAttestationId: "citation-test-song",
+    provenancePath: [{ kind: "provenance_root", id: "independent-editorial-root" }],
+    note: "The source explicitly places this recording in the Test scene.",
+  }];
+  const unrelatedSong: CatalogSong = {
+    ...song,
+    id: "apple-unbound",
+    artistName: "House Builders",
+    isrc: "USAAA2000999",
+  };
+  const queries: string[] = [];
+  const provider: CatalogDiscoveryProvider = {
+    async search(_storefront, query) {
+      queries.push(query);
+      return { songs: [unrelatedSong, song], artists: [], albums: [], playlists: [] };
+    },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [exactCandidate],
+    discoveryBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "One track from the documented Test scene",
+    brief: discoveryBrief,
+    storefront: "us",
+  });
+  expect(repository.selectionPlan.intents).toEqual(["genre_scene"]);
+
+  await matchResearchRun(repository, "run-v2-discovery", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(queries.length).toBeGreaterThan(0);
+  expect(queries.length).toBeLessThanOrEqual(16);
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: "v2-discovery-candidate",
+    status: "accepted",
+    song: expect.objectContaining({ id: "apple-1" }),
+  })]);
+  expect(repository.matches.some((match) => match.song?.id === "apple-unbound")).toBe(false);
+  expect(lookupAppleCatalogByIsrc).not.toHaveBeenCalled();
+  expect(repository.checkpointWrites).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      phase: "catalog_discovery_v2",
+      checkpoint: expect.objectContaining({
+        schemaVersion: 2,
+        state: "terminal",
+        complete: true,
+        discoveredCount: 2,
+        qualifiedCount: 1,
+        resolvedCount: 1,
+        progress: expect.objectContaining({ version: CATALOG_DISCOVERY_PROGRESS_VERSION }),
+      }),
+    }),
+  ]));
+  expect(repository.checkpointWrites).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      phase: "catalog_discovery_v2",
+      checkpoint: expect.objectContaining({
+        schemaVersion: 2,
+        state: "running",
+        complete: false,
+        attempt: 1,
+        retryAttempt: 1,
+        inputFingerprint: expect.any(String),
+        progress: expect.objectContaining({
+          version: CATALOG_DISCOVERY_PROGRESS_VERSION,
+          sequence: expect.any(Number),
+        }),
+        trustedPlaylists: expect.any(Array),
+      }),
+    }),
+  ]));
+});
+
+test("V2 curated discovery grows the persisted pool from a scoped Apple editorial playlist and exact-fills", async () => {
+  const growthBrief: PlaylistBrief = {
+    title: "House music survey",
+    description: "A source-backed survey of house music.",
+    mode: "curated",
+    subjectEntities: ["house music"],
+    relationship: "represents house music",
+    include: ["house music"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "source order",
+    targetSize: { min: 2, max: 2 },
+    ambiguities: [],
+  };
+  const existing = candidate("house-existing", "editorial");
+  existing.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "genre",
+    scopeValue: "house music",
+    relationship: "represents house music",
+    confidence: 0.96,
+    sourceUrl: "https://example.com/house/existing",
+    sourceRecordId: "source-existing",
+    researchContainerId: null,
+    citationAttestationId: "citation-existing",
+    provenancePath: [{ kind: "provenance_root", id: "independent-house-history" }],
+    note: "Track-specific house history.",
+  }];
+  const newSong: CatalogSong = {
+    id: "apple-house-new",
+    name: "Warehouse Signal",
+    artistName: "South Side Unit",
+    albumName: "Warehouse Signal",
+    releaseDate: "1987-04-01",
+    durationInMillis: 360_000,
+    isrc: "USAAA8700002",
+  };
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      return {
+        songs: [song],
+        artists: [],
+        albums: [],
+        playlists: [{
+          id: "pl.house-editorial",
+          name: "House Essentials",
+          curatorName: "Apple Music Dance",
+          description: "Foundational house music.",
+          playlistType: "editorial",
+          url: "https://music.apple.com/us/playlist/house-essentials/pl.house-editorial",
+        }],
+      };
+    },
+    async playlistTracks() { return { items: [newSong], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [existing],
+    growthBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Two documented house music tracks",
+    brief: growthBrief,
+    storefront: "us",
+  });
+
+  await matchResearchRun(repository, "run-v2-growth", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(repository.persistedDiscoveries).toHaveLength(1);
+  expect(repository.persistedDiscoveries[0]).toMatchObject({
+    song: { id: "apple-house-new" },
+    source: { sourceClass: "apple", provenanceRoot: "apple_music_editorial:pl.house-editorial" },
+    bindings: [expect.objectContaining({ bindingKind: "catalog_editorial_membership", eligibility: "qualifying" })],
+  });
+  expect(repository.persistedDiscoveries[0]!.bindings[0]!.relationship).not.toContain(growthBrief.relationship);
+  expect(repository.candidates).toHaveLength(2);
+  expect(repository.matches).toEqual(expect.arrayContaining([
+    expect.objectContaining({ candidateId: "house-existing", status: "accepted" }),
+    expect.objectContaining({ candidateId: "catalog-apple-house-new", status: "accepted", song: expect.objectContaining({ id: "apple-house-new" }) }),
+  ]));
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_discovery_v2",
+    checkpoint: expect.objectContaining({ persistedCandidateCount: 1, resolvedCount: 2 }),
+  }));
+});
+
+test("V2 catalog growth does not turn genre playlist membership into influence evidence", async () => {
+  const influenceBrief: PlaylistBrief = {
+    title: "Influential house music",
+    description: "Historically influential house recordings.",
+    mode: "curated",
+    subjectEntities: ["house music"],
+    relationship: "influenced the development of house music",
+    include: ["house music with documented historical influence"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "track-specific music-history sources",
+    orderingPolicy: "historical influence",
+    targetSize: { min: 1, max: 1 },
+    ambiguities: [],
+  };
+  const playlistSong: CatalogSong = {
+    id: "apple-house-playlist-only",
+    name: "Unproven Influence",
+    artistName: "Warehouse Unit",
+    albumName: "House Collection",
+    isrc: "USAAA8700998",
+  };
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      return {
+        songs: [], artists: [], albums: [], playlists: [{
+          id: "pl.house-membership-only",
+          name: "House Essentials",
+          curatorName: "Apple Music Dance",
+          description: "House music across the decades.",
+          playlistType: "editorial",
+          url: "https://music.apple.com/us/playlist/house-essentials/pl.house-membership-only",
+        }],
+      };
+    },
+    async playlistTracks() { return { items: [playlistSong], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [], influenceBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "One influential house music track",
+    brief: influenceBrief,
+    storefront: "us",
+  });
+  expect(repository.selectionPlan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
+
+  await matchResearchRun(repository, "run-v2-no-influence-laundering", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(repository.persistedDiscoveries).toHaveLength(0);
+  expect(repository.matches).toHaveLength(0);
+});
+
+test("editorial scope matching uses phrase boundaries instead of substrings", () => {
+  expect(musicScopePhraseMatches("House Essentials", "house")).toBe(true);
+  expect(musicScopePhraseMatches("Warehouse Anthems", "house")).toBe(false);
+  expect(musicScopePhraseMatches("Rock Essentials", "rock")).toBe(true);
+  expect(musicScopePhraseMatches("Rockabilly Essentials", "rock")).toBe(false);
+});
+
+test("catalog deficit searches preserve composite geography and genre scope", () => {
+  const compositeBrief: PlaylistBrief = {
+    title: "American drill essentials",
+    description: "American drill across documented regional scenes.",
+    mode: "curated",
+    subjectEntities: ["American drill"],
+    relationship: "represents American drill",
+    include: ["drill from the United States"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "editorial rank",
+    targetSize: { min: 50, max: 50 },
+    ambiguities: [],
+  };
+  const selectionPlan = createSelectionPlanV2({
+    prompt: "50 American drill tracks",
+    brief: compositeBrief,
+    storefront: "us",
+  });
+
+  expect(catalogDeficitQueries({ brief: compositeBrief, selectionPlan })).toEqual(
+    expect.arrayContaining([
+      expect.stringMatching(/American drill/iu),
+      expect.stringMatching(/American drill essentials/iu),
+    ]),
+  );
+});
+
+test("catalog growth persists one qualifying binding for every hard French-jazz scope axis", async () => {
+  const compositeBrief: PlaylistBrief = {
+    title: "French jazz essentials",
+    description: "A source-backed survey of jazz from France.",
+    mode: "curated",
+    subjectEntities: ["French jazz"],
+    relationship: "represents French jazz",
+    include: ["jazz from France"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "editorial rank",
+    targetSize: { min: 1, max: 1 },
+    ambiguities: [],
+  };
+  const newSong: CatalogSong = {
+    id: "apple-french-jazz-new",
+    name: "Paris at Midnight",
+    artistName: "Quartet Moderne",
+    albumName: "Paris at Midnight",
+    isrc: "FRAAA2600001",
+  };
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      return {
+        songs: [], artists: [], albums: [], playlists: [{
+          id: "pl.french-jazz-editorial",
+          name: "French Jazz Essentials",
+          curatorName: "Apple Music Jazz",
+          description: "Jazz from France and the Paris scene.",
+          playlistType: "editorial",
+          url: "https://music.apple.com/us/playlist/french-jazz-essentials/pl.french-jazz-editorial",
+        }],
+      };
+    },
+    async playlistTracks() { return { items: [newSong], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [], compositeBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "One French jazz recording",
+    brief: compositeBrief,
+    storefront: "us",
+  });
+
+  await matchResearchRun(repository, "run-v2-composite", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(repository.persistedDiscoveries).toHaveLength(1);
+  expect(repository.persistedDiscoveries[0]!.bindings.map((binding) => [binding.scopeAxis, binding.scopeValue]))
+    .toEqual(expect.arrayContaining([
+      ["genre", "jazz"],
+      ["geography", "French"],
+    ]));
+  expect(repository.candidates[0]!.scopeBindings?.map((binding) => binding.scopeAxis))
+    .toEqual(expect.arrayContaining(["genre", "geography"]));
+});
+
+test("a geography-labelled French Jazz playlist does not prove a French-language constraint", async () => {
+  const languageBrief: PlaylistBrief = {
+    title: "French-language jazz",
+    description: "Jazz with lyrics sung in French.",
+    mode: "curated",
+    subjectEntities: ["French-language jazz"],
+    relationship: "is sung in French",
+    include: ["French-language jazz"],
+    exclude: [],
+    versionPolicy: "studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "editorial rank",
+    targetSize: { min: 1, max: 1 },
+    ambiguities: [],
+  };
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      return { songs: [], artists: [], albums: [], playlists: [{
+        id: "pl.french-jazz-geography",
+        name: "French Jazz Essentials",
+        curatorName: "Apple Music Jazz",
+        description: "Jazz from France.",
+        playlistType: "editorial",
+        url: "https://music.apple.com/us/playlist/french-jazz-essentials/pl.french-jazz-geography",
+      }] };
+    },
+    async playlistTracks() { return { items: [song], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [], languageBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "French-language jazz",
+    brief: languageBrief,
+    storefront: "us",
+  });
+  await matchResearchRun(repository, "run-v2-language", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+  expect(repository.persistedDiscoveries).toHaveLength(0);
+});
+
+test("V2 catalog checkpoints keep transient failures retryable and recovery resumes discovery", async () => {
+  const retryCandidate = candidate("v2-retry", "editorial");
+  retryCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "genre",
+    scopeValue: "Test scene",
+    relationship: "represents the scene",
+    confidence: 0.95,
+    sourceUrl: "https://example.com/retry",
+    sourceRecordId: "source-retry",
+    researchContainerId: null,
+    citationAttestationId: "citation-retry",
+    provenancePath: [{ kind: "provenance_root", id: "retry-source" }],
+    note: "Retry fixture.",
+  }];
+  let degraded = true;
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      if (degraded) throw new Error("temporary catalog outage");
+      return { songs: [song], artists: [], albums: [], playlists: [] };
+    },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const retryBrief = sceneBrief(1);
+  const repository = new V2MemoryMatchingRepository(
+    [retryCandidate],
+    retryBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({ prompt: "Test scene", brief: retryBrief, storefront: "us" });
+  vi.mocked(lookupAppleCatalogByIsrc).mockResolvedValue([]);
+  vi.mocked(searchAppleCatalog).mockResolvedValue([]);
+
+  await matchResearchRun(repository, "run-v2-retry", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+  const first = repository.checkpointWrites.filter((write) => write.phase === "catalog_discovery_v2").at(-1)?.checkpoint;
+  expect(first).toMatchObject({
+    schemaVersion: 2,
+    state: "terminal",
+    complete: false,
+    retryable: true,
+    attempt: 1,
+    retryAttempt: 1,
+    stoppedBecause: "provider_degraded",
+  });
+
+  degraded = false;
+  await matchResearchRun(repository, "run-v2-retry", "us", undefined, {
+    retryIncomplete: true,
+    catalogDiscoveryProvider: provider,
+  });
+  const second = repository.checkpointWrites.filter((write) => write.phase === "catalog_discovery_v2").at(-1)?.checkpoint;
+  expect(second).toMatchObject({
+    schemaVersion: 2,
+    state: "terminal",
+    complete: true,
+    retryable: false,
+    attempt: 2,
+    retryAttempt: 2,
+    resolvedCount: 1,
+  });
+  expect(repository.matches).toContainEqual(expect.objectContaining({
+    candidateId: "v2-retry",
+    status: "accepted",
+    song: expect.objectContaining({ id: "apple-1" }),
+  }));
+});
+
+test("V2 discovery reruns a completed frontier when later research adds an evidenced candidate", async () => {
+  const first = candidate("v2-first", "editorial");
+  first.scopeBindings = [{
+    bindingKind: "track_specific_source", eligibility: "qualifying", scopeAxis: "scene",
+    scopeValue: "Test scene", relationship: "represents the scene", confidence: 0.95,
+    sourceUrl: "https://example.com/first", sourceRecordId: "source-first", researchContainerId: null,
+    citationAttestationId: "citation-first", provenancePath: [{ kind: "provenance_root", id: "first-root" }], note: "First.",
+  }];
+  const second = { ...candidate("v2-later", "editorial"), title: "Later Track", isrc: "USAAA2000002" };
+  second.scopeBindings = [{
+    bindingKind: "track_specific_source", eligibility: "qualifying", scopeAxis: "scene",
+    scopeValue: "Test scene", relationship: "represents the scene", confidence: 0.95,
+    sourceUrl: "https://example.com/later", sourceRecordId: "source-later", researchContainerId: null,
+    citationAttestationId: "citation-later", provenancePath: [{ kind: "provenance_root", id: "later-root" }], note: "Later.",
+  }];
+  const laterSong: CatalogSong = { ...song, id: "apple-later", name: "Later Track", isrc: "USAAA2000002" };
+  const provider: CatalogDiscoveryProvider = {
+    async search() { return { songs: [song, laterSong], artists: [], albums: [], playlists: [] }; },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const rerunBrief = sceneBrief(2);
+  const repository = new V2MemoryMatchingRepository(
+    [first], rerunBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({ prompt: "Test scene", brief: rerunBrief, storefront: "us" });
+
+  await matchResearchRun(repository, "run-v2-later", "us", undefined, { fast: true, catalogDiscoveryProvider: provider });
+  repository.candidates.push(second);
+  await matchResearchRun(repository, "run-v2-later", "us", undefined, { retryIncomplete: true, catalogDiscoveryProvider: provider });
+
+  const discoveryWrites = repository.checkpointWrites.filter((write) => write.phase === "catalog_discovery_v2");
+  const terminalWrites = discoveryWrites.filter((write) => (
+    (write.checkpoint as { state?: string }).state === "terminal"
+  ));
+  expect(terminalWrites).toHaveLength(2);
+  expect(terminalWrites[1]?.checkpoint).toMatchObject({ attempt: 2, resolvedCount: 1 });
+  expect(repository.matches).toContainEqual(expect.objectContaining({ candidateId: "v2-later", status: "accepted" }));
+});
+
+test("V2 catalog discovery resumes the last durable page without consuming provider retry budget", async () => {
+  const retryCandidate = candidate("v2-page-resume", "editorial");
+  retryCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source", eligibility: "qualifying", scopeAxis: "scene",
+    scopeValue: "Test scene", relationship: "represents the scene", confidence: 0.95,
+    sourceUrl: "https://example.com/page-resume", sourceRecordId: "source-page-resume", researchContainerId: null,
+    citationAttestationId: "citation-page-resume", provenancePath: [{ kind: "provenance_root", id: "page-resume-root" }],
+    note: "Durable page resume fixture.",
+  }];
+  const searchRequests: string[] = [];
+  const provider: CatalogDiscoveryProvider = {
+    async search(_storefront, query, types, _limit, _signal, cursor) {
+      searchRequests.push(JSON.stringify({ query, types, cursor: cursor ?? null }));
+      return { songs: [song], artists: [], albums: [], playlists: [] };
+    },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const resumeBrief = sceneBrief(1);
+  const repository = new V2MemoryMatchingRepository(
+    [retryCandidate], resumeBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({ prompt: "Test scene", brief: resumeBrief, storefront: "us" });
+  const durableSave = repository.saveResearchCheckpoint.bind(repository);
+  let interruptAfterFirstDurablePage = true;
+  repository.saveResearchCheckpoint = async (runId, phase, checkpoint) => {
+    await durableSave(runId, phase, checkpoint);
+    if (phase === "catalog_discovery_v2"
+      && (checkpoint as { state?: string }).state === "running"
+      && interruptAfterFirstDurablePage) {
+      interruptAfterFirstDurablePage = false;
+      const cancellation = new Error("worker lease revoked");
+      cancellation.name = "AbortError";
+      throw cancellation;
+    }
+  };
+
+  await expect(matchResearchRun(repository, "run-v2-page-resume", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  })).rejects.toThrow("worker lease revoked");
+  const interrupted = repository.checkpointsByPhase.get("catalog_discovery_v2") as Record<string, unknown>;
+  expect(interrupted).toMatchObject({
+    schemaVersion: 2,
+    state: "running",
+    attempt: 1,
+    retryAttempt: 1,
+    progress: expect.objectContaining({ sequence: 1, providerCallCount: 1 }),
+  });
+  const runningWritesBeforeResume = repository.checkpointWrites.filter((write) => (
+    write.phase === "catalog_discovery_v2"
+      && (write.checkpoint as { state?: string }).state === "running"
+  ));
+  expect(runningWritesBeforeResume).toHaveLength(1);
+
+  await matchResearchRun(repository, "run-v2-page-resume", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  const runningWrites = repository.checkpointWrites.filter((write) => (
+    write.phase === "catalog_discovery_v2"
+      && (write.checkpoint as { state?: string }).state === "running"
+  ));
+  expect(runningWrites[1]?.checkpoint).toMatchObject({
+    attempt: 1,
+    retryAttempt: 1,
+    progress: expect.objectContaining({ sequence: 2, providerCallCount: 2 }),
+  });
+  const terminal = repository.checkpointsByPhase.get("catalog_discovery_v2") as Record<string, unknown>;
+  expect(terminal).toMatchObject({
+    schemaVersion: 2,
+    state: "terminal",
+    complete: true,
+    attempt: 1,
+    retryAttempt: 1,
+    resolvedCount: 1,
+  });
+});
+
+test("V2 catalog discovery safely restarts malformed running progress as the same attempt", async () => {
+  const retryCandidate = candidate("v2-malformed-resume", "editorial");
+  retryCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source", eligibility: "qualifying", scopeAxis: "scene",
+    scopeValue: "Test scene", relationship: "represents the scene", confidence: 0.95,
+    sourceUrl: "https://example.com/malformed-resume", sourceRecordId: "source-malformed-resume", researchContainerId: null,
+    citationAttestationId: "citation-malformed-resume", provenancePath: [{ kind: "provenance_root", id: "malformed-root" }],
+    note: "Malformed resume fixture.",
+  }];
+  const searchRequests: string[] = [];
+  const provider: CatalogDiscoveryProvider = {
+    async search(_storefront, query, types, _limit, _signal, cursor) {
+      searchRequests.push(JSON.stringify({ query, types, cursor: cursor ?? null }));
+      return { songs: [song], artists: [], albums: [], playlists: [] };
+    },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const resumeBrief = sceneBrief(1);
+  const repository = new V2MemoryMatchingRepository(
+    [retryCandidate], resumeBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({ prompt: "Test scene", brief: resumeBrief, storefront: "us" });
+  const durableSave = repository.saveResearchCheckpoint.bind(repository);
+  let interruptAfterFirstDurablePage = true;
+  repository.saveResearchCheckpoint = async (runId, phase, checkpoint) => {
+    await durableSave(runId, phase, checkpoint);
+    if (phase === "catalog_discovery_v2"
+      && (checkpoint as { state?: string }).state === "running"
+      && interruptAfterFirstDurablePage) {
+      interruptAfterFirstDurablePage = false;
+      throw new Error("simulated process crash");
+    }
+  };
+  await expect(matchResearchRun(repository, "run-v2-malformed-resume", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  })).rejects.toThrow("simulated process crash");
+  const running = repository.checkpointsByPhase.get("catalog_discovery_v2") as {
+    progress: Record<string, unknown>;
+  } & Record<string, unknown>;
+  repository.checkpointsByPhase.set("catalog_discovery_v2", {
+    ...running,
+    progress: { ...running.progress, sequence: -1 },
+  });
+  const writesBeforeRestart = repository.checkpointWrites.length;
+
+  await matchResearchRun(repository, "run-v2-malformed-resume", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  const restartedRunning = repository.checkpointWrites.slice(writesBeforeRestart).find((write) => (
+    write.phase === "catalog_discovery_v2"
+      && (write.checkpoint as { state?: string }).state === "running"
+  ));
+  expect(restartedRunning?.checkpoint).toMatchObject({
+    attempt: 1,
+    retryAttempt: 1,
+    progress: expect.objectContaining({ sequence: 1, providerCallCount: 1 }),
+  });
+  expect(repository.checkpointsByPhase.get("catalog_discovery_v2")).toMatchObject({
+    schemaVersion: 2,
+    state: "terminal",
+    complete: true,
+    attempt: 1,
+    retryAttempt: 1,
+  });
+});
+
+test("V2 catalog discovery preserves completed legacy terminal checkpoint compatibility", async () => {
+  const exactCandidate = candidate("v2-legacy-terminal", "editorial");
+  exactCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source", eligibility: "qualifying", scopeAxis: "scene",
+    scopeValue: "Test scene", relationship: "represents the scene", confidence: 0.95,
+    sourceUrl: "https://example.com/legacy-terminal", sourceRecordId: "source-legacy-terminal", researchContainerId: null,
+    citationAttestationId: "citation-legacy-terminal", provenancePath: [{ kind: "provenance_root", id: "legacy-root" }],
+    note: "Legacy terminal fixture.",
+  }];
+  let searchCalls = 0;
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      searchCalls += 1;
+      return { songs: [song], artists: [], albums: [], playlists: [] };
+    },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const legacyBrief = sceneBrief(1);
+  const repository = new V2MemoryMatchingRepository(
+    [exactCandidate], legacyBrief, new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({ prompt: "Test scene", brief: legacyBrief, storefront: "us" });
+  await matchResearchRun(repository, "run-v2-legacy-terminal", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+  const terminal = repository.checkpointsByPhase.get("catalog_discovery_v2") as Record<string, unknown>;
+  const legacy = { ...terminal };
+  delete legacy.schemaVersion;
+  delete legacy.state;
+  delete legacy.progress;
+  repository.checkpointsByPhase.set("catalog_discovery_v2", legacy);
+  const callsAfterFirstRun = searchCalls;
+
+  await matchResearchRun(repository, "run-v2-legacy-terminal", "us", undefined, {
+    retryIncomplete: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(searchCalls).toBe(callsAfterFirstRun);
 });
 
 test("catalog reads use bounded concurrency while match decisions stay ordered", async () => {
@@ -403,6 +1410,7 @@ test("One Command queues bounded Apple recovery before terminalizing a retryable
   }]);
   expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
   expect(repository.automaticPublications).toEqual([]);
+  expect(repository.pipelineOutcomes).toEqual([]);
 });
 
 test("One Command counts only strict unique Apple matches toward an exact target", async () => {
@@ -453,6 +1461,13 @@ test("One Command records a zero-match shortfall as partial instead of failed", 
     error: null,
   });
   expect(repository.automaticPublications).toEqual([]);
+  expect(repository.pipelineOutcomes).toEqual([expect.objectContaining({
+    status: "no_compatible_tracks",
+    targetTrackCount: 2,
+    publishedTrackCount: 0,
+    exactCountSatisfied: false,
+    reasonCodes: ["catalog_recovery_exhausted_without_compatible_tracks"],
+  })]);
 });
 
 test("One Command matching durably hands a satisfied run to automatic publication", async () => {

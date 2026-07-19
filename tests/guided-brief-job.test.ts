@@ -106,7 +106,7 @@ test("guided finalization reapplies the server-owned exact count after an advers
       evidencePolicy: draftBrief.evidencePolicy,
       targetSize: { min: 75, max: 75 },
     }),
-    estimateUsd: 0.75,
+    estimateUsd: 1.5,
     error: null,
   });
   expect(repository.reserveProviderCost).not.toHaveBeenCalled();
@@ -181,13 +181,13 @@ test("a billed but invalid question-scout response degrades to a completed brief
   const providerResponses = [
     {
       id: "response-guided-brief",
-      model: "test-model",
+      model: "gpt-5.4-mini",
       usage: { input_tokens: 500, output_tokens: 200 },
       output_text: JSON.stringify(draftBrief),
     },
     {
       id: "response-guided-invalid-scout",
-      model: "test-model",
+      model: "gpt-5.4-mini",
       usage: { input_tokens: 400, output_tokens: 80 },
       // Reproduce a semantic failure after the optional scout has already
       // returned billable usage. The playlist brief must still proceed.
@@ -207,7 +207,7 @@ test("a billed but invalid question-scout response degrades to a completed brief
       id: "brief-guided-invalid",
       prompt: "Create a rainy-night playlist",
       requestedTrackCount: 50,
-      model: "test-model",
+      model: "gpt-5.4-mini",
       status: "queued" as const,
     })),
     reserveProviderCost: vi.fn(async (_subject, operation: string) => ({ reservationId: `reservation-${operation}` })),
@@ -220,16 +220,22 @@ test("a billed but invalid question-scout response degrades to a completed brief
     briefRequestId: "brief-guided-invalid",
   })).resolves.toBeUndefined();
 
+  expect(repository.reserveProviderCost).toHaveBeenNthCalledWith(
+    2,
+    { briefRequestId: "brief-guided-invalid" },
+    expect.stringContaining("brief.question_scout"),
+    0.03,
+  );
   expect(reconcileProviderCost).toHaveBeenCalledTimes(2);
   expect(reconcileProviderCost).toHaveBeenCalledWith(
     expect.stringContaining("brief.interpret"),
     expect.any(Number),
-    expect.objectContaining({ input_tokens: 500, output_tokens: 200, model: "test-model" }),
+    expect.objectContaining({ input_tokens: 500, output_tokens: 200, model: "gpt-5.4-mini" }),
   );
   expect(reconcileProviderCost).toHaveBeenCalledWith(
     expect.stringContaining("brief.question_scout"),
     expect.any(Number),
-    expect.objectContaining({ input_tokens: 400, output_tokens: 80, model: "test-model" }),
+    expect.objectContaining({ input_tokens: 400, output_tokens: 80, model: "gpt-5.4-mini" }),
   );
   expect(releaseProviderCost).not.toHaveBeenCalled();
   expect(saveBriefResult).toHaveBeenCalledWith(
@@ -255,7 +261,7 @@ test("a question-scout provider failure releases only the scout reservation and 
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(new Response(JSON.stringify({
       id: "response-guided-provider-brief",
-      model: "test-model",
+      model: "gpt-5.4-mini",
       usage: { input_tokens: 500, output_tokens: 200 },
       output_text: JSON.stringify(draftBrief),
     }), {
@@ -278,7 +284,7 @@ test("a question-scout provider failure releases only the scout reservation and 
       id: "brief-guided-provider-failure",
       prompt: "An introduction to Wandelweiser recordings",
       requestedTrackCount: 25,
-      model: "test-model",
+      model: "gpt-5.4-mini",
       status: "queued" as const,
     })),
     reserveProviderCost: vi.fn(async (_subject, operation: string) => ({ reservationId: `reservation-${operation}` })),
@@ -317,7 +323,7 @@ test("an exhausted scout-only budget skips follow-up questions without failing t
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-scout-budget");
   const fetchMock = vi.fn(async () => new Response(JSON.stringify({
     id: "response-guided-budget-brief",
-    model: "test-model",
+    model: "gpt-5.4-mini",
     usage: { input_tokens: 500, output_tokens: 200 },
     output_text: JSON.stringify(draftBrief),
   }), {
@@ -335,7 +341,7 @@ test("an exhausted scout-only budget skips follow-up questions without failing t
       id: "brief-guided-scout-budget",
       prompt: "An introduction to Tamil nadaswaram recordings",
       requestedTrackCount: 25,
-      model: "test-model",
+      model: "gpt-5.4-mini",
       status: "queued" as const,
     })),
     reserveProviderCost: vi.fn(async (_subject, operation: string) => {
@@ -383,7 +389,7 @@ test("the exact baile-funk screenshot request completes when the primary structu
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(new Response(JSON.stringify({
       id: "response-malformed-baile-brief",
-      model: "test-model",
+      model: "gpt-5.4-mini",
       usage: { input_tokens: 420, output_tokens: 63 },
       output_text: "{\"title\":\"Baile Funk x Drill\",\"mode\":\"curated\"",
     }), {
@@ -409,7 +415,7 @@ test("the exact baile-funk screenshot request completes when the primary structu
       id: "brief-baile-drill-malformed",
       prompt: "Iconic baile funk songs with drill inspiration",
       requestedTrackCount: 25,
-      model: "test-model",
+      model: "gpt-5.4-mini",
       status: "queued" as const,
     })),
     reserveProviderCost: vi.fn(async (_subject, operation: string) => ({

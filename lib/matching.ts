@@ -209,6 +209,36 @@ function catalogAlbumPenalty(song: CatalogSong): number {
   return collectionMarkers.some((marker) => album.includes(marker)) ? 20 : 0;
 }
 
+function supportedCatalogReleaseTime(song: CatalogSong): number {
+  const value = song.releaseDate?.trim() ?? "";
+  if (!/^\d{4}(?:-\d{2}(?:-\d{2})?)?$/u.test(value)) return Number.MAX_SAFE_INTEGER;
+  const completeDate = value.length === 4 ? `${value}-01-01` : value.length === 7 ? `${value}-01` : value;
+  const parsed = Date.parse(`${completeDate}T00:00:00Z`);
+  return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Prefer a canonical/non-derived compatible issue, then the earliest release
+ * date Apple actually supplies. This is a catalog presentation preference;
+ * it must never be described as proof that the issue is historically first.
+ */
+function compareCompatibleCatalogIssues(
+  left: SparseCatalogMatch,
+  right: SparseCatalogMatch,
+): number {
+  return catalogAlbumPenalty(left.song) - catalogAlbumPenalty(right.song)
+    || supportedCatalogReleaseTime(left.song) - supportedCatalogReleaseTime(right.song)
+    || left.sourceIndex - right.sourceIndex
+    || left.song.id.localeCompare(right.song.id);
+}
+
+function preferredFamilyReleaseTime(family: readonly SparseCatalogMatch[]): number {
+  const minimumPenalty = Math.min(...family.map((item) => catalogAlbumPenalty(item.song)));
+  return Math.min(...family
+    .filter((item) => catalogAlbumPenalty(item.song) === minimumPenalty)
+    .map((item) => supportedCatalogReleaseTime(item.song)));
+}
+
 function normalizedCatalogIsrc(song: CatalogSong): string | null {
   const value = song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "";
   return value || null;
@@ -286,6 +316,9 @@ function selectCanonicalSparseMatch<T extends SparseCatalogMatch>(
     const leftPenalty = Math.min(...left.map((item) => catalogAlbumPenalty(item.song)));
     const rightPenalty = Math.min(...right.map((item) => catalogAlbumPenalty(item.song)));
     if (leftPenalty !== rightPenalty) return leftPenalty - rightPenalty;
+    const leftRelease = preferredFamilyReleaseTime(left);
+    const rightRelease = preferredFamilyReleaseTime(right);
+    if (leftRelease !== rightRelease) return leftRelease - rightRelease;
     const leftDuration = Math.max(...left.map((item) => item.song.durationInMillis ?? 0));
     const rightDuration = Math.max(...right.map((item) => item.song.durationInMillis ?? 0));
     if (leftDuration !== rightDuration) return rightDuration - leftDuration;
@@ -294,11 +327,7 @@ function selectCanonicalSparseMatch<T extends SparseCatalogMatch>(
   })[0];
   if (!strongest) return null;
 
-  return [...strongest].sort((left, right) => {
-    const penaltyDifference = catalogAlbumPenalty(left.song) - catalogAlbumPenalty(right.song);
-    if (penaltyDifference !== 0) return penaltyDifference;
-    return left.sourceIndex - right.sourceIndex;
-  })[0];
+  return [...strongest].sort(compareCompatibleCatalogIssues)[0];
 }
 
 function releaseYear(song: CatalogSong): number | null {
@@ -643,9 +672,9 @@ export function rankCatalogMatches(
         : exactMetadata
           ? `${acceptedMatch.basis}; unique exact metadata`
           : canonicalSparseMetadata
-            ? `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family`
+            ? `${acceptedMatch.basis}; exact sparse metadata selects a corroborated recording family; preferred earliest supported compatible catalog issue without asserting historical originality`
             : canonicalSparseCredit
-              ? `${acceptedMatch.basis}; compatible sparse catalog credit selects a corroborated recording family`
+              ? `${acceptedMatch.basis}; compatible sparse catalog credit selects a corroborated recording family; preferred earliest supported compatible catalog issue without asserting historical originality`
             : acceptedMatch.basis,
       score: acceptedMatch.score,
       song: acceptedMatch.song,

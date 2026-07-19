@@ -6,9 +6,12 @@ import {
 } from "../shared/fast-run-sla.ts";
 import {
   briefInterpretationModel,
+  boundedFastCandidateLimit,
   catalogMatchingCandidateGoal,
   createFastRouteCheckpoint,
   FAST_MATCHING_RESERVE_MS,
+  fastOpenAIRequestPolicy,
+  fastPostMatchRefillOpenAIRequestPolicy,
   fastPostMatchRefillPlan,
   FAST_RUN_DEADLINE_MS,
   parseFastRouteCheckpoint,
@@ -70,6 +73,27 @@ describe("research execution policy", () => {
     });
   });
 
+  test("derives request and local validation limits from one fast OpenAI contract", () => {
+    const policy = researchExecutionPolicy(brief("curated"), {});
+    if (policy.kind !== "fast_curated") throw new Error("Fixture policy must be fast");
+
+    expect(fastOpenAIRequestPolicy(policy, 999)).toMatchObject({
+      maxToolCalls: 5,
+      maxHostedSearchCalls: 5,
+      maxSynthesisTokens: 6_000,
+      maxExtractionTokens: 8_000,
+      candidateLimit: 120,
+    });
+    expect(fastPostMatchRefillOpenAIRequestPolicy(policy, 999)).toMatchObject({
+      maxToolCalls: 3,
+      maxHostedSearchCalls: 3,
+      maxSynthesisTokens: 3_000,
+      maxExtractionTokens: 8_000,
+      candidateLimit: 120,
+    });
+    expect(boundedFastCandidateLimit(Number.NaN)).toBe(1);
+  });
+
   test("keeps exhaustive and hybrid prompts on a separate deep policy", () => {
     expect(researchExecutionPolicy(brief("exhaustive"), {})).toEqual({ kind: "deep", version: "deep_v1", model: "gpt-5.6-terra" });
     expect(researchExecutionPolicy(brief("hybrid"), { OPENAI_DEEP_MODEL: "deep-snapshot" }))
@@ -87,7 +111,7 @@ describe("research execution policy", () => {
       requestedMinimum: 50,
       selectableCount: 28,
       shortfall: 22,
-      additionalCandidateGoal: 62,
+      additionalCandidateGoal: 79,
     });
     expect(fastPostMatchRefillPlan({
       requestedMinimum: 50,
@@ -146,10 +170,19 @@ describe("research execution policy", () => {
 
   test("binds cache identity to the complete effective fast and deep policies", () => {
     expect(JSON.parse(researchPolicyFingerprint(brief("curated"), {}))).toEqual({
-      fingerprintVersion: 2,
+      fingerprintVersion: 4,
+      intents: [],
       kind: "fast_curated",
       version: "fast_curated_v3",
       model: "gpt-5.6-luna",
+      modelRoute: {
+        version: "curated_model_route_v1",
+        tier: "luna",
+        modelSnapshot: "gpt-5.6-luna",
+        reason: "luna_baseline",
+        scoutConfidence: "medium",
+        structuredRepairFailures: 0,
+      },
       runDeadlineMs: 120_000,
       matchingReserveMs: 40_000,
       targetMinimum: 50,
@@ -163,7 +196,8 @@ describe("research execution policy", () => {
       searchContextSize: "low",
     });
     expect(JSON.parse(researchPolicyFingerprint(brief("exhaustive"), {}))).toEqual({
-      fingerprintVersion: 2,
+      fingerprintVersion: 4,
+      intents: [],
       kind: "deep",
       version: "deep_v1",
       model: "gpt-5.6-terra",

@@ -3,8 +3,11 @@ import {
   interpretPrompt,
   interpretPromptWithGuidance,
   refineBriefWithGuidance,
+  responseCostUsd,
   scoutPlaylistGuidance,
 } from "../server/openai.ts";
+import { guidanceScoutCostEnvelope } from "../server/guidance-scout-budget.ts";
+import { GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import { canonicalBriefForRequest, estimateResearchCost } from "../server/brief-policy.ts";
 import { researchExecutionPolicy } from "../server/research-policy.ts";
 import type {
@@ -73,6 +76,49 @@ function groundedScoutQuestion(input: {
         label: "Deep branches",
         description: "Favor well-supported but less canonical branches of the subject.",
         effect: { kind: effectKind, value: `prioritize less canonical ${input.subject} branches`, orderingBehavior: null },
+      },
+    ],
+  };
+}
+
+function groundedFrenchJazzRelationshipQuestion(sourceUrl: string) {
+  return {
+    decisionKey: "french_jazz_relationship_boundary",
+    header: "FRENCH CONNECTION",
+    question: "Which documented relationship to France should define this French jazz playlist?",
+    whyMaterial: "Artist origin, French scene membership, and recording location produce materially different French jazz candidate pools.",
+    groundingSummary: "The source documents distinct artist, scene, and recording-location relationships within French jazz.",
+    sourceUrls: [sourceUrl],
+    options: [
+      {
+        label: "French artists",
+        description: "Require the performers to be documented as originating in France.",
+        effect: {
+          kind: "research_preference" as const,
+          value: "require jazz by artists documented as originating in France",
+          orderingBehavior: null,
+          geographyConstraint: { value: "French", relationship: "artist_origin" as const },
+        },
+      },
+      {
+        label: "French scene",
+        description: "Require documented participation in France's jazz scenes, labels, or venues.",
+        effect: {
+          kind: "research_preference" as const,
+          value: "require documented membership in the French jazz scene",
+          orderingBehavior: null,
+          geographyConstraint: { value: "French", relationship: "label_or_venue_scene" as const },
+        },
+      },
+      {
+        label: "Recorded in France",
+        description: "Require the recording session to be documented as taking place in France.",
+        effect: {
+          kind: "research_preference" as const,
+          value: "require jazz recordings documented as recorded in France",
+          orderingBehavior: null,
+          geographyConstraint: { value: "French", relationship: "recording_location" as const },
+        },
       },
     ],
   };
@@ -422,8 +468,8 @@ test("runs brief interpretation and grounded question scouting as separate bound
   expect(result.guidanceTelemetry.generationMode).toBe("grounded_scout");
   expect(requestBodies[0].text.format.name).toBe("playlist_brief");
   expect(requestBodies[1]).toMatchObject({
-    max_output_tokens: 2_600,
-    max_tool_calls: 2,
+    max_output_tokens: 1_800,
+    max_tool_calls: 1,
     reasoning: { effort: "none" },
     parallel_tool_calls: false,
     tool_choice: "required",
@@ -512,15 +558,24 @@ test("repairs a truncated researched scout once without another web search", asy
   expect(fetchMock).toHaveBeenCalledTimes(2);
   expect(requestBodies[0]).toMatchObject({
     reasoning: { effort: "none" },
-    max_output_tokens: 2_600,
+    max_output_tokens: 1_800,
     tools: [{ type: "web_search", search_context_size: "low" }],
   });
   expect(requestBodies[1]).toMatchObject({
     reasoning: { effort: "none" },
-    max_output_tokens: 2_200,
+    max_output_tokens: 550,
   });
   expect(requestBodies[1]).not.toHaveProperty("tools");
   expect(requestBodies[1]).not.toHaveProperty("max_tool_calls");
+  const primaryEnvelope = guidanceScoutCostEnvelope(requestBodies[0]);
+  expect(primaryEnvelope.maximumCostUsd).toBeLessThanOrEqual(GUIDED_SCOUT_BUDGET_USD);
+  const primaryActualCost = responseCostUsd({
+    model: "gpt-5.4-mini",
+    usage: { input_tokens: 120, output_tokens: 130 },
+    output: [{ type: "web_search_call" }],
+  });
+  expect(guidanceScoutCostEnvelope(requestBodies[1]).maximumCostUsd)
+    .toBeLessThanOrEqual(GUIDED_SCOUT_BUDGET_USD - primaryActualCost);
   expect(requestBodies[1].text.format).toMatchObject({
     type: "json_schema",
     name: "repaired_playlist_question_scout",
@@ -563,6 +618,64 @@ test("repairs a truncated researched scout once without another web search", asy
     }),
     costUsd: result.costUsd,
   }));
+});
+
+test("blocks the optional repair before spend when primary actual cost leaves too little scout budget", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-combined-pre-spend-cap");
+  const sourceUrl = "https://example.org/french-jazz-boundaries";
+  const incompleteDraft = '{"questions":[{"decisionKey":"french_jazz_relationship_boundary"';
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    id: "response-guidance-expensive-primary",
+    model: "gpt-5.4-mini",
+    status: "incomplete",
+    incomplete_details: { reason: "max_output_tokens" },
+    // This is a valid usage total inside the primary request bounds, but it
+    // deliberately leaves less than the conservative repair envelope.
+    usage: { input_tokens: 11_000, output_tokens: 1_500, total_tokens: 12_500 },
+    output_text: incompleteDraft,
+    output: [
+      {
+        type: "web_search_call",
+        id: "search-french-jazz-boundaries",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "French jazz scene language geography history",
+          sources: [{ type: "url", url: sourceUrl, title: "French jazz boundaries" }],
+        },
+      },
+      {
+        type: "message",
+        id: "message-guidance-expensive-primary",
+        content: [{ type: "output_text", text: incompleteDraft, annotations: [] }],
+      },
+    ],
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await scoutPlaylistGuidance(
+    "50 French jazz tracks",
+    {
+      ...guidedDraftBrief,
+      title: "French Jazz",
+      subjectEntities: ["French jazz"],
+      relationship: "representative of",
+    },
+    "gpt-5.4-mini",
+  );
+
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(result.costUsd).toBeLessThanOrEqual(GUIDED_SCOUT_BUDGET_USD);
+  expect(result.questions).toEqual([]);
+  expect(result.sourceHints).toEqual([expect.objectContaining({ url: sourceUrl })]);
+  expect(result.telemetry.validationIssues).toEqual(expect.arrayContaining([
+    "response:primary_incomplete_max_output_tokens",
+    expect.stringMatching(/^response:repair_cost_guard_/u),
+  ]));
+  expect(result.usage).toMatchObject({ provider_calls: 1 });
 });
 
 test("accounts both billable calls once when the bounded scout repair is unavailable", async () => {
@@ -651,19 +764,34 @@ test("accepts a grounded geographic relationship fork for an underspecified plac
       sourceUrls: [sourceUrl],
       options: [
         {
-          label: "Songs about Rio",
-          description: "Select recordings whose lyrics or documented subject is Rio de Janeiro.",
-          effect: { kind: "research_preference", value: "require Rio de Janeiro as the documented song subject", orderingBehavior: null },
+          label: "Artists from Rio",
+          description: "Select recordings by artists documented as originating in Rio de Janeiro.",
+          effect: {
+            kind: "research_preference",
+            value: "require artists documented as originating in Rio de Janeiro",
+            orderingBehavior: null,
+            geographyConstraint: { value: "Rio de Janeiro", relationship: "artist_origin" },
+          },
         },
         {
-          label: "Rio artists and scenes",
-          description: "Select recordings by artists documented within Rio's musical scenes.",
-          effect: { kind: "research_preference", value: "require a documented artist or scene relationship to Rio de Janeiro", orderingBehavior: null },
+          label: "Rio scenes",
+          description: "Select recordings documented within Rio's musical scenes, labels, or venues.",
+          effect: {
+            kind: "research_preference",
+            value: "require a documented Rio de Janeiro scene relationship",
+            orderingBehavior: null,
+            geographyConstraint: { value: "Rio de Janeiro", relationship: "label_or_venue_scene" },
+          },
         },
         {
           label: "Recorded in Rio",
           description: "Select recordings documented as made in Rio de Janeiro studios or venues.",
-          effect: { kind: "research_preference", value: "require a documented recording-location relationship to Rio de Janeiro", orderingBehavior: null },
+          effect: {
+            kind: "research_preference",
+            value: "require a documented recording-location relationship to Rio de Janeiro",
+            orderingBehavior: null,
+            geographyConstraint: { value: "Rio de Janeiro", relationship: "recording_location" },
+          },
         },
       ],
     }],
@@ -753,6 +881,127 @@ test("unrelated prompts receive different subject-specific grounded decisions", 
       title: `${scenarios[index]!.subject} history`,
     })]);
     expect(result.questions[0]!.grounding!.sourceUrls).toEqual([scenarios[index]!.sourceUrl]);
+  }
+});
+
+test("production-like broad requests admit complete subject-specific scouts inside the hard budget", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-production-like-guidance");
+  const scenarios = [
+    {
+      prompt: "50 American drill tracks",
+      brief: {
+        ...guidedDraftBrief,
+        title: "American Drill",
+        subjectEntities: ["American drill"],
+        relationship: "representative of",
+      },
+      sourceUrl: "https://example.org/american-drill-history",
+      questions: [
+        groundedScoutQuestion({
+          decisionKey: "american_drill_regional_lineage",
+          subject: "American drill regional lineage",
+          sourceUrl: "https://example.org/american-drill-history",
+        }),
+        groundedScoutQuestion({
+          decisionKey: "american_drill_era_emphasis",
+          subject: "American drill historical era emphasis",
+          sourceUrl: "https://example.org/american-drill-history",
+        }),
+        groundedScoutQuestion({
+          decisionKey: "american_drill_canon_balance",
+          subject: "American drill canon and discovery balance",
+          sourceUrl: "https://example.org/american-drill-history",
+          effectKind: "familiarity_bias",
+        }),
+      ],
+    },
+    {
+      prompt: "50 French jazz tracks",
+      brief: {
+        ...guidedDraftBrief,
+        title: "French Jazz",
+        subjectEntities: ["French jazz"],
+        relationship: "representative of",
+      },
+      sourceUrl: "https://example.org/french-jazz-history",
+      questions: [
+        groundedFrenchJazzRelationshipQuestion("https://example.org/french-jazz-history"),
+        groundedScoutQuestion({
+          decisionKey: "french_jazz_period_emphasis",
+          subject: "French jazz historical period emphasis",
+          sourceUrl: "https://example.org/french-jazz-history",
+        }),
+      ],
+    },
+    {
+      prompt: "Build a deep Paulinho da Costa playlist",
+      brief: {
+        ...guidedDraftBrief,
+        title: "Paulinho da Costa",
+        subjectEntities: ["Paulinho da Costa"],
+        relationship: "performed on",
+      },
+      sourceUrl: "https://example.org/paulinho-da-costa-credits",
+      questions: [groundedScoutQuestion({
+        decisionKey: "paulinho_credit_emphasis",
+        subject: "Paulinho da Costa documented credit emphasis",
+        sourceUrl: "https://example.org/paulinho-da-costa-credits",
+        effectKind: "research_preference",
+      })],
+    },
+  ] satisfies Array<{
+    prompt: string;
+    brief: PlaylistBrief;
+    sourceUrl: string;
+    questions: ReturnType<typeof groundedScoutQuestion>[];
+  }>;
+
+  for (const scenario of scenarios) {
+    let requestBody: Record<string, unknown> | null = null;
+    const outputText = JSON.stringify({ questions: scenario.questions });
+    // Three concise, fully grounded questions must fit comfortably inside the
+    // provider output allowance. This catches regressions that silently reduce
+    // the scout to a one-question-only schema in production.
+    expect(Buffer.byteLength(outputText, "utf8")).toBeLessThan(7_200);
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return scoutResponse({
+        questions: [...scenario.questions],
+        sourceUrl: scenario.sourceUrl,
+        sourceTitle: `${scenario.brief.title} documented history`,
+      });
+    }));
+
+    const result = await scoutPlaylistGuidance(
+      scenario.prompt,
+      scenario.brief,
+      "gpt-5.4-mini",
+    );
+
+    expect(requestBody).not.toBeNull();
+    expect(requestBody).toMatchObject({
+      max_output_tokens: 1_800,
+      max_tool_calls: 1,
+      reasoning: { effort: "none" },
+      tool_choice: "required",
+      tools: [{ type: "web_search", search_context_size: "low" }],
+    });
+    expect(guidanceScoutCostEnvelope(requestBody!).maximumCostUsd)
+      .toBeLessThanOrEqual(GUIDED_SCOUT_BUDGET_USD);
+    expect(result.questions).toHaveLength(scenario.questions.length);
+    expect(result.telemetry).toMatchObject({
+      generationMode: "grounded_scout",
+      acceptedQuestionCount: scenario.questions.length,
+      webSearchCalls: 1,
+    });
+    expect(result.sourceHints).toEqual([
+      expect.objectContaining({ url: scenario.sourceUrl }),
+    ]);
+    expect(result.questions.every((question) =>
+      question.grounding?.sourceUrls.every((url) => url === scenario.sourceUrl)))
+      .toBe(true);
+    expect(result.questions.some((question) => question.decisionKey === "ordering_behavior"))
+      .toBe(false);
   }
 });
 
@@ -1039,6 +1288,30 @@ test("enforces the scout cost cap by returning zero questions", async () => {
     acceptedQuestionCount: 0,
   });
   expect(result.telemetry.validationIssues).toContain("response:cost_cap_exceeded");
+});
+
+test("blocks a scout before provider spend when its worst-case request cannot fit the cap", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-pre-spend-cap");
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await scoutPlaylistGuidance(
+    "A deeply researched but bounded playlist",
+    guidedDraftBrief,
+    "unpriced-expensive-model",
+  );
+
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(result).toMatchObject({
+    questions: [],
+    sourceHints: [],
+    costUsd: 0,
+    usage: { provider_calls: 0, total_tokens: 0 },
+    telemetry: {
+      generationMode: "scout_unavailable",
+      validationIssues: ["scout:request_cost_guard"],
+    },
+  });
 });
 
 test("typed scout answers produce distinct downstream research directives", async () => {

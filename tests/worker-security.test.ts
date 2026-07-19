@@ -19,6 +19,7 @@ import {
 } from "../server/publisher.ts";
 import {
   createAppleAuthorizationRepositoryFacade,
+  createMatchingRepositoryFacade,
   createPublicationRepositoryFacade,
   createResearchRepositoryFacade,
 } from "../server/worker-facades.ts";
@@ -51,10 +52,12 @@ function methodProxy(): any {
 test("worker handler facades enforce role-specific runtime capabilities", async () => {
   const source = methodProxy();
   const research = createResearchRepositoryFacade(source);
+  const matching = createMatchingRepositoryFacade(source);
   const publication = createPublicationRepositoryFacade(source);
   const appleAuthorization = createAppleAuthorizationRepositoryFacade(source);
 
   expect(Object.isFrozen(research)).toBe(true);
+  expect(Object.isFrozen(matching)).toBe(true);
   expect(Object.isFrozen(publication)).toBe(true);
   expect("getAppleAuthorization" in research).toBe(false);
   expect("getManifestById" in research).toBe(false);
@@ -68,6 +71,20 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
 
   await research.enqueueJob({ kind: "research" });
   expect(source.enqueueJob).toHaveBeenCalledTimes(1);
+
+  // Catalog discovery happens behind the matching worker facade in
+  // production. If this capability is omitted, direct repository tests pass
+  // while real workers silently discard every discovered track.
+  expect("persistCatalogDiscoveredCandidates" in matching).toBe(true);
+  await matching.persistCatalogDiscoveredCandidates?.("run-1", [], {
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+  });
+  expect(source.persistCatalogDiscoveredCandidates).toHaveBeenCalledTimes(1);
+
+  expect("getManifestPreflightReserveTracks" in publication).toBe(true);
+  await publication.getManifestPreflightReserveTracks?.("manifest-1", "revision-1", "us");
+  expect(source.getManifestPreflightReserveTracks).toHaveBeenCalledWith("manifest-1", "revision-1", "us");
 });
 
 test("production worker refuses startup when provider or encryption secrets are absent", () => {
@@ -289,6 +306,8 @@ function runnerHarness(): RunnerHarness {
     payload: { runId: "run-1" },
     attempts: 1,
     maxAttempts: 3,
+    pipelineVersion: "legacy_v1",
+    minimumWorkerProtocol: 4,
   };
   const repository = methodProxy();
   repository.ensureSchemaVersion.mockResolvedValue(undefined);

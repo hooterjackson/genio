@@ -20,6 +20,7 @@ vi.mock("../server/apple.ts", async () => {
 
 import { lookupAppleCatalogByIsrc, searchAppleCatalog } from "../server/apple.ts";
 import { processMatchingJob } from "../server/matching-service.ts";
+import { ProviderRequestError } from "../server/openai.ts";
 import {
   ResearchOrchestrator,
   type HostedCitationAttestation,
@@ -31,6 +32,7 @@ import {
   FAST_POST_MATCH_REFILL_LIMIT,
   researchExecutionPolicy,
 } from "../server/research-policy.ts";
+import { HttpError } from "../server/security.ts";
 
 const RUN_ID = "rio-exact-50-regression";
 
@@ -324,6 +326,24 @@ class PipelineRepository {
   }
 }
 
+class RowRejectingPipelineRepository extends PipelineRepository {
+  override async addCandidates(
+    runId: string,
+    candidates: TrackCandidateInput[],
+    sourceIds: Map<string, string>,
+    verificationPhase: ResearchPhase,
+  ) {
+    if (candidates.some((candidate) => candidate.title === "Refill Track 03")) {
+      throw new HttpError(
+        400,
+        "Fixture rejects one locally invalid candidate row",
+        "evidence_subject_mismatch",
+      );
+    }
+    return super.addCandidates(runId, candidates, sourceIds, verificationPhase);
+  }
+}
+
 class ScriptedRefillOrchestrator extends ResearchOrchestrator {
   readonly calls: Array<{ operation: string; body: Record<string, unknown> }> = [];
 
@@ -345,7 +365,7 @@ class ScriptedRefillOrchestrator extends ResearchOrchestrator {
   }
 }
 
-function refillProviderResponse(count = 8) {
+function refillProviderResponse(count = 8, searchCalls = 2) {
   const pairs = Array.from({ length: count }, (_, index) => (
     `Refill Artist ${String(index + 1).padStart(2, "0")} — Refill Track ${String(index + 1).padStart(2, "0")}`
   ));
@@ -362,8 +382,10 @@ function refillProviderResponse(count = 8) {
     model: "gpt-5.6-luna",
     usage: { input_tokens: 100, output_tokens: 100, total_tokens: 200 },
     output: [
-      { type: "web_search_call", action: { type: "search", query: "catalog-ready Rio songs" } },
-      { type: "web_search_call", action: { type: "search", query: "Rio songs recording discography" } },
+      ...Array.from({ length: searchCalls }, (_, index) => ({
+        type: "web_search_call",
+        action: { type: "search", query: `catalog-ready Rio songs pass ${index + 1}` },
+      })),
       {
         type: "web_search_call",
         action: { type: "open_page", url: "https://history.example/rio/catalog-ready-refill" },
@@ -424,6 +446,62 @@ beforeEach(() => {
 });
 
 describe("catalog shortfall -> evidence refill -> exact publication scenario", () => {
+  test("allows the same three hosted searches requested by the refill contract", async () => {
+    const repository = new PipelineRepository();
+    const orchestrator = new ScriptedRefillOrchestrator(repository, [refillProviderResponse(8, 3)]);
+
+    await runInitialMatching(repository);
+    const researchJob = repository.takeJob("research");
+    await orchestrator.processJob(researchJob.payload);
+
+    expect(orchestrator.calls[0]?.body).toMatchObject({
+      max_tool_calls: 3,
+      max_output_tokens: 3_000,
+    });
+    expect(repository.checkpoints.get("fast:post-match-refill:1:complete")).toMatchObject({
+      status: "complete",
+      hostedWebSearchCalls: 3,
+      newlyAdded: 8,
+    });
+  });
+
+  test("labels an over-limit completed response as a local contract error", async () => {
+    const repository = new PipelineRepository();
+    const orchestrator = new ScriptedRefillOrchestrator(repository, [refillProviderResponse(8, 4)]);
+
+    await runInitialMatching(repository);
+    const researchJob = repository.takeJob("research");
+    await orchestrator.processJob(researchJob.payload);
+
+    expect(repository.checkpoints.get("fast:post-match-refill:1:complete")).toMatchObject({
+      status: "contract_error",
+      newlyAdded: 0,
+      contractError: true,
+      contractCode: "hosted_search_limit",
+    });
+    expect(repository.checkpoints.get("fast:post-match-refill:1:complete"))
+      .not.toMatchObject({ providerError: true });
+  });
+
+  test("isolates one locally invalid candidate row and persists its valid siblings", async () => {
+    const repository = new RowRejectingPipelineRepository();
+    const orchestrator = new ScriptedRefillOrchestrator(repository, [refillProviderResponse(8, 3)]);
+
+    await runInitialMatching(repository);
+    const researchJob = repository.takeJob("research");
+    await orchestrator.processJob(researchJob.payload);
+
+    expect(repository.checkpoints.get("fast:post-match-refill:1:complete")).toMatchObject({
+      status: "complete",
+      newlyAdded: 7,
+      persistenceRejectedCandidateCount: 1,
+      rejectedCandidateCount: 1,
+    });
+    expect(repository.candidates.some((candidate) => candidate.title === "Refill Track 02")).toBe(true);
+    expect(repository.candidates.some((candidate) => candidate.title === "Refill Track 03")).toBe(false);
+    expect(repository.candidates.some((candidate) => candidate.title === "Refill Track 04")).toBe(true);
+  });
+
   test("a diversity-deficit route tells cited refill research which accepted artists to move beyond", async () => {
     const repository = new PipelineRepository();
     const representedArtists = [
@@ -485,7 +563,7 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
 
     expect(repository.candidateRefillRequests).toEqual([{
       storefront: "us",
-      additionalCandidateGoal: 21,
+      additionalCandidateGoal: 34,
       currentRefillGeneration: 0,
     }]);
     expect(repository.run).toMatchObject({ status: "researching", phase: "catalog_refill_research", error: null });
@@ -537,7 +615,12 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
     const orchestrator = new ScriptedRefillOrchestrator(
       repository,
       Array.from({ length: FAST_POST_MATCH_REFILL_LIMIT }, () => (
-        new Error("fixture provider transport failure")
+        new ProviderRequestError(
+          "fixture provider transport failure",
+          "openai",
+          503,
+          true,
+        )
       )),
     );
 

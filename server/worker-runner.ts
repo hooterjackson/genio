@@ -26,13 +26,22 @@ import {
   sanitizeFailure,
 } from "./error-sanitizer.ts";
 import { readCostConfiguration } from "./cost-config.ts";
-import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
+import {
+  WORKER_PIPELINE_CAPABILITY,
+  type WorkerPipelineCapability,
+} from "./worker-protocol.ts";
+import {
+  DATABASE_SCHEMA_SUPPORT,
+  type DatabaseSchemaSupport,
+} from "../db/index.ts";
+import type { PipelineVersion } from "../shared/types.ts";
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_RENEW_MS = 60_000;
 const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_CONTROL_INTERVAL_MS = 5_000;
+const PIPELINE_OBSERVABILITY_MAX_CATCHUP_HOURS = 24;
 
 function positiveEnv(name: string, fallback: number, maximum: number): number {
   const value = Number(process.env[name] ?? fallback);
@@ -47,11 +56,18 @@ export interface DurableJob {
   payload: Record<string, unknown>;
   attempts: number;
   maxAttempts: number;
+  pipelineVersion: PipelineVersion;
+  minimumWorkerProtocol: number;
 }
 
 export interface WorkerQueueRepository {
-  ensureSchemaVersion(): Promise<void>;
-  leaseNextJob(workerId: string, leaseMs: number): Promise<DurableJob | null>;
+  getSchemaVersion(): Promise<string | null>;
+  ensureSchemaVersion(support?: DatabaseSchemaSupport): Promise<void>;
+  leaseNextJob(
+    workerId: string,
+    leaseMs: number,
+    capability: WorkerPipelineCapability,
+  ): Promise<DurableJob | null>;
   renewJobLease(jobId: string, workerId: string, leaseMs: number): Promise<boolean>;
   deferJob(jobId: string, workerId: string, availableAt: Date, reason: string): Promise<void>;
   cancelLeasedJob(jobId: string, workerId: string, reason: string): Promise<void>;
@@ -65,10 +81,15 @@ export interface WorkerQueueRepository {
     protocolVersion: string;
     capacity?: number;
     activeJobs?: number;
+    [key: string]: unknown;
   }): Promise<void>;
   getSetting(key: string): Promise<string | null>;
   getRunControlState(runId: string): Promise<{ status: string; phase: string } | null>;
   runRetentionSweep(limit?: number): Promise<number>;
+  runPipelineV2OperationalAlertSweep(input?: {
+    windowHours?: number;
+    windowEndedAt?: Date;
+  }): Promise<unknown>;
 }
 
 export type WorkerRepository = WorkerQueueRepository
@@ -90,6 +111,8 @@ export interface WorkerRunnerOptions {
   heartbeatMs?: number;
   pollMs?: number;
   controlIntervalMs?: number;
+  pipelineCapability?: WorkerPipelineCapability;
+  schemaSupport?: DatabaseSchemaSupport;
   handlers?: Record<string, JobHandler>;
 }
 
@@ -129,6 +152,19 @@ export function defaultJobHandlers(repository: WorkerRepository): Record<string,
       await repository.runRetentionSweep(100);
       signal.throwIfAborted();
     },
+    pipeline_observability: async (payload, signal) => {
+      signal.throwIfAborted();
+      const rawWindowEnd = typeof payload.windowEndedAt === "string"
+        ? new Date(payload.windowEndedAt)
+        : undefined;
+      await repository.runPipelineV2OperationalAlertSweep({
+        windowHours: 1,
+        ...(rawWindowEnd && Number.isFinite(rawWindowEnd.getTime())
+          ? { windowEndedAt: rawWindowEnd }
+          : {}),
+      });
+      signal.throwIfAborted();
+    },
   };
 }
 
@@ -160,6 +196,8 @@ export class WorkerRunner {
   private readonly heartbeatMs: number;
   private readonly pollMs: number;
   private readonly controlIntervalMs: number;
+  private readonly pipelineCapability: WorkerPipelineCapability;
+  private readonly schemaSupport: DatabaseSchemaSupport;
   private readonly handlers: Record<string, JobHandler>;
   private readonly active = new Map<string, {
     promise: Promise<void>;
@@ -181,12 +219,14 @@ export class WorkerRunner {
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS;
     this.controlIntervalMs = options.controlIntervalMs ?? DEFAULT_CONTROL_INTERVAL_MS;
+    this.pipelineCapability = options.pipelineCapability ?? WORKER_PIPELINE_CAPABILITY;
+    this.schemaSupport = options.schemaSupport ?? DATABASE_SCHEMA_SUPPORT;
     this.handlers = { ...defaultJobHandlers(repository), ...(options.handlers ?? {}) };
   }
 
   async run(): Promise<void> {
     assertProductionWorkerSecrets();
-    await this.repository.ensureSchemaVersion();
+    await this.repository.ensureSchemaVersion(this.schemaSupport);
     await this.heartbeat();
     await this.enforceControls();
     this.heartbeatTimer = setInterval(() => {
@@ -206,7 +246,15 @@ export class WorkerRunner {
       while (!this.controller.signal.aborted) {
         let claimed = false;
         while (this.active.size < this.concurrency && !this.controller.signal.aborted) {
-          const job = await this.repository.leaseNextJob(this.workerId, this.leaseMs);
+          // Do not continue leasing across a schema cutover that this binary
+          // cannot safely read. Release-A bridge workers accept 12..13; the
+          // V13 worker intentionally accepts 13 only.
+          await this.repository.ensureSchemaVersion(this.schemaSupport);
+          const job = await this.repository.leaseNextJob(
+            this.workerId,
+            this.leaseMs,
+            this.pipelineCapability,
+          );
           if (!job) break;
           claimed = true;
           const controller = new AbortController();
@@ -241,12 +289,20 @@ export class WorkerRunner {
   }
 
   private async heartbeat(): Promise<void> {
+    const observedSchemaVersion = await this.repository.getSchemaVersion();
     await this.repository.updateWorkerHeartbeat(this.workerId, {
       startedAt: this.startedAt,
       seenAt: new Date().toISOString(),
       activeJobIds: [...this.active.keys()],
       version: this.version,
-      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      schemaVersion: this.schemaSupport.preferred,
+      schemaMinimum: this.schemaSupport.minimum,
+      schemaMaximum: this.schemaSupport.maximum,
+      schemaPreferred: this.schemaSupport.preferred,
+      observedSchemaVersion,
+      protocolVersion: this.pipelineCapability.protocolVersion,
+      protocolNumber: this.pipelineCapability.protocolNumber,
+      pipelineVersions: [...this.pipelineCapability.pipelineVersions],
       capacity: this.concurrency,
       activeJobs: this.active.size,
     });
@@ -275,6 +331,32 @@ export class WorkerRunner {
       dedupeKey: `retention:${day}`,
       maxAttempts: 3,
     });
+    // Sweep only fully closed UTC hours. The durable hourly keys prevent
+    // duplicate work across replicas, while the persisted high-water mark
+    // backfills up to one day after a worker outage.
+    const operationalWindowEnd = new Date();
+    operationalWindowEnd.setUTCMinutes(0, 0, 0);
+    const priorWindowValue = await this.repository.getSetting("pipeline_v2_alert_last_window_end");
+    const priorWindowEnd = priorWindowValue ? new Date(priorWindowValue) : null;
+    const oldestCatchupEnd = new Date(
+      operationalWindowEnd.getTime() - (PIPELINE_OBSERVABILITY_MAX_CATCHUP_HOURS - 1) * 60 * 60 * 1_000,
+    );
+    let nextWindowEnd = priorWindowEnd && Number.isFinite(priorWindowEnd.getTime())
+      ? new Date(priorWindowEnd.getTime() + 60 * 60 * 1_000)
+      : operationalWindowEnd;
+    if (nextWindowEnd < oldestCatchupEnd) nextWindowEnd = oldestCatchupEnd;
+    const observabilityJobs: Array<Promise<unknown>> = [];
+    while (nextWindowEnd <= operationalWindowEnd) {
+      const closedWindowEnd = new Date(nextWindowEnd);
+      observabilityJobs.push(this.repository.enqueueJob({
+        kind: "pipeline_observability",
+        payload: { windowEndedAt: closedWindowEnd.toISOString() },
+        dedupeKey: `pipeline-observability:${closedWindowEnd.toISOString().slice(0, 13)}`,
+        maxAttempts: 3,
+      }));
+      nextWindowEnd = new Date(nextWindowEnd.getTime() + 60 * 60 * 1_000);
+    }
+    await Promise.all(observabilityJobs);
   }
 
   private async enforceControls(): Promise<void> {

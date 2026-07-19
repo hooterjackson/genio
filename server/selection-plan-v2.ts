@@ -1,0 +1,573 @@
+import { createHash } from "node:crypto";
+import type {
+  PlaylistBrief,
+  ResearchIntent,
+  SelectionConstraint,
+  SelectionConstraintAxis,
+  SelectionGeographyConstraint,
+  SelectionGeographyRelationship,
+  SelectionPlan,
+  SelectionVersionPolicy,
+} from "../shared/types.ts";
+import type { PlaylistGuidancePreference } from "./guidance-context.ts";
+import {
+  parseSelectionGeographyConstraints,
+  selectionConstraintGeography,
+  uniqueGeographyConstraints,
+} from "./selection-geography-policy.ts";
+
+export const PIPELINE_V2_SELECTION_PLAN_VERSION = "relevance_first_2026_07" as const;
+
+const FACTUAL_RELATIONSHIP = /\b(?:performed?|played|credited|session|contribut|produced|wrote|written|composed|arranged|sampled|featured\s+on)\b/iu;
+const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
+const SIMILARITY_INTENT = /\b(?:sounds?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
+const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus|relax|meditat|sunset|churrasco)\b/iu;
+const EDITORIAL_INTENT = /\b(?:best|essential|influential|important|definitive|iconic|foundational|representative|history\s+of|shaped)\b/iu;
+const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
+const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggae|classical|country|electronic)\b/iu;
+const THEME_INTENT = /\b(?:songs?\s+about|tracks?\s+about|lyrics?\s+about|theme|themed)\b/iu;
+
+const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
+  [/\blive\b/iu, "live"],
+  [/\bremix(?:es)?\b/iu, "remix"],
+  [/\b(?:radio|single)\s+edit\b/iu, "radio_edit"],
+  [/\bextended\b/iu, "extended"],
+  [/\bacoustic\b/iu, "acoustic"],
+  [/\binstrumental\b/iu, "instrumental"],
+  [/\bkaraoke\b/iu, "karaoke"],
+  [/\b(?:cover|tribute)\b/iu, "cover"],
+  [/\bclean\b/iu, "clean"],
+  [/\bexplicit\b/iu, "explicit"],
+];
+
+function normalized(value: string): string {
+  return value.normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+function unique(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const key = normalized(value);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
+  const scope = [prompt, brief.title, brief.description, brief.relationship, ...brief.include].join(" ");
+  const intents: ResearchIntent[] = [];
+  if (brief.mode === "exhaustive" || EXHAUSTIVE_INTENT.test(scope)) intents.push("exhaustive");
+  if (FACTUAL_RELATIONSHIP.test(brief.relationship) || FACTUAL_RELATIONSHIP.test(prompt)) intents.push("factual_relationship");
+  if (SIMILARITY_INTENT.test(scope) || /stylistically similar/iu.test(brief.relationship)) intents.push("similarity");
+  if (MOOD_ACTIVITY_INTENT.test(scope)) intents.push("mood_activity");
+  if (THEME_INTENT.test(scope)) intents.push("theme");
+  if (ARTIST_CATALOGUE_INTENT.test(scope)) intents.push("artist_catalogue");
+  if (EDITORIAL_INTENT.test(scope) || /influenc|editorial|cultural|historical/iu.test(brief.relationship)) intents.push("editorial_ranking");
+  if (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship)) intents.push("genre_scene");
+  if (intents.length === 0) intents.push("genre_scene");
+  return [...new Set(intents)];
+}
+
+function axisForRule(rule: string): SelectionConstraintAxis {
+  const value = normalized(rule);
+  if (/language|french language|portuguese|spanish/iu.test(value)) return "language";
+  if (/year|decade|era|century|before|after|between/iu.test(value)) return "era";
+  if (/live|remix|edit|version|studio|acoustic|instrumental/iu.test(value)) return "recording_version";
+  if (/explicit|clean|lyrics/iu.test(value)) return "content";
+  if (/country|city|scene|origin|resident|recorded in|geograph|french|brazil|berlin|american/iu.test(value)) return "geography";
+  if (/label|imprint/iu.test(value)) return "label";
+  if (/venue|club/iu.test(value)) return "venue";
+  if (/mood|vibe|energy|dark|bright|calm/iu.test(value)) return "mood";
+  if (/sleep|study|workout|party|dinner|road trip/iu.test(value)) return "activity";
+  if (/genre|subgenre|house music|techno|jazz|drill|funk/iu.test(value)) return "genre";
+  return "relationship";
+}
+
+interface ParsedAxisRule {
+  axis: SelectionConstraintAxis;
+  operator: SelectionConstraint["operator"];
+  values: string[];
+  geographyRelationship?: SelectionGeographyRelationship | null;
+}
+
+const GENRE_TERMS: Array<[string, RegExp]> = [
+  ["baile funk", /\b(?:baile funk|funk carioca)\b/iu],
+  ["hip-hop", /\bhip[ -]?hop\b/iu],
+  ["bossa nova", /\bbossa nova\b/iu],
+  ["house music", /\bhouse(?: music)?\b/iu],
+  ["drill", /\bdrill\b/iu],
+  ["jazz", /\bjazz\b/iu],
+  ["techno", /\btechno\b/iu],
+  ["footwork", /\bfootwork\b/iu],
+  ["ambient", /\bambient\b/iu],
+  ["samba", /\bsamba\b/iu],
+  ["disco", /\bdisco\b/iu],
+  ["soul", /\bsoul\b/iu],
+  ["metal", /\bmetal\b/iu],
+  ["punk", /\bpunk\b/iu],
+  ["reggae", /\breggae\b/iu],
+  ["classical", /\bclassical\b/iu],
+  ["country", /\bcountry\b/iu],
+  ["electronic", /\belectronic\b/iu],
+  ["rock", /\brock\b/iu],
+  // Keep generic funk last so funk carioca is represented by its more
+  // specific, independently enforceable scope above.
+  ["funk", /\bfunk\b/iu],
+];
+
+const MOOD_TERMS: Array<[string, RegExp]> = [
+  ["dark", /\bdark\b/iu],
+  ["calm", /\b(?:calm|calming|serene|tranquil)\b/iu],
+  ["bright", /\bbright\b/iu],
+  ["melancholic", /\b(?:melancholic|melancholy)\b/iu],
+  ["uplifting", /\b(?:uplifting|euphoric)\b/iu],
+];
+
+const ACTIVITY_TERMS: Array<[string, RegExp]> = [
+  ["sleep", /\b(?:sleep|sleeping|bedtime)\b/iu],
+  ["study", /\b(?:study|studying|focus)\b/iu],
+  ["workout", /\b(?:workout|exercise|running)\b/iu],
+  ["road trip", /\broad[ -]trip\b/iu],
+  ["dinner", /\bdinner\b/iu],
+  ["party", /\bparty\b/iu],
+];
+
+function eraRules(value: string): ParsedAxisRule[] {
+  const range = value.match(/\b((?:19|20)\d{2})\s*(?:-|\u2013|\u2014|to|through)\s*((?:19|20)\d{2})\b/iu);
+  if (range) return [{ axis: "era", operator: "between", values: [range[1]!, range[2]!] }];
+  const decade = value.match(/\b(?:(early|mid|late)[ -]?)?((?:19|20)\d0)s\b/iu);
+  if (decade) {
+    const qualifier = decade[1] ? `${decade[1]!.toLocaleLowerCase("en-US")} ` : "";
+    return [{ axis: "era", operator: "within", values: [`${qualifier}${decade[2]}s`] }];
+  }
+  const year = value.match(/\b(?:19|20)\d{2}\b/u)?.[0];
+  if (!year) return [];
+  const operator: SelectionConstraint["operator"] = /\bbefore\b/iu.test(value)
+    ? "before"
+    : /\bafter\b/iu.test(value)
+      ? "after"
+      : "within";
+  return [{ axis: "era", operator, values: [year] }];
+}
+
+/**
+ * A single natural-language rule may carry several orthogonal requirements.
+ * Return one independently enforceable constraint per axis instead of letting
+ * the first matching keyword flatten the rest of the request.
+ */
+function parsedAxisRules(value: string): ParsedAxisRule[] {
+  const rules: ParsedAxisRule[] = [];
+  const genres = GENRE_TERMS.filter(([, pattern]) => pattern.test(value)).map(([label]) => label);
+  if (genres.length > 0) rules.push({ axis: "genre", operator: "require", values: genres });
+  const geographic = parseSelectionGeographyConstraints(value);
+  const languages = geographic.filter((constraint) => constraint.relationship === "language");
+  for (const constraint of languages) {
+    rules.push({
+      axis: "language",
+      operator: "require",
+      values: [constraint.value],
+      geographyRelationship: "language",
+    });
+  }
+  // When a multilingual request includes aliases or another script, retain
+  // the original phrase as a separate typed language rule. Individual
+  // language labels alone would otherwise erase the explicit raï/rai/الراي
+  // equivalence that discovery and evidence must preserve.
+  if (languages.length > 1 && /[()\/]|[^\u0000-\u024f]/u.test(value)) {
+    rules.push({
+      axis: "language",
+      operator: "require",
+      values: [value.trim()],
+      geographyRelationship: "language",
+    });
+  }
+  for (const constraint of geographic.filter((item) => item.relationship !== "language")) {
+    rules.push({
+      axis: constraint.relationship === "label_or_venue_scene" ? "scene" : "geography",
+      operator: "require",
+      values: [constraint.value],
+      geographyRelationship: constraint.relationship,
+    });
+  }
+  rules.push(...eraRules(value));
+
+  const moods = MOOD_TERMS.filter(([, pattern]) => pattern.test(value)).map(([label]) => label);
+  if (moods.length > 0) rules.push({ axis: "mood", operator: "require", values: moods });
+  const activities = ACTIVITY_TERMS.filter(([, pattern]) => pattern.test(value)).map(([label]) => label);
+  if (activities.length > 0) rules.push({ axis: "activity", operator: "require", values: activities });
+
+  if (/\b(?:women|woman|female)\b/iu.test(value)) {
+    rules.push({ axis: "theme", operator: "require", values: ["Women"] });
+  }
+  if (/\bclubs?\b/iu.test(value)) {
+    rules.push({ axis: "venue", operator: "require", values: ["club"] });
+  }
+
+  const scene = value.match(/\b([\p{L}\p{N}][\p{L}\p{N}' -]{1,60}?)\s+scene\b/iu)?.[1]?.trim();
+  if (scene) {
+    rules.push({
+      axis: "scene",
+      operator: "require",
+      values: [scene],
+    });
+  }
+  const subgenre = value.match(/\bsubgenre\s+(?:of\s+)?([\p{L}\p{N}][\p{L}\p{N}' -]{1,60})/iu)?.[1]?.trim();
+  if (subgenre) rules.push({ axis: "subgenre", operator: "require", values: [subgenre] });
+  return rules;
+}
+
+function constraintsForBrief(
+  prompt: string,
+  brief: PlaylistBrief,
+  guidance: readonly PlaylistGuidancePreference[],
+): SelectionConstraint[] {
+  const constraints: SelectionConstraint[] = [];
+  const constraintKeys = new Set<string>();
+  let index = 0;
+  const add = (
+    prefix: string,
+    axis: SelectionConstraintAxis,
+    operator: SelectionConstraint["operator"],
+    values: string[],
+    kind: SelectionConstraint["kind"],
+    relaxationRank: number | null,
+    geographyRelationship: SelectionGeographyRelationship | null = null,
+  ) => {
+    const clean = unique(values.map((value) => value.trim()).filter(Boolean));
+    if (clean.length === 0) return;
+    const key = `${axis}:${operator}:${kind}:${geographyRelationship ?? ""}:${clean.map(normalized).sort().join("|")}`;
+    if (constraintKeys.has(key)) return;
+    constraintKeys.add(key);
+    constraints.push({
+      id: `${prefix}_${++index}`,
+      axis,
+      operator,
+      values: clean,
+      kind,
+      geographyRelationship,
+      relaxationRank,
+    });
+  };
+
+  // Interpret recognizable axes from the confirmed scope as hard requirements.
+  // Generated prose is never used as a catch-all constraint here; only typed
+  // values emitted by the bounded parser survive into the plan.
+  for (const scopeText of unique([
+    prompt,
+    brief.title,
+    brief.description,
+    ...brief.subjectEntities,
+    ...brief.include,
+  ])) {
+    for (const parsed of parsedAxisRules(scopeText)) {
+      add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
+    }
+  }
+  for (const rule of brief.include) {
+    const parsed = parsedAxisRules(rule);
+    if (parsed.length === 0) add("include", axisForRule(rule), "require", [rule], "hard", null);
+  }
+  for (const rule of brief.exclude) {
+    const parsed = parsedAxisRules(rule);
+    if (parsed.length === 0) {
+      add("exclude", axisForRule(rule), "exclude", [rule], "hard", null);
+    } else {
+      for (const item of parsed) {
+        add("exclude", item.axis, "exclude", item.values, "hard", null, item.geographyRelationship ?? null);
+      }
+    }
+  }
+  add("relationship", "relationship", "require", [brief.relationship], "hard", null);
+  add("evidence", "evidence", "require", [brief.evidencePolicy], "hard", null);
+  add("version", "recording_version", "require", [brief.versionPolicy], "hard", null);
+
+  // A selected scout answer resolves a previously ambiguous place adjective
+  // into an exact, non-relaxable semantic relationship. Remove only the
+  // matching `unspecified` rule; unrelated hard axes remain intact.
+  for (const preference of guidance) {
+    const resolved = preference.geographyConstraint;
+    if (!resolved) continue;
+    for (let constraintIndex = constraints.length - 1; constraintIndex >= 0; constraintIndex -= 1) {
+      const existing = constraints[constraintIndex]!;
+      if (existing.kind !== "hard" || existing.geographyRelationship !== "unspecified") continue;
+      if (!existing.values.some((value) => normalized(value) === normalized(resolved.value))) continue;
+      constraints.splice(constraintIndex, 1);
+    }
+    const axis: SelectionConstraintAxis = resolved.relationship === "language"
+      ? "language"
+      : resolved.relationship === "label_or_venue_scene"
+        ? "scene"
+        : "geography";
+    add("guidance_scope", axis, "require", [resolved.value], "hard", null, resolved.relationship);
+  }
+
+  guidance.forEach((preference, guidanceIndex) => {
+    const axis: SelectionConstraintAxis = preference.kind === "version_preference"
+      ? "recording_version"
+      : preference.kind === "subscene_focus"
+        ? "scene"
+        : preference.kind === "ordering_behavior"
+          ? "relationship"
+          : "theme";
+    if (!preference.geographyConstraint) {
+      add("guidance", axis, "prefer", [preference.value], "soft", 100 + guidanceIndex);
+    }
+  });
+  return constraints;
+}
+
+function similarityDimensions(prompt: string): string[] {
+  const dimensions: string[] = [];
+  if (/production|texture|sound design|timbre/iu.test(prompt)) dimensions.push("production");
+  if (/tempo|pace|fast|slow|bpm/iu.test(prompt)) dimensions.push("tempo");
+  if (/harmon|chord|melod/iu.test(prompt)) dimensions.push("harmony");
+  if (/scene|regional|geograph|community/iu.test(prompt)) dimensions.push("scene");
+  if (/era|decade|\b(?:19|20)\d{2}s?\b/iu.test(prompt)) dimensions.push("era");
+  if (/vocal|voice|singing|rap style|flow/iu.test(prompt)) dimensions.push("vocal_style");
+  return dimensions.length > 0 ? dimensions : ["production", "scene", "era"];
+}
+
+function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
+  const scope = brief.versionPolicy;
+  const requested = VERSION_MARKERS.filter(([pattern]) => pattern.test(scope)).map(([, value]) => value);
+  const explicitOnly = /only|must|require/iu.test(scope) && requested.length > 0;
+  const defaultAllowed: SelectionVersionPolicy["allowed"] = ["canonical", "remaster", "clean", "explicit", "unknown"];
+  return {
+    preferred: requested.length > 0 ? requested : ["canonical", "remaster"],
+    allowed: explicitOnly ? requested : [...new Set([...defaultAllowed, ...requested])],
+    excludeCompilations: /exclude|avoid/iu.test(scope) && /compilation/iu.test(scope),
+    excludeKaraokeAndTributes: true,
+  };
+}
+
+function contentPolicyFor(brief: PlaylistBrief): SelectionPlan["contentPolicy"] {
+  const scope = [brief.versionPolicy, ...brief.include, ...brief.exclude].join(" ");
+  return {
+    explicitContent: /clean(?:\s+versions?)?\s+only|no explicit|exclude explicit/iu.test(scope)
+      ? "clean_only"
+      : /prefer clean/iu.test(scope)
+        ? "prefer_clean"
+        : "allow",
+    instrumental: /exclude instrumental|no instrumentals/iu.test(scope)
+      ? "exclude"
+      : /prefer instrumental|instrumental only/iu.test(scope)
+        ? "prefer"
+        : "allow",
+    languages: unique([
+      ...brief.include,
+      ...brief.subjectEntities,
+    ].filter((value) => /language|english|french|portuguese|spanish|german|japanese/iu.test(value))),
+  };
+}
+
+function directScope(intents: readonly ResearchIntent[], brief: PlaylistBrief): boolean {
+  return intents.includes("artist_catalogue")
+    || intents.includes("factual_relationship")
+    || intents.includes("exhaustive")
+    || /soundtrack|specified album|fixed container/iu.test([brief.description, ...brief.include].join(" "));
+}
+
+export function createSelectionPlanV2(input: {
+  prompt: string;
+  brief: PlaylistBrief;
+  guidancePreferences?: readonly PlaylistGuidancePreference[];
+  storefront?: string;
+}): SelectionPlan {
+  const guidance = input.guidancePreferences ?? [];
+  const intents = intentSet(input.prompt, input.brief);
+  const requestedTrackCount = Math.max(1, Math.floor(input.brief.targetSize?.min ?? 50));
+  const reserveTrackCount = Math.max(5, Math.ceil(requestedTrackCount * 0.1));
+  const fixedScope = directScope(intents, input.brief);
+  const maxArtist = fixedScope ? null : Math.max(1, Math.ceil(requestedTrackCount * 0.15));
+  const constraints = constraintsForBrief(input.prompt, input.brief, guidance);
+  const geographyConstraints: SelectionGeographyConstraint[] = uniqueGeographyConstraints(
+    constraints
+      .filter((constraint) => constraint.kind === "hard"
+        && !["exclude", "avoid", "maximum"].includes(constraint.operator))
+      .flatMap(selectionConstraintGeography),
+  );
+  const orderingMode = /chronolog/iu.test(input.brief.orderingPolicy)
+    ? "chronological"
+    : /contrast/iu.test(input.brief.orderingPolicy)
+      ? "contrast"
+      : /smooth|flow|intermix/iu.test(input.brief.orderingPolicy)
+        ? "smooth"
+        : "editorial";
+
+  return {
+    schemaVersion: 1,
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: PIPELINE_V2_SELECTION_PLAN_VERSION,
+    intents,
+    storefront: (input.storefront ?? "us").toLocaleLowerCase("en-US"),
+    requestedTrackCount,
+    minimumQualifiedTrackCount: requestedTrackCount,
+    reserveTrackCount,
+    constraints,
+    geographyConstraints,
+    similarityDimensions: intents.includes("similarity") ? similarityDimensions(input.prompt) : [],
+    labels: unique(input.brief.include.filter((value) => /label|imprint/iu.test(value))),
+    venues: unique(input.brief.include.filter((value) => /venue|club/iu.test(value))),
+    referenceRecordings: intents.includes("similarity") ? unique(input.brief.subjectEntities) : [],
+    softGoalRelaxationOrder: [
+      "sequencing_preferences",
+      "album_concentration",
+      "artist_concentration",
+      "era_balance",
+      "subgenre_regional_representation",
+    ],
+    diversityGoals: {
+      minimumDistinctArtists: fixedScope ? null : Math.min(requestedTrackCount, Math.max(5, Math.ceil(requestedTrackCount * 0.2))),
+      minimumDistinctAlbums: fixedScope ? null : Math.min(requestedTrackCount, Math.max(5, Math.ceil(requestedTrackCount * 0.25))),
+      minimumDistinctEras: fixedScope ? null : 2,
+      minimumDistinctScenes: fixedScope ? null : 2,
+      minimumDistinctGeographies: null,
+      maximumTracksPerArtist: maxArtist,
+      maximumTracksPerAlbum: fixedScope ? null : Math.max(2, Math.ceil(requestedTrackCount * 0.1)),
+    },
+    evidencePolicy: input.brief.evidencePolicy,
+    versionPolicy: versionPolicyFor(input.brief),
+    orderingPolicy: {
+      mode: orderingMode,
+      goals: unique([input.brief.orderingPolicy, ...guidance.map((preference) => preference.value)]),
+      avoidAdjacentSameArtist: !fixedScope,
+      avoidAdjacentSameAlbum: !fixedScope,
+    },
+    contentPolicy: contentPolicyFor(input.brief),
+  };
+}
+
+export function pipelineV2Route(plan: Pick<SelectionPlan, "intents">): "curated_catalog" | "factual_frontier" {
+  return plan.intents.includes("factual_relationship") || plan.intents.includes("exhaustive")
+    ? "factual_frontier"
+    : "curated_catalog";
+}
+
+export type PipelineV2RolloutGroup = "curated_core" | "curated_similarity" | "factual_frontier";
+
+/**
+ * Similarity is intentionally a separate public rollout cohort. It has a
+ * different relevance benchmark (track-level stylistic support and reference
+ * artist exclusion) and must not be enabled merely because genre/scene and
+ * mood traffic graduated.
+ */
+export function pipelineV2RolloutGroup(
+  plan: Pick<SelectionPlan, "intents">,
+): PipelineV2RolloutGroup {
+  if (pipelineV2Route(plan) === "factual_frontier") return "factual_frontier";
+  return plan.intents.includes("similarity") ? "curated_similarity" : "curated_core";
+}
+
+export interface PipelineV2Assignment {
+  assigned: boolean;
+  cohort: number;
+  percentage: number;
+  reason: "owner_canary" | "sticky_rollout" | "legacy_control";
+}
+
+/**
+ * A rollout cohort belongs to a browser/client bucket and a versioned route,
+ * not to one prompt. This keeps a visitor on one pipeline while they compare
+ * different playlist requests, while a deliberate route or policy revision
+ * receives an independent cohort assignment.
+ */
+export function pipelineRolloutStickyKey(
+  clientBucket: string,
+  plan: Pick<SelectionPlan, "intents" | "policyVersion">,
+): string {
+  return `${clientBucket}:${pipelineV2RolloutGroup(plan)}:${plan.policyVersion}`;
+}
+
+function rolloutPercentage(value: string | undefined): number {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(100, parsed));
+}
+
+/**
+ * Stable rollout assignment. Owner-curated runs are the first canary; public
+ * traffic advances only when the explicit percentage is raised. Factual and
+ * exhaustive work has a separate switch because its claim/frontier benchmark
+ * must pass independently of curated genre and mood playlists.
+ */
+export function assignPipelineV2(input: {
+  plan: SelectionPlan;
+  owner: boolean;
+  stickyKey: string;
+  env?: NodeJS.ProcessEnv;
+}): PipelineV2Assignment {
+  const env = input.env ?? process.env;
+  const rolloutGroup = pipelineV2RolloutGroup(input.plan);
+  const factual = rolloutGroup === "factual_frontier";
+  const digest = createHash("sha256").update(input.stickyKey).digest();
+  const cohort = digest.readUInt32BE(0) % 10_000;
+  // Factual/exhaustive work has independent rollout controls because its
+  // claim/frontier benchmark graduates separately from curated catalog work.
+  // Both routes remain legacy control when their own gates are absent.
+  if (factual) {
+    if (input.owner && env.PIPELINE_V2_FACTUAL_OWNER_CANARY === "true") {
+      return { assigned: true, cohort, percentage: 100, reason: "owner_canary" };
+    }
+    const percentage = rolloutPercentage(env.PIPELINE_V2_FACTUAL_PERCENT);
+    const assigned = cohort < Math.round(percentage * 100);
+    return {
+      assigned,
+      cohort,
+      percentage,
+      reason: assigned ? "sticky_rollout" : "legacy_control",
+    };
+  }
+  // Owner canaries are an explicit operational gate. Keeping this disabled by
+  // default prevents an owner request from creating a V2 job during the short
+  // interval in which pre-capability workers may still be draining a rolling
+  // deployment. Operations enables the gate only after fresh V2-capable
+  // heartbeats are the sole workers eligible for new V2 work.
+  if (input.owner && env.PIPELINE_V2_OWNER_CANARY === "true") {
+    return { assigned: true, cohort, percentage: 100, reason: "owner_canary" };
+  }
+  const percentage = rolloutPercentage(
+    rolloutGroup === "curated_similarity"
+      ? env.PIPELINE_V2_SIMILARITY_PERCENT
+      : env.PIPELINE_V2_CURATED_PERCENT,
+  );
+  const assigned = cohort < Math.round(percentage * 100);
+  return {
+    assigned,
+    cohort,
+    percentage,
+    reason: assigned ? "sticky_rollout" : "legacy_control",
+  };
+}
+
+/**
+ * The persisted plan is the server-owned contract. Expose only the fields a
+ * research pass needs so model prompts cannot silently reinterpret hard
+ * constraints, diversity targets, or the relaxation order from presentation
+ * prose. This object is data, not an instruction source.
+ */
+export function selectionPlanResearchContext(plan: SelectionPlan | null | undefined) {
+  if (!plan) return null;
+  return {
+    pipelineVersion: plan.pipelineVersion,
+    policyVersion: plan.policyVersion,
+    intents: plan.intents,
+    hardConstraints: plan.constraints.filter((constraint) => constraint.kind === "hard"),
+    softGoals: plan.constraints.filter((constraint) => constraint.kind === "soft"),
+    softGoalRelaxationOrder: plan.softGoalRelaxationOrder,
+    similarityDimensions: plan.similarityDimensions,
+    referenceRecordings: plan.referenceRecordings,
+    labels: plan.labels,
+    venues: plan.venues,
+    diversityGoals: plan.diversityGoals,
+    evidencePolicy: plan.evidencePolicy,
+    versionPolicy: plan.versionPolicy,
+    contentPolicy: plan.contentPolicy,
+    orderingPolicy: plan.orderingPolicy,
+  };
+}

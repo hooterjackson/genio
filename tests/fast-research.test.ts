@@ -453,4 +453,21 @@ describe("fast curated research", () => {
     const schema = fastExtractionSchema(999) as any;
     expect(schema.properties.candidates.maxItems).toBe(120);
   });
+
+  test("preserves valid structured candidates when a sibling row is malformed", () => {
+    const rows = parseFastExtraction({
+      output_text: JSON.stringify({
+        candidates: [
+          { artist: "Valid Artist A", title: "Valid Track A", album: null, releaseYear: null, versionLabel: null, relationship: "is influential", citationIndexes: [0] },
+          { artist: "", title: "Malformed Track", album: null, releaseYear: null, versionLabel: null, relationship: "is influential", citationIndexes: [] },
+          { artist: "Valid Artist B", title: "Valid Track B", album: null, releaseYear: null, versionLabel: null, relationship: "is influential", citationIndexes: [1] },
+        ],
+      }),
+    }, 120);
+
+    expect(rows.map((row) => `${row.artist} — ${row.title}`)).toEqual([
+      "Valid Artist A — Valid Track A",
+      "Valid Artist B — Valid Track B",
+    ]);
+  });
 });

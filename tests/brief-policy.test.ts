@@ -17,6 +17,7 @@ import {
 } from "../server/brief-policy.ts";
 import { researchExecutionPolicy } from "../server/research-policy.ts";
 import {
+  curatedResearchBudgetUsd,
   GUIDED_BRIEF_BUDGET_USD,
   PUBLIC_FAST_RESEARCH_BUDGET_USD,
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
@@ -175,7 +176,7 @@ describe("playlist brief policy", () => {
     expect(publicRunBudgetUsd(1.5, GUIDED_BRIEF_BUDGET_USD)).toBe(1.25);
     expect(
       GUIDED_BRIEF_BUDGET_USD + publicRunBudgetUsd(1.5, GUIDED_BRIEF_BUDGET_USD),
-    ).toBe(PUBLIC_FAST_RESEARCH_BUDGET_USD);
+    ).toBe(curatedResearchBudgetUsd(100));
     expect(publicRunBudgetUsd(1.5, PUBLIC_FAST_RESEARCH_BUDGET_USD)).toBe(0);
     expect(publicRunBudgetUsd(1.5, PUBLIC_FAST_RESEARCH_BUDGET_USD + 0.01)).toBe(0);
     expect(publicRunBudgetUsd(Number.NaN, 0)).toBe(0);
@@ -237,7 +238,7 @@ describe("playlist brief policy", () => {
         { mode: "curated", targetSize: { min: 100, max: 100 } },
         { mode: "curated", targetSize: { min: 100, max: 100 } },
       ]);
-    expect(new Set(normalized.map(estimateResearchCost))).toEqual(new Set([0.75]));
+    expect(new Set(normalized.map(estimateResearchCost))).toEqual(new Set([1.5]));
   });
 
   test("keeps explicit factual enumeration on the deep path when no count control is present", () => {
@@ -338,10 +339,10 @@ describe("playlist brief policy", () => {
       relationship: "performed on as a session musician",
       versionPolicy: "all remixes, live versions, and edits",
     })).toEqual({
-      minimumUsd: 0.15,
-      maximumUsd: 0.75,
-      approvalUsd: 0.75,
-      factors: [{ label: "bounded fast cited research", minimumUsd: 0.15, maximumUsd: 0.75 }],
+      minimumUsd: 0.25,
+      maximumUsd: 1.5,
+      approvalUsd: 1.5,
+      factors: [{ label: "bounded fast cited research", minimumUsd: 0.25, maximumUsd: 1.5 }],
     });
   });
 
@@ -354,10 +355,20 @@ describe("playlist brief policy", () => {
 
     expect(estimate).toEqual({
       minimumUsd: 0.35,
-      maximumUsd: 1.5,
-      approvalUsd: 1.5,
-      factors: [{ label: "large bounded fast cited research", minimumUsd: 0.35, maximumUsd: 1.5 }],
+      maximumUsd: 3,
+      approvalUsd: 3,
+      factors: [{ label: "large bounded fast cited research", minimumUsd: 0.35, maximumUsd: 3 }],
     });
+  });
+
+  test("uses explicit size-tier budgets without prompt-language escalation", () => {
+    expect(curatedResearchBudgetUsd(25)).toBe(0.75);
+    expect(curatedResearchBudgetUsd(50)).toBe(0.75);
+    expect(curatedResearchBudgetUsd(51)).toBe(1.5);
+    expect(curatedResearchBudgetUsd(100)).toBe(1.5);
+    expect(curatedResearchBudgetUsd(101)).toBe(3);
+    expect(curatedResearchBudgetUsd(300)).toBe(3);
+    expect(curatedResearchBudgetUsd(301)).toBe(0);
   });
 
   test("uses the pessimistic edge of the range for the approval gate", () => {

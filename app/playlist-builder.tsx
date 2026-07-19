@@ -55,9 +55,6 @@ type ResearchRun = {
   prompt: string;
   brief: PlaylistBrief;
   status: string;
-  estimatedCostUsd: number;
-  actualCostUsd: number;
-  approvedBudgetUsd?: number;
   phase: string;
   autoPublish?: boolean;
   error?: string | null;
@@ -167,8 +164,6 @@ type BriefResponse = {
   brief?: PlaylistBrief;
   prompt?: string;
   requestedTrackCount?: number | null;
-  estimateUsd?: number;
-  estimatedCostUsd?: number;
   cached?: boolean;
   requestId?: string;
   status?: string;

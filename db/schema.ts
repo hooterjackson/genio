@@ -9,6 +9,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   varchar,
@@ -37,6 +38,9 @@ export const briefRequests = pgTable("brief_requests", {
   guidanceSourceHintsJson: jsonb("guidance_source_hints_json").notNull().default([]),
   guidanceTelemetryJson: jsonb("guidance_telemetry_json"),
   guidancePreferencesJson: jsonb("guidance_preferences_json").notNull().default([]),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  selectionPlanJson: jsonb("selection_plan_json"),
   answersIdempotencyKey: varchar("answers_idempotency_key", { length: 160 }),
   answersHash: varchar("answers_hash", { length: 64 }),
   estimateUsd: numeric("estimate_usd", { precision: 12, scale: 6, mode: "number" }),
@@ -68,6 +72,11 @@ export const researchRuns = pgTable("research_runs", {
   guidanceSourceHintsJson: jsonb("guidance_source_hints_json").notNull().default([]),
   guidanceTelemetryJson: jsonb("guidance_telemetry_json"),
   guidancePreferencesJson: jsonb("guidance_preferences_json").notNull().default([]),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  selectionPlanJson: jsonb("selection_plan_json"),
+  pipelinePolicySnapshotJson: jsonb("pipeline_policy_snapshot_json"),
+  pipelineOutcomeJson: jsonb("pipeline_outcome_json"),
   briefHash: varchar("brief_hash", { length: 64 }).notNull(),
   status: varchar("status", { length: 48 }).notNull(),
   phase: varchar("phase", { length: 80 }).notNull(),
@@ -150,11 +159,32 @@ export const sourceRecords = pgTable("source_records", {
   retrievedAt: timestamp("retrieved_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("source_run_url_idx").on(table.runId, table.url)]);
 
+export const recordingFamilies = pgTable("recording_families", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  familyKey: text("family_key").notNull(),
+  canonicalArtist: varchar("canonical_artist", { length: 240 }).notNull(),
+  canonicalTitle: varchar("canonical_title", { length: 240 }).notNull(),
+  versionClass: varchar("version_class", { length: 40 }).notNull().default("unknown"),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("recording_family_run_key_idx").on(table.runId, table.familyKey),
+  index("recording_family_run_version_idx").on(table.runId, table.versionClass),
+]);
+
 export const trackCandidates = pgTable("track_candidates", {
   id: uuid("id").primaryKey(),
   runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
   canonicalKey: text("canonical_key").notNull(),
   duplicateClusterKey: text("duplicate_cluster_key"),
+  recordingFamilyId: uuid("recording_family_id").references(() => recordingFamilies.id, { onDelete: "set null" }),
+  candidateStage: varchar("candidate_stage", { length: 48 }).notNull().default("discovered"),
+  stageUpdatedAt: timestamp("stage_updated_at", { withTimezone: true }).notNull().defaultNow(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
   selectionRank: integer("selection_rank"),
   artist: varchar("artist", { length: 240 }).notNull(),
   title: varchar("title", { length: 240 }).notNull(),
@@ -169,8 +199,43 @@ export const trackCandidates = pgTable("track_candidates", {
 }, (table) => [
   uniqueIndex("candidate_run_key_idx").on(table.runId, table.canonicalKey),
   index("candidate_duplicate_cluster_idx").on(table.runId, table.duplicateClusterKey),
+  index("candidate_recording_family_idx").on(table.recordingFamilyId),
+  index("candidate_run_stage_idx").on(table.runId, table.candidateStage),
   index("candidate_selection_rank_idx").on(table.runId, table.selectionRank),
   index("candidate_run_outcome_idx").on(table.runId, table.outcome),
+]);
+
+export const recordingFamilyCandidates = pgTable("recording_family_candidates", {
+  recordingFamilyId: uuid("recording_family_id").notNull().references(() => recordingFamilies.id, { onDelete: "cascade" }),
+  candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id, { onDelete: "cascade" }),
+  relationship: varchar("relationship", { length: 40 }).notNull().default("member"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.recordingFamilyId, table.candidateId], name: "recording_family_candidates_pkey" }),
+  uniqueIndex("recording_family_candidate_unique_idx").on(table.candidateId),
+]);
+
+export const recordingCatalogIdentities = pgTable("recording_catalog_identities", {
+  id: uuid("id").primaryKey(),
+  recordingFamilyId: uuid("recording_family_id").notNull().references(() => recordingFamilies.id, { onDelete: "cascade" }),
+  provider: varchar("provider", { length: 40 }).notNull(),
+  storefront: varchar("storefront", { length: 16 }),
+  catalogId: varchar("catalog_id", { length: 160 }).notNull(),
+  isPreferred: boolean("is_preferred").notNull().default(false),
+  identityConfidence: numeric("identity_confidence", { precision: 8, scale: 6, mode: "number" }).notNull().default(0),
+  artist: varchar("artist", { length: 240 }).notNull(),
+  title: varchar("title", { length: 240 }).notNull(),
+  album: varchar("album", { length: 240 }),
+  isrc: varchar("isrc", { length: 32 }),
+  musicbrainzId: varchar("musicbrainz_id", { length: 80 }),
+  durationMs: integer("duration_ms"),
+  versionLabel: varchar("version_label", { length: 120 }),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("recording_catalog_identity_unique_idx").on(table.recordingFamilyId, table.provider, table.storefront, table.catalogId),
+  index("recording_catalog_identity_lookup_idx").on(table.provider, table.storefront, table.catalogId),
+  index("recording_catalog_identity_isrc_idx").on(table.isrc),
 ]);
 
 export const citationAttestations = pgTable("citation_attestations", {
@@ -247,12 +312,151 @@ export const researchContainers = pgTable("research_containers", {
   index("container_run_status_idx").on(table.runId, table.status),
 ]);
 
+export const trackScopeBindings = pgTable("track_scope_bindings", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id, { onDelete: "cascade" }),
+  sourceRecordId: uuid("source_record_id").references(() => sourceRecords.id, { onDelete: "set null" }),
+  sourceUrl: text("source_url"),
+  researchContainerId: uuid("research_container_id").references(() => researchContainers.id, { onDelete: "set null" }),
+  citationAttestationId: uuid("citation_attestation_id").references(() => citationAttestations.id, { onDelete: "set null" }),
+  bindingKind: varchar("binding_kind", { length: 64 }).notNull(),
+  eligibility: varchar("eligibility", { length: 32 }).notNull(),
+  scopeAxis: varchar("scope_axis", { length: 48 }).notNull(),
+  scopeValue: varchar("scope_value", { length: 240 }).notNull(),
+  relationship: varchar("relationship", { length: 240 }).notNull(),
+  confidence: numeric("confidence", { precision: 8, scale: 6, mode: "number" }).notNull().default(0),
+  provenancePathJson: jsonb("provenance_path_json").notNull().default([]),
+  note: varchar("note", { length: 500 }).notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("scope_binding_run_candidate_idx").on(table.runId, table.candidateId),
+  index("scope_binding_run_eligibility_idx").on(table.runId, table.eligibility),
+  unique("scope_binding_unique_key").on(
+    table.candidateId,
+    table.bindingKind,
+    table.scopeAxis,
+    table.scopeValue,
+    table.relationship,
+    table.sourceRecordId,
+    table.researchContainerId,
+  ).nullsNotDistinct(),
+]);
+
+export const candidateStageEvents = pgTable("candidate_stage_events", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id, { onDelete: "cascade" }),
+  fromStage: varchar("from_stage", { length: 48 }),
+  toStage: varchar("to_stage", { length: 48 }).notNull(),
+  reasonCode: varchar("reason_code", { length: 120 }).notNull(),
+  detailJson: jsonb("detail_json").notNull().default({}),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("candidate_stage_event_run_time_idx").on(table.runId, table.occurredAt),
+  index("candidate_stage_event_candidate_time_idx").on(table.candidateId, table.occurredAt),
+]);
+
+export const pipelineDeficitLedger = pgTable("pipeline_deficit_ledger", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  stage: varchar("stage", { length: 48 }).notNull(),
+  kind: varchar("kind", { length: 64 }).notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("open"),
+  requiredCount: integer("required_count").notNull().default(0),
+  actualCount: integer("actual_count").notNull().default(0),
+  deficitCount: integer("deficit_count").notNull().default(0),
+  reasonCode: varchar("reason_code", { length: 120 }).notNull(),
+  detailJson: jsonb("detail_json").notNull().default({}),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("pipeline_deficit_run_time_idx").on(table.runId, table.observedAt),
+  index("pipeline_deficit_run_status_idx").on(table.runId, table.status),
+]);
+
+export const pipelineOutcomes = pgTable("pipeline_outcomes", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }).unique(),
+  status: varchar("status", { length: 40 }).notNull(),
+  targetTrackCount: integer("target_track_count").notNull().default(0),
+  discoveredTrackCount: integer("discovered_track_count").notNull().default(0),
+  qualifiedTrackCount: integer("qualified_track_count").notNull().default(0),
+  selectedTrackCount: integer("selected_track_count").notNull().default(0),
+  publishedTrackCount: integer("published_track_count").notNull().default(0),
+  exactCountSatisfied: boolean("exact_count_satisfied").notNull().default(false),
+  frontierExhausted: boolean("frontier_exhausted").notNull().default(false),
+  providerUnavailable: boolean("provider_unavailable").notNull().default(false),
+  reasonCodesJson: jsonb("reason_codes_json").notNull().default([]),
+  deficitSnapshotJson: jsonb("deficit_snapshot_json").notNull().default([]),
+  outcomeJson: jsonb("outcome_json").notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  completedAt: timestamp("completed_at", { withTimezone: true }).notNull(),
+  ...timestamps,
+}, (table) => [index("pipeline_outcome_status_idx").on(table.status, table.completedAt)]);
+
 export const researchCheckpoints = pgTable("research_checkpoints", {
   runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
   phase: varchar("phase", { length: 80 }).notNull(),
   stateJson: jsonb("state_json").notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("checkpoint_run_phase_idx").on(table.runId, table.phase)]);
+
+/** Storefront-scoped, provider-response cache used only by Pipeline V2 reads. */
+export const appleCatalogCacheEntries = pgTable("apple_catalog_cache_entries", {
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  resourceKind: varchar("resource_kind", { length: 48 }).notNull(),
+  requestFingerprint: varchar("request_fingerprint", { length: 64 }).notNull(),
+  payloadJson: jsonb("payload_json").notNull(),
+  fetchedAt: timestamp("fetched_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({
+    columns: [table.storefront, table.resourceKind, table.requestFingerprint],
+    name: "apple_catalog_cache_entries_pkey",
+  }),
+  index("apple_catalog_cache_expiry_idx").on(table.expiresAt),
+]);
+
+/** Cross-worker cache-fill leases; an expired owner can always be replaced. */
+export const appleCatalogCacheLeases = pgTable("apple_catalog_cache_leases", {
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  resourceKind: varchar("resource_kind", { length: 48 }).notNull(),
+  requestFingerprint: varchar("request_fingerprint", { length: 64 }).notNull(),
+  ownerId: uuid("owner_id").notNull(),
+  acquiredAt: timestamp("acquired_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({
+    columns: [table.storefront, table.resourceKind, table.requestFingerprint],
+    name: "apple_catalog_cache_leases_pkey",
+  }),
+  index("apple_catalog_cache_lease_expiry_idx").on(table.expiresAt),
+]);
+
+/** Per-run hit/miss and upstream-state telemetry; never stores provider secrets. */
+export const appleCatalogCacheEvents = pgTable("apple_catalog_cache_events", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  resourceKind: varchar("resource_kind", { length: 48 }).notNull(),
+  requestFingerprint: varchar("request_fingerprint", { length: 64 }).notNull(),
+  cacheState: varchar("cache_state", { length: 32 }).notNull(),
+  providerState: varchar("provider_state", { length: 32 }).notNull(),
+  detailJson: jsonb("detail_json").notNull().default({}),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("apple_catalog_cache_event_run_time_idx").on(table.runId, table.occurredAt),
+  index("apple_catalog_cache_event_state_idx").on(table.cacheState, table.providerState, table.occurredAt),
+]);
 
 export const catalogMatches = pgTable("catalog_matches", {
   id: uuid("id").primaryKey(),
@@ -285,6 +489,9 @@ export const manifests = pgTable("manifests", {
   name: varchar("name", { length: 240 }).notNull(),
   description: text("description").notNull(),
   contentHash: varchar("content_hash", { length: 64 }).notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
+  selectionPlanJson: jsonb("selection_plan_json"),
   lockedAt: timestamp("locked_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
@@ -304,9 +511,66 @@ export const manifestTracks = pgTable("manifest_tracks", {
   index("manifest_track_candidate_idx").on(table.candidateId),
 ]);
 
+export const manifestRevisions = pgTable("manifest_revisions", {
+  id: uuid("id").primaryKey(),
+  manifestId: uuid("manifest_id").notNull().references(() => manifests.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  parentRevisionId: uuid("parent_revision_id"),
+  status: varchar("status", { length: 32 }).notNull().default("draft"),
+  reason: varchar("reason", { length: 500 }).notNull(),
+  contentHash: varchar("content_hash", { length: 64 }).notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  selectionPlanSnapshotJson: jsonb("selection_plan_snapshot_json"),
+  pipelinePolicySnapshotJson: jsonb("pipeline_policy_snapshot_json"),
+  outcomeSnapshotJson: jsonb("outcome_snapshot_json"),
+  deficitSnapshotJson: jsonb("deficit_snapshot_json").notNull().default([]),
+  lockedAt: timestamp("locked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("manifest_revision_number_idx").on(table.manifestId, table.revision),
+  uniqueIndex("manifest_revision_hash_idx").on(table.manifestId, table.contentHash),
+  index("manifest_revision_parent_idx").on(table.parentRevisionId),
+]);
+
+export const manifestRevisionTracks = pgTable("manifest_revision_tracks", {
+  manifestRevisionId: uuid("manifest_revision_id").notNull().references(() => manifestRevisions.id, { onDelete: "cascade" }),
+  position: integer("position").notNull(),
+  candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id),
+  recordingFamilyId: uuid("recording_family_id").references(() => recordingFamilies.id, { onDelete: "set null" }),
+  catalogIdentityId: uuid("catalog_identity_id").references(() => recordingCatalogIdentities.id, { onDelete: "set null" }),
+  catalogId: varchar("catalog_id", { length: 160 }).notNull(),
+  artist: varchar("artist", { length: 240 }).notNull(),
+  title: varchar("title", { length: 240 }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.manifestRevisionId, table.position], name: "manifest_revision_tracks_pkey" }),
+  index("manifest_revision_track_candidate_idx").on(table.candidateId),
+  index("manifest_revision_track_family_idx").on(table.recordingFamilyId),
+]);
+
+export const manifestRevisionReserveTracks = pgTable("manifest_revision_reserve_tracks", {
+  manifestRevisionId: uuid("manifest_revision_id").notNull().references(() => manifestRevisions.id, { onDelete: "cascade" }),
+  position: integer("position").notNull(),
+  candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id),
+  recordingFamilyId: uuid("recording_family_id").notNull().references(() => recordingFamilies.id, { onDelete: "cascade" }),
+  catalogIdentityId: uuid("catalog_identity_id").notNull().references(() => recordingCatalogIdentities.id, { onDelete: "cascade" }),
+  catalogId: varchar("catalog_id", { length: 160 }).notNull(),
+  artist: varchar("artist", { length: 240 }).notNull(),
+  title: varchar("title", { length: 240 }).notNull(),
+  evidenceEligible: boolean("evidence_eligible").notNull(),
+  hardConstraintsSatisfied: boolean("hard_constraints_satisfied").notNull(),
+  versionCompatible: boolean("version_compatible").notNull(),
+  qualified: boolean("qualified").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.manifestRevisionId, table.position], name: "manifest_revision_reserve_tracks_pkey" }),
+  uniqueIndex("manifest_revision_reserve_candidate_idx").on(table.manifestRevisionId, table.candidateId),
+  uniqueIndex("manifest_revision_reserve_family_idx").on(table.manifestRevisionId, table.recordingFamilyId),
+]);
+
 export const publicationVolumes = pgTable("publication_volumes", {
   id: uuid("id").primaryKey(),
   manifestId: uuid("manifest_id").notNull().references(() => manifests.id, { onDelete: "cascade" }),
+  manifestRevisionId: uuid("manifest_revision_id").references(() => manifestRevisions.id, { onDelete: "set null" }),
   volumeNumber: integer("volume_number").notNull(),
   volumeCount: integer("volume_count").notNull(),
   startPosition: integer("start_position").notNull(),
@@ -319,7 +583,10 @@ export const publicationVolumes = pgTable("publication_volumes", {
   lastError: text("last_error"),
   publishedAt: timestamp("published_at", { withTimezone: true }),
   ...timestamps,
-}, (table) => [uniqueIndex("publication_manifest_volume_idx").on(table.manifestId, table.volumeNumber)]);
+}, (table) => [
+  uniqueIndex("publication_manifest_volume_idx").on(table.manifestId, table.volumeNumber),
+  index("publication_manifest_revision_idx").on(table.manifestRevisionId, table.volumeNumber),
+]);
 
 /**
  * A deliberately small, public-safe projection of successfully published
@@ -335,6 +602,10 @@ export const publicPlaylists = pgTable("public_playlists", {
   trackCount: integer("track_count").notNull(),
   volumeCount: integer("volume_count").notNull(),
   status: varchar("status", { length: 32 }).notNull().default("listed"),
+  // Owner visibility is durable across automatic publication projections.
+  // The publisher may temporarily hide a stale revision, but only an explicit
+  // owner action may set or clear this flag.
+  ownerHidden: boolean("owner_hidden").notNull().default(false),
   publishedAt: timestamp("published_at", { withTimezone: true }).notNull(),
   hiddenAt: timestamp("hidden_at", { withTimezone: true }),
   ...timestamps,
@@ -368,6 +639,8 @@ export const jobQueue = pgTable("job_queue", {
   briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "cascade" }),
   kind: varchar("kind", { length: 64 }).notNull(),
   dedupeKey: varchar("dedupe_key", { length: 160 }).notNull().default("default"),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
+  minimumWorkerProtocol: integer("minimum_worker_protocol").notNull().default(4),
   status: varchar("status", { length: 32 }).notNull().default("queued"),
   payloadJson: jsonb("payload_json").notNull().default({}),
   attempts: integer("attempts").notNull().default(0),
@@ -381,6 +654,13 @@ export const jobQueue = pgTable("job_queue", {
 }, (table) => [
   uniqueIndex("job_dedupe_idx").on(table.kind, table.dedupeKey),
   index("job_lease_idx").on(table.status, table.availableAt, table.leaseExpiresAt),
+  index("job_protocol_lease_idx").on(
+    table.status,
+    table.minimumWorkerProtocol,
+    table.pipelineVersion,
+    table.availableAt,
+    table.leaseExpiresAt,
+  ),
   index("job_run_idx").on(table.runId),
 ]);
 

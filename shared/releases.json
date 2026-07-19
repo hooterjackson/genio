@@ -2,6 +2,21 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.1.0",
+      "releasedAt": "2026-07-19",
+      "title": "Relevance-first pipeline foundation",
+      "notes": [
+        "Added a versioned relevance-first selection plan for curated requests while preserving the claim-first factual and exhaustive workflow.",
+        "Added subject-specific guidance, typed constraints, and explicit disambiguation for genre, scene, geography, similarity, and factual relationships.",
+        "Added track-scope evidence bindings, recording families, catalog alternates, candidate-stage counters, and a diagnostic deficit ledger.",
+        "Added adaptive exact-fill recovery, immutable manifest revisions, and safe partial or no-compatible-track outcomes instead of count-shortfall errors.",
+        "Added pinned Luna and Terra model routing with bounded scout and playlist-size research budgets visible only to the owner.",
+        "Added the Pipeline V2 discovery controller and policy contracts for staged rollout without reinterpreting existing V1 runs.",
+        "Added mixed-version worker leasing so V1 and V2 jobs remain isolated during deploys, rollback, and worker restart recovery.",
+        "Added a storefront-scoped Apple catalog cache with request fingerprints, bounded TTLs, and durable hit and provider-state telemetry."
+      ]
+    },
+    {
       "version": "1.0.0",
       "releasedAt": "2026-07-18",
       "title": "Production baseline",

@@ -1,0 +1,226 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Provider-free Pipeline V2 release contracts for intent routing, conservative exact-fill planning, constraint relaxation, and partial-vs-failed terminal semantics.",
+  "exactFillCases": [
+    {
+      "id": "XF-COLD-25",
+      "target": 25,
+      "selectable": 0,
+      "observedAttempts": 0,
+      "observedSelectable": 0,
+      "minimumPlannedRaw": 60,
+      "note": "A cold start uses the conservative 50% prior and includes a five-track selectable reserve."
+    },
+    {
+      "id": "XF-OBSERVED-50",
+      "target": 50,
+      "selectable": 39,
+      "observedAttempts": 50,
+      "observedSelectable": 39,
+      "minimumPlannedRaw": 24,
+      "note": "Planning uses the lower confidence bound, not the optimistic observed 78% point estimate."
+    },
+    {
+      "id": "XF-LOW-YIELD-50",
+      "target": 50,
+      "selectable": 18,
+      "observedAttempts": 50,
+      "observedSelectable": 18,
+      "minimumPlannedRaw": 135,
+      "note": "A low-yield route expands discovery rather than repeatedly asking for target plus a fixed percentage."
+    },
+    {
+      "id": "XF-ALREADY-FULL",
+      "target": 100,
+      "selectable": 100,
+      "observedAttempts": 140,
+      "observedSelectable": 100,
+      "minimumPlannedRaw": 0,
+      "note": "Exact fill stops on selectable catalog matches, never on raw candidate count."
+    }
+  ],
+  "routeCases": [
+    {
+      "id": "RT-HOUSE-GENRE",
+      "prompt": "25 classic house tracks for a late-night dance floor",
+      "requestedTrackCount": 25,
+      "seedTitle": "Songs About Houses",
+      "seedEntities": ["Houses"],
+      "seedRelationship": "has a title or lyric about a physical house",
+      "expectedRoute": "catalog_curated",
+      "expectedIntent": "genre",
+      "expectedTerms": ["house music genre"],
+      "forbiddenTerms": ["title or lyric about a physical house"]
+    },
+    {
+      "id": "RT-FRENCH-JAZZ",
+      "prompt": "50 French jazz tracks across eras and scenes",
+      "requestedTrackCount": 50,
+      "seedTitle": "French Jazz",
+      "seedEntities": ["French jazz"],
+      "seedRelationship": "is representative of French jazz",
+      "expectedRoute": "catalog_curated",
+      "expectedIntent": "geographic_genre",
+      "expectedTerms": ["french jazz"],
+      "forbiddenTerms": []
+    },
+    {
+      "id": "RT-DRILL",
+      "prompt": "50 foundational Chicago drill tracks, from early street releases to its global influence",
+      "requestedTrackCount": 50,
+      "seedTitle": "Chicago Drill",
+      "seedEntities": ["Chicago drill"],
+      "seedRelationship": "is foundational to the Chicago drill genre and scene",
+      "expectedRoute": "catalog_curated",
+      "expectedIntent": "genre_history",
+      "expectedTerms": ["chicago drill"],
+      "forbiddenTerms": ["power tools"]
+    },
+    {
+      "id": "RT-SIMILARITY",
+      "prompt": "Music like Radiohead, but by other artists",
+      "requestedTrackCount": 50,
+      "seedTitle": "Radiohead Essentials",
+      "seedEntities": ["Radiohead"],
+      "seedRelationship": "is a recording by Radiohead",
+      "expectedRoute": "catalog_curated",
+      "expectedIntent": "similarity",
+      "expectedTerms": ["stylistically similar", "reference artist"],
+      "forbiddenTerms": ["is a recording by radiohead"]
+    },
+    {
+      "id": "RT-PAULINHO-EXHAUSTIVE",
+      "prompt": "Every released recording Paulinho da Costa performed on",
+      "requestedTrackCount": null,
+      "seedTitle": "Paulinho da Costa Complete Credits",
+      "seedEntities": ["Paulinho da Costa"],
+      "seedRelationship": "has documented track-level performance credit for Paulinho da Costa",
+      "expectedRoute": "evidence_frontier",
+      "expectedIntent": "factual_exhaustive_credit",
+      "expectedTerms": ["paulinho da costa", "performance credit"],
+      "forbiddenTerms": []
+    },
+    {
+      "id": "RT-PAULINHO-CURATED",
+      "prompt": "Paulinho da Costa's 100 most influential recordings",
+      "requestedTrackCount": 100,
+      "seedTitle": "Paulinho da Costa: Most Influential",
+      "seedEntities": ["Paulinho da Costa"],
+      "seedRelationship": "is an influential recording with documented Paulinho da Costa performance credit",
+      "expectedRoute": "catalog_curated",
+      "expectedIntent": "credited_artist_editorial",
+      "expectedTerms": ["paulinho da costa", "influential", "performance credit"],
+      "forbiddenTerms": []
+    }
+  ],
+  "titleKeywordFalsePositives": [
+    {
+      "id": "KW-HOUSE-01",
+      "requestIntent": "house_music_genre",
+      "artist": "Madness",
+      "title": "Our House",
+      "genreEvidence": false,
+      "expectedSelectable": false
+    },
+    {
+      "id": "KW-HOUSE-02",
+      "requestIntent": "house_music_genre",
+      "artist": "The Animals",
+      "title": "The House of the Rising Sun",
+      "genreEvidence": false,
+      "expectedSelectable": false
+    },
+    {
+      "id": "KW-HOUSE-03",
+      "requestIntent": "house_music_genre",
+      "artist": "Talking Heads",
+      "title": "Burning Down the House",
+      "genreEvidence": false,
+      "expectedSelectable": false
+    },
+    {
+      "id": "KW-HOUSE-04",
+      "requestIntent": "house_music_genre",
+      "artist": "Frankie Knuckles",
+      "title": "Your Love",
+      "genreEvidence": true,
+      "expectedSelectable": true
+    }
+  ],
+  "constraintCases": [
+    {
+      "id": "CN-RELAX-SOFT",
+      "target": 5,
+      "constraints": [
+        { "id": "explicit_exclusion", "kind": "hard", "relaxationRank": null },
+        { "id": "requested_genre", "kind": "hard", "relaxationRank": null },
+        { "id": "album_cap", "kind": "soft", "relaxationRank": 1 },
+        { "id": "era_balance", "kind": "soft", "relaxationRank": 2 }
+      ],
+      "candidates": [
+        { "id": "a", "violations": [] },
+        { "id": "b", "violations": [] },
+        { "id": "c", "violations": ["album_cap"] },
+        { "id": "d", "violations": ["album_cap"] },
+        { "id": "e", "violations": ["album_cap"] },
+        { "id": "f", "violations": ["explicit_exclusion"] }
+      ],
+      "expectedState": "exact",
+      "expectedRelaxed": ["album_cap"],
+      "expectedSelected": ["a", "b", "c", "d", "e"]
+    },
+    {
+      "id": "CN-HARD-SHORTFALL",
+      "target": 5,
+      "constraints": [
+        { "id": "requested_genre", "kind": "hard", "relaxationRank": null },
+        { "id": "explicit_exclusion", "kind": "hard", "relaxationRank": null },
+        { "id": "artist_diversity", "kind": "soft", "relaxationRank": 1 }
+      ],
+      "candidates": [
+        { "id": "a", "violations": [] },
+        { "id": "b", "violations": [] },
+        { "id": "c", "violations": ["artist_diversity"] },
+        { "id": "d", "violations": ["requested_genre"] },
+        { "id": "e", "violations": ["explicit_exclusion"] }
+      ],
+      "expectedState": "partial",
+      "expectedRelaxed": ["artist_diversity"],
+      "expectedSelected": ["a", "b", "c"]
+    }
+  ],
+  "terminalCases": [
+    {
+      "id": "TM-PROVIDER-PARTIAL",
+      "failureOrigin": "provider",
+      "safeTrackCount": 39,
+      "target": 50,
+      "expectedStatus": "partial",
+      "expectedPublicClass": "provider_unavailable"
+    },
+    {
+      "id": "TM-CATALOG-PARTIAL",
+      "failureOrigin": "catalog_shortfall",
+      "safeTrackCount": 18,
+      "target": 50,
+      "expectedStatus": "partial",
+      "expectedPublicClass": "catalog_shortfall"
+    },
+    {
+      "id": "TM-ZERO-YIELD-PARTIAL",
+      "failureOrigin": "provider",
+      "safeTrackCount": 0,
+      "target": 25,
+      "expectedStatus": "partial",
+      "expectedPublicClass": "provider_unavailable"
+    },
+    {
+      "id": "TM-LOCAL-CONTRACT-FAIL",
+      "failureOrigin": "local_contract",
+      "safeTrackCount": 39,
+      "target": 50,
+      "expectedStatus": "failed",
+      "expectedPublicClass": "internal_contract"
+    }
+  ]
+}

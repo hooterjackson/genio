@@ -1,25 +1,57 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { Pool, PoolClient } from "pg";
-import { createDatabase, DATABASE_SCHEMA_VERSION, type DatabaseHandle } from "../db/index.ts";
+import {
+  createDatabase,
+  DATABASE_SCHEMA_SUPPORT,
+  DATABASE_SCHEMA_VERSION,
+  isDatabaseSchemaVersionCompatible,
+  type DatabaseHandle,
+  type DatabaseSchemaSupport,
+} from "../db/index.ts";
 import { settings } from "../db/schema.ts";
 import type {
+  AlternateCatalogIdentity,
+  CandidateStage,
+  CandidateStageEvent,
+  CatalogDiscoveredCandidateInput,
+  CatalogDiscoveredCandidateResult,
   CatalogMatchResult,
   CatalogSong,
   EvidenceClaimInput,
+  ManifestRevision,
+  ManifestRevisionReserveTrack,
+  ManifestRevisionStatus,
+  ManifestRevisionTrack,
+  PipelineDeficitLedgerEntry,
+  PipelineOutcome,
+  PipelinePolicyVersion,
+  PipelinePolicySnapshot,
+  PipelineVersion,
   PlaylistBrief,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
   PlaylistGuidanceSourceHint,
   PlaylistGuidanceTelemetry,
   PlaylistManifest,
+  PublicResearchRunView,
   PublicPlaylistDirectoryItem,
   PublicPlaylistDirectoryPage,
+  RecordingFamily,
   ResearchRunView,
+  SelectionConstraint,
+  SelectionPlan,
   SourceFrontierItem,
   SourceRecordInput,
+  TrackScopeBinding,
   TrackCandidateInput,
 } from "../shared/types.ts";
+import { publicResearchRunView } from "./public-api-projections.ts";
+import {
+  selectBroadCuratedCandidates,
+  shouldScoreBroadCuratedSelection,
+  type BroadCuratedCandidate,
+} from "../shared/selection-score-v2.ts";
 import {
   GUIDED_BRIEF_BUDGET_USD,
   GUIDED_SCOUT_BUDGET_USD,
@@ -58,10 +90,12 @@ import {
   createFastPostMatchRefillRouteCheckpoint,
   FAST_POST_MATCH_REFILL_MAX_COST_USD,
   createFastRouteCheckpoint,
+  createPipelinePolicySnapshot,
   FAST_POST_MATCH_REFILL_LIMIT,
   researchExecutionPolicy,
   researchPolicyFingerprint,
 } from "./research-policy.ts";
+import type { PreflightManifestTrack, PreflightReserveTrack } from "./manifest-preflight-v2.ts";
 import { resolveEvidenceSubjectBinding } from "./evidence-binding.ts";
 import {
   CATALOG_RECOVERY_UNRESOLVED_BASIS,
@@ -74,9 +108,18 @@ import {
   type HostedCitationAttestation,
 } from "./citation-attestation.ts";
 import { appleAuthorizationGeneration } from "./apple.ts";
+import type {
+  AppleCatalogCacheEntry,
+  AppleCatalogCacheEvent,
+  AppleCatalogCacheResourceKind,
+  AppleCatalogCacheWrite,
+} from "./apple-catalog-cache.ts";
 import { excludedReferenceArtists } from "./similarity-policy.ts";
 import {
+  isWorkerCapabilityValid,
   isWorkerPipelineProtocolCompatible,
+  WORKER_PIPELINE_CAPABILITY,
+  type WorkerPipelineCapability,
   workerPipelineProtocolVersion,
 } from "./worker-protocol.ts";
 import {
@@ -94,6 +137,31 @@ import {
   safeCustomGuidanceText,
   type PlaylistGuidancePreference,
 } from "./guidance-context.ts";
+import { assignPipelineV2, createSelectionPlanV2, pipelineRolloutStickyKey } from "./selection-plan-v2.ts";
+import {
+  catalogContentRating,
+  catalogRecordingVersionClass,
+  scopeBindingEligible,
+  selectWithConstraintLadder,
+  type ConstraintCandidate,
+  type ConstraintRule,
+  type ConstraintSelection,
+} from "./pipeline-v2-policy.ts";
+import { buildPipelineOutcome, mergePipelineOutcomes } from "./pipeline-outcome-v2.ts";
+import {
+  evaluatePipelineOperationalWindow,
+  PIPELINE_LEDGER_STAGES,
+  type PipelineOperationalSweepResult,
+  type PipelineOperationalWindow,
+  type PipelineStageCounts,
+} from "./pipeline-v2-observability.ts";
+import { requiresFactualFrontier } from "./factual-frontier-policy.ts";
+import {
+  bindingGeographyRelationship,
+  proofSupportsSelectionGeography,
+  provenancePathWithGeographyRelationship,
+  selectionGeographyBindingsSatisfied,
+} from "./selection-geography-policy.ts";
 
 // Global capacity protects paid/worker work, not saved visitor state. A run
 // waiting on scope review, budget approval, track selection, or Apple
@@ -176,6 +244,8 @@ type CandidateRow = TrackCandidateInput & {
   runId: string;
   outcome: string;
   duplicateClusterKey: string | null;
+  pipelineVersion: PipelineVersion;
+  policyVersion: SelectionPlan["policyVersion"];
 };
 
 export interface JobView {
@@ -186,6 +256,8 @@ export interface JobView {
   payload: Record<string, unknown>;
   attempts: number;
   maxAttempts: number;
+  pipelineVersion: PipelineVersion;
+  minimumWorkerProtocol: number;
   leaseOwner: string | null;
   leaseExpiresAt: Date | null;
 }
@@ -250,6 +322,7 @@ export interface CatalogSelectionInput {
 
 export interface PublicationVolumeInput {
   manifestId: string;
+  manifestRevisionId?: string | null;
   volumeNumber: number;
   volumeCount: number;
   startPosition: number;
@@ -302,6 +375,671 @@ function finiteMoney(value: number, field: string): number {
 function date(value: unknown): Date | null {
   if (!value) return null;
   return value instanceof Date ? value : new Date(String(value));
+}
+
+function heartbeatSchemaSupport(row: {
+  schema_version: string;
+  metadata_json?: unknown;
+}): DatabaseSchemaSupport {
+  const metadata = row.metadata_json && typeof row.metadata_json === "object" && !Array.isArray(row.metadata_json)
+    ? row.metadata_json as Record<string, unknown>
+    : {};
+  const minimum = typeof metadata.schemaMinimum === "string" ? metadata.schemaMinimum : row.schema_version;
+  const maximum = typeof metadata.schemaMaximum === "string" ? metadata.schemaMaximum : row.schema_version;
+  const preferred = typeof metadata.schemaPreferred === "string" ? metadata.schemaPreferred : row.schema_version;
+  return { minimum, maximum, preferred };
+}
+
+function heartbeatObservedSchemaVersion(row: {
+  schema_version: string;
+  metadata_json?: unknown;
+}): string {
+  const metadata = row.metadata_json && typeof row.metadata_json === "object" && !Array.isArray(row.metadata_json)
+    ? row.metadata_json as Record<string, unknown>
+    : {};
+  return typeof metadata.observedSchemaVersion === "string"
+    ? metadata.observedSchemaVersion
+    : row.schema_version;
+}
+
+function heartbeatSchemaCompatible(
+  row: { schema_version: string; metadata_json?: unknown },
+  databaseSchemaVersion: string | null,
+): boolean {
+  return isDatabaseSchemaVersionCompatible(databaseSchemaVersion, heartbeatSchemaSupport(row))
+    && heartbeatObservedSchemaVersion(row) === databaseSchemaVersion;
+}
+
+function deterministicUuid(value: unknown): string {
+  const hex = sha256Hex(stableStringify(value));
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+const APPLE_CATALOG_CACHE_RESOURCE_KINDS = new Set<AppleCatalogCacheResourceKind>([
+  "catalog_resource",
+  "search_view",
+  "artist_view",
+  "playlist_membership",
+  "musicbrainz_identity",
+]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function assertAppleCatalogCacheIdentity(
+  storefront: string,
+  resourceKind: AppleCatalogCacheResourceKind,
+  requestFingerprint: string,
+): void {
+  if (!/^[a-z]{2}$/u.test(storefront.toLowerCase())
+    || !APPLE_CATALOG_CACHE_RESOURCE_KINDS.has(resourceKind)
+    || !/^[a-f0-9]{64}$/u.test(requestFingerprint)) {
+    throw new HttpError(400, "Apple catalog cache identity is invalid", "invalid_catalog_cache_identity");
+  }
+}
+
+async function persistPipelineOutcomeTransaction(
+  client: PoolClient,
+  runId: string,
+  incoming: PipelineOutcome,
+): Promise<PipelineOutcome> {
+  const selectedRun = await client.query<{
+    pipeline_version: string;
+    policy_version: string;
+  }>(
+    `SELECT pipeline_version,policy_version FROM research_runs
+     WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+    [runId],
+  );
+  const run = selectedRun.rows[0];
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  if (run.pipeline_version !== incoming.pipelineVersion || run.policy_version !== incoming.policyVersion) {
+    throw new HttpError(409, "Pipeline outcome versions do not match the immutable run", "pipeline_policy_mismatch");
+  }
+  const selectedOutcome = await client.query<{ outcome_json: PipelineOutcome }>(
+    "SELECT outcome_json FROM pipeline_outcomes WHERE run_id=$1 FOR UPDATE",
+    [runId],
+  );
+  let merged: PipelineOutcome;
+  try {
+    merged = selectedOutcome.rows[0]
+      ? mergePipelineOutcomes(selectedOutcome.rows[0].outcome_json, incoming)
+      : incoming;
+  } catch (error) {
+    throw new HttpError(
+      409,
+      error instanceof Error ? error.message : "Pipeline outcome conflicts with persisted state",
+      "pipeline_outcome_immutable",
+    );
+  }
+  const serializedOutcome = JSON.stringify(merged);
+  await client.query(
+    `INSERT INTO pipeline_outcomes(
+       id,run_id,status,target_track_count,discovered_track_count,qualified_track_count,
+       selected_track_count,published_track_count,exact_count_satisfied,frontier_exhausted,
+       provider_unavailable,reason_codes_json,deficit_snapshot_json,outcome_json,
+       pipeline_version,policy_version,completed_at)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+     ON CONFLICT(run_id) DO UPDATE SET
+       status=EXCLUDED.status,target_track_count=EXCLUDED.target_track_count,
+       discovered_track_count=EXCLUDED.discovered_track_count,
+       qualified_track_count=EXCLUDED.qualified_track_count,
+       selected_track_count=EXCLUDED.selected_track_count,
+       published_track_count=EXCLUDED.published_track_count,
+       exact_count_satisfied=EXCLUDED.exact_count_satisfied,
+       frontier_exhausted=EXCLUDED.frontier_exhausted,
+       provider_unavailable=EXCLUDED.provider_unavailable,
+       reason_codes_json=EXCLUDED.reason_codes_json,
+       deficit_snapshot_json=EXCLUDED.deficit_snapshot_json,
+       outcome_json=EXCLUDED.outcome_json,completed_at=EXCLUDED.completed_at,updated_at=now()`,
+    [
+      randomUUID(),
+      runId,
+      merged.status,
+      merged.targetTrackCount,
+      merged.discoveredTrackCount,
+      merged.qualifiedTrackCount,
+      merged.selectedTrackCount,
+      merged.publishedTrackCount,
+      merged.exactCountSatisfied,
+      merged.frontierExhausted,
+      merged.providerUnavailable,
+      JSON.stringify(merged.reasonCodes),
+      JSON.stringify(merged.deficits),
+      serializedOutcome,
+      merged.pipelineVersion,
+      merged.policyVersion,
+      merged.completedAt,
+    ],
+  );
+  // Version columns are immutable after run creation. Outcome retries may only
+  // advance the monotonic projection stored on the run.
+  await client.query(
+    "UPDATE research_runs SET pipeline_outcome_json=$2,updated_at=now() WHERE id=$1",
+    [runId, serializedOutcome],
+  );
+  return merged;
+}
+
+function boundedPipelineBatch<T>(items: readonly T[], maximum: number, field: string): readonly T[] {
+  if (items.length > maximum) {
+    throw new HttpError(400, `${field} exceeds the ${maximum}-item persistence limit`, "pipeline_batch_too_large");
+  }
+  return items;
+}
+
+interface CandidateStageProgression {
+  candidateId: string;
+  stages: ReadonlyArray<{
+    toStage: CandidateStage;
+    reasonCode: string;
+    detail?: Record<string, unknown>;
+  }>;
+}
+
+const CANDIDATE_STAGE_RANK: Partial<Record<CandidateStage, number>> = {
+  discovered: 0,
+  identity_resolved: 1,
+  scope_qualified: 2,
+  claim_verified: 3,
+  version_compatible: 4,
+  catalog_resolved: 5,
+  playable: 6,
+  canonicalized: 7,
+  eligible: 7,
+  quota_eligible: 8,
+  sequenced: 9,
+  selected: 9,
+  manifested: 10,
+  published: 11,
+};
+
+const TERMINAL_CANDIDATE_STAGES = new Set<CandidateStage>(["rejected", "exhausted"]);
+
+/**
+ * Advance candidate history inside an existing transaction. Events are
+ * inserted in one bounded batch and use stable IDs that deliberately exclude
+ * their timestamp, so a reclaimed worker cannot create a second copy of the
+ * same semantic transition.
+ */
+async function advanceCandidateStagesTransaction(
+  client: PoolClient,
+  runId: string,
+  progressions: readonly CandidateStageProgression[],
+  versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+): Promise<CandidateStageEvent[]> {
+  const targetCount = progressions.reduce((count, progression) => count + progression.stages.length, 0);
+  if (targetCount === 0) return [];
+  if (targetCount > 50_000) {
+    throw new HttpError(400, "Candidate stage transitions exceed the 50000-item persistence limit", "pipeline_batch_too_large");
+  }
+  const candidateIds = [...new Set(progressions.map((progression) => progression.candidateId))];
+  const selected = await client.query<{
+    id: string;
+    candidate_stage: CandidateStage;
+    stage_updated_at: Date;
+  }>(
+    `SELECT id,candidate_stage,stage_updated_at FROM track_candidates
+     WHERE run_id=$1 AND id=ANY($2::uuid[]) FOR UPDATE`,
+    [runId, candidateIds],
+  );
+  if (selected.rows.length !== candidateIds.length) {
+    throw new HttpError(400, "Stage transition references a candidate outside this research run", "invalid_candidate_stage_event");
+  }
+  const currentById = new Map(selected.rows.map((row) => [row.id, {
+    stage: row.candidate_stage,
+    occurredAt: date(row.stage_updated_at) ?? new Date(0),
+  }]));
+  const base = Date.now();
+  const events: CandidateStageEvent[] = [];
+  for (const progression of progressions) {
+    const current = currentById.get(progression.candidateId)!;
+    for (const target of progression.stages) {
+      if (TERMINAL_CANDIDATE_STAGES.has(current.stage)) break;
+      const currentRank = CANDIDATE_STAGE_RANK[current.stage];
+      const targetRank = CANDIDATE_STAGE_RANK[target.toStage];
+      if (target.toStage !== "rejected"
+        && currentRank != null
+        && targetRank != null
+        && currentRank >= targetRank) continue;
+      if (target.toStage === current.stage) continue;
+      const occurredAt = new Date(Math.max(
+        base + events.length,
+        current.occurredAt.getTime() + 1,
+      ));
+      events.push({
+        candidateId: progression.candidateId,
+        fromStage: current.stage,
+        toStage: target.toStage,
+        reasonCode: target.reasonCode.slice(0, 120),
+        detail: { ...(target.detail ?? {}) },
+        occurredAt: occurredAt.toISOString(),
+      });
+      current.stage = target.toStage;
+      current.occurredAt = occurredAt;
+    }
+  }
+  if (events.length === 0) return [];
+  const input = events.map((event) => ({
+    id: deterministicUuid({
+      runId,
+      candidateId: event.candidateId,
+      fromStage: event.fromStage,
+      toStage: event.toStage,
+      reasonCode: event.reasonCode,
+      detail: event.detail,
+    }),
+    candidate_id: event.candidateId,
+    from_stage: event.fromStage,
+    to_stage: event.toStage,
+    reason_code: event.reasonCode,
+    detail_json: event.detail,
+    occurred_at: event.occurredAt,
+  }));
+  await client.query(
+    `WITH input AS (
+       SELECT * FROM jsonb_to_recordset($2::jsonb) AS item(
+         id uuid,candidate_id uuid,from_stage varchar,to_stage varchar,
+         reason_code varchar,detail_json jsonb,occurred_at timestamptz
+       )
+     )
+     INSERT INTO candidate_stage_events(
+       id,run_id,candidate_id,from_stage,to_stage,reason_code,detail_json,
+       pipeline_version,policy_version,occurred_at)
+     SELECT id,$1,candidate_id,from_stage,to_stage,reason_code,detail_json,$3,$4,occurred_at
+     FROM input ON CONFLICT(id) DO NOTHING`,
+    [runId, JSON.stringify(input), versions.pipelineVersion, versions.policyVersion],
+  );
+  await client.query(
+    `UPDATE track_candidates tc SET candidate_stage=latest.to_stage,
+       stage_updated_at=latest.occurred_at,pipeline_version=$2,policy_version=$3
+     FROM (
+       SELECT DISTINCT ON (candidate_id) candidate_id,to_stage,occurred_at
+       FROM candidate_stage_events WHERE run_id=$1
+       ORDER BY candidate_id,occurred_at DESC,id DESC
+     ) latest
+     WHERE tc.id=latest.candidate_id AND tc.run_id=$1
+       AND tc.stage_updated_at<=latest.occurred_at`,
+    [runId, versions.pipelineVersion, versions.policyVersion],
+  );
+  return events;
+}
+
+async function getPipelineStageCountsTransaction(
+  client: Pick<PoolClient, "query">,
+  runId: string,
+): Promise<PipelineStageCounts> {
+  const [candidateCount, reached] = await Promise.all([
+    client.query<{ count: number }>(
+      "SELECT count(*)::int count FROM track_candidates WHERE run_id=$1",
+      [runId],
+    ),
+    client.query<{ stage: string; count: number }>(
+      `SELECT CASE
+         WHEN to_stage='eligible' THEN 'canonicalized'
+         WHEN to_stage='selected' THEN 'sequenced'
+         ELSE to_stage
+       END stage,count(DISTINCT candidate_id)::int count
+       FROM candidate_stage_events WHERE run_id=$1
+       GROUP BY 1`,
+      [runId],
+    ),
+  ]);
+  const counts: PipelineStageCounts = {
+    discovered: Number(candidateCount.rows[0]?.count ?? 0),
+  };
+  for (const row of reached.rows) {
+    if ((PIPELINE_LEDGER_STAGES as readonly string[]).includes(row.stage)) {
+      counts[row.stage as keyof PipelineStageCounts] = Number(row.count ?? 0);
+    }
+  }
+  return counts;
+}
+
+function primaryEvidenceScopeAxis(
+  plan: SelectionPlan | null,
+): TrackScopeBinding["scopeAxis"] {
+  if (plan?.intents.includes("factual_relationship")) return "factual_relationship";
+  if (plan?.intents.includes("similarity")) return "similarity";
+  if (plan?.intents.includes("mood_activity")) return "mood_theme_activity";
+  if (plan?.intents.includes("theme")) return "theme";
+  if (plan?.intents.includes("artist_catalogue")) return "artist_catalog";
+  if (plan?.intents.includes("editorial_ranking")) return "editorial_ranked";
+  if (plan?.intents.includes("exhaustive")) return "exhaustive";
+  const scopedConstraint = plan?.constraints.find((constraint) => [
+    "genre", "scene", "era", "geography", "language", "mood", "theme", "activity",
+  ].includes(constraint.axis));
+  if (scopedConstraint && [
+    "genre", "scene", "era", "geography", "language", "mood", "theme", "activity",
+  ].includes(scopedConstraint.axis)) {
+    return scopedConstraint.axis as TrackScopeBinding["scopeAxis"];
+  }
+  return "genre_scene";
+}
+
+const CONSTRAINT_PROOF_STOPWORDS = new Set([
+  "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "the", "to", "with",
+  "recording", "recordings", "song", "songs", "track", "tracks", "music",
+]);
+
+function meaningfulConstraintTokens(value: string): string[] {
+  return normalizedPolicyText(value).split(" ").filter((token) => (
+    token.length >= 3 && !CONSTRAINT_PROOF_STOPWORDS.has(token)
+  ));
+}
+
+function proofTextSupportsValue(proofText: string, value: string): boolean {
+  const proofTokens = new Set(meaningfulConstraintTokens(proofText));
+  const expected = [...new Set(meaningfulConstraintTokens(value))];
+  if (expected.length === 0) return false;
+  const overlap = expected.filter((token) => proofTokens.has(token)).length;
+  const required = expected.length <= 2 ? expected.length : Math.max(2, Math.ceil(expected.length / 2));
+  return overlap >= required;
+}
+
+interface EvidenceScopeDescriptor {
+  scopeAxis: TrackScopeBinding["scopeAxis"];
+  scopeValue: string;
+  geographyRelationship: TrackScopeBinding["geographyRelationship"];
+}
+
+function constraintScopeAxis(axis: SelectionConstraint["axis"]): TrackScopeBinding["scopeAxis"] | null {
+  if (axis === "genre" || axis === "subgenre") return "genre";
+  if (axis === "scene" || axis === "label" || axis === "venue") return "scene";
+  if (axis === "geography") return "geography";
+  if (axis === "language") return "language";
+  if (axis === "mood") return "mood";
+  if (axis === "activity") return "activity";
+  if (axis === "theme") return "theme";
+  return null;
+}
+
+function evidenceScopeDescriptors(
+  plan: SelectionPlan | null,
+  brief: PlaylistBrief,
+  proofText: string,
+  relationshipProofText: string,
+): EvidenceScopeDescriptor[] {
+  const descriptors: EvidenceScopeDescriptor[] = [];
+  const seen = new Set<string>();
+  const add = (
+    scopeAxis: TrackScopeBinding["scopeAxis"],
+    scopeValue: string,
+    geographyRelationship: TrackScopeBinding["geographyRelationship"] = null,
+  ) => {
+    const clean = scopeValue.trim().slice(0, 240);
+    const key = `${scopeAxis}:${normalizedPolicyText(clean)}:${geographyRelationship ?? ""}`;
+    if (!clean || seen.has(key)) return;
+    seen.add(key);
+    descriptors.push({ scopeAxis, scopeValue: clean, geographyRelationship });
+  };
+
+  for (const constraint of plan?.constraints ?? []) {
+    if (constraint.kind !== "hard" || constraint.operator === "exclude" || constraint.operator === "avoid") continue;
+    if (constraint.axis === "relationship") {
+      for (const value of constraint.values) {
+        if (proofTextSupportsValue(relationshipProofText, value)) add(primaryEvidenceScopeAxis(plan), value);
+      }
+      continue;
+    }
+    const scopeAxis = constraintScopeAxis(constraint.axis);
+    if (!scopeAxis) continue;
+    for (const value of constraint.values) {
+      const geographyRelationship = constraint.geographyRelationship
+        ?? (constraint.axis === "language" ? "language" : null);
+      const exactRelationshipSupported = !geographyRelationship
+        || geographyRelationship === "unspecified"
+        || proofSupportsSelectionGeography(proofText, {
+          value,
+          relationship: geographyRelationship,
+        });
+      if (proofTextSupportsValue(proofText, value) && exactRelationshipSupported) {
+        add(scopeAxis, value, geographyRelationship);
+      }
+    }
+  }
+
+  // Legacy V1 runs do not persist typed constraints. Preserve their one-axis
+  // binding shape without weakening V2, whose relationship constraint must be
+  // proven explicitly above.
+  if (!plan && descriptors.length === 0) {
+    add(primaryEvidenceScopeAxis(null), brief.subjectEntities.join(", ") || brief.title);
+  }
+  return descriptors;
+}
+
+interface ManifestScopeBindingProof {
+  bindingKind: TrackScopeBinding["bindingKind"];
+  scopeAxis: TrackScopeBinding["scopeAxis"];
+  scopeValue: string;
+  geographyRelationship: TrackScopeBinding["geographyRelationship"];
+  relationship: string;
+  note: string;
+  confidence: number;
+  provenanceRoot: string;
+  sourceRecordId: string;
+  sourceUrl: string;
+  citationAttestationId: string | null;
+  provenancePath: Array<{ kind: string; id: string; label?: string }>;
+}
+
+interface ManifestSelectionRow {
+  candidate_id: string;
+  selection_rank: number | null;
+  catalog_id: string;
+  song_json: CatalogSong;
+  artist: string;
+  title: string;
+  album: string | null;
+  release_year: number | null;
+  duration_ms: number | null;
+}
+
+function normalizedPolicyText(value: unknown): string {
+  return normalizeMusicText(typeof value === "string" ? value : "");
+}
+
+function authoritativeScopeBinding(
+  binding: ManifestScopeBindingProof,
+  pipelineVersion: string,
+  policyVersion: string,
+  storedPipelineVersion: string,
+  storedPolicyVersion: string,
+): boolean {
+  if (storedPipelineVersion !== pipelineVersion || storedPolicyVersion !== policyVersion) return false;
+  const root = normalizedPolicyText(binding.provenanceRoot);
+  if (!root || root === "unclassified" || root === "unknown") return false;
+  if (!binding.sourceRecordId || !binding.sourceUrl.startsWith("https://")) return false;
+  const rootStep = binding.provenancePath.some((step) => (
+    step.kind === "provenance_root" && normalizedPolicyText(step.id) === root
+  ));
+  const sourceStep = binding.provenancePath.some((step) => (
+    step.kind === "source_record" && step.id === binding.sourceRecordId
+  ));
+  if (!rootStep || !sourceStep) return false;
+  // A track-specific hosted-web assertion is authoritative only when its
+  // citation attestation survived persistence. Scoped adapter/editorial
+  // membership may instead be bound by its stored source/container record.
+  if (binding.bindingKind === "track_specific_source" && !binding.citationAttestationId) return false;
+  return Number.isFinite(binding.confidence) && binding.confidence >= 0.7;
+}
+
+function bindingSupportsConstraint(
+  binding: ManifestScopeBindingProof,
+  constraint: SelectionConstraint,
+): boolean {
+  if (constraint.axis === "evidence") return false;
+  if (constraint.axis === "relationship") {
+    return constraint.values.some((value) => proofTextSupportsValue(
+      `${binding.scopeValue} ${binding.relationship}`,
+      value,
+    ));
+  }
+  const compatibleAxes: Record<SelectionConstraint["axis"], TrackScopeBinding["scopeAxis"][]> = {
+    genre: ["genre", "scene", "genre_scene"],
+    scene: ["scene", "genre_scene"],
+    subgenre: ["genre", "scene", "genre_scene"],
+    era: ["era"],
+    geography: ["geography", "scene", "genre_scene"],
+    language: ["language"],
+    mood: ["mood", "mood_theme_activity"],
+    activity: ["activity", "mood_theme_activity"],
+    theme: ["theme", "mood_theme_activity"],
+    artist: ["artist_catalog"],
+    track: [],
+    label: ["scene", "genre_scene"],
+    venue: ["scene", "genre_scene"],
+    recording_version: [],
+    content: [],
+    evidence: [],
+    relationship: [],
+  };
+  if (!compatibleAxes[constraint.axis].includes(binding.scopeAxis)) return false;
+  const requiredGeographyRelationship = constraint.geographyRelationship
+    ?? (constraint.axis === "language" ? "language" : null);
+  if (requiredGeographyRelationship
+    && requiredGeographyRelationship !== "unspecified"
+    && bindingGeographyRelationship(binding) !== requiredGeographyRelationship) {
+    return false;
+  }
+  const proofText = [
+    binding.scopeValue,
+    binding.relationship,
+    binding.note,
+  ].join(" ");
+  return constraint.values.some((value) => proofTextSupportsValue(proofText, value));
+}
+
+function metadataContainsConstraintValue(
+  row: ManifestSelectionRow,
+  constraint: SelectionConstraint,
+): boolean {
+  const song = row.song_json;
+  const metadata = normalizedPolicyText([
+    row.artist,
+    row.title,
+    row.album ?? "",
+    song.artistName,
+    song.name,
+    song.albumName,
+    ...(song.genreNames ?? []),
+    song.versionLabel ?? "",
+  ].join(" "));
+  return constraint.values.some((rawValue) => {
+    const value = normalizedPolicyText(rawValue)
+      .replace(/^(?:exclude|avoid|without|no|not)\s+/u, "")
+      .trim();
+    return value.length > 0 && metadata.includes(value);
+  });
+}
+
+function eraConstraintSatisfied(row: ManifestSelectionRow, constraint: SelectionConstraint): boolean {
+  const releaseYear = row.release_year
+    ?? (typeof row.song_json.releaseDate === "string"
+      ? Number.parseInt(row.song_json.releaseDate.slice(0, 4), 10)
+      : Number.NaN);
+  if (!Number.isInteger(releaseYear)) return false;
+  const ranges = constraint.values.flatMap((value): Array<{ start: number; end: number }> => {
+    const decade = value.match(/\b(?:(early|mid|late)[ -]?)?((?:19|20)\d0)s\b/iu);
+    if (decade) {
+      const start = Number(decade[2]);
+      if (decade[1]?.toLocaleLowerCase("en-US") === "early") return [{ start, end: start + 3 }];
+      if (decade[1]?.toLocaleLowerCase("en-US") === "mid") return [{ start: start + 3, end: start + 6 }];
+      if (decade[1]?.toLocaleLowerCase("en-US") === "late") return [{ start: start + 7, end: start + 9 }];
+      return [{ start, end: start + 9 }];
+    }
+    const explicitRange = value.match(/\b((?:19|20)\d{2})\s*(?:-|\u2013|\u2014|to|through)\s*((?:19|20)\d{2})\b/iu);
+    if (explicitRange) return [{
+      start: Math.min(Number(explicitRange[1]), Number(explicitRange[2])),
+      end: Math.max(Number(explicitRange[1]), Number(explicitRange[2])),
+    }];
+    return [...value.matchAll(/\b(?:19|20)\d{2}\b/gu)]
+      .map((match) => ({ start: Number(match[0]), end: Number(match[0]) }));
+  });
+  if (ranges.length === 0) return false;
+  const start = Math.min(...ranges.map((range) => range.start));
+  const end = Math.max(...ranges.map((range) => range.end));
+  if (constraint.operator === "before") return releaseYear < start;
+  if (constraint.operator === "after") return releaseYear > end;
+  if (constraint.operator === "between" || constraint.operator === "within" || ranges.length > 1) {
+    return releaseYear >= start && releaseYear <= end;
+  }
+  return ranges.some((range) => releaseYear >= range.start && releaseYear <= range.end);
+}
+
+function manifestConstraintViolations(input: {
+  row: ManifestSelectionRow;
+  plan: SelectionPlan;
+  bindings: readonly ManifestScopeBindingProof[];
+  scopeEligible: boolean;
+}): string[] {
+  const { row, plan, bindings } = input;
+  const versionClass = catalogRecordingVersionClass(row.song_json);
+  const contentRating = catalogContentRating(row.song_json);
+  const violations: string[] = [];
+  for (const constraint of plan.constraints) {
+    let satisfied = false;
+    if (constraint.axis === "evidence") {
+      satisfied = input.scopeEligible;
+    } else if (constraint.axis === "recording_version") {
+      satisfied = plan.versionPolicy.allowed.includes(versionClass);
+    } else if (constraint.operator === "exclude" || constraint.operator === "avoid") {
+      const scopeBound = constraint.axis === "relationship" || constraintScopeAxis(constraint.axis) !== null;
+      satisfied = scopeBound
+        ? !bindings.some((binding) => bindingSupportsConstraint(binding, constraint))
+        : !metadataContainsConstraintValue(row, constraint);
+    } else if (constraint.axis === "era") {
+      satisfied = eraConstraintSatisfied(row, constraint);
+    } else if (constraint.axis === "artist") {
+      const artist = normalizedPolicyText(row.song_json.artistName || row.artist);
+      satisfied = constraint.values.some((value) => artist === normalizedPolicyText(value));
+    } else if (constraint.axis === "track") {
+      const title = normalizedPolicyText(row.song_json.name || row.title);
+      satisfied = constraint.values.some((value) => title === normalizedPolicyText(value));
+    } else if (constraint.axis === "content") {
+      const requested = normalizedPolicyText(constraint.values.join(" "));
+      satisfied = requested.includes("clean")
+        ? contentRating === "clean"
+        : requested.includes("explicit")
+          ? contentRating === "explicit"
+          : requested.includes("instrumental")
+            ? /\binstrumental\b/iu.test(`${row.song_json.name} ${row.song_json.versionLabel ?? ""}`)
+            : metadataContainsConstraintValue(row, constraint);
+    } else {
+      satisfied = bindings.some((binding) => bindingSupportsConstraint(binding, constraint));
+    }
+    if (!satisfied) violations.push(constraint.id);
+  }
+  if (!input.scopeEligible) violations.push("scope_evidence_eligibility");
+  if (!plan.versionPolicy.allowed.includes(versionClass)) violations.push("recording_version_policy");
+  if (plan.contentPolicy.explicitContent === "clean_only" && contentRating !== "clean") {
+    violations.push("clean_content_policy");
+  }
+  if (plan.contentPolicy.instrumental === "exclude"
+    && /\binstrumental\b/iu.test(`${row.song_json.name} ${row.song_json.versionLabel ?? ""}`)) {
+    violations.push("instrumental_content_policy");
+  }
+  return [...new Set(violations)];
+}
+
+function manifestConstraintRules(plan: SelectionPlan): ConstraintRule[] {
+  const byId = new Map<string, ConstraintRule>();
+  const add = (rule: ConstraintRule) => {
+    if (!byId.has(rule.id)) byId.set(rule.id, rule);
+  };
+  for (const constraint of plan.constraints) {
+    add({ id: constraint.id, kind: constraint.kind, relaxationRank: constraint.relaxationRank });
+  }
+  add({ id: "scope_evidence_eligibility", kind: "hard", relaxationRank: null });
+  add({ id: "recording_version_policy", kind: "hard", relaxationRank: null });
+  if (plan.contentPolicy.explicitContent === "clean_only") {
+    add({ id: "clean_content_policy", kind: "hard", relaxationRank: null });
+  }
+  if (plan.contentPolicy.instrumental === "exclude") {
+    add({ id: "instrumental_content_policy", kind: "hard", relaxationRank: null });
+  }
+  plan.softGoalRelaxationOrder.forEach((id, index) => {
+    add({ id, kind: "soft", relaxationRank: index });
+  });
+  return [...byId.values()];
 }
 
 function normalizedGuidanceAnswers(
@@ -511,10 +1249,12 @@ export class Repository {
     }
   }
 
-  async ensureSchemaVersion(): Promise<void> {
+  async ensureSchemaVersion(support: DatabaseSchemaSupport = DATABASE_SCHEMA_SUPPORT): Promise<void> {
     const actual = await this.getSchemaVersion();
-    if (actual !== DATABASE_SCHEMA_VERSION) {
-      throw new Error(`Database schema mismatch: expected ${DATABASE_SCHEMA_VERSION}, found ${actual ?? "uninitialized"}`);
+    if (!isDatabaseSchemaVersionCompatible(actual, support)) {
+      throw new Error(
+        `Database schema mismatch: supported ${support.minimum}-${support.maximum}, found ${actual ?? "uninitialized"}`,
+      );
     }
   }
 
@@ -843,6 +1583,7 @@ export class Repository {
     const result = await this.pool.query(
       `SELECT id,prompt,requested_track_count,model,status,brief_json,questions_json,answers_json,
               guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
+              pipeline_version,policy_version,selection_plan_json,
               estimate_usd,error,client_bucket,expires_at,created_at,updated_at
        FROM brief_requests WHERE id=$1 AND expires_at>now()`,
       [id],
@@ -861,6 +1602,9 @@ export class Repository {
       guidanceSourceHints: row.guidance_source_hints_json ?? [],
       guidanceTelemetry: row.guidance_telemetry_json ?? null,
       guidancePreferences: row.guidance_preferences_json ?? [],
+      pipelineVersion: row.pipeline_version ?? "legacy_v1",
+      policyVersion: row.policy_version ?? "legacy_v1",
+      selectionPlan: row.selection_plan_json ?? null,
       estimateUsd: row.estimate_usd == null ? null : Number(row.estimate_usd),
       error: sanitizeOptionalFailure(row.error, "brief"),
       clientBucket: row.client_bucket,
@@ -964,6 +1708,16 @@ export class Repository {
     );
   }
 
+  async saveBriefSelectionPlan(id: string, plan: SelectionPlan): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE brief_requests SET pipeline_version=$2,policy_version=$3,
+         selection_plan_json=$4,updated_at=now()
+       WHERE id=$1 AND expires_at>now()`,
+      [id, plan.pipelineVersion, plan.policyVersion, JSON.stringify(plan)],
+    );
+    if (result.rowCount === 0) throw new HttpError(404, "Brief request not found", "brief_not_found");
+  }
+
   async submitBriefAnswers(input: {
     briefRequestId: string;
     idempotencyKey: string;
@@ -1059,13 +1813,15 @@ export class Repository {
     let guidanceSourceHints: PlaylistGuidanceSourceHint[] = [];
     let guidanceTelemetry: PlaylistGuidanceTelemetry | null = null;
     let guidancePreferences: PlaylistGuidancePreference[] = [];
+    let selectionPlan: SelectionPlan | null = null;
     if (input.briefRequestId) {
       const context = await this.pool.query<{
         guidance_source_hints_json: PlaylistGuidanceSourceHint[] | null;
         guidance_telemetry_json: PlaylistGuidanceTelemetry | null;
         guidance_preferences_json: PlaylistGuidancePreference[] | null;
+        selection_plan_json: SelectionPlan | null;
       }>(
-        `SELECT guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json
+        `SELECT guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,selection_plan_json
          FROM brief_requests WHERE id=$1 AND expires_at>now()`,
         [input.briefRequestId],
       );
@@ -1078,13 +1834,38 @@ export class Repository {
       guidancePreferences = Array.isArray(row.guidance_preferences_json)
         ? row.guidance_preferences_json
         : [];
+      selectionPlan = row.selection_plan_json ?? null;
     }
+    const proposedSelectionPlan = selectionPlan ?? createSelectionPlanV2({
+      prompt: input.prompt,
+      brief: input.brief,
+      guidancePreferences,
+      storefront: process.env.APPLE_STOREFRONT ?? "us",
+    });
+    const pipelineAssignment = assignPipelineV2({
+      plan: proposedSelectionPlan,
+      owner: input.forceFreshResearch === true,
+      // A visitor remains in the same rollout cohort across prompts. Scope
+      // text must not reshuffle one browser between V1 and V2; only a new
+      // pipeline route or policy version intentionally creates a new cohort.
+      stickyKey: pipelineRolloutStickyKey(input.clientBucket, proposedSelectionPlan),
+      env: process.env,
+    });
+    selectionPlan = pipelineAssignment.assigned ? proposedSelectionPlan : null;
+    const modelRoutingSignals = { scoutTelemetry: guidanceTelemetry };
     const briefHash = sha256Hex(stableStringify({
       brief: input.brief,
       guidancePreferences,
-      researchPolicy: researchPolicyFingerprint(input.brief),
+      selectionPlan,
+      researchPolicy: researchPolicyFingerprint(input.brief, process.env, selectionPlan, modelRoutingSignals),
     }));
-    const executionPolicy = researchExecutionPolicy(input.brief);
+    const pipelinePolicySnapshot = selectionPlan == null ? null : createPipelinePolicySnapshot({
+      brief: input.brief,
+      selectionPlan,
+      environment: process.env,
+      modelRoutingSignals,
+    });
+    const executionPolicy = researchExecutionPolicy(input.brief, process.env, selectionPlan, modelRoutingSignals);
     // Owner requests are deliberate test/refresh runs. Never attach them to a
     // prior visitor result, even when the confirmed brief hashes identically.
     const reuseDays = input.forceFreshResearch
@@ -1179,8 +1960,10 @@ export class Repository {
           `INSERT INTO research_runs(
              id,prompt,brief_json,guidance_source_hints_json,guidance_telemetry_json,
              guidance_preferences_json,brief_hash,status,phase,client_bucket,idempotency_key,auto_publish,
-             estimated_cost_usd,approved_budget_usd,budget_approval_expires_at,retention_expires_at)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8::varchar,$9,$10,$11,$12,$13,$14,
+             estimated_cost_usd,approved_budget_usd,pipeline_version,policy_version,selection_plan_json,
+             pipeline_policy_snapshot_json,
+             budget_approval_expires_at,retention_expires_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::varchar,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
              CASE WHEN $8::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,
              now()+interval '90 days')
            RETURNING created_at`,
@@ -1199,6 +1982,10 @@ export class Repository {
             input.autoPublish === true,
             estimate,
             Math.max(approved, status === "queued" ? estimate : 0),
+            selectionPlan?.pipelineVersion ?? "legacy_v1",
+            selectionPlan?.policyVersion ?? "legacy_v1",
+            selectionPlan == null ? null : JSON.stringify(selectionPlan),
+            pipelinePolicySnapshot == null ? null : JSON.stringify(pipelinePolicySnapshot),
           ],
         );
         if (executionPolicy.kind === "fast_curated") {
@@ -1356,6 +2143,13 @@ export class Repository {
         `SELECT
           (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidate_count,
           (SELECT count(*)::int FROM source_records WHERE run_id=$1) source_count,
+          COALESCE((
+            SELECT jsonb_object_agg(staged.candidate_stage,staged.stage_count)
+            FROM (
+              SELECT candidate_stage,count(*)::int stage_count
+              FROM track_candidates WHERE run_id=$1 GROUP BY candidate_stage
+            ) staged
+          ),'{}'::jsonb) candidate_stage_counts,
           ((SELECT count(*)::int FROM source_frontier
              WHERE run_id=$1 AND status IN ('pending','unresolved','inaccessible')) +
           (SELECT count(*)::int FROM research_containers
@@ -1376,6 +2170,11 @@ export class Repository {
       guidanceSourceHints: row.guidance_source_hints_json ?? [],
       guidanceTelemetry: row.guidance_telemetry_json ?? null,
       guidancePreferences: row.guidance_preferences_json ?? [],
+      pipelineVersion: row.pipeline_version ?? "legacy_v1",
+      policyVersion: row.policy_version ?? "legacy_v1",
+      selectionPlan: row.selection_plan_json ?? null,
+      pipelinePolicySnapshot: row.pipeline_policy_snapshot_json ?? null,
+      pipelineOutcome: row.pipeline_outcome_json ?? null,
       status: row.status,
       phase: row.phase,
       autoPublish: row.auto_publish === true,
@@ -1386,6 +2185,7 @@ export class Repository {
       noNewGapPasses: Number(row.no_new_gap_passes),
       error: sanitizeOptionalFailure(row.error, failureContextForRun(row.phase)),
       candidateCount: count.candidate_count,
+      candidateStageCounts: count.candidate_stage_counts ?? {},
       sourceCount: count.source_count,
       unresolvedCount: count.unresolved_count,
       frontier,
@@ -1396,14 +2196,17 @@ export class Repository {
     } as ResearchRunView & Record<string, unknown>;
   }
 
-  async getRunByAccess(accessId: string): Promise<(ResearchRunView & Record<string, unknown>) | null> {
+  async getRunByAccess(accessId: string): Promise<PublicResearchRunView | null> {
     const result = await this.pool.query<{ run_id: string; prompt: string | null }>(
       "SELECT run_id,prompt FROM run_accesses WHERE id=$1 AND deleted_at IS NULL AND expires_at>now()",
       [accessId],
     );
     if (!result.rows[0]) return null;
     const run = await this.getRun(result.rows[0].run_id);
-    return { ...run, id: accessId, canonicalRunId: result.rows[0].run_id, prompt: result.rows[0].prompt ?? run.prompt };
+    return publicResearchRunView(run, {
+      id: accessId,
+      prompt: result.rows[0].prompt ?? run.prompt,
+    });
   }
 
   async listRunsForCapabilitySession(sessionId: string, limit = 50): Promise<ResearchRunHistoryItem[]> {
@@ -1508,7 +2311,17 @@ export class Repository {
         if (run.rows[0]) {
           const manifest = await client.query("SELECT id,content_hash,name FROM manifests WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1", [runId]);
           const volumes = manifest.rows[0]
-            ? await client.query("SELECT apple_share_url FROM publication_volumes WHERE manifest_id=$1 AND apple_share_url IS NOT NULL ORDER BY volume_number", [manifest.rows[0].id])
+            ? await client.query(
+              `SELECT pv.apple_share_url FROM publication_volumes pv
+               WHERE pv.manifest_id=$1 AND pv.status='complete' AND pv.apple_share_url IS NOT NULL
+                 AND pv.manifest_revision_id IS NOT DISTINCT FROM (
+                   SELECT mr.id FROM manifest_revisions mr
+                   WHERE mr.manifest_id=$1 AND mr.status IN ('locked','published')
+                   ORDER BY mr.revision DESC LIMIT 1
+                 )
+               ORDER BY pv.volume_number`,
+              [manifest.rows[0].id],
+            )
             : { rows: [] };
           const counts = await client.query("SELECT outcome,count(*)::int count FROM track_candidates WHERE run_id=$1 GROUP BY outcome", [runId]);
           const appleLinks = volumes.rows.map((volume) => volume.apple_share_url);
@@ -1622,12 +2435,24 @@ export class Repository {
       "track_verification", "catalog_enrichment", "gap_analysis",
     ]);
     const storedPhase = allowedPhases.has(verificationPhase) ? verificationPhase : "unverified";
-    const briefResult = await client.query<{ brief_json: PlaylistBrief }>(
-      "SELECT brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL",
+    const briefResult = await client.query<{
+      brief_json: PlaylistBrief;
+      selection_plan_json: SelectionPlan | null;
+      pipeline_version: SelectionPlan["pipelineVersion"] | null;
+      policy_version: SelectionPlan["policyVersion"] | null;
+    }>(
+      `SELECT brief_json,selection_plan_json,pipeline_version,policy_version
+       FROM research_runs WHERE id=$1 AND deleted_at IS NULL`,
       [runId],
     );
-    const brief = briefResult.rows[0]?.brief_json;
+    const run = briefResult.rows[0];
+    const brief = run?.brief_json;
     if (!brief) throw new HttpError(404, "Research run not found", "run_not_found");
+    const selectionPlan = run.selection_plan_json ?? null;
+    const versions = {
+      pipelineVersion: selectionPlan?.pipelineVersion ?? run.pipeline_version ?? "legacy_v1",
+      policyVersion: selectionPlan?.policyVersion ?? run.policy_version ?? "legacy_v1",
+    } satisfies Pick<SelectionPlan, "pipelineVersion" | "policyVersion">;
     let added = 0;
     for (const candidate of candidates) {
         const boundEvidence = candidate.evidence.map((evidence) => {
@@ -1654,16 +2479,20 @@ export class Repository {
           : null;
         const inserted = await client.query<{ id: string; inserted: boolean }>(
           `INSERT INTO track_candidates(
-             id,run_id,canonical_key,duplicate_cluster_key,selection_rank,artist,title,album,release_year,duration_ms,isrc,musicbrainz_id,version_label)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             id,run_id,canonical_key,duplicate_cluster_key,candidate_stage,pipeline_version,policy_version,
+             selection_rank,artist,title,album,release_year,duration_ms,isrc,musicbrainz_id,version_label)
+           VALUES($1,$2,$3,$4,'discovered',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
            ON CONFLICT(run_id,canonical_key) DO UPDATE SET
              selection_rank=CASE
                WHEN EXCLUDED.selection_rank IS NULL THEN track_candidates.selection_rank
                WHEN track_candidates.selection_rank IS NULL THEN EXCLUDED.selection_rank
                ELSE LEAST(track_candidates.selection_rank,EXCLUDED.selection_rank)
-             END
+             END,
+             pipeline_version=EXCLUDED.pipeline_version,
+             policy_version=EXCLUDED.policy_version
            RETURNING id,(xmax=0) inserted`,
-          [candidateId, runId, identityKey, duplicateClusterKey(candidate), selectionRank,
+          [candidateId, runId, identityKey, duplicateClusterKey(candidate),
+            versions.pipelineVersion, versions.policyVersion, selectionRank,
             candidate.artist.slice(0, 240), candidate.title.slice(0, 240), candidate.album?.slice(0, 240) ?? null,
             candidate.releaseYear, candidate.durationMs, candidate.isrc, candidate.musicbrainzId,
             candidate.versionLabel?.slice(0, 120) ?? null],
@@ -1671,6 +2500,25 @@ export class Repository {
         const storedId = inserted.rows[0]?.id;
         if (!storedId) throw new Error("Candidate upsert did not return an identifier");
         if (inserted.rows[0]!.inserted) added += 1;
+        if (inserted.rows[0]!.inserted) {
+          const discoveredAt = new Date();
+          await client.query(
+            `INSERT INTO candidate_stage_events(
+               id,run_id,candidate_id,from_stage,to_stage,reason_code,detail_json,
+               pipeline_version,policy_version,occurred_at)
+             VALUES($1,$2,$3,NULL,'discovered','candidate_persisted',$4::jsonb,$5,$6,$7)
+             ON CONFLICT(id) DO NOTHING`,
+            [
+              deterministicUuid({ runId, candidateId: storedId, toStage: "discovered", reasonCode: "candidate_persisted" }),
+              runId,
+              storedId,
+              JSON.stringify({ verificationPhase: storedPhase }),
+              versions.pipelineVersion,
+              versions.policyVersion,
+              discoveredAt,
+            ],
+          );
+        }
         if (!inserted.rows[0]!.inserted) {
           const existing = await client.query<{ id: string; artist: string; title: string; version_label: string | null }>(
             "SELECT id,artist,title,version_label FROM track_candidates WHERE run_id=$1 AND canonical_key=$2",
@@ -1763,19 +2611,26 @@ export class Repository {
         }
         const storedEvidence = await client.query<{
           id: string;
+          source_id: string;
           source_url: string;
           source_class: SourceRecordInput["sourceClass"];
           provenance_root: string;
+          citation_attestation_id: string | null;
+          citation_excerpt: string | null;
           state: EvidenceClaimInput["state"];
           support_scope: EvidenceClaimInput["supportScope"];
+          verification_phase: string;
           subject_entity: string;
           subject_relationship: string;
           relationship: string;
           note: string;
         }>(
-          `SELECT e.id,s.url source_url,s.source_class,s.provenance_root,e.state,e.support_scope,
+          `SELECT e.id,e.source_id,s.url source_url,s.source_class,s.provenance_root,
+             e.citation_attestation_id,ca.excerpt citation_excerpt,e.state,e.support_scope,e.verification_phase,
              e.subject_entity,e.subject_relationship,e.relationship,e.note
            FROM evidence_claims e JOIN source_records s ON s.id=e.source_id
+           LEFT JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
+             AND ca.run_id=e.run_id AND ca.source_url=s.url
            WHERE e.candidate_id=$1 ORDER BY e.id`,
           [storedId],
         );
@@ -1800,6 +2655,195 @@ export class Repository {
           const effective = integrity.evidence[index]!;
           if (row.state !== effective.state) {
             await client.query("UPDATE evidence_claims SET state=$2 WHERE id=$1", [row.id, effective.state]);
+          }
+        }
+        const factualScope = requiresFactualFrontier(brief, selectionPlan);
+        const qualifyingBindings = storedEvidence.rows.flatMap((row, index): TrackScopeBinding[] => {
+          const effective = integrity.evidence[index]!;
+          // Catalog metadata is identity evidence only. A qualifying scope
+          // binding must originate in an attested exact-track web claim (or a
+          // subject-specific editorial claim for curated work).
+          if (row.source_class !== "web" || !row.citation_attestation_id) return [];
+          const qualifiesTrackClaim = row.support_scope === "track"
+            && (effective.state === "verified" || effective.state === "corroborated");
+          const qualifiesEditorialClaim = !factualScope
+            && (row.support_scope === "track" || row.support_scope === "editorial")
+            && effective.state === "editorial";
+          if (!qualifiesTrackClaim && !qualifiesEditorialClaim) return [];
+          const proofText = [
+            row.citation_excerpt ?? "",
+            row.subject_entity,
+            row.relationship,
+            row.note,
+          ].join(" ");
+          return evidenceScopeDescriptors(selectionPlan, brief, proofText, row.relationship)
+            .map(({ scopeAxis, scopeValue, geographyRelationship }) => ({
+            bindingKind: "track_specific_source" as const,
+            eligibility: "qualifying" as const,
+            scopeAxis,
+            scopeValue,
+            geographyRelationship,
+            relationship: row.relationship.slice(0, 240),
+            confidence: effective.state === "verified"
+              ? 0.99
+              : effective.state === "corroborated"
+                ? 0.94
+                : 0.86,
+            sourceUrl: row.source_url,
+            sourceRecordId: row.source_id,
+            researchContainerId: null,
+            citationAttestationId: row.citation_attestation_id,
+            provenancePath: provenancePathWithGeographyRelationship([
+              { kind: "provenance_root", id: row.provenance_root },
+              { kind: "source_record", id: row.source_id },
+              { kind: "evidence_claim", id: row.id },
+            ], geographyRelationship),
+            note: compactEvidenceNote(row.note),
+            }));
+        });
+        const activeBindingIds: string[] = [];
+        for (const binding of qualifyingBindings) {
+          const bindingId = deterministicUuid({
+            runId,
+            candidateId: storedId,
+            bindingKind: binding.bindingKind,
+            scopeAxis: binding.scopeAxis,
+            scopeValue: binding.scopeValue,
+            geographyRelationship: binding.geographyRelationship ?? null,
+            relationship: binding.relationship,
+            sourceRecordId: binding.sourceRecordId,
+            researchContainerId: binding.researchContainerId,
+          });
+          const persisted = await client.query<{ id: string }>(
+            `INSERT INTO track_scope_bindings(
+               id,run_id,candidate_id,source_record_id,source_url,research_container_id,
+               citation_attestation_id,binding_kind,eligibility,scope_axis,scope_value,
+               relationship,confidence,provenance_path_json,note,pipeline_version,policy_version)
+             SELECT $1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16
+             FROM track_candidates tc
+             WHERE tc.id=$3 AND tc.run_id=$2
+               AND EXISTS(SELECT 1 FROM source_records sr WHERE sr.id=$4 AND sr.run_id=$2)
+               AND EXISTS(SELECT 1 FROM citation_attestations ca WHERE ca.id=$6 AND ca.run_id=$2)
+             ON CONFLICT ON CONSTRAINT scope_binding_unique_key DO UPDATE SET
+               source_record_id=EXCLUDED.source_record_id,source_url=EXCLUDED.source_url,
+               citation_attestation_id=EXCLUDED.citation_attestation_id,
+               eligibility=EXCLUDED.eligibility,confidence=EXCLUDED.confidence,
+               provenance_path_json=EXCLUDED.provenance_path_json,note=EXCLUDED.note,
+               pipeline_version=EXCLUDED.pipeline_version,policy_version=EXCLUDED.policy_version
+             RETURNING id`,
+            [
+              bindingId,
+              runId,
+              storedId,
+              binding.sourceRecordId,
+              binding.sourceUrl,
+              binding.citationAttestationId,
+              binding.bindingKind,
+              binding.eligibility,
+              binding.scopeAxis,
+              binding.scopeValue,
+              binding.relationship,
+              binding.confidence,
+              JSON.stringify(binding.provenancePath),
+              binding.note,
+              versions.pipelineVersion,
+              versions.policyVersion,
+            ],
+          );
+          if (!persisted.rows[0]) {
+            throw new HttpError(400, "Scope binding references data outside this research run", "invalid_scope_binding");
+          }
+          activeBindingIds.push(persisted.rows[0].id);
+        }
+        await client.query(
+          `DELETE FROM track_scope_bindings
+           WHERE run_id=$1 AND candidate_id=$2 AND binding_kind='track_specific_source'
+             AND provenance_path_json @> '[{"kind":"evidence_claim"}]'::jsonb
+             AND NOT (id=ANY($3::uuid[]))`,
+          [runId, storedId, activeBindingIds],
+        );
+        if (qualifyingBindings.length > 0) {
+          const priorStage = await client.query<{
+            candidate_stage: "discovered" | "identity_resolved" | "scope_qualified" | "claim_verified";
+            stage_updated_at: Date;
+          }>(
+            `SELECT candidate_stage,stage_updated_at FROM track_candidates
+             WHERE id=$1 AND run_id=$2 FOR UPDATE`,
+            [storedId, runId],
+          );
+          const prior = priorStage.rows[0];
+          if (prior && (prior.candidate_stage === "discovered" || prior.candidate_stage === "identity_resolved")) {
+            const stageAt = new Date(Math.max(Date.now(), prior.stage_updated_at.getTime() + 1));
+            await client.query(
+              `INSERT INTO candidate_stage_events(
+                 id,run_id,candidate_id,from_stage,to_stage,reason_code,detail_json,
+                 pipeline_version,policy_version,occurred_at)
+               VALUES($1,$2,$3,$4,'scope_qualified','qualifying_scope_binding',$5::jsonb,$6,$7,$8)
+               ON CONFLICT(id) DO NOTHING`,
+              [
+                deterministicUuid({
+                  runId,
+                  candidateId: storedId,
+                  fromStage: prior.candidate_stage,
+                  fromStageUpdatedAt: prior.stage_updated_at.toISOString(),
+                  toStage: "scope_qualified",
+                  reasonCode: "qualifying_scope_binding",
+                  bindingIds: activeBindingIds.sort(),
+                }),
+                runId,
+                storedId,
+                prior.candidate_stage,
+                JSON.stringify({ bindingCount: qualifyingBindings.length }),
+                versions.pipelineVersion,
+                versions.policyVersion,
+                stageAt,
+              ],
+            );
+            await client.query(
+              `UPDATE track_candidates SET candidate_stage='scope_qualified',stage_updated_at=$3,
+                 pipeline_version=$4,policy_version=$5
+               WHERE id=$1 AND run_id=$2 AND candidate_stage=$6`,
+              [storedId, runId, stageAt, versions.pipelineVersion, versions.policyVersion, prior.candidate_stage],
+            );
+          }
+        } else {
+          const resetAt = new Date(Date.now() + 1);
+          const priorStage = await client.query<{ candidate_stage: "scope_qualified" | "claim_verified" }>(
+            `SELECT candidate_stage FROM track_candidates
+             WHERE id=$1 AND run_id=$2 AND candidate_stage IN ('scope_qualified','claim_verified')
+             FOR UPDATE`,
+            [storedId, runId],
+          );
+          const reset = await client.query(
+            `UPDATE track_candidates SET candidate_stage='discovered',stage_updated_at=$3,
+               pipeline_version=$4,policy_version=$5
+             WHERE id=$1 AND run_id=$2 AND candidate_stage IN ('scope_qualified','claim_verified')`,
+            [storedId, runId, resetAt, versions.pipelineVersion, versions.policyVersion],
+          );
+          if (reset.rowCount && priorStage.rows[0]) {
+            await client.query(
+              `INSERT INTO candidate_stage_events(
+                 id,run_id,candidate_id,from_stage,to_stage,reason_code,detail_json,
+                 pipeline_version,policy_version,occurred_at)
+               VALUES($1,$2,$3,$4,'discovered','qualifying_scope_binding_withdrawn',$5::jsonb,$6,$7,$8)
+               ON CONFLICT(id) DO NOTHING`,
+              [
+                deterministicUuid({
+                  runId,
+                  candidateId: storedId,
+                  toStage: "discovered",
+                  reasonCode: "qualifying_scope_binding_withdrawn",
+                  evidenceIds: storedEvidence.rows.map((row) => row.id),
+                }),
+                runId,
+                storedId,
+                priorStage.rows[0].candidate_stage,
+                JSON.stringify({ verificationPhase: storedPhase }),
+                versions.pipelineVersion,
+                versions.policyVersion,
+                resetAt,
+              ],
+            );
           }
         }
         if (integrity.hasDisagreement) {
@@ -1884,9 +2928,9 @@ export class Repository {
         [runId, run.brief.subjectEntities, run.brief.relationship],
       ),
     ]);
-    const eligibleCandidateCount = run.brief.mode === "curated"
-      ? Number(eligibility.rows[0]?.editorial_count ?? 0)
-      : Number(eligibility.rows[0]?.verified_count ?? 0);
+    const eligibleCandidateCount = requiresFactualFrontier(run.brief, run.selectionPlan)
+      ? Number(eligibility.rows[0]?.verified_count ?? 0)
+      : Number(eligibility.rows[0]?.editorial_count ?? 0);
     return { candidateCount: run.candidateCount, eligibleCandidateCount, sourceCount: run.sourceCount, unresolvedCount: run.unresolvedCount, frontier: run.frontier, containers, existingKeys: keys.rows.map((row) => row.canonical_key) };
   }
 
@@ -1950,7 +2994,7 @@ export class Repository {
   }
 
   async listCandidates(runId: string): Promise<CandidateRow[]> {
-    const [result, evidenceResult] = await Promise.all([
+    const [result, evidenceResult, scopeBindingResult] = await Promise.all([
       this.pool.query(
         "SELECT * FROM track_candidates WHERE run_id=$1 ORDER BY selection_rank NULLS LAST,artist,release_year NULLS LAST,album NULLS LAST,title,id",
         [runId],
@@ -1964,6 +3008,14 @@ export class Repository {
          LEFT JOIN citation_attestations ca ON ca.id=e.citation_attestation_id
            AND ca.run_id=e.run_id AND ca.source_url=s.url
          WHERE e.run_id=$1 ORDER BY e.candidate_id,e.state,s.url`,
+        [runId],
+      ),
+      this.pool.query(
+        `SELECT candidate_id,source_record_id,source_url,research_container_id,citation_attestation_id,
+           binding_kind,eligibility,scope_axis,scope_value,relationship,confidence,
+           provenance_path_json,note
+         FROM track_scope_bindings WHERE run_id=$1
+         ORDER BY candidate_id,eligibility,binding_kind,scope_axis,scope_value,relationship`,
         [runId],
       ),
     ]);
@@ -1996,6 +3048,29 @@ export class Repository {
       });
       evidenceByCandidate.set(row.candidate_id, evidence);
     }
+    const scopeBindingsByCandidate = new Map<string, TrackScopeBinding[]>();
+    for (const row of scopeBindingResult.rows) {
+      const bindings = scopeBindingsByCandidate.get(row.candidate_id) ?? [];
+      const provenancePath = Array.isArray(row.provenance_path_json) ? row.provenance_path_json : [];
+      const binding: TrackScopeBinding = {
+        bindingKind: row.binding_kind,
+        eligibility: row.eligibility,
+        scopeAxis: row.scope_axis,
+        scopeValue: row.scope_value,
+        geographyRelationship: null,
+        relationship: row.relationship,
+        confidence: Number(row.confidence),
+        sourceUrl: row.source_url,
+        sourceRecordId: row.source_record_id,
+        researchContainerId: row.research_container_id,
+        citationAttestationId: row.citation_attestation_id,
+        provenancePath,
+        note: row.note,
+      };
+      binding.geographyRelationship = bindingGeographyRelationship(binding);
+      bindings.push(binding);
+      scopeBindingsByCandidate.set(row.candidate_id, bindings);
+    }
     return result.rows.map((row): CandidateRow => ({
         id: row.id,
         runId: row.run_id,
@@ -2008,8 +3083,13 @@ export class Repository {
         isrc: row.isrc,
         musicbrainzId: row.musicbrainz_id,
         versionLabel: row.version_label,
+        candidateStage: row.candidate_stage ?? "discovered",
+        recordingFamilyId: row.recording_family_id ?? null,
+        scopeBindings: scopeBindingsByCandidate.get(row.id) ?? [],
         outcome: row.outcome,
         duplicateClusterKey: row.duplicate_cluster_key,
+        pipelineVersion: row.pipeline_version ?? "legacy_v1",
+        policyVersion: row.policy_version ?? "legacy_v1",
         evidence: evidenceByCandidate.get(row.id) ?? [],
       }));
   }
@@ -2155,9 +3235,9 @@ export class Repository {
     const size = Math.max(1, Math.min(Math.floor(pageSize), 500));
     const offset = (safePage - 1) * size;
     const orderSql = manifestOrderSql(brief);
-    const evidenceStates = brief.mode === "curated"
-      ? ["verified", "corroborated", "editorial"]
-      : ["verified", "corroborated"];
+    const evidenceStates = requiresFactualFrontier(brief, run.selection_plan_json as SelectionPlan | null)
+      ? ["verified", "corroborated"]
+      : ["verified", "corroborated", "editorial"];
     // Alternatives are evidence for an ambiguity screen, not proof that a
     // catalog recording is safe to include. A row is selectable by default
     // only when matching produced a plausible primary song.
@@ -2484,6 +3564,11 @@ export class Repository {
         [runId],
       );
       const priorCount = Number(prior.rows[0]?.count ?? 0);
+      // A caller that has already consumed the configured generation ceiling
+      // is terminal even if an earlier durable handoff is still being
+      // acknowledged. Returning in_flight here would keep a finished refill
+      // controller polling forever instead of recording frontier exhaustion.
+      if (suppliedGeneration >= FAST_POST_MATCH_REFILL_LIMIT) return "exhausted";
       // Exact-generation CAS: a replay of generation zero must not queue
       // generation two merely because generation one already exists.
       if (priorCount !== suppliedGeneration) return "in_flight";
@@ -2834,6 +3919,10 @@ export class Repository {
       }
       if (!["review", "visitor_review"].includes(run.status)) throw new HttpError(409, "Run is not ready for a manifest", "manifest_not_ready");
       const brief = run.brief_json as PlaylistBrief;
+      const selectionPlan = run.selection_plan_json as SelectionPlan | null;
+      const pipelineVersion = run.pipeline_version ?? "legacy_v1";
+      const policyVersion = run.policy_version ?? "legacy_v1";
+      const pipelineV2 = selectionPlan != null && pipelineVersion !== "legacy_v1";
       const guidancePreferences = Array.isArray(run.guidance_preferences_json)
         ? run.guidance_preferences_json as PlaylistGuidancePreference[]
         : [];
@@ -2884,7 +3973,7 @@ export class Repository {
         // disposition for unresolved or evidence-ineligible candidates. Keep
         // every candidate accounted for before the immutable manifest locks.
         const rejected = accounting.rows.filter((candidate) => candidate.match_status === "review").map((candidate) => candidate.id);
-        const unsupported = accounting.rows
+        const unsupported = pipelineV2 ? [] : accounting.rows
           .filter((candidate) => candidate.match_status === "accepted" && !candidate.evidence_eligible)
           .map((candidate) => candidate.id);
         if (rejected.length > 0) {
@@ -2907,7 +3996,11 @@ export class Repository {
           );
         }
       }
-      const verifiedClause = options.verifiedOnly
+      // V2 never falls back to the legacy evidence_claims EXISTS predicate.
+      // Its authoritative eligibility gate is the provenance-validated
+      // track_scope_bindings evaluation below, for both automatic and
+      // "verified only" publication.
+      const verifiedClause = options.verifiedOnly && !pipelineV2
         ? `AND EXISTS (
              SELECT 1 FROM evidence_claims e
              JOIN source_records es ON es.id=e.source_id AND es.source_class='web'
@@ -2919,8 +4012,8 @@ export class Repository {
            )`
         : "";
       const orderSql = manifestOrderSql({ ...brief, orderingPolicy: effectiveOrderingPolicy });
-      const matches = await client.query(
-        `SELECT m.candidate_id,m.catalog_id,m.song_json,c.artist,c.title,c.album,c.release_year,c.duration_ms
+      const matches = await client.query<ManifestSelectionRow>(
+        `SELECT m.candidate_id,c.selection_rank,m.catalog_id,m.song_json,c.artist,c.title,c.album,c.release_year,c.duration_ms
          FROM catalog_matches m
          JOIN track_candidates c ON c.id=m.candidate_id
          WHERE m.run_id=$1 AND m.status='accepted' AND m.catalog_id IS NOT NULL ${verifiedClause}
@@ -2930,9 +4023,210 @@ export class Repository {
       const maximumTracks = brief.mode === "curated"
         ? Math.max(1, Math.floor(brief.targetSize?.max ?? 100))
         : Number.POSITIVE_INFINITY;
+      let constraintSelection: ConstraintSelection<ManifestSelectionRow> = {
+        outcome: "complete",
+        selected: matches.rows,
+        relaxedSoftConstraints: [] as string[],
+      };
+      let hardRejectedMatches: ManifestSelectionRow[] = [];
+      let ladderOverflowMatches: ManifestSelectionRow[] = [];
+      if (selectionPlan && pipelineVersion !== "legacy_v1") {
+        const bindingResult = await client.query<{
+          candidate_id: string;
+          binding_kind: TrackScopeBinding["bindingKind"];
+          scope_axis: TrackScopeBinding["scopeAxis"];
+          scope_value: string;
+          relationship: string;
+          note: string;
+          confidence: string | number;
+          provenance_root: string;
+          source_record_id: string;
+          source_url: string;
+          citation_attestation_id: string | null;
+          provenance_path_json: Array<{ kind: string; id: string; label?: string }>;
+          pipeline_version: string;
+          policy_version: string;
+        }>(
+          `SELECT b.candidate_id,b.binding_kind,b.scope_axis,b.scope_value,b.relationship,b.note,
+             b.confidence,s.provenance_root,b.source_record_id,b.source_url,
+             b.citation_attestation_id,b.provenance_path_json,b.pipeline_version,b.policy_version
+           FROM track_scope_bindings b
+           JOIN source_records s ON s.id=b.source_record_id AND s.run_id=b.run_id
+             AND s.url=b.source_url
+           LEFT JOIN citation_attestations ca ON ca.id=b.citation_attestation_id
+             AND ca.run_id=b.run_id AND ca.source_url=s.url
+           WHERE b.run_id=$1 AND b.eligibility='qualifying'
+             AND (b.binding_kind<>'track_specific_source' OR ca.id IS NOT NULL)
+           ORDER BY b.candidate_id,b.confidence DESC,b.id`,
+          [runId],
+        );
+        const bindingsByCandidate = new Map<string, ManifestScopeBindingProof[]>();
+        for (const binding of bindingResult.rows) {
+          const provenancePath = Array.isArray(binding.provenance_path_json) ? binding.provenance_path_json : [];
+          const proof: ManifestScopeBindingProof = {
+            bindingKind: binding.binding_kind,
+            scopeAxis: binding.scope_axis,
+            scopeValue: binding.scope_value,
+            geographyRelationship: null,
+            relationship: binding.relationship,
+            note: binding.note,
+            confidence: Number(binding.confidence),
+            provenanceRoot: binding.provenance_root,
+            sourceRecordId: binding.source_record_id,
+            sourceUrl: binding.source_url,
+            citationAttestationId: binding.citation_attestation_id,
+            provenancePath,
+          };
+          proof.geographyRelationship = bindingGeographyRelationship(proof);
+          if (!authoritativeScopeBinding(
+            proof,
+            selectionPlan.pipelineVersion,
+            selectionPlan.policyVersion,
+            binding.pipeline_version,
+            binding.policy_version,
+          )) continue;
+          const candidateBindings = bindingsByCandidate.get(binding.candidate_id) ?? [];
+          candidateBindings.push(proof);
+          bindingsByCandidate.set(binding.candidate_id, candidateBindings);
+        }
+        const rules = manifestConstraintRules(selectionPlan);
+        const hardRuleIds = new Set(rules.filter((rule) => rule.kind === "hard").map((rule) => rule.id));
+        const factualScope = selectionPlan.intents.includes("factual_relationship")
+          || selectionPlan.intents.includes("exhaustive");
+        const artistOccurrences = new Map<string, number>();
+        const albumOccurrences = new Map<string, number>();
+        const candidates: ConstraintCandidate<ManifestSelectionRow>[] = matches.rows.map((row) => {
+          const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
+          const summaries = bindings.map((binding) => {
+            const layer = factualScope
+              ? binding.bindingKind === "track_specific_source" && binding.citationAttestationId
+                ? "factual_claim" as const
+                : "scope_binding" as const
+              : binding.bindingKind === "track_specific_source"
+                ? "track_claim" as const
+                : "scope_binding" as const;
+            return {
+              strength: binding.confidence >= 0.9 ? "strong" as const : "medium" as const,
+              provenanceRoot: binding.provenanceRoot,
+              layer,
+              supportsRequestedRelationship: !factualScope || layer === "factual_claim",
+              bindingKind: binding.bindingKind,
+              scopeAxis: binding.scopeAxis,
+            };
+          });
+          const candidateScopeEligible = scopeBindingEligible(brief.mode, summaries, selectionPlan.intents)
+            && selectionGeographyBindingsSatisfied(selectionPlan, bindings);
+          const violations = manifestConstraintViolations({
+            row,
+            plan: selectionPlan,
+            bindings,
+            scopeEligible: candidateScopeEligible,
+          });
+          const artistKey = normalizedPolicyText(row.song_json.artistName || row.artist);
+          const albumKey = normalizedPolicyText(row.song_json.albumName || row.album || "");
+          const artistCount = (artistOccurrences.get(artistKey) ?? 0) + 1;
+          const albumCount = (albumOccurrences.get(albumKey) ?? 0) + 1;
+          artistOccurrences.set(artistKey, artistCount);
+          if (albumKey) albumOccurrences.set(albumKey, albumCount);
+          if (selectionPlan.diversityGoals.maximumTracksPerArtist != null
+            && artistCount > selectionPlan.diversityGoals.maximumTracksPerArtist) {
+            violations.push("artist_concentration");
+          }
+          if (albumKey && selectionPlan.diversityGoals.maximumTracksPerAlbum != null
+            && albumCount > selectionPlan.diversityGoals.maximumTracksPerAlbum) {
+            violations.push("album_concentration");
+          }
+          return { value: row, violations: [...new Set(violations)] };
+        });
+        const target = Number.isFinite(maximumTracks) ? maximumTracks : matches.rows.length;
+        const rankQualifiedCandidates = shouldScoreBroadCuratedSelection(brief.mode, selectionPlan.intents)
+          ? (qualified: readonly ConstraintCandidate<ManifestSelectionRow>[]) => {
+            const broadCandidates = qualified.map((candidate): BroadCuratedCandidate<ConstraintCandidate<ManifestSelectionRow>> => {
+              const row = candidate.value;
+              const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
+              const appleReleaseYear = Number.parseInt(row.song_json.releaseDate?.slice(0, 4) ?? "", 10);
+              return {
+                id: row.candidate_id,
+                artist: row.song_json.artistName || row.artist,
+                title: row.song_json.name || row.title,
+                album: row.song_json.albumName || row.album,
+                releaseYear: row.release_year ?? (Number.isInteger(appleReleaseYear) ? appleReleaseYear : null),
+                scenes: bindings
+                  .filter((binding) => binding.scopeAxis === "scene" || binding.scopeAxis === "genre_scene")
+                  .map((binding) => binding.scopeValue),
+                geographies: bindings
+                  .filter((binding) => binding.scopeAxis === "geography")
+                  .map((binding) => binding.scopeValue),
+                sourceRank: row.selection_rank,
+                evidenceConfidence: bindings.reduce((maximum, binding) => (
+                  Math.max(maximum, binding.confidence)
+                ), 0),
+                independentProvenanceRoots: bindings.map((binding) => binding.provenanceRoot),
+                value: candidate,
+              };
+            });
+            return selectBroadCuratedCandidates(broadCandidates, target).selected.map((item) => {
+              item.candidate.value.selectionScore = item.score;
+              return item.candidate.value;
+            });
+          }
+          : undefined;
+        constraintSelection = selectWithConstraintLadder({
+          target,
+          constraints: rules,
+          candidates,
+          ...(rankQualifiedCandidates ? { rankQualifiedCandidates } : {}),
+        });
+        const selectedIds = new Set(constraintSelection.selected.map((row) => row.candidate_id));
+        hardRejectedMatches = candidates
+          .filter((candidate) => candidate.violations.some((violation) => hardRuleIds.has(violation)))
+          .map((candidate) => candidate.value);
+        const hardRejectedIds = new Set(hardRejectedMatches.map((row) => row.candidate_id));
+        ladderOverflowMatches = matches.rows.filter((row) => (
+          !selectedIds.has(row.candidate_id) && !hardRejectedIds.has(row.candidate_id)
+        ));
+        if (hardRejectedMatches.length > 0) {
+          const rejectedIds = hardRejectedMatches.map((match) => match.candidate_id);
+          await client.query(
+            `UPDATE catalog_matches SET status='unsupported',
+               basis='Pipeline V2 manifest lock rejected an unproven hard constraint',reviewed_at=now()
+             WHERE run_id=$1 AND candidate_id=ANY($2::uuid[]) AND status='accepted'`,
+            [runId, rejectedIds],
+          );
+          await client.query(
+            "UPDATE track_candidates SET outcome='unsupported' WHERE run_id=$1 AND id=ANY($2::uuid[])",
+            [runId, rejectedIds],
+          );
+        }
+        if (constraintSelection.outcome === "partial_policy_conflict") {
+          const observedAt = new Date();
+          const deficitCount = Math.max(0, target - constraintSelection.selected.length);
+          await client.query(
+            `INSERT INTO pipeline_deficit_ledger(
+               id,run_id,stage,kind,status,required_count,actual_count,deficit_count,
+               reason_code,detail_json,pipeline_version,policy_version,observed_at)
+             VALUES($1,$2,'quota_eligible','version_policy','open',$3,$4,$5,
+               'manifest_hard_constraint_shortfall',$6::jsonb,$7,$8,$9)`,
+            [
+              deterministicUuid({ runId, stage: "quota_eligible", reason: "manifest_hard_constraint_shortfall" }),
+              runId,
+              target,
+              constraintSelection.selected.length,
+              deficitCount,
+              JSON.stringify({
+                hardRejectedCount: hardRejectedMatches.length,
+                relaxedSoftConstraints: constraintSelection.relaxedSoftConstraints,
+              }),
+              selectionPlan.pipelineVersion,
+              selectionPlan.policyVersion,
+              observedAt,
+            ],
+          );
+        }
+      }
       const diversifyArtists = excludedReferenceArtists(brief).length > 0
         || briefShouldDiversifyArtists(brief);
-      const selection = selectRankedPlaylistRows(matches.rows, maximumTracks, {
+      const selection = selectRankedPlaylistRows(constraintSelection.selected, maximumTracks, {
         // “Sounds like X” uses X only as a reference. Prefer a genuinely
         // exploratory set from the accepted reserve instead of allowing the
         // first adjacent artist returned by research to dominate the result.
@@ -2944,7 +4238,12 @@ export class Repository {
           : 0,
       });
       const selectedMatches = selection.selected;
-      const overflowMatches = selection.overflow;
+      const overflowMatches = [
+        ...ladderOverflowMatches,
+        ...selection.overflow,
+      ].filter((match, index, values) => (
+        values.findIndex((candidate) => candidate.candidate_id === match.candidate_id) === index
+      ));
       if (overflowMatches.length > 0) {
         const overflowIds = overflowMatches.map((match) => match.candidate_id);
         await client.query(
@@ -2954,7 +4253,9 @@ export class Repository {
           [
             runId,
             overflowIds,
-            `Excluded by the confirmed curated target maximum of ${maximumTracks} tracks after deterministic ${brief.orderingPolicy || "artist/title"} ordering`,
+            selectionPlan && constraintSelection.relaxedSoftConstraints.length > 0
+              ? `Excluded after Pipeline V2 relaxed soft goals in order (${constraintSelection.relaxedSoftConstraints.join(", ")}) and applied the confirmed target of ${maximumTracks} tracks`
+              : `Excluded by the confirmed curated target maximum of ${maximumTracks} tracks after deterministic ${brief.orderingPolicy || "artist/title"} ordering`,
           ],
         );
         await client.query(
@@ -3000,12 +4301,229 @@ export class Repository {
       const normalizedTitle = normalizePlaylistTitle(brief.title, brief);
       const name = appendPlaylistTitleSuffix(normalizedTitle, `· ${now.toISOString().slice(0, 10)}`);
       const description = manifestDescriptionForBrief(brief);
-      await client.query("INSERT INTO manifests(id,run_id,name,description,content_hash) VALUES($1,$2,$3,$4,$5)", [id, runId, name, description, contentHash]);
+      await client.query(
+        `INSERT INTO manifests(
+           id,run_id,name,description,content_hash,pipeline_version,policy_version,selection_plan_json)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+        [id, runId, name, description, contentHash, pipelineVersion, policyVersion,
+          selectionPlan == null ? null : JSON.stringify(selectionPlan)],
+      );
       for (const track of tracks) {
         await client.query(
           "INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title) VALUES($1,$2,$3,$4,$5,$6)",
           [id, track.position, track.candidateId, track.catalogId, track.artist, track.title],
         );
+      }
+      // V2 locks an initial revision alongside the compatibility projection.
+      // Future Apple preflight changes create a child revision; these base
+      // rows are never rewritten.
+      if (pipelineVersion !== "legacy_v1") {
+        const policySnapshot = run.pipeline_policy_snapshot_json as PipelinePolicySnapshot | null;
+        if (!selectionPlan || !policySnapshot
+          || policySnapshot.pipelineVersion !== pipelineVersion
+          || policySnapshot.policyVersion !== policyVersion) {
+          throw new HttpError(
+            409,
+            "Pipeline V2 manifest lock requires its immutable policy snapshot",
+            "pipeline_policy_snapshot_missing",
+          );
+        }
+        let qualifiedReserveCandidateIds: string[] = [];
+        if (overflowMatches.length > 0) {
+          const reserveInput = overflowMatches.map((match, sourcePosition) => ({
+            source_position: sourcePosition,
+            candidate_id: match.candidate_id,
+            catalog_id: match.catalog_id,
+          }));
+          const qualifiedReserve = await client.query<{ candidate_id: string }>(
+            `WITH input AS (
+               SELECT * FROM jsonb_to_recordset($2::jsonb) AS item(
+                 source_position integer,candidate_id uuid,catalog_id text
+               )
+             ), qualified AS (
+               SELECT DISTINCT ON (candidate.recording_family_id)
+                 item.source_position,item.candidate_id,candidate.recording_family_id
+               FROM input item
+               JOIN track_candidates candidate ON candidate.id=item.candidate_id
+                 AND candidate.run_id=$1 AND candidate.recording_family_id IS NOT NULL
+               JOIN LATERAL (
+                 SELECT identity.id FROM recording_catalog_identities identity
+                 WHERE identity.recording_family_id=candidate.recording_family_id
+                   AND identity.provider='apple' AND identity.catalog_id=item.catalog_id
+                 ORDER BY identity.is_preferred DESC,identity.identity_confidence DESC,identity.id
+                 LIMIT 1
+               ) identity ON true
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM track_candidates selected
+                 WHERE selected.run_id=$1 AND selected.id=ANY($3::uuid[])
+                   AND selected.recording_family_id=candidate.recording_family_id
+               )
+               ORDER BY candidate.recording_family_id,item.source_position,item.candidate_id
+             )
+             SELECT candidate_id FROM qualified ORDER BY source_position,candidate_id`,
+            [runId, JSON.stringify(reserveInput), tracks.map((track) => track.candidateId)],
+          );
+          qualifiedReserveCandidateIds = qualifiedReserve.rows.map((row) => row.candidate_id);
+        }
+        const qualifiedReserveSet = new Set(qualifiedReserveCandidateIds);
+        const rejectedOverflowIds = overflowMatches
+          .map((match) => match.candidate_id)
+          .filter((candidateId) => !qualifiedReserveSet.has(candidateId));
+        await advanceCandidateStagesTransaction(client, runId, [
+          ...hardRejectedMatches.map((match) => ({
+            candidateId: match.candidate_id,
+            stages: [{
+              toStage: "rejected" as const,
+              reasonCode: "manifest_hard_constraint_rejected",
+              detail: { manifestId: id },
+            }],
+          })),
+          ...rejectedOverflowIds.map((candidateId) => ({
+            candidateId,
+            stages: [{
+              toStage: "rejected" as const,
+              reasonCode: "manifest_reserve_identity_rejected",
+              detail: { manifestId: id },
+            }],
+          })),
+          ...qualifiedReserveCandidateIds.map((candidateId) => ({
+            candidateId,
+            stages: [{
+              toStage: "quota_eligible" as const,
+              reasonCode: "qualified_manifest_reserve",
+              detail: { manifestId: id },
+            }],
+          })),
+          ...tracks.map((track) => ({
+            candidateId: track.candidateId,
+            stages: [
+              {
+                toStage: "quota_eligible" as const,
+                reasonCode: "manifest_quota_selected",
+                detail: { manifestId: id, position: track.position },
+              },
+              {
+                toStage: "sequenced" as const,
+                reasonCode: "playlist_sequence_assigned",
+                detail: { manifestId: id, position: track.position },
+              },
+              {
+                toStage: "manifested" as const,
+                reasonCode: "manifest_revision_locked",
+                detail: { manifestId: id, position: track.position, revision: 1 },
+              },
+            ],
+          })),
+        ], { pipelineVersion, policyVersion });
+        const stageCounts = await getPipelineStageCountsTransaction(client, runId);
+        const targetTrackCount = Math.max(1, selectionPlan.requestedTrackCount);
+        const lockOutcome = buildPipelineOutcome({
+          pipelineVersion,
+          policyVersion,
+          status: "partial_catalog_degraded",
+          targetTrackCount,
+          discoveredTrackCount: stageCounts.discovered ?? accounting.rows.length,
+          qualifiedTrackCount: Math.min(
+            stageCounts.discovered ?? accounting.rows.length,
+            stageCounts.claim_verified ?? matches.rows.length,
+          ),
+          selectedTrackCount: tracks.length,
+          publishedTrackCount: 0,
+          reasonCodes: ["manifest_locked_pending_publication"],
+          stageCounts,
+        });
+        const outcomeSnapshot = await persistPipelineOutcomeTransaction(client, runId, lockOutcome);
+        const revisionId = randomUUID();
+        await client.query(
+          `INSERT INTO manifest_revisions(
+             id,manifest_id,revision,parent_revision_id,status,reason,content_hash,pipeline_version,
+             policy_version,selection_plan_snapshot_json,pipeline_policy_snapshot_json,
+             outcome_snapshot_json,deficit_snapshot_json,locked_at,created_at)
+           VALUES($1,$2,1,NULL,'locked','initial_manifest_lock',$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,$10)`,
+          [revisionId, id, contentHash, pipelineVersion, policyVersion,
+            JSON.stringify(selectionPlan),
+            JSON.stringify(policySnapshot),
+            JSON.stringify(outcomeSnapshot),
+            JSON.stringify(outcomeSnapshot.deficits),
+            now],
+        );
+        for (const track of tracks) {
+          const family = await client.query<{ recording_family_id: string | null; catalog_identity_id: string | null }>(
+            `SELECT tc.recording_family_id,
+               (SELECT rci.id FROM recording_catalog_identities rci
+                WHERE rci.recording_family_id=tc.recording_family_id AND rci.provider='apple'
+                  AND rci.catalog_id=$3 ORDER BY rci.is_preferred DESC,rci.identity_confidence DESC LIMIT 1) catalog_identity_id
+             FROM track_candidates tc WHERE tc.id=$1 AND tc.run_id=$2`,
+            [track.candidateId, runId, track.catalogId],
+          );
+          await client.query(
+            `INSERT INTO manifest_revision_tracks(
+               manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
+               catalog_id,artist,title) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              revisionId,
+              track.position,
+              track.candidateId,
+              family.rows[0]?.recording_family_id ?? null,
+              family.rows[0]?.catalog_identity_id ?? null,
+              track.catalogId,
+              track.artist,
+              track.title,
+            ],
+          );
+        }
+        if (overflowMatches.length > 0) {
+          const reserveInput = overflowMatches.map((match, sourcePosition) => ({
+            source_position: sourcePosition,
+            candidate_id: match.candidate_id,
+            catalog_id: match.catalog_id,
+            artist: match.artist,
+            title: match.title,
+          }));
+          // Snapshot only stable, canonical recording identities that already
+          // cleared the V2 evidence, hard-constraint, and version-policy gate.
+          // Same-family overflow is an alternate identity, not a reserve
+          // recording, so it remains available through the selected track's
+          // alternate identity list instead.
+          await client.query(
+            `WITH input AS (
+               SELECT * FROM jsonb_to_recordset($3::jsonb) AS item(
+                 source_position integer,candidate_id uuid,catalog_id text,artist text,title text
+               )
+             ), qualified AS (
+               SELECT DISTINCT ON (tc.recording_family_id)
+                 item.source_position,item.candidate_id,item.catalog_id,item.artist,item.title,
+                 tc.recording_family_id,rci.id catalog_identity_id
+               FROM input item
+               JOIN track_candidates tc ON tc.id=item.candidate_id AND tc.run_id=$2
+                 AND tc.recording_family_id IS NOT NULL
+               JOIN LATERAL (
+                 SELECT identity.id FROM recording_catalog_identities identity
+                 WHERE identity.recording_family_id=tc.recording_family_id
+                   AND identity.provider='apple' AND identity.catalog_id=item.catalog_id
+                 ORDER BY identity.is_preferred DESC,identity.identity_confidence DESC,identity.id
+                 LIMIT 1
+               ) rci ON true
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM manifest_revision_tracks selected
+                 WHERE selected.manifest_revision_id=$1
+                   AND selected.recording_family_id=tc.recording_family_id
+               )
+               ORDER BY tc.recording_family_id,item.source_position,item.candidate_id
+             ), ranked AS (
+               SELECT row_number() OVER (ORDER BY source_position,candidate_id)-1 position,qualified.*
+               FROM qualified
+             )
+             INSERT INTO manifest_revision_reserve_tracks(
+               manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
+               catalog_id,artist,title,evidence_eligible,hard_constraints_satisfied,
+               version_compatible,qualified)
+             SELECT $1,position,candidate_id,recording_family_id,catalog_identity_id,
+               catalog_id,artist,title,true,true,true,true
+             FROM ranked ORDER BY position`,
+            [revisionId, runId, JSON.stringify(reserveInput)],
+          );
+        }
       }
       await client.query("UPDATE research_runs SET status='manifest_ready',phase='manifest',updated_at=now() WHERE id=$1", [runId]);
       return { id, runId, name, description, createdAt: now.toISOString(), tracks, contentHash, lockedAt: now.toISOString() };
@@ -3018,21 +4536,213 @@ export class Repository {
   async getManifestById(id: string): Promise<any | null> {
     const manifest = await this.pool.query("SELECT * FROM manifests WHERE id=$1", [id]);
     if (!manifest.rows[0]) return null;
-    const tracks = await this.pool.query(
-      "SELECT position,candidate_id,catalog_id,artist,title FROM manifest_tracks WHERE manifest_id=$1 ORDER BY position",
+    const row = manifest.rows[0];
+    const revision = await this.pool.query(
+      `SELECT * FROM manifest_revisions
+       WHERE manifest_id=$1 AND status IN ('locked','published')
+       ORDER BY revision DESC LIMIT 1`,
       [id],
     );
-    const row = manifest.rows[0];
+    const activeRevision = revision.rows[0] ?? null;
+    const tracks = activeRevision
+      ? await this.pool.query(
+        `SELECT position,candidate_id,catalog_id,artist,title,recording_family_id,catalog_identity_id
+         FROM manifest_revision_tracks WHERE manifest_revision_id=$1 ORDER BY position`,
+        [activeRevision.id],
+      )
+      : await this.pool.query(
+        `SELECT position,candidate_id,catalog_id,artist,title,
+           NULL::uuid recording_family_id,NULL::uuid catalog_identity_id
+         FROM manifest_tracks WHERE manifest_id=$1 ORDER BY position`,
+        [id],
+      );
     return {
       id: row.id,
       runId: row.run_id,
       name: row.name,
       description: row.description,
-      contentHash: row.content_hash,
-      lockedAt: date(row.locked_at)?.toISOString(),
+      contentHash: activeRevision?.content_hash ?? row.content_hash,
+      lockedAt: date(activeRevision?.locked_at ?? row.locked_at)?.toISOString(),
       createdAt: date(row.created_at)?.toISOString(),
-      tracks: tracks.rows.map((track) => ({ position: track.position, candidateId: track.candidate_id, catalogId: track.catalog_id, artist: track.artist, title: track.title })),
+      pipelineVersion: activeRevision?.pipeline_version ?? row.pipeline_version ?? "legacy_v1",
+      policyVersion: activeRevision?.policy_version ?? row.policy_version ?? "legacy_v1",
+      selectionPlan: activeRevision?.selection_plan_snapshot_json ?? row.selection_plan_json ?? null,
+      policySnapshot: activeRevision?.pipeline_policy_snapshot_json ?? null,
+      outcomeSnapshot: activeRevision?.outcome_snapshot_json ?? null,
+      deficitSnapshot: Array.isArray(activeRevision?.deficit_snapshot_json)
+        ? activeRevision.deficit_snapshot_json
+        : [],
+      revisionId: activeRevision?.id ?? null,
+      revision: activeRevision ? Number(activeRevision.revision) : null,
+      tracks: tracks.rows.map((track) => ({
+        position: Number(track.position),
+        candidateId: track.candidate_id,
+        catalogId: track.catalog_id,
+        artist: track.artist,
+        title: track.title,
+        recordingFamilyId: track.recording_family_id,
+        catalogIdentityId: track.catalog_identity_id,
+      })),
     };
+  }
+
+  /**
+   * Load exact locked rows plus explicitly compatible Apple identities for
+   * publication preflight. Metadata-neighbor candidates are deliberately not
+   * returned as substitutes.
+   */
+  async getManifestPreflightTracks(
+    manifestId: string,
+    revisionId: string | null = null,
+    storefront = process.env.APPLE_STOREFRONT ?? "us",
+  ): Promise<PreflightManifestTrack[]> {
+    if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront must be a two-letter code", "invalid_storefront");
+    const manifest = await this.pool.query("SELECT id FROM manifests WHERE id=$1", [manifestId]);
+    if (!manifest.rows[0]) throw new HttpError(404, "Manifest not found", "manifest_not_found");
+    const tracks = revisionId
+      ? await this.pool.query(
+        `SELECT mrt.position,mrt.candidate_id,mrt.catalog_id,mrt.artist,mrt.title,
+           COALESCE(mrt.recording_family_id,tc.recording_family_id) recording_family_id,
+           mrt.catalog_identity_id
+         FROM manifest_revision_tracks mrt
+         JOIN manifest_revisions mr ON mr.id=mrt.manifest_revision_id AND mr.manifest_id=$1
+         JOIN track_candidates tc ON tc.id=mrt.candidate_id
+         WHERE mrt.manifest_revision_id=$2 ORDER BY mrt.position`,
+        [manifestId, revisionId],
+      )
+      : await this.pool.query(
+        `SELECT mt.position,mt.candidate_id,mt.catalog_id,mt.artist,mt.title,
+           tc.recording_family_id,NULL::uuid catalog_identity_id
+         FROM manifest_tracks mt JOIN track_candidates tc ON tc.id=mt.candidate_id
+         WHERE mt.manifest_id=$1 ORDER BY mt.position`,
+        [manifestId],
+      );
+    const familyIds = [...new Set(tracks.rows
+      .map((track) => track.recording_family_id as string | null)
+      .filter((id): id is string => Boolean(id)))];
+    const identities = familyIds.length > 0
+      ? await this.pool.query(
+        `SELECT id,recording_family_id,catalog_id,is_preferred,identity_confidence,metadata_json
+         FROM recording_catalog_identities
+         WHERE recording_family_id=ANY($1::uuid[]) AND provider='apple'
+           AND (storefront IS NULL OR lower(storefront)=lower($2))
+         ORDER BY recording_family_id,is_preferred DESC,identity_confidence DESC,catalog_id`,
+        [familyIds, storefront],
+      )
+      : { rows: [] as any[] };
+    const byFamily = new Map<string, typeof identities.rows>();
+    for (const identity of identities.rows) {
+      const list = byFamily.get(identity.recording_family_id) ?? [];
+      list.push(identity);
+      byFamily.set(identity.recording_family_id, list);
+    }
+    return tracks.rows.map((track): PreflightManifestTrack => {
+      const familyId = track.recording_family_id as string | null;
+      const familyIdentities = familyId ? byFamily.get(familyId) ?? [] : [];
+      const currentIdentity = track.catalog_identity_id
+        ?? familyIdentities.find((identity) => identity.catalog_id === track.catalog_id)?.id
+        ?? null;
+      return {
+        position: Number(track.position),
+        candidateId: track.candidate_id,
+        catalogId: track.catalog_id,
+        artist: track.artist,
+        title: track.title,
+        recordingFamilyId: familyId,
+        catalogIdentityId: currentIdentity,
+        alternates: familyIdentities.map((identity) => {
+          const metadata = identity.metadata_json && typeof identity.metadata_json === "object"
+            ? identity.metadata_json as Record<string, unknown>
+            : {};
+          return {
+            id: identity.id,
+            catalogId: identity.catalog_id,
+            recordingFamilyId: identity.recording_family_id,
+            identityConfidence: Number(identity.identity_confidence),
+            isPreferred: identity.is_preferred === true,
+            compatible: identity.is_preferred === true
+              || metadata.compatible === true
+              || metadata.versionCompatible === true,
+          };
+        }),
+      };
+    });
+  }
+
+  /**
+   * Load the immutable qualified overflow captured with a locked revision.
+   * This is intentionally separate from mutable catalog-match status: once a
+   * revision is locked, only its own reserve snapshot may refill it.
+   */
+  async getManifestPreflightReserveTracks(
+    manifestId: string,
+    revisionId: string,
+    storefront = process.env.APPLE_STOREFRONT ?? "us",
+  ): Promise<PreflightReserveTrack[]> {
+    if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront must be a two-letter code", "invalid_storefront");
+    const reserves = await this.pool.query(
+      `SELECT reserve.position,reserve.candidate_id,reserve.catalog_id,reserve.artist,reserve.title,
+         reserve.recording_family_id,reserve.catalog_identity_id,reserve.evidence_eligible,
+         reserve.hard_constraints_satisfied,reserve.version_compatible,reserve.qualified
+       FROM manifest_revision_reserve_tracks reserve
+       JOIN manifest_revisions revision ON revision.id=reserve.manifest_revision_id
+         AND revision.manifest_id=$1
+       WHERE reserve.manifest_revision_id=$2 ORDER BY reserve.position`,
+      [manifestId, revisionId],
+    );
+    const revision = await this.pool.query(
+      "SELECT 1 FROM manifest_revisions WHERE id=$2 AND manifest_id=$1",
+      [manifestId, revisionId],
+    );
+    if (!revision.rows[0]) throw new HttpError(404, "Manifest revision not found", "manifest_revision_not_found");
+    const familyIds = [...new Set(reserves.rows.map((reserve) => reserve.recording_family_id as string))];
+    const identities = familyIds.length > 0
+      ? await this.pool.query(
+        `SELECT id,recording_family_id,catalog_id,is_preferred,identity_confidence,metadata_json
+         FROM recording_catalog_identities
+         WHERE recording_family_id=ANY($1::uuid[]) AND provider='apple'
+           AND (storefront IS NULL OR lower(storefront)=lower($2))
+         ORDER BY recording_family_id,is_preferred DESC,identity_confidence DESC,catalog_id`,
+        [familyIds, storefront],
+      )
+      : { rows: [] as any[] };
+    const byFamily = new Map<string, typeof identities.rows>();
+    for (const identity of identities.rows) {
+      const list = byFamily.get(identity.recording_family_id) ?? [];
+      list.push(identity);
+      byFamily.set(identity.recording_family_id, list);
+    }
+    return reserves.rows.map((reserve): PreflightReserveTrack => {
+      const familyIdentities = byFamily.get(reserve.recording_family_id) ?? [];
+      return {
+        position: Number(reserve.position),
+        candidateId: reserve.candidate_id,
+        catalogId: reserve.catalog_id,
+        artist: reserve.artist,
+        title: reserve.title,
+        recordingFamilyId: reserve.recording_family_id,
+        catalogIdentityId: reserve.catalog_identity_id,
+        evidenceEligible: reserve.evidence_eligible === true,
+        hardConstraintsSatisfied: reserve.hard_constraints_satisfied === true,
+        versionCompatible: reserve.version_compatible === true,
+        qualified: reserve.qualified === true,
+        alternates: familyIdentities.map((identity) => {
+          const metadata = identity.metadata_json && typeof identity.metadata_json === "object"
+            ? identity.metadata_json as Record<string, unknown>
+            : {};
+          return {
+            id: identity.id,
+            catalogId: identity.catalog_id,
+            recordingFamilyId: identity.recording_family_id,
+            identityConfidence: Number(identity.identity_confidence),
+            isPreferred: identity.is_preferred === true,
+            compatible: identity.is_preferred === true
+              || metadata.compatible === true
+              || metadata.versionCompatible === true,
+          };
+        }),
+      };
+    });
   }
 
   async getLatestManifestForRun(runId: string): Promise<any | null> {
@@ -3043,12 +4753,78 @@ export class Repository {
   async createPublicationVolume(input: PublicationVolumeInput): Promise<any> {
     const id = randomUUID();
     const result = await this.pool.query(
-      `INSERT INTO publication_volumes(id,manifest_id,volume_number,volume_count,start_position,end_position,status)
-       VALUES($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT(manifest_id,volume_number) DO UPDATE SET volume_count=EXCLUDED.volume_count RETURNING *`,
-      [id, input.manifestId, input.volumeNumber, input.volumeCount, input.startPosition, input.endPosition, input.status ?? "queued"],
+      `INSERT INTO publication_volumes(
+         id,manifest_id,manifest_revision_id,volume_number,volume_count,start_position,end_position,status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT(manifest_id,volume_number) DO UPDATE SET updated_at=now()
+       WHERE publication_volumes.manifest_revision_id IS NOT DISTINCT FROM EXCLUDED.manifest_revision_id
+         AND publication_volumes.volume_count=EXCLUDED.volume_count
+         AND publication_volumes.start_position=EXCLUDED.start_position
+         AND publication_volumes.end_position=EXCLUDED.end_position
+       RETURNING *`,
+      [
+        id,
+        input.manifestId,
+        input.manifestRevisionId ?? null,
+        input.volumeNumber,
+        input.volumeCount,
+        input.startPosition,
+        input.endPosition,
+        input.status ?? "queued",
+      ],
     );
+    if (!result.rows[0]) {
+      throw new HttpError(
+        409,
+        "Publication volume belongs to a different manifest revision or immutable range",
+        "publication_revision_conflict",
+      );
+    }
     return result.rows[0];
+  }
+
+  async retirePublicationVolume(input: {
+    manifestId: string;
+    publicationVolumeId: string;
+    applePlaylistId?: string | null;
+    reason: string;
+  }): Promise<string | null> {
+    return this.transaction(async (client) => {
+      const locked = await client.query<{ apple_playlist_id: string | null }>(
+        `SELECT apple_playlist_id FROM publication_volumes
+         WHERE id=$1 AND manifest_id=$2 FOR UPDATE`,
+        [input.publicationVolumeId, input.manifestId],
+      );
+      if (!locked.rows[0]) return null;
+      const applePlaylistId = locked.rows[0].apple_playlist_id ?? input.applePlaylistId;
+      let orphanId: string | null = null;
+      if (applePlaylistId) {
+        orphanId = randomUUID();
+        await client.query(
+          `INSERT INTO orphan_playlists(
+             id,manifest_id,publication_volume_id,apple_playlist_id,reason)
+           VALUES($1,$2,$3,$4,$5)`,
+          [
+            orphanId,
+            input.manifestId,
+            input.publicationVolumeId,
+            applePlaylistId,
+            sanitizeFailure(input.reason, "publication"),
+          ],
+        );
+      }
+      await client.query("DELETE FROM publication_volumes WHERE id=$1", [input.publicationVolumeId]);
+      return orphanId;
+    });
+  }
+
+  async hidePublicPlaylistsForRun(runId: string): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE public_playlists SET status='hidden',hidden_at=COALESCE(hidden_at,now()),updated_at=now()
+       WHERE run_id=$1 AND status='listed' AND hidden_at IS NULL`,
+      [runId],
+    );
+    return result.rowCount ?? 0;
   }
 
   async updatePublicationVolume(id: string, patch: {
@@ -3071,11 +4847,19 @@ export class Repository {
     if (!result.rowCount) throw new HttpError(404, "Publication volume not found", "publication_not_found");
   }
 
-  async listPublicationVolumes(manifestId: string): Promise<any[]> {
-    const result = await this.pool.query("SELECT * FROM publication_volumes WHERE manifest_id=$1 ORDER BY volume_number", [manifestId]);
+  async listPublicationVolumes(manifestId: string, manifestRevisionId?: string | null): Promise<any[]> {
+    const result = manifestRevisionId === undefined
+      ? await this.pool.query("SELECT * FROM publication_volumes WHERE manifest_id=$1 ORDER BY volume_number", [manifestId])
+      : await this.pool.query(
+        `SELECT * FROM publication_volumes
+         WHERE manifest_id=$1 AND manifest_revision_id IS NOT DISTINCT FROM $2::uuid
+         ORDER BY volume_number`,
+        [manifestId, manifestRevisionId],
+      );
     return result.rows.map((row) => ({
       id: row.id,
       manifestId: row.manifest_id,
+      manifestRevisionId: row.manifest_revision_id,
       volumeNumber: row.volume_number,
       volumeCount: row.volume_count,
       startPosition: row.start_position,
@@ -3098,10 +4882,21 @@ export class Repository {
         name: string;
         run_status: string;
         track_count: number;
+        manifest_revision_id: string | null;
       }>(
-        `SELECT m.id,m.run_id,m.content_hash,m.name,r.status run_status,
-           (SELECT count(*)::int FROM manifest_tracks mt WHERE mt.manifest_id=m.id) track_count
+        `SELECT m.id,m.run_id,COALESCE(active_revision.content_hash,m.content_hash) content_hash,
+           m.name,r.status run_status,active_revision.id manifest_revision_id,
+           CASE WHEN active_revision.id IS NULL
+             THEN (SELECT count(*)::int FROM manifest_tracks mt WHERE mt.manifest_id=m.id)
+             ELSE (SELECT count(*)::int FROM manifest_revision_tracks mrt
+                   WHERE mrt.manifest_revision_id=active_revision.id)
+           END track_count
          FROM manifests m JOIN research_runs r ON r.id=m.run_id
+         LEFT JOIN LATERAL (
+           SELECT mr.id,mr.content_hash FROM manifest_revisions mr
+           WHERE mr.manifest_id=m.id AND mr.status IN ('locked','published')
+           ORDER BY mr.revision DESC LIMIT 1
+         ) active_revision ON true
          WHERE m.run_id=$1
          ORDER BY m.created_at DESC,m.id DESC LIMIT 1
          FOR UPDATE OF m,r`,
@@ -3131,9 +4926,10 @@ export class Repository {
       }>(
         `SELECT volume_number,volume_count,start_position,end_position,status,
            apple_share_url,appended_count,published_at
-         FROM publication_volumes WHERE manifest_id=$1
+         FROM publication_volumes
+         WHERE manifest_id=$1 AND manifest_revision_id IS NOT DISTINCT FROM $2::uuid
          ORDER BY volume_number FOR UPDATE`,
-        [source.id],
+        [source.id, source.manifest_revision_id],
       );
       const volumes = volumeResult.rows;
       const volumeCount = volumes[0]?.volume_count ?? 0;
@@ -3170,7 +4966,13 @@ export class Repository {
          ) VALUES($1,$2,$3,$4,$5,$6,'listed',$7)
          ON CONFLICT(manifest_hash) DO UPDATE SET
            run_id=EXCLUDED.run_id,title=EXCLUDED.title,track_count=EXCLUDED.track_count,
-           volume_count=EXCLUDED.volume_count,published_at=EXCLUDED.published_at,updated_at=now()
+           volume_count=EXCLUDED.volume_count,
+           status=CASE WHEN public_playlists.owner_hidden THEN 'hidden' ELSE 'listed' END,
+           hidden_at=CASE
+             WHEN public_playlists.owner_hidden THEN COALESCE(public_playlists.hidden_at,now())
+             ELSE NULL
+           END,
+           published_at=EXCLUDED.published_at,updated_at=now()
          RETURNING id,status,hidden_at`,
         [directoryId, source.run_id, source.content_hash, title, manifestTrackCount, volumeCount, publishedAt],
       );
@@ -3267,6 +5069,7 @@ export class Repository {
     const result = await this.pool.query(
       `UPDATE public_playlists SET
          status=CASE WHEN $2::boolean THEN 'listed' ELSE 'hidden' END,
+         owner_hidden=NOT $2::boolean,
          hidden_at=CASE WHEN $2::boolean THEN NULL ELSE now() END,
          updated_at=now()
        WHERE id=$1`,
@@ -3450,12 +5253,67 @@ export class Repository {
    * for One Command runs, so closing the browser cannot interrupt publication.
    */
   async queueAutomaticPublication(runId: string): Promise<void> {
-    const manifest = await this.finalizeCatalogSelection(runId, {
-      useRecommended: true,
-      excludedCandidateIds: [],
-      overrides: [],
-      automatic: true,
-    });
+    let manifest: Awaited<ReturnType<Repository["finalizeCatalogSelection"]>>;
+    try {
+      manifest = await this.finalizeCatalogSelection(runId, {
+        useRecommended: true,
+        excludedCandidateIds: [],
+        overrides: [],
+        automatic: true,
+      });
+    } catch (error) {
+      if (error instanceof HttpError && error.code === "empty_manifest") {
+        const run = await this.getRunRow(runId);
+        const plan = run?.selection_plan_json as SelectionPlan | null | undefined;
+        if (run && plan && run.pipeline_version !== "legacy_v1") {
+          // Catalog identity and manifest eligibility are deliberately separate
+          // in V2. An exact Apple match can still fail a non-relaxable scope,
+          // evidence, content, or version rule. That is a valid zero-result
+          // completeness outcome, not an operational publication failure.
+          const counts = await this.pool.query<{ discovered_count: number }>(
+            "SELECT count(*)::int discovered_count FROM track_candidates WHERE run_id=$1",
+            [runId],
+          );
+          await this.pool.query(
+            `WITH rejected AS (
+               UPDATE catalog_matches SET status='unsupported',
+                 basis='Pipeline V2 manifest eligibility rejected every catalog match',
+                 reviewed_at=now()
+               WHERE run_id=$1 AND status='accepted'
+               RETURNING candidate_id
+             )
+             UPDATE track_candidates SET outcome='unsupported'
+             WHERE run_id=$1 AND id IN (SELECT candidate_id FROM rejected)`,
+            [runId],
+          );
+          const outcome = buildPipelineOutcome({
+            pipelineVersion: plan.pipelineVersion,
+            policyVersion: plan.policyVersion,
+            status: "no_compatible_tracks",
+            targetTrackCount: plan.requestedTrackCount,
+            discoveredTrackCount: Number(counts.rows[0]?.discovered_count ?? 0),
+            qualifiedTrackCount: 0,
+            selectedTrackCount: 0,
+            publishedTrackCount: 0,
+            frontierExhausted: true,
+            reasonCodes: ["manifest_hard_constraints_rejected_all"],
+          });
+          await this.savePipelineOutcome(runId, outcome);
+          await this.savePipelineDeficitLedger(runId, outcome.deficits, {
+            pipelineVersion: plan.pipelineVersion,
+            policyVersion: plan.policyVersion,
+            mode: "append",
+          });
+          await this.updateRun(runId, {
+            status: "partial",
+            phase: "manifest_policy_empty",
+            error: null,
+          });
+          return;
+        }
+      }
+      throw error;
+    }
     const run = await this.getRunRow(runId);
     if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
     const apple = await this.getAppleAuthorization();
@@ -3516,7 +5374,14 @@ export class Repository {
     return { id: existing.rows[0]!.id, created: false };
   }
 
-  async leaseNextJob(workerId: string, leaseMs: number): Promise<JobView | null> {
+  async leaseNextJob(
+    workerId: string,
+    leaseMs: number,
+    capability: WorkerPipelineCapability = WORKER_PIPELINE_CAPABILITY,
+  ): Promise<JobView | null> {
+    if (!isWorkerCapabilityValid(capability)) {
+      throw new HttpError(400, "Worker lease capability is invalid", "invalid_worker_capability");
+    }
     return this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock($1)", [JOB_ADVISORY_LOCK]);
       const exhausted = await client.query<{ run_id: string | null; brief_request_id: string | null; kind: string; payload_json: Record<string, unknown> | null }>(
@@ -3531,6 +5396,8 @@ export class Repository {
            ELSE $7 END,
          updated_at=now()
          WHERE status='leased' AND lease_expires_at<=now() AND attempts>=max_attempts
+           AND minimum_worker_protocol<=$8
+           AND pipeline_version=ANY($9::varchar[])
          RETURNING run_id,brief_request_id,kind,payload_json`,
         [
           sanitizeFailure(null, "brief"),
@@ -3540,6 +5407,8 @@ export class Repository {
           sanitizeFailure(null, "notification"),
           sanitizeFailure(null, "apple_authorization"),
           sanitizeFailure(null, "background"),
+          capability.protocolNumber,
+          [...capability.pipelineVersions],
         ],
       );
       for (const job of exhausted.rows) {
@@ -3609,6 +5478,8 @@ export class Repository {
       const selected = await client.query(
         `SELECT candidate.* FROM job_queue candidate WHERE
            ((candidate.status='queued' AND candidate.available_at<=now()) OR (candidate.status='leased' AND candidate.lease_expires_at<=now()))
+           AND candidate.minimum_worker_protocol<=$1
+           AND candidate.pipeline_version=ANY($2::varchar[])
            AND NOT (candidate.kind IN ('brief','research','matching') AND COALESCE((SELECT value='true' FROM settings WHERE key='research_paused'),false))
            AND NOT (candidate.kind='publication' AND COALESCE((SELECT value='true' FROM settings WHERE key='publishing_paused'),false))
            AND NOT (
@@ -3646,6 +5517,7 @@ export class Repository {
              ELSE 2
            END,
            candidate.available_at,candidate.created_at FOR UPDATE OF candidate SKIP LOCKED LIMIT 1`,
+        [capability.protocolNumber, [...capability.pipelineVersions]],
       );
       const job = selected.rows[0];
       if (!job) return null;
@@ -3656,7 +5528,19 @@ export class Repository {
         [job.id, workerId, expiresAt],
       );
       const row = updated.rows[0];
-      return { id: row.id, runId: row.run_id, briefRequestId: row.brief_request_id, kind: row.kind, payload: row.payload_json ?? {}, attempts: row.attempts, maxAttempts: row.max_attempts, leaseOwner: row.lease_owner, leaseExpiresAt: date(row.lease_expires_at) };
+      return {
+        id: row.id,
+        runId: row.run_id,
+        briefRequestId: row.brief_request_id,
+        kind: row.kind,
+        payload: row.payload_json ?? {},
+        attempts: row.attempts,
+        maxAttempts: row.max_attempts,
+        pipelineVersion: row.pipeline_version,
+        minimumWorkerProtocol: Number(row.minimum_worker_protocol),
+        leaseOwner: row.lease_owner,
+        leaseExpiresAt: date(row.lease_expires_at),
+      };
     });
   }
 
@@ -3805,6 +5689,1374 @@ export class Repository {
        ON CONFLICT(run_id,phase) DO UPDATE SET state_json=EXCLUDED.state_json,updated_at=now()`,
       [runId, phase, state],
     );
+  }
+
+  /**
+   * Atomically reserves one uncached MusicBrainz HTTP request. A checkpoint is
+   * used instead of an in-memory counter so worker restarts and retries cannot
+   * reset the five-request Pipeline V2 ceiling.
+   */
+  async reserveMusicBrainzEnrichmentRequest(runId: string, maximum: number): Promise<number | null> {
+    const boundedMaximum = Math.min(5, Math.max(0, Math.floor(maximum)));
+    if (!Number.isFinite(boundedMaximum) || boundedMaximum < 1) return null;
+    return this.transaction(async (client) => {
+      const run = await client.query(
+        "SELECT id FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        [runId],
+      );
+      if (!run.rows[0]) return null;
+      const phase = "musicbrainz_identity_budget_v1";
+      const current = await client.query<{ state_json: unknown }>(
+        "SELECT state_json FROM research_checkpoints WHERE run_id=$1 AND phase=$2 FOR UPDATE",
+        [runId, phase],
+      );
+      const state = current.rows[0]?.state_json && typeof current.rows[0].state_json === "object"
+        && !Array.isArray(current.rows[0].state_json)
+        ? current.rows[0].state_json as Record<string, unknown>
+        : {};
+      const observed = Number(state.uncachedRequests);
+      const used = Number.isInteger(observed) && observed >= 0 ? observed : 0;
+      if (used >= boundedMaximum) return null;
+      const next = used + 1;
+      const checkpoint = {
+        version: "musicbrainz_identity_budget_v1",
+        uncachedRequests: next,
+        maximum: boundedMaximum,
+        updatedAt: new Date().toISOString(),
+      };
+      if (current.rows[0]) {
+        await client.query(
+          "UPDATE research_checkpoints SET state_json=$3::jsonb,updated_at=now() WHERE run_id=$1 AND phase=$2",
+          [runId, phase, JSON.stringify(checkpoint)],
+        );
+      } else {
+        await client.query(
+          "INSERT INTO research_checkpoints(run_id,phase,state_json) VALUES($1,$2,$3::jsonb)",
+          [runId, phase, JSON.stringify(checkpoint)],
+        );
+      }
+      return next;
+    });
+  }
+
+  async updateCandidateMusicBrainzIdentity(
+    runId: string,
+    candidateId: string,
+    recordingId: string,
+  ): Promise<void> {
+    if (!UUID_PATTERN.test(recordingId)) return;
+    await this.pool.query(
+      `UPDATE track_candidates SET musicbrainz_id=$3
+       WHERE id=$2 AND run_id=$1 AND (musicbrainz_id IS NULL OR musicbrainz_id=$3)`,
+      [runId, candidateId, recordingId.toLowerCase()],
+    );
+  }
+
+  async getAppleCatalogCacheEntry(
+    storefront: string,
+    resourceKind: AppleCatalogCacheResourceKind,
+    requestFingerprint: string,
+  ): Promise<AppleCatalogCacheEntry | null> {
+    assertAppleCatalogCacheIdentity(storefront, resourceKind, requestFingerprint);
+    const result = await this.pool.query<{
+      storefront: string;
+      resource_kind: AppleCatalogCacheResourceKind;
+      request_fingerprint: string;
+      payload_json: unknown;
+      fetched_at: Date;
+      expires_at: Date;
+    }>(
+      `SELECT storefront,resource_kind,request_fingerprint,payload_json,fetched_at,expires_at
+       FROM apple_catalog_cache_entries
+       WHERE storefront=$1 AND resource_kind=$2 AND request_fingerprint=$3`,
+      [storefront.toLowerCase(), resourceKind, requestFingerprint],
+    );
+    const row = result.rows[0];
+    return row ? {
+      storefront: row.storefront,
+      resourceKind: row.resource_kind,
+      requestFingerprint: row.request_fingerprint,
+      payload: row.payload_json,
+      fetchedAt: row.fetched_at.toISOString(),
+      expiresAt: row.expires_at.toISOString(),
+    } : null;
+  }
+
+  async putAppleCatalogCacheEntry(entry: AppleCatalogCacheWrite): Promise<void> {
+    assertAppleCatalogCacheIdentity(entry.storefront, entry.resourceKind, entry.requestFingerprint);
+    const fetchedAt = new Date(entry.fetchedAt);
+    const expiresAt = new Date(entry.expiresAt);
+    if (!Number.isFinite(fetchedAt.getTime()) || !Number.isFinite(expiresAt.getTime())) {
+      throw new HttpError(400, "Apple catalog cache timestamps are invalid", "invalid_catalog_cache_entry");
+    }
+    const payload = JSON.stringify(entry.payload);
+    if (payload === undefined || payload.length > 8 * 1024 * 1024) {
+      throw new HttpError(400, "Apple catalog cache payload is invalid", "invalid_catalog_cache_entry");
+    }
+    await this.pool.query(
+      `INSERT INTO apple_catalog_cache_entries(
+         storefront,resource_kind,request_fingerprint,payload_json,fetched_at,expires_at)
+       VALUES($1,$2,$3,$4::jsonb,$5,$6)
+       ON CONFLICT(storefront,resource_kind,request_fingerprint) DO UPDATE SET
+         payload_json=EXCLUDED.payload_json,fetched_at=EXCLUDED.fetched_at,
+         expires_at=EXCLUDED.expires_at,updated_at=now()`,
+      [
+        entry.storefront.toLowerCase(),
+        entry.resourceKind,
+        entry.requestFingerprint,
+        payload,
+        fetchedAt,
+        expiresAt,
+      ],
+    );
+  }
+
+  async deleteAppleCatalogCacheEntry(
+    storefront: string,
+    resourceKind: AppleCatalogCacheResourceKind,
+    requestFingerprint: string,
+  ): Promise<void> {
+    assertAppleCatalogCacheIdentity(storefront, resourceKind, requestFingerprint);
+    await this.pool.query(
+      `DELETE FROM apple_catalog_cache_entries
+       WHERE storefront=$1 AND resource_kind=$2 AND request_fingerprint=$3`,
+      [storefront.toLowerCase(), resourceKind, requestFingerprint],
+    );
+  }
+
+  async recordAppleCatalogCacheEvent(event: AppleCatalogCacheEvent): Promise<void> {
+    assertAppleCatalogCacheIdentity(event.storefront, event.resourceKind, event.requestFingerprint);
+    const occurredAt = new Date(event.occurredAt);
+    if (!Number.isFinite(occurredAt.getTime())) {
+      throw new HttpError(400, "Apple catalog cache event timestamp is invalid", "invalid_catalog_cache_event");
+    }
+    const detail = JSON.stringify(event.detail);
+    if (detail === undefined || detail.length > 20_000) {
+      throw new HttpError(400, "Apple catalog cache event detail is invalid", "invalid_catalog_cache_event");
+    }
+    await this.pool.query(
+      `INSERT INTO apple_catalog_cache_events(
+         id,run_id,storefront,resource_kind,request_fingerprint,
+         cache_state,provider_state,detail_json,occurred_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`,
+      [
+        randomUUID(),
+        event.runId,
+        event.storefront.toLowerCase(),
+        event.resourceKind,
+        event.requestFingerprint,
+        event.cacheState,
+        event.providerState,
+        detail,
+        occurredAt,
+      ],
+    );
+  }
+
+  async tryAcquireAppleCatalogCacheLease(
+    storefront: string,
+    resourceKind: AppleCatalogCacheResourceKind,
+    requestFingerprint: string,
+    ownerId: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    assertAppleCatalogCacheIdentity(storefront, resourceKind, requestFingerprint);
+    if (!UUID_PATTERN.test(ownerId)) {
+      throw new HttpError(400, "Apple catalog cache lease owner is invalid", "invalid_catalog_cache_lease");
+    }
+    const boundedLeaseMs = Math.min(120_000, Math.max(5_000, Math.floor(leaseMs)));
+    if (!Number.isFinite(boundedLeaseMs)) {
+      throw new HttpError(400, "Apple catalog cache lease duration is invalid", "invalid_catalog_cache_lease");
+    }
+    const result = await this.pool.query<{ owner_id: string }>(
+      `INSERT INTO apple_catalog_cache_leases(
+         storefront,resource_kind,request_fingerprint,owner_id,acquired_at,expires_at,updated_at)
+       VALUES($1,$2,$3,$4,now(),now()+($5::text || ' milliseconds')::interval,now())
+       ON CONFLICT(storefront,resource_kind,request_fingerprint) DO UPDATE SET
+         owner_id=EXCLUDED.owner_id,acquired_at=EXCLUDED.acquired_at,
+         expires_at=EXCLUDED.expires_at,updated_at=now()
+       WHERE apple_catalog_cache_leases.expires_at <= now()
+          OR apple_catalog_cache_leases.owner_id=EXCLUDED.owner_id
+       RETURNING owner_id`,
+      [storefront.toLowerCase(), resourceKind, requestFingerprint, ownerId, boundedLeaseMs],
+    );
+    return result.rows[0]?.owner_id === ownerId;
+  }
+
+  async releaseAppleCatalogCacheLease(
+    storefront: string,
+    resourceKind: AppleCatalogCacheResourceKind,
+    requestFingerprint: string,
+    ownerId: string,
+  ): Promise<void> {
+    assertAppleCatalogCacheIdentity(storefront, resourceKind, requestFingerprint);
+    if (!UUID_PATTERN.test(ownerId)) {
+      throw new HttpError(400, "Apple catalog cache lease owner is invalid", "invalid_catalog_cache_lease");
+    }
+    await this.pool.query(
+      `DELETE FROM apple_catalog_cache_leases
+       WHERE storefront=$1 AND resource_kind=$2 AND request_fingerprint=$3 AND owner_id=$4`,
+      [storefront.toLowerCase(), resourceKind, requestFingerprint, ownerId],
+    );
+  }
+
+  async cleanupExpiredAppleCatalogCacheLeases(limit = 1_000): Promise<number> {
+    const boundedLimit = Math.min(10_000, Math.max(1, Math.floor(limit)));
+    if (!Number.isFinite(boundedLimit)) {
+      throw new HttpError(400, "Apple catalog cache cleanup limit is invalid", "invalid_catalog_cache_lease");
+    }
+    const result = await this.pool.query(
+      `WITH expired AS (
+         SELECT storefront,resource_kind,request_fingerprint
+         FROM apple_catalog_cache_leases
+         WHERE expires_at <= now()
+         ORDER BY expires_at ASC
+         LIMIT $1
+       )
+       DELETE FROM apple_catalog_cache_leases target
+       USING expired
+       WHERE target.storefront=expired.storefront
+         AND target.resource_kind=expired.resource_kind
+         AND target.request_fingerprint=expired.request_fingerprint`,
+      [boundedLimit],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Persist the immutable, versioned interpretation consumed by Pipeline V2.
+   * This is intentionally separate from brief_json so legacy workers can keep
+   * reading the confirmed brief during an expand/contract rollout.
+   */
+  async savePipelineSelectionPlan(runId: string, plan: SelectionPlan): Promise<void> {
+    await this.transaction(async (client) => {
+      const selected = await client.query<{
+        brief_json: PlaylistBrief;
+        guidance_telemetry_json: PlaylistGuidanceTelemetry | null;
+        pipeline_version: string;
+        policy_version: string;
+        selection_plan_json: SelectionPlan | null;
+        pipeline_policy_snapshot_json: PipelinePolicySnapshot | null;
+      }>(
+        `SELECT brief_json,guidance_telemetry_json,pipeline_version,policy_version,
+                selection_plan_json,pipeline_policy_snapshot_json
+         FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+        [runId],
+      );
+      const run = selected.rows[0];
+      if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+      if (run.pipeline_version !== "legacy_v1" && (
+        run.pipeline_version !== plan.pipelineVersion || run.policy_version !== plan.policyVersion
+      )) {
+        throw new HttpError(409, "Pipeline versions are immutable after assignment", "pipeline_policy_mismatch");
+      }
+      if (run.selection_plan_json
+        && stableStringify(run.selection_plan_json) !== stableStringify(plan)) {
+        throw new HttpError(409, "Pipeline selection plan is immutable after assignment", "pipeline_plan_immutable");
+      }
+      const policySnapshot = run.pipeline_policy_snapshot_json ?? createPipelinePolicySnapshot({
+        brief: run.brief_json,
+        selectionPlan: plan,
+        environment: process.env,
+        modelRoutingSignals: { scoutTelemetry: run.guidance_telemetry_json },
+      });
+      if (policySnapshot.pipelineVersion !== plan.pipelineVersion
+        || policySnapshot.policyVersion !== plan.policyVersion) {
+        throw new HttpError(409, "Pipeline policy snapshot does not match the selection plan", "pipeline_policy_mismatch");
+      }
+      await client.query(
+        `UPDATE research_runs SET pipeline_version=$2,policy_version=$3,
+           selection_plan_json=$4,pipeline_policy_snapshot_json=$5,updated_at=now()
+         WHERE id=$1`,
+        [
+          runId,
+          plan.pipelineVersion,
+          plan.policyVersion,
+          JSON.stringify(plan),
+          JSON.stringify(policySnapshot),
+        ],
+      );
+    });
+  }
+
+  async getPipelineOutcome(runId: string): Promise<PipelineOutcome | null> {
+    const result = await this.pool.query<{ outcome_json: PipelineOutcome }>(
+      "SELECT outcome_json FROM pipeline_outcomes WHERE run_id=$1",
+      [runId],
+    );
+    return result.rows[0]?.outcome_json ?? null;
+  }
+
+  /** Store a final or partial outcome without collapsing its deficit history. */
+  async savePipelineOutcome(runId: string, outcome: PipelineOutcome): Promise<void> {
+    await this.transaction(async (client) => {
+      await persistPipelineOutcomeTransaction(client, runId, outcome);
+    });
+  }
+
+  /**
+   * Summarize one completed UTC window of durable Pipeline V2 telemetry and
+   * enqueue owner alerts. Notification dedupe keys are tied to the closed
+   * window, so retries and overlapping workers remain idempotent.
+   */
+  async runPipelineV2OperationalAlertSweep(input: {
+    windowHours?: number;
+    windowEndedAt?: Date;
+  } = {}): Promise<PipelineOperationalSweepResult> {
+    const windowHours = Number.isFinite(input.windowHours)
+      ? Math.max(1, Math.min(24, Math.floor(input.windowHours!)))
+      : 1;
+    const requestedEnd = input.windowEndedAt ?? new Date();
+    if (!Number.isFinite(requestedEnd.getTime())) {
+      throw new HttpError(400, "Pipeline alert window is invalid", "invalid_pipeline_alert_window");
+    }
+    const windowEnd = new Date(requestedEnd);
+    windowEnd.setUTCMinutes(0, 0, 0);
+    const windowStart = new Date(windowEnd.getTime() - windowHours * 60 * 60 * 1_000);
+
+    const result = await this.pool.query<{
+      terminal_runs: number;
+      zero_result_runs: number;
+      partial_runs: number;
+      local_contract_rejections: number;
+      provider_circuit_openings: number;
+      pagination_loops: number;
+      endpoint_drift_events: number;
+      publication_divergences: number;
+    }>(
+      `WITH recent_outcomes AS (
+         SELECT po.id,po.status,po.published_track_count,po.reason_codes_json
+         FROM pipeline_outcomes po
+         JOIN research_runs r ON r.id=po.run_id
+         WHERE po.pipeline_version<>'legacy_v1'
+           AND po.completed_at >= $1 AND po.completed_at < $2
+           AND r.status IN ('complete','partial','failed','expired','deleted')
+       ), outcome_signals AS (
+         SELECT 'outcome:' || ro.id::text || ':' || reason signal_id,lower(reason) signal
+         FROM recent_outcomes ro
+         CROSS JOIN LATERAL jsonb_array_elements_text(ro.reason_codes_json) AS reasons(reason)
+       ), audit_signals AS (
+         SELECT 'audit:' || ae.id::text signal_id,
+                lower(ae.action || ':' || coalesce(
+                  ae.detail_json->>'reasonCode',ae.detail_json->>'reason_code',
+                  ae.detail_json->>'code',ae.detail_json->>'kind','')) signal
+         FROM audit_events ae
+         JOIN research_runs r ON r.id=ae.run_id
+         WHERE r.pipeline_version<>'legacy_v1'
+           AND ae.occurred_at >= $1 AND ae.occurred_at < $2
+       ), checkpoint_signals AS (
+         SELECT 'checkpoint:' || rc.run_id::text || ':' || rc.phase signal_id,
+                lower(rc.phase || ':' || coalesce(
+                  rc.state_json->>'status',rc.state_json->>'contractCode',
+                  rc.state_json->>'reasonCode',rc.state_json->>'error','')) signal
+         FROM research_checkpoints rc
+         JOIN research_runs r ON r.id=rc.run_id
+         WHERE r.pipeline_version<>'legacy_v1'
+           AND rc.updated_at >= $1 AND rc.updated_at < $2
+           AND (rc.state_json->>'status'='contract_error'
+             OR rc.state_json ? 'contractError'
+             OR lower(coalesce(rc.state_json->>'error','')) LIKE '%pagination%loop%'
+             OR lower(coalesce(rc.state_json->>'error','')) LIKE '%cursor%loop%')
+       ), durable_signals AS (
+         SELECT * FROM outcome_signals
+         UNION ALL
+         SELECT * FROM audit_signals
+         UNION ALL
+         SELECT * FROM checkpoint_signals
+       ), cache_signals AS (
+         SELECT ace.id,ace.provider_state,
+                lower(coalesce(ace.detail_json->>'errorName','')) error_name,
+                lower(coalesce(ace.detail_json->>'errorMessage','')) error_message
+         FROM apple_catalog_cache_events ace
+         JOIN research_runs r ON r.id=ace.run_id
+         WHERE r.pipeline_version<>'legacy_v1'
+           AND ace.occurred_at >= $1 AND ace.occurred_at < $2
+       ), publication_signals AS (
+         SELECT n.id FROM notification_outbox n
+         JOIN research_runs r ON r.id::text=n.payload_json->>'runId'
+         WHERE r.pipeline_version<>'legacy_v1'
+           AND n.kind='publication_orphaned' AND n.created_at >= $1 AND n.created_at < $2
+       )
+       SELECT
+         (SELECT count(*)::int FROM recent_outcomes) terminal_runs,
+         (SELECT count(*)::int FROM recent_outcomes
+          WHERE status='no_compatible_tracks') zero_result_runs,
+         (SELECT count(*)::int FROM recent_outcomes
+          WHERE status LIKE 'partial_%') partial_runs,
+         (SELECT count(*)::int FROM durable_signals
+          WHERE signal LIKE '%local_contract%' OR signal LIKE '%contract_reject%') local_contract_rejections,
+         ((SELECT count(*)::int FROM durable_signals
+           WHERE signal LIKE '%circuit_open%')
+          + (SELECT count(*)::int FROM cache_signals
+             WHERE provider_state='circuit_open'
+                OR error_name LIKE '%circuit%open%'
+                OR error_message LIKE '%circuit%open%')) provider_circuit_openings,
+         ((SELECT count(*)::int FROM durable_signals
+           WHERE signal LIKE '%pagination_loop%' OR signal LIKE '%cursor_loop%')
+          + (SELECT count(*)::int FROM cache_signals
+             WHERE error_message LIKE '%pagination%loop%' OR error_message LIKE '%cursor%loop%')) pagination_loops,
+         ((SELECT count(*)::int FROM durable_signals
+           WHERE signal LIKE '%endpoint_drift%')
+          + (SELECT count(*)::int FROM cache_signals
+             WHERE provider_state='invalid')) endpoint_drift_events,
+         ((SELECT count(*)::int FROM publication_signals)
+          + (SELECT count(*)::int FROM durable_signals
+             WHERE signal LIKE '%publication_divergence%')) publication_divergences`,
+      [windowStart, windowEnd],
+    );
+    const row = result.rows[0] ?? {
+      terminal_runs: 0,
+      zero_result_runs: 0,
+      partial_runs: 0,
+      local_contract_rejections: 0,
+      provider_circuit_openings: 0,
+      pagination_loops: 0,
+      endpoint_drift_events: 0,
+      publication_divergences: 0,
+    };
+    const window: PipelineOperationalWindow = {
+      windowStartedAt: windowStart.toISOString(),
+      windowEndedAt: windowEnd.toISOString(),
+      terminalRuns: Number(row.terminal_runs ?? 0),
+      zeroResultRuns: Number(row.zero_result_runs ?? 0),
+      partialRuns: Number(row.partial_runs ?? 0),
+      localContractRejections: Number(row.local_contract_rejections ?? 0),
+      providerCircuitOpenings: Number(row.provider_circuit_openings ?? 0),
+      paginationLoops: Number(row.pagination_loops ?? 0),
+      endpointDriftEvents: Number(row.endpoint_drift_events ?? 0),
+      publicationDivergences: Number(row.publication_divergences ?? 0),
+    };
+    const alerts = evaluatePipelineOperationalWindow(window);
+    const notificationIds: string[] = [];
+    for (const alert of alerts) {
+      notificationIds.push(await this.enqueueNotification(alert.kind, {
+        deduplicationKey: `pipeline-v2-alert:${alert.kind}:${window.windowStartedAt}`,
+        ...alert,
+        terminalRuns: window.terminalRuns,
+        pipelineVersion: "catalog_first_v2",
+      }));
+    }
+    await this.pool.query(
+      `INSERT INTO settings(key,value) VALUES('pipeline_v2_alert_last_window_end',$1)
+       ON CONFLICT(key) DO UPDATE SET value=GREATEST(settings.value,EXCLUDED.value),updated_at=now()`,
+      [window.windowEndedAt],
+    );
+    return { window, alerts, notificationIds };
+  }
+
+  /**
+   * Seal publication state and its monotonic outcome projection atomically.
+   * The revision's ordered tracks and content hash are deliberately excluded
+   * from this update: publication may annotate a locked revision, never mutate it.
+   */
+  async sealManifestRevisionPublication(
+    runId: string,
+    revisionId: string,
+    outcome: PipelineOutcome,
+  ): Promise<void> {
+    await this.transaction(async (client) => {
+      const merged = await persistPipelineOutcomeTransaction(client, runId, outcome);
+      const revision = await client.query<{
+        pipeline_version: PipelineVersion;
+        policy_version: PipelinePolicyVersion;
+        status: ManifestRevisionStatus;
+      }>(
+        `SELECT mr.pipeline_version,mr.policy_version,mr.status
+         FROM manifest_revisions mr
+         JOIN manifests m ON m.id=mr.manifest_id
+         WHERE mr.id=$2 AND m.run_id=$1 FOR UPDATE OF mr`,
+        [runId, revisionId],
+      );
+      const row = revision.rows[0];
+      if (!row) throw new HttpError(404, "Manifest revision not found", "manifest_revision_not_found");
+      if (row.pipeline_version !== outcome.pipelineVersion || row.policy_version !== outcome.policyVersion) {
+        throw new HttpError(409, "Publication outcome versions do not match the locked revision", "pipeline_policy_mismatch");
+      }
+      if (row.status !== "locked" && row.status !== "published") {
+        throw new HttpError(409, "Only a locked manifest revision can be published", "manifest_revision_not_locked");
+      }
+      await client.query(
+        `UPDATE manifest_revisions SET status='published',
+           outcome_snapshot_json=$3::jsonb,deficit_snapshot_json=$4::jsonb,
+           locked_at=COALESCE(locked_at,now())
+         WHERE id=$2 AND manifest_id IN (SELECT id FROM manifests WHERE run_id=$1)`,
+        [runId, revisionId, JSON.stringify(merged), JSON.stringify(merged.deficits)],
+      );
+    });
+  }
+
+  async upsertRecordingFamily(
+    runId: string,
+    input: Pick<
+      RecordingFamily,
+      "familyKey" | "canonicalArtist" | "canonicalTitle" | "versionClass" | "metadata" | "pipelineVersion" | "policyVersion"
+    > & { id?: string },
+  ): Promise<string> {
+    const id = input.id ?? randomUUID();
+    const result = await this.pool.query<{ id: string }>(
+      `INSERT INTO recording_families(
+         id,run_id,family_key,canonical_artist,canonical_title,version_class,metadata_json,
+         pipeline_version,policy_version)
+       SELECT $1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9
+       FROM research_runs r WHERE r.id=$2 AND r.deleted_at IS NULL
+       ON CONFLICT(run_id,family_key) DO UPDATE SET
+         canonical_artist=EXCLUDED.canonical_artist,canonical_title=EXCLUDED.canonical_title,
+         version_class=EXCLUDED.version_class,metadata_json=EXCLUDED.metadata_json,
+         pipeline_version=EXCLUDED.pipeline_version,policy_version=EXCLUDED.policy_version,updated_at=now()
+       RETURNING id`,
+      [
+        id,
+        runId,
+        input.familyKey,
+        input.canonicalArtist,
+        input.canonicalTitle,
+        input.versionClass,
+        JSON.stringify(input.metadata),
+        input.pipelineVersion,
+        input.policyVersion,
+      ],
+    );
+    if (!result.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+    return result.rows[0].id;
+  }
+
+  async attachCandidateToRecordingFamily(
+    runId: string,
+    recordingFamilyId: string,
+    candidateId: string,
+    relationship = "member",
+  ): Promise<void> {
+    await this.transaction(async (client) => {
+      const owned = await client.query(
+        `SELECT rf.id FROM recording_families rf
+         JOIN track_candidates tc ON tc.id=$3 AND tc.run_id=rf.run_id
+         WHERE rf.id=$2 AND rf.run_id=$1 FOR UPDATE OF rf,tc`,
+        [runId, recordingFamilyId, candidateId],
+      );
+      if (!owned.rows[0]) throw new HttpError(404, "Recording family or candidate not found", "recording_identity_not_found");
+      await client.query(
+        `INSERT INTO recording_family_candidates(recording_family_id,candidate_id,relationship)
+         VALUES($1,$2,$3)
+         ON CONFLICT(candidate_id) DO UPDATE SET
+           recording_family_id=EXCLUDED.recording_family_id,relationship=EXCLUDED.relationship`,
+        [recordingFamilyId, candidateId, relationship],
+      );
+      await client.query(
+        "UPDATE track_candidates SET recording_family_id=$2 WHERE id=$1 AND run_id=$3",
+        [candidateId, recordingFamilyId, runId],
+      );
+    });
+  }
+
+  async upsertAlternateCatalogIdentity(runId: string, input: AlternateCatalogIdentity): Promise<string> {
+    if (!Number.isFinite(input.identityConfidence) || input.identityConfidence < 0 || input.identityConfidence > 1) {
+      throw new HttpError(400, "Catalog identity confidence must be between zero and one", "invalid_catalog_identity");
+    }
+    return this.transaction(async (client) => {
+      const family = await client.query(
+        "SELECT id FROM recording_families WHERE id=$1 AND run_id=$2 FOR UPDATE",
+        [input.recordingFamilyId, runId],
+      );
+      if (!family.rows[0]) throw new HttpError(404, "Recording family not found", "recording_family_not_found");
+      const existing = await client.query<{ id: string }>(
+        `SELECT id FROM recording_catalog_identities
+         WHERE recording_family_id=$1 AND provider=$2 AND storefront IS NOT DISTINCT FROM $3 AND catalog_id=$4`,
+        [input.recordingFamilyId, input.provider, input.storefront, input.catalogId],
+      );
+      const id = existing.rows[0]?.id ?? input.id ?? randomUUID();
+      if (input.isPreferred) {
+        await client.query(
+          "UPDATE recording_catalog_identities SET is_preferred=false,updated_at=now() WHERE recording_family_id=$1 AND provider=$2 AND id<>$3",
+          [input.recordingFamilyId, input.provider, id],
+        );
+      }
+      if (existing.rows[0]) {
+        await client.query(
+          `UPDATE recording_catalog_identities SET is_preferred=$2,identity_confidence=$3,
+             artist=$4,title=$5,album=$6,isrc=$7,musicbrainz_id=$8,duration_ms=$9,
+             version_label=$10,metadata_json=$11::jsonb,updated_at=now() WHERE id=$1`,
+          [
+            id,
+            input.isPreferred,
+            input.identityConfidence,
+            input.artist,
+            input.title,
+            input.album,
+            input.isrc,
+            input.musicbrainzId,
+            input.durationMs,
+            input.versionLabel,
+            JSON.stringify(input.metadata),
+          ],
+        );
+      } else {
+        await client.query(
+          `INSERT INTO recording_catalog_identities(
+             id,recording_family_id,provider,storefront,catalog_id,is_preferred,identity_confidence,
+             artist,title,album,isrc,musicbrainz_id,duration_ms,version_label,metadata_json)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)`,
+          [
+            id,
+            input.recordingFamilyId,
+            input.provider,
+            input.storefront,
+            input.catalogId,
+            input.isPreferred,
+            input.identityConfidence,
+            input.artist,
+            input.title,
+            input.album,
+            input.isrc,
+            input.musicbrainzId,
+            input.durationMs,
+            input.versionLabel,
+            JSON.stringify(input.metadata),
+          ],
+        );
+      }
+      return id;
+    });
+  }
+
+  async saveTrackScopeBindings(
+    runId: string,
+    candidateId: string,
+    bindings: readonly TrackScopeBinding[],
+    versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+  ): Promise<void> {
+    boundedPipelineBatch(bindings, 200, "Track scope bindings");
+    await this.transaction(async (client) => {
+      for (const binding of bindings) {
+        if (!Number.isFinite(binding.confidence) || binding.confidence < 0 || binding.confidence > 1) {
+          throw new HttpError(400, "Scope-binding confidence must be between zero and one", "invalid_scope_binding");
+        }
+        if (binding.sourceUrl) assertPublicHttpsUrl(binding.sourceUrl);
+        const provenancePath = provenancePathWithGeographyRelationship(
+          binding.provenancePath,
+          binding.geographyRelationship,
+        );
+        const id = deterministicUuid({
+          runId,
+          candidateId,
+          bindingKind: binding.bindingKind,
+          scopeAxis: binding.scopeAxis,
+          scopeValue: binding.scopeValue,
+          geographyRelationship: binding.geographyRelationship ?? null,
+          relationship: binding.relationship,
+          sourceRecordId: binding.sourceRecordId,
+          researchContainerId: binding.researchContainerId,
+        });
+        const inserted = await client.query(
+          `INSERT INTO track_scope_bindings(
+             id,run_id,candidate_id,source_record_id,source_url,research_container_id,
+             citation_attestation_id,binding_kind,eligibility,scope_axis,scope_value,
+             relationship,confidence,provenance_path_json,note,pipeline_version,policy_version)
+           SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17
+           FROM track_candidates tc
+           WHERE tc.id=$3 AND tc.run_id=$2
+             AND ($4::uuid IS NULL OR EXISTS(SELECT 1 FROM source_records sr WHERE sr.id=$4 AND sr.run_id=$2))
+             AND ($6::uuid IS NULL OR EXISTS(SELECT 1 FROM research_containers rc WHERE rc.id=$6 AND rc.run_id=$2))
+             AND ($7::uuid IS NULL OR EXISTS(SELECT 1 FROM citation_attestations ca WHERE ca.id=$7 AND ca.run_id=$2))
+           ON CONFLICT ON CONSTRAINT scope_binding_unique_key DO UPDATE SET
+             source_record_id=EXCLUDED.source_record_id,source_url=EXCLUDED.source_url,
+             research_container_id=EXCLUDED.research_container_id,
+             citation_attestation_id=EXCLUDED.citation_attestation_id,
+             eligibility=EXCLUDED.eligibility,confidence=EXCLUDED.confidence,
+             provenance_path_json=EXCLUDED.provenance_path_json,note=EXCLUDED.note,
+             pipeline_version=EXCLUDED.pipeline_version,policy_version=EXCLUDED.policy_version
+           RETURNING id`,
+          [
+            id,
+            runId,
+            candidateId,
+            binding.sourceRecordId,
+            binding.sourceUrl,
+            binding.researchContainerId,
+            binding.citationAttestationId,
+            binding.bindingKind,
+            binding.eligibility,
+            binding.scopeAxis,
+            binding.scopeValue,
+            binding.relationship,
+            binding.confidence,
+            JSON.stringify(provenancePath),
+            binding.note,
+            versions.pipelineVersion,
+            versions.policyVersion,
+          ],
+        );
+        if (!inserted.rows[0]) {
+          throw new HttpError(400, "Scope binding references data outside this research run", "invalid_scope_binding");
+        }
+      }
+    });
+  }
+
+  /**
+   * Atomically promote exact Apple identities discovered inside a trusted,
+   * scoped editorial container. Search results alone cannot call this path:
+   * every row must carry a durable Apple source and qualifying container
+   * membership, which are persisted before the candidate becomes eligible.
+   */
+  async persistCatalogDiscoveredCandidates(
+    runId: string,
+    candidates: readonly CatalogDiscoveredCandidateInput[],
+    versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+  ): Promise<CatalogDiscoveredCandidateResult[]> {
+    boundedPipelineBatch(candidates, 200, "Catalog-discovered candidates");
+    if (candidates.length === 0) return [];
+    return this.transaction(async (client) => {
+      const run = await client.query<{
+        pipeline_version: string | null;
+        policy_version: string | null;
+        selection_plan_json: SelectionPlan | null;
+      }>(
+        `SELECT pipeline_version,policy_version,selection_plan_json
+         FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+        [runId],
+      );
+      const stored = run.rows[0];
+      const plan = stored?.selection_plan_json;
+      if (!stored || !plan) throw new HttpError(404, "Pipeline V2 research run not found", "run_not_found");
+      if (plan.pipelineVersion !== versions.pipelineVersion
+        || plan.policyVersion !== versions.policyVersion
+        || stored.pipeline_version !== versions.pipelineVersion
+        || stored.policy_version !== versions.policyVersion) {
+        throw new HttpError(409, "Catalog discovery policy does not match the persisted run", "pipeline_policy_mismatch");
+      }
+
+      const normalizedByIdentity = new Map<string, CatalogDiscoveredCandidateInput & { candidate: TrackCandidateInput }>();
+      for (const input of candidates) {
+        const sourceUrl = assertPublicHttpsUrl(input.source.url).toString();
+        if (input.source.sourceClass !== "apple"
+          || !sourceUrl.startsWith("https://music.apple.com/")) {
+          throw new HttpError(400, "Catalog discovery requires an Apple Music editorial source", "invalid_catalog_scope_source");
+        }
+        if (!/^pl\.[A-Za-z0-9_-]{1,200}$/u.test(input.container.providerId)
+          || !new URL(sourceUrl).pathname.split("/").includes(input.container.providerId)
+          || input.source.provenanceRoot !== `apple_music_editorial:${input.container.providerId}`
+          || input.bindings.length === 0
+          || input.bindings.length > 16
+          || input.bindings.some((binding) => (
+            binding.bindingKind !== "catalog_editorial_membership"
+            || binding.eligibility !== "qualifying"
+            || binding.sourceUrl !== sourceUrl
+            || !binding.scopeValue.trim()
+            || !binding.relationship.trim()
+            || !Number.isFinite(binding.confidence)
+            || binding.confidence < 0.7
+            || binding.confidence > 1
+          ))
+          || !input.song.id.trim()
+          || !input.song.artistName.trim()
+          || !input.song.name.trim()) {
+          throw new HttpError(400, "Catalog discovery scope binding is invalid", "invalid_catalog_scope_binding");
+        }
+        const candidate: TrackCandidateInput = {
+          artist: input.song.artistName,
+          title: input.song.name,
+          album: input.song.albumName || null,
+          releaseYear: input.song.releaseDate ? Number.parseInt(input.song.releaseDate.slice(0, 4), 10) || null : null,
+          durationMs: input.song.durationInMillis ?? null,
+          isrc: input.song.isrc ?? null,
+          musicbrainzId: null,
+          versionLabel: input.song.versionLabel ?? null,
+          candidateStage: "scope_qualified",
+          evidence: [],
+        };
+        const normalized = { ...input, source: { ...input.source, url: sourceUrl }, candidate };
+        // Multiple Apple catalog rows may describe the same stable recording
+        // (most commonly the same ISRC on several releases). Candidate growth
+        // is recording-oriented, so persist one deterministic row per identity
+        // and let catalog-identity enrichment retain compatible alternates.
+        const identityKey = candidateIdentityKey(candidate);
+        if (!normalizedByIdentity.has(identityKey)) normalizedByIdentity.set(identityKey, normalized);
+      }
+      const normalized = [...normalizedByIdentity.values()];
+      const keys = normalized.map((input) => candidateIdentityKey(input.candidate));
+      const before = await client.query<{ canonical_key: string }>(
+        "SELECT canonical_key FROM track_candidates WHERE run_id=$1 AND canonical_key=ANY($2::text[])",
+        [runId, keys],
+      );
+      const existingKeys = new Set(before.rows.map((row) => row.canonical_key));
+      const sourceIds = await this.addSourcesInTransaction(
+        client,
+        runId,
+        [...new Map(normalized.map((input) => [input.source.url, input.source])).values()],
+      );
+      await this.addCandidatesInTransaction(
+        client,
+        runId,
+        normalized.map((input) => input.candidate),
+        sourceIds,
+        "catalog_enrichment",
+      );
+
+      const output: CatalogDiscoveredCandidateResult[] = [];
+      for (const input of normalized) {
+        const canonicalKey = candidateIdentityKey(input.candidate);
+        const candidate = await client.query<{
+          id: string;
+          candidate_stage: TrackCandidateInput["candidateStage"];
+          stage_updated_at: Date;
+        }>(
+          `SELECT id,candidate_stage,stage_updated_at FROM track_candidates
+           WHERE run_id=$1 AND canonical_key=$2 FOR UPDATE`,
+          [runId, canonicalKey],
+        );
+        const row = candidate.rows[0];
+        const sourceRecordId = sourceIds.get(input.source.url);
+        if (!row || !sourceRecordId) throw new Error("Catalog-discovered candidate persistence lost its source identity");
+        const containerId = randomUUID();
+        const container = await client.query<{ id: string }>(
+          `INSERT INTO research_containers(
+             id,run_id,source_record_id,container_type,provider_id,title,status,
+             recovered_total,metadata_json,completed_at)
+           VALUES($1,$2,$3,'collection',$4,$5,'complete',1,$6::jsonb,now())
+           ON CONFLICT(run_id,container_type,provider_id) DO UPDATE SET
+             source_record_id=EXCLUDED.source_record_id,title=EXCLUDED.title,status='complete',
+             recovered_total=GREATEST(research_containers.recovered_total,EXCLUDED.recovered_total),
+             metadata_json=research_containers.metadata_json||EXCLUDED.metadata_json,
+             completed_at=COALESCE(research_containers.completed_at,now()),updated_at=now()
+           RETURNING id`,
+          [containerId, runId, sourceRecordId, input.container.providerId, input.container.title.slice(0, 240), JSON.stringify(input.container.metadata)],
+        );
+        const storedContainerId = container.rows[0]!.id;
+        const scopeBindings: TrackScopeBinding[] = [];
+        const bindingIds: string[] = [];
+        for (const inputBinding of input.bindings) {
+          const geographyRelationship = inputBinding.geographyRelationship
+            ?? (inputBinding.scopeAxis === "language" ? "language" : null);
+          const scopeBinding: TrackScopeBinding = {
+            ...inputBinding,
+            geographyRelationship,
+            sourceRecordId,
+            researchContainerId: storedContainerId,
+            citationAttestationId: null,
+            provenancePath: provenancePathWithGeographyRelationship([
+              { kind: "provenance_root", id: input.source.provenanceRoot },
+              { kind: "source_record", id: sourceRecordId },
+              { kind: "research_container", id: storedContainerId, label: input.container.providerId },
+              { kind: "catalog_recording", id: input.song.id, label: input.song.name },
+            ], geographyRelationship),
+          };
+          const bindingId = deterministicUuid({
+            runId,
+            candidateId: row.id,
+            bindingKind: scopeBinding.bindingKind,
+            scopeAxis: scopeBinding.scopeAxis,
+            scopeValue: scopeBinding.scopeValue,
+            geographyRelationship: scopeBinding.geographyRelationship ?? null,
+            relationship: scopeBinding.relationship,
+            sourceRecordId,
+            researchContainerId: storedContainerId,
+          });
+          await client.query(
+            `INSERT INTO track_scope_bindings(
+               id,run_id,candidate_id,source_record_id,source_url,research_container_id,
+               citation_attestation_id,binding_kind,eligibility,scope_axis,scope_value,
+               relationship,confidence,provenance_path_json,note,pipeline_version,policy_version)
+             VALUES($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16)
+             ON CONFLICT ON CONSTRAINT scope_binding_unique_key DO UPDATE SET
+               source_url=EXCLUDED.source_url,eligibility=EXCLUDED.eligibility,
+               confidence=EXCLUDED.confidence,provenance_path_json=EXCLUDED.provenance_path_json,
+               note=EXCLUDED.note,pipeline_version=EXCLUDED.pipeline_version,
+               policy_version=EXCLUDED.policy_version`,
+            [
+              bindingId, runId, row.id, sourceRecordId, scopeBinding.sourceUrl, storedContainerId,
+              scopeBinding.bindingKind, scopeBinding.eligibility, scopeBinding.scopeAxis,
+              scopeBinding.scopeValue.slice(0, 240), scopeBinding.relationship.slice(0, 240),
+              scopeBinding.confidence, JSON.stringify(scopeBinding.provenancePath),
+              compactEvidenceNote(scopeBinding.note), versions.pipelineVersion, versions.policyVersion,
+            ],
+          );
+          scopeBindings.push(scopeBinding);
+          bindingIds.push(bindingId);
+        }
+        if (row.candidate_stage === "discovered" || row.candidate_stage === "identity_resolved") {
+          const occurredAt = new Date(Math.max(Date.now(), row.stage_updated_at.getTime() + 1));
+          await client.query(
+            `INSERT INTO candidate_stage_events(
+               id,run_id,candidate_id,from_stage,to_stage,reason_code,detail_json,
+               pipeline_version,policy_version,occurred_at)
+             VALUES($1,$2,$3,$4,'scope_qualified','catalog_editorial_membership',$5::jsonb,$6,$7,$8)
+             ON CONFLICT(id) DO NOTHING`,
+            [
+              deterministicUuid({ runId, candidateId: row.id, bindingIds, toStage: "scope_qualified" }),
+              runId, row.id, row.candidate_stage,
+              JSON.stringify({ bindingIds, appleSongId: input.song.id, containerId: storedContainerId }),
+              versions.pipelineVersion, versions.policyVersion, occurredAt,
+            ],
+          );
+          await client.query(
+            `UPDATE track_candidates SET candidate_stage='scope_qualified',stage_updated_at=$3,
+               pipeline_version=$4,policy_version=$5
+             WHERE id=$1 AND run_id=$2 AND candidate_stage IN ('discovered','identity_resolved')`,
+            [row.id, runId, occurredAt, versions.pipelineVersion, versions.policyVersion],
+          );
+        }
+        output.push({
+          candidateId: row.id,
+          appleSongId: input.song.id,
+          inserted: !existingKeys.has(canonicalKey),
+          scopeBindings,
+        });
+        existingKeys.add(canonicalKey);
+      }
+      return output;
+    });
+  }
+
+  async appendCandidateStageEvents(
+    runId: string,
+    events: readonly CandidateStageEvent[],
+    versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+  ): Promise<void> {
+    boundedPipelineBatch(events, 500, "Candidate stage events");
+    await this.transaction(async (client) => {
+      const candidateIds = [...new Set(events.map((event) => event.candidateId))];
+      if (candidateIds.length > 0) {
+        const owned = await client.query<{ count: number }>(
+          "SELECT count(*)::int count FROM track_candidates WHERE run_id=$1 AND id=ANY($2::uuid[])",
+          [runId, candidateIds],
+        );
+        if (Number(owned.rows[0]?.count ?? 0) !== candidateIds.length) {
+          throw new HttpError(400, "Stage event references a candidate outside this research run", "invalid_candidate_stage_event");
+        }
+      }
+      for (const event of events) {
+        const occurredAt = date(event.occurredAt);
+        if (!occurredAt || Number.isNaN(occurredAt.getTime())) {
+          throw new HttpError(400, "Stage event timestamp is invalid", "invalid_candidate_stage_event");
+        }
+        // The semantic transition is the idempotency key. Excluding the
+        // timestamp means a reclaimed worker cannot duplicate the same stage
+        // transition merely because it retried at a later wall-clock time.
+        const id = deterministicUuid({
+          runId,
+          candidateId: event.candidateId,
+          fromStage: event.fromStage,
+          toStage: event.toStage,
+          reasonCode: event.reasonCode,
+          detail: event.detail,
+        });
+        await client.query(
+          `INSERT INTO candidate_stage_events(
+             id,run_id,candidate_id,from_stage,to_stage,reason_code,detail_json,
+             pipeline_version,policy_version,occurred_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)
+           ON CONFLICT(id) DO NOTHING`,
+          [
+            id,
+            runId,
+            event.candidateId,
+            event.fromStage,
+            event.toStage,
+            event.reasonCode,
+            JSON.stringify(event.detail),
+            versions.pipelineVersion,
+            versions.policyVersion,
+            occurredAt,
+          ],
+        );
+      }
+      await client.query(
+        `UPDATE track_candidates tc SET candidate_stage=latest.to_stage,
+           stage_updated_at=latest.occurred_at,pipeline_version=$2,policy_version=$3
+         FROM (
+           SELECT DISTINCT ON (candidate_id) candidate_id,to_stage,occurred_at
+           FROM candidate_stage_events WHERE run_id=$1
+           ORDER BY candidate_id,occurred_at DESC,id DESC
+         ) latest
+         WHERE tc.id=latest.candidate_id AND tc.run_id=$1 AND tc.stage_updated_at<=latest.occurred_at`,
+        [runId, versions.pipelineVersion, versions.policyVersion],
+      );
+    });
+  }
+
+  async getPipelineStageCounts(runId: string): Promise<PipelineStageCounts> {
+    return getPipelineStageCountsTransaction(this.pool, runId);
+  }
+
+  async savePipelineDeficitLedger(
+    runId: string,
+    entries: readonly PipelineDeficitLedgerEntry[],
+    options: Pick<SelectionPlan, "pipelineVersion" | "policyVersion"> & { mode: "append" | "replace" },
+  ): Promise<void> {
+    boundedPipelineBatch(entries, 200, "Pipeline deficit ledger");
+    await this.transaction(async (client) => {
+      const run = await client.query("SELECT id FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE", [runId]);
+      if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
+      if (options.mode === "replace") {
+        await client.query("DELETE FROM pipeline_deficit_ledger WHERE run_id=$1", [runId]);
+      }
+      for (const entry of entries) {
+        const observedAt = date(entry.observedAt);
+        if (!observedAt || Number.isNaN(observedAt.getTime())) {
+          throw new HttpError(400, "Deficit timestamp is invalid", "invalid_pipeline_deficit");
+        }
+        const id = deterministicUuid({ runId, ...entry });
+        await client.query(
+          `INSERT INTO pipeline_deficit_ledger(
+             id,run_id,stage,kind,status,required_count,actual_count,deficit_count,
+             reason_code,detail_json,pipeline_version,policy_version,observed_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)
+           ON CONFLICT(id) DO NOTHING`,
+          [
+            id,
+            runId,
+            entry.stage,
+            entry.kind,
+            entry.status,
+            entry.requiredCount,
+            entry.actualCount,
+            entry.deficitCount,
+            entry.reasonCode,
+            JSON.stringify(entry.detail),
+            options.pipelineVersion,
+            options.policyVersion,
+            observedAt,
+          ],
+        );
+      }
+    });
+  }
+
+  async createManifestRevision(runId: string, revision: ManifestRevision): Promise<string> {
+    boundedPipelineBatch(revision.tracks, 10_000, "Manifest revision tracks");
+    const reserveTracks = revision.reserveTracks ?? [];
+    boundedPipelineBatch(reserveTracks, 10_000, "Manifest revision reserve tracks");
+    return this.transaction(async (client) => {
+      const manifest = await client.query<{
+        id: string;
+        pipeline_version: PipelineVersion;
+        policy_version: PipelinePolicyVersion;
+        selection_plan_json: SelectionPlan | null;
+        pipeline_policy_snapshot_json: PipelinePolicySnapshot | null;
+      }>(
+        `SELECT m.id,r.pipeline_version,r.policy_version,r.selection_plan_json,
+                r.pipeline_policy_snapshot_json
+         FROM manifests m JOIN research_runs r ON r.id=m.run_id
+         WHERE m.id=$2 AND m.run_id=$1 AND r.deleted_at IS NULL FOR UPDATE OF m,r`,
+        [runId, revision.manifestId],
+      );
+      const run = manifest.rows[0];
+      if (!run) throw new HttpError(404, "Manifest not found", "manifest_not_found");
+      if (run.pipeline_version !== revision.pipelineVersion || run.policy_version !== revision.policyVersion) {
+        throw new HttpError(409, "Manifest revision versions do not match the immutable run", "pipeline_policy_mismatch");
+      }
+      const existing = await client.query<{ id: string; revision: number; content_hash: string }>(
+        `SELECT id,revision,content_hash FROM manifest_revisions
+         WHERE manifest_id=$1 AND (revision=$2 OR content_hash=$3)`,
+        [revision.manifestId, revision.revision, revision.contentHash],
+      );
+      if (existing.rows[0]) {
+        if (Number(existing.rows[0].revision) !== revision.revision || existing.rows[0].content_hash !== revision.contentHash) {
+          throw new HttpError(409, "Manifest revision conflicts with an existing immutable revision", "manifest_revision_conflict");
+        }
+        return existing.rows[0].id;
+      }
+      if (revision.parentRevisionId) {
+        const parent = await client.query(
+          "SELECT id FROM manifest_revisions WHERE id=$1 AND manifest_id=$2",
+          [revision.parentRevisionId, revision.manifestId],
+        );
+        if (!parent.rows[0]) throw new HttpError(400, "Manifest revision parent is invalid", "manifest_revision_parent_invalid");
+      }
+      const candidateIds = [...new Set([
+        ...revision.tracks.map((track) => track.candidateId),
+        ...reserveTracks.map((track) => track.candidateId),
+      ])];
+      if (candidateIds.length > 0) {
+        const owned = await client.query<{ count: number }>(
+          "SELECT count(*)::int count FROM track_candidates WHERE run_id=$1 AND id=ANY($2::uuid[])",
+          [runId, candidateIds],
+        );
+        if (Number(owned.rows[0]?.count ?? 0) !== candidateIds.length) {
+          throw new HttpError(400, "Manifest revision references a candidate outside this research run", "manifest_revision_track_invalid");
+        }
+      }
+      const familyIds = [...new Set([
+        ...revision.tracks.map((track) => track.recordingFamilyId),
+        ...reserveTracks.map((track) => track.recordingFamilyId),
+      ].filter((id): id is string => Boolean(id)))];
+      if (familyIds.length > 0) {
+        const owned = await client.query<{ count: number }>(
+          "SELECT count(*)::int count FROM recording_families WHERE run_id=$1 AND id=ANY($2::uuid[])",
+          [runId, familyIds],
+        );
+        if (Number(owned.rows[0]?.count ?? 0) !== familyIds.length) {
+          throw new HttpError(400, "Manifest revision references a recording family outside this research run", "manifest_revision_track_invalid");
+        }
+      }
+      const identityIds = [...new Set([
+        ...revision.tracks.map((track) => track.catalogIdentityId),
+        ...reserveTracks.map((track) => track.catalogIdentityId),
+      ].filter((id): id is string => Boolean(id)))];
+      if (identityIds.length > 0) {
+        const owned = await client.query<{ count: number }>(
+          `SELECT count(*)::int count FROM recording_catalog_identities rci
+           JOIN recording_families rf ON rf.id=rci.recording_family_id
+           WHERE rf.run_id=$1 AND rci.id=ANY($2::uuid[])`,
+          [runId, identityIds],
+        );
+        if (Number(owned.rows[0]?.count ?? 0) !== identityIds.length) {
+          throw new HttpError(400, "Manifest revision references a catalog identity outside this research run", "manifest_revision_track_invalid");
+        }
+      }
+      const positions = new Set<number>();
+      for (const track of revision.tracks) {
+        if (!Number.isInteger(track.position) || track.position < 0 || positions.has(track.position)) {
+          throw new HttpError(400, "Manifest revision positions must be unique non-negative integers", "manifest_revision_track_invalid");
+        }
+        positions.add(track.position);
+      }
+      const selectedCandidateIds = new Set(revision.tracks.map((track) => track.candidateId));
+      const selectedFamilyIds = new Set(revision.tracks
+        .map((track) => track.recordingFamilyId)
+        .filter((id): id is string => Boolean(id)));
+      const reservePositions = new Set<number>();
+      const reserveCandidateIds = new Set<string>();
+      const reserveFamilyIds = new Set<string>();
+      for (const reserve of reserveTracks) {
+        if (!Number.isInteger(reserve.position) || reserve.position < 0 || reservePositions.has(reserve.position)
+          || !reserve.candidateId || selectedCandidateIds.has(reserve.candidateId)
+          || reserveCandidateIds.has(reserve.candidateId)
+          || !reserve.recordingFamilyId || selectedFamilyIds.has(reserve.recordingFamilyId)
+          || reserveFamilyIds.has(reserve.recordingFamilyId)
+          || !reserve.catalogIdentityId || !reserve.catalogId.trim()
+          || typeof reserve.evidenceEligible !== "boolean"
+          || typeof reserve.hardConstraintsSatisfied !== "boolean"
+          || typeof reserve.versionCompatible !== "boolean"
+          || typeof reserve.qualified !== "boolean") {
+          throw new HttpError(400, "Manifest revision reserve rows are invalid or not recording-unique", "manifest_revision_reserve_invalid");
+        }
+        reservePositions.add(reserve.position);
+        reserveCandidateIds.add(reserve.candidateId);
+        reserveFamilyIds.add(reserve.recordingFamilyId);
+      }
+      if (reserveTracks.length > 0) {
+        const verified = await client.query<{ count: number }>(
+          `WITH input AS (
+             SELECT * FROM jsonb_to_recordset($2::jsonb) AS item(
+               candidate_id uuid,recording_family_id uuid,catalog_identity_id uuid,catalog_id text
+             )
+           )
+           SELECT count(*)::int count FROM input item
+           JOIN track_candidates candidate ON candidate.id=item.candidate_id
+             AND candidate.run_id=$1 AND candidate.recording_family_id=item.recording_family_id
+           JOIN recording_catalog_identities identity ON identity.id=item.catalog_identity_id
+             AND identity.recording_family_id=item.recording_family_id
+             AND identity.provider='apple' AND identity.catalog_id=item.catalog_id`,
+          [runId, JSON.stringify(reserveTracks.map((reserve) => ({
+            candidate_id: reserve.candidateId,
+            recording_family_id: reserve.recordingFamilyId,
+            catalog_identity_id: reserve.catalogIdentityId,
+            catalog_id: reserve.catalogId,
+          })))],
+        );
+        if (Number(verified.rows[0]?.count ?? 0) !== reserveTracks.length) {
+          throw new HttpError(400, "Manifest revision reserve identity is not an exact Apple recording for this run", "manifest_revision_reserve_invalid");
+        }
+      }
+      let selectionPlanSnapshot = revision.selectionPlanSnapshot;
+      let policySnapshot = revision.policySnapshot;
+      let outcomeSnapshot = revision.outcomeSnapshot;
+      let deficitSnapshot = revision.deficitSnapshot;
+      if (revision.pipelineVersion !== "legacy_v1" && revision.status !== "draft") {
+        const storedOutcome = await client.query<{ outcome_json: PipelineOutcome }>(
+          "SELECT outcome_json FROM pipeline_outcomes WHERE run_id=$1 FOR SHARE",
+          [runId],
+        );
+        selectionPlanSnapshot = run.selection_plan_json;
+        policySnapshot = run.pipeline_policy_snapshot_json;
+        outcomeSnapshot = storedOutcome.rows[0]?.outcome_json ?? null;
+        deficitSnapshot = outcomeSnapshot?.deficits ?? [];
+        if (!selectionPlanSnapshot || !policySnapshot || !outcomeSnapshot) {
+          throw new HttpError(
+            409,
+            "Pipeline V2 manifest revisions require persisted plan, policy, and outcome snapshots",
+            "manifest_revision_snapshot_missing",
+          );
+        }
+      }
+      const id = revision.id || randomUUID();
+      await client.query(
+        `INSERT INTO manifest_revisions(
+           id,manifest_id,revision,parent_revision_id,status,reason,content_hash,pipeline_version,
+           policy_version,selection_plan_snapshot_json,pipeline_policy_snapshot_json,
+           outcome_snapshot_json,deficit_snapshot_json,locked_at,created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15)`,
+        [
+          id,
+          revision.manifestId,
+          revision.revision,
+          revision.parentRevisionId,
+          revision.status,
+          revision.reason,
+          revision.contentHash,
+          revision.pipelineVersion,
+          revision.policyVersion,
+          selectionPlanSnapshot == null ? null : JSON.stringify(selectionPlanSnapshot),
+          policySnapshot == null ? null : JSON.stringify(policySnapshot),
+          outcomeSnapshot == null ? null : JSON.stringify(outcomeSnapshot),
+          JSON.stringify(deficitSnapshot),
+          revision.lockedAt == null ? null : date(revision.lockedAt),
+          date(revision.createdAt) ?? new Date(),
+        ],
+      );
+      for (const track of revision.tracks) {
+        await client.query(
+          `INSERT INTO manifest_revision_tracks(
+             manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
+             catalog_id,artist,title) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [
+            id,
+            track.position,
+            track.candidateId,
+            track.recordingFamilyId,
+            track.catalogIdentityId,
+            track.catalogId,
+            track.artist,
+            track.title,
+          ],
+        );
+      }
+      for (const reserve of reserveTracks) {
+        await client.query(
+          `INSERT INTO manifest_revision_reserve_tracks(
+             manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
+             catalog_id,artist,title,evidence_eligible,hard_constraints_satisfied,
+             version_compatible,qualified)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            id,
+            reserve.position,
+            reserve.candidateId,
+            reserve.recordingFamilyId,
+            reserve.catalogIdentityId,
+            reserve.catalogId,
+            reserve.artist,
+            reserve.title,
+            reserve.evidenceEligible,
+            reserve.hardConstraintsSatisfied,
+            reserve.versionCompatible,
+            reserve.qualified,
+          ],
+        );
+      }
+      if (revision.pipelineVersion !== "legacy_v1" && revision.tracks.length > 0) {
+        await advanceCandidateStagesTransaction(
+          client,
+          runId,
+          revision.tracks.map((track) => ({
+            candidateId: track.candidateId,
+            stages: [
+              {
+                toStage: "quota_eligible",
+                reasonCode: "manifest_revision_quota_selected",
+                detail: { manifestId: revision.manifestId, revision: revision.revision, position: track.position },
+              },
+              {
+                toStage: "sequenced",
+                reasonCode: "manifest_revision_sequence_assigned",
+                detail: { manifestId: revision.manifestId, revision: revision.revision, position: track.position },
+              },
+              {
+                toStage: "manifested",
+                reasonCode: "manifest_revision_locked",
+                detail: { manifestId: revision.manifestId, revision: revision.revision, position: track.position },
+              },
+            ],
+          })),
+          { pipelineVersion: revision.pipelineVersion, policyVersion: revision.policyVersion },
+        );
+      }
+      return id;
+    });
+  }
+
+  async getManifestRevision(runId: string, revisionId: string): Promise<ManifestRevision | null> {
+    const [revision, tracks, reserveTracks] = await Promise.all([
+      this.pool.query(
+        `SELECT mr.* FROM manifest_revisions mr
+         JOIN manifests m ON m.id=mr.manifest_id
+         JOIN research_runs r ON r.id=m.run_id
+         WHERE mr.id=$2 AND m.run_id=$1 AND r.deleted_at IS NULL`,
+        [runId, revisionId],
+      ),
+      this.pool.query(
+        `SELECT mrt.* FROM manifest_revision_tracks mrt
+         JOIN manifest_revisions mr ON mr.id=mrt.manifest_revision_id
+         JOIN manifests m ON m.id=mr.manifest_id
+         WHERE mrt.manifest_revision_id=$2 AND m.run_id=$1 ORDER BY mrt.position`,
+        [runId, revisionId],
+      ),
+      this.pool.query(
+        `SELECT reserve.* FROM manifest_revision_reserve_tracks reserve
+         JOIN manifest_revisions revision ON revision.id=reserve.manifest_revision_id
+         JOIN manifests manifest ON manifest.id=revision.manifest_id
+         WHERE reserve.manifest_revision_id=$2 AND manifest.run_id=$1 ORDER BY reserve.position`,
+        [runId, revisionId],
+      ),
+    ]);
+    const row = revision.rows[0];
+    if (!row) return null;
+    return {
+      id: row.id,
+      manifestId: row.manifest_id,
+      revision: Number(row.revision),
+      parentRevisionId: row.parent_revision_id,
+      status: row.status,
+      reason: row.reason,
+      contentHash: row.content_hash,
+      pipelineVersion: row.pipeline_version,
+      policyVersion: row.policy_version,
+      selectionPlanSnapshot: row.selection_plan_snapshot_json ?? null,
+      policySnapshot: row.pipeline_policy_snapshot_json ?? null,
+      outcomeSnapshot: row.outcome_snapshot_json ?? null,
+      deficitSnapshot: Array.isArray(row.deficit_snapshot_json) ? row.deficit_snapshot_json : [],
+      lockedAt: date(row.locked_at)?.toISOString() ?? null,
+      createdAt: date(row.created_at)?.toISOString() ?? new Date(0).toISOString(),
+      tracks: tracks.rows.map((track): ManifestRevisionTrack => ({
+        position: Number(track.position),
+        candidateId: track.candidate_id,
+        recordingFamilyId: track.recording_family_id,
+        catalogIdentityId: track.catalog_identity_id,
+        catalogId: track.catalog_id,
+        artist: track.artist,
+        title: track.title,
+      })),
+      reserveTracks: reserveTracks.rows.map((reserve): ManifestRevisionReserveTrack => ({
+        position: Number(reserve.position),
+        candidateId: reserve.candidate_id,
+        recordingFamilyId: reserve.recording_family_id,
+        catalogIdentityId: reserve.catalog_identity_id,
+        catalogId: reserve.catalog_id,
+        artist: reserve.artist,
+        title: reserve.title,
+        evidenceEligible: reserve.evidence_eligible === true,
+        hardConstraintsSatisfied: reserve.hard_constraints_satisfied === true,
+        versionCompatible: reserve.version_compatible === true,
+        qualified: reserve.qualified === true,
+      })),
+    };
+  }
+
+  async markManifestRevisionStatus(
+    runId: string,
+    revisionId: string,
+    status: ManifestRevisionStatus,
+  ): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE manifest_revisions mr SET status=$3,
+         locked_at=CASE WHEN $3 IN ('locked','published') THEN COALESCE(mr.locked_at,now()) ELSE mr.locked_at END
+       FROM manifests m
+       WHERE mr.id=$2 AND m.id=mr.manifest_id AND m.run_id=$1
+       RETURNING mr.id`,
+      [runId, revisionId, status],
+    );
+    if (!result.rows[0]) throw new HttpError(404, "Manifest revision not found", "manifest_revision_not_found");
   }
 
   async consumeRateLimit(clientBucketAliases: string[], action: string, limit: number, windowHours = 24): Promise<{ remaining: number }> {
@@ -4519,7 +7771,7 @@ export class Repository {
 
   async getSystemHealth(): Promise<any> {
     const [worker, queue, costs, apple, notifications, publications, orphans, retention, researchPaused, publishingPaused, feedbackPaused] = await Promise.all([
-      this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1"),
+      this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC"),
       this.pool.query(
         `SELECT
           count(*) FILTER (WHERE status='queued')::int queued,
@@ -4558,28 +7810,49 @@ export class Repository {
       this.getSetting("publishing_paused"),
       this.getSetting("feedback_paused"),
     ]);
-    const heartbeat = worker.rows[0];
     const queueRow = queue.rows[0] ?? {};
     const notificationRow = notifications.rows[0] ?? {};
     const publicationRow = publications.rows[0] ?? {};
     const retentionRow = retention.rows[0] ?? {};
-    const lastSeenAt = date(heartbeat?.last_seen_at);
     const configuredStaleSeconds = Number(process.env.WORKER_STALE_SECONDS ?? 90);
     const staleAfterMs = (Number.isFinite(configuredStaleSeconds) ? Math.max(30, configuredStaleSeconds) : 90) * 1_000;
+    const databaseSchemaVersion = await this.getSchemaVersion();
+    const evaluatedWorkers = worker.rows.map((row) => {
+      const lastSeenAt = date(row.last_seen_at);
+      const stale = !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs;
+      return {
+        ...row,
+        lastSeenAt: lastSeenAt?.toISOString(),
+        stale,
+        schemaCompatible: heartbeatSchemaCompatible(row, databaseSchemaVersion),
+        protocolVersion: workerPipelineProtocolVersion(row.metadata_json),
+        protocolCompatible: isWorkerPipelineProtocolCompatible(row.metadata_json),
+      };
+    });
+    // A newer bridge heartbeat must not hide healthy v5 capacity during a
+    // mixed rollout. Prefer a fully compatible fresh worker, then any fresh
+    // worker for actionable diagnostics, then the newest stale heartbeat.
+    const heartbeat = evaluatedWorkers.find((row) => (
+      !row.stale && row.schemaCompatible && row.protocolCompatible
+    )) ?? evaluatedWorkers.find((row) => !row.stale) ?? evaluatedWorkers[0];
+    const compatibleCapacity = evaluatedWorkers
+      .filter((row) => !row.stale && row.schemaCompatible && row.protocolCompatible)
+      .reduce((sum, row) => sum + Number(row.capacity ?? 0), 0);
     return {
-      database: { ok: true, schemaVersion: await this.getSchemaVersion() },
+      database: {
+        ok: true,
+        schemaVersion: databaseSchemaVersion,
+        schemaCompatible: isDatabaseSchemaVersionCompatible(databaseSchemaVersion),
+      },
       worker: heartbeat ? {
         ...heartbeat,
-        lastSeenAt: lastSeenAt?.toISOString(),
-        stale: !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs,
-        schemaCompatible: heartbeat.schema_version === DATABASE_SCHEMA_VERSION,
-        protocolVersion: workerPipelineProtocolVersion(heartbeat.metadata_json),
-        protocolCompatible: isWorkerPipelineProtocolCompatible(heartbeat.metadata_json),
+        compatibleCapacity,
       } : {
         stale: true,
         schemaCompatible: false,
         protocolVersion: null,
         protocolCompatible: false,
+        compatibleCapacity: 0,
       },
       queue: {
         queued: Number(queueRow.queued ?? 0),
@@ -4620,7 +7893,7 @@ export class Repository {
       this.getOutcomeCounts(runId),
     ]);
     if (!manifest) return { status: run.status, manifest: null, volumes: [], outcomeCounts, completedTracks: 0, totalTracks: 0 };
-    const rawVolumes = await this.listPublicationVolumes(manifest.id);
+    const rawVolumes = await this.listPublicationVolumes(manifest.id, manifest.revisionId ?? null);
     const volumes = rawVolumes.map((volume) => ({
       ...volume,
       index: volume.volumeNumber,
@@ -4746,7 +8019,17 @@ export class Repository {
       if (!run.rows[0]) return;
       const manifest = await client.query("SELECT id,content_hash,name FROM manifests WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1", [runId]);
       const volumes = manifest.rows[0]
-        ? await client.query("SELECT apple_share_url FROM publication_volumes WHERE manifest_id=$1 AND apple_share_url IS NOT NULL ORDER BY volume_number", [manifest.rows[0].id])
+        ? await client.query(
+          `SELECT pv.apple_share_url FROM publication_volumes pv
+           WHERE pv.manifest_id=$1 AND pv.status='complete' AND pv.apple_share_url IS NOT NULL
+             AND pv.manifest_revision_id IS NOT DISTINCT FROM (
+               SELECT mr.id FROM manifest_revisions mr
+               WHERE mr.manifest_id=$1 AND mr.status IN ('locked','published')
+               ORDER BY mr.revision DESC LIMIT 1
+             )
+           ORDER BY pv.volume_number`,
+          [manifest.rows[0].id],
+        )
         : { rows: [] };
       const counts = await client.query("SELECT outcome,count(*)::int count FROM track_candidates WHERE run_id=$1 GROUP BY outcome", [runId]);
       const appleLinks = volumes.rows.map((volume) => volume.apple_share_url);

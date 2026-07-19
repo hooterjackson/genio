@@ -18,10 +18,481 @@ export type RunStatus =
   | "expired"
   | "deleted";
 
-export type JobKind = "brief" | "research" | "matching" | "publication" | "retention" | "notification";
+export type JobKind =
+  | "brief"
+  | "research"
+  | "matching"
+  | "publication"
+  | "retention"
+  | "notification"
+  | "apple_authorization"
+  | "pipeline_observability";
 export type JobStatus = "queued" | "leased" | "retry" | "complete" | "failed" | "cancelled";
 export type MatchStatus = "accepted" | "review" | "unavailable" | "rejected" | "duplicate" | "unsupported" | "overflow";
 export type PublicationStatus = "queued" | "creating" | "appending" | "waiting_for_share_url" | "complete" | "orphaned" | "waiting_for_owner" | "failed";
+
+/**
+ * Durable pipeline identifiers. Existing rows are explicitly marked legacy so
+ * a mixed-version deployment can read old work without pretending it was
+ * produced by the catalog-first policy.
+ */
+export type PipelineVersion = "legacy_v1" | "catalog_first_v2" | "pipeline_v2";
+export type PipelinePolicyVersion =
+  | "legacy_v1"
+  | "catalog_first_v2_policy_v1"
+  | "relevance_first_2026_07";
+
+/** Primary research intents. Several may coexist in one request. */
+export type ResearchIntent =
+  | "genre_scene"
+  | "similarity"
+  | "mood_activity"
+  | "theme"
+  | "artist_catalogue"
+  | "editorial_ranking"
+  | "factual_relationship"
+  | "exhaustive";
+
+export type ResearchArchetype =
+  | "genre_scene"
+  | "similarity"
+  | "mood_theme_activity"
+  | "artist_catalog"
+  | "editorial_ranked"
+  | "factual_relationship"
+  | "exhaustive";
+
+export type SelectionConstraintKind = "hard" | "soft";
+export type SelectionConstraintAxis =
+  | "genre"
+  | "scene"
+  | "subgenre"
+  | "era"
+  | "geography"
+  | "language"
+  | "mood"
+  | "activity"
+  | "theme"
+  | "artist"
+  | "track"
+  | "label"
+  | "venue"
+  | "recording_version"
+  | "content"
+  | "evidence"
+  | "relationship";
+export type SelectionConstraintOperator =
+  | "include"
+  | "exclude"
+  | "prefer"
+  | "avoid"
+  | "require"
+  | "within"
+  | "before"
+  | "after"
+  | "between"
+  | "maximum";
+
+/** One independently enforceable rule, with an explicit relaxation contract. */
+export interface SelectionConstraint {
+  id: string;
+  axis: SelectionConstraintAxis;
+  operator: SelectionConstraintOperator;
+  values: string[];
+  kind: SelectionConstraintKind;
+  /** Exact place/language semantics; `unspecified` preserves real ambiguity. */
+  geographyRelationship?: SelectionGeographyRelationship | null;
+  /** Null for hard constraints; unique ascending rank for soft goals. */
+  relaxationRank: number | null;
+}
+
+export type SelectionGeographyRelationship =
+  | "artist_origin"
+  | "artist_residence"
+  | "recording_location"
+  | "label_or_venue_scene"
+  | "language"
+  | "sound_association"
+  | "unspecified";
+
+export interface SelectionEraConstraint {
+  label: string;
+  startYear: number | null;
+  endYear: number | null;
+}
+
+export interface SelectionGeographyConstraint {
+  value: string;
+  relationship: SelectionGeographyRelationship;
+}
+
+/**
+ * Orthogonal constraints survive strategy selection. A ResearchArchetype may
+ * choose an execution path, but it must never flatten a similarity + mood +
+ * era + exclusion request into one lossy label.
+ */
+export interface SelectionConstraints {
+  genres: string[];
+  scenes: string[];
+  subgenres: string[];
+  eras: SelectionEraConstraint[];
+  geographies: SelectionGeographyConstraint[];
+  languages: string[];
+  moods: string[];
+  themes: string[];
+  activities: string[];
+  seedArtists: string[];
+  seedTracks: string[];
+  hardIncludes: string[];
+  hardExcludes: string[];
+}
+
+export interface SelectionDiversityGoals {
+  minimumDistinctArtists: number | null;
+  minimumDistinctAlbums: number | null;
+  minimumDistinctEras: number | null;
+  minimumDistinctScenes: number | null;
+  minimumDistinctGeographies: number | null;
+  maximumTracksPerArtist: number | null;
+  maximumTracksPerAlbum: number | null;
+}
+
+export interface SelectionOrderingPolicy {
+  mode: "editorial" | "smooth" | "contrast" | "chronological" | "source_order";
+  goals: string[];
+  avoidAdjacentSameArtist: boolean;
+  avoidAdjacentSameAlbum: boolean;
+}
+
+export interface SelectionVersionPolicy {
+  preferred: RecordingVersionClass[];
+  allowed: RecordingVersionClass[];
+  excludeCompilations: boolean;
+  excludeKaraokeAndTributes: boolean;
+}
+
+export interface SelectionContentPolicy {
+  explicitContent: "allow" | "prefer_clean" | "clean_only";
+  instrumental: "allow" | "prefer" | "exclude";
+  languages: string[];
+}
+
+export interface SelectionPlan {
+  schemaVersion: 1;
+  pipelineVersion: PipelineVersion;
+  policyVersion: PipelinePolicyVersion;
+  intents: ResearchIntent[];
+  /** Compatibility routing hints only; constraints and intents are authoritative. */
+  archetypes?: ResearchArchetype[];
+  storefront: string;
+  requestedTrackCount: number;
+  minimumQualifiedTrackCount: number;
+  reserveTrackCount: number;
+  constraints: SelectionConstraint[];
+  /** Typed place/language semantics retained independently of prose. */
+  geographyConstraints: SelectionGeographyConstraint[];
+  similarityDimensions: string[];
+  labels: string[];
+  venues: string[];
+  referenceRecordings: string[];
+  softGoalRelaxationOrder: string[];
+  diversityGoals: SelectionDiversityGoals;
+  evidencePolicy: string;
+  versionPolicy: SelectionVersionPolicy;
+  orderingPolicy: SelectionOrderingPolicy;
+  contentPolicy: SelectionContentPolicy;
+  /** Original v1 axis bags, retained only while legacy workers are drained. */
+  legacyConstraintAxes?: SelectionConstraints;
+}
+
+/**
+ * The fully resolved execution contract captured when a Pipeline V2 run is
+ * created.  Resumed work must consume this value instead of re-reading mutable
+ * process environment configuration.
+ */
+export type PipelineExecutionPolicySnapshot =
+  | {
+    kind: "fast_curated";
+    version: string;
+    model: string;
+    runDeadlineMs: number;
+    matchingReserveMs: number;
+    targetMinimum: number;
+    targetMaximum: number;
+    candidateGoal: number;
+    candidateLimit: number;
+    maxPasses: number;
+    maxWebToolCalls: number;
+    maxSynthesisTokens: number;
+    maxExtractionTokens: number;
+    searchContextSize: "low" | "medium";
+    modelRoute: {
+      version: string;
+      tier: "luna" | "terra";
+      modelSnapshot: string;
+      reason: string;
+      scoutConfidence: "high" | "medium" | "low";
+      structuredRepairFailures: number;
+    };
+  }
+  | {
+    kind: "deep";
+    version: string;
+    model: string;
+  };
+
+export interface PipelinePolicySnapshot {
+  schemaVersion: 1;
+  pipelineVersion: PipelineVersion;
+  policyVersion: PipelinePolicyVersion;
+  selectionPlanVersion: string;
+  capturedAt: string;
+  storefront: string;
+  executionPolicy: PipelineExecutionPolicySnapshot;
+  requestLimits: {
+    maxToolCalls: number | null;
+    maxHostedSearchCalls: number | null;
+    maxSynthesisTokens: number | null;
+    maxExtractionTokens: number | null;
+  };
+  costLimits: {
+    scoutUsd: number;
+    curatedRunUsd: number | null;
+    factualApprovalGateUsd: number;
+    postMatchRefillUsd: number;
+  };
+  catalogLimits: {
+    appleConcurrencyInitial: number;
+    appleConcurrencyMinimum: number;
+    appleConcurrencyMaximum: number;
+    catalogRecoveryDeadlineMs: number;
+    catalogLookupTimeoutMs: number;
+    musicBrainzMaxUncachedRequests: number;
+    maximumRawDiscoveryGoal: number;
+    catalogResourceCacheTtlSeconds: number;
+    catalogSearchCacheTtlSeconds: number;
+    playlistMembershipCacheTtlSeconds: number;
+  };
+  durableResearchLimits: {
+    gapPasses: number;
+    turnsPerSegment: number;
+    segmentsPerPass: number;
+  };
+  evidencePolicy: string;
+}
+
+export type TrackScopeBindingKind =
+  | "track_specific_source"
+  | "scoped_container_membership"
+  | "catalog_editorial_membership"
+  | "catalog_genre_metadata"
+  | "artist_scope"
+  | "album_scope"
+  | "lexical_match"
+  | "manual_import";
+
+export type TrackScopeBindingEligibility =
+  | "qualifying"
+  | "supporting"
+  | "discovery_only"
+  | "rejected";
+
+/** Auditable reason that one exact recording belongs in the requested scope. */
+export interface TrackScopeBinding {
+  bindingKind: TrackScopeBindingKind;
+  eligibility: TrackScopeBindingEligibility;
+  scopeAxis: ResearchArchetype | "genre" | "scene" | "era" | "geography" | "language" | "mood" | "theme" | "activity";
+  scopeValue: string;
+  /** Exact place/language relationship established by this source. */
+  geographyRelationship?: SelectionGeographyRelationship | null;
+  relationship: string;
+  confidence: number;
+  sourceUrl: string | null;
+  sourceRecordId: string | null;
+  researchContainerId: string | null;
+  citationAttestationId: string | null;
+  provenancePath: Array<{ kind: string; id: string; label?: string }>;
+  note: string;
+}
+
+/** Independently auditable proof layers retained by Pipeline V2. */
+export type EvidenceLayer =
+  | "catalog_identity"
+  | "scope_binding"
+  | "track_claim"
+  | "factual_claim";
+
+export type CandidateStage =
+  | "discovered"
+  | "identity_resolved"
+  | "scope_qualified"
+  | "claim_verified"
+  | "version_compatible"
+  | "playable"
+  | "canonicalized"
+  | "catalog_resolved"
+  | "eligible"
+  | "quota_eligible"
+  | "sequenced"
+  | "manifested"
+  | "published"
+  | "selected"
+  | "rejected"
+  | "exhausted";
+
+export interface CandidateStageEvent {
+  candidateId: string;
+  fromStage: CandidateStage | null;
+  toStage: CandidateStage;
+  reasonCode: string;
+  detail: Record<string, unknown>;
+  occurredAt: string;
+}
+
+export type PipelineDeficitKind =
+  | "candidate_pool"
+  | "scope_relevance"
+  | "catalog_availability"
+  | "recording_identity"
+  | "evidence"
+  | "artist_breadth"
+  | "album_cap"
+  | "version_policy"
+  | "source_frontier"
+  | "provider_unavailable";
+
+export type PipelineDeficitStatus = "open" | "resolved" | "exhausted" | "waived";
+
+export interface PipelineDeficitLedgerEntry {
+  stage: CandidateStage;
+  kind: PipelineDeficitKind;
+  status: PipelineDeficitStatus;
+  requiredCount: number;
+  actualCount: number;
+  deficitCount: number;
+  reasonCode: string;
+  detail: Record<string, unknown>;
+  observedAt: string;
+}
+
+export type RecordingVersionClass =
+  | "canonical"
+  | "remaster"
+  | "radio_edit"
+  | "extended"
+  | "remix"
+  | "live"
+  | "acoustic"
+  | "clean"
+  | "explicit"
+  | "instrumental"
+  | "karaoke"
+  | "cover"
+  | "alternate"
+  | "unknown";
+
+export interface AlternateCatalogIdentity {
+  id: string;
+  recordingFamilyId: string;
+  provider: "apple" | "musicbrainz" | "discogs" | "import";
+  storefront: string | null;
+  catalogId: string;
+  isPreferred: boolean;
+  identityConfidence: number;
+  artist: string;
+  title: string;
+  album: string | null;
+  isrc: string | null;
+  musicbrainzId: string | null;
+  durationMs: number | null;
+  versionLabel: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface RecordingFamily {
+  id: string;
+  runId: string;
+  pipelineVersion: PipelineVersion;
+  policyVersion: PipelinePolicyVersion;
+  familyKey: string;
+  canonicalArtist: string;
+  canonicalTitle: string;
+  versionClass: RecordingVersionClass;
+  metadata: Record<string, unknown>;
+  candidateIds: string[];
+  catalogIdentities: AlternateCatalogIdentity[];
+}
+
+export type ManifestRevisionStatus = "draft" | "locked" | "superseded" | "published" | "abandoned";
+
+export interface ManifestRevisionTrack {
+  position: number;
+  candidateId: string;
+  recordingFamilyId: string | null;
+  catalogIdentityId: string | null;
+  catalogId: string;
+  artist: string;
+  title: string;
+}
+
+export interface ManifestRevisionReserveTrack extends ManifestRevisionTrack {
+  evidenceEligible: boolean;
+  hardConstraintsSatisfied: boolean;
+  versionCompatible: boolean;
+  qualified: boolean;
+}
+
+export interface ManifestRevision {
+  id: string;
+  manifestId: string;
+  revision: number;
+  parentRevisionId: string | null;
+  status: ManifestRevisionStatus;
+  reason: string;
+  contentHash: string;
+  pipelineVersion: PipelineVersion;
+  policyVersion: PipelinePolicyVersion;
+  selectionPlanSnapshot: SelectionPlan | null;
+  policySnapshot: PipelinePolicySnapshot | null;
+  outcomeSnapshot: PipelineOutcome | null;
+  deficitSnapshot: PipelineDeficitLedgerEntry[];
+  lockedAt: string | null;
+  createdAt: string;
+  tracks: ManifestRevisionTrack[];
+  /** Immutable qualified overflow captured when this revision was locked. */
+  reserveTracks?: ManifestRevisionReserveTrack[];
+}
+
+export type PipelineOutcomeStatus =
+  | "complete"
+  | "partial_frontier_exhausted"
+  | "partial_evidence_shortfall"
+  | "partial_catalog_degraded"
+  | "partial_timed_out"
+  | "partial_policy_conflict"
+  | "no_compatible_tracks"
+  | "waiting_for_owner_authorization"
+  | "cancelled"
+  | "failed_system"
+  | "failed_integrity";
+
+export interface PipelineOutcome {
+  schemaVersion: 1;
+  pipelineVersion: PipelineVersion;
+  policyVersion: PipelinePolicyVersion;
+  status: PipelineOutcomeStatus;
+  targetTrackCount: number;
+  discoveredTrackCount: number;
+  qualifiedTrackCount: number;
+  selectedTrackCount: number;
+  publishedTrackCount: number;
+  exactCountSatisfied: boolean;
+  frontierExhausted: boolean;
+  providerUnavailable: boolean;
+  reasonCodes: string[];
+  deficits: PipelineDeficitLedgerEntry[];
+  completedAt: string;
+}
 
 export interface PlaylistBrief {
   title: string;
@@ -72,6 +543,8 @@ export interface PlaylistGuidanceEffect {
   value: string;
   /** Non-null only when kind is ordering_behavior. */
   orderingBehavior: PlaylistGuidanceOrderingBehavior | null;
+  /** Typed resolution when the option answers a place/language ambiguity. */
+  geographyConstraint?: SelectionGeographyConstraint | null;
 }
 
 export interface PlaylistGuidanceGrounding {
@@ -189,6 +662,39 @@ export interface TrackCandidateInput {
   musicbrainzId: string | null;
   versionLabel: string | null;
   evidence: EvidenceClaimInput[];
+  /** Pipeline V2 fields are optional so legacy research rows remain readable. */
+  candidateStage?: CandidateStage;
+  recordingFamilyId?: string | null;
+  scopeBindings?: TrackScopeBinding[];
+}
+
+/**
+ * Exact Apple recording discovered inside an independently identifiable
+ * editorial container. The repository replaces the nullable source/container
+ * references with durable run-owned IDs before the binding can qualify a
+ * candidate. Apple search results without this source context never use this
+ * persistence path.
+ */
+export interface CatalogDiscoveredCandidateInput {
+  song: CatalogSong;
+  source: SourceRecordInput;
+  container: {
+    providerId: string;
+    title: string;
+    metadata: Record<string, unknown>;
+  };
+  /** One independently auditable binding for every proven hard scope axis. */
+  bindings: Array<Omit<
+    TrackScopeBinding,
+    "sourceRecordId" | "researchContainerId" | "citationAttestationId" | "provenancePath"
+  >>;
+}
+
+export interface CatalogDiscoveredCandidateResult {
+  candidateId: string;
+  appleSongId: string;
+  inserted: boolean;
+  scopeBindings: TrackScopeBinding[];
 }
 
 export interface SourceFrontierItem {
@@ -227,6 +733,8 @@ export interface CatalogSong {
   url?: string;
   artworkUrl?: string;
   versionLabel?: string;
+  /** Apple catalog content rating. Absence means Apple did not classify it. */
+  contentRating?: "clean" | "explicit";
 }
 
 export interface CatalogMatchResult {
@@ -255,6 +763,10 @@ export interface PlaylistManifest {
   lockedAt: string;
   createdAt: string;
   tracks: ManifestTrack[];
+  pipelineVersion?: PipelineVersion;
+  policyVersion?: PipelinePolicyVersion;
+  selectionPlan?: SelectionPlan | null;
+  revision?: ManifestRevision | null;
 }
 
 export interface PublicationVolume {
@@ -327,10 +839,57 @@ export interface ResearchRunView {
   manifestId?: string | null;
   capabilityUrl?: string;
   frontier: SourceFrontierItem[];
+  pipelineVersion?: PipelineVersion;
+  policyVersion?: PipelinePolicyVersion;
+  selectionPlan?: SelectionPlan | null;
+  pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
+  pipelineOutcome?: PipelineOutcome | null;
+  candidateStageCounts?: Partial<Record<CandidateStage, number>>;
+}
+
+/**
+ * Capability-authenticated browser view of a research run.
+ *
+ * This is intentionally a positive allowlist instead of an `Omit` from the
+ * owner/internal view. New private accounting or policy fields added to
+ * `ResearchRunView` therefore cannot silently cross the public API boundary.
+ */
+export interface PublicResearchRunView {
+  id: string;
+  prompt: string;
+  brief: PlaylistBrief;
+  status: RunStatus;
+  phase: string;
+  autoPublish?: boolean;
+  error: string | null;
+  candidateCount: number;
+  sourceCount: number;
+  unresolvedCount: number;
+  frontier: SourceFrontierItem[];
+  pipelineVersion?: PipelineVersion;
+  policyVersion?: PipelinePolicyVersion;
+  selectionPlan?: SelectionPlan | null;
+  pipelineOutcome?: PipelineOutcome | null;
+  candidateStageCounts?: Partial<Record<CandidateStage, number>>;
+  createdAt?: string;
+  updatedAt?: string;
+  completedAt?: string | null;
+}
+
+/** Public status payload for prompt interpretation; estimates are owner-only. */
+export interface PublicBriefStatusView {
+  requestId: string;
+  prompt: string;
+  requestedTrackCount: number | null;
+  status: string;
+  brief?: PlaylistBrief;
+  questions: PlaylistGuidanceQuestion[];
+  answers?: PlaylistGuidanceAnswer[];
+  error?: string;
 }
 
 export interface RunResultView {
-  run: ResearchRunView;
+  run: PublicResearchRunView;
   publication: PublicationResult | null;
   outcomes: Record<MatchStatus, number>;
   evidenceExpiresAt: string | null;

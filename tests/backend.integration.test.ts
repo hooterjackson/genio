@@ -3,7 +3,11 @@ import { readFileSync, readdirSync } from "node:fs";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { createDatabase, DATABASE_SCHEMA_VERSION } from "../db/index.ts";
+import {
+  createDatabase,
+  DATABASE_SCHEMA_V12_BRIDGE_SUPPORT,
+  DATABASE_SCHEMA_VERSION,
+} from "../db/index.ts";
 import { CapabilityService, CAPABILITY_COOKIE } from "../server/capabilities.ts";
 import {
   CATALOG_RECOVERY_UNRESOLVED_BASIS,
@@ -21,8 +25,14 @@ import {
 import { appleAuthorizationGeneration } from "../server/apple.ts";
 import type { HostedCitationAttestation } from "../server/research.ts";
 import { capabilityHash, hmacBase64Url, sha256Hex } from "../server/security.ts";
-import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
+import {
+  WORKER_PIPELINE_CAPABILITY,
+  WORKER_PIPELINE_PROTOCOL_VERSION,
+  WORKER_PIPELINE_V4_BRIDGE_CAPABILITY,
+} from "../server/worker-protocol.ts";
 import { parseFeedbackSubmission } from "../server/feedback.ts";
+import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
+import { buildPipelineOutcome } from "../server/pipeline-outcome-v2.ts";
 import { GUIDED_BRIEF_BUDGET_USD, GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import type {
   CitationAttestationInput,
@@ -280,6 +290,15 @@ databaseDescribe("hosted backend integration", () => {
     );
     expect(constraintAfter.rows).toEqual(constraintBefore.rows);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V12_BRIDGE_SUPPORT)).resolves.toBeUndefined();
+    // Model the staged rollout marker without pretending that V13 code can
+    // execute against the V12 schema. The separately deployed bridge accepts
+    // both markers; the V13 binary remains fail-closed until migration.
+    await repository.setSetting("schema_version", "12");
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V12_BRIDGE_SUPPORT)).resolves.toBeUndefined();
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-13, found 12/u);
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     const result = await repository.pool.query<{ name: string }>(
       `SELECT unnest(ARRAY[
         to_regclass('settings')::text,
@@ -292,7 +311,10 @@ databaseDescribe("hosted backend integration", () => {
         to_regclass('capability_session_briefs')::text,
         to_regclass('citation_attestations')::text,
         to_regclass('public_playlists')::text,
-        to_regclass('public_playlist_volumes')::text
+        to_regclass('public_playlist_volumes')::text,
+        to_regclass('apple_catalog_cache_entries')::text,
+        to_regclass('apple_catalog_cache_leases')::text,
+        to_regclass('apple_catalog_cache_events')::text
       ]) AS name`,
     );
     expect(result.rows.map((row) => row.name)).toEqual([
@@ -307,6 +329,9 @@ databaseDescribe("hosted backend integration", () => {
       "citation_attestations",
       "public_playlists",
       "public_playlist_volumes",
+      "apple_catalog_cache_entries",
+      "apple_catalog_cache_leases",
+      "apple_catalog_cache_events",
     ]);
     const evidenceColumns = await repository.pool.query<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
@@ -327,6 +352,98 @@ databaseDescribe("hosted backend integration", () => {
          AND column_name='selection_rank'`,
     );
     expect(candidateColumns.rows.map((row) => row.column_name)).toEqual(["selection_rank"]);
+  });
+
+  test("Apple catalog cache persists storefront-isolated payloads and provider telemetry", async () => {
+    const runId = await repository.createRun("Apple cache integration", brief, 0, 1);
+    const requestFingerprint = "a".repeat(64);
+    const fetchedAt = "2026-07-19T12:00:00.000Z";
+    const expiresAt = "2026-07-20T12:00:00.000Z";
+    await repository.putAppleCatalogCacheEntry({
+      storefront: "us",
+      resourceKind: "search_view",
+      requestFingerprint,
+      payload: { songs: [{ id: "us-song" }], artists: [], albums: [], playlists: [] },
+      fetchedAt,
+      expiresAt,
+    });
+    await repository.putAppleCatalogCacheEntry({
+      storefront: "gb",
+      resourceKind: "search_view",
+      requestFingerprint,
+      payload: { songs: [{ id: "gb-song" }], artists: [], albums: [], playlists: [] },
+      fetchedAt,
+      expiresAt,
+    });
+
+    await expect(repository.getAppleCatalogCacheEntry("us", "search_view", requestFingerprint))
+      .resolves.toMatchObject({ storefront: "us", payload: { songs: [{ id: "us-song" }] } });
+    await expect(repository.getAppleCatalogCacheEntry("gb", "search_view", requestFingerprint))
+      .resolves.toMatchObject({ storefront: "gb", payload: { songs: [{ id: "gb-song" }] } });
+
+    await repository.recordAppleCatalogCacheEvent({
+      runId,
+      storefront: "us",
+      resourceKind: "search_view",
+      requestFingerprint,
+      cacheState: "hit",
+      providerState: "skipped",
+      detail: { ageMs: 1200 },
+      occurredAt: "2026-07-19T12:00:01.200Z",
+    });
+    const event = await repository.pool.query<{
+      run_id: string;
+      cache_state: string;
+      provider_state: string;
+      detail_json: { ageMs: number };
+    }>(
+      `SELECT run_id,cache_state,provider_state,detail_json
+       FROM apple_catalog_cache_events WHERE run_id=$1`,
+      [runId],
+    );
+    expect(event.rows).toEqual([{
+      run_id: runId,
+      cache_state: "hit",
+      provider_state: "skipped",
+      detail_json: { ageMs: 1200 },
+    }]);
+
+    await repository.deleteAppleCatalogCacheEntry("us", "search_view", requestFingerprint);
+    await expect(repository.getAppleCatalogCacheEntry("us", "search_view", requestFingerprint)).resolves.toBeNull();
+    await expect(repository.getAppleCatalogCacheEntry("gb", "search_view", requestFingerprint))
+      .resolves.toMatchObject({ storefront: "gb" });
+
+    const firstOwner = randomUUID();
+    const secondOwner = randomUUID();
+    await expect(repository.tryAcquireAppleCatalogCacheLease(
+      "us", "search_view", requestFingerprint, firstOwner, 30_000,
+    )).resolves.toBe(true);
+    await expect(repository.tryAcquireAppleCatalogCacheLease(
+      "us", "search_view", requestFingerprint, secondOwner, 30_000,
+    )).resolves.toBe(false);
+    await repository.pool.query(
+      `UPDATE apple_catalog_cache_leases SET expires_at=now()-interval '1 second'
+       WHERE storefront='us' AND resource_kind='search_view' AND request_fingerprint=$1`,
+      [requestFingerprint],
+    );
+    await expect(repository.tryAcquireAppleCatalogCacheLease(
+      "us", "search_view", requestFingerprint, secondOwner, 30_000,
+    )).resolves.toBe(true);
+    await repository.releaseAppleCatalogCacheLease(
+      "us", "search_view", requestFingerprint, firstOwner,
+    );
+    await expect(repository.pool.query(
+      `SELECT owner_id FROM apple_catalog_cache_leases
+       WHERE storefront='us' AND resource_kind='search_view' AND request_fingerprint=$1`,
+      [requestFingerprint],
+    )).resolves.toMatchObject({ rows: [{ owner_id: secondOwner }] });
+    await repository.pool.query(
+      `UPDATE apple_catalog_cache_leases SET expires_at=now()-interval '1 second'
+       WHERE storefront='us' AND resource_kind='search_view' AND request_fingerprint=$1`,
+      [requestFingerprint],
+    );
+    await expect(repository.cleanupExpiredAppleCatalogCacheLeases(1)).resolves.toBe(1);
+    await expect(repository.cleanupExpiredAppleCatalogCacheLeases(1)).resolves.toBe(0);
   });
 
   test("track verification can promote and later demote the same persisted claim", async () => {
@@ -376,6 +493,17 @@ databaseDescribe("hosted backend integration", () => {
     );
     expect(stored.rows[0]).toMatchObject({ state: "verified", support_scope: "track", verification_phase: "track_verification" });
     expect((await repository.getCoverage(runId)).eligibleCandidateCount).toBe(1);
+    expect((await repository.pool.query(
+      `SELECT tsb.binding_kind,tsb.eligibility,tsb.source_url,tc.candidate_stage
+       FROM track_scope_bindings tsb JOIN track_candidates tc ON tc.id=tsb.candidate_id
+       WHERE tsb.run_id=$1`,
+      [runId],
+    )).rows).toEqual([expect.objectContaining({
+      binding_kind: "track_specific_source",
+      eligibility: "qualifying",
+      source_url: sourceUrl,
+      candidate_stage: "scope_qualified",
+    })]);
 
     await repository.addCandidates(runId, [{ ...candidate, evidence: [claim("inferred", "track", "session participation")] }], sourceIds, "track_verification");
     stored = await repository.pool.query(
@@ -388,6 +516,14 @@ databaseDescribe("hosted backend integration", () => {
       expect.objectContaining({ support_scope: "track", verification_phase: "track_verification" }),
     ]));
     expect((await repository.getCoverage(runId)).eligibleCandidateCount).toBe(0);
+    expect((await repository.pool.query(
+      "SELECT count(*)::int count FROM track_scope_bindings WHERE run_id=$1 AND eligibility='qualifying'",
+      [runId],
+    )).rows[0]).toEqual({ count: 0 });
+    expect((await repository.pool.query(
+      "SELECT candidate_stage FROM track_candidates WHERE run_id=$1",
+      [runId],
+    )).rows[0]).toEqual({ candidate_stage: "discovered" });
   });
 
   test("strong web evidence requires a persisted exact citation attestation", async () => {
@@ -2084,6 +2220,130 @@ databaseDescribe("hosted backend integration", () => {
     expect(revived.rows[0]).toMatchObject({ status: "queued", attempts: 0, max_attempts: 3, payload_json: { safeRetry: true } });
   });
 
+  test("stamps queue protocol from persisted pipeline state across mixed v4 and v5 workers", async () => {
+    vi.stubEnv("WORKER_CONCURRENCY", "4");
+    const v1RunId = await repository.createRun("Mixed rollout V1", brief, 0, 1);
+    const v2Brief: PlaylistBrief = {
+      ...brief,
+      mode: "curated",
+      title: "Mixed rollout V2",
+      targetSize: { min: 25, max: 25 },
+    };
+    const v2RunId = await repository.createRun("Mixed rollout V2", v2Brief, 0, 1);
+    await repository.savePipelineSelectionPlan(
+      v2RunId,
+      createSelectionPlanV2({ prompt: "Mixed rollout V2", brief: v2Brief }),
+    );
+
+    // Enqueue V2 first and lie in both payloads. The database trigger must use
+    // authoritative run state, and a bridge worker must skip the older V2 row
+    // rather than blocking the runnable V1 row behind it.
+    const v2Job = await repository.enqueueJob({
+      kind: "integration-v2",
+      runId: v2RunId,
+      payload: { pipelineVersion: "legacy_v1" },
+      availableAt: new Date(Date.now() - 10_000),
+      dedupeKey: randomUUID(),
+    });
+    const v1Job = await repository.enqueueJob({
+      kind: "integration-v1",
+      runId: v1RunId,
+      payload: { pipelineVersion: "catalog_first_v2" },
+      dedupeKey: randomUUID(),
+    });
+    const stamped = await repository.pool.query<{
+      id: string;
+      pipeline_version: string;
+      minimum_worker_protocol: number;
+    }>(
+      `SELECT id,pipeline_version,minimum_worker_protocol FROM job_queue
+       WHERE id=ANY($1::uuid[]) ORDER BY id`,
+      [[v1Job.id, v2Job.id]],
+    );
+    expect(Object.fromEntries(stamped.rows.map((row) => [row.id, {
+      pipelineVersion: row.pipeline_version,
+      minimumWorkerProtocol: row.minimum_worker_protocol,
+    }]))).toEqual({
+      [v1Job.id]: { pipelineVersion: "legacy_v1", minimumWorkerProtocol: 4 },
+      [v2Job.id]: { pipelineVersion: "catalog_first_v2", minimumWorkerProtocol: 5 },
+    });
+
+    const bridgeLease = await repository.leaseNextJob(
+      "bridge-v4",
+      30_000,
+      WORKER_PIPELINE_V4_BRIDGE_CAPABILITY,
+    );
+    expect(bridgeLease).toMatchObject({
+      id: v1Job.id,
+      pipelineVersion: "legacy_v1",
+      minimumWorkerProtocol: 4,
+    });
+    await repository.completeJob(v1Job.id, "bridge-v4");
+    await expect(repository.leaseNextJob(
+      "bridge-v4",
+      30_000,
+      WORKER_PIPELINE_V4_BRIDGE_CAPABILITY,
+    )).resolves.toBeNull();
+    expect((await repository.pool.query(
+      "SELECT status,attempts FROM job_queue WHERE id=$1",
+      [v2Job.id],
+    )).rows[0]).toMatchObject({ status: "queued", attempts: 0 });
+
+    const v5Lease = await repository.leaseNextJob(
+      "worker-v5",
+      30_000,
+      WORKER_PIPELINE_CAPABILITY,
+    );
+    expect(v5Lease).toMatchObject({
+      id: v2Job.id,
+      pipelineVersion: "catalog_first_v2",
+      minimumWorkerProtocol: 5,
+    });
+    await repository.completeJob(v2Job.id, "worker-v5");
+
+    // An exhausted V2 lease is also invisible to the v4 sweeper. Only a
+    // capable v5 worker may terminalize it and its owning run.
+    const exhaustedRunId = await repository.createRun("Mixed rollout exhausted V2", v2Brief, 0, 1);
+    await repository.savePipelineSelectionPlan(
+      exhaustedRunId,
+      createSelectionPlanV2({ prompt: "Mixed rollout exhausted V2", brief: v2Brief }),
+    );
+    const exhaustedJob = await repository.enqueueJob({
+      kind: "research",
+      runId: exhaustedRunId,
+      dedupeKey: randomUUID(),
+      maxAttempts: 1,
+    });
+    expect(await repository.leaseNextJob(
+      "worker-v5-exhausted",
+      30_000,
+      WORKER_PIPELINE_CAPABILITY,
+    )).toMatchObject({ id: exhaustedJob.id, attempts: 1 });
+    await repository.pool.query(
+      "UPDATE job_queue SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [exhaustedJob.id],
+    );
+    await expect(repository.leaseNextJob(
+      "bridge-v4-sweeper",
+      30_000,
+      WORKER_PIPELINE_V4_BRIDGE_CAPABILITY,
+    )).resolves.toBeNull();
+    expect((await repository.pool.query(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [exhaustedJob.id],
+    )).rows[0]?.status).toBe("leased");
+    await expect(repository.leaseNextJob(
+      "worker-v5-sweeper",
+      30_000,
+      WORKER_PIPELINE_CAPABILITY,
+    )).resolves.toBeNull();
+    expect((await repository.pool.query(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [exhaustedJob.id],
+    )).rows[0]?.status).toBe("failed");
+    expect((await repository.getRun(exhaustedRunId)).status).toBe("failed");
+  });
+
   test("reserves one worker slot from deep research while prioritizing exact fast jobs", async () => {
     vi.stubEnv("WORKER_CONCURRENCY", "2");
     const deepResearch = await repository.enqueueJob({
@@ -2396,6 +2656,514 @@ databaseDescribe("hosted backend integration", () => {
         initial_basis: "Exact compatible match",
       }),
     ]);
+  });
+
+  test("Pipeline V2 manifest lock requires authoritative scope provenance and never relaxes hard version policy", async () => {
+    const v2Brief: PlaylistBrief = {
+      ...brief,
+      title: "V2 manifest eligibility",
+      description: "A curated set whose manifest must retain only exact, proven studio recordings.",
+      mode: "curated",
+      include: [],
+      exclude: [],
+      orderingPolicy: "artist/title",
+      targetSize: { min: 3, max: 3 },
+    };
+    const runId = await repository.createRun("V2 manifest eligibility", v2Brief, 0, 1);
+    const plan = createSelectionPlanV2({ prompt: "V2 manifest eligibility", brief: v2Brief });
+    await repository.savePipelineSelectionPlan(runId, plan);
+    const sourceUrl = `https://v2-evidence.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Exact track evidence",
+      sourceClass: "web",
+      provenanceRoot: "v2-evidence.example",
+      note: "A track-specific integration fixture.",
+    }]);
+    const attestedTitles = ["Safe Studio Recording", "Wrong Live Recording"];
+    const citations = new Map(attestedTitles.map((title) => [
+      title,
+      citationFixture(sourceUrl, title, "primary artist", v2Brief.subjectEntities[0]),
+    ]));
+    await repository.addCitationAttestations(
+      runId,
+      [...citations.values()].map((citation) => citation.attestation),
+    );
+    await repository.addCandidates(runId, [
+      ...attestedTitles.map((title) => ({
+        artist: "V2 Artist",
+        title,
+        album: "V2 Album",
+        releaseYear: 2024,
+        durationMs: 180_000,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [{
+          sourceUrl,
+          state: "verified" as const,
+          supportScope: "track" as const,
+          subjectEntity: v2Brief.subjectEntities[0]!,
+          subjectRelationship: v2Brief.relationship,
+          relationship: "primary artist",
+          note: "Exact track support.",
+          citationSupport: citations.get(title)!.support,
+        }],
+      })),
+      {
+        artist: "V2 Artist",
+        title: "Unproven Recording",
+        album: "V2 Album",
+        releaseYear: 2024,
+        durationMs: 180_000,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [{
+          sourceUrl,
+          state: "inferred" as const,
+          supportScope: "track" as const,
+          subjectEntity: v2Brief.subjectEntities[0]!,
+          subjectRelationship: v2Brief.relationship,
+          relationship: "primary artist",
+          note: "This candidate deliberately has no qualifying attested claim.",
+        }],
+      },
+    ], sourceIds, "track_verification");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [candidate.title, candidate]));
+    for (const [title, candidate] of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible catalog identity",
+        score: 1,
+        song: {
+          id: `catalog-${title.toLowerCase().replaceAll(" ", "-")}`,
+          name: title === "Wrong Live Recording" ? `${title} (Live)` : title,
+          artistName: candidate.artist,
+          albumName: candidate.album ?? "",
+          releaseDate: "2024-01-01",
+          durationInMillis: 180_000,
+        },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => track.title)).toEqual(["Safe Studio Recording"]);
+    const outcomes = await repository.pool.query<{ title: string; status: string; outcome: string }>(
+      `SELECT c.title,m.status,c.outcome FROM track_candidates c
+       JOIN catalog_matches m ON m.run_id=c.run_id AND m.candidate_id=c.id
+       WHERE c.run_id=$1 ORDER BY c.title`,
+      [runId],
+    );
+    expect(outcomes.rows).toEqual([
+      { title: "Safe Studio Recording", status: "accepted", outcome: "accepted" },
+      { title: "Unproven Recording", status: "unsupported", outcome: "unsupported" },
+      { title: "Wrong Live Recording", status: "unsupported", outcome: "unsupported" },
+    ]);
+    const deficit = await repository.pool.query<{
+      required_count: number;
+      actual_count: number;
+      deficit_count: number;
+      reason_code: string;
+    }>(
+      `SELECT required_count,actual_count,deficit_count,reason_code
+       FROM pipeline_deficit_ledger WHERE run_id=$1 ORDER BY observed_at DESC LIMIT 1`,
+      [runId],
+    );
+    expect(deficit.rows[0]).toEqual({
+      required_count: 3,
+      actual_count: 1,
+      deficit_count: 2,
+      reason_code: "manifest_hard_constraint_shortfall",
+    });
+  });
+
+  test("Pipeline V2 atomically persists catalog-grown candidates with stable identity and authoritative scope provenance", async () => {
+    const catalogBrief: PlaylistBrief = {
+      ...brief,
+      title: "House music essentials",
+      description: "A source-backed survey of house music.",
+      mode: "curated",
+      subjectEntities: ["house music"],
+      relationship: "represents house music",
+      include: ["house music"],
+      exclude: [],
+      versionPolicy: "studio recordings",
+      evidencePolicy: "trusted scoped editorial sources",
+      orderingPolicy: "editorial rank",
+      targetSize: { min: 2, max: 2 },
+    };
+    const runId = await repository.createRun(catalogBrief.title, catalogBrief, 0, 1);
+    const plan = createSelectionPlanV2({ prompt: catalogBrief.description, brief: catalogBrief });
+    await repository.savePipelineSelectionPlan(runId, plan);
+    const sourceUrl = "https://music.apple.com/us/playlist/house-essentials/pl.house-integration";
+    const discovered = {
+      song: {
+        id: "apple-house-integration-1",
+        name: "Warehouse Signal",
+        artistName: "South Side Unit",
+        albumName: "Warehouse Signal",
+        releaseDate: "1987-04-01",
+        durationInMillis: 360_000,
+        isrc: "USAAA8700002",
+      },
+      source: {
+        url: sourceUrl,
+        title: "House Essentials",
+        sourceClass: "apple" as const,
+        provenanceRoot: "apple_music_editorial:pl.house-integration",
+        note: "Apple Music editorial playlist scoped to house music.",
+      },
+      container: {
+        providerId: "pl.house-integration",
+        title: "House Essentials",
+        metadata: { curatorName: "Apple Music Dance", playlistType: "editorial" },
+      },
+      bindings: [{
+        bindingKind: "catalog_editorial_membership" as const,
+        eligibility: "qualifying" as const,
+        scopeAxis: "genre" as const,
+        scopeValue: "house music",
+        relationship: "represents house music",
+        confidence: 0.9,
+        sourceUrl,
+        note: "Exact membership in a trusted, scope-matched Apple Music editorial playlist.",
+      }, {
+        bindingKind: "catalog_editorial_membership" as const,
+        eligibility: "qualifying" as const,
+        scopeAxis: "geography" as const,
+        scopeValue: "Chicago",
+        relationship: "represents the Chicago house scene",
+        confidence: 0.9,
+        sourceUrl,
+        note: "The same exact editorial membership also binds the requested Chicago scope axis.",
+      }],
+    };
+    const versions = { pipelineVersion: plan.pipelineVersion, policyVersion: plan.policyVersion };
+
+    const first = await repository.persistCatalogDiscoveredCandidates(runId, [discovered], versions);
+    const second = await repository.persistCatalogDiscoveredCandidates(runId, [discovered], versions);
+
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(1);
+    expect(first[0]).toMatchObject({ appleSongId: discovered.song.id, inserted: true });
+    expect(second[0]).toMatchObject({
+      candidateId: first[0]!.candidateId,
+      appleSongId: discovered.song.id,
+      inserted: false,
+    });
+    const candidates = await repository.listCandidates(runId);
+    expect(candidates).toEqual([expect.objectContaining({
+      id: first[0]!.candidateId,
+      artist: discovered.song.artistName,
+      title: discovered.song.name,
+      candidateStage: "scope_qualified",
+      scopeBindings: expect.arrayContaining([
+        expect.objectContaining({
+          bindingKind: "catalog_editorial_membership",
+          eligibility: "qualifying",
+          scopeAxis: "genre",
+          scopeValue: "house music",
+          sourceUrl,
+          sourceRecordId: expect.any(String),
+          researchContainerId: expect.any(String),
+          provenancePath: expect.arrayContaining([
+            expect.objectContaining({ kind: "provenance_root", id: discovered.source.provenanceRoot }),
+            expect.objectContaining({ kind: "catalog_recording", id: discovered.song.id }),
+          ]),
+        }),
+        expect.objectContaining({ scopeAxis: "geography", scopeValue: "Chicago" }),
+      ]),
+    })]);
+    const counts = await repository.pool.query<{
+      sources: number;
+      containers: number;
+      candidates: number;
+      bindings: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM source_records WHERE run_id=$1) sources,
+         (SELECT count(*)::int FROM research_containers WHERE run_id=$1) containers,
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
+         (SELECT count(*)::int FROM track_scope_bindings WHERE run_id=$1) bindings`,
+      [runId],
+    );
+    expect(counts.rows[0]).toEqual({ sources: 1, containers: 1, candidates: 1, bindings: 2 });
+  });
+
+  test("Pipeline V2 enforces cross-axis proof, relationship evidence, and decade ranges without rejecting a valid track", async () => {
+    const scopedBrief: PlaylistBrief = {
+      ...brief,
+      title: "French-language American house from the 1990s",
+      description: "American house music released in the 1990s and sung in French.",
+      mode: "curated",
+      subjectEntities: ["American French-language house music"],
+      relationship: "is a house genre recording from the American scene sung in French",
+      include: ["American house music from the 1990s", "French-language recordings"],
+      exclude: [],
+      orderingPolicy: "artist/title",
+      targetSize: { min: 3, max: 3 },
+    };
+    const runId = await repository.createRun(scopedBrief.title, scopedBrief, 0, 1);
+    const plan = createSelectionPlanV2({ prompt: scopedBrief.description, brief: scopedBrief });
+    await repository.savePipelineSelectionPlan(runId, plan);
+    const sourceUrl = `https://v2-cross-axis.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Cross-axis track evidence",
+      sourceClass: "web",
+      provenanceRoot: "v2-cross-axis.example",
+      note: "Exact track-level integration evidence.",
+    }]);
+    const fixtures = [
+      {
+        title: "Qualified 1996 Recording",
+        releaseYear: 1996,
+        relationship: scopedBrief.relationship,
+      },
+      {
+        title: "Wrong Relationship Recording",
+        releaseYear: 1996,
+        relationship: "is featured on an unrelated editorial playlist",
+      },
+      {
+        title: "Outside Era Recording",
+        releaseYear: 1989,
+        relationship: scopedBrief.relationship,
+      },
+    ].map((item) => ({ ...item, citation: citationFixture(
+      sourceUrl,
+      item.title,
+      item.relationship,
+      scopedBrief.subjectEntities[0],
+    ) }));
+    await repository.addCitationAttestations(runId, fixtures.map((item) => item.citation.attestation));
+    await repository.addCandidates(runId, fixtures.map((item) => ({
+      artist: "Fixture Artist",
+      title: item.title,
+      album: "Fixture Album",
+      releaseYear: item.releaseYear,
+      durationMs: 180_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [{
+        sourceUrl,
+        state: "verified" as const,
+        supportScope: "track" as const,
+        subjectEntity: scopedBrief.subjectEntities[0]!,
+        subjectRelationship: scopedBrief.relationship,
+        relationship: item.relationship,
+        note: `${scopedBrief.subjectEntities[0]} ${item.relationship}`,
+        citationSupport: item.citation.support,
+      }],
+    })), sourceIds, "track_verification");
+    const candidates = await repository.listCandidates(runId);
+    for (const candidate of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible catalog identity",
+        score: 1,
+        song: {
+          id: `catalog-${candidate.title.toLowerCase().replaceAll(" ", "-")}`,
+          name: candidate.title,
+          artistName: candidate.artist,
+          albumName: candidate.album ?? "",
+          releaseDate: `${candidate.releaseYear}-01-01`,
+          durationInMillis: 180_000,
+          genreNames: ["House"],
+        },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => track.title)).toEqual(["Qualified 1996 Recording"]);
+    const outcomes = await repository.pool.query<{ title: string; status: string }>(
+      `SELECT c.title,m.status FROM track_candidates c
+       JOIN catalog_matches m ON m.run_id=c.run_id AND m.candidate_id=c.id
+       WHERE c.run_id=$1 ORDER BY c.title`,
+      [runId],
+    );
+    expect(outcomes.rows).toEqual([
+      { title: "Outside Era Recording", status: "unsupported" },
+      { title: "Qualified 1996 Recording", status: "accepted" },
+      { title: "Wrong Relationship Recording", status: "unsupported" },
+    ]);
+    const bindingAxes = await repository.pool.query<{ scope_axis: string; scope_value: string }>(
+      `SELECT scope_axis,scope_value FROM track_scope_bindings b
+       JOIN track_candidates c ON c.id=b.candidate_id
+       WHERE b.run_id=$1 AND c.title='Qualified 1996 Recording'
+       ORDER BY scope_axis,scope_value`,
+      [runId],
+    );
+    expect(bindingAxes.rows).toEqual(expect.arrayContaining([
+      { scope_axis: "genre", scope_value: "house music" },
+      { scope_axis: "geography", scope_value: "American" },
+      { scope_axis: "language", scope_value: "French" },
+      { scope_axis: "genre", scope_value: scopedBrief.relationship },
+    ]));
+  });
+
+  test("Pipeline V2 operational sweep derives and deduplicates owner alerts from durable telemetry", async () => {
+    const occurredAt = new Date();
+    const windowEndedAt = new Date(occurredAt);
+    windowEndedAt.setUTCMinutes(0, 0, 0);
+    windowEndedAt.setUTCHours(windowEndedAt.getUTCHours() + 1);
+    let publicationRunId = "";
+    for (let index = 0; index < 3; index += 1) {
+      const scopedBrief: PlaylistBrief = {
+        ...brief,
+        title: `Pipeline operational signal ${index + 1}`,
+        mode: "curated",
+        targetSize: { min: 25, max: 25 },
+      };
+      const runId = await repository.createRun(scopedBrief.title, scopedBrief, 0, 1);
+      publicationRunId ||= runId;
+      const plan = createSelectionPlanV2({ prompt: scopedBrief.title, brief: scopedBrief });
+      await repository.savePipelineSelectionPlan(runId, plan);
+      await repository.pool.query(
+        "UPDATE research_runs SET status='partial',phase='no_compatible_tracks',completed_at=$2 WHERE id=$1",
+        [runId, occurredAt],
+      );
+      await repository.savePipelineOutcome(runId, buildPipelineOutcome({
+        pipelineVersion: plan.pipelineVersion,
+        policyVersion: plan.policyVersion,
+        status: "no_compatible_tracks",
+        targetTrackCount: 25,
+        discoveredTrackCount: 0,
+        qualifiedTrackCount: 0,
+        selectedTrackCount: 0,
+        publishedTrackCount: 0,
+        frontierExhausted: true,
+        reasonCodes: [
+          "apple_circuit_open",
+          ...(index < 2 ? ["local_contract_rejected"] : []),
+        ],
+        completedAt: occurredAt.toISOString(),
+      }));
+      if (index === 0) {
+        await repository.recordAudit("worker", "pipeline.pagination_loop", {
+          reasonCode: "pagination_loop_detected",
+        }, runId);
+        await repository.recordAppleCatalogCacheEvent({
+          runId,
+          storefront: "us",
+          resourceKind: "search_view",
+          requestFingerprint: "a".repeat(64),
+          cacheState: "miss",
+          providerState: "invalid",
+          detail: { errorName: "MalformedCatalogResponse" },
+          occurredAt: occurredAt.toISOString(),
+        });
+      }
+    }
+    await repository.enqueueNotification("publication_orphaned", {
+      deduplicationKey: `operational-publication-orphan:${publicationRunId}`,
+      runId: publicationRunId,
+      manifestId: "integration-manifest",
+    });
+
+    const first = await repository.runPipelineV2OperationalAlertSweep({ windowEndedAt });
+    expect(first.alerts.map((alert) => alert.kind)).toEqual([
+      "pipeline_zero_result_spike",
+      "pipeline_local_contract_rejections",
+      "pipeline_provider_circuit_repeated",
+      "pipeline_pagination_loop",
+      "pipeline_endpoint_drift",
+      "pipeline_publication_divergence",
+    ]);
+    const second = await repository.runPipelineV2OperationalAlertSweep({ windowEndedAt });
+    expect(second.notificationIds).toEqual(first.notificationIds);
+    const notifications = await repository.pool.query<{ kind: string; count: number }>(
+      `SELECT kind,count(*)::int count FROM notification_outbox
+       WHERE kind LIKE 'pipeline_%' GROUP BY kind ORDER BY kind`,
+    );
+    expect(notifications.rows).toHaveLength(6);
+    expect(notifications.rows.every((row) => row.count === 1)).toBe(true);
+  });
+
+  test("Pipeline V2 automatic publication finishes as a non-error when hard eligibility rejects every Apple match", async () => {
+    const emptyBrief: PlaylistBrief = {
+      ...brief,
+      title: "V2 safe zero result",
+      description: "A V2 run whose only Apple match lacks authoritative scope evidence.",
+      mode: "curated",
+      include: [],
+      exclude: [],
+      targetSize: { min: 1, max: 1 },
+    };
+    const runId = await repository.createRun("V2 safe zero result", emptyBrief, 0, 1);
+    const plan = createSelectionPlanV2({ prompt: "V2 safe zero result", brief: emptyBrief });
+    await repository.savePipelineSelectionPlan(runId, plan);
+    await repository.addCandidates(runId, [{
+      artist: "Unproven Artist",
+      title: "Unproven Track",
+      album: "Unproven Album",
+      releaseYear: 2024,
+      durationMs: 180_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [],
+    }], new Map(), "track_verification");
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    await repository.saveMatch(runId, {
+      candidateId: candidate.id,
+      status: "accepted",
+      basis: "Exact compatible catalog identity",
+      score: 1,
+      song: {
+        id: "catalog-unproven-track",
+        name: candidate.title,
+        artistName: candidate.artist,
+        albumName: candidate.album ?? "",
+        releaseDate: "2024-01-01",
+        durationInMillis: 180_000,
+      },
+      alternatives: [],
+    });
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    await expect(repository.queueAutomaticPublication(runId)).resolves.toBeUndefined();
+
+    const terminal = await repository.pool.query<{
+      status: string;
+      phase: string;
+      error: string | null;
+      match_status: string;
+      candidate_outcome: string;
+      pipeline_outcome: string;
+      selected_track_count: number;
+    }>(
+      `SELECT r.status,r.phase,r.error,m.status match_status,c.outcome candidate_outcome,
+         po.status pipeline_outcome,po.selected_track_count
+       FROM research_runs r
+       JOIN track_candidates c ON c.run_id=r.id
+       JOIN catalog_matches m ON m.run_id=r.id AND m.candidate_id=c.id
+       JOIN pipeline_outcomes po ON po.run_id=r.id
+       WHERE r.id=$1`,
+      [runId],
+    );
+    expect(terminal.rows[0]).toEqual({
+      status: "partial",
+      phase: "manifest_policy_empty",
+      error: null,
+      match_status: "unsupported",
+      candidate_outcome: "unsupported",
+      pipeline_outcome: "no_compatible_tracks",
+      selected_track_count: 0,
+    });
+    const publicationJobs = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM job_queue WHERE run_id=$1 AND kind='publication'",
+      [runId],
+    );
+    expect(publicationJobs.rows[0]?.count).toBe(0);
   });
 
   test("curated influence manifests preserve the fast research selection rank", async () => {
@@ -3947,6 +4715,10 @@ databaseDescribe("hosted backend integration", () => {
     expect(briefView?.error).toBe("gênio could not interpret this request after the final attempt.");
     expect(runView?.error).toBe("Research could not be completed after the final attempt.");
     expect(publicResult.error).toBe("Research could not be completed after the final attempt.");
+    const publicRunKeys = Object.keys(runView ?? {});
+    expect(publicRunKeys.filter((key) => /cost|budget|estimate/iu.test(key))).toEqual([]);
+    expect(publicRunKeys).not.toContain("pipelinePolicySnapshot");
+    expect(publicRunKeys).not.toContain("canonicalRunId");
     expect(JSON.stringify({ briefView, runView, publicResult })).not.toContain("sk-proj-PRIVATE");
     expect(JSON.stringify({ briefView, runView, publicResult })).not.toContain("postgres://");
   });
@@ -4583,6 +5355,7 @@ databaseDescribe("hosted backend integration", () => {
 
   test("system health marks a stale heartbeat unhealthy and accepts a fresh replacement heartbeat", async () => {
     vi.stubEnv("WORKER_STALE_SECONDS", "90");
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     await repository.updateWorkerHeartbeat("stale-worker", { schemaVersion: "1", capacity: 2, activeJobs: 1 });
     await repository.pool.query(
       "UPDATE worker_heartbeats SET last_seen_at=now()-interval '91 seconds' WHERE worker_id='stale-worker'",
@@ -4616,8 +5389,10 @@ databaseDescribe("hosted backend integration", () => {
       protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
     });
 
+    await repository.pool.query("DELETE FROM worker_heartbeats");
     await repository.updateWorkerHeartbeat("wrong-schema-worker", {
       schemaVersion: "1",
+      observedSchemaVersion: "1",
       protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
       capacity: 2,
       activeJobs: 0,
@@ -4629,8 +5404,10 @@ databaseDescribe("hosted backend integration", () => {
       protocolCompatible: true,
     });
 
+    await repository.pool.query("DELETE FROM worker_heartbeats");
     await repository.updateWorkerHeartbeat("wrong-protocol-worker", {
       schemaVersion: DATABASE_SCHEMA_VERSION,
+      observedSchemaVersion: DATABASE_SCHEMA_VERSION,
       protocolVersion: "playlist-pipeline-v1",
       capacity: 2,
       activeJobs: 0,
@@ -4641,6 +5418,35 @@ databaseDescribe("hosted backend integration", () => {
       schemaCompatible: true,
       protocolCompatible: false,
       protocolVersion: "playlist-pipeline-v1",
+    });
+
+    await repository.pool.query("DELETE FROM worker_heartbeats");
+    await repository.updateWorkerHeartbeat("healthy-v5", {
+      schemaVersion: DATABASE_SCHEMA_VERSION,
+      schemaMinimum: DATABASE_SCHEMA_VERSION,
+      schemaMaximum: DATABASE_SCHEMA_VERSION,
+      schemaPreferred: DATABASE_SCHEMA_VERSION,
+      observedSchemaVersion: DATABASE_SCHEMA_VERSION,
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      capacity: 2,
+      activeJobs: 0,
+    });
+    await repository.updateWorkerHeartbeat("newer-v4-bridge", {
+      schemaVersion: "12",
+      schemaMinimum: "12",
+      schemaMaximum: "13",
+      schemaPreferred: "12",
+      observedSchemaVersion: DATABASE_SCHEMA_VERSION,
+      protocolVersion: WORKER_PIPELINE_V4_BRIDGE_CAPABILITY.protocolVersion,
+      capacity: 3,
+      activeJobs: 0,
+    });
+    expect((await repository.getSystemHealth()).worker).toMatchObject({
+      worker_id: "healthy-v5",
+      stale: false,
+      schemaCompatible: true,
+      protocolCompatible: true,
+      compatibleCapacity: 2,
     });
   });
 });

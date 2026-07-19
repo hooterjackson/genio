@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "genio-pipeline-v2-shadow-input/v1",
+  "comparisonId": "provider-free-shadow-canary",
+  "generatedAt": "2026-07-19T20:00:00.000Z",
+  "promptHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "storefront": "us",
+  "targetTrackCount": 2,
+  "primary": {
+    "pipelineVersion": "legacy_v1",
+    "policyVersion": "legacy_v1",
+    "modelSnapshot": "legacy-test-snapshot",
+    "sourceRunId": "legacy-shadow-fixture",
+    "candidates": [
+      {
+        "rank": 1,
+        "candidateId": "legacy-1",
+        "appleSongId": "apple-shared",
+        "recordingFamilyKey": "family-shared",
+        "artist": "Artist One",
+        "title": "Track One",
+        "scopeBindingIds": [],
+        "includeInManifest": true,
+        "evidenceEligible": false,
+        "hardConstraintsSatisfied": true,
+        "versionCompatible": true,
+        "storefrontPlayable": true
+      },
+      {
+        "rank": 2,
+        "candidateId": "legacy-2",
+        "appleSongId": "apple-legacy-only",
+        "recordingFamilyKey": "family-legacy-only",
+        "artist": "Artist Two",
+        "title": "Track Two",
+        "scopeBindingIds": [],
+        "includeInManifest": true,
+        "evidenceEligible": false,
+        "hardConstraintsSatisfied": true,
+        "versionCompatible": true,
+        "storefrontPlayable": true
+      }
+    ]
+  },
+  "shadow": {
+    "pipelineVersion": "catalog_first_v2",
+    "policyVersion": "relevance_first_2026_07",
+    "modelSnapshot": "gpt-5.6-luna-test-snapshot",
+    "sourceRunId": "v2-shadow-fixture",
+    "candidates": [
+      {
+        "rank": 1,
+        "candidateId": "v2-1",
+        "appleSongId": "apple-shared",
+        "recordingFamilyKey": "family-shared",
+        "artist": "Artist One",
+        "title": "Track One",
+        "scopeBindingIds": ["binding-1"],
+        "includeInManifest": true,
+        "evidenceEligible": true,
+        "hardConstraintsSatisfied": true,
+        "versionCompatible": true,
+        "storefrontPlayable": true
+      },
+      {
+        "rank": 2,
+        "candidateId": "v2-2",
+        "appleSongId": "apple-v2-only",
+        "recordingFamilyKey": "family-v2-only",
+        "artist": "Artist Three",
+        "title": "Track Three",
+        "scopeBindingIds": ["binding-2"],
+        "includeInManifest": true,
+        "evidenceEligible": true,
+        "hardConstraintsSatisfied": true,
+        "versionCompatible": true,
+        "storefrontPlayable": true
+      }
+    ]
+  }
+}

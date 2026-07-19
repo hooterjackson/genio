@@ -23,7 +23,7 @@ export default function AboutPage() {
             <span>CURRENT RELEASE</span>
             <time dateTime={currentRelease.releasedAt}>{formatReleaseDate(currentRelease.releasedAt)}</time>
           </div>
-          <p className="about-intro">Deep music research, assembled into public Apple Music playlists. This is the first formally versioned gênio release.</p>
+          <p className="about-intro">Deep music research, assembled into public Apple Music playlists. Release history and the deployed API build are shown below.</p>
         </header>
 
         <RuntimeBuild />

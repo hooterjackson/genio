@@ -22,17 +22,21 @@ import {
 import {
   canonicalBriefForRequest,
   estimateResearchCost,
-  estimateResearchCostRange,
   isPlaylistBrief,
   materialAmbiguitiesAccepted,
 } from "./brief-policy.ts";
+import { publicBriefStatusView } from "./public-api-projections.ts";
 import { researchResumeJob, type ResearchResumeCheckpoint } from "./research-resume.ts";
 import {
   briefInterpretationModel,
   parseFastRouteCheckpoint,
   researchExecutionPolicy,
+  researchExecutionPolicyForRun,
 } from "./research-policy.ts";
-import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
+import {
+  DATABASE_SCHEMA_SUPPORT,
+  isDatabaseSchemaVersionCompatible,
+} from "../db/index.ts";
 import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 import { buildInformation } from "./build-info.ts";
@@ -170,7 +174,7 @@ async function enqueueResearchResume(runId: string): Promise<void> {
     repository.getRun(runId),
     repository.getResearchCheckpoint(runId, "resume") as Promise<ResearchResumeCheckpoint | null>,
   ]);
-  const policy = researchExecutionPolicy(run.brief);
+  const policy = researchExecutionPolicyForRun(run);
   let fast = false;
   let fastRoute = null;
   if (policy.kind === "fast_curated") {
@@ -192,21 +196,28 @@ app.get("/health/live", async () => {
 app.get("/health/ready", async (_request, reply) => {
   const ok = await repository.ping();
   const schemaVersion = ok ? await repository.getSchemaVersion() : null;
-  if (!ok || schemaVersion !== DATABASE_SCHEMA_VERSION) return reply.code(503).send({ ok: false, database: ok, schemaVersion });
-  return { ok: true, database: true, schemaVersion };
+  const schemaCompatible = ok && isDatabaseSchemaVersionCompatible(schemaVersion);
+  if (!schemaCompatible) return reply.code(503).send({
+    ok: false,
+    database: ok,
+    schemaVersion,
+    schemaSupport: DATABASE_SCHEMA_SUPPORT,
+  });
+  return { ok: true, database: true, schemaVersion, schemaSupport: DATABASE_SCHEMA_SUPPORT };
 });
 
 app.get("/health/system", async (_request, reply) => {
   try {
     const health = await repository.getSystemHealth();
     const schemaVersion = health.database.schemaVersion;
-    const ok = schemaVersion === DATABASE_SCHEMA_VERSION
+    const schemaCompatible = isDatabaseSchemaVersionCompatible(schemaVersion);
+    const ok = schemaCompatible
       && !health.worker.stale
       && health.worker.schemaCompatible
       && health.worker.protocolCompatible;
     return reply.code(ok ? 200 : 503).send({
       ok,
-      database: schemaVersion === DATABASE_SCHEMA_VERSION ? "ready" : "schema_mismatch",
+      database: schemaCompatible ? "ready" : "schema_mismatch",
       worker: health.worker.worker_id
         ? health.worker.stale
           ? "stale"
@@ -323,7 +334,7 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     : ["awaiting_answers", "finalizing"].includes(brief.status) && isPlaylistBrief(brief.brief)
       ? canonicalBriefForRequest(brief, brief.brief)
     : undefined;
-  return {
+  return publicBriefStatusView({
     requestId: brief.id,
     prompt: brief.prompt,
     requestedTrackCount: brief.requestedTrackCount,
@@ -331,10 +342,8 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     brief: canonicalBrief,
     questions: Array.isArray(brief.questions) ? brief.questions : [],
     answers: Array.isArray(brief.answers) && brief.answers.length > 0 ? brief.answers : undefined,
-    estimateUsd: canonicalBrief ? estimateResearchCost(canonicalBrief) : undefined,
-    estimate: canonicalBrief ? estimateResearchCostRange(canonicalBrief) : undefined,
     error: brief.status === "failed" ? brief.error : undefined,
-  };
+  });
 });
 
 app.post<{
@@ -417,7 +426,7 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     if (interpreted.requestedTrackCount === null) {
       throw new HttpError(409, "A public playlist requires an exact track count", "brief_not_ready");
     }
-    const policy = researchExecutionPolicy(brief);
+    const policy = researchExecutionPolicy(brief, process.env, interpreted.selectionPlan);
     if (
       policy.kind !== "fast_curated"
       || brief.targetSize?.min !== interpreted.requestedTrackCount
@@ -437,7 +446,11 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
   }
   const key = idempotencyKey(request, request.body?.idempotencyKey);
   const briefActualCostUsd = await repository.getBriefActualCostUsd(briefRequestId);
-  const publicRunBudget = publicRunBudgetUsd(confirmedEstimateUsd, briefActualCostUsd);
+  const publicRunBudget = publicRunBudgetUsd(
+    confirmedEstimateUsd,
+    briefActualCostUsd,
+    interpreted.requestedTrackCount ?? brief.targetSize?.max ?? undefined,
+  );
   if (!isOwner(caller) && publicRunBudget <= 0) {
     throw new HttpError(
       402,

@@ -1090,6 +1090,9 @@ test("a 200-track request selects exactly 200 tracks from its 300-candidate rese
 });
 
 test("an active fast run keeps its profile and concise phase message visible", async ({ page }) => {
+  // Keep this accessibility assertion independent of project/device merge
+  // behavior. The following scenario explicitly opts back into motion.
+  await page.emulateMedia({ reducedMotion: "reduce" });
   const fastRun = {
     ...run,
     id: "run-fast",

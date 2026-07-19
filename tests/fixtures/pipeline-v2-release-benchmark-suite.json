@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "genio-pipeline-v2-release-suite/v1",
+  "fixtureVersion": "2026-07-19.1",
+  "frozenAt": "2026-07-19T18:00:00.000Z",
+  "methodology": {
+    "independence": "The scenario prompts, constraints, evidence axes, and thresholds were frozen before either model route was evaluated. Published tracks must be adjudicated by a reviewer who did not use model output as ground truth.",
+    "amendmentPolicy": "Never change this fixture to make a run pass. Any substantive change requires a new fixture version, a written rationale, and a fresh evaluation of both model routes."
+  },
+  "requiredModelTiers": ["luna", "terra"],
+  "thresholds": {
+    "catalogIdentityPrecision": 0.995,
+    "relevancePrecision": 0.95,
+    "evidenceCoverage": 1,
+    "hardConstraintCompliance": 1,
+    "exactFillRate": 0.98
+  },
+  "latencyThresholds": {
+    "interactive_25_50": { "p50Ms": 120000, "p95Ms": 300000 },
+    "interactive_51_100": { "p50Ms": 180000, "p95Ms": 420000 },
+    "interactive_101_300": { "p50Ms": 360000, "p95Ms": 720000 }
+  },
+  "scenarios": [
+    {
+      "id": "american_drill_25",
+      "prompt": "25 foundational and influential American drill tracks. Keep the focus on the United States scene rather than UK drill.",
+      "targetCount": 25,
+      "catalogRich": true,
+      "exactFillRequired": true,
+      "minimumPublishedRatio": 1,
+      "latencyTier": "interactive_25_50",
+      "maximumCostUsd": 0.75,
+      "requiredEvidenceAxes": ["genre", "geography", "editorial_ranked"],
+      "hardConstraints": [
+        { "id": "american_scene", "description": "Every selected track must have a documented relationship to the United States drill scene." },
+        { "id": "drill_genre", "description": "Every selected track must be drill music; title or artist-name keyword overlap is insufficient." }
+      ]
+    },
+    {
+      "id": "house_music_50",
+      "prompt": "50 influential house music tracks spanning Chicago foundations and later international developments. Do not include songs merely because their titles mention a house or home.",
+      "targetCount": 50,
+      "catalogRich": true,
+      "exactFillRequired": true,
+      "minimumPublishedRatio": 1,
+      "latencyTier": "interactive_25_50",
+      "maximumCostUsd": 0.75,
+      "requiredEvidenceAxes": ["genre", "editorial_ranked"],
+      "hardConstraints": [
+        { "id": "house_genre_semantics", "description": "Every selected track must be house music; literal songs about houses or homes do not qualify." },
+        { "id": "track_level_influence", "description": "Influence must be supported at the exact-track or trusted scoped-container level." }
+      ]
+    },
+    {
+      "id": "berlin_techno_100",
+      "prompt": "100 influential Berlin techno tracks across post-Wall foundations, dub and minimal evolution, and experimental and queer continuums.",
+      "targetCount": 100,
+      "catalogRich": true,
+      "exactFillRequired": true,
+      "minimumPublishedRatio": 1,
+      "latencyTier": "interactive_51_100",
+      "maximumCostUsd": 1.5,
+      "requiredEvidenceAxes": ["genre", "scene", "geography", "editorial_ranked"],
+      "hardConstraints": [
+        { "id": "berlin_scene_relationship", "description": "Every selected track must have a documented relationship to the Berlin techno scene, not merely a German release." },
+        { "id": "techno_scope", "description": "Every selected track must fit the requested techno scope; adjacent electronic genres require explicit scene evidence." }
+      ]
+    },
+    {
+      "id": "french_jazz_200",
+      "prompt": "200 French jazz tracks across eras and regional scenes, with at least 20 distinct primary artists and no single artist exceeding 15 percent of the playlist.",
+      "targetCount": 200,
+      "catalogRich": true,
+      "exactFillRequired": false,
+      "minimumPublishedRatio": 0.9,
+      "latencyTier": "interactive_101_300",
+      "maximumCostUsd": 3,
+      "requiredEvidenceAxes": ["genre", "geography", "artist_catalog"],
+      "hardConstraints": [
+        { "id": "french_relationship", "description": "Every selected track must have a documented French artist, French scene, or French recording relationship." },
+        { "id": "jazz_genre", "description": "Every selected track must be jazz or a documented jazz hybrid." },
+        { "id": "minimum_artist_breadth", "description": "The published manifest must include at least 20 distinct primary artists." },
+        { "id": "maximum_artist_share", "description": "No primary artist may account for more than 15 percent of the published manifest." }
+      ]
+    },
+    {
+      "id": "global_techno_300",
+      "prompt": "300 influential techno tracks from distinct eras and scenes worldwide. Use individual studio recordings, not full DJ sets, podcasts, or continuous mixes.",
+      "targetCount": 300,
+      "catalogRich": true,
+      "exactFillRequired": false,
+      "minimumPublishedRatio": 0.9,
+      "latencyTier": "interactive_101_300",
+      "maximumCostUsd": 3,
+      "requiredEvidenceAxes": ["genre", "scene", "editorial_ranked"],
+      "hardConstraints": [
+        { "id": "techno_genre", "description": "Every selected track must be techno or a documented techno hybrid." },
+        { "id": "individual_recordings", "description": "Every manifest row must be an individual recording rather than a DJ set, podcast, or continuous mix." },
+        { "id": "track_level_influence", "description": "Influence must be supported at the exact-track or trusted scoped-container level." }
+      ]
+    }
+  ]
+}

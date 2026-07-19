@@ -1,6 +1,6 @@
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
-  PUBLIC_FAST_RESEARCH_BUDGET_USD,
+  curatedResearchBudgetUsd,
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
   PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS,
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
@@ -57,15 +57,13 @@ export function estimateResearchCostRange(brief: PlaylistBrief): ResearchCostEst
     // passes, low-context hosted search, and no exhaustive frontier passes.
     // Keep this estimate aligned with researchExecutionPolicy rather than the
     // semantic complexity table used by open-ended deep research.
-    if (maximumTracks <= 200) {
-      add("bounded fast cited research", 0.15, 0.75);
-      return { minimumUsd: 0.15, maximumUsd: 0.75, approvalUsd: 0.75, factors };
-    }
-    add("large bounded fast cited research", 0.35, PUBLIC_FAST_RESEARCH_BUDGET_USD);
+    const maximumUsd = curatedResearchBudgetUsd(maximumTracks);
+    const minimumUsd = maximumTracks <= 50 ? 0.15 : maximumTracks <= 100 ? 0.25 : 0.35;
+    add(maximumTracks <= 100 ? "bounded fast cited research" : "large bounded fast cited research", minimumUsd, maximumUsd);
     return {
-      minimumUsd: 0.35,
-      maximumUsd: PUBLIC_FAST_RESEARCH_BUDGET_USD,
-      approvalUsd: PUBLIC_FAST_RESEARCH_BUDGET_USD,
+      minimumUsd,
+      maximumUsd,
+      approvalUsd: maximumUsd,
       factors,
     };
   }

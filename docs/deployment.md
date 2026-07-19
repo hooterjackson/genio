@@ -30,7 +30,7 @@ The public `/playlists` page is backed by a dedicated Postgres projection, not
 by direct reads of private run state. Migration `0010_public_playlist_directory.sql`
 creates the projection and backfills only internally consistent terminal
 publications with stable Apple share links. The application schema version is
-`11`; API and worker readiness must report that version before Sites exposes
+`13`; API and worker readiness must report that version before Sites exposes
 the directory revision.
 
 ## `9enio.com` cutover

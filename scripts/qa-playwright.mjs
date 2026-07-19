@@ -5,6 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { playwrightProjectRuns } from "./qa-playwright-args.mjs";
 
 const host = "127.0.0.1";
 const suiteLockDirectory = join(tmpdir(), "genio-playwright-suite.lock");
@@ -132,6 +133,7 @@ function cleanupLocalLocks() {
 
 let child;
 let forceKillTimer;
+let receivedSignal;
 
 function signalChild(signal) {
   if (!child?.pid) return;
@@ -148,36 +150,60 @@ process.once("exit", () => {
 });
 
 process.stdout.write(`Browser QA target: ${baseURL}\n`);
-child = spawn(process.execPath, [playwrightCli, "test", ...process.argv.slice(2)], {
-  stdio: "inherit",
-  env: { ...process.env, PLAYWRIGHT_BASE_URL: baseURL },
-  detached: process.platform !== "win32",
-});
-
-child.once("error", (error) => {
-  cleanupLocalLocks();
-  throw error;
-});
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
+    receivedSignal = signal;
     signalChild(signal);
     forceKillTimer = setTimeout(() => signalChild("SIGKILL"), 5_000);
     forceKillTimer.unref();
   });
 }
-child.once("exit", (code, signal) => {
-  if (forceKillTimer) clearTimeout(forceKillTimer);
-  // Playwright should have stopped its configured web server before exiting.
-  // Kill any process-group residue so a failed runner cannot poison the next
-  // suite with a stale Vinext or Wrangler listener.
-  signalChild("SIGKILL");
-  if (signal) {
-    // Signal termination does not reliably run Node's normal `exit` handlers.
-    // Release our owned lock before re-emitting the child's signal.
-    cleanupLocalLocks();
-    process.removeAllListeners(signal);
-    process.kill(process.pid, signal);
-    return;
+
+function runPlaywright(arguments_, projectName) {
+  return new Promise((resolve, reject) => {
+    child = spawn(process.execPath, [playwrightCli, "test", ...arguments_], {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        PLAYWRIGHT_BASE_URL: baseURL,
+        ...(projectName ? { PLAYWRIGHT_HTML_OUTPUT_DIR: `playwright-report/${projectName}` } : {}),
+      },
+      detached: process.platform !== "win32",
+    });
+
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      // Each responsive project receives a fresh Vinext preview. Kill any
+      // process-group residue before the next project starts so closed RSC
+      // streams cannot accumulate and poison later tests.
+      signalChild("SIGKILL");
+      child = undefined;
+      resolve({ code: code ?? 1, signal });
+    });
+  });
+}
+
+// `pnpm run test:e2e -- ...` forwards the delimiter itself to this wrapper.
+// The helper strips it before Playwright parses project and test filters.
+const runs = playwrightProjectRuns(process.argv.slice(2));
+
+let failed = false;
+for (const run of runs) {
+  if (receivedSignal) break;
+  process.stdout.write(`\nBrowser QA project: ${run.projectName ?? "explicit selection"}\n`);
+  const result = await runPlaywright(run.arguments_, run.projectName);
+  if (result.signal) {
+    receivedSignal = receivedSignal || result.signal;
+    break;
   }
-  process.exitCode = code ?? 1;
-});
+  if (result.code !== 0) failed = true;
+}
+
+if (forceKillTimer) clearTimeout(forceKillTimer);
+if (receivedSignal) {
+  cleanupLocalLocks();
+  process.removeAllListeners(receivedSignal);
+  process.kill(process.pid, receivedSignal);
+} else {
+  process.exitCode = failed ? 1 : 0;
+}

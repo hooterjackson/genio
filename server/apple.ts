@@ -7,6 +7,55 @@ const APPLE_API = "https://api.music.apple.com";
 const TOKEN_PURPOSE = "apple-music-user-token";
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
+export type AppleCatalogSearchType = "songs" | "artists" | "albums" | "playlists";
+
+export interface AppleCatalogArtist {
+  id: string;
+  name: string;
+  genreNames: string[];
+  url?: string;
+}
+
+export interface AppleCatalogAlbum {
+  id: string;
+  name: string;
+  artistName: string;
+  genreNames: string[];
+  releaseDate?: string;
+  trackCount?: number;
+  isSingle?: boolean;
+  isCompilation?: boolean;
+  recordLabel?: string;
+  url?: string;
+}
+
+export interface AppleCatalogPlaylist {
+  id: string;
+  name: string;
+  curatorName: string;
+  description: string;
+  playlistType?: string;
+  url?: string;
+}
+
+export interface AppleCatalogSearchResult {
+  songs: CatalogSong[];
+  artists: AppleCatalogArtist[];
+  albums: AppleCatalogAlbum[];
+  playlists: AppleCatalogPlaylist[];
+  /**
+   * Apple paginates each search resource collection independently. Keeping
+   * those continuations separate prevents a song cursor from being reused as
+   * an artist, album, or playlist cursor.
+   */
+  next?: Partial<Record<AppleCatalogSearchType, string>>;
+}
+
+export interface AppleCatalogPage<T> {
+  items: T[];
+  next: string | null;
+}
+
 export interface AppleAuthorizationRecord {
   ciphertext: string;
   iv: string;
@@ -45,6 +94,7 @@ export class AppleApiError extends Error {
     readonly status: number | null,
     readonly retriable: boolean,
     readonly uncertainMutation = false,
+    readonly retryAfterMs: number | null = null,
   ) {
     super(message);
   }
@@ -183,8 +233,13 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
 });
 
 function retryDelay(response: Response | null, attempt: number): number {
-  const retryAfter = Number(response?.headers.get("retry-after"));
-  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1_000, 15_000);
+  const header = response?.headers.get("retry-after")?.trim() ?? "";
+  const retryAfterSeconds = Number(header);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.min(retryAfterSeconds * 1_000, 15_000);
+  }
+  const retryAt = Date.parse(header);
+  if (Number.isFinite(retryAt)) return Math.min(Math.max(0, retryAt - Date.now()), 15_000);
   return Math.min(500 * 2 ** attempt + Math.floor(Math.random() * 250), 8_000);
 }
 
@@ -240,10 +295,17 @@ export class AppleMusicClient {
         }
         const detail = payload?.errors?.[0]?.detail ?? payload?.errors?.[0]?.title ?? `Apple Music request failed (${response.status})`;
         const retriable = response.status === 429 || response.status >= 500;
-        const error = new AppleApiError(detail, response.status, retriable, method !== "GET" && retriable);
+        const delayMs = retriable ? retryDelay(response, attempt) : null;
+        const error = new AppleApiError(
+          detail,
+          response.status,
+          retriable,
+          method !== "GET" && retriable,
+          delayMs,
+        );
         if (!retriable || attempt === maxAttempts - 1) throw error;
         lastError = error;
-        await wait(retryDelay(response, attempt), options.signal);
+        await wait(delayMs!, options.signal);
       } catch (error) {
         if (error instanceof AppleAuthorizationRequiredError) throw error;
         if (error instanceof AppleApiError) {
@@ -634,21 +696,258 @@ export async function searchAppleCatalog(first: string | unknown, second: string
   return appleSongs(payload?.results?.songs?.data);
 }
 
-function appleSongs(items: unknown): CatalogSong[] {
-  return (Array.isArray(items) ? items : []).slice(0, 25).map((item: any) => ({
-    id: String(item.id),
-    name: item.attributes?.name ?? "",
-    artistName: item.attributes?.artistName ?? "",
-    albumName: item.attributes?.albumName ?? "",
-    genreNames: Array.isArray(item.attributes?.genreNames)
-      ? item.attributes.genreNames.filter((genre: unknown): genre is string => typeof genre === "string").slice(0, 20)
-      : undefined,
-    releaseDate: item.attributes?.releaseDate,
-    durationInMillis: item.attributes?.durationInMillis,
-    isrc: item.attributes?.isrc,
-    url: item.attributes?.url,
-    artworkUrl: item.attributes?.artwork?.url,
-  }));
+function stringGenres(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((genre: unknown): genre is string => typeof genre === "string").slice(0, 20)
+    : [];
+}
+
+function appleSongs(items: unknown, limit = 100): CatalogSong[] {
+  return (Array.isArray(items) ? items : []).slice(0, limit).map((item: any) => {
+    const contentRating = item.attributes?.contentRating;
+    return {
+      id: String(item.id),
+      name: item.attributes?.name ?? "",
+      artistName: item.attributes?.artistName ?? "",
+      albumName: item.attributes?.albumName ?? "",
+      genreNames: stringGenres(item.attributes?.genreNames),
+      releaseDate: item.attributes?.releaseDate,
+      durationInMillis: item.attributes?.durationInMillis,
+      isrc: item.attributes?.isrc,
+      url: item.attributes?.url,
+      artworkUrl: item.attributes?.artwork?.url,
+      ...(contentRating === "clean" || contentRating === "explicit" ? { contentRating } : {}),
+    };
+  });
+}
+
+function appleArtists(items: unknown, limit = 25): AppleCatalogArtist[] {
+  return (Array.isArray(items) ? items : []).slice(0, limit).flatMap((item: any) => {
+    const id = typeof item?.id === "string" ? item.id : "";
+    const name = typeof item?.attributes?.name === "string" ? item.attributes.name.trim() : "";
+    if (!id || !name) return [];
+    return [{
+      id,
+      name,
+      genreNames: stringGenres(item.attributes?.genreNames),
+      ...(typeof item.attributes?.url === "string" ? { url: item.attributes.url } : {}),
+    }];
+  });
+}
+
+function appleAlbums(items: unknown, limit = 100): AppleCatalogAlbum[] {
+  return (Array.isArray(items) ? items : []).slice(0, limit).flatMap((item: any) => {
+    const id = typeof item?.id === "string" ? item.id : "";
+    const name = typeof item?.attributes?.name === "string" ? item.attributes.name.trim() : "";
+    if (!id || !name) return [];
+    return [{
+      id,
+      name,
+      artistName: typeof item.attributes?.artistName === "string" ? item.attributes.artistName : "",
+      genreNames: stringGenres(item.attributes?.genreNames),
+      ...(typeof item.attributes?.releaseDate === "string" ? { releaseDate: item.attributes.releaseDate } : {}),
+      ...(Number.isInteger(item.attributes?.trackCount) ? { trackCount: Number(item.attributes.trackCount) } : {}),
+      ...(typeof item.attributes?.isSingle === "boolean" ? { isSingle: item.attributes.isSingle } : {}),
+      ...(typeof item.attributes?.isCompilation === "boolean" ? { isCompilation: item.attributes.isCompilation } : {}),
+      ...(typeof item.attributes?.recordLabel === "string" ? { recordLabel: item.attributes.recordLabel } : {}),
+      ...(typeof item.attributes?.url === "string" ? { url: item.attributes.url } : {}),
+    }];
+  });
+}
+
+function appleDescription(value: unknown): string {
+  if (typeof value === "string") return value.slice(0, 2_000);
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  const text = typeof record.standard === "string"
+    ? record.standard
+    : typeof record.short === "string"
+      ? record.short
+      : "";
+  return text.replace(/<[^>]+>/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 2_000);
+}
+
+function applePlaylists(items: unknown, limit = 25): AppleCatalogPlaylist[] {
+  return (Array.isArray(items) ? items : []).slice(0, limit).flatMap((item: any) => {
+    const id = typeof item?.id === "string" ? item.id : "";
+    const name = typeof item?.attributes?.name === "string" ? item.attributes.name.trim() : "";
+    if (!id || !name) return [];
+    return [{
+      id,
+      name,
+      curatorName: typeof item.attributes?.curatorName === "string" ? item.attributes.curatorName : "",
+      description: appleDescription(item.attributes?.description),
+      ...(typeof item.attributes?.playlistType === "string" ? { playlistType: item.attributes.playlistType } : {}),
+      ...(typeof item.attributes?.url === "string" ? { url: item.attributes.url } : {}),
+    }];
+  });
+}
+
+function checkedStorefront(storefront: string): string {
+  if (!/^[a-z]{2}$/iu.test(storefront)) throw new Error("Apple storefront must be a two-letter code");
+  return storefront.toLowerCase();
+}
+
+function checkedNumericCatalogId(id: string, resource: string): string {
+  const normalized = id.trim();
+  if (!/^\d{1,32}$/u.test(normalized)) throw new Error(`Apple ${resource} ID is invalid`);
+  return normalized;
+}
+
+/**
+ * Search several Apple resource classes in one request. These results prove
+ * storefront identity and availability only; callers must attach an
+ * independent scope binding before a song becomes playlist-eligible.
+ */
+export async function searchAppleCatalogResources(
+  storefront: string,
+  query: string,
+  types: readonly AppleCatalogSearchType[] = ["songs", "artists", "albums", "playlists"],
+  limit = 25,
+  signal?: AbortSignal,
+  next: string | null = null,
+): Promise<AppleCatalogSearchResult> {
+  const normalizedStorefront = checkedStorefront(storefront);
+  const allowed = new Set<AppleCatalogSearchType>(["songs", "artists", "albums", "playlists"]);
+  const normalizedTypes = [...new Set(types)].filter((type) => allowed.has(type));
+  if (normalizedTypes.length < 1) throw new Error("At least one Apple catalog search type is required");
+  const boundedLimit = Math.max(1, Math.min(25, Math.floor(limit)));
+  const params = new URLSearchParams({
+    term: query.trim().slice(0, 300),
+    types: normalizedTypes.join(","),
+    limit: String(boundedLimit),
+  });
+  if (!params.get("term")) throw new Error("Apple catalog search term is required");
+  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/search?${params}`;
+  const path = next ? normalizeAppleNext(next) : initial;
+  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/search?`)) {
+    throw new Error("Apple search pagination scope changed unexpectedly");
+  }
+  const continued = new URL(path, APPLE_API);
+  const continuedTypes = (continued.searchParams.get("types") ?? "").split(",").filter(Boolean);
+  if (continued.searchParams.get("term") !== params.get("term")
+    || continuedTypes.length < 1
+    || continuedTypes.some((type) => !normalizedTypes.includes(type as AppleCatalogSearchType))) {
+    throw new Error("Apple search pagination scope changed unexpectedly");
+  }
+  const payload = await new AppleMusicClient().request(path, { signal });
+  const nextByType = Object.fromEntries(normalizedTypes.flatMap((type) => {
+    const cursor = normalizeAppleNext(payload?.results?.[type]?.next);
+    return cursor ? [[type, cursor]] : [];
+  })) as Partial<Record<AppleCatalogSearchType, string>>;
+  return {
+    songs: appleSongs(payload?.results?.songs?.data, boundedLimit),
+    artists: appleArtists(payload?.results?.artists?.data, boundedLimit),
+    albums: appleAlbums(payload?.results?.albums?.data, boundedLimit),
+    playlists: applePlaylists(payload?.results?.playlists?.data, boundedLimit),
+    ...(Object.keys(nextByType).length > 0 ? { next: nextByType } : {}),
+  };
+}
+
+export async function getAppleCatalogPlaylistTracks(
+  storefront: string,
+  playlistId: string,
+  next: string | null = null,
+  signal?: AbortSignal,
+): Promise<AppleCatalogPage<CatalogSong>> {
+  const normalizedStorefront = checkedStorefront(storefront);
+  const normalizedId = playlistId.trim();
+  if (!/^pl\.[A-Za-z0-9_-]{1,200}$/u.test(normalizedId)) throw new Error("Apple catalog playlist ID is invalid");
+  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/playlists/${encodeURIComponent(normalizedId)}/tracks?limit=100`;
+  const path = next ? normalizeAppleNext(next) : initial;
+  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/playlists/${encodeURIComponent(normalizedId)}/tracks`)) {
+    throw new Error("Apple playlist pagination scope changed unexpectedly");
+  }
+  const payload = await new AppleMusicClient().request(path, { signal });
+  return { items: appleSongs(payload?.data, 100), next: normalizeAppleNext(payload?.next) };
+}
+
+export async function getAppleCatalogAlbumTracks(
+  storefront: string,
+  albumId: string,
+  next: string | null = null,
+  signal?: AbortSignal,
+): Promise<AppleCatalogPage<CatalogSong>> {
+  const normalizedStorefront = checkedStorefront(storefront);
+  const normalizedId = checkedNumericCatalogId(albumId, "album");
+  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/albums/${normalizedId}/tracks?limit=100`;
+  const path = next ? normalizeAppleNext(next) : initial;
+  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/albums/${normalizedId}/tracks`)) {
+    throw new Error("Apple album pagination scope changed unexpectedly");
+  }
+  const payload = await new AppleMusicClient().request(path, { signal });
+  return { items: appleSongs(payload?.data, 100), next: normalizeAppleNext(payload?.next) };
+}
+
+export async function getAppleCatalogArtistTopSongs(
+  storefront: string,
+  artistId: string,
+  next: string | null = null,
+  signal?: AbortSignal,
+): Promise<AppleCatalogPage<CatalogSong>> {
+  const normalizedStorefront = checkedStorefront(storefront);
+  const normalizedId = checkedNumericCatalogId(artistId, "artist");
+  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/top-songs?limit=25`;
+  const path = next ? normalizeAppleNext(next) : initial;
+  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/artists/${normalizedId}/view/top-songs`)) {
+    throw new Error("Apple artist pagination scope changed unexpectedly");
+  }
+  const payload = await new AppleMusicClient().request(path, { signal });
+  return { items: appleSongs(payload?.data, 25), next: normalizeAppleNext(payload?.next) };
+}
+
+export type AppleArtistAlbumView =
+  | "appears-on-albums"
+  | "compilation-albums"
+  | "featured-albums"
+  | "full-albums"
+  | "latest-release"
+  | "live-albums"
+  | "singles";
+
+export async function getAppleCatalogArtistAlbums(
+  storefront: string,
+  artistId: string,
+  view: AppleArtistAlbumView,
+  next: string | null = null,
+  signal?: AbortSignal,
+): Promise<AppleCatalogPage<AppleCatalogAlbum>> {
+  const normalizedStorefront = checkedStorefront(storefront);
+  const normalizedId = checkedNumericCatalogId(artistId, "artist");
+  const allowed = new Set<AppleArtistAlbumView>([
+    "appears-on-albums",
+    "compilation-albums",
+    "featured-albums",
+    "full-albums",
+    "latest-release",
+    "live-albums",
+    "singles",
+  ]);
+  if (!allowed.has(view)) throw new Error("Apple artist album view is invalid");
+  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/${view}?limit=25`;
+  const path = next ? normalizeAppleNext(next) : initial;
+  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/artists/${normalizedId}/view/${view}`)) {
+    throw new Error("Apple artist pagination scope changed unexpectedly");
+  }
+  const payload = await new AppleMusicClient().request(path, { signal });
+  return { items: appleAlbums(payload?.data, 25), next: normalizeAppleNext(payload?.next) };
+}
+
+export async function getAppleCatalogSimilarArtists(
+  storefront: string,
+  artistId: string,
+  next: string | null = null,
+  signal?: AbortSignal,
+): Promise<AppleCatalogPage<AppleCatalogArtist>> {
+  const normalizedStorefront = checkedStorefront(storefront);
+  const normalizedId = checkedNumericCatalogId(artistId, "artist");
+  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/similar-artists?limit=25`;
+  const path = next ? normalizeAppleNext(next) : initial;
+  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/artists/${normalizedId}/view/similar-artists`)) {
+    throw new Error("Apple similar-artist pagination scope changed unexpectedly");
+  }
+  const payload = await new AppleMusicClient().request(path, { signal });
+  return { items: appleArtists(payload?.data, 25), next: normalizeAppleNext(payload?.next) };
 }
 
 export async function lookupAppleCatalogByIsrc(storefront: string, isrc: string, signal?: AbortSignal): Promise<CatalogSong[]> {

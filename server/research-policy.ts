@@ -1,11 +1,26 @@
-import type { PlaylistBrief } from "../shared/types.ts";
+import type {
+  PipelinePolicySnapshot,
+  PlaylistBrief,
+  PlaylistGuidanceTelemetry,
+  SelectionPlan,
+} from "../shared/types.ts";
+import { GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import {
   fastRunServiceLevel,
   isSupportedFastRouteTiming,
 } from "../shared/fast-run-sla.ts";
 import { stableStringify } from "./security.ts";
+import {
+  adaptiveDiscoveryPlan,
+  SELECTION_PLAN_VERSION,
+} from "./pipeline-v2-policy.ts";
+import { APPLE_CATALOG_CACHE_TTL_MS } from "./apple-catalog-cache.ts";
+import { requiresFactualFrontier } from "./factual-frontier-policy.ts";
 
 type Environment = Record<string, string | undefined>;
+
+/** Pipeline V2 has no MusicBrainz hot path; any future enrichment is capped. */
+export const PIPELINE_V2_MUSICBRAINZ_MAX_UNCACHED_REQUESTS = 5;
 
 export interface FastResearchPolicy {
   kind: "fast_curated";
@@ -22,6 +37,22 @@ export interface FastResearchPolicy {
   maxSynthesisTokens: number;
   maxExtractionTokens: number;
   searchContextSize: "low" | "medium";
+  /** Durable explanation of the curated model selected for this run. */
+  modelRoute: CuratedModelRouteDecision;
+}
+
+/**
+ * One authoritative contract for every fast OpenAI Responses call. Keeping
+ * request limits and the corresponding local validation limit in the same
+ * value prevents a response that the provider was allowed to produce from
+ * being rejected after the call completes.
+ */
+export interface FastOpenAIRequestPolicy {
+  maxToolCalls: number;
+  maxHostedSearchCalls: number;
+  maxSynthesisTokens: number;
+  maxExtractionTokens: number;
+  candidateLimit: number;
 }
 
 export interface DeepResearchPolicy {
@@ -31,6 +62,38 @@ export interface DeepResearchPolicy {
 }
 
 export type ResearchExecutionPolicy = FastResearchPolicy | DeepResearchPolicy;
+
+export type CuratedScoutConfidence = "high" | "medium" | "low";
+
+export interface CuratedModelRoutingSignals {
+  /** Explicit confidence emitted by a V2 question scout or deterministic evaluator. */
+  scoutConfidence?: CuratedScoutConfidence | number | null;
+  /** Existing scout telemetry; legacy rows may omit it. */
+  scoutTelemetry?: Pick<PlaylistGuidanceTelemetry,
+    "generationMode" | "proposedQuestionCount" | "acceptedQuestionCount" | "validationIssues"> | null;
+  /** Count of failed structured/schema repairs observed before research begins. */
+  structuredRepairFailures?: number;
+}
+
+export type CuratedModelRouteReason =
+  | "luna_baseline"
+  | "scout_low_confidence"
+  | "structured_repair_failed";
+
+/**
+ * Immutable, typed model-routing record. `modelSnapshot` deliberately records
+ * the resolved environment value rather than the environment variable name so
+ * a resumed run cannot silently move to another model after configuration
+ * changes.
+ */
+export interface CuratedModelRouteDecision {
+  version: "curated_model_route_v1";
+  tier: "luna" | "terra";
+  modelSnapshot: string;
+  reason: CuratedModelRouteReason;
+  scoutConfidence: CuratedScoutConfidence;
+  structuredRepairFailures: number;
+}
 
 // Small curated requests keep the original two-minute route. Larger requests
 // use the size-tiered service levels in shared/fast-run-sla.ts; they are never
@@ -43,6 +106,8 @@ export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
 export const FAST_CURATED_TARGET_MAXIMUM = 300;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
+export const FAST_POST_MATCH_REFILL_MAX_TOOL_CALLS = 3;
+export const FAST_POST_MATCH_REFILL_MAX_SYNTHESIS_TOKENS = 3_000;
 // A third bounded generation is a resilience allowance, not an invitation to
 // loosen matching. Production canaries showed that one transient provider
 // failure otherwise consumed half of the two-pass budget and forced a broad,
@@ -66,6 +131,66 @@ export const FAST_POST_MATCH_REFILL_MAX_COST_USD = 0.35;
 // exact counts are recovered by additional evidence-backed recordings instead
 // of weakening Apple version matching.
 export const FAST_RESERVE_RATIO = 0.75;
+
+export function boundedFastCandidateLimit(candidateLimit: number): number {
+  const parsed = Number(candidateLimit);
+  return Math.max(
+    1,
+    Math.min(
+      FAST_EXTRACTION_CANDIDATE_LIMIT,
+      Number.isFinite(parsed) ? Math.floor(parsed) : 1,
+    ),
+  );
+}
+
+export function fastOpenAIRequestPolicy(
+  policy: FastResearchPolicy,
+  candidateLimit = policy.candidateLimit,
+  ceilings: {
+    maxToolCalls?: number;
+    maxSynthesisTokens?: number;
+    maxExtractionTokens?: number;
+  } = {},
+): FastOpenAIRequestPolicy {
+  const maxToolCalls = Math.max(
+    1,
+    Math.min(
+      policy.maxWebToolCalls,
+      Math.floor(ceilings.maxToolCalls ?? policy.maxWebToolCalls),
+    ),
+  );
+  return {
+    maxToolCalls,
+    // Hosted searches are the billable/search-budget subset of tool calls.
+    // They can never legitimately exceed the total tool-call allowance.
+    maxHostedSearchCalls: maxToolCalls,
+    maxSynthesisTokens: Math.max(
+      1,
+      Math.min(
+        policy.maxSynthesisTokens,
+        Math.floor(ceilings.maxSynthesisTokens ?? policy.maxSynthesisTokens),
+      ),
+    ),
+    maxExtractionTokens: Math.max(
+      1,
+      Math.min(
+        policy.maxExtractionTokens,
+        Math.floor(ceilings.maxExtractionTokens ?? policy.maxExtractionTokens),
+      ),
+    ),
+    candidateLimit: boundedFastCandidateLimit(candidateLimit),
+  };
+}
+
+export function fastPostMatchRefillOpenAIRequestPolicy(
+  policy: FastResearchPolicy,
+  candidateLimit: number,
+): FastOpenAIRequestPolicy {
+  return fastOpenAIRequestPolicy(policy, candidateLimit, {
+    maxToolCalls: FAST_POST_MATCH_REFILL_MAX_TOOL_CALLS,
+    maxSynthesisTokens: FAST_POST_MATCH_REFILL_MAX_SYNTHESIS_TOKENS,
+  });
+}
 
 /**
  * Build a source-backed reserve before Apple matching. Exact requests above
@@ -317,15 +442,17 @@ export function fastPostMatchRefillPlan(input: {
     return { state: "shortfall", requestedMinimum, selectableCount, shortfall, additionalCandidateGoal: 0 };
   }
 
-  // Use observed storefront yield but keep the estimate bounded when the
-  // first pass is exceptionally good or bad. The extra 25% is a reserve for
-  // the refill itself; the per-pass ceiling preserves the fast-route bound.
-  const observedYield = attemptedCandidateCount > 0 ? selectableCount / attemptedCandidateCount : 0;
-  const planningYield = Math.min(0.95, Math.max(0.25, observedYield));
-  const additionalCandidateGoal = Math.min(
-    FAST_EXTRACTION_CANDIDATE_LIMIT,
-    Math.max(shortfall, Math.ceil((shortfall / planningYield) * 1.25)),
-  );
+  // Size the next raw batch from the lower-confidence storefront yield after
+  // every strict filter, not from the model's raw-candidate count. This is the
+  // V2 exact-fill controller: it includes a qualified reserve, starts at a
+  // 50% cold yield, and never plans below the bounded 20% floor.
+  const additionalCandidateGoal = adaptiveDiscoveryPlan({
+    target: requestedMinimum,
+    qualified: selectableCount,
+    attempted: attemptedCandidateCount,
+    observedQualified: selectableCount,
+    maximumRawGoal: FAST_EXTRACTION_CANDIDATE_LIMIT,
+  }).rawDiscoveryGoal;
   return { state: "refill", requestedMinimum, selectableCount, shortfall, additionalCandidateGoal };
 }
 
@@ -333,6 +460,7 @@ export interface FastRouteCheckpoint {
   status: "queued";
   profile: FastResearchPolicy["version"];
   model: string;
+  modelRoute: CuratedModelRouteDecision;
   confirmedAt: string;
   researchDeadlineAt: string;
   deadlineAt: string;
@@ -350,6 +478,7 @@ export function createFastRouteCheckpoint(
     status: "queued",
     profile: policy.version,
     model: policy.model,
+    modelRoute: policy.modelRoute,
     confirmedAt: new Date(confirmedMs).toISOString(),
     researchDeadlineAt: new Date(deadlineMs - policy.matchingReserveMs).toISOString(),
     deadlineAt: new Date(deadlineMs).toISOString(),
@@ -364,6 +493,20 @@ export function parseFastRouteCheckpoint(
   if (!value || typeof value !== "object") return null;
   const row = value as Partial<FastRouteCheckpoint>;
   if (row.status !== "queued" || row.profile !== expectedVersion || typeof row.model !== "string") return null;
+  // Legacy V1 checkpoints did not persist a route explanation. Preserve their
+  // already-pinned model and deadline instead of reinterpreting the in-flight
+  // run under V2 configuration.
+  const modelRoute = row.modelRoute === undefined
+    ? {
+      version: "curated_model_route_v1" as const,
+      tier: "luna" as const,
+      modelSnapshot: row.model,
+      reason: "luna_baseline" as const,
+      scoutConfidence: "medium" as const,
+      structuredRepairFailures: 0,
+    }
+    : parseCuratedModelRouteDecision(row.modelRoute);
+  if (!modelRoute || modelRoute.modelSnapshot !== row.model) return null;
   const confirmedMs = typeof row.confirmedAt === "string" ? Date.parse(row.confirmedAt) : Number.NaN;
   const researchDeadlineMs = typeof row.researchDeadlineAt === "string" ? Date.parse(row.researchDeadlineAt) : Number.NaN;
   const deadlineMs = typeof row.deadlineAt === "string" ? Date.parse(row.deadlineAt) : Number.NaN;
@@ -377,10 +520,41 @@ export function parseFastRouteCheckpoint(
     status: "queued",
     profile: expectedVersion,
     model: row.model,
+    modelRoute,
     confirmedAt: new Date(confirmedMs).toISOString(),
     researchDeadlineAt: new Date(researchDeadlineMs).toISOString(),
     deadlineAt: new Date(deadlineMs).toISOString(),
     matchingReserveMs: row.matchingReserveMs,
+  };
+}
+
+function parseCuratedModelRouteDecision(value: unknown): CuratedModelRouteDecision | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Partial<CuratedModelRouteDecision>;
+  const validReason = row.reason === "luna_baseline"
+    || row.reason === "scout_low_confidence"
+    || row.reason === "structured_repair_failed";
+  const validConfidence = row.scoutConfidence === "high"
+    || row.scoutConfidence === "medium"
+    || row.scoutConfidence === "low";
+  if (row.version !== "curated_model_route_v1"
+    || (row.tier !== "luna" && row.tier !== "terra")
+    || typeof row.modelSnapshot !== "string"
+    || row.modelSnapshot.trim() === ""
+    || !validReason
+    || !validConfidence
+    || !Number.isInteger(row.structuredRepairFailures)
+    || (row.structuredRepairFailures ?? -1) < 0) return null;
+  if ((row.reason === "luna_baseline") !== (row.tier === "luna")) return null;
+  if (row.reason === "structured_repair_failed" && row.structuredRepairFailures === 0) return null;
+  if (row.reason === "scout_low_confidence" && row.scoutConfidence !== "low") return null;
+  return {
+    version: "curated_model_route_v1",
+    tier: row.tier,
+    modelSnapshot: row.modelSnapshot,
+    reason: row.reason as CuratedModelRouteReason,
+    scoutConfidence: row.scoutConfidence as CuratedScoutConfidence,
+    structuredRepairFailures: row.structuredRepairFailures as number,
   };
 }
 
@@ -391,12 +565,102 @@ function boundedInteger(raw: string | undefined, fallback: number, minimum: numb
 }
 
 export function fastResearchModel(environment: Environment = process.env): string {
-  return environment.OPENAI_FAST_MODEL?.trim() || "gpt-5.6-luna";
+  return curatedLunaModelSnapshot(environment);
 }
 
 export function deepResearchModel(environment: Environment = process.env): string {
-  return environment.OPENAI_DEEP_MODEL?.trim()
+  return curatedTerraModelSnapshot(environment);
+}
+
+/**
+ * Resolve the snapshot once at job creation. The Pipeline V2 variables are
+ * intentionally more specific than the legacy aliases, while the legacy
+ * fallbacks keep existing deployments backward compatible.
+ */
+export function curatedLunaModelSnapshot(environment: Environment = process.env): string {
+  return environment.OPENAI_CURATED_LUNA_SNAPSHOT?.trim()
+    || environment.OPENAI_FAST_MODEL?.trim()
+    || "gpt-5.6-luna";
+}
+
+export function curatedTerraModelSnapshot(environment: Environment = process.env): string {
+  return environment.OPENAI_CURATED_TERRA_SNAPSHOT?.trim()
+    || environment.OPENAI_DEEP_MODEL?.trim()
     || "gpt-5.6-terra";
+}
+
+function normalizedScoutConfidence(signals: CuratedModelRoutingSignals): CuratedScoutConfidence {
+  if (typeof signals.scoutConfidence === "number") {
+    if (!Number.isFinite(signals.scoutConfidence)) return "medium";
+    if (signals.scoutConfidence < 0.6) return "low";
+    if (signals.scoutConfidence >= 0.8) return "high";
+    return "medium";
+  }
+  if (signals.scoutConfidence === "high"
+    || signals.scoutConfidence === "medium"
+    || signals.scoutConfidence === "low") return signals.scoutConfidence;
+
+  const telemetry = signals.scoutTelemetry;
+  if (!telemetry) return "medium";
+  if (telemetry.validationIssues.includes("scout:low_confidence")) return "low";
+  // A local structured-output rejection means the scout did not establish a
+  // dependable subject interpretation. Provider outages, timeouts, and budget
+  // failures are deliberately excluded: escalating models cannot repair an
+  // unavailable provider and would only increase cost.
+  const localValidationFailure = telemetry.validationIssues.some((issue) => (
+    /^response:(?:primary_)?(?:invalid_json|invalid_object|missing_output|incomplete_)/u.test(issue)
+    || /^(?:schema|structured_output):/u.test(issue)
+  ));
+  if (telemetry.generationMode === "scout_unavailable" && localValidationFailure) return "low";
+  if (telemetry.generationMode === "grounded_scout" && telemetry.acceptedQuestionCount > 0) return "high";
+  return "medium";
+}
+
+function telemetryRepairFailures(telemetry: CuratedModelRoutingSignals["scoutTelemetry"]): number {
+  if (!telemetry) return 0;
+  return telemetry.validationIssues.filter((issue) => (
+    issue !== "response:repaired_structured_output"
+    && (
+      /^response:repair_(?:invalid|missing|incomplete|timeout|provider|unavailable)/u.test(issue)
+      || /^(?:schema|structured_output):repair_(?:failed|invalid|unavailable)/u.test(issue)
+    )
+  )).length;
+}
+
+/**
+ * Route high-volume curated work to Luna. Terra is an evidence-preserving
+ * repair route, never a generic retry: it is selected only when the scout
+ * explicitly/locally establishes low confidence or a structured repair has
+ * already failed once.
+ */
+export function curatedResearchModelRoute(
+  signals: CuratedModelRoutingSignals = {},
+  environment: Environment = process.env,
+): CuratedModelRouteDecision {
+  const scoutConfidence = normalizedScoutConfidence(signals);
+  const explicitRepairFailures = Number.isFinite(signals.structuredRepairFailures)
+    ? Math.max(0, Math.floor(signals.structuredRepairFailures ?? 0))
+    : 0;
+  const structuredRepairFailures = Math.max(
+    explicitRepairFailures,
+    telemetryRepairFailures(signals.scoutTelemetry),
+  );
+  const reason: CuratedModelRouteReason = structuredRepairFailures > 0
+    ? "structured_repair_failed"
+    : scoutConfidence === "low"
+      ? "scout_low_confidence"
+      : "luna_baseline";
+  const tier = reason === "luna_baseline" ? "luna" : "terra";
+  return {
+    version: "curated_model_route_v1",
+    tier,
+    modelSnapshot: tier === "luna"
+      ? curatedLunaModelSnapshot(environment)
+      : curatedTerraModelSnapshot(environment),
+    reason,
+    scoutConfidence,
+    structuredRepairFailures,
+  };
 }
 
 export function briefInterpretationModel(environment: Environment = process.env): string {
@@ -414,10 +678,13 @@ export function briefInterpretationModel(environment: Environment = process.env)
 export function researchExecutionPolicy(
   brief: Pick<PlaylistBrief, "mode" | "targetSize">,
   environment: Environment = process.env,
+  selectionPlan?: Pick<SelectionPlan, "intents"> | null,
+  modelRoutingSignals: CuratedModelRoutingSignals = {},
 ): ResearchExecutionPolicy {
   const requestedMinimum = Math.max(1, Math.floor(brief.targetSize?.min ?? 50));
   const requestedMaximum = Math.max(requestedMinimum, Math.floor(brief.targetSize?.max ?? 100));
-  if (brief.mode !== "curated" || requestedMaximum > FAST_CURATED_TARGET_MAXIMUM) {
+  const claimFirst = requiresFactualFrontier(brief, selectionPlan);
+  if (claimFirst || brief.mode !== "curated" || requestedMaximum > FAST_CURATED_TARGET_MAXIMUM) {
     return { kind: "deep", version: "deep_v1", model: deepResearchModel(environment) };
   }
 
@@ -425,11 +692,13 @@ export function researchExecutionPolicy(
   const targetMinimum = requestedMinimum;
   const candidateGoal = catalogMatchingCandidateGoal(targetMinimum);
   const serviceLevel = fastRunServiceLevel(targetMinimum);
+  const modelRoute = curatedResearchModelRoute(modelRoutingSignals, environment);
 
   return {
     kind: "fast_curated",
     version: "fast_curated_v3",
-    model: fastResearchModel(environment),
+    model: modelRoute.modelSnapshot,
+    modelRoute,
     // One immutable, size-tiered wall-clock budget begins when the run is
     // confirmed. The research cutoff leaves a fixed tail for Apple catalog
     // matching; phases never start independent countdowns.
@@ -454,12 +723,139 @@ export function researchExecutionPolicy(
   };
 }
 
+function curatedRunCostCeiling(target: number): number {
+  if (target <= 50) return 0.75;
+  if (target <= 100) return 1.5;
+  return 3;
+}
+
+/** Resolve and freeze every mutable policy input used by a Pipeline V2 run. */
+export function createPipelinePolicySnapshot(input: {
+  brief: Pick<PlaylistBrief, "mode" | "targetSize">;
+  selectionPlan: SelectionPlan;
+  environment?: Environment;
+  modelRoutingSignals?: CuratedModelRoutingSignals;
+  capturedAt?: string;
+}): PipelinePolicySnapshot {
+  const environment = input.environment ?? process.env;
+  const executionPolicy = researchExecutionPolicy(
+    input.brief,
+    environment,
+    input.selectionPlan,
+    input.modelRoutingSignals,
+  );
+  const requestPolicy = executionPolicy.kind === "fast_curated"
+    ? fastOpenAIRequestPolicy(executionPolicy)
+    : null;
+  const requested = Math.max(1, Math.floor(
+    input.selectionPlan.requestedTrackCount
+      || input.brief.targetSize?.max
+      || input.brief.targetSize?.min
+      || 50,
+  ));
+  const storefront = input.selectionPlan.storefront.trim().toLowerCase();
+  const catalogConcurrency = boundedInteger(environment.APPLE_MATCHING_CONCURRENCY, 6, 2, 8);
+  const recoveryDeadlineMs = boundedInteger(
+    environment.APPLE_CATALOG_RECOVERY_TIMEOUT_MS,
+    90_000,
+    90_000,
+    180_000,
+  );
+  const lookupTimeoutMs = boundedInteger(environment.FAST_MATCH_LOOKUP_TIMEOUT_MS, 7_000, 3_000, 12_000);
+  const maximumRawDiscoveryGoal = adaptiveDiscoveryPlan({
+    target: requested,
+    qualified: 0,
+    attempted: 0,
+    observedQualified: 0,
+    maximumRawGoal: 1_000,
+  }).rawDiscoveryGoal;
+  return {
+    schemaVersion: 1,
+    pipelineVersion: input.selectionPlan.pipelineVersion,
+    policyVersion: input.selectionPlan.policyVersion,
+    selectionPlanVersion: SELECTION_PLAN_VERSION,
+    capturedAt: input.capturedAt ?? new Date().toISOString(),
+    storefront,
+    executionPolicy,
+    requestLimits: {
+      maxToolCalls: requestPolicy?.maxToolCalls ?? null,
+      maxHostedSearchCalls: requestPolicy?.maxHostedSearchCalls ?? null,
+      maxSynthesisTokens: requestPolicy?.maxSynthesisTokens ?? null,
+      maxExtractionTokens: requestPolicy?.maxExtractionTokens ?? null,
+    },
+    costLimits: {
+      scoutUsd: GUIDED_SCOUT_BUDGET_USD,
+      curatedRunUsd: input.brief.mode === "curated" ? curatedRunCostCeiling(requested) : null,
+      factualApprovalGateUsd: 5,
+      postMatchRefillUsd: FAST_POST_MATCH_REFILL_MAX_COST_USD,
+    },
+    catalogLimits: {
+      appleConcurrencyInitial: catalogConcurrency,
+      appleConcurrencyMinimum: 2,
+      appleConcurrencyMaximum: 8,
+      catalogRecoveryDeadlineMs: recoveryDeadlineMs,
+      catalogLookupTimeoutMs: lookupTimeoutMs,
+      musicBrainzMaxUncachedRequests: PIPELINE_V2_MUSICBRAINZ_MAX_UNCACHED_REQUESTS,
+      maximumRawDiscoveryGoal,
+      catalogResourceCacheTtlSeconds: APPLE_CATALOG_CACHE_TTL_MS.catalog_resource / 1_000,
+      catalogSearchCacheTtlSeconds: APPLE_CATALOG_CACHE_TTL_MS.search_view / 1_000,
+      playlistMembershipCacheTtlSeconds: APPLE_CATALOG_CACHE_TTL_MS.playlist_membership / 1_000,
+    },
+    durableResearchLimits: {
+      gapPasses: boundedInteger(environment.RESEARCH_MAX_GAP_PASSES, 6, 2, 20),
+      turnsPerSegment: boundedInteger(environment.RESEARCH_TURNS_PER_SEGMENT, 5, 1, 20),
+      segmentsPerPass: boundedInteger(environment.RESEARCH_MAX_SEGMENTS_PER_PASS, 3, 1, 100),
+    },
+    evidencePolicy: input.selectionPlan.evidencePolicy,
+  };
+}
+
+export function researchExecutionPolicyForRun(
+  run: {
+    brief: Pick<PlaylistBrief, "mode" | "targetSize">;
+    selectionPlan?: SelectionPlan | null;
+    pipelineVersion?: string;
+    policyVersion?: string;
+    pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
+  },
+  environment: Environment = process.env,
+  modelRoutingSignals: CuratedModelRoutingSignals = {},
+): ResearchExecutionPolicy {
+  const snapshot = run.pipelinePolicySnapshot;
+  if (!snapshot) {
+    // Legacy V1 rows predate policy snapshots and remain readable until the
+    // compatibility path is retired.
+    return researchExecutionPolicy(run.brief, environment, run.selectionPlan, modelRoutingSignals);
+  }
+  if (snapshot.pipelineVersion !== run.pipelineVersion
+    || snapshot.policyVersion !== run.policyVersion
+    || (run.selectionPlan && (
+      snapshot.pipelineVersion !== run.selectionPlan.pipelineVersion
+      || snapshot.policyVersion !== run.selectionPlan.policyVersion
+    ))) {
+    throw new Error("Persisted pipeline policy snapshot does not match this run");
+  }
+  return snapshot.executionPolicy as ResearchExecutionPolicy;
+}
+
+export function storefrontForRun(
+  run: { pipelinePolicySnapshot?: PipelinePolicySnapshot | null; selectionPlan?: SelectionPlan | null },
+  environment: Environment = process.env,
+): string {
+  return run.pipelinePolicySnapshot?.storefront
+    ?? run.selectionPlan?.storefront
+    ?? environment.APPLE_STOREFRONT
+    ?? "us";
+}
+
 export function researchPolicyFingerprint(
   brief: Pick<PlaylistBrief, "mode" | "targetSize">,
   environment: Environment = process.env,
+  selectionPlan?: Pick<SelectionPlan, "intents"> | null,
+  modelRoutingSignals: CuratedModelRoutingSignals = {},
 ): string {
-  const policy = researchExecutionPolicy(brief, environment);
+  const policy = researchExecutionPolicy(brief, environment, selectionPlan, modelRoutingSignals);
   // Spread the complete effective policy so newly introduced execution knobs
   // cannot silently reuse results produced under an older configuration.
-  return stableStringify({ fingerprintVersion: 2, ...policy });
+  return stableStringify({ fingerprintVersion: 4, intents: selectionPlan?.intents ?? [], ...policy });
 }

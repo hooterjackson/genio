@@ -2,10 +2,30 @@ import type { PlaylistBrief, SourceRecordInput, TrackCandidateInput } from "../s
 import type { HostedCitationAttestation } from "./citation-attestation.ts";
 import { citationTextIsLocalToClaim } from "./citation-attestation.ts";
 import { extractOutputText } from "./openai.ts";
+import { boundedFastCandidateLimit } from "./research-policy.ts";
 import { assertPublicHttpsUrl, compactEvidenceNote } from "./security.ts";
 import { isExcludedReferenceArtist } from "./similarity-policy.ts";
 
 export const FAST_RESEARCH_CHECKPOINT_VERSION = "fast_curated_v3";
+
+export type FastResearchContractErrorCode =
+  | "candidate_schema"
+  | "citation_contract"
+  | "hosted_search_limit"
+  | "request_cost_ceiling"
+  | "response_size";
+
+/** A provider response completed, but failed Needle's local fast-run contract. */
+export class FastResearchContractError extends Error {
+  readonly name = "FastResearchContractError";
+
+  constructor(
+    message: string,
+    readonly code: FastResearchContractErrorCode,
+  ) {
+    super(message);
+  }
+}
 
 export interface FastSynthesisCheckpoint {
   version: typeof FAST_RESEARCH_CHECKPOINT_VERSION;
@@ -35,7 +55,7 @@ export function fastExtractionSchema(candidateLimit: number): Record<string, unk
     properties: {
       candidates: {
         type: "array",
-        maxItems: Math.max(1, Math.min(120, Math.floor(candidateLimit))),
+        maxItems: boundedFastCandidateLimit(candidateLimit),
         items: {
           type: "object",
           additionalProperties: false,
@@ -231,7 +251,7 @@ export function extractFastCandidatesFromSynthesis(
   synthesis: FastSynthesisCheckpoint,
   candidateLimit: number,
 ): RawFastCandidate[] {
-  const limit = Math.max(1, Math.min(120, Math.floor(candidateLimit)));
+  const limit = boundedFastCandidateLimit(candidateLimit);
   const candidates = new Map<string, RawFastCandidate>();
 
   for (let citationIndex = 0; citationIndex < synthesis.citationAttestations.length; citationIndex += 1) {
@@ -322,12 +342,22 @@ export function fastSynthesisCheckpoint(
   citationAttestations: readonly HostedCitationAttestation[],
 ): FastSynthesisCheckpoint {
   const outputText = extractOutputText(response);
-  if (outputText.length > 80_000) throw new Error("Fast research synthesis exceeded the persisted text limit");
+  if (outputText.length > 80_000) {
+    throw new FastResearchContractError(
+      "Fast research synthesis exceeded the persisted text limit",
+      "response_size",
+    );
+  }
   const sourceTitles = citationSourceTitles(response);
   const supported = citationAttestations
     .filter((attestation) => Object.hasOwn(sourceTitles, attestation.sourceUrl))
     .slice(0, 1_000);
-  if (supported.length === 0) throw new Error("Fast research returned no provider-attested citations");
+  if (supported.length === 0) {
+    throw new FastResearchContractError(
+      "Fast research returned no provider-attested citations",
+      "citation_contract",
+    );
+  }
   return {
     version: FAST_RESEARCH_CHECKPOINT_VERSION,
     status: "complete",
@@ -351,29 +381,42 @@ export function fastSynthesisCheckpoint(
 export function parseFastExtraction(response: any, candidateLimit: number): RawFastCandidate[] {
   let payload: unknown;
   try { payload = JSON.parse(extractOutputText(response)); } catch {
-    throw new Error("Fast research extraction returned malformed JSON");
+    throw new FastResearchContractError(
+      "Fast research extraction returned malformed JSON",
+      "candidate_schema",
+    );
   }
   const rows = payload && typeof payload === "object" && Array.isArray((payload as any).candidates)
-    ? (payload as any).candidates.slice(0, Math.max(1, Math.min(120, candidateLimit)))
+    ? (payload as any).candidates.slice(0, boundedFastCandidateLimit(candidateLimit))
     : [];
-  return rows.map((row: any): RawFastCandidate | null => {
-    const artist = safeText(row?.artist, 240);
-    const title = safeText(row?.title, 240);
-    const relationship = safeText(row?.relationship, 240);
-    const citationIndexes: number[] = [...new Set<number>((Array.isArray(row?.citationIndexes) ? row.citationIndexes : [])
+  const parsed: RawFastCandidate[] = [];
+  for (const value of rows) {
+    // Structured output is still untrusted input. Validate each row in
+    // isolation so one malformed candidate cannot discard valid siblings.
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    const artist = safeText(row.artist, 240);
+    const title = safeText(row.title, 240);
+    const relationship = safeText(row.relationship, 240);
+    const citationIndexes: number[] = [...new Set<number>((Array.isArray(row.citationIndexes) ? row.citationIndexes : [])
       .filter((index: unknown): index is number => typeof index === "number" && Number.isInteger(index) && index >= 0 && index <= 999))]
       .slice(0, 5);
-    if (!artist || !title || !relationship || citationIndexes.length === 0) return null;
-    return {
+    if (!artist || !title || !relationship || citationIndexes.length === 0) continue;
+    parsed.push({
       artist,
       title,
       album: row.album === null ? null : safeText(row.album, 240) || null,
-      releaseYear: Number.isInteger(row.releaseYear) && row.releaseYear >= 1800 && row.releaseYear <= 2200 ? row.releaseYear : null,
+      releaseYear: Number.isInteger(row.releaseYear)
+        && Number(row.releaseYear) >= 1800
+        && Number(row.releaseYear) <= 2200
+        ? Number(row.releaseYear)
+        : null,
       versionLabel: row.versionLabel === null ? null : safeText(row.versionLabel, 120) || null,
       relationship,
       citationIndexes,
-    };
-  }).filter((row: RawFastCandidate | null): row is RawFastCandidate => row !== null);
+    });
+  }
+  return parsed;
 }
 
 export function validateFastCandidates(

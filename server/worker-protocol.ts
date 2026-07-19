@@ -3,10 +3,62 @@
  * worker that consumes it. Increment this only when a rollout changes the
  * meaning or shape of queued playlist-pipeline work.
  */
-// v4 adds the durable post-match research-refill and refill-aware catalog
-// recovery payloads. An API running this revision must not enqueue those jobs
-// to a pre-v4 worker during a rolling deployment.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v4";
+import type { PipelineVersion } from "../shared/types.ts";
+
+export interface WorkerPipelineCapability {
+  protocolVersion: string;
+  protocolNumber: number;
+  pipelineVersions: readonly PipelineVersion[];
+}
+
+/**
+ * Release-A bridge capability. It must be deployed while V2 assignment is
+ * still disabled, before a v5 worker is introduced. It can drain legacy work
+ * after the expand migration but cannot lease catalog-first jobs.
+ */
+export const WORKER_PIPELINE_V4_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
+  protocolVersion: "playlist-pipeline-v4",
+  protocolNumber: 4,
+  pipelineVersions: ["legacy_v1"],
+};
+
+// v5 adds immutable pipeline/minimum-protocol queue stamping and makes every
+// lease capability-aware. A v5 worker can drain V1 and execute curated V2;
+// bridge v4 workers remain restricted to V1 during a rolling deployment.
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v5";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 5;
+export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
+  protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+  protocolNumber: WORKER_PIPELINE_PROTOCOL_NUMBER,
+  pipelineVersions: ["legacy_v1", "catalog_first_v2"],
+};
+
+export const LEGACY_V1_MINIMUM_WORKER_PROTOCOL = 4;
+export const CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL = 5;
+
+export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
+  return pipelineVersion === "catalog_first_v2"
+    ? CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL
+    : LEGACY_V1_MINIMUM_WORKER_PROTOCOL;
+}
+
+export function workerPipelineProtocolNumber(value: unknown): number | null {
+  const version = typeof value === "string"
+    ? value
+    : workerPipelineProtocolVersion(value);
+  const match = version?.match(/^playlist-pipeline-v([1-9]\d*)$/u);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+export function isWorkerCapabilityValid(capability: WorkerPipelineCapability): boolean {
+  return workerPipelineProtocolNumber(capability.protocolVersion) === capability.protocolNumber
+    && Number.isSafeInteger(capability.protocolNumber)
+    && capability.protocolNumber > 0
+    && capability.pipelineVersions.length > 0
+    && capability.pipelineVersions.every((value) => value === "legacy_v1" || value === "catalog_first_v2");
+}
 
 export function workerPipelineProtocolVersion(metadata: unknown): string | null {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
@@ -15,5 +67,6 @@ export function workerPipelineProtocolVersion(metadata: unknown): string | null 
 }
 
 export function isWorkerPipelineProtocolCompatible(metadata: unknown): boolean {
-  return workerPipelineProtocolVersion(metadata) === WORKER_PIPELINE_PROTOCOL_VERSION;
+  const actual = workerPipelineProtocolNumber(metadata);
+  return actual !== null && actual >= WORKER_PIPELINE_PROTOCOL_NUMBER;
 }

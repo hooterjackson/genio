@@ -172,12 +172,15 @@ describe("retained production searches", () => {
     expect(replay.initialStrictMatchedCount).toBe(42);
     expect(replay.recoveredCatalogCount).toBe(0);
     expect(replay.postMatchRefillGenerations).toBe(1);
-    expect(replay.refillCandidateGoals).toEqual([21]);
-    expect(replay.refillCandidateCount).toBe(21);
-    expect(replay.refillStrictMatchedCount).toBe(8);
+    // Pipeline V2 sizes recovery from the conservative post-filter yield and
+    // includes the qualified reserve instead of multiplying the deficit by a
+    // fixed oversampling factor.
+    expect(replay.refillCandidateGoals).toEqual([34]);
+    expect(replay.refillCandidateCount).toBe(34);
+    expect(replay.refillStrictMatchedCount).toBe(13);
     expect(replay.observation).toMatchObject({
       requestedTrackCount: 50,
-      strictMatchedCount: 50,
+      strictMatchedCount: 55,
       manifestTrackCount: 50,
       publishedTrackCount: 50,
       terminalStatus: "complete",
