@@ -1,3 +1,5 @@
+import { currentRelease } from "../shared/release-metadata";
+
 export type MusicKitInstance = {
   authorize(): Promise<string | void>;
 };
@@ -10,7 +12,7 @@ export type MusicKitApi = {
 export async function configureFreshMusicKit(MusicKit: MusicKitApi, developerToken: string): Promise<MusicKitInstance> {
   await MusicKit.configure({
     developerToken,
-    app: { name: "gênio", build: "1.0.0" },
+    app: { name: "gênio", build: currentRelease.version },
   });
   return MusicKit.getInstance();
 }

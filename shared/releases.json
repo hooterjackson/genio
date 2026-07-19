@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "releases": [
+    {
+      "version": "1.0.0",
+      "releasedAt": "2026-07-18",
+      "title": "Production baseline",
+      "notes": [
+        "Added live progress animation and phase messaging during research, matching, and publication.",
+        "Added grounded, request-specific follow-up questions before research.",
+        "Improved genre disambiguation, artist diversity, sequencing, and cited candidate refills.",
+        "Improved Apple Music matching recovery and partial-result handling when the requested count cannot be resolved safely.",
+        "Added the public playlist directory and private owner feedback inbox with screenshot support."
+      ]
+    }
+  ]
+}

@@ -45,6 +45,12 @@ pnpm lint
 pnpm test:e2e
 ```
 
+Formal releases use semantic versioning and checked-in patch notes. Run
+`pnpm release:new -- patch|minor|major --title "…" --note "…"`, commit and tag
+the resulting version, then run `pnpm release:check:deploy` before production.
+The current release, date, live API build, and complete note history are shown
+at `/about`; the normal build fails when package and release metadata disagree.
+
 `pnpm test` without `DATABASE_URL` is the credential-free deterministic suite.
 Postgres integration requires a disposable Postgres 17 database, migration,
 and `pnpm test:coverage`; browser QA runs through an isolated preview. The

@@ -109,6 +109,7 @@ export function SiteMenu({
               {action.label}
             </button>
           )}
+          <Link href="/about" onClick={() => setOpen(false)}>ABOUT</Link>
           <Link href="/feedback" onClick={preserveSourcePage}>SUBMIT BUG OR IMPROVEMENT</Link>
           <Link href="/privacy" onClick={() => setOpen(false)}>PRIVACY</Link>
         </nav>

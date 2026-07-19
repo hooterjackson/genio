@@ -1324,7 +1324,8 @@ summary:focus-visible {
 /* Feedback + privacy */
 
 .feedback-shell,
-.privacy-shell {
+.privacy-shell,
+.about-shell {
   width: min(var(--reading), calc(100% - 56px));
   margin: 0 auto;
   padding: clamp(84px, 11vh, 132px) 0 max(96px, env(safe-area-inset-bottom));
@@ -1332,6 +1333,7 @@ summary:focus-visible {
 
 .feedback-shell h1,
 .privacy-shell h1,
+.about-shell h1,
 .owner-shell h1 {
   margin: 0;
   color: var(--ink);
@@ -1447,6 +1449,176 @@ summary:focus-visible {
 .privacy-grid a {
   color: var(--ink);
   text-decoration-color: var(--accent);
+}
+
+.about-hero > p:first-child {
+  margin: 0 0 24px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .16em;
+}
+
+.about-shell h1 span {
+  color: var(--accent);
+}
+
+.about-release-line {
+  margin-top: 26px;
+  padding: 16px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .08em;
+}
+
+.about-release-line > span {
+  color: var(--accent);
+}
+
+.about-intro {
+  max-width: 650px;
+  margin: 30px 0 0;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1.65;
+}
+
+.about-builds,
+.about-releases {
+  margin-top: 76px;
+}
+
+.about-section-heading {
+  padding-bottom: 18px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.about-section-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -.02em;
+}
+
+.about-section-heading > span {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+
+.about-section-heading > span.is-warning {
+  color: #ffaaa2;
+}
+
+.about-build-grid {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-bottom: 1px solid var(--line);
+}
+
+.about-build-grid > div {
+  min-width: 0;
+  padding: 24px 18px 26px 0;
+  border-right: 1px solid var(--line);
+}
+
+.about-build-grid > div:nth-child(even),
+.about-build-grid > div:last-child {
+  padding-left: 18px;
+  border-right: 0;
+}
+
+.about-build-grid dt {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .13em;
+}
+
+.about-build-grid dd {
+  margin: 12px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.release-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.release-list > li {
+  padding: 34px 0 38px;
+  border-bottom: 1px solid var(--line);
+}
+
+.release-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 30px;
+}
+
+.release-heading span {
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .13em;
+}
+
+.release-heading h3 {
+  margin: 10px 0 0;
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.release-heading time {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+}
+
+.release-list article > ul {
+  margin: 26px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.release-list article > ul li {
+  max-width: 680px;
+  padding: 10px 0 10px 26px;
+  position: relative;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.release-list article > ul li::before {
+  content: "+";
+  position: absolute;
+  top: 10px;
+  left: 0;
+  color: var(--accent);
+  font-weight: 800;
 }
 
 .site-footer {
@@ -1757,6 +1929,7 @@ summary:focus-visible {
   .restore-screen,
   .feedback-shell,
   .privacy-shell,
+  .about-shell,
   .owner-shell,
   .directory-screen,
   .error-bar {
@@ -1948,6 +2121,7 @@ summary:focus-visible {
   .screen h1,
   .feedback-shell h1,
   .privacy-shell h1,
+  .about-shell h1,
   .owner-shell h1,
   .directory-intro h1 {
     font-size: 36px;
@@ -1994,8 +2168,39 @@ summary:focus-visible {
   .directory-screen,
   .feedback-shell,
   .privacy-shell,
+  .about-shell,
   .owner-shell {
     padding-top: 62px;
+  }
+
+  .about-builds,
+  .about-releases {
+    margin-top: 58px;
+  }
+
+  .about-build-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .about-build-grid > div,
+  .about-build-grid > div:nth-child(even),
+  .about-build-grid > div:last-child {
+    padding: 22px 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .about-build-grid > div:last-child {
+    border-bottom: 0;
+  }
+
+  .release-heading {
+    display: block;
+  }
+
+  .release-heading time {
+    display: block;
+    margin-top: 12px;
   }
 
   .directory-playlist {
@@ -2100,6 +2305,7 @@ summary:focus-visible {
   .restore-screen,
   .feedback-shell,
   .privacy-shell,
+  .about-shell,
   .owner-shell,
   .directory-screen,
   .error-bar {

@@ -389,10 +389,14 @@ test("guided questions and finalization preserve the exact shared header and ASC
   releaseAnswerRequest?.();
 });
 
-test("feedback and privacy keep the same public header geometry", async ({ page }) => {
+test("About, feedback, and privacy keep the same public header geometry", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Create a playlist" })).toBeVisible();
   const createGeometry = await expectStableHeader(page);
+
+  await page.goto("/about");
+  await expect(page.getByRole("heading", { name: /gênio v\d+\.\d+\.\d+/iu })).toBeVisible();
+  await expectSameHorizontalNavigation(createGeometry, await expectStableHeader(page));
 
   await page.goto("/feedback");
   await expect(page.getByRole("heading", { name: "Send feedback" })).toBeVisible();

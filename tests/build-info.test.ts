@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { buildInformation } from "../server/build-info.ts";
+import packageMetadata from "../package.json";
 
 describe("public build information", () => {
   test("combines the package version with the allowlisted Railway commit revision", () => {
@@ -20,7 +21,7 @@ describe("public build information", () => {
       RAILWAY_GIT_COMMIT_SHA: "secret=value",
       COMMIT_SHA: "not-a-commit",
     });
-    expect(result).toEqual({ identifier: "0.1.0", version: "0.1.0", revision: null });
+    expect(result).toEqual({ identifier: packageMetadata.version, version: packageMetadata.version, revision: null });
     expect(JSON.stringify(result)).not.toContain("secret=value");
   });
 });

@@ -87,24 +87,29 @@ Back up the Apple `.p8`, Apple-token encryption key, capability pepper, and both
 
 ## Release procedure
 
-1. Deploy the exact revision to staging.
-2. Run unit, integration, mobile E2E, signed-gateway, anonymous-run, and Apple smoke tests.
-3. Verify the production PITR window and a recent worker heartbeat.
-4. Pause new research, drain the old worker, then run the expand-compatible schema migrations once through the API pre-deploy step.
-5. Deploy API; verify liveness, readiness, schema compatibility, and replay rejection.
-6. Deploy worker; verify heartbeat and a reclaimed test lease.
-7. Deploy Sites last and run custom-domain and owner-authorization smoke tests.
-8. Open `/playlists` anonymously and verify pagination, newest-first ordering,
+1. Prepare the semantic release with `pnpm release:new -- patch|minor|major --title "…" --note "…"`. Repeat `--note` for every user-visible change. This bumps `package.json` and prepends the same version, date, and notes shown on `/about`.
+2. Review the notes, commit the exact source, create the annotated tag `v<version>`, and run `pnpm release:check:deploy`. A production release is invalid when the package, manifest, or tag disagree.
+3. Deploy the exact tagged revision to staging.
+4. Run unit, integration, mobile E2E, signed-gateway, anonymous-run, and Apple smoke tests.
+5. Verify the production PITR window and a recent worker heartbeat.
+6. Pause new research, drain the old worker, then run the expand-compatible schema migrations once through the API pre-deploy step.
+7. Deploy API; verify liveness, readiness, schema compatibility, and replay rejection.
+8. Deploy worker; verify heartbeat and a reclaimed test lease.
+9. Deploy Sites last and run custom-domain and owner-authorization smoke tests.
+10. Open `/about` and confirm the web release and API build report the expected version. Then open `/playlists` anonymously and verify pagination, newest-first ordering,
    ordered volume links, an empty/error-safe response, and the absence of
    prompt, run, capability, evidence, cost, manifest-description, and Apple
    library-ID fields. Hide and relist one entry from the owner control and
    confirm both changes are audited.
-9. Promote manually. Keep one-release backward compatibility before contract migrations.
+11. Create the matching GitHub Release from the checked-in patch notes and promote manually. Keep one-release backward compatibility before contract migrations.
 
 `GET /health/live` exposes only the package version and a validated Git commit
 revision from the deployment environment. Record its `build.identifier` beside
 the successful CI revision during every smoke test; a missing revision is a
 deployment-observability failure, not evidence that production matches CI.
+The public `/about` page shows this API build separately from the Sites web
+release so a partially rolled out deployment is visible instead of being
+mistaken for a complete release.
 
 Never run an automatic destructive down-migration. A worker refuses an unsupported schema version.
 

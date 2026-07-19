@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { currentRelease } from "../shared/release-metadata";
 import "./globals.css";
 import "./option-one.css";
 
@@ -49,7 +50,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" data-build-version={currentRelease.version} suppressHydrationWarning>
       <body>
         {children}
       </body>
