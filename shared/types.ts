@@ -707,6 +707,66 @@ export interface SourceFrontierItem {
   note: string;
 }
 
+/** A bounded, public-safe source label used by the live run status view. */
+export interface RunProgressRecentSource {
+  title: string;
+  /** Hostname only. Paths, query strings, and provider identifiers are excluded. */
+  domain: string;
+  sourceClass: string;
+}
+
+/**
+ * Aggregate progress exposed to a capability-authenticated visitor while a
+ * run is active. This deliberately contains counts and bounded labels only;
+ * provider requests, cursors, costs, model details, and raw errors stay on
+ * the owner/internal side of the API boundary.
+ */
+export interface RunProgressView {
+  targetTrackCount: number | null;
+  latestActivityAt: string | null;
+  sourceSummary: {
+    total: number;
+    recentSources: RunProgressRecentSource[];
+  };
+  frontierSummary: {
+    total: number;
+    complete: number;
+    active: number;
+    unresolved: number;
+    inaccessible: number;
+    discoveredCount: number;
+    recoveredCount: number;
+  };
+  containerSummary: {
+    total: number;
+    complete: number;
+    active: number;
+    unresolved: number;
+    inaccessible: number;
+    advertisedCount: number;
+    recoveredCount: number;
+  };
+  matchSummary: {
+    attempted: number;
+    accepted: number;
+    review: number;
+    unavailable: number;
+    duplicate: number;
+    rejected: number;
+    unsupported: number;
+    overflow: number;
+    shortfall: number | null;
+  };
+  publicationSummary: {
+    volumeCount: number;
+    completedVolumes: number;
+    totalTracks: number;
+    appendedTracks: number;
+    currentVolume: number | null;
+    status: string | null;
+  };
+}
+
 export interface ResearchPassReport {
   phase:
     | "scope_resolution"
@@ -845,6 +905,7 @@ export interface ResearchRunView {
   pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
   pipelineOutcome?: PipelineOutcome | null;
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
+  progress?: RunProgressView;
 }
 
 /**
@@ -871,6 +932,7 @@ export interface PublicResearchRunView {
   selectionPlan?: SelectionPlan | null;
   pipelineOutcome?: PipelineOutcome | null;
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
+  progress?: RunProgressView;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string | null;

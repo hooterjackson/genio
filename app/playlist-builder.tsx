@@ -10,6 +10,7 @@ import {
   fastRunWindowLabel,
   fastRunWindowPhrase,
 } from "../shared/fast-run-sla.ts";
+import type { RunProgressView } from "../shared/types.ts";
 import { BrandIntro } from "./brand-intro";
 import { type PrimaryNavItem } from "./primary-nav";
 import { PublicSiteHeader } from "./public-site-header";
@@ -62,6 +63,22 @@ type ResearchRun = {
   sourceCount: number;
   unresolvedCount: number;
   frontier: FrontierItem[];
+  pipelineVersion?: string;
+  policyVersion?: string;
+  selectionPlan?: {
+    requestedTrackCount?: number;
+    reserveTrackCount?: number;
+    intents?: string[];
+    storefront?: string;
+  } | null;
+  pipelineOutcome?: {
+    targetTrackCount?: number;
+    qualifiedTrackCount?: number;
+    selectedTrackCount?: number;
+    publishedTrackCount?: number;
+  } | null;
+  candidateStageCounts?: Partial<Record<string, number>>;
+  progress?: RunProgressView;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -583,17 +600,25 @@ function phaseMessage(run: ResearchRun): string {
   if (run.status === "failed") return run.error || "Research failed.";
   const requestedTracks = run.brief.targetSize?.min ?? PUBLIC_PLAYLIST_DEFAULT_TRACKS;
   const windowPhrase = fastRunWindowPhrase(requestedTracks);
+  const phase = run.phase.toLowerCase();
   if (run.status === "queued") return run.brief.mode === "curated"
     ? `Queued. The ${windowPhrase} research window includes queue time.`
     : "Waiting for an available research slot.";
-  if (run.status === "publishing") return "Publishing matched tracks to Apple Music.";
+  if (run.status === "publishing" || phase.includes("publication")) return "Creating the public Apple Music playlist and verifying its final order.";
+  if (phase.includes("sequence")) return "Spacing artists, albums, eras, and scenes into a coherent listening order.";
+  if (phase.includes("manifest")) return "Locking the selected recording versions into an ordered playlist manifest.";
+  if (phase.includes("catalog_refill_research")) return "Finding additional evidence-backed recordings for the remaining catalog shortfall.";
+  if (phase.includes("catalog_matching") || run.status === "matching") return "Resolving verified recordings to playable versions in the US Apple Music catalog.";
+  if (phase.includes("catalog_enrichment")) return "Checking recording identities, versions, and release families.";
+  if (phase.includes("gap_analysis")) return "Checking the source frontier for missing artists, eras, releases, and claims.";
+  if (phase.includes("track_verification") || phase.includes("claim_verification")) return "Verifying that each exact recording satisfies the requested relationship and evidence policy.";
+  if (phase.includes("container_enumeration")) return "Enumerating tracks from the discovered releases, sessions, and source collections.";
+  if (phase.includes("container_discovery")) return "Finding releases, sessions, playlists, and other bounded source collections.";
+  if (phase.includes("source_discovery")) return "Finding authoritative editorial, catalog, and specialist sources for this request.";
   if (run.brief.mode === "curated" && run.phase === "fast_research") {
     return `Finding and verifying cited tracks within the ${windowPhrase} window.`;
   }
-  if (run.brief.mode === "curated" && (run.status === "matching" || run.phase === "catalog_matching")) {
-    return `Matching verified tracks within the ${windowPhrase} window.`;
-  }
-  return "Searching sources and verifying recordings.";
+  return "Discovering source-backed recordings and checking each one against the confirmed scope.";
 }
 
 function useRunPolling(
@@ -1088,13 +1113,13 @@ function GuidedQuestionScreen({
 
 function FinalizingBriefScreen() {
   return (
-    <section className="guided-question-screen guided-finalizing-screen" role="status" aria-live="polite">
+    <section className="guided-question-screen guided-finalizing-screen">
       <div className="guided-question-body">
         <span className="guided-question-kicker">PREPARING</span>
         <h1>Preparing your playlist</h1>
         <p>Applying your answers before research begins.</p>
         <WorkingIndicator
-          stage="queue"
+          stage="plan"
           motion="active"
           phaseLabel="Applying your answers and finalizing the request."
           compact
@@ -1109,6 +1134,9 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
   const publishing = ["publishing", "waiting_for_apple_authorization", "manifest_ready"].includes(run.status);
   const work = playlistWorkState(run);
+  const targetCount = run.selectionPlan?.requestedTrackCount
+    ?? run.pipelineOutcome?.targetTrackCount
+    ?? exactRequestedTrackCount(run.brief);
 
   return (
     <section
@@ -1126,6 +1154,22 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
           phaseLabel={phaseMessage(run)}
           sourceCount={run.sourceCount}
           candidateCount={run.candidateCount}
+          unresolvedCount={run.unresolvedCount}
+          targetCount={run.progress?.targetTrackCount ?? targetCount}
+          reserveCount={run.selectionPlan?.reserveTrackCount}
+          candidateStageCounts={run.candidateStageCounts}
+          frontier={run.frontier}
+          createdAt={run.createdAt}
+          updatedAt={run.updatedAt}
+          progress={run.progress}
+          details={{
+            relationship: run.brief.relationship,
+            evidencePolicy: run.brief.evidencePolicy,
+            versionPolicy: run.brief.versionPolicy,
+            intents: run.selectionPlan?.intents,
+            storefront: run.selectionPlan?.storefront,
+            pipelineVersion: run.pipelineVersion,
+          }}
           note={work.motion === "active" ? "Progress is saved in Jobs. You can leave this page." : undefined}
         />
       </div>

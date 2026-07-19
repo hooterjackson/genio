@@ -67,6 +67,38 @@ describe("public API projections", () => {
       },
       pipelineOutcome: null,
       candidateStageCounts: { discovered: 73 },
+      progress: {
+        targetTrackCount: 50,
+        latestActivityAt: "2026-07-19T00:00:45.000Z",
+        sourceSummary: {
+          total: 8,
+          recentSources: [
+            { title: "Scene history", domain: "history.example/private?token=secret", sourceClass: "web", url: "https://history.example/private?token=secret" },
+            { title: "Label archive", domain: "label.example", sourceClass: "web", providerId: "private-provider-id" },
+            { title: "Apple editorial", domain: "music.apple.com", sourceClass: "apple" },
+            { title: "Fourth source is capped", domain: "fourth.example", sourceClass: "web" },
+          ],
+          rawQuery: "private query",
+          model: "private model",
+        },
+        frontierSummary: {
+          total: 4, complete: 2, active: 1, unresolved: 1, inaccessible: 0,
+          discoveredCount: 70, recoveredCount: 55, cursor: "private cursor",
+        },
+        containerSummary: {
+          total: 5, complete: 3, active: 1, unresolved: 1, inaccessible: 0,
+          advertisedCount: 100, recoveredCount: 72, providerIds: ["private"],
+        },
+        matchSummary: {
+          attempted: 52, accepted: 47, review: 2, unavailable: 1, duplicate: 1,
+          rejected: 0, unsupported: 1, overflow: 0, shortfall: 3,
+          estimatedCostUsd: 1.5,
+        },
+        publicationSummary: {
+          volumeCount: 1, completedVolumes: 0, totalTracks: 50, appendedTracks: 25,
+          currentVolume: 1, status: "appending", applePlaylistId: "private-apple-id",
+        },
+      },
       createdAt: "2026-07-19T00:00:00.000Z",
       updatedAt: "2026-07-19T00:01:00.000Z",
       completedAt: null,
@@ -84,8 +116,22 @@ describe("public API projections", () => {
       prompt: "My French jazz request",
       candidateCount: 73,
       pipelineVersion: "pipeline_v2",
+      progress: {
+        targetTrackCount: 50,
+        sourceSummary: {
+          total: 8,
+          recentSources: [
+            { title: "Scene history", domain: "history.example", sourceClass: "web" },
+            { title: "Label archive", domain: "label.example", sourceClass: "web" },
+            { title: "Apple editorial", domain: "music.apple.com", sourceClass: "apple" },
+          ],
+        },
+        matchSummary: { accepted: 47, shortfall: 3 },
+        publicationSummary: { status: "appending" },
+      },
     });
     expect(keys.filter((key) => /cost|budget|estimate/iu.test(key))).toEqual([]);
+    expect(keys.filter((key) => /query|cursor|model|providerId|applePlaylistId|url/iu.test(key))).toEqual([]);
     expect(keys).not.toContain("pipelinePolicySnapshot");
     expect(keys).not.toContain("canonicalRunId");
     expect(source).toMatchObject({

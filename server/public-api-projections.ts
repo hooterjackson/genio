@@ -5,6 +5,7 @@ import type {
   PublicBriefStatusView,
   PublicResearchRunView,
   ResearchRunView,
+  RunProgressView,
 } from "../shared/types.ts";
 
 type InternalResearchRunView = ResearchRunView & {
@@ -13,6 +14,111 @@ type InternalResearchRunView = ResearchRunView & {
   completedAt?: string | null;
   [key: string]: unknown;
 };
+
+const PUBLICATION_PROGRESS_STATUSES = new Set([
+  "pending",
+  "queued",
+  "creating",
+  "appending",
+  "waiting_for_share_url",
+  "waiting_for_owner",
+  "complete",
+  "orphaned",
+  "failed",
+]);
+
+function publicProgressCount(value: unknown): number {
+  const count = Number(value);
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+}
+
+function publicProgressOptionalCount(value: unknown): number | null {
+  if (value == null) return null;
+  const count = Number(value);
+  return Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
+}
+
+function publicProgressText(value: unknown, maximum: number): string {
+  return typeof value === "string"
+    ? value.normalize("NFKC").replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/gu, " ").trim().slice(0, maximum)
+    : "";
+}
+
+function publicProgressDate(value: unknown): string | null {
+  if (typeof value !== "string" && !(value instanceof Date)) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+function publicSourceDomain(value: unknown): string | null {
+  const text = publicProgressText(value, 300).toLowerCase();
+  if (!text) return null;
+  try {
+    const hostname = new URL(`https://${text}`).hostname.toLowerCase();
+    return hostname ? hostname.slice(0, 253) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Positive nested allowlist for live progress; never spread internal state. */
+export function publicRunProgressView(progress: RunProgressView): RunProgressView {
+  const targetTrackCount = publicProgressOptionalCount(progress.targetTrackCount);
+  const recentSources = Array.isArray(progress.sourceSummary?.recentSources)
+    ? progress.sourceSummary.recentSources.flatMap((source) => {
+      const title = publicProgressText(source?.title, 160);
+      const domain = publicSourceDomain(source?.domain);
+      const sourceClass = publicProgressText(source?.sourceClass, 40).replace(/[^a-z0-9_-]/giu, "");
+      return title && domain && sourceClass ? [{ title, domain, sourceClass }] : [];
+    }).slice(0, 3)
+    : [];
+  const publicationStatus = publicProgressText(progress.publicationSummary?.status, 40);
+  return {
+    targetTrackCount: targetTrackCount && targetTrackCount > 0 ? targetTrackCount : null,
+    latestActivityAt: publicProgressDate(progress.latestActivityAt),
+    sourceSummary: {
+      total: publicProgressCount(progress.sourceSummary?.total),
+      recentSources,
+    },
+    frontierSummary: {
+      total: publicProgressCount(progress.frontierSummary?.total),
+      complete: publicProgressCount(progress.frontierSummary?.complete),
+      active: publicProgressCount(progress.frontierSummary?.active),
+      unresolved: publicProgressCount(progress.frontierSummary?.unresolved),
+      inaccessible: publicProgressCount(progress.frontierSummary?.inaccessible),
+      discoveredCount: publicProgressCount(progress.frontierSummary?.discoveredCount),
+      recoveredCount: publicProgressCount(progress.frontierSummary?.recoveredCount),
+    },
+    containerSummary: {
+      total: publicProgressCount(progress.containerSummary?.total),
+      complete: publicProgressCount(progress.containerSummary?.complete),
+      active: publicProgressCount(progress.containerSummary?.active),
+      unresolved: publicProgressCount(progress.containerSummary?.unresolved),
+      inaccessible: publicProgressCount(progress.containerSummary?.inaccessible),
+      advertisedCount: publicProgressCount(progress.containerSummary?.advertisedCount),
+      recoveredCount: publicProgressCount(progress.containerSummary?.recoveredCount),
+    },
+    matchSummary: {
+      attempted: publicProgressCount(progress.matchSummary?.attempted),
+      accepted: publicProgressCount(progress.matchSummary?.accepted),
+      review: publicProgressCount(progress.matchSummary?.review),
+      unavailable: publicProgressCount(progress.matchSummary?.unavailable),
+      duplicate: publicProgressCount(progress.matchSummary?.duplicate),
+      rejected: publicProgressCount(progress.matchSummary?.rejected),
+      unsupported: publicProgressCount(progress.matchSummary?.unsupported),
+      overflow: publicProgressCount(progress.matchSummary?.overflow),
+      shortfall: publicProgressOptionalCount(progress.matchSummary?.shortfall),
+    },
+    publicationSummary: {
+      volumeCount: publicProgressCount(progress.publicationSummary?.volumeCount),
+      completedVolumes: publicProgressCount(progress.publicationSummary?.completedVolumes),
+      totalTracks: publicProgressCount(progress.publicationSummary?.totalTracks),
+      appendedTracks: publicProgressCount(progress.publicationSummary?.appendedTracks),
+      currentVolume: publicProgressOptionalCount(progress.publicationSummary?.currentVolume),
+      status: PUBLICATION_PROGRESS_STATUSES.has(publicationStatus) ? publicationStatus : null,
+    },
+  };
+}
 
 /**
  * Copies only fields approved for a capability-authenticated browser. Keeping
@@ -40,6 +146,7 @@ export function publicResearchRunView(
     selectionPlan: run.selectionPlan,
     pipelineOutcome: run.pipelineOutcome,
     candidateStageCounts: run.candidateStageCounts,
+    progress: run.progress ? publicRunProgressView(run.progress) : undefined,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     completedAt: run.completedAt,

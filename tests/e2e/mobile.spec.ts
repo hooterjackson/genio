@@ -1102,6 +1102,76 @@ test("an active fast run keeps its profile and concise phase message visible", a
     candidateCount: 24,
     sourceCount: 4,
     unresolvedCount: 0,
+    pipelineVersion: "curated_v2",
+    candidateStageCounts: {
+      discovered: 4,
+      scope_qualified: 8,
+      claim_verified: 6,
+      playable: 6,
+    },
+    selectionPlan: {
+      requestedTrackCount: 50,
+      reserveTrackCount: 5,
+      intents: ["genre_scene"],
+      storefront: "us",
+    },
+    createdAt: new Date(Date.now() - 43_000).toISOString(),
+    updatedAt: new Date().toISOString(),
+    progress: {
+      targetTrackCount: 50,
+      latestActivityAt: new Date().toISOString(),
+      sourceSummary: {
+        total: 4,
+        recentSources: [
+          { title: "A field guide to Berlin techno", domain: "example.org", sourceClass: "web" },
+          { title: "Berlin scene archive", domain: "archive.example", sourceClass: "web" },
+        ],
+      },
+      frontierSummary: {
+        total: 3,
+        complete: 1,
+        active: 2,
+        unresolved: 0,
+        inaccessible: 0,
+        discoveredCount: 24,
+        recoveredCount: 18,
+      },
+      containerSummary: {
+        total: 5,
+        complete: 2,
+        active: 3,
+        unresolved: 0,
+        inaccessible: 0,
+        advertisedCount: 80,
+        recoveredCount: 42,
+      },
+      matchSummary: {
+        attempted: 10,
+        accepted: 6,
+        review: 1,
+        unavailable: 1,
+        duplicate: 1,
+        rejected: 1,
+        unsupported: 0,
+        overflow: 0,
+        shortfall: 44,
+      },
+      publicationSummary: {
+        volumeCount: 0,
+        completedVolumes: 0,
+        totalTracks: 0,
+        appendedTracks: 0,
+        currentVolume: null,
+        status: null,
+      },
+    },
+    frontier: [{
+      sourceClass: "editorial",
+      strategy: "Berlin scene histories",
+      status: "pending",
+      discoveredCount: 4,
+      recoveredCount: 3,
+    }],
   };
   await page.route("**/api/v1/capabilities/exchange", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runId: fastRun.id }) });
@@ -1116,12 +1186,19 @@ test("an active fast run keeps its profile and concise phase message visible", a
   const indicator = page.getByTestId("working-indicator");
   await expect(indicator).toBeVisible();
   await expect(indicator.getByText("LIVE", { exact: true })).toBeVisible();
-  await expect(indicator.locator("[aria-current='step']")).toContainText("RESEARCH");
-  await expect(indicator.locator(".working-facts")).toContainText("SOURCES4");
-  await expect(indicator.locator(".working-facts")).toContainText("TRACKS FOUND24");
+  await expect(indicator.locator("[aria-current='step']")).toContainText("DISCOVER");
+  await expect(indicator.locator(".working-facts")).toContainText("TARGET50");
+  await expect(indicator.locator(".working-facts")).toContainText("DISCOVERED24");
+  await expect(indicator.locator(".working-facts")).toContainText("QUALIFIED20");
+  await expect(indicator.locator(".working-facts")).toContainText("APPLE READY6");
+  await expect(indicator.getByText("A field guide to Berlin techno", { exact: true })).toBeVisible();
+  await expect(indicator.getByText("example.org", { exact: true })).toBeVisible();
+  await expect(indicator.getByText("Berlin scene histories", { exact: true })).toBeVisible();
+  await expect(indicator.getByText("scope, evidence, and policy", { exact: true })).toBeVisible();
+  await expect(indicator.locator("[role='status']")).toHaveCount(1);
   await expect(page.locator(".research-progress")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  expect(await indicator.locator(".working-signal-bar").first().evaluate((element) => getComputedStyle(element).animationName)).toBe("none");
+  expect(await indicator.locator(".working-trace-pulse").first().evaluate((element) => getComputedStyle(element).animationName)).toBe("none");
 });
 
 test("the active process signal moves when motion is allowed", async ({ page }) => {
@@ -1145,9 +1222,9 @@ test("the active process signal moves when motion is allowed", async ({ page }) 
   await page.goto("/#cap=one-time-secret&run=run-moving-signal");
   const indicator = page.getByTestId("working-indicator");
   await expect(indicator.locator("[aria-current='step']")).toContainText("MATCH");
-  const animationName = await indicator.locator(".working-signal-bar").first()
+  const animationName = await indicator.locator(".working-trace-lane.is-active .working-trace-pulse")
     .evaluate((element) => getComputedStyle(element).animationName);
-  expect(animationName).toContain("working-signal-wave");
+  expect(animationName).toContain("working-trace-scan");
 });
 
 test("the jobs screen lists and opens earlier jobs for this browser", async ({ page }) => {

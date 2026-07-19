@@ -3,13 +3,14 @@ import { playlistWorkMotion, playlistWorkStage, playlistWorkState } from "../app
 
 describe("playlist waiting state", () => {
   it.each([
-    ["queued", "queued", "queue"],
-    ["researching", "source_discovery", "research"],
-    ["researching", "catalog_refill_research", "match"],
+    ["queued", "queued", "plan"],
+    ["researching", "source_discovery", "discover"],
+    ["researching", "track_verification", "verify"],
+    ["researching", "catalog_refill_research", "discover"],
     ["matching", "catalog_matching", "match"],
     ["visitor_review", "exception_review", "match"],
-    ["manifest_ready", "manifest", "build"],
-    ["publishing", "apple_publication", "build"],
+    ["manifest_ready", "manifest", "sequence"],
+    ["publishing", "apple_publication", "publish"],
   ])("maps %s / %s to %s", (status, phase, expected) => {
     expect(playlistWorkStage({ status, phase })).toBe(expected);
   });
@@ -24,7 +25,7 @@ describe("playlist waiting state", () => {
 
   it("uses a conservative active research fallback for a new phase", () => {
     expect(playlistWorkState({ status: "researching", phase: "future_music_phase" })).toEqual({
-      stage: "research",
+      stage: "discover",
       motion: "active",
     });
   });

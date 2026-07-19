@@ -661,6 +661,38 @@ databaseDescribe("hosted backend integration", () => {
     );
     const run = await repository.getRun(runId);
     expect(run.unresolvedCount).toBe(2);
+    expect(run.progress).toMatchObject({
+      targetTrackCount: null,
+      sourceSummary: { total: 0, recentSources: [] },
+      frontierSummary: {
+        total: 1,
+        complete: 0,
+        active: 1,
+        unresolved: 0,
+        inaccessible: 0,
+        discoveredCount: 1,
+        recoveredCount: 0,
+      },
+      containerSummary: {
+        total: 1,
+        complete: 0,
+        active: 1,
+        unresolved: 0,
+        inaccessible: 0,
+        advertisedCount: 0,
+        recoveredCount: 0,
+      },
+      matchSummary: { attempted: 0, accepted: 0, shortfall: null },
+      publicationSummary: {
+        volumeCount: 0,
+        completedVolumes: 0,
+        totalTracks: 0,
+        appendedTracks: 0,
+        currentVolume: null,
+        status: null,
+      },
+    });
+    expect(run.progress?.latestActivityAt).toEqual(expect.any(String));
   });
 
   test("publication completeness follows curated targets while exhaustive and hybrid runs remain strict", async () => {

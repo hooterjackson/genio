@@ -38,6 +38,8 @@ import type {
   PublicPlaylistDirectoryItem,
   PublicPlaylistDirectoryPage,
   RecordingFamily,
+  RunProgressRecentSource,
+  RunProgressView,
   ResearchRunView,
   SelectionConstraint,
   SelectionPlan,
@@ -380,6 +382,51 @@ function finiteMoney(value: number, field: string): number {
 function date(value: unknown): Date | null {
   if (!value) return null;
   return value instanceof Date ? value : new Date(String(value));
+}
+
+function progressCount(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function progressOptionalCount(value: unknown): number | null {
+  if (value == null) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+}
+
+function progressText(value: unknown, maximum: number): string {
+  return typeof value === "string"
+    ? value.normalize("NFKC").replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/gu, " ").trim().slice(0, maximum)
+    : "";
+}
+
+function recentPublicSources(value: unknown): RunProgressRecentSource[] {
+  if (!Array.isArray(value)) return [];
+  const sources: RunProgressRecentSource[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const title = progressText(row.title, 160);
+    const sourceClass = progressText(row.source_class, 40);
+    if (!title || !sourceClass || typeof row.url !== "string") continue;
+    try {
+      const url = new URL(row.url);
+      if (url.protocol !== "https:") continue;
+      const domain = url.hostname.toLowerCase().slice(0, 253);
+      if (!domain) continue;
+      const key = `${domain}\u0000${title}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      sources.push({ title, domain, sourceClass });
+      if (sources.length >= 3) break;
+    } catch {
+      // Legacy/import source URLs are intentionally omitted from the public
+      // live feed instead of attempting to repair or expose them.
+    }
+  }
+  return sources;
 }
 
 function heartbeatSchemaSupport(row: {
@@ -2240,6 +2287,13 @@ export class Repository {
         `SELECT
           (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidate_count,
           (SELECT count(*)::int FROM source_records WHERE run_id=$1) source_count,
+          (SELECT COALESCE(jsonb_agg(to_jsonb(recent) - 'retrieved_at' ORDER BY recent.retrieved_at DESC),'[]'::jsonb)
+           FROM (
+             SELECT title,url,source_class,retrieved_at
+             FROM source_records
+             WHERE run_id=$1 AND url LIKE 'https://%'
+             ORDER BY retrieved_at DESC,id DESC LIMIT 8
+           ) recent) recent_sources,
           COALESCE((
             SELECT jsonb_object_agg(staged.candidate_stage,staged.stage_count)
             FROM (
@@ -2247,6 +2301,53 @@ export class Repository {
               FROM track_candidates WHERE run_id=$1 GROUP BY candidate_stage
             ) staged
           ),'{}'::jsonb) candidate_stage_counts,
+          (SELECT count(*)::int FROM source_frontier WHERE run_id=$1) frontier_total,
+          (SELECT count(*) FILTER (WHERE status='complete')::int FROM source_frontier WHERE run_id=$1) frontier_complete,
+          (SELECT count(*) FILTER (WHERE status='pending')::int FROM source_frontier WHERE run_id=$1) frontier_active,
+          (SELECT count(*) FILTER (WHERE status='unresolved')::int FROM source_frontier WHERE run_id=$1) frontier_unresolved,
+          (SELECT count(*) FILTER (WHERE status='inaccessible')::int FROM source_frontier WHERE run_id=$1) frontier_inaccessible,
+          (SELECT COALESCE(sum(discovered_count),0)::int FROM source_frontier WHERE run_id=$1) frontier_discovered_count,
+          (SELECT COALESCE(sum(recovered_count),0)::int FROM source_frontier WHERE run_id=$1) frontier_recovered_count,
+          (SELECT count(*)::int FROM research_containers WHERE run_id=$1) container_total,
+          (SELECT count(*) FILTER (WHERE status='complete')::int FROM research_containers WHERE run_id=$1) container_complete,
+          (SELECT count(*) FILTER (WHERE status IN ('discovered','enumerating'))::int FROM research_containers WHERE run_id=$1) container_active,
+          (SELECT count(*) FILTER (WHERE status='unresolved')::int FROM research_containers WHERE run_id=$1) container_unresolved,
+          (SELECT count(*) FILTER (WHERE status='inaccessible')::int FROM research_containers WHERE run_id=$1) container_inaccessible,
+          (SELECT COALESCE(sum(advertised_total),0)::int FROM research_containers WHERE run_id=$1) container_advertised_count,
+          (SELECT COALESCE(sum(recovered_total),0)::int FROM research_containers WHERE run_id=$1) container_recovered_count,
+          (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1) match_attempted,
+          (SELECT count(*) FILTER (WHERE status='accepted')::int FROM catalog_matches WHERE run_id=$1) match_accepted,
+          (SELECT count(*) FILTER (WHERE status='review')::int FROM catalog_matches WHERE run_id=$1) match_review,
+          (SELECT count(*) FILTER (WHERE status='unavailable')::int FROM catalog_matches WHERE run_id=$1) match_unavailable,
+          (SELECT count(*) FILTER (WHERE status='duplicate')::int FROM catalog_matches WHERE run_id=$1) match_duplicate,
+          (SELECT count(*) FILTER (WHERE status='rejected')::int FROM catalog_matches WHERE run_id=$1) match_rejected,
+          (SELECT count(*) FILTER (WHERE status='unsupported')::int FROM catalog_matches WHERE run_id=$1) match_unsupported,
+          (SELECT count(*) FILTER (WHERE status='overflow')::int FROM catalog_matches WHERE run_id=$1) match_overflow,
+          (SELECT count(*)::int FROM publication_volumes pv
+             JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1) publication_volume_count,
+          (SELECT count(*) FILTER (WHERE pv.status='complete')::int FROM publication_volumes pv
+             JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1) publication_completed_volumes,
+          (SELECT COALESCE(sum(GREATEST(pv.end_position-pv.start_position+1,0)),0)::int FROM publication_volumes pv
+             JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1) publication_total_tracks,
+          (SELECT COALESCE(sum(pv.appended_count),0)::int FROM publication_volumes pv
+             JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1) publication_appended_tracks,
+          (SELECT pv.volume_number FROM publication_volumes pv
+             JOIN manifests m ON m.id=pv.manifest_id
+             WHERE m.run_id=$1 AND pv.status<>'complete'
+             ORDER BY pv.volume_number LIMIT 1) publication_current_volume,
+          (SELECT pv.status FROM publication_volumes pv
+             JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1
+             ORDER BY CASE WHEN pv.status='complete' THEN 1 ELSE 0 END,pv.volume_number LIMIT 1) publication_status,
+          (SELECT max(activity_at) FROM (
+             SELECT updated_at activity_at FROM research_runs WHERE id=$1
+             UNION ALL SELECT retrieved_at FROM source_records WHERE run_id=$1
+             UNION ALL SELECT updated_at FROM research_containers WHERE run_id=$1
+             UNION ALL SELECT stage_updated_at FROM track_candidates WHERE run_id=$1
+             UNION ALL SELECT updated_at FROM research_checkpoints WHERE run_id=$1
+             UNION ALL SELECT created_at FROM manifests WHERE run_id=$1
+             UNION ALL SELECT pv.updated_at FROM publication_volumes pv
+               JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1
+           ) activity) latest_activity_at,
           ((SELECT count(*)::int FROM source_frontier
              WHERE run_id=$1 AND status IN ('pending','unresolved','inaccessible')) +
           (SELECT count(*)::int FROM research_containers
@@ -2260,6 +2361,60 @@ export class Repository {
       this.getFrontier(id),
     ]);
     const count = counts.rows[0];
+    const requestedTrackCount = progressOptionalCount(
+      row.selection_plan_json?.requestedTrackCount
+        ?? row.brief_json?.targetSize?.max
+        ?? row.brief_json?.targetSize?.min,
+    );
+    const targetTrackCount = requestedTrackCount && requestedTrackCount > 0
+      ? requestedTrackCount
+      : null;
+    const matchAccepted = progressCount(count.match_accepted);
+    const progress: RunProgressView = {
+      targetTrackCount,
+      latestActivityAt: date(count.latest_activity_at)?.toISOString() ?? null,
+      sourceSummary: {
+        total: progressCount(count.source_count),
+        recentSources: recentPublicSources(count.recent_sources),
+      },
+      frontierSummary: {
+        total: progressCount(count.frontier_total),
+        complete: progressCount(count.frontier_complete),
+        active: progressCount(count.frontier_active),
+        unresolved: progressCount(count.frontier_unresolved),
+        inaccessible: progressCount(count.frontier_inaccessible),
+        discoveredCount: progressCount(count.frontier_discovered_count),
+        recoveredCount: progressCount(count.frontier_recovered_count),
+      },
+      containerSummary: {
+        total: progressCount(count.container_total),
+        complete: progressCount(count.container_complete),
+        active: progressCount(count.container_active),
+        unresolved: progressCount(count.container_unresolved),
+        inaccessible: progressCount(count.container_inaccessible),
+        advertisedCount: progressCount(count.container_advertised_count),
+        recoveredCount: progressCount(count.container_recovered_count),
+      },
+      matchSummary: {
+        attempted: progressCount(count.match_attempted),
+        accepted: matchAccepted,
+        review: progressCount(count.match_review),
+        unavailable: progressCount(count.match_unavailable),
+        duplicate: progressCount(count.match_duplicate),
+        rejected: progressCount(count.match_rejected),
+        unsupported: progressCount(count.match_unsupported),
+        overflow: progressCount(count.match_overflow),
+        shortfall: targetTrackCount == null ? null : Math.max(targetTrackCount - matchAccepted, 0),
+      },
+      publicationSummary: {
+        volumeCount: progressCount(count.publication_volume_count),
+        completedVolumes: progressCount(count.publication_completed_volumes),
+        totalTracks: progressCount(count.publication_total_tracks),
+        appendedTracks: progressCount(count.publication_appended_tracks),
+        currentVolume: progressOptionalCount(count.publication_current_volume),
+        status: progressText(count.publication_status, 40) || null,
+      },
+    };
     return {
       id: row.id,
       prompt: row.prompt,
@@ -2286,6 +2441,7 @@ export class Repository {
       sourceCount: count.source_count,
       unresolvedCount: count.unresolved_count,
       frontier,
+      progress,
       createdAt: date(row.created_at)?.toISOString(),
       updatedAt: date(row.updated_at)?.toISOString(),
       completedAt: date(row.completed_at)?.toISOString() ?? null,

@@ -98,6 +98,124 @@ const pipelineOutcome: PipelineOutcome = {
   completedAt: "2026-07-19T00:00:00.000Z",
 };
 
+test("builds a bounded public-safe live progress summary from durable run state", async () => {
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  const pool = {
+    query: vi.fn(async (text: string, values: unknown[] = []) => {
+      calls.push({ text, values });
+      if (text.includes("SELECT * FROM research_runs")) {
+        return { rows: [{
+          id: "run-id",
+          prompt: "House foundations",
+          brief_json: brief,
+          status: "matching",
+          phase: "catalog_matching",
+          auto_publish: true,
+          estimated_cost_usd: 1,
+          actual_cost_usd: 0.1,
+          approved_budget_usd: 1,
+          reserved_cost_usd: 0,
+          no_new_gap_passes: 0,
+          error: null,
+          pipeline_version: "catalog_first_v2",
+          policy_version: "catalog_first_v2_policy_v1",
+          selection_plan_json: selectionPlan,
+          pipeline_policy_snapshot_json: null,
+          pipeline_outcome_json: null,
+          guidance_source_hints_json: [],
+          guidance_telemetry_json: null,
+          guidance_preferences_json: [],
+          created_at: new Date("2026-07-19T00:00:00.000Z"),
+          updated_at: new Date("2026-07-19T00:01:00.000Z"),
+          completed_at: null,
+          budget_approval_expires_at: null,
+        }], rowCount: 1 };
+      }
+      if (text.includes("candidate_stage_counts")) {
+        return { rows: [{
+          candidate_count: 32,
+          source_count: 7,
+          recent_sources: [
+            { title: "House music history", url: "https://history.example/article?private=1", source_class: "web" },
+            { title: "Imported fixture", url: "import://fixture/private", source_class: "import" },
+            { title: "Apple editorial", url: "https://music.apple.com/us/playlist/example", source_class: "apple" },
+          ],
+          candidate_stage_counts: { discovered: 10, catalog_resolved: 22 },
+          frontier_total: 4,
+          frontier_complete: 2,
+          frontier_active: 1,
+          frontier_unresolved: 1,
+          frontier_inaccessible: 0,
+          frontier_discovered_count: 60,
+          frontier_recovered_count: 44,
+          container_total: 6,
+          container_complete: 4,
+          container_active: 1,
+          container_unresolved: 0,
+          container_inaccessible: 1,
+          container_advertised_count: 80,
+          container_recovered_count: 63,
+          match_attempted: 30,
+          match_accepted: 21,
+          match_review: 2,
+          match_unavailable: 1,
+          match_duplicate: 2,
+          match_rejected: 1,
+          match_unsupported: 2,
+          match_overflow: 1,
+          publication_volume_count: 1,
+          publication_completed_volumes: 0,
+          publication_total_tracks: 25,
+          publication_appended_tracks: 10,
+          publication_current_volume: 1,
+          publication_status: "appending",
+          latest_activity_at: new Date("2026-07-19T00:01:15.000Z"),
+          unresolved_count: 3,
+        }], rowCount: 1 };
+      }
+      if (text.includes("SELECT * FROM source_frontier")) return { rows: [], rowCount: 0 };
+      throw new Error(`Unexpected repository query: ${text}`);
+    }),
+    end: vi.fn(),
+  };
+  const repository = new Repository({ pool, db: {} } as never);
+
+  const run = await repository.getRun("run-id");
+
+  expect(run.progress).toEqual({
+    targetTrackCount: 25,
+    latestActivityAt: "2026-07-19T00:01:15.000Z",
+    sourceSummary: {
+      total: 7,
+      recentSources: [
+        { title: "House music history", domain: "history.example", sourceClass: "web" },
+        { title: "Apple editorial", domain: "music.apple.com", sourceClass: "apple" },
+      ],
+    },
+    frontierSummary: {
+      total: 4, complete: 2, active: 1, unresolved: 1, inaccessible: 0,
+      discoveredCount: 60, recoveredCount: 44,
+    },
+    containerSummary: {
+      total: 6, complete: 4, active: 1, unresolved: 0, inaccessible: 1,
+      advertisedCount: 80, recoveredCount: 63,
+    },
+    matchSummary: {
+      attempted: 30, accepted: 21, review: 2, unavailable: 1, duplicate: 2,
+      rejected: 1, unsupported: 2, overflow: 1, shortfall: 4,
+    },
+    publicationSummary: {
+      volumeCount: 1, completedVolumes: 0, totalTracks: 25, appendedTracks: 10,
+      currentVolume: 1, status: "appending",
+    },
+  });
+  const aggregate = calls.find((call) => call.text.includes("candidate_stage_counts"));
+  expect(aggregate?.text).toContain("LIMIT 8");
+  expect(aggregate?.text).not.toContain("source_records.note");
+  expect(JSON.stringify(run.progress)).not.toContain("private=1");
+  expect(JSON.stringify(run.progress)).not.toContain("import://");
+});
+
 test("serializes catalog songs and alternatives as JSONB parameters", async () => {
   const calls: Array<{ text: string; values: unknown[] }> = [];
   const client = {
