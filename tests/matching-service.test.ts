@@ -43,7 +43,14 @@ import {
   type CatalogDiscoveryProvider,
 } from "../server/catalog-discovery-v2.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
+import { catalogRecordingVersionClass } from "../server/pipeline-v2-policy.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
+import {
+  PIPELINE_V2_SHADOW_INPUT_SCHEMA,
+  evaluatePipelineV2ManifestShadow,
+  type ShadowManifestCandidate,
+} from "../server/pipeline-v2-shadow.ts";
+import { sha256Hex } from "../server/security.ts";
 
 const brief: PlaylistBrief = {
   title: "Matching policy test",
@@ -92,6 +99,17 @@ function routeCheckpoint(confirmedAt = new Date()) {
   const policy = researchExecutionPolicy(curatedBrief, {});
   if (policy.kind !== "fast_curated") throw new Error("Fixture policy must be fast");
   return createFastRouteCheckpoint(policy, confirmedAt);
+}
+
+function emptyCatalogDiscoveryProvider(): CatalogDiscoveryProvider {
+  return {
+    async search() { return { songs: [], artists: [], albums: [], playlists: [] }; },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
 }
 
 function fastRepository(candidates: Candidate[], confirmedAt = new Date()): MemoryMatchingRepository {
@@ -520,6 +538,282 @@ test("V2 matching persists recording identity, compatible alternates, stages, an
       deficitCount: 1,
     }),
   ]));
+});
+
+test("Brazilian disco production policy accepts a full canonical pool and finalizes an immutable 25-track manifest", async () => {
+  const productionBrief: PlaylistBrief = {
+    title: "Brazilian Disco Essentials",
+    description: "A cited survey of Brazilian disco recordings.",
+    mode: "curated",
+    subjectEntities: ["Brazilian disco"],
+    relationship: "represents Brazilian disco",
+    include: ["Brazilian disco recordings"],
+    exclude: [],
+    versionPolicy: "Prefer original-era recordings; include later reissues or remasters only if they preserve the original track identity.",
+    evidencePolicy: "Require cited specialist sources at track scope.",
+    orderingPolicy: "Intermix artists in editorial rank order.",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: [],
+  };
+  const candidates = Array.from({ length: 30 }, (_, index): Candidate => {
+    const ordinal = index + 1;
+    const item = candidate(`brazilian-disco-${ordinal}`, "editorial");
+    item.artist = `Artista Disco ${String(ordinal).padStart(2, "0")}`;
+    item.title = `Faixa Disco ${String(ordinal).padStart(2, "0")}`;
+    // This mirrors the album-null production candidates that were rejected
+    // by v1.2.4 solely because the conditional remaster phrase was parsed as
+    // a remaster-only whitelist.
+    item.album = null;
+    item.releaseYear = null;
+    item.durationMs = null;
+    item.isrc = null;
+    item.versionLabel = null;
+    item.candidateStage = "scope_qualified";
+    item.scopeBindings = [{
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "genre_scene",
+      scopeValue: "Brazilian disco",
+      geographyRelationship: "unspecified",
+      relationship: `${item.title} is a Brazilian disco recording`,
+      confidence: 0.98,
+      sourceUrl: `https://example.com/brazilian-disco/${ordinal}`,
+      sourceRecordId: `source-record-brazilian-disco-${ordinal}`,
+      researchContainerId: null,
+      citationAttestationId: `citation-brazilian-disco-${ordinal}`,
+      provenancePath: [
+        { kind: "provenance_root", id: "independent-brazilian-disco-editorial-root" },
+        { kind: "source_record", id: `source-record-brazilian-disco-${ordinal}` },
+      ],
+      note: "Track-specific Brazilian disco evidence from a stored source record.",
+    }];
+    return item;
+  });
+  const songsByOrdinal = new Map(candidates.map((item, index): [string, CatalogSong] => {
+    const ordinal = index + 1;
+    return [String(ordinal).padStart(2, "0"), {
+      ...song,
+      id: `apple-brazilian-disco-${ordinal}`,
+      artistName: item.artist,
+      name: item.title,
+      albumName: `${item.title} - Single`,
+      releaseDate: `${1977 + (index % 8)}-01-01`,
+      durationInMillis: 210_000 + index,
+      isrc: `BRDSC${String(ordinal).padStart(7, "0")}`,
+      versionLabel: undefined,
+    }];
+  }));
+  vi.mocked(searchAppleCatalog).mockImplementation(async (_storefront, query) => {
+    const ordinal = /(?:Artista|Faixa) Disco (\d{2})/u.exec(query)?.[1];
+    const match = ordinal ? songsByOrdinal.get(ordinal) : null;
+    return match ? [match] : [];
+  });
+
+  const repository = new V2MemoryMatchingRepository(
+    candidates,
+    productionBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Brazilian disco songs",
+    brief: productionBrief,
+    storefront: "us",
+  });
+  expect(repository.selectionPlan.versionPolicy).toMatchObject({
+    preferred: ["canonical", "remaster"],
+    allowed: ["canonical", "remaster", "clean", "explicit", "unknown"],
+  });
+
+  await matchResearchRun(repository, "run-v2-brazilian-disco-manifest", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  const accepted = repository.matches.filter((match) => match.status === "accepted" && match.song);
+  expect(accepted).toHaveLength(30);
+  expect(accepted.every((match) => catalogRecordingVersionClass(match.song!) === "canonical")).toBe(true);
+
+  const manifestCandidates: ShadowManifestCandidate[] = accepted.map((match, index) => ({
+    rank: index + 1,
+    candidateId: match.candidateId,
+    appleSongId: match.song!.id,
+    recordingFamilyKey: `isrc:${match.song!.isrc}`,
+    artist: match.song!.artistName,
+    title: match.song!.name,
+    scopeBindingIds: [`binding-${match.candidateId}`],
+    includeInManifest: index < 25,
+    evidenceEligible: true,
+    hardConstraintsSatisfied: true,
+    versionCompatible: true,
+    storefrontPlayable: true,
+  }));
+  const manifestReport = evaluatePipelineV2ManifestShadow({
+    schemaVersion: PIPELINE_V2_SHADOW_INPUT_SCHEMA,
+    comparisonId: "production-regression-brazilian-disco-v124",
+    generatedAt: "2026-07-19T12:00:00.000Z",
+    promptHash: sha256Hex("Brazilian disco songs"),
+    storefront: "us",
+    targetTrackCount: 25,
+    primary: {
+      pipelineVersion: "legacy_v1",
+      policyVersion: "legacy_v1",
+      modelSnapshot: "legacy-regression-baseline",
+      sourceRunId: "v124-failed-production-run",
+      candidates: [],
+    },
+    shadow: {
+      pipelineVersion: "catalog_first_v2",
+      policyVersion: "relevance_first_2026_07",
+      modelSnapshot: "v125-corrective-release",
+      sourceRunId: "run-v2-brazilian-disco-manifest",
+      candidates: manifestCandidates,
+    },
+  });
+
+  expect(manifestReport.shadow).toMatchObject({
+    pipelineVersion: "catalog_first_v2",
+    trackCount: 25,
+    exactCountSatisfied: true,
+    contentHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+  });
+  expect(manifestReport.shadow.tracks).toHaveLength(25);
+  expect(new Set(manifestReport.shadow.tracks.map((track) => track.appleSongId)).size).toBe(25);
+  expect(new Set(manifestReport.shadow.tracks.map((track) => track.recordingFamilyKey)).size).toBe(25);
+});
+
+test("V2 fixed-album scope never bypasses the requested album with an exact artist/title result", async () => {
+  const fixedAlbumBrief: PlaylistBrief = {
+    ...sceneBrief(1),
+    title: "Michael Jackson — Thriller",
+    description: "Songs from Michael Jackson's Thriller album.",
+    subjectEntities: ["Michael Jackson", "Thriller"],
+    relationship: "is included in the track list for the album Thriller by Michael Jackson",
+    include: ["Tracks on the release Thriller."],
+  };
+  const fixedAlbumCandidate = candidate("v2-fixed-album", "editorial");
+  fixedAlbumCandidate.artist = "Paulo Jerônimo";
+  fixedAlbumCandidate.title = "Vida Agitada";
+  fixedAlbumCandidate.album = "The Requested Album";
+  fixedAlbumCandidate.releaseYear = null;
+  fixedAlbumCandidate.durationMs = null;
+  fixedAlbumCandidate.isrc = null;
+  fixedAlbumCandidate.versionLabel = null;
+  fixedAlbumCandidate.candidateStage = "scope_qualified";
+  fixedAlbumCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "scene",
+    scopeValue: "Test scene",
+    relationship: "represents the Test scene",
+    confidence: 0.98,
+    sourceUrl: "https://example.com/test-scene/vida-agitada",
+    sourceRecordId: "source-record-fixed-album",
+    researchContainerId: "requested-album-container",
+    citationAttestationId: "citation-fixed-album",
+    provenancePath: [{ kind: "provenance_root", id: "fixed-album-source" }],
+    note: "Track-specific evidence for the requested album.",
+  }];
+  vi.mocked(searchAppleCatalog).mockResolvedValue([{
+    ...song,
+    id: "apple-wrong-album",
+    artistName: "Paulo Jeronimo",
+    name: "Vida Agitada",
+    albumName: "A Different Album",
+    releaseDate: "1981-01-01",
+    durationInMillis: 233_000,
+    isrc: "BRABC8100001",
+  }]);
+  const repository = new V2MemoryMatchingRepository(
+    [fixedAlbumCandidate],
+    fixedAlbumBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "songs from Michael Jackson's Thriller",
+    brief: fixedAlbumBrief,
+    storefront: "us",
+  });
+  expect(repository.selectionPlan.scopeKind).toBe("fixed_release_container");
+  expect(repository.selectionPlan.diversityGoals.maximumTracksPerAlbum).toBeNull();
+
+  await matchResearchRun(repository, "run-v2-fixed-album", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: fixedAlbumCandidate.id,
+    status: "review",
+    song: expect.objectContaining({ id: "apple-wrong-album" }),
+  })]);
+  expect(repository.matches[0]?.basis).not.toContain("non-binding editorial source album");
+});
+
+test("V2 broad curated matching does not discard a real album without durable container proof", async () => {
+  const realAlbumCandidate = candidate("v2-real-album", "editorial");
+  realAlbumCandidate.artist = "Paulo Jerônimo";
+  realAlbumCandidate.title = "Vida Agitada";
+  realAlbumCandidate.album = "Vida Agitada";
+  realAlbumCandidate.releaseYear = null;
+  realAlbumCandidate.durationMs = null;
+  realAlbumCandidate.isrc = null;
+  realAlbumCandidate.versionLabel = null;
+  realAlbumCandidate.candidateStage = "scope_qualified";
+  realAlbumCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "scene",
+    scopeValue: "Test scene",
+    relationship: "represents the Test scene",
+    confidence: 0.98,
+    sourceUrl: "https://example.com/test-scene/vida-agitada",
+    sourceRecordId: "source-record-real-album",
+    researchContainerId: null,
+    citationAttestationId: "citation-real-album",
+    provenancePath: [
+      { kind: "provenance_root", id: "independent-editorial-root" },
+      { kind: "source_record", id: "source-record-real-album" },
+      { kind: "evidence_claim", id: "claim-real-album" },
+    ],
+    note: "Track-specific evidence names the recording's real album.",
+  }];
+  vi.mocked(searchAppleCatalog).mockResolvedValue([{
+    ...song,
+    id: "apple-different-album",
+    artistName: "Paulo Jeronimo",
+    name: "Vida Agitada",
+    albumName: "Brazilian Disco Classics",
+    releaseDate: "1981-01-01",
+    durationInMillis: 233_000,
+    isrc: "BRABC8100001",
+  }]);
+  const exactBrief = sceneBrief(1);
+  const repository = new V2MemoryMatchingRepository(
+    [realAlbumCandidate],
+    exactBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "One documented Test scene track",
+    brief: exactBrief,
+    storefront: "us",
+  });
+  expect(repository.selectionPlan.scopeKind).toBe("broad_curated");
+
+  await matchResearchRun(repository, "run-v2-real-album", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: realAlbumCandidate.id,
+    status: "review",
+    song: expect.objectContaining({ id: "apple-different-album" }),
+  })]);
+  expect(repository.matches[0]?.basis).not.toContain("non-binding editorial source album");
 });
 
 function factualV2CandidateForVersionPolicy(id: string): Candidate {

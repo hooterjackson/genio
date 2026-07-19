@@ -108,6 +108,79 @@ describe("Pipeline V2 selection plan", () => {
     expect(plan.versionPolicy.excludeCompilations).toBe(true);
   });
 
+  test("keeps original-era recordings canonical when remasters are conditionally allowed", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: brief({
+        versionPolicy: "Prefer original-era recordings; include later reissues or remasters only if they preserve the original track identity.",
+      }),
+      storefront: "us",
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical", "remaster"]);
+    expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
+  });
+
+  test("does not interpret a conditional only-if clause as a global version whitelist", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Original house recordings",
+      brief: brief({
+        versionPolicy: "Prefer original-era versions. Allow remasters only if the original recording identity is preserved.",
+      }),
+    });
+
+    expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
+    expect(plan.versionPolicy.preferred).toEqual(["canonical", "remaster"]);
+  });
+
+  test("keeps canonical preferred and remasters as fallback for the production wording", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: brief({
+        versionPolicy: "Avoid remasters unless no canonical recording is available.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
+  });
+
+  test("treats an only-if remaster as fallback rather than excluding canonical versions", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House music",
+      brief: brief({
+        versionPolicy: "Allow a remaster only if no canonical version is available.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
+  });
+
+  test("preserves an exclusive remaster request whose identity clause is descriptive", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Remasters only",
+      brief: brief({
+        versionPolicy: "Only remasters that preserve the original recording identity.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["remaster"]);
+    expect(plan.versionPolicy.allowed).toEqual(["remaster"]);
+  });
+
+  test("retains an actual original-era-only request as exclusive", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Original versions only",
+      brief: brief({
+        versionPolicy: "Original-era versions only.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).toEqual(["canonical"]);
+  });
+
   test("does not turn an unrelated only cue into a global version whitelist", () => {
     const plan = createSelectionPlanV2({
       prompt: "House tracks with clean lyrics only when an explicit recording exists",
@@ -516,6 +589,72 @@ describe("Pipeline V2 selection plan", () => {
 
     expect(plan.intents).not.toContain("exhaustive");
     expect(pipelineV2Route(plan)).toBe("curated_catalog");
+  });
+
+  test("natural possessive album requests retain a typed fixed-release scope", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "songs from Michael Jackson's Thriller",
+      brief: brief({
+        title: "Michael Jackson — Thriller",
+        description: "Songs from Michael Jackson's Thriller album.",
+        subjectEntities: ["Michael Jackson", "Thriller"],
+        relationship: "is included in the track list for the album Thriller by Michael Jackson",
+        include: ["Tracks on the release Thriller."],
+        targetSize: { min: 9, max: 9 },
+      }),
+    });
+
+    expect(plan.scopeKind).toBe("fixed_release_container");
+    expect(plan.diversityGoals.maximumTracksPerAlbum).toBeNull();
+    expect(plan.orderingPolicy.avoidAdjacentSameAlbum).toBe(false);
+  });
+
+  test("directional geography prompts do not become fixed release containers", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "songs from Brazil",
+      brief: brief({
+        title: "Songs from Brazil",
+        description: "A broad survey of music made by Brazilian artists.",
+        subjectEntities: ["Brazil"],
+        relationship: "is music associated with Brazil",
+        include: ["Artists and scenes from Brazil."],
+      }),
+    });
+
+    expect(plan.scopeKind).toBe("broad_curated");
+    expect(plan.diversityGoals.maximumTracksPerAlbum).not.toBeNull();
+  });
+
+  test("a soundtrack for an activity remains a broad curated request", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "a soundtrack for my road trip",
+      brief: brief({
+        title: "Road Trip",
+        description: "An energetic playlist for a long drive.",
+        subjectEntities: ["road trip"],
+        relationship: "fits an energetic road trip",
+        include: ["Forward-moving songs for driving."],
+      }),
+    });
+
+    expect(plan.scopeKind).toBe("broad_curated");
+    expect(plan.diversityGoals.maximumTracksPerAlbum).not.toBeNull();
+  });
+
+  test("a broad survey across albums does not become one fixed container", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "tracks from influential French jazz albums",
+      brief: brief({
+        title: "French Jazz Albums",
+        description: "A broad survey across influential French jazz albums.",
+        subjectEntities: ["French jazz"],
+        relationship: "represents influential French jazz",
+        include: ["Tracks drawn from multiple French jazz albums."],
+      }),
+    });
+
+    expect(plan.scopeKind).toBe("broad_curated");
+    expect(plan.diversityGoals.maximumTracksPerAlbum).not.toBeNull();
   });
 
   test("guided answers become typed, soft constraints without weakening hard rules", () => {

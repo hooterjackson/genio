@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.5",
+      "releasedAt": "2026-07-19",
+      "title": "Pipeline V2 catalog activation fix",
+      "notes": [
+        "Fixed conditional remaster language so canonical recordings remain eligible when later reissues are allowed only if they preserve the original recording identity.",
+        "Recognized original-era recording language as a canonical-version preference instead of narrowing the catalog to remasters.",
+        "Added typed fixed-release scope detection for natural requests such as songs from a named album while keeping broad soundtrack and multi-album prompts diverse.",
+        "Kept every album mismatch, artist catalogue, factual request, competing recording, parenthetical variant, and version or identifier conflict on the strict review path.",
+        "Added production-shaped regressions for the Brazilian disco canary, conditional version policies, exact-count manifest assembly, and fixed-album protection."
+      ]
+    },
+    {
       "version": "1.2.4",
       "releasedAt": "2026-07-19",
       "title": "Pipeline V2 manifest survival recovery",

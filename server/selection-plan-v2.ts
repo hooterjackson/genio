@@ -7,6 +7,7 @@ import type {
   SelectionGeographyConstraint,
   SelectionGeographyRelationship,
   SelectionPlan,
+  SelectionScopeKind,
   SelectionVersionPolicy,
 } from "../shared/types.ts";
 import type { PlaylistGuidancePreference } from "./guidance-context.ts";
@@ -28,7 +29,7 @@ const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|dr
 const THEME_INTENT = /\b(?:songs?\s+about|tracks?\s+about|lyrics?\s+about|theme|themed)\b/iu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
-  [/\b(?:canonical|original\s+studio|studio\s+(?:recording|version))s?\b/iu, "canonical"],
+  [/\b(?:canonical|original(?:[-\s]+era)?(?:\s+(?:studio|album|single))?\s+(?:recording|version)s?(?!\s+identity)|studio\s+(?:recording|version)s?)\b/iu, "canonical"],
   [/\bremaster(?:ed|s)?\b/iu, "remaster"],
   [/\blive\b/iu, "live"],
   [/\bremix(?:es)?\b/iu, "remix"],
@@ -107,9 +108,40 @@ function versionMarkerIsExclusive(scope: string, marker: RegExp): boolean {
       const before = clause.slice(0, markerIndex);
       const after = clause.slice(markerIndex + match[0].length);
       if (VERSION_NEGATED_INCLUSION.test(before) || VERSION_NEGATED_EXCLUSION.test(before)) return false;
+      // "Only if/when/as needed" constrains whether this particular version
+      // may be used; it does not mean that every other recording class is
+      // forbidden. Treating that conditional `only` as a global whitelist is
+      // what reduced the production policy to `allowed: ["remaster"]`.
+      const conditionalOnly = /\bonly\s+(?:if|when|where|while|provided|as\s+(?:needed|required|necessary))\b/iu;
+      if (conditionalOnly.test(before)
+        || /^\s*(?:(?:versions?\s+)?only\s+)?(?:if|when|where|while|provided|as\s+(?:needed|required|necessary))\b/iu.test(after)) {
+        return false;
+      }
       return /\b(?:only|must|require|required)\b/iu.test(before)
         || /^\s*(?:versions?\s+)?only\b/iu.test(after);
     });
+  });
+}
+
+function canonicalRecordingIsUnavailable(scope: string): boolean {
+  return /\bno\s+(?:(?:compatible|playable|usable|available)\s+)?canonical(?:\s+(?:recording|version))?\b/iu.test(scope)
+    || /\bcanonical(?:\s+(?:recording|version))?[^.;\n]{0,48}\b(?:is\s+)?(?:unavailable|not\s+available|missing)\b/iu.test(scope);
+}
+
+/**
+ * A remaster named behind an availability condition is a fallback, not the
+ * preferred recording class. In particular, the `no` in "only if no
+ * canonical version is available" describes catalog availability; it must
+ * not be interpreted as a request to exclude canonical recordings.
+ */
+function hasConditionalRemasterFallback(scope: string): boolean {
+  return scope.split(/[.;\n]+/u).some((clause) => {
+    const remaster = /\bremaster(?:ed|s)?\b/iu.exec(clause);
+    if (!remaster) return false;
+    const after = clause.slice(remaster.index + remaster[0].length);
+    const condition = /\b(?:unless|only\s+(?:if|when))\b/iu.exec(after);
+    return condition !== null
+      && canonicalRecordingIsUnavailable(after.slice(condition.index + condition[0].length));
   });
 }
 
@@ -564,17 +596,29 @@ function similarityDimensions(prompt: string): string[] {
 
 function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
   const scope = brief.versionPolicy;
+  const conditionalRemasterFallback = hasConditionalRemasterFallback(scope);
   const dispositions = VERSION_MARKERS.map(([pattern, value]) => ({
     pattern,
     value,
     disposition: versionMarkerDisposition(scope, pattern),
   }));
-  const requested = dispositions
+  const explicitlyRequested = dispositions
     .filter((entry) => entry.disposition === "include")
     .map((entry) => entry.value);
+  const requested = conditionalRemasterFallback
+    ? [
+        "canonical" as const,
+        ...explicitlyRequested.filter((value) => value !== "canonical" && value !== "remaster"),
+        "remaster" as const,
+      ]
+    : explicitlyRequested;
   const excluded = new Set(dispositions
     .filter((entry) => entry.disposition === "exclude")
     .map((entry) => entry.value));
+  if (conditionalRemasterFallback) {
+    excluded.delete("canonical");
+    excluded.delete("remaster");
+  }
   const explicitOnly = dispositions.some((entry) => (
     entry.disposition === "include" && versionMarkerIsExclusive(scope, entry.pattern)
   ));
@@ -584,7 +628,12 @@ function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
     ? requested
     : [...new Set([...defaultAllowed, ...requested])])
     .filter((value) => !excluded.has(value));
-  const preferred: SelectionVersionPolicy["preferred"] = (requested.length > 0 ? requested : defaultPreferred)
+  const preferenceCandidates = conditionalRemasterFallback
+    ? requested.filter((value) => value !== "remaster")
+    : requested.length > 0
+      ? requested
+      : defaultPreferred;
+  const preferred: SelectionVersionPolicy["preferred"] = preferenceCandidates
     .filter((value) => allowed.includes(value));
   return {
     preferred: preferred.length > 0 ? preferred : allowed.slice(0, 2),
@@ -614,11 +663,40 @@ function contentPolicyFor(brief: PlaylistBrief): SelectionPlan["contentPolicy"] 
   };
 }
 
-function directScope(intents: readonly ResearchIntent[], brief: PlaylistBrief): boolean {
-  return intents.includes("artist_catalogue")
-    || intents.includes("factual_relationship")
-    || intents.includes("exhaustive")
-    || /soundtrack|specified album|fixed container/iu.test([brief.description, ...brief.include].join(" "));
+const FIXED_RELEASE_CONTAINER = /\b(?:album|ep|lp|mixtape|soundtrack|compilation|box\s+set|fixed\s+(?:release|container))\b/iu;
+const TRACKS_FROM_CONTAINER = /\b(?:songs?|tracks?|recordings?)\s+(?:from|on|off)\b/iu;
+const POSSESSIVE_CONTAINER_REFERENCE = /\b(?:songs?|tracks?|recordings?)\s+(?:from|on|off)\s+[^,;.!?\n]{1,120}[\p{L}\p{N}]['’]s\s+[^,;.!?\n]{1,120}/iu;
+const EXPLICITLY_NAMED_CONTAINER = /\b(?:album|e\.?p\.?|l\.?p\.?|mixtape|soundtrack|compilation|box\s+set)\s+(?:called|named|titled)\b/iu;
+
+function fixedReleaseContainerScope(prompt: string, brief: PlaylistBrief): boolean {
+  if (EXPLICITLY_NAMED_CONTAINER.test(prompt)) return true;
+  if (!TRACKS_FROM_CONTAINER.test(prompt)) return false;
+
+  // Natural requests often omit the word "album" (for example, “songs from
+  // Michael Jackson's Thriller”). Require either a typed two-entity brief or
+  // an interpreted release/container relationship before treating that
+  // possessive construction as fixed. This avoids misclassifying broad
+  // geography/theme prompts such as “songs from Brazil” or “songs from my
+  // childhood”.
+  const interpretedScope = [
+    brief.description,
+    brief.relationship,
+    ...brief.include,
+  ].join(" ");
+  return FIXED_RELEASE_CONTAINER.test(prompt)
+    || FIXED_RELEASE_CONTAINER.test(interpretedScope)
+    || (brief.subjectEntities.length >= 2 && POSSESSIVE_CONTAINER_REFERENCE.test(prompt));
+}
+
+function selectionScopeKind(
+  prompt: string,
+  intents: readonly ResearchIntent[],
+  brief: PlaylistBrief,
+): SelectionScopeKind {
+  if (fixedReleaseContainerScope(prompt, brief)) return "fixed_release_container";
+  if (intents.includes("factual_relationship") || intents.includes("exhaustive")) return "factual_frontier";
+  if (intents.includes("artist_catalogue")) return "artist_catalogue";
+  return "broad_curated";
 }
 
 export function createSelectionPlanV2(input: {
@@ -629,9 +707,10 @@ export function createSelectionPlanV2(input: {
 }): SelectionPlan {
   const guidance = input.guidancePreferences ?? [];
   const intents = intentSet(input.prompt, input.brief);
+  const scopeKind = selectionScopeKind(input.prompt, intents, input.brief);
   const requestedTrackCount = Math.max(1, Math.floor(input.brief.targetSize?.min ?? 50));
   const reserveTrackCount = Math.max(5, Math.ceil(requestedTrackCount * 0.1));
-  const fixedScope = directScope(intents, input.brief);
+  const fixedScope = scopeKind !== "broad_curated";
   const maxArtist = fixedScope ? null : Math.max(1, Math.ceil(requestedTrackCount * 0.15));
   const constraints = constraintsForBrief(input.prompt, input.brief, guidance, intents);
   const geographyConstraints: SelectionGeographyConstraint[] = uniqueGeographyConstraints(
@@ -653,6 +732,7 @@ export function createSelectionPlanV2(input: {
     pipelineVersion: "catalog_first_v2",
     policyVersion: PIPELINE_V2_SELECTION_PLAN_VERSION,
     intents,
+    scopeKind,
     storefront: (input.storefront ?? "us").toLocaleLowerCase("en-US"),
     requestedTrackCount,
     minimumQualifiedTrackCount: requestedTrackCount,

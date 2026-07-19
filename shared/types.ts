@@ -177,11 +177,24 @@ export interface SelectionContentPolicy {
   languages: string[];
 }
 
+/**
+ * Structural scope of a playlist request. This is intentionally distinct from
+ * research intent: a curated request can still name one fixed release, whose
+ * album identity must not be discarded during catalog matching.
+ */
+export type SelectionScopeKind =
+  | "broad_curated"
+  | "artist_catalogue"
+  | "fixed_release_container"
+  | "factual_frontier";
+
 export interface SelectionPlan {
   schemaVersion: 1;
   pipelineVersion: PipelineVersion;
   policyVersion: PipelinePolicyVersion;
   intents: ResearchIntent[];
+  /** Optional only so plans persisted before this discriminator remain readable. */
+  scopeKind?: SelectionScopeKind;
   /** Compatibility routing hints only; constraints and intents are authoritative. */
   archetypes?: ResearchArchetype[];
   storefront: string;
