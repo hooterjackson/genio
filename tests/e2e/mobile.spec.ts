@@ -1185,7 +1185,7 @@ test("an active fast run keeps its profile and concise phase message visible", a
   await expect(page.getByText("Finding and verifying cited tracks within the 2-minute window.")).toBeVisible();
   const indicator = page.getByTestId("working-indicator");
   await expect(indicator).toBeVisible();
-  await expect(indicator.getByText("LIVE", { exact: true })).toBeVisible();
+  await expect(indicator.locator(".working-live-state")).toContainText("LIVE");
   await expect(indicator.locator("[aria-current='step']")).toContainText("DISCOVER");
   await expect(indicator.locator(".working-facts")).toContainText("TARGET50");
   await expect(indicator.locator(".working-facts")).toContainText("DISCOVERED24");
@@ -1194,7 +1194,7 @@ test("an active fast run keeps its profile and concise phase message visible", a
   await expect(indicator.getByText("A field guide to Berlin techno", { exact: true })).toBeVisible();
   await expect(indicator.getByText("example.org", { exact: true })).toBeVisible();
   await expect(indicator.getByText("Berlin scene histories", { exact: true })).toBeVisible();
-  await expect(indicator.getByText("scope, evidence, and policy", { exact: true })).toBeVisible();
+  await expect(indicator.getByText("RUN DETAILS", { exact: true })).toBeVisible();
   await expect(indicator.locator("[role='status']")).toHaveCount(1);
   await expect(page.locator(".research-progress")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

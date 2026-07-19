@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.1",
+      "releasedAt": "2026-07-19",
+      "title": "Curated Pipeline V2 activation",
+      "notes": [
+        "Activated the catalog-first Pipeline V2 route for curated genre and scene requests.",
+        "Fixed cited source relationship validation that could discard an entire valid candidate pool before Apple Music matching.",
+        "Prevented model-authored scope prose from becoming hidden hard intent, exclusion, venue, activity, era, or multilingual requirements.",
+        "Added deterministic Apple catalog recovery when hosted research yields no usable candidates, while retaining transparent partial outcomes."
+      ]
+    },
+    {
       "version": "1.2.0",
       "releasedAt": "2026-07-19",
       "title": "Live research console",

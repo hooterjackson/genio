@@ -1281,7 +1281,11 @@ export class ResearchOrchestrator {
     },
   ): Promise<"matching" | "partial"> {
     const eligibleCount = Math.max(0, Math.floor(eligibleCandidateCount));
-    if (eligibleCount === 0) {
+    const run = await this.repository.getRun(runId);
+    const pipeline = persistedWorkerPipeline(run);
+    const catalogFirstRecovery = eligibleCount === 0
+      && pipeline.route === "catalog_first_v2_curated";
+    if (eligibleCount === 0 && !catalogFirstRecovery) {
       // An empty Apple playlist cannot be published. A bounded research
       // shortfall is still a valid, transparent outcome rather than a task
       // failure: preserve the frontier/checkpoint report and finish without a
@@ -1297,10 +1301,9 @@ export class ResearchOrchestrator {
 
     await this.repository.updateRun(runId, {
       status: "ready_for_matching",
-      phase: options.readyPhase,
+      phase: catalogFirstRecovery ? "research_empty_catalog_handoff" : options.readyPhase,
       error: null,
     });
-    const run = await this.repository.getRun(runId);
     await this.repository.enqueueJob({
       kind: "matching",
       runId,
@@ -2012,7 +2015,9 @@ export class ResearchOrchestrator {
         },
       ]);
       if (shortfall > 0) {
-        const outcome = eligibleCount > 0 ? "matching" : "partial";
+        const outcome = eligibleCount > 0 || pipeline.route === "catalog_first_v2_curated"
+          ? "matching"
+          : "partial";
         await this.repository.saveResearchCheckpoint(runId, completionKey, {
           status: "shortfall",
           next: outcome,
@@ -2108,7 +2113,9 @@ export class ResearchOrchestrator {
         const candidateGoal = Math.max(requestedMinimum, policy.candidateGoal);
         const shortfall = Math.max(0, requestedMinimum - eligibleCount);
         const reserveShortfall = Math.max(0, candidateGoal - eligibleCount);
-        const outcome = eligibleCount > 0 ? "matching" : "partial";
+        const outcome = eligibleCount > 0 || pipeline.route === "catalog_first_v2_curated"
+          ? "matching"
+          : "partial";
         const message = "Fast research reached its matching reserve; no additional paid calls will run.";
         await this.repository.upsertFrontier(runId, [{
           sourceClass: "fast_policy",
@@ -2173,7 +2180,9 @@ export class ResearchOrchestrator {
         const candidateGoal = Math.max(requestedMinimum, policy.candidateGoal);
         const shortfall = Math.max(0, requestedMinimum - eligibleCount);
         const reserveShortfall = Math.max(0, candidateGoal - eligibleCount);
-        const outcome = eligibleCount > 0 ? "matching" : "partial";
+        const outcome = eligibleCount > 0 || pipeline.route === "catalog_first_v2_curated"
+          ? "matching"
+          : "partial";
         await this.repository.upsertFrontier(runId, [{
           sourceClass: "fast_policy",
           strategy: "bounded provider availability",

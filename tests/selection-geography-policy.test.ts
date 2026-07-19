@@ -45,6 +45,35 @@ describe("typed selection geography", () => {
     ]);
   });
 
+  test("treats coordinated languages as an allowed set instead of requiring bilingual tracks", () => {
+    expect(parseSelectionGeographyConstraints("tracks in Arabic and French")).toEqual(expect.arrayContaining([
+      { value: "Arabic", relationship: "language" },
+      { value: "French", relationship: "language" },
+    ]));
+    const multilingualPlan: Pick<SelectionPlan, "geographyConstraints"> = {
+      geographyConstraints: [
+        { value: "Arabic", relationship: "language" },
+        { value: "French", relationship: "language" },
+      ],
+    };
+    const french = binding({
+      scopeAxis: "language",
+      scopeValue: "French",
+      geographyRelationship: "language",
+      relationship: "The track is sung in French.",
+      note: "The cited track annotation identifies French-language vocals.",
+    });
+    const german = binding({
+      scopeAxis: "language",
+      scopeValue: "German",
+      geographyRelationship: "language",
+      relationship: "The track is sung in German.",
+      note: "The cited track annotation identifies German-language vocals.",
+    });
+    expect(selectionGeographyBindingsSatisfied(multilingualPlan, [french])).toBe(true);
+    expect(selectionGeographyBindingsSatisfied(multilingualPlan, [german])).toBe(false);
+  });
+
   test.each([
     ["jazz from the French scene", "label_or_venue_scene"],
     ["jazz recorded in France", "recording_location"],

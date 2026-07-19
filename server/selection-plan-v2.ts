@@ -20,8 +20,8 @@ import {
 export const PIPELINE_V2_SELECTION_PLAN_VERSION = "relevance_first_2026_07" as const;
 
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
-const SIMILARITY_INTENT = /\b(?:sounds?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
-const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus|relax|meditat|sunset|churrasco)\b/iu;
+const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
+const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
 const EDITORIAL_INTENT = /\b(?:best|essential|influential|important|definitive|iconic|foundational|representative|history\s+of|shaped)\b/iu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
 const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggae|classical|country|electronic)\b/iu;
@@ -49,6 +49,33 @@ function normalized(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+const EXPLICIT_EXCLUSION_CUE = /\b(?:exclude|avoid|without|no|not|never|do\s+not|don't)\b/iu;
+const EXCLUSION_MATCH_STOPWORDS = new Set([
+  "about", "and", "exclude", "include", "merely", "never", "not", "only", "recording", "recordings",
+  "music", "song", "songs", "the", "track", "tracks", "without",
+]);
+
+function explicitUserExclusion(prompt: string, rule: string): boolean {
+  if (!EXPLICIT_EXCLUSION_CUE.test(prompt)) return false;
+  const terms = normalized(rule).split(" ")
+    .filter((term) => term.length >= 3 && !EXCLUSION_MATCH_STOPWORDS.has(term));
+  if (terms.length === 0) return false;
+  // Generated exclusions may reuse generic words from the positive prompt.
+  // A rule is user-authored only when one of its meaningful terms appears in
+  // the clause immediately governed by an exclusion cue (for example,
+  // "house music, no remixes"), never merely somewhere else in the request.
+  const exclusionClauses = [...prompt.matchAll(
+    /\b(?:exclude|avoid|without|no|not|never|do\s+not|don['’]?t)\b\s+([^,;.!?\n]{1,160})/giu,
+  )].map((match) => ` ${normalized(match[1] ?? "")} `);
+  return terms.some((term) => exclusionClauses.some((clause) => clause.includes(` ${term} `)));
+}
+
+function ruleNamesComplement(rule: string, value: string): boolean {
+  const normalizedValue = normalized(value);
+  return normalizedValue.length > 0
+    && normalized(rule).includes(`non ${normalizedValue}`);
+}
+
 function unique(values: readonly string[]): string[] {
   const seen = new Set<string>();
   return values.filter((value) => {
@@ -61,15 +88,31 @@ function unique(values: readonly string[]): string[] {
 
 function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   const scope = [prompt, brief.title, brief.description, brief.relationship, ...brief.include].join(" ");
+  // Subjective intent comes from the visitor's request, not from prose the
+  // brief model generated while explaining that request. Otherwise a plain
+  // genre request such as “Brazilian disco songs” becomes an editorial-ranking
+  // or artist-catalogue request merely because the generated title says
+  // “Essentials” or its description says “recordings by Brazilian artists”.
+  const directIntentScope = prompt;
   const intents: ResearchIntent[] = [];
-  if (brief.mode === "exhaustive" || brief.mode === "hybrid" || EXHAUSTIVE_INTENT.test(scope)) intents.push("exhaustive");
+  if (brief.mode === "exhaustive" || brief.mode === "hybrid" || EXHAUSTIVE_INTENT.test(directIntentScope)) intents.push("exhaustive");
   if (assertsFactualTrackRelationship(`${brief.relationship} ${prompt}`)) intents.push("factual_relationship");
-  if (SIMILARITY_INTENT.test(scope) || /stylistically similar/iu.test(brief.relationship)) intents.push("similarity");
-  if (MOOD_ACTIVITY_INTENT.test(scope)) intents.push("mood_activity");
-  if (THEME_INTENT.test(scope)) intents.push("theme");
-  if (ARTIST_CATALOGUE_INTENT.test(scope)) intents.push("artist_catalogue");
-  if (EDITORIAL_INTENT.test(scope) || /influenc|editorial|cultural|historical/iu.test(brief.relationship)) intents.push("editorial_ranking");
-  if (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship)) intents.push("genre_scene");
+  if (SIMILARITY_INTENT.test(directIntentScope)) intents.push("similarity");
+  if (MOOD_ACTIVITY_INTENT.test(directIntentScope)) intents.push("mood_activity");
+  const directThemeIntent = THEME_INTENT.test(directIntentScope);
+  if (directThemeIntent) intents.push("theme");
+  // Generated descriptions often say “recordings by Brazilian artists” or
+  // similar while describing a genre survey. That is not a direct-artist
+  // catalogue request and must not disable broad-playlist diversity rules.
+  if (ARTIST_CATALOGUE_INTENT.test(directIntentScope)) intents.push("artist_catalogue");
+  if (EDITORIAL_INTENT.test(directIntentScope)) intents.push("editorial_ranking");
+  const physicalHouseTheme = directThemeIntent
+    && /\b(?:a|the|physical)\s+houses?\b|\bhomes?\b/iu.test(directIntentScope)
+    && !/\bhouse\s+music\b/iu.test(directIntentScope);
+  if (!physicalHouseTheme
+    && (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship))) {
+    intents.push("genre_scene");
+  }
   if (intents.length === 0) intents.push("genre_scene");
   return [...new Set(intents)];
 }
@@ -100,7 +143,7 @@ const GENRE_TERMS: Array<[string, RegExp]> = [
   ["baile funk", /\b(?:baile funk|funk carioca)\b/iu],
   ["hip-hop", /\bhip[ -]?hop\b/iu],
   ["bossa nova", /\bbossa nova\b/iu],
-  ["house music", /\bhouse(?: music)?\b/iu],
+  ["house music", /\bhouse\s+music\b|\bhouse\b(?=\s+(?:anthems?|artists?|classics?|djs?|genre|mixes?|producers?|scene|tracks?))/iu],
   ["drill", /\bdrill\b/iu],
   ["jazz", /\bjazz\b/iu],
   ["techno", /\btechno\b/iu],
@@ -131,7 +174,7 @@ const MOOD_TERMS: Array<[string, RegExp]> = [
 
 const ACTIVITY_TERMS: Array<[string, RegExp]> = [
   ["sleep", /\b(?:sleep|sleeping|bedtime)\b/iu],
-  ["study", /\b(?:study|studying|focus)\b/iu],
+  ["study", /\b(?:study|studying|focus(?:\s+(?:music|playlist|session)))\b/iu],
   ["workout", /\b(?:workout|exercise|running)\b/iu],
   ["road trip", /\broad[ -]trip\b/iu],
   ["dinner", /\bdinner\b/iu],
@@ -167,23 +210,15 @@ function parsedAxisRules(value: string): ParsedAxisRule[] {
   if (genres.length > 0) rules.push({ axis: "genre", operator: "require", values: genres });
   const geographic = parseSelectionGeographyConstraints(value);
   const languages = geographic.filter((constraint) => constraint.relationship === "language");
-  for (const constraint of languages) {
+  if (languages.length > 0) {
     rules.push({
       axis: "language",
       operator: "require",
-      values: [constraint.value],
-      geographyRelationship: "language",
-    });
-  }
-  // When a multilingual request includes aliases or another script, retain
-  // the original phrase as a separate typed language rule. Individual
-  // language labels alone would otherwise erase the explicit raï/rai/الراي
-  // equivalence that discovery and evidence must preserve.
-  if (languages.length > 1 && /[()\/]|[^\u0000-\u024f]/u.test(value)) {
-    rules.push({
-      axis: "language",
-      operator: "require",
-      values: [value.trim()],
+      // Values within one constraint are alternatives. A request for tracks
+      // "in Arabic and French" therefore means the playlist may contain
+      // tracks in either requested language; it must not require every track
+      // to be bilingual by emitting two independent hard constraints.
+      values: languages.map((constraint) => constraint.value),
       geographyRelationship: "language",
     });
   }
@@ -205,10 +240,6 @@ function parsedAxisRules(value: string): ParsedAxisRule[] {
   if (/\b(?:women|woman|female)\b/iu.test(value)) {
     rules.push({ axis: "theme", operator: "require", values: ["Women"] });
   }
-  if (/\bclubs?\b/iu.test(value)) {
-    rules.push({ axis: "venue", operator: "require", values: ["club"] });
-  }
-
   const scene = value.match(/\b([\p{L}\p{N}][\p{L}\p{N}' -]{1,60}?)\s+scene\b/iu)?.[1]?.trim();
   if (scene) {
     rules.push({
@@ -226,6 +257,7 @@ function constraintsForBrief(
   prompt: string,
   brief: PlaylistBrief,
   guidance: readonly PlaylistGuidancePreference[],
+  intents: readonly ResearchIntent[],
 ): SelectionConstraint[] {
   const constraints: SelectionConstraint[] = [];
   const constraintKeys = new Set<string>();
@@ -258,32 +290,100 @@ function constraintsForBrief(
   // Interpret recognizable axes from the confirmed scope as hard requirements.
   // Generated prose is never used as a catch-all constraint here; only typed
   // values emitted by the bounded parser survive into the plan.
-  for (const scopeText of unique([
-    prompt,
-    brief.title,
-    brief.description,
-    ...brief.subjectEntities,
-    ...brief.include,
-  ])) {
+  for (const scopeText of unique([prompt, ...brief.subjectEntities])) {
     for (const parsed of parsedAxisRules(scopeText)) {
       add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
     }
   }
+  // The user prompt and resolved subject entities define non-relaxable scope.
+  // Model-authored title/description/include prose supplies useful discovery
+  // hints, but must not silently invent hard eras, venues, activities, or
+  // other requirements the visitor never requested.
+  let generatedPreferenceRank = 10;
+  for (const scopeText of unique([brief.title, brief.description, ...brief.include])) {
+    for (const parsed of parsedAxisRules(scopeText)) {
+      add(
+        "brief_preference",
+        parsed.axis,
+        "prefer",
+        parsed.values,
+        "soft",
+        generatedPreferenceRank++,
+        parsed.geographyRelationship ?? null,
+      );
+    }
+  }
   for (const rule of brief.include) {
     const parsed = parsedAxisRules(rule);
-    if (parsed.length === 0) add("include", axisForRule(rule), "require", [rule], "hard", null);
+    if (parsed.length === 0) add("include", axisForRule(rule), "prefer", [rule], "soft", generatedPreferenceRank++);
   }
   for (const rule of brief.exclude) {
+    const userAuthored = explicitUserExclusion(prompt, rule);
     const parsed = parsedAxisRules(rule);
     if (parsed.length === 0) {
-      add("exclude", axisForRule(rule), "exclude", [rule], "hard", null);
+      add(
+        userAuthored ? "exclude" : "brief_avoid",
+        axisForRule(rule),
+        userAuthored ? "exclude" : "avoid",
+        [rule],
+        userAuthored ? "hard" : "soft",
+        userAuthored ? null : generatedPreferenceRank++,
+      );
     } else {
+      let retainedTypedExclusion = false;
+      let namesRequiredComplement = false;
       for (const item of parsed) {
-        add("exclude", item.axis, "exclude", item.values, "hard", null, item.geographyRelationship ?? null);
+        const nonConflictingValues = item.values.filter((value) => {
+          const conflictsWithRequiredScope = constraints.some((constraint) => (
+            constraint.kind === "hard"
+            && constraint.operator === "require"
+            && constraint.axis === item.axis
+            && constraint.values.some((required) => normalized(required) === normalized(value))
+          ));
+          if (conflictsWithRequiredScope && ruleNamesComplement(rule, value)) {
+            namesRequiredComplement = true;
+          }
+          return !conflictsWithRequiredScope;
+        });
+        if (nonConflictingValues.length === 0) continue;
+        retainedTypedExclusion = true;
+        add(
+          userAuthored ? "exclude" : "brief_avoid",
+          item.axis,
+          userAuthored ? "exclude" : "avoid",
+          nonConflictingValues,
+          userAuthored ? "hard" : "soft",
+          userAuthored ? null : generatedPreferenceRank++,
+          item.geographyRelationship ?? null,
+        );
+      }
+      // Generated phrases such as “non-disco” and “non-Brazilian” merely name
+      // the complement of positive hard scope. Persisting the raw phrase as a
+      // token-matched exclusion causes valid Brazilian-disco evidence to match
+      // both words and reject every candidate. The positive hard axes already
+      // enforce this boundary, so the redundant generated complement is
+      // intentionally dropped. Preserve only a genuinely user-authored,
+      // non-complementary contradiction so it remains visible for policy
+      // conflict handling.
+      if (!retainedTypedExclusion && userAuthored && !namesRequiredComplement) {
+        add("exclude", "relationship", "exclude", [rule], "hard", null);
       }
     }
   }
-  add("relationship", "relationship", "require", [brief.relationship], "hard", null);
+  // Factual and exhaustive work must prove the exact requested relationship.
+  // For curated work, the brief's relationship sentence is model-authored
+  // presentation prose; the typed intent axes and evidence gate already own
+  // relevance. Treating that sentence as a literal hard phrase caused valid
+  // specialist sources to be discarded unless they repeated it verbatim.
+  const relationshipIsHard = intents.includes("factual_relationship") || intents.includes("exhaustive");
+  add(
+    "relationship",
+    "relationship",
+    relationshipIsHard ? "require" : "prefer",
+    [brief.relationship],
+    relationshipIsHard ? "hard" : "soft",
+    relationshipIsHard ? null : 9,
+  );
   add("evidence", "evidence", "require", [brief.evidencePolicy], "hard", null);
   add("version", "recording_version", "require", [brief.versionPolicy], "hard", null);
 
@@ -385,7 +485,7 @@ export function createSelectionPlanV2(input: {
   const reserveTrackCount = Math.max(5, Math.ceil(requestedTrackCount * 0.1));
   const fixedScope = directScope(intents, input.brief);
   const maxArtist = fixedScope ? null : Math.max(1, Math.ceil(requestedTrackCount * 0.15));
-  const constraints = constraintsForBrief(input.prompt, input.brief, guidance);
+  const constraints = constraintsForBrief(input.prompt, input.brief, guidance, intents);
   const geographyConstraints: SelectionGeographyConstraint[] = uniqueGeographyConstraints(
     constraints
       .filter((constraint) => constraint.kind === "hard"

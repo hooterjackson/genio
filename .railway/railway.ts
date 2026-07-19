@@ -122,6 +122,7 @@ export default defineRailway(() => {
     variables: {
       ...workerVariables,
       DATABASE_URL: Postgres.env.DATABASE_URL,
+      PIPELINE_V2_CURATED_PERCENT: "100",
     },
   });
   const needleApi = service("needle-api", {
@@ -140,6 +141,7 @@ export default defineRailway(() => {
       ...apiVariables,
       APP_ORIGIN: "https://9enio.com",
       DATABASE_URL: Postgres.env.DATABASE_URL,
+      PIPELINE_V2_CURATED_PERCENT: "100",
     },
   });
 
