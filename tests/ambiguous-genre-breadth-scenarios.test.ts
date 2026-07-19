@@ -12,7 +12,7 @@ import {
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 
-type SemanticIntent = "genre" | "theme" | "genre_and_theme" | "direct_artist";
+type SemanticIntent = "genre" | "theme" | "media" | "genre_and_theme" | "direct_artist";
 
 interface Scenario {
   id: string;
@@ -63,8 +63,8 @@ describe("ambiguous genre and artist-breadth adversarial corpus", () => {
   test("is a stable, broad corpus with explicit semantic contrast cases", () => {
     expect(fixture.schemaVersion).toBe(1);
     expect(fixture.purpose).toContain("No provider calls");
-    expect(fixture.scenarios).toHaveLength(34);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(34);
+    expect(fixture.scenarios).toHaveLength(44);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(44);
     expect(new Set(fixture.scenarios.map((scenario) => scenario.category))).toEqual(new Set([
       "ambiguous_genre",
       "explicit_theme",
@@ -159,5 +159,51 @@ describe("ambiguous genre and artist-breadth adversarial corpus", () => {
     expect(selection.overflow).toHaveLength(35);
     expect(counts.size).toBeGreaterThanOrEqual(10);
     expect(Math.max(...counts.values())).toBeLessThanOrEqual(8);
+  });
+
+  test("the terse friend report cannot survive as a literal house interpretation", () => {
+    const genreScenario = fixture.scenarios.find((row) => row.id === "AG-G09")!;
+    const literalScenario = fixture.scenarios.find((row) => row.id === "AG-T01")!;
+    const brief = canonicalBriefForRequest({
+      prompt: genreScenario.prompt,
+      requestedTrackCount: genreScenario.requestedTrackCount,
+    }, interpretedBrief(literalScenario));
+    const positiveScope = normalized([
+      ...brief.subjectEntities,
+      brief.relationship,
+      ...brief.include,
+    ].join(" "));
+
+    expect(brief.subjectEntities).toContain("House music");
+    expect(brief.title).toBe("House Music");
+    expect(positiveScope).toContain("house music genre");
+    expect(positiveScope).not.toContain("physical houses");
+    expect(brief.exclude.join(" ")).toMatch(/merely because.*houses.*homes.*architecture/iu);
+  });
+
+  test("the terse French-jazz report uses the reserve instead of returning two artists", () => {
+    const scenario = fixture.scenarios.find((row) => row.id === "AG-P09")!;
+    const brief = canonicalBriefForRequest({
+      prompt: scenario.prompt,
+      requestedTrackCount: scenario.requestedTrackCount,
+    }, interpretedBrief(scenario));
+    const ranked = [
+      ...Array.from({ length: 13 }, (_, index) => ({ id: `django-${index}`, artist: "Django Reinhardt" })),
+      ...Array.from({ length: 12 }, (_, index) => ({ id: `petrucciani-${index}`, artist: "Michel Petrucciani" })),
+      ...Array.from({ length: 25 }, (_, index) => ({ id: `reserve-${index}`, artist: `French Jazz Artist ${index + 1}` })),
+    ];
+    const selection = selectRankedPlaylistRows(ranked, 25, {
+      diversifyArtists: briefShouldDiversifyArtists(brief),
+    });
+    const counts = selection.selected.reduce<Map<string, number>>((map, row) => {
+      map.set(row.artist, (map.get(row.artist) ?? 0) + 1);
+      return map;
+    }, new Map());
+
+    expect(selection.selected).toHaveLength(25);
+    expect(counts.size).toBeGreaterThanOrEqual(10);
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(4);
+    expect(artistDiversityResearchInstruction(brief, 25))
+      .toContain("at least 5 distinct credited recording artists");
   });
 });

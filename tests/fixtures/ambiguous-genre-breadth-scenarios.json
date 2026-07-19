@@ -99,6 +99,30 @@
       "expectArtistDiversity": true
     },
     {
+      "id": "AG-G09",
+      "category": "ambiguous_genre",
+      "prompt": "Give me a house playlist.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["House music"],
+      "relationship": "is representative of the house music genre",
+      "semanticIntent": "genre",
+      "expectedTerms": ["house music"],
+      "forbiddenTerms": ["physical houses", "lyrics about houses"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-G10",
+      "category": "ambiguous_genre",
+      "prompt": "Late-night Chicago house tracks for a DJ set.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Chicago house"],
+      "relationship": "is representative of the Chicago house genre and scene",
+      "semanticIntent": "genre",
+      "expectedTerms": ["chicago house"],
+      "forbiddenTerms": ["buildings in chicago", "songs about houses"],
+      "expectArtistDiversity": true
+    },
+    {
       "id": "AG-T01",
       "category": "explicit_theme",
       "prompt": "Songs about houses, homes, and homeownership.",
@@ -180,6 +204,30 @@
       "semanticIntent": "theme",
       "expectedTerms": ["garage", "title"],
       "forbiddenTerms": ["garage rock genre", "uk garage genre"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-T08",
+      "category": "explicit_theme",
+      "prompt": "Songs about moving house, mortgages, and home renovation.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Moving house and homeownership"],
+      "relationship": "has a lyrical or thematic relationship to moving house, mortgages, or home renovation",
+      "semanticIntent": "theme",
+      "expectedTerms": ["moving house", "mortgages"],
+      "forbiddenTerms": ["house music genre"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-T09",
+      "category": "explicit_theme",
+      "prompt": "Music from the television show House M.D.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["House M.D. television music"],
+      "relationship": "appears in or is officially associated with the television series House M.D.",
+      "semanticIntent": "media",
+      "expectedTerms": ["house m.d.", "television"],
+      "forbiddenTerms": ["house music genre"],
       "expectArtistDiversity": true
     },
     {
@@ -303,6 +351,30 @@
       "expectArtistDiversity": true
     },
     {
+      "id": "AG-P09",
+      "category": "geographic_genre",
+      "prompt": "A French jazz playlist.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["French jazz"],
+      "relationship": "is representative of jazz artists and scenes from France",
+      "semanticIntent": "genre",
+      "expectedTerms": ["french jazz"],
+      "forbiddenTerms": ["only two artists"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-P10",
+      "category": "geographic_genre",
+      "prompt": "Contemporary Finnish jazz from Helsinki and Tampere.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Contemporary Finnish jazz", "Helsinki", "Tampere"],
+      "relationship": "is representative of contemporary Finnish jazz artists and scenes",
+      "semanticIntent": "genre",
+      "expectedTerms": ["contemporary finnish jazz", "helsinki", "tampere"],
+      "forbiddenTerms": [],
+      "expectArtistDiversity": true
+    },
+    {
       "id": "AG-D01",
       "category": "direct_artist_exception",
       "prompt": "Django Reinhardt deep cuts only.",
@@ -408,6 +480,54 @@
       "semanticIntent": "genre",
       "expectedTerms": ["drone metal", "ritual ambient"],
       "forbiddenTerms": ["aircraft field recordings"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-E08",
+      "category": "esoteric_polysemy",
+      "prompt": "Library music from Italian and French production catalogs.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Library music", "Italian production music", "French production music"],
+      "relationship": "was issued as library or production music in Italy or France",
+      "semanticIntent": "genre",
+      "expectedTerms": ["library music", "production music"],
+      "forbiddenTerms": ["songs about libraries", "books"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-E09",
+      "category": "esoteric_polysemy",
+      "prompt": "Minimal wave and coldwave obscurities.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Minimal wave", "Coldwave"],
+      "relationship": "belongs to the minimal-wave or coldwave genres",
+      "semanticIntent": "genre",
+      "expectedTerms": ["minimal wave", "coldwave"],
+      "forbiddenTerms": ["ocean waves", "cold weather"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-E10",
+      "category": "esoteric_polysemy",
+      "prompt": "Outsider house and lo-fi house tracks.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["Outsider house", "Lo-fi house"],
+      "relationship": "belongs to outsider-house or lo-fi-house music",
+      "semanticIntent": "genre",
+      "expectedTerms": ["outsider house", "lo-fi house"],
+      "forbiddenTerms": ["physical houses", "home recordings selected only for location"],
+      "expectArtistDiversity": true
+    },
+    {
+      "id": "AG-E11",
+      "category": "esoteric_polysemy",
+      "prompt": "New Weird America and freak-folk deep cuts.",
+      "requestedTrackCount": 25,
+      "subjectEntities": ["New Weird America", "Freak folk"],
+      "relationship": "belongs to New Weird America or freak-folk music",
+      "semanticIntent": "genre",
+      "expectedTerms": ["new weird america", "freak folk"],
+      "forbiddenTerms": ["unusual songs about the united states"],
       "expectArtistDiversity": true
     }
   ]

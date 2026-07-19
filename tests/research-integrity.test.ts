@@ -1327,11 +1327,20 @@ describe("fast curated orchestration", () => {
           const suffix = String(groupStart + pairIndex).padStart(3, "0");
           return `Performer ${suffix} — Track ${suffix}`;
         });
-        const support = fastEvidenceGroup(
+        const strictSupport = fastEvidenceGroup(
           "Berlin techno",
           "historically influential in the scene",
           pairs,
         );
+        // Replay the harmless formatting drift observed in production: a
+        // descriptive group heading plus no explicit CONTAINERS field. The
+        // deterministic parser must recover this without paying for the
+        // compatibility extraction model.
+        const support = id === "fast-web-initial"
+          ? strictSupport
+            .replace(/^EVIDENCE GROUP/u, "FOUNDATIONAL BERLIN TECHNO RECORDINGS")
+            .replace(/\s*\|\s*CONTAINERS:\s*NONE\s*$/u, " <inline citations>")
+          : strictSupport;
         const marker = `[${id}-source-${lines.length + 1}]`;
         const line = `${support} ${marker}`;
         const markerStart = offset + support.length + 1;

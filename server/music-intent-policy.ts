@@ -58,6 +58,7 @@ function literalHouseEntity(value: string): boolean {
 function titleMisreadHouseLiterally(value: string): boolean {
   const title = normalized(value);
   return /^(?:a |the )?(?:house|houses|homes|housing)$/u.test(title)
+    || /^(?:houses?|homes?|housing)(?: and | or | & )(?:houses?|homes?|housing)$/u.test(title)
     || /^(?:songs?|tracks?|music|playlist) (?:of |about )?(?:houses?|homes?|housing|architecture|buildings?|real estate)$/u.test(title)
     || /^(?:houses?|homes?) (?:songs?|tracks?|music|playlist)$/u.test(title);
 }

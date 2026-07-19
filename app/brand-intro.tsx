@@ -7,6 +7,7 @@ const INTRO_SESSION_KEY = "9enio:brand-intro:v2";
 const CHARACTER_INTERVAL_MS = 22;
 const COMPLETION_HOLD_MS = 700;
 const FADE_DURATION_MS = 240;
+const MAX_TOTAL_DURATION_MS = 6_500;
 
 type IntroPhase = "checking" | "visible" | "leaving" | "hidden";
 
@@ -59,6 +60,15 @@ export function BrandIntro() {
       rememberIntro();
       setVisibleCharacterCount(0);
       setPhase("visible");
+      // Background timer throttling or a saturated device must never leave a
+      // decorative intro intercepting the actual product indefinitely. The
+      // normal character animation completes first; this is only a hard
+      // accessibility/interaction escape hatch.
+      timeoutRefs.current.push(window.setTimeout(() => {
+        clearAnimation();
+        requestComposerFocus();
+        setPhase("hidden");
+      }, MAX_TOTAL_DURATION_MS));
       let nextCharacterCount = 0;
       intervalRef.current = window.setInterval(() => {
         nextCharacterCount += 1;
@@ -72,6 +82,7 @@ export function BrandIntro() {
         timeoutRefs.current.push(
           window.setTimeout(() => setPhase("leaving"), COMPLETION_HOLD_MS),
           window.setTimeout(() => {
+            clearAnimation();
             requestComposerFocus();
             setPhase("hidden");
           }, COMPLETION_HOLD_MS + FADE_DURATION_MS),

@@ -157,10 +157,10 @@ describe("fast curated research", () => {
       .toEqual([null, null]);
   });
 
-  test("recovers a repeated exact subject prefix without weakening subject binding", () => {
+  test("recovers a descriptive evidence-group prefix without weakening tagged subject binding", () => {
     const acceptedSupport = evidenceGroup({
       tracks: ["Fixture Artist — Signal One", "Second Artist — Signal Two"],
-    }).replace(/^EVIDENCE GROUP/u, "Berlin techno");
+    }).replace(/^EVIDENCE GROUP/u, "FOUNDATIONAL BERLIN TECHNO RECORDINGS");
     const accepted = fastSynthesisCheckpoint(
       synthesisResponse(acceptedSupport),
       collectHostedCitationAttestations(synthesisResponse(acceptedSupport)),
@@ -168,12 +168,76 @@ describe("fast curated research", () => {
     expect(extractFastCandidatesFromSynthesis(accepted, 120).map((row) => row.title))
       .toEqual(["Signal One", "Signal Two"]);
 
-    const mismatchedSupport = acceptedSupport.replace(/^Berlin techno/u, "Detroit techno");
+    const mismatchedSupport = acceptedSupport.replace(
+      /SUBJECT: Berlin techno/u,
+      "SUBJECT: Detroit techno",
+    );
     const rejected = fastSynthesisCheckpoint(
       synthesisResponse(mismatchedSupport),
       collectHostedCitationAttestations(synthesisResponse(mismatchedSupport)),
     );
-    expect(extractFastCandidatesFromSynthesis(rejected, 120)).toEqual([]);
+    expect(validateFastCandidates(
+      extractFastCandidatesFromSynthesis(rejected, 120),
+      brief,
+      rejected,
+    ).candidates).toEqual([]);
+  });
+
+  test("recovers and validates the exact provider formatting drift from the production house run", () => {
+    const houseBrief: PlaylistBrief = {
+      ...brief,
+      title: "Foundations of House",
+      subjectEntities: ["House music", "Chicago", "New York", "Detroit", "UK"],
+      relationship: "is a recording in the house music genre that satisfies the requested stylistic, geographic, historical, and editorial criteria",
+      targetSize: { min: 25, max: 25 },
+    };
+    const subject = canonicalFastResearchSubject(houseBrief.subjectEntities);
+    const variants = [
+      `FOUNDATIONAL HOUSE RECORDINGS | SUBJECT: ${subject} | RELATIONSHIP: ${houseBrief.relationship} | TRACKS: Jesse Saunders — On and On; Marshall Jefferson — Move Your Body <inline citations>`,
+      `Curated house-history evidence | SUBJECT: ${subject} | RELATIONSHIP: ${houseBrief.relationship} | TRACKS: Frankie Knuckles — Your Love; Adonis — No Way Back | CONTAINERS: NONE <inline citations>`,
+      `Historical/scene relevance | SUBJECT: ${subject} | RELATIONSHIP: ${houseBrief.relationship} | TRACKS: Lil Louis — French Kiss; Inner City — Good Life | CONTAINERS: NONE <inline citation>`,
+    ];
+
+    for (const support of variants) {
+      const response = synthesisResponse(support);
+      const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+      const extracted = extractFastCandidatesFromSynthesis(synthesis, 120);
+      const validated = validateFastCandidates(extracted, houseBrief, synthesis);
+
+      expect(extracted, support).toHaveLength(2);
+      expect(validated.rejectedCandidateCount, support).toBe(0);
+      expect(validated.sources, support).toHaveLength(1);
+      expect(validated.candidates, support).toHaveLength(2);
+      expect(validated.candidates[0]!.evidence[0]).toMatchObject({
+        subjectEntity: "House music",
+        subjectRelationship: houseBrief.relationship,
+      });
+    }
+  });
+
+  test("preserves bracketed track-version labels while removing citation markers", () => {
+    const support = `Production replay | SUBJECT: Berlin techno | RELATIONSHIP: ${brief.relationship} | TRACKS: Fixture Artist — Signal [Live]; Second Artist — Pulse [Radio Edit] <inline citations>`;
+    const response = synthesisResponse(support);
+    const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+
+    expect(extractFastCandidatesFromSynthesis(synthesis, 120).map((row) => row.title))
+      .toEqual(["Signal [Live]", "Pulse [Radio Edit]"]);
+  });
+
+  test("never upgrades a weaker tagged relationship to the confirmed brief relationship", () => {
+    const support = evidenceGroup({
+      relationship: "is merely mentioned by the source",
+      tracks: ["Fixture Artist — Signal One"],
+    });
+    const response = synthesisResponse(support);
+    const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+    const extracted = extractFastCandidatesFromSynthesis(synthesis, 120);
+
+    expect(extracted).toHaveLength(1);
+    expect(validateFastCandidates(extracted, brief, synthesis)).toMatchObject({
+      candidates: [],
+      rejectedCandidateCount: 1,
+    });
   });
 
   test("recovers a production-shaped dense repeated-subject evidence group", () => {

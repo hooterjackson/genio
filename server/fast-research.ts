@@ -156,6 +156,29 @@ function withoutTrailingCitationMarkers(value: string): string {
       /\s*(?:\(\[[^\]\r\n]+\]\(https?:\/\/[^)\s]+\)\)|\[[^\]\r\n]+\]\(https?:\/\/[^)\s]+\)|\[[^\]]+\]|【[^】]+】|cite[^]*)\s*$/iu,
       "",
     ).trim();
+    // The model occasionally renders the protocol placeholder literally
+    // before the provider appends the real URL citation. It carries no
+    // evidence and must not become part of a track or container title.
+    current = current.replace(/\s*<\s*inline\s+citations?\s*>\s*$/iu, "").trim();
+  }
+  return current;
+}
+
+/**
+ * TRACKS may end at the provider citation when CONTAINERS is omitted. Strip
+ * only recognizable citation syntax here: the broader container cleanup also
+ * accepts arbitrary bracketed markers, which would corrupt legitimate version
+ * labels such as `Song [Live]` or `Mix [Radio Edit]` when used on a track.
+ */
+function withoutTrailingTrackCitationMarkers(value: string): string {
+  let current = value.trim();
+  let previous = "";
+  while (current !== previous) {
+    previous = current;
+    current = current.replace(
+      /\s*(?:\(\[[^\]\r\n]+\]\(https?:\/\/[^)\s]+\)\)|\[[^\]\r\n]+\]\(https?:\/\/[^)\s]+\)|\[(?:(?:source|citation|cite|ref(?:erence)?|turn\w*)\b[^\]]*|\d+)\]|【[^】]+】|cite[^]*|<\s*inline\s+citations?\s*>)\s*$/iu,
+      "",
+    ).trim();
   }
   return current;
 }
@@ -166,31 +189,20 @@ function withoutTrailingCitationMarkers(value: string): string {
  * turning a cited album, EP, compilation, or release title into a recording.
  */
 function parseFastEvidenceGroup(excerpt: string): FastEvidenceGroup | null {
-  const strictMatch = excerpt.match(
-    /^\s*EVIDENCE GROUP\s*\|\s*SUBJECT:\s*([^|]+?)\s*\|\s*RELATIONSHIP:\s*([^|]+?)\s*\|\s*TRACKS:\s*([^|]+?)\s*\|\s*CONTAINERS:\s*(.+?)\s*$/iu,
+  // The tagged fields, rather than the human-readable heading before them,
+  // are the security boundary. Production responses sometimes substitute a
+  // descriptive heading (for example `FOUNDATIONAL HOUSE RECORDINGS`) for
+  // the requested `EVIDENCE GROUP` marker. CONTAINERS is also optional when
+  // the cited line contains only explicit Artist — Track pairs. Downstream
+  // validation still binds the tagged subject and relationship to the
+  // confirmed brief and every pair to this provider-attested support window.
+  const match = excerpt.match(
+    /^\s*[^|\r\n]{1,240}\s*\|\s*SUBJECT:\s*([^|]+?)\s*\|\s*RELATIONSHIP:\s*([^|]+?)\s*\|\s*TRACKS:\s*([^|]+?)(?:\s*\|\s*CONTAINERS:\s*(.+?))?\s*$/iu,
   );
-  // Hosted synthesis occasionally repeats the exact subject in place of the
-  // literal `EVIDENCE GROUP` prefix. Recover only that narrow formatting
-  // drift: the repeated prefix must normalize to the tagged SUBJECT value.
-  // A mismatched prefix remains rejected so unrelated prose cannot become a
-  // candidate-bearing evidence group.
-  const repeatedSubjectMatch = strictMatch ? null : excerpt.match(
-    /^\s*([^|]+?)\s*\|\s*SUBJECT:\s*([^|]+?)\s*\|\s*RELATIONSHIP:\s*([^|]+?)\s*\|\s*TRACKS:\s*([^|]+?)\s*\|\s*CONTAINERS:\s*(.+?)\s*$/iu,
-  );
-  if (repeatedSubjectMatch
-    && normalizeEvidencePhrase(repeatedSubjectMatch[1] ?? "")
-      !== normalizeEvidencePhrase(repeatedSubjectMatch[2] ?? "")) return null;
-  const match = strictMatch ?? (repeatedSubjectMatch ? [
-    repeatedSubjectMatch[0],
-    repeatedSubjectMatch[2],
-    repeatedSubjectMatch[3],
-    repeatedSubjectMatch[4],
-    repeatedSubjectMatch[5],
-  ] : null);
   if (!match) return null;
   const subjectEntity = safeText(match[1], 240);
   const relationship = safeText(match[2], 240);
-  const tracks = evidencePairs(match[3] ?? "");
+  const tracks = evidencePairs(withoutTrailingTrackCitationMarkers(match[3] ?? ""));
   const containers = evidencePairs(withoutTrailingCitationMarkers(match[4] ?? ""));
   if (!subjectEntity || !relationship || tracks.length === 0) return null;
   return { subjectEntity, relationship, tracks, containers };
@@ -390,6 +402,8 @@ export function validateFastCandidates(
         brief.subjectEntities,
       );
       if (!subjectEntity
+        || normalizeEvidencePhrase(evidenceGroup.relationship)
+          !== normalizeEvidencePhrase(brief.relationship)
         || !citationTextIsLocalToClaim(
           attestation.excerpt,
           row.title,
