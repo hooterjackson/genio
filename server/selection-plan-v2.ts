@@ -28,10 +28,13 @@ const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|dr
 const THEME_INTENT = /\b(?:songs?\s+about|tracks?\s+about|lyrics?\s+about|theme|themed)\b/iu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
+  [/\b(?:canonical|original\s+studio|studio\s+(?:recording|version))s?\b/iu, "canonical"],
+  [/\bremaster(?:ed|s)?\b/iu, "remaster"],
   [/\blive\b/iu, "live"],
   [/\bremix(?:es)?\b/iu, "remix"],
-  [/\b(?:radio|single)\s+edit\b/iu, "radio_edit"],
+  [/\b(?:(?:radio|single)\s+)?edits?\b/iu, "radio_edit"],
   [/\bextended\b/iu, "extended"],
+  [/\balternate\b/iu, "alternate"],
   [/\bacoustic\b/iu, "acoustic"],
   [/\binstrumental\b/iu, "instrumental"],
   [/\bkaraoke\b/iu, "karaoke"],
@@ -39,6 +42,56 @@ const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]
   [/\bclean\b/iu, "clean"],
   [/\bexplicit\b/iu, "explicit"],
 ];
+
+type VersionMarkerDisposition = "include" | "exclude";
+
+const VERSION_EXCLUSION_CUE = /\b(?:exclude|excluding|avoid|avoiding|without|no|not|never|omit|omitting|skip|skipping|do\s+not|don['’]?t)\b/giu;
+const VERSION_INCLUSION_CUE = /\b(?:include|including|allow|allowing|prefer|preferring|preferred|only|must|require|required|all|every)\b/giu;
+const VERSION_NEGATED_INCLUSION = /\b(?:avoid(?:ing)?|do\s+not|don['’]?t|never|not|without)\s+(?:include|including|allow|allowing|prefer|preferring|require|requiring)\b[^.;\n]*$/iu;
+const VERSION_TRAILING_EXCLUSION = /\b(?:excluded|avoided|omitted|skipped|not\s+allowed|not\s+included)\b/iu;
+const VERSION_TRAILING_INCLUSION = /\b(?:preferred|required|allowed|included|only)\b/iu;
+
+function lastRegexIndex(value: string, pattern: RegExp): number {
+  let index = -1;
+  for (const match of value.matchAll(pattern)) index = match.index;
+  return index;
+}
+
+/**
+ * Version-policy prose frequently names unwanted versions while excluding
+ * them (for example, "avoid later remixes and live versions"). A marker is a
+ * preference only when it is bare or governed by an inclusion cue. Split on
+ * sentence and adversative boundaries so mixed policies such as "include
+ * live versions but exclude remixes" retain both decisions independently.
+ */
+function versionMarkerDisposition(scope: string, marker: RegExp): VersionMarkerDisposition | null {
+  const clauses = scope.split(/(?:[.;\n]+|\bbut\b|\bwhile\b|\bwhereas\b)/iu);
+  let disposition: VersionMarkerDisposition | null = null;
+  for (const clause of clauses) {
+    const matcher = new RegExp(marker.source, marker.flags.includes("g") ? marker.flags : `${marker.flags}g`);
+    for (const match of clause.matchAll(matcher)) {
+      const markerIndex = match.index;
+      const before = clause.slice(0, markerIndex);
+      const after = clause.slice(markerIndex + match[0].length);
+      const exclusionIndex = lastRegexIndex(before, VERSION_EXCLUSION_CUE);
+      const inclusionIndex = lastRegexIndex(before, VERSION_INCLUSION_CUE);
+      if (VERSION_NEGATED_INCLUSION.test(before)) {
+        disposition = "exclude";
+      } else if (exclusionIndex >= 0 || inclusionIndex >= 0) {
+        disposition = exclusionIndex > inclusionIndex ? "exclude" : "include";
+      } else if (VERSION_TRAILING_EXCLUSION.test(after)) {
+        disposition = "exclude";
+      } else if (VERSION_TRAILING_INCLUSION.test(after)) {
+        disposition = "include";
+      } else {
+        // A bare version name in the dedicated version-policy field is an
+        // explicit request. Negative mentions are handled by the cue paths.
+        disposition = "include";
+      }
+    }
+  }
+  return disposition;
+}
 
 function normalized(value: string): string {
   return value.normalize("NFKD")
@@ -137,6 +190,39 @@ interface ParsedAxisRule {
   operator: SelectionConstraint["operator"];
   values: string[];
   geographyRelationship?: SelectionGeographyRelationship | null;
+}
+
+/**
+ * Values inside one positive scope constraint are alternatives. Coalesce
+ * independently parsed fragments before they become manifest rules so a
+ * request such as "Brazilian or French disco from the 1970s and 1980s" does
+ * not require every recording to be Brazilian AND French, or to belong to
+ * both decades at once.
+ */
+function coalesceAlternativeScopeRules(rules: readonly ParsedAxisRule[]): ParsedAxisRule[] {
+  const coalesced: ParsedAxisRule[] = [];
+  const indexes = new Map<string, number>();
+
+  for (const rule of rules) {
+    if (rule.operator !== "require" && rule.operator !== "within") {
+      coalesced.push(rule);
+      continue;
+    }
+    const key = `${rule.axis}:${rule.operator}:${rule.geographyRelationship ?? ""}`;
+    const existingIndex = indexes.get(key);
+    if (existingIndex === undefined) {
+      indexes.set(key, coalesced.length);
+      coalesced.push({ ...rule, values: unique(rule.values) });
+      continue;
+    }
+    const existing = coalesced[existingIndex]!;
+    coalesced[existingIndex] = {
+      ...existing,
+      values: unique([...existing.values, ...rule.values]),
+    };
+  }
+
+  return coalesced;
 }
 
 const GENRE_TERMS: Array<[string, RegExp]> = [
@@ -297,10 +383,25 @@ function constraintsForBrief(
   // Interpret recognizable axes from the confirmed scope as hard requirements.
   // Generated prose is never used as a catch-all constraint here; only typed
   // values emitted by the bounded parser survive into the plan.
-  for (const scopeText of unique([prompt, ...brief.subjectEntities])) {
-    for (const parsed of parsedAxisRules(scopeText)) {
-      add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
-    }
+  const promptScopeRules = coalesceAlternativeScopeRules(parsedAxisRules(prompt));
+  for (const parsed of promptScopeRules) {
+    add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
+  }
+
+  // Subject entities are useful when the prompt does not name a typed axis,
+  // but they are model-resolved fragments rather than additional visitor
+  // requirements. Once the prompt defines an axis, never let a fragment
+  // narrow it (for example, separate `1970s` and `1980s` entities). For axes
+  // absent from the prompt, merge equivalent positive fragments as
+  // alternatives before making them hard constraints.
+  const promptDefinedAxes = new Set(promptScopeRules.map((rule) => rule.axis));
+  const subjectScopeRules = coalesceAlternativeScopeRules(
+    unique(brief.subjectEntities)
+      .flatMap((scopeText) => parsedAxisRules(scopeText))
+      .filter((rule) => !promptDefinedAxes.has(rule.axis)),
+  );
+  for (const parsed of subjectScopeRules) {
+    add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
   }
   // The user prompt and resolved subject entities define non-relaxable scope.
   // Model-authored title/description/include prose supplies useful discovery
@@ -443,12 +544,28 @@ function similarityDimensions(prompt: string): string[] {
 
 function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
   const scope = brief.versionPolicy;
-  const requested = VERSION_MARKERS.filter(([pattern]) => pattern.test(scope)).map(([, value]) => value);
+  const dispositions = VERSION_MARKERS.map(([pattern, value]) => ({
+    value,
+    disposition: versionMarkerDisposition(scope, pattern),
+  }));
+  const requested = dispositions
+    .filter((entry) => entry.disposition === "include")
+    .map((entry) => entry.value);
+  const excluded = new Set(dispositions
+    .filter((entry) => entry.disposition === "exclude")
+    .map((entry) => entry.value));
   const explicitOnly = /only|must|require/iu.test(scope) && requested.length > 0;
   const defaultAllowed: SelectionVersionPolicy["allowed"] = ["canonical", "remaster", "clean", "explicit", "unknown"];
+  const defaultPreferred: SelectionVersionPolicy["preferred"] = ["canonical", "remaster"];
+  const allowed: SelectionVersionPolicy["allowed"] = (explicitOnly
+    ? requested
+    : [...new Set([...defaultAllowed, ...requested])])
+    .filter((value) => !excluded.has(value));
+  const preferred: SelectionVersionPolicy["preferred"] = (requested.length > 0 ? requested : defaultPreferred)
+    .filter((value) => allowed.includes(value));
   return {
-    preferred: requested.length > 0 ? requested : ["canonical", "remaster"],
-    allowed: explicitOnly ? requested : [...new Set([...defaultAllowed, ...requested])],
+    preferred: preferred.length > 0 ? preferred : allowed.slice(0, 2),
+    allowed,
     excludeCompilations: /exclude|avoid/iu.test(scope) && /compilation/iu.test(scope),
     excludeKaraokeAndTributes: true,
   };

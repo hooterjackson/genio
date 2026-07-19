@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.3",
+      "releasedAt": "2026-07-19",
+      "title": "Pipeline V2 scope normalization hotfix",
+      "notes": [
+        "Merged alternative prompt dimensions into single hard scope rules so multi-era, multi-genre, multilingual, and multi-region requests no longer become impossible conjunctions.",
+        "Prevented model-resolved subject fragments from narrowing a scope axis already defined by the visitor's prompt.",
+        "Made version-policy parsing respect include and exclude polarity so avoiding live versions or remixes never turns them into preferred catalog matches.",
+        "Added production-shaped regressions for Brazilian disco across the 1970s and 1980s and for mixed positive and negative recording-version policies."
+      ]
+    },
+    {
       "version": "1.2.2",
       "releasedAt": "2026-07-19",
       "title": "Pipeline V2 manifest eligibility hotfix",

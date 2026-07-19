@@ -78,6 +78,57 @@ describe("Pipeline V2 selection plan", () => {
     }));
   });
 
+  test("does not reinterpret excluded live and remix versions as preferences", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco and boogie from the 1970s and 1980s",
+      brief: brief({
+        versionPolicy: "Prefer one canonical studio recording; avoid later remixes and live versions.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
+    expect(plan.versionPolicy.preferred).not.toEqual(expect.arrayContaining(["live", "remix"]));
+    expect(plan.versionPolicy.allowed).not.toEqual(expect.arrayContaining(["live", "remix"]));
+  });
+
+  test("preserves mixed positive and negative version directives", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House music with live performances but no remixes",
+      brief: brief({
+        versionPolicy: "Prefer live versions but exclude remixes.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["live"]);
+    expect(plan.versionPolicy.allowed).toContain("live");
+    expect(plan.versionPolicy.allowed).not.toContain("remix");
+  });
+
+  test("keeps negated inclusion phrases negative", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Studio recordings only",
+      brief: brief({
+        versionPolicy: "Do not include live versions or remixes.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical", "remaster"]);
+    expect(plan.versionPolicy.allowed).not.toEqual(expect.arrayContaining(["live", "remix"]));
+  });
+
+  test("retains explicitly requested noncanonical versions", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Include live versions, remixes, and radio edits",
+      brief: brief({
+        versionPolicy: "Include live versions, remixes, and radio edits.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["live", "remix", "radio_edit"]);
+    expect(plan.versionPolicy.allowed).toEqual(expect.arrayContaining(["live", "remix", "radio_edit"]));
+  });
+
   test("composite similarity constraints survive without including the reference artist by default", () => {
     const plan = createSelectionPlanV2({
       prompt: "Songs like Radiohead, focused on production and harmony, but no Radiohead and only clean versions",
@@ -211,7 +262,15 @@ describe("Pipeline V2 selection plan", () => {
       brief: brief({
         title: "Brazilian disco and boogie",
         description: "A dance-floor survey spanning the 1970s and 1980s.",
-        subjectEntities: ["Brazilian disco", "Brazilian boogie", "Brazilian disco-funk"],
+        // The interpretation model may emit subject fragments that repeat
+        // only one side of the user's alternative era range. They must enrich
+        // the one prompt-derived range, never become additional conjunctive
+        // hard rules requiring each track to be from both decades.
+        subjectEntities: [
+          "1970s Brazilian disco",
+          "1980s Brazilian boogie",
+          "1970s and 1980s Brazilian disco-funk",
+        ],
         relationship: "belongs to the requested Brazilian dance-music scope",
         include: ["Disco, boogie, and disco-funk from Brazil in the 1970s and 1980s"],
         exclude: [],
@@ -227,6 +286,48 @@ describe("Pipeline V2 selection plan", () => {
         operator: "within",
         values: ["1970s", "1980s"],
       }),
+    ]);
+  });
+
+  test("merges alternative hard scope fragments by genre, geography, language, and era", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian or French disco and funk from the 1970s and 1980s, with vocals in Portuguese or French",
+      brief: brief({
+        title: "Brazilian and French dance music",
+        description: "A multilingual disco and funk survey across two scenes and decades.",
+        subjectEntities: [
+          "1970s Brazilian disco sung in Portuguese",
+          "1980s French funk sung in French",
+        ],
+        relationship: "belongs to one of the requested dance-music scenes",
+        include: [],
+        exclude: [],
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    const hardFor = (axis: "genre" | "geography" | "language" | "era") => plan.constraints.filter((constraint) => (
+      constraint.kind === "hard" && constraint.axis === axis
+    ));
+    expect(hardFor("genre")).toEqual([
+      expect.objectContaining({ operator: "require", values: ["disco", "funk"] }),
+    ]);
+    expect(hardFor("geography")).toEqual([
+      expect.objectContaining({
+        operator: "require",
+        values: ["Brazilian", "French"],
+        geographyRelationship: "unspecified",
+      }),
+    ]);
+    expect(hardFor("language")).toEqual([
+      expect.objectContaining({
+        operator: "require",
+        values: ["Portuguese", "French"],
+        geographyRelationship: "language",
+      }),
+    ]);
+    expect(hardFor("era")).toEqual([
+      expect.objectContaining({ operator: "within", values: ["1970s", "1980s"] }),
     ]);
   });
 
