@@ -20,14 +20,14 @@ function brazilianDiscoBrief(): PlaylistBrief {
   };
 }
 
-function descriptorsFor(relationship: string, proofText = relationship) {
+function descriptorsFor(relationship: string) {
   const brief = brazilianDiscoBrief();
   const plan = createSelectionPlanV2({
     prompt: "Brazilian disco songs",
     brief,
     storefront: "us",
   });
-  return deriveEvidenceScopeDescriptors(plan, brief, proofText, relationship);
+  return deriveEvidenceScopeDescriptors(plan, brief, relationship);
 }
 
 describe("repository evidence scope-binding derivation", () => {
@@ -42,7 +42,6 @@ describe("repository evidence scope-binding derivation", () => {
   test("does not let repeated positive subject metadata override a negated relationship", () => {
     const descriptors = descriptorsFor(
       "this recording does not belong to Brazilian disco",
-      "Brazilian disco Brazilian disco exact-track editorial support",
     );
 
     expect(descriptors).toEqual([]);
@@ -64,6 +63,6 @@ describe("repository evidence scope-binding derivation", () => {
     "incorrectly classified as Brazilian disco",
     "keyword match only",
   ])("rejects non-supporting source relationships before binding generation: %s", (relationship) => {
-    expect(descriptorsFor(relationship, "Brazilian disco exact-track citation")).toEqual([]);
+    expect(descriptorsFor(relationship)).toEqual([]);
   });
 });

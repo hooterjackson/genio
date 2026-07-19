@@ -145,6 +145,7 @@ import {
   catalogContentRating,
   catalogRecordingVersionClass,
   classifyTrackScopeBindingEvidence,
+  recordingFamilyKey,
   scopeBindingEligible,
   selectWithConstraintLadder,
   trackScopeBindingStrength,
@@ -170,6 +171,12 @@ import {
   provenancePathWithGeographyRelationship,
   selectionGeographyBindingsSatisfied,
 } from "./selection-geography-policy.ts";
+import { deriveAttestedHardScopeDescriptors } from "./evidence-scope-binding.ts";
+import {
+  canonicalRecordingFamilyReleaseYear,
+  recordingFamilySatisfiesEraConstraint,
+} from "./selection-era-policy.ts";
+import { partitionUniqueRecordingFamilies } from "./recording-family-selection.ts";
 
 // Global capacity protects paid/worker work, not saved visitor state. A run
 // waiting on scope review, budget approval, track selection, or Apple
@@ -799,7 +806,6 @@ function evidenceIntentScopeAxis(
  */
 function evidenceIntentScopeAxes(
   plan: SelectionPlan,
-  _proofText: string,
   relationshipProofText: string,
   requestedRelationship: string,
 ): TrackScopeBinding["scopeAxis"][] {
@@ -882,7 +888,6 @@ function constraintScopeAxis(axis: SelectionConstraint["axis"]): TrackScopeBindi
 export function deriveEvidenceScopeDescriptors(
   plan: SelectionPlan | null,
   brief: PlaylistBrief,
-  proofText: string,
   relationshipProofText: string,
 ): EvidenceScopeDescriptor[] {
   if (plan && !evidenceRelationshipIsMaterial(relationshipProofText)) return [];
@@ -914,7 +919,7 @@ export function deriveEvidenceScopeDescriptors(
           if (proofTextSupportsValue(relationshipProofText, value)) add(primaryEvidenceScopeAxis(null), value);
           continue;
         }
-        for (const scopeAxis of evidenceIntentScopeAxes(plan, proofText, relationshipProofText, value)) {
+        for (const scopeAxis of evidenceIntentScopeAxes(plan, relationshipProofText, value)) {
           add(scopeAxis, relationshipProofText);
         }
       }
@@ -969,6 +974,7 @@ interface ManifestScopeBindingProof {
 
 interface ManifestSelectionRow {
   candidate_id: string;
+  recording_family_id: string | null;
   selection_rank: number | null;
   catalog_id: string;
   song_json: CatalogSong;
@@ -976,6 +982,12 @@ interface ManifestSelectionRow {
   title: string;
   album: string | null;
   release_year: number | null;
+  /**
+   * Edition dates from the compatible Apple identities attached to the same
+   * recording family. A modern reissue date must not erase an older,
+   * compatible issue of the exact recording when enforcing a hard era.
+   */
+  compatible_release_years: number[] | null;
   duration_ms: number | null;
 }
 
@@ -1091,38 +1103,40 @@ function metadataContainsConstraintValue(
   });
 }
 
-function eraConstraintSatisfied(row: ManifestSelectionRow, constraint: SelectionConstraint): boolean {
-  const releaseYear = row.release_year
-    ?? (typeof row.song_json.releaseDate === "string"
-      ? Number.parseInt(row.song_json.releaseDate.slice(0, 4), 10)
-      : Number.NaN);
-  if (!Number.isInteger(releaseYear)) return false;
-  const ranges = constraint.values.flatMap((value): Array<{ start: number; end: number }> => {
-    const decade = value.match(/\b(?:(early|mid|late)[ -]?)?((?:19|20)\d0)s\b/iu);
-    if (decade) {
-      const start = Number(decade[2]);
-      if (decade[1]?.toLocaleLowerCase("en-US") === "early") return [{ start, end: start + 3 }];
-      if (decade[1]?.toLocaleLowerCase("en-US") === "mid") return [{ start: start + 3, end: start + 6 }];
-      if (decade[1]?.toLocaleLowerCase("en-US") === "late") return [{ start: start + 7, end: start + 9 }];
-      return [{ start, end: start + 9 }];
-    }
-    const explicitRange = value.match(/\b((?:19|20)\d{2})\s*(?:-|\u2013|\u2014|to|through)\s*((?:19|20)\d{2})\b/iu);
-    if (explicitRange) return [{
-      start: Math.min(Number(explicitRange[1]), Number(explicitRange[2])),
-      end: Math.max(Number(explicitRange[1]), Number(explicitRange[2])),
-    }];
-    return [...value.matchAll(/\b(?:19|20)\d{2}\b/gu)]
-      .map((match) => ({ start: Number(match[0]), end: Number(match[0]) }));
+function manifestCanonicalReleaseYear(row: ManifestSelectionRow): number | null {
+  return canonicalRecordingFamilyReleaseYear({
+    candidateReleaseYear: row.release_year,
+    appleReleaseDate: row.song_json.releaseDate,
+    compatibleReleaseYears: row.compatible_release_years,
   });
-  if (ranges.length === 0) return false;
-  const start = Math.min(...ranges.map((range) => range.start));
-  const end = Math.max(...ranges.map((range) => range.end));
-  if (constraint.operator === "before") return releaseYear < start;
-  if (constraint.operator === "after") return releaseYear > end;
-  if (constraint.operator === "between" || constraint.operator === "within" || ranges.length > 1) {
-    return releaseYear >= start && releaseYear <= end;
-  }
-  return ranges.some((range) => releaseYear >= range.start && releaseYear <= range.end);
+}
+
+/**
+ * Enforce an era against evidence attached to the exact recording family,
+ * rather than treating one Apple edition date as the recording's origin.
+ *
+ * This remains a hard floor: an in-range year must come from the candidate or
+ * a catalog identity already canonicalized into the same compatible recording
+ * family. Metadata-neighbor search results and unrelated covers/remixes never
+ * reach this list.
+ */
+export function manifestEraConstraintSatisfied(
+  input: {
+    candidateReleaseYear: number | null;
+    appleReleaseDate?: string | null;
+    compatibleReleaseYears?: readonly number[] | null;
+  },
+  constraint: Pick<SelectionConstraint, "operator" | "values">,
+): boolean {
+  return recordingFamilySatisfiesEraConstraint(input, constraint);
+}
+
+function eraConstraintSatisfied(row: ManifestSelectionRow, constraint: SelectionConstraint): boolean {
+  return manifestEraConstraintSatisfied({
+    candidateReleaseYear: row.release_year,
+    appleReleaseDate: row.song_json.releaseDate,
+    compatibleReleaseYears: row.compatible_release_years,
+  }, constraint);
 }
 
 function manifestConstraintViolations(input: {
@@ -2894,6 +2908,7 @@ export class Repository {
           id: string;
           source_id: string;
           source_url: string;
+          source_title: string;
           source_class: SourceRecordInput["sourceClass"];
           provenance_root: string;
           citation_attestation_id: string | null;
@@ -2906,7 +2921,7 @@ export class Repository {
           relationship: string;
           note: string;
         }>(
-          `SELECT e.id,e.source_id,s.url source_url,s.source_class,s.provenance_root,
+          `SELECT e.id,e.source_id,s.url source_url,s.title source_title,s.source_class,s.provenance_root,
              e.citation_attestation_id,ca.excerpt citation_excerpt,e.state,e.support_scope,e.verification_phase,
              e.subject_entity,e.subject_relationship,e.relationship,e.note
            FROM evidence_claims e JOIN source_records s ON s.id=e.source_id
@@ -2949,13 +2964,24 @@ export class Repository {
           const qualifiesEditorialClaim = (row.support_scope === "track" || row.support_scope === "editorial")
             && effective.state === "editorial";
           if (!qualifiesTrackClaim && !qualifiesEditorialClaim) return [];
-          const proofText = [
-            row.citation_excerpt ?? "",
-            row.subject_entity,
+          const legacyAndIntentDescriptors = deriveEvidenceScopeDescriptors(
+            selectionPlan,
+            brief,
             row.relationship,
-            row.note,
-          ].join(" ");
-          return deriveEvidenceScopeDescriptors(selectionPlan, brief, proofText, row.relationship)
+          );
+          const attestedHardDescriptors = deriveAttestedHardScopeDescriptors(selectionPlan, {
+            citationAttestationId: row.citation_attestation_id,
+            sourceMetadataText: row.source_title,
+            relationship: row.relationship,
+          });
+          const descriptorKeys = new Set<string>();
+          const descriptors = [...attestedHardDescriptors, ...legacyAndIntentDescriptors].filter((descriptor) => {
+            const key = `${descriptor.scopeAxis}:${normalizedPolicyText(descriptor.scopeValue)}:${descriptor.geographyRelationship ?? ""}`;
+            if (descriptorKeys.has(key)) return false;
+            descriptorKeys.add(key);
+            return true;
+          });
+          return descriptors
             .map(({ scopeAxis, scopeValue, geographyRelationship }) => ({
             bindingKind: "track_specific_source" as const,
             eligibility: "qualifying" as const,
@@ -4292,7 +4318,16 @@ export class Repository {
         : "";
       const orderSql = manifestOrderSql({ ...brief, orderingPolicy: effectiveOrderingPolicy });
       const matches = await client.query<ManifestSelectionRow>(
-        `SELECT m.candidate_id,c.selection_rank,m.catalog_id,m.song_json,c.artist,c.title,c.album,c.release_year,c.duration_ms
+        `SELECT m.candidate_id,c.recording_family_id,c.selection_rank,m.catalog_id,m.song_json,c.artist,c.title,c.album,c.release_year,
+           ARRAY(
+             SELECT DISTINCT left(identity.metadata_json->>'releaseDate',4)::integer release_year
+             FROM recording_catalog_identities identity
+             WHERE identity.recording_family_id=c.recording_family_id
+               AND identity.provider='apple'
+               AND identity.metadata_json->>'releaseDate' ~ '^(19|20)[0-9]{2}'
+             ORDER BY release_year
+           ) compatible_release_years,
+           c.duration_ms
          FROM catalog_matches m
          JOIN track_candidates c ON c.id=m.candidate_id
          WHERE m.run_id=$1 AND m.status='accepted' AND m.catalog_id IS NOT NULL ${verifiedClause}
@@ -4302,13 +4337,20 @@ export class Repository {
       const maximumTracks = brief.mode === "curated"
         ? Math.max(1, Math.floor(brief.targetSize?.max ?? 100))
         : Number.POSITIVE_INFINITY;
+      const familyPartition = pipelineV2
+        ? partitionUniqueRecordingFamilies(matches.rows, (row) => (
+          row.recording_family_id ?? recordingFamilyKey({ song: row.song_json })
+        ))
+        : { unique: matches.rows, duplicates: [] as ManifestSelectionRow[] };
+      const familyDuplicateMatches = familyPartition.duplicates;
+      const manifestEligibleMatches = familyPartition.unique;
       let constraintSelection: ConstraintSelection<ManifestSelectionRow> = {
         outcome: "complete",
-        selected: matches.rows,
+        selected: manifestEligibleMatches,
         relaxedSoftConstraints: [] as string[],
       };
       let hardRejectedMatches: ManifestSelectionRow[] = [];
-      let ladderOverflowMatches: ManifestSelectionRow[] = [];
+      let ladderOverflowMatches: ManifestSelectionRow[] = familyDuplicateMatches;
       if (selectionPlan && pipelineVersion !== "legacy_v1") {
         const bindingResult = await client.query<{
           candidate_id: string;
@@ -4372,7 +4414,7 @@ export class Repository {
         const hardRuleIds = new Set(rules.filter((rule) => rule.kind === "hard").map((rule) => rule.id));
         const artistOccurrences = new Map<string, number>();
         const albumOccurrences = new Map<string, number>();
-        const candidates: ConstraintCandidate<ManifestSelectionRow>[] = matches.rows.map((row) => {
+        const candidates: ConstraintCandidate<ManifestSelectionRow>[] = manifestEligibleMatches.map((row) => {
           const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
           const summaries = bindings.map((binding) => {
             const evidence = classifyTrackScopeBindingEvidence({
@@ -4418,13 +4460,12 @@ export class Repository {
             const broadCandidates = qualified.map((candidate): BroadCuratedCandidate<ConstraintCandidate<ManifestSelectionRow>> => {
               const row = candidate.value;
               const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
-              const appleReleaseYear = Number.parseInt(row.song_json.releaseDate?.slice(0, 4) ?? "", 10);
               return {
                 id: row.candidate_id,
                 artist: row.song_json.artistName || row.artist,
                 title: row.song_json.name || row.title,
                 album: row.song_json.albumName || row.album,
-                releaseYear: row.release_year ?? (Number.isInteger(appleReleaseYear) ? appleReleaseYear : null),
+                releaseYear: manifestCanonicalReleaseYear(row),
                 scenes: bindings
                   .filter((binding) => binding.scopeAxis === "scene" || binding.scopeAxis === "genre_scene")
                   .map((binding) => binding.scopeValue),
@@ -4456,9 +4497,12 @@ export class Repository {
           .filter((candidate) => candidate.violations.some((violation) => hardRuleIds.has(violation)))
           .map((candidate) => candidate.value);
         const hardRejectedIds = new Set(hardRejectedMatches.map((row) => row.candidate_id));
-        ladderOverflowMatches = matches.rows.filter((row) => (
+        ladderOverflowMatches = [
+          ...familyDuplicateMatches,
+          ...manifestEligibleMatches.filter((row) => (
           !selectedIds.has(row.candidate_id) && !hardRejectedIds.has(row.candidate_id)
-        ));
+          )),
+        ];
         if (hardRejectedMatches.length > 0) {
           const rejectedIds = hardRejectedMatches.map((match) => match.candidate_id);
           await client.query(
@@ -4541,15 +4585,16 @@ export class Repository {
         const song = match.song_json && typeof match.song_json === "object"
           ? match.song_json as Partial<CatalogSong>
           : null;
-        const appleYear = typeof song?.releaseDate === "string"
-          ? Number.parseInt(song.releaseDate.slice(0, 4), 10)
-          : null;
         return {
           ...match,
           artist: match.artist,
           album: song?.albumName || match.album,
           genre: song?.genreNames,
-          releaseYear: Number.isInteger(appleYear) ? appleYear : match.release_year,
+          // Broad scoring and chronological sequencing use the canonical
+          // compatible recording-family year. A selected 2024 remaster must
+          // not be treated as a new-era recording when its family contains
+          // the supported 1978 issue.
+          releaseYear: manifestCanonicalReleaseYear(match),
           durationMs: song?.durationInMillis ?? match.duration_ms,
         };
       });

@@ -522,6 +522,396 @@ test("V2 matching persists recording identity, compatible alternates, stages, an
   ]));
 });
 
+function factualV2CandidateForVersionPolicy(id: string): Candidate {
+  const row = candidate(id, "verified");
+  row.isrc = null;
+  row.durationMs = null;
+  row.releaseYear = null;
+  row.versionLabel = null;
+  row.candidateStage = "scope_qualified";
+  row.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "factual_relationship",
+    scopeValue: "Test Artist performed on Test Song",
+    relationship: brief.relationship,
+    confidence: 0.98,
+    sourceUrl: "https://example.com/test-artist/test-song",
+    sourceRecordId: "source-record-version-policy",
+    researchContainerId: null,
+    citationAttestationId: "citation-version-policy",
+    provenancePath: [{ kind: "provenance_root", id: "independent-credit-source" }],
+    note: "Track-specific performed-on credit.",
+  }];
+  return row;
+}
+
+function setFactualV2VersionPolicy(
+  repository: V2MemoryMatchingRepository,
+  allowed: SelectionPlan["versionPolicy"]["allowed"],
+) {
+  const plan = createSelectionPlanV2({
+    prompt: "Every released recording Test Artist performed on",
+    brief,
+    storefront: "us",
+  });
+  repository.selectionPlan = {
+    ...plan,
+    versionPolicy: {
+      ...plan.versionPolicy,
+      allowed,
+      preferred: allowed.slice(0, 2),
+    },
+  };
+}
+
+test("V2 direct matching promotes the best safe allowed alternate before persistence", async () => {
+  const canonical: CatalogSong = {
+    ...song,
+    id: "apple-canonical",
+    releaseDate: "2020-01-01",
+  };
+  const remaster: CatalogSong = {
+    ...song,
+    id: "apple-remaster",
+    releaseDate: "2021-01-01",
+    versionLabel: "2021 Remaster",
+  };
+  vi.mocked(searchAppleCatalog).mockResolvedValue([canonical, remaster]);
+  const repository = new V2MemoryMatchingRepository([
+    factualV2CandidateForVersionPolicy("v2-version-promote"),
+  ]);
+  setFactualV2VersionPolicy(repository, ["remaster"]);
+
+  await matchResearchRun(repository, "run-v2-version-promote", "us", undefined, {
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: "v2-version-promote",
+    status: "accepted",
+    song: expect.objectContaining({ id: "apple-remaster" }),
+    basis: expect.stringContaining("V2 version policy promoted an allowed remaster alternative"),
+  })]);
+  expect(repository.families).toEqual([expect.objectContaining({ versionClass: "remaster" })]);
+  expect(repository.catalogIdentities.map((identity) => identity.catalogId)).toEqual(["apple-remaster"]);
+  expect(repository.stageEvents.map((event) => event.toStage)).toEqual([
+    "claim_verified",
+    "version_compatible",
+    "catalog_resolved",
+    "playable",
+    "canonicalized",
+  ]);
+});
+
+test("V2 direct matching records a version policy conflict without advancing playable stages", async () => {
+  const remaster: CatalogSong = {
+    ...song,
+    id: "apple-remaster-only",
+    versionLabel: "2021 Remaster",
+  };
+  vi.mocked(searchAppleCatalog).mockResolvedValue([song, remaster]);
+  const repository = new V2MemoryMatchingRepository([
+    factualV2CandidateForVersionPolicy("v2-version-conflict"),
+  ]);
+  setFactualV2VersionPolicy(repository, ["live"]);
+
+  await matchResearchRun(repository, "run-v2-version-conflict", "us", undefined, {
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: "v2-version-conflict",
+    status: "unsupported",
+    song: null,
+    basis: expect.stringContaining("version_policy_conflict"),
+  })]);
+  expect(repository.families).toHaveLength(0);
+  expect(repository.catalogIdentities).toHaveLength(0);
+  expect(repository.stageEvents).toEqual([expect.objectContaining({
+    toStage: "rejected",
+    reasonCode: "version_policy_conflict",
+  })]);
+  expect(repository.stageEvents.some((event) => [
+    "version_compatible",
+    "catalog_resolved",
+    "playable",
+    "canonicalized",
+  ].includes(event.toStage))).toBe(false);
+});
+
+test("V2 retries a frontier version conflict through broader search and replaces it with an allowed version", async () => {
+  const live: CatalogSong = {
+    ...song,
+    id: "apple-live-frontier",
+    name: "Test Song (Live)",
+    versionLabel: "Live",
+  };
+  const canonical: CatalogSong = {
+    ...song,
+    id: "apple-canonical-broader-search",
+  };
+  vi.mocked(searchAppleCatalog)
+    .mockResolvedValueOnce([live])
+    .mockResolvedValueOnce([canonical]);
+  const row = factualV2CandidateForVersionPolicy("v2-frontier-version-retry");
+  const repository = new V2MemoryMatchingRepository([row]);
+  setFactualV2VersionPolicy(repository, ["canonical"]);
+  repository.matches.push({
+    candidateId: row.id,
+    status: "unsupported",
+    basis: "version_policy_conflict; live is not allowed and no allowed catalog alternative was found",
+    score: 0,
+    song: null,
+    alternatives: [live],
+  });
+
+  await matchResearchRun(repository, "run-v2-frontier-version-retry", "us", undefined, {
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(searchAppleCatalog).toHaveBeenCalledTimes(2);
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: row.id,
+    status: "accepted",
+    song: expect.objectContaining({ id: canonical.id }),
+  })]);
+});
+
+test("V2 exact-fill recovery counts only matches that can survive a hard era manifest", async () => {
+  const exactBrief: PlaylistBrief = {
+    ...sceneBrief(1),
+    title: "Test scene recordings from the 1970s",
+    description: "Documented Test scene recordings from the 1970s.",
+    subjectEntities: ["Test scene", "1970s"],
+    include: ["Documented Test scene recordings from the 1970s."],
+  };
+  const scopedCandidate = candidate("v2-era-refill", "editorial");
+  scopedCandidate.releaseYear = 2020;
+  scopedCandidate.isrc = null;
+  scopedCandidate.scopeBindings = [
+    {
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "scene",
+      scopeValue: "Test scene",
+      relationship: "represents the Test scene",
+      confidence: 0.98,
+      sourceUrl: "https://example.com/test-scene",
+      sourceRecordId: "source-test-scene",
+      researchContainerId: null,
+      citationAttestationId: "citation-test-scene",
+      provenancePath: [{ kind: "provenance_root", id: "test-scene-source" }],
+      note: "Track-specific scene evidence.",
+    },
+    {
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "era",
+      scopeValue: "1970s",
+      relationship: "was released in the 1970s",
+      confidence: 0.98,
+      sourceUrl: "https://example.com/test-scene",
+      sourceRecordId: "source-test-scene",
+      researchContainerId: null,
+      citationAttestationId: "citation-test-scene",
+      provenancePath: [{ kind: "provenance_root", id: "test-scene-source" }],
+      note: "Track-specific era evidence.",
+    },
+  ];
+  vi.mocked(searchAppleCatalog).mockResolvedValue([{
+    ...song,
+    id: "apple-modern-only",
+    releaseDate: "2020-01-01",
+    isrc: "USAAA2000001",
+  }, {
+    ...song,
+    id: "apple-unrelated-old-recording",
+    releaseDate: "1978-01-01",
+    isrc: "USAAA7800001",
+  }]);
+  const policy = researchExecutionPolicy(exactBrief, {});
+  if (policy.kind !== "fast_curated") throw new Error("Fixture must use the fast curated route");
+  const repository = new V2MemoryMatchingRepository(
+    [scopedCandidate],
+    exactBrief,
+    new Map([["fast:route:fast_curated_v3", createFastRouteCheckpoint(policy)]]),
+    undefined,
+    true,
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Test scene recording from the 1970s",
+    brief: exactBrief,
+    storefront: "us",
+  });
+  repository.automaticRefillState = "queued";
+  const emptyDiscoveryProvider: CatalogDiscoveryProvider = {
+    async search() { return { songs: [], artists: [], albums: [], playlists: [] }; },
+    async playlistTracks() { return { items: [], next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+
+  await matchResearchRun(repository, "run-v2-era-refill", "us", undefined, {
+    musicBrainzEnricher: async () => null,
+    catalogDiscoveryProvider: emptyDiscoveryProvider,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    status: "accepted",
+    song: expect.objectContaining({ id: "apple-modern-only" }),
+  })]);
+  expect(repository.automaticRefills).toEqual([expect.objectContaining({
+    runId: "run-v2-era-refill",
+    currentGeneration: 0,
+  })]);
+  expect(repository.automaticPublications).toEqual([]);
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_matching_outcome",
+    checkpoint: expect.objectContaining({ safePrimaryCount: 0, shortfall: 1 }),
+  }));
+});
+
+test("V2 exact-fill safe count applies hard exclusions before publication handoff", async () => {
+  const exactBrief = {
+    ...sceneBrief(1),
+    title: "Test scene tracks",
+    description: "Documented tracks in the Test scene.",
+  };
+  const scopedCandidate = candidate("v2-excluded-artist", "editorial");
+  scopedCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "scene",
+    scopeValue: "Test scene",
+    relationship: "represents the Test scene",
+    confidence: 0.98,
+    sourceUrl: "https://example.com/test-scene",
+    sourceRecordId: "source-test-scene",
+    researchContainerId: null,
+    citationAttestationId: "citation-test-scene",
+    provenancePath: [{ kind: "provenance_root", id: "test-scene-source" }],
+    note: "Track-specific scene evidence.",
+  }];
+  const repository = new V2MemoryMatchingRepository(
+    [scopedCandidate],
+    exactBrief,
+    new Map([["catalog_matching", {
+      nextIndex: 1,
+      storefront: "us",
+      complete: true,
+      updatedAt: new Date().toISOString(),
+    }]]),
+    undefined,
+    true,
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Test scene recording excluding Test Artist",
+    brief: exactBrief,
+    storefront: "us",
+  });
+  repository.selectionPlan.constraints.push({
+    id: "exclude-test-artist",
+    axis: "artist",
+    operator: "exclude",
+    values: ["Test Artist"],
+    kind: "hard",
+    relaxationRank: null,
+  });
+  repository.matches.push({
+    candidateId: scopedCandidate.id,
+    status: "accepted",
+    basis: "Exact Apple identity",
+    score: 1,
+    song,
+    alternatives: [],
+  });
+  repository.automaticRefillState = "queued";
+
+  await matchResearchRun(repository, "run-v2-hard-exclude", "us");
+
+  expect(repository.automaticPublications).toEqual([]);
+  expect(repository.automaticRefills).toEqual([expect.objectContaining({
+    runId: "run-v2-hard-exclude",
+  })]);
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_matching_outcome",
+    checkpoint: expect.objectContaining({ safePrimaryCount: 0, shortfall: 1 }),
+  }));
+});
+
+test("V2 exact-fill counts one recording family once across multiple Apple song IDs", async () => {
+  const exactBrief = {
+    ...sceneBrief(2),
+    title: "Test scene tracks",
+    description: "Documented tracks in the Test scene.",
+  };
+  const first = candidate("v2-family-a", "editorial");
+  const second = candidate("v2-family-b", "editorial");
+  for (const row of [first, second]) {
+    row.scopeBindings = [{
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "scene",
+      scopeValue: "Test scene",
+      relationship: "represents the Test scene",
+      confidence: 0.98,
+      sourceUrl: `https://example.com/test-scene/${row.id}`,
+      sourceRecordId: `source-${row.id}`,
+      researchContainerId: null,
+      citationAttestationId: `citation-${row.id}`,
+      provenancePath: [{ kind: "provenance_root", id: `root-${row.id}` }],
+      note: "Track-specific scene evidence.",
+    }];
+  }
+  const repository = new V2MemoryMatchingRepository(
+    [first, second],
+    exactBrief,
+    new Map([["catalog_matching", {
+      nextIndex: 2,
+      storefront: "us",
+      complete: true,
+      updatedAt: new Date().toISOString(),
+    }]]),
+    undefined,
+    true,
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Test scene recordings",
+    brief: exactBrief,
+    storefront: "us",
+  });
+  repository.matches.push({
+    candidateId: first.id,
+    status: "accepted",
+    basis: "Exact Apple identity A",
+    score: 1,
+    song: { ...song, id: "apple-family-a" },
+    alternatives: [],
+  }, {
+    candidateId: second.id,
+    status: "accepted",
+    basis: "Exact Apple identity B",
+    score: 1,
+    song: { ...song, id: "apple-family-b" },
+    alternatives: [],
+  });
+  repository.automaticRefillState = "queued";
+
+  await matchResearchRun(repository, "run-v2-family-dedupe", "us");
+
+  expect(repository.automaticPublications).toEqual([]);
+  expect(repository.automaticRefills).toEqual([expect.objectContaining({
+    runId: "run-v2-family-dedupe",
+  })]);
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_matching_outcome",
+    checkpoint: expect.objectContaining({ safePrimaryCount: 1, shortfall: 1 }),
+  }));
+});
+
 test("V2 curated matching invokes bounded discovery and accepts only an exact evidence-bound identity", async () => {
   const discoveryBrief: PlaylistBrief = {
     title: "Test scene recordings",
@@ -1364,13 +1754,13 @@ test("matching records an explicit shortfall instead of presenting a partial req
   expect(repository.updates.at(-1)).toMatchObject({
     status: "visitor_review",
     phase: "catalog_matching_shortfall",
-    error: expect.stringContaining("2 safe unique catalog matches for the required 4; 2 remain unresolved"),
+    error: expect.stringContaining("1 safe unique catalog match for the required 4; 3 remain unresolved"),
   });
   expect(repository.checkpoints).toContainEqual(expect.objectContaining({
     storefront: "us",
     targetMinimum: 4,
-    safePrimaryCount: 2,
-    shortfall: 2,
+    safePrimaryCount: 1,
+    shortfall: 3,
     status: "shortfall",
   }));
 });

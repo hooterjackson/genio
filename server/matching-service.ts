@@ -79,6 +79,8 @@ import {
   type CuratedCatalogDiscoveryResult,
 } from "./catalog-discovery-v2.ts";
 import { pipelineV2Route } from "./selection-plan-v2.ts";
+import { recordingFamilySatisfiesEraConstraint } from "./selection-era-policy.ts";
+import { partitionUniqueRecordingFamilies } from "./recording-family-selection.ts";
 import {
   proofSupportsSelectionGeography,
   selectionGeographyBindingsSatisfied,
@@ -104,6 +106,7 @@ interface ExistingMatch {
   status: CatalogMatchResult["status"];
   basis: string;
   song: CatalogMatchResult["song"];
+  alternatives?: CatalogSong[];
 }
 
 interface MatchingCheckpoint {
@@ -268,6 +271,76 @@ function compatibleCatalogAlternate(primary: CatalogSong, alternate: CatalogSong
   return true;
 }
 
+const VERSION_POLICY_CONFLICT_BASIS = "version_policy_conflict";
+
+/**
+ * The ordinary Apple matcher ranks identity compatibility, not the V2
+ * selection policy. Apply that policy before an accepted row is persisted so
+ * a disallowed primary cannot advance the version/playability ledger. When an
+ * allowed alternative still clears the matcher's automatic-identity bar,
+ * promote it deterministically; otherwise retain the catalog observations as
+ * a non-publishable result for diagnostics and review.
+ */
+function applyV2VersionPolicy(
+  run: Pick<
+    Awaited<ReturnType<MatchingRepository["getRun"]>>,
+    "pipelineVersion" | "selectionPlan"
+  >,
+  candidate: Candidate,
+  match: CatalogMatchResult,
+  observedCatalogSongs: readonly CatalogSong[] = [
+    ...(match.song ? [match.song] : []),
+    ...match.alternatives,
+  ],
+): CatalogMatchResult {
+  const plan = run.selectionPlan;
+  if (run.pipelineVersion !== "catalog_first_v2"
+    || !plan
+    || match.status !== "accepted"
+    || !match.song) return match;
+
+  const allowed = new Set(plan.versionPolicy.allowed);
+  const primaryVersion = catalogRecordingVersionClass(match.song);
+  if (allowed.has(primaryVersion)) {
+    return {
+      ...match,
+      alternatives: match.alternatives.filter((song) => (
+        allowed.has(catalogRecordingVersionClass(song))
+      )),
+    };
+  }
+
+  const observedSongs = mergeCatalogSongs([...observedCatalogSongs, match.song, ...match.alternatives]);
+  const allowedSongs = observedSongs.filter((song) => allowed.has(catalogRecordingVersionClass(song)));
+  if (allowedSongs.length === 0) {
+    return {
+      ...match,
+      status: "unsupported",
+      basis: `${VERSION_POLICY_CONFLICT_BASIS}; ${primaryVersion} is not allowed and no allowed catalog alternative was found`,
+      song: null,
+      alternatives: observedSongs.slice(0, 4),
+    };
+  }
+
+  const promoted = rankCatalogMatches(candidate.id, candidate, allowedSongs);
+  if (promoted.status === "accepted" && promoted.song) {
+    return {
+      ...promoted,
+      basis: `${promoted.basis}; V2 version policy promoted an allowed ${catalogRecordingVersionClass(promoted.song)} alternative after rejecting ${primaryVersion}`,
+      alternatives: promoted.alternatives.filter((song) => (
+        allowed.has(catalogRecordingVersionClass(song))
+      )),
+    };
+  }
+
+  return {
+    ...promoted,
+    status: "review",
+    basis: `${VERSION_POLICY_CONFLICT_BASIS}; ${primaryVersion} is not allowed and the allowed catalog alternatives did not meet the automatic identity threshold`,
+    alternatives: allowedSongs.slice(0, 4),
+  };
+}
+
 async function persistCatalogResolution(
   repository: MatchingRepository,
   runId: string,
@@ -338,7 +411,9 @@ async function persistCatalogResolution(
     if (match.status !== "review") {
       await repository.appendCandidateStageEvents(runId, stageEvents([{
         toStage: "rejected",
-        reasonCode: `catalog_${match.status}`,
+        reasonCode: match.basis.includes(VERSION_POLICY_CONFLICT_BASIS)
+          ? VERSION_POLICY_CONFLICT_BASIS
+          : `catalog_${match.status}`,
         detail: { basis: match.basis },
       }]), versions);
     }
@@ -447,6 +522,161 @@ function isSafePrimaryMatch(match: ExistingMatch, automatic: boolean): boolean {
     && Boolean(match.song?.id);
 }
 
+function bindingSupportsRequiredScope(binding: TrackScopeBinding, constraint: SelectionConstraint): boolean {
+  if (binding.eligibility !== "qualifying") return false;
+  if (constraint.axis === "relationship") {
+    return constraint.values.some((value) => matchingProofSupportsValue(
+      `${binding.scopeValue} ${binding.relationship}`,
+      value,
+    ));
+  }
+  const expectedAxis = bindingAxisForConstraint(constraint.axis);
+  if (!expectedAxis) return false;
+  const compatibleAxes: Readonly<Record<string, readonly TrackScopeBinding["scopeAxis"][]>> = {
+    genre: ["genre", "scene", "genre_scene"],
+    scene: ["scene", "genre_scene"],
+    era: ["era"],
+    geography: ["geography", "scene", "genre_scene"],
+    language: ["language"],
+    mood: ["mood", "mood_theme_activity"],
+    activity: ["activity", "mood_theme_activity"],
+    theme: ["theme", "mood_theme_activity"],
+  };
+  if (!(compatibleAxes[expectedAxis] ?? [expectedAxis]).includes(binding.scopeAxis)) return false;
+  const proof = `${binding.scopeValue} ${binding.relationship} ${binding.note}`;
+  return constraint.values.some((value) => (
+    scopeValueAliases(expectedAxis, value).some((alias) => musicScopePhraseMatches(proof, alias))
+  ));
+}
+
+const MATCHING_CONSTRAINT_STOPWORDS = new Set([
+  "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "the", "to", "with",
+  "recording", "recordings", "song", "songs", "track", "tracks", "music",
+]);
+
+function matchingConstraintTokens(value: string): string[] {
+  return normalizedPhrase(value).split(" ").filter((token) => (
+    token.length >= 3 && !MATCHING_CONSTRAINT_STOPWORDS.has(token)
+  ));
+}
+
+function matchingProofSupportsValue(proofText: string, value: string): boolean {
+  const proofTokens = new Set(matchingConstraintTokens(proofText));
+  const expected = [...new Set(matchingConstraintTokens(value))];
+  if (expected.length === 0) return false;
+  const overlap = expected.filter((token) => proofTokens.has(token)).length;
+  const required = expected.length <= 2 ? expected.length : Math.max(2, Math.ceil(expected.length / 2));
+  return overlap >= required;
+}
+
+function matchingMetadataContainsConstraintValue(
+  candidate: Candidate,
+  song: CatalogSong,
+  constraint: SelectionConstraint,
+): boolean {
+  const metadata = normalizedPhrase([
+    candidate.artist,
+    candidate.title,
+    candidate.album ?? "",
+    song.artistName,
+    song.name,
+    song.albumName,
+    ...(song.genreNames ?? []),
+    song.versionLabel ?? "",
+  ].join(" "));
+  return constraint.values.some((rawValue) => {
+    const value = normalizedPhrase(rawValue)
+      .replace(/^(?:exclude|avoid|without|no|not)\s+/u, "")
+      .trim();
+    return value.length > 0 && musicScopePhraseMatches(metadata, value);
+  });
+}
+
+function matchingConstraintSatisfied(
+  candidate: Candidate,
+  match: ExistingMatch,
+  constraint: SelectionConstraint,
+): boolean {
+  const song = match.song;
+  if (!song) return false;
+  const bindings = candidate.scopeBindings ?? [];
+  const qualifyingBindings = bindings.filter((binding) => binding.eligibility === "qualifying");
+  if (constraint.axis === "evidence") return true;
+  if (constraint.axis === "recording_version") return true;
+  if (constraint.operator === "exclude" || constraint.operator === "avoid") {
+    const scopeBound = constraint.axis === "relationship" || bindingAxisForConstraint(constraint.axis) !== null;
+    return scopeBound
+      ? !qualifyingBindings.some((binding) => bindingSupportsRequiredScope(binding, constraint))
+      : !matchingMetadataContainsConstraintValue(candidate, song, constraint);
+  }
+  if (constraint.axis === "era") {
+    const compatibleReleaseYears = (match.alternatives ?? [])
+      .filter((alternate) => compatibleCatalogAlternate(song, alternate))
+      .map((alternate) => Number.parseInt(alternate.releaseDate?.slice(0, 4) ?? "", 10))
+      .filter((year) => Number.isInteger(year));
+    return recordingFamilySatisfiesEraConstraint({
+      candidateReleaseYear: candidate.releaseYear ?? null,
+      appleReleaseDate: song.releaseDate,
+      compatibleReleaseYears,
+    }, constraint);
+  }
+  if (constraint.axis === "artist") {
+    const artist = normalizedPhrase(song.artistName || candidate.artist);
+    return constraint.values.some((value) => artist === normalizedPhrase(value));
+  }
+  if (constraint.axis === "track") {
+    const title = normalizedPhrase(song.name || candidate.title);
+    return constraint.values.some((value) => title === normalizedPhrase(value));
+  }
+  if (constraint.axis === "content") {
+    const requested = normalizedPhrase(constraint.values.join(" "));
+    const rating = catalogContentRating(song);
+    if (requested.includes("clean")) return rating === "clean";
+    if (requested.includes("explicit")) return rating === "explicit";
+    if (requested.includes("instrumental")) {
+      return /\binstrumental\b/iu.test(`${song.name} ${song.versionLabel ?? ""}`);
+    }
+    return matchingMetadataContainsConstraintValue(candidate, song, constraint);
+  }
+  if (constraint.axis === "relationship") {
+    const combinedProof = qualifyingBindings
+      .filter((binding) => matchingProofSupportsValue(binding.relationship, binding.scopeValue))
+      .map((binding) => `${binding.scopeValue} ${binding.relationship}`)
+      .join(" ");
+    return constraint.values.some((value) => matchingProofSupportsValue(combinedProof, value));
+  }
+  return qualifyingBindings.some((binding) => bindingSupportsRequiredScope(binding, constraint));
+}
+
+/**
+ * Count only matches that can survive the immutable V2 manifest floor. This
+ * lets the adaptive refill controller react to evidence, era, and content
+ * losses instead of mistaking a raw Apple identity for a publishable track.
+ */
+function matchSatisfiesV2HardEligibility(
+  run: Pick<Awaited<ReturnType<MatchingRepository["getRun"]>>, "brief" | "pipelineVersion" | "selectionPlan">,
+  candidate: Candidate | undefined,
+  match: ExistingMatch,
+): boolean {
+  const plan = run.selectionPlan;
+  if (run.pipelineVersion !== "catalog_first_v2" || !plan) return true;
+  if (!candidate || !match.song || !isEvidenceEligible(run.brief, candidate, plan)) return false;
+  if (!plan.versionPolicy.allowed.includes(catalogRecordingVersionClass(match.song))) return false;
+  const bindings = candidate.scopeBindings ?? [];
+  if (!selectionGeographyBindingsSatisfied(plan, bindings.filter((binding) => binding.eligibility === "qualifying"))) {
+    return false;
+  }
+  for (const constraint of plan.constraints) {
+    if (constraint.kind !== "hard") continue;
+    if (!matchingConstraintSatisfied(candidate, match, constraint)) return false;
+  }
+  const rating = catalogContentRating(match.song);
+  if (plan.contentPolicy.explicitContent === "clean_only" && rating !== "clean") return false;
+  if (plan.contentPolicy.instrumental === "exclude"
+    && /\binstrumental\b/iu.test(`${match.song.name} ${match.song.versionLabel ?? ""}`)) return false;
+  return true;
+}
+
 async function resumeOrIgnoreAutomaticHandoff(
   repository: MatchingRepository,
   runId: string,
@@ -482,20 +712,29 @@ async function finalizeMatchingOutcome(
   const latest = run.autoPublish ? await repository.getRun(runId) : run;
   if (await resumeOrIgnoreAutomaticHandoff(repository, runId, latest)) return;
   const brief = latest.brief;
+  const candidates = await repository.listCandidates(runId);
+  const candidatesById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
   const matches = await repository.listMatches(runId);
   const safePrimaryMatches = matches
-    .filter((match) => isSafePrimaryMatch(match, latest.autoPublish === true));
-  const uniqueSafePrimaryMatches = [...new Map(safePrimaryMatches.map((match) => [
-    match.song!.id,
-    match,
-  ])).values()];
+    .filter((match) => isSafePrimaryMatch(match, latest.autoPublish === true))
+    .filter((match) => matchSatisfiesV2HardEligibility(
+      latest,
+      candidatesById.get(match.candidateId),
+      match,
+    ));
+  const uniqueSafePrimaryMatches = partitionUniqueRecordingFamilies(safePrimaryMatches, (match) => {
+    const candidate = candidatesById.get(match.candidateId);
+    return recordingFamilyKey({
+      song: match.song!,
+      musicBrainzRecordingId: candidate?.musicbrainzId,
+    });
+  }).unique;
   const safePrimaryCount = uniqueSafePrimaryMatches.length;
   const configuredMinimum = Number(brief.targetSize?.min);
   const targetMinimum = brief.targetSize && Number.isFinite(configuredMinimum)
     ? Math.max(0, Math.floor(configuredMinimum))
     : null;
   const shortfall = targetMinimum === null ? 0 : Math.max(0, targetMinimum - safePrimaryCount);
-  const candidates = await repository.listCandidates(runId);
   const candidateArtists = new Map(candidates.map((candidate) => [candidate.id, candidate.artist]));
   const safeArtists = uniqueSafePrimaryMatches.map((match) => (
     (match as ExistingMatch & { artist?: string }).artist
@@ -746,16 +985,23 @@ export async function lookupCandidateSongs(
   candidate: Candidate,
   storefront: string,
   signal?: AbortSignal,
+  allowedVersionClasses?: ReadonlySet<ReturnType<typeof catalogRecordingVersionClass>>,
 ): Promise<CatalogSong[]> {
   let songs = candidate.isrc ? await lookupAppleCatalogByIsrc(storefront, candidate.isrc, signal) : [];
-  if (hasDirectCatalogMatch(candidate, songs)) return songs;
+  const hasAllowedDirectMatch = () => hasDirectCatalogMatch(
+    candidate,
+    allowedVersionClasses
+      ? songs.filter((candidateSong) => allowedVersionClasses.has(catalogRecordingVersionClass(candidateSong)))
+      : songs,
+  );
+  if (hasAllowedDirectMatch()) return songs;
 
   const maximumQueries = boundedEnvironmentInteger("APPLE_MATCH_MAX_QUERIES", 8, 1, 8);
   for (const query of catalogSearchQueries(candidate).slice(0, maximumQueries)) {
     signal?.throwIfAborted();
     const results = await searchAppleCatalog(storefront, query, signal);
     songs = mergeCatalogSongs(songs, results);
-    if (hasDirectCatalogMatch(candidate, songs)) break;
+    if (hasAllowedDirectMatch()) break;
   }
   return songs;
 }
@@ -1436,7 +1682,7 @@ async function resolveV2CatalogFrontier(
       const input = discoveredInputs.find((item) => item.song.id === persistedDiscoveries
         .find((persisted) => persisted.candidateId === candidate.id)?.appleSongId);
       if (!input || existingCandidateIds.has(candidate.id) || acceptedCatalogIds.has(input.song.id)) continue;
-      const match: CatalogMatchResult = {
+      let match: CatalogMatchResult = {
         candidateId: candidate.id,
         status: "accepted",
         basis: "Pipeline V2 exact Apple editorial-container identity",
@@ -1444,25 +1690,31 @@ async function resolveV2CatalogFrontier(
         song: input.song,
         alternatives: [],
       };
+      match = applyV2VersionPolicy(run, candidate, match, [input.song]);
       await repository.saveMatch(runId, match);
       await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
       existingCandidateIds.add(candidate.id);
-      acceptedCatalogIds.add(input.song.id);
-      resolvedCount += 1;
+      if (match.status === "accepted" && match.song) {
+        acceptedCatalogIds.add(match.song.id);
+        resolvedCount += 1;
+      }
     }
     for (const candidate of eligibleCandidates) {
       if (existingCandidateIds.has(candidate.id)) continue;
       const songs = songsByKey.get(candidateCatalogKey(candidate)) ?? [];
       if (songs.length === 0) continue;
       let match = rankCatalogMatches(candidate.id, candidate, songs);
-      if (match.status !== "accepted" || !match.song || acceptedCatalogIds.has(match.song.id)) continue;
-      const matchedSong = match.song;
+      if (match.status !== "accepted" || !match.song) continue;
       match = { ...match, basis: `Pipeline V2 evidence-bound Apple discovery: ${match.basis}` };
+      match = applyV2VersionPolicy(run, candidate, match, songs);
+      if (match.status === "accepted" && match.song && acceptedCatalogIds.has(match.song.id)) continue;
       await repository.saveMatch(runId, match);
       await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
-      acceptedCatalogIds.add(matchedSong.id);
       existingCandidateIds.add(candidate.id);
-      resolvedCount += 1;
+      if (match.status === "accepted" && match.song) {
+        acceptedCatalogIds.add(match.song.id);
+        resolvedCount += 1;
+      }
     }
     const transientFailureCount = discovery.frontier.filter((item) => item.status === "failed" && item.retryable).length;
     const permanentFailureCount = discovery.frontier.filter((item) => item.status === "failed" && !item.retryable).length;
@@ -1687,11 +1939,15 @@ export async function matchResearchRun(
   const retryableCandidateIds = new Set(existingMatches
     .filter((match) => isRetryableCatalogMatch(match))
     .map((match) => match.candidateId));
+  const versionPolicyRetryCandidateIds = new Set(existingMatches
+    .filter((match) => match.basis.includes(VERSION_POLICY_CONFLICT_BASIS))
+    .map((match) => match.candidateId));
   const existingCandidateIds = new Set(existingMatches.map((match) => match.candidateId));
   const work = allCandidates.flatMap((candidate, originalIndex) => {
     const shouldProcess = recovery
       ? retryableCandidateIds.has(candidate.id)
-      : originalIndex >= start && !existingCandidateIds.has(candidate.id);
+      : originalIndex >= start
+        && (!existingCandidateIds.has(candidate.id) || versionPolicyRetryCandidateIds.has(candidate.id));
     return shouldProcess ? [{ candidate, originalIndex }] : [];
   });
   const acceptedCatalogIds = new Set(existingMatches
@@ -1745,7 +2001,17 @@ export async function matchResearchRun(
               ])
             : signal;
           try {
-            return { songs: await lookupCandidateSongs(candidate, normalizedStorefront, lookupSignal), failure: null };
+            return {
+              songs: await lookupCandidateSongs(
+                candidate,
+                normalizedStorefront,
+                lookupSignal,
+                run.pipelineVersion === "catalog_first_v2" && run.selectionPlan
+                  ? new Set(run.selectionPlan.versionPolicy.allowed)
+                  : undefined,
+              ),
+              failure: null,
+            };
           } catch (error) {
             if (signal?.aborted) throw error;
             const failure = fastLookupFailure(error, lookupSignal, signal);
@@ -1775,20 +2041,22 @@ export async function matchResearchRun(
             alternatives: [],
           }
         : rankCatalogMatches(candidate.id, candidate, lookup.songs);
+      match = applyV2VersionPolicy(run, candidate, match, lookup.songs);
       const possibleDuplicate = Boolean(candidate.duplicateClusterKey && (clusterCounts.get(candidate.duplicateClusterKey) ?? 0) > 1);
-      if (match.status === "accepted" && match.song && acceptedCatalogIds.has(match.song.id)) {
+      const versionPolicyConflict = match.basis.includes(VERSION_POLICY_CONFLICT_BASIS);
+      if (!versionPolicyConflict && match.status === "accepted" && match.song && acceptedCatalogIds.has(match.song.id)) {
         match = {
           ...match,
           status: "duplicate",
           basis: `Stable Apple catalog ID ${match.song.id} was already accepted for this run`,
         };
-      } else if (possibleDuplicate) {
+      } else if (!versionPolicyConflict && possibleDuplicate) {
         match = {
           ...match,
           status: "review",
           basis: `Possible duplicate cluster ${candidate.duplicateClusterKey}; metadata similarity does not prove recording identity`,
         };
-      } else if (!isEvidenceEligible(run.brief, candidate, run.selectionPlan)) {
+      } else if (!versionPolicyConflict && !isEvidenceEligible(run.brief, candidate, run.selectionPlan)) {
         match = { ...match, status: "review", basis: ineligibleEvidenceBasis(run.brief, candidate) };
       }
       await repository.saveMatch(runId, match);

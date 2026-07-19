@@ -48,6 +48,7 @@ type VersionMarkerDisposition = "include" | "exclude";
 const VERSION_EXCLUSION_CUE = /\b(?:exclude|excluding|avoid|avoiding|without|no|not|never|omit|omitting|skip|skipping|do\s+not|don['’]?t)\b/giu;
 const VERSION_INCLUSION_CUE = /\b(?:include|including|allow|allowing|prefer|preferring|preferred|only|must|require|required|all|every)\b/giu;
 const VERSION_NEGATED_INCLUSION = /\b(?:avoid(?:ing)?|do\s+not|don['’]?t|never|not|without)\s+(?:include|including|allow|allowing|prefer|preferring|require|requiring)\b[^.;\n]*$/iu;
+const VERSION_NEGATED_EXCLUSION = /\b(?:do\s+not|don['’]?t|never|not)\s+(?:exclude|excluding|avoid|avoiding|omit|omitting|skip|skipping)\b[^.;\n]*$/iu;
 const VERSION_TRAILING_EXCLUSION = /\b(?:excluded|avoided|omitted|skipped|not\s+allowed|not\s+included)\b/iu;
 const VERSION_TRAILING_INCLUSION = /\b(?:preferred|required|allowed|included|only)\b/iu;
 
@@ -61,11 +62,13 @@ function lastRegexIndex(value: string, pattern: RegExp): number {
  * Version-policy prose frequently names unwanted versions while excluding
  * them (for example, "avoid later remixes and live versions"). A marker is a
  * preference only when it is bare or governed by an inclusion cue. Split on
- * sentence and adversative boundaries so mixed policies such as "include
- * live versions but exclude remixes" retain both decisions independently.
+ * sentence, adversative, and `unless` boundaries so mixed policies such as
+ * "include live versions but exclude remixes" retain both decisions
+ * independently, and an exclusion cue cannot leak through "unless" to reject
+ * the canonical recording named by the exception.
  */
 function versionMarkerDisposition(scope: string, marker: RegExp): VersionMarkerDisposition | null {
-  const clauses = scope.split(/(?:[.;\n]+|\bbut\b|\bwhile\b|\bwhereas\b)/iu);
+  const clauses = scope.split(/(?:[.;\n]+|\bbut\b|\bwhile\b|\bwhereas\b|\bunless\b)/iu);
   let disposition: VersionMarkerDisposition | null = null;
   for (const clause of clauses) {
     const matcher = new RegExp(marker.source, marker.flags.includes("g") ? marker.flags : `${marker.flags}g`);
@@ -77,6 +80,8 @@ function versionMarkerDisposition(scope: string, marker: RegExp): VersionMarkerD
       const inclusionIndex = lastRegexIndex(before, VERSION_INCLUSION_CUE);
       if (VERSION_NEGATED_INCLUSION.test(before)) {
         disposition = "exclude";
+      } else if (VERSION_NEGATED_EXCLUSION.test(before)) {
+        disposition = "include";
       } else if (exclusionIndex >= 0 || inclusionIndex >= 0) {
         disposition = exclusionIndex > inclusionIndex ? "exclude" : "include";
       } else if (VERSION_TRAILING_EXCLUSION.test(after)) {
@@ -91,6 +96,21 @@ function versionMarkerDisposition(scope: string, marker: RegExp): VersionMarkerD
     }
   }
   return disposition;
+}
+
+function versionMarkerIsExclusive(scope: string, marker: RegExp): boolean {
+  const clauses = scope.split(/(?:[.;\n]+|\bbut\b|\bwhile\b|\bwhereas\b|\bunless\b)/iu);
+  return clauses.some((clause) => {
+    const matcher = new RegExp(marker.source, marker.flags.includes("g") ? marker.flags : `${marker.flags}g`);
+    return [...clause.matchAll(matcher)].some((match) => {
+      const markerIndex = match.index;
+      const before = clause.slice(0, markerIndex);
+      const after = clause.slice(markerIndex + match[0].length);
+      if (VERSION_NEGATED_INCLUSION.test(before) || VERSION_NEGATED_EXCLUSION.test(before)) return false;
+      return /\b(?:only|must|require|required)\b/iu.test(before)
+        || /^\s*(?:versions?\s+)?only\b/iu.test(after);
+    });
+  });
 }
 
 function normalized(value: string): string {
@@ -545,6 +565,7 @@ function similarityDimensions(prompt: string): string[] {
 function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
   const scope = brief.versionPolicy;
   const dispositions = VERSION_MARKERS.map(([pattern, value]) => ({
+    pattern,
     value,
     disposition: versionMarkerDisposition(scope, pattern),
   }));
@@ -554,7 +575,9 @@ function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
   const excluded = new Set(dispositions
     .filter((entry) => entry.disposition === "exclude")
     .map((entry) => entry.value));
-  const explicitOnly = /only|must|require/iu.test(scope) && requested.length > 0;
+  const explicitOnly = dispositions.some((entry) => (
+    entry.disposition === "include" && versionMarkerIsExclusive(scope, entry.pattern)
+  ));
   const defaultAllowed: SelectionVersionPolicy["allowed"] = ["canonical", "remaster", "clean", "explicit", "unknown"];
   const defaultPreferred: SelectionVersionPolicy["preferred"] = ["canonical", "remaster"];
   const allowed: SelectionVersionPolicy["allowed"] = (explicitOnly
@@ -566,7 +589,7 @@ function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
   return {
     preferred: preferred.length > 0 ? preferred : allowed.slice(0, 2),
     allowed,
-    excludeCompilations: /exclude|avoid/iu.test(scope) && /compilation/iu.test(scope),
+    excludeCompilations: versionMarkerDisposition(scope, /\bcompilations?\b/iu) === "exclude",
     excludeKaraokeAndTributes: true,
   };
 }

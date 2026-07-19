@@ -92,6 +92,45 @@ describe("Pipeline V2 selection plan", () => {
     expect(plan.versionPolicy.allowed).not.toEqual(expect.arrayContaining(["live", "remix"]));
   });
 
+  test("does not let an avoidance cue cross an unless boundary and exclude canonical recordings", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco, boogie, and disco-funk from the 1970s and 1980s",
+      brief: brief({
+        versionPolicy: "Prefer original 1970s/1980s album or single versions; avoid later remixes, edits, or compilations unless needed to identify the canonical recording.",
+      }),
+      storefront: "us",
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).toContain("canonical");
+    expect(plan.versionPolicy.allowed).not.toContain("remix");
+    expect(plan.versionPolicy.allowed).not.toContain("radio_edit");
+    expect(plan.versionPolicy.excludeCompilations).toBe(true);
+  });
+
+  test("does not turn an unrelated only cue into a global version whitelist", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House tracks with clean lyrics only when an explicit recording exists",
+      brief: brief({
+        versionPolicy: "Prefer canonical recordings. Use clean versions only when the canonical recording is explicit.",
+      }),
+    });
+
+    expect(plan.versionPolicy.allowed).toContain("canonical");
+    expect(plan.versionPolicy.allowed).toContain("clean");
+  });
+
+  test("keeps compilations when an exclusion cue is explicitly negated", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco including compilations",
+      brief: brief({
+        versionPolicy: "Prefer canonical recordings; do not exclude compilations.",
+      }),
+    });
+
+    expect(plan.versionPolicy.excludeCompilations).toBe(false);
+  });
+
   test("preserves mixed positive and negative version directives", () => {
     const plan = createSelectionPlanV2({
       prompt: "House music with live performances but no remixes",

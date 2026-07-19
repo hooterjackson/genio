@@ -2,6 +2,19 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.4",
+      "releasedAt": "2026-07-19",
+      "title": "Pipeline V2 manifest survival recovery",
+      "notes": [
+        "Made exact-fill recovery count only Apple matches that can survive the final evidence, scope, era, content, and version-policy floor.",
+        "Derived genre, geography, and era eligibility from persisted citation attestations instead of prompt-shaped notes or generic source labels.",
+        "Used compatible recording-family issue dates so modern Apple reissues no longer disqualify evidence-backed period recordings.",
+        "Preserved disjoint requested eras and deduplicated alternate Apple editions by canonical recording family before exact-fill and manifest selection.",
+        "Fixed version-policy negation and unless clauses, including requests that reject live or remix versions while retaining canonical recordings.",
+        "Retried version-policy conflicts through broader Apple lookup and added production-shaped regressions for Brazilian disco and boogie, adaptive refill, and modern reissue handling."
+      ]
+    },
+    {
       "version": "1.2.3",
       "releasedAt": "2026-07-19",
       "title": "Pipeline V2 scope normalization hotfix",

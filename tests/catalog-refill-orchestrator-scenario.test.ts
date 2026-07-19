@@ -420,7 +420,10 @@ function catalogSongFromQuery(query: string): CatalogSong[] {
     albumName: "Rio music-history fixture",
     releaseDate: "2026-01-01",
     durationInMillis: 180_000,
-    isrc: `USRIO26000${track}`,
+    // Refill tracks are distinct recordings from the initial fixture pool.
+    // Reusing the initial ISRC namespace would correctly collapse them into
+    // the same recording families and suppress an exact-fill handoff.
+    isrc: `USNEW26000${track}`,
   }];
 }
 
