@@ -35,6 +35,49 @@ describe("Pipeline V2 selection plan", () => {
     expect(pipelineV2Route(plan)).toBe("curated_catalog");
   });
 
+  test("a physical-house theme is not silently constrained to the house-music genre", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Songs about a house or home",
+      brief: brief({
+        title: "Songs About Home",
+        description: "Songs whose lyrics or themes concern houses and home.",
+        subjectEntities: ["houses", "home"],
+        relationship: "has lyrics or themes about a house or home",
+        include: ["Songs about physical houses and home."],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).toContain("theme");
+    expect(plan.intents).not.toContain("genre_scene");
+    expect(plan.constraints.some((constraint) => (
+      constraint.kind === "hard"
+      && constraint.axis === "genre"
+      && constraint.values.includes("house music")
+    ))).toBe(false);
+  });
+
+  test("an exclusion cue cannot harden an unrelated generated exclusion", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House music, no remixes",
+      brief: brief({
+        exclude: ["Remixes", "Commercial pop music"],
+      }),
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "recording_version",
+      operator: "exclude",
+      kind: "hard",
+      values: ["Remixes"],
+    }));
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      operator: "avoid",
+      kind: "soft",
+      values: expect.arrayContaining(["Commercial pop music"]),
+    }));
+  });
+
   test("composite similarity constraints survive without including the reference artist by default", () => {
     const plan = createSelectionPlanV2({
       prompt: "Songs like Radiohead, focused on production and harmony, but no Radiohead and only clean versions",
@@ -80,12 +123,17 @@ describe("Pipeline V2 selection plan", () => {
         geographyRelationship: "language",
       }),
       expect.objectContaining({ axis: "era", operator: "within", values: ["1990s"] }),
-      expect.objectContaining({ axis: "relationship", operator: "require", values: ["is a house music recording from the American scene sung in French"] }),
     ]));
     expect(hard.filter((constraint) => constraint.axis === "genre")).toHaveLength(1);
     expect(hard.filter((constraint) => constraint.axis === "geography")).toHaveLength(1);
     expect(hard.filter((constraint) => constraint.axis === "language")).toHaveLength(1);
     expect(hard.filter((constraint) => constraint.axis === "era")).toHaveLength(1);
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "relationship",
+      operator: "prefer",
+      values: ["is a house music recording from the American scene sung in French"],
+      kind: "soft",
+    }));
     expect(plan.geographyConstraints).toEqual(expect.arrayContaining([
       { value: "French", relationship: "language" },
       { value: "American", relationship: "unspecified" },
@@ -226,6 +274,50 @@ describe("Pipeline V2 selection plan", () => {
     });
     expect(producerCreditPlan.intents).toContain("factual_relationship");
     expect(pipelineV2Route(producerCreditPlan)).toBe("factual_frontier");
+  });
+
+  test("generated Essentials and representative prose cannot upgrade a plain genre request", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: brief({
+        title: "Brazilian Disco Essentials",
+        description: "Representative and important disco recordings by Brazilian artists.",
+        subjectEntities: ["Brazilian disco"],
+        relationship: "represents the most important Brazilian disco recordings",
+        include: ["Iconic Brazilian disco classics"],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).toContain("genre_scene");
+    expect(plan.intents).not.toEqual(expect.arrayContaining([
+      "editorial_ranking",
+      "artist_catalogue",
+      "mood_activity",
+    ]));
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "relationship",
+      kind: "soft",
+      operator: "prefer",
+    }));
+  });
+
+  test("fixed-count curated requests ignore generated exhaustive wording", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: brief({
+        title: "Complete Brazilian Disco Catalogue",
+        description: "All tracks in a complete Brazilian disco survey.",
+        mode: "curated",
+        subjectEntities: ["Brazilian disco"],
+        relationship: "covers all Brazilian disco recordings",
+        include: ["Every essential track"],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).not.toContain("exhaustive");
+    expect(pipelineV2Route(plan)).toBe("curated_catalog");
   });
 
   test("guided answers become typed, soft constraints without weakening hard rules", () => {

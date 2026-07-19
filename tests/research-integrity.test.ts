@@ -20,6 +20,7 @@ import {
 import type { PlaylistBrief, SourceAdapterResult } from "../shared/types.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
 import { ProviderRequestError } from "../server/openai.ts";
+import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -900,6 +901,23 @@ function segmentedRepository() {
   return { repository, checkpoints, jobs, updates, run, coverage, citations };
 }
 
+function enableCatalogFirstV2(
+  state: ReturnType<typeof segmentedRepository>,
+  prompt = "Brazilian disco songs",
+) {
+  const selectionPlan = createSelectionPlanV2({
+    prompt,
+    brief: state.run.brief,
+    storefront: "us",
+  });
+  Object.assign(state.run, {
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: selectionPlan.policyVersion,
+    selectionPlan,
+  });
+  return selectionPlan;
+}
+
 class ScriptedResearchOrchestrator extends ResearchOrchestrator {
   readonly calls: Array<{ operation: string; body: Record<string, unknown> }> = [];
 
@@ -1631,6 +1649,39 @@ describe("fast curated orchestration", () => {
     });
   });
 
+  test("V2 delayed pickup sends an empty web pool to catalog-first matching", async () => {
+    vi.useFakeTimers();
+    const confirmedAt = new Date("2026-07-19T12:00:00.000Z");
+    vi.setSystemTime(confirmedAt);
+    const state = segmentedRepository();
+    state.run.brief = brief("curated", { min: 50, max: 50 });
+    state.run.createdAt = confirmedAt.toISOString();
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    enableCatalogFirstV2(state);
+    const route = installFastRoute(state, confirmedAt);
+    vi.setSystemTime(new Date(Date.parse(route.researchDeadlineAt) + 1));
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, []);
+
+    await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", fast: true });
+
+    expect(orchestrator.calls).toHaveLength(0);
+    expect(state.run).toMatchObject({
+      status: "ready_for_matching",
+      phase: "research_empty_catalog_handoff",
+      error: null,
+    });
+    expect(state.jobs.at(-1)).toMatchObject({
+      kind: "matching",
+      payload: expect.objectContaining({ runId: state.run.id, storefront: "us", fast: true }),
+    });
+    expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
+      boundary: "deadline",
+      citationEligibleCandidateCount: 0,
+      next: "matching",
+    });
+  });
+
   test("a provider quota rejection finishes as a transparent partial without worker retries", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("curated", { min: 25, max: 25 });
@@ -1660,6 +1711,37 @@ describe("fast curated orchestration", () => {
       citationEligibleCandidateCount: 0,
       shortfall: 25,
       next: "partial",
+    });
+  });
+
+  test("V2 provider rejection still reaches deterministic Apple catalog recovery", async () => {
+    const state = segmentedRepository();
+    state.run.brief = brief("curated", { min: 25, max: 25 });
+    state.run.status = "queued";
+    state.run.phase = "queued";
+    enableCatalogFirstV2(state);
+    installFastRoute(state);
+    const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [
+      new ProviderRequestError("Current project has no available quota", "openai", 429, false),
+    ]);
+
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "scope_resolution",
+      gapAttempt: 0,
+      fast: true,
+    });
+
+    expect(state.run).toMatchObject({
+      status: "ready_for_matching",
+      phase: "research_empty_catalog_handoff",
+      error: null,
+    });
+    expect(state.jobs.at(-1)).toMatchObject({ kind: "matching" });
+    expect(state.checkpoints.get("fast:complete:fast_curated_v3")).toMatchObject({
+      boundary: "provider_error",
+      citationEligibleCandidateCount: 0,
+      next: "matching",
     });
   });
 

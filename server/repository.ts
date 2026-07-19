@@ -88,6 +88,7 @@ import {
 } from "./error-sanitizer.ts";
 import { readCostConfiguration } from "./cost-config.ts";
 import { resolveEvidenceIntegrity } from "./evidence-integrity.ts";
+import { evidenceRelationshipIsMaterial } from "./evidence-relationship-policy.ts";
 import {
   createFastPostMatchRefillRouteCheckpoint,
   FAST_POST_MATCH_REFILL_MAX_COST_USD,
@@ -878,12 +879,13 @@ function constraintScopeAxis(axis: SelectionConstraint["axis"]): TrackScopeBindi
   return null;
 }
 
-function evidenceScopeDescriptors(
+export function deriveEvidenceScopeDescriptors(
   plan: SelectionPlan | null,
   brief: PlaylistBrief,
   proofText: string,
   relationshipProofText: string,
 ): EvidenceScopeDescriptor[] {
+  if (plan && !evidenceRelationshipIsMaterial(relationshipProofText)) return [];
   const descriptors: EvidenceScopeDescriptor[] = [];
   const seen = new Set<string>();
   const add = (
@@ -899,8 +901,14 @@ function evidenceScopeDescriptors(
   };
 
   for (const constraint of plan?.constraints ?? []) {
-    if (constraint.kind !== "hard" || constraint.operator === "exclude" || constraint.operator === "avoid") continue;
+    if (constraint.operator === "exclude" || constraint.operator === "avoid") continue;
     if (constraint.axis === "relationship") {
+      // A curated brief's model-authored relationship is intentionally a soft
+      // selection preference, but an exact source assertion may still use it
+      // to establish the typed intent axis. Ignoring soft relationship rows
+      // here left otherwise authoritative track citations with no scope
+      // binding at all. Whether the relationship is a non-relaxable manifest
+      // requirement remains controlled by the constraint's hard/soft kind.
       for (const value of constraint.values) {
         if (!plan) {
           if (proofTextSupportsValue(relationshipProofText, value)) add(primaryEvidenceScopeAxis(null), value);
@@ -912,6 +920,7 @@ function evidenceScopeDescriptors(
       }
       continue;
     }
+    if (constraint.kind !== "hard") continue;
     const scopeAxis = constraintScopeAxis(constraint.axis);
     if (!scopeAxis) continue;
     for (const value of constraint.values) {
@@ -919,11 +928,16 @@ function evidenceScopeDescriptors(
         ?? (constraint.axis === "language" ? "language" : null);
       const exactRelationshipSupported = !geographyRelationship
         || geographyRelationship === "unspecified"
-        || proofSupportsSelectionGeography(proofText, {
+        || proofSupportsSelectionGeography(relationshipProofText, {
           value,
           relationship: geographyRelationship,
         });
-      if (proofTextSupportsValue(proofText, value) && exactRelationshipSupported) {
+      // The brief subject and evidence note routinely repeat the requested
+      // scope. They are context, not proof. Only the source-specific
+      // relationship assertion may establish a hard scope axis; otherwise a
+      // citation described as "unrelated" can qualify simply because its
+      // canonical subject contains words such as "American house".
+      if (proofTextSupportsValue(relationshipProofText, value) && exactRelationshipSupported) {
         add(scopeAxis, value, geographyRelationship);
       }
     }
@@ -2927,7 +2941,7 @@ export class Repository {
             row.relationship,
             row.note,
           ].join(" ");
-          return evidenceScopeDescriptors(selectionPlan, brief, proofText, row.relationship)
+          return deriveEvidenceScopeDescriptors(selectionPlan, brief, proofText, row.relationship)
             .map(({ scopeAxis, scopeValue, geographyRelationship }) => ({
             bindingKind: "track_specific_source" as const,
             eligibility: "qualifying" as const,

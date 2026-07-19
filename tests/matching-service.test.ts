@@ -822,6 +822,35 @@ test("catalog deficit searches preserve composite geography and genre scope", ()
   );
 });
 
+test("catalog deficit searches preserve Brazilian disco as a composite query", () => {
+  const discoBrief: PlaylistBrief = {
+    title: "Brazilian Disco Classics",
+    description: "A source-backed survey of Brazilian disco.",
+    mode: "curated",
+    subjectEntities: ["Brazilian disco"],
+    relationship: "represents Brazilian disco",
+    include: ["Brazilian disco recordings"],
+    exclude: [],
+    versionPolicy: "canonical studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "editorial rank",
+    targetSize: { min: 50, max: 50 },
+    ambiguities: [],
+  };
+  const selectionPlan = createSelectionPlanV2({
+    prompt: "50 Brazilian disco songs",
+    brief: discoBrief,
+    storefront: "us",
+  });
+
+  expect(catalogDeficitQueries({ brief: discoBrief, selectionPlan })).toEqual(
+    expect.arrayContaining([
+      expect.stringMatching(/Brazilian disco/iu),
+      expect.stringMatching(/Brazilian disco essentials/iu),
+    ]),
+  );
+});
+
 test("catalog growth persists one qualifying binding for every hard French-jazz scope axis", async () => {
   const compositeBrief: PlaylistBrief = {
     title: "French jazz essentials",

@@ -28,7 +28,9 @@ test("the hamburger menu opens the current version and patch notes", async ({ pa
 
   await expect(page).toHaveURL(/\/about$/u);
   await expect(page.getByRole("heading", { name: `gênio v${currentRelease.version}` })).toBeVisible();
-  await expect(page.getByText(formatReleaseDate(currentRelease.releasedAt), { exact: true })).toHaveCount(2);
+  await expect(page.locator(".about-hero time")).toHaveText(formatReleaseDate(currentRelease.releasedAt));
+  await expect(page.locator(".release-list article").first().locator("time"))
+    .toHaveText(formatReleaseDate(currentRelease.releasedAt));
   await expect(page.getByText("CURRENT RELEASE", { exact: true })).toBeVisible();
   await expect(page.getByText(`${currentRelease.version}+123456789abc`, { exact: true })).toBeVisible();
   await expect(page.getByText("IN SYNC", { exact: true })).toBeVisible();

@@ -132,6 +132,19 @@ export function parseSelectionGeographyConstraints(text: string): SelectionGeogr
   const languages = SELECTION_LANGUAGE_TERMS
     .filter(([, pattern]) => pattern.test(text))
     .map(([value]) => ({ value, relationship: "language" as const }));
+  // “Tracks in Arabic and French” is an explicit multilingual requirement,
+  // even though a bare adjective such as “French jazz” must remain a
+  // geography ambiguity. Require at least two coordinated language names so
+  // phrases such as “jazz in French clubs” are not misclassified.
+  const languageNames = SELECTION_LANGUAGE_TERMS.map(([value]) => value);
+  const coordinated = text.match(
+    /\bin\s+((?:english|french|portuguese|spanish|german|japanese|arabic)(?:\s*(?:,|and|or|\/)\s*(?:english|french|portuguese|spanish|german|japanese|arabic))+)/iu,
+  )?.[1] ?? "";
+  for (const value of languageNames) {
+    if (new RegExp(`\\b${value}\\b`, "iu").test(coordinated)) {
+      languages.push({ value, relationship: "language" as const });
+    }
+  }
   const withoutLanguage = text
     .replace(/\b(?:english|french|portuguese|spanish|german|japanese|arabic)[ -]language\b/giu, " ")
     .replace(/\b(?:sung|lyrics?|vocals?)\s+(?:primarily\s+)?(?:in\s+)?(?:english|french|portuguese|spanish|german|japanese|arabic)\b/giu, " ");
@@ -218,17 +231,25 @@ function bindingValueMatches(binding: GeographyBindingProof, value: string): boo
     || phrasePresent(binding.note, alias));
 }
 
-/** All resolved place/language constraints require an exact matching binding. */
+/**
+ * Resolved place constraints are conjunctive. Requested languages form one
+ * allowed set: an individual track may satisfy any requested language while
+ * playlist-level discovery and diversity can still represent the full set.
+ */
 export function selectionGeographyBindingsSatisfied(
   plan: Pick<SelectionPlan, "geographyConstraints">,
   bindings: readonly GeographyBindingProof[],
 ): boolean {
   const constraints = Array.isArray(plan.geographyConstraints) ? plan.geographyConstraints : [];
-  return constraints.every((constraint) => bindings.some((binding) => {
+  const bindingSatisfies = (constraint: SelectionGeographyConstraint) => bindings.some((binding) => {
     if (!bindingValueMatches(binding, constraint.value)) return false;
     if (constraint.relationship === "unspecified") {
       return ["geography", "scene", "genre_scene"].includes(binding.scopeAxis);
     }
     return bindingGeographyRelationship(binding) === constraint.relationship;
-  }));
+  });
+  const languageConstraints = constraints.filter((constraint) => constraint.relationship === "language");
+  const placeConstraints = constraints.filter((constraint) => constraint.relationship !== "language");
+  return placeConstraints.every(bindingSatisfies)
+    && (languageConstraints.length === 0 || languageConstraints.some(bindingSatisfies));
 }

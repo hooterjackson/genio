@@ -2,6 +2,7 @@ import type { PlaylistBrief, SourceRecordInput, TrackCandidateInput } from "../s
 import type { HostedCitationAttestation } from "./citation-attestation.ts";
 import { citationTextIsLocalToClaim } from "./citation-attestation.ts";
 import { extractOutputText } from "./openai.ts";
+import { evidenceRelationshipIsMaterial } from "./evidence-relationship-policy.ts";
 import { boundedFastCandidateLimit } from "./research-policy.ts";
 import { assertPublicHttpsUrl, compactEvidenceNote } from "./security.ts";
 import { isExcludedReferenceArtist } from "./similarity-policy.ts";
@@ -445,8 +446,7 @@ export function validateFastCandidates(
         brief.subjectEntities,
       );
       if (!subjectEntity
-        || normalizeEvidencePhrase(evidenceGroup.relationship)
-          !== normalizeEvidencePhrase(brief.relationship)
+        || !evidenceRelationshipIsMaterial(evidenceGroup.relationship)
         || !citationTextIsLocalToClaim(
           attestation.excerpt,
           row.title,

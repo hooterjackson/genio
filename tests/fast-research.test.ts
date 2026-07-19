@@ -240,6 +240,98 @@ describe("fast curated research", () => {
     });
   });
 
+  test("accepts source-specific editorial container wording without requiring the brief prose verbatim", () => {
+    const discoBrief: PlaylistBrief = {
+      ...brief,
+      title: "Brazilian Disco Classics",
+      subjectEntities: ["Brazilian disco"],
+      relationship: "iconic tracks from",
+      evidencePolicy: "Cited Brazilian disco histories and specialist compilations.",
+      targetSize: { min: 50, max: 50 },
+    };
+    const support = evidenceGroup({
+      subject: "Brazilian disco",
+      relationship: "Brazilian Disco Boogie Sounds: 1978-1982",
+      tracks: ["Marcos Valle — Estrelar", "Lady Zu — A Noite Vai Chegar"],
+    });
+    const response = synthesisResponse(support);
+    const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+    const validated = validateFastCandidates(
+      extractFastCandidatesFromSynthesis(synthesis, 120),
+      discoBrief,
+      synthesis,
+    );
+
+    expect(validated.rejectedCandidateCount).toBe(0);
+    expect(validated.candidates).toHaveLength(2);
+    expect(validated.candidates[0]!.evidence[0]).toMatchObject({
+      subjectEntity: "Brazilian disco",
+      subjectRelationship: "iconic tracks from",
+      relationship: "Brazilian Disco Boogie Sounds: 1978-1982",
+    });
+  });
+
+  test("rejects provider-attested relationships that explicitly negate scope support", () => {
+    const discoBrief: PlaylistBrief = {
+      ...brief,
+      title: "Brazilian Disco Classics",
+      subjectEntities: ["Brazilian disco"],
+      relationship: "iconic tracks from",
+      targetSize: { min: 50, max: 50 },
+    };
+    const incompatibleRelationships = [
+      "not part of Brazilian disco",
+      "this recording does not belong to Brazilian disco",
+      "unrelated to Brazilian disco",
+      "outside the Brazilian disco genre",
+      "incorrectly classified as Brazilian disco",
+      "contains only the phrase Brazilian disco",
+    ];
+
+    for (const relationship of incompatibleRelationships) {
+      const support = evidenceGroup({
+        subject: "Brazilian disco",
+        relationship,
+        tracks: ["Fixture Artist — Fixture Track"],
+      });
+      const response = synthesisResponse(support);
+      const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+      const validated = validateFastCandidates(
+        extractFastCandidatesFromSynthesis(synthesis, 120),
+        discoBrief,
+        synthesis,
+      );
+
+      expect(validated.candidates, relationship).toEqual([]);
+      expect(validated.rejectedCandidateCount, relationship).toBe(1);
+    }
+  });
+
+  test("does not mistake affirmative 'not only' editorial wording for a negated relationship", () => {
+    const discoBrief: PlaylistBrief = {
+      ...brief,
+      title: "Brazilian Disco Classics",
+      subjectEntities: ["Brazilian disco"],
+      relationship: "iconic tracks from",
+      targetSize: { min: 50, max: 50 },
+    };
+    const support = evidenceGroup({
+      subject: "Brazilian disco",
+      relationship: "not only a Brazilian disco classic but also a boogie landmark",
+      tracks: ["Marcos Valle — Estrelar"],
+    });
+    const response = synthesisResponse(support);
+    const synthesis = fastSynthesisCheckpoint(response, collectHostedCitationAttestations(response));
+    const validated = validateFastCandidates(
+      extractFastCandidatesFromSynthesis(synthesis, 120),
+      discoBrief,
+      synthesis,
+    );
+
+    expect(validated.rejectedCandidateCount).toBe(0);
+    expect(validated.candidates).toHaveLength(1);
+  });
+
   test("recovers a production-shaped dense repeated-subject evidence group", () => {
     const tracks = Array.from({ length: 10 }, (_, index) => (
       `Fixture Artist ${index + 1} — Signal ${index + 1}`

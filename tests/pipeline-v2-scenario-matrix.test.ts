@@ -49,6 +49,137 @@ function hardConstraintText(plan: ReturnType<typeof createSelectionPlanV2>): str
 }
 
 describe("Pipeline V2 provider-free scenario matrix", () => {
+  test("Brazilian disco keeps only user-stated hard scope and never creates contradictory exclusions", () => {
+    const discoBrief: PlaylistBrief = {
+      title: "Brazilian Disco Classics",
+      description: "Focus on canonical recordings, club staples, and era-defining cuts.",
+      mode: "curated",
+      subjectEntities: ["Brazilian disco"],
+      relationship: "iconic tracks from",
+      include: [
+        "Disco recordings by Brazilian artists",
+        "Brazil-linked disco classics from the late 1970s and early 1980s",
+        "Widely recognized dancefloor staples",
+      ],
+      exclude: [
+        "Non-disco Brazilian music",
+        "Non-Brazilian disco unrelated to Brazil",
+      ],
+      versionPolicy: "Prefer canonical original-era recordings.",
+      evidencePolicy: "Require cited Brazilian disco histories and specialist editorial sources.",
+      orderingPolicy: "Order by historical prominence and dancefloor recognition.",
+      targetSize: { min: 50, max: 50 },
+      ambiguities: [],
+    };
+    const plan = createSelectionPlanV2({
+      prompt: "Iconic Brazilian disco songs",
+      brief: discoBrief,
+      storefront: "us",
+    });
+    const hardRequired = plan.constraints.filter((constraint) => constraint.kind === "hard" && constraint.operator === "require");
+    const hardExcluded = plan.constraints.filter((constraint) => constraint.kind === "hard" && constraint.operator === "exclude");
+
+    expect(plan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
+    expect(plan.intents).not.toEqual(expect.arrayContaining(["mood_activity", "artist_catalogue"]));
+    expect(hardRequired).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "genre", values: expect.arrayContaining(["disco"]) }),
+      expect.objectContaining({ axis: "geography", values: expect.arrayContaining(["Brazilian"]) }),
+    ]));
+    for (const excluded of hardExcluded) {
+      const required = hardRequired.find((constraint) => constraint.axis === excluded.axis);
+      expect(excluded.values.some((value) => required?.values.some((item) => item.toLowerCase() === value.toLowerCase()))).toBe(false);
+    }
+    expect(plan.constraints.flatMap((constraint) => constraint.values)).not.toEqual(expect.arrayContaining([
+      "Non-disco Brazilian music",
+      "Non-Brazilian disco unrelated to Brazil",
+    ]));
+    expect(plan.constraints).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "activity", values: expect.arrayContaining(["study"]) }),
+      expect.objectContaining({ axis: "venue", values: expect.arrayContaining(["club"]) }),
+    ]));
+    expect(plan.diversityGoals.minimumDistinctArtists).toBeGreaterThan(2);
+    expect(plan.diversityGoals.maximumTracksPerArtist).toBeLessThan(50);
+  });
+
+  test("plain Brazilian disco is not silently upgraded by generated editorial prose", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: {
+        title: "Brazilian Disco Essentials",
+        description: "A representative survey of important recordings by Brazilian artists.",
+        mode: "curated",
+        subjectEntities: ["Brazilian disco"],
+        relationship: "represents essential Brazilian disco",
+        include: ["Iconic dancefloor classics"],
+        exclude: [],
+        versionPolicy: "Prefer canonical studio recordings.",
+        evidencePolicy: "Require cited specialist sources.",
+        orderingPolicy: "Intermix artists.",
+        targetSize: { min: 50, max: 50 },
+        ambiguities: [],
+      },
+    });
+
+    expect(plan.intents).toEqual(["genre_scene"]);
+    expect(plan.constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "genre", kind: "hard", values: expect.arrayContaining(["disco"]) }),
+      expect.objectContaining({ axis: "geography", kind: "hard", values: expect.arrayContaining(["Brazilian"]) }),
+      expect.objectContaining({ axis: "relationship", kind: "soft", operator: "prefer" }),
+    ]));
+  });
+
+  test("generated exhaustive wording cannot reroute a fixed-count curated request", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: {
+        title: "Complete Brazilian Disco",
+        description: "All essential tracks from the complete Brazilian disco catalogue.",
+        mode: "curated",
+        subjectEntities: ["Brazilian disco"],
+        relationship: "represents all important Brazilian disco recordings",
+        include: ["Complete survey of all essential tracks"],
+        exclude: [],
+        versionPolicy: "Prefer canonical studio recordings.",
+        evidencePolicy: "Require cited specialist sources.",
+        orderingPolicy: "Intermix artists.",
+        targetSize: { min: 50, max: 50 },
+        ambiguities: [],
+      },
+    });
+
+    expect(plan.intents).not.toContain("exhaustive");
+    expect(pipelineV2Route(plan)).toBe("curated_catalog");
+  });
+
+  test("an explicit reference-artist exclusion remains a hard user constraint", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Songs like Radiohead, but do not include Radiohead",
+      brief: {
+        title: "Beyond Radiohead",
+        description: "Artists with a similar musical character.",
+        mode: "curated",
+        subjectEntities: ["Radiohead"],
+        relationship: "sounds stylistically similar to Radiohead",
+        include: [],
+        exclude: ["Radiohead"],
+        versionPolicy: "Prefer canonical studio recordings.",
+        evidencePolicy: "Require track-level stylistic support.",
+        orderingPolicy: "Intermix artists.",
+        targetSize: { min: 25, max: 25 },
+        ambiguities: [],
+      },
+    });
+
+    expect(plan.constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        axis: "relationship",
+        kind: "hard",
+        operator: "exclude",
+        values: ["Radiohead"],
+      }),
+    ]));
+  });
+
   test.each([
     {
       name: "American drill",
@@ -60,7 +191,7 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
         include: ["American drill recordings across Chicago, New York, and other documented US scenes."],
       }),
       intents: ["genre_scene", "editorial_ranking"],
-      hardTerms: ["American drill", "Chicago"],
+      hardTerms: ["drill", "American"],
     },
     {
       name: "Berlin techno",
@@ -72,7 +203,7 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
         include: ["Berlin club, venue, and label histories across the major eras."],
       }),
       intents: ["genre_scene", "editorial_ranking"],
-      hardTerms: ["Berlin", "club"],
+      hardTerms: ["Berlin", "techno"],
     },
     {
       name: "Brazilian funk / funk carioca",
@@ -84,7 +215,7 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
         include: ["Brazilian funk / funk carioca recordings grounded in the documented Rio scene."],
       }),
       intents: ["genre_scene", "editorial_ranking"],
-      hardTerms: ["funk carioca", "Rio"],
+      hardTerms: ["baile funk", "Brazilian"],
     },
     {
       name: "influential footwork",
@@ -108,7 +239,7 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
         include: ["Women artists and producers with documented importance to the Detroit techno scene."],
       }),
       intents: ["genre_scene", "editorial_ranking"],
-      hardTerms: ["Women", "Detroit techno"],
+      hardTerms: ["Women", "Detroit", "techno"],
     },
   ])("retains the full $name scope as hard selection criteria", (scenario) => {
     const plan = createSelectionPlanV2({ prompt: scenario.prompt, brief: scenario.brief });
@@ -225,12 +356,17 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
       prompt: "50 Algerian raï / rai / الراي tracks in Arabic and French",
       brief: multilingual,
     });
-    expect(plan.constraints).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        kind: "hard",
-        axis: "language",
-        values: [expect.stringMatching(/raï \(rai \/ الراي\)/iu)],
-      }),
+    const hardLanguage = plan.constraints.filter((constraint) => (
+      constraint.kind === "hard" && constraint.axis === "language"
+    ));
+    expect(hardLanguage).toHaveLength(1);
+    expect(hardLanguage[0]).toEqual(expect.objectContaining({
+      operator: "require",
+      values: expect.arrayContaining(["Arabic", "French"]),
+    }));
+    expect(plan.geographyConstraints).toEqual(expect.arrayContaining([
+      { value: "Arabic", relationship: "language" },
+      { value: "French", relationship: "language" },
     ]));
     expect(plan.contentPolicy.languages.join(" ")).toMatch(/French-language.*Arabic-language/iu);
   });
