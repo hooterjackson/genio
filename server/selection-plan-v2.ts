@@ -10,6 +10,7 @@ import type {
   SelectionVersionPolicy,
 } from "../shared/types.ts";
 import type { PlaylistGuidancePreference } from "./guidance-context.ts";
+import { assertsFactualTrackRelationship } from "./factual-frontier-policy.ts";
 import {
   parseSelectionGeographyConstraints,
   selectionConstraintGeography,
@@ -18,7 +19,6 @@ import {
 
 export const PIPELINE_V2_SELECTION_PLAN_VERSION = "relevance_first_2026_07" as const;
 
-const FACTUAL_RELATIONSHIP = /\b(?:performed?|played|credited|session|contribut|produced|wrote|written|composed|arranged|sampled|featured\s+on)\b/iu;
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
 const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus|relax|meditat|sunset|churrasco)\b/iu;
@@ -62,8 +62,8 @@ function unique(values: readonly string[]): string[] {
 function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   const scope = [prompt, brief.title, brief.description, brief.relationship, ...brief.include].join(" ");
   const intents: ResearchIntent[] = [];
-  if (brief.mode === "exhaustive" || EXHAUSTIVE_INTENT.test(scope)) intents.push("exhaustive");
-  if (FACTUAL_RELATIONSHIP.test(brief.relationship) || FACTUAL_RELATIONSHIP.test(prompt)) intents.push("factual_relationship");
+  if (brief.mode === "exhaustive" || brief.mode === "hybrid" || EXHAUSTIVE_INTENT.test(scope)) intents.push("exhaustive");
+  if (assertsFactualTrackRelationship(`${brief.relationship} ${prompt}`)) intents.push("factual_relationship");
   if (SIMILARITY_INTENT.test(scope) || /stylistically similar/iu.test(brief.relationship)) intents.push("similarity");
   if (MOOD_ACTIVITY_INTENT.test(scope)) intents.push("mood_activity");
   if (THEME_INTENT.test(scope)) intents.push("theme");

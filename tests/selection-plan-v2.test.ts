@@ -173,6 +173,61 @@ describe("Pipeline V2 selection plan", () => {
     expect(pipelineV2Route(plan)).toBe("factual_frontier");
   });
 
+  test("hybrid source-bounded scopes retain the exhaustive frontier contract", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Every documented Detroit techno track from 1985–1992",
+      brief: brief({
+        title: "Early Detroit techno",
+        mode: "hybrid",
+        subjectEntities: ["Detroit techno"],
+        relationship: "belongs to the documented Detroit techno scene",
+        include: ["Released from 1985–1992"],
+        targetSize: { min: 100, max: 100 },
+      }),
+    });
+
+    expect(plan.intents).toContain("exhaustive");
+    expect(pipelineV2Route(plan)).toBe("factual_frontier");
+  });
+
+  test("production quality adjectives stay curated while producer credits route factual", () => {
+    const qualityPlan = createSelectionPlanV2({
+      prompt: "50 well-produced ambient tracks",
+      brief: brief({
+        title: "Well-produced ambient",
+        subjectEntities: ["Ambient music"],
+        relationship: "is a well-produced ambient recording",
+        include: ["Detailed, polished production"],
+      }),
+    });
+    expect(qualityPlan.intents).not.toContain("factual_relationship");
+    expect(pipelineV2Route(qualityPlan)).toBe("curated_catalog");
+
+    const activityPlan = createSelectionPlanV2({
+      prompt: "50 songs to play at dinner during a listening session",
+      brief: brief({
+        title: "Dinner listening",
+        subjectEntities: ["Dinner music"],
+        relationship: "is music to play at dinner during a listening session",
+        include: ["Relaxed pacing"],
+      }),
+    });
+    expect(activityPlan.intents).not.toContain("factual_relationship");
+    expect(pipelineV2Route(activityPlan)).toBe("curated_catalog");
+
+    const producerCreditPlan = createSelectionPlanV2({
+      prompt: "50 recordings produced by Quincy Jones",
+      brief: brief({
+        title: "Quincy Jones productions",
+        subjectEntities: ["Quincy Jones"],
+        relationship: "was produced by Quincy Jones",
+        include: ["Documented producer credits"],
+      }),
+    });
+    expect(producerCreditPlan.intents).toContain("factual_relationship");
+    expect(pipelineV2Route(producerCreditPlan)).toBe("factual_frontier");
+  });
+
   test("guided answers become typed, soft constraints without weakening hard rules", () => {
     const plan = createSelectionPlanV2({
       prompt: "French jazz",

@@ -141,8 +141,10 @@ import { assignPipelineV2, createSelectionPlanV2, pipelineRolloutStickyKey } fro
 import {
   catalogContentRating,
   catalogRecordingVersionClass,
+  classifyTrackScopeBindingEvidence,
   scopeBindingEligible,
   selectWithConstraintLadder,
+  trackScopeBindingStrength,
   type ConstraintCandidate,
   type ConstraintRule,
   type ConstraintSelection,
@@ -155,7 +157,10 @@ import {
   type PipelineOperationalWindow,
   type PipelineStageCounts,
 } from "./pipeline-v2-observability.ts";
-import { requiresFactualFrontier } from "./factual-frontier-policy.ts";
+import {
+  assertsFactualTrackRelationship,
+  requiresFactualFrontier,
+} from "./factual-frontier-policy.ts";
 import {
   bindingGeographyRelationship,
   proofSupportsSelectionGeography,
@@ -715,6 +720,80 @@ function primaryEvidenceScopeAxis(
   return "genre_scene";
 }
 
+const EDITORIAL_RANKING_PROOF = /\b(?:best|essential|influential|important|definitive|iconic|foundational|representative|historical(?:ly)?|cultural(?:ly)?|shaped|impact)\b/iu;
+const SIMILARITY_PROOF = /\b(?:sounds?\s+like|similar(?:ity|\s+to)?|resembl|adjacent\s+to|style\s+of|vein\s+of|production|tempo|harmony|vocal\s+style)\b/iu;
+const ARTIST_CATALOG_PROOF = /\b(?:primary\s+artist|recorded\s+by|performed\s+by|songs?\s+by|tracks?\s+by|artist\s+catalog(?:ue)?|discograph)\b/iu;
+
+function evidenceIntentScopeAxis(
+  plan: SelectionPlan,
+  intent: SelectionPlan["intents"][number],
+): TrackScopeBinding["scopeAxis"] {
+  if (intent === "factual_relationship") return "factual_relationship";
+  if (intent === "exhaustive") return "exhaustive";
+  if (intent === "similarity") return "similarity";
+  if (intent === "mood_activity") return "mood_theme_activity";
+  if (intent === "theme") return "theme";
+  if (intent === "artist_catalogue") return "artist_catalog";
+  if (intent === "editorial_ranking") return "editorial_ranked";
+  const scoped = plan.constraints.find((constraint) => (
+    constraint.axis === "genre" || constraint.axis === "scene"
+  ));
+  return scoped?.axis === "genre" || scoped?.axis === "scene"
+    ? scoped.axis
+    : "genre_scene";
+}
+
+/**
+ * One evidence row may prove one or several explicit intent axes, but it must
+ * never inherit every axis just because the run is composite. This lets two
+ * independent citations jointly prove "performed on" + "influential" while
+ * retaining two auditable claims through manifest lock.
+ */
+function evidenceIntentScopeAxes(
+  plan: SelectionPlan,
+  _proofText: string,
+  relationshipProofText: string,
+  requestedRelationship: string,
+): TrackScopeBinding["scopeAxis"][] {
+  // Intent axes must be asserted by the exact relationship claim. The subject
+  // entity and explanatory note describe the requested scope; allowing either
+  // to prove an axis makes an unrelated citation look relevant merely because
+  // it repeats the prompt.
+  const text = relationshipProofText;
+  const exactRelationship = proofTextSupportsValue(relationshipProofText, requestedRelationship);
+  const axes: TrackScopeBinding["scopeAxis"][] = [];
+  for (const intent of plan.intents) {
+    const supported = intent === "factual_relationship"
+      ? assertsFactualTrackRelationship(text)
+      : intent === "exhaustive"
+        ? exactRelationship || assertsFactualTrackRelationship(text)
+        : intent === "editorial_ranking"
+          ? EDITORIAL_RANKING_PROOF.test(text)
+          : intent === "similarity"
+            ? SIMILARITY_PROOF.test(text)
+            : intent === "artist_catalogue"
+              ? exactRelationship || ARTIST_CATALOG_PROOF.test(text)
+              : intent === "genre_scene"
+                ? exactRelationship || plan.constraints.some((constraint) => (
+                  (constraint.axis === "genre" || constraint.axis === "scene")
+                    && constraint.values.some((value) => proofTextSupportsValue(relationshipProofText, value))
+                ))
+                : intent === "mood_activity"
+                  ? plan.constraints.some((constraint) => (
+                    (constraint.axis === "mood" || constraint.axis === "activity")
+                      && constraint.values.some((value) => proofTextSupportsValue(relationshipProofText, value))
+                  ))
+                  : intent === "theme"
+                    ? plan.constraints.some((constraint) => (
+                      constraint.axis === "theme"
+                        && constraint.values.some((value) => proofTextSupportsValue(relationshipProofText, value))
+                    ))
+                    : false;
+    if (supported) axes.push(evidenceIntentScopeAxis(plan, intent));
+  }
+  return [...new Set(axes)];
+}
+
 const CONSTRAINT_PROOF_STOPWORDS = new Set([
   "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "the", "to", "with",
   "recording", "recordings", "song", "songs", "track", "tracks", "music",
@@ -776,7 +855,13 @@ function evidenceScopeDescriptors(
     if (constraint.kind !== "hard" || constraint.operator === "exclude" || constraint.operator === "avoid") continue;
     if (constraint.axis === "relationship") {
       for (const value of constraint.values) {
-        if (proofTextSupportsValue(relationshipProofText, value)) add(primaryEvidenceScopeAxis(plan), value);
+        if (!plan) {
+          if (proofTextSupportsValue(relationshipProofText, value)) add(primaryEvidenceScopeAxis(null), value);
+          continue;
+        }
+        for (const scopeAxis of evidenceIntentScopeAxes(plan, proofText, relationshipProofText, value)) {
+          add(scopeAxis, relationshipProofText);
+        }
       }
       continue;
     }
@@ -1003,6 +1088,18 @@ function manifestConstraintViolations(input: {
           : requested.includes("instrumental")
             ? /\binstrumental\b/iu.test(`${row.song_json.name} ${row.song_json.versionLabel ?? ""}`)
             : metadataContainsConstraintValue(row, constraint);
+    } else if (constraint.axis === "relationship") {
+      // Composite relationships may be proved across multiple independent
+      // intent-axis bindings, but only when each binding's explicit
+      // relationship supports its own scope value. Never borrow subject or
+      // note prose: those fields often repeat the requested prompt verbatim.
+      const combinedProof = bindings
+        .filter((binding) => proofTextSupportsValue(binding.relationship, binding.scopeValue))
+        .map((binding) => `${binding.scopeValue} ${binding.relationship}`)
+        .join(" ");
+      satisfied = constraint.values.some((value) => (
+        proofTextSupportsValue(combinedProof, value)
+      ));
     } else {
       satisfied = bindings.some((binding) => bindingSupportsConstraint(binding, constraint));
     }
@@ -2657,7 +2754,6 @@ export class Repository {
             await client.query("UPDATE evidence_claims SET state=$2 WHERE id=$1", [row.id, effective.state]);
           }
         }
-        const factualScope = requiresFactualFrontier(brief, selectionPlan);
         const qualifyingBindings = storedEvidence.rows.flatMap((row, index): TrackScopeBinding[] => {
           const effective = integrity.evidence[index]!;
           // Catalog metadata is identity evidence only. A qualifying scope
@@ -2666,8 +2762,7 @@ export class Repository {
           if (row.source_class !== "web" || !row.citation_attestation_id) return [];
           const qualifiesTrackClaim = row.support_scope === "track"
             && (effective.state === "verified" || effective.state === "corroborated");
-          const qualifiesEditorialClaim = !factualScope
-            && (row.support_scope === "track" || row.support_scope === "editorial")
+          const qualifiesEditorialClaim = (row.support_scope === "track" || row.support_scope === "editorial")
             && effective.state === "editorial";
           if (!qualifiesTrackClaim && !qualifiesEditorialClaim) return [];
           const proofText = [
@@ -4091,25 +4186,20 @@ export class Repository {
         }
         const rules = manifestConstraintRules(selectionPlan);
         const hardRuleIds = new Set(rules.filter((rule) => rule.kind === "hard").map((rule) => rule.id));
-        const factualScope = selectionPlan.intents.includes("factual_relationship")
-          || selectionPlan.intents.includes("exhaustive");
         const artistOccurrences = new Map<string, number>();
         const albumOccurrences = new Map<string, number>();
         const candidates: ConstraintCandidate<ManifestSelectionRow>[] = matches.rows.map((row) => {
           const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
           const summaries = bindings.map((binding) => {
-            const layer = factualScope
-              ? binding.bindingKind === "track_specific_source" && binding.citationAttestationId
-                ? "factual_claim" as const
-                : "scope_binding" as const
-              : binding.bindingKind === "track_specific_source"
-                ? "track_claim" as const
-                : "scope_binding" as const;
+            const evidence = classifyTrackScopeBindingEvidence({
+              bindingKind: binding.bindingKind,
+              scopeAxis: binding.scopeAxis,
+              citationAttested: Boolean(binding.citationAttestationId),
+            });
             return {
-              strength: binding.confidence >= 0.9 ? "strong" as const : "medium" as const,
+              strength: trackScopeBindingStrength(binding.confidence),
               provenanceRoot: binding.provenanceRoot,
-              layer,
-              supportsRequestedRelationship: !factualScope || layer === "factual_claim",
+              ...evidence,
               bindingKind: binding.bindingKind,
               scopeAxis: binding.scopeAxis,
             };

@@ -4,15 +4,47 @@ import {
   catalogContentRating,
   catalogRecordingVersionClass,
   catalogRecordingVersionSignature,
+  classifyTrackScopeBindingEvidence,
   conservativeQualifiedYield,
   recordingFamilyKey,
   scopeBindingEligible,
   selectWithConstraintLadder,
   terminalPipelineOutcome,
+  trackScopeBindingStrength,
   validatePipelineStageCounts,
 } from "../server/pipeline-v2-policy.ts";
 
 describe("Pipeline V2 production policy", () => {
+  test("classifies exact citations per binding axis instead of per run intent", () => {
+    expect(classifyTrackScopeBindingEvidence({
+      bindingKind: "track_specific_source",
+      scopeAxis: "factual_relationship",
+      citationAttested: true,
+    })).toEqual({ layer: "factual_claim", supportsRequestedRelationship: true });
+    expect(classifyTrackScopeBindingEvidence({
+      bindingKind: "track_specific_source",
+      scopeAxis: "editorial_ranked",
+      citationAttested: true,
+    })).toEqual({ layer: "track_claim", supportsRequestedRelationship: true });
+    expect(classifyTrackScopeBindingEvidence({
+      bindingKind: "catalog_editorial_membership",
+      scopeAxis: "genre",
+      citationAttested: false,
+    })).toEqual({ layer: "scope_binding", supportsRequestedRelationship: true });
+    expect(classifyTrackScopeBindingEvidence({
+      bindingKind: "track_specific_source",
+      scopeAxis: "similarity",
+      citationAttested: false,
+    })).toEqual({ layer: "scope_binding", supportsRequestedRelationship: false });
+  });
+
+  test("shares one binding-strength boundary across matching and manifest lock", () => {
+    expect(trackScopeBindingStrength(0.86)).toBe("strong");
+    expect(trackScopeBindingStrength(0.8)).toBe("strong");
+    expect(trackScopeBindingStrength(0.799)).toBe("medium");
+    expect(trackScopeBindingStrength(Number.NaN)).toBe("medium");
+  });
+
   test("exact-fill plans from the conservative post-filter yield and includes a qualified reserve", () => {
     expect(conservativeQualifiedYield(0, 0)).toBe(0.5);
     expect(conservativeQualifiedYield(0, 100)).toBe(0.2);
@@ -154,6 +186,49 @@ describe("Pipeline V2 production policy", () => {
       "curated",
       [appleGenreMembership, ...mirroredRankingClaims],
       ["genre_scene", "editorial_ranking"],
+    )).toBe(false);
+  });
+
+  test("a factual credit cannot launder an independent editorial-ranking claim", () => {
+    const factualCredit = {
+      strength: "strong" as const,
+      provenanceRoot: "session-liner-notes",
+      layer: "factual_claim" as const,
+      supportsRequestedRelationship: true,
+      bindingKind: "track_specific_source" as const,
+      scopeAxis: "factual_relationship" as const,
+    };
+    const rankingClaim = {
+      strength: "strong" as const,
+      provenanceRoot: "independent-music-history",
+      layer: "track_claim" as const,
+      supportsRequestedRelationship: true,
+      bindingKind: "track_specific_source" as const,
+      scopeAxis: "editorial_ranked" as const,
+    };
+
+    expect(scopeBindingEligible(
+      "curated",
+      [factualCredit],
+      ["factual_relationship", "editorial_ranking"],
+    )).toBe(false);
+    expect(scopeBindingEligible(
+      "curated",
+      [factualCredit, rankingClaim],
+      ["factual_relationship", "editorial_ranking"],
+    )).toBe(true);
+    expect(scopeBindingEligible(
+      "curated",
+      [factualCredit, {
+        ...rankingClaim,
+        strength: "medium",
+        provenanceRoot: "mirrored-ranking-root",
+      }, {
+        ...rankingClaim,
+        strength: "medium",
+        provenanceRoot: "mirrored-ranking-root",
+      }],
+      ["factual_relationship", "editorial_ranking"],
     )).toBe(false);
   });
 

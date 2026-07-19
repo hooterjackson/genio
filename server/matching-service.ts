@@ -63,8 +63,10 @@ import {
   catalogContentRating,
   catalogRecordingVersionClass,
   catalogRecordingVersionSignature,
+  classifyTrackScopeBindingEvidence,
   recordingFamilyKey,
   scopeBindingEligible,
+  trackScopeBindingStrength,
 } from "./pipeline-v2-policy.ts";
 import {
   CATALOG_DISCOVERY_PROGRESS_VERSION,
@@ -785,29 +787,26 @@ function isEvidenceEligible(
   selectionPlan?: SelectionPlan | null,
 ): boolean {
   if (candidate.scopeBindings && candidate.scopeBindings.length > 0) {
-    const factual = requiresFactualFrontier(brief, selectionPlan);
     const qualifyingBindings = candidate.scopeBindings.filter((binding) => binding.eligibility === "qualifying");
     if (selectionPlan && !selectionGeographyBindingsSatisfied(selectionPlan, qualifyingBindings)) return false;
     return scopeBindingEligible(brief.mode, qualifyingBindings
-      .map((binding) => ({
-        strength: binding.confidence >= 0.8 ? "strong" as const : "medium" as const,
-        provenanceRoot: binding.provenancePath.find((item) => item.kind === "provenance_root")?.id
-          ?? binding.sourceRecordId
-          ?? binding.sourceUrl
-          ?? "",
-        layer: factual
-          ? binding.bindingKind === "track_specific_source" && binding.citationAttestationId
-            ? "factual_claim" as const
-            : "scope_binding" as const
-          : binding.bindingKind === "track_specific_source"
-            ? "track_claim" as const
-            : "scope_binding" as const,
-        supportsRequestedRelationship: factual
-          ? binding.bindingKind === "track_specific_source" && Boolean(binding.citationAttestationId)
-          : true,
-        bindingKind: binding.bindingKind,
-        scopeAxis: binding.scopeAxis,
-      })), selectionPlan?.intents);
+      .map((binding) => {
+        const evidence = classifyTrackScopeBindingEvidence({
+          bindingKind: binding.bindingKind,
+          scopeAxis: binding.scopeAxis,
+          citationAttested: Boolean(binding.citationAttestationId),
+        });
+        return {
+          strength: trackScopeBindingStrength(binding.confidence),
+          provenanceRoot: binding.provenancePath.find((item) => item.kind === "provenance_root")?.id
+            ?? binding.sourceRecordId
+            ?? binding.sourceUrl
+            ?? "",
+          ...evidence,
+          bindingKind: binding.bindingKind,
+          scopeAxis: binding.scopeAxis,
+        };
+      }), selectionPlan?.intents);
   }
   // V2 eligibility is binding-based. Falling back to the legacy evidence-state
   // shortcut would let a broad editorial claim bypass the typed intent and

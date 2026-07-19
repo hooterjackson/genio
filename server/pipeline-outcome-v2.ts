@@ -113,6 +113,30 @@ function boundedCount(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
 
+function countConsistentStatus(input: {
+  status: PipelineOutcomeStatus;
+  targetTrackCount: number;
+  publishedTrackCount: number;
+}): PipelineOutcomeStatus {
+  if (input.targetTrackCount <= 0) return input.status;
+  // Count completeness must never erase an operational or integrity state.
+  // Only the completeness vocabulary may be promoted when an exact manifest
+  // was actually published.
+  const completenessStatus = input.status === "complete"
+    || input.status.startsWith("partial_")
+    || input.status === "no_compatible_tracks";
+  if (input.publishedTrackCount > input.targetTrackCount) return "failed_integrity";
+  if (input.publishedTrackCount === input.targetTrackCount) {
+    return completenessStatus ? "complete" : input.status;
+  }
+  if (input.status !== "complete") return input.status;
+  // A safe shortfall is a completeness result, not a red system error. An
+  // over-publication, however, violates the immutable exact-count manifest.
+  return input.publishedTrackCount > input.targetTrackCount
+    ? "failed_integrity"
+    : "partial_evidence_shortfall";
+}
+
 function deficitKind(status: PipelineOutcomeStatus): PipelineDeficitKind {
   if (status === "partial_evidence_shortfall") return "evidence";
   if (status === "partial_policy_conflict") return "version_policy";
@@ -235,12 +259,22 @@ export function mergePipelineOutcomes(
     boundedCount(left.publishedTrackCount),
     boundedCount(right.publishedTrackCount),
   ));
-  const exactCountSatisfied = targetTrackCount > 0 && publishedTrackCount >= targetTrackCount;
+  const exactCountSatisfied = targetTrackCount > 0 && publishedTrackCount === targetTrackCount;
+  const status = countConsistentStatus({
+    status: winner.status,
+    targetTrackCount,
+    publishedTrackCount,
+  });
+  const countReasonCode = publishedTrackCount > targetTrackCount
+    ? "complete_status_overpublished_target"
+    : winner.status === "complete" && !exactCountSatisfied
+      ? "complete_status_below_target"
+      : null;
   return {
     schemaVersion: 1,
     pipelineVersion: left.pipelineVersion,
     policyVersion: left.policyVersion,
-    status: exactCountSatisfied ? "complete" : winner.status,
+    status,
     targetTrackCount,
     discoveredTrackCount,
     qualifiedTrackCount,
@@ -249,7 +283,11 @@ export function mergePipelineOutcomes(
     exactCountSatisfied,
     frontierExhausted: left.frontierExhausted || right.frontierExhausted,
     providerUnavailable: left.providerUnavailable || right.providerUnavailable,
-    reasonCodes: [...new Set([...left.reasonCodes, ...right.reasonCodes])].sort(),
+    reasonCodes: [...new Set([
+      ...left.reasonCodes,
+      ...right.reasonCodes,
+      ...(countReasonCode ? [countReasonCode] : []),
+    ])].sort(),
     deficits: mergeDeficits(left.deficits, right.deficits),
     completedAt: left.completedAt > right.completedAt ? left.completedAt : right.completedAt,
   };
@@ -276,7 +314,20 @@ export function buildPipelineOutcome(input: {
   const selectedTrackCount = Math.min(qualifiedTrackCount, boundedCount(input.selectedTrackCount));
   const publishedTrackCount = Math.min(selectedTrackCount, boundedCount(input.publishedTrackCount));
   const completedAt = input.completedAt ?? new Date().toISOString();
-  const reasonCodes = [...new Set((input.reasonCodes ?? []).map((reason) => reason.trim()).filter(Boolean))];
+  const status = countConsistentStatus({
+    status: input.status,
+    targetTrackCount,
+    publishedTrackCount,
+  });
+  const countReasonCode = publishedTrackCount > targetTrackCount
+    ? "complete_status_overpublished_target"
+    : input.status === "complete" && status !== "complete"
+      ? "complete_status_below_target"
+      : null;
+  const reasonCodes = [...new Set([
+    ...(input.reasonCodes ?? []).map((reason) => reason.trim()).filter(Boolean),
+    ...(countReasonCode ? [countReasonCode] : []),
+  ])];
   const fallbackStageCounts: PipelineStageCounts = {
     discovered: discoveredTrackCount,
     scope_qualified: qualifiedTrackCount,
@@ -298,26 +349,26 @@ export function buildPipelineOutcome(input: {
   const stageCounts = input.stageCounts == null
     ? fallbackStageCounts
     : { ...input.stageCounts };
-  const reasonCode = reasonCodes[0] ?? input.status;
+  const reasonCode = reasonCodes[0] ?? status;
   const deficits = buildPipelineStageLedger({
     targetTrackCount,
     stageCounts,
     exhausted: input.frontierExhausted === true,
     reasonCodes: {
       discovered: reasonCode,
-      scope_qualified: input.status === "partial_evidence_shortfall" ? reasonCode : undefined,
-      claim_verified: input.status === "partial_evidence_shortfall" ? reasonCode : undefined,
-      version_compatible: input.status === "partial_policy_conflict" ? reasonCode : undefined,
-      catalog_resolved: input.status === "partial_catalog_degraded" ? reasonCode : undefined,
-      playable: input.status === "partial_catalog_degraded" ? reasonCode : undefined,
-      canonicalized: input.status === "partial_policy_conflict" ? reasonCode : undefined,
+      scope_qualified: status === "partial_evidence_shortfall" ? reasonCode : undefined,
+      claim_verified: status === "partial_evidence_shortfall" ? reasonCode : undefined,
+      version_compatible: status === "partial_policy_conflict" ? reasonCode : undefined,
+      catalog_resolved: status === "partial_catalog_degraded" ? reasonCode : undefined,
+      playable: status === "partial_catalog_degraded" ? reasonCode : undefined,
+      canonicalized: status === "partial_policy_conflict" ? reasonCode : undefined,
       quota_eligible: reasonCode,
       sequenced: reasonCode,
       manifested: reasonCode,
       published: reasonCode,
     },
     detail: {
-      published: { outcomeStatus: input.status, deficitKind: deficitKind(input.status) },
+      published: { outcomeStatus: status, deficitKind: deficitKind(status) },
     },
     observedAt: completedAt,
   });
@@ -325,7 +376,7 @@ export function buildPipelineOutcome(input: {
     schemaVersion: 1,
     pipelineVersion: input.pipelineVersion,
     policyVersion: input.policyVersion,
-    status: input.status,
+    status,
     targetTrackCount,
     discoveredTrackCount,
     qualifiedTrackCount,

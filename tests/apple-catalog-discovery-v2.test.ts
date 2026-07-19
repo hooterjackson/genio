@@ -152,6 +152,11 @@ describe("Apple-resolved V2 discovery primitives", () => {
       "pl.scope",
       "/v1/catalog/us/playlists/pl.attacker/tracks?offset=100",
     )).rejects.toThrow(/scope changed/iu);
+    await expect(getAppleCatalogPlaylistTracks(
+      "us",
+      "pl.scope",
+      "/v1/catalog/us/playlists/pl.scope/tracks-evil?offset=100",
+    )).rejects.toThrow(/scope changed/iu);
   });
 
   test("artist views expose top songs, albums, and similar artists through fixed endpoints", async () => {

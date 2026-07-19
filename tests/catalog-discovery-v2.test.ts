@@ -7,6 +7,7 @@ import {
   catalogDiscoverySizePolicy,
   classifyCatalogProviderFailure,
   discoverCuratedAppleCatalog,
+  isSafeAppleCatalogCursor,
   scheduleCatalogTasks,
   type CatalogDiscoveryProgressSnapshot,
   type CatalogDiscoveryProvider,
@@ -149,6 +150,81 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
     expect(result.stoppedBecause).toBe("frontier_exhausted");
   });
 
+  test("lossy display slugs never collapse distinct multilingual search aliases", async () => {
+    const queries: string[] = [];
+    await discoverCuratedAppleCatalog(provider({
+      search: async (_storefront, query) => {
+        queries.push(query);
+        return { songs: [], artists: [], albums: [], playlists: [] };
+      },
+    }), {
+      storefront: "us",
+      query: "café",
+      aliases: ["cafe"],
+      target: 25,
+      concurrency: 2,
+      evaluate: () => ({ eligible: false, scopeBindingRefs: [], reasonCode: "none" }),
+    });
+
+    expect(queries).toEqual(["café", "cafe"]);
+  });
+
+  test("failed or malformed track evaluations are isolated without discarding valid siblings", async () => {
+    const result = await discoverCuratedAppleCatalog(provider({
+      search: async () => ({ songs: [song(1), song(2), song(3)], artists: [], albums: [], playlists: [] }),
+    }), {
+      storefront: "us",
+      query: "mixed evaluator output",
+      target: 25,
+      concurrency: 2,
+      evaluate(item) {
+        if (item.id === song(1).id) throw new TypeError("malformed evidence row");
+        if (item.id === song(2).id) return { eligible: "yes", scopeBindingRefs: [null], reasonCode: "" } as never;
+        return { eligible: true, scopeBindingRefs: ["binding:2"], reasonCode: "qualified" };
+      },
+    });
+
+    expect(result.candidates).toHaveLength(3);
+    expect(result.candidates.find((candidate) => candidate.song.id === song(1).id)).toMatchObject({
+      eligible: false,
+      reasonCodes: ["eligibility_evaluation_failed"],
+    });
+    expect(result.candidates.find((candidate) => candidate.song.id === song(2).id)).toMatchObject({
+      eligible: false,
+      reasonCodes: ["eligibility_evaluation_invalid"],
+    });
+    expect(result.qualified.map((candidate) => candidate.song.id)).toEqual([song(3).id]);
+  });
+
+  test("later container pages enrich a duplicate Apple identity before matching", async () => {
+    const sparse = { ...song(1), albumName: "", isrc: undefined, genreNames: ["Music"] };
+    const enriched = { ...song(1), albumName: "Canonical Album", genreNames: ["House"], releaseDate: "1992-01-01" };
+    const result = await discoverCuratedAppleCatalog(provider({
+      search: async () => ({ songs: [sparse], artists: [], albums: [], playlists: [] }),
+      playlistTracks: async () => ({ items: [enriched], next: null }),
+    }), {
+      storefront: "us",
+      query: "metadata enrichment",
+      target: 25,
+      concurrency: 2,
+      scopedPlaylists: [{ id: "pl.enrichment", scopeBindingRefs: ["binding:trusted"] }],
+      evaluate(_item, context) {
+        return context.containerType === "playlist"
+          ? { eligible: true, scopeBindingRefs: [], reasonCode: "qualified" }
+          : { eligible: false, scopeBindingRefs: [], reasonCode: "unbound_search" };
+      },
+    });
+
+    expect(result.qualified).toHaveLength(1);
+    expect(result.qualified[0]!.song).toMatchObject({
+      id: song(1).id,
+      albumName: "Canonical Album",
+      genreNames: ["Music", "House"],
+      releaseDate: "1992-01-01",
+      isrc: song(1).isrc,
+    });
+  });
+
   test("artist and album expansion discovers identities but never qualifies unsupported whole-album tracks", async () => {
     const result = await discoverCuratedAppleCatalog(provider({
       search: async () => ({
@@ -187,6 +263,37 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
     expect(result.candidates.every((candidate) => (
       candidate.reasonCodes.includes("missing_scope_binding")
     ))).toBe(true);
+  });
+
+  test("catalog rediscovery cannot erase trusted bindings from a selected album", async () => {
+    const result = await discoverCuratedAppleCatalog(provider({
+      search: async () => ({
+        songs: [],
+        artists: [],
+        albums: [{ id: "album-bound", name: "Bound Album", artistName: "Artist", genreNames: [] }],
+        playlists: [],
+      }),
+      albumTracks: async (_storefront, albumId) => ({
+        items: albumId === "album-bound" ? [song(1)] : [],
+        next: null,
+      }),
+    }), {
+      storefront: "us",
+      query: "bound album",
+      target: 25,
+      concurrency: 2,
+      selectedAlbums: [{ id: "album-bound", scopeBindingRefs: ["binding:album"] }],
+      evaluate(_item, context) {
+        return {
+          eligible: context.inheritedScopeBindingRefs.includes("binding:album"),
+          scopeBindingRefs: [],
+          reasonCode: "trusted_album_track",
+        };
+      },
+    });
+
+    expect(result.qualified.map((candidate) => candidate.song.id)).toEqual([song(1).id]);
+    expect(result.qualified[0]!.scopeBindingRefs).toContain("binding:album");
   });
 
   test("trusted container bindings remain external and can qualify exact playlist members", async () => {
@@ -305,6 +412,23 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
     }));
   });
 
+  test("cursor validation requires an exact container path boundary", () => {
+    expect(isSafeAppleCatalogCursor("us", {
+      resourceKind: "playlist",
+      resourceId: "pl.scope",
+      artistAlbumView: null,
+      query: "scope",
+      searchTypes: [],
+    }, "/v1/catalog/us/playlists/pl.scope/tracks?offset=100")).toBe(true);
+    expect(isSafeAppleCatalogCursor("us", {
+      resourceKind: "playlist",
+      resourceId: "pl.scope",
+      artistAlbumView: null,
+      query: "scope",
+      searchTypes: [],
+    }, "/v1/catalog/us/playlists/pl.scope/tracks-evil?offset=100")).toBe(false);
+  });
+
   test("returns typed budget, deadline, degraded-provider, and policy stop reasons", async () => {
     const budget = await discoverCuratedAppleCatalog(provider(), {
       storefront: "us",
@@ -316,6 +440,7 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
       evaluate: () => ({ eligible: false, scopeBindingRefs: [], reasonCode: "not_supported" }),
     });
     expect(budget.stoppedBecause).toBe("provider_call_limit");
+    expect(budget.roundsCompleted).toEqual([]);
 
     const deadline = new AbortController();
     deadline.abort(new DOMException("deadline", "AbortError"));
@@ -653,6 +778,17 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
       target: 25,
       concurrency: 2,
       resumeProgress: oversizedContexts,
+      evaluate: () => ({ eligible: false, scopeBindingRefs: [], reasonCode: "none" }),
+    })).rejects.toThrow("checkpoint candidates are invalid");
+
+    const malformedBindings = structuredClone(first.progress);
+    malformedBindings.candidates[0]!.scopeBindingRefs = [null as unknown as string];
+    await expect(discoverCuratedAppleCatalog(provider(), {
+      storefront: "us",
+      query: "bounded resume",
+      target: 25,
+      concurrency: 2,
+      resumeProgress: malformedBindings,
       evaluate: () => ({ eligible: false, scopeBindingRefs: [], reasonCode: "none" }),
     })).rejects.toThrow("checkpoint candidates are invalid");
   });

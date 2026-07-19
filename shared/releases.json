@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.1.1",
+      "releasedAt": "2026-07-19",
+      "title": "Pipeline V2 QA hardening",
+      "notes": [
+        "Hardened staged Apple discovery against malformed pages, multilingual alias collisions, unsafe cursors, incomplete pagination, and corrupted resume checkpoints.",
+        "Separated factual, editorial, similarity, and genre evidence so one claim cannot silently prove another or inherit prompt text as source evidence.",
+        "Unified evidence strength across catalog matching and manifest locking, and expanded factual routing for worked-on and recorded-with requests.",
+        "Made completion outcomes exact: shortfalls stay transparent partial results, while over-publication and integrity failures remain operationally distinct.",
+        "Stabilized the complete responsive browser QA matrix and added regression coverage for every defect found in this release audit."
+      ]
+    },
+    {
       "version": "1.1.0",
       "releasedAt": "2026-07-19",
       "title": "Relevance-first pipeline foundation",

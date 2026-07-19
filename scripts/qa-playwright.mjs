@@ -10,6 +10,7 @@ import { playwrightProjectRuns } from "./qa-playwright-args.mjs";
 const host = "127.0.0.1";
 const suiteLockDirectory = join(tmpdir(), "genio-playwright-suite.lock");
 const localHostnames = new Set(["localhost", "127.0.0.1"]);
+const responsiveProjectCooldownMs = 1_500;
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -188,7 +189,7 @@ function runPlaywright(arguments_, projectName) {
 const runs = playwrightProjectRuns(process.argv.slice(2));
 
 let failed = false;
-for (const run of runs) {
+for (const [index, run] of runs.entries()) {
   if (receivedSignal) break;
   process.stdout.write(`\nBrowser QA project: ${run.projectName ?? "explicit selection"}\n`);
   const result = await runPlaywright(run.arguments_, run.projectName);
@@ -197,6 +198,11 @@ for (const run of runs) {
     break;
   }
   if (result.code !== 0) failed = true;
+  // WebKit helper processes can briefly outlive the Playwright process group
+  // on macOS. Give them a bounded drain window before booting the next
+  // responsive project; otherwise a long matrix can cascade one late timeout
+  // into unrelated failures even though every project passes in isolation.
+  if (index < runs.length - 1 && !receivedSignal) await delay(responsiveProjectCooldownMs);
 }
 
 if (forceKillTimer) clearTimeout(forceKillTimer);

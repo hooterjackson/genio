@@ -72,7 +72,10 @@ describe("legacy factual-frontier compatibility gate", () => {
   test("recognizes factual aliases without treating incidental production adjectives as claims", () => {
     for (const relationship of [
       "collaborated on the released recording",
+      "documents collaborations with Quincy Jones on released tracks",
       "appears on the released recording",
+      "worked on the released recording",
+      "recorded the song with Quincy Jones",
       "was credited as arranger",
       "contributed percussion to the track",
     ]) {
@@ -85,6 +88,31 @@ describe("legacy factual-frontier compatibility gate", () => {
         include: ["well-produced recordings"],
       }),
     })).toBe(false);
+    expect(requiresFactualFrontier(factualBrief({
+      relationship: "is a well-produced ambient recording",
+      evidencePolicy: "cited editorial sources",
+    }))).toBe(false);
+    expect(requiresFactualFrontier(factualBrief({
+      relationship: "was produced by Quincy Jones",
+      evidencePolicy: "require an explicit producer credit",
+    }))).toBe(true);
+    expect(requiresFactualFrontier(factualBrief({
+      relationship: "is a documented contribution by a woman who shaped Detroit techno",
+      evidencePolicy: "cited editorial and scene-history sources",
+    }))).toBe(false);
+    expect(requiresFactualFrontier(factualBrief({
+      relationship: "is music to play at dinner during a listening session",
+      evidencePolicy: "cited mood and activity sources",
+    }))).toBe(false);
+  });
+
+  test("hybrid briefs and typed routes agree on claim-first frontier work", () => {
+    const hybrid = factualBrief({
+      mode: "hybrid",
+      relationship: "belongs to the documented Detroit techno scene",
+      evidencePolicy: "require source-bounded scene evidence",
+    });
+    expect(requiresFactualFrontier(hybrid)).toBe(true);
   });
 
   test("requires reconciled release containers and the complete claim-first frontier", () => {

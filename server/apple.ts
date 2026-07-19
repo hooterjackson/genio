@@ -516,6 +516,11 @@ function normalizeAppleNext(value: unknown): string | null {
   return `${parsed.pathname}${parsed.search}`;
 }
 
+function applePaginationPathMatches(path: string, expectedPathname: string): boolean {
+  const parsed = new URL(path, APPLE_API);
+  return parsed.origin === APPLE_API && parsed.pathname === expectedPathname;
+}
+
 export function playlistShareUrl(item: any): string | null {
   const candidates = [item?.attributes?.url, item?.attributes?.playParams?.shareUrl];
   for (const value of candidates) {
@@ -820,7 +825,7 @@ export async function searchAppleCatalogResources(
   if (!params.get("term")) throw new Error("Apple catalog search term is required");
   const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/search?${params}`;
   const path = next ? normalizeAppleNext(next) : initial;
-  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/search?`)) {
+  if (!path || !applePaginationPathMatches(path, `/v1/catalog/${normalizedStorefront}/search`)) {
     throw new Error("Apple search pagination scope changed unexpectedly");
   }
   const continued = new URL(path, APPLE_API);
@@ -853,9 +858,10 @@ export async function getAppleCatalogPlaylistTracks(
   const normalizedStorefront = checkedStorefront(storefront);
   const normalizedId = playlistId.trim();
   if (!/^pl\.[A-Za-z0-9_-]{1,200}$/u.test(normalizedId)) throw new Error("Apple catalog playlist ID is invalid");
-  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/playlists/${encodeURIComponent(normalizedId)}/tracks?limit=100`;
+  const expectedPath = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/playlists/${encodeURIComponent(normalizedId)}/tracks`;
+  const initial = `${expectedPath}?limit=100`;
   const path = next ? normalizeAppleNext(next) : initial;
-  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/playlists/${encodeURIComponent(normalizedId)}/tracks`)) {
+  if (!path || !applePaginationPathMatches(path, expectedPath)) {
     throw new Error("Apple playlist pagination scope changed unexpectedly");
   }
   const payload = await new AppleMusicClient().request(path, { signal });
@@ -870,9 +876,10 @@ export async function getAppleCatalogAlbumTracks(
 ): Promise<AppleCatalogPage<CatalogSong>> {
   const normalizedStorefront = checkedStorefront(storefront);
   const normalizedId = checkedNumericCatalogId(albumId, "album");
-  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/albums/${normalizedId}/tracks?limit=100`;
+  const expectedPath = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/albums/${normalizedId}/tracks`;
+  const initial = `${expectedPath}?limit=100`;
   const path = next ? normalizeAppleNext(next) : initial;
-  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/albums/${normalizedId}/tracks`)) {
+  if (!path || !applePaginationPathMatches(path, expectedPath)) {
     throw new Error("Apple album pagination scope changed unexpectedly");
   }
   const payload = await new AppleMusicClient().request(path, { signal });
@@ -887,9 +894,10 @@ export async function getAppleCatalogArtistTopSongs(
 ): Promise<AppleCatalogPage<CatalogSong>> {
   const normalizedStorefront = checkedStorefront(storefront);
   const normalizedId = checkedNumericCatalogId(artistId, "artist");
-  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/top-songs?limit=25`;
+  const expectedPath = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/top-songs`;
+  const initial = `${expectedPath}?limit=25`;
   const path = next ? normalizeAppleNext(next) : initial;
-  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/artists/${normalizedId}/view/top-songs`)) {
+  if (!path || !applePaginationPathMatches(path, expectedPath)) {
     throw new Error("Apple artist pagination scope changed unexpectedly");
   }
   const payload = await new AppleMusicClient().request(path, { signal });
@@ -924,9 +932,10 @@ export async function getAppleCatalogArtistAlbums(
     "singles",
   ]);
   if (!allowed.has(view)) throw new Error("Apple artist album view is invalid");
-  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/${view}?limit=25`;
+  const expectedPath = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/${view}`;
+  const initial = `${expectedPath}?limit=25`;
   const path = next ? normalizeAppleNext(next) : initial;
-  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/artists/${normalizedId}/view/${view}`)) {
+  if (!path || !applePaginationPathMatches(path, expectedPath)) {
     throw new Error("Apple artist pagination scope changed unexpectedly");
   }
   const payload = await new AppleMusicClient().request(path, { signal });
@@ -941,9 +950,10 @@ export async function getAppleCatalogSimilarArtists(
 ): Promise<AppleCatalogPage<AppleCatalogArtist>> {
   const normalizedStorefront = checkedStorefront(storefront);
   const normalizedId = checkedNumericCatalogId(artistId, "artist");
-  const initial = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/similar-artists?limit=25`;
+  const expectedPath = `/v1/catalog/${encodeURIComponent(normalizedStorefront)}/artists/${normalizedId}/view/similar-artists`;
+  const initial = `${expectedPath}?limit=25`;
   const path = next ? normalizeAppleNext(next) : initial;
-  if (!path || !path.startsWith(`/v1/catalog/${normalizedStorefront}/artists/${normalizedId}/view/similar-artists`)) {
+  if (!path || !applePaginationPathMatches(path, expectedPath)) {
     throw new Error("Apple similar-artist pagination scope changed unexpectedly");
   }
   const payload = await new AppleMusicClient().request(path, { signal });

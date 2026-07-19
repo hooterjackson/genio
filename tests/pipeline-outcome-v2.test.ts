@@ -109,6 +109,80 @@ describe("Pipeline V2 terminal outcomes", () => {
     expect(outcome.deficits.every((entry) => entry.status === "resolved" && entry.deficitCount === 0)).toBe(true);
   });
 
+  test("normalizes a claimed complete shortfall into a safe typed partial", () => {
+    const outcome = buildPipelineOutcome({
+      ...versions,
+      status: "complete",
+      targetTrackCount: 25,
+      discoveredTrackCount: 30,
+      qualifiedTrackCount: 20,
+      selectedTrackCount: 19,
+      publishedTrackCount: 19,
+    });
+
+    expect(outcome).toMatchObject({
+      status: "partial_evidence_shortfall",
+      exactCountSatisfied: false,
+      reasonCodes: expect.arrayContaining(["complete_status_below_target"]),
+    });
+  });
+
+  test("treats over-publication as an integrity outcome rather than exact completion", () => {
+    const outcome = buildPipelineOutcome({
+      ...versions,
+      status: "complete",
+      targetTrackCount: 25,
+      discoveredTrackCount: 30,
+      qualifiedTrackCount: 30,
+      selectedTrackCount: 26,
+      publishedTrackCount: 26,
+    });
+
+    expect(outcome).toMatchObject({
+      status: "failed_integrity",
+      exactCountSatisfied: false,
+      reasonCodes: expect.arrayContaining(["complete_status_overpublished_target"]),
+    });
+  });
+
+  test("over-publication remains an integrity outcome even when a stale worker labels it partial", () => {
+    const outcome = buildPipelineOutcome({
+      ...versions,
+      status: "partial_catalog_degraded",
+      targetTrackCount: 25,
+      discoveredTrackCount: 30,
+      qualifiedTrackCount: 30,
+      selectedTrackCount: 26,
+      publishedTrackCount: 26,
+    });
+
+    expect(outcome).toMatchObject({
+      status: "failed_integrity",
+      exactCountSatisfied: false,
+      reasonCodes: expect.arrayContaining(["complete_status_overpublished_target"]),
+    });
+  });
+
+  test.each([
+    "failed_integrity",
+    "failed_system",
+    "cancelled",
+    "waiting_for_owner_authorization",
+  ] as const)("exact count never erases the %s operational outcome", (status) => {
+    const outcome = buildPipelineOutcome({
+      ...versions,
+      status,
+      targetTrackCount: 25,
+      discoveredTrackCount: 30,
+      qualifiedTrackCount: 30,
+      selectedTrackCount: 25,
+      publishedTrackCount: 25,
+    });
+
+    expect(outcome.status).toBe(status);
+    expect(outcome.exactCountSatisfied).toBe(true);
+  });
+
   test("normalizes impossible stage counts without inventing tracks", () => {
     const outcome = buildPipelineOutcome({
       ...versions,
@@ -189,6 +263,33 @@ describe("Pipeline V2 terminal outcomes", () => {
       deficits: expect.arrayContaining([
         expect.objectContaining({ stage: "published", status: "resolved", deficitCount: 0 }),
       ]),
+    });
+  });
+
+  test("merge does not call an over-published legacy snapshot complete", () => {
+    const validPartial = buildPipelineOutcome({
+      ...versions,
+      status: "partial_evidence_shortfall",
+      targetTrackCount: 25,
+      discoveredTrackCount: 30,
+      qualifiedTrackCount: 30,
+      selectedTrackCount: 24,
+      publishedTrackCount: 24,
+    });
+    const legacyOverPublished = {
+      ...validPartial,
+      status: "complete" as const,
+      selectedTrackCount: 26,
+      publishedTrackCount: 26,
+      exactCountSatisfied: true,
+      reasonCodes: [],
+    };
+
+    expect(mergePipelineOutcomes(validPartial, legacyOverPublished)).toMatchObject({
+      status: "failed_integrity",
+      exactCountSatisfied: false,
+      publishedTrackCount: 26,
+      reasonCodes: expect.arrayContaining(["complete_status_overpublished_target"]),
     });
   });
 

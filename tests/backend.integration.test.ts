@@ -2781,6 +2781,173 @@ databaseDescribe("hosted backend integration", () => {
     });
   });
 
+  test("Pipeline V2 manifest eligibility retains separate factual and editorial claims for composite requests", async () => {
+    const compositeBrief: PlaylistBrief = {
+      ...brief,
+      title: "Influential Paulinho da Costa performances",
+      description: "Influential recordings Paulinho da Costa performed on.",
+      mode: "curated",
+      subjectEntities: ["Paulinho da Costa"],
+      relationship: "Paulinho da Costa performed on and the recording was influential",
+      include: [],
+      exclude: [],
+      evidencePolicy: "track-level performance credit and independent historical support",
+      orderingPolicy: "influence rank",
+      targetSize: { min: 2, max: 2 },
+    };
+    const runId = await repository.createRun(compositeBrief.title, compositeBrief, 0, 1);
+    const plan = createSelectionPlanV2({
+      prompt: compositeBrief.description,
+      brief: compositeBrief,
+    });
+    expect(plan.intents).toEqual(expect.arrayContaining(["factual_relationship", "editorial_ranking"]));
+    await repository.savePipelineSelectionPlan(runId, plan);
+
+    const factualUrl = `https://session-credit.example/${randomUUID()}`;
+    const editorialUrl = `https://music-history.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: factualUrl,
+      title: "Exact session credit",
+      sourceClass: "web",
+      provenanceRoot: "session-credit.example",
+      note: "Exact track-level performance evidence.",
+    }, {
+      url: editorialUrl,
+      title: "Independent historical assessment",
+      sourceClass: "web",
+      provenanceRoot: "music-history.example",
+      note: "Independent track-level influence evidence.",
+    }]);
+    const factualRelationship = "Paulinho da Costa performed percussion on this track";
+    const editorialRelationship = "This recording was culturally influential and historically important";
+    const qualifiedFactual = citationFixture(
+      factualUrl,
+      "Composite Qualified Recording",
+      factualRelationship,
+      compositeBrief.subjectEntities[0],
+    );
+    const qualifiedEditorial = citationFixture(
+      editorialUrl,
+      "Composite Qualified Recording",
+      editorialRelationship,
+      compositeBrief.subjectEntities[0],
+    );
+    const factualOnly = citationFixture(
+      factualUrl,
+      "Factual Only Recording",
+      factualRelationship,
+      compositeBrief.subjectEntities[0],
+    );
+    await repository.addCitationAttestations(runId, [
+      qualifiedFactual.attestation,
+      qualifiedEditorial.attestation,
+      factualOnly.attestation,
+    ]);
+    await repository.addCandidates(runId, [{
+      artist: "Session Artist",
+      title: "Composite Qualified Recording",
+      album: "Composite Album",
+      releaseYear: 1982,
+      durationMs: 180_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [{
+        sourceUrl: factualUrl,
+        state: "verified" as const,
+        supportScope: "track" as const,
+        subjectEntity: compositeBrief.subjectEntities[0]!,
+        subjectRelationship: compositeBrief.relationship,
+        relationship: factualRelationship,
+        note: factualRelationship,
+        citationSupport: qualifiedFactual.support,
+      }, {
+        sourceUrl: editorialUrl,
+        state: "editorial" as const,
+        supportScope: "editorial" as const,
+        subjectEntity: compositeBrief.subjectEntities[0]!,
+        subjectRelationship: compositeBrief.relationship,
+        relationship: editorialRelationship,
+        note: editorialRelationship,
+        citationSupport: qualifiedEditorial.support,
+      }],
+    }, {
+      artist: "Session Artist",
+      title: "Factual Only Recording",
+      album: "Composite Album",
+      releaseYear: 1983,
+      durationMs: 181_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [{
+        sourceUrl: factualUrl,
+        state: "verified" as const,
+        supportScope: "track" as const,
+        subjectEntity: compositeBrief.subjectEntities[0]!,
+        subjectRelationship: compositeBrief.relationship,
+        relationship: factualRelationship,
+        note: factualRelationship,
+        citationSupport: factualOnly.support,
+      }],
+    }], sourceIds, "track_verification");
+
+    const candidates = await repository.listCandidates(runId);
+    for (const candidate of candidates) {
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible catalog identity",
+        score: 1,
+        song: {
+          id: `catalog-${candidate.title.toLowerCase().replaceAll(" ", "-")}`,
+          name: candidate.title,
+          artistName: candidate.artist,
+          albumName: candidate.album ?? "",
+          releaseDate: `${candidate.releaseYear}-01-01`,
+          durationInMillis: candidate.durationMs ?? undefined,
+        },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => track.title)).toEqual(["Composite Qualified Recording"]);
+    const storedBindings = await repository.pool.query<{
+      title: string;
+      scope_axis: string;
+      provenance_root: string;
+    }>(
+      `SELECT c.title,b.scope_axis,s.provenance_root
+       FROM track_scope_bindings b
+       JOIN track_candidates c ON c.id=b.candidate_id
+       JOIN source_records s ON s.id=b.source_record_id
+       WHERE b.run_id=$1 ORDER BY c.title,b.scope_axis`,
+      [runId],
+    );
+    expect(storedBindings.rows.filter((row) => row.title === "Composite Qualified Recording"))
+      .toEqual(expect.arrayContaining([
+        {
+          title: "Composite Qualified Recording",
+          scope_axis: "factual_relationship",
+          provenance_root: "session-credit.example",
+        },
+        {
+          title: "Composite Qualified Recording",
+          scope_axis: "editorial_ranked",
+          provenance_root: "music-history.example",
+        },
+      ]));
+    const rejected = await repository.pool.query<{ status: string; outcome: string }>(
+      `SELECT m.status,c.outcome FROM track_candidates c
+       JOIN catalog_matches m ON m.run_id=c.run_id AND m.candidate_id=c.id
+       WHERE c.run_id=$1 AND c.title='Factual Only Recording'`,
+      [runId],
+    );
+    expect(rejected.rows[0]).toEqual({ status: "unsupported", outcome: "unsupported" });
+  });
+
   test("Pipeline V2 atomically persists catalog-grown candidates with stable identity and authoritative scope provenance", async () => {
     const catalogBrief: PlaylistBrief = {
       ...brief,

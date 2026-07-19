@@ -313,6 +313,16 @@ const MAX_CHECKPOINT_CANDIDATES = 50_000;
 const MAX_CHECKPOINT_FRONTIER_ITEMS = 2_000;
 const MAX_CHECKPOINT_CONTEXTS_PER_CANDIDATE = 64;
 const MAX_CHECKPOINT_SEQUENCE = 1_000_000_000;
+const STRATEGY_KINDS = new Set<CatalogDiscoveryStrategyKind>([
+  "direct_search", "trusted_scoped_playlist", "seed_artist_top_songs", "artist_singles",
+  "selected_album_tracks", "artist_full_albums", "artist_appears_on", "similar_artists",
+  "similar_artist_top_songs", "deep_pagination", "deficit_search",
+]);
+const SEARCH_TYPES = new Set<AppleCatalogSearchType>(["songs", "artists", "albums", "playlists"]);
+const ARTIST_ALBUM_VIEWS = new Set<AppleArtistAlbumView>([
+  "appears-on-albums", "compilation-albums", "featured-albums", "full-albums",
+  "latest-release", "live-albums", "singles",
+]);
 
 const CATALOG_SIZE_POLICIES: readonly CatalogDiscoverySizePolicy[] = Object.freeze([
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 25, deadlineMs: 30_000, maxPagesPerStrategy: 4, maxTotalProviderCalls: 48 }),
@@ -384,6 +394,10 @@ function stableUnique(values: readonly string[], maximum = 32): string[] {
   return output;
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
 function discoveryRequestFingerprint(input: {
   queryTerms: readonly string[];
   deficitQueries: readonly string[];
@@ -420,6 +434,19 @@ function copySeedAlbum(album: CatalogDiscoverySeedAlbum): CatalogDiscoverySeedAl
   return {
     id: album.id,
     scopeBindingRefs: stableUnique(album.scopeBindingRefs ?? [], 64),
+  };
+}
+
+function mergeSeedAlbum(
+  existing: CatalogDiscoverySeedAlbum | undefined,
+  incoming: CatalogDiscoverySeedAlbum,
+): CatalogDiscoverySeedAlbum {
+  return {
+    id: incoming.id,
+    scopeBindingRefs: stableUnique([
+      ...(existing?.scopeBindingRefs ?? []),
+      ...(incoming.scopeBindingRefs ?? []),
+    ], 64),
   };
 }
 
@@ -502,21 +529,34 @@ function assertResumeProgress(
     throw new Error("Catalog discovery checkpoint rounds are invalid");
   }
   if (!Array.isArray(snapshot.seedArtists) || snapshot.seedArtists.length > MAX_SEED_ARTISTS
-    || snapshot.seedArtists.some((artist) => !artist.id || !artist.name)
+    || snapshot.seedArtists.some((artist) => typeof artist?.id !== "string" || !artist.id
+      || typeof artist.name !== "string" || !artist.name)
     || !Array.isArray(snapshot.selectedAlbums) || snapshot.selectedAlbums.length > MAX_DYNAMIC_ALBUMS
-    || snapshot.selectedAlbums.some((album) => !album.id || !Array.isArray(album.scopeBindingRefs))
+    || snapshot.selectedAlbums.some((album) => typeof album?.id !== "string" || !album.id
+      || !isStringArray(album.scopeBindingRefs))
     || !Array.isArray(snapshot.fullAlbums) || snapshot.fullAlbums.length > MAX_DYNAMIC_ALBUMS
-    || snapshot.fullAlbums.some((album) => !album.id || !Array.isArray(album.scopeBindingRefs))) {
+    || snapshot.fullAlbums.some((album) => typeof album?.id !== "string" || !album.id
+      || !isStringArray(album.scopeBindingRefs))) {
     throw new Error("Catalog discovery checkpoint resources are invalid");
   }
   const candidateIds = new Set<string>();
   let eligibleCandidates = 0;
   for (const candidate of snapshot.candidates) {
-    if (!candidate?.song?.id || candidateIds.has(candidate.song.id)
+    if (typeof candidate?.song?.id !== "string" || !candidate.song.id
+      || candidateIds.has(candidate.song.id)
+      || typeof candidate.eligible !== "boolean"
       || !Array.isArray(candidate.contexts)
       || candidate.contexts.length > MAX_CHECKPOINT_CONTEXTS_PER_CANDIDATE
-      || !Array.isArray(candidate.scopeBindingRefs)
-      || !Array.isArray(candidate.reasonCodes)) {
+      || candidate.contexts.some((context) => !context
+        || !ROUND_ORDER.includes(context.round)
+        || typeof context.strategyId !== "string" || !context.strategyId
+        || !STRATEGY_KINDS.has(context.strategyKind)
+        || !["search", "playlist", "album", "artist"].includes(context.containerType)
+        || !(context.query === null || typeof context.query === "string")
+        || !(context.containerId === null || typeof context.containerId === "string")
+        || !isStringArray(context.inheritedScopeBindingRefs))
+      || !isStringArray(candidate.scopeBindingRefs)
+      || !isStringArray(candidate.reasonCodes)) {
       throw new Error("Catalog discovery checkpoint candidates are invalid");
     }
     candidateIds.add(candidate.song.id);
@@ -539,6 +579,23 @@ function assertResumeProgress(
 function safeIdPart(value: string): string {
   return value.normalize("NFKD").replace(/[\u0300-\u036f]/gu, "")
     .toLocaleLowerCase("en-US").replace(/[^a-z0-9]+/gu, "-").replace(/^-|-$/gu, "").slice(0, 80) || "item";
+}
+
+function workIdentity(item: WorkItem): string {
+  return JSON.stringify({
+    round: item.round,
+    kind: item.kind,
+    resourceKind: item.resourceKind,
+    searchTypes: item.searchTypes,
+    query: item.query,
+    resourceId: item.resourceId,
+    artistAlbumView: item.artistAlbumView,
+    inheritedScopeBindingRefs: [...item.inheritedScopeBindingRefs].sort(),
+  });
+}
+
+function workIdentitySuffix(item: WorkItem): string {
+  return createHash("sha256").update(workIdentity(item)).digest("hex").slice(0, 10);
 }
 
 function workItem(input: Omit<WorkItem, "cursor" | "pagesAttempted" | "zeroYieldPages" | "discoveredCount" | "qualifiedCount" | "status" | "lastReasonCode" | "retryable" | "searchTypes"> & {
@@ -565,13 +622,28 @@ function resumableWorkItem(state: CatalogDiscoveryStrategyState): WorkItem | nul
   const validResources: readonly WorkItem["resourceKind"][] = [
     "search", "playlist", "album", "artist_top", "artist_albums", "similar_artists",
   ];
-  if (!state.resourceKind || !state.id || !ROUND_ORDER.includes(state.round)
+  if (!state.resourceKind || typeof state.id !== "string" || !state.id
+    || !ROUND_ORDER.includes(state.round) || !STRATEGY_KINDS.has(state.kind)
     || !validStatuses.includes(state.status) || !validResources.includes(state.resourceKind)
     || !Number.isSafeInteger(state.pagesAttempted) || state.pagesAttempted < 0
     || !Number.isSafeInteger(state.maxPages) || state.maxPages < 1 || state.maxPages > 20
     || !Number.isSafeInteger(state.zeroYieldPages) || state.zeroYieldPages < 0
     || !Number.isSafeInteger(state.discoveredCount) || state.discoveredCount < 0
-    || !Number.isSafeInteger(state.qualifiedCount) || state.qualifiedCount < 0) return null;
+    || !Number.isSafeInteger(state.qualifiedCount) || state.qualifiedCount < 0
+    || typeof state.retryable !== "boolean"
+    || !(state.lastReasonCode === null || typeof state.lastReasonCode === "string")
+    || !(state.cursor === null || typeof state.cursor === "string")
+    || !(state.query === null || typeof state.query === "string")
+    || !(state.resourceId === null || typeof state.resourceId === "string")
+    || !(state.artistAlbumView === null || ARTIST_ALBUM_VIEWS.has(state.artistAlbumView))
+    || !isStringArray(state.inheritedScopeBindingRefs)
+    || (state.searchTypes !== undefined
+      && (!isStringArray(state.searchTypes)
+        || state.searchTypes.some((type) => !SEARCH_TYPES.has(type as AppleCatalogSearchType))))
+    || (state.resourceKind === "search" && (!state.query || state.resourceId !== null))
+    || (state.resourceKind !== "search" && !state.resourceId)
+    || (state.resourceKind === "artist_albums" && !state.artistAlbumView)
+    || (state.resourceKind !== "artist_albums" && state.artistAlbumView !== null)) return null;
   const retryTransient = state.status === "failed" && state.retryable;
   const interrupted = state.status === "running";
   return {
@@ -579,7 +651,11 @@ function resumableWorkItem(state: CatalogDiscoveryStrategyState): WorkItem | nul
     round: state.round,
     kind: state.kind,
     resourceKind: state.resourceKind,
-    searchTypes: state.searchTypes?.length ? [...state.searchTypes] : ["songs", "artists", "albums", "playlists"],
+    searchTypes: state.searchTypes?.length
+      ? [...state.searchTypes]
+      : state.resourceKind === "search"
+        ? ["songs", "artists", "albums", "playlists"]
+        : [],
     query: state.query,
     resourceId: state.resourceId,
     artistAlbumView: state.artistAlbumView,
@@ -637,9 +713,10 @@ export function isSafeAppleCatalogCursor(
   if (!cursor.startsWith("/") || cursor.startsWith("//") || cursor.includes("://") || cursor.includes("\\")) return false;
   const comparable = { ...item } as WorkItem;
   const prefix = cursorPrefix(storefront, comparable);
-  if (!prefix || !cursor.startsWith(prefix)) return false;
-  if (item.resourceKind !== "search") return true;
+  if (!prefix) return false;
   const parsed = new URL(cursor, "https://api.music.apple.com");
+  if (item.resourceKind !== "search") return parsed.pathname === prefix;
+  if (parsed.pathname !== `/v1/catalog/${storefront}/search`) return false;
   const cursorTypes = (parsed.searchParams.get("types") ?? "").split(",").filter(Boolean);
   return parsed.searchParams.get("term") === item.query
     && cursorTypes.length > 0
@@ -670,9 +747,44 @@ function frontierState(item: WorkItem): CatalogDiscoveryStrategyState {
 }
 
 function addWork(queue: WorkItem[], seen: Set<string>, item: WorkItem): void {
-  if (seen.has(item.id)) return;
+  if (seen.has(item.id)) {
+    const existing = queue.find((queued) => queued.id === item.id);
+    if (existing && workIdentity(existing) === workIdentity(item)) return;
+    const baseId = item.id;
+    item.id = `${baseId}:${workIdentitySuffix(item)}`;
+    let collision = 1;
+    while (seen.has(item.id)) {
+      const colliding = queue.find((queued) => queued.id === item.id);
+      if (colliding && workIdentity(colliding) === workIdentity(item)) return;
+      item.id = `${baseId}:${workIdentitySuffix(item)}:${collision}`;
+      collision += 1;
+    }
+  }
   seen.add(item.id);
   queue.push(item);
+}
+
+function mergeCatalogSong(existing: CatalogSong, incoming: CatalogSong): CatalogSong {
+  const genreNames = stableUnique([
+    ...(existing.genreNames ?? []),
+    ...(incoming.genreNames ?? []),
+  ], 64);
+  return {
+    id: existing.id,
+    name: existing.name || incoming.name,
+    artistName: existing.artistName || incoming.artistName,
+    albumName: existing.albumName || incoming.albumName,
+    ...(genreNames.length ? { genreNames } : {}),
+    ...(existing.releaseDate || incoming.releaseDate ? { releaseDate: existing.releaseDate ?? incoming.releaseDate } : {}),
+    ...(existing.durationInMillis !== undefined || incoming.durationInMillis !== undefined
+      ? { durationInMillis: existing.durationInMillis ?? incoming.durationInMillis }
+      : {}),
+    ...(existing.isrc || incoming.isrc ? { isrc: existing.isrc ?? incoming.isrc } : {}),
+    ...(existing.url || incoming.url ? { url: existing.url ?? incoming.url } : {}),
+    ...(existing.artworkUrl || incoming.artworkUrl ? { artworkUrl: existing.artworkUrl ?? incoming.artworkUrl } : {}),
+    ...(existing.versionLabel || incoming.versionLabel ? { versionLabel: existing.versionLabel ?? incoming.versionLabel } : {}),
+    ...(existing.contentRating || incoming.contentRating ? { contentRating: existing.contentRating ?? incoming.contentRating } : {}),
+  };
 }
 
 function qualifiedGoalFor(target: number, qualified: number, attempts: number): { reserve: number; goal: number; rawGoal: number } {
@@ -832,8 +944,12 @@ export async function discoverCuratedAppleCatalog(
   const selectedAlbums = new Map<string, CatalogDiscoverySeedAlbum>();
   const fullAlbums = new Map<string, CatalogDiscoverySeedAlbum>();
   for (const artist of request.resumeProgress?.seedArtists ?? []) seedArtists.set(artist.id, { ...artist });
-  for (const album of request.resumeProgress?.selectedAlbums ?? []) selectedAlbums.set(album.id, copySeedAlbum(album));
-  for (const album of request.resumeProgress?.fullAlbums ?? []) fullAlbums.set(album.id, copySeedAlbum(album));
+  for (const album of request.resumeProgress?.selectedAlbums ?? []) {
+    selectedAlbums.set(album.id, mergeSeedAlbum(selectedAlbums.get(album.id), album));
+  }
+  for (const album of request.resumeProgress?.fullAlbums ?? []) {
+    fullAlbums.set(album.id, mergeSeedAlbum(fullAlbums.get(album.id), album));
+  }
   for (const candidate of request.resumeProgress?.candidates ?? []) {
     const restored = copyCheckpointCandidate(candidate);
     candidates.set(restored.song.id, restored);
@@ -893,8 +1009,12 @@ export async function discoverCuratedAppleCatalog(
   };
 
   for (const artist of requestSeedArtists) seedArtists.set(artist.id, { ...artist });
-  for (const album of requestSelectedAlbums) selectedAlbums.set(album.id, copySeedAlbum(album));
-  for (const album of requestFullAlbums) fullAlbums.set(album.id, copySeedAlbum(album));
+  for (const album of requestSelectedAlbums) {
+    selectedAlbums.set(album.id, mergeSeedAlbum(selectedAlbums.get(album.id), album));
+  }
+  for (const album of requestFullAlbums) {
+    fullAlbums.set(album.id, mergeSeedAlbum(fullAlbums.get(album.id), album));
+  }
 
   const qualifySongs = async (item: WorkItem, songs: readonly CatalogSong[]): Promise<{ discovered: number; qualified: number }> => {
     let discovered = 0;
@@ -903,7 +1023,27 @@ export async function discoverCuratedAppleCatalog(
     for (const song of songs) {
       if (!song.id) continue;
       const wasKnown = candidates.has(song.id);
-      const decision = await request.evaluate(song, context);
+      let decision: CatalogEligibilityDecision;
+      let evaluationFailure: "eligibility_evaluation_failed" | "eligibility_evaluation_invalid" | null = null;
+      try {
+        const evaluated = await request.evaluate(song, context);
+        if (!evaluated || typeof evaluated !== "object"
+          || typeof evaluated.eligible !== "boolean"
+          || !Array.isArray(evaluated.scopeBindingRefs)
+          || evaluated.scopeBindingRefs.some((reference) => typeof reference !== "string")
+          || typeof evaluated.reasonCode !== "string"
+          || !evaluated.reasonCode.trim()) {
+          evaluationFailure = "eligibility_evaluation_invalid";
+          decision = { eligible: false, scopeBindingRefs: [], reasonCode: evaluationFailure };
+        } else {
+          decision = evaluated;
+        }
+      } catch (error) {
+        if (request.signal?.aborted
+          || (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))) throw error;
+        evaluationFailure = "eligibility_evaluation_failed";
+        decision = { eligible: false, scopeBindingRefs: [], reasonCode: evaluationFailure };
+      }
       const bindingRefs = stableUnique([
         ...item.inheritedScopeBindingRefs,
         ...decision.scopeBindingRefs,
@@ -918,16 +1058,18 @@ export async function discoverCuratedAppleCatalog(
           eligible,
           scopeBindingRefs: bindingRefs,
           contexts: [context],
-          reasonCodes: [eligible ? decision.reasonCode : bindingRefs.length === 0 ? "missing_scope_binding" : decision.reasonCode],
+          reasonCodes: [evaluationFailure
+            ?? (eligible ? decision.reasonCode : bindingRefs.length === 0 ? "missing_scope_binding" : decision.reasonCode)],
         });
         discovered += 1;
       } else {
+        existing.song = mergeCatalogSong(existing.song, song);
         existing.eligible ||= eligible;
         existing.scopeBindingRefs = stableUnique([...existing.scopeBindingRefs, ...bindingRefs], 64);
         existing.contexts = boundedCandidateContexts([...existing.contexts, context]);
         existing.reasonCodes = stableUnique([
           ...existing.reasonCodes,
-          eligible ? decision.reasonCode : bindingRefs.length === 0 ? "missing_scope_binding" : decision.reasonCode,
+          evaluationFailure ?? (eligible ? decision.reasonCode : bindingRefs.length === 0 ? "missing_scope_binding" : decision.reasonCode),
         ], 64);
       }
       if (eligible && (!wasKnown || !wasEligible)) qualified += 1;
@@ -942,6 +1084,7 @@ export async function discoverCuratedAppleCatalog(
   };
 
   const runRound = async (round: CatalogDiscoveryRound, work: WorkItem[], deep = false): Promise<void> => {
+    const roundWasRunnable = !goalReached() && providerCallCount < maxProviderCalls && !request.signal?.aborted;
     let pending = work.filter((item) => item.round === round && item.status === "pending");
     while (pending.length > 0 && !goalReached() && providerCallCount < maxProviderCalls && !request.signal?.aborted) {
       const allowance = maxProviderCalls - providerCallCount;
@@ -981,7 +1124,7 @@ export async function discoverCuratedAppleCatalog(
           }
           for (const album of page.albums) {
             if (selectedAlbums.size >= MAX_DYNAMIC_ALBUMS) break;
-            selectedAlbums.set(album.id, { id: album.id });
+            selectedAlbums.set(album.id, mergeSeedAlbum(selectedAlbums.get(album.id), { id: album.id }));
           }
           if (request.trustDiscoveredPlaylist && item.query) {
             for (const playlist of page.playlists) {
@@ -1037,7 +1180,10 @@ export async function discoverCuratedAppleCatalog(
             : selectedAlbums;
           for (const album of page.albums) {
             if (destination.size >= MAX_DYNAMIC_ALBUMS) break;
-            destination.set(album.id, { id: album.id, scopeBindingRefs: item.inheritedScopeBindingRefs });
+            destination.set(album.id, mergeSeedAlbum(destination.get(album.id), {
+              id: album.id,
+              scopeBindingRefs: item.inheritedScopeBindingRefs,
+            }));
             const albumRound = item.artistAlbumView === "singles" ? "B" : "C";
             addWork(allWork, seenWork, workItem({
               id: `${albumRound}:album:${safeIdPart(album.id)}`,
@@ -1086,7 +1232,9 @@ export async function discoverCuratedAppleCatalog(
       }
       pending = work.filter((item) => item.round === round && item.status === "pending");
     }
-    roundsCompleted.push(round);
+    const unresolved = work.some((item) => item.round === round
+      && (item.status === "pending" || item.status === "running" || (item.status === "failed" && item.retryable)));
+    if (roundWasRunnable && !unresolved) roundsCompleted.push(round);
   };
 
   for (const term of queryTerms) {

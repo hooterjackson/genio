@@ -77,6 +77,45 @@ export interface TrackScopeBindingSummary {
   scopeAxis?: TrackScopeBinding["scopeAxis"];
 }
 
+export interface TrackScopeBindingEvidenceClassification {
+  layer: TrackScopeBindingSummary["layer"];
+  supportsRequestedRelationship: boolean;
+}
+
+/**
+ * One confidence boundary is shared by catalog matching and manifest lock.
+ * An attested exact-track editorial claim is intentionally strong enough to
+ * stand on one independent source; lower-confidence claims still require two
+ * independent provenance roots.
+ */
+export function trackScopeBindingStrength(confidence: number): TrackScopeBindingSummary["strength"] {
+  return Number.isFinite(confidence) && confidence >= 0.8 ? "strong" : "medium";
+}
+
+/**
+ * Classify one binding by the claim it actually proves. A composite request
+ * must not turn every exact-track citation into a factual claim merely because
+ * one of the run's other intents is factual.
+ */
+export function classifyTrackScopeBindingEvidence(input: {
+  bindingKind: TrackScopeBindingKind;
+  scopeAxis?: TrackScopeBinding["scopeAxis"];
+  citationAttested: boolean;
+}): TrackScopeBindingEvidenceClassification {
+  if (input.bindingKind !== "track_specific_source") {
+    return { layer: "scope_binding", supportsRequestedRelationship: true };
+  }
+  if (!input.citationAttested) {
+    return { layer: "scope_binding", supportsRequestedRelationship: false };
+  }
+  return {
+    layer: ["factual_relationship", "exhaustive"].includes(input.scopeAxis ?? "")
+      ? "factual_claim"
+      : "track_claim",
+    supportsRequestedRelationship: true,
+  };
+}
+
 const ONE_SIDED_95_PERCENT_Z = 1.6448536269514722;
 const COLD_START_YIELD = 0.5;
 const MINIMUM_PLANNING_YIELD = 0.2;
@@ -300,11 +339,15 @@ export function scopeBindingEligible(
   if (mode === "exhaustive"
     || requestedIntents.includes("factual_relationship")
     || requestedIntents.includes("exhaustive")) {
-    return independentEvidenceThreshold(supporting, (binding) => binding.layer === "factual_claim"
-      && ["factual_relationship", "exhaustive"].includes(binding.scopeAxis ?? ""));
+    if (!independentEvidenceThreshold(supporting, (binding) => binding.layer === "factual_claim"
+      && ["factual_relationship", "exhaustive"].includes(binding.scopeAxis ?? ""))) return false;
   }
 
   for (const intent of requestedIntents) {
+    // The factual threshold above is necessary but not sufficient for a
+    // composite request. For example, a verified percussion credit cannot by
+    // itself prove that the track was influential or stylistically similar.
+    if (intent === "factual_relationship" || intent === "exhaustive") continue;
     if (intent === "genre_scene") {
       if (!independentEvidenceThreshold(supporting, genreSceneBinding)) return false;
       continue;
