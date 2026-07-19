@@ -38,6 +38,7 @@ import {
 import { normalizeMusicText } from "../lib/matching.ts";
 import {
   briefShouldDiversifyArtists,
+  desiredPlaylistArtistCount,
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
@@ -1303,6 +1304,7 @@ export class Repository {
       manifest_track_count: number;
       omitted_candidate_count: number;
       unresolved_coverage_count: number;
+      curated_quality_gap_count: number;
     }>(
       `SELECT
          r.brief_json->>'mode' AS mode,
@@ -1323,7 +1325,11 @@ export class Repository {
            WHERE c.run_id=$1 AND (
              c.status IN ('discovered','enumerating','inaccessible','unresolved')
              OR (c.advertised_total IS NOT NULL AND c.advertised_total>c.recovered_total)
-           ))) AS unresolved_coverage_count
+           ))) AS unresolved_coverage_count,
+         COALESCE((SELECT CASE
+           WHEN COALESCE((rc.state_json->>'artistShortfall')::int,0)>0 THEN 1 ELSE 0 END
+           FROM research_checkpoints rc
+           WHERE rc.run_id=$1 AND rc.phase='catalog_matching_outcome'),0)::int AS curated_quality_gap_count
        FROM research_runs r
        WHERE r.id=$1`,
       [runId, manifestId],
@@ -1338,6 +1344,7 @@ export class Repository {
       manifestTrackCount: Number(row?.manifest_track_count ?? 0),
       omittedCandidateCount: Number(row?.omitted_candidate_count ?? 0),
       unresolvedCoverageCount: Number(row?.unresolved_coverage_count ?? 0),
+      curatedQualityGapCount: Number(row?.curated_quality_gap_count ?? 0),
     });
   }
 
@@ -1351,8 +1358,12 @@ export class Repository {
           (SELECT count(*)::int FROM source_records WHERE run_id=$1) source_count,
           ((SELECT count(*)::int FROM source_frontier
              WHERE run_id=$1 AND status IN ('pending','unresolved','inaccessible')) +
-           (SELECT count(*)::int FROM research_containers
-             WHERE run_id=$1 AND status IN ('discovered','enumerating','inaccessible','unresolved'))) unresolved_count`,
+          (SELECT count(*)::int FROM research_containers
+             WHERE run_id=$1 AND status IN ('discovered','enumerating','inaccessible','unresolved'))
+          + COALESCE((SELECT CASE
+              WHEN COALESCE((state_json->>'artistShortfall')::int,0)>0 THEN 1 ELSE 0 END
+            FROM research_checkpoints
+            WHERE run_id=$1 AND phase='catalog_matching_outcome'),0)) unresolved_count`,
         [id],
       ),
       this.getFrontier(id),
@@ -1412,7 +1423,11 @@ export class Repository {
             WHERE sf.run_id=r.id AND sf.status IN ('pending','unresolved','inaccessible'))
           +
           (SELECT count(*)::int FROM research_containers rc
-            WHERE rc.run_id=r.id AND rc.status IN ('discovered','enumerating','inaccessible','unresolved'))) AS unresolved_count
+            WHERE rc.run_id=r.id AND rc.status IN ('discovered','enumerating','inaccessible','unresolved'))
+          + COALESCE((SELECT CASE
+              WHEN COALESCE((cp.state_json->>'artistShortfall')::int,0)>0 THEN 1 ELSE 0 END
+            FROM research_checkpoints cp
+            WHERE cp.run_id=r.id AND cp.phase='catalog_matching_outcome'),0)) AS unresolved_count
        FROM capability_session_accesses csa
        JOIN capability_sessions s ON s.id=csa.session_id
        JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
@@ -2444,6 +2459,10 @@ export class Repository {
     storefront: string,
     additionalCandidateGoal: number,
     currentRefillGeneration: number,
+    diversity: { desiredArtistCount: number; representedArtists: string[] } = {
+      desiredArtistCount: 0,
+      representedArtists: [],
+    },
   ): Promise<"queued" | "in_flight" | "not_needed" | "exhausted"> {
     if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
     const boundedGoal = Math.max(1, Math.min(120, Math.floor(additionalCandidateGoal)));
@@ -2514,6 +2533,8 @@ export class Repository {
         {
           eligibleCount: Number(baseline.rows[0]?.eligible_count ?? 0),
           selectionRank: Number(baseline.rows[0]?.selection_rank ?? 0),
+          diversityTarget: diversity.desiredArtistCount,
+          representedArtists: diversity.representedArtists,
         },
       );
       await client.query(
@@ -2909,14 +2930,18 @@ export class Repository {
       const maximumTracks = brief.mode === "curated"
         ? Math.max(1, Math.floor(brief.targetSize?.max ?? 100))
         : Number.POSITIVE_INFINITY;
+      const diversifyArtists = excludedReferenceArtists(brief).length > 0
+        || briefShouldDiversifyArtists(brief);
       const selection = selectRankedPlaylistRows(matches.rows, maximumTracks, {
         // “Sounds like X” uses X only as a reference. Prefer a genuinely
         // exploratory set from the accepted reserve instead of allowing the
         // first adjacent artist returned by research to dominate the result.
         // The progressive cap still fills the exact target when the available
         // catalog has only a few qualifying artists.
-        diversifyArtists: excludedReferenceArtists(brief).length > 0
-          || briefShouldDiversifyArtists(brief),
+        diversifyArtists,
+        minimumDistinctArtists: diversifyArtists && Number.isFinite(maximumTracks)
+          ? desiredPlaylistArtistCount(brief, maximumTracks)
+          : 0,
       });
       const selectedMatches = selection.selected;
       const overflowMatches = selection.overflow;

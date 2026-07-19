@@ -9,6 +9,7 @@ import { interpretPrompt } from "../server/openai.ts";
 import {
   artistDiversityResearchInstruction,
   briefShouldDiversifyArtists,
+  desiredPlaylistArtistCount,
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 
@@ -194,6 +195,7 @@ describe("ambiguous genre and artist-breadth adversarial corpus", () => {
     ];
     const selection = selectRankedPlaylistRows(ranked, 25, {
       diversifyArtists: briefShouldDiversifyArtists(brief),
+      minimumDistinctArtists: desiredPlaylistArtistCount(brief, 25),
     });
     const counts = selection.selected.reduce<Map<string, number>>((map, row) => {
       map.set(row.artist, (map.get(row.artist) ?? 0) + 1);
@@ -204,6 +206,6 @@ describe("ambiguous genre and artist-breadth adversarial corpus", () => {
     expect(counts.size).toBeGreaterThanOrEqual(10);
     expect(Math.max(...counts.values())).toBeLessThanOrEqual(4);
     expect(artistDiversityResearchInstruction(brief, 25))
-      .toContain("at least 5 distinct credited recording artists");
+      .toContain("at least 10 distinct credited recording artists");
   });
 });

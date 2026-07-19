@@ -9,6 +9,9 @@ import {
   artistDiversityResearchInstruction,
   briefExplicitlyRequestsArtistDiversity,
   briefShouldDiversifyArtists,
+  desiredPlaylistArtistCount,
+  playlistArtistKey,
+  prioritizeUnrepresentedArtistRows,
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 
@@ -172,6 +175,7 @@ describe("deterministic playlist sequencing", () => {
     expect(briefShouldDiversifyArtists(frenchJazzBrief)).toBe(true);
     const selection = selectRankedPlaylistRows(ranked, 50, {
       diversifyArtists: briefShouldDiversifyArtists(frenchJazzBrief),
+      minimumDistinctArtists: desiredPlaylistArtistCount(frenchJazzBrief, 50),
     });
     const counts = selection.selected.reduce<Map<string, number>>((result, row) => {
       result.set(row.artist, (result.get(row.artist) ?? 0) + 1);
@@ -183,8 +187,58 @@ describe("deterministic playlist sequencing", () => {
     expect(counts.size).toBeGreaterThanOrEqual(10);
     expect(Math.max(...counts.values())).toBeLessThanOrEqual(8);
     expect(artistDiversityResearchInstruction(frenchJazzBrief, 50)).toContain(
-      "at least 10 distinct credited recording artists",
+      "at least 20 distinct credited recording artists",
     );
+  });
+
+  test("preserves the accepted artist minimum when ranked rows are grouped by artist", () => {
+    const brief = {
+      mode: "curated",
+      relationship: "representative of",
+      description: "A French jazz playlist.",
+      include: [],
+      orderingPolicy: "editorial flow",
+    };
+    const ranked = Array.from({ length: 10 }, (_, artistIndex) => (
+      Array.from({ length: 5 }, (_, trackIndex) => track(
+        `${artistIndex}-${trackIndex}`,
+        `French Jazz Artist ${artistIndex + 1}`,
+        `Album ${artistIndex + 1}`,
+      ))
+    )).flat();
+
+    const selection = selectRankedPlaylistRows(ranked, 25, {
+      diversifyArtists: true,
+      minimumDistinctArtists: desiredPlaylistArtistCount(brief, 25),
+    });
+    const counts = selection.selected.reduce<Map<string, number>>((result, row) => {
+      result.set(row.artist, (result.get(row.artist) ?? 0) + 1);
+      return result;
+    }, new Map());
+
+    expect(selection.selected).toHaveLength(25);
+    expect(counts.size).toBe(10);
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(4);
+  });
+
+  test("keeps non-Latin credited artists distinct in diversity accounting", () => {
+    const artists = ["山下洋輔", "渡辺貞夫", "上原ひろみ"];
+    expect(new Set(artists.map((artist) => playlistArtistKey(artist))).size).toBe(3);
+    expect(artists.every((artist) => playlistArtistKey(artist).length > 0)).toBe(true);
+  });
+
+  test("prioritizes one row from every new artist before refill repeats", () => {
+    const rows = [
+      ...Array.from({ length: 5 }, (_, index) => ({ id: `old-${index}`, artist: "Django Reinhardt" })),
+      ...Array.from({ length: 5 }, (_, index) => ({ id: `new-a-${index}`, artist: "Barney Wilen" })),
+      ...Array.from({ length: 5 }, (_, index) => ({ id: `new-b-${index}`, artist: "Jef Gilson" })),
+      ...Array.from({ length: 5 }, (_, index) => ({ id: `new-c-${index}`, artist: "Leïla Olivesi" })),
+    ];
+
+    const prioritized = prioritizeUnrepresentedArtistRows(rows, ["Django Reinhardt"]);
+    expect(prioritized.slice(0, 3).map((row) => row.artist))
+      .toEqual(["Barney Wilen", "Jef Gilson", "Leïla Olivesi"]);
+    expect(new Set(prioritized.map((row) => row.id))).toEqual(new Set(rows.map((row) => row.id)));
   });
 
   test.each([

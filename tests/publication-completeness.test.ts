@@ -39,6 +39,16 @@ describe("publication completeness policy", () => {
     expect(publicationTerminalStatus(completeness)).toBe("partial");
   });
 
+  test("an exhausted curated artist-breadth shortfall remains a visible publication gap", () => {
+    const completeness = resolve({ curatedQualityGapCount: 1 });
+
+    expect(completeness).toEqual({
+      omittedCandidateCount: 0,
+      unresolvedCoverageCount: 1,
+    });
+    expect(publicationTerminalStatus(completeness)).toBe("partial");
+  });
+
   test.each(["exhaustive", "hybrid"] as const)(
     "%s publication retains strict candidate and source-frontier accounting",
     (mode) => {

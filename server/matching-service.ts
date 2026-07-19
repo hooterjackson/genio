@@ -19,6 +19,7 @@ import {
 } from "./catalog-match-recovery.ts";
 import {
   createFastRouteCheckpoint,
+  fastArtistDiversityRefillPlan,
   fastPostMatchRefillPlan,
   FAST_MATCHING_FINALIZATION_RESERVE_MS,
   FAST_POST_MATCH_REFILL_LIMIT,
@@ -26,6 +27,10 @@ import {
   parseFastRouteCheckpoint,
   researchExecutionPolicy,
 } from "./research-policy.ts";
+import {
+  desiredPlaylistArtistCount,
+  playlistArtistKey,
+} from "../lib/playlist-selection.ts";
 
 interface Candidate extends TrackCandidateInput {
   id: string;
@@ -55,6 +60,9 @@ interface MatchingOutcomeCheckpoint {
   targetMinimum: number | null;
   safePrimaryCount: number;
   shortfall: number;
+  desiredArtistCount: number;
+  representedArtistCount: number;
+  artistShortfall: number;
   status: "complete" | "shortfall";
   updatedAt: string;
 }
@@ -88,6 +96,7 @@ export interface MatchingRepository {
     storefront: string,
     additionalCandidateGoal: number,
     currentRefillGeneration: number,
+    diversity?: { desiredArtistCount: number; representedArtists: string[] },
   ): Promise<AutomaticCandidateRefillState>;
   queueAutomaticPublication(runId: string): Promise<void>;
 }
@@ -140,27 +149,59 @@ async function finalizeMatchingOutcome(
   if (await resumeOrIgnoreAutomaticHandoff(repository, runId, latest)) return;
   const brief = latest.brief;
   const matches = await repository.listMatches(runId);
-  const safePrimaryIds = matches
-    .filter((match) => isSafePrimaryMatch(match, latest.autoPublish === true))
-    .map((match) => match.song!.id);
-  const safePrimaryCount = new Set(safePrimaryIds).size;
+  const safePrimaryMatches = matches
+    .filter((match) => isSafePrimaryMatch(match, latest.autoPublish === true));
+  const uniqueSafePrimaryMatches = [...new Map(safePrimaryMatches.map((match) => [
+    match.song!.id,
+    match,
+  ])).values()];
+  const safePrimaryCount = uniqueSafePrimaryMatches.length;
   const configuredMinimum = Number(brief.targetSize?.min);
   const targetMinimum = brief.targetSize && Number.isFinite(configuredMinimum)
     ? Math.max(0, Math.floor(configuredMinimum))
     : null;
   const shortfall = targetMinimum === null ? 0 : Math.max(0, targetMinimum - safePrimaryCount);
+  const candidates = await repository.listCandidates(runId);
+  const candidateArtists = new Map(candidates.map((candidate) => [candidate.id, candidate.artist]));
+  const safeArtists = uniqueSafePrimaryMatches.map((match) => (
+    (match as ExistingMatch & { artist?: string }).artist
+      ?? candidateArtists.get(match.candidateId)
+      ?? match.song?.artistName
+      ?? ""
+  )).map((artist) => artist.trim()).filter(Boolean);
+  // A legacy or synthetic repository may not expose candidate artist names.
+  // Skip diversity recovery rather than inventing a deficit when the accepted
+  // pool cannot be assessed. The production repository always joins them.
+  const artistBreadthIsAssessable = safeArtists.length === uniqueSafePrimaryMatches.length;
+  const desiredArtistCount = targetMinimum !== null && artistBreadthIsAssessable
+    ? desiredPlaylistArtistCount(brief, targetMinimum)
+    : 0;
+  const representedArtists = [...new Set(safeArtists.map((artist) => playlistArtistKey(artist)))];
+  const representedArtistLabels = [...new Map(safeArtists.map((artist) => [
+    playlistArtistKey(artist),
+    artist,
+  ])).values()];
+  const representedArtistCount = representedArtists.length;
+  const artistShortfall = Math.max(0, desiredArtistCount - representedArtistCount);
   const checkpoint: MatchingOutcomeCheckpoint = {
     storefront,
     targetMinimum,
     safePrimaryCount,
     shortfall,
-    status: shortfall > 0 ? "shortfall" : "complete",
+    desiredArtistCount,
+    representedArtistCount,
+    artistShortfall,
+    status: shortfall > 0 || artistShortfall > 0 ? "shortfall" : "complete",
     updatedAt: new Date().toISOString(),
   };
   await repository.saveResearchCheckpoint(runId, MATCHING_OUTCOME_CHECKPOINT, checkpoint);
 
-  if (shortfall > 0) {
-    if (latest.autoPublish) {
+  if (latest.autoPublish) {
+    const exactTarget = targetMinimum !== null
+      && Number(brief.targetSize?.max) === targetMinimum;
+    const policy = researchExecutionPolicy(brief);
+    const refillEligible = exactTarget && brief.mode === "curated" && policy.kind === "fast_curated";
+    if (shortfall > 0) {
       const recovery = await repository.queueAutomaticCatalogRecovery(
         runId,
         storefront,
@@ -168,33 +209,44 @@ async function finalizeMatchingOutcome(
         currentRefillGeneration,
       );
       if (recovery === "queued" || recovery === "in_flight") return;
-      const exactTarget = targetMinimum !== null
-        && Number(brief.targetSize?.max) === targetMinimum;
-      const policy = researchExecutionPolicy(brief);
-      if (exactTarget && brief.mode === "curated" && policy.kind === "fast_curated") {
-        const refillPlan = fastPostMatchRefillPlan({
-          requestedMinimum: targetMinimum,
-          selectableCount: safePrimaryCount,
-          attemptedCandidateCount: matches.length,
-          refillAttempts: currentRefillGeneration,
-        });
-        if (refillPlan.state === "refill") {
-          const refill = await repository.queueAutomaticCandidateRefill(
-            runId,
-            storefront,
-            refillPlan.additionalCandidateGoal,
-            currentRefillGeneration,
-          );
-          if (refill === "queued" || refill === "in_flight") return;
-        }
+    }
+    if (refillEligible && targetMinimum !== null) {
+      const countRefillPlan = fastPostMatchRefillPlan({
+        requestedMinimum: targetMinimum,
+        selectableCount: safePrimaryCount,
+        attemptedCandidateCount: matches.length,
+        refillAttempts: currentRefillGeneration,
+      });
+      const diversityRefillPlan = fastArtistDiversityRefillPlan({
+        requestedTrackCount: targetMinimum,
+        desiredArtistCount,
+        representedArtistCount,
+        refillAttempts: currentRefillGeneration,
+      });
+      const additionalCandidateGoal = Math.max(
+        countRefillPlan.state === "refill" ? countRefillPlan.additionalCandidateGoal : 0,
+        diversityRefillPlan.state === "refill" ? diversityRefillPlan.additionalCandidateGoal : 0,
+      );
+      if (additionalCandidateGoal > 0) {
+        const refill = await repository.queueAutomaticCandidateRefill(
+          runId,
+          storefront,
+          additionalCandidateGoal,
+          currentRefillGeneration,
+          {
+            desiredArtistCount,
+            representedArtists: representedArtistLabels,
+          },
+        );
+        if (refill === "queued" || refill === "in_flight") return;
       }
+    }
 
+    if (shortfall > 0) {
       // Count recovery is deliberately bounded, but exhausting that budget is
       // not a publication failure. Lock and publish every strict, unique Apple
       // match we did find; publication completeness will record the missing
-      // target count and finish the run as `partial`. This keeps the exact-count
-      // target as a recovery goal without turning an otherwise useful playlist
-      // into a terminal error.
+      // target count and finish the run as `partial`.
       if (safePrimaryCount > 0) {
         await repository.updateRun(runId, {
           status: "visitor_review",
@@ -205,15 +257,18 @@ async function finalizeMatchingOutcome(
         return;
       }
 
-      // Apple cannot publish a zero-track manifest. Still do not classify an
-      // empty catalog result as a failed task solely because it missed the
-      // requested count; preserve the outcome checkpoint and complete it as a
-      // transparent partial result with no playlist volume.
       await repository.updateRun(runId, {
         status: "partial",
         phase: "catalog_matching_empty",
         error: null,
       });
+      return;
+    }
+  }
+
+  if (shortfall > 0) {
+    if (latest.autoPublish) {
+      // The automatic branch above always returns for a count shortfall.
       return;
     }
     await repository.updateRun(runId, {

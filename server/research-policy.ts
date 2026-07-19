@@ -93,6 +93,15 @@ export interface FastPostMatchRefillPlan {
   additionalCandidateGoal: number;
 }
 
+export interface FastArtistDiversityRefillPlan {
+  state: "satisfied" | "refill" | "shortfall";
+  requestedTrackCount: number;
+  desiredArtistCount: number;
+  representedArtistCount: number;
+  artistShortfall: number;
+  additionalCandidateGoal: number;
+}
+
 export interface FastPostMatchRefillRouteCheckpoint {
   status: "queued";
   profile: "fast_post_match_refill_v1";
@@ -107,6 +116,8 @@ export interface FastPostMatchRefillRouteCheckpoint {
   baselineEligibleCount: number;
   targetEligibleCount: number;
   baselineSelectionRank: number;
+  diversityTarget?: number;
+  representedArtists?: string[];
 }
 
 export function fastPostMatchRefillMatchingReserveMs(additionalCandidateGoal: number): number {
@@ -125,7 +136,12 @@ export function createFastPostMatchRefillRouteCheckpoint(
   storefront: string,
   confirmedAt = new Date(),
   environment: Environment = process.env,
-  baseline: { eligibleCount?: number; selectionRank?: number } = {},
+  baseline: {
+    eligibleCount?: number;
+    selectionRank?: number;
+    diversityTarget?: number;
+    representedArtists?: readonly string[];
+  } = {},
 ): FastPostMatchRefillRouteCheckpoint {
   const confirmedMs = confirmedAt.getTime();
   if (!Number.isFinite(confirmedMs)) throw new Error("Catalog refill confirmation time is invalid");
@@ -137,6 +153,13 @@ export function createFastPostMatchRefillRouteCheckpoint(
   const deadlineMs = confirmedMs + FAST_POST_MATCH_REFILL_RESEARCH_MS + matchingReserveMs;
   const baselineEligibleCount = Math.max(0, Math.floor(baseline.eligibleCount ?? 0));
   const baselineSelectionRank = Math.max(0, Math.floor(baseline.selectionRank ?? 0));
+  const requestedDiversityTarget = Number(baseline.diversityTarget ?? 0);
+  const diversityTarget = Number.isFinite(requestedDiversityTarget)
+    ? Math.max(0, Math.min(boundedGoal + baselineEligibleCount, Math.floor(requestedDiversityTarget)))
+    : 0;
+  const representedArtists = [...new Set((baseline.representedArtists ?? [])
+    .map((artist) => artist.trim())
+    .filter(Boolean))].slice(0, 120);
   return {
     status: "queued",
     profile: "fast_post_match_refill_v1",
@@ -151,6 +174,8 @@ export function createFastPostMatchRefillRouteCheckpoint(
     baselineEligibleCount,
     targetEligibleCount: baselineEligibleCount + boundedGoal,
     baselineSelectionRank,
+    ...(diversityTarget > 0 ? { diversityTarget } : {}),
+    ...(representedArtists.length > 0 ? { representedArtists } : {}),
   };
 }
 
@@ -176,6 +201,11 @@ export function parseFastPostMatchRefillRouteCheckpoint(
   if (!Number.isInteger(row.targetEligibleCount)
     || Number(row.targetEligibleCount) !== Number(row.baselineEligibleCount) + Number(row.additionalCandidateGoal)) return null;
   if (!Number.isInteger(row.baselineSelectionRank) || Number(row.baselineSelectionRank) < 0) return null;
+  if (row.diversityTarget !== undefined
+    && (!Number.isInteger(row.diversityTarget) || Number(row.diversityTarget) < 1)) return null;
+  if (row.representedArtists !== undefined
+    && (!Array.isArray(row.representedArtists)
+      || row.representedArtists.some((artist) => typeof artist !== "string" || !artist.trim()))) return null;
   const expectedMatchingReserveMs = fastPostMatchRefillMatchingReserveMs(Number(row.additionalCandidateGoal));
   if (deadlineMs - confirmedMs !== FAST_POST_MATCH_REFILL_RESEARCH_MS + expectedMatchingReserveMs
     || deadlineMs - researchDeadlineMs !== expectedMatchingReserveMs
@@ -194,6 +224,73 @@ export function parseFastPostMatchRefillRouteCheckpoint(
     baselineEligibleCount: Number(row.baselineEligibleCount),
     targetEligibleCount: Number(row.targetEligibleCount),
     baselineSelectionRank: Number(row.baselineSelectionRank),
+    ...(row.diversityTarget !== undefined ? { diversityTarget: Number(row.diversityTarget) } : {}),
+    ...(row.representedArtists !== undefined
+      ? { representedArtists: [...new Set(row.representedArtists.map((artist) => artist.trim()))].slice(0, 120) }
+      : {}),
+  };
+}
+
+/**
+ * Plan a bounded cited refill when Apple already has enough strict tracks but
+ * the accepted pool is still concentrated in too few credited artists.
+ * Each missing artist needs more than one research candidate because some
+ * versions will fail strict catalog matching; a 75% target reserve keeps the
+ * path useful without exceeding the existing per-generation ceiling.
+ */
+export function fastArtistDiversityRefillPlan(input: {
+  requestedTrackCount: number;
+  desiredArtistCount: number;
+  representedArtistCount: number;
+  refillAttempts: number;
+}): FastArtistDiversityRefillPlan {
+  const requestedTrackCount = Number.isFinite(input.requestedTrackCount)
+    ? Math.max(1, Math.floor(input.requestedTrackCount))
+    : 1;
+  const requestedDesiredArtistCount = Number.isFinite(input.desiredArtistCount)
+    ? Math.floor(input.desiredArtistCount)
+    : 0;
+  const desiredArtistCount = Math.max(0, Math.min(
+    requestedTrackCount,
+    requestedDesiredArtistCount,
+  ));
+  const representedArtistCount = Number.isFinite(input.representedArtistCount)
+    ? Math.max(0, Math.floor(input.representedArtistCount))
+    : 0;
+  const artistShortfall = Math.max(0, desiredArtistCount - representedArtistCount);
+  if (artistShortfall === 0 || desiredArtistCount === 0) {
+    return {
+      state: "satisfied",
+      requestedTrackCount,
+      desiredArtistCount,
+      representedArtistCount,
+      artistShortfall: 0,
+      additionalCandidateGoal: 0,
+    };
+  }
+  const refillAttempts = Number.isFinite(input.refillAttempts)
+    ? Math.max(0, Math.floor(input.refillAttempts))
+    : FAST_POST_MATCH_REFILL_LIMIT;
+  if (refillAttempts >= FAST_POST_MATCH_REFILL_LIMIT) {
+    return {
+      state: "shortfall",
+      requestedTrackCount,
+      desiredArtistCount,
+      representedArtistCount,
+      artistShortfall,
+      additionalCandidateGoal: 0,
+    };
+  }
+  return {
+    state: "refill",
+    requestedTrackCount,
+    desiredArtistCount,
+    representedArtistCount,
+    artistShortfall,
+    additionalCandidateGoal: Math.min(
+      FAST_EXTRACTION_CANDIDATE_LIMIT,
+      Math.max(artistShortfall * 3, Math.ceil(requestedTrackCount * 0.75)),
+    ),
   };
 }
 

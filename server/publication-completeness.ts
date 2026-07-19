@@ -9,6 +9,7 @@ export interface PublicationCompletenessInput extends PublicationCompleteness {
   mode: PlaylistMode;
   targetMinimum: number | null;
   manifestTrackCount: number;
+  curatedQualityGapCount?: number;
 }
 
 function nonNegativeInteger(value: number): number {
@@ -45,6 +46,9 @@ export function resolvePublicationCompleteness(
       0,
       Number(input.targetMinimum) - nonNegativeInteger(input.manifestTrackCount),
     ),
-    unresolvedCoverageCount: 0,
+    // Curated reserve/frontier rows are not gaps once the requested count is
+    // filled, but a measured quality contract (currently credited-artist
+    // breadth) remains visible when bounded recovery could not satisfy it.
+    unresolvedCoverageCount: nonNegativeInteger(input.curatedQualityGapCount ?? 0),
   };
 }

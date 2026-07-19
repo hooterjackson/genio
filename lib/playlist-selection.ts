@@ -10,6 +10,33 @@ export interface PlaylistSelectionResult<T extends PlaylistSelectionRow> {
 export interface PlaylistSelectionOptions {
   diversifyArtists?: boolean;
   maximumInitialArtistShare?: number;
+  minimumDistinctArtists?: number;
+}
+
+/**
+ * Keep model/source rank stable while moving one strongest row from every
+ * newly discovered artist ahead of repeat rows. This is used only by a
+ * measured diversity refill; it does not alter direct-artist research.
+ */
+export function prioritizeUnrepresentedArtistRows<T extends PlaylistSelectionRow>(
+  rows: readonly T[],
+  representedArtists: readonly string[],
+): T[] {
+  const represented = new Set(representedArtists.map(playlistArtistKey).filter(Boolean));
+  const seeded = new Set<string>();
+  const prioritizedIndexes = new Set<number>();
+  const output: T[] = [];
+  rows.forEach((row, index) => {
+    const key = playlistArtistKey(row.artist);
+    if (!key || represented.has(key) || seeded.has(key)) return;
+    seeded.add(key);
+    prioritizedIndexes.add(index);
+    output.push(row);
+  });
+  rows.forEach((row, index) => {
+    if (!prioritizedIndexes.has(index)) output.push(row);
+  });
+  return output;
 }
 
 export interface ArtistDiversityBrief {
@@ -80,6 +107,24 @@ export function briefShouldDiversifyArtists(brief: ArtistDiversityBrief): boolea
 }
 
 /**
+ * Broad curated playlists need enough distinct credited artists to function
+ * as a scene or genre survey instead of an accidental stack of mini-
+ * discographies. Keep the goal proportional for larger requests, while an
+ * eight-artist floor prevents a normal 25-track playlist from collapsing to
+ * the first two or three canonical names returned by search.
+ */
+export function desiredPlaylistArtistCount(
+  brief: ArtistDiversityBrief,
+  requestedTrackCount: number,
+): number {
+  if (!briefShouldDiversifyArtists(brief)) return 0;
+  const target = Number.isFinite(requestedTrackCount)
+    ? Math.max(1, Math.floor(requestedTrackCount))
+    : 50;
+  return Math.min(target, Math.max(8, Math.ceil(target * 0.4)));
+}
+
+/**
  * Give research a measurable breadth target before deterministic selection.
  * The wording remains conditional because a genuinely narrow documented
  * scope must never be broadened with unsupported recordings merely to hit a
@@ -93,19 +138,23 @@ export function artistDiversityResearchInstruction(
   const target = Number.isFinite(requestedTrackCount)
     ? Math.max(1, Math.floor(requestedTrackCount))
     : 50;
-  const desiredArtists = Math.min(target, Math.max(5, Math.ceil(target / 5)));
+  const desiredArtists = desiredPlaylistArtistCount(brief, target);
   const artistCap = Math.max(2, Math.ceil(target * 0.15));
   return ` This is a multi-artist curated scope. When the documented scope permits, recover candidates from at least ${desiredArtists} distinct credited recording artists and do not let one artist supply more than ${artistCap} of the ${target} publication tracks. Search beyond the first canonical artists and sources; on refill passes prioritize supported artists not yet represented. Never broaden the confirmed scope or weaken evidence merely to satisfy artist breadth.`;
 }
 
-function artistKey(value: string): string {
-  return value
+export function playlistArtistKey(value: string): string {
+  const normalized = value
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/gu, "")
     .toLocaleLowerCase("en-US")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/gu, " ");
+  // A small number of credited artist names intentionally contain only
+  // punctuation or symbols (for example “!!!”). Preserve those as distinct
+  // identities instead of collapsing them into an unknown empty bucket.
+  return normalized || value.normalize("NFKC").toLocaleLowerCase("en-US").trim().replace(/\s+/gu, " ");
 }
 
 /**
@@ -138,6 +187,26 @@ export function selectRankedPlaylistRows<T extends PlaylistSelectionRow>(
   let artistCap = Math.max(1, Math.ceil(limit * initialShare));
   const selectedIndexes = new Set<number>();
   const artistCounts = new Map<string, number>();
+  const configuredMinimumDistinctArtists = options.minimumDistinctArtists ?? 0;
+  const minimumDistinctArtists = Number.isFinite(configuredMinimumDistinctArtists)
+    ? Math.max(0, Math.min(limit, Math.floor(configuredMinimumDistinctArtists)))
+    : 0;
+
+  // Preserve the research/matching diversity contract in the immutable
+  // manifest. Ranked results commonly arrive grouped by artist, so applying
+  // only a per-artist cap can fill the target before later artists are ever
+  // reached. Seed the strongest row from each distinct artist first, then
+  // complete the playlist under the progressive cap below.
+  if (minimumDistinctArtists > 0) {
+    const seededArtists = new Set<string>();
+    for (let index = 0; index < rows.length && seededArtists.size < minimumDistinctArtists; index += 1) {
+      const key = playlistArtistKey(rows[index]!.artist);
+      if (!key || seededArtists.has(key)) continue;
+      seededArtists.add(key);
+      selectedIndexes.add(index);
+      artistCounts.set(key, 1);
+    }
+  }
 
   // Increase the cap one step at a time. This finds the lowest feasible
   // maximum artist count for the available pool while preserving source rank
@@ -146,7 +215,7 @@ export function selectRankedPlaylistRows<T extends PlaylistSelectionRow>(
     let added = 0;
     for (let index = 0; index < rows.length && selectedIndexes.size < limit; index += 1) {
       if (selectedIndexes.has(index)) continue;
-      const key = artistKey(rows[index]!.artist) || `unknown:${index}`;
+      const key = playlistArtistKey(rows[index]!.artist) || `unknown:${index}`;
       const count = artistCounts.get(key) ?? 0;
       if (count >= artistCap) continue;
       selectedIndexes.add(index);

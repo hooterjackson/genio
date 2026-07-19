@@ -23,6 +23,7 @@ import {
   createFastPostMatchRefillRouteCheckpoint,
   FAST_POST_MATCH_REFILL_LIMIT,
   FAST_POST_MATCH_REFILL_RESEARCH_MS,
+  fastArtistDiversityRefillPlan,
   fastPostMatchRefillPlan,
   parseFastPostMatchRefillRouteCheckpoint,
 } from "../server/research-policy.ts";
@@ -101,6 +102,44 @@ describe("post-match research-refill policy", () => {
     });
   });
 
+  test("plans a bounded distinct-artist refill after track count is already satisfied", () => {
+    expect(fastArtistDiversityRefillPlan({
+      requestedTrackCount: 25,
+      desiredArtistCount: 10,
+      representedArtistCount: 4,
+      refillAttempts: 0,
+    })).toEqual({
+      state: "refill",
+      requestedTrackCount: 25,
+      desiredArtistCount: 10,
+      representedArtistCount: 4,
+      artistShortfall: 6,
+      additionalCandidateGoal: 19,
+    });
+    expect(fastArtistDiversityRefillPlan({
+      requestedTrackCount: 25,
+      desiredArtistCount: 10,
+      representedArtistCount: 4,
+      refillAttempts: FAST_POST_MATCH_REFILL_LIMIT,
+    })).toMatchObject({ state: "shortfall", artistShortfall: 6, additionalCandidateGoal: 0 });
+  });
+
+  test("fails closed instead of returning NaN for malformed diversity inputs", () => {
+    expect(fastArtistDiversityRefillPlan({
+      requestedTrackCount: Number.NaN,
+      desiredArtistCount: Number.NaN,
+      representedArtistCount: Number.NaN,
+      refillAttempts: Number.NaN,
+    })).toEqual({
+      state: "satisfied",
+      requestedTrackCount: 1,
+      desiredArtistCount: 0,
+      representedArtistCount: 0,
+      artistShortfall: 0,
+      additionalCandidateGoal: 0,
+    });
+  });
+
   test("persists each refill's candidate goal and immutable research/matching deadline split", () => {
     const confirmedAt = new Date("2026-07-17T12:00:00.000Z");
     const checkpoint = createFastPostMatchRefillRouteCheckpoint(
@@ -109,6 +148,12 @@ describe("post-match research-refill policy", () => {
       "US",
       confirmedAt,
       { OPENAI_FAST_MODEL: "fast-refill-snapshot" },
+      {
+        eligibleCount: 25,
+        selectionRank: 44,
+        diversityTarget: 10,
+        representedArtists: ["Django Reinhardt", "Michel Petrucciani"],
+      },
     );
 
     expect(checkpoint).toMatchObject({
@@ -118,6 +163,10 @@ describe("post-match research-refill policy", () => {
       additionalCandidateGoal: 21,
       storefront: "us",
       model: "fast-refill-snapshot",
+      baselineEligibleCount: 25,
+      baselineSelectionRank: 44,
+      diversityTarget: 10,
+      representedArtists: ["Django Reinhardt", "Michel Petrucciani"],
       confirmedAt: confirmedAt.toISOString(),
       researchDeadlineAt: new Date(confirmedAt.getTime() + FAST_POST_MATCH_REFILL_RESEARCH_MS).toISOString(),
       deadlineAt: new Date(
@@ -200,6 +249,10 @@ class RefillMatchingRepository implements MatchingRepository {
     currentRefillGeneration: number;
   }> = [];
   readonly automaticPublications: string[] = [];
+  readonly automaticDiversityContexts: Array<{
+    desiredArtistCount: number;
+    representedArtists: string[];
+  }> = [];
   automaticRecoveryState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
 
   constructor(
@@ -229,7 +282,11 @@ class RefillMatchingRepository implements MatchingRepository {
   }
 
   async listMatches() {
-    return this.matches;
+    const candidateArtists = new Map(this.candidates.map((item) => [item.id, item.artist]));
+    return this.matches.map((match) => ({
+      ...match,
+      artist: candidateArtists.get(match.candidateId),
+    }));
   }
 
   async saveMatch(_runId: string, match: CatalogMatchResult) {
@@ -274,6 +331,7 @@ class RefillMatchingRepository implements MatchingRepository {
     storefront: string,
     additionalCandidateGoal: number,
     currentRefillGeneration: number,
+    diversity?: { desiredArtistCount: number; representedArtists: string[] },
   ) {
     this.automaticCandidateRefills.push({
       runId,
@@ -281,6 +339,7 @@ class RefillMatchingRepository implements MatchingRepository {
       additionalCandidateGoal,
       currentRefillGeneration,
     });
+    if (diversity) this.automaticDiversityContexts.push(structuredClone(diversity));
     return this.candidateRefillState;
   }
 
@@ -462,6 +521,136 @@ describe("matching after a research refill", () => {
     expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));
   });
 
+  test("production French-jazz replay refills a four-artist pool even after all 25 tracks matched", async () => {
+    const representedArtists = [
+      "Django Reinhardt",
+      "Michel Petrucciani",
+      "Stéphane Grappelli",
+      "Martial Solal",
+    ];
+    const candidates = Array.from({ length: 25 }, (_, index) => ({
+      ...candidate(`candidate-${index + 1}`),
+      artist: representedArtists[Math.min(3, Math.floor(index / 7))]!,
+    }));
+    const matches: CatalogMatchResult[] = candidates.map((item) => ({
+      candidateId: item.id,
+      status: "accepted",
+      basis: "strict Apple match",
+      score: 1,
+      song: catalogSongFor(item),
+      alternatives: [],
+    }));
+    const repository = new RefillMatchingRepository(
+      candidates,
+      matches,
+      exactBrief("French Jazz Flow", 25),
+      true,
+      "queued",
+    );
+
+    await matchResearchRun(repository, "french-jazz-production-replay", "us", undefined, {
+      refillGeneration: 0,
+    });
+
+    expect(repository.automaticCandidateRefills).toEqual([{
+      runId: "french-jazz-production-replay",
+      storefront: "us",
+      additionalCandidateGoal: 19,
+      currentRefillGeneration: 0,
+    }]);
+    expect(repository.automaticDiversityContexts).toEqual([{
+      desiredArtistCount: 10,
+      representedArtists,
+    }]);
+    expect(repository.checkpoints.get("catalog_matching_outcome")).toMatchObject({
+      safePrimaryCount: 25,
+      shortfall: 0,
+      desiredArtistCount: 10,
+      representedArtistCount: 4,
+      artistShortfall: 6,
+      status: "shortfall",
+    });
+    expect(repository.automaticPublications).toEqual([]);
+  });
+
+  test("counts source candidate artists rather than Apple collaboration-credit variants", async () => {
+    const candidates = Array.from({ length: 25 }, (_, index) => ({
+      ...candidate(`candidate-${index + 1}`),
+      artist: "Django Reinhardt",
+    }));
+    const matches: CatalogMatchResult[] = candidates.map((item, index) => ({
+      candidateId: item.id,
+      status: "accepted",
+      basis: "strict Apple match",
+      score: 1,
+      song: {
+        ...catalogSongFor(item),
+        artistName: `Django Reinhardt & Collaborator ${index + 1}`,
+      },
+      alternatives: [],
+    }));
+    const repository = new RefillMatchingRepository(
+      candidates,
+      matches,
+      exactBrief("French Jazz Flow", 25),
+      true,
+      "queued",
+    );
+
+    await matchResearchRun(repository, "collaboration-credit-replay", "us", undefined, {
+      refillGeneration: 0,
+    });
+
+    expect(repository.checkpoints.get("catalog_matching_outcome")).toMatchObject({
+      representedArtistCount: 1,
+      desiredArtistCount: 10,
+      artistShortfall: 9,
+    });
+    expect(repository.automaticDiversityContexts[0]?.representedArtists)
+      .toEqual(["Django Reinhardt"]);
+  });
+
+  test("publishes fail-open after bounded diversity recovery while preserving the visible shortfall", async () => {
+    const candidates = Array.from({ length: 25 }, (_, index) => ({
+      ...candidate(`candidate-${index + 1}`),
+      artist: index < 13 ? "Django Reinhardt" : "Michel Petrucciani",
+    }));
+    const matches: CatalogMatchResult[] = candidates.map((item) => ({
+      candidateId: item.id,
+      status: "accepted",
+      basis: "strict Apple match",
+      score: 1,
+      song: catalogSongFor(item),
+      alternatives: [],
+    }));
+    const repository = new RefillMatchingRepository(
+      candidates,
+      matches,
+      exactBrief("French Jazz Flow", 25),
+      true,
+      "exhausted",
+    );
+    repository.checkpoints.set(
+      `fast:post-match-refill:${FAST_POST_MATCH_REFILL_LIMIT}:route`,
+      createFastPostMatchRefillRouteCheckpoint(FAST_POST_MATCH_REFILL_LIMIT, 1, "us"),
+    );
+
+    await matchResearchRun(repository, "exhausted-diversity-replay", "us", undefined, {
+      refillGeneration: FAST_POST_MATCH_REFILL_LIMIT,
+    });
+
+    expect(repository.automaticCandidateRefills).toEqual([]);
+    expect(repository.automaticPublications).toEqual(["exhausted-diversity-replay"]);
+    expect(repository.checkpoints.get("catalog_matching_outcome")).toMatchObject({
+      safePrimaryCount: 25,
+      shortfall: 0,
+      representedArtistCount: 2,
+      desiredArtistCount: 10,
+      artistShortfall: 8,
+      status: "shortfall",
+    });
+  });
+
   test("generation three publishes an unresolved shortfall as partial without queuing a fourth refill", async () => {
     const candidates = Array.from({ length: 50 }, (_, index) => candidate(`candidate-${index + 1}`));
     const matches: CatalogMatchResult[] = candidates.map((item, index) => index < 49
@@ -550,7 +739,7 @@ describe("matching after a research refill", () => {
     expect(repository.automaticCandidateRefills).toEqual([{
       runId: "rio-refill-recovery",
       storefront: "us",
-      additionalCandidateGoal: 2,
+      additionalCandidateGoal: 3,
       currentRefillGeneration: 1,
     }]);
     expect(repository.updates).not.toContainEqual(expect.objectContaining({ status: "failed" }));

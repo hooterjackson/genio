@@ -424,6 +424,59 @@ beforeEach(() => {
 });
 
 describe("catalog shortfall -> evidence refill -> exact publication scenario", () => {
+  test("a diversity-deficit route tells cited refill research which accepted artists to move beyond", async () => {
+    const repository = new PipelineRepository();
+    const representedArtists = [
+      "Django Reinhardt",
+      "Michel Petrucciani",
+      "Stéphane Grappelli",
+      "Martial Solal",
+    ];
+    const route = createFastPostMatchRefillRouteCheckpoint(
+      1,
+      19,
+      "us",
+      new Date(),
+      {},
+      {
+        eligibleCount: 25,
+        selectionRank: 44,
+        diversityTarget: 10,
+        representedArtists,
+      },
+    );
+    repository.checkpoints.set("fast:post-match-refill:1:route", route);
+    const orchestrator = new ScriptedRefillOrchestrator(repository, [refillProviderResponse(8)]);
+
+    await orchestrator.processJob({
+      runId: RUN_ID,
+      fast: true,
+      postMatchRefill: true,
+      refillGeneration: 1,
+      additionalCandidateGoal: route.additionalCandidateGoal,
+      storefront: route.storefront,
+      refillConfirmedAt: route.confirmedAt,
+      refillResearchDeadlineAt: route.researchDeadlineAt,
+      refillDeadlineAt: route.deadlineAt,
+    });
+
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(String(orchestrator.calls[0]!.body.instructions)).toContain(
+      "Recover cited tracks by at least 6 additional credited recording artists",
+    );
+    const providerInput = JSON.parse(String(orchestrator.calls[0]!.body.input));
+    expect(providerInput).toMatchObject({
+      diversityTarget: 10,
+      representedArtists,
+      additionalDistinctArtistGoal: 6,
+    });
+    expect(repository.checkpoints.get("fast:post-match-refill:1:complete")).toMatchObject({
+      diversityTarget: 10,
+      representedArtistCount: 4,
+      additionalDistinctArtistGoal: 6,
+    });
+  });
+
   test("recovers the observed 42-of-50 shortfall and hands exactly 50 strict matches to publication", async () => {
     const repository = new PipelineRepository();
     const orchestrator = new ScriptedRefillOrchestrator(repository, [refillProviderResponse(8)]);
