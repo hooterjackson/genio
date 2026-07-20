@@ -406,7 +406,7 @@ app.post<{ Body: { token?: string; capabilityToken?: string } }>("/api/v1/capabi
   return { runId: session.accessId, expiresAt: session.expiresAt.toISOString() };
 });
 
-app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKey?: string } }>("/api/v1/runs", async (request, reply) => {
+app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; targetTrackCount?: number; idempotencyKey?: string } }>("/api/v1/runs", async (request, reply) => {
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const caller = identity(request);
@@ -421,6 +421,25 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; idempotencyKe
     throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
   }
   const brief = canonicalBriefForRequest(interpreted, interpreted.brief, submittedBrief);
+  const submittedTrackCount = request.body?.targetTrackCount;
+  if (submittedTrackCount !== undefined && (
+    !Number.isInteger(submittedTrackCount)
+    || submittedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+    || submittedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+  )) {
+    throw new HttpError(
+      400,
+      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`,
+      "invalid_track_count",
+    );
+  }
+  if (submittedTrackCount !== undefined && submittedTrackCount !== interpreted.requestedTrackCount) {
+    throw new HttpError(
+      409,
+      "The selected playlist size changed before research began; return to the request and retry",
+      "track_count_mismatch",
+    );
+  }
   const confirmedEstimateUsd = estimateResearchCost(brief);
   if (!isOwner(caller)) {
     if (interpreted.requestedTrackCount === null) {

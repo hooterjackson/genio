@@ -2014,6 +2014,7 @@ export class Repository {
     let guidanceTelemetry: PlaylistGuidanceTelemetry | null = null;
     let guidancePreferences: PlaylistGuidancePreference[] = [];
     let selectionPlan: SelectionPlan | null = null;
+    let repairedStoredSelectionPlan = false;
     if (input.briefRequestId) {
       const context = await this.pool.query<{
         guidance_source_hints_json: PlaylistGuidanceSourceHint[] | null;
@@ -2036,12 +2037,47 @@ export class Repository {
         : [];
       selectionPlan = row.selection_plan_json ?? null;
     }
+    const exactRequestedTrackCount = (() => {
+      const minimum = Number(input.brief.targetSize?.min);
+      const maximum = Number(input.brief.targetSize?.max);
+      return input.brief.mode === "curated"
+        && input.brief.targetSize
+        && Number.isInteger(minimum)
+        && Number.isInteger(maximum)
+        && minimum === maximum
+        && minimum >= PUBLIC_PLAYLIST_MINIMUM_TRACKS
+        && minimum <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+        ? minimum
+        : null;
+    })();
+    // A brief request can outlive the worker revision that created its plan.
+    // Never let a stale persisted plan silently replace the exact count that
+    // the canonical brief carries into run creation. Rebuilding from the same
+    // prompt and typed guidance preferences preserves every semantic choice
+    // while restoring the authoritative publication target.
+    if (selectionPlan && exactRequestedTrackCount !== null && (
+      selectionPlan.requestedTrackCount !== exactRequestedTrackCount
+      || selectionPlan.minimumQualifiedTrackCount !== exactRequestedTrackCount
+    )) {
+      selectionPlan = null;
+      repairedStoredSelectionPlan = true;
+    }
     const proposedSelectionPlan = selectionPlan ?? createSelectionPlanV2({
       prompt: input.prompt,
       brief: input.brief,
       guidancePreferences,
       storefront: process.env.APPLE_STOREFRONT ?? "us",
     });
+    if (exactRequestedTrackCount !== null && (
+      proposedSelectionPlan.requestedTrackCount !== exactRequestedTrackCount
+      || proposedSelectionPlan.minimumQualifiedTrackCount !== exactRequestedTrackCount
+    )) {
+      throw new HttpError(
+        409,
+        "The selected playlist size is inconsistent with its research plan",
+        "track_count_mismatch",
+      );
+    }
     const pipelineAssignment = assignPipelineV2({
       plan: proposedSelectionPlan,
       owner: input.forceFreshResearch === true,
@@ -2073,6 +2109,19 @@ export class Repository {
       : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
       await lockClientAliases(client, `run:${input.idempotencyKey}`, input.clientBucketAliases);
+      if (repairedStoredSelectionPlan && input.briefRequestId) {
+        await client.query(
+          `UPDATE brief_requests SET pipeline_version=$2,policy_version=$3,
+             selection_plan_json=$4,updated_at=now()
+           WHERE id=$1 AND expires_at>now()`,
+          [
+            input.briefRequestId,
+            proposedSelectionPlan.pipelineVersion,
+            proposedSelectionPlan.policyVersion,
+            JSON.stringify(proposedSelectionPlan),
+          ],
+        );
+      }
       const existing = await client.query<{
         access_id: string;
         run_id: string;

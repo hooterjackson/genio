@@ -1747,6 +1747,136 @@ databaseDescribe("hosted backend integration", () => {
     })).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
   });
 
+  test("preserves a custom 150-track target from the brief through the persisted V2 run", async () => {
+    vi.stubEnv("PIPELINE_V2_CURATED_PERCENT", "100");
+    const clientBucket = `brief-count-150-${randomUUID()}`;
+    const exactBrief: PlaylistBrief = {
+      ...brief,
+      mode: "curated",
+      targetSize: { min: 150, max: 150 },
+    };
+    const request = await repository.createBriefRequest({
+      prompt: "Brazilian disco heard in Rio clubs during the late 1970s",
+      requestedTrackCount: 150,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: `brief-count-150-${randomUUID()}`,
+    });
+    await repository.saveBriefResult(request.id, {
+      status: "complete",
+      brief: exactBrief,
+      estimateUsd: 0,
+    });
+    await repository.saveBriefSelectionPlan(request.id, createSelectionPlanV2({
+      prompt: "Brazilian disco heard in Rio clubs during the late 1970s",
+      brief: exactBrief,
+      storefront: "us",
+    }));
+
+    const created = await repository.createRunIdempotent({
+      prompt: "Brazilian disco heard in Rio clubs during the late 1970s",
+      briefRequestId: request.id,
+      brief: exactBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: `run-count-150-${randomUUID()}`,
+      autoPublish: true,
+      reuseDays: 0,
+      globalLimit: 100,
+    });
+
+    await expect(repository.getBriefRequest(request.id)).resolves.toMatchObject({
+      requestedTrackCount: 150,
+      brief: { targetSize: { min: 150, max: 150 } },
+      selectionPlan: {
+        requestedTrackCount: 150,
+        minimumQualifiedTrackCount: 150,
+      },
+    });
+    await expect(repository.getRun(created.runId)).resolves.toMatchObject({
+      brief: { targetSize: { min: 150, max: 150 } },
+      selectionPlan: {
+        requestedTrackCount: 150,
+        minimumQualifiedTrackCount: 150,
+      },
+      pipelinePolicySnapshot: {
+        executionPolicy: {
+          targetMinimum: 150,
+          targetMaximum: 150,
+        },
+      },
+      progress: { targetTrackCount: 150 },
+    });
+  });
+
+  test("repairs a stale 100-track brief plan before creating a 150-track run", async () => {
+    vi.stubEnv("PIPELINE_V2_CURATED_PERCENT", "100");
+    const clientBucket = `brief-plan-repair-${randomUUID()}`;
+    const prompt = "Brazilian disco heard in Rio clubs during the late 1970s";
+    const exactBrief: PlaylistBrief = {
+      ...brief,
+      mode: "curated",
+      targetSize: { min: 150, max: 150 },
+    };
+    const request = await repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 150,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: `brief-plan-repair-${randomUUID()}`,
+    });
+    await repository.saveBriefResult(request.id, {
+      status: "complete",
+      brief: exactBrief,
+      estimateUsd: 0,
+    });
+    await repository.saveBriefSelectionPlan(request.id, createSelectionPlanV2({
+      prompt,
+      brief: { ...exactBrief, targetSize: { min: 100, max: 100 } },
+      storefront: "us",
+    }));
+
+    const created = await repository.createRunIdempotent({
+      prompt,
+      briefRequestId: request.id,
+      brief: exactBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: `run-plan-repair-${randomUUID()}`,
+      autoPublish: true,
+      reuseDays: 0,
+      globalLimit: 100,
+    });
+
+    await expect(repository.getBriefRequest(request.id)).resolves.toMatchObject({
+      requestedTrackCount: 150,
+      selectionPlan: {
+        requestedTrackCount: 150,
+        minimumQualifiedTrackCount: 150,
+      },
+    });
+    await expect(repository.getRun(created.runId)).resolves.toMatchObject({
+      brief: { targetSize: { min: 150, max: 150 } },
+      selectionPlan: {
+        requestedTrackCount: 150,
+        minimumQualifiedTrackCount: 150,
+      },
+      pipelinePolicySnapshot: {
+        executionPolicy: {
+          targetMinimum: 150,
+          targetMaximum: 150,
+        },
+      },
+      progress: { targetTrackCount: 150 },
+    });
+  });
+
   test.each([1, 2, 3] as const)(
     "accepts one option or one custom answer for each of %i guided questions",
     async (questionCount) => {

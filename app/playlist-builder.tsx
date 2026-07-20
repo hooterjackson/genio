@@ -54,6 +54,11 @@ type PlaylistBrief = {
   ambiguityAcceptance?: string[];
 };
 
+type PlaylistCommandSubmission = {
+  prompt: string;
+  trackCount: string;
+};
+
 type FrontierItem = {
   sourceClass: string;
   strategy: string;
@@ -512,6 +517,14 @@ function exactRequestedTrackCount(brief: PlaylistBrief): number | null {
     : null;
 }
 
+function assertExactBriefTrackCount(brief: PlaylistBrief, requestedTrackCount: number): void {
+  if (exactRequestedTrackCount(brief) !== requestedTrackCount) {
+    throw new Error(
+      `The playlist size changed while preparing the request. Expected ${requestedTrackCount.toLocaleString()} tracks; please retry.`,
+    );
+  }
+}
+
 function trackChoices(item: SelectableTrack, limit = 12): CatalogSong[] {
   const seen = new Set<string>();
   const choices: CatalogSong[] = [];
@@ -785,7 +798,7 @@ function OneCommandScreen({
   busy: string;
   onPrompt: (value: string) => void;
   onTrackCount: (value: string) => void;
-  onSubmit: () => void;
+  onSubmit: (submission: PlaylistCommandSubmission) => void;
 }) {
   // The composer is server-rendered, but its controlled fields cannot retain
   // edits made before React has hydrated and attached event handlers. Keep the
@@ -799,6 +812,7 @@ function OneCommandScreen({
   );
   const [focused, setFocused] = useState(false);
   const [exampleIndex, setExampleIndex] = useState(0);
+  const promptInputRef = useRef<HTMLTextAreaElement>(null);
   const customInputRef = useRef<HTMLInputElement>(null);
   const countIsDigits = /^[0-9]+$/u.test(trackCount);
   const count = countIsDigits ? Number.parseInt(trackCount, 10) : Number.NaN;
@@ -828,14 +842,25 @@ function OneCommandScreen({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    onSubmit();
+    // Read the submitted DOM values rather than relying only on React state.
+    // Mobile browsers can dispatch submit immediately after the final numeric
+    // edit; FormData makes the exact value visible in the field authoritative.
+    const data = new FormData(event.currentTarget);
+    onSubmit({
+      prompt: String(data.get("prompt") ?? prompt),
+      trackCount: String(data.get("trackCount") ?? trackCount),
+    });
   }
 
   function choosePreset(value: number) {
+    // Preserve the DOM draft if a fast mobile edit landed before React's
+    // controlled state finished reconciling.
+    onPrompt(promptInputRef.current?.value ?? prompt);
     onTrackCount(String(value));
   }
 
   function chooseCustom() {
+    onPrompt(promptInputRef.current?.value ?? prompt);
     onTrackCount("");
     window.requestAnimationFrame(() => customInputRef.current?.focus());
   }
@@ -854,7 +879,9 @@ function OneCommandScreen({
             <label className="one-command-request" htmlFor="playlist-request">
               <span className="sr-only">PLAYLIST REQUEST</span>
               <textarea
+                ref={promptInputRef}
                 id="playlist-request"
+                name="prompt"
                 value={prompt}
                 onChange={(event) => onPrompt(event.target.value)}
                 onFocus={() => setFocused(true)}
@@ -907,6 +934,7 @@ function OneCommandScreen({
                   <input
                     ref={customInputRef}
                     id="playlist-track-count"
+                    name="trackCount"
                     type="text"
                     inputMode="numeric"
                     pattern="[0-9]*"
@@ -948,7 +976,11 @@ function OneCommandScreen({
               type="submit"
               disabled={!hydrated || Boolean(busy) || prompt.trim().length < 4 || !validCount}
             >
-              {busy ? "STARTING..." : "CREATE PLAYLIST"}
+              {busy
+                ? "STARTING..."
+                : validCount
+                  ? `CREATE PLAYLIST · ${count.toLocaleString()} TRACKS`
+                  : "CREATE PLAYLIST"}
             </button>
           </section>
         </form>
@@ -1689,6 +1721,7 @@ export function PlaylistBuilder() {
   const idempotencyKey = useRef<string | null>(null);
   const briefIdempotencyKey = useRef<string | null>(null);
   const guidanceIdempotencyKey = useRef<string | null>(null);
+  const submittedTrackCountRef = useRef<number | null>(null);
   const publishingRef = useRef(false);
   const matchingRetryAttempted = useRef<Set<string>>(new Set());
   const briefRequestRef = useRef<AbortController | null>(null);
@@ -1736,6 +1769,7 @@ export function PlaylistBuilder() {
     idempotencyKey.current = null;
     briefIdempotencyKey.current = null;
     guidanceIdempotencyKey.current = null;
+    submittedTrackCountRef.current = null;
     publishingRef.current = false;
     matchingRetryAttempted.current.clear();
     window.history.replaceState(null, "", window.location.pathname);
@@ -1826,8 +1860,10 @@ export function PlaylistBuilder() {
   const startResearchFromBrief = useCallback(async (
     nextBrief: PlaylistBrief,
     nextBriefRequestId: string,
+    expectedTrackCount: number,
     signal?: AbortSignal,
   ) => {
+    assertExactBriefTrackCount(nextBrief, expectedTrackCount);
     if (!idempotencyKey.current) idempotencyKey.current = "run-" + nextBriefRequestId;
     const response = await api<ResearchRun | RunResponse>("/api/v1/runs", {
       method: "POST",
@@ -1835,6 +1871,7 @@ export function PlaylistBuilder() {
       body: JSON.stringify({
         briefRequestId: nextBriefRequestId,
         brief: nextBrief,
+        targetTrackCount: expectedTrackCount,
       }),
       signal,
     });
@@ -1876,7 +1913,9 @@ export function PlaylistBuilder() {
           if (!response.brief) throw new Error("The playlist request could not be restored.");
           setPrompt(response.prompt ?? "");
           const restoredCount = response.requestedTrackCount ?? exactRequestedTrackCount(response.brief);
-          if (restoredCount) setTrackCount(String(restoredCount));
+          if (!restoredCount) throw new Error("The playlist size could not be restored.");
+          setTrackCount(String(restoredCount));
+          submittedTrackCountRef.current = restoredCount;
           setBrief(response.brief);
           setBriefRequestId(queuedBriefId);
           if (response.status === "awaiting_answers" && response.questions?.length) {
@@ -1886,7 +1925,7 @@ export function PlaylistBuilder() {
             setGuidanceSubmission(null);
             setBriefFinalizing(false);
           } else {
-            await startResearchFromBrief(response.brief, queuedBriefId);
+            await startResearchFromBrief(response.brief, queuedBriefId, restoredCount);
           }
         }
       } catch (caught) {
@@ -2055,14 +2094,19 @@ export function PlaylistBuilder() {
     })();
   }, [run, result]);
 
-  async function createPlaylist() {
-    const requestedTrackCount = /^[0-9]+$/u.test(trackCount)
-      ? Number.parseInt(trackCount, 10)
+  async function createPlaylist(submission?: PlaylistCommandSubmission) {
+    const submittedPrompt = (submission?.prompt ?? prompt).trim();
+    const submittedTrackCount = submission?.trackCount ?? trackCount;
+    const requestedTrackCount = /^[0-9]+$/u.test(submittedTrackCount)
+      ? Number.parseInt(submittedTrackCount, 10)
       : Number.NaN;
-    if (prompt.trim().length < 4
+    if (submittedPrompt.length < 4
       || !Number.isInteger(requestedTrackCount)
       || requestedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
       || requestedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS) return;
+    setPrompt(submittedPrompt);
+    setTrackCount(String(requestedTrackCount));
+    submittedTrackCountRef.current = requestedTrackCount;
     briefRequestRef.current?.abort();
     const controller = new AbortController();
     briefRequestRef.current = controller;
@@ -2070,8 +2114,9 @@ export function PlaylistBuilder() {
     setError("");
     try {
       if (brief && briefRequestId) {
+        assertExactBriefTrackCount(brief, requestedTrackCount);
         setBriefFinalizing(true);
-        await startResearchFromBrief(brief, briefRequestId, controller.signal);
+        await startResearchFromBrief(brief, briefRequestId, requestedTrackCount, controller.signal);
         return;
       }
       if (!briefIdempotencyKey.current) briefIdempotencyKey.current = crypto.randomUUID();
@@ -2079,7 +2124,7 @@ export function PlaylistBuilder() {
         method: "POST",
         headers: { "Idempotency-Key": briefIdempotencyKey.current },
         body: JSON.stringify({
-          prompt: prompt.trim(),
+          prompt: submittedPrompt,
           targetTrackCount: requestedTrackCount,
           idempotencyKey: briefIdempotencyKey.current,
         }),
@@ -2103,6 +2148,7 @@ export function PlaylistBuilder() {
       }
       if (controller.signal.aborted) return;
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
+      assertExactBriefTrackCount(response.brief, requestedTrackCount);
       const requestId = response.requestId ?? initialRequestId;
       if (!requestId) throw new Error("gênio could not resume this playlist request.");
       setBrief(response.brief);
@@ -2115,7 +2161,7 @@ export function PlaylistBuilder() {
         setBriefFinalizing(false);
       } else {
         setBriefFinalizing(true);
-        await startResearchFromBrief(response.brief, requestId, controller.signal);
+        await startResearchFromBrief(response.brief, requestId, requestedTrackCount, controller.signal);
       }
     } catch (caught) {
       if (isAbortError(caught)) return;
@@ -2215,8 +2261,13 @@ export function PlaylistBuilder() {
         return;
       }
       if (!finalized.brief) throw new Error("The playlist request could not be finalized.");
+      const expectedTrackCount = submittedTrackCountRef.current
+        ?? (/^[0-9]+$/u.test(trackCount) ? Number.parseInt(trackCount, 10) : Number.NaN);
+      if (!Number.isInteger(expectedTrackCount)) {
+        throw new Error("The playlist size could not be restored. Return to the request and choose it again.");
+      }
       setBrief(finalized.brief);
-      await startResearchFromBrief(finalized.brief, briefRequestId, controller.signal);
+      await startResearchFromBrief(finalized.brief, briefRequestId, expectedTrackCount, controller.signal);
     } catch (caught) {
       if (isAbortError(caught)) return;
       setBriefFinalizing(false);
@@ -2433,6 +2484,7 @@ export function PlaylistBuilder() {
             setBriefRequestId(null);
             briefIdempotencyKey.current = null;
             idempotencyKey.current = null;
+            submittedTrackCountRef.current = null;
           }}
           onTrackCount={(value) => {
             setTrackCount(value);
@@ -2440,8 +2492,9 @@ export function PlaylistBuilder() {
             setBriefRequestId(null);
             briefIdempotencyKey.current = null;
             idempotencyKey.current = null;
+            submittedTrackCountRef.current = null;
           }}
-          onSubmit={() => void createPlaylist()}
+          onSubmit={(submission) => void createPlaylist(submission)}
         />
       </main>
     );

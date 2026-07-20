@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.15",
+      "releasedAt": "2026-07-20",
+      "title": "Custom playlist-size integrity",
+      "notes": [
+        "Uses the exact track count visible in the custom-size field even when a mobile browser submits immediately after the final edit.",
+        "Shows the selected count in the Create Playlist action so the request is explicit before submission.",
+        "Rejects any count drift between interpretation and research instead of silently creating a smaller playlist.",
+        "Adds desktop and mobile regressions proving a custom 150-track request remains exactly 150 through guidance, research creation, and publication."
+      ]
+    },
+    {
       "version": "1.2.14",
       "releasedAt": "2026-07-20",
       "title": "Listener-market scope correction",
