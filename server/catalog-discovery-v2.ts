@@ -1085,18 +1085,37 @@ export async function discoverCuratedAppleCatalog(
     return qualified >= qualifiedGoalFor(target, qualified, initialAttemptedCount + candidates.size).goal;
   };
 
+  const pendingWorkForRound = (work: readonly WorkItem[], round: CatalogDiscoveryRound): WorkItem[] => {
+    const pending = work.filter((item) => item.round === round && item.status === "pending");
+    // A trusted scoped playlist is already backed by external evidence and can
+    // produce many exact Apple identities in one request. When search discovers
+    // one, enumerate it before spending the next wave on lower-confidence direct
+    // queries. Keep equal-priority work stable so retries remain deterministic.
+    return pending.sort((left, right) => (
+      Number(right.kind === "trusted_scoped_playlist")
+      - Number(left.kind === "trusted_scoped_playlist")
+    ));
+  };
+
   const runRound = async (round: CatalogDiscoveryRound, work: WorkItem[], deep = false): Promise<void> => {
     const roundWasRunnable = !goalReached() && providerCallCount < maxProviderCalls && !request.signal?.aborted;
-    let pending = work.filter((item) => item.round === round && item.status === "pending");
+    let pending = pendingWorkForRound(work, round);
     while (pending.length > 0 && !goalReached() && providerCallCount < maxProviderCalls && !request.signal?.aborted) {
       const allowance = maxProviderCalls - providerCallCount;
       const newlyQualifiedCount = [...candidates.values()].filter((candidate) => candidate.eligible).length;
       const qualifiedCount = initialQualifiedCount + newlyQualifiedCount;
       const plan = qualifiedGoalFor(target, qualifiedCount, initialAttemptedCount + candidates.size);
-      // Every Apple page contains at most 100 resources. Re-plan after this
-      // bounded wave rather than eagerly draining a large frontier.
-      const adaptiveTaskWave = Math.max(1, Math.ceil(plan.rawGoal / 100));
-      const batch = pending.slice(0, Math.min(allowance, adaptiveTaskWave));
+      // Apple catalog search pages contain at most 25 resources per requested
+      // resource type. Plan against that actual page size, then re-plan after
+      // this bounded wave instead of assuming every call can return 100 songs.
+      const adaptiveTaskWave = Math.max(1, Math.ceil(plan.rawGoal / 25));
+      const highestPriority = pending[0]?.kind === "trusted_scoped_playlist"
+        ? "trusted_scoped_playlist"
+        : null;
+      const priorityWave = highestPriority
+        ? pending.filter((item) => item.kind === highestPriority)
+        : pending;
+      const batch = priorityWave.slice(0, Math.min(allowance, adaptiveTaskWave));
       providerCallCount += batch.length;
       for (const item of batch) item.status = "running";
       const pages = await scheduleCatalogTasks(batch, concurrency, (item) => fetchPage(provider, storefront, item, request.signal));
@@ -1232,7 +1251,7 @@ export async function discoverCuratedAppleCatalog(
         }
         await checkpointPage();
       }
-      pending = work.filter((item) => item.round === round && item.status === "pending");
+      pending = pendingWorkForRound(work, round);
     }
     const unresolved = work.some((item) => item.round === round
       && (item.status === "pending" || item.status === "running" || (item.status === "failed" && item.retryable)));

@@ -14,7 +14,7 @@ import type { RunProgressView } from "../shared/types.ts";
 import { BrandIntro } from "./brand-intro";
 import { type PrimaryNavItem } from "./primary-nav";
 import { PublicSiteHeader } from "./public-site-header";
-import { playlistWorkState } from "./playlist-waiting-state";
+import { isAutomaticPlaylistHandoff, playlistWorkState } from "./playlist-waiting-state";
 import { WorkingIndicator } from "./working-indicator";
 import {
   apiErrorCode,
@@ -604,6 +604,9 @@ function phaseMessage(run: ResearchRun): string {
   if (run.status === "queued") return run.brief.mode === "curated"
     ? `Queued. The ${windowPhrase} research window includes queue time.`
     : "Waiting for an available research slot.";
+  if (isAutomaticPlaylistHandoff(run)) {
+    return "Locking the selected recording versions into the final playlist order before publication.";
+  }
   if (run.status === "publishing" || phase.includes("publication")) return "Creating the public Apple Music playlist and verifying its final order.";
   if (phase.includes("sequence")) return "Spacing artists, albums, eras, and scenes into a coherent listening order.";
   if (phase.includes("manifest")) return "Locking the selected recording versions into an ordered playlist manifest.";
@@ -1132,7 +1135,9 @@ function FinalizingBriefScreen() {
 function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
   const showReset = terminalStatuses.has(run.status);
   const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
-  const publishing = ["publishing", "waiting_for_apple_authorization", "manifest_ready"].includes(run.status);
+  const automaticHandoff = isAutomaticPlaylistHandoff(run);
+  const publishing = automaticHandoff
+    || ["publishing", "waiting_for_apple_authorization", "manifest_ready"].includes(run.status);
   const work = playlistWorkState(run);
   const targetCount = run.selectionPlan?.requestedTrackCount
     ?? run.pipelineOutcome?.targetTrackCount
@@ -1145,7 +1150,7 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
       aria-busy={work.motion === "active"}
     >
       <div className="flow-body research-body">
-        <span className="tag profile-tag">[{profile} · {statusLabel(run.status).toUpperCase()}]</span>
+        <span className="tag profile-tag">[{profile} · {automaticHandoff ? "ASSEMBLING" : statusLabel(run.status).toUpperCase()}]</span>
         <h1 id="run-title">{publishing ? "Creating your playlist" : "Researching your playlist"}</h1>
         <p className="run-subject">{run.brief.title}</p>
         <WorkingIndicator

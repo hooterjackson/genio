@@ -216,7 +216,7 @@ test("builds a bounded public-safe live progress summary from durable run state"
   expect(JSON.stringify(run.progress)).not.toContain("import://");
 });
 
-test("serializes catalog songs and alternatives as JSONB parameters", async () => {
+test("serializes catalog songs and alternatives and bounds exact-match scores for Postgres", async () => {
   const calls: Array<{ text: string; values: unknown[] }> = [];
   const client = {
     query: vi.fn(async (text: string, values: unknown[] = []) => {
@@ -249,14 +249,24 @@ test("serializes catalog songs and alternatives as JSONB parameters", async () =
     candidateId: "candidate-id",
     status: "review",
     basis: "ambiguous catalog results",
-    score: 0.8,
+    score: 100,
     song,
     alternatives,
   });
 
   const insert = calls.find((call) => call.text.includes("INSERT INTO catalog_matches"));
+  expect(insert?.values[5]).toBe(99.999999);
   expect(insert?.values[7]).toBe(JSON.stringify(song));
   expect(insert?.values[8]).toBe(JSON.stringify(alternatives));
+
+  await expect(repository.saveMatch("run-id", {
+    candidateId: "candidate-id",
+    status: "review",
+    basis: "invalid score",
+    score: Number.POSITIVE_INFINITY,
+    song,
+    alternatives,
+  })).rejects.toMatchObject({ code: "invalid_catalog_match_score" });
 });
 
 test("serializes a versioned selection plan into the durable run boundary", async () => {

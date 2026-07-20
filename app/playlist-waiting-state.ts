@@ -4,6 +4,7 @@ export type PlaylistWorkMotion = "active" | "paused" | "idle";
 type WaitingRun = {
   status: string;
   phase?: string | null;
+  autoPublish?: boolean;
 };
 
 const terminalStatuses = new Set(["complete", "partial", "failed", "expired", "deleted"]);
@@ -51,6 +52,11 @@ const discoverySignals = [
   "catalog_refill",
 ];
 
+export function isAutomaticPlaylistHandoff(run: WaitingRun): boolean {
+  return run.autoPublish === true
+    && (run.status === "visitor_review" || run.status === "manifest_ready");
+}
+
 export function playlistWorkMotion(run: WaitingRun): PlaylistWorkMotion {
   if (terminalStatuses.has(run.status)) return "idle";
   if (pausedStatuses.has(run.status)) return "paused";
@@ -63,6 +69,7 @@ export function playlistWorkMotion(run: WaitingRun): PlaylistWorkMotion {
  * even though it contains the word "catalog".
  */
 export function playlistWorkStage(run: WaitingRun): PlaylistWorkStage {
+  if (isAutomaticPlaylistHandoff(run)) return "sequence";
   const signal = `${run.status} ${run.phase ?? ""}`.toLowerCase();
   if (publishSignals.some((value) => signal.includes(value))) return "publish";
   if (sequenceSignals.some((value) => signal.includes(value))) return "sequence";

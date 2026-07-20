@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { playlistWorkMotion, playlistWorkStage, playlistWorkState } from "../app/playlist-waiting-state";
+import {
+  isAutomaticPlaylistHandoff,
+  playlistWorkMotion,
+  playlistWorkStage,
+  playlistWorkState,
+} from "../app/playlist-waiting-state";
 
 describe("playlist waiting state", () => {
   it.each([
@@ -28,5 +33,23 @@ describe("playlist waiting state", () => {
       stage: "discover",
       motion: "active",
     });
+  });
+
+  it.each([
+    ["visitor_review", "exception_review"],
+    ["manifest_ready", "manifest"],
+  ])("keeps an automatic %s handoff active in the assembly stage", (status, phase) => {
+    const run = { status, phase, autoPublish: true };
+    expect(isAutomaticPlaylistHandoff(run)).toBe(true);
+    expect(playlistWorkState(run)).toEqual({
+      stage: "sequence",
+      motion: "active",
+    });
+  });
+
+  it("does not treat a manual visitor review as an automatic handoff", () => {
+    const run = { status: "visitor_review", phase: "exception_review", autoPublish: false };
+    expect(isAutomaticPlaylistHandoff(run)).toBe(false);
+    expect(playlistWorkStage(run)).toBe("match");
   });
 });

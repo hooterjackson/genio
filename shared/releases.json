@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.7",
+      "releasedAt": "2026-07-19",
+      "title": "Atomic Pipeline V2 catalog recovery",
+      "notes": [
+        "Committed trusted Apple editorial evidence, exact catalog identity, match outcome, and candidate state atomically so worker interruptions cannot strand playable tracks.",
+        "Bounded exact-match scores to PostgreSQL's numeric contract and classified post-discovery persistence faults as local handoff errors instead of provider degradation.",
+        "Prioritized trusted scoped playlists, planned Apple search waves against the real 25-song page size, and rejected editorial containers whose titles do not declare the requested music scope.",
+        "Resolved evidence-backed release collisions deterministically and kept automatic review-to-publication handoffs visibly active instead of presenting a manual review state."
+      ]
+    },
+    {
       "version": "1.2.6",
       "releasedAt": "2026-07-19",
       "title": "Pipeline V2 catalog handoff hardening",

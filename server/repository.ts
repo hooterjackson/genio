@@ -586,6 +586,15 @@ function boundedPipelineBatch<T>(items: readonly T[], maximum: number, field: st
   return items;
 }
 
+const MAX_CATALOG_MATCH_SCORE = 99.999999;
+
+function normalizedCatalogMatchScore(score: number): number {
+  if (!Number.isFinite(score)) {
+    throw new HttpError(400, "Catalog match score must be finite", "invalid_catalog_match_score");
+  }
+  return Math.min(MAX_CATALOG_MATCH_SCORE, Math.max(0, score));
+}
+
 interface CandidateStageProgression {
   candidateId: string;
   stages: ReadonlyArray<{
@@ -3400,6 +3409,7 @@ export class Repository {
   }
 
   async saveMatch(runId: string, match: CatalogMatchResult): Promise<void> {
+    const normalizedScore = normalizedCatalogMatchScore(match.score);
     await this.transaction(async (client) => {
       const run = await client.query("SELECT id FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
@@ -3431,7 +3441,7 @@ export class Repository {
           match.candidateId,
           resultingStatus,
           match.basis,
-          match.score,
+          normalizedScore,
           match.song?.id ?? null,
           match.song ? JSON.stringify(match.song) : null,
           JSON.stringify(match.alternatives ?? []),
@@ -6917,6 +6927,48 @@ export class Repository {
             [row.id, runId, occurredAt, versions.pipelineVersion, versions.policyVersion],
           );
         }
+        // The trusted editorial-container row already is an exact Apple
+        // catalog identity. Persist that identity in the same transaction as
+        // its source, container membership, scope binding, and candidate. A
+        // worker can therefore be interrupted immediately after this method
+        // returns without leaving a qualified candidate stranded between the
+        // discovery and matching phases.
+        const duplicate = await client.query(
+          `SELECT 1 FROM catalog_matches
+           WHERE run_id=$1 AND catalog_id=$2 AND status='accepted' AND candidate_id<>$3
+           LIMIT 1`,
+          [runId, input.song.id, row.id],
+        );
+        const matchStatus: CatalogMatchResult["status"] = duplicate.rows[0]
+          ? "duplicate"
+          : "accepted";
+        const matchBasis = "Pipeline V2 exact Apple editorial-container identity";
+        const exactMatchScore = normalizedCatalogMatchScore(100);
+        await client.query(
+          `INSERT INTO catalog_matches(
+             id,run_id,candidate_id,status,basis,score,catalog_id,song_json,alternatives_json,
+             initial_status,initial_basis,initial_score,initial_catalog_id,initial_song_json,initial_matched_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'[]'::jsonb,
+                  $4,$5,$6,$7,$8::jsonb,now())
+           ON CONFLICT(candidate_id) DO UPDATE SET
+             status=EXCLUDED.status,basis=EXCLUDED.basis,score=EXCLUDED.score,
+             catalog_id=EXCLUDED.catalog_id,song_json=EXCLUDED.song_json,
+             alternatives_json=EXCLUDED.alternatives_json`,
+          [
+            randomUUID(),
+            runId,
+            row.id,
+            matchStatus,
+            matchBasis,
+            exactMatchScore,
+            input.song.id,
+            JSON.stringify(input.song),
+          ],
+        );
+        await client.query(
+          "UPDATE track_candidates SET outcome=$1 WHERE id=$2 AND run_id=$3",
+          [matchStatus, row.id, runId],
+        );
         output.push({
           candidateId: row.id,
           appleSongId: input.song.id,

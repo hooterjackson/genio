@@ -3086,15 +3086,82 @@ databaseDescribe("hosted backend integration", () => {
       containers: number;
       candidates: number;
       bindings: number;
+      matches: number;
+      acceptedMatches: number;
+      acceptedOutcomes: number;
     }>(
       `SELECT
          (SELECT count(*)::int FROM source_records WHERE run_id=$1) sources,
          (SELECT count(*)::int FROM research_containers WHERE run_id=$1) containers,
          (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
-         (SELECT count(*)::int FROM track_scope_bindings WHERE run_id=$1) bindings`,
+         (SELECT count(*)::int FROM track_scope_bindings WHERE run_id=$1) bindings,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1) matches,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1 AND status='accepted') "acceptedMatches",
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1 AND outcome='accepted') "acceptedOutcomes"`,
       [runId],
     );
-    expect(counts.rows[0]).toEqual({ sources: 1, containers: 1, candidates: 1, bindings: 2 });
+    expect(counts.rows[0]).toEqual({
+      sources: 1,
+      containers: 1,
+      candidates: 1,
+      bindings: 2,
+      matches: 1,
+      acceptedMatches: 1,
+      acceptedOutcomes: 1,
+    });
+    expect(await repository.listMatches(runId)).toEqual([
+      expect.objectContaining({
+        candidateId: first[0]!.candidateId,
+        status: "accepted",
+        score: 99.999999,
+        song: expect.objectContaining({ id: discovered.song.id }),
+      }),
+    ]);
+
+    // A second candidate can resolve to an Apple ID already accepted for the
+    // run. The entire duplicate decision is made behind the same run lock and
+    // remains stable when that handoff is retried.
+    const duplicateIdentity = {
+      ...discovered,
+      song: {
+        ...discovered.song,
+        name: "Warehouse Signal (Duplicate Metadata)",
+        isrc: "USAAA8700999",
+      },
+    };
+    const duplicateFirst = await repository.persistCatalogDiscoveredCandidates(
+      runId,
+      [duplicateIdentity],
+      versions,
+    );
+    const duplicateSecond = await repository.persistCatalogDiscoveredCandidates(
+      runId,
+      [duplicateIdentity],
+      versions,
+    );
+    expect(duplicateSecond[0]).toMatchObject({
+      candidateId: duplicateFirst[0]!.candidateId,
+      appleSongId: discovered.song.id,
+      inserted: false,
+    });
+    expect(await repository.listMatches(runId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ candidateId: first[0]!.candidateId, status: "accepted" }),
+      expect.objectContaining({ candidateId: duplicateFirst[0]!.candidateId, status: "duplicate" }),
+    ]));
+    const duplicateCounts = await repository.pool.query<{
+      matches: number;
+      accepted: number;
+      duplicates: number;
+      duplicateOutcomes: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1) matches,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1 AND status='accepted') accepted,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1 AND status='duplicate') duplicates,
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1 AND outcome='duplicate') "duplicateOutcomes"`,
+      [runId],
+    );
+    expect(duplicateCounts.rows[0]).toEqual({ matches: 2, accepted: 1, duplicates: 1, duplicateOutcomes: 1 });
   });
 
   test("Pipeline V2 enforces cross-axis proof, relationship evidence, and decade ranges without rejecting a valid track", async () => {

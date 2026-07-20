@@ -1227,6 +1227,43 @@ test("the active process signal moves when motion is allowed", async ({ page }) 
   expect(animationName).toContain("working-trace-scan");
 });
 
+test("an automatic review handoff stays in the assembly state and keeps polling", async ({ page }) => {
+  const automaticRun = {
+    ...run,
+    id: "run-automatic-handoff",
+    autoPublish: true,
+    status: "visitor_review",
+    phase: "exception_review",
+  };
+  let runReads = 0;
+  await page.route("**/api/v1/capabilities/exchange", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ runId: automaticRun.id }),
+    });
+  });
+  await page.route("**/api/v1/runs/run-automatic-handoff", async (route) => {
+    runReads += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(automaticRun),
+    });
+  });
+
+  await page.goto("/#cap=one-time-secret&run=run-automatic-handoff");
+
+  await expect(page.getByText("[EXHAUSTIVE · ASSEMBLING]", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Creating your playlist" })).toBeVisible();
+  await expect(page.getByTestId("working-indicator").getByRole("status")).toContainText(
+    "Locking the selected recording versions into the final playlist order before publication.",
+  );
+  await expect(page.getByRole("heading", { name: "Choose tracks" })).toHaveCount(0);
+  await expect(page.getByTestId("working-indicator").locator("[aria-current='step']")).toContainText("SEQUENCE");
+  await expect.poll(() => runReads, { timeout: 4_000 }).toBeGreaterThanOrEqual(3);
+});
+
 test("the jobs screen lists and opens earlier jobs for this browser", async ({ page }) => {
   const earlierRun = {
     ...run,

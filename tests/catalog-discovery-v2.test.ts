@@ -230,10 +230,10 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
     expect(result.qualified[0]!.song).toMatchObject({
       id: song(1).id,
       albumName: "Canonical Album",
-      genreNames: ["Music", "House"],
       releaseDate: "1992-01-01",
       isrc: song(1).isrc,
     });
+    expect(new Set(result.qualified[0]!.song.genreNames)).toEqual(new Set(["Music", "House"]));
   });
 
   test("artist and album expansion discovers identities but never qualifies unsupported whole-album tracks", async () => {
@@ -371,6 +371,78 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
       kind: "trusted_scoped_playlist",
       status: "complete",
     }));
+  });
+
+  test("enumerates a newly trusted playlist before remaining direct searches", async () => {
+    const calls: string[] = [];
+    const result = await discoverCuratedAppleCatalog(provider({
+      search: async (_storefront, query) => {
+        calls.push(`search:${query}`);
+        return {
+          songs: [],
+          artists: [],
+          albums: [],
+          playlists: query === "house music"
+            ? [{
+                id: "pl.house",
+                name: "Classic House Essentials",
+                curatorName: "Apple Music Dance",
+                description: "Foundational house records",
+              }]
+            : [],
+        };
+      },
+      playlistTracks: async (_storefront, playlistId) => {
+        calls.push(`playlist:${playlistId}`);
+        return { items: Array.from({ length: 6 }, (_, index) => song(index + 1)), next: null };
+      },
+    }), {
+      storefront: "us",
+      query: "house music",
+      aliases: ["classic house", "Chicago house", "deep house"],
+      target: 1,
+      concurrency: 4,
+      trustDiscoveredPlaylist(playlist) {
+        return playlist.id === "pl.house" ? ["source-record:classic-house"] : null;
+      },
+      evaluate: (_item, context) => ({
+        eligible: context.inheritedScopeBindingRefs.includes("source-record:classic-house"),
+        scopeBindingRefs: [],
+        reasonCode: "trusted_scoped_membership",
+      }),
+    });
+
+    expect(calls).toEqual(["search:house music", "playlist:pl.house"]);
+    expect(result.qualified).toHaveLength(6);
+    expect(result.stoppedBecause).toBe("target_and_reserve");
+  });
+
+  test("sizes each adaptive discovery wave for Apple's 25-result search pages", async () => {
+    let activeSearches = 0;
+    let maximumActiveSearches = 0;
+    const result = await discoverCuratedAppleCatalog(provider({
+      search: async () => {
+        activeSearches += 1;
+        maximumActiveSearches = Math.max(maximumActiveSearches, activeSearches);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        activeSearches -= 1;
+        return { songs: [], artists: [], albums: [], playlists: [] };
+      },
+    }), {
+      storefront: "us",
+      query: "primary",
+      aliases: ["alias one", "alias two", "alias three"],
+      target: 25,
+      concurrency: 8,
+      maxTotalProviderCalls: 3,
+      evaluate: () => ({ eligible: false, scopeBindingRefs: [], reasonCode: "none" }),
+    });
+
+    // A cold 25-track target needs 60 raw discoveries including reserve.
+    // At 25 Apple resources per page, the first bounded wave is three calls.
+    expect(maximumActiveSearches).toBe(3);
+    expect(result.providerCallCount).toBe(3);
+    expect(result.stoppedBecause).toBe("provider_call_limit");
   });
 
   test("two zero-yield pages exhaust a strategy and unsafe cursors never reach the provider", async () => {
