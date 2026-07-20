@@ -40,7 +40,8 @@ export type PipelineVersion = "legacy_v1" | "catalog_first_v2" | "pipeline_v2";
 export type PipelinePolicyVersion =
   | "legacy_v1"
   | "catalog_first_v2_policy_v1"
-  | "relevance_first_2026_07";
+  | "relevance_first_2026_07"
+  | "relevance_first_2026_07_r2";
 
 /** Primary research intents. Several may coexist in one request. */
 export type ResearchIntent =

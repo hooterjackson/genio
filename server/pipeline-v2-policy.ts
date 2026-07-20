@@ -14,7 +14,7 @@ import {
 
 export const PIPELINE_V2_VERSION = "catalog_first_v2" as const;
 export const SELECTION_PLAN_VERSION = "selection_plan_v2" as const;
-export const PIPELINE_POLICY_VERSION = "relevance_first_2026_07" as const;
+export const PIPELINE_POLICY_VERSION = "relevance_first_2026_07_r2" as const;
 
 export const SOFT_CONSTRAINT_RELAXATION_ORDER = [
   "sequencing",
@@ -384,10 +384,7 @@ export function catalogContentRating(
     : null;
 }
 
-export function catalogRecordingVersionClass(
-  song: Pick<CatalogSong, "name" | "versionLabel" | "contentRating">,
-): RecordingVersionClass {
-  const value = `${song.name} ${song.versionLabel ?? ""}`.normalize("NFKD").toLowerCase();
+function catalogRecordingVersionMarkerClass(value: string): RecordingVersionClass | null {
   if (/\b(karaoke)\b/u.test(value)) return "karaoke";
   if (/\b(cover|tribute)\b/u.test(value)) return "cover";
   if (/\b(instrumental)\b/u.test(value)) return "instrumental";
@@ -397,6 +394,30 @@ export function catalogRecordingVersionClass(
   if (/\b(?:(?:radio|single)\s+)?edit\b/u.test(value)) return "radio_edit";
   if (/\b(extended)\b/u.test(value)) return "extended";
   if (/\b(acoustic)\b/u.test(value)) return "acoustic";
+  return null;
+}
+
+export function catalogRecordingVersionClass(
+  song: Pick<CatalogSong, "name" | "versionLabel" | "contentRating">,
+): RecordingVersionClass {
+  const value = `${song.name} ${song.versionLabel ?? ""}`.normalize("NFKD").toLowerCase();
+  // Dance catalogs commonly use “Original Mix” (and “Original Club Mix”)
+  // for the canonical recording, not a later remix. Remove only that exact
+  // phrase before checking for another version marker so “Original Mix -
+  // Live” cannot launder a derived recording into the canonical class.
+  const originalMixPattern = /\boriginal(?:\s+club)?\s+mix\b/u;
+  if (originalMixPattern.test(value)) {
+    const remainingVersionText = value.replace(/\boriginal(?:\s+club)?\s+mix\b/gu, " ");
+    const conflictingVersion = catalogRecordingVersionMarkerClass(
+      remainingVersionText,
+    );
+    if (conflictingVersion) return conflictingVersion;
+    if (/\b(clean)\b/u.test(remainingVersionText)) return "clean";
+    if (/\b(explicit)\b/u.test(remainingVersionText)) return "explicit";
+    return "canonical";
+  }
+  const markerClass = catalogRecordingVersionMarkerClass(value);
+  if (markerClass) return markerClass;
   const rating = catalogContentRating(song);
   if (rating) return rating;
   if (/\b(clean)\b/u.test(value)) return "clean";

@@ -2,6 +2,19 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.6",
+      "releasedAt": "2026-07-19",
+      "title": "Pipeline V2 catalog handoff hardening",
+      "notes": [
+        "Promoted trusted Apple editorial identities in bounded chunks before optional enrichment, preventing large discovery pages from exhausting the matching window before usable tracks become durable.",
+        "Reserved matching time for catalog handoff and re-read exact identities before timeout bookkeeping so accepted Apple matches cannot be overwritten by bulk timeout outcomes.",
+        "Kept inferred subject geography as a discovery preference while preserving explicit prompt and guided-answer geography as hard scope.",
+        "Treated geographic alternatives inside one relationship as OR while retaining AND across distinct requested relationships, with prior-policy compatibility for in-flight runs.",
+        "Distinguished canonical Original Mix releases from actual remixes and treated conditionally allowed edits as fallbacks rather than preferred versions.",
+        "Added production-scale regressions for catalog-page handoff, exact-match concurrency, broad house scope, explicit Chicago scope, geographic alternatives, and version classification."
+      ]
+    },
+    {
       "version": "1.2.5",
       "releasedAt": "2026-07-19",
       "title": "Pipeline V2 catalog activation fix",

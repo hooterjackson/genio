@@ -12,13 +12,14 @@ import type {
 } from "../shared/types.ts";
 import type { PlaylistGuidancePreference } from "./guidance-context.ts";
 import { assertsFactualTrackRelationship } from "./factual-frontier-policy.ts";
+import { PIPELINE_POLICY_VERSION } from "./pipeline-v2-policy.ts";
 import {
   parseSelectionGeographyConstraints,
   selectionConstraintGeography,
   uniqueGeographyConstraints,
 } from "./selection-geography-policy.ts";
 
-export const PIPELINE_V2_SELECTION_PLAN_VERSION = "relevance_first_2026_07" as const;
+export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
@@ -29,7 +30,7 @@ const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|dr
 const THEME_INTENT = /\b(?:songs?\s+about|tracks?\s+about|lyrics?\s+about|theme|themed)\b/iu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
-  [/\b(?:canonical|original(?:[-\s]+era)?(?:\s+(?:studio|album|single))?\s+(?:recording|version)s?(?!\s+identity)|studio\s+(?:recording|version)s?)\b/iu, "canonical"],
+  [/\b(?:canonical|original\s+or\s+definitive\s+(?:recording|version)s?|original(?:[-\s]+era)?(?:\s+(?:studio|album|single))?\s+(?:recording|version)s?(?!\s+identity)|studio\s+(?:recording|version)s?)\b/iu, "canonical"],
   [/\bremaster(?:ed|s)?\b/iu, "remaster"],
   [/\blive\b/iu, "live"],
   [/\bremix(?:es)?\b/iu, "remix"],
@@ -143,6 +144,32 @@ function hasConditionalRemasterFallback(scope: string): boolean {
     return condition !== null
       && canonicalRecordingIsUnavailable(after.slice(condition.index + condition[0].length));
   });
+}
+
+/**
+ * "Include/use X only if ..." makes X an allowed fallback, not a preferred
+ * recording class. Without this distinction, guidance such as "prefer the
+ * original; include later edits only if historically central" incorrectly
+ * turns every canonical Apple match into an exception.
+ */
+function conditionallyAllowedVersionValues(
+  scope: string,
+): Set<SelectionVersionPolicy["allowed"][number]> {
+  const conditional = new Set<SelectionVersionPolicy["allowed"][number]>();
+  const clauses = scope.split(/[.;\n]+/u);
+  for (const clause of clauses) {
+    for (const [marker, value] of VERSION_MARKERS) {
+      const matcher = new RegExp(marker.source, marker.flags.includes("g") ? marker.flags : `${marker.flags}g`);
+      for (const match of clause.matchAll(matcher)) {
+        const before = clause.slice(0, match.index);
+        const after = clause.slice(match.index + match[0].length);
+        if (!/\b(?:include(?:d|s)?|including|allow(?:ed|s|ing)?|use(?:d|s)?|using|accept(?:ed|s|ing)?)\b/iu.test(before)) continue;
+        if (!/^\s*(?:versions?\s+)?only\s+(?:if|when|where|provided)\b/iu.test(after)) continue;
+        conditional.add(value);
+      }
+    }
+  }
+  return conditional;
 }
 
 function normalized(value: string): string {
@@ -440,26 +467,32 @@ function constraintsForBrief(
     add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
   }
 
-  // Subject entities are useful when the prompt does not name a typed axis,
-  // but they are model-resolved fragments rather than additional visitor
-  // requirements. Once the prompt defines an axis, never let a fragment
-  // narrow it (for example, separate `1970s` and `1980s` entities). For axes
-  // absent from the prompt, merge equivalent positive fragments as
-  // alternatives before making them hard constraints.
+  // Subject entities are model-resolved discovery hints, not visitor-authored
+  // requirements. They must never silently harden inferred places, eras,
+  // scenes, languages, or subgenres (for example, a plain `House music`
+  // request expanded by the model to Chicago, New York, Detroit, and the UK).
+  // Raw prompt rules above and typed guidance below are the only paths that
+  // may create non-relaxable semantic scope.
   const promptDefinedAxes = new Set(promptScopeRules.map((rule) => rule.axis));
   const subjectScopeRules = coalesceAlternativeScopeRules(
     unique(brief.subjectEntities)
       .flatMap((scopeText) => parsedAxisRules(scopeText))
       .filter((rule) => !promptDefinedAxes.has(rule.axis)),
   );
-  for (const parsed of subjectScopeRules) {
-    add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
-  }
-  // The user prompt and resolved subject entities define non-relaxable scope.
-  // Model-authored title/description/include prose supplies useful discovery
-  // hints, but must not silently invent hard eras, venues, activities, or
-  // other requirements the visitor never requested.
   let generatedPreferenceRank = 10;
+  for (const parsed of subjectScopeRules) {
+    add(
+      "subject_preference",
+      parsed.axis,
+      "prefer",
+      parsed.values,
+      "soft",
+      generatedPreferenceRank++,
+      parsed.geographyRelationship ?? null,
+    );
+  }
+  // Model-authored title/description/include prose likewise supplies useful
+  // discovery hints, but cannot invent hard requirements.
   for (const scopeText of unique([brief.title, brief.description, ...brief.include])) {
     for (const parsed of parsedAxisRules(scopeText)) {
       add(
@@ -597,6 +630,7 @@ function similarityDimensions(prompt: string): string[] {
 function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
   const scope = brief.versionPolicy;
   const conditionalRemasterFallback = hasConditionalRemasterFallback(scope);
+  const conditionallyAllowed = conditionallyAllowedVersionValues(scope);
   const dispositions = VERSION_MARKERS.map(([pattern, value]) => ({
     pattern,
     value,
@@ -628,10 +662,11 @@ function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
     ? requested
     : [...new Set([...defaultAllowed, ...requested])])
     .filter((value) => !excluded.has(value));
+  const preferredRequested = requested.filter((value) => !conditionallyAllowed.has(value));
   const preferenceCandidates = conditionalRemasterFallback
-    ? requested.filter((value) => value !== "remaster")
-    : requested.length > 0
-      ? requested
+    ? preferredRequested.filter((value) => value !== "remaster")
+    : preferredRequested.length > 0
+      ? preferredRequested
       : defaultPreferred;
   const preferred: SelectionVersionPolicy["preferred"] = preferenceCandidates
     .filter((value) => allowed.includes(value));

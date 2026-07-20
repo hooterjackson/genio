@@ -335,13 +335,15 @@ const CATALOG_SIZE_POLICIES: readonly CatalogDiscoverySizePolicy[] = Object.free
 /** Immutable execution limits selected from the requested output tier. */
 export function catalogDiscoverySizePolicy(
   target: number,
-  policyVersion: PipelinePolicyVersion = "relevance_first_2026_07",
+  policyVersion: PipelinePolicyVersion = "relevance_first_2026_07_r2",
 ): Readonly<CatalogDiscoverySizePolicy> {
-  if (policyVersion !== "relevance_first_2026_07") {
+  if (policyVersion !== "relevance_first_2026_07"
+    && policyVersion !== "relevance_first_2026_07_r2") {
     throw new Error(`Unsupported catalog discovery policy: ${policyVersion}`);
   }
   const bounded = Math.max(1, Math.min(300, Math.floor(Number.isFinite(target) ? target : 50)));
-  return CATALOG_SIZE_POLICIES.find((policy) => bounded <= policy.tier) ?? CATALOG_SIZE_POLICIES.at(-1)!;
+  const policy = CATALOG_SIZE_POLICIES.find((candidate) => bounded <= candidate.tier) ?? CATALOG_SIZE_POLICIES.at(-1)!;
+  return policy.policyVersion === policyVersion ? policy : Object.freeze({ ...policy, policyVersion });
 }
 
 export function boundedCatalogConcurrency(requested: number): number {

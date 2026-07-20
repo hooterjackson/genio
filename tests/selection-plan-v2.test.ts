@@ -29,6 +29,7 @@ function brief(overrides: Partial<PlaylistBrief> = {}): PlaylistBrief {
 describe("Pipeline V2 selection plan", () => {
   test("house music remains a genre and receives broad-playlist diversity goals", () => {
     const plan = createSelectionPlanV2({ prompt: "50 essential house music tracks", brief: brief() });
+    expect(plan.policyVersion).toBe("relevance_first_2026_07_r2");
     expect(plan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
     expect(plan.constraints.some((constraint) => constraint.values.some((value) => value.includes("physical houses")))).toBe(true);
     expect(plan.diversityGoals.maximumTracksPerArtist).toBe(8);
@@ -117,7 +118,7 @@ describe("Pipeline V2 selection plan", () => {
       storefront: "us",
     });
 
-    expect(plan.versionPolicy.preferred).toEqual(["canonical", "remaster"]);
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
     expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
   });
 
@@ -130,7 +131,7 @@ describe("Pipeline V2 selection plan", () => {
     });
 
     expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
-    expect(plan.versionPolicy.preferred).toEqual(["canonical", "remaster"]);
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
   });
 
   test("keeps canonical preferred and remasters as fallback for the production wording", () => {
@@ -143,6 +144,25 @@ describe("Pipeline V2 selection plan", () => {
 
     expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
     expect(plan.versionPolicy.allowed).toEqual(["canonical", "remaster", "clean", "explicit", "unknown"]);
+  });
+
+  test("keeps original house versions preferred when later edits are conditional", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House music",
+      brief: brief({
+        versionPolicy: "Prefer original or definitive versions when multiple commonly cited versions exist; include later edits only if they are historically central or more widely recognized than the original.",
+      }),
+    });
+
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).toEqual([
+      "canonical",
+      "remaster",
+      "clean",
+      "explicit",
+      "unknown",
+      "radio_edit",
+    ]);
   });
 
   test("treats an only-if remaster as fallback rather than excluding canonical versions", () => {
@@ -301,6 +321,68 @@ describe("Pipeline V2 selection plan", () => {
       { value: "French", relationship: "language" },
       { value: "American", relationship: "unspecified" },
     ]));
+  });
+
+  test("does not harden model-inferred house-music cities absent from the prompt", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House music",
+      brief: brief({
+        subjectEntities: ["House music", "Chicago", "New York", "Detroit", "UK"],
+        description: "A broad survey spanning Chicago, New York, Detroit, and UK house.",
+        include: ["Foundational tracks from Chicago, New York, Detroit, and the UK."],
+      }),
+    });
+
+    expect(plan.constraints.filter((constraint) => (
+      constraint.kind === "hard"
+      && ["geography", "language", "scene"].includes(constraint.axis)
+    ))).toEqual([]);
+    expect(plan.geographyConstraints).toEqual([]);
+  });
+
+  test("keeps visitor-requested Chicago house as hard geography", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Chicago house music",
+      brief: brief({
+        subjectEntities: ["House music", "Chicago", "New York", "Detroit", "UK"],
+      }),
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      kind: "hard",
+      axis: "geography",
+      values: ["Chicago"],
+      geographyRelationship: "unspecified",
+    }));
+    expect(plan.geographyConstraints).toContainEqual({ value: "Chicago", relationship: "unspecified" });
+  });
+
+  test("keeps a typed Chicago scene answer hard even when the prompt is broad", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "House music",
+      brief: brief({ subjectEntities: ["House music", "Chicago", "New York"] }),
+      guidancePreferences: [{
+        questionId: "q-house-scene",
+        decisionKey: "house_scene_boundary",
+        kind: "research_preference",
+        value: "Require the Chicago label and venue scene.",
+        orderingBehavior: null,
+        geographyConstraint: { value: "Chicago", relationship: "label_or_venue_scene" },
+        source: "option",
+      }],
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      id: expect.stringMatching(/^guidance_scope_/u),
+      kind: "hard",
+      axis: "scene",
+      values: ["Chicago"],
+      geographyRelationship: "label_or_venue_scene",
+    }));
+    expect(plan.geographyConstraints).toContainEqual({
+      value: "Chicago",
+      relationship: "label_or_venue_scene",
+    });
   });
 
   test.each([

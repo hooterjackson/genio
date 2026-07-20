@@ -271,7 +271,7 @@ class V2MemoryMatchingRepository extends MemoryMatchingRepository {
     return {
       ...(await super.getRun()),
       pipelineVersion: "catalog_first_v2" as const,
-      policyVersion: "relevance_first_2026_07" as const,
+      policyVersion: this.selectionPlan?.policyVersion ?? "relevance_first_2026_07",
       selectionPlan: this.selectionPlan,
     };
   }
@@ -371,6 +371,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 test("inferred evidence keeps ranked Apple choices but is forced to visitor review", async () => {
@@ -620,7 +621,7 @@ test("Brazilian disco production policy accepts a full canonical pool and finali
     storefront: "us",
   });
   expect(repository.selectionPlan.versionPolicy).toMatchObject({
-    preferred: ["canonical", "remaster"],
+    preferred: ["canonical"],
     allowed: ["canonical", "remaster", "clean", "explicit", "unknown"],
   });
 
@@ -680,6 +681,79 @@ test("Brazilian disco production policy accepts a full canonical pool and finali
   expect(manifestReport.shadow.tracks).toHaveLength(25);
   expect(new Set(manifestReport.shadow.tracks.map((track) => track.appleSongId)).size).toBe(25);
   expect(new Set(manifestReport.shadow.tracks.map((track) => track.recordingFamilyKey)).size).toBe(25);
+});
+
+test("conditional later-edit prose does not send an exact canonical house recording to review", async () => {
+  const houseBrief: PlaylistBrief = {
+    ...sceneBrief(1),
+    title: "House Essentials 25",
+    description: "A source-backed selection of recordings in the requested house music scope.",
+    subjectEntities: ["House music"],
+    relationship: "is a recording in the house music genre",
+    include: ["Canonical house tracks"],
+    versionPolicy: "Prefer original or definitive versions when multiple commonly cited versions exist; include later edits only if they are historically central or more widely recognized than the original.",
+  };
+  const houseCandidate = candidate("v2-house-conditional-edit", "editorial");
+  houseCandidate.artist = "Marshall Jefferson";
+  houseCandidate.title = "Move Your Body";
+  houseCandidate.album = null;
+  houseCandidate.releaseYear = null;
+  houseCandidate.durationMs = null;
+  houseCandidate.isrc = null;
+  houseCandidate.versionLabel = null;
+  houseCandidate.candidateStage = "scope_qualified";
+  houseCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "genre_scene",
+    scopeValue: "house music",
+    relationship: "Move Your Body is a house recording",
+    confidence: 0.98,
+    sourceUrl: "https://example.com/house/move-your-body",
+    sourceRecordId: "source-record-house-move-your-body",
+    researchContainerId: null,
+    citationAttestationId: "citation-house-move-your-body",
+    provenancePath: [{ kind: "provenance_root", id: "independent-house-editorial-root" }],
+    note: "Track-specific house evidence from a stored source record.",
+  }];
+  vi.mocked(searchAppleCatalog).mockResolvedValue([{
+    ...song,
+    id: "apple-house-canonical",
+    artistName: houseCandidate.artist,
+    name: houseCandidate.title,
+    albumName: "Move Your Body - Single",
+    releaseDate: "1986-01-01",
+    durationInMillis: 405_760,
+    isrc: "GBBLG0100315",
+    versionLabel: undefined,
+  }]);
+
+  const repository = new V2MemoryMatchingRepository(
+    [houseCandidate],
+    houseBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "House music",
+    brief: houseBrief,
+    storefront: "us",
+  });
+  expect(repository.selectionPlan.versionPolicy).toMatchObject({
+    preferred: ["canonical"],
+    allowed: expect.arrayContaining(["canonical", "radio_edit"]),
+  });
+
+  await matchResearchRun(repository, "run-v2-house-conditional-edit", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    candidateId: houseCandidate.id,
+    status: "accepted",
+    song: expect.objectContaining({ id: "apple-house-canonical" }),
+  })]);
 });
 
 test("V2 fixed-album scope never bypasses the requested album with an exact artist/title result", async () => {
@@ -1408,6 +1482,262 @@ test("V2 curated discovery grows the persisted pool from a scoped Apple editoria
     phase: "catalog_discovery_v2",
     checkpoint: expect.objectContaining({ persistedCandidateCount: 1, resolvedCount: 2 }),
   }));
+});
+
+test("V2 keeps qualified Apple rows resumable when the fast deadline expires before handoff", async () => {
+  vi.useFakeTimers();
+  const confirmedAt = new Date("2026-07-19T20:00:00.000Z");
+  vi.setSystemTime(confirmedAt);
+  const handoffBrief: PlaylistBrief = {
+    title: "House music starter",
+    description: "A source-backed house music playlist.",
+    mode: "curated",
+    subjectEntities: ["house music"],
+    relationship: "represents house music",
+    include: ["house music"],
+    exclude: [],
+    versionPolicy: "canonical studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "source order",
+    targetSize: { min: 1, max: 1 },
+    ambiguities: [],
+  };
+  const editorialSongs: CatalogSong[] = Array.from({ length: 6 }, (_, index) => ({
+    id: `apple-handoff-${index}`,
+    name: `Handoff House Track ${index}`,
+    artistName: `Handoff Artist ${index}`,
+    albumName: `Handoff Release ${index}`,
+    releaseDate: "1988-01-01",
+    durationInMillis: 300_000 + index,
+    isrc: `USHHH88${String(index).padStart(5, "0")}`,
+  }));
+  let providerCalls = 0;
+  let consumeFirstRoute = true;
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      providerCalls += 1;
+      return {
+        songs: [], artists: [], albums: [], playlists: [{
+          id: "pl.house-deadline-handoff",
+          name: "House Essentials",
+          curatorName: "Apple Music Dance",
+          description: "Foundational house music.",
+          playlistType: "editorial",
+          url: "https://music.apple.com/us/playlist/house-essentials/pl.house-deadline-handoff",
+        }],
+      };
+    },
+    async playlistTracks() {
+      providerCalls += 1;
+      if (consumeFirstRoute) {
+        consumeFirstRoute = false;
+        const route = repository.checkpointsByPhase.get("fast:route:fast_curated_v3") as { deadlineAt: string };
+        vi.setSystemTime(new Date(Date.parse(route.deadlineAt) - 1_000));
+      }
+      return { items: editorialSongs, next: null };
+    },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [],
+    handoffBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint(confirmedAt)]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "One house music track",
+    brief: handoffBrief,
+    storefront: "us",
+  });
+
+  await expect(matchResearchRun(repository, "run-v2-deadline-handoff", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+    musicBrainzEnricher: async () => null,
+  })).rejects.toThrow("awaiting durable handoff");
+
+  expect(repository.persistedDiscoveries).toHaveLength(0);
+  expect(repository.matches).toHaveLength(0);
+  expect(repository.checkpointsByPhase.get("catalog_discovery_v2")).toMatchObject({
+    schemaVersion: 2,
+    state: "running",
+    complete: false,
+    retryable: true,
+    qualifiedCount: 6,
+    handoffPendingCount: 6,
+    durableAcceptedCount: 0,
+    progress: expect.objectContaining({ candidates: expect.any(Array) }),
+  });
+  const callsBeforeResume = providerCalls;
+
+  await matchResearchRun(repository, "run-v2-deadline-handoff", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(providerCalls).toBe(callsBeforeResume);
+  expect(repository.persistedDiscoveries).toHaveLength(6);
+  expect(repository.matches.filter((match) => match.status === "accepted")).toHaveLength(6);
+  expect(repository.checkpointsByPhase.get("catalog_discovery_v2")).toMatchObject({
+    schemaVersion: 2,
+    state: "terminal",
+    complete: true,
+    retryable: false,
+    handoffPendingCount: 0,
+    durableAcceptedCount: 6,
+  });
+});
+
+test("V2 promotes production-sized trusted Apple discoveries in bounded chunks before generic timeout", async () => {
+  vi.useFakeTimers();
+  const confirmedAt = new Date("2026-07-19T23:24:44.000Z");
+  vi.setSystemTime(confirmedAt);
+  const productionBrief: PlaylistBrief = {
+    title: "House Essentials 25",
+    description: "A source-backed selection of recordings in the requested house music scope.",
+    mode: "curated",
+    subjectEntities: ["house music"],
+    relationship: "represents house music",
+    include: ["house music"],
+    exclude: [],
+    versionPolicy: "canonical studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "source order",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: [],
+  };
+  const researchCandidates = Array.from({ length: 44 }, (_, index) => {
+    const row = candidate(`house-research-${index}`, "editorial");
+    row.artist = `Research Artist ${index}`;
+    row.title = `Research Track ${index}`;
+    row.album = `Research Album ${index}`;
+    row.isrc = `USAAA26${String(index).padStart(5, "0")}`;
+    row.candidateStage = index < 15 ? "canonicalized" : "scope_qualified";
+    row.scopeBindings = [{
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "genre",
+      scopeValue: "house music",
+      relationship: "represents house music",
+      confidence: 0.95,
+      sourceUrl: `https://example.com/house/${index}`,
+      sourceRecordId: `source-house-${index}`,
+      researchContainerId: null,
+      citationAttestationId: `citation-house-${index}`,
+      provenancePath: [{ kind: "provenance_root", id: `house-root-${index}` }],
+      note: "Track-specific house evidence.",
+    }];
+    return row;
+  });
+  const editorialSongs: CatalogSong[] = Array.from({ length: 122 }, (_, index) => ({
+    id: `apple-house-editorial-${index}`,
+    name: `Editorial House Track ${index}`,
+    artistName: `Editorial House Artist ${index}`,
+    albumName: `Editorial House Release ${index}`,
+    releaseDate: "1988-01-01",
+    durationInMillis: 300_000 + index,
+    isrc: `GBBBB88${String(index).padStart(5, "0")}`,
+  }));
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      return {
+        songs: [], artists: [], albums: [], playlists: [{
+          id: "pl.house-production-handoff",
+          name: "House Essentials",
+          curatorName: "Apple Music Dance",
+          description: "Foundational house music.",
+          playlistType: "editorial",
+          url: "https://music.apple.com/us/playlist/house-essentials/pl.house-production-handoff",
+        }],
+      };
+    },
+    async playlistTracks() { return { items: editorialSongs, next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    researchCandidates,
+    productionBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint(confirmedAt)]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "25 house music tracks",
+    brief: productionBrief,
+    storefront: "us",
+  });
+  for (let index = 0; index < 15; index += 1) {
+    repository.matches.push({
+      candidateId: `house-research-${index}`,
+      status: "accepted",
+      basis: "Previously resolved exact Apple identity",
+      score: 100,
+      song: {
+        id: `apple-house-research-${index}`,
+        name: `Research Track ${index}`,
+        artistName: `Research Artist ${index}`,
+        albumName: `Research Album ${index}`,
+      },
+      alternatives: [],
+    });
+  }
+  const persist = repository.persistCatalogDiscoveredCandidates.bind(repository);
+  const persistedChunkSizes: number[] = [];
+  repository.persistCatalogDiscoveredCandidates = async (...args) => {
+    persistedChunkSizes.push(args[1].length);
+    const result = await persist(...args);
+    // Model a production database handoff that consumes most of the route.
+    // The second acknowledged chunk crosses the absolute deadline, but its
+    // exact identities must still be durable before generic timeout handling.
+    vi.setSystemTime(new Date(Date.now() + (persistedChunkSizes.length === 1 ? 30_000 : 70_000)));
+    return result;
+  };
+  vi.setSystemTime(new Date(confirmedAt.getTime() + 26_000));
+  vi.mocked(lookupAppleCatalogByIsrc).mockResolvedValue([]);
+  vi.mocked(searchAppleCatalog).mockResolvedValue([]);
+
+  await matchResearchRun(repository, "run-v2-production-handoff", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(persistedChunkSizes).toEqual([10, 10]);
+  expect(repository.persistedDiscoveries).toHaveLength(20);
+  const acceptedEditorial = repository.matches.filter((match) => (
+    match.status === "accepted" && match.song?.id.startsWith("apple-house-editorial-")
+  ));
+  expect(acceptedEditorial).toHaveLength(20);
+  expect(repository.matches.filter((match) => match.status === "accepted")).toHaveLength(35);
+  expect(repository.bulkTimeoutWrites.flatMap((write) => write.candidateIds))
+    .not.toEqual(expect.arrayContaining(acceptedEditorial.map((match) => match.candidateId)));
+  expect(repository.persistedDiscoveries.length).toBeLessThan(editorialSongs.length);
+});
+
+test("bulk timeout recheck never overwrites a concurrently stored exact Apple identity", async () => {
+  const row = candidate("concurrent-exact", "editorial");
+  const repository = fastRepository([row], new Date(Date.now() - 180_000));
+  let reads = 0;
+  repository.listMatches = async () => {
+    reads += 1;
+    return reads === 1 ? [] : [{
+      candidateId: row.id,
+      status: "accepted",
+      basis: "Concurrent trusted Apple identity",
+      score: 100,
+      song,
+      alternatives: [],
+    }];
+  };
+
+  await matchResearchRun(repository, "run-concurrent-exact", "us", undefined, { fast: true });
+
+  expect(reads).toBeGreaterThanOrEqual(2);
+  expect(repository.bulkTimeoutWrites).toEqual([]);
 });
 
 test("V2 catalog growth does not turn genre playlist membership into influence evidence", async () => {

@@ -69,13 +69,24 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
     [300, 300, 300_000, 10, 400],
   ] as const)("target %i selects the immutable %i-track discovery tier", (target, tier, deadlineMs, pages, calls) => {
     expect(catalogDiscoverySizePolicy(target)).toEqual({
-      policyVersion: "relevance_first_2026_07",
+      policyVersion: "relevance_first_2026_07_r2",
       tier,
       deadlineMs,
       maxPagesPerStrategy: pages,
       maxTotalProviderCalls: calls,
     });
     expect(Object.isFrozen(catalogDiscoverySizePolicy(target))).toBe(true);
+  });
+
+  test("retains immutable catalog limits for resumable pre-r2 runs", () => {
+    expect(catalogDiscoverySizePolicy(50, "relevance_first_2026_07")).toEqual({
+      policyVersion: "relevance_first_2026_07",
+      tier: 50,
+      deadlineMs: 45_000,
+      maxPagesPerStrategy: 5,
+      maxTotalProviderCalls: 80,
+    });
+    expect(Object.isFrozen(catalogDiscoverySizePolicy(50, "relevance_first_2026_07"))).toBe(true);
   });
 
   test.each([25, 50, 100, 200, 300] as const)(

@@ -232,12 +232,14 @@ function bindingValueMatches(binding: GeographyBindingProof, value: string): boo
 }
 
 /**
- * Resolved place constraints are conjunctive. Requested languages form one
- * allowed set: an individual track may satisfy any requested language while
- * playlist-level discovery and diversity can still represent the full set.
+ * Values inside one semantic relationship are alternatives for an individual
+ * track. Distinct relationships remain conjunctive: a request for artists
+ * from Brazil recorded in France must prove both, while “Brazilian or French”
+ * may be satisfied by either value. Playlist-level selection can still use
+ * diversity goals to represent every requested alternative across the set.
  */
 export function selectionGeographyBindingsSatisfied(
-  plan: Pick<SelectionPlan, "geographyConstraints">,
+  plan: Pick<SelectionPlan, "geographyConstraints"> & Partial<Pick<SelectionPlan, "policyVersion">>,
   bindings: readonly GeographyBindingProof[],
 ): boolean {
   const constraints = Array.isArray(plan.geographyConstraints) ? plan.geographyConstraints : [];
@@ -250,6 +252,19 @@ export function selectionGeographyBindingsSatisfied(
   });
   const languageConstraints = constraints.filter((constraint) => constraint.relationship === "language");
   const placeConstraints = constraints.filter((constraint) => constraint.relationship !== "language");
-  return placeConstraints.every(bindingSatisfies)
-    && (languageConstraints.length === 0 || languageConstraints.some(bindingSatisfies));
+  // Preserve the exact persisted semantics of pre-r2 runs. Their place
+  // constraints were conjunctive even when several values shared one
+  // relationship; changing that behavior mid-run would violate the immutable
+  // policy snapshot contract.
+  if (plan.policyVersion !== "relevance_first_2026_07_r2") {
+    return placeConstraints.every(bindingSatisfies)
+      && (languageConstraints.length === 0 || languageConstraints.some(bindingSatisfies));
+  }
+  const byRelationship = new Map<SelectionGeographyRelationship, SelectionGeographyConstraint[]>();
+  for (const constraint of constraints) {
+    const group = byRelationship.get(constraint.relationship) ?? [];
+    group.push(constraint);
+    byRelationship.set(constraint.relationship, group);
+  }
+  return [...byRelationship.values()].every((alternatives) => alternatives.some(bindingSatisfies));
 }

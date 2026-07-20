@@ -74,6 +74,51 @@ describe("typed selection geography", () => {
     expect(selectionGeographyBindingsSatisfied(multilingualPlan, [german])).toBe(false);
   });
 
+  test("treats places within one geography relationship as alternatives", () => {
+    const eitherScene: Pick<SelectionPlan, "geographyConstraints"> = {
+      geographyConstraints: [
+        { value: "Brazilian", relationship: "unspecified" },
+        { value: "French", relationship: "unspecified" },
+      ],
+    };
+    const brazilian = binding({
+      scopeValue: "Brazilian",
+      relationship: "The recording belongs to the Brazilian scene.",
+      note: "The track-specific source places it in Brazil.",
+    });
+    expect(selectionGeographyBindingsSatisfied({
+      ...eitherScene,
+      policyVersion: "relevance_first_2026_07_r2",
+    }, [brazilian])).toBe(true);
+    expect(selectionGeographyBindingsSatisfied({
+      ...eitherScene,
+      policyVersion: "relevance_first_2026_07",
+    }, [brazilian])).toBe(false);
+  });
+
+  test("keeps distinct geography relationships conjunctive", () => {
+    const originAndLocation: Pick<SelectionPlan, "geographyConstraints"> = {
+      geographyConstraints: [
+        { value: "Brazilian", relationship: "artist_origin" },
+        { value: "French", relationship: "recording_location" },
+      ],
+    };
+    const brazilianOrigin = binding({
+      scopeValue: "Brazilian",
+      geographyRelationship: "artist_origin",
+      relationship: "The artist is from Brazil.",
+      note: "The cited biography documents Brazilian origin.",
+    });
+    const frenchSession = binding({
+      scopeValue: "French",
+      geographyRelationship: "recording_location",
+      relationship: "The recording was made in France.",
+      note: "The cited liner notes document a French recording session.",
+    });
+    expect(selectionGeographyBindingsSatisfied(originAndLocation, [brazilianOrigin])).toBe(false);
+    expect(selectionGeographyBindingsSatisfied(originAndLocation, [brazilianOrigin, frenchSession])).toBe(true);
+  });
+
   test.each([
     ["jazz from the French scene", "label_or_venue_scene"],
     ["jazz recorded in France", "recording_location"],

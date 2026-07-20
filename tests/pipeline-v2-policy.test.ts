@@ -263,6 +263,43 @@ describe("Pipeline V2 production policy", () => {
     expect(recordingFamilyKey({ song: clean })).not.toBe(recordingFamilyKey({ song: explicit }));
   });
 
+  test("treats explicit original-mix labels as canonical without laundering arbitrary mixes", () => {
+    const base = { id: "version", artistName: "Artist", albumName: "Album" };
+    expect(catalogRecordingVersionClass({ ...base, name: "Track (Original Mix)" })).toBe("canonical");
+    expect(catalogRecordingVersionClass({ ...base, name: "Track (Original Club Mix)" })).toBe("canonical");
+    expect(catalogRecordingVersionClass({ ...base, name: "Track (Club Mix)" })).toBe("remix");
+    expect(catalogRecordingVersionClass({ ...base, name: "Track (Underground Network Mix)" })).toBe("remix");
+    expect(catalogRecordingVersionClass({ ...base, name: "Track (Dance Remix)" })).toBe("remix");
+  });
+
+  test.each([
+    ["live", "Track (Original Mix) [Live]"],
+    ["remaster", "Track (Original Club Mix) - 2024 Remaster"],
+    ["radio_edit", "Track (Original Mix) (Radio Edit)"],
+    ["extended", "Track (Original Mix) [Extended]"],
+    ["acoustic", "Track (Original Mix) - Acoustic"],
+    ["remix", "Track (Original Mix) (VIP Remix)"],
+    ["remix", "Track (Original Club Mix) (Underground Mix)"],
+    ["instrumental", "Track (Original Mix) - Instrumental"],
+    ["karaoke", "Track (Original Mix) - Karaoke"],
+    ["cover", "Track (Original Mix) - Tribute Cover"],
+    ["clean", "Track (Original Mix) - Clean"],
+    ["explicit", "Track (Original Club Mix) - Explicit"],
+  ] as const)("does not let Original Mix override a conflicting %s marker", (expected, name) => {
+    expect(catalogRecordingVersionClass({
+      name,
+    })).toBe(expected);
+  });
+
+  test("keeps content rating orthogonal to an otherwise exact Original Mix label", () => {
+    const song = {
+      name: "Track (Original Mix)",
+      contentRating: "explicit" as const,
+    };
+    expect(catalogRecordingVersionClass(song)).toBe("canonical");
+    expect(catalogRecordingVersionSignature(song)).toBe("canonical:explicit");
+  });
+
   test.each([
     ["clean", { contentRating: "clean" as const }],
     ["explicit", { contentRating: "explicit" as const }],

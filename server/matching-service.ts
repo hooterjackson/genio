@@ -214,6 +214,12 @@ function supportsAppleCatalogCache(
 
 const MATCHING_OUTCOME_CHECKPOINT = "catalog_matching_outcome";
 const V2_CATALOG_DISCOVERY_CHECKPOINT = "catalog_discovery_v2";
+// Trusted Apple editorial rows already carry the catalog identity we need.
+// Persist them in small groups and promote each group immediately so a large
+// playlist page cannot consume the whole fast-run window before the first
+// usable identity is durable.
+const V2_CATALOG_HANDOFF_CHUNK_SIZE = 10;
+const V2_CATALOG_HANDOFF_START_RESERVE_MS = 10_000;
 const AUTOMATIC_HANDOFF_TERMINAL_STATUSES = new Set([
   "publishing",
   "waiting_for_apple_authorization",
@@ -1147,6 +1153,10 @@ interface V2CatalogDiscoveryCheckpoint {
   stoppedBecause?: import("./catalog-discovery-v2.ts").CatalogDiscoveryStopReason;
   providerCallCount?: number;
   attemptedCount?: number;
+  /** Qualified Apple rows still present only in the discovery snapshot. */
+  handoffPendingCount?: number;
+  /** Unique exact Apple identities that are durable in catalog_matches. */
+  durableAcceptedCount?: number;
   frontier?: import("./catalog-discovery-v2.ts").CatalogDiscoveryStrategyState[];
   trustedPlaylists?: TrustedEditorialPlaylist[];
 }
@@ -1491,9 +1501,12 @@ async function resolveV2CatalogFrontier(
   storefront: string,
   provider: CatalogDiscoveryProvider,
   signal?: AbortSignal,
-): Promise<void> {
+  routeDeadlineAt?: string,
+): Promise<{ handoffPending: boolean }> {
   const plan = run.selectionPlan;
-  if (!plan || plan.pipelineVersion !== "catalog_first_v2" || pipelineV2Route(plan) !== "curated_catalog") return;
+  if (!plan || plan.pipelineVersion !== "catalog_first_v2" || pipelineV2Route(plan) !== "curated_catalog") {
+    return { handoffPending: false };
+  }
   const inputFingerprint = catalogDiscoveryFingerprint(plan, candidates);
   const prior = await repository.getResearchCheckpoint(runId, V2_CATALOG_DISCOVERY_CHECKPOINT) as V2CatalogDiscoveryCheckpoint | null;
   const sameFingerprint = prior?.inputFingerprint === inputFingerprint;
@@ -1501,7 +1514,9 @@ async function resolveV2CatalogFrontier(
   const priorIsTerminal = Boolean(prior) && !priorIsRunning;
   // Checkpoints written before schemaVersion/state existed are terminal
   // summaries. Continue to honor their complete/retryable contract.
-  if (priorIsTerminal && prior?.complete && !prior.retryable && sameFingerprint) return;
+  if (priorIsTerminal && prior?.complete && !prior.retryable && sameFingerprint) {
+    return { handoffPending: false };
+  }
   const runningProgress = resumableRunningCatalogProgress(
     prior,
     inputFingerprint,
@@ -1542,7 +1557,25 @@ async function resolveV2CatalogFrontier(
     .filter((match) => match.status === "accepted" && match.song?.id)
     .map((match) => match.song!.id));
   const discoveryPolicy = catalogDiscoverySizePolicy(plan.requestedTrackCount, plan.policyVersion);
-  const deadlineSignal = AbortSignal.timeout(discoveryPolicy.deadlineMs);
+  // A worker retry after an acknowledged discovery/handoff checkpoint must
+  // receive a fresh local persistence window. Reusing the expired immutable
+  // visitor route would restore the exact snapshot and then immediately skip
+  // the handoff forever. No new research or provider calls are needed when the
+  // restored snapshot already met its discovery goal.
+  const resumingPendingHandoff = sameRunningAttempt
+    && Number(prior?.handoffPendingCount ?? 0) > 0;
+  const handoffDeadlineAt = resumingPendingHandoff
+    ? new Date(Date.now() + catalogRecoveryDeadlineMs(run.pipelinePolicySnapshot)).toISOString()
+    : routeDeadlineAt;
+  const routeDiscoveryBudget = handoffDeadlineAt
+    ? Date.parse(handoffDeadlineAt) - Date.now()
+      - FAST_MATCHING_FINALIZATION_RESERVE_MS
+      - V2_CATALOG_HANDOFF_START_RESERVE_MS
+    : Number.POSITIVE_INFINITY;
+  const deadlineSignal = AbortSignal.timeout(Math.max(
+    1,
+    Math.min(discoveryPolicy.deadlineMs, routeDiscoveryBudget),
+  ));
   const discoverySignal = signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal;
   const trustedPlaylists = new Map<string, TrustedEditorialPlaylist>();
   if (sameFingerprint) {
@@ -1653,53 +1686,58 @@ async function resolveV2CatalogFrontier(
       const input = discoveredCandidateInput(candidate, trustedPlaylists, run);
       return input ? [input] : [];
     });
-    const persistedDiscoveries = repository.persistCatalogDiscoveredCandidates && discoveredInputs.length > 0
-      ? await repository.persistCatalogDiscoveredCandidates(runId, discoveredInputs, {
-        pipelineVersion: plan.pipelineVersion,
-        policyVersion: plan.policyVersion,
-      })
-      : [];
-    const persistedCandidates: Candidate[] = persistedDiscoveries.flatMap((persisted) => {
-      const input = discoveredInputs.find((item) => item.song.id === persisted.appleSongId);
-      if (!input) return [];
-      return [{
-        id: persisted.candidateId,
-        artist: input.song.artistName,
-        title: input.song.name,
-        album: input.song.albumName || null,
-        releaseYear: input.song.releaseDate ? Number.parseInt(input.song.releaseDate.slice(0, 4), 10) || null : null,
-        durationMs: input.song.durationInMillis ?? null,
-        isrc: input.song.isrc ?? null,
-        musicbrainzId: null,
-        versionLabel: input.song.versionLabel ?? null,
-        candidateStage: "scope_qualified",
-        scopeBindings: persisted.scopeBindings,
-        evidence: [],
-      }];
-    });
+    const inputByAppleId = new Map(discoveredInputs.map((input) => [input.song.id, input]));
+    const persistedDiscoveries: CatalogDiscoveredCandidateResult[] = [];
+    const persistedCandidates: Candidate[] = [];
     let resolvedCount = 0;
-    for (const candidate of persistedCandidates) {
-      const input = discoveredInputs.find((item) => item.song.id === persistedDiscoveries
-        .find((persisted) => persisted.candidateId === candidate.id)?.appleSongId);
-      if (!input || existingCandidateIds.has(candidate.id) || acceptedCatalogIds.has(input.song.id)) continue;
+
+    const persistExactIdentity = async (
+      candidate: Candidate,
+      input: CatalogDiscoveredCandidateInput,
+      basis: string,
+    ): Promise<void> => {
+      if (existingCandidateIds.has(candidate.id) || acceptedCatalogIds.has(input.song.id)) return;
       let match: CatalogMatchResult = {
         candidateId: candidate.id,
         status: "accepted",
-        basis: "Pipeline V2 exact Apple editorial-container identity",
+        basis,
         score: 100,
         song: input.song,
         alternatives: [],
       };
       match = applyV2VersionPolicy(run, candidate, match, [input.song]);
+      // The exact Apple identity is the critical handoff. Save it before
+      // recording-family enrichment and stage bookkeeping so a crash or an
+      // exhausted route can resume from a usable catalog result.
       await repository.saveMatch(runId, match);
-      await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
       existingCandidateIds.add(candidate.id);
       if (match.status === "accepted" && match.song) {
         acceptedCatalogIds.add(match.song.id);
         resolvedCount += 1;
       }
-    }
+      await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
+    };
+
+    // Resolve research candidates returned by the catalog frontier first.
+    // This is also the idempotent recovery path for a prior crash after the
+    // candidate/binding transaction but before its exact match was saved.
     for (const candidate of eligibleCandidates) {
+      const existingAccepted = existingMatches.find((match) => (
+        match.candidateId === candidate.id && match.status === "accepted" && match.song?.id
+      ));
+      if (existingAccepted?.song) {
+        if (candidate.candidateStage !== "canonicalized") {
+          await persistCatalogResolution(repository, runId, run, candidate, {
+            candidateId: candidate.id,
+            status: "accepted",
+            basis: existingAccepted.basis,
+            score: 100,
+            song: existingAccepted.song,
+            alternatives: existingAccepted.alternatives ?? [],
+          }, storefront);
+        }
+        continue;
+      }
       if (existingCandidateIds.has(candidate.id)) continue;
       const songs = songsByKey.get(candidateCatalogKey(candidate)) ?? [];
       if (songs.length === 0) continue;
@@ -1709,25 +1747,90 @@ async function resolveV2CatalogFrontier(
       match = applyV2VersionPolicy(run, candidate, match, songs);
       if (match.status === "accepted" && match.song && acceptedCatalogIds.has(match.song.id)) continue;
       await repository.saveMatch(runId, match);
-      await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
       existingCandidateIds.add(candidate.id);
       if (match.status === "accepted" && match.song) {
         acceptedCatalogIds.add(match.song.id);
         resolvedCount += 1;
       }
+      await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
+    }
+
+    // A single Apple editorial page can contain hundreds of rows. Persist and
+    // promote bounded chunks until the qualified pool (target + reserve) is
+    // satisfied. Unneeded rows stay in the resumable discovery checkpoint
+    // instead of becoming unmatched candidates that the generic matcher later
+    // labels as timed out.
+    if (repository.persistCatalogDiscoveredCandidates) {
+      for (let start = 0; start < discoveredInputs.length; start += V2_CATALOG_HANDOFF_CHUNK_SIZE) {
+        if (acceptedCatalogIds.size >= discovery.qualifiedGoal) break;
+        const remainingRouteMs = handoffDeadlineAt
+          ? Date.parse(handoffDeadlineAt) - Date.now()
+          : Number.POSITIVE_INFINITY;
+        if (remainingRouteMs <= FAST_MATCHING_FINALIZATION_RESERVE_MS + V2_CATALOG_HANDOFF_START_RESERVE_MS) break;
+        const chunk = discoveredInputs.slice(start, start + V2_CATALOG_HANDOFF_CHUNK_SIZE);
+        const persistedChunk = await repository.persistCatalogDiscoveredCandidates(runId, chunk, {
+          pipelineVersion: plan.pipelineVersion,
+          policyVersion: plan.policyVersion,
+        });
+        persistedDiscoveries.push(...persistedChunk);
+        for (const persisted of persistedChunk) {
+          const input = inputByAppleId.get(persisted.appleSongId);
+          if (!input) continue;
+          const candidate: Candidate = {
+            id: persisted.candidateId,
+            artist: input.song.artistName,
+            title: input.song.name,
+            album: input.song.albumName || null,
+            releaseYear: input.song.releaseDate ? Number.parseInt(input.song.releaseDate.slice(0, 4), 10) || null : null,
+            durationMs: input.song.durationInMillis ?? null,
+            isrc: input.song.isrc ?? null,
+            musicbrainzId: null,
+            versionLabel: input.song.versionLabel ?? null,
+            candidateStage: "scope_qualified",
+            scopeBindings: persisted.scopeBindings,
+            evidence: [],
+          };
+          persistedCandidates.push(candidate);
+          await persistExactIdentity(
+            candidate,
+            input,
+            "Pipeline V2 exact Apple editorial-container identity",
+          );
+        }
+      }
     }
     const transientFailureCount = discovery.frontier.filter((item) => item.status === "failed" && item.retryable).length;
     const permanentFailureCount = discovery.frontier.filter((item) => item.status === "failed" && !item.retryable).length;
-    const goalSatisfied = discovery.totalQualifiedCount >= discovery.qualifiedGoal;
-    const retryable = retryAttempt < 3 && !goalSatisfied
+    const discoveryGoalSatisfied = discovery.totalQualifiedCount >= discovery.qualifiedGoal;
+    const finalCandidates = await repository.listCandidates(runId);
+    const finalMatches = await repository.listMatches(runId);
+    const durableAcceptedCatalogIds = new Set(finalMatches
+      .filter((match) => match.status === "accepted" && match.song?.id)
+      .map((match) => match.song!.id));
+    const durableCandidateKeys = new Set(finalCandidates.map(candidateCatalogKey));
+    const handoffPendingCount = discoveredInputs.filter((input) => (
+      !durableAcceptedCatalogIds.has(input.song.id)
+        && !durableCandidateKeys.has(songCatalogKey(input.song))
+    )).length;
+    const durableGoalSatisfied = durableAcceptedCatalogIds.size >= discovery.qualifiedGoal;
+    const handoffPending = !durableGoalSatisfied && handoffPendingCount > 0;
+    const providerRetryable = retryAttempt < 3 && !discoveryGoalSatisfied
       && (transientFailureCount > 0
         || discovery.stoppedBecause === "provider_call_limit"
         || discovery.stoppedBecause === "provider_degraded"
         || discovery.stoppedBecause === "provider_circuit_open");
-    const finalCandidates = await repository.listCandidates(runId);
+    const retryable = handoffPending || providerRetryable;
+
+    // Discovery completion is only meaningful after its qualified Apple rows
+    // have crossed the durable candidate/match boundary. A fast-route deadline
+    // can expire after Apple returns a full editorial page but before the first
+    // handoff transaction begins. Keep that final discovery snapshot running
+    // so the next matching invocation restores it without another provider
+    // call and persists the exact identities instead of treating the frontier
+    // as terminal merely because the in-memory qualified count met its goal.
     await repository.saveResearchCheckpoint(runId, V2_CATALOG_DISCOVERY_CHECKPOINT, {
       schemaVersion: 2,
-      state: "terminal",
+      state: handoffPending ? "running" : "terminal",
       complete: !retryable,
       retryable,
       attempt,
@@ -1742,13 +1845,15 @@ async function resolveV2CatalogFrontier(
       qualifiedCount: discovery.totalQualifiedCount,
       resolvedCount,
       persistedCandidateCount: persistedCandidates.length,
+      handoffPendingCount,
+      durableAcceptedCount: durableAcceptedCatalogIds.size,
       transientFailureCount,
       permanentFailureCount,
       frontier: discovery.frontier,
       trustedPlaylists: [...trustedPlaylists.values()],
       updatedAt: new Date().toISOString(),
     });
-    if (!goalSatisfied && repository.savePipelineOutcome) {
+    if (!discoveryGoalSatisfied && !handoffPending && repository.savePipelineOutcome) {
       const disposition = catalogDiscoveryOutcomeDisposition({
         stoppedBecause: discovery.stoppedBecause,
         safeTrackCount: acceptedCatalogIds.size,
@@ -1771,6 +1876,7 @@ async function resolveV2CatalogFrontier(
         reasonCodes: [disposition.reasonCode],
       }));
     }
+    return { handoffPending };
   } catch (error) {
     if (signal?.aborted) throw error;
     // Never replace the last acknowledged page with a coarse summary when a
@@ -1797,6 +1903,7 @@ async function resolveV2CatalogFrontier(
       trustedPlaylists: [...trustedPlaylists.values()],
       updatedAt: new Date().toISOString(),
     });
+    return { handoffPending: false };
   }
 }
 
@@ -1921,7 +2028,7 @@ export async function matchResearchRun(
         } : undefined,
       })
       : baseDiscoveryProvider;
-    await resolveV2CatalogFrontier(
+    const catalogFrontier = await resolveV2CatalogFrontier(
       repository,
       runId,
       run,
@@ -1930,7 +2037,15 @@ export async function matchResearchRun(
       normalizedStorefront,
       discoveryProvider,
       signal,
+      deadlineAt,
     );
+    if (catalogFrontier.handoffPending) {
+      // Returning successfully would finalize the matching job and can turn a
+      // source-rich run into a zero-track partial. A normal durable-job retry
+      // restores the checkpoint with a fresh handoff-only window; the provider
+      // frontier is not queried again.
+      throw new Error("Qualified Apple catalog identities are awaiting durable handoff");
+    }
     // Discovery can atomically grow the candidate pool. Refresh both sides of
     // the join before the ordinary matcher calculates its remaining work.
     allCandidates = await repository.listCandidates(runId);
@@ -1966,10 +2081,19 @@ export async function matchResearchRun(
     const remaining = deadlineAt ? Date.parse(deadlineAt) - Date.now() : Number.POSITIVE_INFINITY;
     const lookupBudget = remaining - FAST_MATCHING_FINALIZATION_RESERVE_MS;
     if (lookupBudget <= 0) {
-      const timeoutCandidates = work.slice(batchStart).map(({ candidate }) => candidate);
+      // Re-read outcomes before the bulk timeout write. Catalog-frontier
+      // promotion and a reclaimed worker can persist an exact identity after
+      // this matcher's initial snapshot; an exact Apple ID must never be
+      // overwritten or represented as a lookup timeout.
+      const latestExactCandidateIds = new Set((await repository.listMatches(runId))
+        .filter((match) => Boolean(match.song?.id))
+        .map((match) => match.candidateId));
+      const timeoutCandidates = work.slice(batchStart)
+        .map(({ candidate }) => candidate)
+        .filter((candidate) => !latestExactCandidateIds.has(candidate.id));
       // Recovery rows already carry an explicit timeout-to-review outcome.
       // Leave them retryable for the next visitor-requested recovery generation.
-      if (!recovery) {
+      if (!recovery && timeoutCandidates.length > 0) {
         await repository.saveTimeoutMatches(
           runId,
           timeoutCandidates.map((candidate) => candidate.id),
