@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   AppleApiError,
   AppleAuthorizationRequiredError,
+  catalogRecordingKeysEquivalent,
   type AppleAuthorizationRecord,
   type AppleAuthorizationStore,
   authorizedAppleClient,
@@ -503,7 +504,7 @@ async function observeStablePrefix(
       compatible = ids.every((catalogId, index) => {
         const observedKey = keys[catalogId];
         const expectedKey = keys[expectedPrefix[index]!];
-        return Boolean(observedKey && expectedKey && observedKey === expectedKey);
+        return Boolean(observedKey && expectedKey && catalogRecordingKeysEquivalent(observedKey, expectedKey));
       });
     }
 

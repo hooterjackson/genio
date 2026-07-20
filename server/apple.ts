@@ -1,11 +1,78 @@
 import { createHash, createPrivateKey, sign } from "node:crypto";
 import type { CatalogSong } from "../shared/types.ts";
+import { normalizeMusicText } from "../lib/matching.ts";
 import { decryptSecret, encryptSecret } from "./crypto.ts";
+import { catalogRecordingVersionSignature } from "./pipeline-v2-policy.ts";
 import { requirePrivateKey, requireSecret } from "./secrets.ts";
 
 const APPLE_API = "https://api.music.apple.com";
 const TOKEN_PURPOSE = "apple-music-user-token";
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const CATALOG_RECORDING_KEY_PREFIX = "recording-json:";
+
+interface CatalogRecordingKeyPayload {
+  version: 1;
+  isrc: string | null;
+  artist: string;
+  title: string;
+  durationMs: number | null;
+  versionSignature: string;
+}
+
+function catalogRecordingKey(song: CatalogSong): string {
+  const normalizedIsrc = song.isrc?.trim().toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "";
+  const duration = Number(song.durationInMillis);
+  const payload: CatalogRecordingKeyPayload = {
+    version: 1,
+    isrc: normalizedIsrc || null,
+    artist: normalizeMusicText(song.artistName),
+    title: normalizeMusicText(song.name),
+    durationMs: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : null,
+    versionSignature: catalogRecordingVersionSignature(song),
+  };
+  return `${CATALOG_RECORDING_KEY_PREFIX}${JSON.stringify(payload)}`;
+}
+
+function parseCatalogRecordingKey(value: string): CatalogRecordingKeyPayload | null {
+  if (!value.startsWith(CATALOG_RECORDING_KEY_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(value.slice(CATALOG_RECORDING_KEY_PREFIX.length)) as Partial<CatalogRecordingKeyPayload>;
+    if (parsed.version !== 1
+      || typeof parsed.artist !== "string"
+      || typeof parsed.title !== "string"
+      || typeof parsed.versionSignature !== "string") return null;
+    return {
+      version: 1,
+      isrc: typeof parsed.isrc === "string" && parsed.isrc ? parsed.isrc : null,
+      artist: parsed.artist,
+      title: parsed.title,
+      durationMs: typeof parsed.durationMs === "number" && Number.isFinite(parsed.durationMs)
+        ? parsed.durationMs
+        : null,
+      versionSignature: parsed.versionSignature,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Apple may canonicalize a submitted song ID to another storefront ID when it
+ * inserts a library playlist item.  Exact IDs and exact ISRCs remain the
+ * strongest proof, but the V2 recording-family policy also permits exact
+ * artist/title metadata with a compatible duration and no version conflict.
+ */
+export function catalogRecordingKeysEquivalent(left: string, right: string): boolean {
+  if (left === right) return true;
+  const leftKey = parseCatalogRecordingKey(left);
+  const rightKey = parseCatalogRecordingKey(right);
+  if (!leftKey || !rightKey || leftKey.versionSignature !== rightKey.versionSignature) return false;
+  if (leftKey.isrc && rightKey.isrc && leftKey.isrc === rightKey.isrc) return true;
+  if (!leftKey.artist || leftKey.artist !== rightKey.artist
+    || !leftKey.title || leftKey.title !== rightKey.title
+    || leftKey.durationMs === null || rightKey.durationMs === null) return false;
+  return Math.abs(leftKey.durationMs - rightKey.durationMs) <= 10_000;
+}
 
 export type AppleCatalogSearchType = "songs" | "artists" | "albums" | "playlists";
 
@@ -404,11 +471,9 @@ export class AppleMusicClient {
         `/v1/catalog/${encodeURIComponent(this.storefront.toLowerCase())}/songs?${params}`,
         { signal },
       );
-      for (const item of payload?.data ?? []) {
-        const id = typeof item?.id === "string" ? item.id : "";
-        if (!id) continue;
-        const isrc = typeof item?.attributes?.isrc === "string" ? item.attributes.isrc.trim().toUpperCase() : "";
-        keys[id] = isrc ? `isrc:${isrc}` : `apple:${id}`;
+      for (const song of appleSongs(payload?.data)) {
+        if (!song.id) continue;
+        keys[song.id] = catalogRecordingKey(song);
       }
     }
     return keys;

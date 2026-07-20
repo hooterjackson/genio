@@ -2,6 +2,15 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.9",
+      "releasedAt": "2026-07-19",
+      "title": "Apple catalog alias reconciliation",
+      "notes": [
+        "Accepts Apple Music storefront ID canonicalization only when exact artist and title, compatible duration, and version policy prove the same recording family.",
+        "Preserves strict rejection and orphan recovery for genuine playlist ordering or version conflicts."
+      ]
+    },
+    {
       "version": "1.2.8",
       "releasedAt": "2026-07-19",
       "title": "Portable Sites production build",

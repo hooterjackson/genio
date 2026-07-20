@@ -8,6 +8,7 @@ import {
   AppleShareLinkUnavailableError,
   appleAuthorizationGeneration,
   appleAuthorizationJobDedupeKey,
+  catalogRecordingKeysEquivalent,
   createDeveloperToken,
   encryptMusicUserToken,
   libraryPlaylistIsPublic,
@@ -38,6 +39,23 @@ import {
   type PublicationRepository,
   type PublicationVolume,
 } from "../server/publisher.ts";
+
+function richRecordingKey(input: {
+  isrc: string;
+  artist?: string;
+  title?: string;
+  durationMs?: number;
+  versionSignature?: string;
+}): string {
+  return `recording-json:${JSON.stringify({
+    version: 1,
+    isrc: input.isrc,
+    artist: input.artist ?? "phuture",
+    title: input.title ?? "acid tracks",
+    durationMs: input.durationMs ?? 737_173,
+    versionSignature: input.versionSignature ?? "canonical:unrated",
+  })}`;
+}
 
 const validAuthorization: AppleAuthorizationRecord = {
   ciphertext: "ciphertext-generation-one",
@@ -86,6 +104,30 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+});
+
+test("recording-key metadata fallback stays inside exact title, artist, duration, and version boundaries", () => {
+  const expected = richRecordingKey({ isrc: "GBBLG0100348" });
+  expect(catalogRecordingKeysEquivalent(
+    expected,
+    richRecordingKey({ isrc: "QMFMF1498221", durationMs: 739_627 }),
+  )).toBe(true);
+  expect(catalogRecordingKeysEquivalent(
+    expected,
+    richRecordingKey({ isrc: "QMFMF1498221", artist: "Another Artist" }),
+  )).toBe(false);
+  expect(catalogRecordingKeysEquivalent(
+    expected,
+    richRecordingKey({ isrc: "QMFMF1498221", title: "Another Track" }),
+  )).toBe(false);
+  expect(catalogRecordingKeysEquivalent(
+    expected,
+    richRecordingKey({ isrc: "QMFMF1498221", durationMs: 747_174 }),
+  )).toBe(false);
+  expect(catalogRecordingKeysEquivalent(
+    expected,
+    richRecordingKey({ isrc: "QMFMF1498221", versionSignature: "live:unrated" }),
+  )).toBe(false);
 });
 
 test("Apple catalog parsing preserves supported clean and explicit ratings", async () => {
@@ -1045,6 +1087,68 @@ test("publisher accepts Apple catalog-ID normalization only when ordered ISRC id
   expect(result).toMatchObject({ playlistId: "p.normalized", appendedCount: 2, status: "complete" });
   expect(repository.markPlaylistOrphan).not.toHaveBeenCalled();
   expect(client.getCatalogRecordingKeys).toHaveBeenCalled();
+});
+
+test("publisher accepts Apple's storefront alias when exact metadata and compatible duration prove the recording family", async () => {
+  const repository = publicationRepository();
+  const aliases: Record<string, string> = { "1601915460": "885922991" };
+  const recordingKeys: Record<string, string> = {
+    "1601915460": 'recording-json:{"version":1,"isrc":"GBBLG0100348","artist":"phuture","title":"acid tracks","durationMs":737173,"versionSignature":"canonical:unrated"}',
+    "885922991": 'recording-json:{"version":1,"isrc":"QMFMF1498221","artist":"phuture","title":"acid tracks","durationMs":739627,"versionSignature":"canonical:unrated"}',
+  };
+  const state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.storefront-alias", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId: string, ids: readonly string[]) => {
+      state.push(...ids.map((id) => aliases[id] ?? id));
+    }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => [...state]),
+    getCatalogRecordingKeys: vi.fn(async (ids: readonly string[]) => Object.fromEntries(
+      ids.filter((id) => recordingKeys[id]).map((id) => [id, recordingKeys[id]!]),
+    )),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/storefront-alias/pl.storefront-alias"),
+  };
+
+  const result = await appendExactVolume(
+    repository,
+    client,
+    manifest,
+    pendingVolume(),
+    ["1601915460"],
+    validAuthorization,
+  );
+
+  expect(result).toMatchObject({ playlistId: "p.storefront-alias", appendedCount: 1, status: "complete" });
+  expect(repository.markPlaylistOrphan).not.toHaveBeenCalled();
+});
+
+test("publisher rejects a catalog alias when Apple reports a conflicting version", async () => {
+  const repository = publicationRepository();
+  const recordingKeys: Record<string, string> = {
+    "101": 'recording-json:{"version":1,"isrc":"USAAA0000001","artist":"artist","title":"song","durationMs":240000,"versionSignature":"canonical:unrated"}',
+    "901": 'recording-json:{"version":1,"isrc":"USBBB0000002","artist":"artist","title":"song","durationMs":240000,"versionSignature":"live:unrated"}',
+  };
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.conflicting-alias", url: null })),
+    appendCatalogTracks: vi.fn(async () => undefined),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => ["901"]),
+    getCatalogRecordingKeys: vi.fn(async (ids: readonly string[]) => Object.fromEntries(
+      ids.filter((id) => recordingKeys[id]).map((id) => [id, recordingKeys[id]!]),
+    )),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/unexpected/pl.unexpected"),
+  };
+  const exhausted = {
+    ...pendingVolume(),
+    attempt: 3,
+    playlistId: "p.conflicting-alias",
+    status: "appending" as const,
+  };
+
+  await expect(appendExactVolume(repository, client, manifest, exhausted, ["101"], validAuthorization))
+    .rejects.toThrow(/diverged too many times/);
+  expect(repository.markPlaylistOrphan).toHaveBeenCalledTimes(1);
 });
 
 test("publisher preserves the Apple playlist ID and exact track count when share polling times out", async () => {
