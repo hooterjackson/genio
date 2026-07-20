@@ -39,7 +39,7 @@ const EXPLICIT_EDITORIAL_EVIDENCE_INTENT = /\b(?:require|required|must|only)\b[^
 const SOFT_EDITORIAL_DESCRIPTOR = /\b(?:essential|iconic|classic|definitive|representative)\b/giu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
 const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggae|classical|country|electronic)\b/iu;
-const THEME_INTENT = /\b(?:songs?\s+about|tracks?\s+about|lyrics?\s+about|theme|themed)\b/iu;
+const THEME_INTENT_MENTION = /\b(?:(?:songs?|tracks?|recordings?|music)\s+about|lyrics?\s+about|themes?|themed)\b/giu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
   [/\b(?:canonical|original\s+or\s+definitive\s+(?:recording|version)s?|original(?:[-\s]+era)?(?:\s+(?:studio|album|single))?\s+(?:recording|version)s?(?!\s+identity)|studio\s+(?:recording|version)s?)\b/iu, "canonical"],
@@ -235,6 +235,37 @@ function softEditorialDescriptors(prompt: string): string[] {
     .map((match) => match[0].toLocaleLowerCase("en-US")));
 }
 
+/**
+ * Theme language is also commonly used to reject a literal interpretation,
+ * especially for polysemous genre names: "house music, not songs about
+ * literal houses".  Treating that clarification as a positive theme intent
+ * raises the evidence floor from genre membership to track-level thematic
+ * proof and can discard an otherwise fully qualified catalog.
+ *
+ * Inspect each theme mention independently so a real mixed request such as
+ * "songs about home, but exclude songs about real estate" keeps its positive
+ * theme intent.  The local clause check deliberately recognizes both direct
+ * rejection and double-negation/non-exclusive wording.
+ */
+function hasPositiveThemeIntent(prompt: string): boolean {
+  for (const mention of prompt.matchAll(THEME_INTENT_MENTION)) {
+    const prefix = prompt.slice(Math.max(0, mention.index - 160), mention.index);
+    const localClause = prefix.split(/(?:[.,;!?\n\r]|[–—]|\bbut\b)/iu).at(-1)?.trim() ?? "";
+
+    // "not only/just songs about ..." broadens the request; "do not
+    // exclude songs about ..." explicitly retains it. Neither is a rejection.
+    if (/\bnot\s+(?:only|just)\b/iu.test(localClause)
+      || /\b(?:do\s+not|don['’]?t)\s+(?:exclude|avoid|omit|reject|remove)\b/iu.test(localClause)) {
+      return true;
+    }
+
+    const rejected = /(?:\b(?:not|no|never|without|except|exclude(?:d|s|ing)?|avoid(?:ed|s|ing)?|omit(?:ted|s|ting)?|reject(?:ed|s|ing)?|remove(?:d|s|ing)?)\b|\brather\s+than\b|\binstead\s+of\b|\bas\s+opposed\s+to\b)/iu
+      .test(localClause);
+    if (!rejected) return true;
+  }
+  return false;
+}
+
 function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   const scope = [prompt, brief.title, brief.description, brief.relationship, ...brief.include].join(" ");
   // Subjective intent comes from the visitor's request, not from prose the
@@ -248,7 +279,7 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   if (assertsFactualTrackRelationship(`${brief.relationship} ${prompt}`)) intents.push("factual_relationship");
   if (SIMILARITY_INTENT.test(directIntentScope)) intents.push("similarity");
   if (MOOD_ACTIVITY_INTENT.test(directIntentScope)) intents.push("mood_activity");
-  const directThemeIntent = THEME_INTENT.test(directIntentScope);
+  const directThemeIntent = hasPositiveThemeIntent(directIntentScope);
   if (directThemeIntent) intents.push("theme");
   // Generated descriptions often say “recordings by Brazilian artists” or
   // similar while describing a genre survey. That is not a direct-artist
@@ -272,7 +303,11 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
 function axisForRule(rule: string): SelectionConstraintAxis {
   const value = normalized(rule);
   if (/language|french language|portuguese|spanish/iu.test(value)) return "language";
-  if (/year|decade|era|century|before|after|between/iu.test(value)) return "era";
+  // Classify literal/theme exclusions before era. Token boundaries matter:
+  // the old bare `era` alternative matched the middle of `literal`, turning
+  // "not songs about literal houses" into a synthetic era constraint.
+  if (/\b(?:(?:songs?|tracks?|recordings?|music|lyrics?)\s+about|themes?|themed)\b/iu.test(value)) return "theme";
+  if (/\b(?:year|decade|era|century|before|after|between)\b/iu.test(value)) return "era";
   if (/live|remix|edit|version|studio|acoustic|instrumental/iu.test(value)) return "recording_version";
   if (/explicit|clean|lyrics/iu.test(value)) return "content";
   if (/country|city|scene|origin|resident|recorded in|geograph|french|brazil|berlin|american/iu.test(value)) return "geography";
@@ -807,6 +842,64 @@ function selectionOrderingMode(
   return "editorial";
 }
 
+const PLAYLIST_COUNT_WORDS = new Map<string, number>([
+  ["one", 1],
+  ["two", 2],
+  ["three", 3],
+  ["four", 4],
+  ["five", 5],
+  ["six", 6],
+  ["seven", 7],
+  ["eight", 8],
+  ["nine", 9],
+  ["ten", 10],
+  ["eleven", 11],
+  ["twelve", 12],
+  ["thirteen", 13],
+  ["fourteen", 14],
+  ["fifteen", 15],
+  ["sixteen", 16],
+  ["seventeen", 17],
+  ["eighteen", 18],
+  ["nineteen", 19],
+  ["twenty", 20],
+  ["single", 1],
+]);
+
+const ARTIST_TRACK_LIMIT_VALUE = "(?:\\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|single)";
+const ARTIST_TRACK_LIMIT_PATTERNS = [
+  new RegExp(`\\b(?:no\\s+more\\s+than|at\\s+most|up\\s+to|maximum(?:\\s+of)?|max(?:imum)?(?:\\s+of)?)\\s+(${ARTIST_TRACK_LIMIT_VALUE})\\s+(?:tracks?|songs?|recordings?)\\s+(?:per|from|by)\\s+(?:any\\s+(?:one\\s+)?|each\\s+|every\\s+|(?:a\\s+)?single\\s+|the\\s+same\\s+)?artist\\b`, "iu"),
+  new RegExp(`\\b(?:limit|cap)\\s+(?:each|every|any)\\s+artist(?:['’]s)?\\s+(?:to|at)\\s+(${ARTIST_TRACK_LIMIT_VALUE})\\s+(?:tracks?|songs?|recordings?)?\\b`, "iu"),
+  new RegExp(`\\b(${ARTIST_TRACK_LIMIT_VALUE})\\s+(?:tracks?|songs?|recordings?)\\s+(?:maximum|max)\\s+(?:per|from|by)\\s+(?:any\\s+(?:one\\s+)?|each\\s+|every\\s+|the\\s+same\\s+)?artist\\b`, "iu"),
+  new RegExp(`\\b(${ARTIST_TRACK_LIMIT_VALUE})\\s+(?:tracks?|songs?|recordings?)\\s+(?:per\\s+(?:(?:each|every)\\s+)?artist|from\\s+(?:each|every)\\s+artist)\\b`, "iu"),
+  new RegExp(`\\bno\\s+artist\\s+(?:should\\s+)?(?:have|gets?|appears?\\s+with)\\s+more\\s+than\\s+(${ARTIST_TRACK_LIMIT_VALUE})\\s+(?:tracks?|songs?|recordings?)\\b`, "iu"),
+];
+
+function parsedPlaylistCount(value: string | undefined): number | null {
+  if (!value) return null;
+  const normalizedValue = normalized(value);
+  const numeric = /^\d{1,3}$/u.test(normalizedValue)
+    ? Number.parseInt(normalizedValue, 10)
+    : PLAYLIST_COUNT_WORDS.get(normalizedValue);
+  return Number.isSafeInteger(numeric) && Number(numeric) >= 1 && Number(numeric) <= 300
+    ? Number(numeric)
+    : null;
+}
+
+/**
+ * An explicit visitor-authored concentration ceiling is a hard constraint,
+ * unlike the default broad-playlist diversity preference. Keep the grammar
+ * intentionally narrow so unrelated quantities (for example, “artists from
+ * no more than two countries”) cannot silently become an artist-track cap.
+ */
+function explicitMaximumTracksPerArtist(prompt: string): number | null {
+  for (const pattern of ARTIST_TRACK_LIMIT_PATTERNS) {
+    const parsed = parsedPlaylistCount(pattern.exec(prompt)?.[1]);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
 export function createSelectionPlanV2(input: {
   prompt: string;
   brief: PlaylistBrief;
@@ -819,8 +912,21 @@ export function createSelectionPlanV2(input: {
   const requestedTrackCount = Math.max(1, Math.floor(input.brief.targetSize?.min ?? 50));
   const reserveTrackCount = Math.max(5, Math.ceil(requestedTrackCount * 0.1));
   const fixedScope = scopeKind !== "broad_curated";
-  const maxArtist = fixedScope ? null : Math.max(1, Math.ceil(requestedTrackCount * 0.15));
+  const explicitArtistMaximum = explicitMaximumTracksPerArtist(input.prompt);
+  const maxArtist = explicitArtistMaximum
+    ?? (fixedScope ? null : Math.max(1, Math.ceil(requestedTrackCount * 0.15)));
   const constraints = constraintsForBrief(input.prompt, input.brief, guidance, intents);
+  if (explicitArtistMaximum !== null) {
+    constraints.push({
+      id: "artist_concentration_hard",
+      axis: "artist",
+      operator: "maximum",
+      values: [String(explicitArtistMaximum)],
+      kind: "hard",
+      geographyRelationship: null,
+      relaxationRank: null,
+    });
+  }
   const geographyConstraints: SelectionGeographyConstraint[] = uniqueGeographyConstraints(
     constraints
       .filter((constraint) => constraint.kind === "hard"

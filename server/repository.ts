@@ -1159,6 +1159,11 @@ function manifestConstraintViolations(input: {
   const contentRating = catalogContentRating(row.song_json);
   const violations: string[] = [];
   for (const constraint of plan.constraints) {
+    // Aggregate maxima are evaluated against the ordered candidate pool
+    // below. They cannot be answered from one row's metadata or evidence.
+    if (constraint.operator === "maximum" && constraint.axis === "artist") {
+      continue;
+    }
     let satisfied = false;
     if (constraint.axis === "evidence") {
       satisfied = input.scopeEligible;
@@ -4424,6 +4429,11 @@ export class Repository {
         const hardRuleIds = new Set(rules.filter((rule) => rule.kind === "hard").map((rule) => rule.id));
         const artistOccurrences = new Map<string, number>();
         const albumOccurrences = new Map<string, number>();
+        const hardArtistConcentration = selectionPlan.constraints.find((constraint) => (
+          constraint.kind === "hard"
+          && constraint.axis === "artist"
+          && constraint.operator === "maximum"
+        ));
         const candidates: ConstraintCandidate<ManifestSelectionRow>[] = manifestEligibleMatches.map((row) => {
           const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
           const summaries = bindings.map((binding) => {
@@ -4456,7 +4466,7 @@ export class Repository {
           if (albumKey) albumOccurrences.set(albumKey, albumCount);
           if (selectionPlan.diversityGoals.maximumTracksPerArtist != null
             && artistCount > selectionPlan.diversityGoals.maximumTracksPerArtist) {
-            violations.push("artist_concentration");
+            violations.push(hardArtistConcentration?.id ?? "artist_concentration");
           }
           if (albumKey && selectionPlan.diversityGoals.maximumTracksPerAlbum != null
             && albumCount > selectionPlan.diversityGoals.maximumTracksPerAlbum) {

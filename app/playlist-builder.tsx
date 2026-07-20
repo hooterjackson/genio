@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
@@ -25,6 +25,18 @@ import {
 } from "./playlist-builder-ui-policy";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
+
+function subscribeToHydration(): () => void {
+  return () => undefined;
+}
+
+function hydratedClientSnapshot(): boolean {
+  return true;
+}
+
+function hydratedServerSnapshot(): boolean {
+  return false;
+}
 
 type PlaylistBrief = {
   title: string;
@@ -775,6 +787,16 @@ function OneCommandScreen({
   onTrackCount: (value: string) => void;
   onSubmit: () => void;
 }) {
+  // The composer is server-rendered, but its controlled fields cannot retain
+  // edits made before React has hydrated and attached event handlers. Keep the
+  // form inert for that very short window so a fast tap—or an assistive setup
+  // that skips the intro—can never have valid input silently replaced by the
+  // initial client state.
+  const hydrated = useSyncExternalStore(
+    subscribeToHydration,
+    hydratedClientSnapshot,
+    hydratedServerSnapshot,
+  );
   const [focused, setFocused] = useState(false);
   const [exampleIndex, setExampleIndex] = useState(0);
   const customInputRef = useRef<HTMLInputElement>(null);
@@ -826,7 +848,7 @@ function OneCommandScreen({
           <p className="command-lead">Describe what you want to hear.</p>
           <p>gênio researches the music, finds the tracks, and builds it in Apple Music.</p>
         </header>
-        <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy)}>
+        <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy) || !hydrated}>
           <section className="command-request-section" aria-labelledby="request-step-title">
             <h2 className="sr-only" id="request-step-title">Playlist request</h2>
             <label className="one-command-request" htmlFor="playlist-request">
@@ -841,7 +863,7 @@ function OneCommandScreen({
                 maxLength={2000}
                 spellCheck
                 required
-                disabled={Boolean(busy)}
+                disabled={Boolean(busy) || !hydrated}
                 aria-invalid={promptInvalid}
                 aria-describedby="playlist-request-note"
                 placeholder={focused ? examples[exampleIndex] : "What should the playlist contain?"}
@@ -862,7 +884,7 @@ function OneCommandScreen({
                     aria-label={`${value} tracks`}
                     aria-pressed={count === value}
                     onClick={() => choosePreset(value)}
-                    disabled={Boolean(busy)}
+                    disabled={Boolean(busy) || !hydrated}
                   >
                     {value}
                   </button>
@@ -873,7 +895,7 @@ function OneCommandScreen({
                   aria-label="Custom size"
                   aria-pressed={false}
                   onClick={chooseCustom}
-                  disabled={Boolean(busy)}
+                  disabled={Boolean(busy) || !hydrated}
                 >
                   Custom
                 </button>
@@ -892,7 +914,7 @@ function OneCommandScreen({
                     value={trackCount}
                     onChange={(event) => onTrackCount(event.target.value)}
                     required
-                    disabled={Boolean(busy)}
+                    disabled={Boolean(busy) || !hydrated}
                     aria-invalid={countInvalid || trackCount.length === 0}
                     aria-describedby="playlist-track-count-note"
                     aria-label="Exact track count"
@@ -902,7 +924,7 @@ function OneCommandScreen({
                 <button
                   type="button"
                   onClick={() => choosePreset(PUBLIC_PLAYLIST_DEFAULT_TRACKS)}
-                  disabled={Boolean(busy)}
+                  disabled={Boolean(busy) || !hydrated}
                 >
                   PRESETS
                 </button>
@@ -924,7 +946,7 @@ function OneCommandScreen({
             <button
               className="one-command-submit"
               type="submit"
-              disabled={Boolean(busy) || prompt.trim().length < 4 || !validCount}
+              disabled={!hydrated || Boolean(busy) || prompt.trim().length < 4 || !validCount}
             >
               {busy ? "STARTING..." : "CREATE PLAYLIST"}
             </button>

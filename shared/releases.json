@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.12",
+      "releasedAt": "2026-07-19",
+      "title": "Semantic scope and composer stability",
+      "notes": [
+        "Negated literal-theme clarifications no longer turn genre requests into unsupported theme searches.",
+        "Explicit per-artist track limits are preserved as hard, non-relaxable playlist constraints.",
+        "Typed exclusions now distinguish theme language from era terms such as the substring in literal.",
+        "The playlist composer now waits for client hydration before accepting input, preventing fast edits from being lost."
+      ]
+    },
+    {
       "version": "1.2.11",
       "releasedAt": "2026-07-19",
       "title": "Catalog eligibility recovery",

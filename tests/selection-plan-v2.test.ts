@@ -43,6 +43,108 @@ describe("Pipeline V2 selection plan", () => {
     expect(pipelineV2Route(plan)).toBe("curated_catalog");
   });
 
+  test.each([
+    "25 classic house music tracks, not songs about literal houses or homes",
+    "25 classic house music tracks; exclude songs about houses",
+    "25 classic house music tracks — avoid lyrics about physical homes",
+    "25 classic house music tracks rather than a theme about architecture",
+  ])("a rejected literal interpretation does not create positive theme evidence: %s", (prompt) => {
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "Classic House Music",
+        description: "A source-backed survey of classic house music.",
+        relationship: "is a recording in the house music genre",
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    expect(plan.intents).toContain("genre_scene");
+    expect(plan.intents).not.toContain("theme");
+  });
+
+  test("a literal-house exclusion is typed as theme rather than era", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "25 classic house music tracks, not songs about literal houses",
+      brief: brief({
+        title: "Classic House Music",
+        relationship: "is a recording in the house music genre",
+        exclude: ["songs about literal houses"],
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "theme",
+      operator: "exclude",
+      values: ["songs about literal houses"],
+      kind: "hard",
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "era",
+      values: ["songs about literal houses"],
+    }));
+  });
+
+  test.each([
+    ["25 classic house music tracks, with no more than two tracks per artist", 2],
+    ["25 classic house music tracks; at most 3 songs from any one artist", 3],
+    ["25 classic house music tracks; limit each artist to four tracks", 4],
+    ["25 classic house music tracks; 1 track from each artist", 1],
+    ["25 classic house music tracks; five songs max per artist", 5],
+    ["25 classic house music tracks; 2 tracks per artist", 2],
+    ["25 classic house music tracks; at most two tracks from a single artist", 2],
+  ])("preserves an explicit artist concentration ceiling as a hard rule: %s", (prompt, maximum) => {
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({ targetSize: { min: 25, max: 25 } }),
+    });
+
+    expect(plan.diversityGoals.maximumTracksPerArtist).toBe(maximum);
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      id: "artist_concentration_hard",
+      axis: "artist",
+      operator: "maximum",
+      values: [String(maximum)],
+      kind: "hard",
+      relaxationRank: null,
+    }));
+  });
+
+  test("does not confuse an unrelated geographic quantity with an artist track ceiling", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "25 house tracks by artists from no more than two countries",
+      brief: brief({ targetSize: { min: 25, max: 25 } }),
+    });
+
+    expect(plan.diversityGoals.maximumTracksPerArtist).not.toBe(2);
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      id: "artist_concentration_hard",
+    }));
+  });
+
+  test.each([
+    "25 songs about houses and homes",
+    "25 house music tracks about houses and architecture",
+    "Not only songs about homes, but also songs about belonging",
+    "Do not exclude songs about domestic life",
+  ])("an affirmative theme remains a theme intent: %s", (prompt) => {
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "Songs About Home",
+        description: "Songs with a documented thematic relationship to homes and domestic life.",
+        subjectEntities: ["homes", "domestic life"],
+        relationship: "has a lyrical or thematic relationship to homes",
+        include: ["Songs about homes and domestic life."],
+        exclude: [],
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    expect(plan.intents).toContain("theme");
+  });
+
   test("does not choose chronology when the brief explicitly rejects strict chronology", () => {
     const plan = createSelectionPlanV2({
       prompt: "25 classic house music tracks with a diverse mix of artists",
