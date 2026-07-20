@@ -59,7 +59,7 @@
       "refillStrictMatchRate": 0.4
     }
   },
-  "scenarioCount": 31,
+  "scenarioCount": 32,
   "scenarios": [
     {
       "id": "2026-07-16-01",
@@ -311,6 +311,14 @@
       "expectedOutcome": "exact_playlist",
       "replayProfile": "disco-4-of-50",
       "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-20-32",
+      "prompt": "Brazil Disco Nights: A 50-track playlist of iconic disco-era songs that a 65-year-old listener in Brazil may plausibly have heard while growing up and going to nightclubs. Emphasis is on widely recognizable disco and disco-adjacent hits from the global 1970s–early 1980s club era, with inclusion of internationally known tracks that were popular in Brazil or strongly associated with nightclub culture.",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "disco-4-of-50",
+      "failureClasses": ["semantic_scope", "catalog_shortfall"]
     }
   ]
 }

@@ -43,6 +43,95 @@ describe("Pipeline V2 selection plan", () => {
     expect(pipelineV2Route(plan)).toBe("curated_catalog");
   });
 
+  test("treats Brazilian listener and popularity context as a soft market preference", () => {
+    const prompt = "Brazil Disco Nights: A 50-track playlist of iconic disco-era songs that a 65-year-old listener in Brazil may plausibly have heard while growing up and going to nightclubs. Emphasis is on widely recognizable disco and disco-adjacent hits from the global 1970s–early 1980s club era, with inclusion of internationally known tracks that were popular in Brazil or strongly associated with nightclub culture.";
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "Brazil Disco Nights",
+        description: "International disco-era club hits familiar to a listener in Brazil.",
+        subjectEntities: ["disco", "global club hits", "Brazilian audience"],
+        relationship: "was a widely recognizable disco-era club recording",
+        include: ["International disco staples popular in Brazil"],
+        exclude: [],
+        targetSize: { min: 50, max: 50 },
+      }),
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      kind: "hard",
+      operator: "require",
+      values: ["disco"],
+    }));
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      id: expect.stringMatching(/^audience_market_preference_/u),
+      axis: "geography",
+      kind: "soft",
+      operator: "prefer",
+      values: ["Brazilian"],
+      geographyRelationship: "unspecified",
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "geography",
+      kind: "hard",
+      values: ["Brazilian"],
+    }));
+    expect(plan.geographyConstraints).not.toContainEqual({
+      value: "Brazilian",
+      relationship: "unspecified",
+    });
+  });
+
+  test("keeps the visitor's original growing-up-in-Brazil wording out of hard track geography", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Iconic disco songs my father who is 65 might have listened to growing up in Brazil and going to night clubs",
+      brief: brief({
+        title: "Brazil Disco Nights",
+        description: "International disco hits familiar to a 65-year-old listener who grew up in Brazil.",
+        subjectEntities: ["disco", "global nightclub hits"],
+        relationship: "was a recognizable disco-era club recording",
+        include: ["International disco staples popular in Brazil"],
+        exclude: [],
+        targetSize: { min: 50, max: 50 },
+      }),
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      kind: "hard",
+      values: ["disco"],
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "geography",
+      kind: "hard",
+      values: ["Brazilian"],
+    }));
+    expect(plan.geographyConstraints).toEqual([]);
+  });
+
+  test.each([
+    "50 Brazilian disco songs",
+    "50 French jazz recordings",
+    "50 American drill tracks",
+    "50 disco recordings from Brazil",
+  ])("keeps intrinsic music geography hard: %s", (prompt) => {
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: prompt,
+        subjectEntities: [prompt],
+        include: [],
+        exclude: [],
+      }),
+    });
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "geography",
+      kind: "hard",
+    }));
+    expect(plan.geographyConstraints.length).toBeGreaterThan(0);
+  });
+
   test.each([
     "25 classic house music tracks, not songs about literal houses or homes",
     "25 classic house music tracks; exclude songs about houses",

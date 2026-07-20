@@ -70,8 +70,8 @@ describe("retained production searches", () => {
   test("contains every retained brief attempt from the production audit", () => {
     expect(fixture.schemaVersion).toBe(5);
     expect(fixture.scenarios).toHaveLength(fixture.scenarioCount);
-    expect(fixture.scenarioCount).toBe(31);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(31);
+    expect(fixture.scenarioCount).toBe(32);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(32);
     expect(Object.keys(fixture.replayProfiles).sort()).toEqual([
       "baile-funk-19-of-25",
       "baile-funk-23-of-50",
@@ -463,6 +463,7 @@ describe("retained production searches", () => {
       "catalog_shortfall",
       "cost_explosion",
       "research_under_yield",
+      "semantic_scope",
       "target_truncation",
     ]));
   });

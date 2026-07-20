@@ -19,6 +19,7 @@ export type ProductionScenarioFailureClass =
   | "catalog_shortfall"
   | "cost_explosion"
   | "research_under_yield"
+  | "semantic_scope"
   | "target_truncation"
   | "latency_regression";
 

@@ -75,6 +75,58 @@ function aliasesFor(value: string): string[] {
   return [...new Set(family ?? [key])].filter(Boolean);
 }
 
+function escapedPhrase(value: string): string {
+  return normalized(value).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(/\s+/gu, "\\s+");
+}
+
+/**
+ * A place can describe the listener or popularity market without describing
+ * the recordings themselves. “Disco a listener in Brazil may have heard” and
+ * “international hits popular in Brazil” must therefore remain curation
+ * preferences: neither phrase means Brazilian artists, the Brazilian scene,
+ * or recordings made in Brazil.
+ *
+ * This intentionally applies only to otherwise-unspecified place mentions.
+ * Explicit artist-origin, residence, recording-location, language, scene, and
+ * sound relationships are classified before this helper is consulted. A
+ * direct demonym + music-scope phrase (for example, “Brazilian disco”) also
+ * remains intrinsic and non-relaxable.
+ */
+export function selectionGeographyIsAudienceMarketContext(
+  text: string,
+  value: string,
+): boolean {
+  const source = normalized(text);
+  const aliases = aliasesFor(value).map(escapedPhrase);
+  const primary = escapedPhrase(value);
+  const musicScope = "(?:music|songs?|tracks?|recordings?|artists?|disco|house|jazz|techno|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|soul|metal|punk|reggae|classical|country|electronic)";
+
+  // Demonym-scoped music is about the recording pool, not merely its target
+  // audience. Country-noun titles such as “Brazil Disco Nights” are left to
+  // the explicit popularity/listener prose below because they are frequently
+  // display names rather than origin claims.
+  const hasIntrinsicScope = new RegExp(`\\b${primary}\\s+${musicScope}\\b`, "iu").test(source)
+    || aliases.some((alias) => new RegExp(
+      `\\b(?:${musicScope})\\s+(?:from|originating\\s+in|recorded\\s+in)\\s+(?:the\\s+)?${alias}\\b`,
+      "iu",
+    ).test(source));
+  if (hasIntrinsicScope) return false;
+
+  return aliases.some((alias) => [
+    // The place modifies a listener, audience, or recollection.
+    `\\b(?:listeners?|audiences?|clubgoers?|people|fans?|residents?|someone|anyone|a\\s+\\d{1,3}[ -]year[ -]old\\s+listener)\\s+(?:based\\s+|living\\s+)?in\\s+(?:the\\s+)?${alias}\\b`,
+    // The place is a market in which global recordings were heard or popular.
+    `\\b(?:popular|heard|listened\\s+to|known|recognizable|recognised|recognized|played|broadcast|charted|successful|familiar|widely\\s+heard|radio\\s+hits?)\\s+(?:among\\s+[^.;,!?:]{0,40}\\s+)?in\\s+(?:the\\s+)?${alias}\\b`,
+    `\\b(?:popular|heard|listened\\s+to|known|recognizable|recognised|recognized|played|broadcast|charted|successful|familiar)\\s+(?:among|with)\\s+(?:the\\s+)?${alias}\\s+(?:audience|listeners?|public|clubgoers?|market)\\b`,
+    // Biographical listener context such as “my father listened to these
+    // while growing up in Brazil” describes exposure, not recording origin.
+    `\\b(?:heard|listened\\s+to|played|remembered)\\b[^.;!?]{0,100}\\b(?:growing\\s+up|living|partying|clubbing|going\\s+to\\s+(?:night\\s+)?clubs?)\\s+in\\s+(?:the\\s+)?${alias}\\b`,
+    `\\b(?:grew|growing)\\s+up\\s+in\\s+(?:the\\s+)?${alias}\\b`,
+    `\\b${alias}\\s+(?:audience|listeners?|public|market|charts?|airplay|radio|nightlife)\\b`,
+    `\\b(?:market|charts?|airplay|radio|nightlife|club\\s+culture)\\s+in\\s+(?:the\\s+)?${alias}\\b`,
+  ].some((pattern) => new RegExp(pattern, "iu").test(source)));
+}
+
 /** Treat country adjectives and country names as the same geographic value. */
 export function selectionGeographyValuesEquivalent(left: string, right: string): boolean {
   const rightAliases = new Set(aliasesFor(right));

@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.14",
+      "releasedAt": "2026-07-20",
+      "title": "Listener-market scope correction",
+      "notes": [
+        "Treats where a listener grew up or where global hits were popular as a discovery and ranking preference, not a false artist-origin or local-scene requirement.",
+        "Preserves genuine hard geography for Brazilian disco, French jazz, American drill, named scenes, artist origin, language, and recording location.",
+        "Retains the exact zero-of-50 disco production incident and its original visitor wording as permanent semantic-scope regressions."
+      ]
+    },
+    {
       "version": "1.2.13",
       "releasedAt": "2026-07-20",
       "title": "Disco exact-fill regression guard",

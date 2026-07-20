@@ -18,6 +18,7 @@ import { assertsFactualTrackRelationship } from "./factual-frontier-policy.ts";
 import { PIPELINE_POLICY_VERSION } from "./pipeline-v2-policy.ts";
 import {
   parseSelectionGeographyConstraints,
+  selectionGeographyIsAudienceMarketContext,
   selectionConstraintGeography,
   selectionGeographyValuesEquivalent,
   uniqueGeographyConstraints,
@@ -528,9 +529,37 @@ function constraintsForBrief(
   // Interpret recognizable axes from the confirmed scope as hard requirements.
   // Generated prose is never used as a catch-all constraint here; only typed
   // values emitted by the bounded parser survive into the plan.
-  const promptScopeRules = coalesceAlternativeScopeRules(parsedAxisRules(prompt));
+  const parsedPromptScopeRules = coalesceAlternativeScopeRules(parsedAxisRules(prompt));
+  const promptScopeRules: ParsedAxisRule[] = [];
+  const audienceMarketPreferenceRules: ParsedAxisRule[] = [];
+  for (const parsed of parsedPromptScopeRules) {
+    if (parsed.axis !== "geography" || parsed.geographyRelationship !== "unspecified") {
+      promptScopeRules.push(parsed);
+      continue;
+    }
+    const marketValues = parsed.values.filter((value) => (
+      selectionGeographyIsAudienceMarketContext(prompt, value)
+    ));
+    const intrinsicValues = parsed.values.filter((value) => !marketValues.includes(value));
+    if (intrinsicValues.length > 0) promptScopeRules.push({ ...parsed, values: intrinsicValues });
+    if (marketValues.length > 0) audienceMarketPreferenceRules.push({ ...parsed, values: marketValues });
+  }
   for (const parsed of promptScopeRules) {
     add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
+  }
+  // Listener location and popularity-market context should guide discovery
+  // and ranking without requiring every track to prove artist origin, scene
+  // membership, or recording location in that place.
+  for (const parsed of audienceMarketPreferenceRules) {
+    add(
+      "audience_market_preference",
+      parsed.axis,
+      "prefer",
+      parsed.values,
+      "soft",
+      2,
+      parsed.geographyRelationship ?? null,
+    );
   }
   // Words such as "iconic" and "essential" express a curation preference,
   // not a demand for an independent influence/ranking claim on every track.
@@ -551,7 +580,7 @@ function constraintsForBrief(
   // request expanded by the model to Chicago, New York, Detroit, and the UK).
   // Raw prompt rules above and typed guidance below are the only paths that
   // may create non-relaxable semantic scope.
-  const promptDefinedAxes = new Set(promptScopeRules.map((rule) => rule.axis));
+  const promptDefinedAxes = new Set(parsedPromptScopeRules.map((rule) => rule.axis));
   const subjectScopeRules = coalesceAlternativeScopeRules(
     unique(brief.subjectEntities)
       .flatMap((scopeText) => parsedAxisRules(scopeText))

@@ -5,6 +5,7 @@ import {
   parseSelectionGeographyConstraints,
   proofSupportsSelectionGeography,
   provenancePathWithGeographyRelationship,
+  selectionGeographyIsAudienceMarketContext,
   selectionGeographyBindingsSatisfied,
 } from "../server/selection-geography-policy.ts";
 
@@ -133,6 +134,25 @@ describe("typed selection geography", () => {
     expect(parseSelectionGeographyConstraints("French jazz")).toEqual([
       { value: "French", relationship: "unspecified" },
     ]);
+  });
+
+  test.each([
+    ["disco a 65-year-old listener in Brazil may plausibly have heard", "Brazilian"],
+    ["iconic disco songs my father might have listened to growing up in Brazil", "Brazilian"],
+    ["international disco staples that were popular in Brazil", "Brazilian"],
+    ["global jazz familiar to listeners in France", "French"],
+    ["club hits that charted in the American market", "American"],
+  ])("recognizes listener and popularity geography as market context: %s", (prompt, value) => {
+    expect(selectionGeographyIsAudienceMarketContext(prompt, value)).toBe(true);
+  });
+
+  test.each([
+    ["Brazilian disco songs", "Brazilian"],
+    ["French jazz recordings", "French"],
+    ["American drill tracks", "American"],
+    ["disco recordings from Brazil", "Brazilian"],
+  ])("keeps intrinsic recording geography out of market context: %s", (prompt, value) => {
+    expect(selectionGeographyIsAudienceMarketContext(prompt, value)).toBe(false);
   });
 
   test("requires exact relationship proof rather than a shared place word", () => {
