@@ -68,7 +68,17 @@ function normalized(value: string): string {
 
 function aliasesFor(value: string): string[] {
   const key = normalized(value);
-  return [...new Set(PLACE_ALIASES[key] ?? [key])].filter(Boolean);
+  const family = PLACE_ALIASES[key]
+    ?? Object.values(PLACE_ALIASES).find((aliases) => (
+      aliases.some((alias) => normalized(alias) === key)
+    ));
+  return [...new Set(family ?? [key])].filter(Boolean);
+}
+
+/** Treat country adjectives and country names as the same geographic value. */
+export function selectionGeographyValuesEquivalent(left: string, right: string): boolean {
+  const rightAliases = new Set(aliasesFor(right));
+  return aliasesFor(left).some((alias) => rightAliases.has(alias));
 }
 
 function phrasePresent(text: string, phrase: string): boolean {

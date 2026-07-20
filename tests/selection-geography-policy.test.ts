@@ -146,6 +146,21 @@ describe("typed selection geography", () => {
     )).toBe(true);
   });
 
+  test("treats a country noun and demonym as equivalent without weakening relationship proof", () => {
+    expect(proofSupportsSelectionGeography(
+      "A foundational disco recording by Brazilian artists.",
+      { value: "Brazil", relationship: "artist_origin" },
+    )).toBe(true);
+    expect(proofSupportsSelectionGeography(
+      "A foundational Brazilian disco recording.",
+      { value: "Brazil", relationship: "artist_origin" },
+    )).toBe(false);
+    expect(proofSupportsSelectionGeography(
+      "The record was made by Brazilian artists in Paris.",
+      { value: "Brazil", relationship: "recording_location" },
+    )).toBe(false);
+  });
+
   test("round-trips the relationship through the persisted provenance path", () => {
     const stored = binding({
       geographyRelationship: null,

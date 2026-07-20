@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   deriveGuidancePreferences,
+  effectiveGuidanceGeographyConstraint,
   guidanceOrderingPolicy,
   guidanceResearchContext,
   safeCustomGuidanceText,
@@ -33,6 +34,23 @@ const questions: PlaylistGuidanceQuestion[] = [
 ];
 
 describe("durable guidance context", () => {
+  test("broad national guidance cannot invent a hard artist-origin boundary", () => {
+    const preference = {
+      questionId: "q-brazil",
+      decisionKey: "brazilian_scene_scope",
+      kind: "research_preference" as const,
+      value: "broad_national_scope",
+      orderingBehavior: null,
+      geographyConstraint: { value: "Brazil", relationship: "artist_origin" as const },
+      source: "option" as const,
+    };
+
+    expect(effectiveGuidanceGeographyConstraint(preference)).toBeNull();
+    expect(guidanceResearchContext([preference]).researchDirectives).toEqual([
+      "Research and candidate-selection preference: broad_national_scope",
+    ]);
+  });
+
   test("derives typed effects and applies each one to downstream behavior", () => {
     const preferences = deriveGuidancePreferences(questions, [
       { questionId: "q1", optionId: "q1-o2" },

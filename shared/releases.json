@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.11",
+      "releasedAt": "2026-07-19",
+      "title": "Catalog eligibility recovery",
+      "notes": [
+        "Preserve broad national scope while enforcing explicit artist-origin, scene, language, and recording-location answers with country/demonym-aware evidence.",
+        "Stop deterministic geography-evidence mismatches from triggering futile paid refill rounds, and discard malformed generated complement exclusions.",
+        "Prefer clean canonical Apple Music issues over misleading compilations, seasonal promotions, and remasters, while respecting non-chronological sequencing requests."
+      ]
+    },
+    {
       "version": "1.2.10",
       "releasedAt": "2026-07-19",
       "title": "Open-ended scope and catalog recovery",

@@ -120,6 +120,74 @@ describe("Pipeline V2 recording and catalog edge cases", () => {
     expect(result.basis).toContain("without asserting historical originality");
   });
 
+  test("prefers a canonical issue over an earlier compilation with conflicting release evidence", () => {
+    const result = rankCatalogMatches("candidate", sparseCandidate({
+      artist: "Technotronic",
+      title: "Pump Up the Jam",
+      releaseYear: 1989,
+    }), [
+      {
+        id: "bad-compilation-date",
+        name: "Pump Up the Jam",
+        artistName: "Technotronic",
+        albumName: "Car All Hits",
+        releaseDate: "1979-09-07",
+        durationInMillis: 320_307,
+        isrc: "BED018901375",
+      },
+      {
+        id: "canonical-issue",
+        name: "Pump Up the Jam",
+        artistName: "Technotronic",
+        albumName: "Pump Up the Jam",
+        releaseDate: "1989-08-18",
+        durationInMillis: 320_000,
+        isrc: "BED018901375",
+      },
+    ]);
+
+    expect(result.status).toBe("accepted");
+    expect(result.song?.id).toBe("canonical-issue");
+  });
+
+  test("prefers a clean canonical title over seasonal promotional and remastered presentations", () => {
+    const result = rankCatalogMatches("candidate", sparseCandidate({
+      artist: "Alison Limerick",
+      title: "Where Love Lives (featured on the John Lewis Christmas Advert 2025)",
+    }), [
+      {
+        id: "seasonal-promotion",
+        name: "Where Love Lives (featured on the John Lewis Christmas Advert 2025)",
+        artistName: "Alison Limerick",
+        albumName: "Club Classics",
+        releaseDate: "1990-01-01",
+        durationInMillis: 416_027,
+        isrc: "GBARK9000003",
+      },
+      {
+        id: "later-remaster",
+        name: "Where Love Lives (Remastered 2023)",
+        artistName: "Alison Limerick",
+        albumName: "Where Love Lives - Single",
+        releaseDate: "2023-01-01",
+        durationInMillis: 416_100,
+        isrc: "GBARK9000003",
+      },
+      {
+        id: "canonical-title",
+        name: "Where Love Lives",
+        artistName: "Alison Limerick",
+        albumName: "Where Love Lives - Single",
+        releaseDate: "1990-01-01",
+        durationInMillis: 416_000,
+        isrc: "GBARK9000003",
+      },
+    ]);
+
+    expect(result.status).toBe("accepted");
+    expect(result.song?.id).toBe("canonical-title");
+  });
+
   test("treats a deleted Apple ID as unavailable and substitutes a qualified reserve without failing", () => {
     const result = preflightManifestRevision(
       [manifestTrack()],

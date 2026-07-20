@@ -1,6 +1,6 @@
 {
   "name": "needle-playlist-builder",
-  "version": "1.2.10",
+  "version": "1.2.11",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "engines": {

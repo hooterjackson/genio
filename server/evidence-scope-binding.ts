@@ -101,9 +101,15 @@ export function deriveAttestedHardScopeDescriptors(
 
     for (const rawValue of constraint.values) {
       const scopeValue = rawValue.trim().slice(0, 240);
-      if (!scopeValue || !scopeProofSupportsValue(scopeProofText, scopeValue)) continue;
       const geographyRelationship = constraint.geographyRelationship
         ?? (constraint.axis === "language" ? "language" : null);
+      const valueSupported = geographyRelationship
+        ? proofSupportsSelectionGeography(scopeProofText, {
+            value: scopeValue,
+            relationship: "unspecified",
+          })
+        : scopeProofSupportsValue(scopeProofText, scopeValue);
+      if (!scopeValue || !valueSupported) continue;
       if (geographyRelationship
         && geographyRelationship !== "unspecified"
         && !proofSupportsSelectionGeography(scopeProofText, {

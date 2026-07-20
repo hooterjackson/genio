@@ -43,6 +43,19 @@ describe("Pipeline V2 selection plan", () => {
     expect(pipelineV2Route(plan)).toBe("curated_catalog");
   });
 
+  test("does not choose chronology when the brief explicitly rejects strict chronology", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "25 classic house music tracks with a diverse mix of artists",
+      brief: brief({
+        orderingPolicy: "Use a smooth listening journey with artists and albums intermixed when supported, rather than strict chronology.",
+        targetSize: { min: 25, max: 25 },
+      }),
+    });
+
+    expect(plan.orderingPolicy.mode).toBe("smooth");
+    expect(plan.orderingPolicy.mode).not.toBe("chronological");
+  });
+
   test("iconic remains a soft ranking preference for a broad genre request", () => {
     const plan = createSelectionPlanV2({
       prompt: "Brazil disco nights: iconic Brazilian disco across eras",
@@ -476,6 +489,81 @@ describe("Pipeline V2 selection plan", () => {
       }],
     });
     expect(plan.geographyConstraints).toContainEqual({ value: "French", relationship: "recording_location" });
+    expect(plan.geographyConstraints).not.toContainEqual({ value: "French", relationship: "unspecified" });
+  });
+
+  test("drops a generated complement instead of parsing its unless-clause as a scene", () => {
+    const generatedComplement = "Non-French jazz unless clearly tied to the French jazz scene.";
+    const plan = createSelectionPlanV2({
+      prompt: "French jazz",
+      brief: brief({
+        title: "French jazz",
+        subjectEntities: ["French jazz"],
+        relationship: "is a French jazz recording",
+        include: [],
+        exclude: [generatedComplement],
+      }),
+    });
+
+    expect(plan.constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "genre", kind: "hard", values: ["jazz"] }),
+      expect.objectContaining({ axis: "geography", kind: "hard", values: ["French"] }),
+    ]));
+    expect(plan.constraints.some((constraint) => (
+      constraint.values.some((value) => value.includes("non-French jazz"))
+    ))).toBe(false);
+    expect(plan.constraints.some((constraint) => (
+      constraint.axis === "scene"
+      && constraint.values.some((value) => value.includes("unless clearly tied"))
+    ))).toBe(false);
+  });
+
+  test("a broad national answer preserves an existing ambiguous country scope", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazilian disco songs",
+      brief: brief({
+        title: "Brazilian disco",
+        subjectEntities: ["Brazilian disco"],
+        relationship: "is a Brazilian disco recording",
+        include: [],
+        exclude: [],
+      }),
+      guidancePreferences: [{
+        questionId: "q3",
+        decisionKey: "brazilian_scene_scope",
+        kind: "research_preference",
+        value: "broad_national_scope",
+        orderingBehavior: null,
+        geographyConstraint: { value: "Brazil", relationship: "artist_origin" },
+        source: "option",
+      }],
+    });
+
+    expect(plan.geographyConstraints).toContainEqual({ value: "Brazilian", relationship: "unspecified" });
+    expect(plan.geographyConstraints).not.toContainEqual({ value: "Brazil", relationship: "artist_origin" });
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      kind: "soft",
+      operator: "prefer",
+      values: ["broad_national_scope"],
+    }));
+  });
+
+  test("an explicit artist-origin answer remains a hard relationship boundary", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "French jazz",
+      brief: brief({ title: "French jazz", subjectEntities: ["French jazz"], include: [], exclude: [] }),
+      guidancePreferences: [{
+        questionId: "q-france",
+        decisionKey: "french_jazz_relationship_boundary",
+        kind: "research_preference",
+        value: "french_artists_first",
+        orderingBehavior: null,
+        geographyConstraint: { value: "France", relationship: "artist_origin" },
+        source: "option",
+      }],
+    });
+
+    expect(plan.geographyConstraints).toContainEqual({ value: "France", relationship: "artist_origin" });
     expect(plan.geographyConstraints).not.toContainEqual({ value: "French", relationship: "unspecified" });
   });
 

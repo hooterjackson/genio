@@ -199,14 +199,30 @@ function isUnsafeLooseCreditContext(song: CatalogSong): boolean {
   return additionalMarkers.some((marker) => album.includes(marker));
 }
 
-function catalogAlbumPenalty(song: CatalogSong): number {
+/**
+ * Rank catalog presentations of the same compatible recording. This is not
+ * relevance evidence and never makes an incompatible recording acceptable;
+ * it only prevents a seasonal promotion, compilation, or later mastering
+ * label from outranking a cleaner canonical issue when both are available.
+ */
+export function catalogPresentationPenalty(song: CatalogSong): number {
   const album = ` ${normalizeMusicText(song.albumName)} `;
   if (isDerivedCatalogContext(song)) return 1_000;
+  const titleAndVersion = ` ${normalizeMusicText(`${song.name} ${song.versionLabel ?? ""}`)} `;
+  let penalty = 0;
   const collectionMarkers = [
     " best of ", " greatest hits ", " collection ", " essential ",
-    " anthology ", " indispensable ", " millennium ",
+    " anthology ", " indispensable ", " millennium ", " compilation ",
+    " all hits ", " chart hits ", " party hits ", " various artists ",
   ];
-  return collectionMarkers.some((marker) => album.includes(marker)) ? 20 : 0;
+  if (collectionMarkers.some((marker) => album.includes(marker))) penalty += 24;
+  if (/\b(?:featured\s+(?:on|in)|from)\b[^.;]{0,80}\b(?:advert|advertisement|commercial|campaign)\b/iu.test(titleAndVersion)
+    || /\b(?:christmas|holiday)\s+(?:advert|commercial)\b/iu.test(titleAndVersion)) {
+    penalty += 40;
+  }
+  if (/\bremaster(?:ed)?\b/iu.test(titleAndVersion)) penalty += 12;
+  if (/\b(?:deluxe|expanded|anniversary)\s+edition\b/iu.test(album)) penalty += 6;
+  return penalty;
 }
 
 function supportedCatalogReleaseTime(song: CatalogSong): number {
@@ -226,17 +242,26 @@ function compareCompatibleCatalogIssues(
   left: SparseCatalogMatch,
   right: SparseCatalogMatch,
 ): number {
-  return catalogAlbumPenalty(left.song) - catalogAlbumPenalty(right.song)
+  return catalogPresentationPenalty(left.song) - catalogPresentationPenalty(right.song)
     || supportedCatalogReleaseTime(left.song) - supportedCatalogReleaseTime(right.song)
     || left.sourceIndex - right.sourceIndex
     || left.song.id.localeCompare(right.song.id);
 }
 
 function preferredFamilyReleaseTime(family: readonly SparseCatalogMatch[]): number {
-  const minimumPenalty = Math.min(...family.map((item) => catalogAlbumPenalty(item.song)));
+  const minimumPenalty = Math.min(...family.map((item) => catalogPresentationPenalty(item.song)));
   return Math.min(...family
-    .filter((item) => catalogAlbumPenalty(item.song) === minimumPenalty)
+    .filter((item) => catalogPresentationPenalty(item.song) === minimumPenalty)
     .map((item) => supportedCatalogReleaseTime(item.song)));
+}
+
+export function compareCatalogIssuePreference(
+  left: CatalogSong,
+  right: CatalogSong,
+): number {
+  return catalogPresentationPenalty(left) - catalogPresentationPenalty(right)
+    || supportedCatalogReleaseTime(left) - supportedCatalogReleaseTime(right)
+    || left.id.localeCompare(right.id);
 }
 
 function normalizedCatalogIsrc(song: CatalogSong): string | null {
@@ -313,8 +338,8 @@ function selectCanonicalSparseMatch<T extends SparseCatalogMatch>(
   const strongest = uniqueFamilies.sort((left, right) => {
     const sizeDifference = right.length - left.length;
     if (sizeDifference !== 0) return sizeDifference;
-    const leftPenalty = Math.min(...left.map((item) => catalogAlbumPenalty(item.song)));
-    const rightPenalty = Math.min(...right.map((item) => catalogAlbumPenalty(item.song)));
+    const leftPenalty = Math.min(...left.map((item) => catalogPresentationPenalty(item.song)));
+    const rightPenalty = Math.min(...right.map((item) => catalogPresentationPenalty(item.song)));
     if (leftPenalty !== rightPenalty) return leftPenalty - rightPenalty;
     const leftRelease = preferredFamilyReleaseTime(left);
     const rightRelease = preferredFamilyReleaseTime(right);
@@ -560,6 +585,7 @@ export function rankCatalogMatches(
     }
     if (comparison.versionConflict) score -= 100;
     if (comparison.yearConflict) score -= 60;
+    score -= catalogPresentationPenalty(song);
     const identifierCompatible = comparison.isrcMatch && comparison.artistExact
       && (comparison.titleExact || comparison.baseTitleExact || comparison.compactTitleExact)
       && compatibleDuration(candidate.durationMs, song.durationInMillis)
@@ -605,6 +631,23 @@ export function rankCatalogMatches(
     ? ranked.filter((item) => !item.isrcConflict && item.artistExact && item.titleExact
       && !item.versionConflict && !item.yearConflict)
     : [];
+  // A trusted container may print a temporary promotional suffix while Apple
+  // also exposes the clean canonical title for the same ISRC. Base-title
+  // variants remain review-only by default; admit them to the sparse family
+  // resolver only when an exact-title result independently supplies the same
+  // stable ISRC. Presentation ranking can then select the cleaner issue.
+  const sparseExactIsrcs = new Set(sparseExactMatches
+    .map((item) => normalizedCatalogIsrc(item.song))
+    .filter((value): value is string => Boolean(value)));
+  const sparseStableBaseTitleMatches = isSparseEditorialCandidate(candidate)
+    ? ranked.filter((item) => {
+      const isrc = normalizedCatalogIsrc(item.song);
+      return !item.isrcConflict && item.artistExact && !item.titleExact && item.baseTitleExact
+        && !item.versionConflict && !item.yearConflict
+        && Boolean(isrc && sparseExactIsrcs.has(isrc));
+    })
+    : [];
+  const sparseRecordingFamilyMatches = [...sparseExactMatches, ...sparseStableBaseTitleMatches];
   const sparseStrongCreditMatches = isSparseEditorialCandidate(candidate)
     ? ranked.filter((item) => !item.isrcConflict && !item.versionConflict && !item.yearConflict
       && (
@@ -625,11 +668,11 @@ export function rankCatalogMatches(
   // only when multiple exact results corroborate one recording family. A
   // single exact title on an unrelated album remains review-only.
   const sparseAlbumMatches = candidate.album
-    ? sparseExactMatches.filter((item) => item.albumExact)
-    : sparseExactMatches;
+    ? sparseRecordingFamilyMatches.filter((item) => item.albumExact)
+    : sparseRecordingFamilyMatches;
   const canonicalSparseMetadata = selectCanonicalSparseMatch(sparseAlbumMatches)
     ?? (candidate.album
-      ? selectCanonicalSparseMatch(sparseExactMatches, false)
+      ? selectCanonicalSparseMatch(sparseRecordingFamilyMatches, false)
       : null);
   // Apple frequently moves featured performers between artistName and a
   // parenthetical title credit, or expands a cited primary artist into the

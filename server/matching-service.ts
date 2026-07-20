@@ -28,6 +28,7 @@ import {
   type AppleCatalogPlaylist,
 } from "./apple.ts";
 import {
+  compareCatalogIssuePreference,
   hasDirectCatalogMatch,
   mergeCatalogSongs,
   normalizeMusicBaseTitle,
@@ -127,6 +128,8 @@ interface MatchingOutcomeCheckpoint {
   desiredArtistCount: number;
   representedArtistCount: number;
   artistShortfall: number;
+  semanticGeographyMismatchCount?: number;
+  refillSuppressedReason?: "deterministic_geography_evidence_semantics" | null;
   status: "complete" | "shortfall";
   updatedAt: string;
 }
@@ -280,6 +283,7 @@ function compatibleCatalogAlternate(primary: CatalogSong, alternate: CatalogSong
 }
 
 const VERSION_POLICY_CONFLICT_BASIS = "version_policy_conflict";
+const SELECTION_GEOGRAPHY_SEMANTICS_REVIEW_BASIS = "selection_geography_evidence_semantics_conflict";
 
 /**
  * The ordinary Apple matcher ranks identity compatibility, not the V2
@@ -308,8 +312,26 @@ function applyV2VersionPolicy(
     || !match.song) return match;
 
   const allowed = new Set(plan.versionPolicy.allowed);
+  const preferred = new Set(plan.versionPolicy.preferred);
   const primaryVersion = catalogRecordingVersionClass(match.song);
   if (allowed.has(primaryVersion)) {
+    const observedSongs = mergeCatalogSongs([...observedCatalogSongs, match.song, ...match.alternatives]);
+    const preferredSongs = observedSongs.filter((song) => (
+      allowed.has(catalogRecordingVersionClass(song))
+      && preferred.has(catalogRecordingVersionClass(song))
+    ));
+    if (!preferred.has(primaryVersion) && preferredSongs.length > 0) {
+      const promoted = rankCatalogMatches(candidate.id, candidate, preferredSongs);
+      if (promoted.status === "accepted" && promoted.song) {
+        return {
+          ...promoted,
+          basis: `${promoted.basis}; V2 version policy preferred ${catalogRecordingVersionClass(promoted.song)} over allowed ${primaryVersion}`,
+          alternatives: observedSongs.filter((song) => (
+            song.id !== promoted.song!.id && allowed.has(catalogRecordingVersionClass(song))
+          )).slice(0, 4),
+        };
+      }
+    }
     return {
       ...match,
       alternatives: match.alternatives.filter((song) => (
@@ -685,6 +707,54 @@ function matchSatisfiesV2HardEligibility(
   return true;
 }
 
+/**
+ * Detect a catalog-resolved row whose only hard-policy failure is the
+ * semantic relationship attached to otherwise qualifying geography evidence.
+ * Researching more track names cannot repair an `unspecified` versus
+ * `artist_origin` (or equivalent) binding mismatch, so this signal prevents a
+ * paid refill loop while preserving ordinary era, content, version, and
+ * evidence-shortfall recovery.
+ */
+function catalogIdentityFailsOnlySelectionGeographySemantics(
+  run: Pick<Awaited<ReturnType<MatchingRepository["getRun"]>>, "brief" | "pipelineVersion" | "selectionPlan">,
+  candidate: Candidate | undefined,
+  match: ExistingMatch,
+): boolean {
+  const plan = run.selectionPlan;
+  if (run.pipelineVersion !== "catalog_first_v2" || !plan || !candidate || !match.song) return false;
+  const qualifyingBindings = (candidate.scopeBindings ?? [])
+    .filter((binding) => binding.eligibility === "qualifying");
+  if (qualifyingBindings.length === 0
+    || selectionGeographyBindingsSatisfied(plan, qualifyingBindings)
+    || !scopeBindingsMeetEvidenceFloor(run.brief, qualifyingBindings, plan)) {
+    return false;
+  }
+  if (!plan.versionPolicy.allowed.includes(catalogRecordingVersionClass(match.song))) return false;
+  for (const constraint of plan.constraints) {
+    if (constraint.kind !== "hard" || constraint.geographyRelationship !== null) continue;
+    if (!matchingConstraintSatisfied(candidate, match, constraint)) return false;
+  }
+  const rating = catalogContentRating(match.song);
+  if (plan.contentPolicy.explicitContent === "clean_only" && rating !== "clean") return false;
+  if (plan.contentPolicy.instrumental === "exclude"
+    && /\binstrumental\b/iu.test(`${match.song.name} ${match.song.versionLabel ?? ""}`)) return false;
+  return true;
+}
+
+function matchFailsOnlySelectionGeographySemantics(
+  run: Pick<Awaited<ReturnType<MatchingRepository["getRun"]>>, "brief" | "pipelineVersion" | "selectionPlan">,
+  candidate: Candidate | undefined,
+  match: ExistingMatch,
+): boolean {
+  // Only a strict identity that was accepted by the Apple matcher and then
+  // demoted by the evidence gate may suppress another paid candidate refill.
+  // Generic `review` rows can represent fuzzy identity, conflicting versions,
+  // or duplicate clusters and therefore are not a proven recovery pool.
+  return match.status === "review"
+    && match.basis.startsWith(`${SELECTION_GEOGRAPHY_SEMANTICS_REVIEW_BASIS};`)
+    && catalogIdentityFailsOnlySelectionGeographySemantics(run, candidate, match);
+}
+
 async function resumeOrIgnoreAutomaticHandoff(
   repository: MatchingRepository,
   runId: string,
@@ -743,6 +813,27 @@ async function finalizeMatchingOutcome(
     ? Math.max(0, Math.floor(configuredMinimum))
     : null;
   const shortfall = targetMinimum === null ? 0 : Math.max(0, targetMinimum - safePrimaryCount);
+  const semanticGeographyMismatchMatches = matches.filter((match) => (
+    matchFailsOnlySelectionGeographySemantics(
+      latest,
+      candidatesById.get(match.candidateId),
+      match,
+    )
+  ));
+  const semanticRecoveryPoolCount = partitionUniqueRecordingFamilies(
+    [...safePrimaryMatches, ...semanticGeographyMismatchMatches],
+    (match) => {
+      const candidate = candidatesById.get(match.candidateId);
+      return recordingFamilyKey({
+        song: match.song!,
+        musicBrainzRecordingId: candidate?.musicbrainzId,
+      });
+    },
+  ).unique.length;
+  const deterministicGeographySemanticMismatch = targetMinimum !== null
+    && shortfall > 0
+    && semanticGeographyMismatchMatches.length > 0
+    && semanticRecoveryPoolCount >= targetMinimum;
   const candidateArtists = new Map(candidates.map((candidate) => [candidate.id, candidate.artist]));
   const safeArtists = uniqueSafePrimaryMatches.map((match) => (
     (match as ExistingMatch & { artist?: string }).artist
@@ -772,6 +863,10 @@ async function finalizeMatchingOutcome(
     desiredArtistCount,
     representedArtistCount,
     artistShortfall,
+    semanticGeographyMismatchCount: semanticGeographyMismatchMatches.length,
+    refillSuppressedReason: deterministicGeographySemanticMismatch
+      ? "deterministic_geography_evidence_semantics"
+      : null,
     status: shortfall > 0 || artistShortfall > 0 ? "shortfall" : "complete",
     updatedAt: new Date().toISOString(),
   };
@@ -826,7 +921,7 @@ async function finalizeMatchingOutcome(
       );
       if (recovery === "queued" || recovery === "in_flight") return;
     }
-    if (refillEligible && targetMinimum !== null) {
+    if (refillEligible && targetMinimum !== null && !deterministicGeographySemanticMismatch) {
       const countRefillPlan = fastPostMatchRefillPlan({
         requestedMinimum: targetMinimum,
         selectableCount: safePrimaryCount,
@@ -1043,24 +1138,7 @@ function isEvidenceEligible(
   if (candidate.scopeBindings && candidate.scopeBindings.length > 0) {
     const qualifyingBindings = candidate.scopeBindings.filter((binding) => binding.eligibility === "qualifying");
     if (selectionPlan && !selectionGeographyBindingsSatisfied(selectionPlan, qualifyingBindings)) return false;
-    return scopeBindingEligible(brief.mode, qualifyingBindings
-      .map((binding) => {
-        const evidence = classifyTrackScopeBindingEvidence({
-          bindingKind: binding.bindingKind,
-          scopeAxis: binding.scopeAxis,
-          citationAttested: Boolean(binding.citationAttestationId),
-        });
-        return {
-          strength: trackScopeBindingStrength(binding.confidence),
-          provenanceRoot: binding.provenancePath.find((item) => item.kind === "provenance_root")?.id
-            ?? binding.sourceRecordId
-            ?? binding.sourceUrl
-            ?? "",
-          ...evidence,
-          bindingKind: binding.bindingKind,
-          scopeAxis: binding.scopeAxis,
-        };
-      }), selectionPlan?.intents);
+    return scopeBindingsMeetEvidenceFloor(brief, qualifyingBindings, selectionPlan);
   }
   // V2 eligibility is binding-based. Falling back to the legacy evidence-state
   // shortcut would let a broad editorial claim bypass the typed intent and
@@ -1080,6 +1158,30 @@ function isEvidenceEligible(
   return requiresFactualFrontier(brief, selectionPlan)
     ? states.has("verified") || states.has("corroborated")
     : states.has("editorial") || states.has("verified") || states.has("corroborated");
+}
+
+function scopeBindingsMeetEvidenceFloor(
+  brief: PlaylistBrief,
+  qualifyingBindings: readonly TrackScopeBinding[],
+  selectionPlan?: SelectionPlan | null,
+): boolean {
+  return scopeBindingEligible(brief.mode, qualifyingBindings.map((binding) => {
+    const evidence = classifyTrackScopeBindingEvidence({
+      bindingKind: binding.bindingKind,
+      scopeAxis: binding.scopeAxis,
+      citationAttested: Boolean(binding.citationAttestationId),
+    });
+    return {
+      strength: trackScopeBindingStrength(binding.confidence),
+      provenanceRoot: binding.provenancePath.find((item) => item.kind === "provenance_root")?.id
+        ?? binding.sourceRecordId
+        ?? binding.sourceUrl
+        ?? "",
+      ...evidence,
+      bindingKind: binding.bindingKind,
+      scopeAxis: binding.scopeAxis,
+    };
+  }), selectionPlan?.intents);
 }
 
 function ineligibleEvidenceBasis(brief: PlaylistBrief, candidate: Candidate): string {
@@ -1576,7 +1678,7 @@ function preferredEvidenceBoundCatalogMatch(
     return ranked.status === "accepted" && ranked.song ? [ranked] : [];
   }).sort((left, right) => (
     right.score - left.score
-      || (left.song?.releaseDate ?? "9999").localeCompare(right.song?.releaseDate ?? "9999")
+      || compareCatalogIssuePreference(left.song!, right.song!)
       || (left.song?.id ?? "").localeCompare(right.song?.id ?? "")
   ));
   const selected = eligible[0];
@@ -1867,10 +1969,24 @@ async function resolveV2CatalogFrontier(
     // candidate has the same artist/base-title key. That collision is the
     // recovery path for a prior crash after candidate/binding persistence but
     // before its exact Apple match became durable.
-    const discoveredInputs = [...new Map(discovery.qualified.flatMap((candidate) => {
+    const discoveredInputsByAppleId = [...new Map(discovery.qualified.flatMap((candidate) => {
       const input = discoveredCandidateInput(candidate, trustedPlaylists, run);
       return input ? [[input.song.id, input] as const] : [];
     })).values()];
+    // One recording can appear in the trusted frontier through an original
+    // release, a compilation, a remaster, and a seasonal promotional title.
+    // Stable ISRC identity lets us keep the cleanest catalog presentation
+    // before a first-seen duplicate becomes the recording-family primary.
+    const preferredDiscoveredInputs = new Map<string, CatalogDiscoveredCandidateInput>();
+    for (const input of discoveredInputsByAppleId) {
+      const normalizedIsrc = input.song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "";
+      const identityKey = normalizedIsrc ? `isrc:${normalizedIsrc}` : `apple:${input.song.id}`;
+      const existing = preferredDiscoveredInputs.get(identityKey);
+      if (!existing || compareCatalogIssuePreference(input.song, existing.song) < 0) {
+        preferredDiscoveredInputs.set(identityKey, input);
+      }
+    }
+    const discoveredInputs = [...preferredDiscoveredInputs.values()];
     const inputByAppleId = new Map(discoveredInputs.map((input) => [input.song.id, input]));
 
     // A single Apple editorial page can contain hundreds of rows. Persist and
@@ -2331,7 +2447,15 @@ export async function matchResearchRun(
           basis: `Possible duplicate cluster ${candidate.duplicateClusterKey}; metadata similarity does not prove recording identity`,
         };
       } else if (!versionPolicyConflict && !isEvidenceEligible(run.brief, candidate, run.selectionPlan)) {
-        match = { ...match, status: "review", basis: ineligibleEvidenceBasis(run.brief, candidate) };
+        const strictIdentityDemotedOnlyByGeography = match.status === "accepted"
+          && catalogIdentityFailsOnlySelectionGeographySemantics(run, candidate, match);
+        match = {
+          ...match,
+          status: "review",
+          basis: strictIdentityDemotedOnlyByGeography
+            ? `${SELECTION_GEOGRAPHY_SEMANTICS_REVIEW_BASIS}; ${ineligibleEvidenceBasis(run.brief, candidate)}`
+            : ineligibleEvidenceBasis(run.brief, candidate),
+        };
       }
       await repository.saveMatch(runId, match);
       const musicBrainzIdentity = run.pipelineVersion === "catalog_first_v2"

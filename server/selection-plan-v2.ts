@@ -10,12 +10,16 @@ import type {
   SelectionScopeKind,
   SelectionVersionPolicy,
 } from "../shared/types.ts";
-import type { PlaylistGuidancePreference } from "./guidance-context.ts";
+import {
+  effectiveGuidanceGeographyConstraint,
+  type PlaylistGuidancePreference,
+} from "./guidance-context.ts";
 import { assertsFactualTrackRelationship } from "./factual-frontier-policy.ts";
 import { PIPELINE_POLICY_VERSION } from "./pipeline-v2-policy.ts";
 import {
   parseSelectionGeographyConstraints,
   selectionConstraintGeography,
+  selectionGeographyValuesEquivalent,
   uniqueGeographyConstraints,
 } from "./selection-geography-policy.ts";
 
@@ -551,6 +555,18 @@ function constraintsForBrief(
   }
   for (const rule of brief.exclude) {
     const userAuthored = explicitUserExclusion(prompt, rule);
+    const generatedRequiredComplement = !userAuthored && constraints.some((constraint) => (
+      constraint.kind === "hard"
+      && !["exclude", "avoid", "maximum"].includes(constraint.operator)
+      && constraint.values.some((value) => ruleNamesComplement(rule, value))
+    ));
+    // A generated complement such as “non-French jazz unless clearly tied to
+    // the French jazz scene” restates the positive French/jazz boundary. Its
+    // free-form `... scene` suffix is also liable to parse as one malformed
+    // scene name. The positive hard constraints already enforce the boundary,
+    // so discard the entire generated complement rather than retaining a
+    // synthetic avoid-rule that can reject every valid candidate.
+    if (generatedRequiredComplement) continue;
     const parsed = parsedAxisRules(rule);
     if (parsed.length === 0) {
       add(
@@ -624,12 +640,12 @@ function constraintsForBrief(
   // into an exact, non-relaxable semantic relationship. Remove only the
   // matching `unspecified` rule; unrelated hard axes remain intact.
   for (const preference of guidance) {
-    const resolved = preference.geographyConstraint;
+    const resolved = effectiveGuidanceGeographyConstraint(preference);
     if (!resolved) continue;
     for (let constraintIndex = constraints.length - 1; constraintIndex >= 0; constraintIndex -= 1) {
       const existing = constraints[constraintIndex]!;
       if (existing.kind !== "hard" || existing.geographyRelationship !== "unspecified") continue;
-      if (!existing.values.some((value) => normalized(value) === normalized(resolved.value))) continue;
+      if (!existing.values.some((value) => selectionGeographyValuesEquivalent(value, resolved.value))) continue;
       constraints.splice(constraintIndex, 1);
     }
     const axis: SelectionConstraintAxis = resolved.relationship === "language"
@@ -648,7 +664,7 @@ function constraintsForBrief(
         : preference.kind === "ordering_behavior"
           ? "relationship"
           : "theme";
-    if (!preference.geographyConstraint) {
+    if (!effectiveGuidanceGeographyConstraint(preference)) {
       add("guidance", axis, "prefer", [preference.value], "soft", 100 + guidanceIndex);
     }
   });
@@ -773,6 +789,24 @@ function selectionScopeKind(
   return "broad_curated";
 }
 
+/**
+ * Ordering prose is often contrastive (for example, "smoothly intermixed
+ * rather than strict chronology"). A bare keyword check treated the rejected
+ * alternative as the requested mode. Keep chronology opt-in whenever the
+ * nearby phrase explicitly negates or contrasts it.
+ */
+function selectionOrderingMode(
+  orderingPolicy: string,
+): SelectionPlan["orderingPolicy"]["mode"] {
+  const chronologyMentioned = /chronolog/iu.test(orderingPolicy);
+  const chronologyRejected = /\b(?:rather\s+than|instead\s+of|avoid(?:ing)?|without|not|never|no)\s+(?:(?:a|an)\s+)?(?:strict(?:ly)?\s+)?chronolog/iu
+    .test(orderingPolicy);
+  if (chronologyMentioned && !chronologyRejected) return "chronological";
+  if (/contrast/iu.test(orderingPolicy)) return "contrast";
+  if (/smooth|flow|intermix/iu.test(orderingPolicy)) return "smooth";
+  return "editorial";
+}
+
 export function createSelectionPlanV2(input: {
   prompt: string;
   brief: PlaylistBrief;
@@ -793,13 +827,7 @@ export function createSelectionPlanV2(input: {
         && !["exclude", "avoid", "maximum"].includes(constraint.operator))
       .flatMap(selectionConstraintGeography),
   );
-  const orderingMode = /chronolog/iu.test(input.brief.orderingPolicy)
-    ? "chronological"
-    : /contrast/iu.test(input.brief.orderingPolicy)
-      ? "contrast"
-      : /smooth|flow|intermix/iu.test(input.brief.orderingPolicy)
-        ? "smooth"
-        : "editorial";
+  const orderingMode = selectionOrderingMode(input.brief.orderingPolicy);
 
   return {
     schemaVersion: 1,

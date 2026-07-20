@@ -22,6 +22,30 @@ export interface GuidanceResearchContext {
   orderingBehavior: PlaylistGuidanceOrderingBehavior | null;
 }
 
+/**
+ * A broad/countrywide answer preserves the listener's existing national
+ * scope; it does not resolve whether that scope means artist origin, scene,
+ * recording location, or sound association. Question-scout output is model
+ * authored, so defensively discard an over-specific geography relationship
+ * when the machine-readable value explicitly says to keep the scope broad.
+ */
+export function effectiveGuidanceGeographyConstraint(
+  preference: Pick<PlaylistGuidancePreference, "decisionKey" | "value" | "geographyConstraint">,
+): SelectionGeographyConstraint | null {
+  const constraint = preference.geographyConstraint ?? null;
+  if (!constraint) return null;
+  const semanticValue = `${preference.decisionKey} ${preference.value}`
+    .normalize("NFKC")
+    .replace(/[_-]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const preservesBroadNationalScope = /\b(?:broad(?:ly)?|national|nationwide|countrywide|all regions?|regional (?:balance|breadth|mix)|across (?:the )?country)\b/iu
+    .test(semanticValue);
+  return preservesBroadNationalScope && constraint.relationship !== "language"
+    ? null
+    : constraint;
+}
+
 function boundedText(value: unknown, maximum: number): string {
   return typeof value === "string"
     ? value.normalize("NFKC").replace(/\s+/gu, " ").trim().slice(0, maximum)
@@ -71,15 +95,20 @@ export function deriveGuidancePreferences(
       const option = question.options.find((candidate) => candidate.id === answer.optionId);
       if (!option) continue;
       const effect = option.effect;
+      const preference = {
+        decisionKey,
+        value: boundedText(effect?.value || legacyOptionValue(question, option), 500),
+        geographyConstraint: effect?.geographyConstraint ?? null,
+      };
       preferences.push({
         questionId: question.id,
         decisionKey,
         kind: effect?.kind ?? "research_preference",
-        value: boundedText(effect?.value || legacyOptionValue(question, option), 500),
+        value: preference.value,
         orderingBehavior: effect?.kind === "ordering_behavior"
           ? effect.orderingBehavior
           : null,
-        geographyConstraint: effect?.geographyConstraint ?? null,
+        geographyConstraint: effectiveGuidanceGeographyConstraint(preference),
         source: "option",
       });
       continue;
@@ -115,9 +144,10 @@ export function guidanceResearchContext(
   for (const preference of preferences ?? []) {
     const value = boundedText(preference.value, 500);
     if (!value) continue;
-    if (preference.geographyConstraint) {
+    const geographyConstraint = effectiveGuidanceGeographyConstraint(preference);
+    if (geographyConstraint) {
       directives.push(
-        `Required ${preference.geographyConstraint.relationship.replace(/_/gu, " ")} relationship to ${preference.geographyConstraint.value}: ${value}`,
+        `Required ${geographyConstraint.relationship.replace(/_/gu, " ")} relationship to ${geographyConstraint.value}: ${value}`,
       );
       continue;
     }

@@ -1159,6 +1159,231 @@ test("V2 exact-fill recovery counts only matches that can survive a hard era man
   }));
 });
 
+test("V2 does not buy candidate refills for a target-sized Apple pool blocked only by geography semantics", async () => {
+  const frenchBrief: PlaylistBrief = {
+    ...sceneBrief(3),
+    title: "French jazz across the decades",
+    description: "A broad survey of French jazz artists.",
+    subjectEntities: ["French jazz"],
+    relationship: "is a French jazz recording",
+    include: ["French jazz recordings"],
+    versionPolicy: "Prefer canonical studio recordings.",
+  };
+  const rows = Array.from({ length: 3 }, (_, index) => {
+    const row = candidate(`french-jazz-${index}`, "editorial");
+    row.artist = `French Jazz Artist ${index}`;
+    row.title = `French Jazz Track ${index}`;
+    row.album = null;
+    row.releaseYear = null;
+    row.durationMs = null;
+    row.isrc = null;
+    row.versionLabel = null;
+    row.candidateStage = "scope_qualified";
+    row.scopeBindings = [{
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "genre",
+      scopeValue: "jazz",
+      relationship: `${row.title} is documented as jazz`,
+      confidence: 0.98,
+      sourceUrl: `https://example.com/french-jazz/${index}`,
+      sourceRecordId: `source-french-jazz-${index}`,
+      researchContainerId: null,
+      citationAttestationId: `citation-french-jazz-${index}`,
+      provenancePath: [{ kind: "provenance_root", id: `french-jazz-root-${index}` }],
+      note: "Track-specific jazz evidence.",
+    }, {
+      bindingKind: "track_specific_source",
+      eligibility: "qualifying",
+      scopeAxis: "geography",
+      scopeValue: "French",
+      geographyRelationship: "unspecified",
+      relationship: `${row.title} is associated with French jazz`,
+      confidence: 0.98,
+      sourceUrl: `https://example.com/french-jazz/${index}`,
+      sourceRecordId: `source-french-jazz-${index}`,
+      researchContainerId: null,
+      citationAttestationId: `citation-french-jazz-${index}`,
+      provenancePath: [{ kind: "provenance_root", id: `french-jazz-root-${index}` }],
+      note: "The source does not establish artist origin.",
+    }];
+    return row;
+  });
+  vi.mocked(searchAppleCatalog).mockImplementation(async (_storefront, query) => {
+    const index = /French Jazz (?:Artist|Track) (\d+)/u.exec(query)?.[1];
+    if (index === undefined) return [];
+    return [{
+      ...song,
+      id: `apple-french-jazz-${index}`,
+      artistName: `French Jazz Artist ${index}`,
+      name: `French Jazz Track ${index}`,
+      albumName: `French Jazz Album ${index}`,
+      isrc: `FRJAZ260000${index}`,
+    }];
+  });
+  const repository = new V2MemoryMatchingRepository(
+    rows,
+    frenchBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+    undefined,
+    true,
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "French jazz",
+    brief: frenchBrief,
+    storefront: "us",
+    guidancePreferences: [{
+      questionId: "q-french-origin",
+      decisionKey: "french_jazz_relationship_boundary",
+      kind: "research_preference",
+      value: "french_artists_first",
+      orderingBehavior: null,
+      geographyConstraint: { value: "France", relationship: "artist_origin" },
+      source: "option",
+    }],
+  });
+  repository.automaticRefillState = "queued";
+
+  await matchResearchRun(repository, "run-v2-french-jazz-semantic-mismatch", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toHaveLength(3);
+  expect(repository.matches.every((match) => match.song?.id && match.status === "review")).toBe(true);
+  expect(repository.automaticRefills).toEqual([]);
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_matching_outcome",
+    checkpoint: expect.objectContaining({
+      safePrimaryCount: 0,
+      shortfall: 3,
+      semanticGeographyMismatchCount: 3,
+      refillSuppressedReason: "deterministic_geography_evidence_semantics",
+    }),
+  }));
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "partial",
+    phase: "catalog_matching_empty",
+    error: null,
+  });
+});
+
+test("V2 ambiguous Apple review rows do not suppress a candidate refill when geography also mismatches", async () => {
+  const frenchBrief: PlaylistBrief = {
+    ...sceneBrief(1),
+    title: "French jazz across the decades",
+    description: "A broad survey of French jazz artists.",
+    subjectEntities: ["French jazz"],
+    relationship: "is a French jazz recording",
+    include: ["French jazz recordings"],
+    versionPolicy: "Prefer canonical studio recordings.",
+  };
+  const row = candidate("ambiguous-french-jazz", "editorial");
+  row.artist = "Ambiguous French Artist";
+  row.title = "Ambiguous French Track";
+  row.album = null;
+  row.releaseYear = null;
+  row.durationMs = null;
+  row.isrc = null;
+  row.versionLabel = null;
+  row.candidateStage = "scope_qualified";
+  row.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "genre",
+    scopeValue: "jazz",
+    relationship: "Ambiguous French Track is documented as jazz",
+    confidence: 0.98,
+    sourceUrl: "https://example.com/ambiguous-french-jazz",
+    sourceRecordId: "source-ambiguous-french-jazz",
+    researchContainerId: null,
+    citationAttestationId: "citation-ambiguous-french-jazz",
+    provenancePath: [{ kind: "provenance_root", id: "ambiguous-french-jazz-root" }],
+    note: "Track-specific jazz evidence.",
+  }, {
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "geography",
+    scopeValue: "French",
+    geographyRelationship: "unspecified",
+    relationship: "Ambiguous French Track is associated with French jazz",
+    confidence: 0.98,
+    sourceUrl: "https://example.com/ambiguous-french-jazz",
+    sourceRecordId: "source-ambiguous-french-jazz",
+    researchContainerId: null,
+    citationAttestationId: "citation-ambiguous-french-jazz",
+    provenancePath: [{ kind: "provenance_root", id: "ambiguous-french-jazz-root" }],
+    note: "The source does not establish artist origin.",
+  }];
+  vi.mocked(searchAppleCatalog).mockResolvedValue([
+    {
+      ...song,
+      id: "apple-ambiguous-french-jazz-a",
+      artistName: row.artist,
+      name: row.title,
+      albumName: "Ambiguous French Album A",
+      durationInMillis: 180_000,
+      isrc: "FRJAZ2600101",
+    },
+    {
+      ...song,
+      id: "apple-ambiguous-french-jazz-b",
+      artistName: row.artist,
+      name: row.title,
+      albumName: "Ambiguous French Album B",
+      durationInMillis: 260_000,
+      isrc: "FRJAZ2600102",
+    },
+  ]);
+  const repository = new V2MemoryMatchingRepository(
+    [row],
+    frenchBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+    undefined,
+    true,
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "French jazz",
+    brief: frenchBrief,
+    storefront: "us",
+    guidancePreferences: [{
+      questionId: "q-french-origin",
+      decisionKey: "french_jazz_relationship_boundary",
+      kind: "research_preference",
+      value: "french_artists_first",
+      orderingBehavior: null,
+      geographyConstraint: { value: "France", relationship: "artist_origin" },
+      source: "option",
+    }],
+  });
+  repository.automaticRefillState = "queued";
+
+  await matchResearchRun(repository, "run-v2-french-jazz-ambiguous-review", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.matches).toEqual([expect.objectContaining({
+    status: "review",
+    song: expect.objectContaining({ id: "apple-ambiguous-french-jazz-a" }),
+  })]);
+  expect(repository.automaticRefills).toEqual([expect.objectContaining({
+    runId: "run-v2-french-jazz-ambiguous-review",
+    currentGeneration: 0,
+  })]);
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_matching_outcome",
+    checkpoint: expect.objectContaining({
+      safePrimaryCount: 0,
+      shortfall: 1,
+      semanticGeographyMismatchCount: 0,
+      refillSuppressedReason: null,
+    }),
+  }));
+});
+
 test("V2 exact-fill safe count applies hard exclusions before publication handoff", async () => {
   const exactBrief = {
     ...sceneBrief(1),

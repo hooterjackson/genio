@@ -77,6 +77,30 @@ describe("attested evidence scope-binding derivation", () => {
     ]);
   });
 
+  test("binds a country constraint from attested demonym artist-origin proof", () => {
+    const originPlan = {
+      constraints: [constraint("origin", "geography", ["Brazil"], "artist_origin")],
+    };
+    expect(deriveAttestedHardScopeDescriptors(originPlan, {
+      citationAttestationId: "citation-country-demonym-origin",
+      sourceMetadataText: "A foundational disco recording by Brazilian artists.",
+      relationship: "is performed by Brazilian artists",
+    })).toEqual([
+      { scopeAxis: "geography", scopeValue: "Brazil", geographyRelationship: "artist_origin" },
+    ]);
+  });
+
+  test("does not use a country-demonym alias to satisfy the wrong geography relationship", () => {
+    const locationPlan = {
+      constraints: [constraint("location", "geography", ["Brazil"], "recording_location")],
+    };
+    expect(deriveAttestedHardScopeDescriptors(locationPlan, {
+      citationAttestationId: "citation-country-demonym-wrong-relationship",
+      sourceMetadataText: "A foundational disco recording by Brazilian artists.",
+      relationship: "is performed by Brazilian artists",
+    })).toEqual([]);
+  });
+
   test("rejects non-supporting relationship assertions even when proof repeats every value", () => {
     expect(deriveAttestedHardScopeDescriptors(brazilianDiscoPlan(), {
       citationAttestationId: "citation-negative",
