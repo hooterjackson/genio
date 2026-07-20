@@ -14,6 +14,7 @@ import {
   type ProductionScenarioFailureClass,
   type ProductionScenarioReplayProfile,
 } from "../server/production-scenario-qa.ts";
+import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 import { researchExecutionPolicy } from "../server/research-policy.ts";
 import { applySimilaritySeedPolicy, excludedReferenceArtists } from "../server/similarity-policy.ts";
 import {
@@ -67,10 +68,10 @@ function canonicalScenarioBrief(scenario: ArchivedScenario): PlaylistBrief {
 
 describe("retained production searches", () => {
   test("contains every retained brief attempt from the production audit", () => {
-    expect(fixture.schemaVersion).toBe(4);
+    expect(fixture.schemaVersion).toBe(5);
     expect(fixture.scenarios).toHaveLength(fixture.scenarioCount);
-    expect(fixture.scenarioCount).toBe(29);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(29);
+    expect(fixture.scenarioCount).toBe(30);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(30);
     expect(Object.keys(fixture.replayProfiles).sort()).toEqual([
       "baile-funk-19-of-25",
       "baile-funk-23-of-50",
@@ -222,6 +223,45 @@ describe("retained production searches", () => {
       failClosed: false,
       violations: [],
     });
+  });
+
+  test("the Brazilian-disco incident preserves the open-ended era and treats count shortfall as partial", () => {
+    const scenario = fixture.scenarios.find((row) => row.id === "2026-07-20-30");
+    expect(scenario).toBeDefined();
+
+    const brief = canonicalScenarioBrief(scenario!);
+    const plan = createSelectionPlanV2({ prompt: scenario!.prompt, brief, storefront: "us" });
+    const hardEraConstraints = plan.constraints.filter((constraint) => (
+      constraint.kind === "hard" && constraint.axis === "era"
+    ));
+
+    expect(hardEraConstraints).toEqual([
+      expect.objectContaining({
+        operator: "between",
+        values: ["1970", String(new Date().getUTCFullYear())],
+      }),
+    ]);
+    expect(hardEraConstraints).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ operator: "within", values: ["1970s"] }),
+    ]));
+
+    const shortfall = replayProductionScenario(brief, {
+      candidateYieldRate: 1,
+      initialStrictMatchRate: 0.1,
+      retryableCatalogRate: 0,
+      recoverySuccessRate: 0,
+      refillCandidateYieldRate: 1,
+      refillStrictMatchRate: 0,
+    });
+
+    expect(shortfall.observation.strictMatchedCount).toBeGreaterThan(0);
+    expect(shortfall.observation.strictMatchedCount).toBeLessThan(25);
+    expect(shortfall.observation).toMatchObject({
+      requestedTrackCount: 25,
+      terminalStatus: "partial",
+      terminalPhase: "publication_partial",
+    });
+    expect(shortfall.observation.terminalStatus).not.toBe("failed");
   });
 
   test("post-match refill stops after three bounded generations and publishes a transparent partial", () => {

@@ -24,7 +24,15 @@ export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
 const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
-const EDITORIAL_INTENT = /\b(?:best|essential|influential|important|definitive|iconic|foundational|representative|history\s+of|shaped)\b/iu;
+// `editorial_ranking` is an evidence-bearing intent: every selected track must
+// independently prove the requested ranking or historical claim. Reserve it
+// for requests that actually make such a claim. Lightweight curation words
+// such as "iconic", "classic", and "essential" are useful ordering signals,
+// but making them an intent rejected otherwise well-supported genre tracks
+// whenever a source did not literally describe each recording that way.
+const EDITORIAL_RANKING_INTENT = /\b(?:best|greatest|top(?:\s+\d+)?|ranked|ranking|influential|important|foundational|landmark|history\s+of|shaped)\b/iu;
+const EXPLICIT_EDITORIAL_EVIDENCE_INTENT = /\b(?:require|required|must|only)\b[^.;!?\n]{0,100}\b(?:editorial|historical|documented|cited|ranking|ranked|influence)\b|\b(?:editorial|historical|documented|cited)\b[^.;!?\n]{0,100}\bevidence\b/iu;
+const SOFT_EDITORIAL_DESCRIPTOR = /\b(?:essential|iconic|classic|definitive|representative)\b/giu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
 const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggae|classical|country|electronic)\b/iu;
 const THEME_INTENT = /\b(?:songs?\s+about|tracks?\s+about|lyrics?\s+about|theme|themed)\b/iu;
@@ -218,6 +226,11 @@ function unique(values: readonly string[]): string[] {
   });
 }
 
+function softEditorialDescriptors(prompt: string): string[] {
+  return unique([...prompt.matchAll(SOFT_EDITORIAL_DESCRIPTOR)]
+    .map((match) => match[0].toLocaleLowerCase("en-US")));
+}
+
 function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   const scope = [prompt, brief.title, brief.description, brief.relationship, ...brief.include].join(" ");
   // Subjective intent comes from the visitor's request, not from prose the
@@ -237,7 +250,10 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   // similar while describing a genre survey. That is not a direct-artist
   // catalogue request and must not disable broad-playlist diversity rules.
   if (ARTIST_CATALOGUE_INTENT.test(directIntentScope)) intents.push("artist_catalogue");
-  if (EDITORIAL_INTENT.test(directIntentScope)) intents.push("editorial_ranking");
+  if (EDITORIAL_RANKING_INTENT.test(directIntentScope)
+    || EXPLICIT_EDITORIAL_EVIDENCE_INTENT.test(directIntentScope)) {
+    intents.push("editorial_ranking");
+  }
   const physicalHouseTheme = directThemeIntent
     && /\b(?:a|the|physical)\s+houses?\b|\bhomes?\b/iu.test(directIntentScope)
     && !/\bhouse\s+music\b/iu.test(directIntentScope);
@@ -347,6 +363,17 @@ const ACTIVITY_TERMS: Array<[string, RegExp]> = [
 ];
 
 function eraRules(value: string): ParsedAxisRule[] {
+  const openEndedRange = value.match(
+    /\b(?:from\s+(?:the\s+)?)?(?:(?:(?:early|mid|late)[ -]?)?((?:19|20)\d0)s|((?:19|20)\d{2}))\s*(?:-|\u2013|\u2014|to|through|thru|until|up\s+to)\s*(?:the\s+)?(?:present(?:\s+day)?|current(?:\s+(?:year|day))?|today|now|date)\b/iu,
+  );
+  if (openEndedRange) {
+    const startYear = openEndedRange[1] ?? openEndedRange[2];
+    return [{
+      axis: "era",
+      operator: "between",
+      values: [startYear!, String(new Date().getUTCFullYear())],
+    }];
+  }
   const range = value.match(/\b((?:19|20)\d{2})\s*(?:-|\u2013|\u2014|to|through)\s*((?:19|20)\d{2})\b/iu);
   if (range) return [{ axis: "era", operator: "between", values: [range[1]!, range[2]!] }];
   const decades = [...value.matchAll(/\b(?:(early|mid|late)[ -]?)?((?:19|20)\d0)s\b/giu)]
@@ -465,6 +492,18 @@ function constraintsForBrief(
   const promptScopeRules = coalesceAlternativeScopeRules(parsedAxisRules(prompt));
   for (const parsed of promptScopeRules) {
     add("scope", parsed.axis, parsed.operator, parsed.values, "hard", null, parsed.geographyRelationship ?? null);
+  }
+  // Words such as "iconic" and "essential" express a curation preference,
+  // not a demand for an independent influence/ranking claim on every track.
+  // Keep the preference visible to the constraint ladder, where it can improve
+  // ordering and selection when supported without emptying a catalog-rich
+  // genre request. Explicit ranking/history claims remain an
+  // `editorial_ranking` intent and keep their strict evidence threshold.
+  if (!intents.includes("editorial_ranking")) {
+    const descriptors = softEditorialDescriptors(prompt);
+    if (descriptors.length > 0) {
+      add("editorial_preference", "relationship", "prefer", descriptors, "soft", 1);
+    }
   }
 
   // Subject entities are model-resolved discovery hints, not visitor-authored

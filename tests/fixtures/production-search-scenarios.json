@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 4,
-  "source": "production audits and visitor-submitted regressions captured 2026-07-16 through 2026-07-18",
+  "schemaVersion": 5,
+  "source": "production audits and visitor-submitted regressions captured 2026-07-16 through 2026-07-20",
   "replayProfiles": {
     "nominal": {
       "candidateYieldRate": 0.9,
@@ -51,7 +51,7 @@
       "refillStrictMatchRate": 0.7
     }
   },
-  "scenarioCount": 29,
+  "scenarioCount": 30,
   "scenarios": [
     {
       "id": "2026-07-16-01",
@@ -286,6 +286,14 @@
       "requestedTrackCount": 25,
       "expectedOutcome": "exact_playlist",
       "replayProfile": "baile-funk-19-of-25",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-20-30",
+      "prompt": "25 Brazilian disco songs spanning the 1970s through today, with a diverse mix of artists",
+      "expectedTrackCount": 25,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "catalog-shortfall",
       "failureClasses": ["catalog_shortfall"]
     }
   ]

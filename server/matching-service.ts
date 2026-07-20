@@ -1223,6 +1223,60 @@ function scopeTokens(run: Pick<Awaited<ReturnType<MatchingRepository["getRun"]>>
     .slice(0, 16);
 }
 
+const DISCOVERY_COUNT_INSTRUCTION_WORDS = new Set([
+  "about", "approximately", "around", "at", "count", "cut", "cuts", "exact", "exactly", "least", "maximum",
+  "minimum", "most", "playlist", "recording", "recordings", "requested", "song", "songs", "target", "to", "track",
+  "tracks", "up",
+]);
+
+const DISCOVERY_DIVERSITY_INSTRUCTION_WORDS = new Set([
+  "a", "across", "album", "albums", "an", "and", "artist", "artists", "balance", "balanced", "broad", "different",
+  "diverse", "diversity", "era", "eras", "genre", "genres", "mix", "mixture", "multiple", "of", "range", "recording",
+  "recordings", "scene", "scenes", "selection", "song", "songs", "source", "sources", "style", "styles", "the", "track",
+  "tracks", "varied", "variety", "wide", "with",
+]);
+
+const DISCOVERY_ERA_INSTRUCTION_WORDS = new Set([
+  "across", "and", "between", "classic", "contemporary", "current", "decade", "decades", "early", "era", "eras", "from",
+  "late", "mid", "modern", "now", "onward", "onwards", "present", "since", "the", "through", "thru", "to", "today",
+  "until", "up",
+]);
+
+function instructionTokens(value: string): string[] {
+  return normalizedPhrase(value).split(" ").filter(Boolean);
+}
+
+/**
+ * Model-authored briefs sometimes echo operational instructions as if they
+ * were musical scope (for example `exactly 25 tracks`, `diverse mix of
+ * artists`, or `1970s through today`). Those phrases have no useful Apple
+ * catalog recall and consume the bounded deficit-query frontier. Filter only
+ * phrases made entirely from instruction vocabulary: a composite such as
+ * `1970s Brazilian disco` still contains real scope tokens and is retained.
+ */
+function isInstructionOnlyDiscoveryScope(value: string): boolean {
+  const tokens = instructionTokens(value);
+  if (tokens.length === 0) return true;
+
+  const hasCount = tokens.some((token) => /^\d{1,4}$/u.test(token));
+  if (hasCount && tokens.every((token) => /^\d{1,4}$/u.test(token) || DISCOVERY_COUNT_INSTRUCTION_WORDS.has(token))) {
+    return true;
+  }
+
+  const hasDiversityInstruction = tokens.some((token) => [
+    "balance", "balanced", "broad", "different", "diverse", "diversity", "mix", "mixture", "multiple", "range", "varied",
+    "variety", "wide",
+  ].includes(token));
+  if (hasDiversityInstruction && tokens.every((token) => DISCOVERY_DIVERSITY_INSTRUCTION_WORDS.has(token))) {
+    return true;
+  }
+
+  const hasEraInstruction = tokens.some((token) => /^\d{4}s?$/u.test(token)
+    || ["contemporary", "current", "era", "eras", "modern", "now", "present", "today"].includes(token));
+  return hasEraInstruction
+    && tokens.every((token) => /^\d{4}s?$/u.test(token) || DISCOVERY_ERA_INSTRUCTION_WORDS.has(token));
+}
+
 function catalogScopeQueries(
   run: Pick<Awaited<ReturnType<MatchingRepository["getRun"]>>, "brief" | "selectionPlan">,
 ): string[] {
@@ -1234,7 +1288,8 @@ function catalogScopeQueries(
     ...run.brief.subjectEntities,
     ...run.brief.include,
     ...scopedConstraints,
-  ].map((value) => value.trim()).filter(Boolean);
+  ].map((value) => value.trim())
+    .filter((value) => value.length > 0 && !isInstructionOnlyDiscoveryScope(value));
   return [...new Map(values.map((value) => [normalizedPhrase(value), value])).values()].slice(0, 6);
 }
 
@@ -1914,6 +1969,9 @@ async function resolveV2CatalogFrontier(
       updatedAt: new Date().toISOString(),
     });
     if (!discoveryGoalSatisfied && !handoffPending && repository.savePipelineOutcome) {
+      const stageCounts = repository.getPipelineStageCounts
+        ? await repository.getPipelineStageCounts(runId)
+        : undefined;
       const disposition = catalogDiscoveryOutcomeDisposition({
         stoppedBecause: discovery.stoppedBecause,
         safeTrackCount: acceptedCatalogIds.size,
@@ -1929,11 +1987,17 @@ async function resolveV2CatalogFrontier(
           Math.max(candidates.length, discovery.totalAttemptedCount),
           discovery.totalQualifiedCount,
         ),
-        selectedTrackCount: acceptedCatalogIds.size,
+        // Catalog acceptance precedes quota selection, sequencing, and
+        // manifest lock. Reporting every accepted Apple identity as selected
+        // makes an early discovery shortfall look more complete than the
+        // immutable manifest that is eventually published. Only a durable
+        // manifested-stage count is allowed to advance this field.
+        selectedTrackCount: stageCounts?.manifested ?? 0,
         publishedTrackCount: 0,
         frontierExhausted: disposition.frontierExhausted,
         providerUnavailable: disposition.providerUnavailable,
         reasonCodes: [disposition.reasonCode],
+        stageCounts,
       }));
     }
     return { handoffPending };

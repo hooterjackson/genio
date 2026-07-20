@@ -3,6 +3,7 @@ import type { PlaylistBrief } from "../shared/types.ts";
 import { canonicalBriefForRequest } from "../server/brief-policy.ts";
 import {
   adaptiveDiscoveryPlan,
+  scopeBindingEligible,
   selectWithConstraintLadder,
   terminalPipelineOutcome,
 } from "../server/pipeline-v2-policy.ts";
@@ -79,7 +80,14 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
     const hardRequired = plan.constraints.filter((constraint) => constraint.kind === "hard" && constraint.operator === "require");
     const hardExcluded = plan.constraints.filter((constraint) => constraint.kind === "hard" && constraint.operator === "exclude");
 
-    expect(plan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
+    expect(plan.intents).toContain("genre_scene");
+    expect(plan.intents).not.toContain("editorial_ranking");
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "relationship",
+      operator: "prefer",
+      kind: "soft",
+      values: ["iconic"],
+    }));
     expect(plan.intents).not.toEqual(expect.arrayContaining(["mood_activity", "artist_catalogue"]));
     expect(hardRequired).toEqual(expect.arrayContaining([
       expect.objectContaining({ axis: "genre", values: expect.arrayContaining(["disco"]) }),
@@ -97,6 +105,14 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
       expect.objectContaining({ axis: "activity", values: expect.arrayContaining(["study"]) }),
       expect.objectContaining({ axis: "venue", values: expect.arrayContaining(["club"]) }),
     ]));
+    expect(scopeBindingEligible("curated", [{
+      strength: "strong",
+      provenanceRoot: "specialist-brazilian-disco-container",
+      layer: "scope_binding",
+      supportsRequestedRelationship: true,
+      bindingKind: "scoped_container_membership",
+      scopeAxis: "genre",
+    }], plan.intents)).toBe(true);
     expect(plan.diversityGoals.minimumDistinctArtists).toBeGreaterThan(2);
     expect(plan.diversityGoals.maximumTracksPerArtist).toBeLessThan(50);
   });
@@ -214,7 +230,7 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
         relationship: "is representative of Brazilian funk, funk carioca, or baile funk",
         include: ["Brazilian funk / funk carioca recordings grounded in the documented Rio scene."],
       }),
-      intents: ["genre_scene", "editorial_ranking"],
+      intents: ["genre_scene"],
       hardTerms: ["baile funk", "Brazilian"],
     },
     {

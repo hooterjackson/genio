@@ -30,11 +30,58 @@ describe("Pipeline V2 selection plan", () => {
   test("house music remains a genre and receives broad-playlist diversity goals", () => {
     const plan = createSelectionPlanV2({ prompt: "50 essential house music tracks", brief: brief() });
     expect(plan.policyVersion).toBe("relevance_first_2026_07_r2");
-    expect(plan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
+    expect(plan.intents).toContain("genre_scene");
+    expect(plan.intents).not.toContain("editorial_ranking");
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "relationship",
+      operator: "prefer",
+      kind: "soft",
+      values: ["essential"],
+    }));
     expect(plan.constraints.some((constraint) => constraint.values.some((value) => value.includes("physical houses")))).toBe(true);
     expect(plan.diversityGoals.maximumTracksPerArtist).toBe(8);
     expect(pipelineV2Route(plan)).toBe("curated_catalog");
   });
+
+  test("iconic remains a soft ranking preference for a broad genre request", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Brazil disco nights: iconic Brazilian disco across eras",
+      brief: brief({
+        title: "Brazil Disco Nights",
+        description: "Brazilian disco across eras.",
+        subjectEntities: ["Brazilian disco"],
+        relationship: "is a Brazilian disco recording",
+        include: ["Brazilian disco across multiple eras."],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).toContain("genre_scene");
+    expect(plan.intents).not.toContain("editorial_ranking");
+    expect(plan.constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "genre", kind: "hard", values: expect.arrayContaining(["disco"]) }),
+      expect.objectContaining({ axis: "geography", kind: "hard", values: expect.arrayContaining(["Brazilian"]) }),
+      expect.objectContaining({ axis: "relationship", operator: "prefer", kind: "soft", values: ["iconic"] }),
+    ]));
+  });
+
+  test.each(["influential", "foundational", "best", "ranked"])(
+    "%s remains a strict editorial-ranking request",
+    (descriptor) => {
+      const plan = createSelectionPlanV2({
+        prompt: `50 ${descriptor} Brazilian disco tracks`,
+        brief: brief({
+          title: "Brazilian Disco",
+          subjectEntities: ["Brazilian disco"],
+          relationship: `is ${descriptor} in Brazilian disco`,
+          include: [`${descriptor} Brazilian disco recordings.`],
+          exclude: [],
+        }),
+      });
+
+      expect(plan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
+    },
+  );
 
   test("a physical-house theme is not silently constrained to the house-music genre", () => {
     const plan = createSelectionPlanV2({
@@ -448,6 +495,33 @@ describe("Pipeline V2 selection plan", () => {
       values: ["1992", "1998"],
       kind: "hard",
     }));
+  });
+
+  test.each([
+    ["Brazilian disco from the 1970s through today", "1970"],
+    ["Jazz from the 1950s to present", "1950"],
+    ["Detroit techno from 1987 until now", "1987"],
+    ["House music from 1992 through the current year", "1992"],
+    ["Electronic music from 2004 to the present day", "2004"],
+  ])("keeps an open-ended era in %s as a continuous hard range", (prompt, startYear) => {
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: prompt,
+        subjectEntities: ["Music"],
+        include: [],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.constraints.filter((constraint) => (
+      constraint.kind === "hard" && constraint.axis === "era"
+    ))).toEqual([
+      expect.objectContaining({
+        operator: "between",
+        values: [startYear, String(new Date().getUTCFullYear())],
+      }),
+    ]);
   });
 
   test("keeps a two-decade request as one non-relaxable era range", () => {

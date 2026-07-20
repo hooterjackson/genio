@@ -1617,6 +1617,44 @@ test("V2 rejects an artist Essentials playlist whose description only incidental
   expect(repository.matches).toHaveLength(0);
 });
 
+test("V2 discovery shortfall never counts accepted but unmanifested catalog identities as selected", async () => {
+  const shortfallBrief = sceneBrief(2);
+  const repository = new V2MemoryMatchingRepository(
+    [],
+    shortfallBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Two documented Test scene recordings",
+    brief: shortfallBrief,
+    storefront: "us",
+  });
+  repository.matches.push({
+    candidateId: "accepted-before-manifest",
+    status: "accepted",
+    basis: "Exact Apple catalog identity",
+    score: 100,
+    song,
+    alternatives: [],
+  });
+
+  await matchResearchRun(repository, "run-v2-pre-manifest-shortfall", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: emptyCatalogDiscoveryProvider(),
+    musicBrainzEnricher: async () => null,
+  });
+
+  expect(repository.pipelineOutcomes).toContainEqual(expect.objectContaining({
+    targetTrackCount: 2,
+    selectedTrackCount: 0,
+    publishedTrackCount: 0,
+  }));
+  expect(repository.matches).toContainEqual(expect.objectContaining({
+    candidateId: "accepted-before-manifest",
+    status: "accepted",
+  }));
+});
+
 test("V2 keeps qualified Apple rows resumable when the fast deadline expires before handoff", async () => {
   vi.useFakeTimers();
   const confirmedAt = new Date("2026-07-19T20:00:00.000Z");
@@ -1996,6 +2034,75 @@ test("catalog deficit searches preserve Brazilian disco as a composite query", (
       expect.stringMatching(/Brazilian disco essentials/iu),
     ]),
   );
+});
+
+test("catalog deficit searches discard operational prose but keep Brazilian disco scope", () => {
+  const discoBrief: PlaylistBrief = {
+    title: "Brazilian Disco Across the Decades",
+    description: "A source-backed survey of Brazilian disco from the 1970s through today.",
+    mode: "curated",
+    subjectEntities: [
+      "Brazilian disco",
+      "exactly 25 tracks",
+      "1970s through today",
+      "diverse mix of artists",
+    ],
+    relationship: "represents Brazilian disco",
+    include: [
+      "Brazilian disco recordings",
+      "A diverse mix of artists",
+      "1970s through today",
+    ],
+    exclude: [],
+    versionPolicy: "canonical studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "intermix artists",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: [],
+  };
+  const selectionPlan = createSelectionPlanV2({
+    prompt: "25 Brazilian disco songs spanning the 1970s through today, with a diverse mix of artists",
+    brief: discoBrief,
+    storefront: "us",
+  });
+
+  const queries = catalogDeficitQueries({ brief: discoBrief, selectionPlan });
+  expect(queries).toEqual(expect.arrayContaining([
+    expect.stringMatching(/Brazilian disco/iu),
+    expect.stringMatching(/Brazilian disco essentials/iu),
+  ]));
+  expect(queries.join("\n")).not.toMatch(/exactly\s+25\s+tracks/iu);
+  expect(queries.join("\n")).not.toMatch(/diverse\s+mix\s+of\s+artists/iu);
+  expect(queries.join("\n")).not.toMatch(/1970s\s+through\s+today/iu);
+  expect(queries).not.toEqual(expect.arrayContaining([
+    expect.stringMatching(/^\s*(?:19|20)\d{2}s?(?:\s+(?:through|to)\s+(?:today|present|(?:19|20)\d{2}s?))?\s+(?:essentials|influential tracks)\s*$/iu),
+  ]));
+});
+
+test("catalog deficit searches preserve an era when it is part of genuine musical scope", () => {
+  const discoBrief: PlaylistBrief = {
+    title: "1970s Brazilian Disco",
+    description: "Brazilian disco recordings from the 1970s.",
+    mode: "curated",
+    subjectEntities: ["1970s Brazilian disco", "a diverse mix of artists"],
+    relationship: "represents Brazilian disco",
+    include: ["1970s Brazilian disco recordings"],
+    exclude: [],
+    versionPolicy: "canonical studio recordings",
+    evidencePolicy: "trusted scoped editorial sources",
+    orderingPolicy: "intermix artists",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: [],
+  };
+  const selectionPlan = createSelectionPlanV2({
+    prompt: "25 songs of 1970s Brazilian disco",
+    brief: discoBrief,
+    storefront: "us",
+  });
+
+  expect(catalogDeficitQueries({ brief: discoBrief, selectionPlan })).toEqual(expect.arrayContaining([
+    expect.stringMatching(/1970s Brazilian disco/iu),
+  ]));
 });
 
 test("catalog growth persists one qualifying binding for every hard French-jazz scope axis", async () => {

@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.10",
+      "releasedAt": "2026-07-19",
+      "title": "Open-ended scope and catalog recovery",
+      "notes": [
+        "Parses open-ended era requests such as 1970s through today as continuous current-year ranges instead of single-decade hard constraints.",
+        "Treats iconic, essential, classic, definitive, and representative as soft curation preferences while preserving strict evidence for ranked or influential requests.",
+        "Filters count, diversity, and era instructions from Apple deficit queries without dropping genuine composite music scope.",
+        "Reports only durable manifested tracks as selected in partial outcome counters.",
+        "Captures the live production incident in the frozen scenario suite and classifies safe count shortfalls as typed partial results, never system failures."
+      ]
+    },
+    {
       "version": "1.2.9",
       "releasedAt": "2026-07-19",
       "title": "Apple catalog alias reconciliation",

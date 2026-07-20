@@ -18,11 +18,12 @@ Before promoting a release:
 6. Run `pnpm qa:scenarios:check`, `pnpm test`, `pnpm build`, `pnpm lint`, and the independent holdout
    benchmark.
 
-The checked-in 2026-07-16 fixture contains all 25 brief attempts retained
-during the first production audit. It records the catalog-shortfall,
-research-under-yield, target-truncation, and cost-explosion failures seen in
-that audit. Each archived request is replayed through the current fast-route
-policy against a frozen, deterministic provider tape.
+The checked-in fixture began with all 25 brief attempts retained during the
+first 2026-07-16 production audit and now also includes promoted visitor and
+live-browser incidents through 2026-07-20. It records catalog shortfalls,
+research under-yield, target truncation, and cost explosions as historical
+failure classes. Each archived request is replayed through the current
+fast-route policy against a frozen, deterministic provider tape.
 
 The replay is a release contract, not a claim about live provider behavior. It
 exercises:
@@ -32,7 +33,7 @@ exercises:
 - The real pre-match Apple matching reserve.
 - Strict unique Apple matches and bounded recovery of retryable lookup
   failures.
-- Up to two bounded post-match evidence-research refills when strict matching
+- Up to three bounded post-match evidence-research refills when strict matching
   still leaves an exact-count shortfall, including their candidate yield,
   strict Apple yield, fixed cost ceiling, and immutable timing windows.
 - Exact manifest and publication counts.
@@ -41,11 +42,13 @@ exercises:
 - The same immutable size-tiered research-and-matching windows used by the
   product: two minutes for 1–100 tracks, four for 101–200, and six for 201–300.
 
-The replay calls the same post-match refill planner used by production. It
-fails closed after the same two-generation ceiling and never creates a smaller
-manifest. A release is blocked unless the promoted Rio regression reproduces
-the observed 88 initial candidates and 42 strict matches, then reaches exactly
-50 publishable tracks through the bounded refill path.
+The replay calls the same post-match refill planner used by production. After
+the bounded three-generation ceiling, a count shortfall publishes any safe
+Apple matches as a typed partial result; it is never relabeled as a system
+failure and never padded with weak matches. A release is blocked unless the
+promoted Rio regression reproduces the observed 88 initial candidates and 42
+strict matches, then reaches exactly 50 publishable tracks through the bounded
+refill path.
 
 ## Exported observations
 
@@ -60,11 +63,12 @@ The private export includes both raw state and derived QA measurements:
 - a release assessment listing every violated gate.
 
 Incomplete attempts remain in the export with a `null` assessment. A
-completed 28-track result for a 50-track request is a release failure, not a
-partial success. A catalog shortfall is considered safely fail-closed only
-when it has status `failed`, phase `catalog_matching_shortfall`, and created
-neither a manifest nor an Apple playlist. It still blocks a release when the
-scenario's expected outcome is `exact_playlist`.
+completed 28-track result for a 50-track request is a release-quality
+shortfall, not an exact success. It must retain a typed `partial` outcome and
+publish the safe Apple matches it has; catalog or evidence scarcity must not
+be classified as `failed_system`. The shortfall still blocks promotion when
+the scenario's expected outcome is `exact_playlist`, while remaining a valid
+transparent user result.
 
 ## Fixture review rules
 
