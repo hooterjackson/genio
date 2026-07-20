@@ -2,6 +2,14 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.8",
+      "releasedAt": "2026-07-19",
+      "title": "Portable Sites production build",
+      "notes": [
+        "Made the production build invoke release validation directly so Sites can compile the exact tagged source even when its package-manager shim is not exported to nested scripts."
+      ]
+    },
+    {
       "version": "1.2.7",
       "releasedAt": "2026-07-19",
       "title": "Atomic Pipeline V2 catalog recovery",
