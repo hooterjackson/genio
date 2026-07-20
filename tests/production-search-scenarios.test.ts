@@ -70,12 +70,13 @@ describe("retained production searches", () => {
   test("contains every retained brief attempt from the production audit", () => {
     expect(fixture.schemaVersion).toBe(5);
     expect(fixture.scenarios).toHaveLength(fixture.scenarioCount);
-    expect(fixture.scenarioCount).toBe(30);
-    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(30);
+    expect(fixture.scenarioCount).toBe(31);
+    expect(new Set(fixture.scenarios.map((scenario) => scenario.id)).size).toBe(31);
     expect(Object.keys(fixture.replayProfiles).sort()).toEqual([
       "baile-funk-19-of-25",
       "baile-funk-23-of-50",
       "catalog-shortfall",
+      "disco-4-of-50",
       "large-target",
       "nominal",
       "research-under-yield",
@@ -262,6 +263,33 @@ describe("retained production searches", () => {
       terminalPhase: "publication_partial",
     });
     expect(shortfall.observation.terminalStatus).not.toBe("failed");
+  });
+
+  test("the 4-of-50 Brazilian disco incident refills and publishes the exact requested count", () => {
+    const scenario = fixture.scenarios.find((row) => row.id === "2026-07-20-31");
+    expect(scenario).toBeDefined();
+
+    const replay = replayProductionScenario(
+      canonicalScenarioBrief(scenario!),
+      fixture.replayProfiles[scenario!.replayProfile]!,
+    );
+
+    expect(replay.initialStrictMatchedCount).toBe(4);
+    expect(replay.postMatchRefillGenerations).toBe(1);
+    expect(replay.refillCandidateGoals).toEqual([120]);
+    expect(replay.observation).toMatchObject({
+      requestedTrackCount: 50,
+      strictMatchedCount: 52,
+      manifestTrackCount: 50,
+      publishedTrackCount: 50,
+      terminalStatus: "complete",
+      terminalPhase: "publication_complete",
+    });
+    expect(assessProductionScenario(replay.observation, "exact_playlist")).toEqual({
+      releaseReady: true,
+      failClosed: false,
+      violations: [],
+    });
   });
 
   test("post-match refill stops after three bounded generations and publishes a transparent partial", () => {

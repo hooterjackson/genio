@@ -49,9 +49,17 @@
       "recoverySuccessRate": 1,
       "refillCandidateYieldRate": 1,
       "refillStrictMatchRate": 0.7
+    },
+    "disco-4-of-50": {
+      "candidateYieldRate": 1,
+      "initialStrictMatchRate": 0.045454545454545456,
+      "retryableCatalogRate": 0,
+      "recoverySuccessRate": 0,
+      "refillCandidateYieldRate": 1,
+      "refillStrictMatchRate": 0.4
     }
   },
-  "scenarioCount": 30,
+  "scenarioCount": 31,
   "scenarios": [
     {
       "id": "2026-07-16-01",
@@ -294,6 +302,14 @@
       "expectedTrackCount": 25,
       "expectedOutcome": "exact_playlist",
       "replayProfile": "catalog-shortfall",
+      "failureClasses": ["catalog_shortfall"]
+    },
+    {
+      "id": "2026-07-20-31",
+      "prompt": "50 iconic disco songs associated with Brazilian nightclub culture in the late 1970s and early 1980s. Include international disco staples that were popular in Brazil, with broad artist variety.",
+      "expectedTrackCount": 50,
+      "expectedOutcome": "exact_playlist",
+      "replayProfile": "disco-4-of-50",
       "failureClasses": ["catalog_shortfall"]
     }
   ]

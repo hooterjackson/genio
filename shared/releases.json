@@ -2,6 +2,15 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "1.2.13",
+      "releasedAt": "2026-07-20",
+      "title": "Disco exact-fill regression guard",
+      "notes": [
+        "Retains the observed 4-of-50 Brazilian disco incident as a permanent exact-fill recovery scenario.",
+        "Verifies both a detailed Brazilian disco request and the terse prompt disco songs publish exactly 50 playable tracks with broad artist variety."
+      ]
+    },
+    {
       "version": "1.2.12",
       "releasedAt": "2026-07-19",
       "title": "Semantic scope and composer stability",
