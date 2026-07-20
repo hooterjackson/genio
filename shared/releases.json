@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.0",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 governed retrieval foundation",
+      "notes": [
+        "Adds immutable 1–300 track requests, intent-specific retrieval, adaptive exact-fill reserves, and explicit partial-result consent.",
+        "Introduces append-only evidence governance, frozen graph snapshots, fail-closed source eligibility, and owner review controls.",
+        "Adds fenced protocol-6 workers, a dedicated deep-research lane, idempotent Apple publication, and unlisted-by-default Explore behavior.",
+        "Public V3 assignment remains disabled until independent production-evidence and factual-feasibility gates pass."
+      ]
+    },
+    {
       "version": "1.2.15",
       "releasedAt": "2026-07-20",
       "title": "Custom playlist-size integrity",

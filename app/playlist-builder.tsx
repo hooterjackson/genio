@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
@@ -17,26 +17,21 @@ import { PublicSiteHeader } from "./public-site-header";
 import { isAutomaticPlaylistHandoff, playlistWorkState } from "./playlist-waiting-state";
 import { WorkingIndicator } from "./working-indicator";
 import {
+  actionRequiredJobLabel,
   apiErrorCode,
   evidenceCountSummary,
+  partialDecisionHeading,
+  partialDecisionSummary,
+  partialReadyView,
   publishedTrackCountSummary,
   publishedResultHeading,
+  shouldPresentShortfallWithoutError,
   shouldQuietlyClearInitialRunRestore,
+  type PartialPublicationAction,
+  type PartialReadyView,
 } from "./playlist-builder-ui-policy";
 
 type PlaylistMode = "exhaustive" | "curated" | "hybrid";
-
-function subscribeToHydration(): () => void {
-  return () => undefined;
-}
-
-function hydratedClientSnapshot(): boolean {
-  return true;
-}
-
-function hydratedServerSnapshot(): boolean {
-  return false;
-}
 
 type PlaylistBrief = {
   title: string;
@@ -89,11 +84,15 @@ type ResearchRun = {
     storefront?: string;
   } | null;
   pipelineOutcome?: {
+    status?: string;
     targetTrackCount?: number;
     qualifiedTrackCount?: number;
     selectedTrackCount?: number;
     publishedTrackCount?: number;
+    reasonCodes?: string[];
   } | null;
+  actionRequired?: PartialPublicationAction | null;
+  partialAction?: PartialPublicationAction | null;
   candidateStageCounts?: Partial<Record<string, number>>;
   progress?: RunProgressView;
   createdAt?: string;
@@ -192,6 +191,12 @@ type RunResult = {
   unresolvedGapCount?: number;
   evidenceUrl?: string | null;
   coverageSummary?: string;
+  explore?: {
+    eligible: boolean;
+    listed: boolean;
+    canChange: boolean;
+    reason?: string | null;
+  } | null;
 };
 
 type BriefResponse = {
@@ -255,7 +260,17 @@ const examples = [
   "Songs built around the Amen break",
 ];
 
-const terminalStatuses = new Set(["complete", "partial", "failed", "expired", "deleted"]);
+const terminalStatuses = new Set([
+  "complete",
+  "partial",
+  "failed",
+  "no_compatible_tracks",
+  "cancelled",
+  "failed_system",
+  "failed_integrity",
+  "expired",
+  "deleted",
+]);
 const reviewStatuses = new Set(["review", "visitor_review"]);
 class ApiError extends Error {
   status: number;
@@ -344,6 +359,21 @@ function unwrapManifest(payload: PlaylistManifest | { manifest: PlaylistManifest
   return (object.manifest ?? payload) as PlaylistManifest;
 }
 
+function resultExploreSettings(...values: unknown[]): RunResult["explore"] {
+  for (const value of values) {
+    const object = asObject(value);
+    if (Object.keys(object).length === 0) continue;
+    if (typeof object.eligible !== "boolean" || typeof object.listed !== "boolean") continue;
+    return {
+      eligible: object.eligible,
+      listed: object.listed,
+      canChange: typeof object.canChange === "boolean" ? object.canChange : true,
+      reason: typeof object.reason === "string" ? object.reason : null,
+    };
+  }
+  return null;
+}
+
 function unwrapResult(
   payload: RunResult | { result: RunResult } | JsonObject,
   currentRun?: ResearchRun | null,
@@ -383,6 +413,7 @@ function unwrapResult(
       unresolvedGapCount: numberValue(run.unresolvedCount),
       evidenceUrl: runId ? "/api/v1/runs/" + encodeURIComponent(runId) + "/evidence" : null,
       coverageSummary: "Published from " + numberValue(run.sourceCount) + " documented sources with " + numberValue(run.unresolvedCount) + " visible gaps.",
+      explore: resultExploreSettings(object.explore, run.explore),
     };
   }
   const directVolumeRows = Array.isArray(object.volumes) ? object.volumes : null;
@@ -429,6 +460,7 @@ function unwrapResult(
       coverageSummary: typeof object.coverageSummary === "string"
         ? object.coverageSummary
         : "Published from " + sourceCount + " documented sources with " + unresolvedGapCount + " visible gaps.",
+      explore: resultExploreSettings(object.explore),
     };
   }
   if (Array.isArray(object.volumes)) {
@@ -462,6 +494,7 @@ function unwrapResult(
         ? "/api/v1/runs/" + encodeURIComponent(currentRun.id) + "/evidence"
         : null,
       coverageSummary: "Published from " + numberValue(currentRun?.sourceCount) + " documented sources with " + numberValue(currentRun?.unresolvedCount) + " visible gaps.",
+      explore: resultExploreSettings(object.explore),
     };
   }
   return (object.result ?? payload) as RunResult;
@@ -620,9 +653,18 @@ async function copyText(value: string): Promise<void> {
 }
 
 function phaseMessage(run: ResearchRun): string {
+  if (run.status === "awaiting_guidance") return "Your answer is needed before research can continue.";
+  if (run.status === "partial_ready") return "Choose whether to continue researching or publish the verified tracks.";
   if (run.status === "awaiting_budget") return "Paused for owner budget approval.";
   if (run.status === "waiting_for_apple_authorization") return "Paused until the owner reconnects Apple Music.";
-  if (run.status === "failed") return run.error || "Research failed.";
+  if (run.status === "waiting_for_corpus_review") {
+    return "Paused until the owner reviews and activates the evidence corpus required by this request.";
+  }
+  if (["failed", "failed_system", "failed_integrity"].includes(run.status)) {
+    return run.error || "Research stopped before a safe playlist could be prepared.";
+  }
+  if (run.status === "no_compatible_tracks") return "Research finished without a compatible Apple Music recording.";
+  if (run.status === "cancelled") return "This playlist job was cancelled.";
   const requestedTracks = run.brief.targetSize?.min ?? PUBLIC_PLAYLIST_DEFAULT_TRACKS;
   const windowPhrase = fastRunWindowPhrase(requestedTracks);
   const phase = run.phase.toLowerCase();
@@ -636,6 +678,8 @@ function phaseMessage(run: ResearchRun): string {
   if (phase.includes("sequence")) return "Spacing artists, albums, eras, and scenes into a coherent listening order.";
   if (phase.includes("manifest")) return "Locking the selected recording versions into an ordered playlist manifest.";
   if (phase.includes("catalog_refill_research")) return "Finding additional evidence-backed recordings for the remaining catalog shortfall.";
+  if (run.status === "continuing_research") return "Searching the remaining approved strategies for more qualified recordings.";
+  if (run.status === "resolving_catalog") return "Resolving qualified recordings to playable versions in the US Apple Music catalog.";
   if (phase.includes("catalog_matching") || run.status === "matching") return "Resolving verified recordings to playable versions in the US Apple Music catalog.";
   if (phase.includes("catalog_enrichment")) return "Checking recording identities, versions, and release families.";
   if (phase.includes("gap_analysis")) return "Checking the source frontier for missing artists, eras, releases, and claims.";
@@ -653,6 +697,7 @@ function useRunPolling(
   runId: string | null,
   runStatus: string | null,
   autoPublish: boolean,
+  actionRequired: boolean,
   onRun: (run: ResearchRun) => void,
   onError: (message: string) => void,
 ) {
@@ -664,9 +709,10 @@ function useRunPolling(
 
   useEffect(() => {
     if (!runId) return;
-    const automaticHandoff = autoPublish && Boolean(
+    const automaticHandoff = !actionRequired && autoPublish && Boolean(
       runStatus && (reviewStatuses.has(runStatus) || runStatus === "manifest_ready"),
     );
+    if (actionRequired) return;
     if (runStatus && !automaticHandoff
       && (terminalStatuses.has(runStatus) || reviewStatuses.has(runStatus) || runStatus === "manifest_ready")) return;
     let cancelled = false;
@@ -678,8 +724,10 @@ function useRunPolling(
         const next = unwrapRun(await api<ResearchRun | RunResponse>("/api/v1/runs/" + encodeURIComponent(runId)));
         if (cancelled) return;
         onRunRef.current(next);
-        const nextAutomaticHandoff = next.autoPublish === true
+        const nextActionRequired = Boolean(partialReadyView(next));
+        const nextAutomaticHandoff = !nextActionRequired && next.autoPublish === true
           && (reviewStatuses.has(next.status) || next.status === "manifest_ready");
+        if (nextActionRequired) return;
         if (!nextAutomaticHandoff
           && (terminalStatuses.has(next.status) || reviewStatuses.has(next.status) || next.status === "manifest_ready")) return;
         pollCount += 1;
@@ -701,7 +749,7 @@ function useRunPolling(
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [runId, runStatus, autoPublish]);
+  }, [runId, runStatus, autoPublish, actionRequired]);
 }
 
 function AppHeader({
@@ -763,18 +811,23 @@ function JobsScreen({
         {!loading && jobs.length === 0 && <div className="jobs-empty">NO JOBS FOUND</div>}
         {!loading && jobs.length > 0 && (
           <div className="jobs-list">
-            {jobs.map((job) => (
-              <button
-                key={job.id}
-                onClick={() => onOpen(job.id)}
-                aria-label={`Open ${job.brief.title} — ${statusLabel(job.status)}`}
-              >
-                <span className="job-status">{statusLabel(job.status).toUpperCase()}</span>
-                <strong>{job.brief.title}</strong>
-                <small>{job.candidateCount.toLocaleString()} tracks · {job.brief.mode}</small>
-                <span className="job-open">OPEN →</span>
-              </button>
-            ))}
+            {jobs.map((job) => {
+              const actionLabel = actionRequiredJobLabel(job);
+              const displayStatus = actionLabel ?? statusLabel(job.status).toUpperCase();
+              return (
+                <button
+                  key={job.id}
+                  className={actionLabel ? "needs-action" : undefined}
+                  onClick={() => onOpen(job.id)}
+                  aria-label={`Open ${job.brief.title} — ${displayStatus}`}
+                >
+                  <span className="job-status">{displayStatus}</span>
+                  <strong>{job.brief.title}</strong>
+                  <small>{job.candidateCount.toLocaleString()} tracks · {job.brief.mode}</small>
+                  <span className="job-open">{actionLabel ? "REVIEW →" : "OPEN →"}</span>
+                </button>
+              );
+            })}
           </div>
         )}
       </div>
@@ -805,11 +858,16 @@ function OneCommandScreen({
   // form inert for that very short window so a fast tap—or an assistive setup
   // that skips the intro—can never have valid input silently replaced by the
   // initial client state.
-  const hydrated = useSyncExternalStore(
-    subscribeToHydration,
-    hydratedClientSnapshot,
-    hydratedServerSnapshot,
-  );
+  // Keep the server render and the first client render inert. Enabling the
+  // form from an effect guarantees React's handlers are attached before a
+  // browser or assistive tool can edit the controlled fields; a client
+  // snapshot that reports `true` during hydration can briefly expose an
+  // editable DOM node whose first input event is then lost.
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setHydrated(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
   const [focused, setFocused] = useState(false);
   const [exampleIndex, setExampleIndex] = useState(0);
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
@@ -1068,6 +1126,12 @@ function GuidedQuestionScreen({
             {question.whyMaterial}
           </p>
         )}
+        {question.grounding?.summary && (
+          <p className="guided-question-grounding">
+            <span>WHAT THE SCOUT FOUND</span>
+            {question.grounding.summary}
+          </p>
+        )}
         {question.grounding?.sourceUrls?.length ? (
           <p className="guided-question-sources" aria-label="Sources for this question">
             <span>SCOUTED FROM</span>
@@ -1238,6 +1302,100 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
           <button className="action-button step-primary" onClick={onNew}>NEW JOB →</button>
         </div>
       )}
+    </section>
+  );
+}
+
+function PartialDecisionScreen({
+  decision,
+  busy,
+  onContinueResearch,
+  onPublishPartial,
+  onChangeRequest,
+  onCancel,
+}: {
+  decision: PartialReadyView;
+  busy: string;
+  onContinueResearch: () => void;
+  onPublishPartial: () => void;
+  onChangeRequest: () => void;
+  onCancel: () => void;
+}) {
+  const hasTracks = decision.qualifiedTrackCount > 0;
+  const reason = decision.reasonCode
+    ? statusLabel(decision.reasonCode).replace(/^partial /iu, "")
+    : "The remaining tracks did not clear the current evidence and Apple Music checks.";
+
+  return (
+    <section
+      className="screen flow-screen partial-decision-screen"
+      aria-labelledby="partial-decision-title"
+      data-testid="partial-decision-screen"
+    >
+      <div className="flow-body partial-decision-body">
+        <span className="tag">[ACTION NEEDED]</span>
+        <h1 id="partial-decision-title">{partialDecisionHeading(decision.qualifiedTrackCount)}</h1>
+        <p className="partial-decision-summary">
+          {partialDecisionSummary(decision.qualifiedTrackCount, decision.targetTrackCount)}
+        </p>
+
+        <div className="partial-decision-meter" aria-label="Verified playlist progress">
+          <div>
+            <span>VERIFIED</span>
+            <strong>{decision.qualifiedTrackCount.toLocaleString()}</strong>
+          </div>
+          <div>
+            <span>REQUESTED</span>
+            <strong>{decision.targetTrackCount.toLocaleString()}</strong>
+          </div>
+          <div>
+            <span>REMAINING</span>
+            <strong>{decision.deficit.toLocaleString()}</strong>
+          </div>
+        </div>
+
+        <div className="partial-decision-note">
+          <span>WHY RESEARCH PAUSED</span>
+          <p>{reason} No playlist has been published yet.</p>
+          {decision.canContinueResearch && (
+            <small>
+              {decision.remainingStrategyCount.toLocaleString()} additional research {decision.remainingStrategyCount === 1 ? "strategy is" : "strategies are"} available.
+            </small>
+          )}
+        </div>
+
+        <div className="partial-decision-actions">
+          {decision.canContinueResearch && (
+            <button
+              className="action-button step-primary"
+              type="button"
+              onClick={onContinueResearch}
+              disabled={Boolean(busy)}
+            >
+              {busy === "continue-research" ? "CONTINUING RESEARCH..." : "CONTINUE RESEARCH →"}
+            </button>
+          )}
+          <button
+            className="quiet-button partial-publish-button"
+            type="button"
+            onClick={onPublishPartial}
+            disabled={!hasTracks || Boolean(busy)}
+          >
+            {busy === "publish-partial"
+              ? "PREPARING PLAYLIST..."
+              : hasTracks
+                ? `PUBLISH ${decision.qualifiedTrackCount.toLocaleString()} VERIFIED TRACKS`
+                : "NO VERIFIED TRACKS TO PUBLISH"}
+          </button>
+          <button className="quiet-button" type="button" onClick={onChangeRequest} disabled={Boolean(busy)}>
+            CHANGE REQUEST
+          </button>
+          <button className="text-danger" type="button" onClick={onCancel} disabled={Boolean(busy)}>
+            {busy === "cancel-run" ? "CANCELING..." : "CANCEL JOB"}
+          </button>
+        </div>
+        <p className="partial-decision-saved">This decision is saved in Jobs. You can return later.</p>
+      </div>
     </section>
   );
 }
@@ -1630,12 +1788,16 @@ function ManifestScreen({
 
 function ResultScreen({
   result,
+  exploreBusy,
   onReset,
   onDelete,
+  onExploreVisibility,
 }: {
   result: RunResult;
+  exploreBusy: boolean;
   onReset: () => void;
   onDelete: () => void;
+  onExploreVisibility: (listed: boolean) => void;
 }) {
   const outcomes = Object.entries(result.outcomeCounts ?? {});
   const publishedTrackCount = result.volumes.reduce((total, volume) => total + volume.trackCount, 0);
@@ -1674,6 +1836,35 @@ function ResultScreen({
             </article>
           ))}
         </div>
+
+        {hasPublishedPlaylist && result.explore && (
+          <section className="explore-visibility-card" aria-labelledby="explore-visibility-title">
+            <div>
+              <span>{result.explore.listed ? "[LISTED]" : "[UNLISTED]"}</span>
+              <h2 id="explore-visibility-title">
+                {result.explore.listed ? "Visible in Explore" : "Private from Explore"}
+              </h2>
+              <p>{result.explore.listed
+                ? "Anyone with access to gênio can discover this playlist."
+                : "The Apple Music link still works, but this playlist is not shown in Explore."}</p>
+              {!result.explore.eligible && result.explore.reason && <small>{result.explore.reason}</small>}
+            </div>
+            {result.explore.canChange && result.explore.eligible && (
+              <button
+                className="quiet-button"
+                type="button"
+                onClick={() => onExploreVisibility(!result.explore!.listed)}
+                disabled={exploreBusy}
+              >
+                {exploreBusy
+                  ? "SAVING..."
+                  : result.explore.listed
+                    ? "REMOVE FROM EXPLORE"
+                    : "LIST IN EXPLORE"}
+              </button>
+            )}
+          </section>
+        )}
 
         <details className="terminal-details result-details">
           <summary>VIEW COVERAGE REPORT</summary>
@@ -1781,10 +1972,18 @@ export function PlaylistBuilder() {
   const updateRun = useCallback((next: ResearchRun) => {
     if (activeRunId.current !== next.id) return;
     setRun(next);
-    if (next.status === "failed" && next.error) setError(next.error);
+    if (shouldPresentShortfallWithoutError(next)) setError("");
+    else if (next.status === "failed" && next.error) setError(next.error);
   }, []);
 
-  useRunPolling(run?.id ?? null, run?.status ?? null, run?.autoPublish === true, updateRun, setError);
+  useRunPolling(
+    run?.id ?? null,
+    run?.status ?? null,
+    run?.autoPublish === true,
+    Boolean(partialReadyView(run)),
+    updateRun,
+    setError,
+  );
 
   const loadRun = useCallback(async (runId: string, signal?: AbortSignal) => {
     activeRunId.current = runId;
@@ -1798,6 +1997,7 @@ export function PlaylistBuilder() {
     setRun(next);
     setBrief(next.brief);
     setPrompt(next.prompt);
+    if (shouldPresentShortfallWithoutError(next)) setError("");
     const requestedCount = exactRequestedTrackCount(next.brief);
     if (requestedCount) setTrackCount(String(requestedCount));
   }, []);
@@ -2079,7 +2279,7 @@ export function PlaylistBuilder() {
   }, [run, manifest]);
 
   useEffect(() => {
-    if (!run || !["complete", "partial"].includes(run.status) || result) return;
+    if (!run || partialReadyView(run) || !["complete", "partial"].includes(run.status) || result) return;
     void (async () => {
       try {
         setResult(unwrapResult(
@@ -2383,6 +2583,159 @@ export function PlaylistBuilder() {
     }
   }
 
+  async function continuePartialResearch() {
+    if (!run || operationRequestRef.current) return;
+    const decision = partialReadyView(run);
+    if (!decision?.canContinueResearch) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    setBusy("continue-research");
+    setError("");
+    try {
+      const response = await api<ResearchRun | RunResponse>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/research/continue",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": `continue-${runId}-${decision.outcomeVersion ?? "current"}` },
+          body: JSON.stringify({ outcomeVersion: decision.outcomeVersion }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      setRun(unwrapRun(response));
+    } catch (caught) {
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
+    } finally {
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        if (activeRunId.current === runId) setBusy("");
+      }
+    }
+  }
+
+  async function publishPartialPlaylist() {
+    if (!run || operationRequestRef.current || publishingRef.current) return;
+    const decision = partialReadyView(run);
+    if (!decision || decision.qualifiedTrackCount <= 0) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    publishingRef.current = true;
+    setBusy("publish-partial");
+    setError("");
+    try {
+      const response = await api<JsonObject>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/partial/confirm",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": `partial-${runId}-${decision.outcomeVersion ?? "current"}` },
+          body: JSON.stringify({
+            outcomeHash: decision.outcomeHash,
+            manifestId: decision.manifestId,
+            manifestHash: decision.manifestHash,
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      const responseObject = asObject(response);
+      const nextRunObject = asObject(responseObject.run);
+      if (typeof nextRunObject.id === "string") setRun(nextRunObject as ResearchRun);
+
+      const manifestObject = asObject(responseObject.manifest);
+      if (typeof manifestObject.id === "string") {
+        const nextManifest = manifestObject as PlaylistManifest;
+        setManifest(nextManifest);
+        const nextStatus = typeof nextRunObject.status === "string" ? nextRunObject.status : "";
+        if (!["publishing", "waiting_for_apple_authorization", "complete", "partial"].includes(nextStatus)) {
+          const publishResponse = await api<ResearchRun | RunResponse>(
+            "/api/v1/runs/" + encodeURIComponent(runId) + "/publish",
+            {
+              method: "POST",
+              headers: { "Idempotency-Key": "publish-" + nextManifest.id },
+              body: JSON.stringify({ manifestId: nextManifest.id }),
+              signal: controller.signal,
+            },
+          );
+          if (!controller.signal.aborted && activeRunId.current === runId) setRun(unwrapRun(publishResponse));
+        }
+      }
+    } catch (caught) {
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
+    } finally {
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        publishingRef.current = false;
+        if (activeRunId.current === runId) setBusy("");
+      }
+    }
+  }
+
+  async function cancelRun() {
+    if (!run || operationRequestRef.current) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    setBusy("cancel-run");
+    setError("");
+    try {
+      const response = await api<ResearchRun | RunResponse | JsonObject>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/cancel",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": "cancel-" + runId },
+          body: "{}",
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      const object = asObject(response);
+      if (object.run || typeof object.id === "string") setRun(unwrapRun(response as ResearchRun | RunResponse));
+      else newJob();
+    } catch (caught) {
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
+    } finally {
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        if (activeRunId.current === runId) setBusy("");
+      }
+    }
+  }
+
+  async function updateExploreVisibility(listed: boolean) {
+    if (!run || !result || operationRequestRef.current) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    setBusy("explore-visibility");
+    setError("");
+    try {
+      const response = await api<JsonObject>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/explore",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": `explore-${runId}-${listed ? "listed" : "unlisted"}` },
+          body: JSON.stringify({ listed }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      const nextExplore = resultExploreSettings(response.explore, response);
+      setResult((current) => current ? {
+        ...current,
+        explore: nextExplore ?? (current.explore ? { ...current.explore, listed } : null),
+      } : current);
+    } catch (caught) {
+      if (!isAbortError(caught) && activeRunId.current === runId) setError((caught as Error).message);
+    } finally {
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        if (activeRunId.current === runId) setBusy("");
+      }
+    }
+  }
+
   async function deleteRun() {
     if (!run || !window.confirm("Delete this run’s research data from gênio? Published Apple playlists will remain.")) return;
     setBusy("delete");
@@ -2424,6 +2777,8 @@ export function PlaylistBuilder() {
       setTransferState("");
     }
   }
+
+  const partialDecision = partialReadyView(run);
 
   if (restoring) {
     return (
@@ -2531,9 +2886,20 @@ export function PlaylistBuilder() {
           active="jobs"
         />
       )}
-      <ErrorBar message={error} onDismiss={() => setError("")} />
+      <ErrorBar message={run && shouldPresentShortfallWithoutError(run) ? "" : error} onDismiss={() => setError("")} />
 
-      {run && !run.autoPublish && reviewStatuses.has(run.status) && !manifest && (
+      {run && partialDecision && !manifest && !result && (
+        <PartialDecisionScreen
+          decision={partialDecision}
+          busy={busy}
+          onContinueResearch={() => void continuePartialResearch()}
+          onPublishPartial={() => void publishPartialPlaylist()}
+          onChangeRequest={newJob}
+          onCancel={() => void cancelRun()}
+        />
+      )}
+
+      {run && !partialDecision && !run.autoPublish && reviewStatuses.has(run.status) && !manifest && (
         <ReviewScreen
           selection={trackSelection}
           busy={busy}
@@ -2542,7 +2908,7 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {run && (run.autoPublish || !reviewStatuses.has(run.status)) && !manifest && !result && (
+      {run && !partialDecision && (run.autoPublish || !reviewStatuses.has(run.status)) && !manifest && !result && (
         <RunScreen run={run} onNew={newJob} />
       )}
 
@@ -2555,7 +2921,15 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {result && <ResultScreen result={result} onReset={newJob} onDelete={deleteRun} />}
+      {result && (
+        <ResultScreen
+          result={result}
+          exploreBusy={busy === "explore-visibility"}
+          onExploreVisibility={(listed) => void updateExploreVisibility(listed)}
+          onReset={newJob}
+          onDelete={deleteRun}
+        />
+      )}
     </main>
   );
 }

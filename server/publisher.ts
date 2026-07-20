@@ -29,6 +29,10 @@ import {
   type PreflightReserveTrack,
 } from "./manifest-preflight-v2.ts";
 import { buildPipelineOutcome } from "./pipeline-outcome-v2.ts";
+import type {
+  AppleWritePermit,
+  AppleWritePermitRequest,
+} from "./apple-write-gateway.ts";
 
 const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
@@ -141,6 +145,40 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
     versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
   ): Promise<void>;
   sealManifestRevisionPublication?(runId: string, revisionId: string, outcome: PipelineOutcome): Promise<void>;
+  /**
+   * Defense-in-depth publication fence. Schema-14 repositories return the
+   * immutable RunSpec target plus any current, capability-scoped consent for
+   * this exact manifest revision. Schema-13 repositories may omit the method
+   * while legacy V1/V2 jobs drain; V3 never accepts that compatibility path.
+   */
+  getPublicationGuard?(input: {
+    runId: string;
+    manifestId: string;
+    manifestRevisionId: string | null;
+    manifestRevisionHash: string;
+    selectedCount: number;
+  }): Promise<{
+    requestedTrackCount: number | null;
+    enforcement: "required" | "legacy_compat";
+    currentOutcomeHash: string | null;
+    decision: {
+      decision: "accepted";
+      manifestRevisionId: string;
+      manifestRevisionHash: string;
+      targetCount: number;
+      selectedCount: number;
+      outcomeHash: string;
+      expiresAt: string | Date;
+    } | null;
+  }>;
+  /**
+   * Database-backed global mutation fence. Optional only while schema-13
+   * V1/V2 jobs drain; corpus-first V3 fails closed if it is unavailable.
+   */
+  acquireAppleWritePermit?(
+    input: AppleWritePermitRequest,
+    signal?: AbortSignal,
+  ): Promise<AppleWritePermit>;
 }
 
 export interface PublicationAppleClient {
@@ -165,6 +203,15 @@ export class PublicationRunCancelledError extends Error {
 
   constructor() {
     super("The playlist run was cancelled or deleted");
+  }
+}
+
+export class PartialPublicationDecisionRequiredError extends Error {
+  readonly name = "PartialPublicationDecisionRequiredError";
+  readonly code = "partial_publication_decision_required";
+
+  constructor(readonly reason: string) {
+    super(`A current partial-publication decision is required: ${reason}`);
   }
 }
 
@@ -252,6 +299,78 @@ export function publicationPartialOutcomeStatus(input: {
 export function manifestContentHash(tracks: readonly LockedManifestTrack[]): string {
   const ordered = tracks.map((track, index) => [index, track.candidateId, track.catalogId]);
   return createHash("sha256").update(JSON.stringify(ordered)).digest("hex");
+}
+
+function isCorpusFirstV3(manifest: LockedManifest): boolean {
+  return manifest.pipelineVersion === "corpus_first_v3";
+}
+
+/**
+ * Ensure count shortfalls cannot cross the deterministic Apple write gateway
+ * without explicit consent bound to the current immutable revision.
+ *
+ * This check deliberately runs both before and after storefront preflight:
+ * preflight may create a successor revision when an Apple ID disappears, and
+ * consent for the prior revision must not authorize the shorter successor.
+ */
+export async function assertManifestPublicationAuthorized(
+  repository: PublicationRepository,
+  manifest: LockedManifest,
+): Promise<void> {
+  const getPublicationGuard = repository.getPublicationGuard?.bind(repository);
+  if (!getPublicationGuard) {
+    if (isCorpusFirstV3(manifest)) {
+      throw new PartialPublicationDecisionRequiredError("the V3 publication guard is unavailable");
+    }
+    // Expand/contract compatibility: do not reinterpret already-locked
+    // schema-13 V1/V2 work while protocol-6 workers are rolling out.
+    return;
+  }
+
+  const guard = await getPublicationGuard({
+    runId: manifest.runId,
+    manifestId: manifest.id,
+    manifestRevisionId: manifest.revisionId ?? null,
+    manifestRevisionHash: manifest.contentHash,
+    selectedCount: manifest.tracks.length,
+  });
+  if (guard.enforcement === "legacy_compat") {
+    if (isCorpusFirstV3(manifest)) {
+      throw new PartialPublicationDecisionRequiredError("V3 cannot use the schema-13 compatibility path");
+    }
+    return;
+  }
+
+  const target = guard.requestedTrackCount;
+  if (!Number.isInteger(target) || target === null || target < 1 || target > 300) {
+    throw new PartialPublicationDecisionRequiredError("the immutable requested count is unavailable or invalid");
+  }
+  if (isCorpusFirstV3(manifest) && !manifest.revisionId) {
+    throw new PartialPublicationDecisionRequiredError("the V3 manifest has no immutable revision identity");
+  }
+  if (manifest.tracks.length > target) {
+    throw new Error(`Manifest contains ${manifest.tracks.length} tracks for an authoritative target of ${target}`);
+  }
+  if (manifest.tracks.length === target) return;
+
+  const decision = guard.decision;
+  const expiresAt = decision ? new Date(decision.expiresAt).getTime() : Number.NaN;
+  const valid = decision?.decision === "accepted"
+    && Boolean(manifest.revisionId)
+    && decision.manifestRevisionId === manifest.revisionId
+    && decision.manifestRevisionHash === manifest.contentHash
+    && decision.targetCount === target
+    && decision.selectedCount === manifest.tracks.length
+    && typeof guard.currentOutcomeHash === "string"
+    && guard.currentOutcomeHash.length > 0
+    && decision.outcomeHash === guard.currentOutcomeHash
+    && Number.isFinite(expiresAt)
+    && expiresAt > Date.now();
+  if (!valid) {
+    throw new PartialPublicationDecisionRequiredError(
+      `${manifest.tracks.length} of ${target} tracks are selected, but consent does not match the current revision`,
+    );
+  }
 }
 
 async function appendPublicationCandidateStages(
@@ -761,6 +880,41 @@ async function getOrCreateVolumes(
   return result.sort((a, b) => a.volumeIndex - b.volumeIndex);
 }
 
+async function withAppleWritePermit<T>(
+  repository: PublicationRepository,
+  manifest: LockedManifest,
+  volume: PublicationVolume,
+  operation: AppleWritePermitRequest["operation"],
+  signal: AbortSignal | undefined,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const acquire = repository.acquireAppleWritePermit?.bind(repository);
+  if (!acquire) {
+    if (isCorpusFirstV3(manifest)) {
+      throw new Error("The V3 Apple write gateway is unavailable");
+    }
+    // Expand/contract compatibility for an already-leased schema-13 V1/V2
+    // job. Production schema-14 repositories always expose the gate.
+    return mutation();
+  }
+  const permit = await acquire({
+    runId: manifest.runId,
+    manifestId: manifest.id,
+    publicationVolumeId: volume.id,
+    operation,
+  }, signal);
+  if (!permit || typeof permit.release !== "function") {
+    if (isCorpusFirstV3(manifest)) throw new Error("The V3 Apple write gateway did not issue a permit");
+    return mutation();
+  }
+  try {
+    signal?.throwIfAborted();
+    return await mutation();
+  } finally {
+    await permit.release();
+  }
+}
+
 async function ensureApplePlaylist(
   repository: PublicationRepository,
   client: PublicationAppleClient,
@@ -783,7 +937,14 @@ async function ensureApplePlaylist(
   const description = volumeDescription(manifest, marker);
   try {
     await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
-    const created = await client.createLibraryPlaylist(volume.name, description, signal);
+    const created = await withAppleWritePermit(
+      repository,
+      manifest,
+      volume,
+      "create_playlist",
+      signal,
+      () => client.createLibraryPlaylist(volume.name, description, signal),
+    );
     signal?.throwIfAborted();
     await repository.updatePublicationVolume(volume.id, {
       applePlaylistId: created.id,
@@ -908,7 +1069,14 @@ export async function appendExactVolume(
       await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
       const batch = nextPublicationAppendBatch(expected, submittedCount);
       try {
-        await client.appendCatalogTracks(playlistId, batch, signal);
+        await withAppleWritePermit(
+          repository,
+          manifest,
+          volume,
+          "append_tracks",
+          signal,
+          () => client.appendCatalogTracks(playlistId, batch, signal),
+        );
         await advanceSubmittedCount(submittedCount + batch.length);
         stalledAttempts = 0;
       } catch (error) {
@@ -1013,8 +1181,16 @@ export async function publishManifest(
   if (!lockedManifest) throw new Error("Approved playlist manifest was not found");
   if (!lockedManifest.lockedAt || !lockedManifest.contentHash) throw new Error("Only an immutable locked manifest can be published");
   if (manifestContentHash(lockedManifest.tracks) !== lockedManifest.contentHash) throw new Error("Manifest content hash does not match its ordered tracks");
-  if (lockedManifest.tracks.length === 0) throw new Error("A zero-track manifest cannot be published");
+  if (lockedManifest.tracks.length === 0) {
+    await repository.updateRun(lockedManifest.runId, {
+      status: "no_compatible_tracks",
+      phase: "no_compatible_tracks",
+      error: null,
+    });
+    return { status: "no_compatible_tracks", manifestId, volumes: [] };
+  }
   if (lockedManifest.tracks.some((track) => !track.catalogId)) throw new Error("Manifest contains a track without an Apple catalog ID");
+  await assertManifestPublicationAuthorized(repository, lockedManifest);
   const priorPipelineOutcome = repository.getPipelineOutcome
     ? await repository.getPipelineOutcome(lockedManifest.runId)
     : null;
@@ -1094,6 +1270,7 @@ export async function publishManifest(
       return { status: "no_compatible_tracks", manifestId, volumes: [] };
     }
     manifest = preflight.manifest;
+    await assertManifestPublicationAuthorized(repository, manifest);
     await appendPublicationCandidateStages(
       repository,
       manifest,

@@ -1,0 +1,104 @@
+{
+  "fixtureVersion": "pipeline-v3-regressions-2026-07-20",
+  "scenarios": [
+    {
+      "id": "disco_25",
+      "prompt": "25 disco songs",
+      "requestedTrackCount": 25,
+      "expectedIntents": ["genre_scene"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "disco" }],
+      "expectedRanking": ["relevance"],
+      "expectedCriticalAmbiguities": []
+    },
+    {
+      "id": "brazilian_disco_50",
+      "prompt": "50 Brazilian disco songs",
+      "requestedTrackCount": 50,
+      "expectedIntents": ["genre_scene"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "disco" }],
+      "expectedRanking": ["relevance"],
+      "expectedCriticalAmbiguities": []
+    },
+    {
+      "id": "american_drill_100",
+      "prompt": "100 foundational American drill tracks",
+      "requestedTrackCount": 100,
+      "expectedIntents": ["genre_scene", "editorial_ranking"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "drill" }],
+      "expectedRanking": ["relevance", "influence"],
+      "expectedCriticalAmbiguities": []
+    },
+    {
+      "id": "house_semantic_25",
+      "prompt": "Make me a house playlist",
+      "requestedTrackCount": 25,
+      "answers": [{ "key": "house_semantics", "optionId": "house_genre" }],
+      "expectedIntents": ["genre_scene"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "house music" }],
+      "expectedRanking": ["relevance"],
+      "expectedCriticalAmbiguities": ["house_semantics"]
+    },
+    {
+      "id": "french_jazz_diversity_50",
+      "prompt": "50 French jazz tracks across the decades",
+      "requestedTrackCount": 50,
+      "answers": [{ "key": "french_jazz_scope", "optionId": "french_scene" }],
+      "expectedIntents": ["genre_scene"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [
+        { "axis": "genre", "operator": "require", "value": "jazz" },
+        { "axis": "scene", "operator": "require", "value": "French jazz scene" }
+      ],
+      "expectedRanking": ["relevance", "artist_diversity"],
+      "expectedCriticalAmbiguities": ["french_jazz_scope"]
+    },
+    {
+      "id": "similarity_excludes_seed_100",
+      "prompt": "100 songs like Radiohead but do not include Radiohead",
+      "requestedTrackCount": 100,
+      "expectedIntents": ["similarity"],
+      "expectedEngines": ["similarity"],
+      "expectedMembership": [{ "axis": "artist", "operator": "exclude", "value": "radiohead" }],
+      "expectedRanking": ["relevance", "similarity"],
+      "expectedCriticalAmbiguities": []
+    },
+    {
+      "id": "berlin_techno_150",
+      "prompt": "150 influential Berlin techno tracks",
+      "requestedTrackCount": 150,
+      "expectedIntents": ["genre_scene", "editorial_ranking"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "techno" }],
+      "expectedRanking": ["relevance", "influence"],
+      "expectedCriticalAmbiguities": []
+    },
+    {
+      "id": "paulinho_factual_176",
+      "prompt": "Paulinho da Costa's 176 most influential songs",
+      "requestedTrackCount": 176,
+      "answers": [{ "key": "possessive_relationship", "optionId": "subject_performed" }],
+      "expectedIntents": ["editorial_ranking", "factual_relationship"],
+      "expectedEngines": ["factual_relationship"],
+      "expectedMembership": [
+        { "axis": "artist", "operator": "require", "value": "Paulinho da Costa" },
+        { "axis": "factual_relationship", "operator": "require", "value": "subject_performed" }
+      ],
+      "expectedRanking": ["relevance", "influence"],
+      "expectedCriticalAmbiguities": ["possessive_relationship"]
+    },
+    {
+      "id": "brazilian_disco_300",
+      "prompt": "300 Brazilian disco songs across the major eras",
+      "requestedTrackCount": 300,
+      "expectedIntents": ["genre_scene"],
+      "expectedEngines": ["curated_genre_scene"],
+      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "disco" }],
+      "expectedRanking": ["relevance", "artist_diversity"],
+      "expectedCriticalAmbiguities": []
+    }
+  ]
+}

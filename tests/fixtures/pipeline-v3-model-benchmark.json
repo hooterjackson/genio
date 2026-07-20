@@ -1,0 +1,56 @@
+{
+  "fixtureVersion": "pipeline-v3-model-routing-2026-07-20",
+  "provenance": {
+    "source": "deterministic_test_tape",
+    "generatedAt": "2026-07-20T12:00:00.000Z"
+  },
+  "thresholds": {
+    "interpretationAccuracy": 1,
+    "schemaValidity": 1,
+    "relevancePrecision": 0.95,
+    "hardConstraintCompliance": 1,
+    "exactFillRate": 0.98
+  },
+  "routes": [
+    {
+      "tier": "baseline",
+      "providerModelId": "gpt-5.6-luna",
+      "resolutionMode": "provider_managed_alias",
+      "modelCatalogValidatedAt": "2026-07-20T00:00:00.000Z",
+      "aggregateCostUsd": 1.24,
+      "p50LatencyMs": 1850,
+      "metrics": {
+        "interpretationAccuracy": 1,
+        "schemaValidity": 1,
+        "relevancePrecision": 0.97,
+        "hardConstraintCompliance": 1,
+        "exactFillRate": 1
+      },
+      "scenarioIds": [
+        "disco_25", "brazilian_disco_50", "american_drill_100", "house_semantic_25",
+        "french_jazz_diversity_50", "similarity_excludes_seed_100", "berlin_techno_150",
+        "paulinho_factual_176", "brazilian_disco_300"
+      ]
+    },
+    {
+      "tier": "escalation",
+      "providerModelId": "gpt-5.6-terra",
+      "resolutionMode": "provider_managed_alias",
+      "modelCatalogValidatedAt": "2026-07-20T00:00:00.000Z",
+      "aggregateCostUsd": 2.81,
+      "p50LatencyMs": 2670,
+      "metrics": {
+        "interpretationAccuracy": 1,
+        "schemaValidity": 1,
+        "relevancePrecision": 0.985,
+        "hardConstraintCompliance": 1,
+        "exactFillRate": 1
+      },
+      "scenarioIds": [
+        "disco_25", "brazilian_disco_50", "american_drill_100", "house_semantic_25",
+        "french_jazz_diversity_50", "similarity_excludes_seed_100", "berlin_techno_150",
+        "paulinho_factual_176", "brazilian_disco_300"
+      ]
+    }
+  ]
+}

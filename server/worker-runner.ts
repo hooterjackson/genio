@@ -35,6 +35,24 @@ import {
   type DatabaseSchemaSupport,
 } from "../db/index.ts";
 import type { PipelineVersion } from "../shared/types.ts";
+import {
+  createPipelineV3RetrievalExecutionPort,
+  type PipelineV3RetrievalExecutionPort,
+} from "./pipeline-v3-worker-execution.ts";
+import {
+  createHostedColdCorpusBuilderV3,
+  type ColdCorpusBuilderPortV3,
+} from "./pipeline-v3-corpus-builder.ts";
+import { createPipelineV3LiveAdapters } from "./pipeline-v3-live-adapters.ts";
+import {
+  createPipelineV3GovernedGraphDiscovery,
+  PgPipelineV3GovernedGraphReadRepository,
+} from "./pipeline-v3-governed-graph-adapter.ts";
+import {
+  parseWorkerQueueClass,
+  type JobQueueClass,
+  type WorkerQueueClass,
+} from "./job-queue-class.ts";
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_RENEW_MS = 60_000;
@@ -53,11 +71,17 @@ export interface DurableJob {
   runId: string | null;
   briefRequestId: string | null;
   kind: "brief" | "research" | "matching" | "publication" | "notification" | string;
+  /** Present on schema-14 jobs; optional while schema-13 bridge workers drain. */
+  queueClass?: JobQueueClass;
   payload: Record<string, unknown>;
   attempts: number;
   maxAttempts: number;
   pipelineVersion: PipelineVersion;
   minimumWorkerProtocol: number;
+  /** Present on schema-14 jobs; optional while schema-13 bridge workers drain. */
+  queryPlanRevisionId?: string | null;
+  stageKey?: string;
+  leaseEpoch?: number;
 }
 
 export interface WorkerQueueRepository {
@@ -67,12 +91,13 @@ export interface WorkerQueueRepository {
     workerId: string,
     leaseMs: number,
     capability: WorkerPipelineCapability,
+    queueClass: WorkerQueueClass,
   ): Promise<DurableJob | null>;
-  renewJobLease(jobId: string, workerId: string, leaseMs: number): Promise<boolean>;
-  deferJob(jobId: string, workerId: string, availableAt: Date, reason: string): Promise<void>;
-  cancelLeasedJob(jobId: string, workerId: string, reason: string): Promise<void>;
-  completeJob(jobId: string, workerId: string): Promise<void>;
-  failJob(jobId: string, workerId: string, error: string, retryAt: Date | null): Promise<void>;
+  renewJobLease(jobId: string, workerId: string, leaseMs: number, leaseEpoch?: number): Promise<boolean>;
+  deferJob(jobId: string, workerId: string, availableAt: Date, reason: string, leaseEpoch?: number): Promise<void>;
+  cancelLeasedJob(jobId: string, workerId: string, reason: string, leaseEpoch?: number): Promise<void>;
+  completeJob(jobId: string, workerId: string, leaseEpoch?: number): Promise<void>;
+  failJob(jobId: string, workerId: string, error: string, retryAt: Date | null, leaseEpoch?: number): Promise<void>;
   updateWorkerHeartbeat(workerId: string, metadata: {
     startedAt: string;
     seenAt: string;
@@ -113,6 +138,9 @@ export interface WorkerRunnerOptions {
   controlIntervalMs?: number;
   pipelineCapability?: WorkerPipelineCapability;
   schemaSupport?: DatabaseSchemaSupport;
+  v3RetrievalPort?: PipelineV3RetrievalExecutionPort | null;
+  v3CorpusBuilder?: ColdCorpusBuilderPortV3 | null;
+  queueClass?: WorkerQueueClass;
   handlers?: Record<string, JobHandler>;
 }
 
@@ -133,17 +161,38 @@ function retryAtFor(job: DurableJob): Date | null {
   return new Date(Date.now() + Math.min(2 ** Math.max(0, job.attempts - 1) * 30_000, 15 * 60_000));
 }
 
-export function defaultJobHandlers(repository: WorkerRepository): Record<string, JobHandler> {
+export function defaultJobHandlers(
+  repository: WorkerRepository,
+  options: {
+    v3RetrievalPort?: PipelineV3RetrievalExecutionPort | null;
+    v3CorpusBuilder?: ColdCorpusBuilderPortV3 | null;
+    queueClass?: WorkerQueueClass;
+  } = {},
+): Record<string, JobHandler> {
   const researchRepository = createResearchRepositoryFacade(repository);
   const matchingRepository = createMatchingRepositoryFacade(repository);
-  const publicationRepository = createPublicationRepositoryFacade(repository);
-  const notificationRepository = createNotificationRepositoryFacade(repository);
-  const appleAuthorizationRepository = createAppleAuthorizationRepositoryFacade(repository);
-  const research = new ResearchOrchestrator(researchRepository);
-  return {
+  const research = new ResearchOrchestrator(researchRepository, {
+    v3RetrievalPort: options.v3RetrievalPort ?? null,
+    v3CorpusBuilder: options.v3CorpusBuilder ?? null,
+  });
+  const researchHandlers: Record<string, JobHandler> = {
     brief: async (payload, signal) => processBriefInterpretationJob(researchRepository, payload, signal),
     research: async (payload, signal) => research.processJob(payload, signal),
     matching: async (payload, signal) => processMatchingJob(matchingRepository, payload, signal),
+  };
+  if (options.queueClass === "deep") {
+    // Deep workers intentionally never construct publication, authorization,
+    // notification, or system-maintenance facades.
+    return {
+      research: researchHandlers.research!,
+      matching: researchHandlers.matching!,
+    };
+  }
+  const publicationRepository = createPublicationRepositoryFacade(repository);
+  const notificationRepository = createNotificationRepositoryFacade(repository);
+  const appleAuthorizationRepository = createAppleAuthorizationRepositoryFacade(repository);
+  return {
+    ...researchHandlers,
     publication: async (payload, signal) => processPublicationJob(publicationRepository, payload, signal),
     notification: async (payload, signal) => processNotificationJob(notificationRepository, payload, signal),
     apple_authorization: async (payload, signal) => processAppleAuthorizationJob(appleAuthorizationRepository, payload, signal),
@@ -168,15 +217,21 @@ export function defaultJobHandlers(repository: WorkerRepository): Record<string,
   };
 }
 
-export function assertProductionWorkerSecrets(environment: NodeJS.ProcessEnv = process.env): void {
+export function assertProductionWorkerSecrets(
+  environment: NodeJS.ProcessEnv = process.env,
+  queueClass: WorkerQueueClass = parseWorkerQueueClass(environment.WORKER_QUEUE_CLASS),
+): void {
   readCostConfiguration(environment);
   if (environment.NODE_ENV !== "production") return;
+  if (queueClass === "all") {
+    throw new Error("Production workers must use an isolated interactive or deep queue class");
+  }
   const required = [
     "OPENAI_API_KEY",
     "APPLE_TEAM_ID",
     "APPLE_KEY_ID",
     "APPLE_MEDIA_ID",
-    "APPLE_TOKEN_ENCRYPTION_KEY",
+    ...(queueClass === "interactive" ? ["APPLE_TOKEN_ENCRYPTION_KEY"] : []),
   ];
   const missing = required.filter((name) => !environment[name]?.trim());
   if (!environment.APPLE_MUSICKIT_PRIVATE_KEY?.trim() && !environment.APPLE_MUSICKIT_PRIVATE_KEY_BASE64?.trim()) {
@@ -198,6 +253,7 @@ export class WorkerRunner {
   private readonly controlIntervalMs: number;
   private readonly pipelineCapability: WorkerPipelineCapability;
   private readonly schemaSupport: DatabaseSchemaSupport;
+  private readonly queueClass: WorkerQueueClass;
   private readonly handlers: Record<string, JobHandler>;
   private readonly active = new Map<string, {
     promise: Promise<void>;
@@ -221,11 +277,19 @@ export class WorkerRunner {
     this.controlIntervalMs = options.controlIntervalMs ?? DEFAULT_CONTROL_INTERVAL_MS;
     this.pipelineCapability = options.pipelineCapability ?? WORKER_PIPELINE_CAPABILITY;
     this.schemaSupport = options.schemaSupport ?? DATABASE_SCHEMA_SUPPORT;
-    this.handlers = { ...defaultJobHandlers(repository), ...(options.handlers ?? {}) };
+    this.queueClass = options.queueClass ?? parseWorkerQueueClass(process.env.WORKER_QUEUE_CLASS);
+    this.handlers = {
+      ...defaultJobHandlers(repository, {
+        v3RetrievalPort: options.v3RetrievalPort ?? null,
+        v3CorpusBuilder: options.v3CorpusBuilder ?? null,
+        queueClass: this.queueClass,
+      }),
+      ...(options.handlers ?? {}),
+    };
   }
 
   async run(): Promise<void> {
-    assertProductionWorkerSecrets();
+    assertProductionWorkerSecrets(process.env, this.queueClass);
     await this.repository.ensureSchemaVersion(this.schemaSupport);
     await this.heartbeat();
     await this.enforceControls();
@@ -254,6 +318,7 @@ export class WorkerRunner {
             this.workerId,
             this.leaseMs,
             this.pipelineCapability,
+            this.queueClass,
           );
           if (!job) break;
           claimed = true;
@@ -303,9 +368,11 @@ export class WorkerRunner {
       protocolVersion: this.pipelineCapability.protocolVersion,
       protocolNumber: this.pipelineCapability.protocolNumber,
       pipelineVersions: [...this.pipelineCapability.pipelineVersions],
+      queueClass: this.queueClass,
       capacity: this.concurrency,
       activeJobs: this.active.size,
     });
+    if (this.queueClass === "deep") return;
     // Reconciliation is best-effort maintenance. A transient queue/database
     // error here must not prevent the worker from starting or processing
     // unrelated jobs; the next heartbeat will retry it.
@@ -360,11 +427,13 @@ export class WorkerRunner {
   }
 
   private async enforceControls(): Promise<void> {
-    const [researchPaused, publishingPaused, apple] = await Promise.all([
-      this.repository.getSetting("research_paused"),
-      this.repository.getSetting("publishing_paused"),
-      this.repository.getAppleAuthorization(),
-    ]);
+    const researchPaused = await this.repository.getSetting("research_paused");
+    const [publishingPaused, apple] = this.queueClass === "deep"
+      ? [null, null]
+      : await Promise.all([
+        this.repository.getSetting("publishing_paused"),
+        this.repository.getAppleAuthorization(),
+      ]);
     for (const active of this.active.values()) {
       const cancellationReason = await this.runCancellationReason(active.job);
       if (cancellationReason) {
@@ -399,7 +468,7 @@ export class WorkerRunner {
     const handler = this.handlers[job.kind];
     let leaseLost = false;
     const renewal = setInterval(() => {
-      void this.repository.renewJobLease(job.id, this.workerId, this.leaseMs).then((renewed) => {
+      void this.repository.renewJobLease(job.id, this.workerId, this.leaseMs, job.leaseEpoch).then((renewed) => {
         if (!renewed && !controller.signal.aborted) {
           leaseLost = true;
           controller.abort(new Error("Job lease was lost"));
@@ -415,37 +484,64 @@ export class WorkerRunner {
       if (!handler) throw new NonRetriableJobError(`Unknown durable job kind ${job.kind}`);
       const cancellationBeforeStart = await this.runCancellationReason(job);
       if (cancellationBeforeStart) {
-        await this.repository.cancelLeasedJob(job.id, this.workerId, cancellationBeforeStart);
+        await this.repository.cancelLeasedJob(job.id, this.workerId, cancellationBeforeStart, job.leaseEpoch);
         return;
       }
       await handler({
         ...job.payload,
         ...(job.runId && !job.payload.runId ? { runId: job.runId } : {}),
         ...(job.briefRequestId && !job.payload.briefRequestId ? { briefRequestId: job.briefRequestId } : {}),
+        ...(job.stageKey ? { __jobStageKey: job.stageKey } : {}),
+        ...(Number.isSafeInteger(job.leaseEpoch) ? { __jobLeaseEpoch: job.leaseEpoch } : {}),
+        ...(job.queryPlanRevisionId ? { __queryPlanRevisionId: job.queryPlanRevisionId } : {}),
+        __jobId: job.id,
+        __jobWorkerId: this.workerId,
       }, controller.signal);
       if (leaseLost) return;
       const cancellationAfterHandler = await this.runCancellationReason(job);
       const controlAction = this.active.get(job.id)?.controlAction;
       if (cancellationAfterHandler || controlAction === "cancel") {
-        await this.repository.cancelLeasedJob(job.id, this.workerId, cancellationAfterHandler ?? "Run was cancelled");
+        await this.repository.cancelLeasedJob(
+          job.id,
+          this.workerId,
+          cancellationAfterHandler ?? "Run was cancelled",
+          job.leaseEpoch,
+        );
         return;
       }
       if (controlAction === "pause") {
-        await this.repository.deferJob(job.id, this.workerId, new Date(Date.now() + 60_000), "Deferred by owner control");
+        await this.repository.deferJob(
+          job.id,
+          this.workerId,
+          new Date(Date.now() + 60_000),
+          "Deferred by owner control",
+          job.leaseEpoch,
+        );
         return;
       }
-      await this.repository.completeJob(job.id, this.workerId);
+      await this.repository.completeJob(job.id, this.workerId, job.leaseEpoch);
     } catch (error) {
       if (leaseLost) return;
       const cancellationReason = await this.runCancellationReason(job);
       const controlAction = this.active.get(job.id)?.controlAction;
       if (cancellationReason || controlAction === "cancel") {
-        await this.repository.cancelLeasedJob(job.id, this.workerId, cancellationReason ?? "Run was cancelled");
+        await this.repository.cancelLeasedJob(
+          job.id,
+          this.workerId,
+          cancellationReason ?? "Run was cancelled",
+          job.leaseEpoch,
+        );
         return;
       }
       if (controlAction === "pause" || error instanceof PublicationPausedError) {
         const reason = error instanceof PublicationPausedError ? error.message : "Deferred by owner control";
-        await this.repository.deferJob(job.id, this.workerId, new Date(Date.now() + 60_000), reason);
+        await this.repository.deferJob(
+          job.id,
+          this.workerId,
+          new Date(Date.now() + 60_000),
+          reason,
+          job.leaseEpoch,
+        );
         return;
       }
       const message = job.kind === "apple_authorization"
@@ -460,6 +556,7 @@ export class WorkerRunner {
         this.workerId,
         message,
         retryAt,
+        job.leaseEpoch,
       );
     } finally {
       clearInterval(renewal);
@@ -473,17 +570,28 @@ class NonRetriableJobError extends Error {
 
 async function runExecutableWorker(): Promise<void> {
   const repository = new Repository();
+  const governedGraph = new PgPipelineV3GovernedGraphReadRepository(repository.pool);
+  const v3RetrievalPort = createPipelineV3RetrievalExecutionPort({
+    adapters: createPipelineV3LiveAdapters({
+      discoverGovernedGraph: createPipelineV3GovernedGraphDiscovery(governedGraph),
+    }),
+  });
+  const v3CorpusBuilder = createHostedColdCorpusBuilderV3();
   const leaseMs = positiveEnv("WORKER_LEASE_SECONDS", DEFAULT_LEASE_MS / 1_000, 30 * 60) * 1_000;
   const renewMs = Math.min(
     positiveEnv("WORKER_RENEW_SECONDS", DEFAULT_RENEW_MS / 1_000, 10 * 60) * 1_000,
     Math.max(1_000, leaseMs - 1_000),
   );
+  const queueClass = parseWorkerQueueClass(process.env.WORKER_QUEUE_CLASS);
   const runner = new WorkerRunner(repository, {
     concurrency: positiveEnv("WORKER_CONCURRENCY", 2, 2),
     leaseMs,
     renewMs,
     heartbeatMs: positiveEnv("WORKER_HEARTBEAT_SECONDS", DEFAULT_HEARTBEAT_MS / 1_000, 5 * 60) * 1_000,
     pollMs: positiveEnv("WORKER_POLL_MS", DEFAULT_POLL_MS, 60_000),
+    v3RetrievalPort,
+    v3CorpusBuilder,
+    queueClass,
   });
   let shuttingDown = false;
   const shutdown = async (signal: string) => {

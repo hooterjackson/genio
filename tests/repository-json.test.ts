@@ -174,6 +174,12 @@ test("builds a bounded public-safe live progress summary from durable run state"
         }], rowCount: 1 };
       }
       if (text.includes("SELECT * FROM source_frontier")) return { rows: [], rowCount: 0 };
+      if (text.includes("SELECT state_json FROM research_checkpoints")) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (text.includes("SELECT r.status run_status")) {
+        return { rows: [], rowCount: 0 };
+      }
       throw new Error(`Unexpected repository query: ${text}`);
     }),
     end: vi.fn(),

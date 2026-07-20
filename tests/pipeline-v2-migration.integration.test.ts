@@ -10,7 +10,7 @@ const migrationFiles = readdirSync(migrationDirectory)
   .filter((file) => /^\d+_.+\.sql$/u.test(file))
   .sort();
 const legacyMigrationSql = migrationFiles
-  .filter((file) => file !== "0012_pipeline_v2_foundation.sql")
+  .filter((file) => file !== "0012_pipeline_v2_foundation.sql" && file !== "0013_corpus_first_v3_foundation.sql")
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
 const pipelineV2MigrationSql = readFileSync(

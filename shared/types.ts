@@ -2,19 +2,28 @@ export type PlaylistMode = "exhaustive" | "curated" | "hybrid";
 export type EvidenceState = "verified" | "corroborated" | "editorial" | "inferred" | "disputed";
 export type RunStatus =
   | "draft"
+  | "awaiting_guidance"
   | "queued"
   | "awaiting_budget"
   | "researching"
   | "ready_for_matching"
   | "matching"
+  | "resolving_catalog"
   | "review"
   | "visitor_review"
+  | "partial_ready"
+  | "continuing_research"
   | "manifest_ready"
   | "publishing"
   | "waiting_for_apple_authorization"
+  | "waiting_for_corpus_review"
   | "complete"
   | "partial"
+  | "no_compatible_tracks"
+  | "cancelled"
   | "failed"
+  | "failed_system"
+  | "failed_integrity"
   | "expired"
   | "deleted";
 
@@ -36,10 +45,11 @@ export type PublicationStatus = "queued" | "creating" | "appending" | "waiting_f
  * a mixed-version deployment can read old work without pretending it was
  * produced by the catalog-first policy.
  */
-export type PipelineVersion = "legacy_v1" | "catalog_first_v2" | "pipeline_v2";
+export type PipelineVersion = "legacy_v1" | "catalog_first_v2" | "corpus_first_v3" | "pipeline_v2";
 export type PipelinePolicyVersion =
   | "legacy_v1"
   | "catalog_first_v2_policy_v1"
+  | "corpus_first_v3_policy_v1"
   | "relevance_first_2026_07"
   | "relevance_first_2026_07_r2";
 
@@ -75,6 +85,7 @@ export type SelectionConstraintAxis =
   | "activity"
   | "theme"
   | "artist"
+  | "album"
   | "track"
   | "label"
   | "venue"
@@ -220,6 +231,108 @@ export interface SelectionPlan {
 }
 
 /**
+ * Immutable execution plan for the corpus-first pipeline. This is deliberately
+ * separate from SelectionPlan: V3 evaluates normalized graph assertions and
+ * catalog identities instead of reinterpreting mutable prompt prose at every
+ * stage.
+ */
+export type QueryPlanV3Engine =
+  | "curated_genre_scene"
+  | "mood_activity_theme"
+  | "similarity"
+  | "artist_catalogue"
+  | "fixed_container"
+  | "factual_relationship"
+  | "exhaustive";
+
+export interface QueryPlanV3Predicate {
+  id: string;
+  kind: string;
+  subject: string;
+  relationship: string;
+  hard: boolean;
+}
+
+export interface QueryPlanV3RankingObjective {
+  id: string;
+  kind: string;
+  description: string;
+  weight: number;
+}
+
+/**
+ * Immutable authorization for the single V3 continuation pass. The successor
+ * query-plan revision binds the work to the exact partial outcome and source
+ * checkpoint that exposed the remaining server-approved strategies.
+ */
+export interface QueryPlanV3Continuation {
+  sourceQueryPlanRevisionId: string;
+  sourceQueryPlanHash: string;
+  sourceStageKey: string;
+  sourceOutcomeHash: string;
+  sourceOutcomeVersion: number;
+  strategyIds: string[];
+}
+
+/**
+ * Immutable proof that an owner reviewed a cold factual/exhaustive corpus
+ * batch and activated a successor graph snapshot. The marker belongs on the
+ * successor query-plan revision; the source revision remains unchanged.
+ */
+export interface QueryPlanV3CorpusReview {
+  sourceQueryPlanRevisionId: string;
+  sourceQueryPlanHash: string;
+  sourceStageKey: string;
+  sourceCheckpointHash: string;
+  reviewedGraphSnapshotId: string;
+  enumerationComplete: boolean;
+  reviewedAt: string;
+}
+
+/**
+ * A bounded discovery lead captured from the provider-returned guidance
+ * scout response. This is intentionally not evidence: retrieval must fetch
+ * the URL again, and the exact URL must be returned by that retrieval
+ * response before it may support a track.
+ */
+export interface PipelineV3SourceDiscoveryHint {
+  url: string;
+  title: string;
+  excerpt: string;
+  attestation: "guidance_scout_provider_response";
+}
+
+export interface QueryPlanV3 {
+  schemaVersion: 1;
+  pipelineVersion: "corpus_first_v3";
+  policyVersion: "corpus_first_v3_policy_v1";
+  engine: QueryPlanV3Engine;
+  /** Composite requests may use several engines; `engine` is the durable primary queue class. */
+  engines: QueryPlanV3Engine[];
+  /** Hash of the immutable confirmed selection-plan revision used to build this query plan. */
+  selectionPlanHash: string;
+  graphSnapshotId: string;
+  membershipPredicates: QueryPlanV3Predicate[];
+  rankingObjectives: QueryPlanV3RankingObjective[];
+  targetTrackCount: number | null;
+  storefront: string;
+  hardConstraints: SelectionConstraint[];
+  softPreferences: SelectionConstraint[];
+  sourceDiscoveryHints: PipelineV3SourceDiscoveryHint[];
+  /**
+   * Optional only for query plans written before V3 selection-policy
+   * persistence shipped. New plans always carry these fields; workers use
+   * conservative engine-derived defaults when draining an older plan.
+   */
+  scopeKind?: SelectionScopeKind;
+  diversityGoals?: SelectionDiversityGoals;
+  orderingPolicy?: SelectionOrderingPolicy;
+  softGoalRelaxationOrder?: string[];
+  continuation?: QueryPlanV3Continuation;
+  corpusReview?: QueryPlanV3CorpusReview;
+}
+
+/**
  * The fully resolved execution contract captured when a Pipeline V2 run is
  * created.  Resumed work must consume this value instead of re-reading mutable
  * process environment configuration.
@@ -253,6 +366,29 @@ export type PipelineExecutionPolicySnapshot =
     kind: "deep";
     version: string;
     model: string;
+  }
+  | {
+    kind: "corpus_first_v3";
+    version: "corpus_first_v3_policy_v1";
+    model: string;
+    modelRoute: {
+      version: "pipeline_v3_model_route_v2";
+      tier: "baseline" | "escalation";
+      providerModelId: string;
+      baselineProviderModelId: string;
+      escalationProviderModelId: string;
+      resolutionMode: "provider_managed_alias";
+      modelCatalogValidatedAt: string;
+      reason: "baseline" | "interpretation_low_confidence" | "structured_repair_failed";
+      interpretationConfidence: "high" | "medium" | "low";
+      structuredRepairFailures: number;
+      /** V3 permits no more than one higher-capability attempt. */
+      escalationCount: 0 | 1;
+    };
+    maximumGlobalRounds: number;
+    maximumRawCandidates: number;
+    reservePercent: number;
+    maximumCostUsd: number;
   };
 
 export interface PipelinePolicySnapshot {
@@ -466,6 +602,11 @@ export interface ManifestRevision {
   contentHash: string;
   pipelineVersion: PipelineVersion;
   policyVersion: PipelinePolicyVersion;
+  /** Immutable V3 bindings; absent/null on historical V1/V2 revisions. */
+  selectionPlanId?: string | null;
+  queryPlanRevisionId?: string | null;
+  graphSnapshotId?: string | null;
+  runSpecHash?: string | null;
   selectionPlanSnapshot: SelectionPlan | null;
   policySnapshot: PipelinePolicySnapshot | null;
   outcomeSnapshot: PipelineOutcome | null;
@@ -593,6 +734,7 @@ export interface PlaylistGuidanceSourceHint {
 
 export type PlaylistGuidanceGenerationMode =
   | "grounded_scout"
+  | "deterministic_critical"
   | "no_material_questions"
   | "scout_unavailable";
 
@@ -608,6 +750,8 @@ export interface PlaylistGuidanceScoutResult {
   questions: PlaylistGuidanceQuestion[];
   sourceHints: PlaylistGuidanceSourceHint[];
   telemetry: PlaylistGuidanceTelemetry;
+  /** End-to-end scout wall time, including the optional no-search repair. */
+  durationMs: number;
   usage: Record<string, unknown>;
   costUsd: number;
 }
@@ -916,10 +1060,36 @@ export interface ResearchRunView {
   pipelineVersion?: PipelineVersion;
   policyVersion?: PipelinePolicyVersion;
   selectionPlan?: SelectionPlan | null;
+  /** Internal immutable V3 execution contract; public projections omit it. */
+  queryPlan?: QueryPlanV3 | null;
   pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
   pipelineOutcome?: PipelineOutcome | null;
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
   progress?: RunProgressView;
+  partialAction?: PartialPublicationActionView | null;
+  explore?: ExplorePreferenceView | null;
+}
+
+/** Public-safe, hash-bound action required before publishing an underfilled manifest. */
+export interface PartialPublicationActionView {
+  kind: "partial_publication";
+  targetTrackCount: number;
+  qualifiedTrackCount: number;
+  remainingStrategyCount: number;
+  canContinueResearch: boolean;
+  reasonCode: string | null;
+  outcomeVersion: number;
+  outcomeHash: string;
+  manifestId?: string;
+  manifestHash?: string;
+}
+
+/** Visitor-controlled Explore visibility for a validated Apple publication. */
+export interface ExplorePreferenceView {
+  eligible: boolean;
+  listed: boolean;
+  canChange: boolean;
+  reason: string | null;
 }
 
 /**
@@ -947,6 +1117,8 @@ export interface PublicResearchRunView {
   pipelineOutcome?: PipelineOutcome | null;
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
   progress?: RunProgressView;
+  partialAction?: PartialPublicationActionView | null;
+  explore?: ExplorePreferenceView | null;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string | null;

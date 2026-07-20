@@ -184,7 +184,13 @@ export function WorkingIndicator({
 }: WorkingIndicatorProps) {
   const currentIndex = stages.findIndex((item) => item.id === stage);
   const active = motion === "active";
-  const stateLabel = motion === "paused" ? "PAUSED" : motion === "idle" ? "STOPPED" : "LIVE";
+  const stateLabel = motion === "action-required"
+    ? "ACTION REQUIRED"
+    : motion === "paused"
+      ? "PAUSED"
+      : motion === "idle"
+        ? "STOPPED"
+        : "LIVE";
   const now = useNow(active);
   const created = createdAt ? Date.parse(createdAt) : Number.NaN;
   const elapsedSeconds = now !== null && Number.isFinite(created)
@@ -200,6 +206,17 @@ export function WorkingIndicator({
       safeCount(playableCount),
       safeCount(progress?.matchSummary.accepted),
     );
+  const readyForTarget = Math.max(
+    safeCount(appleReadyCount),
+    safeCount(selectedCount),
+    safeCount(progress?.publicationSummary.appendedTracks),
+  );
+  const normalizedTarget = typeof targetCount === "number" && targetCount > 0
+    ? Math.max(1, Math.floor(targetCount))
+    : null;
+  const targetCoverage = normalizedTarget !== null
+    ? Math.min(100, Math.round((readyForTarget / normalizedTarget) * 100))
+    : null;
   const recentSources = progress?.sourceSummary.recentSources ?? [];
   const latestActivityAt = progress?.latestActivityAt ?? updatedAt;
   const activeLane = activeTraceLane(stage);
@@ -216,6 +233,8 @@ export function WorkingIndicator({
     <div
       className={`working-indicator working-indicator-${motion}${compact ? " is-compact" : ""}`}
       data-testid="working-indicator"
+      data-stage={stage}
+      data-motion={motion}
     >
       <div className="working-indicator-header">
         <span>LIVE RESEARCH CONSOLE</span>
@@ -254,6 +273,24 @@ export function WorkingIndicator({
         </p>
         {!compact && activityLabel && <small>{activityLabel}</small>}
       </div>
+
+      {!compact && normalizedTarget !== null && targetCoverage !== null && (
+        <div
+          className="working-target-progress"
+          role="progressbar"
+          aria-label="Catalog-ready tracks toward the playlist target"
+          aria-valuemin={0}
+          aria-valuemax={normalizedTarget}
+          aria-valuenow={Math.min(normalizedTarget, readyForTarget)}
+        >
+          <div>
+            <span>CATALOG-READY YIELD</span>
+            <strong>{Math.min(normalizedTarget, readyForTarget).toLocaleString("en-US")} / {normalizedTarget.toLocaleString("en-US")}</strong>
+          </div>
+          <i aria-hidden="true"><b style={{ width: `${targetCoverage}%` }} /></i>
+          <small>{Math.max(0, normalizedTarget - readyForTarget).toLocaleString("en-US")} still needed</small>
+        </div>
+      )}
 
       {!compact && (
         <div className="working-facts" aria-label="Current playlist research totals">

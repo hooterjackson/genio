@@ -256,6 +256,152 @@ test("a billed but invalid question-scout response degrades to a completed brief
   );
 });
 
+test("the durable production brief boundary preserves a valid V3 scout sibling", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-v3-boundary");
+  const sourceUrls = [
+    "https://example.org/house-history",
+    "https://example.org/acid-house-history",
+    "https://example.org/deep-house-history",
+  ];
+  const rawQuestion = (decisionKey: string, urls: string[]) => ({
+    decisionKey,
+    header: "HOUSE LINEAGE",
+    question: "Which documented house-music lineage should guide discovery?",
+    whyMaterial: "Chicago foundations, acid house, and deep house produce different candidate pools.",
+    groundingSummary: "The sources document distinct historical lineages within house music.",
+    sourceUrls: urls,
+    options: [
+      {
+        label: "Chicago foundations",
+        description: "Prioritize the earliest Chicago network.",
+        effect: { kind: "subscene_focus", value: `${decisionKey} Chicago foundations`, orderingBehavior: null, geographyConstraint: null },
+      },
+      {
+        label: "Acid house",
+        description: "Prioritize the acid-house lineage.",
+        effect: { kind: "subscene_focus", value: `${decisionKey} acid house`, orderingBehavior: null, geographyConstraint: null },
+      },
+      {
+        label: "Deep house",
+        description: "Prioritize the deep-house lineage.",
+        effect: { kind: "subscene_focus", value: `${decisionKey} deep house`, orderingBehavior: null, geographyConstraint: null },
+      },
+    ],
+  });
+  const scoutText = JSON.stringify({
+    questions: [
+      rawQuestion("house_lineage_emphasis", [sourceUrls[0]!]),
+      {
+        ...rawQuestion("house_era_emphasis", sourceUrls),
+        header: "HOUSE ERA",
+        question: "Which documented era of house music should anchor the playlist?",
+        whyMaterial: "Foundational, expansion-era, and contemporary house produce materially different recording pools.",
+        groundingSummary: "The sources document distinct historical periods in the development of house music.",
+        options: [
+          {
+            label: "Foundational years",
+            description: "Prioritize foundational releases from house music's earliest documented period.",
+            effect: { kind: "research_preference", value: "house_era_emphasis foundational", orderingBehavior: null, geographyConstraint: null },
+          },
+          {
+            label: "Global expansion",
+            description: "Prioritize releases from house music's documented international expansion.",
+            effect: { kind: "research_preference", value: "house_era_emphasis global expansion", orderingBehavior: null, geographyConstraint: null },
+          },
+          {
+            label: "Contemporary lineages",
+            description: "Prioritize current recordings that extend documented house traditions.",
+            effect: { kind: "research_preference", value: "house_era_emphasis contemporary", orderingBehavior: null, geographyConstraint: null },
+          },
+        ],
+      },
+    ],
+  });
+  const providerResponses = [
+    {
+      id: "response-v3-boundary-brief",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 400, output_tokens: 150 },
+      output_text: JSON.stringify({
+        ...draftBrief,
+        title: "House Lineages",
+        subjectEntities: ["house music"],
+        relationship: "belongs to the house-music genre",
+        targetSize: { min: 50, max: 50 },
+      }),
+    },
+    {
+      id: "response-v3-boundary-scout",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 450, output_tokens: 300 },
+      output_text: scoutText,
+      output: [
+        {
+          type: "web_search_call",
+          id: "search-v3-boundary",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "house music documented historical lineages",
+            sources: sourceUrls.map((url) => ({ type: "url", url, title: "House history" })),
+          },
+        },
+        {
+          type: "message",
+          id: "message-v3-boundary",
+          content: [{
+            type: "output_text",
+            text: scoutText,
+            annotations: sourceUrls.map((url) => ({
+              type: "url_citation",
+              start_index: 0,
+              end_index: Math.min(80, scoutText.length),
+              url,
+              title: "House history",
+            })),
+          }],
+        },
+      ],
+    },
+  ];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(providerResponses.shift()), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-v3-boundary",
+      prompt: "50 house music tracks",
+      requestedTrackCount: 50,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({ reservationId: `reservation-${operation}` })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, { briefRequestId: "brief-v3-boundary" });
+
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-v3-boundary",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      questions: [expect.objectContaining({ decisionKey: "house_lineage_emphasis" })],
+      guidanceTelemetry: expect.objectContaining({
+        proposedQuestionCount: 2,
+        acceptedQuestionCount: 1,
+        validationIssues: expect.arrayContaining([
+          "scout:v3:q2:invalid_source_grounding",
+        ]),
+      }),
+    }),
+  );
+});
+
 test("a question-scout provider failure releases only the scout reservation and completes without questions", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-provider-failure");
   const fetchMock = vi.fn()

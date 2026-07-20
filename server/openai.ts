@@ -1106,6 +1106,7 @@ export async function scoutPlaylistGuidance(
   model: string,
   context: OpenAIRequestContext = {},
 ): Promise<PlaylistGuidanceScoutResult> {
+  const scoutStartedAt = Date.now();
   const stableKey = context.idempotencyKey
     ?? createHash("sha256")
       .update(`question-scout:${model}:${prompt}:${JSON.stringify(brief)}`)
@@ -1159,6 +1160,7 @@ export async function scoutPlaylistGuidance(
         webSearchCalls: 0,
         validationIssues: ["scout:request_cost_guard"],
       },
+      durationMs: Math.max(0, Date.now() - scoutStartedAt),
       usage: { provider_calls: 0, total_tokens: 0 },
       costUsd: 0,
     };
@@ -1310,6 +1312,7 @@ export async function scoutPlaylistGuidance(
       webSearchCalls,
       validationIssues,
     },
+    durationMs: Math.max(0, Date.now() - scoutStartedAt),
     usage: accounting.usage,
     costUsd,
   };

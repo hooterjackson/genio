@@ -23,23 +23,32 @@ export const WORKER_PIPELINE_V4_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
 };
 
 // v5 adds immutable pipeline/minimum-protocol queue stamping and makes every
-// lease capability-aware. A v5 worker can drain V1 and execute curated V2;
-// bridge v4 workers remain restricted to V1 during a rolling deployment.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v5";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 5;
+// lease capability-aware. It remains an explicit bridge during the V3 expand
+// rollout: it may drain V1/V2 work but can never lease corpus-first jobs.
+export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
+  protocolVersion: "playlist-pipeline-v5",
+  protocolNumber: 5,
+  pipelineVersions: ["legacy_v1", "catalog_first_v2"],
+};
+
+// v6 understands the inert corpus-first routing contract. Assignment remains
+// separately disabled; declaring capability does not opt a run into V3.
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v6";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 6;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
   protocolNumber: WORKER_PIPELINE_PROTOCOL_NUMBER,
-  pipelineVersions: ["legacy_v1", "catalog_first_v2"],
+  pipelineVersions: ["legacy_v1", "catalog_first_v2", "corpus_first_v3"],
 };
 
 export const LEGACY_V1_MINIMUM_WORKER_PROTOCOL = 4;
 export const CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL = 5;
+export const CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL = 6;
 
 export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
-  return pipelineVersion === "catalog_first_v2"
-    ? CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL
-    : LEGACY_V1_MINIMUM_WORKER_PROTOCOL;
+  if (pipelineVersion === "corpus_first_v3") return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
+  if (pipelineVersion === "catalog_first_v2") return CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL;
+  return LEGACY_V1_MINIMUM_WORKER_PROTOCOL;
 }
 
 export function workerPipelineProtocolNumber(value: unknown): number | null {
@@ -57,7 +66,11 @@ export function isWorkerCapabilityValid(capability: WorkerPipelineCapability): b
     && Number.isSafeInteger(capability.protocolNumber)
     && capability.protocolNumber > 0
     && capability.pipelineVersions.length > 0
-    && capability.pipelineVersions.every((value) => value === "legacy_v1" || value === "catalog_first_v2");
+    && capability.pipelineVersions.every((value) => (
+      value === "legacy_v1"
+      || value === "catalog_first_v2"
+      || value === "corpus_first_v3"
+    ));
 }
 
 export function workerPipelineProtocolVersion(metadata: unknown): string | null {

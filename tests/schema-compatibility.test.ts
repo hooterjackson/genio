@@ -1,17 +1,19 @@
 import { describe, expect, test } from "vitest";
 import {
   DATABASE_SCHEMA_SUPPORT,
-  DATABASE_SCHEMA_V12_BRIDGE_SUPPORT,
+  DATABASE_SCHEMA_V13_BRIDGE_SUPPORT,
   databaseSchemaCompatibility,
   isDatabaseSchemaVersionCompatible,
 } from "../db/index.ts";
 
 describe("database schema rollout compatibility", () => {
-  test("keeps the v12 bridge healthy before, after, and during rollback", () => {
-    expect(isDatabaseSchemaVersionCompatible("12", DATABASE_SCHEMA_V12_BRIDGE_SUPPORT)).toBe(true);
-    expect(isDatabaseSchemaVersionCompatible("13", DATABASE_SCHEMA_V12_BRIDGE_SUPPORT)).toBe(true);
-    expect(isDatabaseSchemaVersionCompatible("12", DATABASE_SCHEMA_SUPPORT)).toBe(false);
+  test("keeps the Release-A bridge healthy on schema 13 and 14 without admitting schema 12", () => {
+    expect(isDatabaseSchemaVersionCompatible("12", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(false);
+    expect(isDatabaseSchemaVersionCompatible("13", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(true);
+    expect(isDatabaseSchemaVersionCompatible("14", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(true);
+    expect(isDatabaseSchemaVersionCompatible("15", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(false);
     expect(isDatabaseSchemaVersionCompatible("13", DATABASE_SCHEMA_SUPPORT)).toBe(true);
+    expect(isDatabaseSchemaVersionCompatible("14", DATABASE_SCHEMA_SUPPORT)).toBe(true);
   });
 
   test.each([
@@ -19,7 +21,8 @@ describe("database schema rollout compatibility", () => {
     ["garbage", "malformed"],
     ["12", "too_old"],
     ["13", "compatible"],
-    ["14", "too_new"],
+    ["14", "compatible"],
+    ["15", "too_new"],
   ] as const)("classifies observed schema %s as %s", (actual, expected) => {
     expect(databaseSchemaCompatibility(actual, DATABASE_SCHEMA_SUPPORT)).toBe(expected);
   });

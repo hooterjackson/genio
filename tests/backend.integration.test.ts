@@ -5,7 +5,7 @@ import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   createDatabase,
-  DATABASE_SCHEMA_V12_BRIDGE_SUPPORT,
+  DATABASE_SCHEMA_V13_BRIDGE_SUPPORT,
   DATABASE_SCHEMA_VERSION,
 } from "../db/index.ts";
 import { CapabilityService, CAPABILITY_COOKIE } from "../server/capabilities.ts";
@@ -290,13 +290,22 @@ databaseDescribe("hosted backend integration", () => {
     );
     expect(constraintAfter.rows).toEqual(constraintBefore.rows);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
-    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V12_BRIDGE_SUPPORT)).resolves.toBeUndefined();
-    // Model the staged rollout marker without pretending that V13 code can
-    // execute against the V12 schema. The separately deployed bridge accepts
-    // both markers; the V13 binary remains fail-closed until migration.
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
+    // The Release-A bridge must remain healthy immediately before and after
+    // the schema-14 expand migration, while failing closed for both older and
+    // newer schemas that current queries have not declared compatible.
+    await repository.setSetting("schema_version", "13");
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "12");
-    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V12_BRIDGE_SUPPORT)).resolves.toBeUndefined();
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-13, found 12/u);
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
+      /supported 13-14, found 12/u,
+    );
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-14, found 12/u);
+    await repository.setSetting("schema_version", "15");
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
+      /supported 13-14, found 15/u,
+    );
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     const result = await repository.pool.query<{ name: string }>(
@@ -3551,7 +3560,7 @@ databaseDescribe("hosted backend integration", () => {
       [runId],
     );
     expect(terminal.rows[0]).toEqual({
-      status: "partial",
+      status: "no_compatible_tracks",
       phase: "manifest_policy_empty",
       error: null,
       match_status: "unsupported",
@@ -5502,6 +5511,19 @@ databaseDescribe("hosted backend integration", () => {
     );
 
     await repository.updateRun(created.runId, { status: "complete", phase: "published" });
+    // New public Apple playlists are share-link accessible but do not enter
+    // Explore until the capability holder explicitly opts in.
+    await expect(repository.listPublicPlaylists()).resolves.toMatchObject({ items: [], total: 0 });
+    await expect(repository.getRunExplorePreference(created.runId)).resolves.toMatchObject({
+      eligible: true,
+      listed: false,
+      canChange: true,
+    });
+    await expect(repository.setRunExplorePreference(created.runId, true)).resolves.toMatchObject({
+      eligible: true,
+      listed: true,
+      canChange: true,
+    });
     const listed = await repository.listPublicPlaylists(1, 24);
     expect(listed).toMatchObject({ page: 1, pageSize: 24, total: 1, totalPages: 1 });
     expect(listed.items).toEqual([{
@@ -5626,6 +5648,11 @@ databaseDescribe("hosted backend integration", () => {
       [randomUUID(), manifestId, shareUrl],
     );
     await repository.updateRun(created.runId, { status: "complete", phase: "publication_complete" });
+    // Deletion preserves an Explore projection only when the user previously
+    // chose to list the otherwise-unlisted-by-default publication.
+    await expect(repository.setRunExplorePreference(created.runId, true)).resolves.toMatchObject({
+      listed: true,
+    });
     await expect(repository.listPublicPlaylists()).resolves.toMatchObject({ total: 1 });
 
     await expect(repository.deleteRunAccess(created.accessId)).resolves.toBe(true);

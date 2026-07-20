@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
   PipelinePolicySnapshot,
+  PipelineVersion,
   PlaylistBrief,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
@@ -90,6 +91,23 @@ import {
 } from "../lib/playlist-selection.ts";
 import { createSelectionPlanV2, selectionPlanResearchContext } from "./selection-plan-v2.ts";
 import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
+import {
+  PipelineV3WorkerExecution,
+  v3RetrievalStageKey,
+  type PipelineV3RetrievalExecutionPort,
+  type PipelineV3WorkerRepository,
+  type PipelineV3WriteFence,
+} from "./pipeline-v3-worker-execution.ts";
+import type { ColdCorpusBuilderPortV3 } from "./pipeline-v3-corpus-builder.ts";
+import { minimumWorkerProtocolForPipeline } from "./worker-protocol.ts";
+import type { JobQueueClass } from "./job-queue-class.ts";
+import {
+  criticalAmbiguityAnswersFromGuidanceV3,
+  criticalGuidanceQuestionsV3,
+  createRunSpecV3,
+  resolveRunSpecV3,
+} from "./selection-plan-v3.ts";
+import { validateProductionGuidedScoutV3 } from "./pipeline-v3-policy.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -152,6 +170,7 @@ type ResearchPassOutcome =
 
 export interface ResearchRunRecord {
   id: string;
+  prompt?: string;
   brief: PlaylistBrief;
   guidanceSourceHints?: PlaylistGuidanceSourceHint[];
   guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
@@ -159,6 +178,7 @@ export interface ResearchRunRecord {
   pipelineVersion?: string;
   policyVersion?: string;
   selectionPlan?: SelectionPlan | null;
+  queryPlan?: import("../shared/types.ts").QueryPlanV3 | null;
   pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
   status: string;
   phase: string;
@@ -189,7 +209,7 @@ export interface ResearchContainerView extends ResearchContainerInput {
   id: string;
 }
 
-export interface ResearchRepository {
+export interface ResearchRepository extends PipelineV3WorkerRepository {
   getBriefRequest(briefRequestId: string): Promise<{
     id: string;
     prompt: string;
@@ -222,7 +242,7 @@ export interface ResearchRepository {
     approvedBudget?: number;
     noNewGapPasses?: number;
     error?: string | null;
-  }): Promise<void>;
+  }, fence?: PipelineV3WriteFence): Promise<void>;
   getCoverage(runId: string): Promise<Record<string, unknown>>;
   addSources(runId: string, sources: SourceRecordInput[]): Promise<Map<string, string>>;
   addCitationAttestations(runId: string, attestations: readonly HostedCitationAttestation[]): Promise<void>;
@@ -232,7 +252,7 @@ export interface ResearchRepository {
   upsertResearchContainers(runId: string, items: ResearchContainerInput[]): Promise<void>;
   listResearchContainers(runId: string): Promise<ResearchContainerView[]>;
   getResearchCheckpoint(runId: string, checkpointKey: string): Promise<unknown | null>;
-  saveResearchCheckpoint(runId: string, checkpointKey: string, checkpoint: unknown): Promise<void>;
+  saveResearchCheckpoint(runId: string, checkpointKey: string, checkpoint: unknown, fence?: PipelineV3WriteFence): Promise<void>;
   enqueueJob(input: {
     kind: string;
     runId?: string | null;
@@ -241,6 +261,11 @@ export interface ResearchRepository {
     dedupeKey?: string;
     availableAt?: Date;
     maxAttempts?: number;
+    pipelineVersion?: PipelineVersion;
+    minimumWorkerProtocol?: number;
+    queryPlanRevisionId?: string | null;
+    stageKey?: string;
+    queueClass?: JobQueueClass;
   }): Promise<unknown>;
   reserveProviderCost(subject: { runId?: string | null; briefRequestId?: string | null } | string, operation: string, maximumCostUsd: number): Promise<ProviderCostReservation>;
   reconcileProviderCost(reservationId: string, actualCostUsd: number, usage?: unknown): Promise<void>;
@@ -1262,8 +1287,21 @@ function coveragePage(coverage: Record<string, unknown>, frontierOffset = 0, con
 
 export class ResearchOrchestrator {
   private readonly adapters = createAdapterRegistry();
+  private readonly pipelineV3: PipelineV3WorkerExecution;
 
-  constructor(private readonly repository: ResearchRepository) {}
+  constructor(
+    private readonly repository: ResearchRepository,
+    options: {
+      v3RetrievalPort?: PipelineV3RetrievalExecutionPort | null;
+      v3CorpusBuilder?: ColdCorpusBuilderPortV3 | null;
+    } = {},
+  ) {
+    this.pipelineV3 = new PipelineV3WorkerExecution(
+      repository,
+      options.v3RetrievalPort ?? null,
+      options.v3CorpusBuilder ?? null,
+    );
+  }
 
   /** Compatibility entry point: this now enqueues durable work and never runs it in-process. */
   start(runId: string): void {
@@ -1292,7 +1330,7 @@ export class ResearchOrchestrator {
       // user-facing error. Provider, persistence, and integrity failures still
       // throw through their normal worker path.
       await this.repository.updateRun(runId, {
-        status: "partial",
+        status: "no_compatible_tracks",
         phase: options.emptyPhase,
         error: null,
       });
@@ -1316,6 +1354,28 @@ export class ResearchOrchestrator {
   async enqueue(runId: string): Promise<void> {
     const run = await this.repository.getRun(runId);
     const pipeline = persistedWorkerPipeline(run);
+    if (pipeline.route === "corpus_first_v3") {
+      const stageKey = v3RetrievalStageKey(pipeline.queryPlan!, "active");
+      const queueClass: JobQueueClass = pipeline.queryPlan!.engines.some((engine) => (
+        engine === "factual_relationship" || engine === "exhaustive"
+      )) ? "deep" : "interactive";
+      await this.repository.enqueueJob({
+        kind: "research",
+        runId,
+        payload: {
+          runId,
+          phase: "v3_retrieval",
+          v3ExecutionMode: "active",
+          stageExecutionKey: stageKey,
+        },
+        dedupeKey: `research:${runId}:${stageKey}`,
+        pipelineVersion: "corpus_first_v3",
+        minimumWorkerProtocol: minimumWorkerProtocolForPipeline("corpus_first_v3"),
+        stageKey,
+        queueClass,
+      });
+      return;
+    }
     const resume = await this.repository.getResearchCheckpoint(runId, "resume") as { phase?: ResearchPhase; gapAttempt?: number; generation?: number; segment?: number } | null;
     const policy = researchExecutionPolicyForRun({ ...run, selectionPlan: pipeline.selectionPlan });
     let fast = false;
@@ -2247,6 +2307,16 @@ export class ResearchOrchestrator {
       assertActive(signal);
       const initialRun = await this.repository.getRun(runId);
       const pipeline = persistedWorkerPipeline(initialRun);
+      if (pipeline.route === "corpus_first_v3") {
+        await this.pipelineV3.process({
+          runId,
+          run: initialRun,
+          queryPlan: pipeline.queryPlan!,
+          payload,
+          signal,
+        });
+        return;
+      }
       const executionPolicy = researchExecutionPolicyForRun({ ...initialRun, selectionPlan: pipeline.selectionPlan });
       if (payload.postMatchRefill === true) {
         await this.processFastPostMatchRefillJob(runId, initialRun, payload, signal);
@@ -3099,6 +3169,24 @@ export class BudgetPause extends Error {
   constructor(message = "Research reached its approved budget", readonly isProviderOverrun = false) { super(message); }
 }
 
+function requestedTrackCountForV3(
+  requestedTrackCount: number | null | undefined,
+  brief: PlaylistBrief,
+): number {
+  const candidates = [requestedTrackCount, brief.targetSize?.max, brief.targetSize?.min];
+  const count = candidates.find((value) => Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 300);
+  return count == null ? 50 : Number(count);
+}
+
+function combineGuidanceQuestionsV3(
+  critical: readonly PlaylistGuidanceQuestion[],
+  scouted: readonly PlaylistGuidanceQuestion[],
+): PlaylistGuidanceQuestion[] {
+  const criticalKeys = new Set(critical.map(({ decisionKey, id }) => decisionKey || id));
+  const optional = scouted.filter(({ decisionKey, id }) => !criticalKeys.has(decisionKey || id));
+  return [...critical, ...optional].slice(0, 3);
+}
+
 export async function processBriefInterpretationJob(
   repository: ResearchRepository,
   payload: Record<string, unknown>,
@@ -3126,6 +3214,16 @@ export async function processBriefInterpretationJob(
       // sequencing. Re-canonicalize the original brief without folding answer
       // prose into its factual subject, relationship, evidence, or exclusions.
       const canonicalBrief = canonicalBriefForRequest(request, request.brief!);
+      const v3Spec = createRunSpecV3({
+        prompt: request.prompt,
+        requestedTrackCount: requestedTrackCountForV3(request.requestedTrackCount, canonicalBrief),
+        storefront: process.env.APPLE_STOREFRONT ?? "us",
+      });
+      const v3Plan = resolveRunSpecV3(
+        v3Spec,
+        criticalAmbiguityAnswersFromGuidanceV3(v3Spec, request.answers ?? []),
+      );
+      if (!v3Plan.confirmed) throw new Error("Critical playlist scope is unresolved");
       const selectionPlan = createSelectionPlanV2({
         prompt: request.prompt,
         brief: canonicalBrief,
@@ -3240,6 +3338,8 @@ export async function processBriefInterpretationJob(
       questions: PlaylistGuidanceQuestion[];
       sourceHints: PlaylistGuidanceSourceHint[];
       telemetry: PlaylistGuidanceTelemetry;
+      durationMs: number;
+      costUsd: number;
     };
     const canScout = interpretationFallbackIssue === null
       || interpretationFallbackIssue === "interpretation:invalid_structured_output";
@@ -3252,6 +3352,8 @@ export async function processBriefInterpretationJob(
       scout = {
         questions: [],
         sourceHints: [],
+        durationMs: 0,
+        costUsd: 0,
         telemetry: {
           generationMode: "scout_unavailable",
           proposedQuestionCount: 0,
@@ -3277,6 +3379,8 @@ export async function processBriefInterpretationJob(
       scout = {
         questions: scoutResult.questions,
         sourceHints: scoutResult.sourceHints,
+        durationMs: scoutResult.durationMs,
+        costUsd: scoutResult.costUsd,
         telemetry: interpretationFallbackIssue
           ? {
             ...scoutResult.telemetry,
@@ -3294,6 +3398,8 @@ export async function processBriefInterpretationJob(
       scout = {
         questions: [],
         sourceHints: [],
+        durationMs: 0,
+        costUsd: 0,
         telemetry: {
           generationMode: "scout_unavailable",
           proposedQuestionCount: 0,
@@ -3309,7 +3415,54 @@ export async function processBriefInterpretationJob(
       };
     }
 
-    const status = scout.questions.length > 0 ? "awaiting_answers" : "complete";
+    const v3Spec = createRunSpecV3({
+      prompt: request.prompt,
+      requestedTrackCount: requestedTrackCountForV3(request.requestedTrackCount, canonicalBrief),
+      storefront: process.env.APPLE_STOREFRONT ?? "us",
+    });
+    const scoutValidation = validateProductionGuidedScoutV3({
+      spec: v3Spec,
+      questions: scout.questions,
+      sourceHints: scout.sourceHints,
+      usage: {
+        searchCount: scout.telemetry.webSearchCalls,
+        durationMs: scout.durationMs,
+        costUsd: scout.costUsd,
+      },
+    });
+    const v3ValidationIssues = [
+      ...scoutValidation.usageIssues.map((issue) => `scout:v3:usage:${issue}`),
+      ...scoutValidation.questionResults.flatMap((result) => result.issues.map(
+        (issue) => `scout:v3:${result.questionId}:${issue}`,
+      )),
+    ];
+    scout.questions = [...scoutValidation.acceptedQuestions];
+    scout.telemetry = {
+      ...scout.telemetry,
+      generationMode: scout.questions.length > 0
+        ? "grounded_scout"
+        : scout.telemetry.generationMode === "no_material_questions"
+            && scout.telemetry.proposedQuestionCount === 0
+            && scoutValidation.usageIssues.length === 0
+          ? "no_material_questions"
+          : "scout_unavailable",
+      acceptedQuestionCount: scout.questions.length,
+      validationIssues: [
+        ...v3ValidationIssues,
+        ...scout.telemetry.validationIssues,
+      ].slice(0, 12),
+    };
+    const criticalQuestions = criticalGuidanceQuestionsV3(v3Spec);
+    const questions = combineGuidanceQuestionsV3(criticalQuestions, scout.questions);
+    if (criticalQuestions.length > 0) {
+      scout.telemetry = {
+        ...scout.telemetry,
+        generationMode: scout.questions.length > 0 ? scout.telemetry.generationMode : "deterministic_critical",
+        proposedQuestionCount: Math.min(3, scout.telemetry.proposedQuestionCount + criticalQuestions.length),
+        acceptedQuestionCount: questions.length,
+      };
+    }
+    const status = questions.length > 0 ? "awaiting_answers" : "complete";
     const selectionPlan = createSelectionPlanV2({
       prompt: request.prompt,
       brief: canonicalBrief,
@@ -3321,7 +3474,7 @@ export async function processBriefInterpretationJob(
       status,
       expectedStatus: "queued",
       brief: canonicalBrief,
-      questions: scout.questions,
+      questions,
       guidanceSourceHints: scout.sourceHints,
       guidanceTelemetry: scout.telemetry,
       ...(status === "complete" ? { estimateUsd: estimateResearchCost(canonicalBrief) } : {}),

@@ -835,7 +835,7 @@ describe("research completion policy", () => {
     ).ready).toBe(true);
   });
 
-  test("gap-pass bounds are configurable and stale excess work finishes partial without candidates", async () => {
+  test("gap-pass bounds are configurable and stale excess work completes without compatible tracks", async () => {
     vi.stubEnv("RESEARCH_MAX_GAP_PASSES", "2");
     expect(researchGapPassLimit()).toBe(2);
     expect(researchGapPassLimit("1")).toBe(2);
@@ -852,7 +852,7 @@ describe("research completion policy", () => {
     } as any);
     await orchestrator.processJob({ runId: "run-1", phase: "gap_analysis", gapAttempt: 2 });
     expect(checkpoints).toContainEqual(expect.objectContaining({ status: "complete", next: "partial" }));
-    expect(updates).toContainEqual(expect.objectContaining({ status: "partial", phase: "research_empty", error: null }));
+    expect(updates).toContainEqual(expect.objectContaining({ status: "no_compatible_tracks", phase: "research_empty", error: null }));
   });
 });
 
@@ -1655,7 +1655,7 @@ describe("fast curated orchestration", () => {
     });
   });
 
-  test("delayed pickup performs no paid call and records a transparent partial when no candidate exists", async () => {
+  test("delayed pickup performs no paid call and records a non-error zero-track outcome", async () => {
     vi.useFakeTimers();
     const confirmedAt = new Date("2026-07-14T12:00:00.000Z");
     vi.setSystemTime(confirmedAt);
@@ -1671,7 +1671,7 @@ describe("fast curated orchestration", () => {
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", fast: true });
 
     expect(orchestrator.calls).toHaveLength(0);
-    expect(state.run).toMatchObject({ status: "partial", phase: "research_empty" });
+    expect(state.run).toMatchObject({ status: "no_compatible_tracks", phase: "research_empty" });
     expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(false);
     expect(state.checkpoints.get("fast:policy:fast_curated_v3")).toMatchObject({
       status: "deadline",
@@ -1718,7 +1718,7 @@ describe("fast curated orchestration", () => {
     });
   });
 
-  test("a provider quota rejection finishes as a transparent partial without worker retries", async () => {
+  test("a provider quota rejection records a non-error zero-track outcome without worker retries", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("curated", { min: 25, max: 25 });
     state.run.status = "queued";
@@ -1736,7 +1736,7 @@ describe("fast curated orchestration", () => {
     });
 
     expect(orchestrator.calls).toHaveLength(1);
-    expect(state.run).toMatchObject({ status: "partial", phase: "research_empty", error: null });
+    expect(state.run).toMatchObject({ status: "no_compatible_tracks", phase: "research_empty", error: null });
     expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(false);
     expect(state.checkpoints.get("fast:policy:fast_curated_v3")).toMatchObject({
       status: "provider_error",
@@ -2087,7 +2087,7 @@ describe("durable research segmentation", () => {
     }));
   });
 
-  test("finishes partial at the segment ceiling without making an extra provider call", async () => {
+  test("finishes with a non-error zero-track outcome at the segment ceiling without an extra provider call", async () => {
     vi.stubEnv("RESEARCH_TURNS_PER_SEGMENT", "1");
     vi.stubEnv("RESEARCH_MAX_SEGMENTS_PER_PASS", "1");
     const state = segmentedRepository();
@@ -2096,7 +2096,7 @@ describe("durable research segmentation", () => {
     await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, generation: 0, segment: 0 });
 
     expect(orchestrator.calls).toHaveLength(1);
-    expect(state.run).toMatchObject({ status: "partial", phase: "research_empty" });
+    expect(state.run).toMatchObject({ status: "no_compatible_tracks", phase: "research_empty" });
     expect(state.checkpoints.get("resume")).toMatchObject({ status: "complete", segment: 1, next: "partial" });
     expect(state.checkpoints.get("scope_resolution:segment-limit").completionBlockers[0]).toMatch(/1 durable segments/);
     expect(state.jobs).toHaveLength(0);

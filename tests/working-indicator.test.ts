@@ -94,6 +94,25 @@ describe("working indicator candidate funnel", () => {
     expect(markup).toContain("Scene archive");
     expect(markup).toContain("archive.example");
     expect(markup).toContain("0 of 2 strategies complete");
+    expect(markup).toContain('data-stage="discover"');
+    expect(markup).toContain('data-motion="paused"');
+    expect(markup).toContain('role="progressbar"');
+    expect(markup).toContain("CATALOG-READY YIELD");
+    expect(markup).toContain("0 / 25");
+    expect(markup).toContain("25 still needed");
     expect(markup.match(/role="status"/gu)).toHaveLength(1);
+  });
+
+  it("renders action-required work without a live animation state", () => {
+    const markup = renderToStaticMarkup(createElement(WorkingIndicator, {
+      stage: "sequence",
+      motion: "action-required",
+      phaseLabel: "Choose whether to continue researching or publish the verified tracks.",
+      targetCount: 50,
+    }));
+
+    expect(markup).toContain('data-motion="action-required"');
+    expect(markup).toContain("ACTION REQUIRED");
+    expect(markup).not.toContain(">LIVE<");
   });
 });

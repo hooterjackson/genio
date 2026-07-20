@@ -14,6 +14,7 @@ import type {
   PipelinePolicyVersion,
   PipelineVersion,
   PlaylistBrief,
+  QueryPlanV3,
   RecordingFamily,
   SelectionConstraint,
   SelectionPlan,
@@ -147,6 +148,7 @@ export interface MatchingRepository extends Partial<AppleCatalogCacheRepository>
     pipelineVersion?: PipelineVersion;
     policyVersion?: PipelinePolicyVersion;
     selectionPlan?: SelectionPlan | null;
+    queryPlan?: QueryPlanV3 | null;
     pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
   }>;
   updateRun(runId: string, patch: { status?: string; phase?: string; error?: string | null }): Promise<void>;
@@ -170,6 +172,14 @@ export interface MatchingRepository extends Partial<AppleCatalogCacheRepository>
     diversity?: { desiredArtistCount: number; representedArtists: string[] },
   ): Promise<AutomaticCandidateRefillState>;
   queueAutomaticPublication(runId: string): Promise<void>;
+  preparePartialPublication?(
+    runId: string,
+    input: {
+      targetTrackCount: number;
+      verifiedTrackCount: number;
+      remainingStrategyCount?: number;
+    },
+  ): Promise<void>;
   savePipelineOutcome?(runId: string, outcome: PipelineOutcome): Promise<void>;
   getPipelineStageCounts?(runId: string): Promise<import("./pipeline-v2-observability.ts").PipelineStageCounts>;
   upsertRecordingFamily?(
@@ -226,6 +236,8 @@ const EXACT_CATALOG_MATCH_SCORE = 99.999999;
 const V2_CATALOG_HANDOFF_CHUNK_SIZE = 10;
 const V2_CATALOG_HANDOFF_START_RESERVE_MS = 10_000;
 const AUTOMATIC_HANDOFF_TERMINAL_STATUSES = new Set([
+  "partial_ready",
+  "no_compatible_tracks",
   "publishing",
   "waiting_for_apple_authorization",
   "complete",
@@ -954,22 +966,33 @@ async function finalizeMatchingOutcome(
     }
 
     if (shortfall > 0) {
-      // Count recovery is deliberately bounded, but exhausting that budget is
-      // not a publication failure. Lock and publish every strict, unique Apple
-      // match we did find; publication completeness will record the missing
-      // target count and finish the run as `partial`.
+      // A bounded discovery shortfall is a valid product outcome, not a
+      // publication instruction. Freeze the verified selection outcome so the
+      // visitor can inspect an immutable count, but do not let any Apple write
+      // begin until a hash-bound partial publication decision is recorded.
       if (safePrimaryCount > 0) {
         await repository.updateRun(runId, {
           status: "visitor_review",
           phase: "exception_review",
           error: null,
         });
-        await repository.queueAutomaticPublication(runId);
+        if (repository.preparePartialPublication) {
+          await repository.preparePartialPublication(runId, {
+            targetTrackCount: targetMinimum ?? safePrimaryCount,
+            verifiedTrackCount: safePrimaryCount,
+          });
+        } else {
+          await repository.updateRun(runId, {
+            status: "partial_ready",
+            phase: "partial_confirmation_required",
+            error: null,
+          });
+        }
         return;
       }
 
       await repository.updateRun(runId, {
-        status: "partial",
+        status: "no_compatible_tracks",
         phase: "catalog_matching_empty",
         error: null,
       });

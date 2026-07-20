@@ -82,6 +82,47 @@ type FeedbackCounts = {
   resolved: number;
 };
 
+type CorpusSource = {
+  id: string;
+  title: string;
+  url: string;
+  sourceClass: string;
+  provenanceRoot: string;
+  status: string;
+  approvalState: string;
+  authority: string;
+  licenseState: string;
+};
+
+type CorpusObservation = {
+  id: string;
+  predicate: string;
+  supportExcerpt: string;
+  confidence: number;
+  status: string;
+  recordingId: string | null;
+  source: Pick<CorpusSource, "id" | "title" | "url" | "provenanceRoot" | "status">;
+};
+
+type CorpusAssertion = {
+  id: string;
+  predicate: string;
+  status: string;
+  evidenceTier: string;
+  evidenceCount: number;
+  recordingId: string | null;
+};
+
+type CorpusSnapshot = {
+  id: string;
+  parentSnapshotId: string | null;
+  status: string;
+  contentHash: string | null;
+  assertionCount: number;
+  catalogIdentityCount: number;
+  lockedAt: string | null;
+};
+
 type AppleTokenResponse = {
   developerToken: string;
   mediaId?: string;
@@ -223,6 +264,85 @@ function normalizeFeedbackMetadata(payload: unknown): { total: number; counts: F
   };
 }
 
+function corpusTotal(payload: unknown): number {
+  return Math.max(0, Number(asObject(payload).total ?? 0) || 0);
+}
+
+function normalizeCorpusSources(payload: unknown): CorpusSource[] {
+  return arrayFrom<unknown>(payload, ["items"]).flatMap((raw) => {
+    const item = asObject(raw);
+    if (typeof item.id !== "string") return [];
+    const policy = asObject(asObject(item.metadataJson).evidenceGraphPolicy);
+    return [{
+      id: item.id,
+      title: typeof item.title === "string" ? item.title : "Untitled source",
+      url: typeof item.url === "string" ? item.url : "",
+      sourceClass: typeof item.sourceClass === "string" ? item.sourceClass : "unknown",
+      provenanceRoot: typeof item.provenanceRoot === "string" ? item.provenanceRoot : "unknown",
+      status: typeof item.status === "string" ? item.status : "unknown",
+      approvalState: typeof policy.approvalState === "string" ? policy.approvalState : "pending",
+      authority: typeof policy.authority === "string" ? policy.authority : "unknown",
+      licenseState: typeof policy.licenseState === "string" ? policy.licenseState : "unknown",
+    }];
+  });
+}
+
+function normalizeCorpusObservations(payload: unknown): CorpusObservation[] {
+  return arrayFrom<unknown>(payload, ["items"]).flatMap((raw) => {
+    const row = asObject(raw);
+    const observation = asObject(row.observation);
+    const source = asObject(row.source);
+    if (typeof observation.id !== "string" || typeof source.id !== "string") return [];
+    return [{
+      id: observation.id,
+      predicate: typeof observation.predicate === "string" ? observation.predicate : "unknown_claim",
+      supportExcerpt: typeof observation.supportExcerpt === "string" ? observation.supportExcerpt : "No excerpt stored.",
+      confidence: Math.max(0, Math.min(1, Number(observation.confidence ?? 0) || 0)),
+      status: typeof observation.status === "string" ? observation.status : "unknown",
+      recordingId: typeof observation.recordingId === "string" ? observation.recordingId : null,
+      source: {
+        id: source.id,
+        title: typeof source.title === "string" ? source.title : "Untitled source",
+        url: typeof source.url === "string" ? source.url : "",
+        provenanceRoot: typeof source.provenanceRoot === "string" ? source.provenanceRoot : "unknown",
+        status: typeof source.status === "string" ? source.status : "unknown",
+      },
+    }];
+  });
+}
+
+function normalizeCorpusAssertions(payload: unknown): CorpusAssertion[] {
+  return arrayFrom<unknown>(payload, ["items"]).flatMap((raw) => {
+    const row = asObject(raw);
+    const assertion = asObject(row.assertion);
+    if (typeof assertion.id !== "string") return [];
+    return [{
+      id: assertion.id,
+      predicate: typeof assertion.predicate === "string" ? assertion.predicate : "unknown_claim",
+      status: typeof assertion.status === "string" ? assertion.status : "unknown",
+      evidenceTier: typeof assertion.evidenceTier === "string" ? assertion.evidenceTier : "unknown",
+      evidenceCount: Math.max(0, Number(row.evidenceCount ?? 0) || 0),
+      recordingId: typeof assertion.recordingId === "string" ? assertion.recordingId : null,
+    }];
+  });
+}
+
+function normalizeCorpusSnapshots(payload: unknown): CorpusSnapshot[] {
+  return arrayFrom<unknown>(payload, ["items"]).flatMap((raw) => {
+    const item = asObject(raw);
+    if (typeof item.id !== "string") return [];
+    return [{
+      id: item.id,
+      parentSnapshotId: typeof item.parentSnapshotId === "string" ? item.parentSnapshotId : null,
+      status: typeof item.status === "string" ? item.status : "unknown",
+      contentHash: typeof item.contentHash === "string" ? item.contentHash : null,
+      assertionCount: Math.max(0, Number(item.assertionCount ?? 0) || 0),
+      catalogIdentityCount: Math.max(0, Number(item.catalogIdentityCount ?? 0) || 0),
+      lockedAt: typeof item.lockedAt === "string" ? item.lockedAt : null,
+    }];
+  });
+}
+
 function feedbackTimestamp(value: string): string {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return "UNKNOWN TIME";
@@ -318,6 +438,15 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
   const [feedbackTotal, setFeedbackTotal] = useState(0);
   const [feedbackCounts, setFeedbackCounts] = useState<FeedbackCounts>({ new: 0, reviewed: 0, resolved: 0 });
   const [feedbackCopyStatus, setFeedbackCopyStatus] = useState("");
+  const [corpusSources, setCorpusSources] = useState<CorpusSource[]>([]);
+  const [corpusSourcesTotal, setCorpusSourcesTotal] = useState(0);
+  const [corpusReview, setCorpusReview] = useState<CorpusObservation[]>([]);
+  const [corpusReviewTotal, setCorpusReviewTotal] = useState(0);
+  const [corpusAssertions, setCorpusAssertions] = useState<CorpusAssertion[]>([]);
+  const [corpusAssertionsTotal, setCorpusAssertionsTotal] = useState(0);
+  const [corpusSnapshots, setCorpusSnapshots] = useState<CorpusSnapshot[]>([]);
+  const [corpusSnapshotsTotal, setCorpusSnapshotsTotal] = useState(0);
+  const [selectedObservationIds, setSelectedObservationIds] = useState<string[]>([]);
   const [importRunId, setImportRunId] = useState("");
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importStatus, setImportStatus] = useState("");
@@ -338,12 +467,26 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
 
   const refresh = useCallback(async () => {
     setBusy((current) => current || "refresh");
-    const [healthResult, budgetResult, orphanResult, runResult, feedbackResult] = await Promise.allSettled([
+    const [
+      healthResult,
+      budgetResult,
+      orphanResult,
+      runResult,
+      feedbackResult,
+      corpusSourcesResult,
+      corpusReviewResult,
+      corpusAssertionsResult,
+      corpusSnapshotsResult,
+    ] = await Promise.allSettled([
       ownerApi<OwnerHealth>("/api/v1/owner/status"),
       ownerApi<unknown>("/api/v1/owner/budgets"),
       ownerApi<unknown>("/api/v1/owner/publications/orphans"),
       ownerApi<unknown>("/api/v1/owner/runs?limit=50"),
       ownerApi<unknown>("/api/v1/owner/feedback?limit=50&offset=0"),
+      ownerApi<unknown>("/api/v1/owner/corpus/sources?limit=25&offset=0"),
+      ownerApi<unknown>("/api/v1/owner/corpus/review?limit=25&offset=0"),
+      ownerApi<unknown>("/api/v1/owner/corpus/assertions?limit=25&offset=0"),
+      ownerApi<unknown>("/api/v1/owner/corpus/snapshots?limit=25&offset=0"),
     ]);
 
     if (healthResult.status === "fulfilled") {
@@ -370,13 +513,31 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     if (runResult.status === "fulfilled") {
       const runs = normalizeRecentRuns(runResult.value);
       setRecentRuns(runs);
-      setImportRunId((current) => current || runs.find((run) => ["queued", "awaiting_budget", "researching", "ready_for_matching"].includes(run.status))?.id || "");
+      setImportRunId((current) => current || runs.find((run) => ["queued", "awaiting_budget", "waiting_for_corpus_review", "researching", "ready_for_matching"].includes(run.status))?.id || "");
     }
     if (feedbackResult.status === "fulfilled") {
       setFeedback(normalizeFeedback(feedbackResult.value));
       const metadata = normalizeFeedbackMetadata(feedbackResult.value);
       setFeedbackTotal(metadata.total);
       setFeedbackCounts(metadata.counts);
+    }
+    if (corpusSourcesResult.status === "fulfilled") {
+      setCorpusSources(normalizeCorpusSources(corpusSourcesResult.value));
+      setCorpusSourcesTotal(corpusTotal(corpusSourcesResult.value));
+    }
+    if (corpusReviewResult.status === "fulfilled") {
+      const review = normalizeCorpusObservations(corpusReviewResult.value);
+      setCorpusReview(review);
+      setCorpusReviewTotal(corpusTotal(corpusReviewResult.value));
+      setSelectedObservationIds((current) => current.filter((id) => review.some((item) => item.id === id)));
+    }
+    if (corpusAssertionsResult.status === "fulfilled") {
+      setCorpusAssertions(normalizeCorpusAssertions(corpusAssertionsResult.value));
+      setCorpusAssertionsTotal(corpusTotal(corpusAssertionsResult.value));
+    }
+    if (corpusSnapshotsResult.status === "fulfilled") {
+      setCorpusSnapshots(normalizeCorpusSnapshots(corpusSnapshotsResult.value));
+      setCorpusSnapshotsTotal(corpusTotal(corpusSnapshotsResult.value));
     }
     setBusy("");
   }, []);
@@ -655,6 +816,204 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
     }
   }
 
+  async function approveCorpusSource(source: CorpusSource) {
+    const authority = window.prompt(
+      "Evidence authority (primary_track_credit, official_track_credit, specialist_track_credit, trusted_editorial_container, secondary_database, or catalog_metadata)",
+      source.authority === "unknown" ? "secondary_database" : source.authority,
+    )?.trim();
+    if (!authority) return;
+    const licenseState = window.prompt(
+      "License state (reusable or permission_recorded)",
+      source.licenseState === "unknown" ? "permission_recorded" : source.licenseState,
+    )?.trim();
+    if (!licenseState) return;
+    const licenseVersion = window.prompt("License or permission version", "owner-review-v1")?.trim();
+    if (!licenseVersion) return;
+    const sourceRevision = window.prompt("Source revision reviewed", "current")?.trim();
+    if (!sourceRevision) return;
+    setBusy("corpus-source-" + source.id);
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/sources/" + encodeURIComponent(source.id) + "/approve", {
+        method: "POST",
+        body: JSON.stringify({ authority, licenseState, licenseVersion, sourceRevision }),
+      });
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function takeDownCorpusSource(source: CorpusSource) {
+    const reason = window.prompt(`Why should “${source.title}” be taken down?`)?.trim();
+    if (!reason) return;
+    if (!window.confirm("This will retract assertions that no longer have independent support. Continue?")) return;
+    setBusy("corpus-source-" + source.id);
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/sources/" + encodeURIComponent(source.id) + "/takedown", {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      });
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function toggleCorpusObservation(id: string) {
+    setSelectedObservationIds((current) => current.includes(id)
+      ? current.filter((candidate) => candidate !== id)
+      : [...current, id]);
+  }
+
+  async function promoteSelectedObservations() {
+    if (selectedObservationIds.length === 0) return;
+    setBusy("corpus-promote");
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/observations/promote", {
+        method: "POST",
+        body: JSON.stringify({ observationIds: selectedObservationIds }),
+      });
+      setSelectedObservationIds([]);
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function rejectCorpusObservation(observation: CorpusObservation) {
+    const reason = window.prompt("Why should this observation be rejected?")?.trim();
+    if (!reason) return;
+    setBusy("corpus-observation-" + observation.id);
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/observations/" + encodeURIComponent(observation.id) + "/reject", {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      });
+      setSelectedObservationIds((current) => current.filter((id) => id !== observation.id));
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function disputeCorpusAssertion(assertion: CorpusAssertion) {
+    const observationId = window.prompt("Quarantined negative observation ID supporting this dispute")?.trim();
+    if (!observationId) return;
+    setBusy("corpus-assertion-" + assertion.id);
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/assertions/" + encodeURIComponent(assertion.id) + "/dispute", {
+        method: "POST",
+        body: JSON.stringify({ observationId }),
+      });
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function retractCorpusAssertion(assertion: CorpusAssertion) {
+    const reason = window.prompt("Why should this assertion be retracted?")?.trim();
+    if (!reason) return;
+    setBusy("corpus-assertion-" + assertion.id);
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/assertions/" + encodeURIComponent(assertion.id) + "/retract", {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      });
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function lockCorpusSnapshot() {
+    const parentSnapshotId = corpusSnapshots.find((snapshot) => snapshot.status === "locked")?.id ?? null;
+    setBusy("corpus-snapshot");
+    setError("");
+    try {
+      await ownerApi("/api/v1/owner/corpus/snapshots", {
+        method: "POST",
+        body: JSON.stringify({ parentSnapshotId }),
+      });
+      await refresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadOlderCorpus(kind: "sources" | "review" | "assertions" | "snapshots") {
+    const currentLength = kind === "sources"
+      ? corpusSources.length
+      : kind === "review"
+        ? corpusReview.length
+        : kind === "assertions"
+          ? corpusAssertions.length
+          : corpusSnapshots.length;
+    setBusy("corpus-more-" + kind);
+    setError("");
+    try {
+      const payload = await ownerApi<unknown>(`/api/v1/owner/corpus/${kind}?limit=25&offset=${currentLength}`);
+      if (kind === "sources") {
+        const rows = normalizeCorpusSources(payload);
+        setCorpusSources((current) => [...current, ...rows.filter((row) => !current.some(({ id }) => id === row.id))]);
+        setCorpusSourcesTotal(corpusTotal(payload));
+      } else if (kind === "review") {
+        const rows = normalizeCorpusObservations(payload);
+        setCorpusReview((current) => [...current, ...rows.filter((row) => !current.some(({ id }) => id === row.id))]);
+        setCorpusReviewTotal(corpusTotal(payload));
+      } else if (kind === "assertions") {
+        const rows = normalizeCorpusAssertions(payload);
+        setCorpusAssertions((current) => [...current, ...rows.filter((row) => !current.some(({ id }) => id === row.id))]);
+        setCorpusAssertionsTotal(corpusTotal(payload));
+      } else {
+        const rows = normalizeCorpusSnapshots(payload);
+        setCorpusSnapshots((current) => [...current, ...rows.filter((row) => !current.some(({ id }) => id === row.id))]);
+        setCorpusSnapshotsTotal(corpusTotal(payload));
+      }
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function hideAllExplorePlaylists() {
+    if (!window.confirm("Hide every currently listed playlist from Explore? Apple share links will continue to work.")) return;
+    setBusy("bulk-hide");
+    setError("");
+    try {
+      const result = await ownerApi<{ hidden: number }>("/api/v1/owner/playlists/bulk-hide", {
+        method: "POST",
+        body: JSON.stringify({ scope: "all_listed" }),
+      });
+      window.alert(`${result.hidden} Explore entries hidden.`);
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function importCatalogue() {
     if (!importRunId || !importFile) return;
     if (!health?.paused) {
@@ -751,6 +1110,11 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
             <strong>{feedbackCounts.new + feedbackCounts.reviewed}</strong>
             <small>{feedbackCounts.new} new</small>
           </article>
+          <article className="operator-card">
+            <span>CORPUS REVIEW</span>
+            <strong>{corpusReviewTotal}</strong>
+            <small>{corpusAssertionsTotal} governed assertions</small>
+          </article>
         </div>
 
         <div className="operator-actions">
@@ -780,6 +1144,9 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
           {health?.apple?.authorized && <button onClick={() => void revokeApple()} disabled={Boolean(busy)}>REVOKE APPLE</button>}
           <button className="danger-control" onClick={() => void setPaused(!health?.paused)} disabled={Boolean(busy)}>
             {health?.paused ? "RESUME APPLICATION" : "EMERGENCY PAUSE"}
+          </button>
+          <button className="danger-control" onClick={() => void hideAllExplorePlaylists()} disabled={Boolean(busy)}>
+            HIDE ALL EXPLORE ENTRIES
           </button>
         </div>
         <p className="operator-note" role="status">
@@ -823,6 +1190,125 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
           ))}
         </section>
 
+        <section className="operator-section operator-corpus" aria-labelledby="corpus-title">
+          <div className="operator-section-title">
+            <h2 id="corpus-title">V3 EVIDENCE CORPUS</h2>
+            <span>[{corpusReviewTotal} TO REVIEW]</span>
+          </div>
+          <div className="operator-corpus-summary" aria-label="Evidence corpus totals">
+            <span><strong>{corpusSourcesTotal}</strong> SOURCES</span>
+            <span><strong>{corpusReviewTotal}</strong> QUARANTINED</span>
+            <span><strong>{corpusAssertionsTotal}</strong> ASSERTIONS</span>
+            <span><strong>{corpusSnapshotsTotal}</strong> SNAPSHOTS</span>
+          </div>
+
+          <details className="operator-corpus-group" open>
+            <summary>REVIEW QUEUE <span>[{corpusReview.length}/{corpusReviewTotal}]</span></summary>
+            <div className="operator-corpus-toolbar">
+              <button
+                type="button"
+                onClick={() => void promoteSelectedObservations()}
+                disabled={Boolean(busy) || selectedObservationIds.length === 0}
+              >
+                PROMOTE SELECTED [{selectedObservationIds.length}]
+              </button>
+              {corpusReview.length < corpusReviewTotal && (
+                <button type="button" onClick={() => void loadOlderCorpus("review")} disabled={Boolean(busy)}>LOAD OLDER</button>
+              )}
+            </div>
+            {corpusReview.length === 0 && <div className="operator-empty">NO QUARANTINED OBSERVATIONS.</div>}
+            {corpusReview.map((observation) => (
+              <article className="operator-corpus-row operator-corpus-observation" key={observation.id}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={selectedObservationIds.includes(observation.id)}
+                    onChange={() => toggleCorpusObservation(observation.id)}
+                  />
+                  <span>{observation.predicate.replaceAll("_", " ").toUpperCase()}</span>
+                </label>
+                <p>{observation.supportExcerpt}</p>
+                <small>
+                  {Math.round(observation.confidence * 100)}% CONFIDENCE · {observation.source.provenanceRoot}
+                  {observation.recordingId ? ` · RECORDING ${observation.recordingId}` : ""}
+                </small>
+                <div>
+                  {observation.source.url && <a href={observation.source.url} target="_blank" rel="noreferrer">SOURCE ↗</a>}
+                  <button className="danger-control" type="button" disabled={Boolean(busy)} onClick={() => void rejectCorpusObservation(observation)}>REJECT</button>
+                </div>
+              </article>
+            ))}
+          </details>
+
+          <details className="operator-corpus-group">
+            <summary>SOURCE POLICY <span>[{corpusSources.length}/{corpusSourcesTotal}]</span></summary>
+            {corpusSources.length === 0 && <div className="operator-empty">NO CORPUS SOURCES.</div>}
+            {corpusSources.map((source) => (
+              <article className="operator-corpus-row" key={source.id}>
+                <div>
+                  <strong>{source.title}</strong>
+                  <small>{source.sourceClass} · {source.provenanceRoot}</small>
+                </div>
+                <span>{source.status.toUpperCase()} · {source.approvalState.toUpperCase()}</span>
+                <small>{source.authority} · {source.licenseState}</small>
+                <div>
+                  {source.url && <a href={source.url} target="_blank" rel="noreferrer">OPEN ↗</a>}
+                  {source.status !== "takedown" && <button type="button" disabled={Boolean(busy)} onClick={() => void approveCorpusSource(source)}>APPROVE POLICY</button>}
+                  {source.status !== "takedown" && <button className="danger-control" type="button" disabled={Boolean(busy)} onClick={() => void takeDownCorpusSource(source)}>TAKEDOWN</button>}
+                </div>
+              </article>
+            ))}
+            {corpusSources.length < corpusSourcesTotal && (
+              <div className="operator-corpus-toolbar"><button type="button" onClick={() => void loadOlderCorpus("sources")} disabled={Boolean(busy)}>LOAD OLDER SOURCES</button></div>
+            )}
+          </details>
+
+          <details className="operator-corpus-group">
+            <summary>PROMOTED ASSERTIONS <span>[{corpusAssertions.length}/{corpusAssertionsTotal}]</span></summary>
+            {corpusAssertions.length === 0 && <div className="operator-empty">NO PROMOTED ASSERTIONS.</div>}
+            {corpusAssertions.map((assertion) => (
+              <article className="operator-corpus-row" key={assertion.id}>
+                <div>
+                  <strong>{assertion.predicate.replaceAll("_", " ").toUpperCase()}</strong>
+                  <small>{assertion.recordingId ? `RECORDING ${assertion.recordingId}` : assertion.id}</small>
+                </div>
+                <span>{assertion.status.toUpperCase()} · {assertion.evidenceTier.toUpperCase()}</span>
+                <small>{assertion.evidenceCount} EVIDENCE OBSERVATION{assertion.evidenceCount === 1 ? "" : "S"}</small>
+                {assertion.status !== "retracted" && (
+                  <div>
+                    {assertion.status === "active" && <button type="button" disabled={Boolean(busy)} onClick={() => void disputeCorpusAssertion(assertion)}>DISPUTE</button>}
+                    <button className="danger-control" type="button" disabled={Boolean(busy)} onClick={() => void retractCorpusAssertion(assertion)}>RETRACT</button>
+                  </div>
+                )}
+              </article>
+            ))}
+            {corpusAssertions.length < corpusAssertionsTotal && (
+              <div className="operator-corpus-toolbar"><button type="button" onClick={() => void loadOlderCorpus("assertions")} disabled={Boolean(busy)}>LOAD OLDER ASSERTIONS</button></div>
+            )}
+          </details>
+
+          <details className="operator-corpus-group">
+            <summary>IMMUTABLE GRAPH SNAPSHOTS <span>[{corpusSnapshots.length}/{corpusSnapshotsTotal}]</span></summary>
+            <div className="operator-corpus-toolbar">
+              <button type="button" onClick={() => void lockCorpusSnapshot()} disabled={Boolean(busy)}>LOCK CURRENT GRAPH SNAPSHOT</button>
+              {corpusSnapshots.length < corpusSnapshotsTotal && (
+                <button type="button" onClick={() => void loadOlderCorpus("snapshots")} disabled={Boolean(busy)}>LOAD OLDER</button>
+              )}
+            </div>
+            {corpusSnapshots.length === 0 && <div className="operator-empty">NO GRAPH SNAPSHOTS.</div>}
+            {corpusSnapshots.map((snapshot) => (
+              <article className="operator-corpus-row" key={snapshot.id}>
+                <div>
+                  <strong>{snapshot.id}</strong>
+                  <small>{snapshot.contentHash ? `HASH ${snapshot.contentHash}` : "HASH PENDING"}</small>
+                </div>
+                <span>{snapshot.status.toUpperCase()}</span>
+                <small>{snapshot.assertionCount} ASSERTIONS · {snapshot.catalogIdentityCount} APPLE IDENTITIES</small>
+              </article>
+            ))}
+          </details>
+        </section>
+
         <section className="operator-section" aria-labelledby="budgets-title">
           <div className="operator-section-title"><h2 id="budgets-title">AWAITING BUDGET</h2><span>[{budgets.length}]</span></div>
           {budgets.length === 0 && <div className="operator-empty">NO RUNS ARE WAITING.</div>}
@@ -858,7 +1344,7 @@ export function OwnerConsole({ email, signOutPath }: { email: string; signOutPat
           <div className="operator-import">
             <select value={importRunId} onChange={(event) => setImportRunId(event.target.value)} aria-label="Run for catalogue import">
               <option value="">SELECT A PRE-MATCHING RUN</option>
-              {recentRuns.filter((run) => ["queued", "awaiting_budget", "researching", "ready_for_matching"].includes(run.status)).map((run) => (
+              {recentRuns.filter((run) => ["queued", "awaiting_budget", "waiting_for_corpus_review", "researching", "ready_for_matching"].includes(run.status)).map((run) => (
                 <option key={run.id} value={run.id}>{run.title} / {run.status}</option>
               ))}
             </select>

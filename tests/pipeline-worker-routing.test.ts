@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { PlaylistBrief } from "../shared/types.ts";
+import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 import {
   persistedWorkerPipeline,
   WorkerPipelineIntegrityError,
@@ -31,6 +31,36 @@ function planFor(brief = curatedBrief()) {
     brief,
     storefront: "us",
   });
+}
+
+function queryPlanV3(): QueryPlanV3 {
+  return {
+    schemaVersion: 1,
+    pipelineVersion: "corpus_first_v3",
+    policyVersion: "corpus_first_v3_policy_v1",
+    engine: "curated_genre_scene",
+    engines: ["curated_genre_scene"],
+    graphSnapshotId: "snapshot-1",
+    selectionPlanHash: "a".repeat(64),
+    membershipPredicates: [{
+      id: "genre-house",
+      kind: "genre",
+      subject: "recording",
+      relationship: "classified_as_house_music",
+      hard: true,
+    }],
+    rankingObjectives: [{
+      id: "influence",
+      kind: "editorial_rank",
+      description: "Prefer historically consequential recordings.",
+      weight: 1,
+    }],
+    targetTrackCount: 25,
+    storefront: "us",
+    hardConstraints: [],
+    softPreferences: [],
+    sourceDiscoveryHints: [],
+  };
 }
 
 function enqueueHarness(run: Record<string, unknown>) {
@@ -158,6 +188,39 @@ describe("persisted worker pipeline routing", () => {
       pipelineVersion: "catalog_first_v2",
       selectionPlan,
     });
+  });
+
+  test("routes only a persisted, version-matched V3 query plan to the V3 worker", () => {
+    const queryPlan = queryPlanV3();
+    expect(persistedWorkerPipeline({
+      pipelineVersion: "corpus_first_v3",
+      policyVersion: "corpus_first_v3_policy_v1",
+      queryPlan,
+    })).toEqual({
+      route: "corpus_first_v3",
+      pipelineVersion: "corpus_first_v3",
+      policyVersion: "corpus_first_v3_policy_v1",
+      selectionPlan: null,
+      queryPlan,
+    });
+  });
+
+  test("rejects V3 rows without the immutable V3 query plan", () => {
+    expect(() => persistedWorkerPipeline({
+      pipelineVersion: "corpus_first_v3",
+      policyVersion: "corpus_first_v3_policy_v1",
+      queryPlan: null,
+    })).toThrowError(expect.objectContaining<Partial<WorkerPipelineIntegrityError>>({
+      code: "missing_v3_query_plan",
+    }));
+
+    expect(() => persistedWorkerPipeline({
+      pipelineVersion: "corpus_first_v3",
+      policyVersion: "relevance_first_2026_07_r2",
+      queryPlan: queryPlanV3(),
+    })).toThrowError(expect.objectContaining<Partial<WorkerPipelineIntegrityError>>({
+      code: "v3_policy_version_mismatch",
+    }));
   });
 
   test("enqueues factual V2 as durable deep research and never as fast curated work", async () => {

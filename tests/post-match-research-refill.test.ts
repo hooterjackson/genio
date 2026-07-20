@@ -651,7 +651,7 @@ describe("matching after a research refill", () => {
     });
   });
 
-  test("generation three publishes an unresolved shortfall as partial without queuing a fourth refill", async () => {
+  test("generation three requires partial consent without queuing a fourth refill", async () => {
     const candidates = Array.from({ length: 50 }, (_, index) => candidate(`candidate-${index + 1}`));
     const matches: CatalogMatchResult[] = candidates.map((item, index) => index < 49
       ? {
@@ -688,11 +688,11 @@ describe("matching after a research refill", () => {
 
     expect(repository.automaticCandidateRefills).toEqual([]);
     expect(repository.updates.at(-1)).toMatchObject({
-      status: "visitor_review",
-      phase: "exception_review",
+      status: "partial_ready",
+      phase: "partial_confirmation_required",
       error: null,
     });
-    expect(repository.automaticPublications).toEqual(["rio-terminal-shortfall"]);
+    expect(repository.automaticPublications).toEqual([]);
   });
 
   test("refill generation survives exhausted catalog recovery and queues generation two instead of stranding matching", async () => {

@@ -21,7 +21,7 @@ const navigationBrief: PlaylistBrief = {
   versionPolicy: "one canonical version per track",
   evidencePolicy: "editorial evidence",
   orderingPolicy: "editorial flow",
-  targetSize: { min: 25, max: 25 },
+  targetSize: { min: 50, max: 50 },
   ambiguities: [],
 };
 

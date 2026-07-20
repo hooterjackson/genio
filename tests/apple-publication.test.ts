@@ -30,7 +30,9 @@ import {
 } from "../server/apple-smoke.ts";
 import {
   appendExactVolume,
+  assertManifestPublicationAuthorized,
   manifestContentHash,
+  PartialPublicationDecisionRequiredError,
   planPublicationVolumes,
   publicationPartialOutcomeStatus,
   publishManifest,
@@ -542,6 +544,10 @@ function methodProxy(): any {
 
 function publicationRepository(): PublicationRepository & Record<string, ReturnType<typeof vi.fn>> {
   const repository = methodProxy();
+  // The default harness represents a schema-13 repository. Individual V3
+  // cases opt into the schema-14 publication guard explicitly.
+  repository.getPublicationGuard = undefined;
+  repository.acquireAppleWritePermit.mockImplementation(async () => ({ release: vi.fn(async () => undefined) }));
   repository.getSetting.mockResolvedValue("false");
   repository.getAppleAuthorization.mockResolvedValue(validAuthorization);
   repository.getRunControlState.mockResolvedValue({ status: "publishing", phase: "apple_publication" });
@@ -626,6 +632,9 @@ function durablePublicationHarness(input: {
     : null;
   const volumes: any[] = [];
   const repository = methodProxy();
+  // The default harness represents a schema-13 repository. Individual V3
+  // cases opt into the schema-14 publication guard explicitly.
+  repository.getPublicationGuard = undefined;
   repository.getManifestById.mockImplementation(async (manifestId: string) => (
     activeManifest?.id === manifestId ? activeManifest : null
   ));
@@ -726,6 +735,13 @@ function durablePublicationHarness(input: {
 
 test("publisher recovers an uncertain playlist creation by its private marker", async () => {
   const repository = publicationRepository();
+  const acquireAppleWritePermit = repository.acquireAppleWritePermit as ReturnType<typeof vi.fn>;
+  const releases: Array<ReturnType<typeof vi.fn>> = [];
+  acquireAppleWritePermit.mockImplementation(async () => {
+    const release = vi.fn(async () => undefined);
+    releases.push(release);
+    return { release };
+  });
   let currentMarkerLookups = 0;
   let state: string[] = [];
   const client: PublicationAppleClient = {
@@ -750,6 +766,64 @@ test("publisher recovers an uncertain playlist creation by its private marker", 
     "gênio publication volume-id:0",
     undefined,
   );
+  expect(acquireAppleWritePermit.mock.calls.map((call) => (call[0] as { operation: string }).operation))
+    .toEqual(["create_playlist", "append_tracks"]);
+  expect(releases).toHaveLength(2);
+  expect(releases.every((release) => release.mock.calls.length === 1)).toBe(true);
+});
+
+test("every retried append consumes a fresh permit and always releases the global write fence", async () => {
+  const repository = publicationRepository();
+  const acquireAppleWritePermit = repository.acquireAppleWritePermit as ReturnType<typeof vi.fn>;
+  const releases: Array<ReturnType<typeof vi.fn>> = [];
+  acquireAppleWritePermit.mockImplementation(async () => {
+    const release = vi.fn(async () => undefined);
+    releases.push(release);
+    return { release };
+  });
+  let appendAttempts = 0;
+  let state: string[] = [];
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.unused", url: null })),
+    appendCatalogTracks: vi.fn(async (_playlistId, ids) => {
+      appendAttempts += 1;
+      if (appendAttempts === 1) throw new AppleApiError("transient", 503, true, false);
+      state = [...state, ...ids];
+    }),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => [...state]),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/gated/pl.gated"),
+  };
+  const existing = { ...pendingVolume(), playlistId: "p.gated", status: "appending" as const };
+
+  await expect(appendExactVolume(repository, client, manifest, existing, ["101"], validAuthorization))
+    .resolves.toMatchObject({ playlistId: "p.gated", appendedCount: 1, status: "complete" });
+
+  expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
+  expect(client.appendCatalogTracks).toHaveBeenCalledTimes(2);
+  expect(acquireAppleWritePermit).toHaveBeenCalledTimes(2);
+  expect(acquireAppleWritePermit.mock.calls.every(
+    (call) => (call[0] as { operation: string }).operation === "append_tracks",
+  )).toBe(true);
+  expect(releases.every((release) => release.mock.calls.length === 1)).toBe(true);
+});
+
+test("V3 fails closed before an Apple mutation when the global write gateway is unavailable", async () => {
+  const repository = publicationRepository();
+  repository.acquireAppleWritePermit = undefined;
+  const v3 = { ...manifest, pipelineVersion: "corpus_first_v3" as const };
+  const client: PublicationAppleClient = {
+    findLibraryPlaylistByMarker: vi.fn(async () => null),
+    createLibraryPlaylist: vi.fn(async () => ({ id: "p.unsafe", url: null })),
+    appendCatalogTracks: vi.fn(async () => undefined),
+    getOrderedPlaylistCatalogIds: vi.fn(async () => []),
+    pollStableShareUrl: vi.fn(async () => "https://music.apple.com/us/playlist/unsafe/pl.unsafe"),
+  };
+
+  await expect(appendExactVolume(repository, client, v3, pendingVolume(), ["101"], validAuthorization))
+    .rejects.toThrow(/V3 Apple write gateway is unavailable/u);
+  expect(client.createLibraryPlaylist).not.toHaveBeenCalled();
+  expect(client.appendCatalogTracks).not.toHaveBeenCalled();
 });
 
 test("publisher recovers a playlist created under the previous 9ênio marker", async () => {
@@ -1282,6 +1356,121 @@ test("a safe non-empty manifest publishes as partial instead of failing on a cou
       publishedTrackCount: 1,
     }),
   );
+});
+
+function v3Manifest(trackCount: number, targetCount: number, id: string): LockedManifest {
+  return {
+    ...lockedManifest(trackCount, id),
+    pipelineVersion: "corpus_first_v3",
+    policyVersion: "corpus_first_v3_policy_v1",
+    revisionId: `${id}-revision-1`,
+    revision: 1,
+    selectionPlan: { requestedTrackCount: targetCount } as LockedManifest["selectionPlan"],
+  };
+}
+
+function acceptedGuard(manifest: LockedManifest, targetCount: number) {
+  const outcomeHash = "a".repeat(64);
+  return {
+    requestedTrackCount: targetCount,
+    enforcement: "required" as const,
+    currentOutcomeHash: outcomeHash,
+    decision: {
+      decision: "accepted" as const,
+      manifestRevisionId: manifest.revisionId!,
+      manifestRevisionHash: manifest.contentHash,
+      targetCount,
+      selectedCount: manifest.tracks.length,
+      outcomeHash,
+      expiresAt: new Date(Date.now() + 60_000),
+    },
+  };
+}
+
+test("V3 exact manifests require the schema-14 guard but do not require partial consent", async () => {
+  const productionManifest = v3Manifest(2, 2, "manifest-v3-exact");
+  const getPublicationGuard = vi.fn(async () => ({
+    requestedTrackCount: 2,
+    enforcement: "required" as const,
+    currentOutcomeHash: null,
+    decision: null,
+  }));
+  await expect(assertManifestPublicationAuthorized(
+    { getPublicationGuard } as unknown as PublicationRepository,
+    productionManifest,
+  )).resolves.toBeUndefined();
+  expect(getPublicationGuard).toHaveBeenCalledWith({
+    runId: productionManifest.runId,
+    manifestId: productionManifest.id,
+    manifestRevisionId: productionManifest.revisionId,
+    manifestRevisionHash: productionManifest.contentHash,
+    selectedCount: 2,
+  });
+});
+
+test("V3 short manifests require unexpired consent bound to the exact revision, hash, outcome, and counts", async () => {
+  const productionManifest = v3Manifest(1, 2, "manifest-v3-consented-partial");
+  const valid = acceptedGuard(productionManifest, 2);
+  await expect(assertManifestPublicationAuthorized(
+    { getPublicationGuard: vi.fn(async () => valid) } as unknown as PublicationRepository,
+    productionManifest,
+  )).resolves.toBeUndefined();
+
+  const invalidGuards = [
+    { ...valid, decision: null },
+    { ...valid, decision: { ...valid.decision, manifestRevisionId: "another-revision" } },
+    { ...valid, decision: { ...valid.decision, manifestRevisionHash: "b".repeat(64) } },
+    { ...valid, decision: { ...valid.decision, selectedCount: 0 } },
+    { ...valid, currentOutcomeHash: "c".repeat(64) },
+    { ...valid, decision: { ...valid.decision, expiresAt: new Date(Date.now() - 1) } },
+  ];
+  for (const guard of invalidGuards) {
+    await expect(assertManifestPublicationAuthorized(
+      { getPublicationGuard: vi.fn(async () => guard) } as unknown as PublicationRepository,
+      productionManifest,
+    )).rejects.toBeInstanceOf(PartialPublicationDecisionRequiredError);
+  }
+});
+
+test("V3 rejects an unconsented short manifest before any Apple request or playlist write", async () => {
+  const productionManifest = v3Manifest(1, 25, "manifest-v3-unconsented-partial");
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  harness.repository.getPublicationGuard = vi.fn(async () => ({
+    requestedTrackCount: 25,
+    enforcement: "required" as const,
+    currentOutcomeHash: "d".repeat(64),
+    decision: null,
+  }));
+  const fetchMock = vi.fn(async () => {
+    throw new Error("The V3 partial guard must run before Apple");
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id))
+    .rejects.toBeInstanceOf(PartialPublicationDecisionRequiredError);
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
+});
+
+test("a zero-track manifest completes without any Apple request or playlist write", async () => {
+  const productionManifest = v3Manifest(0, 25, "manifest-v3-zero");
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  harness.repository.getPublicationGuard = vi.fn(async () => {
+    throw new Error("A zero-track manifest must not reach the publication guard");
+  });
+  const fetchMock = vi.fn(async () => {
+    throw new Error("A zero-track manifest must not call Apple");
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(harness.repository, productionManifest.id)).resolves.toEqual({
+    status: "no_compatible_tracks",
+    manifestId: productionManifest.id,
+    volumes: [],
+  });
+  expect(harness.run).toMatchObject({ status: "no_compatible_tracks", phase: "no_compatible_tracks", error: null });
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
 });
 
 test("publication partial outcomes preserve known causes and let catalog preflight take precedence", () => {
@@ -1972,20 +2161,13 @@ test("the publisher stops after the bounded divergent-playlist replacement ceili
   expect(client.pollStableShareUrl).not.toHaveBeenCalled();
 });
 
-test("publishManifest rejects missing, mutable, corrupt, empty, and catalog-incomplete manifests before Apple access", async () => {
+test("publishManifest rejects missing, mutable, corrupt, and catalog-incomplete manifests before Apple access", async () => {
   const base = lockedManifest(1, "manifest-validation");
-  const emptyTracks: LockedManifest = {
-    ...base,
-    id: "manifest-empty",
-    tracks: [],
-    contentHash: manifestContentHash([]),
-  };
   const missingCatalogTracks = [{ ...base.tracks[0]!, catalogId: "" }];
   const cases: Array<{ manifest: LockedManifest | null; id: string; message: RegExp }> = [
     { manifest: null, id: "manifest-missing", message: /was not found/ },
     { manifest: { ...base, lockedAt: "" }, id: base.id, message: /immutable locked manifest/ },
     { manifest: { ...base, contentHash: "0".repeat(64) }, id: base.id, message: /content hash/ },
-    { manifest: emptyTracks, id: emptyTracks.id, message: /zero-track manifest/ },
     {
       manifest: { ...base, id: "manifest-missing-catalog", tracks: missingCatalogTracks, contentHash: manifestContentHash(missingCatalogTracks) },
       id: "manifest-missing-catalog",

@@ -1,6 +1,6 @@
 {
   "name": "needle-playlist-builder",
-  "version": "1.2.15",
+  "version": "2.0.0",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "engines": {
@@ -19,12 +19,13 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:database:preflight": "node scripts/qa-database-preflight.mjs",
-    "test:database": "vitest run tests/backend.integration.test.ts tests/apple-phase-zero.integration.test.ts tests/pipeline-v2-migration.integration.test.ts",
+    "test:database": "vitest run tests/backend.integration.test.ts tests/apple-phase-zero.integration.test.ts tests/pipeline-v2-migration.integration.test.ts tests/pipeline-v3-foundation-migration.integration.test.ts tests/pipeline-v3-run-activation.integration.test.ts tests/pipeline-v3-manifest-persistence.integration.test.ts tests/pipeline-v3-governed-graph-adapter.integration.test.ts tests/pipeline-v3-corpus-resume.integration.test.ts tests/job-queue-class.integration.test.ts tests/apple-write-gateway.integration.test.ts",
     "test:watch": "vitest",
     "test:e2e": "node scripts/qa-playwright.mjs",
     "test:release": "pnpm run lint && pnpm run build && pnpm run test:coverage && pnpm run qa:scenarios:check && pnpm run test:e2e",
     "benchmark": "node --experimental-transform-types scripts/evaluate-benchmarks.ts",
     "benchmark:v2": "node --experimental-transform-types scripts/evaluate-pipeline-v2-release.ts",
+    "benchmark:v3": "node --experimental-transform-types scripts/evaluate-pipeline-v3-benchmark.ts tests/fixtures/pipeline-v3-model-benchmark.json",
     "qa:shadow:v2": "node --experimental-transform-types scripts/evaluate-pipeline-v2-shadow.ts",
     "benchmark:export": "node --experimental-transform-types scripts/export-benchmarks.ts",
     "qa:scenarios:export": "node --experimental-transform-types scripts/export-run-scenarios.ts",

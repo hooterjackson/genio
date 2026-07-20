@@ -166,4 +166,103 @@ describe("public API projections", () => {
     });
     expect(keys.filter((key) => /cost|budget|estimate/iu.test(key))).toEqual([]);
   });
+
+  test("partial-publication and Explore actions expose only capability-safe fields", () => {
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Brazilian disco",
+      brief,
+      status: "partial_ready",
+      phase: "partial_ready",
+      autoPublish: false,
+      error: null,
+      candidateCount: 43,
+      sourceCount: 7,
+      unresolvedCount: 2,
+      frontier: [],
+      partialAction: {
+        kind: "partial_publication",
+        targetTrackCount: 50,
+        qualifiedTrackCount: 43,
+        remainingStrategyCount: 1,
+        canContinueResearch: true,
+        reasonCode: "evidence_shortfall",
+        outcomeVersion: 2,
+        outcomeHash: "a".repeat(64),
+        manifestId: "2c812cc4-ad02-4b98-91ee-0037223f28aa",
+        manifestHash: "b".repeat(64),
+        continuationJob: { kind: "research", payload: { secret: true } },
+        capabilitySessionId: "private-session",
+        costUsd: 0.75,
+      },
+      explore: {
+        eligible: false,
+        listed: false,
+        canChange: true,
+        reason: "Owner approval is required below 90% fill",
+        ownerApproved: false,
+        publicPlaylistId: "private-public-playlist-id",
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+
+    const view = publicResearchRunView(internal, {
+      id: "public-access-id",
+      prompt: "Brazilian disco",
+    });
+
+    expect(view.partialAction).toEqual({
+      kind: "partial_publication",
+      targetTrackCount: 50,
+      qualifiedTrackCount: 43,
+      remainingStrategyCount: 1,
+      canContinueResearch: true,
+      reasonCode: "evidence_shortfall",
+      outcomeVersion: 2,
+      outcomeHash: "a".repeat(64),
+      manifestId: "2c812cc4-ad02-4b98-91ee-0037223f28aa",
+      manifestHash: "b".repeat(64),
+    });
+    expect(view.explore).toEqual({
+      eligible: false,
+      listed: false,
+      canChange: true,
+      reason: "Owner approval is required below 90% fill",
+    });
+    const keys = serializedKeys(view);
+    expect(keys).not.toContain("continuationJob");
+    expect(keys).not.toContain("capabilitySessionId");
+    expect(keys).not.toContain("ownerApproved");
+    expect(keys).not.toContain("publicPlaylistId");
+    expect(keys.filter((key) => /cost|budget|estimate/iu.test(key))).toEqual([]);
+  });
+
+  test("invalid or stale-looking action payloads are omitted instead of repaired", () => {
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Brazilian disco",
+      brief,
+      status: "partial_ready",
+      phase: "partial_ready",
+      autoPublish: false,
+      error: null,
+      candidateCount: 0,
+      sourceCount: 0,
+      unresolvedCount: 1,
+      frontier: [],
+      partialAction: {
+        kind: "partial_publication",
+        targetTrackCount: 50,
+        qualifiedTrackCount: 50,
+        remainingStrategyCount: 1,
+        canContinueResearch: true,
+        outcomeVersion: 1,
+        outcomeHash: "not-a-content-hash",
+      },
+      explore: { eligible: "yes", listed: false, canChange: true },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+
+    const view = publicResearchRunView(internal, { id: "public-access-id" });
+    expect(view.partialAction).toBeNull();
+    expect(view.explore).toBeNull();
+  });
 });

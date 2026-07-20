@@ -1,5 +1,47 @@
 type UnknownObject = Record<string, unknown>;
 
+export type PartialPublicationAction = {
+  kind?: string;
+  targetTrackCount?: number;
+  qualifiedTrackCount?: number;
+  remainingStrategyCount?: number;
+  canContinueResearch?: boolean;
+  reasonCode?: string;
+  outcomeVersion?: string | number;
+  outcomeHash?: string;
+  manifestId?: string;
+  manifestHash?: string;
+};
+
+export type PartialReadyRun = {
+  status?: string;
+  phase?: string;
+  pipelineVersion?: string;
+  error?: string | null;
+  actionRequired?: PartialPublicationAction | null;
+  partialAction?: PartialPublicationAction | null;
+  pipelineOutcome?: {
+    status?: string;
+    targetTrackCount?: number;
+    qualifiedTrackCount?: number;
+    selectedTrackCount?: number;
+    reasonCodes?: string[];
+  } | null;
+};
+
+export type PartialReadyView = {
+  targetTrackCount: number;
+  qualifiedTrackCount: number;
+  deficit: number;
+  remainingStrategyCount: number;
+  canContinueResearch: boolean;
+  outcomeVersion: string | number | null;
+  outcomeHash: string | null;
+  manifestId: string | null;
+  manifestHash: string | null;
+  reasonCode: string | null;
+};
+
 function asObject(value: unknown): UnknownObject {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as UnknownObject
@@ -53,4 +95,92 @@ export function publishedResultHeading(
 ): string {
   if (publishedTrackCount <= 0) return "No compatible tracks found";
   return publishedWithGaps ? "Playlist published with gaps" : "Playlist published";
+}
+
+function finiteCount(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.max(0, Math.floor(value));
+    }
+  }
+  return null;
+}
+
+/**
+ * Adapts both the explicit V3 action payload and the temporary phase-based
+ * compatibility shape into one frontend-only decision view. The compatibility
+ * branch is deliberately gated to Pipeline V3 so legacy visitor_review runs
+ * keep their existing behavior until the backend migration is complete.
+ */
+export function partialReadyView(run: PartialReadyRun | null | undefined): PartialReadyView | null {
+  if (!run) return null;
+  const action = run.partialAction ?? run.actionRequired;
+  const explicitAction = action?.kind === "partial_publication"
+    || action?.kind === "partial_confirmation";
+  const explicitV3Status = run.status === "partial_ready"
+    || run.status === "no_compatible_tracks";
+  const compatibleV3Phase = run.pipelineVersion === "corpus_first_v3"
+    && /(?:partial|shortfall).*(?:ready|confirmation|decision)|awaiting_partial/iu.test(run.phase ?? "");
+  if (!explicitAction && !explicitV3Status && !compatibleV3Phase) return null;
+
+  const targetTrackCount = finiteCount(
+    action?.targetTrackCount,
+    run.pipelineOutcome?.targetTrackCount,
+  );
+  const qualifiedTrackCount = finiteCount(
+    action?.qualifiedTrackCount,
+    run.pipelineOutcome?.selectedTrackCount,
+    run.pipelineOutcome?.qualifiedTrackCount,
+  );
+  if (targetTrackCount === null || qualifiedTrackCount === null || qualifiedTrackCount >= targetTrackCount) {
+    return null;
+  }
+
+  const remainingStrategyCount = finiteCount(action?.remainingStrategyCount) ?? 0;
+  return {
+    targetTrackCount,
+    qualifiedTrackCount,
+    deficit: targetTrackCount - qualifiedTrackCount,
+    remainingStrategyCount,
+    canContinueResearch: action?.canContinueResearch ?? remainingStrategyCount > 0,
+    outcomeVersion: action?.outcomeVersion ?? null,
+    outcomeHash: action?.outcomeHash ?? null,
+    manifestId: action?.manifestId ?? null,
+    manifestHash: action?.manifestHash ?? null,
+    reasonCode: action?.reasonCode
+      ?? run.pipelineOutcome?.reasonCodes?.[0]
+      ?? null,
+  };
+}
+
+export function actionRequiredJobLabel(run: PartialReadyRun | null | undefined): string | null {
+  return partialReadyView(run) ? "ACTION NEEDED" : null;
+}
+
+export function shouldPresentShortfallWithoutError(run: PartialReadyRun | null | undefined): boolean {
+  if (!run) return false;
+  if (partialReadyView(run)) return true;
+  return [
+    "partial_frontier_exhausted",
+    "partial_evidence_shortfall",
+    "partial_catalog_degraded",
+    "partial_timed_out",
+    "partial_policy_conflict",
+    "no_compatible_tracks",
+  ].includes(run.pipelineOutcome?.status ?? "");
+}
+
+export function partialDecisionHeading(qualifiedTrackCount: number): string {
+  return qualifiedTrackCount > 0
+    ? `${qualifiedTrackCount.toLocaleString()} verified ${qualifiedTrackCount === 1 ? "track is" : "tracks are"} ready`
+    : "No verified tracks are ready yet";
+}
+
+export function partialDecisionSummary(qualifiedTrackCount: number, targetTrackCount: number): string {
+  const qualified = Math.max(0, Math.floor(qualifiedTrackCount));
+  const target = Math.max(0, Math.floor(targetTrackCount));
+  if (qualified === 0) {
+    return `Research has not found a safe Apple Music match for any of the ${target.toLocaleString()} requested tracks yet.`;
+  }
+  return `You requested ${target.toLocaleString()} tracks. gênio can publish ${qualified.toLocaleString()} now without lowering the evidence or matching standard.`;
 }

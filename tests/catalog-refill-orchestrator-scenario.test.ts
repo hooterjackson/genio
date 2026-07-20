@@ -643,10 +643,10 @@ describe("catalog shortfall -> evidence refill -> exact publication scenario", (
 
     expect(repository.candidateRefillRequests.map((request) => request.currentRefillGeneration))
       .toEqual(Array.from({ length: FAST_POST_MATCH_REFILL_LIMIT }, (_, index) => index));
-    expect(repository.publicationHandoffs).toEqual([RUN_ID]);
+    expect(repository.publicationHandoffs).toEqual([]);
     expect(repository.run).toMatchObject({
-      status: "visitor_review",
-      phase: "exception_review",
+      status: "partial_ready",
+      phase: "partial_confirmation_required",
       error: null,
     });
     expect(repository.run.error).toBeNull();

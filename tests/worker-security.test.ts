@@ -25,6 +25,7 @@ import {
 } from "../server/worker-facades.ts";
 import {
   assertProductionWorkerSecrets,
+  defaultJobHandlers,
   WorkerRunner,
   type DurableJob,
 } from "../server/worker-runner.ts";
@@ -64,6 +65,9 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("reserveProviderCost" in publication).toBe(false);
   expect("addSources" in publication).toBe(false);
   expect("saveAppleAuthorization" in publication).toBe(false);
+  expect("acquireAppleWritePermit" in publication).toBe(true);
+  expect("acquireAppleWritePermit" in research).toBe(false);
+  expect("acquireAppleWritePermit" in matching).toBe(false);
   expect("reserveProviderCost" in appleAuthorization).toBe(false);
   expect("enqueueJob" in appleAuthorization).toBe(false);
   expect("getManifestById" in appleAuthorization).toBe(false);
@@ -85,6 +89,18 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("getManifestPreflightReserveTracks" in publication).toBe(true);
   await publication.getManifestPreflightReserveTracks?.("manifest-1", "revision-1", "us");
   expect(source.getManifestPreflightReserveTracks).toHaveBeenCalledWith("manifest-1", "revision-1", "us");
+  await publication.acquireAppleWritePermit?.({
+    runId: "run-1",
+    manifestId: "manifest-1",
+    publicationVolumeId: "volume-1",
+    operation: "append_tracks",
+  });
+  expect(source.acquireAppleWritePermit).toHaveBeenCalledWith({
+    runId: "run-1",
+    manifestId: "manifest-1",
+    publicationVolumeId: "volume-1",
+    operation: "append_tracks",
+  });
 });
 
 test("production worker refuses startup when provider or encryption secrets are absent", () => {
@@ -103,6 +119,66 @@ test("production worker refuses startup when provider or encryption secrets are 
     APPLE_TOKEN_ENCRYPTION_KEY: "encryption",
     APPLE_MUSICKIT_PRIVATE_KEY_BASE64: "private-key",
   })).not.toThrow();
+});
+
+test("production deep workers require read-only catalog credentials but not user-token decryption", () => {
+  const readOnlyCatalogEnvironment = {
+    NODE_ENV: "production",
+    OPENAI_API_KEY: "openai",
+    APPLE_TEAM_ID: "team",
+    APPLE_KEY_ID: "key",
+    APPLE_MEDIA_ID: "media",
+    APPLE_MUSICKIT_PRIVATE_KEY_BASE64: "private-key",
+  };
+  expect(() => assertProductionWorkerSecrets(readOnlyCatalogEnvironment, "deep")).not.toThrow();
+  expect(() => assertProductionWorkerSecrets(readOnlyCatalogEnvironment, "interactive"))
+    .toThrow(/APPLE_TOKEN_ENCRYPTION_KEY/u);
+  expect(() => assertProductionWorkerSecrets({
+    ...readOnlyCatalogEnvironment,
+    APPLE_TOKEN_ENCRYPTION_KEY: "encryption",
+  }, "all")).toThrow(/isolated interactive or deep queue class/u);
+});
+
+test("deep-worker handlers expose research and catalog matching only", () => {
+  const handlers = defaultJobHandlers(methodProxy(), { queueClass: "deep" });
+  expect(Object.keys(handlers).sort()).toEqual(["matching", "research"]);
+  expect("publication" in handlers).toBe(false);
+  expect("apple_authorization" in handlers).toBe(false);
+  expect("notification" in handlers).toBe(false);
+  expect("retention" in handlers).toBe(false);
+  expect("pipeline_observability" in handlers).toBe(false);
+});
+
+test("deep workers advertise and lease only the deep lane without authorization recovery", async () => {
+  const harness = runnerHarness();
+  harness.repository.leaseNextJob.mockResolvedValue(null);
+  const runner = new WorkerRunner(harness.repository, {
+    queueClass: "deep",
+    concurrency: 1,
+    pollMs: 5,
+    heartbeatMs: 60_000,
+    controlIntervalMs: 60_000,
+  });
+  const running = runner.run();
+  try {
+    await waitFor(() => harness.repository.leaseNextJob.mock.calls.length > 0);
+    expect(harness.repository.updateWorkerHeartbeat).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ queueClass: "deep" }),
+    );
+    expect(harness.repository.leaseNextJob).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Number),
+      expect.any(Object),
+      "deep",
+    );
+    expect(harness.repository.getAppleAuthorization).not.toHaveBeenCalled();
+    expect(harness.repository.listWaitingPublicationManifests).not.toHaveBeenCalled();
+    expect(harness.repository.enqueueJob).not.toHaveBeenCalled();
+  } finally {
+    await runner.stop();
+    await running;
+  }
 });
 
 test("worker startup durably recovers an unverified Apple authorization", async () => {
@@ -450,6 +526,7 @@ test("terminal worker failures are sanitized before crossing the repository boun
       expect.any(String),
       "Apple publication failed after the final attempt; provider details were redacted.",
       null,
+      undefined,
     );
     expect(JSON.stringify(harness.repository.failJob.mock.calls)).not.toContain("sk-proj-PRIVATE");
     expect(JSON.stringify(harness.repository.failJob.mock.calls)).not.toContain("postgres://");
@@ -484,6 +561,7 @@ test("non-retriable Apple authorization rejections fail without six delayed atte
       expect.any(String),
       "Apple Music rejected gênio's authorization validation request (HTTP 422).",
       null,
+      undefined,
     );
   } finally {
     await runner.stop();

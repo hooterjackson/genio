@@ -1,6 +1,8 @@
+import { sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -101,6 +103,93 @@ export const researchRuns = pgTable("research_runs", {
   index("run_retention_idx").on(table.retentionExpiresAt),
 ]);
 
+/** Immutable caller intent. Mutable orchestration state remains on research_runs. */
+export const runSpecs = pgTable("run_specs", {
+  runId: uuid("run_id").primaryKey().references(() => researchRuns.id, { onDelete: "cascade" }),
+  rawPrompt: text("raw_prompt").notNull(),
+  requestedTrackCount: integer("requested_track_count"),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  guidanceAnswersJson: jsonb("guidance_answers_json").notNull().default([]),
+  specHash: varchar("spec_hash", { length: 64 }).notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("run_spec_hash_idx").on(table.specHash),
+  check("run_spec_requested_track_count_valid", sql`${table.requestedTrackCount} IS NULL OR ${table.requestedTrackCount} BETWEEN 1 AND 300`),
+]);
+
+/** Confirmed V3 membership/ranking contracts; only lifecycle status may change. */
+export const selectionPlans = pgTable("selection_plans", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  planHash: varchar("plan_hash", { length: 64 }).notNull(),
+  planJson: jsonb("plan_json").notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  confirmedAt: timestamp("confirmed_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("selection_plan_run_revision_idx").on(table.runId, table.revision),
+  uniqueIndex("selection_plan_run_hash_idx").on(table.runId, table.planHash),
+  index("selection_plan_status_idx").on(table.runId, table.status, table.createdAt),
+  check("selection_plan_revision_positive", sql`${table.revision} > 0`),
+]);
+
+/** Locked graph views make a V3 query plan reproducible as the corpus evolves. */
+export const graphSnapshots = pgTable("graph_snapshots", {
+  id: uuid("id").primaryKey(),
+  sequence: bigint("sequence", { mode: "number" }).notNull().generatedAlwaysAsIdentity(),
+  parentSnapshotId: uuid("parent_snapshot_id"),
+  status: varchar("status", { length: 32 }).notNull().default("building"),
+  contentHash: varchar("content_hash", { length: 64 }),
+  assertionCount: integer("assertion_count").notNull().default(0),
+  catalogIdentityCount: integer("catalog_identity_count").notNull().default(0),
+  lockedAt: timestamp("locked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("graph_snapshot_sequence_idx").on(table.sequence),
+  uniqueIndex("graph_snapshot_content_hash_idx").on(table.contentHash),
+  index("graph_snapshot_status_idx").on(table.status, table.createdAt),
+  check("graph_snapshot_status_valid", sql`${table.status} IN ('building','locked','superseded')`),
+  check("graph_snapshot_locked_state_valid", sql`(
+    (${table.status}='building' AND ${table.lockedAt} IS NULL AND ${table.contentHash} IS NULL)
+    OR (${table.status} IN ('locked','superseded') AND ${table.lockedAt} IS NOT NULL AND ${table.contentHash} IS NOT NULL)
+  )`),
+  check("graph_snapshot_content_hash_valid", sql`${table.contentHash} IS NULL OR ${table.contentHash} ~ '^[0-9a-f]{64}$'`),
+  check("graph_snapshot_counts_valid", sql`${table.assertionCount} >= 0 AND ${table.catalogIdentityCount} >= 0`),
+]);
+
+export const queryPlanRevisions = pgTable("query_plan_revisions", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  selectionPlanId: uuid("selection_plan_id").notNull().references(() => selectionPlans.id),
+  revision: integer("revision").notNull(),
+  parentRevisionId: uuid("parent_revision_id"),
+  graphSnapshotId: uuid("graph_snapshot_id").notNull().references(() => graphSnapshots.id),
+  engine: varchar("engine", { length: 48 }).notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("draft"),
+  planHash: varchar("plan_hash", { length: 64 }).notNull(),
+  planJson: jsonb("plan_json").notNull(),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  activatedAt: timestamp("activated_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("query_plan_run_revision_idx").on(table.runId, table.revision),
+  uniqueIndex("query_plan_run_hash_idx").on(table.runId, table.planHash),
+  index("query_plan_graph_snapshot_idx").on(table.graphSnapshotId),
+  index("query_plan_selection_plan_idx").on(table.selectionPlanId),
+]);
+
+export const runActiveQueryPlans = pgTable("run_active_query_plans", {
+  runId: uuid("run_id").primaryKey().references(() => researchRuns.id, { onDelete: "cascade" }),
+  queryPlanRevisionId: uuid("query_plan_revision_id").notNull().references(() => queryPlanRevisions.id),
+  activatedAt: timestamp("activated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("run_active_query_plan_revision_idx").on(table.queryPlanRevisionId)]);
+
 export const runAccesses = pgTable("run_accesses", {
   id: uuid("id").primaryKey(),
   runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
@@ -147,6 +236,201 @@ export const capabilityTokens = pgTable("capability_tokens", {
   consumedAt: timestamp("consumed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [index("capability_token_run_idx").on(table.runId)]);
+
+/** Governed, cross-run corpus. New observations enter quarantine first. */
+export const corpusEntities = pgTable("corpus_entities", {
+  id: uuid("id").primaryKey(),
+  entityType: varchar("entity_type", { length: 48 }).notNull(),
+  canonicalKey: text("canonical_key").notNull(),
+  canonicalName: varchar("canonical_name", { length: 240 }).notNull(),
+  state: varchar("state", { length: 32 }).notNull().default("active"),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("corpus_entity_type_key_idx").on(table.entityType, table.canonicalKey),
+  index("corpus_entity_name_idx").on(table.canonicalName),
+]);
+
+export const corpusEntityAliases = pgTable("corpus_entity_aliases", {
+  id: uuid("id").primaryKey(),
+  entityId: uuid("entity_id").notNull().references(() => corpusEntities.id, { onDelete: "cascade" }),
+  alias: varchar("alias", { length: 240 }).notNull(),
+  normalizedAlias: varchar("normalized_alias", { length: 240 }).notNull(),
+  locale: varchar("locale", { length: 32 }),
+  provider: varchar("provider", { length: 48 }).notNull().default("internal"),
+  confidence: numeric("confidence", { precision: 8, scale: 6, mode: "number" }).notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("corpus_entity_alias_unique_idx").on(table.entityId, table.normalizedAlias, table.provider),
+  index("corpus_entity_alias_lookup_idx").on(table.normalizedAlias),
+]);
+
+export const corpusRecordings = pgTable("corpus_recordings", {
+  id: uuid("id").primaryKey(),
+  canonicalKey: text("canonical_key").notNull().unique(),
+  primaryArtistEntityId: uuid("primary_artist_entity_id").references(() => corpusEntities.id, { onDelete: "set null" }),
+  title: varchar("title", { length: 240 }).notNull(),
+  versionClass: varchar("version_class", { length: 48 }).notNull().default("unknown"),
+  state: varchar("state", { length: 32 }).notNull().default("active"),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  ...timestamps,
+}, (table) => [
+  index("corpus_recording_artist_title_idx").on(table.primaryArtistEntityId, table.title),
+]);
+
+export const corpusReleases = pgTable("corpus_releases", {
+  id: uuid("id").primaryKey(),
+  canonicalKey: text("canonical_key").notNull().unique(),
+  primaryArtistEntityId: uuid("primary_artist_entity_id").references(() => corpusEntities.id, { onDelete: "set null" }),
+  title: varchar("title", { length: 240 }).notNull(),
+  releaseDate: varchar("release_date", { length: 40 }),
+  state: varchar("state", { length: 32 }).notNull().default("active"),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  ...timestamps,
+}, (table) => [index("corpus_release_artist_title_idx").on(table.primaryArtistEntityId, table.title)]);
+
+export const corpusReleaseRecordings = pgTable("corpus_release_recordings", {
+  releaseId: uuid("release_id").notNull().references(() => corpusReleases.id, { onDelete: "cascade" }),
+  recordingId: uuid("recording_id").notNull().references(() => corpusRecordings.id, { onDelete: "cascade" }),
+  discNumber: integer("disc_number"),
+  trackNumber: integer("track_number"),
+  scope: varchar("scope", { length: 32 }).notNull().default("track"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.releaseId, table.recordingId], name: "corpus_release_recordings_pkey" }),
+  index("corpus_release_recording_recording_idx").on(table.recordingId),
+]);
+
+export const corpusSourceDocuments = pgTable("corpus_source_documents", {
+  id: uuid("id").primaryKey(),
+  url: text("url").notNull(),
+  contentHash: varchar("content_hash", { length: 64 }).notNull(),
+  title: varchar("title", { length: 240 }).notNull(),
+  sourceClass: varchar("source_class", { length: 48 }).notNull(),
+  provenanceRoot: varchar("provenance_root", { length: 240 }).notNull(),
+  accessMethod: varchar("access_method", { length: 40 }).notNull(),
+  approvalState: varchar("approval_state", { length: 24 }).notNull().default("pending"),
+  authority: varchar("authority", { length: 48 }).notNull().default("unknown"),
+  licenseState: varchar("license_state", { length: 32 }).notNull().default("unknown"),
+  licenseVersion: varchar("license_version", { length: 160 }),
+  termsVersion: varchar("terms_version", { length: 160 }),
+  attribution: text("attribution"),
+  cachePolicy: varchar("cache_policy", { length: 40 }).notNull().default("excerpt_only"),
+  retentionPolicy: varchar("retention_policy", { length: 40 }).notNull().default("ninety_days"),
+  freshnessPolicy: varchar("freshness_policy", { length: 40 }).notNull().default("revalidate_30d"),
+  freshnessExpiresAt: timestamp("freshness_expires_at", { withTimezone: true }),
+  sourceRevision: varchar("source_revision", { length: 160 }).notNull(),
+  approvedBy: varchar("approved_by", { length: 120 }),
+  approvedAt: timestamp("approved_at", { withTimezone: true }),
+  takedownReason: varchar("takedown_reason", { length: 500 }),
+  takenDownAt: timestamp("taken_down_at", { withTimezone: true }),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  retrievedAt: timestamp("retrieved_at", { withTimezone: true }).notNull(),
+  lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("corpus_source_url_hash_idx").on(table.url, table.contentHash),
+  index("corpus_source_provenance_idx").on(table.provenanceRoot),
+  index("corpus_source_governance_idx").on(table.approvalState, table.status, table.freshnessExpiresAt),
+  check("corpus_source_content_hash_valid", sql`${table.contentHash} ~ '^[0-9a-f]{64}$'`),
+  check("corpus_source_status_valid", sql`${table.status} IN ('active','stale','takedown','revoked')`),
+  check("corpus_source_access_method_valid", sql`${table.accessMethod} IN ('hosted_web_search','structured_adapter','public_api','owner_import','manual_entry')`),
+  check("corpus_source_approval_state_valid", sql`${table.approvalState} IN ('pending','approved','rejected')`),
+  check("corpus_source_authority_valid", sql`${table.authority} IN ('primary_track_credit','official_track_credit','specialist_track_credit','trusted_editorial_container','secondary_database','catalog_metadata','unknown')`),
+  check("corpus_source_license_state_valid", sql`${table.licenseState} IN ('reusable','permission_recorded','unknown','prohibited')`),
+  check("corpus_source_cache_policy_valid", sql`${table.cachePolicy} IN ('no_store','metadata_only','excerpt_only','full_document_permitted')`),
+  check("corpus_source_retention_policy_valid", sql`${table.retentionPolicy} IN ('run_only','ninety_days','durable_public_corpus','license_term')`),
+  check("corpus_source_freshness_policy_valid", sql`${table.freshnessPolicy} IN ('immutable_revision','revalidate_30d','revalidate_90d')`),
+]);
+
+export const corpusAssertionObservations = pgTable("corpus_assertion_observations", {
+  id: uuid("id").primaryKey(),
+  observationKey: varchar("observation_key", { length: 64 }).notNull().unique(),
+  sourceDocumentId: uuid("source_document_id").notNull().references(() => corpusSourceDocuments.id),
+  subjectEntityId: uuid("subject_entity_id").references(() => corpusEntities.id, { onDelete: "set null" }),
+  recordingId: uuid("recording_id").references(() => corpusRecordings.id, { onDelete: "set null" }),
+  releaseId: uuid("release_id").references(() => corpusReleases.id, { onDelete: "set null" }),
+  predicate: varchar("predicate", { length: 160 }).notNull(),
+  objectJson: jsonb("object_json").notNull(),
+  creditScope: varchar("credit_scope", { length: 48 }),
+  supportExcerpt: varchar("support_excerpt", { length: 1000 }).notNull(),
+  confidence: numeric("confidence", { precision: 8, scale: 6, mode: "number" }).notNull().default(0),
+  status: varchar("status", { length: 32 }).notNull().default("quarantined"),
+  pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
+  policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("corpus_observation_status_time_idx").on(table.status, table.observedAt),
+  index("corpus_observation_recording_idx").on(table.recordingId, table.predicate),
+]);
+
+export const corpusPromotedAssertions = pgTable("corpus_promoted_assertions", {
+  id: uuid("id").primaryKey(),
+  assertionKey: varchar("assertion_key", { length: 64 }).notNull().unique(),
+  subjectEntityId: uuid("subject_entity_id").references(() => corpusEntities.id, { onDelete: "set null" }),
+  recordingId: uuid("recording_id").references(() => corpusRecordings.id, { onDelete: "set null" }),
+  releaseId: uuid("release_id").references(() => corpusReleases.id, { onDelete: "set null" }),
+  predicate: varchar("predicate", { length: 160 }).notNull(),
+  objectJson: jsonb("object_json").notNull(),
+  evidenceTier: varchar("evidence_tier", { length: 32 }).notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  validFrom: timestamp("valid_from", { withTimezone: true }).notNull().defaultNow(),
+  validTo: timestamp("valid_to", { withTimezone: true }),
+  promotedAt: timestamp("promoted_at", { withTimezone: true }).notNull().defaultNow(),
+  retractedAt: timestamp("retracted_at", { withTimezone: true }),
+  promotedBy: varchar("promoted_by", { length: 120 }).notNull(),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+}, (table) => [
+  index("corpus_assertion_recording_idx").on(table.recordingId, table.predicate, table.status),
+  index("corpus_assertion_subject_idx").on(table.subjectEntityId, table.predicate, table.status),
+]);
+
+export const corpusAssertionEvidence = pgTable("corpus_assertion_evidence", {
+  promotedAssertionId: uuid("promoted_assertion_id").notNull().references(() => corpusPromotedAssertions.id, { onDelete: "cascade" }),
+  observationId: uuid("observation_id").notNull().references(() => corpusAssertionObservations.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.promotedAssertionId, table.observationId], name: "corpus_assertion_evidence_pkey" }),
+  index("corpus_assertion_evidence_observation_idx").on(table.observationId),
+]);
+
+export const corpusCatalogIdentities = pgTable("corpus_catalog_identities", {
+  id: uuid("id").primaryKey(),
+  recordingId: uuid("recording_id").notNull().references(() => corpusRecordings.id, { onDelete: "cascade" }),
+  provider: varchar("provider", { length: 40 }).notNull(),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  catalogId: varchar("catalog_id", { length: 160 }).notNull(),
+  isPreferred: boolean("is_preferred").notNull().default(false),
+  isAvailable: boolean("is_available").notNull().default(true),
+  identityConfidence: numeric("identity_confidence", { precision: 8, scale: 6, mode: "number" }).notNull().default(0),
+  metadataJson: jsonb("metadata_json").notNull().default({}),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull().defaultNow(),
+  lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("corpus_catalog_identity_unique_idx").on(table.recordingId, table.provider, table.storefront, table.catalogId),
+  index("corpus_catalog_identity_lookup_idx").on(table.provider, table.storefront, table.catalogId),
+]);
+
+export const graphSnapshotAssertions = pgTable("graph_snapshot_assertions", {
+  graphSnapshotId: uuid("graph_snapshot_id").notNull().references(() => graphSnapshots.id, { onDelete: "cascade" }),
+  assertionId: uuid("assertion_id").notNull().references(() => corpusPromotedAssertions.id),
+  assertionRevisionJson: jsonb("assertion_revision_json").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.graphSnapshotId, table.assertionId], name: "graph_snapshot_assertions_pkey" }),
+  index("graph_snapshot_assertion_assertion_idx").on(table.assertionId),
+]);
+
+export const graphSnapshotCatalogIdentities = pgTable("graph_snapshot_catalog_identities", {
+  graphSnapshotId: uuid("graph_snapshot_id").notNull().references(() => graphSnapshots.id, { onDelete: "cascade" }),
+  catalogIdentityId: uuid("catalog_identity_id").notNull().references(() => corpusCatalogIdentities.id),
+  catalogIdentityRevisionJson: jsonb("catalog_identity_revision_json").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.graphSnapshotId, table.catalogIdentityId], name: "graph_snapshot_catalog_identities_pkey" }),
+  index("graph_snapshot_catalog_identity_identity_idx").on(table.catalogIdentityId),
+]);
 
 export const sourceRecords = pgTable("source_records", {
   id: uuid("id").primaryKey(),
@@ -236,6 +520,29 @@ export const recordingCatalogIdentities = pgTable("recording_catalog_identities"
   uniqueIndex("recording_catalog_identity_unique_idx").on(table.recordingFamilyId, table.provider, table.storefront, table.catalogId),
   index("recording_catalog_identity_lookup_idx").on(table.provider, table.storefront, table.catalogId),
   index("recording_catalog_identity_isrc_idx").on(table.isrc),
+]);
+
+/** Run-local evaluation linked to immutable global corpus identities. */
+export const runCorpusRecordingLinks = pgTable("run_corpus_recording_links", {
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  candidateId: uuid("candidate_id").notNull().references(() => trackCandidates.id, { onDelete: "cascade" }),
+  queryPlanRevisionId: uuid("query_plan_revision_id").notNull().references(() => queryPlanRevisions.id),
+  graphSnapshotId: uuid("graph_snapshot_id").notNull().references(() => graphSnapshots.id),
+  corpusRecordingId: uuid("corpus_recording_id").notNull().references(() => corpusRecordings.id),
+  corpusCatalogIdentityId: uuid("corpus_catalog_identity_id").references(() => corpusCatalogIdentities.id),
+  identityStatus: varchar("identity_status", { length: 32 }).notNull().default("pending"),
+  membershipStatus: varchar("membership_status", { length: 32 }).notNull().default("pending"),
+  relevanceStatus: varchar("relevance_status", { length: 32 }).notNull().default("pending"),
+  selectionStatus: varchar("selection_status", { length: 32 }).notNull().default("pending"),
+  publicationStatus: varchar("publication_status", { length: 32 }).notNull().default("pending"),
+  rankingScore: numeric("ranking_score", { precision: 12, scale: 8, mode: "number" }),
+  confidence: numeric("confidence", { precision: 8, scale: 6, mode: "number" }).notNull().default(0),
+  reasonCodesJson: jsonb("reason_codes_json").notNull().default([]),
+  evaluatedAt: timestamp("evaluated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.runId, table.candidateId], name: "run_corpus_recording_links_pkey" }),
+  index("run_corpus_link_plan_status_idx").on(table.queryPlanRevisionId, table.selectionStatus),
+  index("run_corpus_link_recording_idx").on(table.corpusRecordingId),
 ]);
 
 export const citationAttestations = pgTable("citation_attestations", {
@@ -521,6 +828,11 @@ export const manifestRevisions = pgTable("manifest_revisions", {
   contentHash: varchar("content_hash", { length: 64 }).notNull(),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
   policyVersion: varchar("policy_version", { length: 80 }).notNull(),
+  /** Immutable V3 provenance bindings. Legacy V1/V2 revisions leave these null. */
+  selectionPlanId: uuid("selection_plan_id").references(() => selectionPlans.id),
+  queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id),
+  graphSnapshotId: uuid("graph_snapshot_id").references(() => graphSnapshots.id),
+  runSpecHash: varchar("run_spec_hash", { length: 64 }),
   selectionPlanSnapshotJson: jsonb("selection_plan_snapshot_json"),
   pipelinePolicySnapshotJson: jsonb("pipeline_policy_snapshot_json"),
   outcomeSnapshotJson: jsonb("outcome_snapshot_json"),
@@ -531,6 +843,28 @@ export const manifestRevisions = pgTable("manifest_revisions", {
   uniqueIndex("manifest_revision_number_idx").on(table.manifestId, table.revision),
   uniqueIndex("manifest_revision_hash_idx").on(table.manifestId, table.contentHash),
   index("manifest_revision_parent_idx").on(table.parentRevisionId),
+  index("manifest_revision_selection_plan_idx").on(table.selectionPlanId),
+  index("manifest_revision_query_plan_idx").on(table.queryPlanRevisionId),
+  index("manifest_revision_graph_snapshot_idx").on(table.graphSnapshotId),
+  check("manifest_revision_v3_binding_presence_valid", sql`(
+    (
+      ${table.pipelineVersion}='corpus_first_v3'
+      AND ${table.selectionPlanId} IS NOT NULL
+      AND ${table.queryPlanRevisionId} IS NOT NULL
+      AND ${table.graphSnapshotId} IS NOT NULL
+      AND ${table.runSpecHash} IS NOT NULL
+    ) OR (
+      ${table.pipelineVersion}<>'corpus_first_v3'
+      AND ${table.selectionPlanId} IS NULL
+      AND ${table.queryPlanRevisionId} IS NULL
+      AND ${table.graphSnapshotId} IS NULL
+      AND ${table.runSpecHash} IS NULL
+    )
+  )`),
+  check(
+    "manifest_revision_run_spec_hash_valid",
+    sql`${table.runSpecHash} IS NULL OR ${table.runSpecHash} ~ '^[0-9a-f]{64}$'`,
+  ),
 ]);
 
 export const manifestRevisionTracks = pgTable("manifest_revision_tracks", {
@@ -566,6 +900,83 @@ export const manifestRevisionReserveTracks = pgTable("manifest_revision_reserve_
   uniqueIndex("manifest_revision_reserve_candidate_idx").on(table.manifestRevisionId, table.candidateId),
   uniqueIndex("manifest_revision_reserve_family_idx").on(table.manifestRevisionId, table.recordingFamilyId),
 ]);
+
+/** Explicit capability-scoped consent for publishing a shortfall. */
+export const partialPublicationDecisions = pgTable("partial_publication_decisions", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  manifestRevisionId: uuid("manifest_revision_id").notNull().references(() => manifestRevisions.id, { onDelete: "cascade" }),
+  manifestRevisionHash: varchar("manifest_revision_hash", { length: 64 }).notNull(),
+  queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id),
+  capabilitySessionId: uuid("capability_session_id").references(() => capabilitySessions.id, { onDelete: "set null" }),
+  outcomeHash: varchar("outcome_hash", { length: 64 }).notNull(),
+  decision: varchar("decision", { length: 32 }).notNull().default("pending"),
+  targetCount: integer("target_count").notNull(),
+  selectedCount: integer("selected_count").notNull(),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  decidedAt: timestamp("decided_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("partial_publication_decision_outcome_idx").on(
+    table.manifestRevisionId,
+    table.outcomeHash,
+    table.decision,
+  ),
+  index("partial_publication_decision_run_expiry_idx").on(table.runId, table.expiresAt),
+  check("partial_publication_decision_counts_valid", sql`${table.targetCount} BETWEEN 1 AND 300 AND ${table.selectedCount} BETWEEN 0 AND ${table.targetCount}`),
+]);
+
+/** A durable logical playlist whose active Apple revision changes atomically. */
+export const publicationSeries = pgTable("publication_series", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "set null" }),
+  title: varchar("title", { length: 240 }).notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  ...timestamps,
+}, (table) => [index("publication_series_run_idx").on(table.runId)]);
+
+export const publicationRevisionAttempts = pgTable("publication_revision_attempts", {
+  id: uuid("id").primaryKey(),
+  seriesId: uuid("series_id").notNull().references(() => publicationSeries.id, { onDelete: "cascade" }),
+  manifestRevisionId: uuid("manifest_revision_id").notNull().references(() => manifestRevisions.id),
+  attempt: integer("attempt").notNull().default(1),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  status: varchar("status", { length: 40 }).notNull().default("pending"),
+  contentHash: varchar("content_hash", { length: 64 }).notNull(),
+  lastError: text("last_error"),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("publication_attempt_series_revision_number_idx").on(table.seriesId, table.manifestRevisionId, table.attempt),
+  index("publication_attempt_manifest_revision_idx").on(table.manifestRevisionId, table.status),
+]);
+
+export const publicationRevisionVolumes = pgTable("publication_revision_volumes", {
+  id: uuid("id").primaryKey(),
+  publicationAttemptId: uuid("publication_attempt_id").notNull().references(() => publicationRevisionAttempts.id, { onDelete: "cascade" }),
+  volumeNumber: integer("volume_number").notNull(),
+  volumeCount: integer("volume_count").notNull(),
+  startPosition: integer("start_position").notNull(),
+  endPosition: integer("end_position").notNull(),
+  status: varchar("status", { length: 40 }).notNull().default("pending"),
+  applePlaylistId: varchar("apple_playlist_id", { length: 160 }),
+  appleShareUrl: text("apple_share_url"),
+  appendedCount: integer("appended_count").notNull().default(0),
+  lastError: text("last_error"),
+  publishedAt: timestamp("published_at", { withTimezone: true }),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("publication_revision_volume_number_idx").on(table.publicationAttemptId, table.volumeNumber),
+  index("publication_revision_volume_apple_idx").on(table.applePlaylistId),
+]);
+
+export const publicationSeriesActiveRevisions = pgTable("publication_series_active_revisions", {
+  seriesId: uuid("series_id").primaryKey().references(() => publicationSeries.id, { onDelete: "cascade" }),
+  publicationAttemptId: uuid("publication_attempt_id").notNull().references(() => publicationRevisionAttempts.id),
+  activatedAt: timestamp("activated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("publication_series_active_attempt_idx").on(table.publicationAttemptId)]);
 
 export const publicationVolumes = pgTable("publication_volumes", {
   id: uuid("id").primaryKey(),
@@ -638,9 +1049,12 @@ export const jobQueue = pgTable("job_queue", {
   runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "cascade" }),
   briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "cascade" }),
   kind: varchar("kind", { length: 64 }).notNull(),
+  queueClass: varchar("queue_class", { length: 24 }).notNull().default("interactive"),
   dedupeKey: varchar("dedupe_key", { length: 160 }).notNull().default("default"),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   minimumWorkerProtocol: integer("minimum_worker_protocol").notNull().default(4),
+  queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "set null" }),
+  stageKey: varchar("stage_key", { length: 160 }).notNull().default("default"),
   status: varchar("status", { length: 32 }).notNull().default("queued"),
   payloadJson: jsonb("payload_json").notNull().default({}),
   attempts: integer("attempts").notNull().default(0),
@@ -648,6 +1062,7 @@ export const jobQueue = pgTable("job_queue", {
   availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
   leaseOwner: varchar("lease_owner", { length: 160 }),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  leaseEpoch: bigint("lease_epoch", { mode: "number" }).notNull().default(0),
   lastError: text("last_error"),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   ...timestamps,
@@ -661,7 +1076,16 @@ export const jobQueue = pgTable("job_queue", {
     table.availableAt,
     table.leaseExpiresAt,
   ),
+  index("job_queue_class_lease_idx").on(
+    table.queueClass,
+    table.status,
+    table.availableAt,
+    table.leaseExpiresAt,
+  ),
+  index("job_plan_stage_status_idx").on(table.runId, table.queryPlanRevisionId, table.stageKey, table.status),
   index("job_run_idx").on(table.runId),
+  check("job_lease_epoch_valid", sql`${table.leaseEpoch} >= 0`),
+  check("job_queue_class_valid", sql`${table.queueClass} IN ('interactive','deep','publication','system')`),
 ]);
 
 export const workerHeartbeats = pgTable("worker_heartbeats", {

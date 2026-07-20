@@ -1263,7 +1263,7 @@ test("V2 does not buy candidate refills for a target-sized Apple pool blocked on
     }),
   }));
   expect(repository.updates.at(-1)).toMatchObject({
-    status: "partial",
+    status: "no_compatible_tracks",
     phase: "catalog_matching_empty",
     error: null,
   });
@@ -2900,7 +2900,7 @@ test("matching records an explicit shortfall instead of presenting a partial req
   }));
 });
 
-test("One Command publishes the maximum strict matches after bounded shortfall recovery", async () => {
+test("One Command pauses with an immutable partial decision after bounded shortfall recovery", async () => {
   const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
   const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
   repository.matches.push({
@@ -2915,8 +2915,8 @@ test("One Command publishes the maximum strict matches after bounded shortfall r
   await matchResearchRun(repository, "run-1", "us");
 
   expect(repository.updates.at(-1)).toMatchObject({
-    status: "visitor_review",
-    phase: "exception_review",
+    status: "partial_ready",
+    phase: "partial_confirmation_required",
     error: null,
   });
   expect(repository.automaticRecoveries).toEqual([{
@@ -2925,7 +2925,7 @@ test("One Command publishes the maximum strict matches after bounded shortfall r
     currentGeneration: 0,
     currentRefillGeneration: 0,
   }]);
-  expect(repository.automaticPublications).toEqual(["run-1"]);
+  expect(repository.automaticPublications).toEqual([]);
 });
 
 test("One Command queues bounded Apple recovery before terminalizing a retryable shortfall", async () => {
@@ -2992,25 +2992,25 @@ test("One Command counts only strict unique Apple matches toward an exact target
   await matchResearchRun(repository, "run-1", "us");
 
   expect(repository.updates.at(-1)).toMatchObject({
-    status: "visitor_review",
-    phase: "exception_review",
+    status: "partial_ready",
+    phase: "partial_confirmation_required",
     error: null,
   });
   expect(repository.checkpoints).toContainEqual(expect.objectContaining({
     safePrimaryCount: 1,
     shortfall: 1,
   }));
-  expect(repository.automaticPublications).toEqual(["run-1"]);
+  expect(repository.automaticPublications).toEqual([]);
 });
 
-test("One Command records a zero-match shortfall as partial instead of failed", async () => {
+test("One Command records a zero-match shortfall as a completed non-error outcome", async () => {
   const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
   const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
 
   await matchResearchRun(repository, "run-1", "us");
 
   expect(repository.updates.at(-1)).toMatchObject({
-    status: "partial",
+    status: "no_compatible_tracks",
     phase: "catalog_matching_empty",
     error: null,
   });

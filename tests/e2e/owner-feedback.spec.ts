@@ -34,6 +34,10 @@ const feedbackItems = Array.from({ length: 55 }, (_, index) => ({
   hasImage: index === 0,
 }));
 
+const corpusSourceId = "00000000-0000-4000-8000-000000000101";
+const corpusObservationId = "00000000-0000-4000-8000-000000000102";
+const corpusRecordingId = "00000000-0000-4000-8000-000000000103";
+
 function feedbackPage(offset: number, limit: number) {
   return {
     items: feedbackItems.slice(offset, offset + limit),
@@ -74,6 +78,64 @@ async function mockOwnerApis(page: Page): Promise<void> {
       });
       return;
     }
+    if (path === "/api/v1/owner/corpus/sources" && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [{
+            id: corpusSourceId,
+            title: "QA specialist archive",
+            url: "https://archive.example/track",
+            sourceClass: "specialist_archive",
+            provenanceRoot: "archive.example",
+            status: "active",
+            metadataJson: { evidenceGraphPolicy: { approvalState: "approved", authority: "specialist_track_credit", licenseState: "permission_recorded" } },
+          }],
+          total: 1,
+          limit: 25,
+          offset: 0,
+        }),
+      });
+      return;
+    }
+    if (path === "/api/v1/owner/corpus/review" && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [{
+            observation: {
+              id: corpusObservationId,
+              predicate: "performed_on",
+              supportExcerpt: "The liner notes explicitly credit percussion on this exact track.",
+              confidence: 0.98,
+              status: "quarantined",
+              recordingId: corpusRecordingId,
+            },
+            source: {
+              id: corpusSourceId,
+              title: "QA specialist archive",
+              url: "https://archive.example/track",
+              provenanceRoot: "archive.example",
+              status: "active",
+            },
+          }],
+          total: 1,
+          limit: 25,
+          offset: 0,
+        }),
+      });
+      return;
+    }
+    if (path === "/api/v1/owner/corpus/assertions" && request.method() === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [], total: 0, limit: 25, offset: 0 }) });
+      return;
+    }
+    if (path === "/api/v1/owner/corpus/snapshots" && request.method() === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [], total: 0, limit: 25, offset: 0 }) });
+      return;
+    }
     if (path === "/api/v1/owner/apple/developer-token") {
       await route.fulfill({
         status: 503,
@@ -108,6 +170,12 @@ test("the owner can page through the private feedback inbox and see attachments"
 
   await expect(page.getByRole("heading", { name: "System control" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "BUGS + IMPROVEMENTS" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "V3 EVIDENCE CORPUS" })).toBeVisible();
+  await expect(page.getByText("The liner notes explicitly credit percussion on this exact track.")).toBeVisible();
+  const promote = page.getByRole("button", { name: "PROMOTE SELECTED [0]" });
+  await expect(promote).toBeDisabled();
+  await page.locator(`.operator-corpus-observation input[type="checkbox"]`).check();
+  await expect(page.getByRole("button", { name: "PROMOTE SELECTED [1]" })).toBeEnabled();
   await expect(page.getByText("[50/55]", { exact: true })).toBeVisible();
   await expect(page.locator(".operator-feedback")).toHaveCount(50);
   await expect(page.getByText("Private feedback report 1", { exact: true })).toBeVisible();

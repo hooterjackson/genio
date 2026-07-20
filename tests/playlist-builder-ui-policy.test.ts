@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  actionRequiredJobLabel,
   apiErrorCode,
   evidenceCountSummary,
+  partialDecisionHeading,
+  partialDecisionSummary,
+  partialReadyView,
   publishedTrackCountSummary,
   publishedResultHeading,
+  shouldPresentShortfallWithoutError,
   shouldQuietlyClearInitialRunRestore,
 } from "../app/playlist-builder-ui-policy.ts";
 
@@ -60,5 +65,92 @@ describe("published playlist result copy", () => {
     expect(publishedResultHeading(0, true)).toBe("No compatible tracks found");
     expect(publishedResultHeading(23, true)).toBe("Playlist published with gaps");
     expect(publishedResultHeading(50, false)).toBe("Playlist published");
+  });
+});
+
+describe("Pipeline V3 partial publication decisions", () => {
+  it("adapts the preferred partialAction payload into a durable decision", () => {
+    const run = {
+      status: "partial_ready",
+      partialAction: {
+        kind: "partial_publication",
+        targetTrackCount: 50,
+        qualifiedTrackCount: 37,
+        remainingStrategyCount: 2,
+        canContinueResearch: true,
+        reasonCode: "partial_evidence_shortfall",
+        outcomeHash: "outcome-37",
+        manifestId: "manifest-37",
+        manifestHash: "manifest-hash-37",
+      },
+    };
+
+    expect(partialReadyView(run)).toEqual({
+      targetTrackCount: 50,
+      qualifiedTrackCount: 37,
+      deficit: 13,
+      remainingStrategyCount: 2,
+      canContinueResearch: true,
+      outcomeVersion: null,
+      outcomeHash: "outcome-37",
+      manifestId: "manifest-37",
+      manifestHash: "manifest-hash-37",
+      reasonCode: "partial_evidence_shortfall",
+    });
+    expect(actionRequiredJobLabel(run)).toBe("ACTION NEEDED");
+    expect(shouldPresentShortfallWithoutError(run)).toBe(true);
+  });
+
+  it("adapts a zero-compatible outcome and disables unsupported continuation by default", () => {
+    expect(partialReadyView({
+      status: "no_compatible_tracks",
+      pipelineOutcome: {
+        status: "no_compatible_tracks",
+        targetTrackCount: 25,
+        qualifiedTrackCount: 0,
+      },
+    })).toMatchObject({
+      targetTrackCount: 25,
+      qualifiedTrackCount: 0,
+      deficit: 25,
+      canContinueResearch: false,
+    });
+    expect(partialDecisionHeading(0)).toBe("No verified tracks are ready yet");
+    expect(partialDecisionSummary(0, 25)).toContain("has not found a safe Apple Music match");
+  });
+
+  it("does not reinterpret a legacy review state as an action-required shortfall", () => {
+    expect(partialReadyView({
+      status: "visitor_review",
+      phase: "partial_confirmation",
+      pipelineVersion: "pipeline_v2",
+      pipelineOutcome: { targetTrackCount: 50, qualifiedTrackCount: 12 },
+    })).toBeNull();
+  });
+
+  it("recognizes the persisted corpus-first V3 pipeline during the compatibility bridge", () => {
+    expect(partialReadyView({
+      status: "visitor_review",
+      phase: "partial_confirmation_required",
+      pipelineVersion: "corpus_first_v3",
+      pipelineOutcome: { targetTrackCount: 100, selectedTrackCount: 84 },
+    })).toMatchObject({
+      targetTrackCount: 100,
+      qualifiedTrackCount: 84,
+      deficit: 16,
+    });
+  });
+
+  it("keeps typed completeness shortfalls out of the red error treatment", () => {
+    expect(shouldPresentShortfallWithoutError({
+      status: "partial",
+      pipelineOutcome: { status: "partial_timed_out" },
+    })).toBe(true);
+    expect(shouldPresentShortfallWithoutError({
+      status: "failed",
+      pipelineOutcome: { status: "failed_system" },
+    })).toBe(false);
+    expect(partialDecisionHeading(1)).toBe("1 verified track is ready");
+    expect(partialDecisionHeading(8)).toBe("8 verified tracks are ready");
   });
 });

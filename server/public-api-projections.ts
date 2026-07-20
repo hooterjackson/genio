@@ -3,10 +3,56 @@ import type {
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
   PublicBriefStatusView,
+  ExplorePreferenceView,
+  PartialPublicationActionView,
   PublicResearchRunView,
   ResearchRunView,
   RunProgressView,
 } from "../shared/types.ts";
+
+function publicPartialAction(value: unknown): PartialPublicationActionView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const targetTrackCount = publicProgressOptionalCount(row.targetTrackCount);
+  const qualifiedTrackCount = publicProgressOptionalCount(row.qualifiedTrackCount);
+  const remainingStrategyCount = publicProgressOptionalCount(row.remainingStrategyCount);
+  const outcomeVersion = publicProgressOptionalCount(row.outcomeVersion);
+  const outcomeHash = publicProgressText(row.outcomeHash, 64).toLowerCase();
+  if (
+    targetTrackCount === null || targetTrackCount < 1 || targetTrackCount > 300
+    || qualifiedTrackCount === null || qualifiedTrackCount >= targetTrackCount
+    || remainingStrategyCount === null
+    || outcomeVersion === null || outcomeVersion < 1
+    || !/^[a-f0-9]{64}$/u.test(outcomeHash)
+  ) return null;
+  const manifestId = publicProgressText(row.manifestId, 80);
+  const manifestHash = publicProgressText(row.manifestHash, 64).toLowerCase();
+  return {
+    kind: "partial_publication",
+    targetTrackCount,
+    qualifiedTrackCount,
+    remainingStrategyCount,
+    canContinueResearch: row.canContinueResearch === true && remainingStrategyCount > 0,
+    reasonCode: publicProgressText(row.reasonCode, 80) || null,
+    outcomeVersion,
+    outcomeHash,
+    ...(manifestId ? { manifestId } : {}),
+    ...(/^[a-f0-9]{64}$/u.test(manifestHash) ? { manifestHash } : {}),
+  };
+}
+
+function publicExplore(value: unknown): ExplorePreferenceView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (typeof row.eligible !== "boolean" || typeof row.listed !== "boolean"
+    || typeof row.canChange !== "boolean") return null;
+  return {
+    eligible: row.eligible,
+    listed: row.listed,
+    canChange: row.canChange,
+    reason: publicProgressText(row.reason, 200) || null,
+  };
+}
 
 type InternalResearchRunView = ResearchRunView & {
   createdAt?: string;
@@ -147,6 +193,8 @@ export function publicResearchRunView(
     pipelineOutcome: run.pipelineOutcome,
     candidateStageCounts: run.candidateStageCounts,
     progress: run.progress ? publicRunProgressView(run.progress) : undefined,
+    partialAction: publicPartialAction(run.partialAction),
+    explore: publicExplore(run.explore),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     completedAt: run.completedAt,

@@ -35,6 +35,14 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
     listResearchContainers: (...args: Parameters<ResearchRepository["listResearchContainers"]>) => source.listResearchContainers(...args),
     getResearchCheckpoint: (...args: Parameters<ResearchRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<ResearchRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
+    persistPipelineV3RetrievalResult: (
+      ...args: Parameters<ResearchRepository["persistPipelineV3RetrievalResult"]>
+    ) => source.persistPipelineV3RetrievalResult(...args),
+    ...(source.ingestPipelineV3ColdCorpus ? {
+      ingestPipelineV3ColdCorpus: (
+        ...args: Parameters<NonNullable<ResearchRepository["ingestPipelineV3ColdCorpus"]>>
+      ) => source.ingestPipelineV3ColdCorpus!(...args),
+    } : {}),
     enqueueJob: (input: Parameters<ResearchRepository["enqueueJob"]>[0]) => {
       if (input.kind !== "research" && input.kind !== "matching") {
         throw new Error(`Research cannot enqueue ${input.kind} jobs`);
@@ -57,6 +65,7 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
         pipelineVersion: pipeline.pipelineVersion,
         policyVersion: pipeline.policyVersion,
         selectionPlan: pipeline.selectionPlan,
+        queryPlan: pipeline.queryPlan,
       };
     },
     updateRun: (...args: Parameters<MatchingRepository["updateRun"]>) => source.updateRun(...args),
@@ -69,6 +78,9 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
     queueAutomaticCatalogRecovery: (...args: Parameters<MatchingRepository["queueAutomaticCatalogRecovery"]>) => source.queueAutomaticCatalogRecovery(...args),
     queueAutomaticCandidateRefill: (...args: Parameters<MatchingRepository["queueAutomaticCandidateRefill"]>) => source.queueAutomaticCandidateRefill(...args),
     queueAutomaticPublication: (...args: Parameters<MatchingRepository["queueAutomaticPublication"]>) => source.queueAutomaticPublication(...args),
+    ...(source.preparePartialPublication ? {
+      preparePartialPublication: (...args: Parameters<NonNullable<MatchingRepository["preparePartialPublication"]>>) => source.preparePartialPublication!(...args),
+    } : {}),
     ...(source.savePipelineOutcome ? {
       savePipelineOutcome: (...args: Parameters<NonNullable<MatchingRepository["savePipelineOutcome"]>>) => source.savePipelineOutcome!(...args),
     } : {}),
@@ -133,6 +145,9 @@ export function createPublicationRepositoryFacade(source: PublicationRepository)
     markPlaylistOrphan: (...args: Parameters<PublicationRepository["markPlaylistOrphan"]>) => source.markPlaylistOrphan(...args),
     updateRun: (...args: Parameters<PublicationRepository["updateRun"]>) => source.updateRun(...args),
     enqueueNotification: (...args: Parameters<PublicationRepository["enqueueNotification"]>) => source.enqueueNotification(...args),
+    ...(source.acquireAppleWritePermit ? {
+      acquireAppleWritePermit: (...args: Parameters<NonNullable<PublicationRepository["acquireAppleWritePermit"]>>) => source.acquireAppleWritePermit!(...args),
+    } : {}),
     ...(source.getManifestPreflightTracks ? {
       getManifestPreflightTracks: (...args: Parameters<NonNullable<PublicationRepository["getManifestPreflightTracks"]>>) => source.getManifestPreflightTracks!(...args),
     } : {}),

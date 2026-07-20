@@ -40,6 +40,7 @@ import {
 import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 import { buildInformation } from "./build-info.ts";
+import { runtimeReleaseContract } from "./runtime-release.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
 import {
   FEEDBACK_BODY_BYTES,
@@ -48,11 +49,30 @@ import {
   parseFeedbackSubmission,
 } from "./feedback.ts";
 import { positiveIntegerQuery } from "./api-validation.ts";
+import {
+  EVIDENCE_GRAPH_PIPELINE_V3,
+  EVIDENCE_GRAPH_POLICY_V3,
+  EvidenceGraphServiceV3,
+} from "./evidence-graph-service-v3.ts";
+import { PgEvidenceGraphRepositoryV3 } from "./evidence-graph-repository-v3.ts";
+import {
+  evidenceGraphHttpErrorV3,
+  parseAppendObservationV3,
+  parseBulkHideV3,
+  parseDisputeV3,
+  parseOwnerCorpusListQueryV3,
+  parsePromotionV3,
+  parseReasonV3,
+  parseSnapshotV3,
+  parseSourcePolicyApprovalV3,
+} from "./evidence-graph-owner-api-v3.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
 const costConfiguration = readCostConfiguration();
 const repository = new Repository();
+const evidenceGraphRepositoryV3 = new PgEvidenceGraphRepositoryV3(repository.pool);
+const evidenceGraphServiceV3 = new EvidenceGraphServiceV3(evidenceGraphRepositoryV3);
 const capabilities = new CapabilityService(repository);
 const verifyGateway = createGatewayVerifier(repository);
 const gatewayIdentities = new WeakMap<FastifyRequest, GatewayIdentity>();
@@ -190,7 +210,41 @@ async function enqueueResearchResume(runId: string): Promise<void> {
 
 app.get("/health/live", async () => {
   const build = buildInformation();
-  return { ok: true, service: "needle-api", version: build.version, revision: build.revision, build };
+  const runtime = runtimeReleaseContract();
+  let graphSnapshot: {
+    id: string;
+    assertionCount: number;
+    catalogIdentityCount: number;
+    lockedAt: string | null;
+  } | null = null;
+  try {
+    const snapshots = await evidenceGraphRepositoryV3.listSnapshots({
+      limit: 1,
+      offset: 0,
+      status: "locked",
+    });
+    const latest = snapshots.items[0];
+    if (latest) {
+      graphSnapshot = {
+        id: latest.id,
+        assertionCount: latest.assertionCount,
+        catalogIdentityCount: latest.catalogIdentityCount,
+        lockedAt: latest.lockedAt?.toISOString() ?? null,
+      };
+    }
+  } catch {
+    // Liveness must not depend on the graph being bootstrapped. The explicit
+    // null still tells operators and visitors that no runtime snapshot could
+    // be verified.
+  }
+  return {
+    ok: true,
+    service: "needle-api",
+    version: build.version,
+    revision: build.revision,
+    build,
+    runtime: { ...runtime, graphSnapshot },
+  };
 });
 
 app.get("/health/ready", async (_request, reply) => {
@@ -516,6 +570,134 @@ app.get<{ Params: { id: string } }>("/api/v1/runs/:id", async (request) => {
   return run;
 });
 
+app.get<{ Params: { id: string } }>("/api/v1/runs/:id/progress", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  await sessionForAccess(request, accessId);
+  const run = await repository.getRunByAccess(accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return {
+    runId: run.id,
+    status: run.status,
+    phase: run.phase,
+    progress: run.progress ?? null,
+    partialAction: run.partialAction ?? null,
+    explore: run.explore ?? null,
+  };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { outcomeVersion?: unknown; idempotencyKey?: unknown };
+}>("/api/v1/runs/:id/research/continue", async (request, reply) => {
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  const outcomeVersion = Number(request.body?.outcomeVersion);
+  if (!Number.isSafeInteger(outcomeVersion) || outcomeVersion < 1) {
+    throw new HttpError(400, "Outcome version is invalid", "invalid_outcome_version");
+  }
+  const continuation = await repository.continuePartialResearch({
+    runId: session.runId,
+    outcomeVersion,
+    idempotencyKey: key,
+  });
+  const run = await repository.getRunByAccess(accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return reply.code(continuation.queued ? 202 : 200).send(run);
+});
+
+app.post<{
+  Params: { id: string };
+  Body: {
+    outcomeHash?: unknown;
+    manifestId?: unknown;
+    manifestHash?: unknown;
+    idempotencyKey?: unknown;
+  };
+}>("/api/v1/runs/:id/partial/confirm", async (request, reply) => {
+  await assertNotPaused("publishing");
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  const outcomeHash = typeof request.body?.outcomeHash === "string"
+    ? request.body.outcomeHash.trim().toLowerCase()
+    : "";
+  if (!/^[a-f0-9]{64}$/u.test(outcomeHash)) {
+    throw new HttpError(400, "Partial outcome hash is invalid", "invalid_outcome_hash");
+  }
+  const manifestId = request.body?.manifestId == null
+    ? null
+    : uuid(request.body.manifestId, "Manifest ID");
+  const manifestHash = request.body?.manifestHash == null
+    ? null
+    : String(request.body.manifestHash).trim().toLowerCase();
+  if (manifestHash !== null && !/^[a-f0-9]{64}$/u.test(manifestHash)) {
+    throw new HttpError(400, "Manifest hash is invalid", "invalid_manifest_hash");
+  }
+  const manifest = await repository.confirmPartialPublication({
+    runId: session.runId,
+    capabilitySessionId: session.id,
+    idempotencyKey: key,
+    outcomeHash,
+    manifestId,
+    manifestHash,
+  });
+  const apple = await repository.getAppleAuthorization();
+  const caller = identity(request);
+  const publication = await repository.queueManifestPublication({
+    runId: session.runId,
+    manifestId: manifest.id,
+    appleAuthorized: apple?.status === "valid",
+    clientBucket: caller.clientBucket,
+    clientBucketAliases: caller.clientBucketAliases,
+    rateLimit: 10,
+  });
+  if (publication.state === "waiting_for_apple_authorization") {
+    await repository.enqueueNotification("apple_reauthorization_required", {
+      deduplicationKey: `apple-reauthorization:${manifest.id}`,
+      runId: session.runId,
+      manifestId: manifest.id,
+    });
+  }
+  return reply.code(publication.state === "terminal" ? 200 : 202).send({
+    run: await repository.getRunByAccess(accessId),
+    manifest,
+    publication: { state: publication.state, queued: publication.queued },
+  });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { idempotencyKey?: unknown };
+}>("/api/v1/runs/:id/cancel", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  await repository.cancelRunByVisitor(session.runId);
+  const run = await repository.getRunByAccess(accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return { run };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { listed?: unknown; idempotencyKey?: unknown };
+}>("/api/v1/runs/:id/explore", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(identity(request).clientBucketAliases, "mutation", 120, 1);
+  if (typeof request.body?.listed !== "boolean") {
+    throw new HttpError(400, "Explore visibility is invalid", "invalid_explore_visibility");
+  }
+  return { explore: await repository.setRunExplorePreference(session.runId, request.body.listed) };
+});
+
 app.post<{ Params: { id: string } }>("/api/v1/runs/:id/capability", async (request) => {
   const accessId = uuid(request.params.id, "Run ID");
   const session = await sessionForAccess(request, accessId);
@@ -663,6 +845,14 @@ function owner(request: FastifyRequest): string {
   return assertOwner(identity(request));
 }
 
+async function ownerCorpusAction<T>(action: () => Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    return evidenceGraphHttpErrorV3(error);
+  }
+}
+
 app.get("/api/v1/owner/status", async (request) => {
   owner(request);
   const health = await repository.getSystemHealth();
@@ -713,6 +903,235 @@ app.get("/api/v1/owner/budgets", async (request) => {
 app.get<{ Querystring: { limit?: string } }>("/api/v1/owner/runs", async (request) => {
   owner(request);
   return { runs: await repository.listRecentRuns(Number(request.query.limit ?? 50)) };
+});
+
+app.get<{
+  Querystring: { limit?: string; offset?: string; status?: string };
+}>("/api/v1/owner/corpus/review", async (request) => {
+  owner(request);
+  const query = parseOwnerCorpusListQueryV3(request.query, "review");
+  return evidenceGraphRepositoryV3.listObservations({ ...query, status: "quarantined" });
+});
+
+app.get<{
+  Querystring: { limit?: string; offset?: string; status?: string };
+}>("/api/v1/owner/corpus/sources", async (request) => {
+  owner(request);
+  const query = parseOwnerCorpusListQueryV3(request.query, "source");
+  return evidenceGraphRepositoryV3.listSources(query);
+});
+
+app.get<{
+  Querystring: { limit?: string; offset?: string; status?: string };
+}>("/api/v1/owner/corpus/assertions", async (request) => {
+  owner(request);
+  const query = parseOwnerCorpusListQueryV3(request.query, "assertion");
+  return evidenceGraphRepositoryV3.listAssertions({
+    ...query,
+    status: query.status as "active" | "superseded" | "retracted" | null,
+  });
+});
+
+app.get<{
+  Querystring: { limit?: string; offset?: string; status?: string };
+}>("/api/v1/owner/corpus/snapshots", async (request) => {
+  owner(request);
+  const query = parseOwnerCorpusListQueryV3(request.query, "snapshot");
+  return evidenceGraphRepositoryV3.listSnapshots({
+    ...query,
+    status: query.status as "building" | "locked" | "superseded" | null,
+  });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: unknown;
+}>("/api/v1/owner/corpus/sources/:id/approve", async (request) => {
+  const email = owner(request);
+  const sourceDocumentId = uuid(request.params.id, "Source document ID");
+  const policy = parseSourcePolicyApprovalV3(request.body);
+  const source = await ownerCorpusAction(() => evidenceGraphServiceV3.approveSourcePolicy({
+    sourceDocumentId,
+    ...policy,
+    approvedBy: email,
+  }));
+  await repository.recordAudit(email, "corpus.source_policy_approved", {
+    sourceDocumentId,
+    authority: policy.authority,
+    accessMethod: policy.accessMethod,
+    licenseState: policy.licenseState,
+    licenseVersion: policy.licenseVersion,
+    termsVersion: policy.termsVersion,
+    attribution: policy.attribution,
+    cachePolicy: policy.cachePolicy,
+    retentionPolicy: policy.retentionPolicy,
+    freshnessPolicy: policy.freshnessPolicy,
+    sourceRevision: policy.sourceRevision,
+  });
+  return { source };
+});
+
+app.post<{ Body: unknown }>("/api/v1/owner/corpus/observations", async (request, reply) => {
+  const email = owner(request);
+  const observationInput = parseAppendObservationV3(request.body);
+  const observation = await ownerCorpusAction(() => evidenceGraphServiceV3.appendObservation({
+    ...observationInput,
+    pipelineVersion: EVIDENCE_GRAPH_PIPELINE_V3,
+    policyVersion: EVIDENCE_GRAPH_POLICY_V3,
+  }));
+  await repository.recordAudit(email, "corpus.observation_appended", {
+    observationId: observation.id,
+    sourceDocumentId: observation.sourceDocumentId,
+    predicate: observation.predicate,
+    creditScope: observation.creditScope,
+  });
+  return reply.code(201).send({ observation });
+});
+
+app.post<{ Body: unknown }>("/api/v1/owner/corpus/observations/promote", async (request) => {
+  const email = owner(request);
+  const input = parsePromotionV3(request.body);
+  const assertion = await ownerCorpusAction(() => evidenceGraphServiceV3.promoteObservations({
+    ...input,
+    promotedBy: email,
+  }));
+  await repository.recordAudit(email, "corpus.observations_promoted", {
+    assertionId: assertion.id,
+    observationIds: input.observationIds,
+    evidenceTier: assertion.evidenceTier,
+  });
+  return { assertion };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: unknown;
+}>("/api/v1/owner/corpus/observations/:id/reject", async (request) => {
+  const email = owner(request);
+  const observationId = uuid(request.params.id, "Observation ID");
+  const input = parseReasonV3(request.body);
+  const observation = await ownerCorpusAction(() => evidenceGraphServiceV3.rejectObservation({
+    observationId,
+    rejectedBy: email,
+    reason: input.reason,
+  }));
+  await repository.recordAudit(email, "corpus.observation_rejected", {
+    observationId,
+    reason: input.reason,
+  });
+  return { observation };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: unknown;
+}>("/api/v1/owner/corpus/assertions/:id/dispute", async (request) => {
+  const email = owner(request);
+  const assertionId = uuid(request.params.id, "Assertion ID");
+  const input = parseDisputeV3(request.body);
+  const assertion = await ownerCorpusAction(() => evidenceGraphServiceV3.disputeAssertion({
+    assertionId,
+    observationId: input.observationId,
+    promotedBy: email,
+  }));
+  await repository.recordAudit(email, "corpus.assertion_disputed", {
+    assertionId,
+    disputeAssertionId: assertion.id,
+    observationId: input.observationId,
+  });
+  return { assertion };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: unknown;
+}>("/api/v1/owner/corpus/assertions/:id/retract", async (request) => {
+  const email = owner(request);
+  const assertionId = uuid(request.params.id, "Assertion ID");
+  const input = parseReasonV3(request.body);
+  const assertion = await ownerCorpusAction(() => evidenceGraphServiceV3.retractAssertion({
+    assertionId,
+    reason: input.reason,
+    promotedBy: email,
+  }));
+  await repository.recordAudit(email, "corpus.assertion_retracted", {
+    assertionId,
+    lifecycleAssertionId: assertion.id,
+    reason: input.reason,
+  });
+  return { assertion };
+});
+
+app.post<{
+  Params: { id: string };
+  Body: unknown;
+}>("/api/v1/owner/corpus/sources/:id/takedown", async (request) => {
+  const email = owner(request);
+  const sourceDocumentId = uuid(request.params.id, "Source document ID");
+  const input = parseReasonV3(request.body);
+  const result = await ownerCorpusAction(() => evidenceGraphServiceV3.takeDownSource({
+    sourceDocumentId,
+    reason: input.reason,
+    promotedBy: email,
+  }));
+  await repository.recordAudit(email, "corpus.source_taken_down", {
+    sourceDocumentId,
+    reason: input.reason,
+    retractedAssertionIds: result.retractedAssertionIds,
+    retainedAssertionIds: result.retainedAssertionIds,
+  });
+  return result;
+});
+
+app.post<{ Body: unknown }>("/api/v1/owner/corpus/snapshots", async (request, reply) => {
+  const email = owner(request);
+  const input = parseSnapshotV3(request.body);
+  const snapshot = await ownerCorpusAction(() => evidenceGraphServiceV3.createLockedSnapshot(input));
+  await repository.recordAudit(email, "corpus.snapshot_locked", {
+    snapshotId: snapshot.id,
+    contentHash: snapshot.contentHash,
+    assertionCount: snapshot.assertionCount,
+    catalogIdentityCount: snapshot.catalogIdentityCount,
+    parentSnapshotId: snapshot.parentSnapshotId,
+  });
+  return reply.code(201).send({ snapshot });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { idempotencyKey?: unknown } | unknown;
+}>("/api/v1/owner/runs/:id/corpus/resume", async (request, reply) => {
+  const email = owner(request);
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  const runId = uuid(request.params.id, "Run ID");
+  const body = request.body && typeof request.body === "object" && !Array.isArray(request.body)
+    ? request.body as { idempotencyKey?: unknown }
+    : {};
+  const key = idempotencyKey(request, body.idempotencyKey);
+  const replay = await repository.getPipelineV3CorpusResumeReplay(runId, key);
+  if (replay) return reply.code(202).send({ replayed: true, resumed: replay });
+  const review = await repository.preparePipelineV3CorpusResume(runId);
+  const snapshot = await ownerCorpusAction(() => evidenceGraphServiceV3.createLockedSnapshot({
+    parentSnapshotId: review.parentGraphSnapshotId,
+  }));
+  const resumed = await repository.resumePipelineV3CorpusResearch({
+    runId,
+    reviewedGraphSnapshotId: snapshot.id,
+    expectedSourceQueryPlanRevisionId: review.sourceQueryPlanRevisionId,
+    expectedSourceCheckpointHash: review.sourceCheckpointHash,
+    idempotencyKey: key,
+  });
+  await repository.recordAudit(email, "corpus.run_resumed", {
+    runId,
+    sourceQueryPlanRevisionId: review.sourceQueryPlanRevisionId,
+    graphSnapshotId: snapshot.id,
+    promotedAssertionCount: review.promotedAssertionCount,
+    enumerationComplete: review.enumerationComplete,
+    successorQueryPlanRevisionId: resumed.queryPlanRevisionId,
+    jobId: resumed.jobId,
+  }, runId);
+  return reply.code(202).send({ snapshot, resumed });
 });
 
 app.get<{
@@ -953,6 +1372,18 @@ app.post<{
     listed: request.body.listed,
   });
   return { id: playlistId, listed: request.body.listed };
+});
+
+app.post<{ Body: unknown }>("/api/v1/owner/playlists/bulk-hide", async (request) => {
+  const email = owner(request);
+  const input = parseBulkHideV3(request.body);
+  const hidden = await repository.bulkHidePublicPlaylists(input);
+  await repository.recordAudit(email, "public_playlist.bulk_hidden", {
+    scope: input.scope,
+    playlistIds: input.scope === "ids" ? input.playlistIds : undefined,
+    hidden,
+  });
+  return { hidden, scope: input.scope };
 });
 
 app.post<{ Body: { limit?: number } }>("/api/v1/owner/retention/run", async (request) => {

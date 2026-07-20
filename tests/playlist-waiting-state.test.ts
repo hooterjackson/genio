@@ -20,11 +20,41 @@ describe("playlist waiting state", () => {
     expect(playlistWorkStage({ status, phase })).toBe(expected);
   });
 
-  it.each(["complete", "partial", "failed", "expired", "deleted"])("stops motion for %s", (status) => {
+  it.each([
+    "complete",
+    "partial",
+    "failed",
+    "no_compatible_tracks",
+    "cancelled",
+    "failed_system",
+    "failed_integrity",
+    "expired",
+    "deleted",
+  ])("stops motion for %s", (status) => {
     expect(playlistWorkMotion({ status, phase: "gap_analysis" })).toBe("idle");
   });
 
-  it.each(["awaiting_budget", "waiting_for_apple_authorization"])("pauses motion for %s", (status) => {
+  it.each([
+    ["awaiting_guidance", "v3_awaiting_guidance", "plan"],
+    ["partial_ready", "partial_confirmation_required", "sequence"],
+  ])("marks %s as action-required without active motion", (status, phase, stage) => {
+    expect(playlistWorkState({ status, phase })).toEqual({
+      stage,
+      motion: "action-required",
+    });
+  });
+
+  it.each([
+    ["resolving_catalog", "v3_resolving_catalog", "match"],
+    ["continuing_research", "v3_continuing_research", "discover"],
+  ])("keeps %s active in the %s stage", (status, phase, stage) => {
+    expect(playlistWorkState({ status, phase })).toEqual({
+      stage,
+      motion: "active",
+    });
+  });
+
+  it.each(["awaiting_budget", "waiting_for_apple_authorization", "waiting_for_corpus_review"])("pauses motion for %s", (status) => {
     expect(playlistWorkMotion({ status, phase: "publishing" })).toBe("paused");
   });
 
