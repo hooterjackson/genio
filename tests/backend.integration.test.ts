@@ -292,20 +292,18 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     // The Release-A bridge must remain healthy immediately before and after
-    // the schema-14 expand migration, while failing closed for both older and
+    // the schema-14/15 expand migrations, while failing closed for both older and
     // newer schemas that current queries have not declared compatible.
     await repository.setSetting("schema_version", "13");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "12");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
-      /supported 13-14, found 12/u,
+      /supported 13-15, found 12/u,
     );
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-14, found 12/u);
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-15, found 12/u);
     await repository.setSetting("schema_version", "15");
-    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
-      /supported 13-14, found 15/u,
-    );
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     const result = await repository.pool.query<{ name: string }>(

@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.1.1",
+      "releasedAt": "2026-07-21",
+      "title": "Source-alias and qualifier recovery",
+      "notes": [
+        "Treats ordinary viral, breakout, and TikTok language as a ranking preference unless the raw request explicitly requires documented virality for every track.",
+        "Preserves funk carioca, baile funk, and Brazilian funk as equivalent source labels inside one OR membership predicate without broadening the scope to unrelated funk.",
+        "Searches equivalent Apple editorial labels independently, allowing focused catalog containers to qualify and fill large genre-rich requests.",
+        "Removes generated evidence and recording-version prose from the legacy hard-constraint path and drops directly contradictory soft preferences.",
+        "Adds production-shaped exact-fill coverage for a 69-track baile-funk request with a qualified reserve."
+      ]
+    },
+    {
       "version": "2.1.0",
       "releasedAt": "2026-07-21",
       "title": "Grounded semantic recovery",

@@ -510,6 +510,57 @@ function detectedGenreTerms(prompt: string): string[] {
   return terms;
 }
 
+/**
+ * The corpus and Apple editorial catalog use several names for the same Rio
+ * genre. They are OR aliases inside one membership predicate, never three
+ * independent requirements and never the unrelated broad US `funk` genre.
+ */
+function genreEvidenceAliases(genre: string): string[] {
+  return normalize(genre) === "funk carioca"
+    ? ["funk carioca", "baile funk", "Brazilian funk"]
+    : [genre];
+}
+
+function explicitTrackLevelViralityRequirement(prompt: string): boolean {
+  return /\b(?:only|every|all|must|require|required)\b[^.;!?\n]{0,100}\b(?:tiktok|viral|virality|trending|trend|breakout)\b/iu.test(prompt)
+    || /\b(?:tiktok|viral|virality|trending|trend|breakout)\b[^.;!?\n]{0,100}\b(?:only|every|all|must|require|required|documented|verified)\b/iu.test(prompt);
+}
+
+function constraintConflictsWithMembership(
+  constraint: SelectionConstraint,
+  predicates: readonly MembershipPredicateV3[],
+  allConstraints: readonly SelectionConstraint[] = [],
+): boolean {
+  if (constraint.operator !== "avoid" && constraint.operator !== "exclude") return false;
+  const contradictsMembership = predicates.some((item) => (
+    item.operator !== "exclude"
+    && item.axis === constraint.axis
+    && item.values.some((required) => constraint.values.some((value) => normalize(value) === normalize(required)))
+  ));
+  const contradictsPositivePreference = allConstraints.some((item) => (
+    item.id !== constraint.id
+    && item.axis === constraint.axis
+    && (item.operator === "prefer" || item.operator === "include" || item.operator === "require")
+    && item.values.some((required) => constraint.values.some((value) => normalize(value) === normalize(required)))
+  ));
+  return contradictsMembership || contradictsPositivePreference;
+}
+
+/**
+ * V2 stored generated evidence and version prose as constraints. In V3 these
+ * domains have dedicated evidence predicates and recording policy. Replaying
+ * that prose as a second hard gate can reject every valid candidate even when
+ * the immutable raw request never made it mandatory.
+ */
+function executionHardConstraints(
+  constraints: readonly SelectionConstraint[],
+): SelectionConstraint[] {
+  return constraints
+    .filter((constraint) => constraint.kind === "hard")
+    .filter((constraint) => constraint.axis !== "evidence" && constraint.axis !== "recording_version")
+    .map(cloneConstraint);
+}
+
 function compileSemanticContractV31(input: {
   rawPrompt: string;
   requestedTrackCount: number;
@@ -634,7 +685,7 @@ function replacePromptGenrePredicates(
   pushPredicate(predicates, predicate(
     "genre",
     "require",
-    genres,
+    genres.flatMap(genreEvidenceAliases),
     genres.length === 1
       ? `The request explicitly names the ${genres[0]} genre.`
       : `Each recording may satisfy any one of the requested genres: ${genres.join(", ")}.`,
@@ -866,15 +917,32 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     pushPredicate(predicates, predicate("theme", "require", ["houses and homes"], "The request explicitly asks for a lyrical theme."));
   }
   if (/\b(?:baile\s+funk|funk\s+carioca)\b/u.test(prompt)) {
-    pushPredicate(predicates, predicate("genre", "require", ["funk carioca"], "The request explicitly names funk carioca/baile funk."));
+    pushPredicate(predicates, predicate(
+      "genre",
+      "require",
+      genreEvidenceAliases("funk carioca"),
+      "The request explicitly names funk carioca/baile funk; these are equivalent source labels.",
+    ));
   }
   if (/\btiktok\b/u.test(prompt) && /\b(?:breakout|breakouts|viral|virality|trending|trend)\b/u.test(prompt)) {
-    pushPredicate(predicates, predicate(
-      "theme",
-      "require",
-      ["TikTok breakout", "TikTok virality"],
-      "The request explicitly requires a documented TikTok breakout or viral context.",
-    ));
+    const values = ["TikTok breakout", "TikTok virality"];
+    if (explicitTrackLevelViralityRequirement(prompt)) {
+      pushPredicate(predicates, predicate(
+        "theme",
+        "require",
+        values,
+        "The request explicitly makes documented TikTok virality mandatory for every recording.",
+      ));
+    } else {
+      objectives.push(objective(
+        "relevance",
+        "maximize",
+        0.95,
+        null,
+        "Prefer genre-eligible recordings with documented TikTok breakout relevance.",
+        values,
+      ));
+    }
   }
   if (/\b(?:1960s|1970s|1980s|60s|70s|80s|soul|samba[- ]funk)\s+(?:brazilian\s+)?funk\b|\bbrazilian\s+(?:soul|samba[- ]funk)\b/u.test(prompt)) {
     pushPredicate(predicates, predicate("genre", "require", ["Brazilian soul and funk"], "The request explicitly distinguishes the soul-and-funk tradition."));
@@ -918,11 +986,14 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   const uniqueIntents = dedupe(intents);
   const scopeKind = input.typedSelectionPlan?.scopeKind
     ?? inferredScopeKind(input.prompt, uniqueIntents);
-  const hardConstraints = (input.typedSelectionPlan?.constraints ?? [])
-    .filter((constraint) => constraint.kind === "hard")
-    .map(cloneConstraint);
+  const hardConstraints = executionHardConstraints(input.typedSelectionPlan?.constraints ?? []);
   const softPreferences = (input.typedSelectionPlan?.constraints ?? [])
     .filter((constraint) => constraint.kind === "soft")
+    .filter((constraint) => !constraintConflictsWithMembership(
+      constraint,
+      predicates,
+      input.typedSelectionPlan?.constraints ?? [],
+    ))
     .map(cloneConstraint);
   const diversityGoals = input.typedSelectionPlan?.diversityGoals
     ? { ...input.typedSelectionPlan.diversityGoals }

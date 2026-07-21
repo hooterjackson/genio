@@ -22,22 +22,64 @@ function genreCandidateMemberships(genres: readonly string[]) {
 }
 
 describe("Pipeline V3 typed planning", () => {
-  test("collapses baile funk aliases and preserves TikTok breakout context", () => {
+  test("collapses baile funk aliases and ranks ordinary TikTok breakout context", () => {
     const spec = createRunSpecV3({
       prompt: "69 baile funk TikTok breakouts",
       requestedTrackCount: 69,
     });
     const genres = spec.membershipPredicates.filter((item) => item.axis === "genre");
     expect(genres).toHaveLength(1);
-    expect(genres[0]?.values).toEqual(["funk carioca"]);
-    expect(spec.membershipPredicates.some((item) => (
-      item.axis === "theme" && item.values.includes("TikTok breakout")
-    ))).toBe(true);
+    expect(genres[0]?.values).toEqual(["funk carioca", "baile funk", "Brazilian funk"]);
+    expect(spec.membershipPredicates.some((item) => item.axis === "theme")).toBe(false);
+    expect(spec.rankingObjectives).toContainEqual(expect.objectContaining({
+      dimension: "relevance",
+      values: ["TikTok breakout", "TikTok virality"],
+    }));
     expect(spec.semanticAudit).toMatchObject({
       passed: true,
       aliasCollapses: ["baile funk|funk carioca=>funk carioca"],
     });
     expect(spec.userGoal?.requestedTrackCount).toBe(69);
+  });
+
+  test("keeps virality as hard membership only when the raw request makes it mandatory", () => {
+    const spec = createRunSpecV3({
+      prompt: "69 baile funk tracks; every track must have documented TikTok virality",
+      requestedTrackCount: 69,
+    });
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "theme",
+      operator: "require",
+      values: ["TikTok breakout", "TikTok virality"],
+    }));
+  });
+
+  test("does not replay generated evidence and version prose as legacy hard gates", () => {
+    const spec = createRunSpecV3({
+      prompt: "69 baile funk TikTok breakouts",
+      requestedTrackCount: 69,
+      typedSelectionPlan: {
+        intents: ["genre_scene"],
+        scopeKind: "broad_curated",
+        constraints: [
+          { id: "genre", axis: "genre", operator: "require", values: ["baile funk", "funk"], kind: "hard", relaxationRank: null },
+          { id: "evidence", axis: "evidence", operator: "require", values: ["strong TikTok evidence"], kind: "hard", relaxationRank: null },
+          { id: "version", axis: "recording_version", operator: "require", values: ["the primary viral upload"], kind: "hard", relaxationRank: null },
+          { id: "prefer-br", axis: "geography", operator: "prefer", values: ["Brazil"], kind: "soft", relaxationRank: 1 },
+          { id: "avoid-br", axis: "geography", operator: "avoid", values: ["Brazil"], kind: "soft", relaxationRank: 2 },
+        ],
+        diversityGoals: { minimumDistinctArtists: 10, minimumDistinctAlbums: null, minimumDistinctEras: null, minimumDistinctScenes: null, minimumDistinctGeographies: null, maximumTracksPerArtist: null, maximumTracksPerAlbum: null },
+        versionPolicy: { preferred: ["canonical"], allowed: ["canonical"], excludeCompilations: false, excludeKaraokeAndTributes: true },
+        orderingPolicy: { mode: "editorial", goals: [], avoidAdjacentSameArtist: true, avoidAdjacentSameAlbum: true },
+        softGoalRelaxationOrder: [],
+        contentPolicy: { explicitContent: "allow", instrumental: "allow", languages: [] },
+      },
+    });
+    expect(spec.hardConstraints.map(({ axis }) => axis).sort()).toEqual(["genre"]);
+    expect(spec.softPreferences.map(({ id }) => id)).toEqual(["prefer-br"]);
+    expect(spec.membershipPredicates.filter(({ axis }) => axis === "genre")).toHaveLength(1);
+    expect(spec.membershipPredicates.find(({ axis }) => axis === "genre")?.values)
+      .toEqual(["funk carioca", "baile funk", "Brazilian funk"]);
   });
 
   test("separates house music from a lyrical theme about houses", () => {
@@ -131,7 +173,7 @@ describe("Pipeline V3 typed planning", () => {
     expect(baile.criticalAmbiguities).toEqual([]);
     expect(baile.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "genre",
-      values: ["funk carioca"],
+      values: ["funk carioca", "baile funk", "Brazilian funk"],
     }));
 
     const seventies = createRunSpecV3({ prompt: "1970s Brazilian soul and funk", requestedTrackCount: 50 });

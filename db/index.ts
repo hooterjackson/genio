@@ -11,7 +11,7 @@ export interface DatabaseSchemaSupport {
 }
 
 /**
- * Schema 14 is an expand-only foundation. Current code intentionally remains
+ * Schemas 14 and 15 are expand-only foundations. Current code intentionally remains
  * readable against schema 13 so the API and V1/V2 workers can roll forward or
  * back independently while V3 assignment is disabled.
  */
@@ -22,7 +22,7 @@ export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
 };
 
 /**
- * Release-A compatibility bridge for the schema-13 -> schema-14 expand
+ * Release-A compatibility bridge for the schema-13 -> schema-14/15 expand
  * migration. Bridge binaries prefer the pre-migration schema while remaining
  * healthy after the expand migration, so API and workers can be promoted
  * independently. Schema 12 is deliberately outside this range: accepting it
@@ -36,7 +36,7 @@ export const DATABASE_SCHEMA_V13_BRIDGE_SUPPORT: DatabaseSchemaSupport = {
 
 /**
  * @deprecated Source-compatibility alias for older rollout tooling. Despite
- * the legacy name, it now uses the fail-closed 13-14 Release-A contract and
+ * the legacy name, it now uses the fail-closed 13-15 Release-A contract and
  * therefore does not accept schema 12.
  */
 export const DATABASE_SCHEMA_V12_BRIDGE_SUPPORT = DATABASE_SCHEMA_V13_BRIDGE_SUPPORT;

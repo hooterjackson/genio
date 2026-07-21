@@ -317,10 +317,15 @@ function discoveryQueries(request: Pick<DiscoveryRequestV3, "plan">): string[] {
     .filter(Boolean);
   const focused = [...new Set(semanticTerms)].join(" ") || terms.join(" ");
   return [...new Set([
+    // Search equivalent labels independently. Apple search is relevance
+    // ranked; concatenating `funk carioca baile funk Brazilian funk` can be
+    // materially worse than three focused queries even though the terms are
+    // OR aliases in the eligibility predicate.
+    ...semanticTerms,
     focused,
     focused ? `${focused} essentials` : "",
     terms.join(" "),
-  ].filter(Boolean))].slice(0, 3);
+  ].filter(Boolean))].slice(0, 6);
 }
 
 const CONTAINER_TEXT_AXES = new Set([

@@ -720,6 +720,37 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(getPlaylistTracks).toHaveBeenCalledTimes(2);
   });
 
+  test("fills baile funk requests from an equivalent Apple editorial alias while TikTok is a ranking preference", async () => {
+    const tracks = Array.from({ length: 85 }, (_, index) => song(index, `Funk Artist ${index}`, `Funk Track ${index}`));
+    const searchAppleResources = vi.fn(async (_storefront: string, query: string) => emptySearch({
+      playlists: query.toLowerCase().includes("baile funk") ? [{
+        id: "pl.baile-funk",
+        name: "Baile Funk Hits",
+        curatorName: "Apple Music",
+        description: "The essential Brazilian funk records moving Rio and the world.",
+        url: "https://music.apple.com/us/playlist/baile-funk-hits/pl.baile-funk",
+      }] : [],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: searchAppleResources as any,
+      getPlaylistTracks: vi.fn(async () => ({ items: tracks, next: null })) as any,
+      searchAppleSongs: vi.fn(async () => []) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+      discoverHostedWeb: vi.fn(async () => []),
+    });
+
+    const result = await executeRetrievalV3({
+      runId: "baile-funk-alias",
+      plan: plan("69 baile funk TikTok breakouts", 69),
+      adapters,
+    });
+
+    expect(result.outcome).toMatchObject({ status: "exact_ready", selectedTrackCount: 69 });
+    expect(result.reserve).toHaveLength(14);
+    expect(searchAppleResources.mock.calls.map((call) => String(call[1]).toLowerCase()))
+      .toContain("baile funk");
+  });
+
   test("requires phrase boundaries and an Apple-authored curator before treating a playlist as a scoped editorial container", async () => {
     const selection = plan("25 house music songs", 25);
     const strategy = retrievalStrategiesForEnginesV3(["curated_genre_scene"])
