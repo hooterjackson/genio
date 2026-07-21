@@ -14,6 +14,7 @@ import {
   type PipelineV3WriteFence,
 } from "../server/pipeline-v3-worker-execution.ts";
 import { ResearchOrchestrator } from "../server/research.ts";
+import { createPublicationRepositoryFacade } from "../server/worker-facades.ts";
 import {
   manifestContentHash as publisherManifestContentHash,
   publishManifest,
@@ -528,7 +529,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       const pipelineOutcomeSpy = vi.fn(async () => {
         throw crossedImmutableGate;
       });
-      const publicationRepository = new Proxy(repository, {
+      const publicationSource = new Proxy(repository, {
         get(target, property) {
           if (property === "getPublicationGuard") return guardSpy;
           if (property === "getPipelineOutcome") return pipelineOutcomeSpy;
@@ -536,6 +537,9 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
+      const publicationRepository = createPublicationRepositoryFacade(
+        publicationSource as unknown as Parameters<typeof createPublicationRepositoryFacade>[0],
+      );
 
       await expect(publishManifest(
         publicationRepository as unknown as Parameters<typeof publishManifest>[0],

@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.9",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 publication gateway recovery",
+      "notes": [
+        "Restores exact Pipeline V3 Apple publication by forwarding the immutable publication guard through the interactive worker's security facade.",
+        "Adds unit coverage for the guarded capability and a database-backed regression that exercises Apple publication through the same frozen facade used in production.",
+        "Preserves fail-closed research and Apple-write separation while allowing validated exact manifests to proceed to deterministic playlist creation."
+      ]
+    },
+    {
       "version": "2.0.8",
       "releasedAt": "2026-07-20",
       "title": "Evidence-first catalog era resolution",

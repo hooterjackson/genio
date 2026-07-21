@@ -90,6 +90,21 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("getManifestPreflightReserveTracks" in publication).toBe(true);
   await publication.getManifestPreflightReserveTracks?.("manifest-1", "revision-1", "us");
   expect(source.getManifestPreflightReserveTracks).toHaveBeenCalledWith("manifest-1", "revision-1", "us");
+  expect("getPublicationGuard" in publication).toBe(true);
+  await publication.getPublicationGuard?.({
+    runId: "run-1",
+    manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    selectedCount: 25,
+  });
+  expect(source.getPublicationGuard).toHaveBeenCalledWith({
+    runId: "run-1",
+    manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    selectedCount: 25,
+  });
   await publication.acquireAppleWritePermit?.({
     runId: "run-1",
     manifestId: "manifest-1",

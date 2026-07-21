@@ -145,6 +145,9 @@ export function createPublicationRepositoryFacade(source: PublicationRepository)
     markPlaylistOrphan: (...args: Parameters<PublicationRepository["markPlaylistOrphan"]>) => source.markPlaylistOrphan(...args),
     updateRun: (...args: Parameters<PublicationRepository["updateRun"]>) => source.updateRun(...args),
     enqueueNotification: (...args: Parameters<PublicationRepository["enqueueNotification"]>) => source.enqueueNotification(...args),
+    ...(source.getPublicationGuard ? {
+      getPublicationGuard: (...args: Parameters<NonNullable<PublicationRepository["getPublicationGuard"]>>) => source.getPublicationGuard!(...args),
+    } : {}),
     ...(source.acquireAppleWritePermit ? {
       acquireAppleWritePermit: (...args: Parameters<NonNullable<PublicationRepository["acquireAppleWritePermit"]>>) => source.acquireAppleWritePermit!(...args),
     } : {}),
