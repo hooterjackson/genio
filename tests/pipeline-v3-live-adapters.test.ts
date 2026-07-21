@@ -823,6 +823,160 @@ describe("Pipeline V3 live read-only adapters", () => {
     });
   });
 
+  test("uses an exact-ISRC compatible catalog issue to prove recording era for a later compilation", async () => {
+    const base = plan("25 disco songs from 1973 through 1983", 25);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      membershipPredicates: [
+        { id: "genre-disco", axis: "genre", operator: "require", values: ["disco"], source: "user", reason: "Genre." },
+        { id: "era-membership", axis: "era", operator: "require", values: ["1973", "1983"], source: "user", reason: "Era." },
+      ],
+      hardConstraints: [{
+        id: "era-between",
+        axis: "era",
+        operator: "between",
+        values: ["1973", "1983"],
+        kind: "hard",
+        relaxationRank: null,
+      }],
+      confirmed: true,
+    };
+    const strategy = retrievalStrategiesForEnginesV3(["curated_genre_scene"])
+      .find((value) => value.kind === "trusted_containers")!;
+    const request: DiscoveryRequestV3 = {
+      runId: "editorial-compatible-era-test",
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: "curated_genre_scene",
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 25,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    const compilationIssue = {
+      ...song(83, "Disco Artist", "Disco Classic"),
+      albumName: "Disco Gold: 2004 Edition",
+      releaseDate: "2004-01-01",
+    };
+    const originalIssue: CatalogSong = {
+      ...compilationIssue,
+      id: "1978001",
+      albumName: "Disco Classic",
+      releaseDate: "1978-06-01",
+    };
+    const lookupAppleByIsrc = vi.fn(async () => [compilationIssue, originalIssue]);
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch({
+        playlists: [{
+          id: "pl.disco-era",
+          name: "Disco Essentials",
+          curatorName: "Apple Music",
+          description: "Defining disco music from the genre's foundational scenes.",
+          url: "https://music.apple.com/us/playlist/disco-essentials/pl.disco-era",
+        }],
+      })) as any,
+      getPlaylistTracks: vi.fn(async () => ({ items: [compilationIssue], next: null })) as any,
+      lookupAppleByIsrc: lookupAppleByIsrc as any,
+    });
+
+    const batch = await adapters.discover(request);
+    const [qualification] = await adapters.qualify({
+      runId: request.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: request.engine,
+      strategy,
+      candidates: batch.candidates,
+    });
+
+    expect(lookupAppleByIsrc).toHaveBeenCalledWith("us", compilationIssue.isrc);
+    expect(qualification).toMatchObject({
+      scope: { passed: true },
+      evidence: { passed: true },
+      hardConstraints: { passed: true, failedConstraintIds: [] },
+      catalog: {
+        appleSongId: compilationIssue.id,
+        releaseYear: 2004,
+        compatibleReleaseYears: [1978, 2004],
+      },
+    });
+  });
+
+  test("does not borrow an era year from a conflicting remix even when Apple reuses the ISRC", async () => {
+    const base = plan("25 disco songs from 1973 through 1983", 25);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      membershipPredicates: [
+        { id: "genre-disco", axis: "genre", operator: "require", values: ["disco"], source: "user", reason: "Genre." },
+        { id: "era-membership", axis: "era", operator: "require", values: ["1973", "1983"], source: "user", reason: "Era." },
+      ],
+      hardConstraints: [{ id: "era-between", axis: "era", operator: "between", values: ["1973", "1983"], kind: "hard", relaxationRank: null }],
+      confirmed: true,
+    };
+    const strategy = retrievalStrategiesForEnginesV3(["curated_genre_scene"])
+      .find((value) => value.kind === "trusted_containers")!;
+    const request: DiscoveryRequestV3 = {
+      runId: "editorial-conflicting-era-test",
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: "curated_genre_scene",
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 25,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    const compilationIssue = {
+      ...song(84, "Disco Artist", "Disco Classic"),
+      releaseDate: "2004-01-01",
+    };
+    const remixIssue: CatalogSong = {
+      ...compilationIssue,
+      id: "1978002",
+      name: "Disco Classic (Remix)",
+      releaseDate: "1978-01-01",
+    };
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch({
+        playlists: [{
+          id: "pl.disco-conflict",
+          name: "Disco Essentials",
+          curatorName: "Apple Music",
+          description: "Defining disco music from the genre's foundational scenes.",
+          url: "https://music.apple.com/us/playlist/disco-essentials/pl.disco-conflict",
+        }],
+      })) as any,
+      getPlaylistTracks: vi.fn(async () => ({ items: [compilationIssue], next: null })) as any,
+      lookupAppleByIsrc: vi.fn(async () => [remixIssue]) as any,
+    });
+
+    const batch = await adapters.discover(request);
+    const [qualification] = await adapters.qualify({
+      runId: request.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: request.engine,
+      strategy,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification).toMatchObject({
+      hardConstraints: { passed: false, failedConstraintIds: ["era-between"] },
+      catalog: { releaseYear: 2004, compatibleReleaseYears: [2004] },
+    });
+  });
+
   test("enumerates the exact normalized fixed-container identity instead of the first Apple search result", async () => {
     const selection = plan("all tracks from album Correct Album by Correct Artist", 25);
     const strategy = retrievalStrategiesForEnginesV3(["fixed_container"])

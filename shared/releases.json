@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.7",
+      "releasedAt": "2026-07-20",
+      "title": "Recording-family era recovery",
+      "notes": [
+        "Recognizes requested eras across exact, version-compatible Apple recording-family issues when the preferred playable item is a later compilation or reissue.",
+        "Keeps hard era and evidence rules fail-closed while preventing remixes, live versions, covers, clean or explicit conflicts, and unrelated recordings from lending dates.",
+        "Persists compatible recording-family years through continued research so resumed jobs retain the same immutable qualification decision.",
+        "Adds regressions for exact-ISRC historical issues, out-of-era-only results, missing dates, conflicting remixes, and continuation checkpoints."
+      ]
+    },
+    {
       "version": "2.0.6",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 catalog-era qualification",

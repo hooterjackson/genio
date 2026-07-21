@@ -211,6 +211,8 @@ export interface CandidateQualificationV3 {
     readonly confidence: number;
     /** Normalized Apple/catalog issue year used for immutable era checks. */
     readonly releaseYear?: number | null;
+    /** Years observed on exact compatible recording-family catalog issues. */
+    readonly compatibleReleaseYears?: readonly number[];
   };
   /** Ranking signals are consumed only after every eligibility stage passes. */
   readonly rankingSignals: Readonly<Partial<Record<RankingObjectiveV3["dimension"], number>>>;
@@ -381,6 +383,8 @@ export interface QualifiedTrackV3 {
   readonly recordingFamilyKey: string;
   /** Catalog-derived year retained so resumed research rechecks hard eras. */
   readonly catalogReleaseYear?: number | null;
+  /** Compatible issue years retained so resumed research preserves era proof. */
+  readonly catalogCompatibleReleaseYears?: readonly number[];
   readonly sourceObservationIds: readonly string[];
   readonly evidenceBindingIds: readonly string[];
   readonly evidenceBindings?: readonly EvidenceBindingReferenceV3[];
@@ -737,7 +741,11 @@ function continuationTrackIntegrityReason(
   if (!(track.catalogConfidence > 0)) return "storefront_unavailable";
   if (!(track.versionConfidence > 0)) return "version_incompatible";
 
-  if (catalogEraConstraintFailuresV3(plan, track.catalogReleaseYear).length > 0) {
+  if (catalogEraConstraintFailuresV3(
+    plan,
+    track.catalogReleaseYear,
+    track.catalogCompatibleReleaseYears,
+  ).length > 0) {
     return "hard_constraint_failed";
   }
 
@@ -797,6 +805,10 @@ function mergeQualifiedTrack(
   const track: QualifiedTrackV3 = {
     ...existing,
     catalogReleaseYear: existing.catalogReleaseYear ?? incoming.catalogReleaseYear ?? null,
+    catalogCompatibleReleaseYears: [...new Set([
+      ...(existing.catalogCompatibleReleaseYears ?? []),
+      ...(incoming.catalogCompatibleReleaseYears ?? []),
+    ])].sort((left, right) => left - right),
     album: existing.album ?? incoming.album,
     sourceObservationIds: observations,
     evidenceBindingIds: bindingIds,
@@ -1583,7 +1595,11 @@ export async function executeRetrievalV3(input: {
         incrementReason(discardedByReason, "hard_constraint_failed");
         continue;
       }
-      if (catalogEraConstraintFailuresV3(input.plan, qualification.catalog.releaseYear).length > 0) {
+      if (catalogEraConstraintFailuresV3(
+        input.plan,
+        qualification.catalog.releaseYear,
+        qualification.catalog.compatibleReleaseYears,
+      ).length > 0) {
         incrementReason(discardedByReason, "hard_constraint_failed");
         continue;
       }
@@ -1632,6 +1648,9 @@ export async function executeRetrievalV3(input: {
         appleSongId: qualification.catalog.appleSongId,
         recordingFamilyKey: qualification.catalog.recordingFamilyKey,
         catalogReleaseYear: qualification.catalog.releaseYear ?? null,
+        catalogCompatibleReleaseYears: [...new Set(
+          qualification.catalog.compatibleReleaseYears ?? [],
+        )].sort((left, right) => left - right),
         sourceObservationIds: [...new Set(candidate.sourceObservationIds)],
         evidenceBindingIds: attestedBindings.map(({ id }) => id),
         evidenceBindings: attestedBindings.map((binding) => ({ ...binding })),

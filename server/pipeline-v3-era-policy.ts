@@ -90,15 +90,15 @@ export function normalizedCatalogReleaseYear(releaseDate: string | null | undefi
 export function catalogEraConstraintFailuresV3(
   plan: Pick<SelectionPlanV3, "hardConstraints" | "membershipPredicates">,
   catalogReleaseYear: number | null | undefined,
+  compatibleReleaseYears: readonly number[] = [],
 ): string[] {
   const policies = catalogEraPoliciesV3(plan);
   if (policies.length === 0) return [];
-  if (!Number.isInteger(catalogReleaseYear)) return policies.map(({ id }) => id);
   return policies.flatMap((policy) => {
     const matches = recordingFamilySatisfiesEraConstraint({
       candidateReleaseYear: catalogReleaseYear ?? null,
       appleReleaseDate: null,
-      compatibleReleaseYears: [],
+      compatibleReleaseYears,
     }, policy.constraint);
     const passed = policy.excluded ? !matches : matches;
     return passed ? [] : [policy.id];

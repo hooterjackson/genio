@@ -46,8 +46,10 @@ import {
 } from "./selection-plan-v3.ts";
 import {
   catalogEraConstraintFailuresV3,
+  catalogEraPoliciesV3,
   normalizedCatalogReleaseYear,
 } from "./pipeline-v3-era-policy.ts";
+import { catalogRecordingVersionSignature } from "./pipeline-v2-policy.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
 /**
@@ -1509,14 +1511,82 @@ async function mapConcurrent<T, R>(items: readonly T[], concurrency: number, fn:
   return results;
 }
 
+interface CatalogResolutionV3 {
+  song: CatalogSong | null;
+  confidence: number;
+  /**
+   * Issue years observed on catalog identities that remain inside the exact
+   * compatible recording family. These may prove a recording-era rule when
+   * Apple's preferred playable item is a later compilation or reissue.
+   */
+  compatibleReleaseYears: number[];
+}
+
+function normalizedCatalogIsrc(song: Pick<CatalogSong, "isrc">): string | null {
+  const value = song.isrc?.trim().toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "";
+  return /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/u.test(value) ? value : null;
+}
+
+/**
+ * Catalog dates may describe an edition rather than the underlying
+ * recording. Accept a date only from the same bounded recording family:
+ * compatible version/content signature plus exact ISRC, or (when neither
+ * side has an ISRC) exact normalized artist/title and compatible duration.
+ */
+function compatibleCatalogRecordingIssue(primary: CatalogSong, alternate: CatalogSong): boolean {
+  if (catalogRecordingVersionSignature(primary) !== catalogRecordingVersionSignature(alternate)) return false;
+  const primaryIsrc = normalizedCatalogIsrc(primary);
+  const alternateIsrc = normalizedCatalogIsrc(alternate);
+  if (primaryIsrc || alternateIsrc) return Boolean(primaryIsrc && primaryIsrc === alternateIsrc);
+  if (normalizeMusicText(primary.artistName) !== normalizeMusicText(alternate.artistName)) return false;
+  if (normalizeMusicText(primary.name) !== normalizeMusicText(alternate.name)) return false;
+  if (primary.durationInMillis && alternate.durationInMillis) {
+    return Math.abs(primary.durationInMillis - alternate.durationInMillis) <= 10_000;
+  }
+  return true;
+}
+
+function compatibleCatalogReleaseYears(primary: CatalogSong, observed: readonly CatalogSong[]): number[] {
+  return [...new Set([primary, ...observed]
+    .filter((song) => song.id === primary.id || compatibleCatalogRecordingIssue(primary, song))
+    .map((song) => normalizedCatalogReleaseYear(song.releaseDate))
+    .filter((year): year is number => year !== null))]
+    .sort((left, right) => left - right);
+}
+
 async function resolveCatalogSong(input: {
   candidate: RawTrackCandidateV3;
   metadata: LiveCandidateMetadataV3;
   request: QualificationRequestV3;
   lookupByIsrc: typeof lookupAppleCatalogByIsrc;
   searchSongs: typeof searchAppleCatalog;
-}): Promise<{ song: CatalogSong | null; confidence: number }> {
-  if (input.metadata.song) return { song: input.metadata.song, confidence: 1 };
+}): Promise<CatalogResolutionV3> {
+  if (input.metadata.song) {
+    const primary = input.metadata.song;
+    const selectedYear = normalizedCatalogReleaseYear(primary.releaseDate);
+    const needsCompatibleIssueLookup = catalogEraPoliciesV3(input.request.plan).length > 0
+      && catalogEraConstraintFailuresV3(input.request.plan, selectedYear).length > 0;
+    let observed: CatalogSong[] = [primary];
+    if (needsCompatibleIssueLookup) {
+      const isrc = normalizedCatalogIsrc(primary);
+      if (isrc) {
+        observed = [...observed, ...await input.lookupByIsrc(input.request.plan.storefront, isrc)];
+      } else {
+        observed = [
+          ...observed,
+          ...await input.searchSongs(
+            input.request.plan.storefront,
+            `${primary.artistName} ${primary.name}`,
+          ),
+        ];
+      }
+    }
+    return {
+      song: primary,
+      confidence: 1,
+      compatibleReleaseYears: compatibleCatalogReleaseYears(primary, observed),
+    };
+  }
   const songs: CatalogSong[] = [];
   const isrc = input.metadata.isrc?.trim();
   if (isrc) songs.push(...await input.lookupByIsrc(input.request.plan.storefront, isrc));
@@ -1541,8 +1611,12 @@ async function resolveCatalogSong(input: {
   };
   const ranked = rankCatalogMatches(input.candidate.id, candidate, songs);
   return ranked.status === "accepted" && ranked.song
-    ? { song: ranked.song, confidence: Math.min(1, Math.max(0.8, ranked.score / 150)) }
-    : { song: null, confidence: 0 };
+    ? {
+        song: ranked.song,
+        confidence: Math.min(1, Math.max(0.8, ranked.score / 150)),
+        compatibleReleaseYears: compatibleCatalogReleaseYears(ranked.song, songs),
+      }
+    : { song: null, confidence: 0, compatibleReleaseYears: [] };
 }
 
 export function createPipelineV3LiveAdapters(
@@ -1672,7 +1746,11 @@ export function createPipelineV3LiveAdapters(
         const attestedRoots = new Set(attestedBindings.map((binding) => binding.provenanceRoot).filter(Boolean));
         const attestedStrength = Math.max(0, ...attestedBindings.map((binding) => boundedScore(binding.strength, 0)));
         const evidencePassed = requiredPredicates.length > 0 && failedPredicates.length === 0;
-        let resolved: { song: CatalogSong | null; confidence: number } = { song: null, confidence: 0 };
+        let resolved: CatalogResolutionV3 = {
+          song: null,
+          confidence: 0,
+          compatibleReleaseYears: [],
+        };
         if (metadata) {
           try {
             resolved = await resolveCatalogSong({ candidate, metadata, request, lookupByIsrc, searchSongs });
@@ -1686,7 +1764,11 @@ export function createPipelineV3LiveAdapters(
         const releaseYear = normalizedCatalogReleaseYear(resolved.song?.releaseDate);
         const failedConstraints = [...new Set([
           ...excludedConstraints,
-          ...catalogEraConstraintFailuresV3(request.plan, releaseYear),
+          ...catalogEraConstraintFailuresV3(
+            request.plan,
+            releaseYear,
+            resolved.compatibleReleaseYears,
+          ),
         ])];
         const rankingSignals = Object.fromEntries(Object.entries(metadata?.rankingSignals ?? {})
           .map(([key, value]) => [key, boundedScore(value, 0)]));
@@ -1722,6 +1804,7 @@ export function createPipelineV3LiveAdapters(
             recordingFamilyKey: resolved.song ? recordingFamily(resolved.song) : null,
             confidence: resolved.confidence,
             releaseYear,
+            compatibleReleaseYears: resolved.compatibleReleaseYears,
           },
           rankingSignals,
           sourceRank: Math.min(Number.MAX_SAFE_INTEGER, ...bindings.map((binding) => binding.sourceRank)),

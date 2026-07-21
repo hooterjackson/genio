@@ -75,4 +75,13 @@ describe("Pipeline V3 catalog era policy", () => {
     expect(normalizedCatalogReleaseYear("1973-06-01")).toBe(1973);
     expect(normalizedCatalogReleaseYear("not-a-date")).toBeNull();
   });
+
+  test("accepts an in-range year from an exact compatible recording-family issue", () => {
+    expect(catalogEraConstraintFailuresV3(eraPlan(), 2004, [1978, 2004])).toEqual([]);
+  });
+
+  test("fails closed when compatible issues still cannot prove the requested era", () => {
+    expect(catalogEraConstraintFailuresV3(eraPlan(), 2004, [2004, 2018])).toEqual(["era-between"]);
+    expect(catalogEraConstraintFailuresV3(eraPlan(), null, [])).toEqual(["era-between"]);
+  });
 });
