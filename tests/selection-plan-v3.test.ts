@@ -22,6 +22,24 @@ function genreCandidateMemberships(genres: readonly string[]) {
 }
 
 describe("Pipeline V3 typed planning", () => {
+  test("collapses baile funk aliases and preserves TikTok breakout context", () => {
+    const spec = createRunSpecV3({
+      prompt: "69 baile funk TikTok breakouts",
+      requestedTrackCount: 69,
+    });
+    const genres = spec.membershipPredicates.filter((item) => item.axis === "genre");
+    expect(genres).toHaveLength(1);
+    expect(genres[0]?.values).toEqual(["funk carioca"]);
+    expect(spec.membershipPredicates.some((item) => (
+      item.axis === "theme" && item.values.includes("TikTok breakout")
+    ))).toBe(true);
+    expect(spec.semanticAudit).toMatchObject({
+      passed: true,
+      aliasCollapses: ["baile funk|funk carioca=>funk carioca"],
+    });
+    expect(spec.userGoal?.requestedTrackCount).toBe(69);
+  });
+
   test("separates house music from a lyrical theme about houses", () => {
     const genre = createRunSpecV3({ prompt: "50 influential house music tracks", requestedTrackCount: 50 });
     expect(genre.criticalAmbiguities).toEqual([]);

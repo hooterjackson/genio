@@ -24,6 +24,8 @@ import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
 
 export const PIPELINE_V3_VERSION = "corpus_first_v3" as const;
 export const PIPELINE_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
+export const GROUNDED_RECOVERY_V3_1_POLICY_VERSION = "grounded_recovery_v3_1_policy_v1" as const;
+export const SEMANTIC_PLAN_V3_1_VERSION = "semantic_plan_v3_1" as const;
 export const SELECTION_PLAN_V3_VERSION = "selection_plan_v3" as const;
 export const SELECTION_PLAN_V3_SCHEMA_VERSION = 1 as const;
 export const PIPELINE_V3_MAX_SOURCE_DISCOVERY_HINTS = 12;
@@ -154,6 +156,32 @@ export interface RunSpecV3 {
   readonly sourceDiscoveryHints: readonly PipelineV3SourceDiscoveryHint[];
   readonly criticalAmbiguities: readonly CriticalAmbiguityV3[];
   readonly recordingPolicy: RecordingPolicyV3;
+  /** Immutable semantic contract compiled from the raw request. */
+  readonly userGoal?: UserGoalV31;
+  /** Deterministic proof that the compiler did not create contradictory hard clauses. */
+  readonly semanticAudit?: SemanticAuditV31;
+}
+
+export type UserGoalClauseRoleV31 = "membership" | "ranking" | "diversity" | "sequencing";
+export interface UserGoalClauseV31 {
+  readonly id: string;
+  readonly role: UserGoalClauseRoleV31;
+  readonly axis: MembershipAxisV3 | RankingDimensionV3;
+  readonly values: readonly string[];
+  readonly sourceIds: readonly string[];
+}
+export interface UserGoalV31 {
+  readonly version: typeof SEMANTIC_PLAN_V3_1_VERSION;
+  readonly rawPrompt: string;
+  readonly requestedTrackCount: number;
+  readonly clauses: readonly UserGoalClauseV31[];
+}
+export interface SemanticAuditV31 {
+  readonly version: typeof SEMANTIC_PLAN_V3_1_VERSION;
+  readonly passed: boolean;
+  readonly hardConstraintHash: string;
+  readonly aliasCollapses: readonly string[];
+  readonly contradictions: readonly string[];
 }
 
 export interface SelectionPlanV3 extends RunSpecV3 {
@@ -470,7 +498,69 @@ function objective(
 }
 
 function detectedGenreTerms(prompt: string): string[] {
-  return GENRE_TERMS.filter((genre) => new RegExp(`\\b${genre.replace(/\s+/gu, "\\s+")}\\b`, "u").test(prompt));
+  // Compound genre names are concepts, not an AND with every token they
+  // contain. In particular, baile funk/funk carioca must never silently
+  // become both `funk carioca` and the much broader `funk` genre.
+  const baileFunk = /\b(?:baile\s+funk|funk\s+carioca)\b/u.test(prompt);
+  const terms = GENRE_TERMS.filter((genre) => {
+    if (genre === "baile funk" || genre === "funk carioca") return false;
+    return new RegExp(`\\b${genre.replace(/\s+/gu, "\\s+")}\\b`, "u").test(prompt);
+  });
+  if (baileFunk) terms.push("funk carioca");
+  return terms;
+}
+
+function compileSemanticContractV31(input: {
+  rawPrompt: string;
+  requestedTrackCount: number;
+  predicates: readonly MembershipPredicateV3[];
+  objectives: readonly RankingObjectiveV3[];
+}): { userGoal: UserGoalV31; semanticAudit: SemanticAuditV31 } {
+  const clauses: UserGoalClauseV31[] = [
+    ...input.predicates.map((item) => ({
+      id: item.id,
+      role: "membership" as const,
+      axis: item.axis,
+      values: [...item.values],
+      sourceIds: [item.id],
+    })),
+    ...input.objectives.map((item) => ({
+      id: item.id,
+      role: item.dimension === "sequencing" ? "sequencing" as const
+        : item.dimension.endsWith("diversity") || item.dimension.endsWith("balance") ? "diversity" as const
+          : "ranking" as const,
+      axis: item.dimension,
+      values: [...item.values],
+      sourceIds: [item.id],
+    })),
+  ];
+  const contradictions: string[] = [];
+  for (const required of input.predicates.filter((item) => item.operator !== "exclude")) {
+    for (const excluded of input.predicates.filter((item) => item.operator === "exclude" && item.axis === required.axis)) {
+      const overlap = required.values.filter((value) => excluded.values.some((other) => normalize(other) === normalize(value)));
+      if (overlap.length > 0) contradictions.push(`${required.axis}:${overlap.map(normalize).join("|")}`);
+    }
+  }
+  const hardConstraintHash = createHash("sha256").update(stableStringify(
+    input.predicates.map(({ axis, operator, values }) => ({ axis, operator, values: values.map(normalize).sort() })),
+  )).digest("hex");
+  return {
+    userGoal: {
+      version: SEMANTIC_PLAN_V3_1_VERSION,
+      rawPrompt: input.rawPrompt,
+      requestedTrackCount: input.requestedTrackCount,
+      clauses,
+    },
+    semanticAudit: {
+      version: SEMANTIC_PLAN_V3_1_VERSION,
+      passed: contradictions.length === 0,
+      hardConstraintHash,
+      aliasCollapses: /\b(?:baile\s+funk|funk\s+carioca)\b/iu.test(input.rawPrompt)
+        ? ["baile funk|funk carioca=>funk carioca"]
+        : [],
+      contradictions: dedupe(contradictions),
+    },
+  };
 }
 
 function escapedPattern(value: string): string {
@@ -518,11 +608,14 @@ function replacePromptGenrePredicates(
 ): void {
   if (genres.length === 0) return;
   const normalizedGenres = new Set(genres.map(normalize));
+  const aliasEquivalentGenres = normalizedGenres.has("funk carioca")
+    ? new Set(["funk carioca", "baile funk", "funk"])
+    : normalizedGenres;
   const promptGenrePredicate = (value: MembershipPredicateV3): boolean => (
     value.axis === "genre"
     && (value.operator === "include" || value.operator === "require")
     && value.values.length > 0
-    && value.values.every((item) => normalizedGenres.has(normalize(item)))
+    && value.values.every((item) => aliasEquivalentGenres.has(normalize(item)))
   );
   for (let index = predicates.length - 1; index >= 0; index -= 1) {
     if (promptGenrePredicate(predicates[index]!)) predicates.splice(index, 1);
@@ -775,6 +868,14 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   if (/\b(?:baile\s+funk|funk\s+carioca)\b/u.test(prompt)) {
     pushPredicate(predicates, predicate("genre", "require", ["funk carioca"], "The request explicitly names funk carioca/baile funk."));
   }
+  if (/\btiktok\b/u.test(prompt) && /\b(?:breakout|breakouts|viral|virality|trending|trend)\b/u.test(prompt)) {
+    pushPredicate(predicates, predicate(
+      "theme",
+      "require",
+      ["TikTok breakout", "TikTok virality"],
+      "The request explicitly requires a documented TikTok breakout or viral context.",
+    ));
+  }
   if (/\b(?:1960s|1970s|1980s|60s|70s|80s|soul|samba[- ]funk)\s+(?:brazilian\s+)?funk\b|\bbrazilian\s+(?:soul|samba[- ]funk)\b/u.test(prompt)) {
     pushPredicate(predicates, predicate("genre", "require", ["Brazilian soul and funk"], "The request explicitly distinguishes the soul-and-funk tradition."));
   }
@@ -841,6 +942,15 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
         "era_balance",
         "subgenre_regional_representation",
       ];
+  const semantic = compileSemanticContractV31({
+    rawPrompt: input.prompt.trim(),
+    requestedTrackCount: input.requestedTrackCount,
+    predicates,
+    objectives,
+  });
+  if (!semantic.semanticAudit.passed) {
+    throw new Error(`Pipeline V3.1 semantic audit found contradictory hard clauses: ${semantic.semanticAudit.contradictions.join(", ")}`);
+  }
   return deepFreeze({
     schemaVersion: SELECTION_PLAN_V3_SCHEMA_VERSION,
     pipelineVersion: PIPELINE_V3_VERSION,
@@ -865,6 +975,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
       preferCanonicalStudio: true,
       excludeKaraokeTributeAndCovers: true,
     },
+    ...semantic,
   });
 }
 
@@ -971,12 +1082,22 @@ export function resolveRunSpecV3(
     unanswered.delete(answer.key);
   }
   const uniqueIntents = dedupe(intents);
+  const semantic = compileSemanticContractV31({
+    rawPrompt: spec.prompt,
+    requestedTrackCount: spec.requestedTrackCount,
+    predicates,
+    objectives,
+  });
+  if (!semantic.semanticAudit.passed) {
+    throw new Error(`Pipeline V3.1 guidance created contradictory hard clauses: ${semantic.semanticAudit.contradictions.join(", ")}`);
+  }
   return deepFreeze({
     ...spec,
     intents: uniqueIntents,
     engines: intentEngines(uniqueIntents),
     membershipPredicates: predicates,
     rankingObjectives: objectives,
+    ...semantic,
     confirmed: unanswered.size === 0,
     resolvedAmbiguityKeys: [...seen] as CriticalAmbiguityV3["key"][],
   });

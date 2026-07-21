@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { Pool, PoolClient } from "pg";
 import {
@@ -2452,6 +2452,7 @@ export class Repository {
     }
     const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
     const supportsImmutableRunSpec = schemaVersion >= 14;
+    const supportsGroundedRecoveryAudit = schemaVersion >= 15;
     let selectionPlanV3: SelectionPlanV3 | null = null;
     if (supportsImmutableRunSpec && exactRequestedTrackCount !== null) {
       try {
@@ -2749,6 +2750,29 @@ export class Repository {
              VALUES($1,$2,now())`,
             [runId, queryPlanRevisionId],
           );
+          if (supportsGroundedRecoveryAudit && selectionPlanV3.userGoal && selectionPlanV3.semanticAudit) {
+            const goalJson = JSON.stringify(selectionPlanV3.userGoal);
+            const goalHash = createHash("sha256").update(goalJson).digest("hex");
+            await client.query(
+              `INSERT INTO user_goals(run_id,goal_hash,goal_json,semantic_plan_version,policy_version)
+               VALUES($1,$2,$3::jsonb,'semantic_plan_v3_1','grounded_recovery_v3_1_policy_v1')
+               ON CONFLICT(run_id) DO NOTHING`,
+              [runId, goalHash, goalJson],
+            );
+            await client.query(
+              `INSERT INTO semantic_plan_revisions(
+                 id,run_id,revision,parent_revision,equivalence,hard_constraint_hash,plan_json,audit_json)
+               VALUES($1,$2,1,NULL,'initial',$3,$4::jsonb,$5::jsonb)
+               ON CONFLICT(run_id,revision) DO NOTHING`,
+              [
+                randomUUID(),
+                runId,
+                selectionPlanV3.semanticAudit.hardConstraintHash,
+                JSON.stringify(selectionPlanV3),
+                JSON.stringify(selectionPlanV3.semanticAudit),
+              ],
+            );
+          }
         }
         if (!selectionPlanV3 && executionPolicy?.kind === "fast_curated") {
           const route = createFastRouteCheckpoint(executionPolicy, insertedRun.rows[0]!.created_at);

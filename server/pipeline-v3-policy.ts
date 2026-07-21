@@ -34,7 +34,7 @@ export const PIPELINE_V3_ALLOWED_PROVIDER_MODEL_IDS = Object.freeze([
   PIPELINE_V3_DEFAULT_BASELINE_MODEL_ID,
   PIPELINE_V3_DEFAULT_ESCALATION_MODEL_ID,
 ] as const);
-export const PIPELINE_V3_PROMPT_VERSION = "corpus_first_v3_prompt_v1" as const;
+export const PIPELINE_V3_PROMPT_VERSION = "grounded_recovery_v3_1_prompt_v1" as const;
 
 export type PipelineV3InterpretationConfidence = "high" | "medium" | "low";
 

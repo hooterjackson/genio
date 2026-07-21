@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.1.0",
+      "releasedAt": "2026-07-21",
+      "title": "Grounded semantic recovery",
+      "notes": [
+        "Requires provider-hosted web search before any discovered track can enter the evidence pipeline, eliminating unaudited model-memory batches.",
+        "Compiles an immutable semantic goal and audit, collapses baile funk and funk carioca into one equivalent concept, and preserves TikTok breakout context as a membership requirement.",
+        "Adds schema-15 semantic revisions, expiring candidate leads, and bounded recovery audit records behind worker protocol 7.",
+        "Keeps exact counts authoritative and preserves explicit partial-result consent when governed discovery cannot safely fill the request."
+      ]
+    },
+    {
       "version": "2.0.9",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 publication gateway recovery",

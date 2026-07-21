@@ -624,6 +624,10 @@ describe("Pipeline V3 live read-only adapters", () => {
     await expect(ungrounded.discover(discoveryRequest(selection, "editorial_tracks")))
       .rejects.toThrow("not bound to provider-returned sources");
     const requestBody = JSON.parse((withoutCurrentRetrieval.mock.calls[0] as any)[0].input);
+    expect((withoutCurrentRetrieval.mock.calls[0] as any)[0]).toMatchObject({
+      tool_choice: "required",
+      max_tool_calls: 3,
+    });
     expect(requestBody.scoutSourceHints).toEqual([{
       url: seedUrl,
       title: "Disco history",

@@ -16,7 +16,7 @@ describe("worker pipeline protocol", () => {
     const current = { protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION };
     expect(workerPipelineProtocolVersion(current)).toBe(WORKER_PIPELINE_PROTOCOL_VERSION);
     expect(isWorkerPipelineProtocolCompatible(current)).toBe(true);
-    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(6);
+    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(7);
     expect(isWorkerPipelineProtocolCompatible({ protocolVersion: "playlist-pipeline-v5" })).toBe(false);
     expect(isWorkerPipelineProtocolCompatible({ version: "matching-git-revision" })).toBe(false);
     expect(isWorkerPipelineProtocolCompatible(null)).toBe(false);

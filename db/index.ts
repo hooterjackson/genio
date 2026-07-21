@@ -2,7 +2,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool, type PoolConfig } from "pg";
 import * as schema from "./schema.ts";
 
-export const DATABASE_SCHEMA_VERSION = "14";
+export const DATABASE_SCHEMA_VERSION = "15";
 
 export interface DatabaseSchemaSupport {
   minimum: string;
@@ -17,7 +17,7 @@ export interface DatabaseSchemaSupport {
  */
 export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",
-  maximum: "14",
+  maximum: "15",
   preferred: DATABASE_SCHEMA_VERSION,
 };
 
@@ -30,7 +30,7 @@ export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
  */
 export const DATABASE_SCHEMA_V13_BRIDGE_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",
-  maximum: "14",
+  maximum: "15",
   preferred: "13",
 };
 

@@ -33,8 +33,8 @@ export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
 
 // v6 understands the inert corpus-first routing contract. Assignment remains
 // separately disabled; declaring capability does not opt a run into V3.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v6";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 6;
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v7";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 7;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
   protocolNumber: WORKER_PIPELINE_PROTOCOL_NUMBER,
