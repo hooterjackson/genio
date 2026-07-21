@@ -80,6 +80,28 @@ describe("Pipeline V3 catalog era policy", () => {
     expect(catalogEraConstraintFailuresV3(eraPlan(), 2004, [1978, 2004])).toEqual([]);
   });
 
+  test("uses the earliest supported family issue rather than treating later compilations as a new-era recording", () => {
+    const modernPlan = {
+      membershipPredicates: [{
+        id: "era-membership",
+        axis: "era" as const,
+        operator: "require" as const,
+        values: ["2000s"],
+        source: "user" as const,
+        reason: "Requested era.",
+      }],
+      hardConstraints: [{
+        id: "era-modern",
+        axis: "era" as const,
+        operator: "within" as const,
+        values: ["2000s"],
+        kind: "hard" as const,
+        relaxationRank: null,
+      }],
+    };
+    expect(catalogEraConstraintFailuresV3(modernPlan, 2004, [1978, 2004])).toEqual(["era-modern"]);
+  });
+
   test("fails closed when compatible issues still cannot prove the requested era", () => {
     expect(catalogEraConstraintFailuresV3(eraPlan(), 2004, [2004, 2018])).toEqual(["era-between"]);
     expect(catalogEraConstraintFailuresV3(eraPlan(), null, [])).toEqual(["era-between"]);

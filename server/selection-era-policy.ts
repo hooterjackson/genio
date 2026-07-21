@@ -59,21 +59,22 @@ export function recordingFamilySatisfiesEraConstraint(
   },
   constraint: Pick<SelectionConstraint, "operator" | "values">,
 ): boolean {
-  const releaseYears = validRecordingFamilyYears(input);
-  if (releaseYears.length === 0) return false;
+  // Era describes the recording, not every later compilation or reissue on
+  // which it appears. Once exact-family issue dates are known, the earliest
+  // supported issue is the conservative catalog proxy for recording era.
+  const releaseYear = canonicalRecordingFamilyReleaseYear(input);
+  if (releaseYear === null) return false;
   const ranges = constraintYearRanges(constraint.values);
   if (ranges.length === 0) return false;
   const start = Math.min(...ranges.map((range) => range.start));
   const end = Math.max(...ranges.map((range) => range.end));
-  if (constraint.operator === "before") return releaseYears.some((releaseYear) => releaseYear < start);
-  if (constraint.operator === "after") return releaseYears.some((releaseYear) => releaseYear > end);
+  if (constraint.operator === "before") return releaseYear < start;
+  if (constraint.operator === "after") return releaseYear > end;
   // `between` expresses one continuous interval whose endpoints are commonly
   // persisted as two scalar values. `within` values are alternatives: a
   // request for the 1970s and 1990s must not silently admit the 1980s.
   if (constraint.operator === "between") {
-    return releaseYears.some((releaseYear) => releaseYear >= start && releaseYear <= end);
+    return releaseYear >= start && releaseYear <= end;
   }
-  return releaseYears.some((releaseYear) => (
-    ranges.some((range) => releaseYear >= range.start && releaseYear <= range.end)
-  ));
+  return ranges.some((range) => releaseYear >= range.start && releaseYear <= range.end);
 }

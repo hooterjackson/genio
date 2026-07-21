@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.8",
+      "releasedAt": "2026-07-20",
+      "title": "Evidence-first catalog era resolution",
+      "notes": [
+        "Prioritizes focused music-scope searches before structural filters, while retaining an era-aware fallback query for deterministic Apple editorial discovery.",
+        "Recovers historical release years only from compatible exact-ISRC catalog issues and rejects conflicting stable recording identities.",
+        "Evaluates hard era constraints against the earliest supported exact-family issue and counts only a newly earlier canonical year as retrieval progress.",
+        "Adds production-shaped disco-era regressions for semantic query order, exact-identifier recovery, conflicting ISRCs, version boundaries, and zero-yield behavior."
+      ]
+    },
+    {
       "version": "2.0.7",
       "releasedAt": "2026-07-20",
       "title": "Recording-family era recovery",

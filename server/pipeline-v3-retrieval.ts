@@ -802,6 +802,15 @@ function mergeQualifiedTrack(
     rankingSignals[key] = Math.max(rankingSignals[key] ?? 0, value ?? 0);
   }
   const provenanceRoots = new Set(bindings.map(({ provenanceRoot }) => provenanceRoot)).size;
+  const canonicalReleaseYear = (candidateReleaseYear: number | null, compatibleReleaseYears: readonly number[]) => (
+    [candidateReleaseYear, ...compatibleReleaseYears]
+      .filter((year): year is number => Number.isInteger(year) && year !== null)
+      .sort((left, right) => left - right)[0] ?? null
+  );
+  const beforeCanonicalReleaseYear = canonicalReleaseYear(
+    existing.catalogReleaseYear ?? null,
+    existing.catalogCompatibleReleaseYears ?? [],
+  );
   const track: QualifiedTrackV3 = {
     ...existing,
     catalogReleaseYear: existing.catalogReleaseYear ?? incoming.catalogReleaseYear ?? null,
@@ -825,10 +834,18 @@ function mergeQualifiedTrack(
     rankingSignals,
     sourceRank: Math.min(existing.sourceRank, incoming.sourceRank),
   };
+  const afterCanonicalReleaseYear = canonicalReleaseYear(
+    track.catalogReleaseYear ?? null,
+    track.catalogCompatibleReleaseYears ?? [],
+  );
   return {
     track,
     improved: observations.length > existing.sourceObservationIds.length
       || bindingIds.length > existing.evidenceBindingIds.length
+      || (afterCanonicalReleaseYear !== null && (
+        beforeCanonicalReleaseYear === null
+        || afterCanonicalReleaseYear < beforeCanonicalReleaseYear
+      ))
       || track.evidenceStrength > existing.evidenceStrength
       || track.scopeFit > existing.scopeFit
       || track.independentProvenanceRoots > existing.independentProvenanceRoots

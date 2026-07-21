@@ -500,6 +500,75 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     }));
   });
 
+  test("resets zero-yield only when an exact-family issue proves an earlier canonical year", async () => {
+    const targetStrategy = "curated_genre_scene:qualified_artist_release_expansion";
+    const run = async (releaseYearsByRound: readonly (readonly number[])[]) => {
+      let targetRound = 0;
+      const adapters: RetrievalAdaptersV3 = {
+        discover: async ({ strategy }) => {
+          if (strategy.id !== targetStrategy) {
+            return { candidates: [], nextCursor: null, exhausted: true };
+          }
+          targetRound += 1;
+          return {
+            candidates: [candidate(targetRound, {
+              id: `shared-era-recording-${targetRound}`,
+              title: "Shared Era Recording",
+              artist: "One Artist",
+              // Distinct source editions reach qualification, but resolve to
+              // the same Apple song and recording family below.
+              album: `One Album · issue ${targetRound}`,
+              sourceObservationIds: ["shared-observation"],
+            })],
+            nextCursor: null,
+            exhausted: false,
+          };
+        },
+        qualify: async ({ candidates }) => candidates.map((value) => {
+          const years = releaseYearsByRound[Math.min(targetRound - 1, releaseYearsByRound.length - 1)]!;
+          const base = qualification(value);
+          const binding = base.evidence.bindings![0]!;
+          return qualification(value, {
+            evidence: {
+              ...base.evidence,
+              bindingIds: ["shared-binding"],
+              bindings: [{ ...binding, id: "shared-binding" }],
+            },
+            catalog: {
+              storefrontPlayable: true,
+              appleSongId: "apple-shared-era",
+              recordingFamilyKey: "family-shared-era",
+              confidence: 0.98,
+              releaseYear: years[years.length - 1] ?? null,
+              compatibleReleaseYears: years,
+            },
+          });
+        }),
+      };
+      const result = await executeRetrievalV3({
+        runId: `canonical-year-${releaseYearsByRound.flat().join("-")}`,
+        plan: plan("two disco tracks", 2),
+        adapters,
+        policy: { maximumGlobalRounds: 100 },
+      });
+      return result.strategies.find(({ id }) => id === targetStrategy)!;
+    };
+
+    const laterCompilationOnly = await run([[1978], [1978, 2004], [1978, 2004], [1978, 2004]]);
+    const earlierExactFamilyIssue = await run([[2004], [1978, 2004], [1978, 2004], [1978, 2004]]);
+
+    expect(laterCompilationOnly).toMatchObject({
+      rounds: 3,
+      consecutiveZeroQualifiedYieldRounds: 2,
+      status: "exhausted",
+    });
+    expect(earlierExactFamilyIssue).toMatchObject({
+      rounds: 4,
+      consecutiveZeroQualifiedYieldRounds: 2,
+      status: "exhausted",
+    });
+  });
+
   test("exhausts each strategy after two zero-qualified-yield rounds", async () => {
     const adapters: RetrievalAdaptersV3 = {
       discover: vi.fn(async () => ({ candidates: [], nextCursor: null, exhausted: false })),

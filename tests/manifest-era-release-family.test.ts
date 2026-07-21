@@ -18,6 +18,17 @@ describe("manifest hard-era evidence", () => {
     }, seventiesAndEighties)).toBe(true);
   });
 
+  test("does not reclassify a period recording into the era of a later compilation", () => {
+    expect(recordingFamilySatisfiesEraConstraint({
+      candidateReleaseYear: null,
+      appleReleaseDate: "2004-05-07",
+      compatibleReleaseYears: [1978, 2004],
+    }, {
+      operator: "within",
+      values: ["2000s"],
+    })).toBe(false);
+  });
+
   test("rejects a genuinely out-of-era recording with only modern compatible issues", () => {
     expect(recordingFamilySatisfiesEraConstraint({
       candidateReleaseYear: null,

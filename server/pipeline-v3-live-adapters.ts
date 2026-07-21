@@ -49,7 +49,10 @@ import {
   catalogEraPoliciesV3,
   normalizedCatalogReleaseYear,
 } from "./pipeline-v3-era-policy.ts";
-import { catalogRecordingVersionSignature } from "./pipeline-v2-policy.ts";
+import {
+  catalogRecordingVersionSignature,
+  recordingFamilyKey,
+} from "./pipeline-v2-policy.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
 /**
@@ -279,12 +282,23 @@ function legacySinglePredicateIds(
 }
 
 function scopeTerms(request: Pick<DiscoveryRequestV3, "plan">): string[] {
-  const values = request.plan.membershipPredicates
-    .filter((predicate) => predicate.operator !== "exclude"
-      && !["recording_version", "content", "factual_relationship"].includes(predicate.axis))
+  // Apple search is relevance-ranked, not a constraint solver. Put the
+  // semantic music scope first (for example `disco`), then add structural
+  // filters such as era. Sending `1973 1983 disco broad artist diversity` as
+  // the first query can rank a current "Club Disco" playlist ahead of
+  // Apple's historically scoped "Disco Essentials" container.
+  const evidenceValues = evidenceMembershipPredicatesV3(request.plan)
     .flatMap((predicate) => predicate.values)
     .map(normalized)
     .filter(Boolean);
+  const structuralValues = request.plan.membershipPredicates
+    .filter((predicate) => predicate.operator !== "exclude"
+      && !["recording_version", "content", "factual_relationship"].includes(predicate.axis)
+      && !evidenceMembershipPredicatesV3(request.plan).some(({ id }) => id === predicate.id))
+    .flatMap((predicate) => predicate.values)
+    .map(normalized)
+    .filter(Boolean);
+  const values = [...evidenceValues, ...structuralValues];
   if (values.length > 0) return [...new Set(values)];
   return [...new Set(normalized(request.plan.prompt)
     .replace(/\b\d+\b/gu, " ")
@@ -297,15 +311,15 @@ function scopeTerms(request: Pick<DiscoveryRequestV3, "plan">): string[] {
 
 function discoveryQueries(request: Pick<DiscoveryRequestV3, "plan">): string[] {
   const terms = scopeTerms(request);
-  const prompt = request.plan.prompt
-    .replace(/\b\d{1,3}\b/gu, " ")
-    .replace(/\b(?:songs?|tracks?|playlist|give me|find me|make me|create)\b/giu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
+  const semanticTerms = evidenceMembershipPredicatesV3(request.plan)
+    .flatMap((predicate) => predicate.values)
+    .map(normalized)
+    .filter(Boolean);
+  const focused = [...new Set(semanticTerms)].join(" ") || terms.join(" ");
   return [...new Set([
-    prompt,
+    focused,
+    focused ? `${focused} essentials` : "",
     terms.join(" "),
-    terms.length > 1 ? `${terms.join(" ")} essentials` : `${terms[0] ?? prompt} essentials`,
   ].filter(Boolean))].slice(0, 3);
 }
 
@@ -1493,10 +1507,7 @@ function contentCompatible(song: CatalogSong, request: QualificationRequestV3): 
 }
 
 function recordingFamily(song: CatalogSong): string {
-  const isrc = song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "");
-  if (isrc) return `isrc:${isrc}`;
-  const durationBucket = song.durationInMillis ? Math.round(song.durationInMillis / 3_000) : "?";
-  return `meta:${normalized(song.artistName)}|${normalized(song.name)}|${durationBucket}`;
+  return recordingFamilyKey({ song });
 }
 
 async function mapConcurrent<T, R>(items: readonly T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -1530,8 +1541,10 @@ function normalizedCatalogIsrc(song: Pick<CatalogSong, "isrc">): string | null {
 /**
  * Catalog dates may describe an edition rather than the underlying
  * recording. Accept a date only from the same bounded recording family:
- * compatible version/content signature plus exact ISRC, or (when neither
- * side has an ISRC) exact normalized artist/title and compatible duration.
+ * compatible version/content signature plus exact ISRC. When neither row has
+ * a stable identifier, exact normalized artist/title and compatible duration
+ * may retain the existing sparse-metadata fallback. Conflicting ISRCs are
+ * different identities and can never lend dates to one another.
  */
 function compatibleCatalogRecordingIssue(primary: CatalogSong, alternate: CatalogSong): boolean {
   if (catalogRecordingVersionSignature(primary) !== catalogRecordingVersionSignature(alternate)) return false;
@@ -1571,7 +1584,9 @@ async function resolveCatalogSong(input: {
       const isrc = normalizedCatalogIsrc(primary);
       if (isrc) {
         observed = [...observed, ...await input.lookupByIsrc(input.request.plan.storefront, isrc)];
-      } else {
+      }
+      const observedYears = compatibleCatalogReleaseYears(primary, observed);
+      if (catalogEraConstraintFailuresV3(input.request.plan, selectedYear, observedYears).length > 0) {
         observed = [
           ...observed,
           ...await input.searchSongs(
