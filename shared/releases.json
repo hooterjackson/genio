@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.1",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 curated production activation",
+      "notes": [
+        "Activates governed Pipeline V3 retrieval for public genre, scene, mood, activity, similarity, artist-catalogue, and fixed-container requests from 1 to 300 tracks.",
+        "Deploys intent-specific evidence retrieval, adaptive exact-fill reserves, recording-family catalog resolution, and explicit consent before any partial playlist publication.",
+        "Adds a dedicated deep-research worker, fenced protocol-6 job execution, resumable source retrieval, and release-path observability across API and workers.",
+        "Keeps factual and exhaustive public assignment gated until their independent evidence-feasibility benchmark is approved, while deploying their compatible runtime and durable job infrastructure."
+      ]
+    },
+    {
       "version": "2.0.0",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 governed retrieval foundation",
