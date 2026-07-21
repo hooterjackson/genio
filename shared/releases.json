@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.5",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 publication integrity",
+      "notes": [
+        "Fixes the exact-track manifest hash so V3 persistence and Apple publication verify the same ordered, run-owned recording identities.",
+        "Adds a database-backed regression that crosses the immutable publication guard before the first Apple authorization read.",
+        "Restores automatic Apple publication after an exact governed retrieval reaches its requested count and qualified reserve."
+      ]
+    },
+    {
       "version": "2.0.4",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 exact-publication recovery",

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   AppleApiError,
   AppleAuthorizationRequiredError,
@@ -33,6 +32,9 @@ import type {
   AppleWritePermit,
   AppleWritePermitRequest,
 } from "./apple-write-gateway.ts";
+import { manifestContentHash } from "./manifest-integrity.ts";
+
+export { manifestContentHash } from "./manifest-integrity.ts";
 
 const VOLUME_SIZE = 1_000;
 const APPEND_BATCH_SIZE = 25;
@@ -294,11 +296,6 @@ export function publicationPartialOutcomeStatus(input: {
   if ((input.unresolvedCoverageCount ?? 0) > 0) return "partial_frontier_exhausted";
   if ((input.omittedCandidateCount ?? 0) > 0) return "partial_evidence_shortfall";
   return "partial_evidence_shortfall";
-}
-
-export function manifestContentHash(tracks: readonly LockedManifestTrack[]): string {
-  const ordered = tracks.map((track, index) => [index, track.candidateId, track.catalogId]);
-  return createHash("sha256").update(JSON.stringify(ordered)).digest("hex");
 }
 
 function isCorpusFirstV3(manifest: LockedManifest): boolean {

@@ -131,6 +131,7 @@ import {
   stableStringify,
 } from "./security.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
+import { manifestContentHash } from "./manifest-integrity.ts";
 import {
   briefShouldDiversifyArtists,
   desiredPlaylistArtistCount,
@@ -10000,23 +10001,26 @@ export class Repository {
       throw new HttpError(409, "Pipeline V3 manifest tracks must be recording-family unique", "pipeline_v3_result_invalid");
     }
 
-    const manifestHash = result.selected.length === 0 ? null : sha256Hex(stableStringify({
-      schemaVersion: 1,
-      runId,
-      runSpecTarget: target,
-      queryPlanHash: queryPlanV3Hash(queryPlan),
-      // The worker receives a semantic execution projection reconstructed
-      // from QueryPlanV3.  It is intentionally not a byte-for-byte copy of
-      // the original SelectionPlanV3 (audit-only provenance, ambiguity, and
-      // authoring fields are not duplicated into the query plan).  Bind the
-      // manifest to the original immutable plan hash carried by QueryPlanV3;
-      // the transaction below verifies that hash against selection_plans.
-      selectionPlanHash: queryPlan.selectionPlanHash,
-      graphSnapshotId: queryPlan.graphSnapshotId,
-      storefront: plan.storefront,
-      selected: result.selected.map((track) => [track.recordingFamilyKey, track.appleSongId]),
-      reserve: result.reserve.map((track) => [track.recordingFamilyKey, track.appleSongId]),
-    }));
+    // The manifest content hash is the publisher's integrity boundary, so it
+    // must cover the exact ordered Apple payload and use the same canonical
+    // algorithm at persistence and publication time. The wider immutable
+    // research contract remains frozen in run_specs, selection_plans,
+    // query_plan_revisions, graph snapshots, and the revision snapshots.
+    const manifestHash = result.selected.length === 0 ? null : manifestContentHash(
+      result.selected.map((track) => ({
+        // V3 persists a run-owned UUID for every discovered candidate. The
+        // publisher loads and hashes that persisted UUID, not the adapter's
+        // source-local candidate key, so bind the revision to the same
+        // deterministic identity before the transaction begins.
+        candidateId: deterministicUuid({
+          runId,
+          pipelineVersion: "corpus_first_v3",
+          candidateId: track.candidateId,
+          familyKey: track.recordingFamilyKey,
+        }),
+        catalogId: track.appleSongId,
+      })),
+    );
     const manifestId = manifestHash ? deterministicUuid({ runId, kind: "pipeline_v3_manifest" }) : null;
     const manifestRevisionId = manifestHash
       ? deterministicUuid({ runId, kind: "pipeline_v3_manifest_revision", manifestHash })

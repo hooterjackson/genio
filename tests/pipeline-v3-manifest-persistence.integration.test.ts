@@ -14,6 +14,10 @@ import {
   type PipelineV3WriteFence,
 } from "../server/pipeline-v3-worker-execution.ts";
 import { ResearchOrchestrator } from "../server/research.ts";
+import {
+  manifestContentHash as publisherManifestContentHash,
+  publishManifest,
+} from "../server/publisher.ts";
 import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
 import {
   evidenceMembershipPredicateIdsV3,
@@ -470,6 +474,83 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         [context.runId],
       )).rows[0]!;
       expect(publication).toEqual({ run_status: "publishing", publication_jobs: 1 });
+    },
+    120_000,
+  );
+
+  test(
+    "persists the publisher's ordered-track hash and crosses the immutable publication gate",
+    async () => {
+      const context = await createLeasedRun(25, "disco-publisher-hash-boundary");
+      const result = retrievalResult({
+        runId: context.runId,
+        target: 25,
+        selectedCount: 25,
+        reserveCount: 10,
+        status: "exact_ready",
+        prefix: "disco-publisher-hash-boundary",
+        predicateIds: positivePredicateIds(context.selectionPlan),
+      });
+      const persisted = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result,
+        fence: context.fence,
+      });
+      expect(persisted).toMatchObject({
+        manifestId: expect.any(String),
+        manifestRevisionId: expect.any(String),
+        manifestHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        publicationState: "queued",
+      });
+
+      const lockedManifest = await repository.getManifestById(persisted.manifestId!);
+      expect(lockedManifest).toBeTruthy();
+      expect(lockedManifest.tracks.map((track: { catalogId: string }) => track.catalogId))
+        .toEqual(result.selected.map((track) => track.appleSongId));
+
+      const publisherHash = publisherManifestContentHash(lockedManifest.tracks);
+      const storedRevision = (await pool.query<{ content_hash: string }>(
+        "SELECT content_hash FROM manifest_revisions WHERE id=$1",
+        [persisted.manifestRevisionId],
+      )).rows[0]!;
+      expect(storedRevision.content_hash).toBe(publisherHash);
+      expect(persisted.manifestHash).toBe(publisherHash);
+      expect(lockedManifest.contentHash).toBe(publisherHash);
+
+      // Stop at the first post-guard outcome read. Reaching this sentinel
+      // proves publishManifest accepted both the immutable ordered-track hash
+      // and the real persisted Pipeline V3 evidence/publication guard without
+      // requiring Apple network access in this database integration test.
+      const crossedImmutableGate = new Error("crossed immutable V3 publication gate");
+      const guardSpy = vi.fn(repository.getPublicationGuard.bind(repository));
+      const pipelineOutcomeSpy = vi.fn(async () => {
+        throw crossedImmutableGate;
+      });
+      const publicationRepository = new Proxy(repository, {
+        get(target, property) {
+          if (property === "getPublicationGuard") return guardSpy;
+          if (property === "getPipelineOutcome") return pipelineOutcomeSpy;
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      await expect(publishManifest(
+        publicationRepository as unknown as Parameters<typeof publishManifest>[0],
+        persisted.manifestId!,
+      )).rejects.toBe(crossedImmutableGate);
+      expect(guardSpy).toHaveBeenCalledOnce();
+      expect(guardSpy).toHaveBeenCalledWith(expect.objectContaining({
+        runId: context.runId,
+        manifestId: persisted.manifestId,
+        manifestRevisionId: persisted.manifestRevisionId,
+        manifestRevisionHash: publisherHash,
+        selectedCount: 25,
+      }));
+      expect(pipelineOutcomeSpy).toHaveBeenCalledOnce();
+      expect(pipelineOutcomeSpy).toHaveBeenCalledWith(context.runId);
     },
     120_000,
   );
