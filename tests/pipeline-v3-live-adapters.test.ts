@@ -1011,7 +1011,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     });
   });
 
-  test("does not let a jazz-only source prove French, women-artist, and 1960s predicates", async () => {
+  test("does not let a jazz-only source prove French or women while catalog enforces the 1960s", async () => {
     const base = plan("French women in 1960s jazz", 25);
     const selection: SelectionPlanV3 = {
       ...base,
@@ -1052,6 +1052,7 @@ describe("Pipeline V3 live read-only adapters", () => {
       confirmed: true,
     };
     const appleSong = song(91, "Example Quartet", "Example Jazz Track");
+    appleSong.releaseDate = "1967-01-01";
     const supported: HostedWebCandidateV3 = {
       artist: appleSong.artistName,
       title: appleSong.name,
@@ -1082,10 +1083,11 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(qualification).toMatchObject({
       scope: {
         passed: false,
-        failedMembershipPredicateIds: ["geography-france", "artist-women", "era-1960s"],
+        failedMembershipPredicateIds: ["geography-france", "artist-women"],
       },
+      hardConstraints: { passed: true, failedConstraintIds: [] },
       evidence: { passed: false, bindingIds: [expect.any(String)] },
-      catalog: { storefrontPlayable: true, appleSongId: appleSong.id },
+      catalog: { storefrontPlayable: true, appleSongId: appleSong.id, releaseYear: 1967 },
     });
     expect(qualification!.evidence.bindings?.[0]?.predicateIds).toEqual(["genre-jazz"]);
   });
@@ -1102,6 +1104,7 @@ describe("Pipeline V3 live read-only adapters", () => {
       confirmed: true,
     };
     const appleSong = song(92, "Example Trio", "Paris 1967");
+    appleSong.releaseDate = "1967-01-01";
     const supported: HostedWebCandidateV3 = {
       artist: appleSong.artistName,
       title: appleSong.name,
@@ -1147,10 +1150,74 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(qualification).toMatchObject({
       scope: { passed: true, failedMembershipPredicateIds: [] },
       evidence: { passed: true, independentProvenanceRoots: 2 },
+      hardConstraints: { passed: true, failedConstraintIds: [] },
+      catalog: { releaseYear: 1967 },
     });
     expect(qualification!.evidence.bindings?.map((binding) => binding.predicateIds)).toEqual([
       ["genre-jazz"],
-      ["geography-france", "era-1960s"],
+      ["geography-france"],
+    ]);
+  });
+
+  test("qualifies disco evidence while enforcing inclusive 1973–1983 dates from Apple metadata", async () => {
+    const base = plan("disco from 1973 through 1983", 4);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      membershipPredicates: [
+        { id: "genre-disco", axis: "genre", operator: "require", values: ["disco"], source: "user", reason: "Genre." },
+        { id: "era-membership", axis: "era", operator: "require", values: ["1973", "1983"], source: "user", reason: "Era." },
+      ],
+      hardConstraints: [{
+        id: "era-between",
+        axis: "era",
+        operator: "between",
+        values: ["1973", "1983"],
+        kind: "hard",
+        relaxationRank: null,
+      }],
+      confirmed: true,
+    };
+    const songs = [1972, 1973, 1983, 1984].map((year, index) => ({
+      ...song(200 + index, `Disco Artist ${index}`, `Disco Track ${year}`),
+      releaseDate: `${year}-01-01`,
+    }));
+    const hosted = songs.map((value, index): HostedWebCandidateV3 => ({
+      artist: value.artistName,
+      title: value.name,
+      album: value.albumName,
+      sourceUrl: `https://example.org/disco/${index}`,
+      provenanceRoot: "example.org",
+      evidenceStrength: 0.9,
+      sourceRank: index + 1,
+      predicateIds: ["genre-disco"],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      discoverHostedWeb: vi.fn(async () => hosted),
+      searchAppleSongs: vi.fn(async () => songs) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+    const batch = await adapters.discover(discovery);
+    const qualifications = await adapters.qualify({
+      runId: discovery.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: discovery.engine,
+      strategy: discovery.strategy,
+      candidates: batch.candidates,
+    });
+
+    expect(qualifications.map(({ scope, evidence, hardConstraints, catalog }) => ({
+      scope: scope.passed,
+      evidence: evidence.passed,
+      hard: hardConstraints.passed,
+      year: catalog.releaseYear,
+    }))).toEqual([
+      { scope: true, evidence: true, hard: false, year: 1972 },
+      { scope: true, evidence: true, hard: true, year: 1973 },
+      { scope: true, evidence: true, hard: true, year: 1983 },
+      { scope: true, evidence: true, hard: false, year: 1984 },
     ]);
   });
 
@@ -1426,6 +1493,7 @@ describe("Pipeline V3 live read-only adapters", () => {
       confirmed: true,
     };
     const appleSong = song(101, "Example Ensemble", "Example Recording");
+    appleSong.releaseDate = "1967-01-01";
     const discoverGovernedGraph = vi.fn(async () => ({
       candidates: [{
         title: appleSong.name,
@@ -1485,9 +1553,11 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(qualification).toMatchObject({
       scope: {
         passed: false,
-        failedMembershipPredicateIds: ["geography-france", "era-1960s"],
+        failedMembershipPredicateIds: ["geography-france"],
       },
       evidence: { passed: false },
+      hardConstraints: { passed: true, failedConstraintIds: [] },
+      catalog: { releaseYear: 1967 },
     });
     expect(qualification!.evidence.bindings?.[0]?.predicateIds).toEqual(["genre-jazz"]);
   });

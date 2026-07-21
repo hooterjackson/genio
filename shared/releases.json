@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.6",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 catalog-era qualification",
+      "notes": [
+        "Verifies requested eras against Apple catalog release metadata instead of requiring editorial citations to repeat literal date-range endpoints.",
+        "Keeps genre, scene, geography, similarity, and factual membership evidence strict while preventing valid cited tracks from being rejected before catalog resolution.",
+        "Preserves catalog release years across qualified reserves and continued research so resumed runs enforce the same immutable era policy.",
+        "Adds inclusive 1973–1983 boundary regressions at policy, live Apple resolution, and continuation-checkpoint layers."
+      ]
+    },
+    {
       "version": "2.0.5",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 publication integrity",

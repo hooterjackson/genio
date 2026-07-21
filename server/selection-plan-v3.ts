@@ -162,10 +162,11 @@ export interface SelectionPlanV3 extends RunSpecV3 {
 }
 
 /**
- * Recording-version and content rules are verified against the resolved
+ * Recording-version, content, and era rules are verified against the resolved
  * catalog recording, not by requiring an editorial source to repeat the
- * policy sentence. They remain immutable membership policy in the plan, but
- * are intentionally absent from the source-evidence contract.
+ * policy sentence (or literal range endpoints). They remain immutable
+ * membership policy in the plan, but are intentionally absent from the
+ * source-evidence contract.
  */
 export function evidenceMembershipPredicatesV3(
   plan: Pick<RunSpecV3, "membershipPredicates">,
@@ -174,6 +175,7 @@ export function evidenceMembershipPredicatesV3(
     predicate.operator !== "exclude"
     && predicate.axis !== "recording_version"
     && predicate.axis !== "content"
+    && predicate.axis !== "era"
   ));
 }
 

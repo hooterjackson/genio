@@ -780,6 +780,70 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     );
   });
 
+  test.each([
+    [1972, false],
+    [1973, true],
+    [1983, true],
+    [1984, false],
+  ] as const)("rechecks the inclusive 1973–1983 catalog era when continuing a %i seed", async (
+    catalogReleaseYear,
+    accepted,
+  ) => {
+    const base = plan("one disco track", 1);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      membershipPredicates: [
+        ...base.membershipPredicates,
+        {
+          id: "era-membership",
+          axis: "era",
+          operator: "require",
+          values: ["1973", "1983"],
+          source: "user",
+          reason: "Requested era.",
+        },
+      ],
+      hardConstraints: [{
+        id: "era-between",
+        axis: "era",
+        operator: "between",
+        values: ["1973", "1983"],
+        kind: "hard",
+        relaxationRank: null,
+      }],
+    };
+    const source = await executeRetrievalV3({
+      runId: `era-seed-source-${catalogReleaseYear}`,
+      plan: base,
+      adapters: allQualifiedAdapter(1),
+      policy: { maximumGlobalRounds: 1 },
+    });
+    const approved = source.strategies.find(({ status }) => status === "available")?.id
+      ?? source.strategies[0]!.id;
+    const result = await executeRetrievalV3({
+      runId: `era-seed-validation-${catalogReleaseYear}`,
+      plan: selection,
+      continuation: {
+        approvedStrategyIds: [approved],
+        qualifiedTracks: [{ ...source.qualifiedPool[0]!, catalogReleaseYear }],
+        compatibleAlternatesByRecordingFamily: {},
+        stages: source.stages,
+        strategies: source.strategies,
+      },
+      adapters: {
+        discover: async () => ({ candidates: [], nextCursor: null, exhausted: true }),
+        qualify: async () => [],
+      },
+    });
+
+    expect(result.qualifiedPool).toHaveLength(accepted ? 1 : 0);
+    if (!accepted) {
+      expect(result.integrityEvents).toContain(
+        "continuation_seed_rejected:hard_constraint_failed:candidate-0",
+      );
+    }
+  });
+
   test("rejects conflicting Apple identities in a continuation checkpoint", async () => {
     const selection = plan("two disco tracks", 2);
     const source = await executeRetrievalV3({

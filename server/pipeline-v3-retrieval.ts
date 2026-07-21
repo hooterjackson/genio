@@ -9,6 +9,7 @@ import {
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import type { PipelineV3ModelRoute } from "./pipeline-v3-policy.ts";
+import { catalogEraConstraintFailuresV3 } from "./pipeline-v3-era-policy.ts";
 import type { SelectionConstraint } from "../shared/types.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
@@ -208,6 +209,8 @@ export interface CandidateQualificationV3 {
     readonly appleSongId: string | null;
     readonly recordingFamilyKey: string | null;
     readonly confidence: number;
+    /** Normalized Apple/catalog issue year used for immutable era checks. */
+    readonly releaseYear?: number | null;
   };
   /** Ranking signals are consumed only after every eligibility stage passes. */
   readonly rankingSignals: Readonly<Partial<Record<RankingObjectiveV3["dimension"], number>>>;
@@ -376,6 +379,8 @@ export interface QualifiedTrackV3 {
   readonly album: string | null;
   readonly appleSongId: string;
   readonly recordingFamilyKey: string;
+  /** Catalog-derived year retained so resumed research rechecks hard eras. */
+  readonly catalogReleaseYear?: number | null;
   readonly sourceObservationIds: readonly string[];
   readonly evidenceBindingIds: readonly string[];
   readonly evidenceBindings?: readonly EvidenceBindingReferenceV3[];
@@ -732,6 +737,10 @@ function continuationTrackIntegrityReason(
   if (!(track.catalogConfidence > 0)) return "storefront_unavailable";
   if (!(track.versionConfidence > 0)) return "version_incompatible";
 
+  if (catalogEraConstraintFailuresV3(plan, track.catalogReleaseYear).length > 0) {
+    return "hard_constraint_failed";
+  }
+
   const bindings = attestedEvidenceBindingsForSelectionV3(
     track.evidenceBindingIds,
     track.evidenceBindings,
@@ -744,6 +753,9 @@ function continuationTrackIntegrityReason(
 
   for (const constraint of plan.hardConstraints) {
     if (constraint.operator === "maximum") continue;
+    // Era is fully evaluated from immutable catalog metadata above. It is not
+    // source prose and must not fall through to artist/title matching.
+    if (constraint.axis === "era") continue;
     if (supportedPredicates.has(constraint.id)) continue;
     const matches = trackMatchesConstraintValue(track, constraint);
     if (constraint.operator === "exclude") {
@@ -784,6 +796,7 @@ function mergeQualifiedTrack(
   const provenanceRoots = new Set(bindings.map(({ provenanceRoot }) => provenanceRoot)).size;
   const track: QualifiedTrackV3 = {
     ...existing,
+    catalogReleaseYear: existing.catalogReleaseYear ?? incoming.catalogReleaseYear ?? null,
     album: existing.album ?? incoming.album,
     sourceObservationIds: observations,
     evidenceBindingIds: bindingIds,
@@ -1570,6 +1583,10 @@ export async function executeRetrievalV3(input: {
         incrementReason(discardedByReason, "hard_constraint_failed");
         continue;
       }
+      if (catalogEraConstraintFailuresV3(input.plan, qualification.catalog.releaseYear).length > 0) {
+        incrementReason(discardedByReason, "hard_constraint_failed");
+        continue;
+      }
       counters.hardConstraintEligible += 1;
       if (!qualification.evidence.passed || qualification.evidence.bindingIds.length === 0) {
         incrementReason(discardedByReason, "evidence_binding_missing");
@@ -1614,6 +1631,7 @@ export async function executeRetrievalV3(input: {
         album: candidate.album?.trim() || null,
         appleSongId: qualification.catalog.appleSongId,
         recordingFamilyKey: qualification.catalog.recordingFamilyKey,
+        catalogReleaseYear: qualification.catalog.releaseYear ?? null,
         sourceObservationIds: [...new Set(candidate.sourceObservationIds)],
         evidenceBindingIds: attestedBindings.map(({ id }) => id),
         evidenceBindings: attestedBindings.map((binding) => ({ ...binding })),

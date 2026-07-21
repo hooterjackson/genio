@@ -44,6 +44,10 @@ import {
   evidenceMembershipPredicateIdsV3,
   evidenceMembershipPredicatesV3,
 } from "./selection-plan-v3.ts";
+import {
+  catalogEraConstraintFailuresV3,
+  normalizedCatalogReleaseYear,
+} from "./pipeline-v3-era-policy.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
 /**
@@ -1652,7 +1656,7 @@ export function createPipelineV3LiveAdapters(
       const providerErrors: unknown[] = [];
       const qualifications = await mapConcurrent(request.candidates, 6, async (candidate): Promise<CandidateQualificationV3> => {
         const metadata = liveMetadata(candidate.metadata);
-        const failedConstraints = excludedByPlan(request, candidate);
+        const excludedConstraints = excludedByPlan(request, candidate);
         const bindings = metadata?.bindings ?? [];
         const roots = new Set(bindings.map((binding) => binding.provenanceRoot).filter(Boolean));
         const evidenceStrength = Math.max(0, ...bindings.map((binding) => boundedScore(binding.strength, 0)));
@@ -1679,6 +1683,11 @@ export function createPipelineV3LiveAdapters(
         const compatible = resolved.song
           ? versionCompatible(resolved.song, request) && contentCompatible(resolved.song, request)
           : false;
+        const releaseYear = normalizedCatalogReleaseYear(resolved.song?.releaseDate);
+        const failedConstraints = [...new Set([
+          ...excludedConstraints,
+          ...catalogEraConstraintFailuresV3(request.plan, releaseYear),
+        ])];
         const rankingSignals = Object.fromEntries(Object.entries(metadata?.rankingSignals ?? {})
           .map(([key, value]) => [key, boundedScore(value, 0)]));
         return {
@@ -1712,6 +1721,7 @@ export function createPipelineV3LiveAdapters(
             appleSongId: resolved.song?.id ?? null,
             recordingFamilyKey: resolved.song ? recordingFamily(resolved.song) : null,
             confidence: resolved.confidence,
+            releaseYear,
           },
           rankingSignals,
           sourceRank: Math.min(Number.MAX_SAFE_INTEGER, ...bindings.map((binding) => binding.sourceRank)),
