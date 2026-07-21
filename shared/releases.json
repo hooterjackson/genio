@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.3",
+      "releasedAt": "2026-07-20",
+      "title": "Sites supply-chain build recovery",
+      "notes": [
+        "Pins and explicitly approves the two exact development-only type packages whose registry age checks repeatedly timed out in the Sites production builder.",
+        "Keeps the Pipeline V3 hosted-discovery fix unchanged while allowing the validated source revision to pass the deployment supply-chain gate.",
+        "Preserves exact package versions, lockfile integrity, and the existing build, lint, and provider-contract checks."
+      ]
+    },
+    {
       "version": "2.0.2",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 hosted discovery recovery",
