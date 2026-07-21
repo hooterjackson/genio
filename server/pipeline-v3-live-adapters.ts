@@ -1455,6 +1455,37 @@ function versionCompatible(song: CatalogSong, request: QualificationRequestV3): 
     || request.plan.recordingPolicy.allowedVersions.includes(version as never));
 }
 
+/**
+ * Content-rating requirements are catalog policy, not editorial evidence.
+ * Fail closed when Apple does not supply a rating for a request that names a
+ * required or excluded rating; an unrated result cannot prove clean-only or
+ * explicit-only membership.
+ */
+function contentCompatible(song: CatalogSong, request: QualificationRequestV3): boolean {
+  const rating = song.contentRating === "clean" || song.contentRating === "explicit"
+    ? song.contentRating
+    : null;
+  const predicates = request.plan.membershipPredicates.filter((predicate) => (
+    predicate.axis === "content"
+  ));
+  for (const predicate of predicates) {
+    const policyText = normalized(predicate.values.join(" "));
+    const namedRatings = new Set<"clean" | "explicit">();
+    if (/\bclean\b/u.test(policyText)) namedRatings.add("clean");
+    if (/\bexplicit\b/u.test(policyText)) namedRatings.add("explicit");
+    // Non-rating content rules (for example instrumental policy) continue to
+    // be handled by recording-version markers and their dedicated policies.
+    if (namedRatings.size === 0) continue;
+    if (rating === null) return false;
+    if (predicate.operator === "exclude") {
+      if (namedRatings.has(rating)) return false;
+      continue;
+    }
+    if (!namedRatings.has(rating)) return false;
+  }
+  return true;
+}
+
 function recordingFamily(song: CatalogSong): string {
   const isrc = song.isrc?.toUpperCase().replace(/[^A-Z0-9]/gu, "");
   if (isrc) return `isrc:${isrc}`;
@@ -1645,7 +1676,9 @@ export function createPipelineV3LiveAdapters(
             providerErrors.push(error);
           }
         }
-        const compatible = resolved.song ? versionCompatible(resolved.song, request) : false;
+        const compatible = resolved.song
+          ? versionCompatible(resolved.song, request) && contentCompatible(resolved.song, request)
+          : false;
         const rankingSignals = Object.fromEntries(Object.entries(metadata?.rankingSignals ?? {})
           .map(([key, value]) => [key, boundedScore(value, 0)]));
         return {

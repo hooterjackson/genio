@@ -200,7 +200,7 @@ describe("Pipeline V3 live read-only adapters", () => {
         },
       ],
     }));
-    const appleSong = song(6, "Chic", "Good Times");
+    const appleSong = { ...song(6, "Chic", "Good Times"), contentRating: "clean" as const };
     const adapters = createPipelineV3LiveAdapters({
       createResponse: createResponse as any,
       searchAppleSongs: vi.fn(async () => [appleSong]) as any,
@@ -228,6 +228,111 @@ describe("Pipeline V3 live read-only adapters", () => {
       evidence: { passed: true },
       version: { compatible: true },
     });
+  });
+
+  test.each([
+    { policy: "clean", rating: "clean", compatible: true },
+    { policy: "clean", rating: "explicit", compatible: false },
+    { policy: "explicit", rating: "explicit", compatible: true },
+    { policy: "explicit", rating: "clean", compatible: false },
+    { policy: "clean", rating: undefined, compatible: false },
+  ] as const)(
+    "enforces $policy-only membership against Apple content rating $rating",
+    async ({ policy, rating, compatible }) => {
+      const base = plan("25 disco songs", 25);
+      const genrePredicate = base.membershipPredicates.find((value) => value.axis === "genre")!;
+      const selection: SelectionPlanV3 = {
+        ...base,
+        membershipPredicates: [
+          ...base.membershipPredicates,
+          {
+            id: `${policy}-content-policy`,
+            axis: "content",
+            operator: "require",
+            values: [policy],
+            source: "user",
+            reason: `Require the Apple-catalog ${policy} recording.`,
+          },
+        ],
+      };
+      const sourceUrl = "https://www.loc.gov/item/disco-history";
+      const appleSong: CatalogSong = {
+        ...song(7, "Chic", "Le Freak"),
+        ...(rating ? { contentRating: rating } : {}),
+      };
+      const adapters = createPipelineV3LiveAdapters({
+        discoverHostedWeb: vi.fn(async () => [{
+          artist: "Chic",
+          title: "Le Freak",
+          album: null,
+          sourceUrl,
+          provenanceRoot: "loc.gov",
+          evidenceStrength: 0.9,
+          sourceRank: 1,
+          predicateIds: [genrePredicate.id],
+          providerAttestedExactTrackScope: true,
+        }]),
+        searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+        lookupAppleByIsrc: vi.fn(async () => []) as any,
+      });
+      const discovery = discoveryRequest(selection, "editorial_tracks");
+      const batch = await adapters.discover(discovery);
+      const [qualification] = await adapters.qualify({
+        runId: discovery.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: selection,
+        engine: discovery.engine,
+        strategy: discovery.strategy,
+        candidates: batch.candidates,
+      });
+
+      expect(qualification.version.compatible).toBe(compatible);
+    },
+  );
+
+  test("carries a typed clean-only policy into the immutable V3 membership contract", () => {
+    const spec = createRunSpecV3({
+      prompt: "25 disco songs, clean versions only",
+      requestedTrackCount: 25,
+      storefront: "US",
+      typedSelectionPlan: {
+        intents: ["genre_scene"],
+        scopeKind: "broad_curated",
+        constraints: [],
+        diversityGoals: {
+          minimumDistinctArtists: 5,
+          minimumDistinctAlbums: 5,
+          minimumDistinctEras: 2,
+          minimumDistinctScenes: 2,
+          minimumDistinctGeographies: null,
+          maximumTracksPerArtist: 4,
+          maximumTracksPerAlbum: 3,
+        },
+        orderingPolicy: {
+          mode: "editorial",
+          goals: [],
+          avoidAdjacentSameArtist: true,
+          avoidAdjacentSameAlbum: true,
+        },
+        softGoalRelaxationOrder: [],
+        versionPolicy: {
+          preferred: ["canonical", "clean"],
+          allowed: ["canonical", "clean"],
+          excludeCompilations: false,
+          excludeKaraokeAndTributes: true,
+        },
+        contentPolicy: {
+          explicitContent: "clean_only",
+          instrumental: "allow",
+          languages: [],
+        },
+      },
+    });
+
+    expect(spec.membershipPredicates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "content", operator: "require", values: ["clean"] }),
+    ]));
   });
 
   test("repairs malformed structured output once with the frozen escalation provider ID", async () => {

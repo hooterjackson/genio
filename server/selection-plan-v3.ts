@@ -671,6 +671,14 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
       const mapped = typedConstraintPredicate(constraint);
       if (mapped) pushPredicate(predicates, mapped);
     }
+    if (input.typedSelectionPlan.contentPolicy.explicitContent === "clean_only") {
+      pushPredicate(predicates, predicate(
+        "content",
+        "require",
+        ["clean"],
+        "The confirmed content policy requires an Apple-catalog clean recording.",
+      ));
+    }
   }
 
   if (/\b(?:every|all|complete|exhaustive|entire)\b/u.test(prompt)) intents.push("exhaustive");

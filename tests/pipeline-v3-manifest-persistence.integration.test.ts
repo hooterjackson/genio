@@ -16,6 +16,7 @@ import {
 import { ResearchOrchestrator } from "../server/research.ts";
 import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
 import {
+  evidenceMembershipPredicateIdsV3,
   selectionPlanV3Hash,
   type SelectionPlanV3,
 } from "../server/selection-plan-v3.ts";
@@ -67,9 +68,7 @@ function curatedBrief(title: string, count: number): PlaylistBrief {
 }
 
 function positivePredicateIds(plan: SelectionPlanV3): string[] {
-  return plan.membershipPredicates
-    .filter((predicate) => predicate.operator !== "exclude")
-    .map((predicate) => predicate.id);
+  return evidenceMembershipPredicateIdsV3(plan);
 }
 
 function qualifiedTrack(
@@ -429,8 +428,54 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     120_000,
   );
 
+  test(
+    "queues an exact manifest when catalog-layer version policy has no source binding",
+    async () => {
+      const context = await createLeasedRun(25, "disco-version-policy-boundary");
+      const sourceBoundPredicateIds = positivePredicateIds(context.selectionPlan);
+      expect(context.selectionPlan.membershipPredicates.some((predicate) => (
+        predicate.axis === "recording_version" && predicate.operator !== "exclude"
+      ))).toBe(true);
+      expect(sourceBoundPredicateIds).not.toContain(
+        context.selectionPlan.membershipPredicates.find((predicate) => (
+          predicate.axis === "recording_version" && predicate.operator !== "exclude"
+        ))?.id,
+      );
+
+      const persisted = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result: retrievalResult({
+          runId: context.runId,
+          target: 25,
+          selectedCount: 25,
+          reserveCount: 10,
+          status: "exact_ready",
+          prefix: "disco-version-policy-boundary",
+          predicateIds: sourceBoundPredicateIds,
+        }),
+        fence: context.fence,
+      });
+
+      expect(persisted).toMatchObject({ publicationState: "queued" });
+      const publication = (await pool.query<{
+        run_status: string;
+        publication_jobs: number;
+      }>(
+        `SELECT r.status run_status,
+                (SELECT count(*)::int FROM job_queue j
+                 WHERE j.run_id=r.id AND j.kind='publication') publication_jobs
+         FROM research_runs r WHERE r.id=$1`,
+        [context.runId],
+      )).rows[0]!;
+      expect(publication).toEqual({ run_status: "publishing", publication_jobs: 1 });
+    },
+    120_000,
+  );
+
   test("persists a query-plan execution projection against the original immutable selection plan", async () => {
-    const context = await createLeasedRun(1, "execution-projection");
+    const context = await createLeasedRun(1, "disco-execution-projection");
     const executionPlan = selectionPlanFromQueryPlanV3(context.queryPlan, {
       prompt: "A deliberately opaque audit prompt that is not reparsed by the worker.",
     });
@@ -450,7 +495,9 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         selectedCount: 1,
         status: "exact_ready",
         prefix: "execution-projection",
-        predicateIds: positivePredicateIds(executionPlan),
+        // The execution projection deliberately omits authoring-only fields;
+        // evidence still binds to the immutable plan carried by QueryPlanV3.
+        predicateIds: positivePredicateIds(context.selectionPlan),
       }),
       fence: context.fence,
     });
@@ -771,7 +818,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
   }, 30_000);
 
   test("publication guard rejects a V3 manifest whose persisted attestation is missing", async () => {
-    const context = await createLeasedRun(1, "publication-attestation");
+    const context = await createLeasedRun(1, "disco-publication-attestation");
     const persisted = await repository.persistPipelineV3RetrievalResult({
       runId: context.runId,
       queryPlan: context.queryPlan,

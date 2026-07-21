@@ -58,6 +58,7 @@ import {
 import {
   createRunSpecV3,
   criticalAmbiguityAnswersFromGuidanceV3,
+  evidenceMembershipPredicatesV3,
   resolveRunSpecV3,
   selectionPlanV3Hash,
   type SelectionPlanV3,
@@ -6745,8 +6746,8 @@ export class Repository {
         [input.manifestRevisionId, input.manifestId],
       );
       const selectionPlan = revisionContract.rows[0]?.selection_plan_snapshot_json;
-      const requiredPredicates = Array.isArray(selectionPlan?.membershipPredicates)
-        ? selectionPlan.membershipPredicates.filter((predicate) => predicate.operator !== "exclude")
+      const requiredPredicates = selectionPlan
+        ? evidenceMembershipPredicatesV3(selectionPlan)
         : [];
       if (!selectionPlan || requiredPredicates.length === 0) {
         throw new HttpError(
@@ -10229,8 +10230,7 @@ export class Repository {
             [sourceRecordId, runId, normalizedUrl, `${track.artist} — ${track.title}`.slice(0, 240), binding.provenanceRoot.slice(0, 240), compactEvidenceNote(`Pipeline V3 exact track-scope evidence (${binding.kind}).`)],
           );
           sourceRecordId = source.rows[0]!.id;
-          const positivePredicates = plan.membershipPredicates
-            .filter((predicate) => predicate.operator !== "exclude");
+          const positivePredicates = evidenceMembershipPredicatesV3(plan);
           const explicitPredicateIds = binding.predicateIds ?? binding.supportedPredicateIds;
           const supportedPredicates = positivePredicates.filter((predicate) => (
             explicitPredicateIds?.includes(predicate.id)

@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.4",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 exact-publication recovery",
+      "notes": [
+        "Fixes the publication guard so catalog-only studio-version and content policies are verified by Apple metadata instead of requiring unrelated editorial citations.",
+        "Preserves strict source attestation for every evidence-bearing genre, scene, geography, similarity, and factual membership predicate.",
+        "Adds a production-shaped 25-track disco regression proving an exact manifest with a qualified reserve enters the Apple publication queue."
+      ]
+    },
+    {
       "version": "2.0.3",
       "releasedAt": "2026-07-20",
       "title": "Sites supply-chain build recovery",
