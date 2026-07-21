@@ -161,6 +161,28 @@ export interface SelectionPlanV3 extends RunSpecV3 {
   readonly resolvedAmbiguityKeys: readonly CriticalAmbiguityV3["key"][];
 }
 
+/**
+ * Recording-version and content rules are verified against the resolved
+ * catalog recording, not by requiring an editorial source to repeat the
+ * policy sentence. They remain immutable membership policy in the plan, but
+ * are intentionally absent from the source-evidence contract.
+ */
+export function evidenceMembershipPredicatesV3(
+  plan: Pick<RunSpecV3, "membershipPredicates">,
+): MembershipPredicateV3[] {
+  return plan.membershipPredicates.filter((predicate) => (
+    predicate.operator !== "exclude"
+    && predicate.axis !== "recording_version"
+    && predicate.axis !== "content"
+  ));
+}
+
+export function evidenceMembershipPredicateIdsV3(
+  plan: Pick<RunSpecV3, "membershipPredicates">,
+): string[] {
+  return evidenceMembershipPredicatesV3(plan).map(({ id }) => id);
+}
+
 export interface RunSpecV3Input {
   prompt: string;
   requestedTrackCount: number;

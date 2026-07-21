@@ -40,6 +40,10 @@ import {
   pipelineV3ModelRoute,
   type PipelineV3ModelRoute,
 } from "./pipeline-v3-policy.ts";
+import {
+  evidenceMembershipPredicateIdsV3,
+  evidenceMembershipPredicatesV3,
+} from "./selection-plan-v3.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
 /**
@@ -244,9 +248,7 @@ function liveBindingIsAttested(binding: LiveEvidenceBindingV3): boolean {
 }
 
 function positivePredicateIds(request: Pick<DiscoveryRequestV3 | QualificationRequestV3, "plan">): string[] {
-  return request.plan.membershipPredicates
-    .filter((predicate) => predicate.operator !== "exclude")
-    .map((predicate) => predicate.id);
+  return evidenceMembershipPredicateIdsV3(request.plan);
 }
 
 function supportedPredicateIds(
@@ -378,10 +380,9 @@ function editorialContainerMatches(request: DiscoveryRequestV3, playlist: AppleC
   // container-wide scope binding.
   if (curator !== "apple music" && !curator.startsWith("apple music ")) return false;
   const haystack = normalized(`${playlist.name} ${playlist.description}`);
-  const positivePredicates = request.plan.membershipPredicates
-    .filter((predicate) => predicate.operator !== "exclude");
-  if (positivePredicates.length === 0
-    || positivePredicates.some((predicate) => !CONTAINER_TEXT_AXES.has(predicate.axis))) return false;
+  const positivePredicates = evidenceMembershipPredicatesV3(request.plan)
+    .filter((predicate) => CONTAINER_TEXT_AXES.has(predicate.axis));
+  if (positivePredicates.length === 0) return false;
   // Every independently parsed membership dimension must be represented in
   // the container description; alternative values within one predicate are OR.
   return positivePredicates.every((predicate) => (
@@ -579,7 +580,6 @@ function hostedCandidateSchema(limit: number, predicateIds: readonly string[]): 
                     type: "array",
                     minItems: predicateIds.length > 0 ? 1 : 0,
                     maxItems: Math.max(1, predicateIds.length),
-                    uniqueItems: true,
                     items: predicateIdSchema,
                   },
                 },

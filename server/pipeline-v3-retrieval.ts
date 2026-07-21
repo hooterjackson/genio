@@ -3,9 +3,10 @@ import {
   adaptiveFillPlanV3,
   type StageYieldObservationV3,
 } from "./adaptive-fill-v3.ts";
-import type {
-  RankingObjectiveV3,
-  SelectionPlanV3,
+import {
+  evidenceMembershipPredicateIdsV3,
+  type RankingObjectiveV3,
+  type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import type { PipelineV3ModelRoute } from "./pipeline-v3-policy.ts";
 import type { SelectionConstraint } from "../shared/types.ts";
@@ -704,9 +705,7 @@ function bindingPredicateIds(binding: EvidenceBindingReferenceV3): readonly stri
 }
 
 function positiveMembershipPredicateIds(plan: SelectionPlanV3): string[] {
-  return plan.membershipPredicates
-    .filter(({ operator }) => operator !== "exclude")
-    .map(({ id }) => id);
+  return evidenceMembershipPredicateIdsV3(plan);
 }
 
 function trackMatchesConstraintValue(

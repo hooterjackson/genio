@@ -105,6 +105,131 @@ describe("Pipeline V3 live read-only adapters", () => {
     );
   });
 
+  test("emits a provider-compatible strict schema and deduplicates predicate IDs locally", async () => {
+    const selection = plan("25 disco songs", 25);
+    const predicateId = selection.membershipPredicates.find((value) => value.axis === "genre")!.id;
+    const sourceUrl = "https://www.loc.gov/item/disco-history";
+    const citationText = "Chic — Good Times is a disco recording documented by the archive. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async (_input: unknown, _context: unknown) => ({
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Chic",
+          title: "Good Times",
+          album: null,
+          sources: [{ url: sourceUrl, predicateIds: [predicateId, predicateId] }],
+        }],
+      }),
+      output: [
+        { type: "web_search_call", action: { sources: [{ url: sourceUrl }] } },
+        {
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: citationText,
+            annotations: [{
+              type: "url_citation",
+              url: sourceUrl,
+              start_index: markerStart,
+              end_index: markerStart + "[source]".length,
+            }],
+          }],
+        },
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({ createResponse: createResponse as any });
+
+    const batch = await adapters.discover(discoveryRequest(selection, "editorial_tracks"));
+
+    const requestBody = createResponse.mock.calls[0]![0] as any;
+    expect(JSON.stringify(requestBody.text.format.schema)).not.toContain('"uniqueItems"');
+    expect((batch.candidates[0] as any).metadata.bindings[0].predicateIds).toEqual([predicateId]);
+  });
+
+  test("verifies recording-version and content policy at the catalog layer instead of demanding citation predicates", async () => {
+    const base = plan("25 disco songs", 25);
+    const genrePredicate = base.membershipPredicates.find((value) => value.axis === "genre")!;
+    const selection: SelectionPlanV3 = {
+      ...base,
+      membershipPredicates: [
+        ...base.membershipPredicates,
+        {
+          id: "version-policy",
+          axis: "recording_version",
+          operator: "require",
+          values: ["canonical studio recording; no live, remix, or tribute versions"],
+          source: "user",
+          reason: "Catalog recording policy.",
+        },
+        {
+          id: "content-policy",
+          axis: "content",
+          operator: "require",
+          values: ["clean or explicit canonical issue"],
+          source: "user",
+          reason: "Catalog content policy.",
+        },
+      ],
+    };
+    const sourceUrl = "https://www.loc.gov/item/disco-history";
+    const citationText = "Chic — Good Times is a disco recording documented by the archive. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async (_input: unknown, _context: unknown) => ({
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Chic",
+          title: "Good Times",
+          album: null,
+          sources: [{ url: sourceUrl, predicateIds: [genrePredicate.id] }],
+        }],
+      }),
+      output: [
+        { type: "web_search_call", action: { sources: [{ url: sourceUrl }] } },
+        {
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: citationText,
+            annotations: [{
+              type: "url_citation",
+              url: sourceUrl,
+              start_index: markerStart,
+              end_index: markerStart + "[source]".length,
+            }],
+          }],
+        },
+      ],
+    }));
+    const appleSong = song(6, "Chic", "Good Times");
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      runId: discovery.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: discovery.engine,
+      strategy: discovery.strategy,
+      candidates: batch.candidates,
+    });
+
+    const requestSchema = JSON.stringify((createResponse.mock.calls[0]![0] as any).text.format.schema);
+    expect(requestSchema).toContain(genrePredicate.id);
+    expect(requestSchema).not.toContain("version-policy");
+    expect(requestSchema).not.toContain("content-policy");
+    expect(qualification).toMatchObject({
+      scope: { passed: true, failedMembershipPredicateIds: [] },
+      evidence: { passed: true },
+      version: { compatible: true },
+    });
+  });
+
   test("repairs malformed structured output once with the frozen escalation provider ID", async () => {
     const validUrl = "https://www.loc.gov/item/disco-history";
     const createResponse = vi.fn()

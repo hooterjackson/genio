@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.0.2",
+      "releasedAt": "2026-07-20",
+      "title": "Pipeline V3 hosted discovery recovery",
+      "notes": [
+        "Fixes the strict hosted-search response schema that OpenAI rejected before any V3 track discovery could begin.",
+        "Keeps duplicate membership predicate IDs safe through local canonicalization instead of relying on an unsupported provider schema keyword.",
+        "Adds a provider-contract regression proving the production discovery request remains OpenAI-compatible while preserving predicate integrity.",
+        "Restores governed track discovery for public V3 curated requests without weakening evidence, Apple identity, or partial-publication safeguards."
+      ]
+    },
+    {
       "version": "2.0.1",
       "releasedAt": "2026-07-20",
       "title": "Pipeline V3 curated production activation",
