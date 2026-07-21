@@ -109,6 +109,12 @@ export interface PipelineV3RetrievalExecutionInput {
   executionMode: RetrievalExecutionModeV3;
   routingHints: RetrievalRoutingHintsV3;
   modelRoute: PipelineV3ModelRoute;
+  /**
+   * Rehydrated exclusively from the immutable policy captured for this run.
+   * Retrieval ports must not consult process defaults or retain a shared
+   * policy because retries can execute on a different worker revision.
+   */
+  policy: RetrievalPolicyV3;
   continuation?: RetrievalContinuationSeedV3;
   signal?: AbortSignal;
 }
@@ -178,7 +184,7 @@ function writeFence(
   const workerId = payload?.__jobWorkerId;
   const leaseEpoch = payload?.__jobLeaseEpoch;
   const queryPlanRevisionId = payload?.__queryPlanRevisionId;
-  if (!jobId || !workerId || !Number.isSafeInteger(leaseEpoch) || Number(leaseEpoch) < 1
+  if (!jobId || !workerId || !stageKey || !Number.isSafeInteger(leaseEpoch) || Number(leaseEpoch) < 1
     || !queryPlanRevisionId) {
     throw new Error("Pipeline V3 execution is missing its durable lease fence");
   }
@@ -327,7 +333,7 @@ export function selectionPlanFromQueryPlanV3(
         : dimension === "album_diversity" ? 2
           : dimension === "artist_diversity" ? 3
             : null,
-      values: [],
+      values: [...(objective.values ?? [])],
       reason: objective.description,
     };
   });
@@ -396,7 +402,6 @@ export function v3RetrievalStageKey(
 
 export function createPipelineV3RetrievalExecutionPort(input: {
   adapters: RetrievalAdaptersV3;
-  policy?: Partial<RetrievalPolicyV3>;
 }): PipelineV3RetrievalExecutionPort {
   return Object.freeze({
     async execute(request: PipelineV3RetrievalExecutionInput): Promise<RetrievalResultV3> {
@@ -422,12 +427,74 @@ export function createPipelineV3RetrievalExecutionPort(input: {
         executionMode: request.executionMode,
         routingHints: request.routingHints,
         modelRoute: request.modelRoute,
-        policy: input.policy,
+        policy: request.policy,
         continuation: request.continuation,
       });
       abortIfNeeded(request.signal);
       return result;
     },
+  });
+}
+
+const PIPELINE_V3_POLICY_V1_PROVIDER_FAILURES_PER_STRATEGY = 2;
+
+function immutablePositiveInteger(value: unknown, field: string, maximum: number): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1 || Number(value) > maximum) {
+    throw new Error(`Pipeline V3 immutable retrieval policy has an invalid ${field}`);
+  }
+  return Number(value);
+}
+
+/**
+ * Rehydrate the complete retrieval contract from the run snapshot.
+ *
+ * `maximumCostUnits` is the frozen total tool-call allowance: discovery
+ * adapters report bounded provider work units, not dollars. Pipeline policy
+ * v1 intentionally has no wall-clock retrieval deadline so durable jobs can
+ * resume on another worker without expiring solely because they were queued.
+ * The retry threshold is fixed by the persisted policy version, rather than a
+ * mutable worker environment variable.
+ */
+export function retrievalPolicyV3FromPipelinePolicySnapshot(
+  snapshot: PipelinePolicySnapshot | null | undefined,
+): RetrievalPolicyV3 {
+  if (!snapshot
+    || snapshot.pipelineVersion !== "corpus_first_v3"
+    || snapshot.policyVersion !== "corpus_first_v3_policy_v1"
+    || snapshot.executionPolicy.kind !== "corpus_first_v3"
+    || snapshot.executionPolicy.version !== "corpus_first_v3_policy_v1") {
+    throw new Error("Pipeline V3 run is missing its immutable retrieval policy");
+  }
+  const execution = snapshot.executionPolicy;
+  const maximumGlobalRounds = immutablePositiveInteger(
+    execution.maximumGlobalRounds,
+    "maximumGlobalRounds",
+    1_000,
+  );
+  const maximumRawCandidates = immutablePositiveInteger(
+    execution.maximumRawCandidates,
+    "maximumRawCandidates",
+    100_000,
+  );
+  const maximumRawDiscoveryGoal = immutablePositiveInteger(
+    snapshot.catalogLimits.maximumRawDiscoveryGoal,
+    "maximumRawDiscoveryGoal",
+    100_000,
+  );
+  if (maximumRawCandidates !== maximumRawDiscoveryGoal) {
+    throw new Error("Pipeline V3 immutable retrieval policy has conflicting candidate ceilings");
+  }
+  const maximumCostUnits = immutablePositiveInteger(
+    snapshot.requestLimits.maxToolCalls,
+    "maxToolCalls",
+    200,
+  );
+  return Object.freeze({
+    maximumGlobalRounds,
+    maximumRawCandidates,
+    maximumCostUnits,
+    deadlineAtEpochMs: null,
+    maximumProviderFailuresPerStrategy: PIPELINE_V3_POLICY_V1_PROVIDER_FAILURES_PER_STRATEGY,
   });
 }
 
@@ -647,8 +714,13 @@ export class PipelineV3WorkerExecution {
   }): Promise<void> {
     const mode: RetrievalExecutionModeV3 = input.payload?.v3ExecutionMode === "shadow" ? "shadow" : "active";
     const stageKey = v3RetrievalStageKey(input.queryPlan, mode);
-    const fence = writeFence(input.payload, stageKey);
     const suppliedStageKey = input.payload?.__jobStageKey ?? input.payload?.stageExecutionKey;
+    // Durable writes are fenced by the stage identity that was actually
+    // leased from job_queue.  If it differs from the recomputed query-plan
+    // stage, use that supplied identity to record the integrity failure; a
+    // fence built from the recomputed key would itself be rejected as a lost
+    // lease and hide the real corruption signal.
+    const fence = writeFence(input.payload, suppliedStageKey ?? "");
     abortIfNeeded(input.signal);
     if (suppliedStageKey && suppliedStageKey !== stageKey) {
       await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
@@ -670,10 +742,20 @@ export class PipelineV3WorkerExecution {
 
     const prior = await this.repository.getResearchCheckpoint(input.runId, fullCheckpointKey(stageKey));
     if (prior && typeof prior === "object" && !Array.isArray(prior)) {
-      const priorState = (prior as Record<string, unknown>).state;
-      if (priorState === "complete" || priorState === "waiting_provider"
+      const priorRecord = prior as Record<string, unknown>;
+      const priorState = priorRecord.state;
+      if (priorState === "complete"
         || priorState === "owner_action_required" || priorState === "failed_integrity") {
         return;
+      }
+      if (priorState === "waiting_provider") {
+        const priorLeaseEpoch = Number(priorRecord.leaseEpoch);
+        const currentLeaseEpoch = Number(input.payload?.__jobLeaseEpoch);
+        // Re-delivery of the same leased attempt is idempotent. A reclaimed
+        // successor lease may resume once a provider becomes available; the
+        // repository fence still prevents the old worker from committing.
+        if (!this.retrieval || (Number.isSafeInteger(priorLeaseEpoch)
+          && currentLeaseEpoch <= priorLeaseEpoch)) return;
       }
     }
 
@@ -788,6 +870,25 @@ export class PipelineV3WorkerExecution {
       });
       return;
     }
+    let retrievalPolicy: RetrievalPolicyV3;
+    try {
+      retrievalPolicy = retrievalPolicyV3FromPipelinePolicySnapshot(input.run.pipelinePolicySnapshot);
+    } catch {
+      await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "failed_integrity",
+        stageKey,
+        queryPlanHash,
+        code: "v3_retrieval_policy_snapshot_invalid",
+        failedAt: new Date().toISOString(),
+      }, fence);
+      await this.repository.updateRun(input.runId, {
+        status: "failed_integrity",
+        phase: "v3_retrieval_policy_snapshot_invalid",
+        error: null,
+      }, fence);
+      return;
+    }
 
     if (!this.retrieval) {
       abortIfNeeded(input.signal);
@@ -799,6 +900,9 @@ export class PipelineV3WorkerExecution {
         graphSnapshotId: input.queryPlan.graphSnapshotId,
         executionMode: mode,
         reasonCode: "v3_retrieval_provider_unavailable",
+        leaseEpoch: Number.isSafeInteger(input.payload?.__jobLeaseEpoch)
+          ? input.payload?.__jobLeaseEpoch
+          : null,
         startedAt,
         waitingAt: new Date().toISOString(),
       }, fence);
@@ -837,6 +941,7 @@ export class PipelineV3WorkerExecution {
       executionMode: mode,
       routingHints: { fixedContainer: input.queryPlan.engines.includes("fixed_container") },
       modelRoute,
+      policy: retrievalPolicy,
       continuation,
       signal: input.signal,
     });

@@ -1498,6 +1498,96 @@ function fixedPlaylistOrder<T extends {
   return ordered;
 }
 
+/**
+ * Revision metadata (continuation/corpus-review lineage) is intentionally not
+ * part of this comparison. Everything that changes candidate eligibility,
+ * ranking, count, or ordering is. Optional selection-policy fields use the
+ * canonical plan only as a compatibility default for query revisions written
+ * before those fields were persisted.
+ */
+function normalizedQueryPlanV3Invariant(
+  queryPlan: QueryPlanV3,
+  compatibilityFallback?: QueryPlanV3,
+): unknown {
+  return {
+    schemaVersion: queryPlan.schemaVersion,
+    pipelineVersion: queryPlan.pipelineVersion,
+    policyVersion: queryPlan.policyVersion,
+    engine: queryPlan.engine,
+    engines: [...queryPlan.engines],
+    membershipPredicates: queryPlan.membershipPredicates.map((predicate) => ({ ...predicate })),
+    rankingObjectives: queryPlan.rankingObjectives.map((objective) => ({
+      ...objective,
+      values: [...(objective.values ?? [])],
+    })),
+    targetTrackCount: queryPlan.targetTrackCount,
+    storefront: queryPlan.storefront,
+    hardConstraints: queryPlan.hardConstraints.map((constraint) => ({
+      ...constraint,
+      values: [...constraint.values],
+      geographyRelationship: constraint.geographyRelationship ?? null,
+    })),
+    softPreferences: queryPlan.softPreferences.map((constraint) => ({
+      ...constraint,
+      values: [...constraint.values],
+      geographyRelationship: constraint.geographyRelationship ?? null,
+    })),
+    sourceDiscoveryHints: queryPlan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
+    scopeKind: queryPlan.scopeKind ?? compatibilityFallback?.scopeKind ?? null,
+    diversityGoals: queryPlan.diversityGoals ?? compatibilityFallback?.diversityGoals ?? null,
+    orderingPolicy: queryPlan.orderingPolicy ?? compatibilityFallback?.orderingPolicy ?? null,
+    softGoalRelaxationOrder: [
+      ...(queryPlan.softGoalRelaxationOrder
+        ?? compatibilityFallback?.softGoalRelaxationOrder
+        ?? []),
+    ],
+  };
+}
+
+function queryPlanV3ExecutionProjection(
+  plan: SelectionPlanV3,
+  template: QueryPlanV3,
+): QueryPlanV3 {
+  return {
+    ...template,
+    engine: plan.engines[0] ?? template.engine,
+    engines: [...plan.engines],
+    membershipPredicates: plan.membershipPredicates.map((predicate) => ({
+      id: predicate.id,
+      kind: predicate.axis,
+      subject: predicate.values.join(" | "),
+      relationship: predicate.operator,
+      hard: true,
+    })),
+    rankingObjectives: plan.rankingObjectives
+      .filter((objective) => objective.id !== "ranking:relevance:persisted_default")
+      .map((objective) => ({
+        id: objective.id,
+        kind: objective.dimension,
+        description: objective.reason,
+        weight: objective.weight,
+        values: [...objective.values],
+      })),
+    targetTrackCount: plan.requestedTrackCount,
+    storefront: plan.storefront,
+    hardConstraints: plan.hardConstraints.map((constraint) => ({
+      ...constraint,
+      values: [...constraint.values],
+      geographyRelationship: constraint.geographyRelationship ?? null,
+    })),
+    softPreferences: plan.softPreferences.map((constraint) => ({
+      ...constraint,
+      values: [...constraint.values],
+      geographyRelationship: constraint.geographyRelationship ?? null,
+    })),
+    sourceDiscoveryHints: plan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
+    scopeKind: plan.scopeKind,
+    diversityGoals: { ...plan.diversityGoals },
+    orderingPolicy: { ...plan.orderingPolicy, goals: [...plan.orderingPolicy.goals] },
+    softGoalRelaxationOrder: [...plan.softGoalRelaxationOrder],
+  };
+}
+
 export class Repository {
   readonly pool: Pool;
   readonly db: DatabaseHandle["db"];
@@ -1547,6 +1637,18 @@ export class Repository {
       ],
     );
     if (!current.rows[0]) {
+      if (process.env.NODE_ENV === "test" && process.env.GENIO_SYSTEM_E2E === "1") {
+        const observed = await client.query(
+          `SELECT id,run_id,lease_owner,lease_epoch,query_plan_revision_id,stage_key,status,
+                  lease_expires_at,now() AS observed_at
+           FROM job_queue WHERE id=$1`,
+          [fence.jobId],
+        );
+        throw new Error(`Pipeline V3 worker lease fence mismatch: ${JSON.stringify({
+          expected: { runId, ...fence },
+          observed: observed.rows[0] ?? null,
+        })}`);
+      }
       throw new HttpError(409, "Pipeline V3 worker lease was lost", "job_lease_lost");
     }
   }
@@ -2423,6 +2525,9 @@ export class Repository {
     const executionPolicy = selectionPlanV3
       ? null
       : researchExecutionPolicy(input.brief, process.env, selectionPlan, modelRoutingSignals);
+    const v3ApprovedBudgetUsd = pipelinePolicySnapshot?.executionPolicy.kind === "corpus_first_v3"
+      ? pipelinePolicySnapshot.executionPolicy.maximumCostUsd
+      : null;
     const runSpecPipelineVersion = selectionPlanV3?.pipelineVersion ?? selectionPlan?.pipelineVersion ?? "legacy_v1";
     const runSpecPolicyVersion = selectionPlanV3?.selectionPlanVersion === "selection_plan_v3"
       ? "corpus_first_v3_policy_v1"
@@ -2584,7 +2689,7 @@ export class Repository {
             input.idempotencyKey,
             input.autoPublish === true,
             estimate,
-            Math.max(approved, status === "queued" ? estimate : 0),
+            Math.max(approved, status === "queued" ? (v3ApprovedBudgetUsd ?? estimate) : 0),
             selectionPlanV3 ? "corpus_first_v3" : selectionPlan?.pipelineVersion ?? "legacy_v1",
             selectionPlanV3 ? "corpus_first_v3_policy_v1" : selectionPlan?.policyVersion ?? "legacy_v1",
             selectionPlanV3 ? null : selectionPlan == null ? null : JSON.stringify(selectionPlan),
@@ -6631,42 +6736,100 @@ export class Repository {
           "pipeline_v3_evidence_attestation_missing",
         );
       }
-      const evidence = await this.pool.query<{
-        track_count: string;
-        attested_count: string;
+      const revisionContract = await this.pool.query<{
+        selection_plan_snapshot_json: SelectionPlanV3;
       }>(
-        `SELECT count(*)::text track_count,
-           count(*) FILTER (WHERE EXISTS (
-             SELECT 1 FROM track_scope_bindings binding
-             WHERE binding.run_id=$1
-               AND binding.candidate_id=track.candidate_id
-               AND binding.eligibility='qualifying'
-               AND binding.pipeline_version='corpus_first_v3'
-               AND binding.source_url LIKE 'https://%'
-               AND EXISTS (
-                 SELECT 1
-                 FROM jsonb_array_elements(
-                   CASE WHEN jsonb_typeof(binding.provenance_path_json)='array'
-                     THEN binding.provenance_path_json ELSE '[]'::jsonb END
-                 ) path
-                 WHERE path->>'kind'='evidence_eligibility_attestation'
-                   AND path->'attestation'->>'schemaVersion'=$3
-                   AND path->'attestation'->>'kind' IN (
-                     'approved_exact_track_scope_source',
-                     'frozen_promoted_graph_assertion'
-                   )
-               )
-           ))::text attested_count
-         FROM manifest_revision_tracks track
-         WHERE track.manifest_revision_id=$2`,
-        [input.runId, input.manifestRevisionId, "genio-pipeline-v3-evidence-attestation/v1"],
+        `SELECT selection_plan_snapshot_json
+         FROM manifest_revisions
+         WHERE id=$1 AND manifest_id=$2 AND pipeline_version='corpus_first_v3'`,
+        [input.manifestRevisionId, input.manifestId],
       );
-      const trackCount = Number(evidence.rows[0]?.track_count ?? 0);
-      const attestedCount = Number(evidence.rows[0]?.attested_count ?? 0);
-      if (trackCount !== input.selectedCount || attestedCount !== trackCount) {
+      const selectionPlan = revisionContract.rows[0]?.selection_plan_snapshot_json;
+      const requiredPredicates = Array.isArray(selectionPlan?.membershipPredicates)
+        ? selectionPlan.membershipPredicates.filter((predicate) => predicate.operator !== "exclude")
+        : [];
+      if (!selectionPlan || requiredPredicates.length === 0) {
         throw new HttpError(
           409,
-          "Pipeline V3 publication is blocked because its manifest evidence is not fully attested",
+          "Pipeline V3 publication is blocked because its immutable membership contract is missing",
+          "pipeline_v3_evidence_attestation_missing",
+        );
+      }
+      const evidence = await this.pool.query<{
+        position: number;
+        candidate_id: string;
+        binding_id: string | null;
+        scope_axis: string | null;
+        scope_value: string | null;
+        relationship: string | null;
+        provenance_path_json: unknown;
+      }>(
+        `SELECT track.position,track.candidate_id,binding.id binding_id,
+                binding.scope_axis,binding.scope_value,binding.relationship,
+                binding.provenance_path_json
+         FROM manifest_revision_tracks track
+         LEFT JOIN track_scope_bindings binding
+           ON binding.run_id=$1
+          AND binding.candidate_id=track.candidate_id
+          AND binding.eligibility='qualifying'
+          AND binding.pipeline_version='corpus_first_v3'
+          AND binding.source_url LIKE 'https://%'
+         WHERE track.manifest_revision_id=$2
+         ORDER BY track.position,binding.id`,
+        [input.runId, input.manifestRevisionId],
+      );
+      const bindingsByCandidate = new Map<string, typeof evidence.rows>();
+      const manifestCandidates = new Set<string>();
+      for (const row of evidence.rows) {
+        manifestCandidates.add(row.candidate_id);
+        if (!row.binding_id) continue;
+        const bindings = bindingsByCandidate.get(row.candidate_id) ?? [];
+        bindings.push(row);
+        bindingsByCandidate.set(row.candidate_id, bindings);
+      }
+      const bindingPredicateIds = (row: typeof evidence.rows[number]): Set<string> => {
+        if (!Array.isArray(row.provenance_path_json)) return new Set();
+        const path = row.provenance_path_json.filter((item): item is Record<string, unknown> => (
+          item !== null && typeof item === "object" && !Array.isArray(item)
+        ));
+        const attested = path.some((item) => {
+          if (item.kind !== "evidence_eligibility_attestation"
+            || !item.attestation || typeof item.attestation !== "object"
+            || Array.isArray(item.attestation)) return false;
+          const attestation = item.attestation as Record<string, unknown>;
+          return attestation.schemaVersion === "genio-pipeline-v3-evidence-attestation/v1"
+            && ["approved_exact_track_scope_source", "frozen_promoted_graph_assertion"]
+              .includes(String(attestation.kind ?? ""));
+        });
+        if (!attested) return new Set();
+        const explicitIds = path.flatMap((item) => (
+          item.kind === "pipeline_v3_binding" && Array.isArray(item.predicateIds)
+            ? item.predicateIds.filter((id): id is string => typeof id === "string")
+            : []
+        ));
+        if (explicitIds.length > 0) return new Set(explicitIds);
+        // Conservative compatibility for manifests created before predicate
+        // ids were embedded in the provenance path. A row may cover only the
+        // one immutable predicate whose complete scope tuple it matches.
+        const compatible = requiredPredicates.filter((predicate) => (
+          predicate.axis === row.scope_axis
+          && predicate.operator === row.relationship
+          && predicate.values.join(" | ") === row.scope_value
+        ));
+        return new Set(compatible.map((predicate) => predicate.id));
+      };
+      const fullyAttested = manifestCandidates.size === input.selectedCount
+        && [...manifestCandidates].every((candidateId) => {
+          const covered = new Set<string>();
+          for (const binding of bindingsByCandidate.get(candidateId) ?? []) {
+            for (const predicateId of bindingPredicateIds(binding)) covered.add(predicateId);
+          }
+          return requiredPredicates.every((predicate) => covered.has(predicate.id));
+        });
+      if (!fullyAttested) {
+        throw new HttpError(
+          409,
+          "Pipeline V3 publication is blocked because every manifest track must attest every required membership predicate",
           "pipeline_v3_evidence_attestation_missing",
         );
       }
@@ -9780,14 +9943,23 @@ export class Repository {
     publicationState: "not_applicable" | "partial_confirmation_required" | "queued" | "waiting_for_apple_authorization";
   }> {
     const { runId, queryPlan, plan, result, fence } = input;
+    const originalSelectionPlanProvided = selectionPlanV3Hash(plan) === queryPlan.selectionPlanHash;
+    const expectedQueryPlan = originalSelectionPlanProvided
+      ? createQueryPlanV3(plan, queryPlan.graphSnapshotId)
+      : queryPlanV3ExecutionProjection(plan, queryPlan);
+    const executionProjectionMatches = stableStringify(normalizedQueryPlanV3Invariant(
+      queryPlan,
+      expectedQueryPlan,
+    )) === stableStringify(normalizedQueryPlanV3Invariant(expectedQueryPlan));
     if (result.runId !== runId || result.executionMode !== "active"
+      || !isQueryPlanV3(queryPlan)
       || queryPlan.pipelineVersion !== "corpus_first_v3"
       || queryPlan.policyVersion !== "corpus_first_v3_policy_v1"
       || plan.pipelineVersion !== "corpus_first_v3"
       || result.outcome.requestedTrackCount !== plan.requestedTrackCount
       || queryPlan.targetTrackCount !== plan.requestedTrackCount
       || queryPlan.storefront !== plan.storefront
-      || queryPlan.selectionPlanHash !== selectionPlanV3Hash(plan)
+      || !executionProjectionMatches
       || queryPlanV3Hash(queryPlan).length !== 64) {
       throw new HttpError(409, "Pipeline V3 retrieval contract does not match the immutable run", "pipeline_policy_mismatch");
     }
@@ -9832,7 +10004,13 @@ export class Repository {
       runId,
       runSpecTarget: target,
       queryPlanHash: queryPlanV3Hash(queryPlan),
-      selectionPlanHash: selectionPlanV3Hash(plan),
+      // The worker receives a semantic execution projection reconstructed
+      // from QueryPlanV3.  It is intentionally not a byte-for-byte copy of
+      // the original SelectionPlanV3 (audit-only provenance, ambiguity, and
+      // authoring fields are not duplicated into the query plan).  Bind the
+      // manifest to the original immutable plan hash carried by QueryPlanV3;
+      // the transaction below verifies that hash against selection_plans.
+      selectionPlanHash: queryPlan.selectionPlanHash,
       graphSnapshotId: queryPlan.graphSnapshotId,
       storefront: plan.storefront,
       selected: result.selected.map((track) => [track.recordingFamilyKey, track.appleSongId]),
@@ -9857,9 +10035,11 @@ export class Repository {
         requested_track_count: number;
         storefront: string;
         selection_plan_id: string;
+        selection_plan_status: string;
         selection_plan_hash: string;
         selection_plan_json: SelectionPlanV3;
         query_plan_id: string;
+        query_plan_status: string;
         query_plan_hash: string;
         query_plan_json: QueryPlanV3;
         graph_snapshot_id: string;
@@ -9867,9 +10047,11 @@ export class Repository {
       }>(
         `SELECT r.status,r.phase,r.brief_json,r.client_bucket,r.pipeline_policy_snapshot_json,
                 spec.spec_hash run_spec_hash,spec.requested_track_count,spec.storefront,
-                selection.id selection_plan_id,selection.plan_hash selection_plan_hash,
+                selection.id selection_plan_id,selection.status selection_plan_status,
+                selection.plan_hash selection_plan_hash,
                 selection.plan_json selection_plan_json,
-                query.id query_plan_id,query.plan_hash query_plan_hash,query.plan_json query_plan_json,
+                query.id query_plan_id,query.status query_plan_status,
+                query.plan_hash query_plan_hash,query.plan_json query_plan_json,
                 query.graph_snapshot_id,graph.status graph_snapshot_status
          FROM research_runs r
          JOIN run_specs spec ON spec.run_id=r.id
@@ -9882,13 +10064,24 @@ export class Repository {
       );
       const immutable = contract.rows[0];
       if (!immutable) throw new HttpError(404, "Research run not found", "run_not_found");
-      const selectionHash = selectionPlanV3Hash(plan);
+      const selectionHash = queryPlan.selectionPlanHash;
       const queryHash = queryPlanV3Hash(queryPlan);
+      const canonicalStoredQueryPlan = createQueryPlanV3(
+        immutable.selection_plan_json,
+        immutable.graph_snapshot_id,
+      );
+      const storedQueryInvariantMatchesSelection = stableStringify(normalizedQueryPlanV3Invariant(
+        immutable.query_plan_json,
+        canonicalStoredQueryPlan,
+      )) === stableStringify(normalizedQueryPlanV3Invariant(canonicalStoredQueryPlan));
       if (immutable.query_plan_id !== fence.queryPlanRevisionId
+        || immutable.query_plan_status !== "active"
+        || immutable.selection_plan_status !== "active"
         || immutable.query_plan_hash !== queryHash
         || queryPlanV3Hash(immutable.query_plan_json) !== queryHash
         || immutable.selection_plan_hash !== selectionHash
         || selectionPlanV3Hash(immutable.selection_plan_json) !== selectionHash
+        || !storedQueryInvariantMatchesSelection
         || immutable.graph_snapshot_id !== queryPlan.graphSnapshotId
         || immutable.graph_snapshot_status !== "locked"
         || Number(immutable.requested_track_count) !== target
@@ -10036,27 +10229,59 @@ export class Repository {
             [sourceRecordId, runId, normalizedUrl, `${track.artist} — ${track.title}`.slice(0, 240), binding.provenanceRoot.slice(0, 240), compactEvidenceNote(`Pipeline V3 exact track-scope evidence (${binding.kind}).`)],
           );
           sourceRecordId = source.rows[0]!.id;
-          const primaryPredicate = plan.membershipPredicates.find((predicate) => predicate.operator !== "exclude")
-            ?? plan.membershipPredicates[0];
-          const scopeAxis = (primaryPredicate?.axis ?? "genre").slice(0, 48);
-          const scopeValue = (primaryPredicate?.values.join(" | ") || plan.prompt).slice(0, 240);
-          const relationship = (primaryPredicate?.operator ?? "include").slice(0, 240);
-          const bindingId = deterministicUuid({ runId, candidateId, sourceRecordId, sourceBindingId: binding.id });
-          await client.query(
-            `INSERT INTO track_scope_bindings(
-               id,run_id,candidate_id,source_record_id,source_url,research_container_id,
-               citation_attestation_id,binding_kind,eligibility,scope_axis,scope_value,relationship,
-               confidence,provenance_path_json,note,pipeline_version,policy_version)
-             VALUES($1,$2,$3,$4,$5,NULL,NULL,$6,'qualifying',$7,$8,$9,$10,$11::jsonb,$12,
-               'corpus_first_v3','corpus_first_v3_policy_v1')
-             ON CONFLICT(id) DO NOTHING`,
-            [bindingId, runId, candidateId, sourceRecordId, normalizedUrl, binding.kind.slice(0, 64), scopeAxis, scopeValue, relationship, Math.max(0, Math.min(1, binding.strength)), JSON.stringify([
-              { kind: "evidence_eligibility_attestation", attestation: binding.eligibilityAttestation },
-              { kind: "evidence_source_governance", governance: binding.governance },
-              { kind: "pipeline_v3_binding", id: binding.id, label: binding.provenanceRoot },
-              ...track.sourceObservationIds.map((id) => ({ kind: "source_observation", id })),
-            ]), compactEvidenceNote(`Qualified by ${binding.kind}; source rank ${binding.sourceRank}.`)],
-          );
+          const positivePredicates = plan.membershipPredicates
+            .filter((predicate) => predicate.operator !== "exclude");
+          const explicitPredicateIds = binding.predicateIds ?? binding.supportedPredicateIds;
+          const supportedPredicates = positivePredicates.filter((predicate) => (
+            explicitPredicateIds?.includes(predicate.id)
+          ));
+          // Compatibility is intentionally limited to a single-axis run. A
+          // composite binding without typed axis attribution must fail closed.
+          const persistedPredicates = supportedPredicates.length > 0
+            ? supportedPredicates
+            : positivePredicates.length === 1 && explicitPredicateIds === undefined
+              ? positivePredicates
+              : [];
+          if (persistedPredicates.length === 0) {
+            throw new HttpError(
+              409,
+              "A qualified V3 evidence binding has no explicit membership-predicate scope",
+              "pipeline_v3_evidence_predicate_missing",
+            );
+          }
+          for (const predicate of persistedPredicates) {
+            const scopeAxis = predicate.axis.slice(0, 48);
+            const scopeValue = predicate.values.join(" | ").slice(0, 240);
+            const relationship = predicate.operator.slice(0, 240);
+            const bindingId = deterministicUuid({
+              runId,
+              candidateId,
+              sourceRecordId,
+              sourceBindingId: binding.id,
+              predicateId: predicate.id,
+            });
+            await client.query(
+              `INSERT INTO track_scope_bindings(
+                 id,run_id,candidate_id,source_record_id,source_url,research_container_id,
+                 citation_attestation_id,binding_kind,eligibility,scope_axis,scope_value,relationship,
+                 confidence,provenance_path_json,note,pipeline_version,policy_version)
+               VALUES($1,$2,$3,$4,$5,NULL,NULL,$6,'qualifying',$7,$8,$9,$10,$11::jsonb,$12,
+                 'corpus_first_v3','corpus_first_v3_policy_v1')
+               ON CONFLICT(id) DO NOTHING`,
+              [bindingId, runId, candidateId, sourceRecordId, normalizedUrl, binding.kind.slice(0, 64), scopeAxis, scopeValue, relationship, Math.max(0, Math.min(1, binding.strength)), JSON.stringify([
+                { kind: "evidence_eligibility_attestation", attestation: binding.eligibilityAttestation },
+                { kind: "evidence_source_governance", governance: binding.governance },
+                {
+                  kind: "pipeline_v3_binding",
+                  id: binding.id,
+                  label: binding.provenanceRoot,
+                  predicateIds: [predicate.id],
+                  sourcePredicateIds: explicitPredicateIds ?? [predicate.id],
+                },
+                ...track.sourceObservationIds.map((id) => ({ kind: "source_observation", id })),
+              ]), compactEvidenceNote(`Qualified ${predicate.id} by ${binding.kind}; source rank ${binding.sourceRank}.`)],
+            );
+          }
         }
         persistedTracks.push({ track, candidateId, familyId, catalogIdentityId, reserve: index >= result.selected.length });
       }
@@ -10155,7 +10380,7 @@ export class Repository {
          VALUES($1,$2,$3,$4,$5,'corpus_first_v3','corpus_first_v3_policy_v1',$6::jsonb)
          ON CONFLICT(run_id) DO UPDATE SET
            content_hash=EXCLUDED.content_hash,selection_plan_json=EXCLUDED.selection_plan_json`,
-        [manifestId, runId, name, description, manifestHash, JSON.stringify(plan)],
+        [manifestId, runId, name, description, manifestHash, JSON.stringify(immutable.selection_plan_json)],
       );
       const latestRevision = await client.query<{ id: string; revision: number }>(
         `SELECT id,revision FROM manifest_revisions
@@ -10182,7 +10407,7 @@ export class Repository {
           immutable.query_plan_id,
           immutable.graph_snapshot_id,
           immutable.run_spec_hash,
-          JSON.stringify(plan),
+          JSON.stringify(immutable.selection_plan_json),
           JSON.stringify(immutable.pipeline_policy_snapshot_json),
           JSON.stringify(outcome),
           JSON.stringify(outcome.deficits),

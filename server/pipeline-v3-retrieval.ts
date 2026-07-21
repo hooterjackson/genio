@@ -221,6 +221,10 @@ export interface EvidenceBindingReferenceV3 {
   readonly strength: number;
   readonly sourceRank: number;
   readonly kind: string;
+  /** Exact positive membership predicates explicitly supported by this source binding. */
+  readonly predicateIds?: readonly string[];
+  /** Compatibility alias used by deterministic E2E fixtures. */
+  readonly supportedPredicateIds?: readonly string[];
   /** Typed, fail-closed source policy. Generic candidate metadata cannot substitute for this contract. */
   readonly governance: EvidenceSourceGovernanceV3;
   /**
@@ -619,6 +623,11 @@ interface RecordingFamilyEntryV3 {
   alternates: QualifiedTrackV3[];
 }
 
+interface RawCandidateLedgerEntryV3 {
+  candidate: RawTrackCandidateV3;
+  candidateIds: Set<string>;
+}
+
 function boundedInteger(value: number, label: string, minimum: number, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${label} must be an integer between ${minimum} and ${maximum}`);
@@ -636,6 +645,203 @@ function validCandidate(candidate: RawTrackCandidateV3): boolean {
     && typeof candidate.artist === "string" && candidate.artist.trim().length > 0
     && (candidate.album === null || typeof candidate.album === "string")
     && Array.isArray(candidate.sourceObservationIds);
+}
+
+function rawCandidateIdentityKey(candidate: RawTrackCandidateV3): string {
+  return [candidate.artist, candidate.title, candidate.album ?? ""]
+    .map(normalizeIdentity)
+    .join("\u0000");
+}
+
+function mergeMetadataValue(left: unknown, right: unknown): unknown {
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const seen = new Set<string>();
+    return [...left, ...right].filter((value) => {
+      const key = JSON.stringify(value);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+  if (left && right && typeof left === "object" && typeof right === "object"
+    && !Array.isArray(left) && !Array.isArray(right)) {
+    const output: Record<string, unknown> = { ...(left as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(right as Record<string, unknown>)) {
+      output[key] = key in output ? mergeMetadataValue(output[key], value) : value;
+    }
+    return output;
+  }
+  return right ?? left;
+}
+
+function mergeRawCandidate(
+  existing: RawTrackCandidateV3,
+  incoming: RawTrackCandidateV3,
+): { candidate: RawTrackCandidateV3; improved: boolean } {
+  const observations = [...new Set([
+    ...existing.sourceObservationIds,
+    ...incoming.sourceObservationIds,
+  ])];
+  const mergedMetadata = mergeMetadataValue(existing.metadata, incoming.metadata) as
+    | Readonly<Record<string, unknown>>
+    | undefined;
+  const previousMetadata = JSON.stringify(existing.metadata ?? null);
+  const nextMetadata = JSON.stringify(mergedMetadata ?? null);
+  return {
+    candidate: {
+      ...existing,
+      album: existing.album ?? incoming.album,
+      sourceObservationIds: observations,
+      ...(mergedMetadata ? { metadata: mergedMetadata } : {}),
+    },
+    improved: observations.length > existing.sourceObservationIds.length
+      || previousMetadata !== nextMetadata,
+  };
+}
+
+function bindingPredicateIds(binding: EvidenceBindingReferenceV3): readonly string[] {
+  return binding.predicateIds ?? binding.supportedPredicateIds ?? [];
+}
+
+function positiveMembershipPredicateIds(plan: SelectionPlanV3): string[] {
+  return plan.membershipPredicates
+    .filter(({ operator }) => operator !== "exclude")
+    .map(({ id }) => id);
+}
+
+function trackMatchesConstraintValue(
+  track: QualifiedTrackV3,
+  constraint: SelectionConstraint,
+): boolean | null {
+  const values = new Set(constraint.values.map(normalizeIdentity));
+  if (constraint.axis === "artist") return values.has(normalizeIdentity(track.artist));
+  if (constraint.axis === "album") return track.album !== null
+    && values.has(normalizeIdentity(track.album));
+  if (constraint.axis === "track") return values.has(normalizeIdentity(track.title));
+  return null;
+}
+
+function continuationTrackIntegrityReason(
+  track: QualifiedTrackV3,
+  plan: SelectionPlanV3,
+): CandidateDeficitReasonV3 | null {
+  if (!nonEmpty(track.candidateId)
+    || !nonEmpty(track.title)
+    || !nonEmpty(track.artist)
+    || !nonEmpty(track.appleSongId)
+    || !nonEmpty(track.recordingFamilyKey)) return "catalog_identity_missing";
+  if (!(track.catalogConfidence > 0)) return "storefront_unavailable";
+  if (!(track.versionConfidence > 0)) return "version_incompatible";
+
+  const bindings = attestedEvidenceBindingsForSelectionV3(
+    track.evidenceBindingIds,
+    track.evidenceBindings,
+  );
+  if (bindings.length === 0) return "evidence_attestation_missing";
+  const supportedPredicates = new Set(bindings.flatMap(bindingPredicateIds));
+  if (positiveMembershipPredicateIds(plan).some((id) => !supportedPredicates.has(id))) {
+    return "scope_membership_failed";
+  }
+
+  for (const constraint of plan.hardConstraints) {
+    if (constraint.operator === "maximum") continue;
+    if (supportedPredicates.has(constraint.id)) continue;
+    const matches = trackMatchesConstraintValue(track, constraint);
+    if (constraint.operator === "exclude") {
+      if (matches === true) return "hard_constraint_failed";
+      if (matches === false) continue;
+    } else if (constraint.operator === "include" || constraint.operator === "require") {
+      if (matches === true) continue;
+      return "hard_constraint_failed";
+    } else {
+      return "hard_constraint_failed";
+    }
+  }
+  return null;
+}
+
+function mergeQualifiedTrack(
+  existing: QualifiedTrackV3,
+  incoming: QualifiedTrackV3,
+): { track: QualifiedTrackV3; improved: boolean } {
+  const observations = [...new Set([
+    ...existing.sourceObservationIds,
+    ...incoming.sourceObservationIds,
+  ])];
+  const bindings = [...new Map([
+    ...(existing.evidenceBindings ?? []),
+    ...(incoming.evidenceBindings ?? []),
+  ].map((binding) => [binding.id, binding])).values()];
+  const bindingIds = [...new Set([
+    ...existing.evidenceBindingIds,
+    ...incoming.evidenceBindingIds,
+    ...bindings.map(({ id }) => id),
+  ])];
+  const rankingSignals = { ...existing.rankingSignals };
+  for (const [dimension, value] of Object.entries(incoming.rankingSignals)) {
+    const key = dimension as RankingObjectiveV3["dimension"];
+    rankingSignals[key] = Math.max(rankingSignals[key] ?? 0, value ?? 0);
+  }
+  const provenanceRoots = new Set(bindings.map(({ provenanceRoot }) => provenanceRoot)).size;
+  const track: QualifiedTrackV3 = {
+    ...existing,
+    album: existing.album ?? incoming.album,
+    sourceObservationIds: observations,
+    evidenceBindingIds: bindingIds,
+    evidenceBindings: bindings,
+    evidenceStrength: Math.max(existing.evidenceStrength, incoming.evidenceStrength),
+    scopeFit: Math.max(existing.scopeFit, incoming.scopeFit),
+    independentProvenanceRoots: Math.max(
+      existing.independentProvenanceRoots,
+      incoming.independentProvenanceRoots,
+      provenanceRoots,
+    ),
+    versionConfidence: Math.max(existing.versionConfidence, incoming.versionConfidence),
+    catalogConfidence: Math.max(existing.catalogConfidence, incoming.catalogConfidence),
+    rankingSignals,
+    sourceRank: Math.min(existing.sourceRank, incoming.sourceRank),
+  };
+  return {
+    track,
+    improved: observations.length > existing.sourceObservationIds.length
+      || bindingIds.length > existing.evidenceBindingIds.length
+      || track.evidenceStrength > existing.evidenceStrength
+      || track.scopeFit > existing.scopeFit
+      || track.independentProvenanceRoots > existing.independentProvenanceRoots
+      || track.versionConfidence > existing.versionConfidence
+      || track.catalogConfidence > existing.catalogConfidence
+      || track.sourceRank < existing.sourceRank
+      || Object.entries(track.rankingSignals).some(([dimension, value]) => (
+        (value ?? 0) > (existing.rankingSignals[dimension as RankingObjectiveV3["dimension"]] ?? 0)
+      )),
+  };
+}
+
+function addQualifiedToFamily(
+  families: Map<string, RecordingFamilyEntryV3>,
+  qualified: QualifiedTrackV3,
+  objectives: readonly RankingObjectiveV3[],
+): { newFamily: boolean; meaningfulProgress: boolean } {
+  const family = families.get(qualified.recordingFamilyKey);
+  if (!family) {
+    families.set(qualified.recordingFamilyKey, { primary: qualified, alternates: [] });
+    return { newFamily: true, meaningfulProgress: true };
+  }
+  const variants = [family.primary, ...family.alternates];
+  const existingIndex = variants.findIndex(({ appleSongId }) => appleSongId === qualified.appleSongId);
+  let meaningfulProgress = false;
+  if (existingIndex >= 0) {
+    const merged = mergeQualifiedTrack(variants[existingIndex]!, qualified);
+    variants[existingIndex] = merged.track;
+    meaningfulProgress = merged.improved;
+  } else {
+    variants.push(qualified);
+    meaningfulProgress = true;
+  }
+  variants.sort((left, right) => compareQualified(left, right, objectives));
+  family.primary = variants[0]!;
+  family.alternates = variants.slice(1);
+  return { newFamily: false, meaningfulProgress };
 }
 
 function incrementReason(
@@ -888,15 +1094,29 @@ function finalStopReason(input: {
   qualifiedCount: number;
 }): RetrievalStopReasonV3 {
   if (input.explicit) return input.explicit;
+  // Scope resolution and gap-pass definitions are orchestration markers in
+  // the live adapter. They deliberately return an exhausted zero-work page
+  // and therefore cannot establish that a provider-backed frontier was
+  // successfully searched. Ignore those markers when deciding whether a
+  // zero-result run was actually caused by provider loss.
+  const materialStrategies = input.strategies.filter((state) => !(
+    (state.definition.kind === "scope_resolution" || state.definition.kind === "gap_pass")
+    && state.status === "exhausted"
+    && state.rounds > 0
+    && state.rawCandidates === 0
+    && state.providerFailures === 0
+  ));
   if (input.qualifiedCount === 0 && input.providerFailureCount > 0
-    && input.strategies.every((state) => state.status === "provider_error" || state.status === "circuit_open")) {
+    && materialStrategies.length > 0
+    && materialStrategies.every((state) => state.status === "provider_error" || state.status === "circuit_open")) {
     return "provider_failure";
   }
   if (input.qualifiedCount === 0 && input.integrityFailureCount > 0
-    && input.strategies.every((state) => state.status === "integrity_error" || state.status === "exhausted")) {
+    && materialStrategies.length > 0
+    && materialStrategies.every((state) => state.status === "integrity_error" || state.status === "exhausted")) {
     return "integrity_failure";
   }
-  if (input.strategies.length > 0 && input.strategies.every((state) => state.status === "circuit_open")) {
+  if (materialStrategies.length > 0 && materialStrategies.every((state) => state.status === "circuit_open")) {
     return "provider_circuit_open";
   }
   return "frontier_exhausted";
@@ -1070,14 +1290,23 @@ export async function executeRetrievalV3(input: {
 
   const discardedByReason: Partial<Record<CandidateDeficitReasonV3, number>> = {};
   const integrityEvents: string[] = [];
+  const appleIdToFamily = new Map<string, string>();
   const rawSeedTracks = input.continuation?.qualifiedTracks ?? [];
   const seedTracks = rawSeedTracks.flatMap((track) => {
-    const bindings = attestedEvidenceBindingsForSelectionV3(track.evidenceBindingIds, track.evidenceBindings);
-    if (bindings.length === 0) {
-      incrementReason(discardedByReason, "evidence_attestation_missing");
-      integrityEvents.push(`continuation_evidence_attestation_missing:${track.candidateId}`);
+    const integrityReason = continuationTrackIntegrityReason(track, input.plan);
+    if (integrityReason) {
+      incrementReason(discardedByReason, integrityReason);
+      integrityEvents.push(`continuation_seed_rejected:${integrityReason}:${track.candidateId}`);
       return [];
     }
+    const existingFamily = appleIdToFamily.get(track.appleSongId);
+    if (existingFamily && existingFamily !== track.recordingFamilyKey) {
+      incrementReason(discardedByReason, "catalog_identity_conflict");
+      integrityEvents.push(`continuation_seed_rejected:catalog_identity_conflict:${track.candidateId}`);
+      return [];
+    }
+    appleIdToFamily.set(track.appleSongId, track.recordingFamilyKey);
+    const bindings = attestedEvidenceBindingsForSelectionV3(track.evidenceBindingIds, track.evidenceBindings);
     return [{
       ...track,
       evidenceBindingIds: bindings.map(({ id }) => id),
@@ -1086,14 +1315,14 @@ export async function executeRetrievalV3(input: {
   });
   const seenCandidateIds = new Set<string>(seedTracks.map(({ candidateId }) => candidateId));
   const seenCandidateTracks = new Map<string, { artist: string; title: string }>();
-  const appleIdToFamily = new Map<string, string>();
+  const rawCandidateLedger = new Map<string, RawCandidateLedgerEntryV3>();
   const families = new Map<string, RecordingFamilyEntryV3>();
   for (const track of seedTracks) {
     seenCandidateTracks.set(track.candidateId, { artist: track.artist, title: track.title });
     appleIdToFamily.set(track.appleSongId, track.recordingFamilyKey);
     const alternates = input.continuation?.compatibleAlternatesByRecordingFamily[track.recordingFamilyKey]
       ?.filter((alternate) => alternate.appleSongId !== track.appleSongId
-        && qualifiedTrackHasAttestedEvidenceV3(alternate))
+        && continuationTrackIntegrityReason(alternate, input.plan) === null)
       .map((alternate) => {
         const bindings = attestedEvidenceBindingsForSelectionV3(
           alternate.evidenceBindingIds,
@@ -1105,11 +1334,16 @@ export async function executeRetrievalV3(input: {
           evidenceBindings: bindings.map((binding) => ({ ...binding })),
         };
       }) ?? [];
-    const existing = families.get(track.recordingFamilyKey);
-    if (!existing) families.set(track.recordingFamilyKey, { primary: { ...track }, alternates });
-    else if (compareQualified(track, existing.primary, input.plan.rankingObjectives) < 0) {
-      existing.alternates.push(existing.primary);
-      existing.primary = { ...track };
+    addQualifiedToFamily(families, { ...track }, input.plan.rankingObjectives);
+    for (const alternate of alternates) {
+      const existingFamily = appleIdToFamily.get(alternate.appleSongId);
+      if (existingFamily && existingFamily !== alternate.recordingFamilyKey) {
+        incrementReason(discardedByReason, "catalog_identity_conflict");
+        integrityEvents.push(`continuation_alternate_rejected:catalog_identity_conflict:${alternate.candidateId}`);
+        continue;
+      }
+      appleIdToFamily.set(alternate.appleSongId, alternate.recordingFamilyKey);
+      addQualifiedToFamily(families, alternate, input.plan.rankingObjectives);
     }
   }
   const priorStages = input.continuation?.stages;
@@ -1226,16 +1460,49 @@ export async function executeRetrievalV3(input: {
     state.rawCandidates += batch.candidates.length;
 
     const candidates: RawTrackCandidateV3[] = [];
+    let roundCandidateEvidenceProgress = 0;
     for (const candidate of boundedBatch) {
       if (!validCandidate(candidate)) {
         incrementReason(discardedByReason, "invalid_candidate_shape");
         continue;
       }
-      if (seenCandidateIds.has(candidate.id)) {
+      const candidateIdWasSeen = seenCandidateIds.has(candidate.id);
+      if (!candidateIdWasSeen) seenCandidateIds.add(candidate.id);
+      const identityKey = rawCandidateIdentityKey(candidate);
+      const existing = rawCandidateLedger.get(identityKey);
+      if (existing) {
+        existing.candidateIds.add(candidate.id);
+        const merged = mergeRawCandidate(existing.candidate, candidate);
+        existing.candidate = merged.candidate;
+        if (!merged.improved) {
+          incrementReason(discardedByReason, "candidate_already_seen");
+          continue;
+        }
+        // A later source may strengthen a candidate that did not previously
+        // clear the evidence floor. Re-qualify the cumulative candidate and
+        // keep the strategy alive for this meaningful frontier advance even
+        // when it has not yet produced a new recording family.
+        roundCandidateEvidenceProgress += 1;
+        seenCandidateTracks.set(existing.candidate.id, {
+          artist: existing.candidate.artist.trim(),
+          title: existing.candidate.title.trim(),
+        });
+        // Stage counters represent validation attempts, whereas the separate
+        // candidate/family ledgers retain unique identities. Counting the
+        // cumulative re-qualification attempt keeps each adaptive-yield stage
+        // denominator monotonic without inflating unique-family totals.
+        counters.validCandidates += 1;
+        candidates.push(existing.candidate);
+        continue;
+      }
+      if (candidateIdWasSeen) {
         incrementReason(discardedByReason, "candidate_already_seen");
         continue;
       }
-      seenCandidateIds.add(candidate.id);
+      rawCandidateLedger.set(identityKey, {
+        candidate: { ...candidate, sourceObservationIds: [...new Set(candidate.sourceObservationIds)] },
+        candidateIds: new Set([candidate.id]),
+      });
       seenCandidateTracks.set(candidate.id, {
         artist: candidate.artist.trim(),
         title: candidate.title.trim(),
@@ -1287,7 +1554,8 @@ export async function executeRetrievalV3(input: {
       byCandidate.set(qualification.candidateId, qualification);
     }
 
-    const familiesBefore = families.size;
+    let newFamilies = 0;
+    let meaningfulProgress = roundCandidateEvidenceProgress;
     for (const candidate of candidates) {
       const qualification = byCandidate.get(candidate.id);
       if (!qualification) {
@@ -1359,27 +1627,20 @@ export async function executeRetrievalV3(input: {
         sourceRank: Number.isFinite(qualification.sourceRank) ? Math.max(0, qualification.sourceRank) : Number.MAX_SAFE_INTEGER,
       };
       appleIdToFamily.set(qualified.appleSongId, qualified.recordingFamilyKey);
-      const family = families.get(qualified.recordingFamilyKey);
-      if (!family) {
-        families.set(qualified.recordingFamilyKey, { primary: qualified, alternates: [] });
+      const familyAlreadyExists = families.has(qualified.recordingFamilyKey);
+      const merge = addQualifiedToFamily(families, qualified, input.plan.rankingObjectives);
+      if (merge.newFamily) {
+        newFamilies += 1;
+        meaningfulProgress += 1;
         counters.canonicalUnique += 1;
         continue;
       }
       incrementReason(discardedByReason, "duplicate_recording_family");
-      if (family.primary.appleSongId === qualified.appleSongId
-        || family.alternates.some(({ appleSongId }) => appleSongId === qualified.appleSongId)) continue;
-      if (compareQualified(qualified, family.primary, input.plan.rankingObjectives) < 0) {
-        family.alternates.push(family.primary);
-        family.primary = qualified;
-      } else {
-        family.alternates.push(qualified);
-      }
-      family.alternates.sort((left, right) => compareQualified(left, right, input.plan.rankingObjectives));
+      if (familyAlreadyExists && merge.meaningfulProgress) meaningfulProgress += 1;
     }
 
-    const newFamilies = families.size - familiesBefore;
     state.newQualifiedFamilies += newFamilies;
-    state.consecutiveZeroQualifiedYieldRounds = newFamilies === 0
+    state.consecutiveZeroQualifiedYieldRounds = meaningfulProgress === 0
       ? state.consecutiveZeroQualifiedYieldRounds + 1
       : 0;
     const cursorLoop = batch.nextCursor !== null && state.seenCursors.has(batch.nextCursor);

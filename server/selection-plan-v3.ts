@@ -117,10 +117,21 @@ export interface RecordingPolicyV3 {
 }
 
 export interface CriticalAmbiguityV3 {
-  readonly key: "house_semantics" | "french_jazz_scope" | "possessive_relationship" | "brazilian_funk_semantics";
+  readonly key:
+    | "house_semantics"
+    | "french_jazz_scope"
+    | "geographic_genre_scope"
+    | "possessive_relationship"
+    | "brazilian_funk_semantics";
   readonly summary: string;
   readonly blocking: true;
   readonly optionIds: readonly string[];
+  /** Context is present for the generic nationality/scene/language question. */
+  readonly geographicLabel?: string;
+  readonly genreLabel?: string;
+  readonly sceneValue?: string;
+  readonly originValue?: string;
+  readonly languageValue?: string;
 }
 
 export interface RunSpecV3 {
@@ -209,6 +220,48 @@ const GENRE_TERMS = [
   "jazz", "jungle", "metal", "pop", "punk", "rap", "reggae", "rock",
   "samba", "soul", "techno", "trance",
 ] as const;
+
+interface GeographicQualifierV3 {
+  readonly aliases: readonly string[];
+  readonly scenePrefix: string;
+  readonly originValue: string;
+  readonly languageValue?: string;
+  /** A bare adjective can materially mean origin, scene, or language. */
+  readonly ambiguousBareGenre?: boolean;
+}
+
+/**
+ * Geography is data-driven rather than a list of complete prompt phrases.
+ * This deliberately distinguishes a music scene from artist nationality:
+ * “Detroit techno” is a scene binding, while “French jazz” needs guidance
+ * unless the visitor explicitly says scene, artist origin, or language.
+ */
+const GEOGRAPHIC_QUALIFIERS: readonly GeographicQualifierV3[] = [
+  { aliases: ["detroit"], scenePrefix: "Detroit", originValue: "Detroit" },
+  { aliases: ["chicago"], scenePrefix: "Chicago", originValue: "Chicago" },
+  { aliases: ["berlin"], scenePrefix: "Berlin", originValue: "Berlin" },
+  { aliases: ["new york", "nyc"], scenePrefix: "New York", originValue: "New York" },
+  { aliases: ["london"], scenePrefix: "London", originValue: "London" },
+  { aliases: ["bristol"], scenePrefix: "Bristol", originValue: "Bristol" },
+  { aliases: ["manchester"], scenePrefix: "Manchester", originValue: "Manchester" },
+  { aliases: ["paris", "parisian"], scenePrefix: "Paris", originValue: "Paris", languageValue: "French" },
+  { aliases: ["uk", "u k", "british"], scenePrefix: "UK", originValue: "United Kingdom", languageValue: "English" },
+  { aliases: ["american", "us", "u s", "united states"], scenePrefix: "American", originValue: "United States", languageValue: "English" },
+  { aliases: ["brazilian", "brazil"], scenePrefix: "Brazilian", originValue: "Brazil", languageValue: "Portuguese" },
+  { aliases: ["french", "france"], scenePrefix: "French", originValue: "France", languageValue: "French", ambiguousBareGenre: true },
+  { aliases: ["german", "germany"], scenePrefix: "German", originValue: "Germany", languageValue: "German" },
+  { aliases: ["italian", "italy"], scenePrefix: "Italian", originValue: "Italy", languageValue: "Italian" },
+  { aliases: ["japanese", "japan"], scenePrefix: "Japanese", originValue: "Japan", languageValue: "Japanese" },
+  { aliases: ["nigerian", "nigeria"], scenePrefix: "Nigerian", originValue: "Nigeria" },
+  { aliases: ["jamaican", "jamaica"], scenePrefix: "Jamaican", originValue: "Jamaica", languageValue: "English" },
+];
+
+interface GeographicGenreScopeV3 {
+  readonly qualifier: GeographicQualifierV3;
+  readonly matchedAlias: string;
+  readonly genre: string;
+  readonly sceneValue: string;
+}
 
 const SIMILARITY_CUE_SOURCE = String.raw`(?:similar to|sounds? like|(?:songs?|tracks?|music) like|in the style of|inspired by)`;
 
@@ -396,6 +449,99 @@ function detectedGenreTerms(prompt: string): string[] {
   return GENRE_TERMS.filter((genre) => new RegExp(`\\b${genre.replace(/\s+/gu, "\\s+")}\\b`, "u").test(prompt));
 }
 
+function escapedPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(/\s+/gu, "\\s+");
+}
+
+function detectedGeographicGenreScopes(
+  prompt: string,
+  genres = detectedGenreTerms(prompt),
+): GeographicGenreScopeV3[] {
+  const scopes: GeographicGenreScopeV3[] = [];
+  const seen = new Set<string>();
+  for (const qualifier of GEOGRAPHIC_QUALIFIERS) {
+    for (const alias of qualifier.aliases) {
+      for (const genre of genres) {
+        const pattern = new RegExp(`\\b${escapedPattern(alias)}\\s+${escapedPattern(genre)}\\b`, "u");
+        if (!pattern.test(prompt)) continue;
+        const sceneValue = `${qualifier.scenePrefix} ${genre}`;
+        const key = `${normalize(sceneValue)}:${normalize(genre)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        scopes.push({ qualifier, matchedAlias: alias, genre, sceneValue });
+      }
+    }
+  }
+  return scopes;
+}
+
+function explicitGenreFusion(prompt: string, genres: readonly string[]): boolean {
+  if (genres.length < 2) return false;
+  if (/\b(?:fusion|fused|blend|blended|hybrid|crossover|cross-over|mashup|combines?|combining)\b/u.test(prompt)) {
+    return true;
+  }
+  if (/\beach\s+(?:song|track|recording)\b.{0,80}\b(?:both|all)\b/u.test(prompt)) return true;
+  return genres.some((left, index) => genres.slice(index + 1).some((right) => (
+    new RegExp(`\\b${escapedPattern(left)}-${escapedPattern(right)}\\b|\\b${escapedPattern(right)}-${escapedPattern(left)}\\b`, "u")
+      .test(prompt)
+  )));
+}
+
+function replacePromptGenrePredicates(
+  predicates: MembershipPredicateV3[],
+  genres: readonly string[],
+  intersection: boolean,
+): void {
+  if (genres.length === 0) return;
+  const normalizedGenres = new Set(genres.map(normalize));
+  const promptGenrePredicate = (value: MembershipPredicateV3): boolean => (
+    value.axis === "genre"
+    && (value.operator === "include" || value.operator === "require")
+    && value.values.length > 0
+    && value.values.every((item) => normalizedGenres.has(normalize(item)))
+  );
+  for (let index = predicates.length - 1; index >= 0; index -= 1) {
+    if (promptGenrePredicate(predicates[index]!)) predicates.splice(index, 1);
+  }
+  if (intersection) {
+    for (const genre of genres) {
+      pushPredicate(predicates, predicate(
+        "genre",
+        "require",
+        [genre],
+        `The request explicitly asks for recordings that combine ${genres.join(" and ")}.`,
+      ));
+    }
+    return;
+  }
+  pushPredicate(predicates, predicate(
+    "genre",
+    "require",
+    genres,
+    genres.length === 1
+      ? `The request explicitly names the ${genres[0]} genre.`
+      : `Each recording may satisfy any one of the requested genres: ${genres.join(", ")}.`,
+  ));
+}
+
+function explicitGeographicRelationship(
+  prompt: string,
+  scope: GeographicGenreScopeV3,
+): "scene" | "origin" | "language" | null {
+  const alias = escapedPattern(scope.matchedAlias);
+  const genre = escapedPattern(scope.genre);
+  if (new RegExp(`\\b${alias}\\s+${genre}\\s+scene\\b|\\b${genre}\\s+scene\\s+in\\s+${alias}\\b`, "u").test(prompt)) {
+    return "scene";
+  }
+  if (new RegExp(`\\b${alias}[-\\s]+language\\s+${genre}\\b|\\b${genre}\\b.{0,40}\\b(?:sung|performed)\\s+in\\s+${alias}\\b`, "u").test(prompt)) {
+    return "language";
+  }
+  if (new RegExp(`\\b${alias}\\s+artists?\\b.{0,50}\\b${genre}\\b|\\b${genre}\\b.{0,50}\\b(?:artists? from|artists? born in)\\s+${alias}\\b`, "u").test(prompt)) {
+    return "origin";
+  }
+  return null;
+}
+
 function intentEngines(intents: readonly IntentV3[]): IntentEngineV3[] {
   const engines: IntentEngineV3[] = [];
   if (intents.includes("exhaustive")) engines.push("exhaustive");
@@ -409,7 +555,9 @@ function intentEngines(intents: readonly IntentV3[]): IntentEngineV3[] {
 
 function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
   const ambiguities: CriticalAmbiguityV3[] = [];
+  const houseAlongsideAnotherGenre = detectedGenreTerms(prompt).some((genre) => genre !== "house");
   const bareHouse = /\bhouse\b/u.test(prompt)
+    && !houseAlongsideAnotherGenre
     && !/\bhouse\s+music\b|\bhouse\s+(?:tracks?|songs?|genre|scene|dj)\b|\b(chicago|acid|deep|progressive|tech|afro)\s+house\b/u.test(prompt)
     && !/\b(?:songs?|music|tracks?)\s+(?:about|mentioning)\s+(?:a\s+)?(?:house|home|houses|homes)\b|\bhome-themed\b/u.test(prompt);
   if (bareHouse) {
@@ -422,13 +570,30 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
   }
 
   if (/\bfrench\s+jazz\b/u.test(prompt)
-    && !/\b(?:french-born|french artists?|artists? from france|recorded in france|france scene|french-language|sung in french)\b/u.test(prompt)) {
+    && !/\b(?:french-born|french artists?|artists? from france|recorded in france|france scene|french jazz scene|french-language|sung in french)\b/u.test(prompt)) {
     ambiguities.push({
       key: "french_jazz_scope",
       summary: "“French jazz” may refer to artist origin, a scene in France, or French-language recordings.",
       blocking: true,
       optionIds: ["french_artist_origin", "french_scene", "french_language", "custom"],
     });
+  }
+
+  for (const scope of detectedGeographicGenreScopes(prompt)) {
+    if (!scope.qualifier.ambiguousBareGenre || scope.genre === "jazz") continue;
+    if (explicitGeographicRelationship(prompt, scope) !== null) continue;
+    ambiguities.push({
+      key: "geographic_genre_scope",
+      summary: `“${scope.sceneValue}” may refer to artist origin, a scene, or ${scope.qualifier.languageValue ?? "a language relationship"}.`,
+      blocking: true,
+      optionIds: ["geographic_artist_origin", "geographic_scene", "geographic_language", "custom"],
+      geographicLabel: scope.qualifier.scenePrefix,
+      genreLabel: scope.genre,
+      sceneValue: scope.sceneValue,
+      originValue: scope.qualifier.originValue,
+      ...(scope.qualifier.languageValue ? { languageValue: scope.qualifier.languageValue } : {}),
+    });
+    break;
   }
 
   const possessive = prompt.match(/\b([a-z0-9][a-z0-9 .&-]{1,80})'s\s+(?:\d+\s+)?(?:most\s+)?(?:influential|essential|important|best)\s+(?:songs?|tracks?|recordings?)\b/u);
@@ -508,9 +673,68 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     if ((genre === "baile funk" || genre === "funk carioca") && ambiguousKeys.has("brazilian_funk_semantics")) return false;
     return true;
   });
+  const genreIntersection = explicitGenreFusion(prompt, genres);
   if (genres.length > 0) {
     intents.push("genre_scene");
-    for (const genre of genres) pushPredicate(predicates, predicate("genre", "require", [genre], `The request explicitly names the ${genre} genre.`));
+    replacePromptGenrePredicates(predicates, genres, genreIntersection);
+  }
+  const geographicScopes = detectedGeographicGenreScopes(prompt, genres);
+  const sceneValues: string[] = [];
+  for (const scope of geographicScopes) {
+    const relationship = explicitGeographicRelationship(prompt, scope);
+    const ambiguous = (normalize(scope.sceneValue) === "french jazz" && ambiguousKeys.has("french_jazz_scope"))
+      || ambiguities.some((ambiguity) => (
+        ambiguity.key === "geographic_genre_scope"
+        && ambiguity.sceneValue === scope.sceneValue
+      ));
+    if (ambiguous && relationship === null) continue;
+    intents.push("genre_scene");
+    if (relationship === "origin") {
+      pushPredicate(predicates, predicate(
+        "geography",
+        "require",
+        [scope.qualifier.originValue],
+        `The request explicitly limits principal artist origin to ${scope.qualifier.originValue}.`,
+      ));
+    } else if (relationship === "language" && scope.qualifier.languageValue) {
+      pushPredicate(predicates, predicate(
+        "language",
+        "require",
+        [scope.qualifier.languageValue],
+        `The request explicitly requires ${scope.qualifier.languageValue}-language recordings.`,
+      ));
+    } else {
+      sceneValues.push(scope.sceneValue);
+    }
+  }
+  if (sceneValues.length > 0) {
+    if (genreIntersection) {
+      for (const scene of sceneValues) {
+        pushPredicate(predicates, predicate(
+          "scene",
+          "require",
+          [scene],
+          `The requested fusion must be supported by the ${scene} scene scope.`,
+        ));
+      }
+    } else {
+      pushPredicate(predicates, predicate(
+        "scene",
+        "require",
+        dedupe(sceneValues),
+        sceneValues.length === 1
+          ? `The request explicitly limits the recording pool to the ${sceneValues[0]} scene.`
+          : `Each recording may belong to any one of the requested scenes: ${sceneValues.join(", ")}.`,
+      ));
+    }
+  }
+
+  // Explicit relationship phrases need not use the compact “place + genre”
+  // spelling handled above.
+  if (/\bfrench[-\s]+language\b/u.test(prompt)) {
+    pushPredicate(predicates, predicate("language", "require", ["French"], "The request explicitly requires French-language recordings."));
+  } else if (/\b(?:french-born|french artists?|artists? from france)\b/u.test(prompt)) {
+    pushPredicate(predicates, predicate("geography", "require", ["France"], "The request explicitly requires artists from France."));
   }
 
   if (/\b(?:songs?|tracks?|music)\s+(?:about|mentioning)\s+(?:a\s+)?(?:house|home|houses|homes)\b/u.test(prompt)) {
@@ -615,6 +839,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
 export type CriticalAmbiguityAnswerV3 =
   | { key: "house_semantics"; optionId: "house_genre" | "house_theme" | "house_both"; customValue?: never }
   | { key: "french_jazz_scope"; optionId: "french_artist_origin" | "french_scene" | "french_language"; customValue?: never }
+  | { key: "geographic_genre_scope"; optionId: "geographic_artist_origin" | "geographic_scene" | "geographic_language"; customValue?: never }
   | { key: "possessive_relationship"; optionId: "subject_performed" | "subject_created" | "subject_influenced"; customValue?: never }
   | { key: "brazilian_funk_semantics"; optionId: "funk_carioca" | "brazilian_soul_funk" | "both_funk_traditions"; customValue?: never }
   | { key: CriticalAmbiguityV3["key"]; optionId: "custom"; customValue: string };
@@ -633,7 +858,7 @@ function customAmbiguityAxis(
   custom: string,
 ): MembershipAxisV3 {
   if (key === "possessive_relationship") return "factual_relationship";
-  if (key === "french_jazz_scope") {
+  if (key === "french_jazz_scope" || key === "geographic_genre_scope") {
     if (/\b(?:language|french[- ]language|francophone|sung|lyrics?)\b/iu.test(custom)) return "language";
     if (/\b(?:origin|nationality|born|artists? from|country)\b/iu.test(custom)) return "geography";
     return "scene";
@@ -681,6 +906,23 @@ export function resolveRunSpecV3(
           ? "French jazz scene"
           : "France";
       pushPredicate(predicates, guidedPredicate(axis, [semanticValue], "The visitor resolved the requested French relationship."));
+    } else if (answer.key === "geographic_genre_scope") {
+      const axis = answer.optionId === "geographic_language"
+        ? "language"
+        : answer.optionId === "geographic_scene"
+          ? "scene"
+          : "geography";
+      const semanticValue = answer.optionId === "geographic_language"
+        ? ambiguity.languageValue
+        : answer.optionId === "geographic_scene"
+          ? ambiguity.sceneValue
+          : ambiguity.originValue;
+      if (!semanticValue) throw new Error(`Answer ${answer.optionId} is unavailable for ${answer.key}`);
+      pushPredicate(predicates, guidedPredicate(
+        axis,
+        [semanticValue],
+        `The visitor resolved the ${ambiguity.geographicLabel ?? "geographic"} relationship for ${ambiguity.genreLabel ?? "the requested genre"}.`,
+      ));
     } else if (answer.key === "possessive_relationship") {
       intents.push(answer.optionId === "subject_influenced" ? "editorial_ranking" : "factual_relationship");
       pushPredicate(predicates, guidedPredicate("factual_relationship", [answer.optionId], "The visitor resolved the possessive relationship."));
@@ -708,7 +950,9 @@ export function resolveRunSpecV3(
   });
 }
 
-const CRITICAL_QUESTION_COPY: Readonly<Record<CriticalAmbiguityV3["key"], {
+type StaticCriticalAmbiguityKeyV3 = Exclude<CriticalAmbiguityV3["key"], "geographic_genre_scope">;
+
+const CRITICAL_QUESTION_COPY: Readonly<Record<StaticCriticalAmbiguityKeyV3, {
   header: string;
   question: string;
   whyMaterial: string;
@@ -763,7 +1007,30 @@ const CRITICAL_QUESTION_COPY: Readonly<Record<CriticalAmbiguityV3["key"], {
 /** Critical questions are server-owned and survive scout/provider failure. */
 export function criticalGuidanceQuestionsV3(spec: RunSpecV3): PlaylistGuidanceQuestion[] {
   return spec.criticalAmbiguities.slice(0, 3).map((ambiguity) => {
-    const copy = CRITICAL_QUESTION_COPY[ambiguity.key];
+    const copy = ambiguity.key === "geographic_genre_scope"
+      ? {
+          header: `${ambiguity.geographicLabel ?? "Geographic"} ${ambiguity.genreLabel ?? "music"}`,
+          question: `Which ${ambiguity.geographicLabel ?? "geographic"} relationship should define the tracks?`,
+          whyMaterial: "Artist origin, scene participation, and language produce substantially different catalogues.",
+          options: [
+            {
+              id: "geographic_artist_origin",
+              label: `${ambiguity.geographicLabel ?? "Local"} artists`,
+              description: `Require principal artists from ${ambiguity.originValue ?? "the named place"}.`,
+            },
+            {
+              id: "geographic_scene",
+              label: `${ambiguity.geographicLabel ?? "Local"} scene`,
+              description: `Include recordings connected to the ${ambiguity.sceneValue ?? "named music scene"}.`,
+            },
+            {
+              id: "geographic_language",
+              label: `${ambiguity.languageValue ?? "Local"} language`,
+              description: `Require ${ambiguity.languageValue ?? "the relevant local language"}-language vocal recordings.`,
+            },
+          ] as const,
+        }
+      : CRITICAL_QUESTION_COPY[ambiguity.key];
     return {
       id: `v3-critical:${ambiguity.key}`,
       header: copy.header,

@@ -93,13 +93,12 @@ import { createSelectionPlanV2, selectionPlanResearchContext } from "./selection
 import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
 import {
   PipelineV3WorkerExecution,
-  v3RetrievalStageKey,
   type PipelineV3RetrievalExecutionPort,
   type PipelineV3WorkerRepository,
   type PipelineV3WriteFence,
 } from "./pipeline-v3-worker-execution.ts";
 import type { ColdCorpusBuilderPortV3 } from "./pipeline-v3-corpus-builder.ts";
-import { minimumWorkerProtocolForPipeline } from "./worker-protocol.ts";
+import { pipelineV3ResearchJob } from "./research-resume.ts";
 import type { JobQueueClass } from "./job-queue-class.ts";
 import {
   criticalAmbiguityAnswersFromGuidanceV3,
@@ -1355,25 +1354,7 @@ export class ResearchOrchestrator {
     const run = await this.repository.getRun(runId);
     const pipeline = persistedWorkerPipeline(run);
     if (pipeline.route === "corpus_first_v3") {
-      const stageKey = v3RetrievalStageKey(pipeline.queryPlan!, "active");
-      const queueClass: JobQueueClass = pipeline.queryPlan!.engines.some((engine) => (
-        engine === "factual_relationship" || engine === "exhaustive"
-      )) ? "deep" : "interactive";
-      await this.repository.enqueueJob({
-        kind: "research",
-        runId,
-        payload: {
-          runId,
-          phase: "v3_retrieval",
-          v3ExecutionMode: "active",
-          stageExecutionKey: stageKey,
-        },
-        dedupeKey: `research:${runId}:${stageKey}`,
-        pipelineVersion: "corpus_first_v3",
-        minimumWorkerProtocol: minimumWorkerProtocolForPipeline("corpus_first_v3"),
-        stageKey,
-        queueClass,
-      });
+      await this.repository.enqueueJob(pipelineV3ResearchJob(runId, pipeline.queryPlan!));
       return;
     }
     const resume = await this.repository.getResearchCheckpoint(runId, "resume") as { phase?: ResearchPhase; gapAttempt?: number; generation?: number; segment?: number } | null;

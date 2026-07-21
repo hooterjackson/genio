@@ -26,7 +26,11 @@ import {
   materialAmbiguitiesAccepted,
 } from "./brief-policy.ts";
 import { publicBriefStatusView } from "./public-api-projections.ts";
-import { researchResumeJob, type ResearchResumeCheckpoint } from "./research-resume.ts";
+import {
+  pipelineV3ResearchJob,
+  researchResumeJob,
+  type ResearchResumeCheckpoint,
+} from "./research-resume.ts";
 import {
   briefInterpretationModel,
   parseFastRouteCheckpoint,
@@ -66,6 +70,7 @@ import {
   parseSnapshotV3,
   parseSourcePolicyApprovalV3,
 } from "./evidence-graph-owner-api-v3.ts";
+import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -194,6 +199,11 @@ async function enqueueResearchResume(runId: string): Promise<void> {
     repository.getRun(runId),
     repository.getResearchCheckpoint(runId, "resume") as Promise<ResearchResumeCheckpoint | null>,
   ]);
+  const pipeline = persistedWorkerPipeline(run);
+  if (pipeline.route === "corpus_first_v3") {
+    await repository.enqueueJob(pipelineV3ResearchJob(runId, pipeline.queryPlan!));
+    return;
+  }
   const policy = researchExecutionPolicyForRun(run);
   let fast = false;
   let fastRoute = null;
@@ -1402,7 +1412,13 @@ app.setErrorHandler((error, request, reply) => {
       ? hintedStatus
       : 500;
   const code = error instanceof HttpError ? error.code : statusCode === 500 ? "internal_error" : "request_error";
-  if (statusCode >= 500) request.log.error({ code, statusCode }, "request failed; private diagnostics suppressed");
+  if (statusCode >= 500) {
+    if (process.env.NODE_ENV === "test" && process.env.GENIO_SYSTEM_E2E === "1") {
+      request.log.error({ err: error, code, statusCode }, "system E2E request failed");
+    } else {
+      request.log.error({ code, statusCode }, "request failed; private diagnostics suppressed");
+    }
+  }
   else request.log.info({ code, statusCode }, "request rejected");
   const message = error instanceof HttpError
     ? error.message

@@ -5,6 +5,7 @@ import {
   retrievalStrategiesForEnginesV3,
   routeRetrievalEnginesV3,
   type CandidateQualificationV3,
+  type QualifiedTrackV3,
   type RawTrackCandidateV3,
   type RetrievalAdaptersV3,
 } from "../server/pipeline-v3-retrieval.ts";
@@ -65,6 +66,7 @@ function qualification(
         strength: 0.9,
         sourceRank: 1,
         kind: "track_specific_source",
+        predicateIds: ["membership:genre:require:disco"],
         governance: {
           policyVersion: "evidence-source-governance-v3",
           useScope: "run_local",
@@ -424,6 +426,80 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(result.stages.canonicalUnique).toBe(1);
   });
 
+  test("merges repeated recording evidence across rounds and treats stronger evidence as yield", async () => {
+    const selection = plan("one disco track", 1);
+    const targetStrategy = "curated_genre_scene:trusted_scoped_containers";
+    const roundsByStrategy = new Map<string, number>();
+    const qualificationObservations: string[][] = [];
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        const round = (roundsByStrategy.get(strategy.id) ?? 0) + 1;
+        roundsByStrategy.set(strategy.id, round);
+        if (strategy.id !== targetStrategy) {
+          return { candidates: [], nextCursor: null, exhausted: true };
+        }
+        return {
+          candidates: [candidate(round, {
+            id: `round-${round}`,
+            title: "Shared Recording",
+            artist: "One Artist",
+            album: "One Album",
+            sourceObservationIds: [`observation-${round}`],
+          })],
+          nextCursor: null,
+          exhausted: false,
+        };
+      },
+      qualify: async ({ candidates }) => candidates.map((value) => {
+        qualificationObservations.push([...value.sourceObservationIds]);
+        const base = qualification(value);
+        const suffix = value.sourceObservationIds.length;
+        const binding = base.evidence.bindings![0]!;
+        return qualification(value, {
+          evidence: {
+            ...base.evidence,
+            bindingIds: [`binding-${suffix}`],
+            bindings: [{
+              ...binding,
+              id: `binding-${suffix}`,
+              provenanceRoot: `source-${suffix}.example.test`,
+              strength: suffix === 1 ? 0.81 : 0.95,
+            }],
+            strength: suffix === 1 ? 0.81 : 0.95,
+            independentProvenanceRoots: suffix,
+          },
+          catalog: {
+            storefrontPlayable: true,
+            appleSongId: "apple-shared",
+            recordingFamilyKey: "family-shared",
+            confidence: 0.98,
+          },
+        });
+      }),
+    };
+
+    const result = await executeRetrievalV3({
+      runId: "evidence-merge",
+      plan: selection,
+      adapters,
+      policy: { maximumGlobalRounds: 4 },
+    });
+
+    expect(qualificationObservations).toContainEqual(["observation-1", "observation-2"]);
+    expect(result.qualifiedPool).toHaveLength(1);
+    expect(result.qualifiedPool[0]).toMatchObject({
+      sourceObservationIds: ["observation-1", "observation-2"],
+      evidenceBindingIds: ["binding-1", "binding-2"],
+      evidenceStrength: 0.95,
+      independentProvenanceRoots: 2,
+    });
+    expect(result.strategies).toContainEqual(expect.objectContaining({
+      id: targetStrategy,
+      newQualifiedFamilies: 1,
+      consecutiveZeroQualifiedYieldRounds: 0,
+    }));
+  });
+
   test("exhausts each strategy after two zero-qualified-yield rounds", async () => {
     const adapters: RetrievalAdaptersV3 = {
       discover: vi.fn(async () => ({ candidates: [], nextCursor: null, exhausted: false })),
@@ -473,6 +549,36 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       adapters,
       policy: { maximumProviderFailuresPerStrategy: 1 },
     });
+    expect(result.outcome).toMatchObject({
+      status: "failed_system",
+      stopReason: "provider_failure",
+    });
+    expect(result.publicationBoundary.manifestDisposition).toBe("blocked_operational_failure");
+  });
+
+  test("does not let synthetic zero-work scope strategies hide provider loss", async () => {
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        if (strategy.kind === "scope_resolution" || strategy.kind === "gap_pass") {
+          return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
+        }
+        throw new Error("provider unavailable");
+      },
+      qualify: async () => [],
+    };
+    const result = await executeRetrievalV3({
+      runId: "provider-failure-with-synthetic-noops",
+      plan: plan("disco songs", 25),
+      adapters,
+      policy: { maximumProviderFailuresPerStrategy: 1 },
+    });
+
+    expect(result.strategies).toContainEqual(expect.objectContaining({
+      kind: "scope_resolution",
+      status: "exhausted",
+      rawCandidates: 0,
+      providerFailures: 0,
+    }));
     expect(result.outcome).toMatchObject({
       status: "failed_system",
       stopReason: "provider_failure",
@@ -585,5 +691,126 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(continued.outcome.status).toBe("exact_ready");
     expect(continued.selected.some(({ candidateId }) => candidateId === "candidate-0")).toBe(true);
     expect(new Set(calledStrategies)).toEqual(new Set([approved!]));
+  });
+
+  test.each([
+    ["missing predicate coverage", (track: QualifiedTrackV3) => ({
+      ...track,
+      evidenceBindings: track.evidenceBindings?.map((binding) => ({
+        ...binding,
+        predicateIds: [],
+      })),
+    }), "scope_membership_failed"],
+    ["incompatible version", (track: QualifiedTrackV3) => ({
+      ...track,
+      versionConfidence: 0,
+    }), "version_incompatible"],
+    ["unplayable catalog identity", (track: QualifiedTrackV3) => ({
+      ...track,
+      catalogConfidence: 0,
+    }), "storefront_unavailable"],
+  ] as const)("rejects continuation seed tracks with %s", async (_label, mutate, reason) => {
+    const selection = plan("one disco track", 1);
+    const source = await executeRetrievalV3({
+      runId: "seed-source",
+      plan: selection,
+      adapters: allQualifiedAdapter(1),
+      policy: { maximumGlobalRounds: 1 },
+    });
+    const approved = source.strategies.find(({ status }) => status === "available")?.id
+      ?? source.strategies[0]!.id;
+    const result = await executeRetrievalV3({
+      runId: "seed-validation",
+      plan: selection,
+      continuation: {
+        approvedStrategyIds: [approved],
+        qualifiedTracks: [mutate(source.qualifiedPool[0]!)],
+        compatibleAlternatesByRecordingFamily: {},
+        stages: source.stages,
+        strategies: source.strategies,
+      },
+      adapters: {
+        discover: async () => ({ candidates: [], nextCursor: null, exhausted: true }),
+        qualify: async () => [],
+      },
+    });
+    expect(result.qualifiedPool).toEqual([]);
+    expect(result.integrityEvents).toContain(`continuation_seed_rejected:${reason}:candidate-0`);
+  });
+
+  test("rechecks persisted hard constraints before trusting a continuation seed", async () => {
+    const base = plan("one disco track", 1);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      hardConstraints: [{
+        id: "exclude-artist-zero",
+        axis: "artist",
+        operator: "exclude",
+        values: ["Artist 0"],
+        kind: "hard",
+        relaxationRank: null,
+      }],
+    };
+    const source = await executeRetrievalV3({
+      runId: "hard-seed-source",
+      plan: base,
+      adapters: allQualifiedAdapter(1),
+      policy: { maximumGlobalRounds: 1 },
+    });
+    const approved = source.strategies.find(({ status }) => status === "available")?.id
+      ?? source.strategies[0]!.id;
+    const result = await executeRetrievalV3({
+      runId: "hard-seed-validation",
+      plan: selection,
+      continuation: {
+        approvedStrategyIds: [approved],
+        qualifiedTracks: [source.qualifiedPool[0]!],
+        compatibleAlternatesByRecordingFamily: {},
+        stages: source.stages,
+        strategies: source.strategies,
+      },
+      adapters: {
+        discover: async () => ({ candidates: [], nextCursor: null, exhausted: true }),
+        qualify: async () => [],
+      },
+    });
+    expect(result.qualifiedPool).toEqual([]);
+    expect(result.integrityEvents).toContain(
+      "continuation_seed_rejected:hard_constraint_failed:candidate-0",
+    );
+  });
+
+  test("rejects conflicting Apple identities in a continuation checkpoint", async () => {
+    const selection = plan("two disco tracks", 2);
+    const source = await executeRetrievalV3({
+      runId: "identity-conflict-source",
+      plan: selection,
+      adapters: allQualifiedAdapter(2),
+      policy: { maximumGlobalRounds: 1 },
+    });
+    const approved = source.strategies.find(({ status }) => status === "available")?.id
+      ?? source.strategies[0]!.id;
+    const first = source.qualifiedPool[0]!;
+    const second = { ...source.qualifiedPool[1]!, appleSongId: first.appleSongId };
+    const result = await executeRetrievalV3({
+      runId: "identity-conflict-continuation",
+      plan: selection,
+      continuation: {
+        approvedStrategyIds: [approved],
+        qualifiedTracks: [first, second],
+        compatibleAlternatesByRecordingFamily: {},
+        stages: source.stages,
+        strategies: source.strategies,
+      },
+      adapters: {
+        discover: async () => ({ candidates: [], nextCursor: null, exhausted: true }),
+        qualify: async () => [],
+      },
+    });
+
+    expect(result.qualifiedPool).toHaveLength(1);
+    expect(result.integrityEvents).toContain(
+      `continuation_seed_rejected:catalog_identity_conflict:${second.candidateId}`,
+    );
   });
 });

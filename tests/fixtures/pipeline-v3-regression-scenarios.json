@@ -17,7 +17,10 @@
       "requestedTrackCount": 50,
       "expectedIntents": ["genre_scene"],
       "expectedEngines": ["curated_genre_scene"],
-      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "disco" }],
+      "expectedMembership": [
+        { "axis": "genre", "operator": "require", "value": "disco" },
+        { "axis": "scene", "operator": "require", "value": "Brazilian disco" }
+      ],
       "expectedRanking": ["relevance"],
       "expectedCriticalAmbiguities": []
     },
@@ -27,7 +30,10 @@
       "requestedTrackCount": 100,
       "expectedIntents": ["genre_scene", "editorial_ranking"],
       "expectedEngines": ["curated_genre_scene"],
-      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "drill" }],
+      "expectedMembership": [
+        { "axis": "genre", "operator": "require", "value": "drill" },
+        { "axis": "scene", "operator": "require", "value": "American drill" }
+      ],
       "expectedRanking": ["relevance", "influence"],
       "expectedCriticalAmbiguities": []
     },
@@ -72,7 +78,10 @@
       "requestedTrackCount": 150,
       "expectedIntents": ["genre_scene", "editorial_ranking"],
       "expectedEngines": ["curated_genre_scene"],
-      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "techno" }],
+      "expectedMembership": [
+        { "axis": "genre", "operator": "require", "value": "techno" },
+        { "axis": "scene", "operator": "require", "value": "Berlin techno" }
+      ],
       "expectedRanking": ["relevance", "influence"],
       "expectedCriticalAmbiguities": []
     },
@@ -96,7 +105,10 @@
       "requestedTrackCount": 300,
       "expectedIntents": ["genre_scene"],
       "expectedEngines": ["curated_genre_scene"],
-      "expectedMembership": [{ "axis": "genre", "operator": "require", "value": "disco" }],
+      "expectedMembership": [
+        { "axis": "genre", "operator": "require", "value": "disco" },
+        { "axis": "scene", "operator": "require", "value": "Brazilian disco" }
+      ],
       "expectedRanking": ["relevance", "artist_diversity"],
       "expectedCriticalAmbiguities": []
     }

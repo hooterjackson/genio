@@ -347,7 +347,16 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
       body: body.byteLength > 0 ? body : undefined,
       redirect: "manual",
     });
-  } catch {
+  } catch (caught) {
+    if (typeof process !== "undefined" && process.env.GENIO_QA_LOCAL_PREVIEW === "1") {
+      // Local stitched QA needs the private transport reason to distinguish a
+      // gateway regression from an application response. This branch is not
+      // reachable in the deployed Worker runtime and never logs request data.
+      console.error("[genio-qa-gateway] upstream fetch failed", {
+        origin: upstream.origin,
+        reason: caught instanceof Error ? caught.message : String(caught),
+      });
+    }
     return jsonError(502, "gênio is temporarily unavailable.");
   }
   if (response.status >= 300 && response.status < 400) {

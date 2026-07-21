@@ -5,6 +5,21 @@ import {
   createRunSpecV3,
   resolveRunSpecV3,
 } from "../server/selection-plan-v3.ts";
+import { evaluateCandidateMembershipV3 } from "../server/pipeline-v3-policy.ts";
+
+function genreCandidateMemberships(genres: readonly string[]) {
+  return {
+    id: `candidate:${genres.join("-")}`,
+    value: null,
+    artist: "Test artist",
+    album: null,
+    year: null,
+    scene: null,
+    memberships: { genre: genres },
+    objectiveScores: {},
+    sourceRank: 1,
+  };
+}
 
 describe("Pipeline V3 typed planning", () => {
   test("separates house music from a lyrical theme about houses", () => {
@@ -126,6 +141,129 @@ describe("Pipeline V3 typed planning", () => {
     expect(spec.rankingObjectives).toContainEqual(expect.objectContaining({ dimension: "similarity" }));
   });
 
+  test("treats ordinary multi-genre requests as a playlist-level union", () => {
+    const spec = createRunSpecV3({
+      prompt: "50 disco and house tracks",
+      requestedTrackCount: 50,
+    });
+    expect(spec.criticalAmbiguities).toEqual([]);
+    const genrePredicates = spec.membershipPredicates.filter(({ axis, operator }) => (
+      axis === "genre" && operator === "require"
+    ));
+    expect(genrePredicates).toHaveLength(1);
+    expect(genrePredicates[0]).toMatchObject({ values: ["disco", "house"] });
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["disco"]), spec.membershipPredicates).eligible).toBe(true);
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["house"]), spec.membershipPredicates).eligible).toBe(true);
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["techno"]), spec.membershipPredicates).eligible).toBe(false);
+    expect(spec.requestedTrackCount).toBe(50);
+  });
+
+  test("requires both genre bindings only for an explicit fusion", () => {
+    const spec = createRunSpecV3({
+      prompt: "25 disco and house fusion tracks",
+      requestedTrackCount: 25,
+    });
+    const genrePredicates = spec.membershipPredicates.filter(({ axis, operator }) => (
+      axis === "genre" && operator === "require"
+    ));
+    expect(genrePredicates.map(({ values }) => values)).toEqual([["disco"], ["house"]]);
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["disco"]), spec.membershipPredicates).eligible).toBe(false);
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["disco", "house"]), spec.membershipPredicates).eligible).toBe(true);
+  });
+
+  test.each([
+    ["Brazilian disco songs", "disco", "Brazilian disco"],
+    ["American drill tracks", "drill", "American drill"],
+    ["Berlin techno across the major eras", "techno", "Berlin techno"],
+    ["Detroit techno essentials", "techno", "Detroit techno"],
+    ["Chicago house classics", "house", "Chicago house"],
+    ["UK drill essentials", "drill", "UK drill"],
+  ] as const)("preserves geographic scene scope without replacing the generic genre: %s", (prompt, genre, scene) => {
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 50 });
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      operator: "require",
+      values: [genre],
+    }));
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "scene",
+      operator: "require",
+      values: [scene],
+    }));
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "geography")).toBe(false);
+  });
+
+  test("keeps multiple geographic genre scenes as alternatives by default", () => {
+    const spec = createRunSpecV3({
+      prompt: "50 Detroit techno and Chicago house tracks",
+      requestedTrackCount: 50,
+    });
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      operator: "require",
+      values: ["house", "techno"],
+    }));
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "scene",
+      operator: "require",
+      values: ["Detroit techno", "Chicago house"],
+    }));
+  });
+
+  test("asks which relationship defines an otherwise ambiguous French genre", () => {
+    const spec = createRunSpecV3({ prompt: "50 French disco tracks", requestedTrackCount: 50 });
+    expect(spec.criticalAmbiguities).toContainEqual(expect.objectContaining({
+      key: "geographic_genre_scope",
+      genreLabel: "disco",
+      sceneValue: "French disco",
+      originValue: "France",
+      languageValue: "French",
+    }));
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      values: ["disco"],
+    }));
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "scene" || axis === "geography" || axis === "language"))
+      .toBe(false);
+
+    const question = criticalGuidanceQuestionsV3(spec)[0]!;
+    expect(question.options.map(({ id }) => id)).toEqual([
+      "geographic_artist_origin",
+      "geographic_scene",
+      "geographic_language",
+    ]);
+    const plan = resolveRunSpecV3(spec, [{
+      key: "geographic_genre_scope",
+      optionId: "geographic_scene",
+    }]);
+    expect(plan.confirmed).toBe(true);
+    expect(plan.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "scene",
+      values: ["French disco"],
+      source: "guided_answer",
+    }));
+  });
+
+  test("honors an explicit French artist-origin relationship without guidance", () => {
+    const spec = createRunSpecV3({
+      prompt: "50 jazz tracks by French artists",
+      requestedTrackCount: 50,
+    });
+    expect(spec.criticalAmbiguities).toEqual([]);
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "geography",
+      values: ["France"],
+    }));
+  });
+
+  test.each(["disco songs", "drill tracks", "techno across the major eras"])(
+    "does not invent geographic scene scope for a generic genre: %s",
+    (prompt) => {
+      const spec = createRunSpecV3({ prompt, requestedTrackCount: 50 });
+      expect(spec.membershipPredicates.some(({ axis }) => axis === "scene")).toBe(false);
+    },
+  );
+
   test("recognizes natural tracks-like phrasing without treating the seed as filler", () => {
     const spec = createRunSpecV3({
       prompt: "50 house music tracks like Beyonce but do not include Beyonce",
@@ -146,5 +284,11 @@ describe("Pipeline V3 typed planning", () => {
     expect(Object.isFrozen(spec)).toBe(true);
     expect(Object.isFrozen(spec.membershipPredicates)).toBe(true);
     expect(() => createRunSpecV3({ prompt: "Berlin techno", requestedTrackCount: 301 })).toThrow(/between 1 and 300/i);
+  });
+
+  test.each([150, 176, 300])("preserves the authoritative requested count %i", (requestedTrackCount) => {
+    const spec = createRunSpecV3({ prompt: "Detroit techno", requestedTrackCount });
+    expect(spec.requestedTrackCount).toBe(requestedTrackCount);
+    expect(resolveRunSpecV3(spec, []).requestedTrackCount).toBe(requestedTrackCount);
   });
 });

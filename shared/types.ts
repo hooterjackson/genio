@@ -258,6 +258,12 @@ export interface QueryPlanV3RankingObjective {
   kind: string;
   description: string;
   weight: number;
+  /**
+   * Optional for query plans written before objective seed persistence.
+   * Similarity plans use this to retain the reference artist/recording across
+   * the database and worker boundary.
+   */
+  values?: string[];
 }
 
 /**

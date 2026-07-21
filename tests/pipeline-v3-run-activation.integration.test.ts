@@ -142,6 +142,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       policy_version: string;
       status: string;
       phase: string;
+      approved_budget_usd: number;
       selection_plan_json: unknown;
       pipeline_policy_snapshot_json: {
         executionPolicy: {
@@ -157,7 +158,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
         };
       };
     }>(
-      `SELECT pipeline_version,policy_version,status,phase,selection_plan_json,
+      `SELECT pipeline_version,policy_version,status,phase,approved_budget_usd::float8,selection_plan_json,
               pipeline_policy_snapshot_json
        FROM research_runs WHERE id=$1`,
       [created.runId],
@@ -167,6 +168,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       policy_version: "corpus_first_v3_policy_v1",
       status: "queued",
       phase: "queued",
+      approved_budget_usd: 3,
       selection_plan_json: null,
       pipeline_policy_snapshot_json: {
         executionPolicy: {

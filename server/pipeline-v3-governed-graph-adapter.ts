@@ -361,7 +361,6 @@ function flattenedClaimTerms(assertion: FrozenAssertionRevision): string[] {
     assertion.predicate,
     String(graph.relationship ?? ""),
     ...supportedValues,
-    JSON.stringify(assertion.object_json),
   ].map(normalize).filter(Boolean);
 }
 

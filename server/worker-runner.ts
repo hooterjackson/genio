@@ -48,6 +48,7 @@ import {
   createPipelineV3GovernedGraphDiscovery,
   PgPipelineV3GovernedGraphReadRepository,
 } from "./pipeline-v3-governed-graph-adapter.ts";
+import { createMeteredPipelineV3Response } from "./pipeline-v3-provider-meter.ts";
 import {
   parseWorkerQueueClass,
   type JobQueueClass,
@@ -522,6 +523,10 @@ export class WorkerRunner {
       await this.repository.completeJob(job.id, this.workerId, job.leaseEpoch);
     } catch (error) {
       if (leaseLost) return;
+      if (process.env.NODE_ENV === "test" && process.env.GENIO_SYSTEM_E2E === "1") {
+        const diagnostic = error instanceof Error ? error.stack ?? error.message : String(error);
+        process.stderr.write(`[genio-system-e2e] ${job.kind} job failed: ${diagnostic}\n`);
+      }
       const cancellationReason = await this.runCancellationReason(job);
       const controlAction = this.active.get(job.id)?.controlAction;
       if (cancellationReason || controlAction === "cancel") {
@@ -571,12 +576,17 @@ class NonRetriableJobError extends Error {
 async function runExecutableWorker(): Promise<void> {
   const repository = new Repository();
   const governedGraph = new PgPipelineV3GovernedGraphReadRepository(repository.pool);
+  // Every V3 provider surface must share the same durable reservation and
+  // reconciliation boundary. In particular, cold factual/exhaustive corpus
+  // discovery is paid OpenAI work just like interactive retrieval.
+  const meteredV3Response = createMeteredPipelineV3Response(repository);
   const v3RetrievalPort = createPipelineV3RetrievalExecutionPort({
     adapters: createPipelineV3LiveAdapters({
       discoverGovernedGraph: createPipelineV3GovernedGraphDiscovery(governedGraph),
+      createResponse: meteredV3Response,
     }),
   });
-  const v3CorpusBuilder = createHostedColdCorpusBuilderV3();
+  const v3CorpusBuilder = createHostedColdCorpusBuilderV3({ createResponse: meteredV3Response });
   const leaseMs = positiveEnv("WORKER_LEASE_SECONDS", DEFAULT_LEASE_MS / 1_000, 30 * 60) * 1_000;
   const renewMs = Math.min(
     positiveEnv("WORKER_RENEW_SECONDS", DEFAULT_RENEW_MS / 1_000, 10 * 60) * 1_000,

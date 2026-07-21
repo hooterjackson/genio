@@ -177,6 +177,33 @@ describe("Pipeline V3 immutable selection policy", () => {
     expect(rehydrated.softGoalRelaxationOrder).toEqual(plan.softGoalRelaxationOrder);
   });
 
+  test("rehydrates similarity seed values from immutable query plans with a legacy-safe default", () => {
+    const plan = resolveRunSpecV3(createRunSpecV3({
+      prompt: "25 songs like Radiohead but do not include Radiohead",
+      requestedTrackCount: 25,
+    }), []);
+    const query = createQueryPlanV3(plan, GRAPH_SNAPSHOT_ID);
+    const rehydrated = selectionPlanFromQueryPlanV3(query, { prompt: plan.prompt });
+    expect(rehydrated.rankingObjectives).toContainEqual(expect.objectContaining({
+      dimension: "similarity",
+      values: ["radiohead"],
+    }));
+
+    const legacy = {
+      ...query,
+      rankingObjectives: query.rankingObjectives.map((objective) => {
+        const legacyObjective = { ...objective };
+        delete legacyObjective.values;
+        return legacyObjective;
+      }),
+    };
+    const legacyRehydrated = selectionPlanFromQueryPlanV3(legacy, { prompt: plan.prompt });
+    expect(legacyRehydrated.rankingObjectives).toContainEqual(expect.objectContaining({
+      dimension: "similarity",
+      values: [],
+    }));
+  });
+
   test("enforces hard per-artist and per-album maxima before target selection and never relaxes them", async () => {
     const hardArtistMaximum: SelectionConstraint = {
       id: "artist-cap",

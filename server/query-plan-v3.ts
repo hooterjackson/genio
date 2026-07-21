@@ -236,6 +236,7 @@ export function createQueryPlanV3(plan: SelectionPlanV3, graphSnapshotId: string
       kind: objective.dimension,
       description: objective.reason,
       weight: objective.weight,
+      values: [...objective.values],
     })),
     targetTrackCount: plan.requestedTrackCount,
     storefront: plan.storefront,
@@ -321,6 +322,16 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
     && row.engine === row.engines[0]
     && Array.isArray(row.membershipPredicates)
     && Array.isArray(row.rankingObjectives)
+    && row.rankingObjectives.every((value) => (
+      value !== null
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && (value.values === undefined || (
+        Array.isArray(value.values)
+        && value.values.length <= 20
+        && value.values.every((seed) => typeof seed === "string" && seed.trim().length > 0 && seed.length <= 240)
+      ))
+    ))
     && Array.isArray(row.hardConstraints)
     && Array.isArray(row.softPreferences)
     && sourceDiscoveryHintsValid

@@ -1,4 +1,5 @@
 import { expect, test, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   AppleApiError,
   appleAuthorizationGeneration,
@@ -119,6 +120,19 @@ test("production worker refuses startup when provider or encryption secrets are 
     APPLE_TOKEN_ENCRYPTION_KEY: "encryption",
     APPLE_MUSICKIT_PRIVATE_KEY_BASE64: "private-key",
   })).not.toThrow();
+});
+
+test("production worker meters both live retrieval and cold corpus provider calls", () => {
+  const source = readFileSync(new URL("../server/worker-runner.ts", import.meta.url), "utf8");
+  expect(source).toMatch(
+    /const meteredV3Response = createMeteredPipelineV3Response\(repository\);/u,
+  );
+  expect(source).toMatch(
+    /createPipelineV3LiveAdapters\(\{[\s\S]*?createResponse: meteredV3Response,[\s\S]*?\}\)/u,
+  );
+  expect(source).toContain(
+    "createHostedColdCorpusBuilderV3({ createResponse: meteredV3Response })",
+  );
 });
 
 test("production deep workers require read-only catalog credentials but not user-token decryption", () => {

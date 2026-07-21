@@ -9,9 +9,16 @@ import type {
   RetrievalResultV3,
 } from "../server/pipeline-v3-retrieval.ts";
 import { publicTrackScopeAttestationV3 } from "../server/pipeline-v3-retrieval.ts";
-import type { PipelineV3WriteFence } from "../server/pipeline-v3-worker-execution.ts";
+import {
+  selectionPlanFromQueryPlanV3,
+  type PipelineV3WriteFence,
+} from "../server/pipeline-v3-worker-execution.ts";
 import { ResearchOrchestrator } from "../server/research.ts";
-import type { SelectionPlanV3 } from "../server/selection-plan-v3.ts";
+import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
+import {
+  selectionPlanV3Hash,
+  type SelectionPlanV3,
+} from "../server/selection-plan-v3.ts";
 import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -59,7 +66,17 @@ function curatedBrief(title: string, count: number): PlaylistBrief {
   };
 }
 
-function qualifiedTrack(prefix: string, index: number): QualifiedTrackV3 {
+function positivePredicateIds(plan: SelectionPlanV3): string[] {
+  return plan.membershipPredicates
+    .filter((predicate) => predicate.operator !== "exclude")
+    .map((predicate) => predicate.id);
+}
+
+function qualifiedTrack(
+  prefix: string,
+  index: number,
+  predicateIds?: readonly string[],
+): QualifiedTrackV3 {
   const ordinal = String(index + 1).padStart(4, "0");
   const sourceUrl = `https://example.test/${encodeURIComponent(prefix)}/tracks/${ordinal}`;
   return {
@@ -78,6 +95,7 @@ function qualifiedTrack(prefix: string, index: number): QualifiedTrackV3 {
       strength: 0.95,
       sourceRank: index + 1,
       kind: "track_specific_source",
+      predicateIds,
       governance: {
         policyVersion: "evidence-source-governance-v3",
         useScope: "run_local",
@@ -112,13 +130,14 @@ function retrievalResult(input: {
   reserveCount?: number;
   status: Extract<RetrievalOutcomeStatusV3, "exact_ready" | "partial_ready" | "no_compatible_tracks">;
   prefix: string;
+  predicateIds?: readonly string[];
 }): RetrievalResultV3 {
   const reserveCount = input.reserveCount ?? 0;
   const selected = Array.from({ length: input.selectedCount }, (_, index) => (
-    qualifiedTrack(input.prefix, index)
+    qualifiedTrack(input.prefix, index, input.predicateIds)
   ));
   const reserve = Array.from({ length: reserveCount }, (_, index) => (
-    qualifiedTrack(`${input.prefix}-reserve`, index)
+    qualifiedTrack(`${input.prefix}-reserve`, index, input.predicateIds)
   ));
   const qualifiedPool = [...selected, ...reserve];
   const exact = input.status === "exact_ready";
@@ -239,7 +258,11 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     }
   }, 30_000);
 
-  async function createLeasedRun(target: number, label: string): Promise<{
+  async function createLeasedRun(
+    target: number,
+    label: string,
+    transformSelectionPlan?: (plan: SelectionPlanV3) => SelectionPlanV3,
+  ): Promise<{
     runId: string;
     accessId: string;
     selectionPlan: SelectionPlanV3;
@@ -260,6 +283,22 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       globalLimit: 100,
       forceFreshResearch: true,
     });
+    if (transformSelectionPlan) {
+      const current = (await pool.query<{ plan_json: SelectionPlanV3 }>(
+        `SELECT selection.plan_json
+         FROM run_active_query_plans active
+         JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+         JOIN selection_plans selection ON selection.id=query.selection_plan_id
+         WHERE active.run_id=$1`,
+        [created.runId],
+      )).rows[0];
+      expect(current?.plan_json).toBeTruthy();
+      await repository.activatePipelineV3Run({
+        runId: created.runId,
+        selectionPlan: transformSelectionPlan(current!.plan_json),
+        graphSnapshotId,
+      });
+    }
     await new ResearchOrchestrator(repository).enqueue(created.runId);
 
     const active = (await pool.query<{
@@ -318,6 +357,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         reserveCount: Math.max(10, Math.ceil(target * 0.2)),
         status: "exact_ready",
         prefix: `exact-${target}`,
+        predicateIds: positivePredicateIds(context.selectionPlan),
       });
       const first = await repository.persistPipelineV3RetrievalResult({
         runId: context.runId,
@@ -389,6 +429,196 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     120_000,
   );
 
+  test("persists a query-plan execution projection against the original immutable selection plan", async () => {
+    const context = await createLeasedRun(1, "execution-projection");
+    const executionPlan = selectionPlanFromQueryPlanV3(context.queryPlan, {
+      prompt: "A deliberately opaque audit prompt that is not reparsed by the worker.",
+    });
+
+    // QueryPlanV3 deliberately omits authoring-only SelectionPlanV3 fields.
+    // Its execution projection therefore cannot reproduce the original plan
+    // hash; persistence must bind to the stored immutable plan instead.
+    expect(selectionPlanV3Hash(executionPlan)).not.toBe(context.queryPlan.selectionPlanHash);
+
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: executionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "execution-projection",
+        predicateIds: positivePredicateIds(executionPlan),
+      }),
+      fence: context.fence,
+    });
+    expect(persisted).toMatchObject({
+      manifestId: expect.any(String),
+      manifestRevisionId: expect.any(String),
+      publicationState: "queued",
+    });
+
+    const snapshots = (await pool.query<{
+      manifest_plan: SelectionPlanV3;
+      revision_plan: SelectionPlanV3;
+    }>(
+      `SELECT manifest.selection_plan_json manifest_plan,
+              revision.selection_plan_snapshot_json revision_plan
+       FROM manifests manifest
+       JOIN manifest_revisions revision ON revision.manifest_id=manifest.id
+       WHERE revision.id=$1`,
+      [persisted.manifestRevisionId],
+    )).rows[0]!;
+    expect(snapshots.manifest_plan).toEqual(context.selectionPlan);
+    expect(snapshots.revision_plan).toEqual(context.selectionPlan);
+    expect(snapshots.revision_plan).not.toEqual(executionPlan);
+  }, 30_000);
+
+  test("rejects a stored immutable selection-plan payload whose hash no longer matches", async () => {
+    const context = await createLeasedRun(1, "tampered-selection-plan");
+    const executionPlan = selectionPlanFromQueryPlanV3(context.queryPlan, {
+      prompt: "Opaque execution context.",
+    });
+    // Production triggers reject mutation before the repository ever sees
+    // it. Disable them only inside this disposable test schema to prove the
+    // repository still detects storage corruption at its trust boundary.
+    await pool.query("ALTER TABLE selection_plans DISABLE TRIGGER USER");
+    try {
+      await pool.query(
+        `UPDATE selection_plans
+         SET plan_json=jsonb_set(plan_json,'{prompt}',to_jsonb('tampered'::text))
+         WHERE run_id=$1 AND status='active'`,
+        [context.runId],
+      );
+    } finally {
+      await pool.query("ALTER TABLE selection_plans ENABLE TRIGGER USER");
+    }
+
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: executionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "tampered-selection-plan",
+        predicateIds: positivePredicateIds(executionPlan),
+      }),
+      fence: context.fence,
+    })).rejects.toMatchObject({ code: "pipeline_v3_plan_stale" });
+    expect((await pool.query<{ candidates: number; manifests: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
+         (SELECT count(*)::int FROM manifests WHERE run_id=$1) manifests`,
+      [context.runId],
+    )).rows[0]).toEqual({ candidates: 0, manifests: 0 });
+  }, 30_000);
+
+  test.each(["query", "selection", "both"] as const)(
+    "rejects persistence when the active pointer references a superseded %s plan",
+    async (superseded) => {
+      const context = await createLeasedRun(1, `superseded-${superseded}`);
+      const executionPlan = selectionPlanFromQueryPlanV3(context.queryPlan, {
+        prompt: "Opaque execution context.",
+      });
+      if (superseded === "query" || superseded === "both") {
+        await pool.query(
+          "UPDATE query_plan_revisions SET status='superseded' WHERE id=$1",
+          [context.fence.queryPlanRevisionId],
+        );
+      }
+      if (superseded === "selection" || superseded === "both") {
+        await pool.query(
+          `UPDATE selection_plans SET status='superseded'
+           WHERE id=(SELECT selection_plan_id FROM query_plan_revisions WHERE id=$1)`,
+          [context.fence.queryPlanRevisionId],
+        );
+      }
+
+      await expect(repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: executionPlan,
+        result: retrievalResult({
+          runId: context.runId,
+          target: 1,
+          selectedCount: 1,
+          status: "exact_ready",
+          prefix: `superseded-${superseded}`,
+          predicateIds: positivePredicateIds(executionPlan),
+        }),
+        fence: context.fence,
+      })).rejects.toMatchObject({ code: "pipeline_v3_plan_stale" });
+      expect((await pool.query<{ candidates: number; manifests: number }>(
+        `SELECT
+           (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
+           (SELECT count(*)::int FROM manifests WHERE run_id=$1) manifests`,
+        [context.runId],
+      )).rows[0]).toEqual({ candidates: 0, manifests: 0 });
+    },
+    30_000,
+  );
+
+  test("rejects a forged stored query contract even when its selection hash and query hash are valid", async () => {
+    const context = await createLeasedRun(1, "forged-query-contract");
+    const forgedQueryPlan: QueryPlanV3 = {
+      ...context.queryPlan,
+      membershipPredicates: context.queryPlan.membershipPredicates.map((predicate, index) => (
+        index === 0 ? { ...predicate, subject: "forged unrelated genre" } : { ...predicate }
+      )),
+      rankingObjectives: context.queryPlan.rankingObjectives.map((objective, index) => (
+        index === 0 ? { ...objective, description: "Prefer forged unrelated recordings." } : { ...objective }
+      )),
+      hardConstraints: context.queryPlan.hardConstraints.map((constraint, index) => (
+        index === 0 ? { ...constraint, values: ["forged unrelated genre"] } : { ...constraint, values: [...constraint.values] }
+      )),
+    };
+    expect(forgedQueryPlan.selectionPlanHash).toBe(context.queryPlan.selectionPlanHash);
+    const forgedHash = queryPlanV3Hash(forgedQueryPlan);
+    expect(forgedHash).toMatch(/^[a-f0-9]{64}$/u);
+
+    // Query-plan revisions are immutable in production. Disable the guard only
+    // in this disposable schema to model storage corruption with an internally
+    // consistent hash, then prove the selection-plan trust anchor still wins.
+    await pool.query("ALTER TABLE query_plan_revisions DISABLE TRIGGER USER");
+    try {
+      await pool.query(
+        "UPDATE query_plan_revisions SET plan_json=$2::jsonb,plan_hash=$3 WHERE id=$1",
+        [context.fence.queryPlanRevisionId, JSON.stringify(forgedQueryPlan), forgedHash],
+      );
+    } finally {
+      await pool.query("ALTER TABLE query_plan_revisions ENABLE TRIGGER USER");
+    }
+    const forgedExecutionPlan = selectionPlanFromQueryPlanV3(forgedQueryPlan, {
+      prompt: "Opaque execution context.",
+    });
+
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: forgedQueryPlan,
+      plan: forgedExecutionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "forged-query-contract",
+        predicateIds: positivePredicateIds(forgedExecutionPlan),
+      }),
+      fence: context.fence,
+    })).rejects.toMatchObject({ code: "pipeline_v3_plan_stale" });
+    expect((await pool.query<{ candidates: number; manifests: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidates,
+         (SELECT count(*)::int FROM manifests WHERE run_id=$1) manifests`,
+      [context.runId],
+    )).rows[0]).toEqual({ candidates: 0, manifests: 0 });
+  }, 30_000);
+
   test("locks a partial manifest without any Apple write until capability-bound consent", async () => {
     const context = await createLeasedRun(50, "french-jazz-partial");
     const result = retrievalResult({
@@ -397,6 +627,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       selectedCount: 23,
       status: "partial_ready",
       prefix: "partial-23",
+      predicateIds: positivePredicateIds(context.selectionPlan),
     });
     const persisted = await repository.persistPipelineV3RetrievalResult({
       runId: context.runId,
@@ -514,6 +745,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       selectedCount: 1,
       status: "exact_ready",
       prefix: "synthetic",
+      predicateIds: positivePredicateIds(context.selectionPlan),
     });
     const selected = unsafe.selected.map((track) => ({
       ...track,
@@ -550,11 +782,67 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         selectedCount: 1,
         status: "exact_ready",
         prefix: "publication-attestation",
+        predicateIds: positivePredicateIds(context.selectionPlan),
       }),
       fence: context.fence,
     });
     await pool.query(
       "UPDATE track_scope_bindings SET provenance_path_json='[]'::jsonb WHERE run_id=$1",
+      [context.runId],
+    );
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).rejects.toMatchObject({ code: "pipeline_v3_evidence_attestation_missing" });
+  }, 30_000);
+
+  test("publication guard requires every positive membership predicate for every manifest track", async () => {
+    const context = await createLeasedRun(1, "composite-publication-evidence", (plan) => ({
+      ...plan,
+      membershipPredicates: [
+        ...plan.membershipPredicates,
+        {
+          id: "geography-france",
+          axis: "geography",
+          operator: "require",
+          values: ["France"],
+          source: "user",
+          reason: "The recording must satisfy the requested French scope.",
+        },
+      ],
+    }));
+    const requiredPredicateIds = context.selectionPlan.membershipPredicates
+      .filter((predicate) => predicate.operator !== "exclude")
+      .map((predicate) => predicate.id);
+    expect(requiredPredicateIds).toContain("geography-france");
+    expect(requiredPredicateIds.length).toBeGreaterThan(1);
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "composite-publication-evidence",
+        predicateIds: requiredPredicateIds,
+      }),
+      fence: context.fence,
+    });
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).resolves.toMatchObject({ enforcement: "required", decision: null });
+
+    await pool.query(
+      "DELETE FROM track_scope_bindings WHERE run_id=$1 AND scope_axis='geography'",
       [context.runId],
     );
     await expect(repository.getPublicationGuard({
@@ -580,6 +868,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         reserveCount: 10,
         status: "exact_ready",
         prefix: "stale",
+        predicateIds: positivePredicateIds(context.selectionPlan),
       }),
       fence: staleFence,
     })).rejects.toMatchObject({ code: "job_lease_lost" });

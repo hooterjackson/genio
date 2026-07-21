@@ -9,6 +9,7 @@ import {
 import {
   governedCorpusActionReasonV3,
   PipelineV3WorkerExecution,
+  retrievalPolicyV3FromPipelinePolicySnapshot,
   v3RetrievalStageKey,
   type PipelineV3RetrievalExecutionPort,
   type PipelineV3WorkerPayload,
@@ -304,6 +305,37 @@ class MemoryRepository implements PipelineV3WorkerRepository {
   }
 }
 
+class FenceValidatingMemoryRepository extends MemoryRepository {
+  constructor(private readonly leasedStageKey: string) {
+    super();
+  }
+
+  private validate(fence: PipelineV3WriteFence | undefined): void {
+    if (fence?.stageKey !== this.leasedStageKey) {
+      throw new Error("job_lease_lost");
+    }
+  }
+
+  override async saveResearchCheckpoint(
+    runId: string,
+    checkpointKey: string,
+    checkpoint: unknown,
+    fence?: PipelineV3WriteFence,
+  ): Promise<void> {
+    this.validate(fence);
+    await super.saveResearchCheckpoint(runId, checkpointKey, checkpoint, fence);
+  }
+
+  override async updateRun(
+    runId: string,
+    patch: { status?: string; phase?: string; error?: string | null },
+    fence?: PipelineV3WriteFence,
+  ): Promise<void> {
+    this.validate(fence);
+    await super.updateRun(runId, patch, fence);
+  }
+}
+
 function payload(plan: ReturnType<typeof queryPlan>, mode: "active" | "shadow" = "active"): PipelineV3WorkerPayload {
   const stageKey = v3RetrievalStageKey(plan, mode);
   return {
@@ -431,6 +463,84 @@ describe("Pipeline V3 durable worker execution", () => {
         escalationProviderModelId: "gpt-5.6-terra",
         resolutionMode: "provider_managed_alias",
       }),
+      policy: {
+        maximumGlobalRounds: 48,
+        maximumRawCandidates: 500,
+        maximumCostUnits: 48,
+        deadlineAtEpochMs: null,
+        maximumProviderFailuresPerStrategy: 2,
+      },
+    }));
+  });
+
+  test("rehydrates retrieval limits from the immutable run snapshot", async () => {
+    const plan = queryPlan();
+    const selection = resolveRunSpecV3(createRunSpecV3({
+      prompt: "25 influential disco recordings",
+      requestedTrackCount: 25,
+      storefront: "us",
+    }), []);
+    const snapshot = createPipelinePolicySnapshotV3({
+      plan: selection,
+      environment: {
+        PIPELINE_V3_MAX_ROUNDS: "7",
+        PIPELINE_V3_MAX_RAW_CANDIDATES: "777",
+        PIPELINE_V3_MAX_TOOL_CALLS: "9",
+      },
+      capturedAt: "2026-07-20T12:00:00.000Z",
+    });
+    expect(retrievalPolicyV3FromPipelinePolicySnapshot(snapshot)).toEqual({
+      maximumGlobalRounds: 7,
+      maximumRawCandidates: 777,
+      maximumCostUnits: 9,
+      deadlineAtEpochMs: null,
+      maximumProviderFailuresPerStrategy: 2,
+    });
+
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("exact_ready", 25));
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: { prompt: "25 influential disco recordings", pipelinePolicySnapshot: snapshot },
+      queryPlan: plan,
+      payload: payload(plan),
+    });
+
+    expect(port.execute).toHaveBeenCalledWith(expect.objectContaining({
+      policy: {
+        maximumGlobalRounds: 7,
+        maximumRawCandidates: 777,
+        maximumCostUnits: 9,
+        deadlineAtEpochMs: null,
+        maximumProviderFailuresPerStrategy: 2,
+      },
+    }));
+  });
+
+  test("fails closed when immutable retrieval ceilings conflict", async () => {
+    const plan = queryPlan();
+    const run = workerRun("25 influential disco recordings");
+    const snapshot = structuredClone(run.pipelinePolicySnapshot);
+    snapshot.catalogLimits.maximumRawDiscoveryGoal += 1;
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("exact_ready", 25));
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: { ...run, pipelinePolicySnapshot: snapshot },
+      queryPlan: plan,
+      payload: payload(plan),
+    });
+
+    expect(port.execute).not.toHaveBeenCalled();
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "failed_integrity",
+      phase: "v3_retrieval_policy_snapshot_invalid",
+      error: null,
+    });
+    expect([...repository.checkpoints.values()]).toContainEqual(expect.objectContaining({
+      state: "failed_integrity",
+      code: "v3_retrieval_policy_snapshot_invalid",
     }));
   });
 
@@ -532,6 +642,54 @@ describe("Pipeline V3 durable worker execution", () => {
     }));
     expect(repository.persisted).toHaveLength(0);
     assertFenced(repository, plan);
+  });
+
+  test("resumes a provider-paused stage only from a successor lease", async () => {
+    const plan = queryPlan();
+    const repository = new MemoryRepository();
+    const originalPayload = payload(plan);
+    await new PipelineV3WorkerExecution(repository, null).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: originalPayload,
+    });
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active")))
+      .toMatchObject({ state: "waiting_provider", leaseEpoch: 7 });
+
+    const port = execution(retrievalResult("exact_ready", 25));
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: originalPayload,
+    });
+    expect(port.execute).not.toHaveBeenCalled();
+
+    const successorPayload: PipelineV3WorkerPayload = {
+      ...originalPayload,
+      __jobLeaseEpoch: 8,
+      __jobId: randomUUID(),
+      __jobWorkerId: "worker-v3-successor",
+    };
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: successorPayload,
+    });
+
+    expect(port.execute).toHaveBeenCalledOnce();
+    expect(repository.updates.at(-1)?.patch).toMatchObject({
+      status: "publishing",
+      phase: "publication_queued",
+    });
+    expect(repository.persisted.at(-1)?.fence).toMatchObject({
+      jobId: successorPayload.__jobId,
+      workerId: "worker-v3-successor",
+      leaseEpoch: 8,
+      stageKey: v3RetrievalStageKey(plan, "active"),
+    });
   });
 
   test("pauses exhaustive work before retrieval until a governed source-frontier builder exists", async () => {
@@ -664,9 +822,10 @@ describe("Pipeline V3 durable worker execution", () => {
 
   test("rejects a mismatched stage identity before invoking retrieval", async () => {
     const plan = queryPlan();
-    const repository = new MemoryRepository();
+    const leasedStageKey = "v3-retrieval:active:stale-plan";
+    const repository = new FenceValidatingMemoryRepository(leasedStageKey);
     const port = execution(retrievalResult("exact_ready", 25));
-    const badPayload = { ...payload(plan), __jobStageKey: "v3-retrieval:active:stale-plan" };
+    const badPayload = { ...payload(plan), __jobStageKey: leasedStageKey };
     await new PipelineV3WorkerExecution(repository, port).process({
       runId: "run-v3",
       run: workerRun("25 influential disco recordings"),
@@ -680,7 +839,8 @@ describe("Pipeline V3 durable worker execution", () => {
       phase: "v3_stage_execution_key_mismatch",
     });
     expect(repository.persisted).toHaveLength(0);
-    assertFenced(repository, plan);
+    for (const write of repository.writes) expect(write.fence?.stageKey).toBe(leasedStageKey);
+    for (const update of repository.updates) expect(update.fence?.stageKey).toBe(leasedStageKey);
   });
 
   test("requires the complete lease fence before any durable mutation", async () => {

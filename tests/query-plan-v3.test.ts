@@ -13,6 +13,7 @@ function confirmed(prompt: string, target = 50) {
   const answers = spec.criticalAmbiguities.map((ambiguity) => {
     if (ambiguity.key === "house_semantics") return { key: ambiguity.key, optionId: "house_genre" as const };
     if (ambiguity.key === "french_jazz_scope") return { key: ambiguity.key, optionId: "french_scene" as const };
+    if (ambiguity.key === "geographic_genre_scope") return { key: ambiguity.key, optionId: "geographic_scene" as const };
     if (ambiguity.key === "possessive_relationship") return { key: ambiguity.key, optionId: "subject_performed" as const };
     return { key: ambiguity.key, optionId: "funk_carioca" as const };
   });
@@ -82,6 +83,32 @@ describe("query plan V3", () => {
       "mood_activity_theme",
       "curated_genre_scene",
     ]);
+  });
+
+  test("persists similarity seeds for worker rehydration while accepting legacy objectives without values", () => {
+    const query = createQueryPlanV3(
+      confirmed("100 songs like Radiohead but do not include Radiohead", 100),
+      "00000000-0000-4000-8000-000000000001",
+    );
+    expect(query.rankingObjectives).toContainEqual(expect.objectContaining({
+      kind: "similarity",
+      values: ["radiohead"],
+    }));
+    expect(isQueryPlanV3(query)).toBe(true);
+
+    const legacy = {
+      ...query,
+      rankingObjectives: query.rankingObjectives.map((objective) => {
+        const legacyObjective = { ...objective };
+        delete legacyObjective.values;
+        return legacyObjective;
+      }),
+    };
+    expect(isQueryPlanV3(legacy)).toBe(true);
+    expect(isQueryPlanV3({
+      ...query,
+      rankingObjectives: query.rankingObjectives.map((objective) => ({ ...objective, values: [""] })),
+    })).toBe(false);
   });
 
   test("binds a continuation to the exact source plan, outcome, and approved strategies", () => {
