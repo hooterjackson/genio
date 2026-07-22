@@ -1,6 +1,6 @@
 import type { QueryPlanV3 } from "../shared/types.ts";
 import {
-  createQueryPlanV3,
+  createRuntimeQueryPlanV3,
   queryPlanV3Hash,
 } from "./query-plan-v3.ts";
 import type { SelectionPlanV3 } from "./selection-plan-v3.ts";
@@ -48,7 +48,7 @@ export function createPipelineV3ActivationContract(
   selectionPlan: SelectionPlanV3,
   graphSnapshotId: string,
 ): PipelineV3ActivationContract {
-  const queryPlan = createQueryPlanV3(selectionPlan, graphSnapshotId);
+  const queryPlan = createRuntimeQueryPlanV3(selectionPlan, graphSnapshotId);
   return Object.freeze({
     queryPlan,
     planHash: queryPlanV3Hash(queryPlan),

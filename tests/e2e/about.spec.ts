@@ -14,6 +14,27 @@ test.beforeEach(async ({ page }) => {
           revision: "123456789abcdef0123456789abcdef012345678",
           version: currentRelease.version,
         },
+        runtime: {
+          pipelineVersion: "corpus_first_v3",
+          assignmentEnabled: true,
+          ownerCanaryEnabled: false,
+          productionEvidenceApproved: true,
+          factualFeasibilityApproved: false,
+          schemaVersion: "15",
+          workerProtocol: "playlist-pipeline-v8",
+          selectionPlanVersion: "selection_plan_v3",
+          queryPlanSchemaVersion: "2",
+          queryPlanPolicyVersion: "corpus_first_v3_policy_v1",
+          semanticScopePolicyVersion: "scope_gate_v2_1_2",
+          musicConceptPolicyVersion: "music_concepts_v3_2_0",
+          pipelinePolicyVersion: "pipeline_v3",
+          promptVersion: "grounded_recovery_v3_1_prompt_v1",
+          baselineProviderModelId: "gpt-5.6-luna",
+          escalationProviderModelId: "gpt-5.6-terra",
+          modelResolutionMode: "provider_managed_alias",
+          modelCatalogValidatedAt: "2026-07-20T00:00:00.000Z",
+          graphSnapshot: null,
+        },
       }),
     });
   });
@@ -33,6 +54,11 @@ test("the hamburger menu opens the current version and patch notes", async ({ pa
     .toHaveText(formatReleaseDate(currentRelease.releasedAt));
   await expect(page.getByText("CURRENT RELEASE", { exact: true })).toBeVisible();
   await expect(page.getByText(`${currentRelease.version}+123456789abc`, { exact: true })).toBeVisible();
+  await expect(page.getByText("123456789abc", { exact: true })).toBeVisible();
+  await expect(page.getByText("playlist-pipeline-v8", { exact: true })).toBeVisible();
+  await expect(page.getByText("2", { exact: true })).toBeVisible();
+  await expect(page.getByText("scope gate v2 1 2", { exact: true })).toBeVisible();
+  await expect(page.getByText("music concepts v3 2 0", { exact: true })).toBeVisible();
   await expect(page.getByText("IN SYNC", { exact: true })).toBeVisible();
   for (const note of currentRelease.notes) await expect(page.getByText(note, { exact: true })).toBeVisible();
   await expect(page.locator("html")).toHaveAttribute("data-build-version", currentRelease.version);

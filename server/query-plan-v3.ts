@@ -3,21 +3,35 @@ import type {
   PipelineV3SourceDiscoveryHint,
   QueryPlanV3,
   QueryPlanV3Engine,
+  QueryPlanV3SemanticClause,
   SelectionConstraint,
-  SelectionConstraintAxis,
-  SelectionConstraintOperator,
 } from "../shared/types.ts";
 import {
   PIPELINE_V3_MAX_SOURCE_DISCOVERY_HINTS,
   selectionPlanV3Hash,
-  type MembershipAxisV3,
-  type MembershipOperatorV3,
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
 
-export const QUERY_PLAN_V3_VERSION = 1 as const;
+export const LEGACY_QUERY_PLAN_V3_VERSION = 1 as const;
+export const LEGACY_QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
+export const QUERY_PLAN_V3_VERSION = 2 as const;
+// Schema 2 refines the query contract; it does not create a new persisted run
+// policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
+
+export type QueryPlanV3SchemaVersion =
+  | typeof LEGACY_QUERY_PLAN_V3_VERSION
+  | typeof QUERY_PLAN_V3_VERSION;
+
+export function queryPlanV3EmissionSchemaVersion(
+  env: NodeJS.ProcessEnv = process.env,
+): QueryPlanV3SchemaVersion {
+  return env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "2"
+    ? QUERY_PLAN_V3_VERSION
+    : LEGACY_QUERY_PLAN_V3_VERSION;
+}
 
 export type PipelineV3RolloutGroup =
   | "genre_scene"
@@ -42,31 +56,6 @@ export interface PipelineV3Assignment {
     | "sticky_rollout"
     | "control";
 }
-
-const MEMBERSHIP_AXIS: Record<MembershipAxisV3, SelectionConstraintAxis> = {
-  genre: "genre",
-  subgenre: "subgenre",
-  scene: "scene",
-  era: "era",
-  geography: "geography",
-  language: "language",
-  theme: "theme",
-  mood: "mood",
-  activity: "activity",
-  artist: "artist",
-  track: "track",
-  label: "label",
-  venue: "venue",
-  factual_relationship: "relationship",
-  recording_version: "recording_version",
-  content: "content",
-};
-
-const MEMBERSHIP_OPERATOR: Record<MembershipOperatorV3, SelectionConstraintOperator> = {
-  include: "include",
-  exclude: "exclude",
-  require: "require",
-};
 
 function boundedPercentage(value: string | undefined): number {
   const parsed = Number(value ?? 0);
@@ -178,20 +167,72 @@ export function assignPipelineV3(input: {
   return { assigned, cohort, percentage, group, reason: assigned ? "sticky_rollout" : "control" };
 }
 
-function hardConstraint(plan: SelectionPlanV3, index: number): SelectionConstraint {
-  const predicate = plan.membershipPredicates[index]!;
+function constraintKey(value: SelectionConstraint): string {
+  return `${value.axis}:${value.operator}:${value.kind}:${value.values.join("|")}:${value.geographyRelationship ?? ""}`;
+}
+
+function semanticClause(value: SelectionPlanV3["semanticClauses"][number]): QueryPlanV3SemanticClause {
   return {
-    id: predicate.id,
-    axis: MEMBERSHIP_AXIS[predicate.axis],
-    operator: MEMBERSHIP_OPERATOR[predicate.operator],
-    values: [...predicate.values],
-    kind: "hard",
-    relaxationRank: null,
+    id: value.id,
+    role: value.role,
+    axis: value.axis,
+    operator: value.operator,
+    values: [...value.values],
+    source: value.source,
+    explicitUserAuthored: value.explicitUserAuthored,
+    geographyRelationship: value.geographyRelationship ?? null,
+    reason: value.reason,
   };
 }
 
-function constraintKey(value: SelectionConstraint): string {
-  return `${value.axis}:${value.operator}:${value.kind}:${value.values.join("|")}:${value.geographyRelationship ?? ""}`;
+function normalizedValues(values: readonly string[]): string[] {
+  return values.map((value) => value.normalize("NFKC").trim().toLowerCase()).sort();
+}
+
+function normalizedSemanticAxis(axis: string): string {
+  return axis === "factual_relationship" ? "relationship" : axis;
+}
+
+function operatorsProjectSameMembership(
+  clauseOperator: QueryPlanV3SemanticClause["operator"],
+  constraintOperator: SelectionConstraint["operator"],
+): boolean {
+  if (clauseOperator === "exclude" || constraintOperator === "exclude" || constraintOperator === "avoid") {
+    return clauseOperator === "exclude"
+      && (constraintOperator === "exclude" || constraintOperator === "avoid");
+  }
+  return (clauseOperator === "include" || clauseOperator === "require")
+    && (constraintOperator === "include" || constraintOperator === "require");
+}
+
+function membershipClauseDuplicatesConstraint(
+  constraint: SelectionConstraint,
+  clauses: readonly QueryPlanV3SemanticClause[],
+): boolean {
+  if (constraint.kind !== "hard" || constraint.operator === "maximum") return false;
+  return clauses.some((clause) => (
+    clause.role === "membership"
+    && normalizedSemanticAxis(clause.axis) === constraint.axis
+    && operatorsProjectSameMembership(clause.operator, constraint.operator)
+    && stableStringify(normalizedValues(clause.values)) === stableStringify(normalizedValues(constraint.values))
+    && (clause.geographyRelationship ?? null) === (constraint.geographyRelationship ?? null)
+  ));
+}
+
+/**
+ * Schema 2 executes semantic membership and catalog policy from their typed
+ * clauses. The legacy hard-constraint bag is retained solely for the two
+ * aggregate quotas the selector still consumes. Any other entry would be an
+ * unbound second execution path and must be dropped at compile time and
+ * rejected at decode time.
+ */
+function schemaTwoExecutableHardConstraint(constraint: SelectionConstraint): boolean {
+  return constraint.kind === "hard"
+    && constraint.operator === "maximum"
+    && (constraint.axis === "artist" || constraint.axis === "album")
+    && constraint.values.length === 1
+    && Number.isSafeInteger(Number(constraint.values[0]))
+    && Number(constraint.values[0]) >= 1;
 }
 
 function distinctConstraints(values: readonly SelectionConstraint[]): SelectionConstraint[] {
@@ -208,7 +249,16 @@ function distinctConstraints(values: readonly SelectionConstraint[]): SelectionC
   });
 }
 
-export function createQueryPlanV3(plan: SelectionPlanV3, graphSnapshotId: string): QueryPlanV3 {
+export function createQueryPlanV3(
+  plan: SelectionPlanV3,
+  graphSnapshotId: string,
+  options: { readonly schemaVersion?: QueryPlanV3SchemaVersion } = {},
+): QueryPlanV3 {
+  const requestedSchemaVersion = options.schemaVersion ?? QUERY_PLAN_V3_VERSION;
+  if (requestedSchemaVersion === QUERY_PLAN_V3_VERSION
+    && plan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION) {
+    throw new Error("Schema-2 query plans require the current governed music-concept policy");
+  }
   if (!plan.confirmed || plan.criticalAmbiguities.some(({ key }) => !plan.resolvedAmbiguityKeys.includes(key))) {
     throw new Error("Critical playlist ambiguity must be resolved before a V3 query plan is created");
   }
@@ -216,7 +266,15 @@ export function createQueryPlanV3(plan: SelectionPlanV3, graphSnapshotId: string
     throw new Error("A locked graph snapshot id is required");
   }
   const engines = queryPlanV3Engines(plan);
-  return Object.freeze({
+  const semanticClauses = plan.semanticClauses.map(semanticClause);
+  const contextSignals = plan.contextSignals.map(semanticClause);
+  const catalogPolicies = plan.catalogPolicies.map(semanticClause);
+  const hardConstraintHash = plan.semanticAudit?.hardConstraintHash
+    ?? createHash("sha256").update(stableStringify(semanticClauses
+      .filter((clause) => clause.role === "membership")
+      .map(({ axis, operator, values }) => ({ axis, operator, values: normalizedValues(values) }))
+    )).digest("hex");
+  const schemaTwo: QueryPlanV3 = {
     schemaVersion: QUERY_PLAN_V3_VERSION,
     pipelineVersion: "corpus_first_v3",
     policyVersion: QUERY_PLAN_V3_POLICY_VERSION,
@@ -240,21 +298,265 @@ export function createQueryPlanV3(plan: SelectionPlanV3, graphSnapshotId: string
     })),
     targetTrackCount: plan.requestedTrackCount,
     storefront: plan.storefront,
-    hardConstraints: distinctConstraints([
-      ...plan.membershipPredicates.map((_, index) => hardConstraint(plan, index)),
-      ...plan.hardConstraints,
-    ]),
+    // Membership is authoritative in semanticClauses. Keeping the same rule
+    // in hardConstraints would execute it twice and previously turned
+    // listener context into an accidental evidence gate.
+    hardConstraints: distinctConstraints(plan.hardConstraints)
+      .filter((constraint) => !membershipClauseDuplicatesConstraint(constraint, semanticClauses))
+      .filter(schemaTwoExecutableHardConstraint),
     softPreferences: distinctConstraints(plan.softPreferences),
     sourceDiscoveryHints: plan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
     scopeKind: plan.scopeKind,
     diversityGoals: { ...plan.diversityGoals },
     orderingPolicy: { ...plan.orderingPolicy, goals: [...plan.orderingPolicy.goals] },
     softGoalRelaxationOrder: [...plan.softGoalRelaxationOrder],
+    semanticPolicyVersion: plan.semanticPolicyVersion,
+    musicConceptPolicyVersion: plan.musicConceptPolicyVersion,
+    semanticClauses,
+    contextSignals,
+    catalogPolicies,
+    recordingPolicy: {
+      allowedVersions: [...plan.recordingPolicy.allowedVersions],
+      preferCanonicalStudio: plan.recordingPolicy.preferCanonicalStudio,
+      excludeKaraokeTributeAndCovers: plan.recordingPolicy.excludeKaraokeTributeAndCovers,
+    },
+    explicitUserConstraintHash: plan.explicitUserConstraintHash,
+    hardConstraintHash,
+    semanticAuditMetadata: {
+      semanticPolicyVersion: plan.semanticPolicyVersion,
+      musicConceptPolicyVersion: plan.musicConceptPolicyVersion,
+      passed: plan.semanticAudit?.passed ?? true,
+      hardConstraintHash,
+      explicitUserConstraintHash: plan.explicitUserConstraintHash,
+      clauseCount: semanticClauses.length,
+      membershipClauseCount: semanticClauses.filter((clause) => clause.role === "membership").length,
+      contextClauseCount: contextSignals.length,
+      catalogPolicyClauseCount: catalogPolicies.length,
+      aliasCollapses: [...(plan.semanticAudit?.aliasCollapses ?? [])],
+      contradictions: [...(plan.semanticAudit?.contradictions ?? [])],
+    },
+  };
+  if ((options.schemaVersion ?? QUERY_PLAN_V3_VERSION) === QUERY_PLAN_V3_VERSION) {
+    return Object.freeze(schemaTwo);
+  }
+  const legacy: QueryPlanV3 = {
+    ...schemaTwo,
+    schemaVersion: LEGACY_QUERY_PLAN_V3_VERSION,
+    policyVersion: LEGACY_QUERY_PLAN_V3_POLICY_VERSION,
+    // Schema 1 has no typed semantic-clause execution path, so its confirmed
+    // selection-plan constraints remain the sole legacy catalog/constraint
+    // projection. Reusing schema 2's deliberately narrow aggregate-only bag
+    // makes the persisted query diverge from its immutable selection plan and
+    // causes a valid worker result to be fenced as stale. The corrected
+    // semantic compiler has already removed contextual and duplicated
+    // membership gates from this list before query compilation.
+    hardConstraints: distinctConstraints(plan.hardConstraints),
+  };
+  delete legacy.semanticPolicyVersion;
+  delete legacy.musicConceptPolicyVersion;
+  delete legacy.semanticClauses;
+  delete legacy.contextSignals;
+  delete legacy.catalogPolicies;
+  delete legacy.recordingPolicy;
+  delete legacy.explicitUserConstraintHash;
+  delete legacy.hardConstraintHash;
+  delete legacy.semanticAuditMetadata;
+  return Object.freeze(legacy);
+}
+
+/** Runtime compilation stays on schema 1 through the compatibility deploy and
+ * switches only when Railway explicitly activates schema 2. */
+export function createRuntimeQueryPlanV3(
+  plan: SelectionPlanV3,
+  graphSnapshotId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): QueryPlanV3 {
+  return createQueryPlanV3(plan, graphSnapshotId, {
+    schemaVersion: queryPlanV3EmissionSchemaVersion(env),
   });
 }
 
 export function queryPlanV3Hash(plan: QueryPlanV3): string {
   return createHash("sha256").update(stableStringify(plan)).digest("hex");
+}
+
+const QUERY_PLAN_V3_ROLES = new Set([
+  "membership",
+  "catalog_policy",
+  "context",
+  "ranking",
+  "diversity_sequencing",
+  "discovery_hint",
+]);
+const QUERY_PLAN_V3_SOURCES = new Set([
+  "raw_prompt",
+  "guided_answer",
+  "v2_compatibility",
+  "system_default",
+]);
+const QUERY_PLAN_V3_GEOGRAPHY_RELATIONSHIPS = new Set([
+  "artist_origin",
+  "artist_residence",
+  "recording_location",
+  "label_or_venue_scene",
+  "language",
+  "sound_association",
+  "unspecified",
+]);
+const QUERY_PLAN_V3_RECORDING_VERSIONS = new Set([
+  "canonical",
+  "clean",
+  "explicit",
+  "live",
+  "remix",
+  "radio_edit",
+  "extended",
+  "acoustic",
+  "instrumental",
+]);
+
+function isSemanticClause(value: unknown): value is QueryPlanV3SemanticClause {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const clause = value as Partial<QueryPlanV3SemanticClause>;
+  return typeof clause.id === "string"
+    && /^[A-Za-z0-9._:-]{1,160}$/u.test(clause.id)
+    && typeof clause.role === "string"
+    && QUERY_PLAN_V3_ROLES.has(clause.role)
+    && typeof clause.axis === "string" && /^[A-Za-z0-9._:-]{1,80}$/u.test(clause.axis)
+    && typeof clause.operator === "string" && /^[A-Za-z0-9._:-]{1,80}$/u.test(clause.operator)
+    && Array.isArray(clause.values)
+    && clause.values.length <= 50
+    && clause.values.every((item) => typeof item === "string" && item.trim().length > 0 && item.length <= 240)
+    && typeof clause.source === "string" && QUERY_PLAN_V3_SOURCES.has(clause.source)
+    && typeof clause.explicitUserAuthored === "boolean"
+    && (clause.geographyRelationship === null
+      || (typeof clause.geographyRelationship === "string"
+        && QUERY_PLAN_V3_GEOGRAPHY_RELATIONSHIPS.has(clause.geographyRelationship)))
+    && typeof clause.reason === "string" && clause.reason.length > 0 && clause.reason.length <= 500;
+}
+
+function sameClause(left: QueryPlanV3SemanticClause, right: QueryPlanV3SemanticClause): boolean {
+  return stableStringify(left) === stableStringify(right);
+}
+
+function membershipOperatorPolarity(operator: string): "positive" | "exclude" | null {
+  if (operator === "include" || operator === "require") return "positive";
+  if (operator === "exclude") return "exclude";
+  return null;
+}
+
+function isMembershipPredicateProjection(
+  value: unknown,
+): value is QueryPlanV3["membershipPredicates"][number] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const predicate = value as Partial<QueryPlanV3["membershipPredicates"][number]>;
+  return typeof predicate.id === "string"
+    && /^[A-Za-z0-9._:-]{1,160}$/u.test(predicate.id)
+    && typeof predicate.kind === "string" && /^[A-Za-z0-9._:-]{1,80}$/u.test(predicate.kind)
+    && typeof predicate.subject === "string" && predicate.subject.length > 0 && predicate.subject.length <= 12_000
+    && typeof predicate.relationship === "string"
+    && membershipOperatorPolarity(predicate.relationship) !== null
+    && typeof predicate.hard === "boolean";
+}
+
+function membershipProjectionMatches(
+  clauses: readonly QueryPlanV3SemanticClause[],
+  predicates: readonly unknown[],
+): boolean {
+  const membershipClauses = clauses.filter((clause) => clause.role === "membership");
+  if (!predicates.every(isMembershipPredicateProjection)
+    || predicates.length !== membershipClauses.length
+    || new Set(predicates.map((predicate) => predicate.id)).size !== predicates.length) return false;
+  const predicateById = new Map(predicates.map((predicate) => [predicate.id, predicate]));
+  return membershipClauses.every((clause) => {
+    const predicate = predicateById.get(clause.id);
+    const clausePolarity = membershipOperatorPolarity(clause.operator);
+    const predicatePolarity = predicate
+      ? membershipOperatorPolarity(predicate.relationship)
+      : null;
+    return predicate !== undefined
+      && predicate.hard === true
+      && normalizedSemanticAxis(predicate.kind) === normalizedSemanticAxis(clause.axis)
+      && clausePolarity !== null
+      && clausePolarity === predicatePolarity
+      // The schema-1 compatibility projection has no values array. Its
+      // subject is therefore an integrity field, not presentation prose.
+      && predicate.subject === clause.values.join(" | ");
+  });
+}
+
+function semanticRoleProjectionMatches(
+  clauses: readonly QueryPlanV3SemanticClause[],
+  projection: readonly QueryPlanV3SemanticClause[],
+  role: "context" | "catalog_policy",
+): boolean {
+  const expected = clauses.filter((clause) => clause.role === role);
+  if (projection.length !== expected.length
+    || new Set(projection.map((clause) => clause.id)).size !== projection.length) return false;
+  const expectedById = new Map(expected.map((clause) => [clause.id, clause]));
+  return projection.every((clause) => (
+    clause.role === role
+    && expectedById.has(clause.id)
+    && sameClause(clause, expectedById.get(clause.id)!)
+  ));
+}
+
+function schemaTwoContractValid(row: Partial<QueryPlanV3>): boolean {
+  if (row.schemaVersion !== QUERY_PLAN_V3_VERSION
+    || row.policyVersion !== QUERY_PLAN_V3_POLICY_VERSION
+    || row.semanticPolicyVersion !== "scope_gate_v2_1_2"
+    || row.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
+    || !Array.isArray(row.semanticClauses)
+    || row.semanticClauses.length < 1 || row.semanticClauses.length > 500
+    || !row.semanticClauses.every(isSemanticClause)
+    || new Set(row.semanticClauses.map((clause) => clause.id)).size !== row.semanticClauses.length
+    || !Array.isArray(row.contextSignals) || !row.contextSignals.every(isSemanticClause)
+    || !Array.isArray(row.catalogPolicies) || !row.catalogPolicies.every(isSemanticClause)
+    || typeof row.explicitUserConstraintHash !== "string" || !/^[a-f0-9]{64}$/u.test(row.explicitUserConstraintHash)
+    || typeof row.hardConstraintHash !== "string" || !/^[a-f0-9]{64}$/u.test(row.hardConstraintHash)
+    || !row.recordingPolicy || typeof row.recordingPolicy !== "object"
+    || !Array.isArray(row.recordingPolicy.allowedVersions)
+    || row.recordingPolicy.allowedVersions.length < 1
+    || row.recordingPolicy.allowedVersions.some((version) => !QUERY_PLAN_V3_RECORDING_VERSIONS.has(version))
+    || typeof row.recordingPolicy.preferCanonicalStudio !== "boolean"
+    || typeof row.recordingPolicy.excludeKaraokeTributeAndCovers !== "boolean"
+    || !row.semanticAuditMetadata || typeof row.semanticAuditMetadata !== "object") return false;
+  const clauses = row.semanticClauses as QueryPlanV3SemanticClause[];
+  const signals = row.contextSignals as QueryPlanV3SemanticClause[];
+  const policies = row.catalogPolicies as QueryPlanV3SemanticClause[];
+  if (clauses.some((clause) => (
+    (clause.role === "membership" || clause.role === "context" || clause.role === "catalog_policy")
+    && clause.values.length === 0
+  ))) return false;
+  if (!Array.isArray(row.membershipPredicates)
+    || !membershipProjectionMatches(clauses, row.membershipPredicates)
+    || !semanticRoleProjectionMatches(clauses, signals, "context")
+    || !semanticRoleProjectionMatches(clauses, policies, "catalog_policy")) return false;
+  const membershipClauseCount = clauses.filter((clause) => clause.role === "membership").length;
+  const contextClauseCount = clauses.filter((clause) => clause.role === "context").length;
+  const catalogPolicyClauseCount = clauses.filter((clause) => clause.role === "catalog_policy").length;
+  const audit = row.semanticAuditMetadata;
+  if (audit.semanticPolicyVersion !== row.semanticPolicyVersion
+    || audit.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
+    || audit.musicConceptPolicyVersion !== row.musicConceptPolicyVersion
+    || audit.passed !== true
+    || audit.hardConstraintHash !== row.hardConstraintHash
+    || audit.explicitUserConstraintHash !== row.explicitUserConstraintHash
+    || audit.clauseCount !== clauses.length
+    || audit.membershipClauseCount !== membershipClauseCount
+    || audit.contextClauseCount !== contextClauseCount
+    || audit.catalogPolicyClauseCount !== catalogPolicyClauseCount
+    || !Array.isArray(audit.aliasCollapses) || !audit.aliasCollapses.every((item) => typeof item === "string" && item.length <= 240)
+    || !Array.isArray(audit.contradictions) || audit.contradictions.length !== 0) return false;
+  // Schema 2 must not execute one membership rule twice through the legacy
+  // hard-constraint bag.
+  if ((row.hardConstraints ?? []).some((constraint) => membershipClauseDuplicatesConstraint(constraint, clauses))) {
+    return false;
+  }
+  if ((row.hardConstraints ?? []).some((constraint) => !schemaTwoExecutableHardConstraint(constraint))) {
+    return false;
+  }
+  return true;
 }
 
 export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
@@ -306,9 +608,11 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
         || hint.excerpt.length > 500) return false;
       try { return assertPublicHttpsUrl(hint.url).toString() === hint.url; } catch { return false; }
     });
-  return row.schemaVersion === 1
+  const schemaValid = (row.schemaVersion === LEGACY_QUERY_PLAN_V3_VERSION
+      && row.policyVersion === LEGACY_QUERY_PLAN_V3_POLICY_VERSION)
+    || schemaTwoContractValid(row);
+  return schemaValid
     && row.pipelineVersion === "corpus_first_v3"
-    && row.policyVersion === QUERY_PLAN_V3_POLICY_VERSION
     && typeof row.selectionPlanHash === "string"
     && /^[a-f0-9]{64}$/u.test(row.selectionPlanHash)
     && typeof row.graphSnapshotId === "string"

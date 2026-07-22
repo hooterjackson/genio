@@ -18,7 +18,10 @@ type RuntimeBuildPayload = {
     schemaVersion?: unknown;
     workerProtocol?: unknown;
     selectionPlanVersion?: unknown;
+    queryPlanSchemaVersion?: unknown;
     queryPlanPolicyVersion?: unknown;
+    semanticScopePolicyVersion?: unknown;
+    musicConceptPolicyVersion?: unknown;
     pipelinePolicyVersion?: unknown;
     promptVersion?: unknown;
     baselineProviderModelId?: unknown;
@@ -57,6 +60,12 @@ function safeBuildTimestamp(value: unknown): string | null {
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? value : null;
 }
 
+function safeBuildRevision(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return /^[0-9a-f]{7,64}$/u.test(normalized) ? normalized : null;
+}
+
 export function RuntimeBuild() {
   const [runtime, setRuntime] = useState<RuntimeBuildState>({ status: "checking" });
 
@@ -72,6 +81,7 @@ export function RuntimeBuild() {
       const identifier = safeBuildText(payload.build?.identifier, 140);
       const version = safeBuildText(payload.build?.version, 64);
       if (!identifier || !version) throw new Error("The API build response is invalid");
+      const revision = safeBuildRevision(payload.build?.revision);
       const contract = payload.runtime;
       const graph = contract?.graphSnapshot;
       const graphId = safeBuildText(graph?.id, 140);
@@ -82,6 +92,7 @@ export function RuntimeBuild() {
         ? contract.ownerCanaryEnabled === true ? "OWNER CANARY" : "ACTIVE"
         : "DISABLED";
       const details: Array<readonly [string, string]> = [
+        ["BUILD REVISION", revision?.slice(0, 12) ?? "UNAVAILABLE"],
         ["PIPELINE", safeBuildText(contract?.pipelineVersion, 64) ?? "UNKNOWN"],
         ["ROLLOUT", rollout],
         ["PRODUCTION EVIDENCE", contract?.productionEvidenceApproved === true ? "APPROVED" : "NOT APPROVED"],
@@ -89,7 +100,10 @@ export function RuntimeBuild() {
         ["DATABASE SCHEMA", safeBuildText(contract?.schemaVersion, 24) ?? "UNKNOWN"],
         ["WORKER PROTOCOL", safeBuildText(contract?.workerProtocol, 64) ?? "UNKNOWN"],
         ["SELECTION PLAN", safeBuildText(contract?.selectionPlanVersion, 80) ?? "UNKNOWN"],
+        ["QUERY PLAN SCHEMA", safeBuildText(contract?.queryPlanSchemaVersion, 24) ?? "UNKNOWN"],
         ["QUERY POLICY", safeBuildText(contract?.queryPlanPolicyVersion, 80) ?? "UNKNOWN"],
+        ["SEMANTIC SCOPE POLICY", safeBuildText(contract?.semanticScopePolicyVersion, 80) ?? "UNKNOWN"],
+        ["MUSIC CONCEPT POLICY", safeBuildText(contract?.musicConceptPolicyVersion, 80) ?? "UNKNOWN"],
         ["PIPELINE POLICY", safeBuildText(contract?.pipelinePolicyVersion, 80) ?? "UNKNOWN"],
         ["PROMPT", safeBuildText(contract?.promptVersion, 80) ?? "UNKNOWN"],
         ["BASELINE PROVIDER MODEL", safeBuildText(contract?.baselineProviderModelId, 80) ?? "UNKNOWN"],

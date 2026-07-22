@@ -10,6 +10,22 @@ import {
 } from "./selection-plan-v3.ts";
 import type { PipelineV3ModelRoute } from "./pipeline-v3-policy.ts";
 import { catalogEraConstraintFailuresV3 } from "./pipeline-v3-era-policy.ts";
+import {
+  appleLookupCountV3,
+  appleProviderRequestCountV3,
+  candidateLeadKeyV3,
+  citationHashesV3,
+  predicateFailureCountsV3,
+  projectQualificationToOriginalPredicatesV3,
+  proposeSemanticRecoveryV3,
+  recoveryAuditIdempotencyKeyV3,
+  recoveryStageSnapshotV3,
+  semanticRecoveryRootCauseV3,
+  type PipelineCandidateLeadArtifactV3,
+  type PipelineRecoveryAuditArtifactV3,
+  type RetrievalPredicateDiagnosticsV3,
+  type SemanticPlanRevisionArtifactV3,
+} from "./pipeline-v3-semantic-recovery.ts";
 import type { SelectionConstraint } from "../shared/types.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
@@ -205,6 +221,10 @@ export interface CandidateQualificationV3 {
     readonly confidence: number;
   };
   readonly catalog: {
+    /** Catalog resolution was attempted, even if cached metadata avoided a provider read. */
+    readonly lookupAttempted?: boolean;
+    /** Actual Apple provider read invocations made during qualification. */
+    readonly appleProviderRequestCount?: number;
     readonly storefrontPlayable: boolean;
     readonly appleSongId: string | null;
     readonly recordingFamilyKey: string | null;
@@ -572,6 +592,11 @@ export interface RetrievalResultV3 {
   readonly deficit: RetrievalDeficitLedgerV3;
   readonly strategies: readonly RetrievalStrategyReportV3[];
   readonly integrityEvents: readonly string[];
+  readonly predicateDiagnostics?: RetrievalPredicateDiagnosticsV3;
+  /** Immutable artifacts persisted with the retrieval boundary. */
+  readonly semanticPlanRevisions?: readonly SemanticPlanRevisionArtifactV3[];
+  readonly recoveryAudits?: readonly PipelineRecoveryAuditArtifactV3[];
+  readonly candidateLeads?: readonly PipelineCandidateLeadArtifactV3[];
   readonly publicationBoundary: RetrievalPublicationBoundaryV3;
 }
 
@@ -636,6 +661,9 @@ interface RecordingFamilyEntryV3 {
 interface RawCandidateLedgerEntryV3 {
   candidate: RawTrackCandidateV3;
   candidateIds: Set<string>;
+  strategyId: string;
+  predicateCoverage: Set<string>;
+  rejectionCode: string | null;
 }
 
 function boundedInteger(value: number, label: string, minimum: number, maximum: number): number {
@@ -1238,6 +1266,20 @@ function emptyResult(input: {
     },
     strategies: input.strategies,
     integrityEvents: input.integrityEvents ?? [],
+    predicateDiagnostics: {
+      qualificationsObserved: 0,
+      scopeFailures: 0,
+      failedMembershipPredicateIds: {},
+      appleLookupCount: 0,
+      appleProviderRequestCount: 0,
+      rootCause: input.stopReason === "provider_failure" || input.stopReason === "provider_circuit_open"
+        ? "provider_degraded"
+        : "under_discovery",
+      recoveryAttemptCount: 0,
+    },
+    semanticPlanRevisions: [],
+    recoveryAudits: [],
+    candidateLeads: [],
     publicationBoundary: publicationBoundary(input.mode, input.status),
   };
 }
@@ -1268,6 +1310,14 @@ export async function executeRetrievalV3(input: {
   runId: string;
   plan: SelectionPlanV3;
   adapters: RetrievalAdaptersV3;
+  /**
+   * Semantic recovery is activated only by query-plan schema 2. Direct unit
+   * callers default to enabled so the recovery contract remains easy to test,
+   * while workers explicitly fence schema-1 compatibility jobs out.
+   */
+  semanticRecoveryEnabled?: boolean;
+  /** Persist and fence the one-shot repair claim before requalification. */
+  claimSemanticRecovery?: (revision: SemanticPlanRevisionArtifactV3) => Promise<void>;
   executionMode?: RetrievalExecutionModeV3;
   routingHints?: RetrievalRoutingHintsV3;
   policy?: Partial<RetrievalPolicyV3>;
@@ -1276,6 +1326,7 @@ export async function executeRetrievalV3(input: {
   now?: () => number;
 }): Promise<RetrievalResultV3> {
   const requested = boundedInteger(input.plan.requestedTrackCount, "requestedTrackCount", 1, 300);
+  let activePlan = input.plan;
   const mode = input.executionMode ?? "active";
   const policy = validatePolicy(input.policy ?? {});
   const now = input.now ?? Date.now;
@@ -1403,14 +1454,42 @@ export async function executeRetrievalV3(input: {
   let stopReason: RetrievalStopReasonV3 | null = null;
   let providerFailureCount = 0;
   let integrityFailureCount = 0;
+  let qualificationsObserved = 0;
+  let scopeFailuresObserved = 0;
+  let appleLookupCount = 0;
+  let appleProviderRequestCount = 0;
+  let semanticRecoveryAttemptCount = 0;
+  const failedMembershipPredicateCounts = new Map<string, number>();
+  const semanticRecoveryQualificationSample: CandidateQualificationV3[] = [];
+  const semanticPlanRevisions: SemanticPlanRevisionArtifactV3[] = [];
+  const recoveryAudits: PipelineRecoveryAuditArtifactV3[] = [];
+
+  const observeQualifications = (
+    values: readonly CandidateQualificationV3[],
+    options: { includeInRecoverySample?: boolean } = {},
+  ) => {
+    qualificationsObserved += values.length;
+    scopeFailuresObserved += values.filter(({ scope }) => !scope.passed).length;
+    appleLookupCount += appleLookupCountV3(values);
+    appleProviderRequestCount += appleProviderRequestCountV3(values);
+    for (const [predicateId, count] of Object.entries(predicateFailureCountsV3(values))) {
+      failedMembershipPredicateCounts.set(
+        predicateId,
+        (failedMembershipPredicateCounts.get(predicateId) ?? 0) + count,
+      );
+    }
+    if (options.includeInRecoverySample !== false) {
+      semanticRecoveryQualificationSample.push(...values);
+    }
+  };
 
   while (true) {
     const currentRankedFamilies = [...families.values()]
       .map(({ primary }) => primary)
-      .sort((left, right) => compareQualified(left, right, input.plan.rankingObjectives));
+      .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
     const currentHardEligible = applyHardAggregateConstraints(
       currentRankedFamilies,
-      input.plan.hardConstraints,
+      activePlan.hardConstraints,
     ).eligible.length;
     const fill = adaptiveFillPlanV3({
       target: requested,
@@ -1456,7 +1535,7 @@ export async function executeRetrievalV3(input: {
       executionMode: mode,
       appleWriteAccess: "forbidden",
       ...(input.modelRoute ? { modelRoute: input.modelRoute } : {}),
-      plan: input.plan,
+      plan: activePlan,
       engine: state.definition.engine,
       strategy: state.definition,
       strategyRound: state.rounds,
@@ -1500,7 +1579,7 @@ export async function executeRetrievalV3(input: {
     counters.discovered += batch.candidates.length;
     state.rawCandidates += batch.candidates.length;
 
-    const candidates: RawTrackCandidateV3[] = [];
+    let candidates: RawTrackCandidateV3[] = [];
     let roundCandidateEvidenceProgress = 0;
     for (const candidate of boundedBatch) {
       if (!validCandidate(candidate)) {
@@ -1513,6 +1592,7 @@ export async function executeRetrievalV3(input: {
       const existing = rawCandidateLedger.get(identityKey);
       if (existing) {
         existing.candidateIds.add(candidate.id);
+        existing.strategyId = state.definition.id;
         const merged = mergeRawCandidate(existing.candidate, candidate);
         existing.candidate = merged.candidate;
         if (!merged.improved) {
@@ -1543,6 +1623,9 @@ export async function executeRetrievalV3(input: {
       rawCandidateLedger.set(identityKey, {
         candidate: { ...candidate, sourceObservationIds: [...new Set(candidate.sourceObservationIds)] },
         candidateIds: new Set([candidate.id]),
+        strategyId: state.definition.id,
+        predicateCoverage: new Set(),
+        rejectionCode: null,
       });
       seenCandidateTracks.set(candidate.id, {
         artist: candidate.artist.trim(),
@@ -1560,7 +1643,7 @@ export async function executeRetrievalV3(input: {
           runId: input.runId,
           executionMode: mode,
           appleWriteAccess: "forbidden",
-          plan: input.plan,
+          plan: activePlan,
           engine: state.definition.engine,
           strategy: state.definition,
           candidates,
@@ -1576,6 +1659,92 @@ export async function executeRetrievalV3(input: {
         ? "provider_error"
         : "available";
       continue;
+    }
+
+    observeQualifications(qualifications);
+    let pendingRecoveryAudit: {
+      revision: SemanticPlanRevisionArtifactV3;
+      before: ReturnType<typeof recoveryStageSnapshotV3>;
+      beforeFailures: Readonly<Record<string, number>>;
+      afterFailures: Readonly<Record<string, number>>;
+      recoveredScopeCount: number;
+    } | null = null;
+    const recoveryProposal = input.semanticRecoveryEnabled === false
+      || input.continuation
+      || semanticRecoveryAttemptCount > 0
+      ? null
+      : proposeSemanticRecoveryV3({
+        plan: activePlan,
+        qualifications: semanticRecoveryQualificationSample,
+        providerDegraded: providerFailureCount > 0 || batch.providerCircuitOpen === true,
+        priorAttemptCount: semanticRecoveryAttemptCount,
+      });
+    if (recoveryProposal) {
+      await input.claimSemanticRecovery?.(recoveryProposal.revision);
+      semanticRecoveryAttemptCount += 1;
+      const before = recoveryStageSnapshotV3({
+        ...counters,
+        selected: 0,
+        reserve: 0,
+      }, appleLookupCount, appleProviderRequestCount);
+      const beforeFailures = predicateFailureCountsV3(semanticRecoveryQualificationSample);
+      const replayCandidates = [...rawCandidateLedger.values()].map(({ candidate }) => candidate);
+      try {
+        const repairedQualifications = await input.adapters.qualify({
+          runId: input.runId,
+          executionMode: mode,
+          appleWriteAccess: "forbidden",
+          plan: recoveryProposal.revision.plan,
+          engine: state.definition.engine,
+          strategy: state.definition,
+          candidates: replayCandidates,
+        });
+        observeQualifications(repairedQualifications, { includeInRecoverySample: false });
+        activePlan = recoveryProposal.revision.plan;
+        semanticPlanRevisions.push(recoveryProposal.revision);
+        candidates = replayCandidates;
+        qualifications = repairedQualifications.map((qualification) => (
+          projectQualificationToOriginalPredicatesV3(
+            qualification,
+            recoveryProposal.revision.predicateProjection,
+          )
+        ));
+        pendingRecoveryAudit = {
+          revision: recoveryProposal.revision,
+          before,
+          beforeFailures,
+          afterFailures: predicateFailureCountsV3(repairedQualifications),
+          recoveredScopeCount: repairedQualifications.filter(({ scope }) => scope.passed).length,
+        };
+        integrityEvents.push(
+          `semantic_recovery:${recoveryProposal.trigger.dominantPredicateId}:${recoveryProposal.revision.transformations.map(({ kind }) => kind).join(",")}`,
+        );
+      } catch (error) {
+        providerFailureCount += 1;
+        state.providerFailures += 1;
+        integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
+        const idempotencyKey = recoveryAuditIdempotencyKeyV3({
+          runId: input.runId,
+          planHash: recoveryProposal.revision.planHash,
+          transformations: recoveryProposal.revision.transformations,
+        });
+        recoveryAudits.push(Object.freeze({
+          generation: 1,
+          rootCause: "provider_degraded",
+          action: "semantic_equivalent_requalification",
+          status: "failed",
+          before,
+          after: recoveryStageSnapshotV3(
+            { ...counters, selected: 0, reserve: 0 },
+            appleLookupCount,
+            appleProviderRequestCount,
+          ),
+          beforeFailedMembershipPredicateIds: beforeFailures,
+          afterFailedMembershipPredicateIds: beforeFailures,
+          transformationKinds: recoveryProposal.revision.transformations.map(({ kind }) => kind),
+          idempotencyKey,
+        }));
+      }
     }
 
     const candidateIds = new Set(candidates.map(({ id }) => id));
@@ -1598,31 +1767,44 @@ export async function executeRetrievalV3(input: {
     let newFamilies = 0;
     let meaningfulProgress = roundCandidateEvidenceProgress;
     for (const candidate of candidates) {
+      const lead = rawCandidateLedger.get(rawCandidateIdentityKey(candidate));
+      const rejectLead = (code: string) => {
+        if (lead) lead.rejectionCode = code;
+      };
       const qualification = byCandidate.get(candidate.id);
       if (!qualification) {
         incrementReason(discardedByReason, "qualification_missing");
+        rejectLead("qualification_missing");
         continue;
+      }
+      const failedPredicates = new Set(qualification.scope.failedMembershipPredicateIds);
+      for (const predicate of activePlan.membershipPredicates) {
+        if (!failedPredicates.has(predicate.id)) lead?.predicateCoverage.add(predicate.id);
       }
       if (!qualification.scope.passed) {
         incrementReason(discardedByReason, "scope_membership_failed");
+        rejectLead("scope_membership_failed");
         continue;
       }
       counters.scopeEligible += 1;
       if (!qualification.hardConstraints.passed) {
         incrementReason(discardedByReason, "hard_constraint_failed");
+        rejectLead("hard_constraint_failed");
         continue;
       }
       if (catalogEraConstraintFailuresV3(
-        input.plan,
+        activePlan,
         qualification.catalog.releaseYear,
         qualification.catalog.compatibleReleaseYears,
       ).length > 0) {
         incrementReason(discardedByReason, "hard_constraint_failed");
+        rejectLead("hard_constraint_failed");
         continue;
       }
       counters.hardConstraintEligible += 1;
       if (!qualification.evidence.passed || qualification.evidence.bindingIds.length === 0) {
         incrementReason(discardedByReason, "evidence_binding_missing");
+        rejectLead("evidence_binding_missing");
         continue;
       }
       const attestedBindings = attestedEvidenceBindingsForSelectionV3(
@@ -1632,20 +1814,27 @@ export async function executeRetrievalV3(input: {
       if (attestedBindings.length === 0) {
         incrementReason(discardedByReason, "evidence_attestation_missing");
         integrityEvents.push(`evidence_attestation_missing:${state.definition.id}:${candidate.id}`);
+        rejectLead("evidence_attestation_missing");
         continue;
+      }
+      for (const predicateId of attestedBindings.flatMap(bindingPredicateIds)) {
+        lead?.predicateCoverage.add(predicateId);
       }
       counters.evidenceEligible += 1;
       if (!qualification.version.compatible) {
         incrementReason(discardedByReason, "version_incompatible");
+        rejectLead("version_incompatible");
         continue;
       }
       counters.versionCompatible += 1;
       if (!qualification.catalog.storefrontPlayable) {
         incrementReason(discardedByReason, "storefront_unavailable");
+        rejectLead("storefront_unavailable");
         continue;
       }
       if (!qualification.catalog.appleSongId || !qualification.catalog.recordingFamilyKey) {
         incrementReason(discardedByReason, "catalog_identity_missing");
+        rejectLead("catalog_identity_missing");
         continue;
       }
       counters.storefrontPlayable += 1;
@@ -1654,6 +1843,7 @@ export async function executeRetrievalV3(input: {
         incrementReason(discardedByReason, "catalog_identity_conflict");
         integrityEvents.push(`catalog_identity_conflict:${qualification.catalog.appleSongId}`);
         integrityFailureCount += 1;
+        rejectLead("catalog_identity_conflict");
         continue;
       }
 
@@ -1680,8 +1870,9 @@ export async function executeRetrievalV3(input: {
         sourceRank: Number.isFinite(qualification.sourceRank) ? Math.max(0, qualification.sourceRank) : Number.MAX_SAFE_INTEGER,
       };
       appleIdToFamily.set(qualified.appleSongId, qualified.recordingFamilyKey);
+      if (lead) lead.rejectionCode = null;
       const familyAlreadyExists = families.has(qualified.recordingFamilyKey);
-      const merge = addQualifiedToFamily(families, qualified, input.plan.rankingObjectives);
+      const merge = addQualifiedToFamily(families, qualified, activePlan.rankingObjectives);
       if (merge.newFamily) {
         newFamilies += 1;
         meaningfulProgress += 1;
@@ -1690,6 +1881,30 @@ export async function executeRetrievalV3(input: {
       }
       incrementReason(discardedByReason, "duplicate_recording_family");
       if (familyAlreadyExists && merge.meaningfulProgress) meaningfulProgress += 1;
+    }
+
+    if (pendingRecoveryAudit) {
+      const idempotencyKey = recoveryAuditIdempotencyKeyV3({
+        runId: input.runId,
+        planHash: pendingRecoveryAudit.revision.planHash,
+        transformations: pendingRecoveryAudit.revision.transformations,
+      });
+      recoveryAudits.push(Object.freeze({
+        generation: 1,
+        rootCause: "semantic_contract",
+        action: "semantic_equivalent_requalification",
+        status: pendingRecoveryAudit.recoveredScopeCount > 0 ? "complete" : "no_yield",
+        before: pendingRecoveryAudit.before,
+        after: recoveryStageSnapshotV3(
+          { ...counters, selected: 0, reserve: 0 },
+          appleLookupCount,
+          appleProviderRequestCount,
+        ),
+        beforeFailedMembershipPredicateIds: pendingRecoveryAudit.beforeFailures,
+        afterFailedMembershipPredicateIds: pendingRecoveryAudit.afterFailures,
+        transformationKinds: pendingRecoveryAudit.revision.transformations.map(({ kind }) => kind),
+        idempotencyKey,
+      }));
     }
 
     state.newQualifiedFamilies += newFamilies;
@@ -1722,18 +1937,18 @@ export async function executeRetrievalV3(input: {
   });
   const rankedPool = [...families.values()]
     .map(({ primary }) => primary)
-    .sort((left, right) => compareQualified(left, right, input.plan.rankingObjectives));
-  const hardAggregate = applyHardAggregateConstraints(rankedPool, input.plan.hardConstraints);
+    .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
+  const hardAggregate = applyHardAggregateConstraints(rankedPool, activePlan.hardConstraints);
   for (const rejection of hardAggregate.rejected) {
     incrementReason(discardedByReason, "hard_constraint_failed");
     for (const reason of rejection.reasons) incrementReason(discardedByReason, reason);
   }
-  const broadCurated = shouldSequenceBroadCurated(engines, input.plan);
+  const broadCurated = shouldSequenceBroadCurated(engines, activePlan);
   const rankedSelected = broadCurated
-    ? selectBroadCurated(hardAggregate.eligible, requested, input.plan)
+    ? selectBroadCurated(hardAggregate.eligible, requested, activePlan)
     : hardAggregate.eligible.slice(0, requested);
   const selected = broadCurated
-    ? sequenceBroadCurated(rankedSelected, input.plan.orderingPolicy)
+    ? sequenceBroadCurated(rankedSelected, activePlan.orderingPolicy)
     : rankedSelected;
   const selectedIds = new Set(selected.map(({ candidateId }) => candidateId));
   const reserve = hardAggregate.eligible
@@ -1760,6 +1975,27 @@ export async function executeRetrievalV3(input: {
       .filter(([, { alternates }]) => alternates.length > 0)
       .map(([family, { alternates }]) => [family, alternates]),
   );
+  const candidateLeads: PipelineCandidateLeadArtifactV3[] = [...rawCandidateLedger.values()]
+    .slice(0, policy.maximumRawCandidates)
+    .map((entry) => Object.freeze({
+      strategyId: entry.strategyId,
+      candidateKey: candidateLeadKeyV3(entry.candidate),
+      artist: entry.candidate.artist.trim().slice(0, 240),
+      title: entry.candidate.title.trim().slice(0, 240),
+      album: entry.candidate.album?.trim().slice(0, 240) || null,
+      sourceRecordIds: [...new Set(entry.candidate.sourceObservationIds)].slice(0, 64),
+      citationHashes: citationHashesV3(entry.candidate),
+      predicateCoverage: [...entry.predicateCoverage].sort().slice(0, 64),
+      rejectionCode: entry.rejectionCode,
+    }));
+  const diagnosticsRootCause = recoveryAudits.some(({ rootCause }) => rootCause === "semantic_contract")
+    ? "semantic_contract" as const
+    : semanticRecoveryRootCauseV3({
+      stages,
+      providerDegraded: providerFailureCount > 0
+        || resolvedStopReason === "provider_failure"
+        || resolvedStopReason === "provider_circuit_open",
+    });
   return {
     schemaVersion: PIPELINE_V3_RETRIEVAL_SCHEMA,
     runId: input.runId,
@@ -1791,6 +2027,20 @@ export async function executeRetrievalV3(input: {
     },
     strategies: strategyReports,
     integrityEvents,
+    predicateDiagnostics: {
+      qualificationsObserved,
+      scopeFailures: scopeFailuresObserved,
+      failedMembershipPredicateIds: Object.fromEntries(
+        [...failedMembershipPredicateCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
+      ),
+      appleLookupCount,
+      appleProviderRequestCount,
+      rootCause: diagnosticsRootCause,
+      recoveryAttemptCount: semanticRecoveryAttemptCount,
+    },
+    semanticPlanRevisions,
+    recoveryAudits,
+    candidateLeads,
     publicationBoundary: publicationBoundary(mode, status),
   };
 }

@@ -155,6 +155,8 @@ async function openPrompt(page: Page): Promise<void> {
   await expect(customSizeButton(page)).toBeVisible();
   await expect(exactTrackCountField(page)).toHaveCount(0);
   await expect(page.getByRole("button", { name: /create playlist/i })).toBeVisible();
+  await expect(page.locator(".one-command-form")).toHaveAttribute("aria-busy", "false");
+  await expect(requestField(page)).toBeEditable();
 }
 
 async function expectQuestionAtTop(page: Page): Promise<void> {
@@ -323,14 +325,16 @@ test("the gênio intro is omitted when reduced motion is requested", async ({ pa
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByTestId("brand-intro")).toHaveCount(0);
-  await expect(requestField(page)).toBeVisible();
+  await expect(requestField(page)).toBeEditable();
 });
 
 test("the gênio intro returns keyboard focus to the composer after automatic completion", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await page.goto("/");
   await expect(page.getByTestId("brand-intro")).toBeVisible();
+  await expect(requestField(page)).toBeDisabled();
   await expect(page.getByTestId("brand-intro")).toHaveCount(0, { timeout: 5_000 });
+  await expect(requestField(page)).toBeEditable();
   await expect(requestField(page)).toBeFocused();
 });
 
@@ -2434,10 +2438,11 @@ test("desktop keyboard focus remains visible and primary text meets WCAG AA cont
   // value and leaving the CTA disabled on slower mobile projects.
   await openPrompt(page);
   const request = requestField(page);
-  await request.fill("Every released song Paulinho da Costa performed on");
+  await request.pressSequentially("Every released song Paulinho da Costa performed on");
+  await expect(request).toHaveValue("Every released song Paulinho da Costa performed on");
   const primary = page.getByRole("button", { name: /create playlist/i });
-  // The enabled state is derived from React state. Under parallel responsive
-  // coverage, the input event can commit one frame after Playwright's fill.
+  // The enabled state is derived from React state. Exercise actual keyboard
+  // input here so this focus test does not depend on WebKit's synthetic fill.
   await expect(primary).toBeEnabled();
   await primary.focus();
   await expect(primary).toBeFocused();

@@ -4,7 +4,12 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { Repository } from "../server/repository.ts";
 import { createQueryPlanV3, queryPlanV3Hash } from "../server/query-plan-v3.ts";
-import { selectionPlanV3Hash, type SelectionPlanV3 } from "../server/selection-plan-v3.ts";
+import {
+  createRunSpecV3,
+  resolveRunSpecV3,
+  selectionPlanV3Hash,
+  type SelectionPlanV3,
+} from "../server/selection-plan-v3.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
@@ -13,7 +18,9 @@ const migrationFiles = readdirSync(migrationDirectory)
   .filter((file) => /^\d+_.+\.sql$/u.test(file))
   .sort();
 const schema13MigrationSql = migrationFiles
-  .filter((file) => file !== "0013_corpus_first_v3_foundation.sql")
+  // Reconstruct the schema immediately before 0013. A name-based exclusion
+  // accidentally included later migrations after schema 14/15 were added.
+  .filter((file) => file < "0013_")
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
 const pipelineV3MigrationSql = readFileSync(
@@ -276,20 +283,11 @@ databaseDescribe("Pipeline V3 expand foundation", () => {
     )).rejects.toThrow(/immutable/u);
 
     const selectionPlanJson = {
-      schemaVersion: 1,
-      pipelineVersion: "corpus_first_v3",
-      selectionPlanVersion: "selection_plan_v3",
-      prompt: "25 essential house music tracks",
-      requestedTrackCount: 25,
-      storefront: "us",
-      intents: ["genre_scene"],
-      engines: ["curated_genre_scene"],
-      membershipPredicates: [],
-      rankingObjectives: [],
-      scopeKind: "broad_curated",
-      hardConstraints: [],
-      softPreferences: [],
-      sourceDiscoveryHints: [],
+      ...resolveRunSpecV3(createRunSpecV3({
+        prompt: "25 essential house music tracks",
+        requestedTrackCount: 25,
+        storefront: "us",
+      }), []),
       diversityGoals: {
         minimumDistinctArtists: 5,
         minimumDistinctAlbums: 7,
@@ -306,14 +304,6 @@ databaseDescribe("Pipeline V3 expand foundation", () => {
         avoidAdjacentSameAlbum: true,
       },
       softGoalRelaxationOrder: ["album_concentration", "artist_concentration"],
-      criticalAmbiguities: [],
-      recordingPolicy: {
-        allowedVersions: ["canonical"],
-        preferCanonicalStudio: true,
-        excludeKaraokeTributeAndCovers: true,
-      },
-      confirmed: true,
-      resolvedAmbiguityKeys: [],
     } satisfies SelectionPlanV3;
     const selectionPlanHash = selectionPlanV3Hash(selectionPlanJson);
     await pool.query(

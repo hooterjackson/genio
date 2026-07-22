@@ -35,6 +35,9 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
     listResearchContainers: (...args: Parameters<ResearchRepository["listResearchContainers"]>) => source.listResearchContainers(...args),
     getResearchCheckpoint: (...args: Parameters<ResearchRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<ResearchRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
+    claimPipelineV3SemanticRecovery: (
+      ...args: Parameters<ResearchRepository["claimPipelineV3SemanticRecovery"]>
+    ) => source.claimPipelineV3SemanticRecovery(...args),
     persistPipelineV3RetrievalResult: (
       ...args: Parameters<ResearchRepository["persistPipelineV3RetrievalResult"]>
     ) => source.persistPipelineV3RetrievalResult(...args),

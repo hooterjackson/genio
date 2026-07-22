@@ -10,7 +10,11 @@ const migrationFiles = readdirSync(migrationDirectory)
   .filter((file) => /^\d+_.+\.sql$/u.test(file))
   .sort();
 const legacyMigrationSql = migrationFiles
-  .filter((file) => file !== "0012_pipeline_v2_foundation.sql" && file !== "0013_corpus_first_v3_foundation.sql")
+  // Reconstruct the database exactly as it existed immediately before 0012.
+  // Excluding named migrations is not sufficient once later migrations are
+  // added: those later files can advance the fixture all the way to the
+  // current schema before the migration under test is applied.
+  .filter((file) => file < "0012_")
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
 const pipelineV2MigrationSql = readFileSync(

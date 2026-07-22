@@ -5874,4 +5874,55 @@ databaseDescribe("hosted backend integration", () => {
       compatibleCapacity: 2,
     });
   });
+
+  test("system health requires protocol-compatible capacity in both worker lanes", async () => {
+    vi.stubEnv("WORKER_STALE_SECONDS", "90");
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    await repository.pool.query("DELETE FROM worker_heartbeats");
+    await repository.updateWorkerHeartbeat("deep-v8", {
+      schemaVersion: DATABASE_SCHEMA_VERSION,
+      schemaMinimum: DATABASE_SCHEMA_VERSION,
+      schemaMaximum: DATABASE_SCHEMA_VERSION,
+      schemaPreferred: DATABASE_SCHEMA_VERSION,
+      observedSchemaVersion: DATABASE_SCHEMA_VERSION,
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      queueClass: "deep",
+      capacity: 1,
+      activeJobs: 0,
+    });
+
+    const deepOnly = await repository.getSystemHealth();
+    expect(deepOnly.workerLanes.deep).toMatchObject({
+      worker_id: "deep-v8",
+      ready: true,
+      compatibleCapacity: 1,
+    });
+    expect(deepOnly.workerLanes.interactive).toMatchObject({
+      ready: false,
+      compatibleCapacity: 0,
+    });
+
+    await repository.updateWorkerHeartbeat("interactive-v8", {
+      schemaVersion: DATABASE_SCHEMA_VERSION,
+      schemaMinimum: DATABASE_SCHEMA_VERSION,
+      schemaMaximum: DATABASE_SCHEMA_VERSION,
+      schemaPreferred: DATABASE_SCHEMA_VERSION,
+      observedSchemaVersion: DATABASE_SCHEMA_VERSION,
+      protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      queueClass: "interactive",
+      capacity: 2,
+      activeJobs: 0,
+    });
+    const bothLanes = await repository.getSystemHealth();
+    expect(bothLanes.workerLanes.interactive).toMatchObject({
+      worker_id: "interactive-v8",
+      ready: true,
+      compatibleCapacity: 2,
+    });
+    expect(bothLanes.workerLanes.deep).toMatchObject({
+      worker_id: "deep-v8",
+      ready: true,
+      compatibleCapacity: 1,
+    });
+  });
 });

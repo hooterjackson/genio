@@ -4,8 +4,11 @@ import {
   criticalGuidanceQuestionsV3,
   createRunSpecV3,
   resolveRunSpecV3,
+  type RunSpecV3Input,
 } from "../server/selection-plan-v3.ts";
 import { evaluateCandidateMembershipV3 } from "../server/pipeline-v3-policy.ts";
+import type { SelectionConstraint } from "../shared/types.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "../server/music-concepts-v3.ts";
 
 function genreCandidateMemberships(genres: readonly string[]) {
   return {
@@ -21,6 +24,19 @@ function genreCandidateMemberships(genres: readonly string[]) {
   };
 }
 
+function typedPlan(constraints: readonly SelectionConstraint[]): NonNullable<RunSpecV3Input["typedSelectionPlan"]> {
+  return {
+    intents: ["genre_scene"],
+    scopeKind: "broad_curated",
+    constraints: constraints.map((constraint) => ({ ...constraint, values: [...constraint.values] })),
+    diversityGoals: { minimumDistinctArtists: 10, minimumDistinctAlbums: null, minimumDistinctEras: null, minimumDistinctScenes: null, minimumDistinctGeographies: null, maximumTracksPerArtist: null, maximumTracksPerAlbum: null },
+    versionPolicy: { preferred: ["canonical"], allowed: ["canonical"], excludeCompilations: false, excludeKaraokeAndTributes: true },
+    orderingPolicy: { mode: "editorial", goals: [], avoidAdjacentSameArtist: true, avoidAdjacentSameAlbum: true },
+    softGoalRelaxationOrder: [],
+    contentPolicy: { explicitContent: "allow", instrumental: "allow", languages: [] },
+  };
+}
+
 describe("Pipeline V3 typed planning", () => {
   test("collapses baile funk aliases and ranks ordinary TikTok breakout context", () => {
     const spec = createRunSpecV3({
@@ -29,7 +45,7 @@ describe("Pipeline V3 typed planning", () => {
     });
     const genres = spec.membershipPredicates.filter((item) => item.axis === "genre");
     expect(genres).toHaveLength(1);
-    expect(genres[0]?.values).toEqual(["funk carioca", "baile funk", "Brazilian funk"]);
+    expect(genres[0]?.values).toEqual(["funk carioca", "baile funk"]);
     expect(spec.membershipPredicates.some((item) => item.axis === "theme")).toBe(false);
     expect(spec.rankingObjectives).toContainEqual(expect.objectContaining({
       dimension: "relevance",
@@ -37,8 +53,10 @@ describe("Pipeline V3 typed planning", () => {
     }));
     expect(spec.semanticAudit).toMatchObject({
       passed: true,
+      musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
       aliasCollapses: ["baile funk|funk carioca=>funk carioca"],
     });
+    expect(spec.musicConceptPolicyVersion).toBe(MUSIC_CONCEPT_POLICY_VERSION);
     expect(spec.userGoal?.requestedTrackCount).toBe(69);
   });
 
@@ -58,28 +76,108 @@ describe("Pipeline V3 typed planning", () => {
     const spec = createRunSpecV3({
       prompt: "69 baile funk TikTok breakouts",
       requestedTrackCount: 69,
-      typedSelectionPlan: {
-        intents: ["genre_scene"],
-        scopeKind: "broad_curated",
-        constraints: [
+      typedSelectionPlan: typedPlan([
           { id: "genre", axis: "genre", operator: "require", values: ["baile funk", "funk"], kind: "hard", relaxationRank: null },
           { id: "evidence", axis: "evidence", operator: "require", values: ["strong TikTok evidence"], kind: "hard", relaxationRank: null },
           { id: "version", axis: "recording_version", operator: "require", values: ["the primary viral upload"], kind: "hard", relaxationRank: null },
           { id: "prefer-br", axis: "geography", operator: "prefer", values: ["Brazil"], kind: "soft", relaxationRank: 1 },
           { id: "avoid-br", axis: "geography", operator: "avoid", values: ["Brazil"], kind: "soft", relaxationRank: 2 },
-        ],
-        diversityGoals: { minimumDistinctArtists: 10, minimumDistinctAlbums: null, minimumDistinctEras: null, minimumDistinctScenes: null, minimumDistinctGeographies: null, maximumTracksPerArtist: null, maximumTracksPerAlbum: null },
-        versionPolicy: { preferred: ["canonical"], allowed: ["canonical"], excludeCompilations: false, excludeKaraokeAndTributes: true },
-        orderingPolicy: { mode: "editorial", goals: [], avoidAdjacentSameArtist: true, avoidAdjacentSameAlbum: true },
-        softGoalRelaxationOrder: [],
-        contentPolicy: { explicitContent: "allow", instrumental: "allow", languages: [] },
-      },
+      ]),
     });
     expect(spec.hardConstraints.map(({ axis }) => axis).sort()).toEqual(["genre"]);
     expect(spec.softPreferences.map(({ id }) => id)).toEqual(["prefer-br"]);
     expect(spec.membershipPredicates.filter(({ axis }) => axis === "genre")).toHaveLength(1);
     expect(spec.membershipPredicates.find(({ axis }) => axis === "genre")?.values)
-      .toEqual(["funk carioca", "baile funk", "Brazilian funk"]);
+      .toEqual(["funk carioca", "baile funk"]);
+  });
+
+  test("replays the Rio disco incident without turning listener context or generated prose into evidence gates", () => {
+    const prompt = "Rio Disco Classics: An exact 49-track playlist of iconic disco songs that someone born around 1960 in Rio de Janeiro would likely have grown up hearing in discoteques and nightlife settings.";
+    const spec = createRunSpecV3({
+      prompt,
+      requestedTrackCount: 49,
+      typedSelectionPlan: typedPlan([
+        { id: "scope_1", axis: "genre", operator: "require", values: ["disco"], kind: "hard", relaxationRank: null },
+        { id: "scope_2", axis: "geography", operator: "require", values: ["Rio de Janeiro"], kind: "hard", geographyRelationship: "unspecified", relaxationRank: null },
+        { id: "scope_3", axis: "era", operator: "within", values: ["1960s onward"], kind: "hard", relaxationRank: null },
+        { id: "evidence_1", axis: "evidence", operator: "require", values: ["documented cultural relevance"], kind: "hard", relaxationRank: null },
+        { id: "version_1", axis: "recording_version", operator: "require", values: ["prefer the historically canonical version"], kind: "hard", relaxationRank: null },
+      ]),
+    });
+
+    expect(spec.requestedTrackCount).toBe(49);
+    expect(spec.membershipPredicates).toEqual([
+      expect.objectContaining({ axis: "genre", operator: "require", values: ["disco"] }),
+    ]);
+    expect(spec.hardConstraints.map(({ axis }) => axis)).toEqual(["genre"]);
+    expect(spec.contextSignals).toContainEqual(expect.objectContaining({
+      role: "context",
+      axis: "geography",
+      values: ["Rio de Janeiro"],
+    }));
+    expect(spec.catalogPolicies).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "era", operator: "prefer", explicitUserAuthored: false }),
+      expect.objectContaining({ axis: "recording_version", operator: "prefer", explicitUserAuthored: false }),
+    ]));
+    expect(spec.recordingPolicy.allowedVersions).toEqual(["canonical", "clean", "explicit"]);
+    expect(spec.semanticClauses.filter(({ role }) => role === "membership").every(({ axis }) => (
+      !["geography", "era", "recording_version", "evidence"].includes(axis)
+    ))).toBe(true);
+  });
+
+  test("does not let generated compatibility prose change the explicit user-constraint hash", () => {
+    const prompt = "49 iconic disco songs heard in Rio nightlife";
+    const base = createRunSpecV3({ prompt, requestedTrackCount: 49 });
+    const compatibility = createRunSpecV3({
+      prompt,
+      requestedTrackCount: 49,
+      typedSelectionPlan: typedPlan([
+        { id: "evidence_99", axis: "evidence", operator: "require", values: ["some generated evidence prose"], kind: "hard", relaxationRank: null },
+        { id: "version_99", axis: "recording_version", operator: "require", values: ["some generated version prose"], kind: "hard", relaxationRank: null },
+        { id: "scope_99", axis: "era", operator: "within", values: ["1960s onward"], kind: "hard", relaxationRank: null },
+      ]),
+    });
+    expect(compatibility.explicitUserConstraintHash).toBe(base.explicitUserConstraintHash);
+    expect(compatibility.semanticAudit?.hardConstraintHash).toBe(base.semanticAudit?.hardConstraintHash);
+  });
+
+  test.each([
+    ["Only tracks by artists born in France", "geography", "France", "artist_origin"],
+    ["Only tracks by artists living in Berlin", "geography", "Berlin", "artist_residence"],
+    ["Only tracks recorded in Rio de Janeiro", "geography", "Rio de Janeiro", "recording_location"],
+    ["Only Portuguese-language tracks", "language", "Portuguese", "language"],
+  ] as const)("keeps an explicit geographic or language relationship hard: %s", (prompt, axis, value, relationship) => {
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 25 });
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis,
+      values: [value],
+      geographyRelationship: relationship,
+    }));
+    if (axis === "geography") {
+      expect(spec.contextSignals.some((signal) => signal.values.includes(value))).toBe(false);
+    }
+  });
+
+  test("enforces an explicit live-only request as catalog policy rather than evidence membership", () => {
+    const spec = createRunSpecV3({ prompt: "25 jazz tracks, only live versions", requestedTrackCount: 25 });
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "recording_version" || axis === "content")).toBe(false);
+    expect(spec.catalogPolicies).toContainEqual(expect.objectContaining({
+      axis: "recording_version",
+      role: "catalog_policy",
+      explicitUserAuthored: true,
+    }));
+    expect(spec.recordingPolicy.allowedVersions).toEqual(["live"]);
+  });
+
+  test.each([
+    ["Disco for a Paris dinner", "Paris"],
+    ["Disco for driving through Los Angeles", "Los Angeles"],
+    ["Disco popular with listeners in Brazil", "Brazil"],
+  ] as const)("keeps listening setting geography as context: %s", (prompt, geography) => {
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 25 });
+    expect(spec.contextSignals).toContainEqual(expect.objectContaining({ values: [geography] }));
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "geography")).toBe(false);
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({ axis: "genre", values: ["disco"] }));
   });
 
   test("separates house music from a lyrical theme about houses", () => {
@@ -89,7 +187,7 @@ describe("Pipeline V3 typed planning", () => {
     expect(genre.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "genre",
       operator: "require",
-      values: ["house"],
+      values: ["house music", "house"],
     }));
 
     const theme = createRunSpecV3({ prompt: "25 songs about houses and homes", requestedTrackCount: 25 });
@@ -173,8 +271,11 @@ describe("Pipeline V3 typed planning", () => {
     expect(baile.criticalAmbiguities).toEqual([]);
     expect(baile.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "genre",
-      values: ["funk carioca", "baile funk", "Brazilian funk"],
+      values: ["funk carioca", "baile funk"],
     }));
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["funk carioca"]), baile.membershipPredicates).eligible).toBe(true);
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["baile funk"]), baile.membershipPredicates).eligible).toBe(true);
+    expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["Brazilian funk"]), baile.membershipPredicates).eligible).toBe(false);
 
     const seventies = createRunSpecV3({ prompt: "1970s Brazilian soul and funk", requestedTrackCount: 50 });
     expect(seventies.criticalAmbiguities).toEqual([]);
@@ -211,7 +312,7 @@ describe("Pipeline V3 typed planning", () => {
       axis === "genre" && operator === "require"
     ));
     expect(genrePredicates).toHaveLength(1);
-    expect(genrePredicates[0]).toMatchObject({ values: ["disco", "house"] });
+    expect(genrePredicates[0]).toMatchObject({ values: ["disco", "house music", "house"] });
     expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["disco"]), spec.membershipPredicates).eligible).toBe(true);
     expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["house"]), spec.membershipPredicates).eligible).toBe(true);
     expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["techno"]), spec.membershipPredicates).eligible).toBe(false);
@@ -226,7 +327,7 @@ describe("Pipeline V3 typed planning", () => {
     const genrePredicates = spec.membershipPredicates.filter(({ axis, operator }) => (
       axis === "genre" && operator === "require"
     ));
-    expect(genrePredicates.map(({ values }) => values)).toEqual([["disco"], ["house"]]);
+    expect(genrePredicates.map(({ values }) => values)).toEqual([["disco"], ["house music", "house"]]);
     expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["disco"]), spec.membershipPredicates).eligible).toBe(false);
     expect(evaluateCandidateMembershipV3(genreCandidateMemberships(["disco", "house"]), spec.membershipPredicates).eligible).toBe(true);
   });
@@ -238,13 +339,9 @@ describe("Pipeline V3 typed planning", () => {
     ["Detroit techno essentials", "techno", "Detroit techno"],
     ["Chicago house classics", "house", "Chicago house"],
     ["UK drill essentials", "drill", "UK drill"],
-  ] as const)("preserves geographic scene scope without replacing the generic genre: %s", (prompt, genre, scene) => {
+  ] as const)("represents a recognized geographic genre as one scene concept: %s", (prompt, _genre, scene) => {
     const spec = createRunSpecV3({ prompt, requestedTrackCount: 50 });
-    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
-      axis: "genre",
-      operator: "require",
-      values: [genre],
-    }));
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "genre")).toBe(false);
     expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "scene",
       operator: "require",
@@ -258,11 +355,7 @@ describe("Pipeline V3 typed planning", () => {
       prompt: "50 Detroit techno and Chicago house tracks",
       requestedTrackCount: 50,
     });
-    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
-      axis: "genre",
-      operator: "require",
-      values: ["house", "techno"],
-    }));
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "genre")).toBe(false);
     expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "scene",
       operator: "require",

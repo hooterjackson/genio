@@ -51,6 +51,59 @@ function eraPlan(): Pick<SelectionPlanV3, "hardConstraints" | "membershipPredica
 }
 
 describe("Pipeline V3 catalog era policy", () => {
+  test("enforces an explicit schema-2 era catalog policy without legacy membership projection", () => {
+    const plan = {
+      membershipPredicates: [{
+        id: "genre-disco",
+        axis: "genre" as const,
+        operator: "require" as const,
+        values: ["disco"],
+        source: "user" as const,
+        reason: "Requested genre.",
+      }],
+      hardConstraints: [],
+      catalogPolicies: [{
+        id: "catalog-era-1970s",
+        role: "catalog_policy" as const,
+        axis: "era" as const,
+        operator: "within" as const,
+        values: ["1970s"],
+        source: "raw_prompt" as const,
+        explicitUserAuthored: true,
+        geographyRelationship: null,
+        reason: "Explicit era.",
+      }],
+    };
+
+    expect(catalogEraPoliciesV3(plan)).toEqual([{
+      id: "catalog-era-1970s",
+      constraint: { operator: "within", values: ["1970s"] },
+      excluded: false,
+    }]);
+    expect(catalogEraConstraintFailuresV3(plan, 1978)).toEqual([]);
+    expect(catalogEraConstraintFailuresV3(plan, 1981)).toEqual(["catalog-era-1970s"]);
+  });
+
+  test("does not turn generated era preference prose into a hard catalog gate", () => {
+    const plan = {
+      membershipPredicates: [],
+      hardConstraints: [],
+      catalogPolicies: [{
+        id: "generated-era-preference",
+        role: "catalog_policy" as const,
+        axis: "era" as const,
+        operator: "prefer" as const,
+        values: ["1970s"],
+        source: "v2_compatibility" as const,
+        explicitUserAuthored: false,
+        geographyRelationship: null,
+        reason: "Generated preference.",
+      }],
+    };
+    expect(catalogEraPoliciesV3(plan)).toEqual([]);
+    expect(catalogEraConstraintFailuresV3(plan, null)).toEqual([]);
+  });
+
   test("keeps genre in the evidence contract but evaluates era from catalog metadata", () => {
     const plan = eraPlan();
     expect(evidenceMembershipPredicateIdsV3(plan)).toEqual(["genre-disco"]);

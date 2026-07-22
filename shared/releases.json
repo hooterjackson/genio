@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.1.2",
+      "releasedAt": "2026-07-22",
+      "title": "Scope-gate safety and protocol bridge",
+      "notes": [
+        "Treats listener-market, nightlife, occasion, and audience geography as discovery and ranking context unless the request explicitly requires origin, residence, recording location, language, label, venue, or documented scene membership.",
+        "Enforces era, recording version, content, and storefront playability through catalog policy instead of requiring editorial sources to repeat those constraints.",
+        "Removes generated evidence and version prose from membership, eliminates duplicate compatibility constraints, and preserves the user's explicit constraint hash across interpretation.",
+        "Deploys protocol-8 workers that continue processing schema-1 plans and are ready for immutable schema-2 activation in a separately approved release.",
+        "Prepares predicate diagnostics and restart-safe one-shot recovery behind the schema-2 activation gate, while adding retry under an updated interpretation and a first-load interaction guard for the playlist composer."
+      ]
+    },
+    {
       "version": "2.1.1",
       "releasedAt": "2026-07-21",
       "title": "Source-alias and qualifier recovery",

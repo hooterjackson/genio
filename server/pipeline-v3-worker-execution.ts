@@ -21,8 +21,11 @@ import {
   type RetrievalRoutingHintsV3,
 } from "./pipeline-v3-retrieval.ts";
 import { queryPlanV3Hash } from "./query-plan-v3.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import {
   PIPELINE_V3_VERSION,
+  SEMANTIC_PLAN_V3_1_VERSION,
+  SEMANTIC_SCOPE_POLICY_VERSION,
   SELECTION_PLAN_V3_SCHEMA_VERSION,
   SELECTION_PLAN_V3_VERSION,
   type IntentV3,
@@ -30,6 +33,7 @@ import {
   type MembershipOperatorV3,
   type RankingDimensionV3,
   type RankingObjectiveV3,
+  type SemanticPlanClauseV32,
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import { stableStringify } from "./security.ts";
@@ -37,6 +41,7 @@ import type {
   ColdCorpusBuilderPortV3,
   ColdCorpusBuildResultV3,
 } from "./pipeline-v3-corpus-builder.ts";
+import type { SemanticPlanRevisionArtifactV3 } from "./pipeline-v3-semantic-recovery.ts";
 
 /**
  * Durable worker boundary for Pipeline V3 retrieval.
@@ -73,6 +78,17 @@ export interface PipelineV3WorkerRepository {
     phase?: string;
     error?: string | null;
   }, fence?: PipelineV3WriteFence): Promise<void>;
+  /**
+   * Claim the sole semantics-preserving recovery revision before any repaired
+   * requalification begins. Exact replays are idempotent; conflicting replays
+   * are integrity failures.
+   */
+  claimPipelineV3SemanticRecovery(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    revision: SemanticPlanRevisionArtifactV3;
+    fence: PipelineV3WriteFence;
+  }): Promise<{ status: "claimed" | "replayed"; revision: 2 }>;
   /**
    * Persist the governed result as one immutable, revision-bound manifest.
    * The repository owns the exact-publication handoff; retrieval itself never
@@ -115,6 +131,9 @@ export interface PipelineV3RetrievalExecutionInput {
    * policy because retries can execute on a different worker revision.
    */
   policy: RetrievalPolicyV3;
+  /** True only for immutable query-plan schema-2 work. */
+  semanticRecoveryEnabled: boolean;
+  claimSemanticRecovery: (revision: SemanticPlanRevisionArtifactV3) => Promise<void>;
   continuation?: RetrievalContinuationSeedV3;
   signal?: AbortSignal;
 }
@@ -287,6 +306,11 @@ export function selectionPlanFromQueryPlanV3(
   queryPlan: QueryPlanV3,
   run: { prompt?: string; brief?: { title?: string; description?: string } },
 ): SelectionPlanV3 {
+  if (queryPlan.schemaVersion === 2
+    && (queryPlan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
+      || queryPlan.semanticAuditMetadata?.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION)) {
+    throw new Error("Pipeline V3 schema-2 query plan uses an unsupported music-concept policy");
+  }
   const target = Number(queryPlan.targetTrackCount);
   if (!Number.isSafeInteger(target) || target < 1 || target > 300) {
     throw new Error("Pipeline V3 query plan has an invalid requested track count");
@@ -294,7 +318,7 @@ export function selectionPlanFromQueryPlanV3(
   if (!/^[a-z]{2}$/u.test(queryPlan.storefront)) {
     throw new Error("Pipeline V3 query plan has an invalid storefront");
   }
-  const membershipPredicates = queryPlan.membershipPredicates.map((predicate) => {
+  const legacyMembershipPredicates = queryPlan.membershipPredicates.map((predicate) => {
     const axis = MEMBERSHIP_AXES.has(predicate.kind as MembershipAxisV3)
       ? predicate.kind as MembershipAxisV3
       : predicate.kind === "relationship"
@@ -319,6 +343,50 @@ export function selectionPlanFromQueryPlanV3(
       reason: `Persisted query-plan membership predicate ${predicate.id}.`,
     };
   });
+  const legacySemanticClauses: SemanticPlanClauseV32[] = legacyMembershipPredicates.map((predicate) => ({
+    id: predicate.id,
+    role: "membership",
+    axis: predicate.axis,
+    operator: predicate.operator,
+    values: [...predicate.values],
+    source: "v2_compatibility",
+    explicitUserAuthored: false,
+    geographyRelationship: null,
+    reason: predicate.reason,
+  }));
+  const semanticClauses: SemanticPlanClauseV32[] = queryPlan.schemaVersion === 2
+    ? queryPlan.semanticClauses!.map((clause) => ({
+        ...clause,
+        axis: clause.axis as SemanticPlanClauseV32["axis"],
+        operator: clause.operator as SemanticPlanClauseV32["operator"],
+        values: [...clause.values],
+      }))
+    : legacySemanticClauses;
+  const membershipPredicates = queryPlan.schemaVersion === 2
+    ? semanticClauses.filter((clause) => clause.role === "membership").map((clause) => {
+        const axis = MEMBERSHIP_AXES.has(clause.axis as MembershipAxisV3)
+          ? clause.axis as MembershipAxisV3
+          : clause.axis === "relationship"
+            ? "factual_relationship" as const
+            : null;
+        const operator = MEMBERSHIP_OPERATORS.has(clause.operator as MembershipOperatorV3)
+          ? clause.operator as MembershipOperatorV3
+          : null;
+        if (!axis || !operator || clause.values.length === 0) {
+          throw new Error(`Pipeline V3 schema-2 query plan contains an unsupported membership clause: ${clause.id}`);
+        }
+        return {
+          id: clause.id,
+          axis,
+          operator,
+          values: [...clause.values],
+          source: clause.source === "guided_answer" ? "guided_answer" as const
+            : clause.source === "raw_prompt" || clause.explicitUserAuthored ? "user" as const
+              : "system_safety" as const,
+          reason: clause.reason,
+        };
+      })
+    : legacyMembershipPredicates;
   const rankingObjectives: RankingObjectiveV3[] = queryPlan.rankingObjectives.map((objective) => {
     const dimension = RANKING_DIMENSIONS.has(objective.kind as RankingDimensionV3)
       ? objective.kind as RankingDimensionV3
@@ -355,6 +423,35 @@ export function selectionPlanFromQueryPlanV3(
   const orderingPolicy = queryPlan.orderingPolicy
     ? { ...queryPlan.orderingPolicy, goals: [...queryPlan.orderingPolicy.goals] }
     : defaultOrderingPolicy(scopeKind);
+  const semanticHardConstraintHash = queryPlan.schemaVersion === 2
+    ? queryPlan.hardConstraintHash!
+    : createHash("sha256").update(stableStringify(membershipPredicates.map(({ axis, operator, values }) => ({
+        axis,
+        operator,
+        values: values.map((value) => value.normalize("NFKC").trim().toLowerCase()).sort(),
+      })))).digest("hex");
+  const explicitUserConstraintHash = queryPlan.schemaVersion === 2
+    ? queryPlan.explicitUserConstraintHash!
+    : createHash("sha256").update(stableStringify({
+        schemaVersion: 1,
+        selectionPlanHash: queryPlan.selectionPlanHash,
+      })).digest("hex");
+  const contextSignals = queryPlan.schemaVersion === 2
+    ? queryPlan.contextSignals!.map((clause) => ({
+        ...clause,
+        axis: clause.axis as SemanticPlanClauseV32["axis"],
+        operator: clause.operator as SemanticPlanClauseV32["operator"],
+        values: [...clause.values],
+      }))
+    : [];
+  const catalogPolicies = queryPlan.schemaVersion === 2
+    ? queryPlan.catalogPolicies!.map((clause) => ({
+        ...clause,
+        axis: clause.axis as SemanticPlanClauseV32["axis"],
+        operator: clause.operator as SemanticPlanClauseV32["operator"],
+        values: [...clause.values],
+      }))
+    : [];
   const plan: SelectionPlanV3 = {
     schemaVersion: SELECTION_PLAN_V3_SCHEMA_VERSION,
     pipelineVersion: PIPELINE_V3_VERSION,
@@ -382,10 +479,32 @@ export function selectionPlanFromQueryPlanV3(
           "subgenre_regional_representation",
         ],
     criticalAmbiguities: [],
-    recordingPolicy: {
-      allowedVersions: ["canonical", "clean", "explicit"],
-      preferCanonicalStudio: true,
-      excludeKaraokeTributeAndCovers: true,
+    recordingPolicy: queryPlan.schemaVersion === 2
+      ? {
+          allowedVersions: [...queryPlan.recordingPolicy!.allowedVersions],
+          preferCanonicalStudio: queryPlan.recordingPolicy!.preferCanonicalStudio,
+          excludeKaraokeTributeAndCovers: queryPlan.recordingPolicy!.excludeKaraokeTributeAndCovers,
+        }
+      : {
+          allowedVersions: ["canonical", "clean", "explicit"],
+          preferCanonicalStudio: true,
+          excludeKaraokeTributeAndCovers: true,
+        },
+    semanticPolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
+    musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
+    semanticClauses,
+    contextSignals,
+    catalogPolicies,
+    explicitUserConstraintHash,
+    semanticAudit: {
+      version: SEMANTIC_PLAN_V3_1_VERSION,
+      musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
+      passed: true,
+      hardConstraintHash: semanticHardConstraintHash,
+      aliasCollapses: queryPlan.schemaVersion === 2
+        ? [...queryPlan.semanticAuditMetadata!.aliasCollapses]
+        : [],
+      contradictions: [],
     },
     confirmed: true,
     resolvedAmbiguityKeys: [],
@@ -427,6 +546,8 @@ export function createPipelineV3RetrievalExecutionPort(input: {
         executionMode: request.executionMode,
         routingHints: request.routingHints,
         modelRoute: request.modelRoute,
+        semanticRecoveryEnabled: request.semanticRecoveryEnabled,
+        claimSemanticRecovery: request.claimSemanticRecovery,
         policy: request.policy,
         continuation: request.continuation,
       });
@@ -935,16 +1056,54 @@ export class PipelineV3WorkerExecution {
       }, fence);
       return;
     }
-    const result = await this.retrieval.execute({
-      runId: input.runId,
-      plan,
-      executionMode: mode,
-      routingHints: { fixedContainer: input.queryPlan.engines.includes("fixed_container") },
-      modelRoute,
-      policy: retrievalPolicy,
-      continuation,
-      signal: input.signal,
-    });
+    let result: RetrievalResultV3;
+    try {
+      result = await this.retrieval.execute({
+        runId: input.runId,
+        plan,
+        executionMode: mode,
+        routingHints: { fixedContainer: input.queryPlan.engines.includes("fixed_container") },
+        modelRoute,
+        semanticRecoveryEnabled: input.queryPlan.schemaVersion === 2,
+        policy: retrievalPolicy,
+        continuation,
+        claimSemanticRecovery: async (revision) => {
+          abortIfNeeded(input.signal);
+          await this.repository.claimPipelineV3SemanticRecovery({
+            runId: input.runId,
+            queryPlan: input.queryPlan,
+            revision,
+            fence,
+          });
+          abortIfNeeded(input.signal);
+        },
+        signal: input.signal,
+      });
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error
+        ? String((error as { code?: unknown }).code ?? "")
+        : "";
+      if (code !== "pipeline_v3_semantic_recovery_conflict" && code !== "pipeline_v3_plan_stale") {
+        throw error;
+      }
+      abortIfNeeded(input.signal);
+      await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "failed_integrity",
+        stageKey,
+        queryPlanHash,
+        code: "v3_semantic_recovery_claim_conflict",
+        claimErrorCode: code,
+        failedAt: new Date().toISOString(),
+      }, fence);
+      abortIfNeeded(input.signal);
+      await this.repository.updateRun(input.runId, {
+        status: "failed_integrity",
+        phase: "v3_semantic_recovery_claim_conflict",
+        error: null,
+      }, fence);
+      return;
+    }
     abortIfNeeded(input.signal);
     const postflightCorpusReason = governedCorpusActionReasonV3(input.queryPlan, result);
     if (postflightCorpusReason) {

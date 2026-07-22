@@ -204,6 +204,36 @@ describe("Pipeline V3 immutable selection policy", () => {
     }));
   });
 
+  test("decodes schema-1 membership projections while schema 2 executes typed arrays", () => {
+    const plan = resolveRunSpecV3(createRunSpecV3({
+      prompt: "25 Berlin techno tracks excluding live versions",
+      requestedTrackCount: 25,
+    }), []);
+    const current = createQueryPlanV3(plan, GRAPH_SNAPSHOT_ID);
+    const schemaTwo = selectionPlanFromQueryPlanV3(current, { prompt: plan.prompt });
+    expect(schemaTwo.semanticClauses).toEqual(plan.semanticClauses);
+    expect(schemaTwo.explicitUserConstraintHash).toBe(plan.explicitUserConstraintHash);
+    expect(schemaTwo.recordingPolicy).toEqual(plan.recordingPolicy);
+
+    const schemaOne = {
+      ...current,
+      schemaVersion: 1 as const,
+      policyVersion: "corpus_first_v3_policy_v1" as const,
+      semanticPolicyVersion: undefined,
+      semanticClauses: undefined,
+      contextSignals: undefined,
+      catalogPolicies: undefined,
+      recordingPolicy: undefined,
+      explicitUserConstraintHash: undefined,
+      hardConstraintHash: undefined,
+      semanticAuditMetadata: undefined,
+    };
+    const legacy = selectionPlanFromQueryPlanV3(schemaOne, { prompt: plan.prompt });
+    expect(legacy.membershipPredicates.map(({ axis, operator, values }) => ({ axis, operator, values })))
+      .toEqual(plan.membershipPredicates.map(({ axis, operator, values }) => ({ axis, operator, values: [...values] })));
+    expect(legacy.semanticClauses.every(({ source }) => source === "v2_compatibility")).toBe(true);
+  });
+
   test("enforces hard per-artist and per-album maxima before target selection and never relaxes them", async () => {
     const hardArtistMaximum: SelectionConstraint = {
       id: "artist-cap",

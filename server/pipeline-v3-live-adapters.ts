@@ -43,6 +43,7 @@ import {
 import {
   evidenceMembershipPredicateIdsV3,
   evidenceMembershipPredicatesV3,
+  type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import {
   catalogEraConstraintFailuresV3,
@@ -53,6 +54,10 @@ import {
   catalogRecordingVersionSignature,
   recordingFamilyKey,
 } from "./pipeline-v2-policy.ts";
+import {
+  exactMusicConceptV3,
+  musicConceptEvidenceMatchesV3,
+} from "./music-concepts-v3.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
 
 /**
@@ -333,6 +338,17 @@ const CONTAINER_TEXT_AXES = new Set([
   "theme", "mood", "activity", "label", "venue",
 ]);
 
+/**
+ * Eligibility aliases and semantic evidence patterns are server-owned. The
+ * model may point at a citation, but it cannot invent alias equivalence or
+ * promote a broader discovery term into membership evidence.
+ */
+function evidenceTextSupportsMembershipValue(value: string, evidenceText: string): boolean {
+  if (containsNormalizedPhrase(normalized(evidenceText), value)) return true;
+  const concept = exactMusicConceptV3(value);
+  return concept !== null && musicConceptEvidenceMatchesV3(concept.id, evidenceText);
+}
+
 function textSupportedPredicateIds(
   request: Pick<DiscoveryRequestV3 | QualificationRequestV3, "plan">,
   value: string,
@@ -342,7 +358,7 @@ function textSupportedPredicateIds(
   return request.plan.membershipPredicates.flatMap((predicate) => (
     predicate.operator !== "exclude"
       && CONTAINER_TEXT_AXES.has(predicate.axis)
-      && predicate.values.some((expected) => containsNormalizedPhrase(haystack, expected))
+      && predicate.values.some((expected) => evidenceTextSupportsMembershipValue(expected, value))
       ? [predicate.id]
       : []
   ));
@@ -404,7 +420,6 @@ function editorialContainerMatches(request: DiscoveryRequestV3, playlist: AppleC
   // unrelated curator name. Only Apple's own editorial namespace may prove a
   // container-wide scope binding.
   if (curator !== "apple music" && !curator.startsWith("apple music ")) return false;
-  const haystack = normalized(`${playlist.name} ${playlist.description}`);
   const positivePredicates = evidenceMembershipPredicatesV3(request.plan)
     .filter((predicate) => CONTAINER_TEXT_AXES.has(predicate.axis));
   if (positivePredicates.length === 0) return false;
@@ -412,7 +427,10 @@ function editorialContainerMatches(request: DiscoveryRequestV3, playlist: AppleC
   // the container description; alternative values within one predicate are OR.
   return positivePredicates.every((predicate) => (
     predicate.values.length > 0
-    && predicate.values.some((value) => containsNormalizedPhrase(haystack, value))
+    && predicate.values.some((value) => evidenceTextSupportsMembershipValue(
+      value,
+      `${playlist.name} ${playlist.description}`,
+    ))
   ));
 }
 
@@ -713,7 +731,7 @@ function citationSupportedPredicateIds(
     predicate.operator !== "exclude"
       && claimed.has(predicate.id)
       && predicate.values.some((value) => local.some((citation) => (
-        containsNormalizedPhrase(citation.excerpt, value)
+        evidenceTextSupportsMembershipValue(value, citation.excerpt)
       )))
       ? [predicate.id]
       : []
@@ -1478,12 +1496,23 @@ function versionCompatible(song: CatalogSong, request: QualificationRequestV3): 
   const text = normalized(`${song.name} ${song.albumName} ${song.versionLabel ?? ""}`);
   if (request.plan.recordingPolicy.excludeKaraokeTributeAndCovers
     && /\b(?:karaoke|tribute|cover version|in the style of)\b/u.test(text)) return false;
-  const markers: Array<[string, string]> = [
+  const markers: Array<[string, Exclude<
+    SelectionPlanV3["recordingPolicy"]["allowedVersions"][number],
+    "clean" | "explicit"
+  >]> = [
     ["live", "live"], ["remix", "remix"], ["instrumental", "instrumental"],
     ["acoustic", "acoustic"], ["radio edit", "radio_edit"], ["extended", "extended"],
   ];
-  return markers.every(([marker, version]) => !text.includes(marker)
-    || request.plan.recordingPolicy.allowedVersions.includes(version as never));
+  const detected = markers.filter(([marker]) => text.includes(marker)).map(([, version]) => version);
+  const recordingVersions = request.plan.recordingPolicy.allowedVersions.filter((version) => (
+    version !== "clean" && version !== "explicit"
+  ));
+  // A content-only request (for example, "clean versions only") keeps the
+  // normal studio/canonical recording floor; it does not accidentally allow
+  // every live/remix/edit family.
+  const allowed = new Set(recordingVersions.length > 0 ? recordingVersions : ["canonical" as const]);
+  const actual = detected.length > 0 ? detected : ["canonical" as const];
+  return actual.every((version) => allowed.has(version));
 }
 
 /**
@@ -1496,11 +1525,32 @@ function contentCompatible(song: CatalogSong, request: QualificationRequestV3): 
   const rating = song.contentRating === "clean" || song.contentRating === "explicit"
     ? song.contentRating
     : null;
-  const predicates = request.plan.membershipPredicates.filter((predicate) => (
-    predicate.axis === "content"
+  const policies = [
+    // Schema 2: explicit content/version clauses are catalog policy only.
+    ...request.plan.catalogPolicies
+      .filter((clause) => (
+        clause.role === "catalog_policy"
+        && clause.explicitUserAuthored === true
+        && clause.operator !== "prefer"
+        && (clause.axis === "content" || clause.axis === "recording_version")
+      ))
+      .map((clause) => ({ operator: clause.operator, values: clause.values })),
+    // Schema 1 and focused compatibility callers may still carry content as
+    // evidence membership. Retain the historical fail-closed behavior.
+    ...request.plan.membershipPredicates
+      .filter((predicate) => predicate.axis === "content")
+      .map((predicate) => ({ operator: predicate.operator, values: predicate.values })),
+  ];
+
+  const recordingRatings = request.plan.recordingPolicy.allowedVersions.filter((version): version is "clean" | "explicit" => (
+    version === "clean" || version === "explicit"
   ));
-  for (const predicate of predicates) {
-    const policyText = normalized(predicate.values.join(" "));
+  if (recordingRatings.length === 1) {
+    policies.push({ operator: "require", values: recordingRatings });
+  }
+
+  for (const policy of policies) {
+    const policyText = normalized(policy.values.join(" "));
     const namedRatings = new Set<"clean" | "explicit">();
     if (/\bclean\b/u.test(policyText)) namedRatings.add("clean");
     if (/\bexplicit\b/u.test(policyText)) namedRatings.add("explicit");
@@ -1508,7 +1558,7 @@ function contentCompatible(song: CatalogSong, request: QualificationRequestV3): 
     // be handled by recording-version markers and their dedicated policies.
     if (namedRatings.size === 0) continue;
     if (rating === null) return false;
-    if (predicate.operator === "exclude") {
+    if (policy.operator === "exclude" || policy.operator === "avoid") {
       if (namedRatings.has(rating)) return false;
       continue;
     }
@@ -1543,6 +1593,18 @@ interface CatalogResolutionV3 {
    */
   compatibleReleaseYears: number[];
 }
+
+type AppleSongLookupByIsrcV3 = (
+  storefront: string,
+  isrc: string,
+  signal?: AbortSignal,
+) => Promise<CatalogSong[]>;
+
+type AppleSongSearchV3 = (
+  storefront: string,
+  query: string,
+  signal?: AbortSignal,
+) => Promise<CatalogSong[]>;
 
 function normalizedCatalogIsrc(song: Pick<CatalogSong, "isrc">): string | null {
   const value = song.isrc?.trim().toUpperCase().replace(/[^A-Z0-9]/gu, "") ?? "";
@@ -1582,8 +1644,8 @@ async function resolveCatalogSong(input: {
   candidate: RawTrackCandidateV3;
   metadata: LiveCandidateMetadataV3;
   request: QualificationRequestV3;
-  lookupByIsrc: typeof lookupAppleCatalogByIsrc;
-  searchSongs: typeof searchAppleCatalog;
+  lookupByIsrc: AppleSongLookupByIsrcV3;
+  searchSongs: AppleSongSearchV3;
 }): Promise<CatalogResolutionV3> {
   if (input.metadata.song) {
     const primary = input.metadata.song;
@@ -1777,9 +1839,28 @@ export function createPipelineV3LiveAdapters(
           confidence: 0,
           compatibleReleaseYears: [],
         };
+        let catalogLookupAttempted = false;
+        let appleProviderRequestCount = 0;
         if (metadata) {
           try {
-            resolved = await resolveCatalogSong({ candidate, metadata, request, lookupByIsrc, searchSongs });
+            catalogLookupAttempted = true;
+            resolved = await resolveCatalogSong({
+              candidate,
+              metadata,
+              request,
+              lookupByIsrc: async (storefront, isrc, signal) => {
+                appleProviderRequestCount += 1;
+                return signal
+                  ? lookupByIsrc(storefront, isrc, signal)
+                  : lookupByIsrc(storefront, isrc);
+              },
+              searchSongs: async (storefront, query, signal) => {
+                appleProviderRequestCount += 1;
+                return signal
+                  ? searchSongs(storefront, query, signal)
+                  : searchSongs(storefront, query);
+              },
+            });
           } catch (error) {
             providerErrors.push(error);
           }
@@ -1825,6 +1906,8 @@ export function createPipelineV3LiveAdapters(
           },
           version: { compatible, confidence: compatible ? 0.95 : 0 },
           catalog: {
+            lookupAttempted: catalogLookupAttempted,
+            appleProviderRequestCount,
             storefrontPlayable: Boolean(resolved.song),
             appleSongId: resolved.song?.id ?? null,
             recordingFamilyKey: resolved.song ? recordingFamily(resolved.song) : null,

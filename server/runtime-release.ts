@@ -7,10 +7,15 @@ import {
   PIPELINE_V3_MODEL_RESOLUTION_MODE,
   PIPELINE_V3_PROMPT_VERSION,
 } from "./pipeline-v3-policy.ts";
-import { QUERY_PLAN_V3_POLICY_VERSION } from "./query-plan-v3.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
+import {
+  QUERY_PLAN_V3_POLICY_VERSION,
+  queryPlanV3EmissionSchemaVersion,
+} from "./query-plan-v3.ts";
 import {
   PIPELINE_V3_POLICY_VERSION,
   SELECTION_PLAN_V3_VERSION,
+  SEMANTIC_SCOPE_POLICY_VERSION,
 } from "./selection-plan-v3.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
 
@@ -23,7 +28,10 @@ export interface RuntimeReleaseContract {
   schemaVersion: string;
   workerProtocol: string;
   selectionPlanVersion: string;
+  queryPlanSchemaVersion: string;
   queryPlanPolicyVersion: string;
+  semanticScopePolicyVersion: string;
+  musicConceptPolicyVersion: string;
   pipelinePolicyVersion: string;
   promptVersion: string;
   baselineProviderModelId: string;
@@ -65,7 +73,10 @@ export function runtimeReleaseContract(
     schemaVersion: DATABASE_SCHEMA_VERSION,
     workerProtocol: WORKER_PIPELINE_PROTOCOL_VERSION,
     selectionPlanVersion: SELECTION_PLAN_V3_VERSION,
+    queryPlanSchemaVersion: String(queryPlanV3EmissionSchemaVersion(environment)),
     queryPlanPolicyVersion: QUERY_PLAN_V3_POLICY_VERSION,
+    semanticScopePolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
+    musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
     pipelinePolicyVersion: PIPELINE_V3_POLICY_VERSION,
     promptVersion: PIPELINE_V3_PROMPT_VERSION,
     baselineProviderModelId: safeProviderModelId(

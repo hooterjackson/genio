@@ -52,6 +52,7 @@ import type {
 import {
   assignPipelineV3,
   createQueryPlanV3,
+  createRuntimeQueryPlanV3,
   isQueryPlanV3,
   queryPlanV3Hash,
 } from "./query-plan-v3.ts";
@@ -69,6 +70,11 @@ import {
 } from "./pipeline-v3-policy.ts";
 import type { PipelineV3WriteFence } from "./pipeline-v3-worker-execution.ts";
 import type { ColdCorpusBuildResultV3 } from "./pipeline-v3-corpus-builder.ts";
+import {
+  buildSemanticEquivalentRecoveryPlanV3,
+  PIPELINE_V3_SEMANTIC_RECOVERY_POLICY,
+  type SemanticPlanRevisionArtifactV3,
+} from "./pipeline-v3-semantic-recovery.ts";
 import {
   APPLE_WRITE_GATEWAY_EVENT_ACTION,
   APPLE_WRITE_GATEWAY_EVENT_BUCKET,
@@ -181,9 +187,11 @@ import type {
 } from "./apple-catalog-cache.ts";
 import { excludedReferenceArtists } from "./similarity-policy.ts";
 import {
+  CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL,
   isWorkerCapabilityValid,
   isWorkerPipelineProtocolCompatible,
   minimumWorkerProtocolForPipeline,
+  minimumWorkerProtocolForQueryPlan,
   WORKER_PIPELINE_CAPABILITY,
   type WorkerPipelineCapability,
   workerPipelineProtocolVersion,
@@ -537,9 +545,43 @@ function heartbeatSchemaCompatible(
     && heartbeatObservedSchemaVersion(row) === databaseSchemaVersion;
 }
 
+function heartbeatQueueClass(metadata: unknown): WorkerQueueClass {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return "interactive";
+  const queueClass = (metadata as Record<string, unknown>).queueClass;
+  return queueClass === "deep" || queueClass === "all" ? queueClass : "interactive";
+}
+
 function deterministicUuid(value: unknown): string {
   const hex = sha256Hex(stableStringify(value));
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function semanticPlanRevisionAuditJson(
+  revision: SemanticPlanRevisionArtifactV3,
+): Record<string, unknown> {
+  return {
+    policyVersion: PIPELINE_V3_SEMANTIC_RECOVERY_POLICY,
+    planHash: revision.planHash,
+    transformations: revision.transformations,
+    predicateProjection: revision.predicateProjection,
+  };
+}
+
+function semanticPlanRevisionMatches(input: {
+  revision: SemanticPlanRevisionArtifactV3;
+  stored: {
+    equivalence: string;
+    hard_constraint_hash: string;
+    plan_json: SelectionPlanV3;
+    audit_json: unknown;
+  };
+}): boolean {
+  return input.stored.equivalence === input.revision.equivalence
+    && input.stored.hard_constraint_hash === input.revision.hardConstraintHash
+    && stableStringify(input.stored.plan_json) === stableStringify(input.revision.plan)
+    && stableStringify(input.stored.audit_json) === stableStringify(
+      semanticPlanRevisionAuditJson(input.revision),
+    );
 }
 
 const APPLE_CATALOG_CACHE_RESOURCE_KINDS = new Set<AppleCatalogCacheResourceKind>([
@@ -1543,6 +1585,37 @@ function normalizedQueryPlanV3Invariant(
         ?? compatibilityFallback?.softGoalRelaxationOrder
         ?? []),
     ],
+    semanticPolicyVersion: queryPlan.semanticPolicyVersion
+      ?? compatibilityFallback?.semanticPolicyVersion
+      ?? null,
+    semanticClauses: (queryPlan.semanticClauses
+      ?? compatibilityFallback?.semanticClauses
+      ?? []).map((clause) => ({ ...clause, values: [...clause.values] })),
+    contextSignals: (queryPlan.contextSignals
+      ?? compatibilityFallback?.contextSignals
+      ?? []).map((clause) => ({ ...clause, values: [...clause.values] })),
+    catalogPolicies: (queryPlan.catalogPolicies
+      ?? compatibilityFallback?.catalogPolicies
+      ?? []).map((clause) => ({ ...clause, values: [...clause.values] })),
+    recordingPolicy: queryPlan.recordingPolicy
+      ? { ...queryPlan.recordingPolicy, allowedVersions: [...queryPlan.recordingPolicy.allowedVersions] }
+      : compatibilityFallback?.recordingPolicy
+        ? {
+          ...compatibilityFallback.recordingPolicy,
+          allowedVersions: [...compatibilityFallback.recordingPolicy.allowedVersions],
+        }
+        : null,
+    explicitUserConstraintHash: queryPlan.explicitUserConstraintHash
+      ?? compatibilityFallback?.explicitUserConstraintHash
+      ?? null,
+    hardConstraintHash: queryPlan.hardConstraintHash
+      ?? compatibilityFallback?.hardConstraintHash
+      ?? null,
+    semanticAuditMetadata: queryPlan.semanticAuditMetadata
+      ? { ...queryPlan.semanticAuditMetadata }
+      : compatibilityFallback?.semanticAuditMetadata
+        ? { ...compatibilityFallback.semanticAuditMetadata }
+        : null,
   };
 }
 
@@ -1587,6 +1660,48 @@ function queryPlanV3ExecutionProjection(
     diversityGoals: { ...plan.diversityGoals },
     orderingPolicy: { ...plan.orderingPolicy, goals: [...plan.orderingPolicy.goals] },
     softGoalRelaxationOrder: [...plan.softGoalRelaxationOrder],
+    // Schema-1 plans are immutable historical contracts. Never project the
+    // newer semantic shape onto them while they drain: doing so changes the
+    // normalized execution invariant even though their stored hash is valid.
+    ...(template.schemaVersion === 2 ? {
+      semanticPolicyVersion: plan.semanticPolicyVersion,
+      semanticClauses: plan.semanticClauses.map((clause) => ({
+        ...clause,
+        values: [...clause.values],
+        geographyRelationship: clause.geographyRelationship ?? null,
+      })),
+      contextSignals: plan.contextSignals.map((clause) => ({
+        ...clause,
+        values: [...clause.values],
+        geographyRelationship: clause.geographyRelationship ?? null,
+      })),
+      catalogPolicies: plan.catalogPolicies.map((clause) => ({
+        ...clause,
+        values: [...clause.values],
+        geographyRelationship: clause.geographyRelationship ?? null,
+      })),
+      recordingPolicy: {
+        ...plan.recordingPolicy,
+        allowedVersions: [...plan.recordingPolicy.allowedVersions],
+      },
+      explicitUserConstraintHash: plan.explicitUserConstraintHash,
+      hardConstraintHash: plan.semanticAudit?.hardConstraintHash ?? template.hardConstraintHash,
+      semanticAuditMetadata: template.semanticAuditMetadata == null
+        ? undefined
+        : {
+          ...template.semanticAuditMetadata,
+          semanticPolicyVersion: plan.semanticPolicyVersion,
+          explicitUserConstraintHash: plan.explicitUserConstraintHash,
+          hardConstraintHash: plan.semanticAudit?.hardConstraintHash
+            ?? template.semanticAuditMetadata.hardConstraintHash,
+          clauseCount: plan.semanticClauses.length,
+          membershipClauseCount: plan.semanticClauses.filter(({ role }) => role === "membership").length,
+          contextClauseCount: plan.contextSignals.length,
+          catalogPolicyClauseCount: plan.catalogPolicies.length,
+          aliasCollapses: [...(plan.semanticAudit?.aliasCollapses ?? [])],
+          contradictions: [...(plan.semanticAudit?.contradictions ?? [])],
+        },
+    } : {}),
   };
 }
 
@@ -2665,7 +2780,7 @@ export class Repository {
               "v3_snapshot_unavailable",
             );
           }
-          v3QueryPlan = createQueryPlanV3(selectionPlanV3, v3GraphSnapshotId);
+          v3QueryPlan = createRuntimeQueryPlanV3(selectionPlanV3, v3GraphSnapshotId);
         }
         const insertedRun = await client.query<{ created_at: Date }>(
           `INSERT INTO research_runs(
@@ -3080,6 +3195,33 @@ export class Repository {
         [input.runId],
       );
       const current = active.rows[0];
+      // A global schema-emission switch must never reinterpret an immutable
+      // active run. If the confirmed selection plan and graph snapshot are the
+      // same, the stored query plan remains authoritative even when the current
+      // compiler would emit a newer schema.
+      if (current
+        && current.selection_plan_hash === selectionPlanHash
+        && current.graph_snapshot_id === input.graphSnapshotId) {
+        if (current.status !== "active"
+          || !isQueryPlanV3(current.plan_json)
+          || queryPlanV3Hash(current.plan_json) !== current.plan_hash) {
+          throw new HttpError(500, "Existing Pipeline V3 plan failed integrity validation", "v3_query_plan_integrity");
+        }
+        await client.query(
+          `UPDATE research_runs SET pipeline_version='corpus_first_v3',
+             policy_version='corpus_first_v3_policy_v1',updated_at=now()
+           WHERE id=$1`,
+          [input.runId],
+        );
+        return {
+          runId: input.runId,
+          queryPlanRevisionId: current.id,
+          revision: current.revision,
+          queryPlan: current.plan_json,
+          planHash: current.plan_hash,
+          idempotent: true,
+        };
+      }
       if (current?.plan_hash === contract.planHash) {
         if (current.status !== "active"
           || current.graph_snapshot_id !== input.graphSnapshotId
@@ -3272,7 +3414,7 @@ export class Repository {
   async getRun(id: string): Promise<ResearchRunView & Record<string, unknown>> {
     const row = await this.getRunRow(id);
     if (!row) throw new HttpError(404, "Research run not found", "run_not_found");
-    const [counts, frontier, partialCheckpoint, explore, queryPlan] = await Promise.all([
+    const [counts, frontier, partialCheckpoint, semanticCheckpoint, explore, queryPlan] = await Promise.all([
       this.pool.query(
         `SELECT
           (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) candidate_count,
@@ -3350,6 +3492,7 @@ export class Repository {
       ),
       this.getFrontier(id),
       this.getResearchCheckpoint(id, "partial_ready"),
+      this.getResearchCheckpoint(id, "semantic_diagnostics"),
       this.getRunExplorePreference(id),
       this.getActiveQueryPlan(id),
     ]);
@@ -3363,6 +3506,9 @@ export class Repository {
       ? requestedTrackCount
       : null;
     const matchAccepted = progressCount(count.match_accepted);
+    const semanticDiagnostics = objectRecord(semanticCheckpoint);
+    const recovery = objectRecord(semanticDiagnostics?.semanticRecovery);
+    const rejectedByPredicate = objectRecord(semanticDiagnostics?.rejectedByPredicate);
     const progress: RunProgressView = {
       targetTrackCount,
       latestActivityAt: date(count.latest_activity_at)?.toISOString() ?? null,
@@ -3407,6 +3553,33 @@ export class Repository {
         currentVolume: progressOptionalCount(count.publication_current_volume),
         status: progressText(count.publication_status, 40) || null,
       },
+      ...(semanticDiagnostics ? {
+        semanticPolicyVersion: progressText(semanticDiagnostics.semanticPolicyVersion, 80) || undefined,
+        queryPlanSchemaVersion: progressOptionalCount(semanticDiagnostics.queryPlanSchemaVersion) ?? undefined,
+        explicitConstraintHash: typeof semanticDiagnostics.explicitConstraintHash === "string"
+          && /^[a-f0-9]{64}$/u.test(semanticDiagnostics.explicitConstraintHash)
+          ? semanticDiagnostics.explicitConstraintHash
+          : undefined,
+        contextSignals: Array.isArray(semanticDiagnostics.contextSignals)
+          ? semanticDiagnostics.contextSignals.slice(0, 20) as QueryPlanV3["contextSignals"]
+          : undefined,
+        rejectedByPredicate: rejectedByPredicate
+          ? Object.fromEntries(Object.entries(rejectedByPredicate).flatMap(([key, value]) => (
+            typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+              ? [[key.slice(0, 160), value] as const]
+              : []
+          )))
+          : undefined,
+        appleLookupCount: progressOptionalCount(semanticDiagnostics.appleLookupCount) ?? undefined,
+        appleProviderRequestCount: progressOptionalCount(semanticDiagnostics.appleProviderRequestCount) ?? undefined,
+        rootCause: progressText(semanticDiagnostics.rootCause, 80) || null,
+        semanticRecovery: recovery ? {
+          attempted: recovery.attempted === true,
+          attemptCount: progressCount(recovery.attemptCount),
+          repaired: recovery.repaired === true,
+        } : undefined,
+        activePlanRevision: progressOptionalCount(semanticDiagnostics.activePlanRevision) ?? undefined,
+      } : {}),
     };
     const partial = parsePartialReadyCheckpoint(partialCheckpoint);
     const partialAction = partial && ["partial_ready", "no_compatible_tracks"].includes(row.status)
@@ -4774,7 +4947,7 @@ export class Repository {
             stageExecutionKey: successorStageKey,
             reviewedGraphSnapshotId: input.reviewedGraphSnapshotId,
           }),
-          minimumWorkerProtocolForPipeline("corpus_first_v3"),
+          minimumWorkerProtocolForQueryPlan(successorPlan),
           successorId,
           successorStageKey,
         ],
@@ -8077,7 +8250,7 @@ export class Repository {
               stageExecutionKey: successorStageKey,
               continuationOutcomeHash: checkpoint.outcomeHash,
             }),
-            minimumWorkerProtocolForPipeline("corpus_first_v3"),
+            minimumWorkerProtocolForQueryPlan(successorPlan),
             successorId,
             successorStageKey,
             queueClass,
@@ -8324,6 +8497,7 @@ export class Repository {
     if (schemaVersion >= 14) {
       let pipelineVersion = input.pipelineVersion ?? "legacy_v1";
       let queryPlanRevisionId = input.queryPlanRevisionId ?? null;
+      let activeQueryPlan: QueryPlanV3 | null = null;
       let queueClass = defaultJobQueueClass({
         kind: input.kind,
         requested: input.queueClass,
@@ -8345,6 +8519,9 @@ export class Repository {
         if (run.rows[0]) {
           pipelineVersion = run.rows[0].pipeline_version;
           queryPlanRevisionId ??= run.rows[0].query_plan_revision_id;
+          if (pipelineVersion === "corpus_first_v3" && isQueryPlanV3(run.rows[0].query_plan_json)) {
+            activeQueryPlan = run.rows[0].query_plan_json;
+          }
           if (["research", "matching"].includes(input.kind)) {
             // The persisted plan is authoritative. Callers cannot smuggle a
             // curated or historical run onto the privileged deep lane merely
@@ -8365,8 +8542,16 @@ export class Repository {
           "v3_query_plan_required",
         );
       }
-      const minimumWorkerProtocol = input.minimumWorkerProtocol
-        ?? minimumWorkerProtocolForPipeline(pipelineVersion);
+      const pipelineMinimum = minimumWorkerProtocolForPipeline(pipelineVersion);
+      const planMinimum = pipelineVersion === "corpus_first_v3"
+        ? minimumWorkerProtocolForQueryPlan(activeQueryPlan)
+        : pipelineMinimum;
+      // A caller may request a newer worker for another reason, but can never
+      // downgrade schema-2 semantic work below protocol 8.
+      const minimumWorkerProtocol = Math.max(
+        input.minimumWorkerProtocol ?? pipelineMinimum,
+        planMinimum,
+      );
       const result = await this.pool.query<{
         id: string;
         inserted: boolean;
@@ -8465,6 +8650,34 @@ export class Repository {
     const publicationPriority = schemaVersion >= 14
       ? "WHEN candidate.queue_class='publication' THEN -1"
       : "";
+    // Schema 15's immutable V3 queue trigger predates query-plan schema 2 and
+    // can physically restamp a newly enqueued job to protocol 6. Derive the
+    // effective minimum from the job-bound immutable query-plan revision at
+    // lease time so an older worker can neither lease nor exhaust schema-2
+    // work. This is intentionally a runtime compatibility fence rather than a
+    // migration: historical schema-1 jobs retain their protocol-6 drain path.
+    const effectiveMinimumWorkerProtocol = schemaVersion >= 15
+      ? `GREATEST(candidate.minimum_worker_protocol, CASE
+           WHEN candidate.pipeline_version='corpus_first_v3'
+            AND EXISTS (
+              SELECT 1 FROM query_plan_revisions protocol_plan
+              WHERE protocol_plan.id=candidate.query_plan_revision_id
+                AND protocol_plan.plan_json @> '{"schemaVersion":2}'::jsonb
+            )
+           THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
+           ELSE 0 END)`
+      : "candidate.minimum_worker_protocol";
+    const exhaustedEffectiveMinimumWorkerProtocol = schemaVersion >= 15
+      ? `GREATEST(job_queue.minimum_worker_protocol, CASE
+           WHEN job_queue.pipeline_version='corpus_first_v3'
+            AND EXISTS (
+              SELECT 1 FROM query_plan_revisions protocol_plan
+              WHERE protocol_plan.id=job_queue.query_plan_revision_id
+                AND protocol_plan.plan_json @> '{"schemaVersion":2}'::jsonb
+            )
+           THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
+           ELSE 0 END)`
+      : "job_queue.minimum_worker_protocol";
     return this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock($1)", [JOB_ADVISORY_LOCK]);
       const exhausted = await client.query<{ run_id: string | null; brief_request_id: string | null; kind: string; payload_json: Record<string, unknown> | null }>(
@@ -8479,7 +8692,7 @@ export class Repository {
            ELSE $7 END,
          updated_at=now()
          WHERE status='leased' AND lease_expires_at<=now() AND attempts>=max_attempts
-           AND minimum_worker_protocol<=$8
+           AND ${exhaustedEffectiveMinimumWorkerProtocol}<=$8
            AND pipeline_version=ANY($9::varchar[])
            ${queuePredicate}
          RETURNING run_id,brief_request_id,kind,payload_json`,
@@ -8566,9 +8779,11 @@ export class Repository {
       // operational job has been runnable for 30 seconds it is promoted above
       // that lane, preventing an endless stream of fast jobs from starving it.
       const selected = await client.query(
-        `SELECT candidate.* FROM job_queue candidate WHERE
+        `SELECT candidate.*,
+                ${effectiveMinimumWorkerProtocol} AS effective_minimum_worker_protocol
+         FROM job_queue candidate WHERE
            ((candidate.status='queued' AND candidate.available_at<=now()) OR (candidate.status='leased' AND candidate.lease_expires_at<=now()))
-           AND candidate.minimum_worker_protocol<=$1
+           AND ${effectiveMinimumWorkerProtocol}<=$1
            AND candidate.pipeline_version=ANY($2::varchar[])
            ${candidateQueuePredicate}
            AND NOT (candidate.kind IN ('brief','research','matching') AND COALESCE((SELECT value='true' FROM settings WHERE key='research_paused'),false))
@@ -8634,7 +8849,7 @@ export class Repository {
         attempts: row.attempts,
         maxAttempts: row.max_attempts,
         pipelineVersion: row.pipeline_version,
-        minimumWorkerProtocol: Number(row.minimum_worker_protocol),
+        minimumWorkerProtocol: Number(job.effective_minimum_worker_protocol ?? row.minimum_worker_protocol),
         queryPlanRevisionId: row.query_plan_revision_id ?? null,
         stageKey: typeof row.stage_key === "string" ? row.stage_key : "default",
         leaseEpoch: Number(row.lease_epoch ?? 0),
@@ -9951,6 +10166,154 @@ export class Repository {
   }
 
   /**
+   * Atomically claim the one permitted semantic-equivalent repair before the
+   * worker requalifies any retained leads. The existing schema-15 immutable
+   * revision table is the crash/restart fence: an identical replay is safe,
+   * while a conflicting replay is an integrity failure.
+   */
+  async claimPipelineV3SemanticRecovery(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    revision: SemanticPlanRevisionArtifactV3;
+    fence: PipelineV3WriteFence;
+  }): Promise<{ status: "claimed" | "replayed"; revision: 2 }> {
+    const { runId, queryPlan, revision, fence } = input;
+    if (queryPlan.schemaVersion !== 2 || !isQueryPlanV3(queryPlan)) {
+      throw new HttpError(
+        409,
+        "Semantic recovery requires an immutable schema-2 query plan",
+        "pipeline_v3_semantic_recovery_conflict",
+      );
+    }
+    if (Number(await this.getSchemaVersion() ?? 0) < 15) {
+      throw new HttpError(
+        409,
+        "Semantic recovery persistence is unavailable for this database schema",
+        "pipeline_v3_semantic_recovery_conflict",
+      );
+    }
+
+    return this.transaction(async (client) => {
+      // The lease fence is deliberately the first authoritative read. A stale
+      // worker must not be able to observe or claim a recovery revision.
+      await this.assertPipelineV3WriteFence(client, runId, fence);
+      const contract = await client.query<{
+        query_plan_id: string;
+        query_plan_status: string;
+        query_plan_hash: string;
+        query_plan_json: QueryPlanV3;
+        selection_plan_status: string;
+        selection_plan_hash: string;
+        selection_plan_json: SelectionPlanV3;
+        initial_equivalence: string | null;
+        initial_hard_constraint_hash: string | null;
+        initial_plan_json: SelectionPlanV3 | null;
+      }>(
+        `SELECT qp.id query_plan_id,qp.status query_plan_status,
+                qp.plan_hash query_plan_hash,qp.plan_json query_plan_json,
+                sp.status selection_plan_status,sp.plan_hash selection_plan_hash,
+                sp.plan_json selection_plan_json,
+                initial.equivalence initial_equivalence,
+                initial.hard_constraint_hash initial_hard_constraint_hash,
+                initial.plan_json initial_plan_json
+         FROM run_active_query_plans active
+         JOIN query_plan_revisions qp ON qp.id=active.query_plan_revision_id
+         JOIN selection_plans sp ON sp.id=qp.selection_plan_id
+         LEFT JOIN semantic_plan_revisions initial
+           ON initial.run_id=active.run_id AND initial.revision=1
+         WHERE active.run_id=$1
+         FOR UPDATE OF qp,sp`,
+        [runId],
+      );
+      const immutable = contract.rows[0];
+      const queryHash = queryPlanV3Hash(queryPlan);
+      if (!immutable
+        || immutable.query_plan_id !== fence.queryPlanRevisionId
+        || immutable.query_plan_status !== "active"
+        || immutable.selection_plan_status !== "active"
+        || immutable.query_plan_hash !== queryHash
+        || queryPlanV3Hash(immutable.query_plan_json) !== queryHash
+        || immutable.selection_plan_hash !== queryPlan.selectionPlanHash
+        || selectionPlanV3Hash(immutable.selection_plan_json) !== queryPlan.selectionPlanHash
+        || immutable.query_plan_json.schemaVersion !== 2) {
+        throw new HttpError(
+          409,
+          "Semantic recovery no longer matches the active immutable plan",
+          "pipeline_v3_semantic_recovery_conflict",
+        );
+      }
+
+      const canonicalQueryPlan = createQueryPlanV3(
+        immutable.selection_plan_json,
+        immutable.query_plan_json.graphSnapshotId,
+        { schemaVersion: 2 },
+      );
+      if (stableStringify(normalizedQueryPlanV3Invariant(
+        immutable.query_plan_json,
+        canonicalQueryPlan,
+      )) !== stableStringify(normalizedQueryPlanV3Invariant(canonicalQueryPlan))) {
+        throw new HttpError(
+          409,
+          "Semantic recovery query-plan projection failed integrity validation",
+          "pipeline_v3_semantic_recovery_conflict",
+        );
+      }
+
+      const expected = buildSemanticEquivalentRecoveryPlanV3(immutable.selection_plan_json);
+      if (!expected || stableStringify(expected) !== stableStringify(revision)
+        || immutable.initial_equivalence !== "initial"
+        || immutable.initial_hard_constraint_hash !== revision.hardConstraintHash
+        || stableStringify(immutable.initial_plan_json) !== stableStringify(immutable.selection_plan_json)) {
+        throw new HttpError(
+          409,
+          "Semantic recovery claim is not the server-attested equivalent revision",
+          "pipeline_v3_semantic_recovery_conflict",
+        );
+      }
+
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO semantic_plan_revisions(
+           id,run_id,revision,parent_revision,equivalence,hard_constraint_hash,plan_json,audit_json)
+         VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)
+         ON CONFLICT(run_id,revision) DO NOTHING
+         RETURNING id`,
+        [
+          deterministicUuid({ runId, kind: "semantic_plan_revision", revision: revision.revision }),
+          runId,
+          revision.revision,
+          revision.parentRevision,
+          revision.equivalence,
+          revision.hardConstraintHash,
+          JSON.stringify(revision.plan),
+          JSON.stringify(semanticPlanRevisionAuditJson(revision)),
+        ],
+      );
+      const stored = await client.query<{
+        equivalence: string;
+        hard_constraint_hash: string;
+        plan_json: SelectionPlanV3;
+        audit_json: unknown;
+      }>(
+        `SELECT equivalence,hard_constraint_hash,plan_json,audit_json
+         FROM semantic_plan_revisions
+         WHERE run_id=$1 AND revision=$2`,
+        [runId, revision.revision],
+      );
+      if (!stored.rows[0] || !semanticPlanRevisionMatches({ revision, stored: stored.rows[0] })) {
+        throw new HttpError(
+          409,
+          "Semantic recovery retry conflicts with its immutable revision",
+          "pipeline_v3_semantic_recovery_conflict",
+        );
+      }
+      return {
+        status: inserted.rows[0] ? "claimed" : "replayed",
+        revision: 2 as const,
+      };
+    });
+  }
+
+  /**
    * Persist the complete, governed V3 retrieval boundary under the lease that
    * produced it.  Candidate evidence and the immutable manifest revision are
    * intentionally committed together: a reclaimed worker can leave neither
@@ -9970,8 +10333,12 @@ export class Repository {
   }> {
     const { runId, queryPlan, plan, result, fence } = input;
     const originalSelectionPlanProvided = selectionPlanV3Hash(plan) === queryPlan.selectionPlanHash;
-    const expectedQueryPlan = originalSelectionPlanProvided
-      ? createQueryPlanV3(plan, queryPlan.graphSnapshotId)
+    const expectedQueryPlan = queryPlan.schemaVersion === 1
+      ? queryPlan
+      : originalSelectionPlanProvided
+      ? createQueryPlanV3(plan, queryPlan.graphSnapshotId, {
+        schemaVersion: queryPlan.schemaVersion,
+      })
       : queryPlanV3ExecutionProjection(plan, queryPlan);
     const executionProjectionMatches = stableStringify(normalizedQueryPlanV3Invariant(
       queryPlan,
@@ -9990,6 +10357,19 @@ export class Repository {
       throw new HttpError(409, "Pipeline V3 retrieval contract does not match the immutable run", "pipeline_policy_mismatch");
     }
     const target = plan.requestedTrackCount;
+    const supportsGroundedRecoveryAudit = Number(await this.getSchemaVersion() ?? 0) >= 15;
+    const finalSemanticPlan = result.semanticPlanRevisions?.at(-1)?.plan ?? plan;
+    if (finalSemanticPlan.prompt !== plan.prompt
+      || finalSemanticPlan.requestedTrackCount !== plan.requestedTrackCount
+      || finalSemanticPlan.storefront !== plan.storefront
+      || stableStringify(finalSemanticPlan.hardConstraints) !== stableStringify(plan.hardConstraints)
+      || stableStringify(finalSemanticPlan.recordingPolicy) !== stableStringify(plan.recordingPolicy)) {
+      throw new HttpError(
+        409,
+        "Pipeline V3 semantic recovery changed an immutable request constraint",
+        "pipeline_v3_result_invalid",
+      );
+    }
     if (result.selected.length !== result.outcome.selectedTrackCount
       || result.reserve.length !== result.outcome.reserveTrackCount
       || result.selected.length > target
@@ -10068,6 +10448,7 @@ export class Repository {
         selection_plan_hash: string;
         selection_plan_json: SelectionPlanV3;
         query_plan_id: string;
+        query_plan_revision: number;
         query_plan_status: string;
         query_plan_hash: string;
         query_plan_json: QueryPlanV3;
@@ -10079,7 +10460,7 @@ export class Repository {
                 selection.id selection_plan_id,selection.status selection_plan_status,
                 selection.plan_hash selection_plan_hash,
                 selection.plan_json selection_plan_json,
-                query.id query_plan_id,query.status query_plan_status,
+                query.id query_plan_id,query.revision query_plan_revision,query.status query_plan_status,
                 query.plan_hash query_plan_hash,query.plan_json query_plan_json,
                 query.graph_snapshot_id,graph.status graph_snapshot_status
          FROM research_runs r
@@ -10095,10 +10476,22 @@ export class Repository {
       if (!immutable) throw new HttpError(404, "Research run not found", "run_not_found");
       const selectionHash = queryPlan.selectionPlanHash;
       const queryHash = queryPlanV3Hash(queryPlan);
-      const canonicalStoredQueryPlan = createQueryPlanV3(
-        immutable.selection_plan_json,
-        immutable.graph_snapshot_id,
-      );
+      // Schema-1 plans predate typed semantic clauses, so they must not be run
+      // back through the schema-2 compiler. They still have a deterministic
+      // execution projection from their own immutable selection plan, though.
+      // Rebuilding that legacy projection lets the selection plan remain the
+      // trust anchor and catches a forged query payload whose attacker also
+      // recomputed the query hash.
+      const canonicalStoredQueryPlan = immutable.query_plan_json.schemaVersion === 1
+        ? queryPlanV3ExecutionProjection(
+          immutable.selection_plan_json,
+          immutable.query_plan_json,
+        )
+        : createQueryPlanV3(
+          immutable.selection_plan_json,
+          immutable.graph_snapshot_id,
+          { schemaVersion: immutable.query_plan_json.schemaVersion },
+        );
       const storedQueryInvariantMatchesSelection = stableStringify(normalizedQueryPlanV3Invariant(
         immutable.query_plan_json,
         canonicalStoredQueryPlan,
@@ -10163,6 +10556,133 @@ export class Repository {
           );
         }
       }
+
+      let manifestSelectionPlan = immutable.selection_plan_json;
+      if (supportsGroundedRecoveryAudit) {
+        const revisions = result.semanticPlanRevisions ?? [];
+        if (revisions.length > 1) {
+          throw new HttpError(409, "Pipeline V3 recovery exceeded its single-repair boundary", "pipeline_v3_result_invalid");
+        }
+        for (const revision of revisions) {
+          const existing = await client.query<{
+            equivalence: string;
+            hard_constraint_hash: string;
+            plan_json: SelectionPlanV3;
+            audit_json: unknown;
+          }>(
+            `SELECT equivalence,hard_constraint_hash,plan_json,audit_json
+             FROM semantic_plan_revisions WHERE run_id=$1 AND revision=$2`,
+            [runId, revision.revision],
+          );
+          if (existing.rows[0]) {
+            if (!semanticPlanRevisionMatches({ revision, stored: existing.rows[0] })) {
+              throw new HttpError(409, "Semantic recovery retry conflicts with its immutable revision", "pipeline_v3_plan_stale");
+            }
+            // Snapshot the already-claimed durable revision, never the
+            // worker-supplied copy. The equality check above proves that the
+            // result references the same immutable recovery artifact.
+            manifestSelectionPlan = existing.rows[0].plan_json;
+          } else {
+            // Recovery must be claimed before requalification. Persistence is
+            // not allowed to turn an untrusted worker result into a durable
+            // semantic revision after the fact.
+            throw new HttpError(
+              409,
+              "Pipeline V3 semantic recovery was not durably claimed before persistence",
+              "pipeline_v3_plan_stale",
+            );
+          }
+        }
+        const semanticRevision = revisions.at(-1)?.revision ?? 1;
+        for (const lead of result.candidateLeads ?? []) {
+          await client.query(
+            `INSERT INTO pipeline_candidate_leads(
+               id,run_id,query_plan_revision_id,semantic_revision,strategy_id,candidate_key,
+               artist,title,album,source_record_ids,citation_hashes,predicate_coverage,rejection_code)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13)
+             ON CONFLICT(run_id,semantic_revision,strategy_id,candidate_key) DO NOTHING`,
+            [
+              deterministicUuid({
+                runId,
+                kind: "pipeline_candidate_lead",
+                semanticRevision,
+                strategyId: lead.strategyId,
+                candidateKey: lead.candidateKey,
+              }),
+              runId,
+              immutable.query_plan_id,
+              semanticRevision,
+              lead.strategyId.slice(0, 160),
+              lead.candidateKey,
+              lead.artist.slice(0, 240),
+              lead.title.slice(0, 240),
+              lead.album?.slice(0, 240) ?? null,
+              JSON.stringify(lead.sourceRecordIds),
+              JSON.stringify(lead.citationHashes),
+              JSON.stringify(lead.predicateCoverage),
+              lead.rejectionCode?.slice(0, 120) ?? null,
+            ],
+          );
+        }
+        for (const audit of result.recoveryAudits ?? []) {
+          await client.query(
+            `INSERT INTO pipeline_recovery_audits(
+               id,run_id,query_plan_revision_id,generation,root_cause,action,status,
+               counters,envelope,idempotency_key)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10)
+             ON CONFLICT(idempotency_key) DO NOTHING`,
+            [
+              deterministicUuid({ runId, kind: "pipeline_recovery_audit", idempotencyKey: audit.idempotencyKey }),
+              runId,
+              immutable.query_plan_id,
+              audit.generation,
+              audit.rootCause,
+              audit.action,
+              audit.status,
+              JSON.stringify({
+                before: audit.before,
+                after: audit.after,
+                beforeFailedMembershipPredicateIds: audit.beforeFailedMembershipPredicateIds,
+                afterFailedMembershipPredicateIds: audit.afterFailedMembershipPredicateIds,
+              }),
+              JSON.stringify({
+                policyVersion: "pipeline-v3-semantic-recovery/v1",
+                transformationKinds: audit.transformationKinds,
+                semanticPlanRevision: semanticRevision,
+                predicateDiagnostics: result.predicateDiagnostics ?? null,
+              }),
+              audit.idempotencyKey,
+            ],
+          );
+        }
+      }
+
+      // Persist a bounded, public-safe diagnostic projection for every V3.2
+      // result, including runs where no semantic repair was attempted. This
+      // lets the UI and owner tooling distinguish semantic rejection from an
+      // Apple/provider failure without exposing provider payloads or costs.
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'semantic_diagnostics',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE
+           SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [runId, JSON.stringify({
+          semanticPolicyVersion: queryPlan.semanticPolicyVersion ?? null,
+          queryPlanSchemaVersion: queryPlan.schemaVersion,
+          explicitConstraintHash: queryPlan.explicitUserConstraintHash ?? null,
+          contextSignals: (queryPlan.contextSignals ?? []).slice(0, 20),
+          rejectedByPredicate: result.predicateDiagnostics?.failedMembershipPredicateIds ?? {},
+          appleLookupCount: result.predicateDiagnostics?.appleLookupCount ?? 0,
+          appleProviderRequestCount: result.predicateDiagnostics?.appleProviderRequestCount ?? 0,
+          rootCause: result.predicateDiagnostics?.rootCause ?? null,
+          semanticRecovery: {
+            attempted: (result.predicateDiagnostics?.recoveryAttemptCount ?? 0) > 0,
+            attemptCount: result.predicateDiagnostics?.recoveryAttemptCount ?? 0,
+            repaired: (result.semanticPlanRevisions?.length ?? 0) > 0,
+          },
+          activePlanRevision: Number(immutable.query_plan_revision),
+        })],
+      );
 
       if (manifestRevisionId) {
         const existing = await client.query<{ manifest_id: string; content_hash: string }>(
@@ -10258,7 +10778,7 @@ export class Repository {
             [sourceRecordId, runId, normalizedUrl, `${track.artist} — ${track.title}`.slice(0, 240), binding.provenanceRoot.slice(0, 240), compactEvidenceNote(`Pipeline V3 exact track-scope evidence (${binding.kind}).`)],
           );
           sourceRecordId = source.rows[0]!.id;
-          const positivePredicates = evidenceMembershipPredicatesV3(plan);
+          const positivePredicates = evidenceMembershipPredicatesV3(finalSemanticPlan);
           const explicitPredicateIds = binding.predicateIds ?? binding.supportedPredicateIds;
           const supportedPredicates = positivePredicates.filter((predicate) => (
             explicitPredicateIds?.includes(predicate.id)
@@ -10408,7 +10928,7 @@ export class Repository {
          VALUES($1,$2,$3,$4,$5,'corpus_first_v3','corpus_first_v3_policy_v1',$6::jsonb)
          ON CONFLICT(run_id) DO UPDATE SET
            content_hash=EXCLUDED.content_hash,selection_plan_json=EXCLUDED.selection_plan_json`,
-        [manifestId, runId, name, description, manifestHash, JSON.stringify(immutable.selection_plan_json)],
+        [manifestId, runId, name, description, manifestHash, JSON.stringify(manifestSelectionPlan)],
       );
       const latestRevision = await client.query<{ id: string; revision: number }>(
         `SELECT id,revision FROM manifest_revisions
@@ -10435,7 +10955,7 @@ export class Repository {
           immutable.query_plan_id,
           immutable.graph_snapshot_id,
           immutable.run_spec_hash,
-          JSON.stringify(immutable.selection_plan_json),
+          JSON.stringify(manifestSelectionPlan),
           JSON.stringify(immutable.pipeline_policy_snapshot_json),
           JSON.stringify(outcome),
           JSON.stringify(outcome.deficits),
@@ -11726,6 +12246,7 @@ export class Repository {
         schemaCompatible: heartbeatSchemaCompatible(row, databaseSchemaVersion),
         protocolVersion: workerPipelineProtocolVersion(row.metadata_json),
         protocolCompatible: isWorkerPipelineProtocolCompatible(row.metadata_json),
+        queueClass: heartbeatQueueClass(row.metadata_json),
       };
     });
     // A newer bridge heartbeat must not hide healthy v5 capacity during a
@@ -11737,6 +12258,32 @@ export class Repository {
     const compatibleCapacity = evaluatedWorkers
       .filter((row) => !row.stale && row.schemaCompatible && row.protocolCompatible)
       .reduce((sum, row) => sum + Number(row.capacity ?? 0), 0);
+    const laneHealth = (lane: Exclude<WorkerQueueClass, "all">) => {
+      const workers = evaluatedWorkers.filter((row) => row.queueClass === lane || row.queueClass === "all");
+      const representative = workers.find((row) => (
+        !row.stale && row.schemaCompatible && row.protocolCompatible
+      )) ?? workers.find((row) => !row.stale) ?? workers[0];
+      const laneCompatibleCapacity = workers
+        .filter((row) => !row.stale && row.schemaCompatible && row.protocolCompatible)
+        .reduce((sum, row) => sum + Number(row.capacity ?? 0), 0);
+      return representative ? {
+        ...representative,
+        compatibleCapacity: laneCompatibleCapacity,
+        ready: laneCompatibleCapacity > 0,
+      } : {
+        stale: true,
+        schemaCompatible: false,
+        protocolVersion: null,
+        protocolCompatible: false,
+        queueClass: lane,
+        compatibleCapacity: 0,
+        ready: false,
+      };
+    };
+    const workerLanes = {
+      interactive: laneHealth("interactive"),
+      deep: laneHealth("deep"),
+    };
     return {
       database: {
         ok: true,
@@ -11753,6 +12300,7 @@ export class Repository {
         protocolCompatible: false,
         compatibleCapacity: 0,
       },
+      workerLanes,
       queue: {
         queued: Number(queueRow.queued ?? 0),
         leased: Number(queueRow.leased ?? 0),

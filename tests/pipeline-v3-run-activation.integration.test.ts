@@ -65,6 +65,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    vi.stubEnv("PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION", "2");
     vi.stubEnv("APPLE_STOREFRONT", "us");
     adminPool = new Pool({
       connectionString: databaseUrl,
@@ -98,7 +99,8 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     }
   }, 30_000);
 
-  test("atomically preserves a 150-track RunSpec and binds protocol-6 work to its active graph plan", async () => {
+  test("atomically preserves a 150-track RunSpec and binds protocol-8 work to its active graph plan", async () => {
+    expect(process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION).toBe("2");
     const rawPrompt = "Create a 150-track playlist of recordings in the disco music genre";
     const clientBucket = `v3-owner-150-${randomUUID()}`;
     const brief = curatedBrief("Disco music", 150);
@@ -250,6 +252,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       selection_plan_id: string;
       graph_snapshot_id: string;
       plan_json: {
+        schemaVersion: number;
         targetTrackCount: number;
         storefront: string;
         graphSnapshotId: string;
@@ -262,6 +265,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     expect(queryPlan.selection_plan_id).toBe(selection.id);
     expect(queryPlan.graph_snapshot_id).toBe(snapshotId);
     expect(queryPlan.plan_json).toMatchObject({
+      schemaVersion: 2,
       targetTrackCount: 150,
       storefront: "us",
       graphSnapshotId: snapshotId,
@@ -301,6 +305,9 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     expect(queuedJob).toMatchObject({
       status: "queued",
       pipeline_version: "corpus_first_v3",
+      // The existing schema-15 trigger physically normalizes V3 rows to 6.
+      // The repository must recover schema 2's effective protocol requirement
+      // from this immutable query-plan revision before any lease is granted.
       minimum_worker_protocol: 6,
       query_plan_revision_id: queryPlan.id,
       lease_epoch: "0",
@@ -313,6 +320,22 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       stageExecutionKey: queuedJob.stage_key,
     });
 
+    const protocol6Lease = await repository.leaseNextJob(
+      "v3-schema-1-worker",
+      60_000,
+      {
+        protocolVersion: "playlist-pipeline-v6",
+        protocolNumber: 6,
+        pipelineVersions: ["legacy_v1", "catalog_first_v2", "corpus_first_v3"],
+      },
+    );
+    expect(protocol6Lease).toBeNull();
+
+    expect((await pool.query<{ status: string; attempts: number }>(
+      "SELECT status,attempts FROM job_queue WHERE id=$1",
+      [queuedJob.id],
+    )).rows[0]).toEqual({ status: "queued", attempts: 0 });
+
     const leased = await repository.leaseNextJob(
       "v3-activation-worker",
       60_000,
@@ -322,11 +345,78 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       id: queuedJob.id,
       runId: created.runId,
       pipelineVersion: "corpus_first_v3",
-      minimumWorkerProtocol: 6,
+      minimumWorkerProtocol: 8,
       queryPlanRevisionId: queryPlan.id,
       stageKey: queuedJob.stage_key,
       leaseEpoch: 1,
       leaseOwner: "v3-activation-worker",
+    });
+  }, 30_000);
+
+  test("keeps an active schema-1 plan authoritative after schema-2 emission activates", async () => {
+    vi.stubEnv("PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION", "1");
+    const rawPrompt = "Create 25 released disco recordings";
+    const clientBucket = `v3-schema-flip-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: rawPrompt,
+      brief: curatedBrief("Disco music", 25),
+      estimateUsd: 0,
+      approvedBudgetUsd: 0,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      autoPublish: false,
+      reuseDays: 0,
+      globalLimit: 10,
+      forceFreshResearch: true,
+    });
+    const before = (await pool.query<{
+      query_plan_revision_id: string;
+      revision: number;
+      plan_hash: string;
+      query_plan: { schemaVersion: number };
+      selection_plan: SelectionPlanV3;
+    }>(
+      `SELECT active.query_plan_revision_id,query.revision,query.plan_hash,
+              query.plan_json query_plan,selection.plan_json selection_plan
+       FROM run_active_query_plans active
+       JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+       JOIN selection_plans selection ON selection.id=query.selection_plan_id
+       WHERE active.run_id=$1`,
+      [created.runId],
+    )).rows[0]!;
+    expect(before.query_plan.schemaVersion).toBe(1);
+
+    vi.stubEnv("PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION", "2");
+    const activated = await repository.activatePipelineV3Run({
+      runId: created.runId,
+      selectionPlan: before.selection_plan,
+      graphSnapshotId: snapshotId,
+    });
+    expect(activated).toMatchObject({
+      idempotent: true,
+      queryPlanRevisionId: before.query_plan_revision_id,
+      revision: before.revision,
+      planHash: before.plan_hash,
+      queryPlan: { schemaVersion: 1 },
+    });
+    const after = (await pool.query<{
+      active_id: string;
+      revision_count: number;
+      schema_version: number;
+    }>(
+      `SELECT active.query_plan_revision_id active_id,
+              (SELECT count(*)::int FROM query_plan_revisions WHERE run_id=$1) revision_count,
+              (query.plan_json->>'schemaVersion')::int schema_version
+       FROM run_active_query_plans active
+       JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+       WHERE active.run_id=$1`,
+      [created.runId],
+    )).rows[0]!;
+    expect(after).toEqual({
+      active_id: before.query_plan_revision_id,
+      revision_count: 1,
+      schema_version: 1,
     });
   }, 30_000);
 

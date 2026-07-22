@@ -253,6 +253,70 @@ export interface QueryPlanV3Predicate {
   hard: boolean;
 }
 
+/**
+ * Query-plan schema 2 persists the scope compiler's typed clause contract.
+ * `QueryPlanV3Predicate` remains as a compatibility projection for schema-1
+ * workers and governed-graph readers; schema-2 workers execute these clauses
+ * directly and never split the legacy `subject` presentation string.
+ */
+export type QueryPlanV3ClauseRole =
+  | "membership"
+  | "catalog_policy"
+  | "context"
+  | "ranking"
+  | "diversity_sequencing"
+  | "discovery_hint";
+
+export type QueryPlanV3ClauseSource =
+  | "raw_prompt"
+  | "guided_answer"
+  | "v2_compatibility"
+  | "system_default";
+
+export interface QueryPlanV3SemanticClause {
+  id: string;
+  role: QueryPlanV3ClauseRole;
+  axis: string;
+  operator: string;
+  values: string[];
+  source: QueryPlanV3ClauseSource;
+  explicitUserAuthored: boolean;
+  geographyRelationship: SelectionGeographyRelationship | null;
+  reason: string;
+}
+
+export interface QueryPlanV3RecordingPolicy {
+  allowedVersions: (
+    | "canonical"
+    | "clean"
+    | "explicit"
+    | "live"
+    | "remix"
+    | "radio_edit"
+    | "extended"
+    | "acoustic"
+    | "instrumental"
+  )[];
+  preferCanonicalStudio: boolean;
+  excludeKaraokeTributeAndCovers: boolean;
+}
+
+/** Compact compiler audit: enough to reject semantic drift without copying prompt prose. */
+export interface QueryPlanV3SemanticAuditMetadata {
+  semanticPolicyVersion: string;
+  /** Exact server-owned music-concept registry used by the semantic compiler. */
+  musicConceptPolicyVersion: string;
+  passed: boolean;
+  hardConstraintHash: string;
+  explicitUserConstraintHash: string;
+  clauseCount: number;
+  membershipClauseCount: number;
+  contextClauseCount: number;
+  catalogPolicyClauseCount: number;
+  aliasCollapses: string[];
+  contradictions: string[];
+}
+
 export interface QueryPlanV3RankingObjective {
   id: string;
   kind: string;
@@ -309,9 +373,9 @@ export interface PipelineV3SourceDiscoveryHint {
 }
 
 export interface QueryPlanV3 {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   pipelineVersion: "corpus_first_v3";
-  policyVersion: "corpus_first_v3_policy_v1";
+  policyVersion: "corpus_first_v3_policy_v1" | "corpus_first_v3_policy_v2";
   engine: QueryPlanV3Engine;
   /** Composite requests may use several engines; `engine` is the durable primary queue class. */
   engines: QueryPlanV3Engine[];
@@ -334,6 +398,21 @@ export interface QueryPlanV3 {
   diversityGoals?: SelectionDiversityGoals;
   orderingPolicy?: SelectionOrderingPolicy;
   softGoalRelaxationOrder?: string[];
+  /**
+   * Schema-2 semantic execution contract. These are absent from historical
+   * schema-1 plans, which continue to decode through the legacy projection.
+   */
+  semanticPolicyVersion?: string;
+  /** Required on schema-2 plans; absent from historical schema-1 plans. */
+  musicConceptPolicyVersion?: string;
+  semanticClauses?: QueryPlanV3SemanticClause[];
+  contextSignals?: QueryPlanV3SemanticClause[];
+  catalogPolicies?: QueryPlanV3SemanticClause[];
+  recordingPolicy?: QueryPlanV3RecordingPolicy;
+  explicitUserConstraintHash?: string;
+  /** Legacy-compatible top-level audit hash retained for fast integrity checks. */
+  hardConstraintHash?: string;
+  semanticAuditMetadata?: QueryPlanV3SemanticAuditMetadata;
   continuation?: QueryPlanV3Continuation;
   corpusReview?: QueryPlanV3CorpusReview;
 }
@@ -929,6 +1008,23 @@ export interface RunProgressView {
     currentVolume: number | null;
     status: string | null;
   };
+  /** Additive V3.2 diagnostics; absent for historical V1/V2/schema-1 runs. */
+  semanticPolicyVersion?: string;
+  queryPlanSchemaVersion?: number;
+  explicitConstraintHash?: string;
+  contextSignals?: QueryPlanV3SemanticClause[];
+  rejectedByPredicate?: Record<string, number>;
+  /** Candidate-level catalog-resolution attempts, retained for compatibility. */
+  appleLookupCount?: number;
+  /** Actual Apple provider read invocations made during qualification. */
+  appleProviderRequestCount?: number;
+  rootCause?: string | null;
+  semanticRecovery?: {
+    attempted: boolean;
+    attemptCount: number;
+    repaired: boolean;
+  };
+  activePlanRevision?: number;
 }
 
 export interface ResearchPassReport {

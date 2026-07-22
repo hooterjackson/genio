@@ -11,6 +11,7 @@ import {
 } from "../server/pipeline-v3-retrieval.ts";
 import {
   createRunSpecV3,
+  evidenceMembershipPredicateIdsV3,
   resolveRunSpecV3,
   type IntentV3,
   type SelectionPlanV3,
@@ -23,6 +24,14 @@ function plan(prompt: string, target = 25): SelectionPlanV3 {
     storefront: "US",
   }), []);
 }
+
+// Evidence bindings are keyed to the immutable predicate ids emitted by the
+// semantic compiler. Keep the test adapter on that same contract instead of
+// pinning the pre-scope-gate disco id: a continuation deliberately rejects a
+// seed whose evidence attests a different plan revision.
+const DISCO_MEMBERSHIP_PREDICATE_IDS = evidenceMembershipPredicateIdsV3(
+  plan("one disco track", 1),
+);
 
 function planWithIntents(intents: readonly IntentV3[], target = 25): SelectionPlanV3 {
   const base = plan("music for a test playlist", target);
@@ -66,7 +75,7 @@ function qualification(
         strength: 0.9,
         sourceRank: 1,
         kind: "track_specific_source",
-        predicateIds: ["membership:genre:require:disco"],
+        predicateIds: DISCO_MEMBERSHIP_PREDICATE_IDS,
         governance: {
           policyVersion: "evidence-source-governance-v3",
           useScope: "run_local",

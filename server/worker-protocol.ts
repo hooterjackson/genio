@@ -3,7 +3,7 @@
  * worker that consumes it. Increment this only when a rollout changes the
  * meaning or shape of queued playlist-pipeline work.
  */
-import type { PipelineVersion } from "../shared/types.ts";
+import type { PipelineVersion, QueryPlanV3 } from "../shared/types.ts";
 
 export interface WorkerPipelineCapability {
   protocolVersion: string;
@@ -33,8 +33,8 @@ export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
 
 // v6 understands the inert corpus-first routing contract. Assignment remains
 // separately disabled; declaring capability does not opt a run into V3.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v7";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 7;
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v8";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 8;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
   protocolNumber: WORKER_PIPELINE_PROTOCOL_NUMBER,
@@ -44,11 +44,25 @@ export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
 export const LEGACY_V1_MINIMUM_WORKER_PROTOCOL = 4;
 export const CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL = 5;
 export const CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL = 6;
+/** Schema-2 workers understand typed semantic clauses and their audit hashes. */
+export const CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL = 8;
 
 export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
   if (pipelineVersion === "corpus_first_v3") return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
   if (pipelineVersion === "catalog_first_v2") return CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL;
   return LEGACY_V1_MINIMUM_WORKER_PROTOCOL;
+}
+
+/**
+ * Preserve the protocol-6 drain path for historical schema-1 plans while
+ * fencing newly compiled schema-2 work to workers that execute typed clauses.
+ */
+export function minimumWorkerProtocolForQueryPlan(
+  queryPlan: Pick<QueryPlanV3, "schemaVersion"> | null | undefined,
+): number {
+  return queryPlan?.schemaVersion === 2
+    ? CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL
+    : CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
 }
 
 export function workerPipelineProtocolNumber(value: unknown): number | null {

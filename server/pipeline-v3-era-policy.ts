@@ -8,6 +8,11 @@ export interface CatalogEraPolicyV3 {
   readonly excluded: boolean;
 }
 
+type CatalogEraPolicyPlanV3 = Pick<
+  SelectionPlanV3,
+  "hardConstraints" | "membershipPredicates"
+> & Partial<Pick<SelectionPlanV3, "catalogPolicies">>;
+
 const EXPRESSIVE_ERA_OPERATORS = new Set<SelectionConstraint["operator"]>([
   "within",
   "between",
@@ -28,8 +33,36 @@ function policyKey(policy: CatalogEraPolicyV3): string {
  * 1973–1983 into the two endpoint years only.
  */
 export function catalogEraPoliciesV3(
-  plan: Pick<SelectionPlanV3, "hardConstraints" | "membershipPredicates">,
+  plan: CatalogEraPolicyPlanV3,
 ): CatalogEraPolicyV3[] {
+  const explicitCatalogEra = (plan.catalogPolicies ?? []).filter((clause) => (
+    clause.role === "catalog_policy"
+    && clause.axis === "era"
+    && clause.explicitUserAuthored === true
+    && clause.operator !== "prefer"
+    && clause.values.length > 0
+  ));
+  if (explicitCatalogEra.length > 0) {
+    const policies = explicitCatalogEra.map((clause): CatalogEraPolicyV3 => {
+      const excluded = clause.operator === "exclude" || clause.operator === "avoid";
+      const operator = EXPRESSIVE_ERA_OPERATORS.has(clause.operator as SelectionConstraint["operator"])
+        ? clause.operator as SelectionConstraint["operator"]
+        : "within";
+      return {
+        id: clause.id,
+        constraint: { operator, values: [...clause.values] },
+        excluded,
+      };
+    });
+    const seen = new Set<string>();
+    return policies.filter((policy) => {
+      const key = policyKey(policy);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   const hardEra = plan.hardConstraints.filter((constraint) => (
     constraint.kind === "hard" && constraint.axis === "era"
   ));
@@ -88,7 +121,7 @@ export function normalizedCatalogReleaseYear(releaseDate: string | null | undefi
 
 /** Fail closed when the catalog cannot prove every hard era rule. */
 export function catalogEraConstraintFailuresV3(
-  plan: Pick<SelectionPlanV3, "hardConstraints" | "membershipPredicates">,
+  plan: CatalogEraPolicyPlanV3,
   catalogReleaseYear: number | null | undefined,
   compatibleReleaseYears: readonly number[] = [],
 ): string[] {

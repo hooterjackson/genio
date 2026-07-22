@@ -61,7 +61,7 @@ function exactCandidate(id: string, genre: string): SelectionCandidateV3<string>
 
 describe("Pipeline V3 frozen historical regression suite", () => {
   test("freezes every historically problematic prompt and count tier", () => {
-    expect(suite.fixtureVersion).toBe("pipeline-v3-regressions-2026-07-20");
+    expect(suite.fixtureVersion).toBe("pipeline-v3-scope-gate-regressions-2026-07-21");
     expect(suite.scenarios.map(({ id }) => id)).toEqual(expect.arrayContaining([
       "disco_25",
       "brazilian_disco_50",

@@ -23,8 +23,13 @@ import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
 import {
   evidenceMembershipPredicateIdsV3,
   selectionPlanV3Hash,
+  type MembershipPredicateV3,
   type SelectionPlanV3,
 } from "../server/selection-plan-v3.ts";
+import {
+  buildSemanticEquivalentRecoveryPlanV3,
+  type SemanticPlanRevisionArtifactV3,
+} from "../server/pipeline-v3-semantic-recovery.ts";
 import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -266,6 +271,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     target: number,
     label: string,
     transformSelectionPlan?: (plan: SelectionPlanV3) => SelectionPlanV3,
+    rawPrompt = `Create ${target} released recordings in the ${label} music genre`,
   ): Promise<{
     runId: string;
     accessId: string;
@@ -275,7 +281,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
   }> {
     const clientBucket = `v3-manifest-${label}-${randomUUID()}`;
     const created = await repository.createRunIdempotent({
-      prompt: `Create ${target} released recordings in the ${label} music genre`,
+      prompt: rawPrompt,
       brief: curatedBrief(label, target),
       estimateUsd: 0,
       approvedBudgetUsd: 0,
@@ -433,19 +439,219 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     120_000,
   );
 
+  test("claims one semantic repair across crash/restart replay and keeps final persistence idempotent", async () => {
+    const previousSchemaVersion = process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+    process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = "2";
+    let context: Awaited<ReturnType<typeof createLeasedRun>>;
+    try {
+      context = await createLeasedRun(25, "baile-funk-recovery", (plan) => {
+        const baile: MembershipPredicateV3 = {
+          id: "genre:baile",
+          axis: "genre",
+          operator: "require",
+          values: ["baile funk"],
+          source: "user",
+          reason: "Explicit baile funk genre",
+        };
+        return {
+          ...plan,
+          membershipPredicates: [
+            ...plan.membershipPredicates,
+            baile,
+            { ...baile, id: "genre:carioca", values: ["funk carioca"] },
+          ],
+          semanticClauses: [
+            ...plan.semanticClauses,
+            {
+              id: baile.id,
+              role: "membership",
+              axis: baile.axis,
+              operator: baile.operator,
+              values: [...baile.values],
+              source: "raw_prompt",
+              explicitUserAuthored: true,
+              geographyRelationship: null,
+              reason: baile.reason,
+            },
+            {
+              id: "genre:carioca",
+              role: "membership",
+              axis: baile.axis,
+              operator: baile.operator,
+              values: ["funk carioca"],
+              source: "raw_prompt",
+              explicitUserAuthored: true,
+              geographyRelationship: null,
+              reason: baile.reason,
+            },
+          ],
+        };
+      });
+    } finally {
+      if (previousSchemaVersion === undefined) {
+        delete process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+      } else {
+        process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = previousSchemaVersion;
+      }
+    }
+    expect(context.queryPlan.schemaVersion).toBe(2);
+    // createLeasedRun activates a transformed plan after run creation. Replace
+    // the fresh test-only initial semantic snapshot so this fixture models a
+    // run whose faulty duplicate projection existed from initial activation.
+    await pool.query("DELETE FROM semantic_plan_revisions WHERE run_id=$1", [context.runId]);
+    await pool.query(
+      `INSERT INTO semantic_plan_revisions(
+         id,run_id,revision,parent_revision,equivalence,hard_constraint_hash,plan_json,audit_json)
+       VALUES($1,$2,1,NULL,'initial',$3,$4::jsonb,$5::jsonb)`,
+      [
+        randomUUID(),
+        context.runId,
+        context.selectionPlan.semanticAudit!.hardConstraintHash,
+        JSON.stringify(context.selectionPlan),
+        JSON.stringify(context.selectionPlan.semanticAudit),
+      ],
+    );
+    const revision = buildSemanticEquivalentRecoveryPlanV3(context.selectionPlan);
+    expect(revision).not.toBeNull();
+
+    await expect(repository.claimPipelineV3SemanticRecovery({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      revision: revision!,
+      fence: context.fence,
+    })).resolves.toEqual({ status: "claimed", revision: 2 });
+
+    // Simulate a crash after the durable claim but before final result
+    // persistence. A successor lease must replay the same immutable revision,
+    // not create a second repair.
+    const successorWorkerId = `v3-restart-${randomUUID()}`;
+    const successorLease = (await pool.query<{ lease_epoch: string }>(
+      `UPDATE job_queue
+       SET lease_owner=$2,lease_epoch=lease_epoch+1,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1
+       RETURNING lease_epoch::text`,
+      [context.fence.jobId, successorWorkerId],
+    )).rows[0]!;
+    const successorFence: PipelineV3WriteFence = {
+      ...context.fence,
+      workerId: successorWorkerId,
+      leaseEpoch: Number(successorLease.lease_epoch),
+    };
+    await expect(repository.claimPipelineV3SemanticRecovery({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      revision: revision!,
+      fence: successorFence,
+    })).resolves.toEqual({ status: "replayed", revision: 2 });
+
+    const storedRevisions = await pool.query<{ revision: number }>(
+      "SELECT revision FROM semantic_plan_revisions WHERE run_id=$1 ORDER BY revision",
+      [context.runId],
+    );
+    expect(storedRevisions.rows.map(({ revision: value }) => value)).toEqual([1, 2]);
+
+    const conflictingRevision: SemanticPlanRevisionArtifactV3 = {
+      ...revision!,
+      planHash: "f".repeat(64),
+    };
+    await expect(repository.claimPipelineV3SemanticRecovery({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      revision: conflictingRevision,
+      fence: successorFence,
+    })).rejects.toMatchObject({ code: "pipeline_v3_semantic_recovery_conflict" });
+
+    const result: RetrievalResultV3 = {
+      ...retrievalResult({
+        runId: context.runId,
+        target: 25,
+        selectedCount: 25,
+        reserveCount: 10,
+        status: "exact_ready",
+        prefix: "semantic-recovery-restart",
+        predicateIds: positivePredicateIds(revision!.plan),
+      }),
+      semanticPlanRevisions: [revision!],
+    };
+    const first = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: successorFence,
+    });
+    const replayed = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: successorFence,
+    });
+    expect(replayed).toEqual(first);
+    expect((await pool.query<{ count: string }>(
+      "SELECT count(*)::text count FROM semantic_plan_revisions WHERE run_id=$1 AND revision=2",
+      [context.runId],
+    )).rows[0]!.count).toBe("1");
+    const recoverySnapshots = (await pool.query<{
+      manifest_plan: SelectionPlanV3;
+      revision_plan: SelectionPlanV3;
+    }>(
+      `SELECT manifest.selection_plan_json manifest_plan,
+              revision.selection_plan_snapshot_json revision_plan
+       FROM manifests manifest
+       JOIN manifest_revisions revision ON revision.manifest_id=manifest.id
+       WHERE revision.id=$1`,
+      [first.manifestRevisionId],
+    )).rows[0]!;
+    expect(recoverySnapshots.manifest_plan).toEqual(revision!.plan);
+    expect(recoverySnapshots.revision_plan).toEqual(revision!.plan);
+    expect(recoverySnapshots.manifest_plan).not.toEqual(context.selectionPlan);
+  });
+
   test(
     "queues an exact manifest when catalog-layer version policy has no source binding",
     async () => {
-      const context = await createLeasedRun(25, "disco-version-policy-boundary");
+      const previousSchemaVersion = process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+      process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = "2";
+      let context: Awaited<ReturnType<typeof createLeasedRun>>;
+      try {
+        context = await createLeasedRun(
+          25,
+          "disco-live-version-policy-boundary",
+          undefined,
+          "Create 25 disco tracks using only live versions",
+        );
+      } finally {
+        if (previousSchemaVersion === undefined) {
+          delete process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+        } else {
+          process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = previousSchemaVersion;
+        }
+      }
       const sourceBoundPredicateIds = positivePredicateIds(context.selectionPlan);
-      expect(context.selectionPlan.membershipPredicates.some((predicate) => (
-        predicate.axis === "recording_version" && predicate.operator !== "exclude"
-      ))).toBe(true);
-      expect(sourceBoundPredicateIds).not.toContain(
-        context.selectionPlan.membershipPredicates.find((predicate) => (
-          predicate.axis === "recording_version" && predicate.operator !== "exclude"
-        ))?.id,
+      expect(context.queryPlan.schemaVersion).toBe(2);
+      expect(context.selectionPlan.membershipPredicates).not.toContainEqual(
+        expect.objectContaining({ axis: "recording_version" }),
       );
+      expect(context.queryPlan.membershipPredicates).not.toContainEqual(
+        expect.objectContaining({ kind: "recording_version" }),
+      );
+      expect(sourceBoundPredicateIds).toEqual([
+        expect.stringMatching(/^membership:genre:/u),
+      ]);
+      expect(context.selectionPlan.catalogPolicies).toContainEqual(expect.objectContaining({
+        role: "catalog_policy",
+        axis: "recording_version",
+        explicitUserAuthored: true,
+      }));
+      expect(context.queryPlan.catalogPolicies).toContainEqual(expect.objectContaining({
+        role: "catalog_policy",
+        axis: "recording_version",
+        explicitUserAuthored: true,
+      }));
+      expect(context.selectionPlan.recordingPolicy.allowedVersions).toEqual(["live"]);
+      expect(context.queryPlan.recordingPolicy?.allowedVersions).toEqual(["live"]);
 
       const persisted = await repository.persistPipelineV3RetrievalResult({
         runId: context.runId,
@@ -475,6 +681,21 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         [context.runId],
       )).rows[0]!;
       expect(publication).toEqual({ run_status: "publishing", publication_jobs: 1 });
+      const persistedBoundary = (await pool.query<{
+        selection_plan: SelectionPlanV3;
+        version_scope_bindings: number;
+      }>(
+        `SELECT revision.selection_plan_snapshot_json selection_plan,
+                (SELECT count(*)::int FROM track_scope_bindings binding
+                 WHERE binding.run_id=manifest.run_id
+                   AND binding.scope_axis='recording_version') version_scope_bindings
+         FROM manifest_revisions revision
+         JOIN manifests manifest ON manifest.id=revision.manifest_id
+         WHERE revision.id=$1`,
+        [persisted.manifestRevisionId],
+      )).rows[0]!;
+      expect(persistedBoundary.selection_plan.recordingPolicy.allowedVersions).toEqual(["live"]);
+      expect(persistedBoundary.version_scope_bindings).toBe(0);
     },
     120_000,
   );
@@ -606,6 +827,85 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     expect(snapshots.manifest_plan).toEqual(context.selectionPlan);
     expect(snapshots.revision_plan).toEqual(context.selectionPlan);
     expect(snapshots.revision_plan).not.toEqual(executionPlan);
+  }, 30_000);
+
+  test("drains a pre-hotfix schema-1 contract without semantic recompilation or reinterpretation", async () => {
+    const previousSchemaVersion = process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+    process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = "1";
+    let context: Awaited<ReturnType<typeof createLeasedRun>>;
+    try {
+      context = await createLeasedRun(1, "disco-schema-one-immutable-drain");
+    } finally {
+      if (previousSchemaVersion === undefined) {
+        delete process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+      } else {
+        process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = previousSchemaVersion;
+      }
+    }
+
+    expect(context.queryPlan.schemaVersion).toBe(1);
+    expect(context.queryPlan).not.toHaveProperty("semanticPolicyVersion");
+    expect(context.queryPlan).not.toHaveProperty("semanticClauses");
+    expect(context.queryPlan).not.toHaveProperty("contextSignals");
+    expect(context.queryPlan).not.toHaveProperty("catalogPolicies");
+    expect(context.queryPlan).not.toHaveProperty("recordingPolicy");
+    expect(context.queryPlan).not.toHaveProperty("explicitUserConstraintHash");
+    expect(context.queryPlan).not.toHaveProperty("semanticAuditMetadata");
+
+    const storedSelectionPlan = structuredClone(context.selectionPlan);
+    const storedQueryPlan = structuredClone(context.queryPlan);
+    const executionPlan = selectionPlanFromQueryPlanV3(context.queryPlan, {
+      prompt: "Opaque legacy audit prose must not change the persisted contract.",
+    });
+    expect(selectionPlanV3Hash(executionPlan)).not.toBe(context.queryPlan.selectionPlanHash);
+
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: executionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "schema-one-immutable-drain",
+        predicateIds: positivePredicateIds(executionPlan),
+      }),
+      fence: context.fence,
+    });
+    expect(persisted).toMatchObject({
+      manifestId: expect.any(String),
+      manifestRevisionId: expect.any(String),
+      publicationState: "queued",
+    });
+
+    const immutable = (await pool.query<{
+      active_selection_plan: SelectionPlanV3;
+      active_query_plan: QueryPlanV3;
+      manifest_selection_plan: SelectionPlanV3;
+      revision_selection_plan: SelectionPlanV3;
+    }>(
+      `SELECT selection.plan_json active_selection_plan,
+              query.plan_json active_query_plan,
+              manifest.selection_plan_json manifest_selection_plan,
+              revision.selection_plan_snapshot_json revision_selection_plan
+       FROM manifest_revisions revision
+       JOIN manifests manifest ON manifest.id=revision.manifest_id
+       JOIN run_active_query_plans active ON active.run_id=manifest.run_id
+       JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+       JOIN selection_plans selection ON selection.id=query.selection_plan_id
+       WHERE revision.id=$1`,
+      [persisted.manifestRevisionId],
+    )).rows[0]!;
+
+    expect(immutable.active_query_plan).toEqual(storedQueryPlan);
+    expect(immutable.active_query_plan.schemaVersion).toBe(1);
+    expect(immutable.active_query_plan).not.toHaveProperty("semanticClauses");
+    expect(immutable.active_selection_plan).toEqual(storedSelectionPlan);
+    expect(immutable.manifest_selection_plan).toEqual(storedSelectionPlan);
+    expect(immutable.revision_selection_plan).toEqual(storedSelectionPlan);
+    expect(immutable.manifest_selection_plan).not.toEqual(executionPlan);
+    expect(immutable.revision_selection_plan).not.toEqual(executionPlan);
   }, 30_000);
 
   test("rejects a stored immutable selection-plan payload whose hash no longer matches", async () => {
@@ -932,25 +1232,36 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
   }, 30_000);
 
   test("publication guard requires every positive membership predicate for every manifest track", async () => {
-    const context = await createLeasedRun(1, "composite-publication-evidence", (plan) => ({
-      ...plan,
-      membershipPredicates: [
-        ...plan.membershipPredicates,
-        {
-          id: "geography-france",
-          axis: "geography",
-          operator: "require",
-          values: ["France"],
-          source: "user",
-          reason: "The recording must satisfy the requested French scope.",
-        },
-      ],
-    }));
+    const previousSchemaVersion = process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+    process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = "2";
+    let context: Awaited<ReturnType<typeof createLeasedRun>>;
+    try {
+      context = await createLeasedRun(
+        1,
+        "composite-publication-evidence",
+        undefined,
+        "Create 1 disco track only by artists born in France",
+      );
+    } finally {
+      if (previousSchemaVersion === undefined) {
+        delete process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
+      } else {
+        process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = previousSchemaVersion;
+      }
+    }
     const requiredPredicateIds = context.selectionPlan.membershipPredicates
       .filter((predicate) => predicate.operator !== "exclude")
       .map((predicate) => predicate.id);
-    expect(requiredPredicateIds).toContain("geography-france");
-    expect(requiredPredicateIds.length).toBeGreaterThan(1);
+    expect(context.queryPlan.schemaVersion).toBe(2);
+    expect(context.selectionPlan.membershipPredicates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ axis: "genre", values: ["disco"] }),
+      expect.objectContaining({
+        axis: "geography",
+        values: ["France"],
+        geographyRelationship: "artist_origin",
+      }),
+    ]));
+    expect(requiredPredicateIds).toHaveLength(2);
     const persisted = await repository.persistPipelineV3RetrievalResult({
       runId: context.runId,
       queryPlan: context.queryPlan,

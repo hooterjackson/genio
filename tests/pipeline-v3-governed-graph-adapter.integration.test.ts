@@ -7,6 +7,7 @@ import {
 } from "../server/pipeline-v3-governed-graph-adapter.ts";
 import { createQueryPlanV3, queryPlanV3Hash } from "../server/query-plan-v3.ts";
 import { selectionPlanV3Hash, type SelectionPlanV3 } from "../server/selection-plan-v3.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "../server/music-concepts-v3.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
@@ -39,6 +40,35 @@ function sha(value: string): string {
 }
 
 function factualPlan(count: number): SelectionPlanV3 {
+  const membershipPredicates: SelectionPlanV3["membershipPredicates"] = [
+    {
+      id: "subject-paulinho",
+      axis: "artist",
+      operator: "require",
+      values: ["Paulinho da Costa"],
+      source: "user",
+      reason: "The exact credited performer is required.",
+    },
+    {
+      id: "relationship-performed",
+      axis: "factual_relationship",
+      operator: "require",
+      values: ["subject_performed"],
+      source: "user",
+      reason: "The exact recording must carry a performance credit.",
+    },
+  ];
+  const semanticClauses: SelectionPlanV3["semanticClauses"] = membershipPredicates.map((predicate) => ({
+    id: predicate.id,
+    role: "membership",
+    axis: predicate.axis,
+    operator: predicate.operator,
+    values: [...predicate.values],
+    source: "raw_prompt",
+    explicitUserAuthored: true,
+    geographyRelationship: null,
+    reason: predicate.reason,
+  }));
   return {
     schemaVersion: 1,
     pipelineVersion: "corpus_first_v3",
@@ -48,24 +78,7 @@ function factualPlan(count: number): SelectionPlanV3 {
     storefront: "us",
     intents: ["factual_relationship"],
     engines: ["factual_relationship"],
-    membershipPredicates: [
-      {
-        id: "subject-paulinho",
-        axis: "artist",
-        operator: "require",
-        values: ["Paulinho da Costa"],
-        source: "user",
-        reason: "The exact credited performer is required.",
-      },
-      {
-        id: "relationship-performed",
-        axis: "factual_relationship",
-        operator: "require",
-        values: ["subject_performed"],
-        source: "user",
-        reason: "The exact recording must carry a performance credit.",
-      },
-    ],
+    membershipPredicates,
     rankingObjectives: [{
       id: "ranking-influence",
       dimension: "influence",
@@ -101,6 +114,12 @@ function factualPlan(count: number): SelectionPlanV3 {
       preferCanonicalStudio: true,
       excludeKaraokeTributeAndCovers: true,
     },
+    semanticPolicyVersion: "scope_gate_v2_1_2",
+    musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
+    semanticClauses,
+    contextSignals: [],
+    catalogPolicies: [],
+    explicitUserConstraintHash: sha(`${count}:Paulinho da Costa performance credits`),
     confirmed: true,
     resolvedAmbiguityKeys: [],
   };

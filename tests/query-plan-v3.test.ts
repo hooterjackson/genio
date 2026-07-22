@@ -2,11 +2,14 @@ import { describe, expect, test } from "vitest";
 import {
   assignPipelineV3,
   createQueryPlanV3,
+  createRuntimeQueryPlanV3,
   isQueryPlanV3,
+  queryPlanV3EmissionSchemaVersion,
   queryPlanV3Engines,
   queryPlanV3Hash,
 } from "../server/query-plan-v3.ts";
 import { createRunSpecV3, resolveRunSpecV3 } from "../server/selection-plan-v3.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "../server/music-concepts-v3.ts";
 
 function confirmed(prompt: string, target = 50) {
   const spec = createRunSpecV3({ prompt, requestedTrackCount: target, storefront: "us" });
@@ -24,13 +27,247 @@ describe("query plan V3", () => {
   test("preserves the exact 1-300 target and separates ranking from hard membership", () => {
     const plan = confirmed("Paulinho da Costa's 176 most influential songs", 176);
     const query = createQueryPlanV3(plan, "00000000-0000-4000-8000-000000000001");
+    expect(query.schemaVersion).toBe(2);
+    expect(query.policyVersion).toBe("corpus_first_v3_policy_v1");
     expect(query.targetTrackCount).toBe(176);
     expect(query.engine).toBe("factual_relationship");
     expect(query.membershipPredicates.some(({ kind }) => kind === "factual_relationship")).toBe(true);
     expect(query.membershipPredicates.some(({ kind }) => kind === "influence")).toBe(false);
     expect(query.rankingObjectives.some(({ kind }) => kind === "influence")).toBe(true);
+    expect(query.semanticPolicyVersion).toBe("scope_gate_v2_1_2");
+    expect(query.musicConceptPolicyVersion).toBe(MUSIC_CONCEPT_POLICY_VERSION);
+    expect(query.semanticAuditMetadata?.musicConceptPolicyVersion).toBe(MUSIC_CONCEPT_POLICY_VERSION);
+    expect(query.semanticClauses?.some(({ role, axis, values }) => (
+      role === "membership" && axis === "factual_relationship" && values.length > 0
+    ))).toBe(true);
+    expect(query.explicitUserConstraintHash).toMatch(/^[a-f0-9]{64}$/u);
+    expect(query.hardConstraintHash).toBe(query.semanticAuditMetadata?.hardConstraintHash);
+    expect(query.hardConstraints.some((constraint) => (
+      constraint.axis === "relationship" && constraint.operator === "require"
+    ))).toBe(false);
     expect(isQueryPlanV3(query)).toBe(true);
     expect(queryPlanV3Hash(query)).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  test("keeps runtime emission on schema 1 until the explicit activation flag is set", () => {
+    const base = confirmed("25 disco songs", 25);
+    const plan = {
+      ...base,
+      hardConstraints: [
+        ...base.hardConstraints,
+        {
+          id: "artist-quota",
+          axis: "artist" as const,
+          operator: "maximum" as const,
+          values: ["4"],
+          kind: "hard" as const,
+          relaxationRank: null,
+        },
+      ],
+    };
+    const snapshot = "00000000-0000-4000-8000-000000000001";
+    expect(queryPlanV3EmissionSchemaVersion({})).toBe(1);
+    const compatibility = createRuntimeQueryPlanV3(plan, snapshot, {});
+    expect(compatibility.schemaVersion).toBe(1);
+    expect(compatibility.semanticClauses).toBeUndefined();
+    expect(compatibility.musicConceptPolicyVersion).toBeUndefined();
+    expect(compatibility.hardConstraints).toEqual([expect.objectContaining({
+      id: "artist-quota",
+      axis: "artist",
+      operator: "maximum",
+      values: ["4"],
+    })]);
+    expect(isQueryPlanV3(compatibility)).toBe(true);
+
+    const activated = createRuntimeQueryPlanV3(plan, snapshot, {
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "2",
+    });
+    expect(activated.schemaVersion).toBe(2);
+    expect(activated.semanticClauses?.some(({ role }) => role === "membership")).toBe(true);
+    expect(isQueryPlanV3(activated)).toBe(true);
+  });
+
+  test("continues to validate historical schema-1 query plans", () => {
+    const current = createQueryPlanV3(
+      confirmed("25 disco songs", 25),
+      "00000000-0000-4000-8000-000000000001",
+    );
+    const legacy = {
+      ...current,
+      schemaVersion: 1,
+      policyVersion: "corpus_first_v3_policy_v1",
+      semanticPolicyVersion: undefined,
+      musicConceptPolicyVersion: undefined,
+      semanticClauses: undefined,
+      contextSignals: undefined,
+      catalogPolicies: undefined,
+      recordingPolicy: undefined,
+      explicitUserConstraintHash: undefined,
+      hardConstraintHash: undefined,
+      semanticAuditMetadata: undefined,
+    };
+    expect(isQueryPlanV3(legacy)).toBe(true);
+  });
+
+  test("rejects schema-2 plans whose governed music-concept policy drifts", () => {
+    const query = createQueryPlanV3(
+      confirmed("25 disco songs", 25),
+      "00000000-0000-4000-8000-000000000001",
+    );
+    expect(isQueryPlanV3(query)).toBe(true);
+    expect(isQueryPlanV3({
+      ...query,
+      musicConceptPolicyVersion: "music_concepts_future",
+    })).toBe(false);
+    expect(isQueryPlanV3({
+      ...query,
+      semanticAuditMetadata: {
+        ...query.semanticAuditMetadata!,
+        musicConceptPolicyVersion: "music_concepts_future",
+      },
+    })).toBe(false);
+  });
+
+  test("rejects drift between schema-2 membership clauses and their legacy projection", () => {
+    const query = createQueryPlanV3(
+      confirmed("Paulinho da Costa's 25 most influential songs", 25),
+      "00000000-0000-4000-8000-000000000001",
+    );
+    const predicates = query.membershipPredicates;
+    const predicate = query.membershipPredicates[0]!;
+    expect(query.semanticClauses?.filter(({ role }) => role === "membership").length).toBeGreaterThan(0);
+    expect(isQueryPlanV3(query)).toBe(true);
+
+    // `include` and `require` are the same positive membership operation.
+    expect(isQueryPlanV3({
+      ...query,
+      membershipPredicates: predicates.map((item, index) => index === 0
+        ? {
+          ...predicate,
+          relationship: predicate.relationship === "include" ? "require" : "include",
+        }
+        : item),
+    })).toBe(true);
+
+    for (const membershipPredicates of [
+      [null],
+      predicates.slice(1),
+      predicates.map((item, index) => index === 0 ? { ...predicate, id: "tampered-id" } : item),
+      predicates.map((item, index) => index === 0 ? { ...predicate, kind: "genre" } : item),
+      predicates.map((item, index) => index === 0 ? { ...predicate, relationship: "exclude" } : item),
+      predicates.map((item, index) => index === 0 ? { ...predicate, subject: `${predicate.subject} (tampered)` } : item),
+      predicates.map((item, index) => index === 0 ? { ...predicate, hard: false } : item),
+      [...predicates, { ...predicate, id: "unexpected-extra-predicate" }],
+    ]) {
+      expect(isQueryPlanV3({ ...query, membershipPredicates })).toBe(false);
+    }
+  });
+
+  test("requires exact bidirectional context and catalog-policy role projections", () => {
+    const query = createQueryPlanV3(
+      confirmed(
+        "49 iconic disco songs for a Paris dinner, only live versions",
+        49,
+      ),
+      "00000000-0000-4000-8000-000000000001",
+    );
+    const context = query.contextSignals?.[0];
+    const policy = query.catalogPolicies?.[0];
+    expect(context).toBeDefined();
+    expect(policy).toBeDefined();
+    expect(isQueryPlanV3(query)).toBe(true);
+
+    expect(isQueryPlanV3({ ...query, contextSignals: [] })).toBe(false);
+    expect(isQueryPlanV3({ ...query, catalogPolicies: [] })).toBe(false);
+    expect(isQueryPlanV3({
+      ...query,
+      contextSignals: [context!, { ...context!, id: "duplicate-context-projection" }],
+    })).toBe(false);
+
+    const unprojectedContext = { ...context!, id: "unprojected-context-clause" };
+    expect(isQueryPlanV3({
+      ...query,
+      semanticClauses: [...query.semanticClauses!, unprojectedContext],
+      semanticAuditMetadata: {
+        ...query.semanticAuditMetadata!,
+        clauseCount: query.semanticAuditMetadata!.clauseCount + 1,
+        contextClauseCount: query.semanticAuditMetadata!.contextClauseCount + 1,
+      },
+    })).toBe(false);
+
+    const unprojectedPolicy = { ...policy!, id: "unprojected-catalog-policy-clause" };
+    expect(isQueryPlanV3({
+      ...query,
+      semanticClauses: [...query.semanticClauses!, unprojectedPolicy],
+      semanticAuditMetadata: {
+        ...query.semanticAuditMetadata!,
+        clauseCount: query.semanticAuditMetadata!.clauseCount + 1,
+        catalogPolicyClauseCount: query.semanticAuditMetadata!.catalogPolicyClauseCount + 1,
+      },
+    })).toBe(false);
+  });
+
+  test("keeps only executable aggregate quotas in schema-2 hard constraints", () => {
+    const base = confirmed("25 disco songs", 25);
+    const query = createQueryPlanV3({
+      ...base,
+      hardConstraints: [
+        ...base.hardConstraints,
+        {
+          id: "legacy-unbound-geography",
+          axis: "geography",
+          operator: "require",
+          values: ["Rio de Janeiro"],
+          kind: "hard",
+          relaxationRank: null,
+        },
+        {
+          id: "artist-quota",
+          axis: "artist",
+          operator: "maximum",
+          values: ["4"],
+          kind: "hard",
+          relaxationRank: null,
+        },
+      ],
+    }, "00000000-0000-4000-8000-000000000001");
+
+    expect(query.hardConstraints).toEqual([expect.objectContaining({
+      id: "artist-quota",
+      axis: "artist",
+      operator: "maximum",
+      values: ["4"],
+    })]);
+    expect(isQueryPlanV3(query)).toBe(true);
+
+    for (const constraint of [
+      {
+        id: "injected-geography",
+        axis: "geography" as const,
+        operator: "require" as const,
+        values: ["Rio de Janeiro"],
+        kind: "hard" as const,
+        relaxationRank: null,
+      },
+      {
+        id: "injected-version",
+        axis: "recording_version" as const,
+        operator: "require" as const,
+        values: ["live"],
+        kind: "hard" as const,
+        relaxationRank: null,
+      },
+      {
+        id: "invalid-quota",
+        axis: "artist" as const,
+        operator: "maximum" as const,
+        values: ["0"],
+        kind: "hard" as const,
+        relaxationRank: null,
+      },
+    ]) {
+      expect(isQueryPlanV3({ ...query, hardConstraints: [...query.hardConstraints, constraint] })).toBe(false);
+    }
   });
 
   test("persists only bounded public provider-attested scout leads", () => {

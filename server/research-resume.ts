@@ -1,6 +1,6 @@
 import type { QueryPlanV3 } from "../shared/types.ts";
 import { v3RetrievalStageKey } from "./pipeline-v3-worker-execution.ts";
-import { minimumWorkerProtocolForPipeline } from "./worker-protocol.ts";
+import { minimumWorkerProtocolForQueryPlan } from "./worker-protocol.ts";
 
 export interface ResearchResumeCheckpoint {
   phase?: string;
@@ -35,7 +35,7 @@ export function pipelineV3ResearchJob(
     },
     dedupeKey: `research:${runId}:${stageKey}`,
     pipelineVersion: "corpus_first_v3" as const,
-    minimumWorkerProtocol: minimumWorkerProtocolForPipeline("corpus_first_v3"),
+    minimumWorkerProtocol: minimumWorkerProtocolForQueryPlan(queryPlan),
     stageKey,
     queueClass,
   };

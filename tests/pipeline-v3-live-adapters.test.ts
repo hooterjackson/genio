@@ -111,7 +111,10 @@ describe("Pipeline V3 live read-only adapters", () => {
     const sourceUrl = "https://www.loc.gov/item/disco-history";
     const citationText = "Chic — Good Times is a disco recording documented by the archive. [source]";
     const markerStart = citationText.indexOf("[source]");
-    const createResponse = vi.fn(async (_input: unknown, _context: unknown) => ({
+    const createResponse = vi.fn(async (input: unknown, context: unknown) => {
+      void input;
+      void context;
+      return {
       output_text: JSON.stringify({
         candidates: [{
           artist: "Chic",
@@ -136,7 +139,8 @@ describe("Pipeline V3 live read-only adapters", () => {
           }],
         },
       ],
-    }));
+      };
+    });
     const adapters = createPipelineV3LiveAdapters({ createResponse: createResponse as any });
 
     const batch = await adapters.discover(discoveryRequest(selection, "editorial_tracks"));
@@ -174,7 +178,10 @@ describe("Pipeline V3 live read-only adapters", () => {
     const sourceUrl = "https://www.loc.gov/item/disco-history";
     const citationText = "Chic — Good Times is a disco recording documented by the archive. [source]";
     const markerStart = citationText.indexOf("[source]");
-    const createResponse = vi.fn(async (_input: unknown, _context: unknown) => ({
+    const createResponse = vi.fn(async (input: unknown, context: unknown) => {
+      void input;
+      void context;
+      return {
       output_text: JSON.stringify({
         candidates: [{
           artist: "Chic",
@@ -199,7 +206,8 @@ describe("Pipeline V3 live read-only adapters", () => {
           }],
         },
       ],
-    }));
+      };
+    });
     const appleSong = { ...song(6, "Chic", "Good Times"), contentRating: "clean" as const };
     const adapters = createPipelineV3LiveAdapters({
       createResponse: createResponse as any,
@@ -291,7 +299,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     },
   );
 
-  test("carries a typed clean-only policy into the immutable V3 membership contract", () => {
+  test("carries a typed clean-only policy as catalog policy rather than evidence membership", () => {
     const spec = createRunSpecV3({
       prompt: "25 disco songs, clean versions only",
       requestedTrackCount: 25,
@@ -330,9 +338,144 @@ describe("Pipeline V3 live read-only adapters", () => {
       },
     });
 
-    expect(spec.membershipPredicates).toEqual(expect.arrayContaining([
-      expect.objectContaining({ axis: "content", operator: "require", values: ["clean"] }),
+    expect(spec.membershipPredicates.some(({ axis }) => axis === "content")).toBe(false);
+    expect(spec.recordingPolicy).toMatchObject({
+      allowedVersions: ["clean"],
+      preferCanonicalStudio: false,
+    });
+    expect(spec.catalogPolicies).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: "catalog_policy",
+        axis: "recording_version",
+        explicitUserAuthored: true,
+      }),
     ]));
+  });
+
+  test("enforces an explicit schema-2 live-only policy against the resolved Apple version", async () => {
+    const selection = plan("25 disco songs, only live versions", 25);
+    const strategy = retrievalStrategiesForEnginesV3(["curated_genre_scene"])
+      .find((value) => value.kind === "trusted_containers")!;
+    const request: DiscoveryRequestV3 = {
+      runId: "live-only-catalog-policy",
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: "curated_genre_scene",
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 25,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    const studio = song(701, "Chic", "Good Times");
+    const live = {
+      ...song(702, "Chic", "Good Times (Live)"),
+      versionLabel: "Live",
+    };
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch({
+        playlists: [{
+          id: "pl.live-disco",
+          name: "Disco Essentials",
+          curatorName: "Apple Music",
+          description: "Defining disco music from the genre's foundational scenes.",
+          url: "https://music.apple.com/us/playlist/disco-essentials/pl.live-disco",
+        }],
+      })) as any,
+      getPlaylistTracks: vi.fn(async () => ({ items: [studio, live], next: null })) as any,
+    });
+
+    const batch = await adapters.discover(request);
+    const qualifications = await adapters.qualify({ ...request, candidates: batch.candidates });
+
+    expect(selection.membershipPredicates.some(({ axis }) => axis === "recording_version")).toBe(false);
+    expect(selection.recordingPolicy.allowedVersions).toEqual(["live"]);
+    expect(qualifications.map(({ version }) => version.compatible)).toEqual([false, true]);
+  });
+
+  test.each([
+    { rating: "clean" as const, compatible: true },
+    { rating: "explicit" as const, compatible: false },
+    { rating: undefined, compatible: false },
+  ])("enforces a compiled schema-2 clean-only policy for Apple rating $rating", async ({ rating, compatible }) => {
+    const selection = plan("25 disco songs, clean versions only", 25);
+    const genre = selection.membershipPredicates.find(({ axis }) => axis === "genre")!;
+    const appleSong: CatalogSong = {
+      ...song(710, "Chic", "Le Freak"),
+      ...(rating ? { contentRating: rating } : {}),
+    };
+    const adapters = createPipelineV3LiveAdapters({
+      discoverHostedWeb: vi.fn(async () => [{
+        artist: "Chic",
+        title: "Le Freak",
+        album: null,
+        sourceUrl: "https://www.loc.gov/item/disco-history",
+        provenanceRoot: "loc.gov",
+        evidenceStrength: 0.9,
+        sourceRank: 1,
+        predicateIds: [genre.id],
+        providerAttestedExactTrackScope: true,
+      }]),
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({ ...discovery, candidates: batch.candidates });
+
+    expect(qualification.version.compatible).toBe(compatible);
+    expect(qualification.catalog).toMatchObject({
+      lookupAttempted: true,
+      appleProviderRequestCount: 2,
+    });
+  });
+
+  test("distinguishes catalog-resolution attempts from actual Apple provider reads", async () => {
+    const selection = plan("25 disco songs", 25);
+    const strategy = retrievalStrategiesForEnginesV3(["curated_genre_scene"])
+      .find((value) => value.kind === "trusted_containers")!;
+    const request: DiscoveryRequestV3 = {
+      runId: "metered-apple-provider-reads",
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: "curated_genre_scene",
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 25,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    const appleSong = song(720, "Chic", "Good Times");
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch({
+        playlists: [{
+          id: "pl.disco-metered",
+          name: "Disco Essentials",
+          curatorName: "Apple Music",
+          description: "Defining disco music from the genre's foundational scenes.",
+          url: "https://music.apple.com/us/playlist/disco-essentials/pl.disco-metered",
+        }],
+      })) as any,
+      getPlaylistTracks: vi.fn(async () => ({ items: [appleSong], next: null })) as any,
+      searchAppleSongs: vi.fn(async () => { throw new Error("must not be called"); }) as any,
+      lookupAppleByIsrc: vi.fn(async () => { throw new Error("must not be called"); }) as any,
+    });
+    const batch = await adapters.discover(request);
+    const [qualification] = await adapters.qualify({ ...request, candidates: batch.candidates });
+
+    expect(qualification.catalog).toMatchObject({
+      lookupAttempted: true,
+      appleProviderRequestCount: 0,
+      appleSongId: appleSong.id,
+    });
   });
 
   test("repairs malformed structured output once with the frozen escalation provider ID", async () => {
@@ -1170,7 +1313,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     });
 
     expect(qualification).toMatchObject({
-      hardConstraints: { passed: false, failedConstraintIds: ["era-between"] },
+      hardConstraints: { passed: false, failedConstraintIds: ["catalog:era:1973_1983"] },
       catalog: { releaseYear: 2004, compatibleReleaseYears: [2004] },
     });
   });
@@ -1240,7 +1383,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     });
 
     expect(qualification).toMatchObject({
-      hardConstraints: { passed: false, failedConstraintIds: ["era-between"] },
+      hardConstraints: { passed: false, failedConstraintIds: ["catalog:era:1973_1983"] },
       catalog: { releaseYear: 2004, compatibleReleaseYears: [2004] },
     });
   });

@@ -10,6 +10,7 @@ import {
   governedCorpusActionReasonV3,
   PipelineV3WorkerExecution,
   retrievalPolicyV3FromPipelinePolicySnapshot,
+  selectionPlanFromQueryPlanV3,
   v3RetrievalStageKey,
   type PipelineV3RetrievalExecutionPort,
   type PipelineV3WorkerPayload,
@@ -21,9 +22,11 @@ import { createQueryPlanV3 } from "../server/query-plan-v3.ts";
 import {
   createRunSpecV3,
   resolveRunSpecV3,
+  type SelectionPlanV3,
 } from "../server/selection-plan-v3.ts";
 import type { ColdCorpusBuildResultV3 } from "../server/pipeline-v3-corpus-builder.ts";
 import { createPipelinePolicySnapshotV3 } from "../server/pipeline-v3-policy.ts";
+import type { SemanticPlanRevisionArtifactV3 } from "../server/pipeline-v3-semantic-recovery.ts";
 
 const GRAPH_SNAPSHOT_ID = "11111111-1111-4111-8111-111111111111";
 const QUERY_PLAN_REVISION_ID = "22222222-2222-4222-8222-222222222222";
@@ -38,6 +41,14 @@ function queryPlan(target = 25) {
     requestedTrackCount: target,
     storefront: "us",
   }), []), GRAPH_SNAPSHOT_ID);
+}
+
+function legacyQueryPlan(target = 25) {
+  return createQueryPlanV3(resolveRunSpecV3(createRunSpecV3({
+    prompt: `${target} influential disco recordings`,
+    requestedTrackCount: target,
+    storefront: "us",
+  }), []), GRAPH_SNAPSHOT_ID, { schemaVersion: 1 });
 }
 
 function workerRun(prompt: string, target = 25) {
@@ -239,6 +250,7 @@ class MemoryRepository implements PipelineV3WorkerRepository {
     fence: PipelineV3WriteFence | undefined;
   }> = [];
   readonly persisted: Array<Parameters<PipelineV3WorkerRepository["persistPipelineV3RetrievalResult"]>[0]> = [];
+  readonly semanticRecoveryClaims: Array<Parameters<PipelineV3WorkerRepository["claimPipelineV3SemanticRecovery"]>[0]> = [];
   readonly corpusIngestions: ColdCorpusBuildResultV3[] = [];
 
   constructor(
@@ -265,6 +277,13 @@ class MemoryRepository implements PipelineV3WorkerRepository {
     fence?: PipelineV3WriteFence,
   ): Promise<void> {
     this.updates.push({ patch: structuredClone(patch), fence });
+  }
+
+  async claimPipelineV3SemanticRecovery(
+    input: Parameters<PipelineV3WorkerRepository["claimPipelineV3SemanticRecovery"]>[0],
+  ): ReturnType<PipelineV3WorkerRepository["claimPipelineV3SemanticRecovery"]> {
+    this.semanticRecoveryClaims.push(structuredClone(input));
+    return { status: this.semanticRecoveryClaims.length === 1 ? "claimed" : "replayed", revision: 2 };
   }
 
   async persistPipelineV3RetrievalResult(
@@ -353,6 +372,24 @@ function execution(result: RetrievalResultV3): PipelineV3RetrievalExecutionPort 
   return { execute: vi.fn(async () => result) };
 }
 
+function semanticRecoveryRevision(plan: SelectionPlanV3): SemanticPlanRevisionArtifactV3 {
+  return {
+    revision: 2,
+    parentRevision: 1,
+    equivalence: "semantic_equivalent_repair",
+    hardConstraintHash: "b".repeat(64),
+    planHash: "c".repeat(64),
+    plan,
+    transformations: [{
+      kind: "duplicate_projection",
+      removedPredicateId: "genre:duplicate",
+      retainedPredicateId: "genre:retained",
+      reason: "Exact duplicate membership projection",
+    }],
+    predicateProjection: { "genre:duplicate": "genre:retained" },
+  };
+}
+
 function assertFenced(repository: MemoryRepository, plan: ReturnType<typeof queryPlan>, mode: "active" | "shadow" = "active") {
   const expected = {
     jobId: JOB_ID,
@@ -366,9 +403,20 @@ function assertFenced(repository: MemoryRepository, plan: ReturnType<typeof quer
   for (const write of repository.writes) expect(write.fence).toEqual(expected);
   for (const update of repository.updates) expect(update.fence).toEqual(expected);
   for (const persisted of repository.persisted) expect(persisted.fence).toEqual(expected);
+  for (const claim of repository.semanticRecoveryClaims) expect(claim.fence).toEqual(expected);
 }
 
 describe("Pipeline V3 durable worker execution", () => {
+  test("refuses schema-2 work compiled against a different music-concept registry", () => {
+    const plan = queryPlan();
+    expect(() => selectionPlanFromQueryPlanV3({
+      ...plan,
+      musicConceptPolicyVersion: "music_concepts_future",
+    }, workerRun("25 influential disco recordings"))).toThrow(
+      "unsupported music-concept policy",
+    );
+  });
+
   test("classifies unsupported exhaustive and cold factual graph work explicitly", () => {
     expect(governedCorpusActionReasonV3(factualQueryPlan({ exhaustive: true }))).toBe(
       "v3_exhaustive_frontier_builder_unavailable",
@@ -458,6 +506,7 @@ describe("Pipeline V3 durable worker execution", () => {
     assertFenced(repository, plan);
     expect(port.execute).toHaveBeenCalledOnce();
     expect(port.execute).toHaveBeenCalledWith(expect.objectContaining({
+      semanticRecoveryEnabled: true,
       modelRoute: expect.objectContaining({
         providerModelId: "gpt-5.6-luna",
         escalationProviderModelId: "gpt-5.6-terra",
@@ -470,6 +519,23 @@ describe("Pipeline V3 durable worker execution", () => {
         deadlineAtEpochMs: null,
         maximumProviderFailuresPerStrategy: 2,
       },
+    }));
+  });
+
+  test("fences semantic recovery out of immutable schema-1 compatibility jobs", async () => {
+    const plan = legacyQueryPlan();
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("no_compatible_tracks", 0));
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: payload(plan),
+    });
+
+    expect(port.execute).toHaveBeenCalledWith(expect.objectContaining({
+      semanticRecoveryEnabled: false,
     }));
   });
 
@@ -541,6 +607,70 @@ describe("Pipeline V3 durable worker execution", () => {
     expect([...repository.checkpoints.values()]).toContainEqual(expect.objectContaining({
       state: "failed_integrity",
       code: "v3_retrieval_policy_snapshot_invalid",
+    }));
+  });
+
+  test("claims semantic recovery under the active lease before persisting the result", async () => {
+    const plan = queryPlan();
+    const repository = new MemoryRepository();
+    const result = retrievalResult("exact_ready", 25);
+    const port: PipelineV3RetrievalExecutionPort = {
+      execute: vi.fn(async (request) => {
+        await request.claimSemanticRecovery(semanticRecoveryRevision(request.plan));
+        expect(repository.persisted).toHaveLength(0);
+        return result;
+      }),
+    };
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: payload(plan),
+    });
+
+    expect(repository.semanticRecoveryClaims).toHaveLength(1);
+    expect(repository.semanticRecoveryClaims[0]).toMatchObject({
+      runId: "run-v3",
+      queryPlan: plan,
+      revision: { revision: 2, parentRevision: 1 },
+    });
+    expect(repository.persisted).toHaveLength(1);
+    assertFenced(repository, plan);
+  });
+
+  test("settles a conflicting semantic-recovery replay as failed integrity", async () => {
+    const plan = queryPlan();
+    const repository = new MemoryRepository();
+    repository.claimPipelineV3SemanticRecovery = vi.fn(async () => {
+      throw Object.assign(new Error("conflicting semantic recovery"), {
+        code: "pipeline_v3_semantic_recovery_conflict",
+      });
+    });
+    const port: PipelineV3RetrievalExecutionPort = {
+      execute: vi.fn(async (request) => {
+        await request.claimSemanticRecovery(semanticRecoveryRevision(request.plan));
+        return retrievalResult("exact_ready", 25);
+      }),
+    };
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: payload(plan),
+    });
+
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "failed_integrity",
+      phase: "v3_semantic_recovery_claim_conflict",
+      error: null,
+    });
+    expect([...repository.checkpoints.values()]).toContainEqual(expect.objectContaining({
+      state: "failed_integrity",
+      code: "v3_semantic_recovery_claim_conflict",
+      claimErrorCode: "pipeline_v3_semantic_recovery_conflict",
     }));
   });
 

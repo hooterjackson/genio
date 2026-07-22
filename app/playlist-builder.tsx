@@ -842,6 +842,7 @@ function OneCommandScreen({
   prompt,
   trackCount,
   busy,
+  introSettled,
   onPrompt,
   onTrackCount,
   onSubmit,
@@ -849,6 +850,7 @@ function OneCommandScreen({
   prompt: string;
   trackCount: string;
   busy: string;
+  introSettled: boolean;
   onPrompt: (value: string) => void;
   onTrackCount: (value: string) => void;
   onSubmit: (submission: PlaylistCommandSubmission) => void;
@@ -887,6 +889,7 @@ function OneCommandScreen({
   const countMessage = !validCount
     ? `Choose ${PUBLIC_PLAYLIST_MINIMUM_TRACKS}–${PUBLIC_PLAYLIST_MAXIMUM_TRACKS} tracks.`
     : "The selected track count is exact.";
+  const interactive = hydrated && introSettled;
 
   useEffect(() => {
     if (!focused || prompt) return;
@@ -931,7 +934,7 @@ function OneCommandScreen({
           <p className="command-lead">Describe what you want to hear.</p>
           <p>gênio researches the music, finds the tracks, and builds it in Apple Music.</p>
         </header>
-        <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy) || !hydrated}>
+        <form className="one-command-form" onSubmit={submit} aria-busy={Boolean(busy) || !interactive}>
           <section className="command-request-section" aria-labelledby="request-step-title">
             <h2 className="sr-only" id="request-step-title">Playlist request</h2>
             <label className="one-command-request" htmlFor="playlist-request">
@@ -948,7 +951,7 @@ function OneCommandScreen({
                 maxLength={2000}
                 spellCheck
                 required
-                disabled={Boolean(busy) || !hydrated}
+                disabled={Boolean(busy) || !interactive}
                 aria-invalid={promptInvalid}
                 aria-describedby="playlist-request-note"
                 placeholder={focused ? examples[exampleIndex] : "What should the playlist contain?"}
@@ -969,7 +972,7 @@ function OneCommandScreen({
                     aria-label={`${value} tracks`}
                     aria-pressed={count === value}
                     onClick={() => choosePreset(value)}
-                    disabled={Boolean(busy) || !hydrated}
+                    disabled={Boolean(busy) || !interactive}
                   >
                     {value}
                   </button>
@@ -980,7 +983,7 @@ function OneCommandScreen({
                   aria-label="Custom size"
                   aria-pressed={false}
                   onClick={chooseCustom}
-                  disabled={Boolean(busy) || !hydrated}
+                  disabled={Boolean(busy) || !interactive}
                 >
                   Custom
                 </button>
@@ -1000,7 +1003,7 @@ function OneCommandScreen({
                     value={trackCount}
                     onChange={(event) => onTrackCount(event.target.value)}
                     required
-                    disabled={Boolean(busy) || !hydrated}
+                    disabled={Boolean(busy) || !interactive}
                     aria-invalid={countInvalid || trackCount.length === 0}
                     aria-describedby="playlist-track-count-note"
                     aria-label="Exact track count"
@@ -1010,7 +1013,7 @@ function OneCommandScreen({
                 <button
                   type="button"
                   onClick={() => choosePreset(PUBLIC_PLAYLIST_DEFAULT_TRACKS)}
-                  disabled={Boolean(busy) || !hydrated}
+                  disabled={Boolean(busy) || !interactive}
                 >
                   PRESETS
                 </button>
@@ -1032,7 +1035,7 @@ function OneCommandScreen({
             <button
               className="one-command-submit"
               type="submit"
-              disabled={!hydrated || Boolean(busy) || prompt.trim().length < 4 || !validCount}
+              disabled={!interactive || Boolean(busy) || prompt.trim().length < 4 || !validCount}
             >
               {busy
                 ? "STARTING..."
@@ -1388,7 +1391,7 @@ function PartialDecisionScreen({
                 : "NO VERIFIED TRACKS TO PUBLISH"}
           </button>
           <button className="quiet-button" type="button" onClick={onChangeRequest} disabled={Boolean(busy)}>
-            CHANGE REQUEST
+            {hasTracks ? "CHANGE REQUEST" : "RETRY WITH UPDATED INTERPRETATION"}
           </button>
           <button className="text-danger" type="button" onClick={onCancel} disabled={Boolean(busy)}>
             {busy === "cancel-run" ? "CANCELING..." : "CANCEL JOB"}
@@ -1790,12 +1793,14 @@ function ResultScreen({
   result,
   exploreBusy,
   onReset,
+  onRetryUpdatedInterpretation,
   onDelete,
   onExploreVisibility,
 }: {
   result: RunResult;
   exploreBusy: boolean;
   onReset: () => void;
+  onRetryUpdatedInterpretation: () => void;
   onDelete: () => void;
   onExploreVisibility: (listed: boolean) => void;
 }) {
@@ -1879,6 +1884,11 @@ function ResultScreen({
       </div>
 
       <div className="step-footer result-actions">
+        {!hasPublishedPlaylist && (
+          <button className="action-button" onClick={onRetryUpdatedInterpretation}>
+            RETRY WITH UPDATED INTERPRETATION →
+          </button>
+        )}
         <button className="quiet-button" onClick={onReset}>← NEW JOB</button>
         {result.evidenceUrl && <a className="quiet-link" href={result.evidenceUrl} target="_blank" rel="noreferrer">VIEW EVIDENCE ↗</a>}
         <button className="text-danger" onClick={onDelete}>DELETE RUN DATA</button>
@@ -1889,6 +1899,7 @@ function ResultScreen({
 
 export function PlaylistBuilder() {
   const [entryStage, setEntryStage] = useState<"command" | "jobs">("command");
+  const [introSettled, setIntroSettled] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [trackCount, setTrackCount] = useState(String(PUBLIC_PLAYLIST_DEFAULT_TRACKS));
   const [brief, setBrief] = useState<PlaylistBrief | null>(null);
@@ -1919,6 +1930,7 @@ export function PlaylistBuilder() {
   const tracksRequestRef = useRef<AbortController | null>(null);
   const operationRequestRef = useRef<AbortController | null>(null);
   const restoreStartedRef = useRef(false);
+  const settleIntro = useCallback(() => setIntroSettled(true), []);
 
   const deleteAbandonedBrief = useCallback((requestId: string) => {
     void api<void>("/api/v1/brief/" + encodeURIComponent(requestId), {
@@ -1968,6 +1980,17 @@ export function PlaylistBuilder() {
 
   const reset = useCallback(() => clearCurrent("command"), [clearCurrent]);
   const newJob = useCallback(() => clearCurrent("command"), [clearCurrent]);
+  const retryWithUpdatedInterpretation = useCallback(() => {
+    const retryPrompt = run?.prompt?.trim() || prompt.trim();
+    const retryCount = result?.requestedTrackCount
+      ?? (run ? partialReadyView(run)?.targetTrackCount : null)
+      ?? (run ? exactRequestedTrackCount(run.brief) : null)
+      ?? (/^[0-9]+$/u.test(trackCount) ? Number.parseInt(trackCount, 10) : PUBLIC_PLAYLIST_DEFAULT_TRACKS);
+    clearCurrent("command");
+    setPrompt(retryPrompt);
+    setTrackCount(String(retryCount));
+    submittedTrackCountRef.current = retryCount;
+  }, [clearCurrent, prompt, result?.requestedTrackCount, run, trackCount]);
 
   const updateRun = useCallback((next: ResearchRun) => {
     if (activeRunId.current !== next.id) return;
@@ -2826,13 +2849,14 @@ export function PlaylistBuilder() {
   if (!run && !manifest && !result && entryStage === "command") {
     return (
       <main className="app-shell one-command-shell">
-        <BrandIntro />
+        <BrandIntro onSettled={settleIntro} />
         <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <OneCommandScreen
           prompt={prompt}
           trackCount={trackCount}
           busy={busy}
+          introSettled={introSettled}
           onPrompt={(value) => {
             setPrompt(value);
             setBrief(null);
@@ -2894,7 +2918,7 @@ export function PlaylistBuilder() {
           busy={busy}
           onContinueResearch={() => void continuePartialResearch()}
           onPublishPartial={() => void publishPartialPlaylist()}
-          onChangeRequest={newJob}
+          onChangeRequest={retryWithUpdatedInterpretation}
           onCancel={() => void cancelRun()}
         />
       )}
@@ -2927,6 +2951,7 @@ export function PlaylistBuilder() {
           exploreBusy={busy === "explore-visibility"}
           onExploreVisibility={(listed) => void updateExploreVisibility(listed)}
           onReset={newJob}
+          onRetryUpdatedInterpretation={retryWithUpdatedInterpretation}
           onDelete={deleteRun}
         />
       )}

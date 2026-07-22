@@ -182,9 +182,40 @@ async function requireWorkerForNewWork(): Promise<void> {
   const required = process.env.REQUIRE_WORKER_HEARTBEAT === "true" || process.env.NODE_ENV === "production";
   if (!required) return;
   const health = await repository.getSystemHealth();
-  if (health.worker.stale || !health.worker.schemaCompatible || !health.worker.protocolCompatible) {
+  if (!workerLaneReady(health, "interactive")) {
     throw new HttpError(503, "Research worker is temporarily unavailable", "worker_unavailable");
   }
+}
+
+interface WorkerLaneHealthView {
+  worker_id?: string;
+  stale?: boolean;
+  schemaCompatible?: boolean;
+  protocolCompatible?: boolean;
+  protocolVersion?: string | number | null;
+  compatibleCapacity?: number;
+}
+
+interface WorkerLaneSystemHealthView {
+  workerLanes?: Partial<Record<"interactive" | "deep", WorkerLaneHealthView>>;
+}
+
+function workerLaneReady(health: WorkerLaneSystemHealthView, lane: "interactive" | "deep"): boolean {
+  const worker = health.workerLanes?.[lane];
+  return Boolean(worker
+    && !worker.stale
+    && worker.schemaCompatible
+    && worker.protocolCompatible
+    && Number(worker.compatibleCapacity ?? 0) > 0);
+}
+
+function workerLaneStatus(health: WorkerLaneSystemHealthView, lane: "interactive" | "deep"): string {
+  const worker = health.workerLanes?.[lane];
+  if (!worker?.worker_id) return "missing";
+  if (worker.stale) return "stale";
+  if (!worker.schemaCompatible) return "schema_mismatch";
+  if (!worker.protocolCompatible) return "protocol_mismatch";
+  return Number(worker.compatibleCapacity ?? 0) > 0 ? "healthy" : "missing";
 }
 
 async function assertNotPaused(kind: "research" | "publishing" | "feedback"): Promise<void> {
@@ -275,12 +306,14 @@ app.get("/health/system", async (_request, reply) => {
     const health = await repository.getSystemHealth();
     const schemaVersion = health.database.schemaVersion;
     const schemaCompatible = isDatabaseSchemaVersionCompatible(schemaVersion);
-    const ok = schemaCompatible
-      && !health.worker.stale
-      && health.worker.schemaCompatible
-      && health.worker.protocolCompatible;
+    // Public/API readiness depends on the interactive lane. The deep lane is
+    // a separate activation prerequisite so a missing deep worker cannot take
+    // otherwise healthy interactive traffic offline during staged rollout.
+    const ok = schemaCompatible && workerLaneReady(health, "interactive");
+    const activationReady = ok && workerLaneReady(health, "deep");
     return reply.code(ok ? 200 : 503).send({
       ok,
+      activationReady,
       database: schemaCompatible ? "ready" : "schema_mismatch",
       worker: health.worker.worker_id
         ? health.worker.stale
@@ -294,6 +327,18 @@ app.get("/health/system", async (_request, reply) => {
       workerProtocol: {
         expected: WORKER_PIPELINE_PROTOCOL_VERSION,
         actual: health.worker.protocolVersion ?? null,
+      },
+      workerLanes: {
+        interactive: {
+          status: workerLaneStatus(health, "interactive"),
+          protocolVersion: health.workerLanes.interactive.protocolVersion ?? null,
+          compatibleCapacity: health.workerLanes.interactive.compatibleCapacity,
+        },
+        deep: {
+          status: workerLaneStatus(health, "deep"),
+          protocolVersion: health.workerLanes.deep.protocolVersion ?? null,
+          compatibleCapacity: health.workerLanes.deep.compatibleCapacity,
+        },
       },
       paused: health.paused.research || health.paused.publishing,
       queue: health.queue,
@@ -314,14 +359,28 @@ app.get("/api/health", async () => ({ ok: await repository.ping(), service: "nee
 
 app.get("/api/v1/system/health", async () => {
   const health = await repository.getSystemHealth();
+  const ok = workerLaneReady(health, "interactive");
   return {
-    ok: !health.worker.stale && health.worker.schemaCompatible && health.worker.protocolCompatible,
+    ok,
+    activationReady: ok && workerLaneReady(health, "deep"),
     worker: {
       stale: health.worker.stale,
       schemaCompatible: health.worker.schemaCompatible,
       protocolCompatible: health.worker.protocolCompatible,
       protocolVersion: health.worker.protocolVersion ?? null,
       expectedProtocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+    },
+    workerLanes: {
+      interactive: {
+        status: workerLaneStatus(health, "interactive"),
+        protocolVersion: health.workerLanes.interactive.protocolVersion ?? null,
+        compatibleCapacity: health.workerLanes.interactive.compatibleCapacity,
+      },
+      deep: {
+        status: workerLaneStatus(health, "deep"),
+        protocolVersion: health.workerLanes.deep.protocolVersion ?? null,
+        compatibleCapacity: health.workerLanes.deep.compatibleCapacity,
+      },
     },
     paused: health.paused,
     queue: health.queue,
@@ -866,8 +925,10 @@ async function ownerCorpusAction<T>(action: () => Promise<T>): Promise<T> {
 app.get("/api/v1/owner/status", async (request) => {
   owner(request);
   const health = await repository.getSystemHealth();
+  const ok = workerLaneReady(health, "interactive");
   return {
-    ok: !health.worker.stale && health.worker.schemaCompatible && health.worker.protocolCompatible,
+    ok,
+    activationReady: ok && workerLaneReady(health, "deep"),
     paused: health.paused.research || health.paused.publishing || health.paused.feedback,
     database: "ready",
     worker: health.worker.worker_id
@@ -875,6 +936,10 @@ app.get("/api/v1/owner/status", async (request) => {
         ? "stale"
         : "healthy"
       : "missing",
+    workerLanes: {
+      interactive: workerLaneStatus(health, "interactive"),
+      deep: workerLaneStatus(health, "deep"),
+    },
     apple: {
       configured: health.apple.status !== "missing",
       authorized: health.apple.status === "valid",

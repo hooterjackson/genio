@@ -21,6 +21,16 @@ import type {
   SelectionScopeKind,
 } from "../shared/types.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
+import {
+  inferSelectionGeographyRelationship,
+  parseSelectionGeographyConstraints,
+  selectionGeographyIsAudienceMarketContext,
+} from "./selection-geography-policy.ts";
+import {
+  canonicalMusicConceptIdV3,
+  eligibilityAliasesForMusicConceptV3,
+  MUSIC_CONCEPT_POLICY_VERSION,
+} from "./music-concepts-v3.ts";
 
 export const PIPELINE_V3_VERSION = "corpus_first_v3" as const;
 export const PIPELINE_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -28,6 +38,7 @@ export const GROUNDED_RECOVERY_V3_1_POLICY_VERSION = "grounded_recovery_v3_1_pol
 export const SEMANTIC_PLAN_V3_1_VERSION = "semantic_plan_v3_1" as const;
 export const SELECTION_PLAN_V3_VERSION = "selection_plan_v3" as const;
 export const SELECTION_PLAN_V3_SCHEMA_VERSION = 1 as const;
+export const SEMANTIC_SCOPE_POLICY_VERSION = "scope_gate_v2_1_2" as const;
 export const PIPELINE_V3_MAX_SOURCE_DISCOVERY_HINTS = 12;
 
 export type IntentV3 =
@@ -75,6 +86,7 @@ export interface MembershipPredicateV3 {
   readonly operator: MembershipOperatorV3;
   readonly values: readonly string[];
   readonly source: "user" | "guided_answer" | "system_safety";
+  readonly geographyRelationship?: SelectionConstraint["geographyRelationship"];
   /** A short machine-readable explanation used in audit reports. */
   readonly reason: string;
 }
@@ -118,6 +130,37 @@ export interface RecordingPolicyV3 {
   readonly excludeKaraokeTributeAndCovers: boolean;
 }
 
+/**
+ * Every interpreted clause has one execution role.  Keeping the role on the
+ * immutable plan prevents presentation prose and listener context from being
+ * replayed later as track-evidence requirements.
+ */
+export type SemanticClauseRoleV32 =
+  | "membership"
+  | "catalog_policy"
+  | "context"
+  | "ranking"
+  | "diversity_sequencing"
+  | "discovery_hint";
+
+export type SemanticClauseSourceV32 =
+  | "raw_prompt"
+  | "guided_answer"
+  | "v2_compatibility"
+  | "system_default";
+
+export interface SemanticPlanClauseV32 {
+  readonly id: string;
+  readonly role: SemanticClauseRoleV32;
+  readonly axis: MembershipAxisV3 | RankingDimensionV3 | SelectionConstraint["axis"];
+  readonly operator: MembershipOperatorV3 | SelectionConstraint["operator"] | RankingObjectiveV3["direction"];
+  readonly values: readonly string[];
+  readonly source: SemanticClauseSourceV32;
+  readonly explicitUserAuthored: boolean;
+  readonly geographyRelationship: SelectionConstraint["geographyRelationship"];
+  readonly reason: string;
+}
+
 export interface CriticalAmbiguityV3 {
   readonly key:
     | "house_semantics"
@@ -156,17 +199,25 @@ export interface RunSpecV3 {
   readonly sourceDiscoveryHints: readonly PipelineV3SourceDiscoveryHint[];
   readonly criticalAmbiguities: readonly CriticalAmbiguityV3[];
   readonly recordingPolicy: RecordingPolicyV3;
+  readonly semanticPolicyVersion: typeof SEMANTIC_SCOPE_POLICY_VERSION;
+  /** Pins the server-owned alias/evidence registry for reproducible execution. */
+  readonly musicConceptPolicyVersion: typeof MUSIC_CONCEPT_POLICY_VERSION;
+  readonly semanticClauses: readonly SemanticPlanClauseV32[];
+  readonly contextSignals: readonly SemanticPlanClauseV32[];
+  readonly catalogPolicies: readonly SemanticPlanClauseV32[];
+  /** Hash of user-authored input only; model/compatibility prose is excluded. */
+  readonly explicitUserConstraintHash: string;
   /** Immutable semantic contract compiled from the raw request. */
   readonly userGoal?: UserGoalV31;
   /** Deterministic proof that the compiler did not create contradictory hard clauses. */
   readonly semanticAudit?: SemanticAuditV31;
 }
 
-export type UserGoalClauseRoleV31 = "membership" | "ranking" | "diversity" | "sequencing";
+export type UserGoalClauseRoleV31 = SemanticClauseRoleV32;
 export interface UserGoalClauseV31 {
   readonly id: string;
   readonly role: UserGoalClauseRoleV31;
-  readonly axis: MembershipAxisV3 | RankingDimensionV3;
+  readonly axis: SemanticPlanClauseV32["axis"];
   readonly values: readonly string[];
   readonly sourceIds: readonly string[];
 }
@@ -178,6 +229,7 @@ export interface UserGoalV31 {
 }
 export interface SemanticAuditV31 {
   readonly version: typeof SEMANTIC_PLAN_V3_1_VERSION;
+  readonly musicConceptPolicyVersion: typeof MUSIC_CONCEPT_POLICY_VERSION;
   readonly passed: boolean;
   readonly hardConstraintHash: string;
   readonly aliasCollapses: readonly string[];
@@ -292,6 +344,8 @@ const GEOGRAPHIC_QUALIFIERS: readonly GeographicQualifierV3[] = [
   { aliases: ["detroit"], scenePrefix: "Detroit", originValue: "Detroit" },
   { aliases: ["chicago"], scenePrefix: "Chicago", originValue: "Chicago" },
   { aliases: ["berlin"], scenePrefix: "Berlin", originValue: "Berlin" },
+  { aliases: ["rio de janeiro", "rio"], scenePrefix: "Rio de Janeiro", originValue: "Rio de Janeiro" },
+  { aliases: ["los angeles", "la", "l a"], scenePrefix: "Los Angeles", originValue: "Los Angeles" },
   { aliases: ["new york", "nyc"], scenePrefix: "New York", originValue: "New York" },
   { aliases: ["london"], scenePrefix: "London", originValue: "London" },
   { aliases: ["bristol"], scenePrefix: "Bristol", originValue: "Bristol" },
@@ -335,21 +389,107 @@ function dedupe<T extends string>(values: readonly T[]): T[] {
   return [...new Set(values)];
 }
 
+function detectedAudienceContextClauses(rawPrompt: string): SemanticPlanClauseV32[] {
+  const prompt = normalize(rawPrompt);
+  const contexts: SemanticPlanClauseV32[] = [];
+  const seen = new Set<string>();
+  for (const qualifier of GEOGRAPHIC_QUALIFIERS) {
+    const mentioned = qualifier.aliases.some((alias) => new RegExp(`\\b${escapedPattern(alias)}\\b`, "u").test(prompt));
+    if (!mentioned || seen.has(normalize(qualifier.originValue))) continue;
+    const contextual = selectionGeographyIsAudienceMarketContext(rawPrompt, qualifier.originValue)
+      || qualifier.aliases.some((alias) => {
+        const escaped = escapedPattern(alias);
+        return new RegExp(
+          `\\b(?:for\\s+(?:a|an|the)?\\s*(?:dinner|party|drive|road trip|night out)|driving|cruising|partying|clubbing|nightlife|discoteques?|clubs?|born|raised|grew|growing)\\b[^.;!?]{0,100}\\b(?:in|through|around)\\s+${escaped}\\b`,
+          "u",
+        ).test(prompt)
+          || new RegExp(
+            `\\bfor\\s+(?:a|an|the)?\\s*${escaped}\\s+(?:dinner|party|drive|road trip|night out|club night)\\b`,
+            "u",
+          ).test(prompt);
+      });
+    if (!contextual) continue;
+    seen.add(normalize(qualifier.originValue));
+    contexts.push({
+      id: stableId("context:audience_market", qualifier.originValue),
+      role: "context",
+      axis: "geography",
+      operator: "prefer",
+      values: [qualifier.originValue],
+      source: "raw_prompt",
+      explicitUserAuthored: true,
+      geographyRelationship: "unspecified",
+      reason: `${qualifier.originValue} describes the intended audience, setting, or listening market.`,
+    });
+  }
+  return contexts;
+}
+
 function predicate(
   axis: MembershipAxisV3,
   operator: MembershipOperatorV3,
   values: readonly string[],
   reason: string,
+  geographyRelationship: SelectionConstraint["geographyRelationship"] = null,
 ): MembershipPredicateV3 {
   const normalizedValues = values.map((value) => value.trim()).filter(Boolean);
   return {
-    id: stableId(`membership:${axis}:${operator}`, normalizedValues.join("-")),
+    id: stableId(`membership:${axis}:${operator}:${geographyRelationship ?? "none"}`, normalizedValues.join("-")),
     axis,
     operator,
     values: normalizedValues,
     source: "user",
+    geographyRelationship,
     reason,
   };
+}
+
+function explicitRawGeographicPredicates(rawPrompt: string): MembershipPredicateV3[] {
+  const predicates: MembershipPredicateV3[] = [];
+  for (const constraint of parseSelectionGeographyConstraints(rawPrompt)) {
+    if (constraint.relationship !== "language") continue;
+    predicates.push(predicate(
+      "language",
+      "require",
+      [constraint.value],
+      `The request explicitly requires ${constraint.value}-language recordings.`,
+      "language",
+    ));
+  }
+  const normalizedPrompt = normalize(rawPrompt);
+  for (const qualifier of GEOGRAPHIC_QUALIFIERS) {
+    const mentioned = qualifier.aliases.some((alias) => (
+      new RegExp(`\\b${escapedPattern(alias)}\\b`, "u").test(normalizedPrompt)
+    ));
+    if (!mentioned || selectionGeographyIsAudienceMarketContext(rawPrompt, qualifier.originValue)) continue;
+    const relationship = inferSelectionGeographyRelationship(rawPrompt, qualifier.originValue);
+    if (relationship === "artist_origin" || relationship === "artist_residence" || relationship === "recording_location") {
+      predicates.push(predicate(
+        "geography",
+        "require",
+        [qualifier.originValue],
+        `The request explicitly requires ${relationship.replaceAll("_", " ")} in ${qualifier.originValue}.`,
+        relationship,
+      ));
+    } else if (relationship === "label_or_venue_scene") {
+      predicates.push(predicate(
+        "scene",
+        "require",
+        [qualifier.originValue],
+        `The request explicitly requires documented scene, label, or venue membership in ${qualifier.originValue}.`,
+        relationship,
+      ));
+    } else if (relationship === "language" && qualifier.languageValue) {
+      predicates.push(predicate(
+        "language",
+        "require",
+        [qualifier.languageValue],
+        `The request explicitly requires ${qualifier.languageValue}-language recordings.`,
+        "language",
+      ));
+    }
+  }
+  return predicates;
 }
 
 function normalizedPredicateKey(value: Pick<MembershipPredicateV3, "axis" | "operator" | "values">): string {
@@ -383,8 +523,72 @@ const TYPED_AXIS_TO_V3: Readonly<Partial<Record<SelectionConstraint["axis"], Mem
   relationship: "factual_relationship",
 };
 
-function typedConstraintPredicate(constraint: SelectionConstraint): MembershipPredicateV3 | null {
-  if (constraint.kind !== "hard" || constraint.operator === "maximum" || constraint.axis === "evidence") return null;
+function explicitEraPolicyRequested(rawPrompt: string): boolean {
+  const prompt = normalize(rawPrompt);
+  return /\b(?:songs?|tracks?|music|recordings?|releases?)\b[^.;!?]{0,30}\b(?:released\s+)?(?:from|during|in|before|after|between)\s+(?:the\s+)?(?:18|19|20)\d{2}s?\b/u.test(prompt)
+    || /\b(?:18|19|20)\d{2}s?\b[^.;!?]{0,30}\b(?:era|songs?|tracks?|music|recordings?|releases?|disco|house|jazz|techno|drill|funk|ambient|rock|soul)\b/u.test(prompt)
+    || /\b(?:before|after|between|from)\s+(?:18|19|20)\d{2}\b/u.test(prompt);
+}
+
+function v2ConstraintExplicitlyUserAuthored(
+  constraint: SelectionConstraint,
+  rawPrompt: string,
+): boolean {
+  if (/^guidance_scope(?:_|$)/u.test(constraint.id)) return true;
+  if (/^(?:evidence|version|relationship|brief_|subject_)/u.test(constraint.id)) return false;
+  if (constraint.axis === "evidence") return false;
+  if (constraint.axis === "recording_version" || constraint.axis === "content") {
+    return explicitVersionPolicyRequested(rawPrompt);
+  }
+  if (constraint.axis === "era") {
+    return explicitEraPolicyRequested(rawPrompt);
+  }
+  const prompt = normalize(rawPrompt);
+  return constraint.values.some((value) => {
+    const normalizedValue = normalize(value);
+    const eligibleAliases = constraint.axis === "genre"
+      ? eligibilityAliasesForMusicConceptV3(value).map(normalize)
+      : [normalizedValue];
+    return eligibleAliases.some((alias) => alias.length >= 2 && ` ${prompt} `.includes(` ${alias} `));
+  });
+}
+
+function audienceMarketContext(
+  rawPrompt: string,
+  constraint: Pick<SelectionConstraint, "values" | "geographyRelationship">,
+): boolean {
+  if (constraint.geographyRelationship && constraint.geographyRelationship !== "unspecified") return false;
+  return constraint.values.some((value) => selectionGeographyIsAudienceMarketContext(rawPrompt, value));
+}
+
+function typedConstraintRole(
+  constraint: SelectionConstraint,
+  rawPrompt: string,
+): SemanticClauseRoleV32 {
+  if (constraint.operator === "maximum") return "diversity_sequencing";
+  if (["era", "recording_version", "content"].includes(constraint.axis)) return "catalog_policy";
+  if (constraint.axis === "evidence") return "discovery_hint";
+  if (constraint.axis === "geography" && audienceMarketContext(rawPrompt, constraint)) return "context";
+  if (constraint.axis === "geography"
+    && (!constraint.geographyRelationship
+      || constraint.geographyRelationship === "unspecified"
+      || constraint.geographyRelationship === "sound_association")) return "discovery_hint";
+  if (constraint.kind === "soft") {
+    return ["geography", "mood", "activity", "theme"].includes(constraint.axis)
+      ? "context"
+      : "discovery_hint";
+  }
+  return v2ConstraintExplicitlyUserAuthored(constraint, rawPrompt)
+    ? "membership"
+    : "discovery_hint";
+}
+
+function typedConstraintPredicate(
+  constraint: SelectionConstraint,
+  rawPrompt: string,
+): MembershipPredicateV3 | null {
+  if (typedConstraintRole(constraint, rawPrompt) !== "membership") return null;
+  if (constraint.kind !== "hard" || constraint.operator === "maximum") return null;
   const axis = TYPED_AXIS_TO_V3[constraint.axis];
   if (!axis) return null;
   const operator: MembershipOperatorV3 = constraint.operator === "exclude" || constraint.operator === "avoid"
@@ -396,7 +600,130 @@ function typedConstraintPredicate(constraint: SelectionConstraint): MembershipPr
     constraint.values,
     `Confirmed typed constraint ${constraint.id} (${constraint.operator}).`,
   );
-  return { ...built, id: `v2:${constraint.id}` };
+  return {
+    ...built,
+    id: `v2:${constraint.id}`,
+    geographyRelationship: constraint.geographyRelationship ?? (axis === "language" ? "language" : null),
+  };
+}
+
+function semanticClauseFromTypedConstraint(
+  constraint: SelectionConstraint,
+  rawPrompt: string,
+): SemanticPlanClauseV32 {
+  const explicitUserAuthored = v2ConstraintExplicitlyUserAuthored(constraint, rawPrompt);
+  const role = typedConstraintRole(constraint, rawPrompt);
+  const operator = role === "catalog_policy" && !explicitUserAuthored
+    ? "prefer"
+    : constraint.operator;
+  return {
+    id: `v2:${constraint.id}`,
+    role,
+    axis: TYPED_AXIS_TO_V3[constraint.axis] ?? constraint.axis,
+    operator,
+    values: [...constraint.values],
+    source: "v2_compatibility",
+    explicitUserAuthored,
+    geographyRelationship: constraint.geographyRelationship ?? null,
+    reason: role === "membership"
+      ? `Confirmed user-authored typed constraint ${constraint.id}.`
+      : `Compatibility constraint ${constraint.id} is classified as ${role}.`,
+  };
+}
+
+const RECORDING_POLICY_V3_VALUES = new Set<RecordingPolicyV3["allowedVersions"][number]>([
+  "canonical", "clean", "explicit", "live", "remix", "radio_edit", "extended", "acoustic", "instrumental",
+]);
+
+function explicitVersionPolicyRequested(rawPrompt: string): boolean {
+  return /\b(?:only|must|require|required|exclude|avoid|without|no|prefer|include|allow)\b[^.;!?\n]{0,80}\b(?:canonical|original|studio|clean|explicit|live|remix|radio edit|single edit|extended|acoustic|instrumental|karaoke|cover|tribute|version)\b/iu.test(rawPrompt)
+    || /\b(?:canonical|original|studio|clean|explicit|live|remix|radio edit|single edit|extended|acoustic|instrumental|karaoke|cover|tribute)\s+(?:recordings?|versions?|tracks?)\s+only\b/iu.test(rawPrompt);
+}
+
+function recordingPolicyForInput(input: RunSpecV3Input): RecordingPolicyV3 {
+  if (!explicitVersionPolicyRequested(input.prompt)) {
+    return {
+      allowedVersions: ["canonical", "clean", "explicit"],
+      preferCanonicalStudio: true,
+      excludeKaraokeTributeAndCovers: true,
+    };
+  }
+  const only = input.prompt.match(/\bonly\s+(?:use\s+)?(?:the\s+)?(canonical|original|studio|clean|explicit|live|remix|radio edit|single edit|extended|acoustic|instrumental)(?:\s+(?:recordings?|versions?|tracks?))?/iu)
+    ?? input.prompt.match(/\b(canonical|original|studio|clean|explicit|live|remix|radio edit|single edit|extended|acoustic|instrumental)\s+(?:recordings?|versions?|tracks?)\s+only\b/iu);
+  const normalizedOnly = normalize(only?.[1] ?? "").replace(/\s+/gu, "_");
+  const mappedOnly = normalizedOnly === "original" || normalizedOnly === "studio" ? "canonical"
+    : normalizedOnly === "single_edit" ? "radio_edit"
+      : normalizedOnly;
+  if (RECORDING_POLICY_V3_VALUES.has(mappedOnly as RecordingPolicyV3["allowedVersions"][number])) {
+    const allowed = [mappedOnly as RecordingPolicyV3["allowedVersions"][number]];
+    return {
+      allowedVersions: allowed,
+      preferCanonicalStudio: allowed.includes("canonical"),
+      excludeKaraokeTributeAndCovers: true,
+    };
+  }
+  if (!input.typedSelectionPlan) {
+    return {
+      allowedVersions: ["canonical", "clean", "explicit"],
+      preferCanonicalStudio: true,
+      excludeKaraokeTributeAndCovers: true,
+    };
+  }
+  const allowed = input.typedSelectionPlan.versionPolicy.allowed
+    .filter((value): value is RecordingPolicyV3["allowedVersions"][number] => (
+      RECORDING_POLICY_V3_VALUES.has(value as RecordingPolicyV3["allowedVersions"][number])
+    ));
+  return {
+    allowedVersions: allowed.length > 0 ? dedupe(allowed) : ["canonical", "clean", "explicit"],
+    preferCanonicalStudio: input.typedSelectionPlan.versionPolicy.preferred.includes("canonical"),
+    excludeKaraokeTributeAndCovers: input.typedSelectionPlan.versionPolicy.excludeKaraokeAndTributes,
+  };
+}
+
+function rawCatalogPolicyClauses(rawPrompt: string): SemanticPlanClauseV32[] {
+  const clauses: SemanticPlanClauseV32[] = [];
+  const eraValues = explicitEraPolicyRequested(rawPrompt)
+    ? dedupe([
+      ...rawPrompt.matchAll(/\b(?:18|19|20)\d0s\b|\b(?:[2-9]0s)\b|\b(?:18|19|20)\d{2}\b/giu),
+    ].map((match) => match[0]))
+    : [];
+  if (eraValues.length > 0) {
+    const rangeRequested = eraValues.length === 2 && (
+      /\bfrom\s+(?:18|19|20)\d{2}\s+(?:through|to|until|-)\s+(?:18|19|20)\d{2}\b/iu.test(rawPrompt)
+      || /\bbetween\s+(?:18|19|20)\d{2}\s+and\s+(?:18|19|20)\d{2}\b/iu.test(rawPrompt)
+      || /\b(?:18|19|20)\d{2}\s*[-–—]\s*(?:18|19|20)\d{2}\b/u.test(rawPrompt)
+    );
+    clauses.push({
+      id: stableId("catalog:era", eraValues.join("-")),
+      role: "catalog_policy",
+      axis: "era",
+      operator: rangeRequested ? "between" : "within",
+      values: eraValues,
+      source: "raw_prompt",
+      explicitUserAuthored: true,
+      geographyRelationship: null,
+      reason: "The request explicitly names an era; the resolved catalog recording enforces it.",
+    });
+  }
+  if (explicitVersionPolicyRequested(rawPrompt)) {
+    const versionValues = dedupe([...rawPrompt.matchAll(
+      /\b(?:canonical|original|studio|clean|explicit|live|remix|radio edit|single edit|extended|acoustic|instrumental|karaoke|cover|tribute)(?:\s+(?:recordings?|versions?|tracks?))?\b/giu,
+    )].map((match) => match[0]));
+    if (versionValues.length > 0) {
+      clauses.push({
+        id: stableId("catalog:recording_version", versionValues.join("-")),
+        role: "catalog_policy",
+        axis: "recording_version",
+        operator: /\b(?:exclude|avoid|without|no)\b/iu.test(rawPrompt) ? "exclude" : "require",
+        values: versionValues,
+        source: "raw_prompt",
+        explicitUserAuthored: true,
+        geographyRelationship: null,
+        reason: "The request explicitly names a recording-version policy.",
+      });
+    }
+  }
+  return clauses;
 }
 
 function intentsFromTypedPlan(intents: readonly ResearchIntent[]): IntentV3[] {
@@ -516,9 +843,20 @@ function detectedGenreTerms(prompt: string): string[] {
  * independent requirements and never the unrelated broad US `funk` genre.
  */
 function genreEvidenceAliases(genre: string): string[] {
-  return normalize(genre) === "funk carioca"
-    ? ["funk carioca", "baile funk", "Brazilian funk"]
-    : [genre];
+  return [...eligibilityAliasesForMusicConceptV3(genre)];
+}
+
+function genrePredicate(
+  operator: MembershipOperatorV3,
+  genres: readonly string[],
+  reason: string,
+): MembershipPredicateV3 {
+  const built = predicate("genre", operator, genres.flatMap(genreEvidenceAliases), reason);
+  const conceptIds = dedupe(genres.map(canonicalMusicConceptIdV3)).sort();
+  return {
+    ...built,
+    id: stableId(`membership:genre:${operator}`, conceptIds.join("|")),
+  };
 }
 
 function explicitTrackLevelViralityRequirement(prompt: string): boolean {
@@ -554,10 +892,12 @@ function constraintConflictsWithMembership(
  */
 function executionHardConstraints(
   constraints: readonly SelectionConstraint[],
+  rawPrompt: string,
 ): SelectionConstraint[] {
   return constraints
     .filter((constraint) => constraint.kind === "hard")
-    .filter((constraint) => constraint.axis !== "evidence" && constraint.axis !== "recording_version")
+    .filter((constraint) => typedConstraintRole(constraint, rawPrompt) === "membership"
+      || typedConstraintRole(constraint, rawPrompt) === "diversity_sequencing")
     .map(cloneConstraint);
 }
 
@@ -566,25 +906,17 @@ function compileSemanticContractV31(input: {
   requestedTrackCount: number;
   predicates: readonly MembershipPredicateV3[];
   objectives: readonly RankingObjectiveV3[];
-}): { userGoal: UserGoalV31; semanticAudit: SemanticAuditV31 } {
-  const clauses: UserGoalClauseV31[] = [
-    ...input.predicates.map((item) => ({
+  semanticClauses: readonly SemanticPlanClauseV32[];
+}): { userGoal: UserGoalV31; semanticAudit: SemanticAuditV31; explicitUserConstraintHash: string } {
+  const clauses: UserGoalClauseV31[] = input.semanticClauses
+    .filter((item) => item.explicitUserAuthored || item.source === "raw_prompt" || item.source === "guided_answer")
+    .map((item) => ({
       id: item.id,
-      role: "membership" as const,
+      role: item.role,
       axis: item.axis,
       values: [...item.values],
       sourceIds: [item.id],
-    })),
-    ...input.objectives.map((item) => ({
-      id: item.id,
-      role: item.dimension === "sequencing" ? "sequencing" as const
-        : item.dimension.endsWith("diversity") || item.dimension.endsWith("balance") ? "diversity" as const
-          : "ranking" as const,
-      axis: item.dimension,
-      values: [...item.values],
-      sourceIds: [item.id],
-    })),
-  ];
+    }));
   const contradictions: string[] = [];
   for (const required of input.predicates.filter((item) => item.operator !== "exclude")) {
     for (const excluded of input.predicates.filter((item) => item.operator === "exclude" && item.axis === required.axis)) {
@@ -592,9 +924,21 @@ function compileSemanticContractV31(input: {
       if (overlap.length > 0) contradictions.push(`${required.axis}:${overlap.map(normalize).join("|")}`);
     }
   }
-  const hardConstraintHash = createHash("sha256").update(stableStringify(
-    input.predicates.map(({ axis, operator, values }) => ({ axis, operator, values: values.map(normalize).sort() })),
-  )).digest("hex");
+  const additionalExplicitConstraints = input.semanticClauses
+    .filter((item) => item.explicitUserAuthored
+      && (item.source === "guided_answer" || /^v2:guidance_scope(?:_|$)/u.test(item.id)))
+    .map(({ role, axis, operator, values, geographyRelationship }) => ({
+      role,
+      axis,
+      operator,
+      values: values.map(normalize).sort(),
+      geographyRelationship: geographyRelationship ?? null,
+    }));
+  const explicitUserConstraintHash = createHash("sha256").update(stableStringify({
+    rawPrompt: input.rawPrompt.trim(),
+    requestedTrackCount: input.requestedTrackCount,
+    explicitGuidanceConstraints: additionalExplicitConstraints,
+  })).digest("hex");
   return {
     userGoal: {
       version: SEMANTIC_PLAN_V3_1_VERSION,
@@ -604,13 +948,55 @@ function compileSemanticContractV31(input: {
     },
     semanticAudit: {
       version: SEMANTIC_PLAN_V3_1_VERSION,
+      musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
       passed: contradictions.length === 0,
-      hardConstraintHash,
+      // Keep the legacy field populated while schema-1 plans drain. Its value
+      // now obeys the corrected user-authored-only hashing contract.
+      hardConstraintHash: explicitUserConstraintHash,
       aliasCollapses: /\b(?:baile\s+funk|funk\s+carioca)\b/iu.test(input.rawPrompt)
         ? ["baile funk|funk carioca=>funk carioca"]
         : [],
       contradictions: dedupe(contradictions),
     },
+    explicitUserConstraintHash,
+  };
+}
+
+function semanticClauseFromPredicate(value: MembershipPredicateV3): SemanticPlanClauseV32 {
+  const compatibilityGuidance = /^v2:guidance_scope(?:_|$)/u.test(value.id);
+  return {
+    id: value.id,
+    role: "membership",
+    axis: value.axis,
+    operator: value.operator,
+    values: [...value.values],
+    source: value.source === "guided_answer" || compatibilityGuidance ? "guided_answer"
+      : value.id.startsWith("v2:") ? "v2_compatibility"
+        : "raw_prompt",
+    explicitUserAuthored: value.source !== "system_safety" && (!value.id.startsWith("v2:") || compatibilityGuidance),
+    geographyRelationship: value.geographyRelationship ?? null,
+    reason: value.reason,
+  };
+}
+
+function semanticClauseFromObjective(value: RankingObjectiveV3, rawPrompt: string): SemanticPlanClauseV32 {
+  const explicit = value.dimension === "influence"
+    ? /\b(?:influential|foundational|important|landmark|shaped)\b/iu.test(rawPrompt)
+    : value.dimension === "similarity"
+      ? new RegExp(`\\b${SIMILARITY_CUE_SOURCE}\\b`, "iu").test(rawPrompt)
+      : value.values.length > 0 && value.values.some((item) => normalize(rawPrompt).includes(normalize(item)));
+  return {
+    id: value.id,
+    role: value.dimension === "sequencing" || value.dimension.endsWith("diversity") || value.dimension.endsWith("balance")
+      ? "diversity_sequencing"
+      : "ranking",
+    axis: value.dimension,
+    operator: value.direction,
+    values: [...value.values],
+    source: explicit ? "raw_prompt" : "system_default",
+    explicitUserAuthored: explicit,
+    geographyRelationship: null,
+    reason: value.reason,
   };
 }
 
@@ -673,8 +1059,7 @@ function replacePromptGenrePredicates(
   }
   if (intersection) {
     for (const genre of genres) {
-      pushPredicate(predicates, predicate(
-        "genre",
+      pushPredicate(predicates, genrePredicate(
         "require",
         [genre],
         `The request explicitly asks for recordings that combine ${genres.join(" and ")}.`,
@@ -682,10 +1067,9 @@ function replacePromptGenrePredicates(
     }
     return;
   }
-  pushPredicate(predicates, predicate(
-    "genre",
+  pushPredicate(predicates, genrePredicate(
     "require",
-    genres.flatMap(genreEvidenceAliases),
+    genres,
     genres.length === 1
       ? `The request explicitly names the ${genres[0]} genre.`
       : `Each recording may satisfy any one of the requested genres: ${genres.join(", ")}.`,
@@ -800,6 +1184,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
 
   const intents: IntentV3[] = [];
   const predicates: MembershipPredicateV3[] = [];
+  const compatibilityClauses: SemanticPlanClauseV32[] = [];
   const objectives: RankingObjectiveV3[] = [
     objective("relevance", "maximize", 1, null, "Prefer the strongest qualified match to the confirmed request."),
     objective("artist_diversity", "balance", 0.35, 3, "Avoid artist concentration in broad curated playlists."),
@@ -814,16 +1199,9 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   if (input.typedSelectionPlan) {
     intents.push(...intentsFromTypedPlan(input.typedSelectionPlan.intents));
     for (const constraint of input.typedSelectionPlan.constraints) {
-      const mapped = typedConstraintPredicate(constraint);
+      compatibilityClauses.push(semanticClauseFromTypedConstraint(constraint, input.prompt));
+      const mapped = typedConstraintPredicate(constraint, input.prompt);
       if (mapped) pushPredicate(predicates, mapped);
-    }
-    if (input.typedSelectionPlan.contentPolicy.explicitContent === "clean_only") {
-      pushPredicate(predicates, predicate(
-        "content",
-        "require",
-        ["clean"],
-        "The confirmed content policy requires an Apple-catalog clean recording.",
-      ));
     }
   }
 
@@ -855,8 +1233,17 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     replacePromptGenrePredicates(predicates, genres, genreIntersection);
   }
   const geographicScopes = detectedGeographicGenreScopes(prompt, genres);
+  // One user clause must compile to one semantic role.  Phrases such as
+  // "artists born in France" contain the lexical cue "born in", but they are
+  // an explicit artist-origin membership rule, not an audience biography.
+  // Resolve the explicit geographic predicates first, then remove the same
+  // place from contextual projections below.
+  let directContextSignals = detectedAudienceContextClauses(input.prompt);
+  const audienceContextValues = new Set(directContextSignals.flatMap(({ values }) => values.map(normalize)));
   const sceneValues: string[] = [];
+  const sceneScopedGenres = new Set<string>();
   for (const scope of geographicScopes) {
+    if (audienceContextValues.has(normalize(scope.qualifier.originValue))) continue;
     const relationship = explicitGeographicRelationship(prompt, scope);
     const ambiguous = (normalize(scope.sceneValue) === "french jazz" && ambiguousKeys.has("french_jazz_scope"))
       || ambiguities.some((ambiguity) => (
@@ -871,6 +1258,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
         "require",
         [scope.qualifier.originValue],
         `The request explicitly limits principal artist origin to ${scope.qualifier.originValue}.`,
+        "artist_origin",
       ));
     } else if (relationship === "language" && scope.qualifier.languageValue) {
       pushPredicate(predicates, predicate(
@@ -878,9 +1266,36 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
         "require",
         [scope.qualifier.languageValue],
         `The request explicitly requires ${scope.qualifier.languageValue}-language recordings.`,
+        "language",
       ));
     } else {
       sceneValues.push(scope.sceneValue);
+      sceneScopedGenres.add(normalize(scope.genre));
+    }
+  }
+  const explicitGeographyValues = new Set(predicates.flatMap((candidate) => (
+    candidate.axis === "geography"
+      && candidate.geographyRelationship !== null
+      && candidate.geographyRelationship !== "unspecified"
+      && candidate.geographyRelationship !== "sound_association"
+      ? candidate.values.map(normalize)
+      : []
+  )));
+  directContextSignals = directContextSignals.filter((signal) => (
+    !signal.values.some((value) => explicitGeographyValues.has(normalize(value)))
+  ));
+  // A recognized geographic genre is one scene concept. Requiring the scene
+  // and then separately requiring its generic genre duplicates one user
+  // clause into two evidence gates and was a primary source of false zeroes.
+  if (genres.length > 0 && genres.every((genre) => sceneScopedGenres.has(normalize(genre)))) {
+    const scopedAliases = new Set(genres.flatMap(genreEvidenceAliases).map(normalize));
+    for (let index = predicates.length - 1; index >= 0; index -= 1) {
+      const candidate = predicates[index]!;
+      if (candidate.axis === "genre"
+        && candidate.operator === "require"
+        && candidate.values.every((value) => scopedAliases.has(normalize(value)))) {
+        predicates.splice(index, 1);
+      }
     }
   }
   if (sceneValues.length > 0) {
@@ -891,6 +1306,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
           "require",
           [scene],
           `The requested fusion must be supported by the ${scene} scene scope.`,
+          "label_or_venue_scene",
         ));
       }
     } else {
@@ -901,26 +1317,29 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
         sceneValues.length === 1
           ? `The request explicitly limits the recording pool to the ${sceneValues[0]} scene.`
           : `Each recording may belong to any one of the requested scenes: ${sceneValues.join(", ")}.`,
+        "label_or_venue_scene",
       ));
     }
+  }
+  for (const explicitGeography of explicitRawGeographicPredicates(input.prompt)) {
+    pushPredicate(predicates, explicitGeography);
   }
 
   // Explicit relationship phrases need not use the compact “place + genre”
   // spelling handled above.
   if (/\bfrench[-\s]+language\b/u.test(prompt)) {
-    pushPredicate(predicates, predicate("language", "require", ["French"], "The request explicitly requires French-language recordings."));
+    pushPredicate(predicates, predicate("language", "require", ["French"], "The request explicitly requires French-language recordings.", "language"));
   } else if (/\b(?:french-born|french artists?|artists? from france)\b/u.test(prompt)) {
-    pushPredicate(predicates, predicate("geography", "require", ["France"], "The request explicitly requires artists from France."));
+    pushPredicate(predicates, predicate("geography", "require", ["France"], "The request explicitly requires artists from France.", "artist_origin"));
   }
 
   if (/\b(?:songs?|tracks?|music)\s+(?:about|mentioning)\s+(?:a\s+)?(?:house|home|houses|homes)\b/u.test(prompt)) {
     pushPredicate(predicates, predicate("theme", "require", ["houses and homes"], "The request explicitly asks for a lyrical theme."));
   }
   if (/\b(?:baile\s+funk|funk\s+carioca)\b/u.test(prompt)) {
-    pushPredicate(predicates, predicate(
-      "genre",
+    pushPredicate(predicates, genrePredicate(
       "require",
-      genreEvidenceAliases("funk carioca"),
+      ["funk carioca"],
       "The request explicitly names funk carioca/baile funk; these are equivalent source labels.",
     ));
   }
@@ -986,7 +1405,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   const uniqueIntents = dedupe(intents);
   const scopeKind = input.typedSelectionPlan?.scopeKind
     ?? inferredScopeKind(input.prompt, uniqueIntents);
-  const hardConstraints = executionHardConstraints(input.typedSelectionPlan?.constraints ?? []);
+  const hardConstraints = executionHardConstraints(input.typedSelectionPlan?.constraints ?? [], input.prompt);
   const softPreferences = (input.typedSelectionPlan?.constraints ?? [])
     .filter((constraint) => constraint.kind === "soft")
     .filter((constraint) => !constraintConflictsWithMembership(
@@ -1013,11 +1432,41 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
         "era_balance",
         "subgenre_regional_representation",
       ];
+  // Some explicit relationship phrases (for example, “artists born in
+  // France”) are compiled after the geographic-scene pass above. Reconcile
+  // context one final time so a single user clause cannot survive as both an
+  // artist-origin membership rule and an audience/listening-market signal.
+  const finalExplicitGeographyValues = new Set(predicates.flatMap((candidate) => (
+    candidate.axis === "geography"
+      && candidate.geographyRelationship !== null
+      && candidate.geographyRelationship !== "unspecified"
+      && candidate.geographyRelationship !== "sound_association"
+      ? candidate.values.map(normalize)
+      : []
+  )));
+  directContextSignals = directContextSignals.filter((signal) => (
+    !signal.values.some((value) => finalExplicitGeographyValues.has(normalize(value)))
+  ));
+  const semanticClauses = [
+    ...predicates.map(semanticClauseFromPredicate),
+    ...objectives.map((value) => semanticClauseFromObjective(value, input.prompt)),
+    ...compatibilityClauses.filter((clause) => clause.role !== "membership"),
+    ...directContextSignals,
+    ...rawCatalogPolicyClauses(input.prompt),
+  ].filter((clause, index, all) => all.findIndex((candidate) => (
+    candidate.role === clause.role
+    && candidate.axis === clause.axis
+    && candidate.operator === clause.operator
+    && candidate.values.map(normalize).sort().join("|") === clause.values.map(normalize).sort().join("|")
+  )) === index);
+  const contextSignals = semanticClauses.filter(({ role }) => role === "context");
+  const catalogPolicies = semanticClauses.filter(({ role }) => role === "catalog_policy");
   const semantic = compileSemanticContractV31({
     rawPrompt: input.prompt.trim(),
     requestedTrackCount: input.requestedTrackCount,
     predicates,
     objectives,
+    semanticClauses,
   });
   if (!semantic.semanticAudit.passed) {
     throw new Error(`Pipeline V3.1 semantic audit found contradictory hard clauses: ${semantic.semanticAudit.contradictions.join(", ")}`);
@@ -1041,11 +1490,12 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     softGoalRelaxationOrder,
     sourceDiscoveryHints: sanitizePipelineV3SourceDiscoveryHints(input.guidanceSourceHints),
     criticalAmbiguities: ambiguities,
-    recordingPolicy: {
-      allowedVersions: ["canonical", "clean", "explicit"],
-      preferCanonicalStudio: true,
-      excludeKaraokeTributeAndCovers: true,
-    },
+    recordingPolicy: recordingPolicyForInput(input),
+    semanticPolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
+    musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
+    semanticClauses,
+    contextSignals,
+    catalogPolicies,
     ...semantic,
   });
 }
@@ -1062,8 +1512,9 @@ function guidedPredicate(
   axis: MembershipAxisV3,
   values: readonly string[],
   reason: string,
+  geographyRelationship: SelectionConstraint["geographyRelationship"] = null,
 ): MembershipPredicateV3 {
-  const built = predicate(axis, "require", values, reason);
+  const built = predicate(axis, "require", values, reason, geographyRelationship);
   return { ...built, source: "guided_answer" };
 }
 
@@ -1119,7 +1570,14 @@ export function resolveRunSpecV3(
         : answer.optionId === "french_scene"
           ? "French jazz scene"
           : "France";
-      pushPredicate(predicates, guidedPredicate(axis, [semanticValue], "The visitor resolved the requested French relationship."));
+      pushPredicate(predicates, guidedPredicate(
+        axis,
+        [semanticValue],
+        "The visitor resolved the requested French relationship.",
+        answer.optionId === "french_language" ? "language"
+          : answer.optionId === "french_scene" ? "label_or_venue_scene"
+            : "artist_origin",
+      ));
     } else if (answer.key === "geographic_genre_scope") {
       const axis = answer.optionId === "geographic_language"
         ? "language"
@@ -1136,6 +1594,9 @@ export function resolveRunSpecV3(
         axis,
         [semanticValue],
         `The visitor resolved the ${ambiguity.geographicLabel ?? "geographic"} relationship for ${ambiguity.genreLabel ?? "the requested genre"}.`,
+        answer.optionId === "geographic_language" ? "language"
+          : answer.optionId === "geographic_scene" ? "label_or_venue_scene"
+            : "artist_origin",
       ));
     } else if (answer.key === "possessive_relationship") {
       intents.push(answer.optionId === "subject_influenced" ? "editorial_ranking" : "factual_relationship");
@@ -1153,11 +1614,24 @@ export function resolveRunSpecV3(
     unanswered.delete(answer.key);
   }
   const uniqueIntents = dedupe(intents);
+  const semanticClauses = [
+    ...predicates.map(semanticClauseFromPredicate),
+    ...objectives.map((value) => semanticClauseFromObjective(value, spec.prompt)),
+    ...spec.semanticClauses.filter(({ role }) => (
+      role === "context" || role === "catalog_policy" || role === "discovery_hint"
+    )),
+  ].filter((clause, index, all) => all.findIndex((candidate) => (
+    candidate.role === clause.role
+    && candidate.axis === clause.axis
+    && candidate.operator === clause.operator
+    && candidate.values.map(normalize).sort().join("|") === clause.values.map(normalize).sort().join("|")
+  )) === index);
   const semantic = compileSemanticContractV31({
     rawPrompt: spec.prompt,
     requestedTrackCount: spec.requestedTrackCount,
     predicates,
     objectives,
+    semanticClauses,
   });
   if (!semantic.semanticAudit.passed) {
     throw new Error(`Pipeline V3.1 guidance created contradictory hard clauses: ${semantic.semanticAudit.contradictions.join(", ")}`);
@@ -1168,6 +1642,9 @@ export function resolveRunSpecV3(
     engines: intentEngines(uniqueIntents),
     membershipPredicates: predicates,
     rankingObjectives: objectives,
+    semanticClauses,
+    contextSignals: semanticClauses.filter(({ role }) => role === "context"),
+    catalogPolicies: semanticClauses.filter(({ role }) => role === "catalog_policy"),
     ...semantic,
     confirmed: unanswered.size === 0,
     resolvedAmbiguityKeys: [...seen] as CriticalAmbiguityV3["key"][],

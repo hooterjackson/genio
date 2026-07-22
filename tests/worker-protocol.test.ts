@@ -3,6 +3,7 @@ import {
   isWorkerCapabilityValid,
   isWorkerPipelineProtocolCompatible,
   minimumWorkerProtocolForPipeline,
+  minimumWorkerProtocolForQueryPlan,
   WORKER_PIPELINE_CAPABILITY,
   WORKER_PIPELINE_PROTOCOL_NUMBER,
   WORKER_PIPELINE_V4_BRIDGE_CAPABILITY,
@@ -16,7 +17,7 @@ describe("worker pipeline protocol", () => {
     const current = { protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION };
     expect(workerPipelineProtocolVersion(current)).toBe(WORKER_PIPELINE_PROTOCOL_VERSION);
     expect(isWorkerPipelineProtocolCompatible(current)).toBe(true);
-    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(7);
+    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(8);
     expect(isWorkerPipelineProtocolCompatible({ protocolVersion: "playlist-pipeline-v5" })).toBe(false);
     expect(isWorkerPipelineProtocolCompatible({ version: "matching-git-revision" })).toBe(false);
     expect(isWorkerPipelineProtocolCompatible(null)).toBe(false);
@@ -32,5 +33,7 @@ describe("worker pipeline protocol", () => {
     expect(minimumWorkerProtocolForPipeline("legacy_v1")).toBe(4);
     expect(minimumWorkerProtocolForPipeline("catalog_first_v2")).toBe(5);
     expect(minimumWorkerProtocolForPipeline("corpus_first_v3")).toBe(6);
+    expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 1 })).toBe(6);
+    expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 2 })).toBe(8);
   });
 });

@@ -181,7 +181,7 @@ test("partial publication is explicit and uses the immutable confirmation identi
   await expect(page.getByRole("heading", { name: "Creating your playlist" })).toBeVisible();
 });
 
-test("zero compatible tracks stays neutral, disables publication, and can be canceled", async ({ page }) => {
+test("zero compatible tracks stays neutral and can retry the immutable request under the updated policy", async ({ page }) => {
   const run = partialRun({
     id: "run-zero-compatible",
     status: "no_compatible_tracks",
@@ -216,10 +216,11 @@ test("zero compatible tracks stays neutral, disables publication, and can be can
   await expect(page.getByRole("heading", { name: "No verified tracks are ready yet" })).toBeVisible();
   await expect(page.getByRole("button", { name: "NO VERIFIED TRACKS TO PUBLISH" })).toBeDisabled();
   await expect(page.getByRole("button", { name: /continue research/i })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "CHANGE REQUEST" })).toBeVisible();
-  await page.getByRole("button", { name: "CANCEL JOB" }).click();
-  await expect.poll(() => cancelCalls).toBe(1);
+  await page.getByRole("button", { name: "RETRY WITH UPDATED INTERPRETATION" }).click();
   await expect(page.getByRole("heading", { name: "Create a playlist" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "PLAYLIST REQUEST" })).toHaveValue("Baile funk and drill crossover");
+  await expect(page.getByRole("button", { name: /create playlist · 25 tracks/i })).toBeVisible();
+  await expect.poll(() => cancelCalls).toBe(0);
 });
 
 test("Explore listing is opt-in and independent from the Apple share link", async ({ page }) => {

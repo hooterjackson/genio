@@ -30,7 +30,7 @@ function rememberIntro(): void {
   }
 }
 
-export function BrandIntro() {
+export function BrandIntro({ onSettled }: { onSettled?: () => void }) {
   const [phase, setPhase] = useState<IntroPhase>("checking");
   const [visibleCharacterCount, setVisibleCharacterCount] = useState(0);
   const intervalRef = useRef<number | undefined>(undefined);
@@ -117,6 +117,11 @@ export function BrandIntro() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [phase]);
+
+  useEffect(() => {
+    if (phase !== "hidden") return;
+    onSettled?.();
+  }, [onSettled, phase]);
 
   useEffect(() => {
     if (phase !== "visible") return;
