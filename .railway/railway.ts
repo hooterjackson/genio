@@ -222,6 +222,7 @@ export default defineRailway(() => {
       DATABASE_URL: Postgres.env.DATABASE_URL,
       PIPELINE_V2_CURATED_PERCENT: "100",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "2",
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS:
         "genre_scene,mood_activity_theme,similarity,artist_catalogue,fixed_container",

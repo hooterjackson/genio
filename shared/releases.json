@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.2.0",
+      "releasedAt": "2026-07-22",
+      "title": "Governed semantic recovery",
+      "notes": [
+        "Activates immutable query-plan schema 2 for new requests while protocol-8 workers continue to decode historical schema-1 jobs under their persisted policy.",
+        "Uses server-governed music concepts and exact alias groups so contextual geography, generated version prose, and broader discovery terms cannot silently become track-membership requirements.",
+        "Adds predicate-level diagnostics that distinguish semantic, evidence, catalog, provider, and integrity shortfalls before Apple Music matching is blamed.",
+        "Performs at most one bounded semantic repair for compiler mistakes, reusing persisted leads and preserving the user's explicit constraint hash, requested count, exclusions, and factual requirements.",
+        "Keeps source grounding, catalog policy, partial-publication consent, immutable manifests, and Apple publication verification unchanged during semantic recovery."
+      ]
+    },
+    {
       "version": "2.1.2",
       "releasedAt": "2026-07-22",
       "title": "Scope-gate safety and protocol bridge",
