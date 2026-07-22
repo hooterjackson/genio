@@ -5,6 +5,7 @@ import type {
   PlaylistBrief,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
+  PlaylistGuidanceQuestionSetContract,
   PlaylistGuidanceSourceHint,
   PlaylistGuidanceTelemetry,
   SelectionPlan,
@@ -107,6 +108,12 @@ import {
   resolveRunSpecV3,
 } from "./selection-plan-v3.ts";
 import { validateProductionGuidedScoutV3 } from "./pipeline-v3-policy.ts";
+import {
+  contractTwoGuidanceQuestion,
+  GUIDANCE_POLICY_VERSION,
+  guidanceQuestionSetHashV2,
+  guidanceRequestClassificationV2,
+} from "./guidance-contract-v2.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -220,6 +227,8 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     answers?: PlaylistGuidanceAnswer[];
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
+    briefContractVersion?: 1 | 2;
+    questionSetHash?: string | null;
     guidancePreferences?: PlaylistGuidancePreference[];
   } | null>;
   saveBriefResult(briefRequestId: string, result: {
@@ -229,6 +238,7 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     questions?: PlaylistGuidanceQuestion[];
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
+    guidanceContract?: PlaylistGuidanceQuestionSetContract;
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void>;
@@ -3315,6 +3325,14 @@ export async function processBriefInterpretationJob(
       interpretationFallbackIssue = briefInterpretationFailureIssue(error);
     }
 
+    const v3Spec = createRunSpecV3({
+      prompt: request.prompt,
+      requestedTrackCount: requestedTrackCountForV3(request.requestedTrackCount, canonicalBrief),
+      storefront: process.env.APPLE_STOREFRONT ?? "us",
+    });
+    const contractTwo = request.briefContractVersion === 2;
+    const requestClassification = guidanceRequestClassificationV2(v3Spec);
+
     let scout: {
       questions: PlaylistGuidanceQuestion[];
       sourceHints: PlaylistGuidanceSourceHint[];
@@ -3322,9 +3340,26 @@ export async function processBriefInterpretationJob(
       durationMs: number;
       costUsd: number;
     };
-    const canScout = interpretationFallbackIssue === null
-      || interpretationFallbackIssue === "interpretation:invalid_structured_output";
-    if (!canScout) {
+    const canScout = (!contractTwo || requestClassification !== "precise")
+      && (interpretationFallbackIssue === null
+        || interpretationFallbackIssue === "interpretation:invalid_structured_output");
+    if (contractTwo && requestClassification === "precise") {
+      scout = {
+        questions: [],
+        sourceHints: [],
+        durationMs: 0,
+        costUsd: 0,
+        telemetry: {
+          generationMode: "no_material_questions",
+          requestClassification,
+          guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
+          proposedQuestionCount: 0,
+          acceptedQuestionCount: 0,
+          webSearchCalls: 0,
+          validationIssues: interpretationFallbackIssue ? [interpretationFallbackIssue] : [],
+        },
+      };
+    } else if (!canScout) {
       // A clear provider outage, quota rejection, or unavailable brief budget
       // would make an immediate second call both slow and predictably useless.
       // Continue directly with the deterministic brief. Malformed structured
@@ -3336,11 +3371,12 @@ export async function processBriefInterpretationJob(
         durationMs: 0,
         costUsd: 0,
         telemetry: {
-          generationMode: "scout_unavailable",
+          generationMode: contractTwo ? "balanced_default" : "scout_unavailable",
+          ...(contractTwo ? { requestClassification, guidancePolicyVersion: GUIDANCE_POLICY_VERSION } : {}),
           proposedQuestionCount: 0,
           acceptedQuestionCount: 0,
           webSearchCalls: 0,
-          validationIssues: [interpretationFallbackIssue!],
+          validationIssues: interpretationFallbackIssue ? [interpretationFallbackIssue] : [],
         },
       };
     } else try {
@@ -3382,7 +3418,8 @@ export async function processBriefInterpretationJob(
         durationMs: 0,
         costUsd: 0,
         telemetry: {
-          generationMode: "scout_unavailable",
+          generationMode: contractTwo ? "balanced_default" : "scout_unavailable",
+          ...(contractTwo ? { requestClassification, guidancePolicyVersion: GUIDANCE_POLICY_VERSION } : {}),
           proposedQuestionCount: 0,
           acceptedQuestionCount: 0,
           webSearchCalls: 0,
@@ -3396,11 +3433,6 @@ export async function processBriefInterpretationJob(
       };
     }
 
-    const v3Spec = createRunSpecV3({
-      prompt: request.prompt,
-      requestedTrackCount: requestedTrackCountForV3(request.requestedTrackCount, canonicalBrief),
-      storefront: process.env.APPLE_STOREFRONT ?? "us",
-    });
     const scoutValidation = validateProductionGuidedScoutV3({
       spec: v3Spec,
       questions: scout.questions,
@@ -3422,6 +3454,8 @@ export async function processBriefInterpretationJob(
       ...scout.telemetry,
       generationMode: scout.questions.length > 0
         ? "grounded_scout"
+        : contractTwo && scout.telemetry.generationMode === "balanced_default"
+          ? "balanced_default"
         : scout.telemetry.generationMode === "no_material_questions"
             && scout.telemetry.proposedQuestionCount === 0
             && scoutValidation.usageIssues.length === 0
@@ -3434,13 +3468,50 @@ export async function processBriefInterpretationJob(
       ].slice(0, 12),
     };
     const criticalQuestions = criticalGuidanceQuestionsV3(v3Spec);
-    const questions = combineGuidanceQuestionsV3(criticalQuestions, scout.questions);
+    const combinedQuestions = combineGuidanceQuestionsV3(criticalQuestions, scout.questions);
+    const questions = contractTwo
+      ? combinedQuestions.map((question) => contractTwoGuidanceQuestion(question, requestClassification))
+      : combinedQuestions;
     if (criticalQuestions.length > 0) {
       scout.telemetry = {
         ...scout.telemetry,
         generationMode: scout.questions.length > 0 ? scout.telemetry.generationMode : "deterministic_critical",
         proposedQuestionCount: Math.min(3, scout.telemetry.proposedQuestionCount + criticalQuestions.length),
         acceptedQuestionCount: questions.length,
+      };
+    }
+    let guidanceContract: PlaylistGuidanceQuestionSetContract | undefined;
+    if (contractTwo) {
+      const generationMode = criticalQuestions.length > 0
+        ? "deterministic_critical"
+        : scout.telemetry.generationMode;
+      const questionSetHash = guidanceQuestionSetHashV2({
+        classification: requestClassification,
+        prompt: request.prompt,
+        targetTrackCount: v3Spec.requestedTrackCount,
+        storefront: v3Spec.storefront,
+        locale: "en",
+        explicitConstraintHash: v3Spec.explicitUserConstraintHash,
+        questions,
+      });
+      scout.telemetry = {
+        ...scout.telemetry,
+        generationMode,
+        requestClassification,
+        guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
+        questionSetHash,
+        acceptedQuestionCount: questions.length,
+      };
+      guidanceContract = {
+        questionSetHash,
+        requestClassification,
+        generationMode,
+        guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
+        locale: "en",
+        storefront: v3Spec.storefront,
+        targetTrackCount: v3Spec.requestedTrackCount,
+        explicitConstraintHash: v3Spec.explicitUserConstraintHash,
+        rejectedQuestionReasons: scout.telemetry.validationIssues,
       };
     }
     const status = questions.length > 0 ? "awaiting_answers" : "complete";
@@ -3458,6 +3529,7 @@ export async function processBriefInterpretationJob(
       questions,
       guidanceSourceHints: scout.sourceHints,
       guidanceTelemetry: scout.telemetry,
+      guidanceContract,
       ...(status === "complete" ? { estimateUsd: estimateResearchCost(canonicalBrief) } : {}),
       error: null,
     });

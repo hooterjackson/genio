@@ -18,6 +18,11 @@ import {
   SEMANTIC_SCOPE_POLICY_VERSION,
 } from "./selection-plan-v3.ts";
 import {
+  BRIEF_CONTRACT_VERSION,
+  EVIDENCE_POLICY_VERSION,
+  GUIDANCE_POLICY_VERSION,
+} from "./guidance-contract-v2.ts";
+import {
   BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
   WORKER_PIPELINE_PROTOCOL_VERSION,
 } from "./worker-protocol.ts";
@@ -36,6 +41,10 @@ export interface RuntimeReleaseContract {
   minimumWorkerProtocol: string;
   selectionPlanVersion: string;
   queryPlanSchemaVersion: string;
+  briefContractVersion: string;
+  guidanceContractOwnerCanaryEnabled: boolean;
+  guidancePolicyVersion: string;
+  evidencePolicyVersion: string;
   queryPlanPolicyVersion: string;
   semanticScopePolicyVersion: string;
   musicConceptPolicyVersion: string;
@@ -84,7 +93,15 @@ export function runtimeReleaseContract(
     workerProtocol: WORKER_PIPELINE_PROTOCOL_VERSION,
     minimumWorkerProtocol: BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
     selectionPlanVersion: SELECTION_PLAN_V3_VERSION,
-    queryPlanSchemaVersion: String(queryPlanV3EmissionSchemaVersion(environment)),
+    queryPlanSchemaVersion: String(environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+      ? 3
+      : queryPlanV3EmissionSchemaVersion(environment)),
+    briefContractVersion: String(environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+      ? BRIEF_CONTRACT_VERSION
+      : 1),
+    guidanceContractOwnerCanaryEnabled: environment.GUIDANCE_CONTRACT_V2_OWNER_CANARY === "true",
+    guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
     queryPlanPolicyVersion: QUERY_PLAN_V3_POLICY_VERSION,
     semanticScopePolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
     musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,

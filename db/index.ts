@@ -2,7 +2,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool, type PoolConfig } from "pg";
 import * as schema from "./schema.ts";
 
-export const DATABASE_SCHEMA_VERSION = "15";
+export const DATABASE_SCHEMA_VERSION = "16";
 
 export interface DatabaseSchemaSupport {
   minimum: string;
@@ -11,9 +11,9 @@ export interface DatabaseSchemaSupport {
 }
 
 /**
- * Schemas 14 and 15 are active expand-only foundations. The 2.2.2 bridge keeps
- * schema 15 preferred while remaining readable against the future schema-16
- * expansion, so API and workers can be promoted before that migration runs.
+ * Release 2.3.0 prefers the expand-only schema-16 guidance/diagnostics
+ * foundation while keeping schema-13/14/15 databases readable during the
+ * rolling binary and migration sequence.
  */
 export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",

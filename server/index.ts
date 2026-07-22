@@ -437,6 +437,10 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
     );
   }
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
+  const briefContractVersion = process.env.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+    || (process.env.GUIDANCE_CONTRACT_V2_OWNER_CANARY === "true" && isOwner(caller))
+    ? 2
+    : 1;
   const created = await repository.createBriefRequest({
     prompt,
     requestedTrackCount: targetTrackCount ?? null,
@@ -444,6 +448,7 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
+    briefContractVersion,
   });
   await capabilities.authorizeBrief(request, reply, created.id);
   if (created.status === "queued") {
@@ -467,6 +472,8 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     prompt: brief.prompt,
     requestedTrackCount: brief.requestedTrackCount,
     status: brief.status,
+    briefContractVersion: brief.briefContractVersion,
+    questionSetHash: brief.questionSetHash,
     brief: canonicalBrief,
     questions: Array.isArray(brief.questions) ? brief.questions : [],
     answers: Array.isArray(brief.answers) && brief.answers.length > 0 ? brief.answers : undefined,
@@ -477,7 +484,8 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
 app.post<{
   Params: { id: string };
   Body: {
-    answers?: Array<{ questionId?: string; optionId?: string; customText?: string }>;
+    answers?: Array<{ questionId?: string; optionId?: string; customText?: string; skipped?: boolean }>;
+    questionSetHash?: string;
     idempotencyKey?: string;
   };
 }>("/api/v1/brief/:id/answers", async (request, reply) => {
@@ -492,12 +500,25 @@ app.post<{
   const submitted = await repository.submitBriefAnswers({
     briefRequestId,
     idempotencyKey: key,
+    questionSetHash: typeof request.body?.questionSetHash === "string"
+      ? request.body.questionSetHash.trim()
+      : undefined,
     answers: request.body.answers.map((answer) => ({
       questionId: typeof answer.questionId === "string" ? answer.questionId : "",
       ...(typeof answer.optionId === "string" ? { optionId: answer.optionId } : {}),
       ...(typeof answer.customText === "string" ? { customText: answer.customText } : {}),
+      ...(answer.skipped === true ? { skipped: true } : {}),
     })),
   });
+  if (submitted.status === "stale_question_set") {
+    return reply.code(409).send({
+      error: "Playlist guidance changed; review the current questions before answering",
+      code: "stale_guidance_question_set",
+      requestId: briefRequestId,
+      questionSetHash: submitted.questionSetHash,
+      questions: submitted.questions,
+    });
+  }
   if (submitted.status === "finalizing") {
     // Also repair a crash after the durable answer transaction but before the
     // queue handoff when an identical idempotent request is repeated.
@@ -1266,6 +1287,12 @@ app.delete<{ Params: { id: string } }>("/api/v1/owner/feedback/:id", async (requ
     throw new HttpError(404, "Feedback was not found", "feedback_not_found");
   }
   return reply.code(204).send();
+});
+
+app.get<{ Querystring: { days?: string } }>("/api/v1/owner/quality-diagnostics", async (request) => {
+  owner(request);
+  const days = Number(request.query?.days ?? 30);
+  return repository.getQualityDiagnosticsSummary(Number.isFinite(days) ? days : 30);
 });
 
 app.post<{ Params: { id: string } }>("/api/v1/owner/runs/:id/refresh", async (request) => {

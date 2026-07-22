@@ -31,6 +31,7 @@ import type {
   PlaylistBrief,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
+  PlaylistGuidanceQuestionSetContract,
   PlaylistGuidanceSourceHint,
   PlaylistGuidanceTelemetry,
   PlaylistManifest,
@@ -52,8 +53,8 @@ import type {
 import {
   assignPipelineV3,
   createQueryPlanV3,
-  createRuntimeQueryPlanV3,
   isQueryPlanV3,
+  queryPlanV3EmissionSchemaVersion,
   queryPlanV3Hash,
 } from "./query-plan-v3.ts";
 import {
@@ -187,7 +188,9 @@ import type {
 } from "./apple-catalog-cache.ts";
 import { excludedReferenceArtists } from "./similarity-policy.ts";
 import {
+  BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL,
   CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL,
+  CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL,
   isWorkerCapabilityValid,
   isWorkerPipelineProtocolCompatible,
   minimumWorkerProtocolForPipeline,
@@ -219,6 +222,7 @@ import {
   safeCustomGuidanceText,
   type PlaylistGuidancePreference,
 } from "./guidance-context.ts";
+import { compileGuidanceExecutionDeltaV2 } from "./guidance-contract-v2.ts";
 import { assignPipelineV2, createSelectionPlanV2, pipelineRolloutStickyKey } from "./selection-plan-v2.ts";
 import {
   catalogContentRating,
@@ -1543,8 +1547,11 @@ function manifestConstraintRules(plan: SelectionPlan): ConstraintRule[] {
 function normalizedGuidanceAnswers(
   questions: readonly PlaylistGuidanceQuestion[],
   submitted: readonly PlaylistGuidanceAnswer[],
+  contractVersion: 1 | 2 = 1,
 ): PlaylistGuidanceAnswer[] {
-  if (questions.length < 1 || questions.length > 3 || submitted.length !== questions.length) {
+  if (questions.length < 1 || questions.length > 3
+    || submitted.length > questions.length
+    || (contractVersion === 1 && submitted.length !== questions.length)) {
     throw new HttpError(400, "Answer every playlist question", "invalid_guidance_answers");
   }
   const submittedByQuestion = new Map<string, PlaylistGuidanceAnswer>();
@@ -1559,11 +1566,19 @@ function normalizedGuidanceAnswers(
   }
   return questions.map((question) => {
     const answer = submittedByQuestion.get(question.id);
-    if (!answer) throw new HttpError(400, "Answer every playlist question", "invalid_guidance_answers");
+    if (!answer || answer.skipped === true) {
+      if (contractVersion === 2 && question.criticality !== "required") {
+        return { questionId: question.id, skipped: true };
+      }
+      throw new HttpError(400, "Answer every required playlist question", "invalid_guidance_answers");
+    }
     const optionId = typeof answer.optionId === "string" ? answer.optionId.trim() : "";
     const customText = typeof answer.customText === "string" ? answer.customText.trim() : "";
     if (Boolean(optionId) === Boolean(customText)) {
       throw new HttpError(400, "Choose one option or enter one custom answer", "invalid_guidance_answers");
+    }
+    if (customText && contractVersion === 2 && question.allowCustom === false) {
+      throw new HttpError(400, "This playlist question does not accept a custom answer", "invalid_guidance_answers");
     }
     if (optionId) {
       if (!question.options.some((option) => option.id === optionId)) {
@@ -1775,6 +1790,10 @@ function normalizedQueryPlanV3Invariant(
       : compatibilityFallback?.semanticAuditMetadata
         ? { ...compatibilityFallback.semanticAuditMetadata }
         : null,
+    briefContractVersion: queryPlan.briefContractVersion ?? null,
+    guidancePolicyVersion: queryPlan.guidancePolicyVersion ?? null,
+    evidencePolicyVersion: queryPlan.evidencePolicyVersion ?? null,
+    executionDeltaHash: queryPlan.executionDeltaHash ?? null,
   };
 }
 
@@ -1822,7 +1841,7 @@ function queryPlanV3ExecutionProjection(
     // Schema-1 plans are immutable historical contracts. Never project the
     // newer semantic shape onto them while they drain: doing so changes the
     // normalized execution invariant even though their stored hash is valid.
-    ...(template.schemaVersion === 2 ? {
+    ...(template.schemaVersion >= 2 ? {
       semanticPolicyVersion: plan.semanticPolicyVersion,
       semanticClauses: plan.semanticClauses.map((clause) => ({
         ...clause,
@@ -3050,10 +3069,12 @@ export class Repository {
     clientBucket: string;
     clientBucketAliases: string[];
     idempotencyKey?: string | null;
+    briefContractVersion?: 1 | 2;
   }): Promise<{ id: string; status: string; created: boolean }> {
     const prompt = input.prompt.trim();
     if (prompt.length < 4 || prompt.length > 2_000) throw new HttpError(400, "Describe the playlist in 4–2,000 characters", "invalid_prompt");
     const requestedTrackCount = input.requestedTrackCount ?? null;
+    const briefContractVersion = input.briefContractVersion === 2 ? 2 : 1;
     if (requestedTrackCount !== null && (
       !Number.isInteger(requestedTrackCount)
       || requestedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
@@ -3068,14 +3089,15 @@ export class Repository {
     return this.transaction(async (client) => {
       if (input.idempotencyKey) {
         await lockClientAliases(client, `brief:${input.idempotencyKey}`, input.clientBucketAliases);
-        const existing = await client.query<{ id: string; status: string; prompt: string; requested_track_count: number | null }>(
-          "SELECT id,status,prompt,requested_track_count FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
+        const existing = await client.query<{ id: string; status: string; prompt: string; requested_track_count: number | null; brief_contract_version: number }>(
+          "SELECT id,status,prompt,requested_track_count,brief_contract_version FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
           [input.clientBucketAliases, input.idempotencyKey],
         );
         if (existing.rows[0]) {
           const prior = existing.rows[0];
           const priorTrackCount = prior.requested_track_count == null ? null : Number(prior.requested_track_count);
-          if (prior.prompt !== prompt || priorTrackCount !== requestedTrackCount) {
+          if (prior.prompt !== prompt || priorTrackCount !== requestedTrackCount
+            || Number(prior.brief_contract_version) !== briefContractVersion) {
             throw new HttpError(409, "Idempotency key was already used for a different playlist request", "idempotency_conflict");
           }
           return { id: prior.id, status: prior.status, created: false };
@@ -3083,9 +3105,10 @@ export class Repository {
       }
       const id = randomUUID();
       await client.query(
-        `INSERT INTO brief_requests(id,prompt,requested_track_count,model,status,client_bucket,idempotency_key,expires_at)
-         VALUES($1,$2,$3,$4,'queued',$5,$6,now()+interval '24 hours')`,
-        [id, prompt, requestedTrackCount, input.model, input.clientBucket, input.idempotencyKey ?? null],
+        `INSERT INTO brief_requests(id,prompt,requested_track_count,model,status,client_bucket,idempotency_key,
+           brief_contract_version,expires_at)
+         VALUES($1,$2,$3,$4,'queued',$5,$6,$7,now()+interval '24 hours')`,
+        [id, prompt, requestedTrackCount, input.model, input.clientBucket, input.idempotencyKey ?? null, briefContractVersion],
       );
       return { id, status: "queued", created: true };
     });
@@ -3095,6 +3118,9 @@ export class Repository {
     const result = await this.pool.query(
       `SELECT id,prompt,requested_track_count,model,status,brief_json,questions_json,answers_json,
               guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
+              brief_contract_version,active_guidance_question_set_id,
+              (SELECT question_set_hash FROM guidance_question_sets
+               WHERE id=brief_requests.active_guidance_question_set_id) question_set_hash,
               pipeline_version,policy_version,selection_plan_json,
               estimate_usd,error,client_bucket,expires_at,created_at,updated_at
        FROM brief_requests WHERE id=$1 AND expires_at>now()`,
@@ -3114,6 +3140,8 @@ export class Repository {
       guidanceSourceHints: row.guidance_source_hints_json ?? [],
       guidanceTelemetry: row.guidance_telemetry_json ?? null,
       guidancePreferences: row.guidance_preferences_json ?? [],
+      briefContractVersion: Number(row.brief_contract_version ?? 1) === 2 ? 2 : 1,
+      questionSetHash: typeof row.question_set_hash === "string" ? row.question_set_hash : null,
       pipelineVersion: row.pipeline_version ?? "legacy_v1",
       policyVersion: row.policy_version ?? "legacy_v1",
       selectionPlan: row.selection_plan_json ?? null,
@@ -3156,6 +3184,8 @@ export class Repository {
         // revoke access immediately, but retain only the opaque brief row until
         // reconciliation can write the aggregate charge. A late worker result
         // cannot restore content because saveBriefResult requires live expiry.
+        await client.query("DELETE FROM guidance_answer_sets WHERE brief_request_id=$1", [id]);
+        await client.query("DELETE FROM guidance_question_sets WHERE brief_request_id=$1", [id]);
         await client.query(
           `UPDATE brief_requests SET prompt='',status='failed',brief_json=NULL,
              questions_json=NULL,answers_json=NULL,answers_idempotency_key=NULL,
@@ -3195,32 +3225,76 @@ export class Repository {
     questions?: PlaylistGuidanceQuestion[];
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
+    guidanceContract?: PlaylistGuidanceQuestionSetContract;
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void> {
     const persistedError = result.status === "failed"
       ? sanitizeFailure(result.error, "brief")
       : null;
-    const saved = await this.pool.query(
-      `UPDATE brief_requests SET status=$2,brief_json=$3,questions_json=COALESCE($4,questions_json),
-              guidance_source_hints_json=COALESCE($5,guidance_source_hints_json),
-              guidance_telemetry_json=CASE WHEN $6::boolean THEN $7 ELSE guidance_telemetry_json END,
-              estimate_usd=$8,error=$9,updated_at=now()
-       WHERE id=$1 AND expires_at>now() AND ($10::varchar IS NULL OR status=$10::varchar)`,
-      [
-        id,
-        result.status,
-        result.brief ?? null,
-        result.questions === undefined ? null : JSON.stringify(result.questions),
-        result.guidanceSourceHints === undefined ? null : JSON.stringify(result.guidanceSourceHints),
-        result.guidanceTelemetry !== undefined,
-        result.guidanceTelemetry === undefined ? null : JSON.stringify(result.guidanceTelemetry),
-        result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"),
-        persistedError,
-        result.expectedStatus ?? null,
-      ],
-    );
-    if (saved.rowCount && result.status === "failed") {
+    const saved = await this.transaction(async (client) => {
+      const updated = await client.query<{ brief_contract_version: number }>(
+        `UPDATE brief_requests SET status=$2,brief_json=$3,questions_json=COALESCE($4,questions_json),
+                guidance_source_hints_json=COALESCE($5,guidance_source_hints_json),
+                guidance_telemetry_json=CASE WHEN $6::boolean THEN $7 ELSE guidance_telemetry_json END,
+                estimate_usd=$8,error=$9,updated_at=now()
+         WHERE id=$1 AND expires_at>now() AND ($10::varchar IS NULL OR status=$10::varchar)
+         RETURNING brief_contract_version`,
+        [
+          id,
+          result.status,
+          result.brief ?? null,
+          result.questions === undefined ? null : JSON.stringify(result.questions),
+          result.guidanceSourceHints === undefined ? null : JSON.stringify(result.guidanceSourceHints),
+          result.guidanceTelemetry !== undefined,
+          result.guidanceTelemetry === undefined ? null : JSON.stringify(result.guidanceTelemetry),
+          result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"),
+          persistedError,
+          result.expectedStatus ?? null,
+        ],
+      );
+      if (!updated.rows[0] || !result.guidanceContract) return updated.rowCount ?? 0;
+      if (Number(updated.rows[0].brief_contract_version) !== 2 || !Array.isArray(result.questions)) {
+        throw new Error("A guidance question-set contract requires a contract-2 brief and questions");
+      }
+      await client.query(
+        "UPDATE guidance_question_sets SET active=false WHERE brief_request_id=$1 AND active",
+        [id],
+      );
+      const revision = await client.query<{ revision: number }>(
+        "SELECT COALESCE(max(revision),0)+1 AS revision FROM guidance_question_sets WHERE brief_request_id=$1",
+        [id],
+      );
+      const questionSetId = randomUUID();
+      await client.query(
+        `INSERT INTO guidance_question_sets(
+           id,brief_request_id,revision,question_set_hash,request_classification,generation_mode,
+           guidance_policy_version,locale,storefront,target_track_count,explicit_constraint_hash,
+           rejected_question_reasons_json,questions_json,active)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,true)`,
+        [
+          questionSetId,
+          id,
+          Number(revision.rows[0]?.revision ?? 1),
+          result.guidanceContract.questionSetHash,
+          result.guidanceContract.requestClassification,
+          result.guidanceContract.generationMode,
+          result.guidanceContract.guidancePolicyVersion,
+          result.guidanceContract.locale,
+          result.guidanceContract.storefront,
+          result.guidanceContract.targetTrackCount,
+          result.guidanceContract.explicitConstraintHash,
+          JSON.stringify(result.guidanceContract.rejectedQuestionReasons),
+          JSON.stringify(result.questions),
+        ],
+      );
+      await client.query(
+        "UPDATE brief_requests SET active_guidance_question_set_id=$2 WHERE id=$1",
+        [id, questionSetId],
+      );
+      return updated.rowCount ?? 0;
+    });
+    if (saved > 0 && result.status === "failed") {
       await this.captureAutomaticBriefFailureSafely(id);
     }
   }
@@ -3238,8 +3312,12 @@ export class Repository {
   async submitBriefAnswers(input: {
     briefRequestId: string;
     idempotencyKey: string;
+    questionSetHash?: string;
     answers: PlaylistGuidanceAnswer[];
-  }): Promise<{ status: "finalizing" | "complete"; created: boolean }> {
+  }): Promise<
+    | { status: "finalizing" | "complete"; created: boolean }
+    | { status: "stale_question_set"; created: false; questionSetHash: string; questions: PlaylistGuidanceQuestion[] }
+  > {
     return this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`brief-answers:${input.briefRequestId}`]);
       const selected = await client.query<{
@@ -3247,19 +3325,43 @@ export class Repository {
         questions_json: PlaylistGuidanceQuestion[] | null;
         answers_idempotency_key: string | null;
         answers_hash: string | null;
+        brief_contract_version: number;
+        active_guidance_question_set_id: string | null;
+        question_set_hash: string | null;
+        contract_questions_json: PlaylistGuidanceQuestion[] | null;
       }>(
-        `SELECT status,questions_json,answers_idempotency_key,answers_hash
-         FROM brief_requests
-         WHERE id=$1 AND expires_at>now()
-         FOR UPDATE`,
+        `SELECT brief.status,brief.questions_json,brief.answers_idempotency_key,brief.answers_hash,
+                brief.brief_contract_version,brief.active_guidance_question_set_id,
+                question_set.question_set_hash,question_set.questions_json contract_questions_json
+         FROM brief_requests brief
+         LEFT JOIN guidance_question_sets question_set
+           ON question_set.id=brief.active_guidance_question_set_id AND question_set.active
+         WHERE brief.id=$1 AND brief.expires_at>now()
+         FOR UPDATE OF brief`,
         [input.briefRequestId],
       );
       const brief = selected.rows[0];
       if (!brief) throw new HttpError(404, "Brief request not found", "brief_not_found");
-      const questions = Array.isArray(brief.questions_json) ? brief.questions_json : [];
-      const answers = normalizedGuidanceAnswers(questions, input.answers);
+      const contractVersion = Number(brief.brief_contract_version) === 2 ? 2 : 1;
+      const questions = contractVersion === 2 && Array.isArray(brief.contract_questions_json)
+        ? brief.contract_questions_json
+        : Array.isArray(brief.questions_json) ? brief.questions_json : [];
+      if (contractVersion === 2) {
+        if (!brief.question_set_hash || input.questionSetHash !== brief.question_set_hash) {
+          return {
+            status: "stale_question_set",
+            created: false,
+            questionSetHash: brief.question_set_hash ?? "",
+            questions,
+          };
+        }
+      }
+      const answers = normalizedGuidanceAnswers(questions, input.answers, contractVersion);
       const guidancePreferences = deriveGuidancePreferences(questions, answers);
-      const answersHash = sha256Hex(stableStringify(answers));
+      const answersHash = sha256Hex(stableStringify({
+        questionSetHash: contractVersion === 2 ? brief.question_set_hash : null,
+        answers,
+      }));
       if (brief.answers_idempotency_key !== null) {
         if (brief.answers_idempotency_key !== input.idempotencyKey || brief.answers_hash !== answersHash) {
           throw new HttpError(
@@ -3275,6 +3377,32 @@ export class Repository {
       }
       if (brief.status !== "awaiting_answers") {
         throw new HttpError(409, "Playlist questions are not ready for answers", "brief_not_ready");
+      }
+      if (contractVersion === 2) {
+        if (!brief.active_guidance_question_set_id || !brief.question_set_hash) {
+          throw new HttpError(409, "Playlist guidance contract is incomplete", "guidance_contract_incomplete");
+        }
+        const execution = compileGuidanceExecutionDeltaV2(questions, answers);
+        await client.query(
+          `INSERT INTO guidance_answer_sets(
+             id,brief_request_id,question_set_id,question_set_hash,normalized_answers_json,
+             raw_custom_answers_json,answer_hash,execution_delta_json,execution_delta_hash,idempotency_key)
+           VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8::jsonb,$9,$10)`,
+          [
+            randomUUID(),
+            input.briefRequestId,
+            brief.active_guidance_question_set_id,
+            brief.question_set_hash,
+            JSON.stringify(answers),
+            JSON.stringify(answers.flatMap((answer) => answer.customText
+              ? [{ questionId: answer.questionId, customText: answer.customText }]
+              : [])),
+            answersHash,
+            JSON.stringify(execution.delta),
+            execution.hash,
+            input.idempotencyKey,
+          ],
+        );
       }
       await client.query(
         `UPDATE brief_requests SET status='finalizing',answers_json=$2,
@@ -3333,6 +3461,8 @@ export class Repository {
     let guidanceAnswers: PlaylistGuidanceAnswer[] = [];
     let briefRequestedTrackCount: number | null = null;
     let selectionPlan: SelectionPlan | null = null;
+    let briefContractVersion: 1 | 2 = 1;
+    let guidanceExecutionDeltaHash = compileGuidanceExecutionDeltaV2([], []).hash;
     let repairedStoredSelectionPlan = false;
     if (input.briefRequestId) {
       const context = await this.pool.query<{
@@ -3342,9 +3472,13 @@ export class Repository {
         answers_json: PlaylistGuidanceAnswer[] | null;
         selection_plan_json: SelectionPlan | null;
         requested_track_count: number | null;
+        brief_contract_version: number;
+        execution_delta_hash: string | null;
       }>(
         `SELECT guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
-           answers_json,selection_plan_json,requested_track_count
+           answers_json,selection_plan_json,requested_track_count,brief_contract_version,
+           (SELECT execution_delta_hash FROM guidance_answer_sets
+            WHERE brief_request_id=brief_requests.id ORDER BY accepted_at DESC LIMIT 1) execution_delta_hash
          FROM brief_requests WHERE id=$1 AND expires_at>now()`,
         [input.briefRequestId],
       );
@@ -3362,6 +3496,10 @@ export class Repository {
       briefRequestedTrackCount = row.requested_track_count == null
         ? null
         : Number(row.requested_track_count);
+      briefContractVersion = Number(row.brief_contract_version) === 2 ? 2 : 1;
+      if (briefContractVersion === 2 && typeof row.execution_delta_hash === "string") {
+        guidanceExecutionDeltaHash = row.execution_delta_hash;
+      }
     }
     const exactRequestedTrackCount = (() => {
       if (Number.isInteger(briefRequestedTrackCount)
@@ -3464,6 +3602,7 @@ export class Repository {
       guidancePreferences,
       selectionPlan,
       selectionPlanV3,
+      ...(briefContractVersion === 2 ? { briefContractVersion, guidanceExecutionDeltaHash } : {}),
       researchPolicy: researchPolicyFingerprint(input.brief, process.env, selectionPlan, modelRoutingSignals),
     }));
     const pipelinePolicySnapshot = selectionPlanV3
@@ -3500,6 +3639,7 @@ export class Repository {
       storefront: runSpecStorefront,
       guidanceAnswers,
       guidanceSourceHints: runSpecGuidanceSourceHints,
+      ...(briefContractVersion === 2 ? { briefContractVersion } : {}),
       pipelineVersion: runSpecPipelineVersion,
       policyVersion: runSpecPolicyVersion,
     }));
@@ -3622,16 +3762,25 @@ export class Repository {
               "v3_snapshot_unavailable",
             );
           }
-          v3QueryPlan = createRuntimeQueryPlanV3(selectionPlanV3, v3GraphSnapshotId);
+          const emittedSchema = queryPlanV3EmissionSchemaVersion(process.env);
+          v3QueryPlan = briefContractVersion === 2
+            ? createQueryPlanV3(selectionPlanV3, v3GraphSnapshotId, {
+              schemaVersion: 3,
+              briefContractVersion,
+              executionDeltaHash: guidanceExecutionDeltaHash,
+            })
+            : createQueryPlanV3(selectionPlanV3, v3GraphSnapshotId, {
+              schemaVersion: emittedSchema === 3 ? 2 : emittedSchema,
+            });
         }
         const insertedRun = await client.query<{ created_at: Date }>(
           `INSERT INTO research_runs(
              id,prompt,brief_json,guidance_source_hints_json,guidance_telemetry_json,
              guidance_preferences_json,brief_hash,status,phase,client_bucket,idempotency_key,auto_publish,
              estimated_cost_usd,approved_budget_usd,pipeline_version,policy_version,selection_plan_json,
-             pipeline_policy_snapshot_json,
+             pipeline_policy_snapshot_json,brief_contract_version,
              budget_approval_expires_at,retention_expires_at)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8::varchar,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::varchar,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
              CASE WHEN $8::varchar='awaiting_budget' THEN now()+interval '7 days' ELSE NULL END,
              now()+interval '90 days')
            RETURNING created_at`,
@@ -3654,14 +3803,15 @@ export class Repository {
             selectionPlanV3 ? "corpus_first_v3_policy_v1" : selectionPlan?.policyVersion ?? "legacy_v1",
             selectionPlanV3 ? null : selectionPlan == null ? null : JSON.stringify(selectionPlan),
             pipelinePolicySnapshot == null ? null : JSON.stringify(pipelinePolicySnapshot),
+            briefContractVersion,
           ],
         );
         if (supportsImmutableRunSpec) {
           await client.query(
             `INSERT INTO run_specs(
                run_id,raw_prompt,requested_track_count,storefront,guidance_answers_json,
-               guidance_source_hints_json,spec_hash,pipeline_version,policy_version)
-             VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9)`,
+               guidance_source_hints_json,spec_hash,pipeline_version,policy_version,brief_contract_version)
+             VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,$10)`,
             [
               runId,
               input.prompt,
@@ -3672,6 +3822,7 @@ export class Repository {
               runSpecHash,
               runSpecPipelineVersion,
               runSpecPolicyVersion,
+              briefContractVersion,
             ],
           );
         }
@@ -3772,6 +3923,296 @@ export class Repository {
     return result.runId;
   }
 
+  async recordProviderMetric(input: {
+    runId?: string | null;
+    provider: string;
+    operation: string;
+    stageKey: string;
+    metricName: string;
+    metricValue: number;
+    requestOutcome: string;
+    cacheOutcome?: string | null;
+    idempotencyKey: string;
+    occurredAt?: Date;
+  }): Promise<void> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 16) return;
+    const metricValue = Math.max(0, Math.floor(input.metricValue));
+    if (!Number.isSafeInteger(metricValue)) throw new HttpError(400, "Provider metric value is invalid", "invalid_provider_metric");
+    const bounded = (value: string, maximum: number) => value.normalize("NFKC").trim().slice(0, maximum);
+    const provider = bounded(input.provider, 80);
+    const operation = bounded(input.operation, 120);
+    const stageKey = bounded(input.stageKey, 120);
+    const metricName = bounded(input.metricName, 120);
+    const requestOutcome = bounded(input.requestOutcome, 48);
+    const cacheOutcome = input.cacheOutcome == null ? null : bounded(input.cacheOutcome, 48);
+    const idempotencyKey = bounded(input.idempotencyKey, 160);
+    if (![provider, operation, stageKey, metricName, requestOutcome, idempotencyKey].every(Boolean)) {
+      throw new HttpError(400, "Provider metric dimensions are invalid", "invalid_provider_metric");
+    }
+    const occurredAt = input.occurredAt ?? new Date();
+    await this.transaction(async (client) => {
+      const inserted = await client.query(
+        `INSERT INTO provider_metric_events(
+           id,run_id,provider,operation,stage_key,metric_name,metric_value,
+           request_outcome,cache_outcome,idempotency_key,occurred_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`,
+        [randomUUID(), input.runId ?? null, provider, operation, stageKey, metricName,
+          metricValue, requestOutcome, cacheOutcome, idempotencyKey, occurredAt],
+      );
+      if (!inserted.rows[0]) return;
+      await client.query(
+        `INSERT INTO provider_metric_daily_aggregates(
+           metric_date,provider,operation,metric_name,metric_value,event_count,expires_at)
+         VALUES(($1::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date,$2,$3,$4,$5,1,
+           (($1::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date + interval '13 months'))
+         ON CONFLICT(metric_date,provider,operation,metric_name) DO UPDATE SET
+           metric_value=provider_metric_daily_aggregates.metric_value+EXCLUDED.metric_value,
+           event_count=provider_metric_daily_aggregates.event_count+1,
+           updated_at=now(),expires_at=GREATEST(provider_metric_daily_aggregates.expires_at,EXCLUDED.expires_at)`,
+        [occurredAt, provider, operation, metricName, metricValue],
+      );
+    });
+  }
+
+  async recordRunSourceObservation(input: {
+    runId: string;
+    queryPlanRevisionId?: string | null;
+    providerMetricEventId?: string | null;
+    idempotencyKey: string;
+    allowedHost: string;
+    resourceType: string;
+    extractionMethod: string;
+    attemptOutcome: string;
+    locator: string;
+    providerRows?: number;
+    uniqueValidLeads?: number;
+    citationBearingLeads?: number;
+    exactPairAttestations?: number;
+    startedAt: Date;
+    completedAt?: Date | null;
+  }): Promise<void> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 16) return;
+    const count = (value: number | undefined) => Math.max(0, Math.floor(value ?? 0));
+    await this.pool.query(
+      `INSERT INTO run_source_observations(
+         id,run_id,query_plan_revision_id,provider_metric_event_id,idempotency_key,
+         allowed_host,resource_type,extraction_method,attempt_outcome,locator_hash,
+         provider_rows,unique_valid_leads,citation_bearing_leads,exact_pair_attestations,
+         started_at,completed_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       ON CONFLICT(idempotency_key) DO NOTHING`,
+      [
+        randomUUID(), input.runId, input.queryPlanRevisionId ?? null,
+        input.providerMetricEventId ?? null, input.idempotencyKey.slice(0, 160),
+        input.allowedHost.toLowerCase().slice(0, 240), input.resourceType.slice(0, 80),
+        input.extractionMethod.slice(0, 80), input.attemptOutcome.slice(0, 80),
+        sha256Hex(input.locator), count(input.providerRows), count(input.uniqueValidLeads),
+        count(input.citationBearingLeads), count(input.exactPairAttestations),
+        input.startedAt, input.completedAt ?? null,
+      ],
+    );
+  }
+
+  private async persistTerminalStageMetricSummary(runId: string): Promise<void> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 16) return;
+    const summary = await this.pool.query<Record<string, unknown>>(
+      `SELECT r.status,r.phase,r.pipeline_outcome_json,active.query_plan_revision_id,
+         COALESCE((SELECT sum(provider_rows)::int FROM run_source_observations WHERE run_id=r.id),0) provider_rows,
+         COALESCE((SELECT sum(unique_valid_leads)::int FROM run_source_observations WHERE run_id=r.id),0) unique_valid_leads,
+         COALESCE((SELECT sum(citation_bearing_leads)::int FROM run_source_observations WHERE run_id=r.id),0) citation_bearing_leads,
+         COALESCE((SELECT sum(exact_pair_attestations)::int FROM run_source_observations WHERE run_id=r.id),0) exact_pair_attestations,
+         (SELECT count(*)::int FROM research_containers WHERE run_id=r.id) containers_discovered,
+         (SELECT count(*)::int FROM research_containers WHERE run_id=r.id AND status='complete') containers_enumerated,
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=r.id AND candidate_stage NOT IN ('discovered','identity_resolved')) scope_bound_candidates,
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=r.id AND candidate_stage IN ('claim_verified','version_compatible','catalog_resolved','playable','canonicalized','quota_eligible','sequenced','manifested','published')) evidence_qualified_candidates,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=r.id) apple_resolution_attempts,
+         COALESCE((SELECT sum(metric_value)::int FROM provider_metric_events WHERE run_id=r.id AND provider='apple' AND metric_name='provider_requests'),0) apple_provider_requests,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=r.id AND status='accepted') apple_matches,
+         (SELECT count(*)::int FROM recording_families WHERE run_id=r.id) recording_families,
+         (SELECT count(*)::int FROM manifest_tracks mt JOIN manifests m ON m.id=mt.manifest_id WHERE m.run_id=r.id) selected_count,
+         (SELECT count(*)::int FROM manifest_revision_reserve_tracks reserve JOIN manifest_revisions revision ON revision.id=reserve.manifest_revision_id JOIN manifests m ON m.id=revision.manifest_id WHERE m.run_id=r.id) reserve_count,
+         (SELECT count(*)::int FROM manifest_revision_tracks track JOIN manifest_revisions revision ON revision.id=track.manifest_revision_id JOIN manifests m ON m.id=revision.manifest_id WHERE m.run_id=r.id) manifested_count,
+         COALESCE((SELECT sum(volume.appended_count)::int FROM publication_volumes volume JOIN manifests m ON m.id=volume.manifest_id WHERE m.run_id=r.id),0) published_count
+       FROM research_runs r
+       LEFT JOIN run_active_query_plans active ON active.run_id=r.id
+       WHERE r.id=$1`,
+      [runId],
+    );
+    const row = summary.rows[0];
+    if (!row) return;
+    const outcome = row.pipeline_outcome_json && typeof row.pipeline_outcome_json === "object"
+      ? row.pipeline_outcome_json as Record<string, unknown>
+      : {};
+    const integer = (key: string) => Math.max(0, Math.floor(Number(row[key] ?? 0) || 0));
+    const stageKey = String(row.phase ?? "terminal").slice(0, 120);
+    const stopReason = typeof outcome.stopReason === "string" ? outcome.stopReason.slice(0, 120) : null;
+    const rootCause = typeof outcome.rootCause === "string" ? outcome.rootCause.slice(0, 160) : null;
+    await this.pool.query(
+      `INSERT INTO run_stage_metric_summaries(
+         id,run_id,query_plan_revision_id,stage_key,metric_revision,provider_rows,
+         unique_valid_leads,citation_bearing_leads,exact_pair_attestations,containers_discovered,
+         containers_enumerated,scope_bound_candidates,evidence_qualified_candidates,
+         apple_resolution_attempts,apple_provider_requests,apple_matches,recording_families,
+         selected_count,reserve_count,manifested_count,published_count,stop_reason,root_cause,
+         downstream_state,terminal)
+       VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,true)
+       ON CONFLICT DO NOTHING`,
+      [
+        deterministicUuid({ runId, stageKey, metricRevision: 1 }), runId,
+        row.query_plan_revision_id ?? null, stageKey, integer("provider_rows"),
+        integer("unique_valid_leads"), integer("citation_bearing_leads"),
+        integer("exact_pair_attestations"), integer("containers_discovered"),
+        integer("containers_enumerated"), integer("scope_bound_candidates"),
+        integer("evidence_qualified_candidates"), integer("apple_resolution_attempts"),
+        integer("apple_provider_requests"), integer("apple_matches"),
+        integer("recording_families"), integer("selected_count"), integer("reserve_count"),
+        integer("manifested_count"), integer("published_count"), stopReason, rootCause,
+        String(row.status ?? "terminal").slice(0, 160),
+      ],
+    );
+  }
+
+  private async captureNormalizedQualityIncident(runId: string): Promise<void> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 16) return;
+    const result = await this.pool.query<Record<string, unknown>>(
+      `SELECT r.status,r.phase,r.pipeline_version,r.pipeline_outcome_json,r.brief_json,
+         active.query_plan_revision_id,query.revision plan_revision,query.plan_json,
+         access.id run_access_id,
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=r.id) candidate_count,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=r.id) apple_attempts,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=r.id AND status='accepted') apple_matches,
+         (SELECT count(*)::int FROM manifest_tracks track JOIN manifests manifest ON manifest.id=track.manifest_id WHERE manifest.run_id=r.id) selected_count,
+         COALESCE((SELECT sum(volume.appended_count)::int FROM publication_volumes volume JOIN manifests manifest ON manifest.id=volume.manifest_id WHERE manifest.run_id=r.id),0) published_count
+       FROM research_runs r
+       LEFT JOIN run_active_query_plans active ON active.run_id=r.id
+       LEFT JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+       LEFT JOIN LATERAL (
+         SELECT id FROM run_accesses WHERE run_id=r.id AND deleted_at IS NULL
+         ORDER BY created_at DESC LIMIT 1
+       ) access ON true
+       WHERE r.id=$1 AND r.deleted_at IS NULL`,
+      [runId],
+    );
+    const row = result.rows[0];
+    if (!row) return;
+    const status = String(row.status ?? "");
+    const phase = String(row.phase ?? "");
+    if (!TERMINAL_RUN_STATUSES.includes(status) || phase === "owner_cancelled") return;
+    const brief = row.brief_json && typeof row.brief_json === "object"
+      ? row.brief_json as Record<string, unknown>
+      : {};
+    const targetSize = brief.targetSize && typeof brief.targetSize === "object"
+      ? brief.targetSize as Record<string, unknown>
+      : {};
+    const target = Math.max(0, Math.floor(Number(targetSize.max ?? targetSize.min ?? 0) || 0));
+    const candidates = Math.max(0, Number(row.candidate_count ?? 0) || 0);
+    const appleAttempts = Math.max(0, Number(row.apple_attempts ?? 0) || 0);
+    const selected = Math.max(0, Number(row.selected_count ?? 0) || 0);
+    const catalogRichUnderfill = target > 0 && selected < Math.ceil(target * 0.9)
+      && candidates >= target && appleAttempts >= target;
+    let incidentClass: string | null = null;
+    if (status === "failed_integrity") incidentClass = "failed_integrity";
+    else if (status === "failed_system" || status === "failed") incidentClass = "failed_system";
+    else if (status === "no_compatible_tracks") incidentClass = "no_compatible_tracks";
+    else if (catalogRichUnderfill) incidentClass = "catastrophic_underfill";
+    if (!incidentClass) return;
+    const outcome = row.pipeline_outcome_json && typeof row.pipeline_outcome_json === "object"
+      ? row.pipeline_outcome_json as Record<string, unknown>
+      : {};
+    const plan = row.plan_json && typeof row.plan_json === "object"
+      ? row.plan_json as Record<string, unknown>
+      : {};
+    const zeroAppleUpstream = candidates > 0 && appleAttempts === 0;
+    const stopReason = (typeof outcome.stopReason === "string" ? outcome.stopReason : phase || status).slice(0, 120);
+    const rootCause = (zeroAppleUpstream
+      ? "zero_apple_provider_requests_after_upstream_candidates"
+      : typeof outcome.rootCause === "string" ? outcome.rootCause : incidentClass).slice(0, 160);
+    const downstreamState = `${status}:${phase || "terminal"}`.slice(0, 160);
+    const terminalOutcomeHash = sha256Hex(stableStringify({
+      status, phase, target, candidates, appleAttempts, selected,
+      published: Number(row.published_count ?? 0) || 0,
+      planRevision: row.plan_revision ?? null,
+    }));
+    const signature = sha256Hex(stableStringify({
+      incidentClass, stopReason, rootCause, downstreamState,
+      pipelineVersion: row.pipeline_version ?? "unknown",
+      queryPlanSchemaVersion: plan.schemaVersion ?? null,
+    }));
+    const eventHash = sha256Hex(`quality-incident\n${runId}\n${terminalOutcomeHash}`);
+    const occurredAt = new Date();
+    await this.transaction(async (client) => {
+      const deduped = await client.query(
+        `INSERT INTO quality_incident_event_keys(event_hash,incident_date)
+         VALUES($1,($2::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)
+         ON CONFLICT(event_hash) DO NOTHING RETURNING event_hash`,
+        [eventHash, occurredAt],
+      );
+      if (!deduped.rows[0]) return;
+      const counter = await client.query<{ detailed_count: number }>(
+        `INSERT INTO quality_incident_daily_counters(incident_date)
+         VALUES(($1::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)
+         ON CONFLICT(incident_date) DO UPDATE SET updated_at=now()
+         RETURNING detailed_count`,
+        [occurredAt],
+      );
+      const detailed = Number(counter.rows[0]?.detailed_count ?? 0) < 100;
+      const groupId = deterministicUuid({ kind: "quality_incident_group", signature });
+      await client.query(
+        `INSERT INTO quality_incident_groups(
+           id,incident_signature,incident_class,stop_reason,root_cause,downstream_state,
+           first_seen_at,last_seen_at,total_count,overflow_count,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz,$7::timestamptz,1,$8,
+           $7::timestamptz+interval '13 months')
+         ON CONFLICT(incident_signature) DO UPDATE SET
+           last_seen_at=EXCLUDED.last_seen_at,total_count=quality_incident_groups.total_count+1,
+           overflow_count=quality_incident_groups.overflow_count+EXCLUDED.overflow_count,
+           expires_at=GREATEST(quality_incident_groups.expires_at,EXCLUDED.expires_at),updated_at=now()`,
+        [groupId, signature, incidentClass, stopReason, rootCause, downstreamState,
+          occurredAt, detailed ? 0 : 1],
+      );
+      await client.query(
+        `UPDATE quality_incident_daily_counters SET
+           detailed_count=detailed_count+$2,overflow_count=overflow_count+$3,updated_at=now()
+         WHERE incident_date=($1::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date`,
+        [occurredAt, detailed ? 1 : 0, detailed ? 0 : 1],
+      );
+      if (!detailed) return;
+      await client.query(
+        `INSERT INTO quality_incident_occurrences(
+           id,group_id,run_id,run_access_id,plan_revision,terminal_outcome_hash,
+           stop_reason,root_cause,downstream_state,diagnostics_json,idempotency_key,occurred_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)`,
+        [
+          randomUUID(), groupId, runId, row.run_access_id ?? null,
+          row.plan_revision ?? null, terminalOutcomeHash, stopReason, rootCause, downstreamState,
+          JSON.stringify({
+            targetTrackCount: target,
+            candidateCount: candidates,
+            appleResolutionAttempts: appleAttempts,
+            appleMatches: Number(row.apple_matches ?? 0) || 0,
+            selectedCount: selected,
+            publishedCount: Number(row.published_count ?? 0) || 0,
+            queryPlanSchemaVersion: typeof plan.schemaVersion === "number" ? plan.schemaVersion : null,
+          }),
+          `quality:${eventHash}`.slice(0, 160), occurredAt,
+        ],
+      );
+    });
+  }
+
+  private async captureTerminalDiagnosticsSafely(runId: string): Promise<void> {
+    try {
+      await this.persistTerminalStageMetricSummary(runId);
+      await this.captureNormalizedQualityIncident(runId);
+    } catch (error) {
+      console.error("[quality-diagnostics] terminal capture failed", {
+        runId,
+        message: error instanceof Error ? error.message.slice(0, 500) : "unknown error",
+      });
+    }
+  }
+
   async updateRun(id: string, values: {
     status?: string;
     phase?: string;
@@ -3820,6 +4261,9 @@ export class Repository {
     if (result.rowCount === 0) throw new HttpError(404, "Research run not found", "run_not_found");
     if (values.status && classifyAutomaticRunFailure(values.status, values.phase ?? null)) {
       await this.captureAutomaticRunFailureSafely(id);
+    }
+    if (values.status && TERMINAL_RUN_STATUSES.includes(values.status)) {
+      await this.captureTerminalDiagnosticsSafely(id);
     }
     if (values.status === "complete" || values.status === "partial") {
       // Publication is already durable at this point. Project only a complete,
@@ -3934,12 +4378,14 @@ export class Repository {
         spec_hash: string | null;
         spec_pipeline_version: string | null;
         spec_policy_version: string | null;
+        brief_contract_version: number;
       }>(
         `SELECT r.status,r.phase,r.deleted_at,r.selection_plan_json,
                 s.raw_prompt,s.requested_track_count,s.storefront,s.guidance_answers_json,
                 s.guidance_source_hints_json,
                 s.spec_hash,s.pipeline_version spec_pipeline_version,
-                s.policy_version spec_policy_version
+                s.policy_version spec_policy_version,
+                ${schemaVersion >= 16 ? "s.brief_contract_version" : "1::integer AS brief_contract_version"}
          FROM research_runs r
          LEFT JOIN run_specs s ON s.run_id=r.id
          WHERE r.id=$1 FOR UPDATE OF r`,
@@ -3965,6 +4411,7 @@ export class Repository {
         storefront: run.storefront,
         guidanceAnswers: Array.isArray(run.guidance_answers_json) ? run.guidance_answers_json : [],
         guidanceSourceHints: Array.isArray(run.guidance_source_hints_json) ? run.guidance_source_hints_json : [],
+        ...(Number(run.brief_contract_version) === 2 ? { briefContractVersion: 2 } : {}),
         pipelineVersion: run.spec_pipeline_version,
         policyVersion: run.spec_policy_version,
       }));
@@ -9504,33 +9951,56 @@ export class Repository {
     const publicationPriority = schemaVersion >= 14
       ? "WHEN candidate.queue_class='publication' THEN -1"
       : "";
-    // Schema 15's immutable V3 queue trigger predates query-plan schema 2 and
-    // can physically restamp a newly enqueued job to protocol 6. Derive the
-    // effective minimum from the job-bound immutable query-plan revision at
-    // lease time so an older worker can neither lease nor exhaust schema-2
-    // work. This is intentionally a runtime compatibility fence rather than a
-    // migration: historical schema-1 jobs retain their protocol-6 drain path.
+    // Derive the effective fence from both immutable contracts at lease time.
+    // This protects work queued during a rolling migration even if an older
+    // trigger physically stamped a lower number on the row.
     const effectiveMinimumWorkerProtocol = schemaVersion >= 15
-      ? `GREATEST(candidate.minimum_worker_protocol, CASE
-           WHEN candidate.pipeline_version='corpus_first_v3'
-            AND EXISTS (
-              SELECT 1 FROM query_plan_revisions protocol_plan
-              WHERE protocol_plan.id=candidate.query_plan_revision_id
-                AND protocol_plan.plan_json @> '{"schemaVersion":2}'::jsonb
-            )
-           THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
-           ELSE 0 END)`
+      ? `GREATEST(
+           candidate.minimum_worker_protocol,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM query_plan_revisions protocol_plan
+             WHERE protocol_plan.id=candidate.query_plan_revision_id
+               AND COALESCE((protocol_plan.plan_json->>'schemaVersion')::int,1)>=3
+           ) THEN ${CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL}
+           WHEN EXISTS (
+             SELECT 1 FROM query_plan_revisions protocol_plan
+             WHERE protocol_plan.id=candidate.query_plan_revision_id
+               AND COALESCE((protocol_plan.plan_json->>'schemaVersion')::int,1)=2
+           ) THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
+           ELSE 0 END,
+           CASE WHEN ${schemaVersion >= 16 ? `EXISTS (
+             SELECT 1 FROM research_runs protocol_run
+             WHERE protocol_run.id=candidate.run_id AND protocol_run.brief_contract_version>=2
+           ) OR EXISTS (
+             SELECT 1 FROM brief_requests protocol_brief
+             WHERE protocol_brief.id=candidate.brief_request_id AND protocol_brief.brief_contract_version>=2
+           )` : "false"}
+           THEN ${BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL} ELSE 0 END
+         )`
       : "candidate.minimum_worker_protocol";
     const exhaustedEffectiveMinimumWorkerProtocol = schemaVersion >= 15
-      ? `GREATEST(job_queue.minimum_worker_protocol, CASE
-           WHEN job_queue.pipeline_version='corpus_first_v3'
-            AND EXISTS (
-              SELECT 1 FROM query_plan_revisions protocol_plan
-              WHERE protocol_plan.id=job_queue.query_plan_revision_id
-                AND protocol_plan.plan_json @> '{"schemaVersion":2}'::jsonb
-            )
-           THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
-           ELSE 0 END)`
+      ? `GREATEST(
+           job_queue.minimum_worker_protocol,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM query_plan_revisions protocol_plan
+             WHERE protocol_plan.id=job_queue.query_plan_revision_id
+               AND COALESCE((protocol_plan.plan_json->>'schemaVersion')::int,1)>=3
+           ) THEN ${CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL}
+           WHEN EXISTS (
+             SELECT 1 FROM query_plan_revisions protocol_plan
+             WHERE protocol_plan.id=job_queue.query_plan_revision_id
+               AND COALESCE((protocol_plan.plan_json->>'schemaVersion')::int,1)=2
+           ) THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
+           ELSE 0 END,
+           CASE WHEN ${schemaVersion >= 16 ? `EXISTS (
+             SELECT 1 FROM research_runs protocol_run
+             WHERE protocol_run.id=job_queue.run_id AND protocol_run.brief_contract_version>=2
+           ) OR EXISTS (
+             SELECT 1 FROM brief_requests protocol_brief
+             WHERE protocol_brief.id=job_queue.brief_request_id AND protocol_brief.brief_contract_version>=2
+           )` : "false"}
+           THEN ${BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL} ELSE 0 END
+         )`
       : "job_queue.minimum_worker_protocol";
     const terminalFailures: Array<{ source: "run" | "brief"; id: string }> = [];
     const leasedJob = await this.transaction(async (client) => {
@@ -10136,6 +10606,40 @@ export class Repository {
         occurredAt,
       ],
     );
+    if (Number(await this.getSchemaVersion() ?? 0) >= 16) {
+      const eventIdentity = sha256Hex(stableStringify({
+        runId: event.runId,
+        storefront: event.storefront.toLowerCase(),
+        resourceKind: event.resourceKind,
+        requestFingerprint: event.requestFingerprint,
+        cacheState: event.cacheState,
+        providerState: event.providerState,
+        occurredAt: occurredAt.toISOString(),
+      }));
+      await this.recordProviderMetric({
+        runId: event.runId,
+        provider: "apple",
+        operation: event.resourceKind,
+        stageKey: "catalog_resolution",
+        metricName: "provider_requests",
+        metricValue: event.providerState === "skipped" ? 0 : 1,
+        requestOutcome: event.providerState,
+        cacheOutcome: event.cacheState,
+        idempotencyKey: `apple:${eventIdentity}`,
+        occurredAt,
+      });
+      await this.recordRunSourceObservation({
+        runId: event.runId,
+        idempotencyKey: `apple-source:${eventIdentity}`,
+        allowedHost: "api.music.apple.com",
+        resourceType: event.resourceKind,
+        extractionMethod: "apple_catalog_api",
+        attemptOutcome: `${event.cacheState}:${event.providerState}`,
+        locator: event.requestFingerprint,
+        startedAt: occurredAt,
+        completedAt: occurredAt,
+      });
+    }
   }
 
   async tryAcquireAppleCatalogCacheLease(
@@ -11062,7 +11566,7 @@ export class Repository {
     fence: PipelineV3WriteFence;
   }): Promise<{ status: "claimed" | "replayed"; revision: 2 }> {
     const { runId, queryPlan, revision, fence } = input;
-    if (queryPlan.schemaVersion !== 2 || !isQueryPlanV3(queryPlan)) {
+    if (queryPlan.schemaVersion < 2 || !isQueryPlanV3(queryPlan)) {
       throw new HttpError(
         409,
         "Semantic recovery requires an immutable schema-2 query plan",
@@ -11119,7 +11623,7 @@ export class Repository {
         || queryPlanV3Hash(immutable.query_plan_json) !== queryHash
         || immutable.selection_plan_hash !== queryPlan.selectionPlanHash
         || selectionPlanV3Hash(immutable.selection_plan_json) !== queryPlan.selectionPlanHash
-        || immutable.query_plan_json.schemaVersion !== 2) {
+        || immutable.query_plan_json.schemaVersion < 2) {
         throw new HttpError(
           409,
           "Semantic recovery no longer matches the active immutable plan",
@@ -11130,7 +11634,11 @@ export class Repository {
       const canonicalQueryPlan = createQueryPlanV3(
         immutable.selection_plan_json,
         immutable.query_plan_json.graphSnapshotId,
-        { schemaVersion: 2 },
+        {
+          schemaVersion: immutable.query_plan_json.schemaVersion,
+          briefContractVersion: immutable.query_plan_json.briefContractVersion,
+          executionDeltaHash: immutable.query_plan_json.executionDeltaHash,
+        },
       );
       if (stableStringify(normalizedQueryPlanV3Invariant(
         immutable.query_plan_json,
@@ -11222,6 +11730,8 @@ export class Repository {
       : originalSelectionPlanProvided
       ? createQueryPlanV3(plan, queryPlan.graphSnapshotId, {
         schemaVersion: queryPlan.schemaVersion,
+        briefContractVersion: queryPlan.briefContractVersion,
+        executionDeltaHash: queryPlan.executionDeltaHash,
       })
       : queryPlanV3ExecutionProjection(plan, queryPlan);
     const executionProjectionMatches = stableStringify(normalizedQueryPlanV3Invariant(
@@ -11374,7 +11884,11 @@ export class Repository {
         : createQueryPlanV3(
           immutable.selection_plan_json,
           immutable.graph_snapshot_id,
-          { schemaVersion: immutable.query_plan_json.schemaVersion },
+          {
+            schemaVersion: immutable.query_plan_json.schemaVersion,
+            briefContractVersion: immutable.query_plan_json.briefContractVersion,
+            executionDeltaHash: immutable.query_plan_json.executionDeltaHash,
+          },
         );
       const storedQueryInvariantMatchesSelection = stableStringify(normalizedQueryPlanV3Invariant(
         immutable.query_plan_json,
@@ -11940,6 +12454,7 @@ export class Repository {
     });
 
     if (!persisted.manifestId || !persisted.manifestRevisionId || !persisted.manifestHash) {
+      await this.captureTerminalDiagnosticsSafely(runId);
       return { manifestId: null, manifestRevisionId: null, manifestHash: null, publicationState: "not_applicable" };
     }
     if (!persisted.exact) {
@@ -12754,6 +13269,50 @@ export class Repository {
       }
       return exceededCeiling;
     });
+    try {
+      if (Number(await this.getSchemaVersion() ?? 0) >= 16) {
+        const metric = await this.pool.query<{
+          run_id: string | null;
+          operation: string;
+          status: string;
+          usage_json: Record<string, unknown> | null;
+        }>(
+          "SELECT run_id,operation,status,usage_json FROM cost_reservations WHERE id=$1",
+          [reservationId],
+        );
+        const row = metric.rows[0];
+        if (row) {
+          await this.recordProviderMetric({
+            runId: row.run_id,
+            provider: "openai",
+            operation: row.operation,
+            stageKey: row.operation.split(".")[0] || "provider",
+            metricName: "provider_requests",
+            metricValue: 1,
+            requestOutcome: row.status,
+            idempotencyKey: `openai:${reservationId}:request`,
+          });
+          const latencyMs = Math.max(0, Math.floor(Number(row.usage_json?.latencyMs ?? 0) || 0));
+          if (latencyMs > 0) {
+            await this.recordProviderMetric({
+              runId: row.run_id,
+              provider: "openai",
+              operation: row.operation,
+              stageKey: row.operation.split(".")[0] || "provider",
+              metricName: "latency_ms",
+              metricValue: latencyMs,
+              requestOutcome: row.status,
+              idempotencyKey: `openai:${reservationId}:latency`,
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.error("[provider-metrics] reconciliation telemetry failed", {
+        reservationId,
+        message: error instanceof Error ? error.message.slice(0, 500) : "unknown error",
+      });
+    }
     if (overrun) {
       throw new HttpError(
         402,
@@ -13299,8 +13858,69 @@ export class Repository {
     };
   }
 
+  async getQualityDiagnosticsSummary(days = 30): Promise<Record<string, unknown>> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 16) {
+      return { schemaAvailable: false, days: 0, incidents: [], daily: [], providers: [], stages: [] };
+    }
+    const boundedDays = Math.max(1, Math.min(90, Math.floor(days)));
+    const [incidents, daily, providers, stages] = await Promise.all([
+      this.pool.query(
+        `SELECT incident_signature,incident_class,stop_reason,root_cause,downstream_state,
+                first_seen_at,last_seen_at,total_count,overflow_count,qa_promoted,qa_promoted_at
+         FROM quality_incident_groups
+         WHERE last_seen_at>=now()-($1::text||' days')::interval
+         ORDER BY total_count DESC,last_seen_at DESC LIMIT 100`,
+        [String(boundedDays)],
+      ),
+      this.pool.query(
+        `SELECT incident_date,detailed_count,overflow_count
+         FROM quality_incident_daily_counters
+         WHERE incident_date>=(now() AT TIME ZONE 'America/Sao_Paulo')::date-$1::int
+         ORDER BY incident_date`,
+        [boundedDays],
+      ),
+      this.pool.query(
+        `SELECT metric_date,provider,operation,metric_name,metric_value,event_count
+         FROM provider_metric_daily_aggregates
+         WHERE metric_date>=(now() AT TIME ZONE 'America/Sao_Paulo')::date-$1::int
+         ORDER BY metric_date,provider,operation,metric_name`,
+        [boundedDays],
+      ),
+      this.pool.query(
+        `SELECT run_id,query_plan_revision_id,stage_key,provider_rows,unique_valid_leads,
+                citation_bearing_leads,exact_pair_attestations,containers_discovered,
+                containers_enumerated,scope_bound_candidates,evidence_qualified_candidates,
+                apple_resolution_attempts,apple_provider_requests,apple_matches,recording_families,
+                selected_count,reserve_count,manifested_count,published_count,stop_reason,
+                root_cause,downstream_state,created_at
+         FROM run_stage_metric_summaries
+         WHERE created_at>=now()-($1::text||' days')::interval
+         ORDER BY created_at DESC LIMIT 200`,
+        [String(boundedDays)],
+      ),
+    ]);
+    return {
+      schemaAvailable: true,
+      days: boundedDays,
+      incidents: incidents.rows,
+      daily: daily.rows,
+      providers: providers.rows,
+      stages: stages.rows,
+    };
+  }
+
   async runRetentionSweep(limit = 50): Promise<number> {
     const detailCutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1_000);
+    if (Number(await this.getSchemaVersion() ?? 0) >= 16) {
+      await this.pool.query("DELETE FROM provider_metric_events WHERE expires_at<=now()");
+      await this.pool.query("DELETE FROM quality_incident_occurrences WHERE expires_at<=now()");
+      await this.pool.query("DELETE FROM quality_incident_event_keys WHERE expires_at<=now()");
+      await this.pool.query("DELETE FROM provider_metric_daily_aggregates WHERE expires_at<=now()");
+      await this.pool.query("DELETE FROM quality_incident_groups WHERE expires_at<=now()");
+      await this.pool.query(
+        "DELETE FROM quality_incident_daily_counters WHERE incident_date<(now() AT TIME ZONE 'America/Sao_Paulo')::date-interval '13 months'",
+      );
+    }
     await this.pool.query(
       `UPDATE research_runs SET status='expired',phase='budget_approval_expired',error='Budget approval expired after seven days',completed_at=now(),updated_at=now()
        WHERE status='awaiting_budget' AND budget_approval_expires_at<=now()`,

@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.3.0",
+      "releasedAt": "2026-07-22",
+      "title": "Intelligent guidance and quality diagnostics",
+      "notes": [
+        "Classifies precise, broad, preference-ambiguous, and critically ambiguous requests before deciding whether grounded follow-up guidance can materially improve the playlist.",
+        "Persists immutable contract-2 question and answer revisions with stale-hash rejection, idempotent answer normalization, and typed execution-delta hashes.",
+        "Binds contract-2 Pipeline V3 runs to query-plan schema 3 and worker protocol 9 while retaining legacy contract and schema drain paths.",
+        "Adds durable provider, source, stage, and privacy-bounded incident diagnostics with 90-day detail and 13-month aggregate retention.",
+        "Lets visitors skip optional guidance with a balanced default and safely refresh questions when a saved answer set becomes stale."
+      ]
+    },
+    {
       "version": "2.2.2",
       "releasedAt": "2026-07-22",
       "title": "Guidance and evidence compatibility bridge",
