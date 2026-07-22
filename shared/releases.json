@@ -2,6 +2,19 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.2.2",
+      "releasedAt": "2026-07-22",
+      "title": "Guidance and evidence compatibility bridge",
+      "notes": [
+        "Advertises protocol-9 worker capability while the bridge API continues accepting protocol-8 workers for existing brief and query-plan contracts.",
+        "Keeps query-plan schema 2 and the existing brief behavior active, with explicit protocol-9 fences reserved for future contract-2 and schema-3 work.",
+        "Extends binary database readability through expand-only schema 16 while leaving the live and preferred database schema at 15.",
+        "Reports the advertised and minimum worker protocols plus the 13–16 database support window on the About page for rollout verification.",
+        "Preserves historical V1, V2, and V3 job draining without activating new guidance, diagnostics, evidence, or Railway assignment behavior.",
+        "Clarifies that visitor feedback remains private to the owner and is not automatically sent to OpenAI."
+      ]
+    },
+    {
       "version": "2.2.1",
       "releasedAt": "2026-07-22",
       "title": "Automatic failure diagnostics",

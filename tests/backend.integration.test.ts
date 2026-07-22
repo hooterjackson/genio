@@ -291,17 +291,21 @@ databaseDescribe("hosted backend integration", () => {
     expect(constraintAfter.rows).toEqual(constraintBefore.rows);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
-    // The Release-A bridge must remain healthy immediately before and after
-    // the schema-14/15 expand migrations, while failing closed for both older and
-    // newer schemas that current queries have not declared compatible.
+    // The 2.2.2 bridge remains healthy across the active schema and the future
+    // schema-16 expansion, while failing closed outside its declared window.
     await repository.setSetting("schema_version", "13");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "12");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
-      /supported 13-15, found 12/u,
+      /supported 13-16, found 12/u,
     );
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-15, found 12/u);
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-16, found 12/u);
+    await repository.setSetting("schema_version", "16");
+    await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
+    await repository.setSetting("schema_version", "17");
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-16, found 17/u);
     await repository.setSetting("schema_version", "15");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);

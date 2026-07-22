@@ -31,10 +31,15 @@ export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
   pipelineVersions: ["legacy_v1", "catalog_first_v2"],
 };
 
-// v6 understands the inert corpus-first routing contract. Assignment remains
-// separately disabled; declaring capability does not opt a run into V3.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v8";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 8;
+// v9 is the compatibility bridge for the next brief/query-plan contracts.
+// Advertising the newer capability does not activate those contracts: the API
+// continues to emit the legacy brief contract and query-plan schema 2 until
+// their separately gated rollout.
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v9";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 9;
+/** Old-contract bridge capacity remains healthy while v9 workers roll out. */
+export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION = "playlist-pipeline-v8";
+export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER = 8;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
   protocolNumber: WORKER_PIPELINE_PROTOCOL_NUMBER,
@@ -46,6 +51,10 @@ export const CATALOG_FIRST_V2_MINIMUM_WORKER_PROTOCOL = 5;
 export const CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL = 6;
 /** Schema-2 workers understand typed semantic clauses and their audit hashes. */
 export const CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL = 8;
+/** Reserved fence for the inactive contract-2 guidance execution contract. */
+export const BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL = 9;
+/** Reserved fence for the inactive query-plan schema-3 execution contract. */
+export const CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL = 9;
 
 export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
   if (pipelineVersion === "corpus_first_v3") return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
@@ -58,11 +67,13 @@ export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersio
  * fencing newly compiled schema-2 work to workers that execute typed clauses.
  */
 export function minimumWorkerProtocolForQueryPlan(
-  queryPlan: Pick<QueryPlanV3, "schemaVersion"> | null | undefined,
+  queryPlan: Pick<QueryPlanV3, "schemaVersion"> | { readonly schemaVersion: number } | null | undefined,
 ): number {
-  return queryPlan?.schemaVersion === 2
-    ? CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL
-    : CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
+  if (typeof queryPlan?.schemaVersion === "number" && queryPlan.schemaVersion >= 3) {
+    return CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL;
+  }
+  if (queryPlan?.schemaVersion === 2) return CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL;
+  return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
 }
 
 export function workerPipelineProtocolNumber(value: unknown): number | null {
@@ -95,5 +106,5 @@ export function workerPipelineProtocolVersion(metadata: unknown): string | null 
 
 export function isWorkerPipelineProtocolCompatible(metadata: unknown): boolean {
   const actual = workerPipelineProtocolNumber(metadata);
-  return actual !== null && actual >= WORKER_PIPELINE_PROTOCOL_NUMBER;
+  return actual !== null && actual >= BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER;
 }

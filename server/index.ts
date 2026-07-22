@@ -45,7 +45,10 @@ import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 import { buildInformation } from "./build-info.ts";
 import { runtimeReleaseContract } from "./runtime-release.ts";
-import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
+import {
+  BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
+  WORKER_PIPELINE_PROTOCOL_VERSION,
+} from "./worker-protocol.ts";
 import {
   FEEDBACK_BODY_BYTES,
   parseFeedbackKind,
@@ -326,6 +329,7 @@ app.get("/health/system", async (_request, reply) => {
         : "missing",
       workerProtocol: {
         expected: WORKER_PIPELINE_PROTOCOL_VERSION,
+        minimumAccepted: BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
         actual: health.worker.protocolVersion ?? null,
       },
       workerLanes: {
@@ -369,6 +373,7 @@ app.get("/api/v1/system/health", async () => {
       protocolCompatible: health.worker.protocolCompatible,
       protocolVersion: health.worker.protocolVersion ?? null,
       expectedProtocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
+      minimumProtocolVersion: BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
     },
     workerLanes: {
       interactive: {
