@@ -197,14 +197,22 @@ import {
   workerPipelineProtocolVersion,
 } from "./worker-protocol.ts";
 import {
+  automaticFailureFingerprint,
+  classifyAutomaticBriefFailure,
+  classifyAutomaticRunFailure,
+  createAutomaticQaScenario,
   feedbackListItem,
   feedbackPayloadHash,
+  redactSensitiveDiagnosticText,
+  type AutomaticFailureDiagnostics,
   type FeedbackKind,
   type FeedbackListItem,
   type FeedbackStatus,
   type FeedbackSubmissionInput,
   type FeedbackSubmissionRecord,
 } from "./feedback.ts";
+import { buildInformation } from "./build-info.ts";
+import { runtimeReleaseContract } from "./runtime-release.ts";
 import {
   deriveGuidancePreferences,
   guidanceOrderingPolicy,
@@ -268,18 +276,169 @@ export function isGuidanceScoutOperation(operation: string): boolean {
     || operation === "brief.scout"
     || operation.startsWith("brief.scout:");
 }
-const TERMINAL_RUN_STATUSES = ["complete", "partial", "failed", "expired", "deleted"];
+const TERMINAL_RUN_STATUSES = [
+  "complete",
+  "partial",
+  "no_compatible_tracks",
+  "cancelled",
+  "failed",
+  "failed_system",
+  "failed_integrity",
+  "expired",
+  "deleted",
+];
 const JOB_ADVISORY_LOCK = 694_207_551;
 const BUDGET_ADVISORY_LOCK = 694_207_552;
 const RUN_CAPACITY_ADVISORY_LOCK = 694_207_553;
 const FEEDBACK_SUBMISSION_PREFIX = "feedback-submission:";
 const FEEDBACK_IDEMPOTENCY_PREFIX = "feedback-idempotency:";
+const FEEDBACK_AUTOMATIC_EVENT_PREFIX = "feedback-automatic-event:";
+const FEEDBACK_AUTOMATIC_SOURCE_LOCK_PREFIX = "feedback-automatic-source:";
+const FEEDBACK_AUTOMATIC_RECONCILIATION_KEY = "feedback-automatic-reconciliation:last";
+const FEEDBACK_AUTOMATIC_RECONCILIATION_LOCK = "feedback-automatic-reconciliation";
+const FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX = "feedback-automatic-reconciliation-touch:";
+const FEEDBACK_AUTOMATIC_RECONCILIATION_INTERVAL_MS = 60_000;
+const FEEDBACK_AUTOMATIC_RECONCILIATION_LIMIT = 20;
 const FEEDBACK_GLOBAL_BUCKET = "feedback-global";
 const FEEDBACK_GLOBAL_DAILY_LIMIT = Math.max(1, Math.min(1_000, Number(process.env.FEEDBACK_GLOBAL_DAILY_LIMIT ?? 100) || 100));
 const FEEDBACK_STORAGE_LIMIT_BYTES = Math.max(
   5 * 1024 * 1024,
   Math.min(1024 * 1024 * 1024, Number(process.env.FEEDBACK_STORAGE_LIMIT_BYTES ?? 100 * 1024 * 1024) || 100 * 1024 * 1024),
 );
+const AUTOMATIC_FAILURE_DIAGNOSTIC_LIMIT_BYTES = 128 * 1024;
+
+const PRIVATE_DIAGNOSTIC_KEY = /(authorization|bearer|bucket|cookie|credential|email|header|key|password|provider.?body|raw.?response|secret|stack|token)/iu;
+
+/**
+ * Keep automatic reports useful without turning them into a second raw-log
+ * sink. Exact request text is stored in the dedicated prompt field; nested
+ * operational metadata is bounded and keys likely to contain secrets or
+ * gateway identity are removed recursively.
+ */
+function boundedOwnerDiagnosticValue(value: unknown, depth = 0): unknown {
+  if (depth > 4 || value === undefined) return null;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") return redactSensitiveDiagnosticText(value, 1_000);
+  if (Array.isArray(value)) {
+    return value.slice(0, 30).map((item) => boundedOwnerDiagnosticValue(item, depth + 1));
+  }
+  if (typeof value !== "object") return String(value).slice(0, 1_000);
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !PRIVATE_DIAGNOSTIC_KEY.test(key))
+      .slice(0, 50)
+      .map(([key, item]) => [key.slice(0, 120), boundedOwnerDiagnosticValue(item, depth + 1)]),
+  );
+}
+
+function boundedAutomaticFailureDiagnostics(
+  diagnostics: AutomaticFailureDiagnostics,
+): AutomaticFailureDiagnostics {
+  const sanitized: AutomaticFailureDiagnostics = {
+    ...diagnostics,
+    prompt: redactSensitiveDiagnosticText(diagnostics.prompt),
+    rootCause: diagnostics.rootCause == null
+      ? null
+      : redactSensitiveDiagnosticText(diagnostics.rootCause, 240),
+    errorCode: diagnostics.errorCode == null
+      ? null
+      : automaticFailureErrorCode(diagnostics.errorCode, "terminal_failure"),
+    errorMessage: diagnostics.errorMessage == null
+      ? null
+      : redactSensitiveDiagnosticText(diagnostics.errorMessage),
+    runtime: boundedOwnerDiagnosticValue(diagnostics.runtime) as AutomaticFailureDiagnostics["runtime"],
+    plan: boundedOwnerDiagnosticValue(diagnostics.plan) as AutomaticFailureDiagnostics["plan"],
+    counters: Object.fromEntries(
+      Object.entries(diagnostics.counters).flatMap(([key, value]) => Number.isFinite(value) && value >= 0
+        ? [[key.slice(0, 80), Math.floor(value)]]
+        : []),
+    ),
+    details: boundedOwnerDiagnosticValue(diagnostics.details) as Record<string, unknown>,
+  };
+  if (Buffer.byteLength(JSON.stringify(sanitized), "utf8") <= AUTOMATIC_FAILURE_DIAGNOSTIC_LIMIT_BYTES) {
+    return sanitized;
+  }
+  // Stage snapshots can contain many bounded branches. Preserve the replay
+  // contract and high-value counters while dropping bulky lower-priority
+  // checkpoint detail so a failure reporter can never become a storage DoS.
+  return {
+    ...sanitized,
+    details: {
+      truncated: true,
+      reason: "automatic_failure_diagnostic_size_limit",
+      originalByteSize: Buffer.byteLength(JSON.stringify(sanitized), "utf8"),
+    },
+  };
+}
+
+function countDiagnosticItems(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === "object") return Object.keys(value as Record<string, unknown>).length;
+  return 0;
+}
+
+function diagnosticOutcomeSummary(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const allowedKeys = [
+    "outcome",
+    "status",
+    "reason",
+    "reasonCode",
+    "rootCause",
+    "shortfall",
+    "requested",
+    "qualified",
+    "published",
+    "completeness",
+  ];
+  const summary = Object.fromEntries(
+    allowedKeys.flatMap((key) => source[key] === undefined ? [] : [[key, source[key]]]),
+  );
+  return Object.keys(summary).length > 0
+    ? boundedOwnerDiagnosticValue(summary) as Record<string, unknown>
+    : null;
+}
+
+function requestedTrackCountFromRunMetadata(row: Record<string, unknown>): number | null {
+  const direct = Number(row.requested_track_count);
+  if (Number.isInteger(direct) && direct >= 1 && direct <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS) return direct;
+  const selection = row.selection_plan_json && typeof row.selection_plan_json === "object"
+    ? row.selection_plan_json as Record<string, unknown>
+    : {};
+  const fromSelection = Number(selection.requestedTrackCount);
+  if (Number.isInteger(fromSelection) && fromSelection >= 1 && fromSelection <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS) {
+    return fromSelection;
+  }
+  const brief = row.brief_json && typeof row.brief_json === "object"
+    ? row.brief_json as Record<string, unknown>
+    : {};
+  const targetSize = brief.targetSize && typeof brief.targetSize === "object"
+    ? brief.targetSize as Record<string, unknown>
+    : {};
+  const fromBrief = Number(targetSize.max ?? targetSize.min);
+  return Number.isInteger(fromBrief) && fromBrief >= 1 && fromBrief <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+    ? fromBrief
+    : null;
+}
+
+function automaticFailureErrorCode(value: unknown, fallback: string): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const normalizedFallback = fallback.trim().toLowerCase()
+    .replace(/[^a-z0-9._-]+/gu, "_").replace(/^_+|_+$/gu, "") || "terminal_failure";
+  if (!raw) return normalizedFallback.slice(0, 120);
+
+  const redacted = redactSensitiveDiagnosticText(raw, 240);
+  const normalized = raw.toLowerCase()
+    .replace(/[^a-z0-9._-]+/gu, "_").replace(/^_+|_+$/gu, "");
+  // Only known server-owned diagnostic namespaces may remain readable. An
+  // arbitrary provider/root-cause string is represented by a stable hash so
+  // an opaque credential can never leak through the error-code field.
+  const controlledNamespace = /^(?:apple|brief|catalog|evidence|failure|integrity|manifest|matching|openai|pipeline|provider|publication|research|schema|semantic|system|timeout|worker)(?:[._-][a-z0-9._-]+)*$/u;
+  if (redacted === raw && controlledNamespace.test(normalized)) return normalized.slice(0, 120);
+  return `failure_${sha256Hex(raw).slice(0, 16)}`;
+}
 
 /**
  * Serialize operations that inspect all aliases for one client identity.
@@ -2052,6 +2211,7 @@ export class Repository {
       const now = new Date().toISOString();
       const record: FeedbackSubmissionRecord = {
         id,
+        origin: "manual",
         kind: input.submission.kind,
         message: input.submission.message,
         pagePath: input.submission.pagePath,
@@ -2090,6 +2250,635 @@ export class Repository {
       }
       return { id, created: true };
     });
+  }
+
+  private async persistAutomaticFailureFeedback(
+    inputDiagnostics: AutomaticFailureDiagnostics,
+  ): Promise<{ id: string; created: boolean } | null> {
+    const diagnostics = boundedAutomaticFailureDiagnostics(inputDiagnostics);
+    const mappingKey = `${FEEDBACK_AUTOMATIC_EVENT_PREFIX}${diagnostics.eventFingerprint}`;
+    return this.transaction(async (client) => {
+      // Capture reads the diagnostic snapshot before opening this transaction.
+      // Revalidate and lock the source here so visitor deletion cannot win the
+      // race and then have this insert recreate an owner-visible copy of the
+      // deleted prompt. Lock the retained access row using the same lock mode
+      // and row order as deleteRunAccess. A KEY SHARE lock is insufficient
+      // here because it does not block that method's non-key deleted_at update.
+      // If capture wins, deletion waits and removes the new report; if deletion
+      // wins, this query resumes after commit and returns no retained source.
+      if (diagnostics.runId) {
+        if (!diagnostics.runAccessId) return null;
+        // Retention otherwise locks the parent run before cascading into its
+        // accesses while capture locks an access before its audit FK touches
+        // the parent. Serialize those opposite row-lock paths at the source.
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1))",
+          [`${FEEDBACK_AUTOMATIC_SOURCE_LOCK_PREFIX}run:${diagnostics.runId}`],
+        );
+        const retained = await client.query(
+          `SELECT 1
+           FROM research_runs r
+           JOIN run_accesses a ON a.run_id=r.id
+           WHERE r.id=$1
+             AND a.id=$2
+             AND r.deleted_at IS NULL
+             AND a.deleted_at IS NULL
+             AND a.expires_at>now()
+           FOR UPDATE OF a`,
+          [diagnostics.runId, diagnostics.runAccessId],
+        );
+        if (!retained.rows[0]) return null;
+      } else if (diagnostics.briefRequestId) {
+        const retained = await client.query(
+          `SELECT 1 FROM brief_requests
+           WHERE id=$1 AND prompt<>''
+           FOR UPDATE`,
+          [diagnostics.briefRequestId],
+        );
+        if (!retained.rows[0]) return null;
+      } else {
+        return null;
+      }
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [mappingKey]);
+      const mapping = await client.query<{ value: string }>(
+        "SELECT value FROM settings WHERE key=$1 FOR UPDATE",
+        [mappingKey],
+      );
+      if (mapping.rows[0]) {
+        try {
+          const parsed = JSON.parse(mapping.rows[0].value) as { id?: unknown; suppressed?: unknown };
+          // Owner deletion and an emergency-pause suppression are durable for
+          // the lifetime of the source. Reconciliation revisits retained
+          // terminal sources, so this check must happen before the pause path
+          // or every heartbeat would append another suppression audit.
+          if (parsed.suppressed === true) return null;
+          if (typeof parsed.id === "string") {
+            const existing = await client.query<{ value: string }>(
+              "SELECT value FROM settings WHERE key=$1 FOR UPDATE",
+              [`${FEEDBACK_SUBMISSION_PREFIX}${parsed.id}`],
+            );
+            if (existing.rows[0]) {
+              // The same terminal transition can be delivered by the direct
+              // hook and heartbeat reconciliation. Treat that replay as
+              // idempotent rather than inflating a user-visible occurrence
+              // count. Genuinely different root causes/generations have a
+              // different fingerprint and create their own report.
+              return { id: parsed.id, created: false };
+            }
+          }
+        } catch {
+          // Replace a malformed internal mapping while holding its lock.
+        }
+      }
+      const pause = await client.query<{ paused: boolean }>(
+        "SELECT COALESCE((SELECT value='true' FROM settings WHERE key='feedback_paused'),false) paused",
+      );
+      if (pause.rows[0]?.paused) {
+        await client.query(
+          `INSERT INTO settings(key,value) VALUES($1,$2)
+           ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+          [mappingKey, JSON.stringify({
+            eventFingerprint: diagnostics.eventFingerprint,
+            runId: diagnostics.runId,
+            runAccessId: diagnostics.runAccessId,
+            briefRequestId: diagnostics.briefRequestId,
+            terminalGeneration: diagnostics.terminalGeneration,
+            suppressed: true,
+            suppressionReason: "feedback_paused",
+            deletedAt: new Date().toISOString(),
+          })],
+        );
+        await client.query(
+          `INSERT INTO audit_events(run_id,actor,action,detail_json)
+           VALUES($1,'system','feedback.automatic_failure_suppressed',$2::jsonb)`,
+          [diagnostics.runId, JSON.stringify({
+            briefRequestId: diagnostics.briefRequestId,
+            runAccessId: diagnostics.runAccessId,
+            failureClass: diagnostics.failureClass,
+            status: diagnostics.status,
+            phase: diagnostics.phase,
+            activePlanRevision: diagnostics.plan.queryPlanRevision
+              ?? diagnostics.plan.selectionPlanRevision ?? null,
+            errorCode: diagnostics.errorCode,
+            terminalGeneration: diagnostics.terminalGeneration,
+            eventFingerprint: diagnostics.eventFingerprint,
+            reason: "feedback_paused",
+          })],
+        );
+        return null;
+      }
+
+      const id = randomUUID();
+      const now = diagnostics.occurredAt;
+      const qaScenario = createAutomaticQaScenario(diagnostics);
+      const report: FeedbackSubmissionRecord = {
+        id,
+        origin: "automatic_failure",
+        kind: "bug",
+        status: "new",
+        message: [
+          `Automatic ${diagnostics.failureClass.replaceAll("_", " ")} report.`,
+          diagnostics.prompt ? `Request: ${diagnostics.prompt}` : "Request text was unavailable.",
+          `${diagnostics.status}${diagnostics.phase ? ` / ${diagnostics.phase}` : ""}.`,
+          diagnostics.errorMessage ?? "No additional error detail was persisted.",
+        ].join(" ").slice(0, 4_000),
+        pagePath: diagnostics.runId ? "/jobs" : "/",
+        appVersion: typeof diagnostics.runtime.appVersion === "string"
+          ? diagnostics.runtime.appVersion
+          : null,
+        image: null,
+        automaticFailure: diagnostics,
+        qaScenario,
+        qaStatus: "quarantined",
+        occurrenceCount: 1,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await client.query(
+        "INSERT INTO settings(key,value) VALUES($1,$2)",
+        [`${FEEDBACK_SUBMISSION_PREFIX}${id}`, JSON.stringify(report)],
+      );
+      await client.query(
+        `INSERT INTO settings(key,value) VALUES($1,$2)
+         ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+        [mappingKey, JSON.stringify({
+          id,
+          eventFingerprint: diagnostics.eventFingerprint,
+          runId: diagnostics.runId,
+          runAccessId: diagnostics.runAccessId,
+          briefRequestId: diagnostics.briefRequestId,
+          terminalGeneration: diagnostics.terminalGeneration,
+          suppressed: false,
+        })],
+      );
+      await client.query(
+        `INSERT INTO audit_events(run_id,actor,action,detail_json)
+         VALUES($1,'system','feedback.automatic_failure_captured',$2::jsonb)`,
+        [
+          diagnostics.runId,
+          JSON.stringify({
+            feedbackId: id,
+            briefRequestId: diagnostics.briefRequestId,
+            runAccessId: diagnostics.runAccessId,
+            failureClass: diagnostics.failureClass,
+            status: diagnostics.status,
+            phase: diagnostics.phase,
+            activePlanRevision: diagnostics.plan.queryPlanRevision
+              ?? diagnostics.plan.selectionPlanRevision ?? null,
+            errorCode: diagnostics.errorCode,
+            terminalGeneration: diagnostics.terminalGeneration,
+            eventFingerprint: diagnostics.eventFingerprint,
+          }),
+        ],
+      );
+      return { id, created: true };
+    });
+  }
+
+  async captureAutomaticRunFailure(runId: string): Promise<{ id: string; created: boolean } | null> {
+    const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
+    const result = await this.pool.query<Record<string, unknown>>(schemaVersion >= 14
+      ? `SELECT r.id,r.status,r.phase,r.error,r.brief_json,r.selection_plan_json,
+                r.pipeline_version,r.policy_version,r.pipeline_policy_snapshot_json,
+                r.pipeline_outcome_json,r.estimated_cost_usd,r.actual_cost_usd,
+                r.approved_budget_usd,r.created_at,r.updated_at,r.completed_at,
+                spec.raw_prompt,spec.requested_track_count,spec.storefront,spec.spec_hash,
+                spec.guidance_answers_json,
+                access.id AS access_id,access.prompt AS access_prompt,access.model AS brief_model,
+                selection.id AS selection_plan_id,selection.revision AS selection_plan_revision,
+                selection.plan_hash AS selection_plan_hash,
+                query.id AS query_plan_id,query.revision AS query_plan_revision,
+                query.plan_hash AS query_plan_hash,query.plan_json AS query_plan_json
+         FROM research_runs r
+         LEFT JOIN run_specs spec ON spec.run_id=r.id
+         LEFT JOIN run_active_query_plans active ON active.run_id=r.id
+         LEFT JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+         LEFT JOIN selection_plans selection ON selection.id=query.selection_plan_id
+         LEFT JOIN LATERAL (
+           SELECT a.id,a.prompt,b.model
+           FROM run_accesses a
+           LEFT JOIN brief_requests b ON b.id=a.brief_request_id
+           WHERE a.run_id=r.id AND a.deleted_at IS NULL AND a.expires_at>now()
+           ORDER BY a.created_at DESC LIMIT 1
+         ) access ON true
+         WHERE r.id=$1 AND r.deleted_at IS NULL`
+      : `SELECT r.id,r.status,r.phase,r.error,r.brief_json,r.selection_plan_json,
+                r.pipeline_version,r.policy_version,r.pipeline_policy_snapshot_json,
+                r.pipeline_outcome_json,r.estimated_cost_usd,r.actual_cost_usd,
+                r.approved_budget_usd,r.created_at,r.updated_at,r.completed_at,
+                NULL::text raw_prompt,NULL::int requested_track_count,NULL::text storefront,
+                NULL::text spec_hash,NULL::jsonb guidance_answers_json,
+                access.id AS access_id,access.prompt AS access_prompt,access.model AS brief_model,
+                NULL::uuid selection_plan_id,NULL::int selection_plan_revision,
+                NULL::text selection_plan_hash,NULL::uuid query_plan_id,
+                NULL::int query_plan_revision,NULL::text query_plan_hash,NULL::jsonb query_plan_json
+         FROM research_runs r
+         LEFT JOIN LATERAL (
+           SELECT a.id,a.prompt,b.model
+           FROM run_accesses a
+           LEFT JOIN brief_requests b ON b.id=a.brief_request_id
+           WHERE a.run_id=r.id AND a.deleted_at IS NULL AND a.expires_at>now()
+           ORDER BY a.created_at DESC LIMIT 1
+         ) access ON true
+         WHERE r.id=$1 AND r.deleted_at IS NULL`,
+    [runId]);
+    const row = result.rows[0];
+    if (!row) return null;
+    const status = String(row.status ?? "");
+    const phase = row.phase == null ? null : String(row.phase);
+    const failureClass = classifyAutomaticRunFailure(status, phase);
+    if (!failureClass) return null;
+
+    const counts = await this.pool.query<Record<string, unknown>>(
+      `SELECT
+         (SELECT count(*)::int FROM track_candidates WHERE run_id=$1) discovered,
+         (SELECT count(*)::int FROM source_records WHERE run_id=$1) sources,
+         (SELECT count(*)::int FROM evidence_claims WHERE run_id=$1) evidence,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1) apple_lookups,
+         (SELECT count(*)::int FROM catalog_matches WHERE run_id=$1 AND status='accepted') accepted,
+         (SELECT count(*)::int FROM manifest_tracks mt JOIN manifests m ON m.id=mt.manifest_id WHERE m.run_id=$1) manifested,
+         (SELECT COALESCE(sum(pv.appended_count),0)::int FROM publication_volumes pv JOIN manifests m ON m.id=pv.manifest_id WHERE m.run_id=$1) published`,
+      [runId],
+    );
+    const checkpointRows = await this.pool.query<{ phase: string; state_json: unknown }>(
+      `SELECT phase,state_json FROM research_checkpoints
+       WHERE run_id=$1 AND (
+         phase ILIKE '%semantic%' OR phase ILIKE '%outcome%'
+         OR phase ILIKE '%recovery%' OR phase='partial_ready'
+       ) ORDER BY updated_at DESC LIMIT 8`,
+      [runId],
+    );
+    const rawCounts = counts.rows[0] ?? {};
+    const counters = Object.fromEntries(
+      Object.entries(rawCounts).map(([key, value]) => [key, Math.max(0, Number(value) || 0)]),
+    );
+    const build = buildInformation();
+    const release = runtimeReleaseContract();
+    const queryPlan = row.query_plan_json && typeof row.query_plan_json === "object"
+      ? row.query_plan_json as Record<string, unknown>
+      : {};
+    const occurredAt = date(row.completed_at ?? row.updated_at)?.toISOString() ?? new Date().toISOString();
+    const terminalGeneration = date(row.completed_at)?.getTime().toString() ?? null;
+    const rootCause = checkpointRows.rows
+      .map(({ state_json }) => state_json && typeof state_json === "object"
+        ? (state_json as Record<string, unknown>).rootCause
+        : null)
+      .find((value): value is string => typeof value === "string" && value.trim().length > 0)
+      ?? (row.pipeline_outcome_json && typeof row.pipeline_outcome_json === "object"
+        && typeof (row.pipeline_outcome_json as Record<string, unknown>).rootCause === "string"
+        ? String((row.pipeline_outcome_json as Record<string, unknown>).rootCause)
+        : null);
+    const errorCode = automaticFailureErrorCode(rootCause, `${failureClass}_terminal`);
+    const activePlanRevision = row.query_plan_revision ?? row.selection_plan_revision ?? null;
+    const eventFingerprint = automaticFailureFingerprint({
+      source: "run",
+      sourceId: runId,
+      status,
+      phase,
+      failureClass,
+      activePlanRevision: typeof activePlanRevision === "string" || typeof activePlanRevision === "number"
+        ? activePlanRevision
+        : null,
+      errorCode,
+      terminalGeneration,
+    });
+    const diagnostics: AutomaticFailureDiagnostics = {
+      schemaVersion: 1,
+      failureClass,
+      eventFingerprint,
+      runId,
+      runAccessId: typeof row.access_id === "string" ? row.access_id : null,
+      briefRequestId: null,
+      // A canonical run may be shared by several capability sessions. Never
+      // copy the run-global immutable spec prompt into owner feedback; bind the
+      // diagnostic to the one retained access whose prompt is being captured.
+      prompt: String(row.access_prompt ?? "").slice(0, 2_000),
+      requestedTrackCount: requestedTrackCountFromRunMetadata(row),
+      storefront: typeof row.storefront === "string" ? row.storefront.slice(0, 16) : null,
+      status,
+      phase,
+      rootCause: rootCause?.slice(0, 240) ?? null,
+      errorCode,
+      errorMessage: row.error == null ? null : sanitizeFailure(String(row.error), failureContextForRun(phase)).slice(0, 2_000),
+      terminalGeneration,
+      occurredAt,
+      runtime: {
+        appVersion: build.identifier,
+        buildRevision: build.revision,
+        databaseSchemaVersion: String(schemaVersion),
+        workerProtocol: release.workerProtocol,
+        promptVersion: release.promptVersion,
+        baselineModel: release.baselineProviderModelId,
+        actualBriefModel: typeof row.brief_model === "string" ? row.brief_model.slice(0, 120) : null,
+      },
+      plan: {
+        pipelineVersion: typeof row.pipeline_version === "string" ? row.pipeline_version : "unknown",
+        policyVersion: typeof row.policy_version === "string" ? row.policy_version : "unknown",
+        specHash: typeof row.spec_hash === "string" ? row.spec_hash : null,
+        selectionPlanId: typeof row.selection_plan_id === "string" ? row.selection_plan_id : null,
+        selectionPlanRevision: typeof row.selection_plan_revision === "number" ? row.selection_plan_revision : null,
+        selectionPlanHash: typeof row.selection_plan_hash === "string" ? row.selection_plan_hash : null,
+        queryPlanId: typeof row.query_plan_id === "string" ? row.query_plan_id : null,
+        queryPlanRevision: typeof row.query_plan_revision === "number" ? row.query_plan_revision : null,
+        queryPlanHash: typeof row.query_plan_hash === "string" ? row.query_plan_hash : null,
+        queryPlanSchemaVersion: typeof queryPlan.schemaVersion === "number" ? queryPlan.schemaVersion : null,
+      },
+      counters,
+      details: boundedOwnerDiagnosticValue({
+        guidanceAnswerCount: countDiagnosticItems(row.guidance_answers_json),
+        pipelinePolicyPresent: Boolean(row.pipeline_policy_snapshot_json),
+        pipelineOutcome: diagnosticOutcomeSummary(row.pipeline_outcome_json),
+        checkpoints: checkpointRows.rows.map((checkpoint) => ({
+          phase: checkpoint.phase,
+          outcome: diagnosticOutcomeSummary(checkpoint.state_json),
+        })),
+        cost: {
+          estimatedUsd: Number(row.estimated_cost_usd ?? 0),
+          actualUsd: Number(row.actual_cost_usd ?? 0),
+          approvedUsd: Number(row.approved_budget_usd ?? 0),
+        },
+        timestamps: {
+          createdAt: date(row.created_at)?.toISOString() ?? null,
+          completedAt: date(row.completed_at)?.toISOString() ?? null,
+        },
+      }) as Record<string, unknown>,
+    };
+    return this.persistAutomaticFailureFeedback(diagnostics);
+  }
+
+  async captureAutomaticBriefFailure(briefRequestId: string): Promise<{ id: string; created: boolean } | null> {
+    const result = await this.pool.query<Record<string, unknown>>(
+      `SELECT id,prompt,requested_track_count,model,status,error,brief_json,
+              questions_json,answers_json,guidance_source_hints_json,guidance_telemetry_json,
+              guidance_preferences_json,pipeline_version,policy_version,selection_plan_json,
+              estimate_usd,created_at,updated_at
+       FROM brief_requests WHERE id=$1`,
+      [briefRequestId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const status = String(row.status ?? "");
+    const failureClass = classifyAutomaticBriefFailure(status);
+    if (!failureClass) return null;
+    const build = buildInformation();
+    const release = runtimeReleaseContract();
+    const terminalGeneration = date(row.updated_at)?.getTime().toString() ?? null;
+    const eventFingerprint = automaticFailureFingerprint({
+      source: "brief",
+      sourceId: briefRequestId,
+      status,
+      phase: "brief_failed",
+      failureClass,
+      errorCode: "brief_interpretation_failed",
+      terminalGeneration,
+    });
+    const requestedTrackCount = Number(row.requested_track_count);
+    const diagnostics: AutomaticFailureDiagnostics = {
+      schemaVersion: 1,
+      failureClass,
+      eventFingerprint,
+      runId: null,
+      runAccessId: null,
+      briefRequestId,
+      prompt: String(row.prompt ?? "").slice(0, 2_000),
+      requestedTrackCount: Number.isInteger(requestedTrackCount) ? requestedTrackCount : null,
+      storefront: null,
+      status,
+      phase: "brief_failed",
+      rootCause: "brief_interpretation_failed",
+      errorCode: "brief_interpretation_failed",
+      errorMessage: row.error == null ? null : sanitizeFailure(String(row.error), "brief").slice(0, 2_000),
+      terminalGeneration,
+      occurredAt: date(row.updated_at)?.toISOString() ?? new Date().toISOString(),
+      runtime: {
+        appVersion: build.identifier,
+        buildRevision: build.revision,
+        databaseSchemaVersion: String(await this.getSchemaVersion() ?? "unknown"),
+        workerProtocol: release.workerProtocol,
+        promptVersion: release.promptVersion,
+        configuredModel: typeof row.model === "string" ? row.model.slice(0, 120) : null,
+      },
+      plan: {
+        pipelineVersion: typeof row.pipeline_version === "string" ? row.pipeline_version : "unknown",
+        policyVersion: typeof row.policy_version === "string" ? row.policy_version : "unknown",
+        selectionPlanPresent: Boolean(row.selection_plan_json),
+      },
+      counters: {},
+      details: boundedOwnerDiagnosticValue({
+        guidance: {
+          questionCount: countDiagnosticItems(row.questions_json),
+          answerCount: countDiagnosticItems(row.answers_json),
+          sourceHintCount: countDiagnosticItems(row.guidance_source_hints_json),
+          preferenceCount: countDiagnosticItems(row.guidance_preferences_json),
+          telemetryPresent: Boolean(row.guidance_telemetry_json),
+          briefPresent: Boolean(row.brief_json),
+        },
+        estimateUsd: Number(row.estimate_usd ?? 0),
+        createdAt: date(row.created_at)?.toISOString() ?? null,
+      }) as Record<string, unknown>,
+    };
+    return this.persistAutomaticFailureFeedback(diagnostics);
+  }
+
+  private async captureAutomaticRunFailureSafely(runId: string): Promise<void> {
+    try {
+      await this.captureAutomaticRunFailure(runId);
+    } catch (error) {
+      console.error("[automatic-failure-feedback] run capture failed", {
+        runId,
+        message: error instanceof Error ? error.message.slice(0, 500) : "unknown error",
+      });
+    }
+  }
+
+  private async captureAutomaticBriefFailureSafely(briefRequestId: string): Promise<void> {
+    try {
+      await this.captureAutomaticBriefFailure(briefRequestId);
+    } catch (error) {
+      console.error("[automatic-failure-feedback] brief capture failed", {
+        briefRequestId,
+        message: error instanceof Error ? error.message.slice(0, 500) : "unknown error",
+      });
+    }
+  }
+
+  /**
+   * Terminal transitions try to capture their diagnostic immediately, but the
+   * report is deliberately best-effort so a reporting outage can never mask
+   * the original search outcome. Worker heartbeats reconcile any uncaptured
+   * recent failures, making the side effect eventually durable after a
+   * transient database/process failure without adding another queue service.
+   */
+  private async reconcileAutomaticFailureFeedback(): Promise<void> {
+    let pending: Array<{ source: "run" | "brief"; id: string }> = [];
+    try {
+      pending = await this.transaction(async (client) => {
+        const lock = await client.query<{ acquired: boolean }>(
+          "SELECT pg_try_advisory_xact_lock(hashtext($1)) acquired",
+          [FEEDBACK_AUTOMATIC_RECONCILIATION_LOCK],
+        );
+        if (lock.rows[0]?.acquired !== true) return [];
+
+        const previous = await client.query<{ value: string }>(
+          "SELECT value FROM settings WHERE key=$1 FOR UPDATE",
+          [FEEDBACK_AUTOMATIC_RECONCILIATION_KEY],
+        );
+        const lastAttemptAt = previous.rows[0]
+          ? Date.parse(previous.rows[0].value)
+          : Number.NaN;
+        if (Number.isFinite(lastAttemptAt)
+          && Date.now() - lastAttemptAt < FEEDBACK_AUTOMATIC_RECONCILIATION_INTERVAL_MS) {
+          return [];
+        }
+        await client.query(
+          `INSERT INTO settings(key,value) VALUES($1,$2)
+           ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+          [FEEDBACK_AUTOMATIC_RECONCILIATION_KEY, new Date().toISOString()],
+        );
+
+        // Reserve half of every reconciliation pass for each source type so
+        // a backlog of terminal runs can never starve failed brief captures.
+        const perSourceLimit = Math.max(1, Math.floor(FEEDBACK_AUTOMATIC_RECONCILIATION_LIMIT / 2));
+        const runs = await client.query<{ id: string }>(
+          `SELECT r.id
+           FROM research_runs r
+           LEFT JOIN settings touch
+             ON touch.key=$2||'run:'||r.id::text
+           WHERE r.deleted_at IS NULL
+             AND r.updated_at>now()-interval '90 days'
+             AND (r.status IN ('failed_system','failed_integrity') OR (
+               r.status='failed'
+               AND COALESCE(r.phase,'') NOT IN (
+                 'owner_cancelled','visitor_deleted','cancelled','deleted','expired',
+                 'apple_authorization','apple_reauthorization','waiting_for_apple_authorization'
+               )
+             ))
+             AND EXISTS (
+               SELECT 1 FROM run_accesses access
+               WHERE access.run_id=r.id
+                 AND access.deleted_at IS NULL
+                 AND access.expires_at>now()
+             )
+           ORDER BY touch.updated_at ASC NULLS FIRST,r.updated_at DESC,r.id
+           LIMIT $1`,
+          [perSourceLimit, FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX],
+        );
+        const briefs = await client.query<{ id: string }>(
+            `SELECT brief.id
+             FROM brief_requests brief
+             LEFT JOIN settings touch
+               ON touch.key=$2||'brief:'||brief.id::text
+             WHERE brief.status='failed'
+               AND brief.prompt<>''
+               AND brief.updated_at>now()-interval '90 days'
+             ORDER BY touch.updated_at ASC NULLS FIRST,brief.updated_at DESC,brief.id
+             LIMIT $1`,
+            [perSourceLimit, FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX],
+          );
+        const selected = [
+          ...runs.rows.map(({ id }) => ({ source: "run" as const, id })),
+          ...briefs.rows.map(({ id }) => ({ source: "brief" as const, id })),
+        ];
+        // Reconciliation rotates through every retained terminal event rather
+        // than relying on a weaker subset of the event fingerprint in SQL.
+        // The capture path computes the authoritative fingerprint (including
+        // root-cause code, active plan, and terminal generation) and remains
+        // idempotent for exact replays. This prevents an older audit or owner
+        // suppression from masking a genuinely different later failure.
+        for (const failure of selected) {
+          await client.query(
+            `INSERT INTO settings(key,value) VALUES($1,$2)
+             ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+            [
+              `${FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX}${failure.source}:${failure.id}`,
+              new Date().toISOString(),
+            ],
+          );
+        }
+        return selected;
+      });
+    } catch (error) {
+      console.error("[automatic-failure-feedback] reconciliation scan failed", {
+        message: error instanceof Error ? error.message.slice(0, 500) : "unknown error",
+      });
+      return;
+    }
+
+    for (const failure of pending) {
+      if (failure.source === "run") await this.captureAutomaticRunFailureSafely(failure.id);
+      else await this.captureAutomaticBriefFailureSafely(failure.id);
+    }
+  }
+
+  /**
+   * Automatic failure reports deliberately contain the visitor request after
+   * credential-like values are redacted so it can be replayed in QA. Keep
+   * that private diagnostic bound to the source record's deletion lifecycle
+   * rather than retaining it as unrelated owner feedback.
+   */
+  private async deleteAutomaticFailureFeedbackForSource(
+    client: PoolClient,
+    source: { runId?: string | null; runAccessId?: string | null; briefRequestId?: string | null },
+  ): Promise<number> {
+    const runId = source.runId?.trim() || null;
+    const runAccessId = source.runAccessId?.trim() || null;
+    const briefRequestId = source.briefRequestId?.trim() || null;
+    if (!runId && !runAccessId && !briefRequestId) return 0;
+    const deleted = await client.query<{ value: string }>(
+      `DELETE FROM settings
+       WHERE key LIKE 'feedback-submission:%'
+         AND value::jsonb->>'origin'='automatic_failure'
+         AND (
+           ($1::text IS NOT NULL AND value::jsonb #>> '{automaticFailure,runId}'=$1)
+           OR ($2::text IS NOT NULL AND value::jsonb #>> '{automaticFailure,runAccessId}'=$2)
+           OR ($3::text IS NOT NULL AND value::jsonb #>> '{automaticFailure,briefRequestId}'=$3)
+         )
+       RETURNING value`,
+      [runId, runAccessId, briefRequestId],
+    );
+    const ids = deleted.rows.flatMap((row) => {
+      try {
+        const id = (JSON.parse(row.value) as { id?: unknown }).id;
+        return typeof id === "string" ? [id] : [];
+      } catch {
+        return [];
+      }
+    });
+    await client.query(
+      `DELETE FROM settings
+       WHERE (key LIKE 'feedback-idempotency:%' OR key LIKE 'feedback-automatic-event:%')
+         AND (
+           value::jsonb->>'id'=ANY($4::text[])
+            OR ($1::text IS NOT NULL AND value::jsonb->>'runId'=$1)
+            OR ($2::text IS NOT NULL AND value::jsonb->>'runAccessId'=$2)
+            OR ($3::text IS NOT NULL AND value::jsonb->>'briefRequestId'=$3)
+         )`,
+      [runId, runAccessId, briefRequestId, ids],
+    );
+    await client.query(
+      `DELETE FROM audit_events
+       WHERE action IN (
+         'feedback.automatic_failure_captured',
+         'feedback.automatic_failure_suppressed'
+       )
+         AND (
+           detail_json->>'feedbackId'=ANY($4::text[])
+           OR ($1::text IS NOT NULL AND run_id=$1::uuid)
+           OR ($2::text IS NOT NULL AND detail_json->>'runAccessId'=$2)
+           OR ($3::text IS NOT NULL AND detail_json->>'briefRequestId'=$3)
+         )`,
+      [runId, runAccessId, briefRequestId, ids],
+    );
+    const reconciliationTouches = [
+      runId ? `${FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX}run:${runId}` : null,
+      briefRequestId ? `${FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX}brief:${briefRequestId}` : null,
+    ].filter((key): key is string => key !== null);
+    if (reconciliationTouches.length > 0) {
+      await client.query("DELETE FROM settings WHERE key=ANY($1::text[])", [reconciliationTouches]);
+    }
+    return deleted.rowCount ?? 0;
   }
 
   async listFeedbackSubmissions(input: {
@@ -2188,16 +2977,64 @@ export class Repository {
 
   async deleteFeedbackSubmission(id: string, actor: string): Promise<boolean> {
     return this.transaction(async (client) => {
-      const deleted = await client.query(
-        "DELETE FROM settings WHERE key=$1 RETURNING key",
-        [`${FEEDBACK_SUBMISSION_PREFIX}${id}`],
+      const reportKey = `${FEEDBACK_SUBMISSION_PREFIX}${id}`;
+      const preview = await client.query<{ value: string }>(
+        "SELECT value FROM settings WHERE key=$1",
+        [reportKey],
       );
-      if (!deleted.rows[0]) return false;
-      await client.query(
-        `DELETE FROM settings
-         WHERE key LIKE 'feedback-idempotency:%' AND value::jsonb->>'id'=$1`,
-        [id],
+      if (!preview.rows[0]) return false;
+      let previewRecord: FeedbackSubmissionRecord | null = null;
+      try {
+        previewRecord = JSON.parse(preview.rows[0].value) as FeedbackSubmissionRecord;
+      } catch {
+        // A malformed private record remains deletable, but cannot create a
+        // suppression key because it has no trustworthy fingerprint.
+      }
+      const fingerprint = previewRecord?.origin === "automatic_failure"
+        ? previewRecord.automaticFailure?.eventFingerprint?.trim() || null
+        : null;
+      const mappingKey = fingerprint ? `${FEEDBACK_AUTOMATIC_EVENT_PREFIX}${fingerprint}` : null;
+      if (mappingKey) await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [mappingKey]);
+      const locked = await client.query<{ value: string }>(
+        "SELECT value FROM settings WHERE key=$1 FOR UPDATE",
+        [reportKey],
       );
+      if (!locked.rows[0]) return false;
+      let record = previewRecord;
+      try {
+        record = JSON.parse(locked.rows[0].value) as FeedbackSubmissionRecord;
+      } catch {
+        record = null;
+      }
+      await client.query("DELETE FROM settings WHERE key=$1", [reportKey]);
+      if (mappingKey && record?.origin === "automatic_failure" && record.automaticFailure) {
+        await client.query(
+          `INSERT INTO settings(key,value) VALUES($1,$2)
+           ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+          [mappingKey, JSON.stringify({
+            id,
+            eventFingerprint: fingerprint,
+            runId: record.automaticFailure.runId,
+            runAccessId: record.automaticFailure.runAccessId,
+            briefRequestId: record.automaticFailure.briefRequestId,
+            terminalGeneration: record.automaticFailure.terminalGeneration,
+            suppressed: true,
+            deletedAt: new Date().toISOString(),
+          })],
+        );
+        await client.query(
+          `DELETE FROM settings
+           WHERE key LIKE 'feedback-idempotency:%' AND value::jsonb->>'id'=$1`,
+          [id],
+        );
+      } else {
+        await client.query(
+          `DELETE FROM settings
+           WHERE (key LIKE 'feedback-idempotency:%' OR key LIKE 'feedback-automatic-event:%')
+             AND value::jsonb->>'id'=$1`,
+          [id],
+        );
+      }
       await client.query(
         "INSERT INTO audit_events(actor,action,detail_json) VALUES($1,'feedback.deleted',$2)",
         [actor.slice(0, 80), { feedbackId: id }],
@@ -2328,6 +3165,7 @@ export class Repository {
            WHERE id=$1`,
           [id],
         );
+        await this.deleteAutomaticFailureFeedbackForSource(client, { briefRequestId: id });
         await client.query("DELETE FROM capability_session_briefs WHERE brief_request_id=$1", [id]);
         await client.query(
           `UPDATE job_queue SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,
@@ -2344,6 +3182,7 @@ export class Repository {
         "UPDATE cost_ledger SET brief_request_id=NULL,usage_json=NULL WHERE brief_request_id=$1",
         [id],
       );
+      await this.deleteAutomaticFailureFeedbackForSource(client, { briefRequestId: id });
       await client.query("DELETE FROM brief_requests WHERE id=$1", [id]);
       return true;
     });
@@ -2362,7 +3201,7 @@ export class Repository {
     const persistedError = result.status === "failed"
       ? sanitizeFailure(result.error, "brief")
       : null;
-    await this.pool.query(
+    const saved = await this.pool.query(
       `UPDATE brief_requests SET status=$2,brief_json=$3,questions_json=COALESCE($4,questions_json),
               guidance_source_hints_json=COALESCE($5,guidance_source_hints_json),
               guidance_telemetry_json=CASE WHEN $6::boolean THEN $7 ELSE guidance_telemetry_json END,
@@ -2381,6 +3220,9 @@ export class Repository {
         result.expectedStatus ?? null,
       ],
     );
+    if (saved.rowCount && result.status === "failed") {
+      await this.captureAutomaticBriefFailureSafely(id);
+    }
   }
 
   async saveBriefSelectionPlan(id: string, plan: SelectionPlan): Promise<void> {
@@ -2976,6 +3818,9 @@ export class Repository {
       })
       : await this.pool.query(sql, parameters);
     if (result.rowCount === 0) throw new HttpError(404, "Research run not found", "run_not_found");
+    if (values.status && classifyAutomaticRunFailure(values.status, values.phase ?? null)) {
+      await this.captureAutomaticRunFailureSafely(id);
+    }
     if (values.status === "complete" || values.status === "partial") {
       // Publication is already durable at this point. Project only a complete,
       // stable, public-safe subset into the browseable directory. A failure to
@@ -3720,6 +4565,11 @@ export class Repository {
       if (!access.rows[0]) return false;
       const runId = access.rows[0].run_id;
       await client.query("UPDATE run_accesses SET prompt=NULL,deleted_at=now(),updated_at=now() WHERE id=$1", [accessId]);
+      // A reused canonical run can outlive one visitor's access. Remove only
+      // the automatic diagnostic bound to this deleted access immediately so
+      // its prompt cannot remain visible merely because another visitor still
+      // has a separate access to the shared run.
+      await this.deleteAutomaticFailureFeedbackForSource(client, { runAccessId: accessId });
       const affectedSessions = await client.query<{ session_id: string }>(
         "DELETE FROM capability_session_accesses WHERE access_id=$1 RETURNING session_id",
         [accessId],
@@ -3745,10 +4595,14 @@ export class Repository {
       );
       await client.query("DELETE FROM capability_tokens WHERE access_id=$1", [accessId]);
       if (access.rows[0].brief_request_id) {
+        await this.deleteAutomaticFailureFeedbackForSource(client, {
+          briefRequestId: access.rows[0].brief_request_id,
+        });
         await client.query("DELETE FROM brief_requests WHERE id=$1", [access.rows[0].brief_request_id]);
       }
       const remaining = await client.query<{ count: number }>("SELECT count(*)::int count FROM run_accesses WHERE run_id=$1 AND deleted_at IS NULL", [runId]);
       if (remaining.rows[0]!.count === 0) {
+        await this.deleteAutomaticFailureFeedbackForSource(client, { runId });
         const run = await client.query<{ status: string; actual_cost_usd: string }>("SELECT status,actual_cost_usd FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
         if (run.rows[0] && !TERMINAL_RUN_STATUSES.includes(run.rows[0].status)) {
           await client.query("UPDATE research_runs SET status='deleted',phase='visitor_deleted',completed_at=now(),updated_at=now() WHERE id=$1", [runId]);
@@ -8678,10 +9532,21 @@ export class Repository {
            THEN ${CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL}
            ELSE 0 END)`
       : "job_queue.minimum_worker_protocol";
-    return this.transaction(async (client) => {
+    const terminalFailures: Array<{ source: "run" | "brief"; id: string }> = [];
+    const leasedJob = await this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock($1)", [JOB_ADVISORY_LOCK]);
       const exhausted = await client.query<{ run_id: string | null; brief_request_id: string | null; kind: string; payload_json: Record<string, unknown> | null }>(
-        `UPDATE job_queue SET status='failed',completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,
+        `WITH exhausted_candidates AS (
+           SELECT id FROM job_queue
+           WHERE status='leased' AND lease_expires_at<=now() AND attempts>=max_attempts
+             AND ${exhaustedEffectiveMinimumWorkerProtocol}<=$8
+             AND pipeline_version=ANY($9::varchar[])
+             ${queuePredicate}
+           ORDER BY lease_expires_at,id
+           FOR UPDATE SKIP LOCKED
+           LIMIT 20
+         )
+         UPDATE job_queue SET status='failed',completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,
          last_error=CASE kind
            WHEN 'brief' THEN $1
            WHEN 'research' THEN $2
@@ -8691,10 +9556,8 @@ export class Repository {
            WHEN 'apple_authorization' THEN $6
            ELSE $7 END,
          updated_at=now()
-         WHERE status='leased' AND lease_expires_at<=now() AND attempts>=max_attempts
-           AND ${exhaustedEffectiveMinimumWorkerProtocol}<=$8
-           AND pipeline_version=ANY($9::varchar[])
-           ${queuePredicate}
+         FROM exhausted_candidates
+         WHERE job_queue.id=exhausted_candidates.id
          RETURNING run_id,brief_request_id,kind,payload_json`,
         [
           sanitizeFailure(null, "brief"),
@@ -8737,7 +9600,7 @@ export class Repository {
             catalogRecoveryGeneration(job.payload_json),
           );
         } else if (job.run_id && ["research", "matching", "publication"].includes(job.kind)) {
-          await client.query(
+          const failedRun = await client.query(
             `UPDATE research_runs SET status='failed',phase=$2,error=$3,
              completed_at=COALESCE(completed_at,now()),updated_at=now()
              WHERE id=$1 AND status NOT IN ('complete','partial','failed','expired','deleted','waiting_for_apple_authorization')`,
@@ -8746,12 +9609,14 @@ export class Repository {
               failureContextForJob(job.kind),
             )],
           );
+          if (failedRun.rowCount) terminalFailures.push({ source: "run", id: job.run_id });
         }
         if (job.brief_request_id && job.kind === "brief") {
-          await client.query(
+          const failedBrief = await client.query(
             "UPDATE brief_requests SET status='failed',error=$2,updated_at=now() WHERE id=$1 AND status<>'complete'",
             [job.brief_request_id, sanitizeFailure(null, "brief")],
           );
+          if (failedBrief.rowCount) terminalFailures.push({ source: "brief", id: job.brief_request_id });
         }
         if (job.kind === "publication") {
           await markTerminalPublicationVolumes(client, job.payload_json, "Worker lease expired after the final attempt");
@@ -8857,6 +9722,16 @@ export class Repository {
         leaseExpiresAt: date(row.lease_expires_at),
       };
     });
+    // Do not hold up the newly leased job while reporting an unrelated
+    // exhausted backlog. The direct capture is best-effort and heartbeat
+    // reconciliation will recover anything interrupted by process shutdown.
+    void (async () => {
+      for (const failure of terminalFailures) {
+        if (failure.source === "run") await this.captureAutomaticRunFailureSafely(failure.id);
+        else await this.captureAutomaticBriefFailureSafely(failure.id);
+      }
+    })();
+    return leasedJob;
   }
 
   async renewJobLease(jobId: string, workerId: string, leaseMs: number, leaseEpoch?: number): Promise<boolean> {
@@ -8965,7 +9840,8 @@ export class Repository {
     retryAt: Date | null = null,
     leaseEpoch?: number,
   ): Promise<void> {
-    await this.transaction(async (client) => {
+    const terminalFailures = await this.transaction(async (client) => {
+      const captured: Array<{ source: "run" | "brief"; id: string }> = [];
       const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
       const current = await client.query<{ attempts: number; max_attempts: number; run_id: string | null; brief_request_id: string | null; kind: string; payload_json: Record<string, unknown> | null }>(
         schemaVersion >= 14
@@ -9027,20 +9903,22 @@ export class Repository {
           catalogRecoveryGeneration(current.rows[0].payload_json),
         );
       } else if (!retry && current.rows[0].run_id && ["research", "matching", "publication"].includes(current.rows[0].kind)) {
-        await client.query(
+        const failedRun = await client.query(
           `UPDATE research_runs SET status='failed',phase=$2,error=$3,completed_at=COALESCE(completed_at,now()),updated_at=now()
            WHERE id=$1 AND status NOT IN ('complete','partial','failed','expired','deleted','waiting_for_apple_authorization')`,
           [current.rows[0].run_id, `${current.rows[0].kind}_failed`, persistedError.slice(0, 2_000)],
         );
+        if (failedRun.rowCount) captured.push({ source: "run", id: current.rows[0].run_id });
       }
       if (!retry && current.rows[0].kind === "publication") {
         await markTerminalPublicationVolumes(client, current.rows[0].payload_json, error);
       }
       if (!retry && current.rows[0].brief_request_id && current.rows[0].kind === "brief") {
-        await client.query(
+        const failedBrief = await client.query(
           "UPDATE brief_requests SET status='failed',error=$2,updated_at=now() WHERE id=$1 AND status<>'complete'",
           [current.rows[0].brief_request_id, sanitizeFailure(error, "brief")],
         );
+        if (failedBrief.rowCount) captured.push({ source: "brief", id: current.rows[0].brief_request_id });
       }
       const notificationId = !retry && current.rows[0].kind === "notification" && typeof current.rows[0].payload_json?.notificationId === "string"
         ? current.rows[0].payload_json.notificationId
@@ -9051,7 +9929,12 @@ export class Repository {
           [notificationId, sanitizeFailure(error, "notification")],
         );
       }
+      return captured;
     });
+    for (const failure of terminalFailures) {
+      if (failure.source === "run") await this.captureAutomaticRunFailureSafely(failure.id);
+      else await this.captureAutomaticBriefFailureSafely(failure.id);
+    }
   }
 
   async updateWorkerHeartbeat(workerId: string, metadata: { schemaVersion?: string; capacity?: number; activeJobs?: number; [key: string]: unknown }): Promise<void> {
@@ -9062,6 +9945,7 @@ export class Repository {
        capacity=EXCLUDED.capacity,active_jobs=EXCLUDED.active_jobs,metadata_json=EXCLUDED.metadata_json,last_seen_at=now()`,
       [workerId, schemaVersion, capacity, activeJobs, rest],
     );
+    await this.reconcileAutomaticFailureFeedback();
   }
 
   async getResearchCheckpoint(runId: string, phase: string): Promise<unknown | null> {
@@ -12421,11 +13305,36 @@ export class Repository {
       `UPDATE research_runs SET status='expired',phase='budget_approval_expired',error='Budget approval expired after seven days',completed_at=now(),updated_at=now()
        WHERE status='awaiting_budget' AND budget_approval_expires_at<=now()`,
     );
+    // Capability expiry is also a prompt-retention boundary. Scrub expired
+    // accesses even when their canonical run remains reusable or a broader
+    // run-retention batch is delayed; deleteRunAccess also removes the exact
+    // automatic diagnostic tied to that visitor access.
+    const expiredAccesses = await this.pool.query<{ id: string }>(
+      `SELECT id FROM run_accesses
+       WHERE deleted_at IS NULL AND expires_at<=now()
+       ORDER BY expires_at,id
+       LIMIT $1`,
+      [Math.max(1, Math.min(limit, 500))],
+    );
+    for (const access of expiredAccesses.rows) await this.deleteRunAccess(access.id);
     const expired = await this.pool.query<{ id: string }>(
       "SELECT id FROM research_runs WHERE retention_expires_at<=now() ORDER BY retention_expires_at FOR UPDATE SKIP LOCKED LIMIT $1",
       [Math.max(1, Math.min(limit, 500))],
     );
     for (const row of expired.rows) await this.purgeRunToTombstone(row.id);
+    // Defensive cleanup for reports left orphaned by older retention sweeps.
+    // The source lock in purgeRunToTombstone prevents new run orphans, but a
+    // sweep must also repair data written before that serialization existed.
+    await this.pool.query(
+      `DELETE FROM settings report
+       WHERE report.key LIKE 'feedback-submission:%'
+         AND report.value::jsonb->>'origin'='automatic_failure'
+         AND report.value::jsonb #>> '{automaticFailure,runId}' IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM research_runs run
+           WHERE run.id::text=report.value::jsonb #>> '{automaticFailure,runId}'
+         )`,
+    );
     // A brief's 24-hour expiry controls visitor access and idempotent reuse,
     // not operational retention. Keep every attempt—including abandoned and
     // budget-gated ones—for the same 90-day QA window as detailed run data.
@@ -12433,7 +13342,30 @@ export class Repository {
       "DELETE FROM cost_ledger WHERE brief_request_id IN (SELECT id FROM brief_requests WHERE created_at<=$1)",
       [detailCutoff],
     );
+    await this.pool.query(
+      `DELETE FROM settings
+       WHERE key LIKE 'feedback-submission:%'
+         AND value::jsonb->>'origin'='automatic_failure'
+         AND value::jsonb #>> '{automaticFailure,briefRequestId}' IN (
+           SELECT id::text FROM brief_requests WHERE created_at<=$1
+         )`,
+      [detailCutoff],
+    );
     await this.pool.query("DELETE FROM brief_requests WHERE created_at<=$1", [detailCutoff]);
+    // A capture that had already locked an expiring brief may commit between
+    // the pre-delete cleanup and the brief deletion. Remove any such orphan in
+    // a second pass so deletion/retention can never be followed by prompt
+    // resurrection in the private diagnostics store.
+    await this.pool.query(
+      `DELETE FROM settings report
+       WHERE report.key LIKE 'feedback-submission:%'
+         AND report.value::jsonb->>'origin'='automatic_failure'
+         AND report.value::jsonb #>> '{automaticFailure,briefRequestId}' IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM brief_requests brief
+           WHERE brief.id::text=report.value::jsonb #>> '{automaticFailure,briefRequestId}'
+         )`,
+    );
     await this.pool.query(
       `DELETE FROM job_queue j USING notification_outbox n
        WHERE j.kind='notification' AND j.payload_json->>'notificationId'=n.id::text AND n.created_at<=$1`,
@@ -12444,22 +13376,63 @@ export class Repository {
     await this.pool.query("DELETE FROM audit_events WHERE occurred_at<=$1", [detailCutoff]);
     await this.pool.query("DELETE FROM rate_limit_events WHERE occurred_at<now()-interval '48 hours'");
     await this.pool.query("DELETE FROM gateway_nonces WHERE expires_at<=now()");
-    // Open feedback remains available to the owner. Once resolved, both its
-    // text and private screenshot are removed after the normal 90-day window.
+    // Manual feedback remains available until it is resolved. Automatic
+    // failure diagnostics always follow the 90-day detailed-data window from
+    // their immutable creation time. Owner triage updates `updated_at`, but it
+    // must never extend retention of a copied visitor prompt.
     await this.pool.query(
       `DELETE FROM settings
        WHERE key LIKE 'feedback-submission:%'
-         AND value::jsonb->>'status'='resolved'
-         AND updated_at<=$1`,
+         AND (
+           (value::jsonb->>'origin'='automatic_failure' AND created_at<=$1)
+           OR (
+             value::jsonb->>'origin' IS DISTINCT FROM 'automatic_failure'
+             AND value::jsonb->>'status'='resolved'
+             AND updated_at<=$1
+           )
+         )`,
       [detailCutoff],
     );
     await this.pool.query(
       `DELETE FROM settings mapping
-       WHERE mapping.key LIKE 'feedback-idempotency:%'
-         AND NOT EXISTS (
+       WHERE NOT EXISTS (
            SELECT 1 FROM settings report
            WHERE report.key='feedback-submission:' || (mapping.value::jsonb->>'id')
+         )
+         AND (
+           mapping.key LIKE 'feedback-idempotency:%'
+           OR (
+             mapping.key LIKE 'feedback-automatic-event:%'
+             AND (
+               mapping.value::jsonb->>'suppressed' IS DISTINCT FROM 'true'
+               OR NOT (
+                 (mapping.value::jsonb->>'runId' IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM research_runs run
+                   WHERE run.id::text=mapping.value::jsonb->>'runId'
+                 ))
+                 OR (mapping.value::jsonb->>'briefRequestId' IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM brief_requests brief
+                   WHERE brief.id::text=mapping.value::jsonb->>'briefRequestId'
+                 ))
+               )
+             )
+           )
          )`,
+    );
+    await this.pool.query(
+      `DELETE FROM settings touch
+       WHERE touch.key LIKE $1||'%'
+         AND (
+           (touch.key LIKE $1||'run:%' AND NOT EXISTS (
+             SELECT 1 FROM research_runs run
+             WHERE run.id::text=substring(touch.key FROM char_length($1||'run:')+1)
+           ))
+           OR (touch.key LIKE $1||'brief:%' AND NOT EXISTS (
+             SELECT 1 FROM brief_requests brief
+             WHERE brief.id::text=substring(touch.key FROM char_length($1||'brief:')+1)
+           ))
+         )`,
+      [FEEDBACK_AUTOMATIC_RECONCILIATION_TOUCH_PREFIX],
     );
     await this.pool.query(
       `INSERT INTO settings(key,value) VALUES
@@ -12472,6 +13445,10 @@ export class Repository {
 
   private async purgeRunToTombstone(runId: string): Promise<void> {
     await this.transaction(async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [`${FEEDBACK_AUTOMATIC_SOURCE_LOCK_PREFIX}run:${runId}`],
+      );
       const run = await client.query("SELECT actual_cost_usd FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
       if (!run.rows[0]) return;
       const manifest = await client.query("SELECT id,content_hash,name FROM manifests WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1", [runId]);
@@ -12513,6 +13490,9 @@ export class Repository {
       await client.query("DELETE FROM cost_ledger WHERE run_id=$1", [runId]);
       await client.query("DELETE FROM audit_events WHERE run_id=$1", [runId]);
       await client.query("DELETE FROM research_runs WHERE id=$1", [runId]);
+      // Delete the source first. Its access cascade is then a barrier against
+      // any capture that reached source validation before this transaction.
+      await this.deleteAutomaticFailureFeedbackForSource(client, { runId });
     });
   }
 }

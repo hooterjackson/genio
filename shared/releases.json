@@ -2,6 +2,19 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.2.1",
+      "releasedAt": "2026-07-22",
+      "title": "Automatic failure diagnostics",
+      "notes": [
+        "Creates a private owner-only diagnostic report whenever a playlist search reaches a terminal technical failure, after the run's original outcome has been durably saved.",
+        "Captures the redacted request, requested count, storefront, pipeline and policy versions, bounded stage counters, and sanitized failure details without raw network identifiers, provider bodies, or stack traces.",
+        "Attaches a quarantined QA scenario to every automatic report so the failed query can be reviewed, exported, and deliberately promoted into the regression harness.",
+        "Deduplicates repeated delivery of the same terminal failure, reconciles interrupted captures from worker heartbeats, and keeps automatic diagnostics independent of public feedback limits.",
+        "Binds each private diagnostic to one retained visitor access so deleting shared-run access, a run, or expired detail removes only the linked report without a deletion race.",
+        "Adds clear automatic-report metadata and QA-copy controls to the private owner inbox while leaving visitor-submitted feedback unchanged."
+      ]
+    },
+    {
       "version": "2.2.0",
       "releasedAt": "2026-07-22",
       "title": "Governed semantic recovery",

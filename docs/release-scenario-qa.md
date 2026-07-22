@@ -9,14 +9,25 @@ Before promoting a release:
 
 1. Run `pnpm qa:scenarios:export` against production through a read-only
    database credential.
-2. Keep the raw export private because it contains visitor prompt text.
-3. Redact personal information and add every new attempt to
+2. Run `pnpm qa:failures:export` through the same read-only credential. This
+   exports only quarantined automatic-failure reports by default; use
+   `--status all` when auditing already reviewed reports too.
+3. Keep both raw exports private because they contain visitor prompt text.
+4. Redact personal information and add every new attempt to
    `tests/fixtures/production-search-scenarios.json`.
-4. Assign an explicit `expectedOutcome`, `replayProfile`, and every observed
+5. Assign an explicit `expectedOutcome`, `replayProfile`, and every observed
    `failureClass` to the promoted case. Never promote only the prompt.
-5. Add a focused assertion for any new failure class, not only the prompt.
-6. Run `pnpm qa:scenarios:check`, `pnpm test`, `pnpm build`, `pnpm lint`, and the independent holdout
+6. Add a focused assertion for any new failure class, not only the prompt.
+7. Run `pnpm qa:scenarios:check`, `pnpm test`, `pnpm build`, `pnpm lint`, and the independent holdout
    benchmark.
+
+Automatic failure reports are private, owner-visible bug submissions. They
+capture the prompt after recognized credential-like values are redacted, requested count, storefront, terminal stage, bounded
+stage counters, and release/policy identifiers. They deliberately exclude
+capability tokens, client buckets, visitor identity, provider payloads, stack
+traces, and recognized credential-like fields. Runtime reports remain quarantined until
+an owner redacts and promotes them; an untrusted production prompt can never
+mutate the checked-in release gate automatically.
 
 The checked-in fixture began with all 25 brief attempts retained during the
 first 2026-07-16 production audit and now also includes promoted visitor and

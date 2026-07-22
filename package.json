@@ -1,6 +1,6 @@
 {
   "name": "needle-playlist-builder",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "engines": {
@@ -30,6 +30,7 @@
     "qa:shadow:v2": "node --experimental-transform-types scripts/evaluate-pipeline-v2-shadow.ts",
     "benchmark:export": "node --experimental-transform-types scripts/export-benchmarks.ts",
     "qa:scenarios:export": "node --experimental-transform-types scripts/export-run-scenarios.ts",
+    "qa:failures:export": "node --experimental-transform-types scripts/export-automatic-failure-scenarios.ts",
     "qa:scenarios:check": "vitest run tests/production-search-scenarios.test.ts",
     "qa:policy:check": "vitest run tests/production-search-scenarios.test.ts tests/release-candidate-prompt-corpus.test.ts tests/esoteric-policy-scenarios.test.ts tests/ambiguous-genre-breadth-scenarios.test.ts tests/cost-config.test.ts tests/brief-policy.test.ts tests/similarity-policy.test.ts tests/playlist-sequencing.test.ts tests/playlist-title.test.ts",
     "smoke:apple": "node --experimental-transform-types scripts/apple-publication-smoke.ts",

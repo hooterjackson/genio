@@ -1617,6 +1617,112 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.deleteFeedbackSubmission(created.id, "owner@example.com")).resolves.toBe(false);
   });
 
+  test("captures and deduplicates a terminal run failure with owner-visible QA metadata", async () => {
+    vi.stubEnv("APPLE_STOREFRONT", "us");
+    // The suite truncates settings between tests. Restore the migrated schema
+    // marker so this fixture exercises the real immutable RunSpec metadata
+    // path used by production schema 15 rather than the legacy fallback.
+    await repository.pool.query(
+      "INSERT INTO settings(key,value) VALUES('schema_version',$1)",
+      [DATABASE_SCHEMA_VERSION],
+    );
+    const prompt = "37 obscure integration-test disco recordings";
+    const requestedTrackCount = 37;
+    const clientBucket = `automatic-failure-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt,
+      brief: {
+        ...brief,
+        title: "Automatic failure integration fixture",
+        mode: "curated",
+        targetSize: { min: requestedTrackCount, max: requestedTrackCount },
+      },
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: `automatic-failure-${randomUUID()}`,
+      reuseDays: 0,
+      globalLimit: 100,
+    });
+
+    await repository.updateRun(created.runId, {
+      status: "failed",
+      phase: "research_failed",
+      error: "The provider contract failed after the final attempt",
+    });
+    await repository.updateRun(created.runId, {
+      status: "failed",
+      phase: "research_failed",
+      error: "The same terminal failure was reported again",
+    });
+
+    const listed = await repository.listFeedbackSubmissions();
+    expect(listed).toMatchObject({ total: 1, counts: { new: 1, reviewed: 0, resolved: 0 } });
+    expect(listed.items).toHaveLength(1);
+    expect(listed.items[0]).toMatchObject({
+      origin: "automatic_failure",
+      kind: "bug",
+      status: "new",
+      qaStatus: "quarantined",
+      occurrenceCount: 1,
+      image: null,
+      automaticFailure: {
+        failureClass: "research_failure",
+        runId: created.runId,
+        prompt,
+        requestedTrackCount,
+        storefront: "us",
+        status: "failed",
+        phase: "research_failed",
+        errorCode: "research_failure_terminal",
+        counters: {
+          discovered: 0,
+          sources: 0,
+          evidence: 0,
+          apple_lookups: 0,
+          accepted: 0,
+          manifested: 0,
+          published: 0,
+        },
+      },
+      qaScenario: {
+        source: "automatic_failure",
+        status: "quarantined",
+        request: { prompt, requestedTrackCount, storefront: "us" },
+        expected: { noTerminalFailure: true, requestedTrackCount },
+        observed: {
+          failureClass: "research_failure",
+          status: "failed",
+          phase: "research_failed",
+          errorCode: "research_failure_terminal",
+        },
+      },
+    });
+
+    const automaticMappings = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM settings WHERE key LIKE 'feedback-automatic-event:%'",
+    );
+    expect(automaticMappings.rows[0]?.count).toBe(1);
+
+    await expect(repository.deleteFeedbackSubmission(listed.items[0]!.id, "owner@example.com"))
+      .resolves.toBe(true);
+    await expect(repository.captureAutomaticRunFailure(created.runId)).resolves.toBeNull();
+    expect(await repository.listFeedbackSubmissions()).toMatchObject({
+      total: 0,
+      counts: { new: 0, reviewed: 0, resolved: 0 },
+    });
+    const suppression = await repository.pool.query<{ value: string }>(
+      "SELECT value FROM settings WHERE key LIKE 'feedback-automatic-event:%' LIMIT 1",
+    );
+    expect(JSON.parse(suppression.rows[0]!.value)).toMatchObject({
+      runId: created.runId,
+      runAccessId: expect.any(String),
+      terminalGeneration: expect.any(String),
+      suppressed: true,
+    });
+  });
+
   test("anonymous brief and run requests do not consume daily quota events", async () => {
     const briefBucket = `anonymous-brief-unlimited-${randomUUID()}`;
     const createBrief = (label: string) => repository.createBriefRequest({

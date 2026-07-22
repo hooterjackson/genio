@@ -32,6 +32,43 @@ const feedbackItems = Array.from({ length: 55 }, (_, index) => ({
   createdAt: new Date(Date.UTC(2026, 6, 16, 12, index)).toISOString(),
   updatedAt: new Date(Date.UTC(2026, 6, 16, 12, index)).toISOString(),
   hasImage: index === 0,
+  ...(index === 1 ? {
+    origin: "automatic_failure",
+    occurrenceCount: 2,
+    firstSeenAt: "2026-07-16T12:01:00.000Z",
+    lastSeenAt: "2026-07-16T12:04:00.000Z",
+    automaticFailure: {
+      failureClass: "research_failure",
+      runId: "00000000-0000-4000-8000-000000000202",
+      briefRequestId: "00000000-0000-4000-8000-000000000203",
+      prompt: "French jazz beyond the obvious standards",
+      requestedTrackCount: 50,
+      storefront: "us",
+      status: "failed_system",
+      phase: "research_failed",
+      errorCode: "provider_timeout",
+      errorMessage: "Research stopped after the final attempt.",
+      rootCause: "provider_timeout",
+      eventFingerprint: "qa-event-fingerprint",
+      runtime: { appVersion: "2.2.1", workerProtocol: 8 },
+      plan: { pipelineVersion: "corpus_first_v3", policyVersion: "semantic_recovery_v3.2" },
+      counters: { discovered: 42, qualified: 0, apple_lookup: 0 },
+      details: { rootCause: "provider_timeout" },
+    },
+    qaScenario: {
+      schemaVersion: 1,
+      scenarioId: "auto-failure-qa-scenario",
+      source: "automatic_failure",
+      status: "quarantined",
+      capturedAt: "2026-07-16T12:01:00.000Z",
+      request: {
+        prompt: "French jazz beyond the obvious standards",
+        requestedTrackCount: 50,
+        storefront: "us",
+      },
+      expected: { noTerminalFailure: true, requestedTrackCount: 50 },
+    },
+  } : {}),
 }));
 
 const corpusSourceId = "00000000-0000-4000-8000-000000000101";
@@ -183,6 +220,18 @@ test("the owner can page through the private feedback inbox and see attachments"
     "href",
     "/api/v1/owner/feedback/feedback-1/image",
   );
+  const automaticReport = page.locator(".operator-feedback").filter({ hasText: "Private feedback report 2" });
+  await expect(automaticReport.getByText("AUTO", { exact: true })).toBeVisible();
+  await expect(automaticReport.getByText("QA QUARANTINED", { exact: true })).toBeVisible();
+  await automaticReport.getByText("AUTOMATIC FAILURE DIAGNOSTICS", { exact: true }).click();
+  await expect(automaticReport.getByText("French jazz beyond the obvious standards", { exact: true })).toBeVisible();
+  await expect(automaticReport.getByRole("link", { name: /RUN 00000000-0000-4000-8000-000000000202/ })).toHaveAttribute(
+    "href",
+    "/?run=00000000-0000-4000-8000-000000000202",
+  );
+  await expect(automaticReport.getByText(/DISCOVERED 42 · QUALIFIED 0 · APPLE LOOKUP 0/)).toBeVisible();
+  await expect(automaticReport.getByText(/APP 2.2.1 · PIPELINE corpus_first_v3 · POLICY semantic_recovery_v3.2 · PROTOCOL 8/)).toBeVisible();
+  await expect(automaticReport.getByRole("button", { name: "COPY QA SCENARIO" })).toBeVisible();
 
   await page.getByRole("button", { name: "LOAD OLDER" }).click();
   await expect(page.getByText("[55/55]", { exact: true })).toBeVisible();

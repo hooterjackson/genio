@@ -24,8 +24,8 @@ export default function PrivacyPage() {
             <p>OpenAI processes prompts and web research with AI. OpenAI Sites serves the interface, Railway runs and stores the service, Resend alerts only the owner, and Apple Music receives the final playlist publication request.</p>
           </article>
           <article>
-            <h2>FEEDBACK</h2>
-            <p>If you submit feedback, we store your message, its type, the page where you opened the form, and any optional screenshot. Submissions are private to the owner and are not automatically sent to OpenAI. Unresolved reports remain in the owner inbox; resolved reports and attached images are deleted after 90 days.</p>
+            <h2>FEEDBACK + DIAGNOSTICS</h2>
+            <p>If you submit feedback, we store your message, its type, the page where you opened the form, and any optional screenshot. When a search ends in a technical failure, gênio also creates a private owner-only diagnostic containing the prompt after recognized credential-like values are redacted, requested count, storefront, run and pipeline versions, stage counts, and a sanitized failure reason. The diagnostic includes a quarantined replay scenario so the same request can be reviewed before becoming a regression test. Raw IP addresses, provider response bodies, and stack traces are not copied into these diagnostics. Deleting a run deletes its linked automatic report; otherwise detailed reports follow the 90-day retention period.</p>
           </article>
           <article>
             <h2>RETENTION + DELETE</h2>
