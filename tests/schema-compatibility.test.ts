@@ -7,14 +7,16 @@ import {
 } from "../db/index.ts";
 
 describe("database schema rollout compatibility", () => {
-  test("keeps the compatibility bridge healthy on schemas 13 through 15 without admitting schema 12", () => {
+  test("keeps the compatibility bridge healthy on schemas 13 through 16 without admitting schema 12", () => {
     expect(isDatabaseSchemaVersionCompatible("12", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(false);
     expect(isDatabaseSchemaVersionCompatible("13", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(true);
     expect(isDatabaseSchemaVersionCompatible("14", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(true);
     expect(isDatabaseSchemaVersionCompatible("15", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(true);
+    expect(isDatabaseSchemaVersionCompatible("16", DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).toBe(true);
     expect(isDatabaseSchemaVersionCompatible("13", DATABASE_SCHEMA_SUPPORT)).toBe(true);
     expect(isDatabaseSchemaVersionCompatible("14", DATABASE_SCHEMA_SUPPORT)).toBe(true);
     expect(isDatabaseSchemaVersionCompatible("15", DATABASE_SCHEMA_SUPPORT)).toBe(true);
+    expect(isDatabaseSchemaVersionCompatible("16", DATABASE_SCHEMA_SUPPORT)).toBe(true);
   });
 
   test.each([
@@ -24,7 +26,8 @@ describe("database schema rollout compatibility", () => {
     ["13", "compatible"],
     ["14", "compatible"],
     ["15", "compatible"],
-    ["16", "too_new"],
+    ["16", "compatible"],
+    ["17", "too_new"],
   ] as const)("classifies observed schema %s as %s", (actual, expected) => {
     expect(databaseSchemaCompatibility(actual, DATABASE_SCHEMA_SUPPORT)).toBe(expected);
   });

@@ -16,7 +16,11 @@ type RuntimeBuildPayload = {
     productionEvidenceApproved?: unknown;
     factualFeasibilityApproved?: unknown;
     schemaVersion?: unknown;
+    schemaMinimum?: unknown;
+    schemaMaximum?: unknown;
+    schemaPreferred?: unknown;
     workerProtocol?: unknown;
+    minimumWorkerProtocol?: unknown;
     selectionPlanVersion?: unknown;
     queryPlanSchemaVersion?: unknown;
     queryPlanPolicyVersion?: unknown;
@@ -91,6 +95,12 @@ export function RuntimeBuild() {
       const rollout = contract?.assignmentEnabled === true
         ? contract.ownerCanaryEnabled === true ? "OWNER CANARY" : "ACTIVE"
         : "DISABLED";
+      const schemaMinimum = safeBuildText(contract?.schemaMinimum, 24);
+      const schemaMaximum = safeBuildText(contract?.schemaMaximum, 24);
+      const schemaPreferred = safeBuildText(contract?.schemaPreferred, 24);
+      const schemaSupport = schemaMinimum && schemaMaximum && schemaPreferred
+        ? `${schemaMinimum}–${schemaMaximum} · PREFERRED ${schemaPreferred}`
+        : "UNKNOWN";
       const details: Array<readonly [string, string]> = [
         ["BUILD REVISION", revision?.slice(0, 12) ?? "UNAVAILABLE"],
         ["PIPELINE", safeBuildText(contract?.pipelineVersion, 64) ?? "UNKNOWN"],
@@ -98,7 +108,9 @@ export function RuntimeBuild() {
         ["PRODUCTION EVIDENCE", contract?.productionEvidenceApproved === true ? "APPROVED" : "NOT APPROVED"],
         ["FACTUAL FEASIBILITY", contract?.factualFeasibilityApproved === true ? "APPROVED" : "NOT APPROVED"],
         ["DATABASE SCHEMA", safeBuildText(contract?.schemaVersion, 24) ?? "UNKNOWN"],
+        ["DATABASE SUPPORT", schemaSupport],
         ["WORKER PROTOCOL", safeBuildText(contract?.workerProtocol, 64) ?? "UNKNOWN"],
+        ["BRIDGE MINIMUM", safeBuildText(contract?.minimumWorkerProtocol, 64) ?? "UNKNOWN"],
         ["SELECTION PLAN", safeBuildText(contract?.selectionPlanVersion, 80) ?? "UNKNOWN"],
         ["QUERY PLAN SCHEMA", safeBuildText(contract?.queryPlanSchemaVersion, 24) ?? "UNKNOWN"],
         ["QUERY POLICY", safeBuildText(contract?.queryPlanPolicyVersion, 80) ?? "UNKNOWN"],

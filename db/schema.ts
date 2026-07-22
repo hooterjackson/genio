@@ -110,6 +110,7 @@ export const runSpecs = pgTable("run_specs", {
   requestedTrackCount: integer("requested_track_count"),
   storefront: varchar("storefront", { length: 16 }).notNull(),
   guidanceAnswersJson: jsonb("guidance_answers_json").notNull().default([]),
+  guidanceSourceHintsJson: jsonb("guidance_source_hints_json").notNull().default([]),
   specHash: varchar("spec_hash", { length: 64 }).notNull(),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
   policyVersion: varchar("policy_version", { length: 80 }).notNull(),

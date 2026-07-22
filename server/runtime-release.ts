@@ -1,4 +1,4 @@
-import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
+import { DATABASE_SCHEMA_SUPPORT, DATABASE_SCHEMA_VERSION } from "../db/index.ts";
 import {
   PIPELINE_V3_ALLOWED_PROVIDER_MODEL_IDS,
   PIPELINE_V3_DEFAULT_BASELINE_MODEL_ID,
@@ -17,7 +17,10 @@ import {
   SELECTION_PLAN_V3_VERSION,
   SEMANTIC_SCOPE_POLICY_VERSION,
 } from "./selection-plan-v3.ts";
-import { WORKER_PIPELINE_PROTOCOL_VERSION } from "./worker-protocol.ts";
+import {
+  BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
+  WORKER_PIPELINE_PROTOCOL_VERSION,
+} from "./worker-protocol.ts";
 
 export interface RuntimeReleaseContract {
   pipelineVersion: "corpus_first_v3";
@@ -26,7 +29,11 @@ export interface RuntimeReleaseContract {
   productionEvidenceApproved: boolean;
   factualFeasibilityApproved: boolean;
   schemaVersion: string;
+  schemaMinimum: string;
+  schemaMaximum: string;
+  schemaPreferred: string;
   workerProtocol: string;
+  minimumWorkerProtocol: string;
   selectionPlanVersion: string;
   queryPlanSchemaVersion: string;
   queryPlanPolicyVersion: string;
@@ -71,7 +78,11 @@ export function runtimeReleaseContract(
     productionEvidenceApproved: environment.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED === "true",
     factualFeasibilityApproved: environment.PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED === "true",
     schemaVersion: DATABASE_SCHEMA_VERSION,
+    schemaMinimum: DATABASE_SCHEMA_SUPPORT.minimum,
+    schemaMaximum: DATABASE_SCHEMA_SUPPORT.maximum,
+    schemaPreferred: DATABASE_SCHEMA_SUPPORT.preferred,
     workerProtocol: WORKER_PIPELINE_PROTOCOL_VERSION,
+    minimumWorkerProtocol: BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
     selectionPlanVersion: SELECTION_PLAN_V3_VERSION,
     queryPlanSchemaVersion: String(queryPlanV3EmissionSchemaVersion(environment)),
     queryPlanPolicyVersion: QUERY_PLAN_V3_POLICY_VERSION,

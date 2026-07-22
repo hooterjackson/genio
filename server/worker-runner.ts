@@ -312,8 +312,8 @@ export class WorkerRunner {
         let claimed = false;
         while (this.active.size < this.concurrency && !this.controller.signal.aborted) {
           // Do not continue leasing across a schema cutover that this binary
-          // cannot safely read. Release-A bridge workers accept 12..13; the
-          // V13 worker intentionally accepts 13 only.
+          // cannot safely read. The 2.2.2 bridge accepts schemas 13..16 while
+          // continuing to prefer the active schema 15 until migration.
           await this.repository.ensureSchemaVersion(this.schemaSupport);
           const job = await this.repository.leaseNextJob(
             this.workerId,
