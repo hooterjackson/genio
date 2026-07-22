@@ -3,6 +3,7 @@ import {
   bigint,
   boolean,
   check,
+  date,
   index,
   integer,
   jsonb,
@@ -40,6 +41,8 @@ export const briefRequests = pgTable("brief_requests", {
   guidanceSourceHintsJson: jsonb("guidance_source_hints_json").notNull().default([]),
   guidanceTelemetryJson: jsonb("guidance_telemetry_json"),
   guidancePreferencesJson: jsonb("guidance_preferences_json").notNull().default([]),
+  briefContractVersion: integer("brief_contract_version").notNull().default(1),
+  activeGuidanceQuestionSetId: uuid("active_guidance_question_set_id"),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
   selectionPlanJson: jsonb("selection_plan_json"),
@@ -74,6 +77,7 @@ export const researchRuns = pgTable("research_runs", {
   guidanceSourceHintsJson: jsonb("guidance_source_hints_json").notNull().default([]),
   guidanceTelemetryJson: jsonb("guidance_telemetry_json"),
   guidancePreferencesJson: jsonb("guidance_preferences_json").notNull().default([]),
+  briefContractVersion: integer("brief_contract_version").notNull().default(1),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
   selectionPlanJson: jsonb("selection_plan_json"),
@@ -111,6 +115,7 @@ export const runSpecs = pgTable("run_specs", {
   storefront: varchar("storefront", { length: 16 }).notNull(),
   guidanceAnswersJson: jsonb("guidance_answers_json").notNull().default([]),
   guidanceSourceHintsJson: jsonb("guidance_source_hints_json").notNull().default([]),
+  briefContractVersion: integer("brief_contract_version").notNull().default(1),
   specHash: varchar("spec_hash", { length: 64 }).notNull(),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull(),
   policyVersion: varchar("policy_version", { length: 80 }).notNull(),
@@ -190,6 +195,194 @@ export const runActiveQueryPlans = pgTable("run_active_query_plans", {
   queryPlanRevisionId: uuid("query_plan_revision_id").notNull().references(() => queryPlanRevisions.id),
   activatedAt: timestamp("activated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("run_active_query_plan_revision_idx").on(table.queryPlanRevisionId)]);
+
+export const guidanceQuestionSets = pgTable("guidance_question_sets", {
+  id: uuid("id").primaryKey(),
+  briefRequestId: uuid("brief_request_id").notNull().references(() => briefRequests.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  questionSetHash: varchar("question_set_hash", { length: 64 }).notNull(),
+  requestClassification: varchar("request_classification", { length: 40 }).notNull(),
+  generationMode: varchar("generation_mode", { length: 40 }).notNull(),
+  guidancePolicyVersion: varchar("guidance_policy_version", { length: 80 }).notNull(),
+  locale: varchar("locale", { length: 32 }).notNull(),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  targetTrackCount: integer("target_track_count").notNull(),
+  explicitConstraintHash: varchar("explicit_constraint_hash", { length: 64 }).notNull(),
+  rejectedQuestionReasonsJson: jsonb("rejected_question_reasons_json").notNull().default([]),
+  questionsJson: jsonb("questions_json").notNull(),
+  active: boolean("active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("guidance_question_sets_revision_idx").on(table.briefRequestId, table.revision),
+  uniqueIndex("guidance_question_sets_hash_idx").on(table.briefRequestId, table.questionSetHash),
+  uniqueIndex("guidance_question_sets_active_idx").on(table.briefRequestId).where(sql`${table.active}`),
+  index("guidance_question_sets_policy_idx").on(table.guidancePolicyVersion, table.createdAt),
+]);
+
+export const guidanceAnswerSets = pgTable("guidance_answer_sets", {
+  id: uuid("id").primaryKey(),
+  briefRequestId: uuid("brief_request_id").notNull().references(() => briefRequests.id, { onDelete: "cascade" }),
+  questionSetId: uuid("question_set_id").notNull().references(() => guidanceQuestionSets.id, { onDelete: "cascade" }),
+  questionSetHash: varchar("question_set_hash", { length: 64 }).notNull(),
+  normalizedAnswersJson: jsonb("normalized_answers_json").notNull(),
+  rawCustomAnswersJson: jsonb("raw_custom_answers_json").notNull().default([]),
+  answerHash: varchar("answer_hash", { length: 64 }).notNull(),
+  executionDeltaJson: jsonb("execution_delta_json").notNull(),
+  executionDeltaHash: varchar("execution_delta_hash", { length: 64 }).notNull(),
+  resultingSelectionPlanId: uuid("resulting_selection_plan_id").references(() => selectionPlans.id, { onDelete: "set null" }),
+  resultingQueryPlanRevisionId: uuid("resulting_query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "set null" }),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
+  acceptedAt: timestamp("accepted_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("guidance_answer_sets_idempotency_idx").on(table.briefRequestId, table.idempotencyKey),
+  uniqueIndex("guidance_answer_sets_hash_idx").on(table.briefRequestId, table.answerHash),
+  index("guidance_answer_sets_question_set_idx").on(table.questionSetId, table.acceptedAt),
+]);
+
+export const runStageMetricSummaries = pgTable("run_stage_metric_summaries", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "cascade" }),
+  stageKey: varchar("stage_key", { length: 120 }).notNull(),
+  metricRevision: integer("metric_revision").notNull().default(1),
+  providerRows: integer("provider_rows").notNull().default(0),
+  uniqueValidLeads: integer("unique_valid_leads").notNull().default(0),
+  requalificationAttempts: integer("requalification_attempts").notNull().default(0),
+  citationBearingLeads: integer("citation_bearing_leads").notNull().default(0),
+  exactPairAttestations: integer("exact_pair_attestations").notNull().default(0),
+  containersDiscovered: integer("containers_discovered").notNull().default(0),
+  containersEnumerated: integer("containers_enumerated").notNull().default(0),
+  scopeBoundCandidates: integer("scope_bound_candidates").notNull().default(0),
+  evidenceQualifiedCandidates: integer("evidence_qualified_candidates").notNull().default(0),
+  appleResolutionAttempts: integer("apple_resolution_attempts").notNull().default(0),
+  appleProviderRequests: integer("apple_provider_requests").notNull().default(0),
+  appleMatches: integer("apple_matches").notNull().default(0),
+  recordingFamilies: integer("recording_families").notNull().default(0),
+  selectedCount: integer("selected_count").notNull().default(0),
+  reserveCount: integer("reserve_count").notNull().default(0),
+  manifestedCount: integer("manifested_count").notNull().default(0),
+  publishedCount: integer("published_count").notNull().default(0),
+  stopReason: varchar("stop_reason", { length: 120 }),
+  rootCause: varchar("root_cause", { length: 160 }),
+  downstreamState: varchar("downstream_state", { length: 160 }),
+  terminal: boolean("terminal").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("run_stage_metric_summaries_revision_idx").on(
+    table.runId,
+    table.queryPlanRevisionId,
+    table.stageKey,
+    table.metricRevision,
+  ),
+  index("run_stage_metric_summaries_run_idx").on(table.runId, table.createdAt),
+]);
+
+export const providerMetricEvents = pgTable("provider_metric_events", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "cascade" }),
+  provider: varchar("provider", { length: 80 }).notNull(),
+  operation: varchar("operation", { length: 120 }).notNull(),
+  stageKey: varchar("stage_key", { length: 120 }).notNull(),
+  metricName: varchar("metric_name", { length: 120 }).notNull(),
+  metricValue: integer("metric_value").notNull(),
+  requestOutcome: varchar("request_outcome", { length: 48 }).notNull(),
+  cacheOutcome: varchar("cache_outcome", { length: 48 }),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("provider_metric_events_run_idx").on(table.runId, table.occurredAt),
+  index("provider_metric_events_expiry_idx").on(table.expiresAt),
+]);
+
+export const runSourceObservations = pgTable("run_source_observations", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "cascade" }),
+  providerMetricEventId: uuid("provider_metric_event_id").references(() => providerMetricEvents.id, { onDelete: "set null" }),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  allowedHost: varchar("allowed_host", { length: 240 }).notNull(),
+  resourceType: varchar("resource_type", { length: 80 }).notNull(),
+  extractionMethod: varchar("extraction_method", { length: 80 }).notNull(),
+  attemptOutcome: varchar("attempt_outcome", { length: 80 }).notNull(),
+  locatorHash: varchar("locator_hash", { length: 64 }).notNull(),
+  providerRows: integer("provider_rows").notNull().default(0),
+  uniqueValidLeads: integer("unique_valid_leads").notNull().default(0),
+  citationBearingLeads: integer("citation_bearing_leads").notNull().default(0),
+  exactPairAttestations: integer("exact_pair_attestations").notNull().default(0),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("run_source_observations_run_idx").on(table.runId, table.createdAt)]);
+
+export const providerMetricDailyAggregates = pgTable("provider_metric_daily_aggregates", {
+  metricDate: date("metric_date").notNull(),
+  provider: varchar("provider", { length: 80 }).notNull(),
+  operation: varchar("operation", { length: 120 }).notNull(),
+  metricName: varchar("metric_name", { length: 120 }).notNull(),
+  metricValue: bigint("metric_value", { mode: "number" }).notNull().default(0),
+  eventCount: bigint("event_count", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.metricDate, table.provider, table.operation, table.metricName] }),
+  index("provider_metric_daily_expiry_idx").on(table.expiresAt),
+]);
+
+export const qualityIncidentGroups = pgTable("quality_incident_groups", {
+  id: uuid("id").primaryKey(),
+  incidentSignature: varchar("incident_signature", { length: 64 }).notNull().unique(),
+  incidentClass: varchar("incident_class", { length: 80 }).notNull(),
+  stopReason: varchar("stop_reason", { length: 120 }),
+  rootCause: varchar("root_cause", { length: 160 }),
+  downstreamState: varchar("downstream_state", { length: 160 }),
+  firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull(),
+  totalCount: bigint("total_count", { mode: "number" }).notNull().default(0),
+  overflowCount: bigint("overflow_count", { mode: "number" }).notNull().default(0),
+  qaPromoted: boolean("qa_promoted").notNull().default(false),
+  qaPromotedAt: timestamp("qa_promoted_at", { withTimezone: true }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  ...timestamps,
+}, (table) => [index("quality_incident_groups_expiry_idx").on(table.expiresAt)]);
+
+export const qualityIncidentDailyCounters = pgTable("quality_incident_daily_counters", {
+  incidentDate: date("incident_date").primaryKey(),
+  detailedCount: integer("detailed_count").notNull().default(0),
+  overflowCount: integer("overflow_count").notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const qualityIncidentEventKeys = pgTable("quality_incident_event_keys", {
+  eventHash: varchar("event_hash", { length: 64 }).primaryKey(),
+  incidentDate: date("incident_date").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("quality_incident_event_keys_expiry_idx").on(table.expiresAt)]);
+
+export const qualityIncidentOccurrences = pgTable("quality_incident_occurrences", {
+  id: uuid("id").primaryKey(),
+  groupId: uuid("group_id").notNull().references(() => qualityIncidentGroups.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "cascade" }),
+  runAccessId: uuid("run_access_id").references(() => runAccesses.id, { onDelete: "cascade" }),
+  briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "cascade" }),
+  planRevision: integer("plan_revision"),
+  terminalOutcomeHash: varchar("terminal_outcome_hash", { length: 64 }).notNull(),
+  stopReason: varchar("stop_reason", { length: 120 }),
+  rootCause: varchar("root_cause", { length: 160 }),
+  downstreamState: varchar("downstream_state", { length: 160 }),
+  diagnosticsJson: jsonb("diagnostics_json").notNull().default({}),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("quality_incident_occurrences_group_idx").on(table.groupId, table.occurredAt),
+  index("quality_incident_occurrences_run_idx").on(table.runId, table.occurredAt),
+  index("quality_incident_occurrences_expiry_idx").on(table.expiresAt),
+]);
 
 export const runAccesses = pgTable("run_accesses", {
   id: uuid("id").primaryKey(),

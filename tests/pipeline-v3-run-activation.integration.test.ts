@@ -308,7 +308,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       // The existing schema-15 trigger physically normalizes V3 rows to 6.
       // The repository must recover schema 2's effective protocol requirement
       // from this immutable query-plan revision before any lease is granted.
-      minimum_worker_protocol: 6,
+      minimum_worker_protocol: 8,
       query_plan_revision_id: queryPlan.id,
       lease_epoch: "0",
     });

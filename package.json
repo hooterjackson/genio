@@ -1,6 +1,6 @@
 {
   "name": "needle-playlist-builder",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "engines": {
@@ -19,7 +19,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:database:preflight": "node scripts/qa-database-preflight.mjs",
-    "test:database": "vitest run tests/backend.integration.test.ts tests/apple-phase-zero.integration.test.ts tests/pipeline-v2-migration.integration.test.ts tests/pipeline-v3-foundation-migration.integration.test.ts tests/pipeline-v3-run-activation.integration.test.ts tests/pipeline-v3-manifest-persistence.integration.test.ts tests/pipeline-v3-governed-graph-adapter.integration.test.ts tests/pipeline-v3-corpus-resume.integration.test.ts tests/job-queue-class.integration.test.ts tests/apple-write-gateway.integration.test.ts",
+    "test:database": "vitest run tests/backend.integration.test.ts tests/apple-phase-zero.integration.test.ts tests/pipeline-v2-migration.integration.test.ts tests/pipeline-v3-foundation-migration.integration.test.ts tests/intelligent-guidance.integration.test.ts tests/pipeline-v3-run-activation.integration.test.ts tests/pipeline-v3-manifest-persistence.integration.test.ts tests/pipeline-v3-governed-graph-adapter.integration.test.ts tests/pipeline-v3-corpus-resume.integration.test.ts tests/job-queue-class.integration.test.ts tests/apple-write-gateway.integration.test.ts",
     "test:watch": "vitest",
     "test:e2e": "node scripts/qa-playwright.mjs",
     "test:e2e:system": "GENIO_SYSTEM_E2E=1 GENIO_SYSTEM_E2E_API_PORT=18788 RAILWAY_API_BASE=http://127.0.0.1:18788 node scripts/qa-playwright.mjs tests/e2e/pipeline-v3-system.spec.ts --project=desktop",

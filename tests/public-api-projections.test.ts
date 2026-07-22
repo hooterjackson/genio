@@ -149,6 +149,8 @@ describe("public API projections", () => {
       prompt: "French jazz",
       requestedTrackCount: 50,
       status: "complete",
+      briefContractVersion: 2,
+      questionSetHash: "a".repeat(64),
       brief,
       questions: [],
       estimateUsd: 1.5,
@@ -163,6 +165,8 @@ describe("public API projections", () => {
       prompt: "French jazz",
       requestedTrackCount: 50,
       status: "complete",
+      briefContractVersion: 2,
+      questionSetHash: "a".repeat(64),
     });
     expect(keys.filter((key) => /cost|budget|estimate/iu.test(key))).toEqual([]);
   });

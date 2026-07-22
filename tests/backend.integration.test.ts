@@ -1725,7 +1725,7 @@ databaseDescribe("hosted backend integration", () => {
       terminalGeneration: expect.any(String),
       suppressed: true,
     });
-  });
+  }, 40_000);
 
   test("anonymous brief and run requests do not consume daily quota events", async () => {
     const briefBucket = `anonymous-brief-unlimited-${randomUUID()}`;

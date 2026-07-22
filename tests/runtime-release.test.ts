@@ -9,6 +9,8 @@ describe("public V3 runtime release contract", () => {
       PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
       PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "false",
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "2",
+      GUIDANCE_CONTRACT_V2_ENABLED: "true",
+      GUIDANCE_CONTRACT_V2_OWNER_CANARY: "true",
       PIPELINE_V3_BASELINE_MODEL_ID: "gpt-5.6-luna",
       PIPELINE_V3_ESCALATION_MODEL_ID: "gpt-5.6-terra",
       PIPELINE_V3_MODEL_CATALOG_VALIDATED_AT: "2026-07-20T14:30:00.000Z",
@@ -21,13 +23,17 @@ describe("public V3 runtime release contract", () => {
       ownerCanaryEnabled: true,
       productionEvidenceApproved: true,
       factualFeasibilityApproved: false,
-      schemaVersion: "15",
+      schemaVersion: "16",
       schemaMinimum: "13",
       schemaMaximum: "16",
-      schemaPreferred: "15",
+      schemaPreferred: "16",
       workerProtocol: "playlist-pipeline-v9",
       minimumWorkerProtocol: "playlist-pipeline-v8",
-      queryPlanSchemaVersion: "2",
+      queryPlanSchemaVersion: "3",
+      briefContractVersion: "2",
+      guidanceContractOwnerCanaryEnabled: true,
+      guidancePolicyVersion: "intelligent_guidance_v2",
+      evidencePolicyVersion: "governed_evidence_v1",
       semanticScopePolicyVersion: "scope_gate_v2_1_2",
       musicConceptPolicyVersion: "music_concepts_v3_2_0",
       promptVersion: "grounded_recovery_v3_1_prompt_v1",
@@ -50,6 +56,10 @@ describe("public V3 runtime release contract", () => {
     expect(result.productionEvidenceApproved).toBe(false);
     expect(result.factualFeasibilityApproved).toBe(false);
     expect(result.queryPlanSchemaVersion).toBe("1");
+    expect(result.briefContractVersion).toBe("1");
+    expect(result.guidanceContractOwnerCanaryEnabled).toBe(false);
+    expect(result.guidancePolicyVersion).toBe("intelligent_guidance_v2");
+    expect(result.evidencePolicyVersion).toBe("governed_evidence_v1");
     expect(result.semanticScopePolicyVersion).toBe("scope_gate_v2_1_2");
     expect(result.musicConceptPolicyVersion).toBe("music_concepts_v3_2_0");
     expect(result.baselineProviderModelId).toBe("gpt-5.6-luna");

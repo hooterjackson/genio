@@ -62,6 +62,7 @@ function boundedText(value: unknown, maximum: number): string {
 export function safeCustomGuidanceText(value: unknown): string | null {
   const text = boundedText(value, 500);
   if (!text) return null;
+  if (/\b(?:https?:\/\/|www\.)\S+/iu.test(text)) return null;
   const instructionAttack = [
     /\b(?:system|developer)\s+(?:prompt|message|instruction)s?\b/iu,
     /\b(?:ignore|disregard|override|bypass|reveal|exfiltrate)\b.{0,80}\b(?:instruction|prompt|policy|system|developer|tool|secret|credential|api\s*key)s?\b/iu,

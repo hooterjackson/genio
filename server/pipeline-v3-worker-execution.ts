@@ -306,7 +306,7 @@ export function selectionPlanFromQueryPlanV3(
   queryPlan: QueryPlanV3,
   run: { prompt?: string; brief?: { title?: string; description?: string } },
 ): SelectionPlanV3 {
-  if (queryPlan.schemaVersion === 2
+  if (queryPlan.schemaVersion >= 2
     && (queryPlan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
       || queryPlan.semanticAuditMetadata?.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION)) {
     throw new Error("Pipeline V3 schema-2 query plan uses an unsupported music-concept policy");
@@ -354,7 +354,7 @@ export function selectionPlanFromQueryPlanV3(
     geographyRelationship: null,
     reason: predicate.reason,
   }));
-  const semanticClauses: SemanticPlanClauseV32[] = queryPlan.schemaVersion === 2
+  const semanticClauses: SemanticPlanClauseV32[] = queryPlan.schemaVersion >= 2
     ? queryPlan.semanticClauses!.map((clause) => ({
         ...clause,
         axis: clause.axis as SemanticPlanClauseV32["axis"],
@@ -362,7 +362,7 @@ export function selectionPlanFromQueryPlanV3(
         values: [...clause.values],
       }))
     : legacySemanticClauses;
-  const membershipPredicates = queryPlan.schemaVersion === 2
+  const membershipPredicates = queryPlan.schemaVersion >= 2
     ? semanticClauses.filter((clause) => clause.role === "membership").map((clause) => {
         const axis = MEMBERSHIP_AXES.has(clause.axis as MembershipAxisV3)
           ? clause.axis as MembershipAxisV3
@@ -423,20 +423,20 @@ export function selectionPlanFromQueryPlanV3(
   const orderingPolicy = queryPlan.orderingPolicy
     ? { ...queryPlan.orderingPolicy, goals: [...queryPlan.orderingPolicy.goals] }
     : defaultOrderingPolicy(scopeKind);
-  const semanticHardConstraintHash = queryPlan.schemaVersion === 2
+  const semanticHardConstraintHash = queryPlan.schemaVersion >= 2
     ? queryPlan.hardConstraintHash!
     : createHash("sha256").update(stableStringify(membershipPredicates.map(({ axis, operator, values }) => ({
         axis,
         operator,
         values: values.map((value) => value.normalize("NFKC").trim().toLowerCase()).sort(),
       })))).digest("hex");
-  const explicitUserConstraintHash = queryPlan.schemaVersion === 2
+  const explicitUserConstraintHash = queryPlan.schemaVersion >= 2
     ? queryPlan.explicitUserConstraintHash!
     : createHash("sha256").update(stableStringify({
         schemaVersion: 1,
         selectionPlanHash: queryPlan.selectionPlanHash,
       })).digest("hex");
-  const contextSignals = queryPlan.schemaVersion === 2
+  const contextSignals = queryPlan.schemaVersion >= 2
     ? queryPlan.contextSignals!.map((clause) => ({
         ...clause,
         axis: clause.axis as SemanticPlanClauseV32["axis"],
@@ -444,7 +444,7 @@ export function selectionPlanFromQueryPlanV3(
         values: [...clause.values],
       }))
     : [];
-  const catalogPolicies = queryPlan.schemaVersion === 2
+  const catalogPolicies = queryPlan.schemaVersion >= 2
     ? queryPlan.catalogPolicies!.map((clause) => ({
         ...clause,
         axis: clause.axis as SemanticPlanClauseV32["axis"],
@@ -479,7 +479,7 @@ export function selectionPlanFromQueryPlanV3(
           "subgenre_regional_representation",
         ],
     criticalAmbiguities: [],
-    recordingPolicy: queryPlan.schemaVersion === 2
+    recordingPolicy: queryPlan.schemaVersion >= 2
       ? {
           allowedVersions: [...queryPlan.recordingPolicy!.allowedVersions],
           preferCanonicalStudio: queryPlan.recordingPolicy!.preferCanonicalStudio,
@@ -501,7 +501,7 @@ export function selectionPlanFromQueryPlanV3(
       musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
       passed: true,
       hardConstraintHash: semanticHardConstraintHash,
-      aliasCollapses: queryPlan.schemaVersion === 2
+      aliasCollapses: queryPlan.schemaVersion >= 2
         ? [...queryPlan.semanticAuditMetadata!.aliasCollapses]
         : [],
       contradictions: [],
@@ -1064,7 +1064,7 @@ export class PipelineV3WorkerExecution {
         executionMode: mode,
         routingHints: { fixedContainer: input.queryPlan.engines.includes("fixed_container") },
         modelRoute,
-        semanticRecoveryEnabled: input.queryPlan.schemaVersion === 2,
+        semanticRecoveryEnabled: input.queryPlan.schemaVersion >= 2,
         policy: retrievalPolicy,
         continuation,
         claimSemanticRecovery: async (revision) => {

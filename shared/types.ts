@@ -373,7 +373,7 @@ export interface PipelineV3SourceDiscoveryHint {
 }
 
 export interface QueryPlanV3 {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   pipelineVersion: "corpus_first_v3";
   policyVersion: "corpus_first_v3_policy_v1" | "corpus_first_v3_policy_v2";
   engine: QueryPlanV3Engine;
@@ -413,6 +413,11 @@ export interface QueryPlanV3 {
   /** Legacy-compatible top-level audit hash retained for fast integrity checks. */
   hardConstraintHash?: string;
   semanticAuditMetadata?: QueryPlanV3SemanticAuditMetadata;
+  /** Contract-2 fencing metadata required by query-plan schema 3. */
+  briefContractVersion?: PlaylistBriefContractVersion;
+  guidancePolicyVersion?: string;
+  evidencePolicyVersion?: string;
+  executionDeltaHash?: string;
   continuation?: QueryPlanV3Continuation;
   corpusReview?: QueryPlanV3CorpusReview;
 }
@@ -751,6 +756,41 @@ export interface PlaylistBrief {
   ambiguityAcceptance?: string[];
 }
 
+export type PlaylistBriefContractVersion = 1 | 2;
+
+export type PlaylistGuidanceRequestClassification =
+  | "precise"
+  | "broad_curated"
+  | "critical_ambiguity"
+  | "preference_ambiguity";
+
+export type PlaylistGuidanceQuestionCriticality = "required" | "optional";
+export type PlaylistGuidanceSelectionMode = "single" | "multiple";
+export type PlaylistGuidanceFeasibility = "broad" | "moderate" | "narrow";
+
+/**
+ * Server-owned execution change compiled from a contract-2 answer. The model
+ * may propose display copy, but it cannot invent fields outside this typed
+ * boundary or mutate the immutable requested count and raw prompt.
+ */
+export interface PlaylistGuidancePlanDelta {
+  version: 1;
+  membershipConstraints: SelectionConstraint[];
+  discoveryFocus: string[];
+  rankingObjectives: Array<{
+    dimension: "relevance" | "influence" | "popularity" | "obscurity" | "chronology" | "source_rank";
+    weight: number;
+    values: string[];
+  }>;
+  diversityGoals: Partial<SelectionDiversityGoals>;
+  sequencingPreference: SelectionOrderingPolicy["mode"] | null;
+  versionContentPreferences: {
+    allowedVersions?: RecordingVersionClass[];
+    explicitContent?: SelectionContentPolicy["explicitContent"];
+    instrumental?: SelectionContentPolicy["instrumental"];
+  };
+}
+
 export interface PlaylistGuidanceOption {
   /** Stable server-owned identifier. */
   id: string;
@@ -758,6 +798,10 @@ export interface PlaylistGuidanceOption {
   description: string;
   /** Exactly the first option is recommended. */
   recommended: boolean;
+  /** Estimated breadth after applying this option. Required by contract 2. */
+  feasibility?: PlaylistGuidanceFeasibility;
+  /** Deterministic server-owned execution change. Required by contract 2. */
+  planDelta?: PlaylistGuidancePlanDelta;
   /**
    * Machine-readable effect of selecting this answer. Optional only so runs
    * created before the grounded question scout remain readable.
@@ -800,12 +844,18 @@ export interface PlaylistGuidanceQuestion {
   /** Short mobile-screen label. */
   header: string;
   question: string;
+  /** Contract-2 questions declare their interaction and blocking behavior. */
+  selectionMode?: PlaylistGuidanceSelectionMode;
+  criticality?: PlaylistGuidanceQuestionCriticality;
+  allowCustom?: boolean;
   /** Stable semantic axis, for example `detroit_second_wave_emphasis`. */
   decisionKey?: string;
   /** Why selecting an answer will materially change the resulting tracks. */
   whyMaterial?: string;
   /** Provider-attested web grounding. Optional only for legacy saved runs. */
   grounding?: PlaylistGuidanceGrounding;
+  /** Server-owned questions may use an explicit inference instead of a URL. */
+  groundingMode?: "grounded" | "inference";
   /** The API always returns exactly three mutually exclusive options. */
   options: PlaylistGuidanceOption[];
 }
@@ -821,14 +871,31 @@ export type PlaylistGuidanceGenerationMode =
   | "grounded_scout"
   | "deterministic_critical"
   | "no_material_questions"
-  | "scout_unavailable";
+  | "scout_unavailable"
+  | "balanced_default"
+  | "guidance_unavailable";
 
 export interface PlaylistGuidanceTelemetry {
   generationMode: PlaylistGuidanceGenerationMode;
+  requestClassification?: PlaylistGuidanceRequestClassification;
+  guidancePolicyVersion?: string;
+  questionSetHash?: string | null;
   proposedQuestionCount: number;
   acceptedQuestionCount: number;
   webSearchCalls: number;
   validationIssues: string[];
+}
+
+export interface PlaylistGuidanceQuestionSetContract {
+  questionSetHash: string;
+  requestClassification: PlaylistGuidanceRequestClassification;
+  generationMode: PlaylistGuidanceGenerationMode;
+  guidancePolicyVersion: string;
+  locale: string;
+  storefront: string;
+  targetTrackCount: number;
+  explicitConstraintHash: string;
+  rejectedQuestionReasons: string[];
 }
 
 export interface PlaylistGuidanceScoutResult {
@@ -847,6 +914,8 @@ export interface PlaylistGuidanceAnswer {
   optionId?: string;
   /** A bounded custom answer, mutually exclusive with optionId. */
   customText?: string;
+  /** Contract-2 optional questions may be skipped explicitly. */
+  skipped?: boolean;
 }
 
 export interface SourceRecordInput {
@@ -1232,6 +1301,8 @@ export interface PublicBriefStatusView {
   prompt: string;
   requestedTrackCount: number | null;
   status: string;
+  briefContractVersion?: PlaylistBriefContractVersion;
+  questionSetHash?: string | null;
   brief?: PlaylistBrief;
   questions: PlaylistGuidanceQuestion[];
   answers?: PlaylistGuidanceAnswer[];

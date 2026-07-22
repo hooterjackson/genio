@@ -206,6 +206,8 @@ export function publicBriefStatusView(input: {
   prompt: string;
   requestedTrackCount: number | null;
   status: string;
+  briefContractVersion?: 1 | 2;
+  questionSetHash?: string | null;
   brief?: PlaylistBrief;
   questions?: PlaylistGuidanceQuestion[];
   answers?: PlaylistGuidanceAnswer[];
@@ -217,6 +219,8 @@ export function publicBriefStatusView(input: {
     prompt: input.prompt,
     requestedTrackCount: input.requestedTrackCount,
     status: input.status,
+    briefContractVersion: input.briefContractVersion,
+    questionSetHash: input.questionSetHash,
     brief: input.brief,
     questions: input.questions ?? [],
     answers: input.answers,

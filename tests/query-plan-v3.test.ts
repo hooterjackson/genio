@@ -109,6 +109,28 @@ describe("query plan V3", () => {
     expect(isQueryPlanV3(legacy)).toBe(true);
   });
 
+  test("schema 3 binds contract-2 guidance and governed evidence metadata", () => {
+    const plan = confirmed("25 disco songs", 25);
+    const snapshot = "00000000-0000-4000-8000-000000000001";
+    const executionDeltaHash = "b".repeat(64);
+    const query = createQueryPlanV3(plan, snapshot, {
+      schemaVersion: 3,
+      briefContractVersion: 2,
+      executionDeltaHash,
+    });
+    expect(query).toMatchObject({
+      schemaVersion: 3,
+      briefContractVersion: 2,
+      guidancePolicyVersion: "intelligent_guidance_v2",
+      evidencePolicyVersion: "governed_evidence_v1",
+      executionDeltaHash,
+    });
+    expect(isQueryPlanV3(query)).toBe(true);
+    expect(() => createQueryPlanV3(plan, snapshot, { schemaVersion: 3 })).toThrow(/contract-2/iu);
+    expect(isQueryPlanV3({ ...query, executionDeltaHash: "tampered" })).toBe(false);
+    expect(isQueryPlanV3({ ...query, briefContractVersion: 1 })).toBe(false);
+  });
+
   test("rejects schema-2 plans whose governed music-concept policy drifts", () => {
     const query = createQueryPlanV3(
       confirmed("25 disco songs", 25),

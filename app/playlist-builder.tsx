@@ -208,6 +208,8 @@ type BriefResponse = {
   status?: string;
   pollAfterMs?: number;
   questions?: GuidedQuestion[];
+  briefContractVersion?: 1 | 2;
+  questionSetHash?: string | null;
   error?: string;
 };
 
@@ -216,6 +218,7 @@ type GuidedQuestionOption = {
   label: string;
   description?: string;
   recommended?: boolean;
+  feasibility?: "broad" | "moderate" | "narrow";
 };
 
 type GuidedQuestionGrounding = {
@@ -229,6 +232,8 @@ type GuidedQuestion = {
   question: string;
   whyMaterial?: string;
   grounding?: GuidedQuestionGrounding;
+  criticality?: "required" | "optional";
+  allowCustom?: boolean;
   options: GuidedQuestionOption[];
 };
 
@@ -244,6 +249,7 @@ type GuidedAnswer = {
   questionId: string;
   optionId?: string;
   customText?: string;
+  skipped?: boolean;
 };
 
 type RunResponse = {
@@ -1092,7 +1098,7 @@ function GuidedQuestionScreen({
   const orderedOptions = [...question.options]
     .sort((left, right) => Number(right.recommended) - Number(left.recommended))
     .slice(0, 3);
-  const validAnswer = Boolean(currentAnswer?.optionId || customText.trim());
+  const validAnswer = Boolean(currentAnswer?.optionId || customText.trim() || currentAnswer?.skipped);
   const lastQuestion = currentIndex === questions.length - 1;
   const groupName = "guidance-" + question.id;
   const progress = ((currentIndex + 1) / questions.length) * 100;
@@ -1181,7 +1187,7 @@ function GuidedQuestionScreen({
             );
           })}
 
-          <div className="guided-custom-card" data-selected={customSelected || undefined}>
+          {question.allowCustom !== false && <div className="guided-custom-card" data-selected={customSelected || undefined}>
             <label htmlFor={groupName + "-custom-choice"}>
               <input
                 id={groupName + "-custom-choice"}
@@ -1208,7 +1214,27 @@ function GuidedQuestionScreen({
               }}
               onChange={(event) => onAnswer({ questionId: question.id, customText: event.target.value })}
             />
-          </div>
+          </div>}
+          {question.criticality === "optional" && (
+            <label
+              className="guided-option-card"
+              data-selected={currentAnswer?.skipped || undefined}
+              htmlFor={groupName + "-skip"}
+            >
+              <input
+                id={groupName + "-skip"}
+                type="radio"
+                name={groupName}
+                checked={currentAnswer?.skipped === true}
+                onChange={() => onAnswer({ questionId: question.id, skipped: true })}
+              />
+              <span className="guided-radio" aria-hidden="true" />
+              <span className="guided-option-copy">
+                <strong>USE THE BALANCED DEFAULT</strong>
+                <span>Skip this optional preference without changing the playlist scope.</span>
+              </span>
+            </label>
+          )}
         </fieldset>
       </div>
 
@@ -1905,6 +1931,7 @@ export function PlaylistBuilder() {
   const [brief, setBrief] = useState<PlaylistBrief | null>(null);
   const [briefRequestId, setBriefRequestId] = useState<string | null>(null);
   const [guidanceQuestions, setGuidanceQuestions] = useState<GuidedQuestion[]>([]);
+  const [guidanceQuestionSetHash, setGuidanceQuestionSetHash] = useState<string | null>(null);
   const [guidanceAnswers, setGuidanceAnswers] = useState<Record<string, GuidedAnswer>>({});
   const [guidanceIndex, setGuidanceIndex] = useState(0);
   const [guidanceSubmission, setGuidanceSubmission] = useState<GuidedAnswer[] | null>(null);
@@ -1957,6 +1984,7 @@ export function PlaylistBuilder() {
     setBrief(null);
     setBriefRequestId(null);
     setGuidanceQuestions([]);
+    setGuidanceQuestionSetHash(null);
     setGuidanceAnswers({});
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
@@ -2143,6 +2171,7 @@ export function PlaylistBuilder() {
           setBriefRequestId(queuedBriefId);
           if (response.status === "awaiting_answers" && response.questions?.length) {
             setGuidanceQuestions(response.questions);
+            setGuidanceQuestionSetHash(response.questionSetHash ?? null);
             setGuidanceAnswers({});
             setGuidanceIndex(0);
             setGuidanceSubmission(null);
@@ -2378,6 +2407,7 @@ export function PlaylistBuilder() {
       setBriefRequestId(requestId);
       if (response.status === "awaiting_answers" && response.questions?.length) {
         setGuidanceQuestions(response.questions);
+        setGuidanceQuestionSetHash(response.questionSetHash ?? null);
         setGuidanceAnswers({});
         setGuidanceIndex(0);
         setGuidanceSubmission(null);
@@ -2406,6 +2436,7 @@ export function PlaylistBuilder() {
       deleteAbandonedBrief(briefRequestId);
     }
     setGuidanceQuestions([]);
+    setGuidanceQuestionSetHash(null);
     setGuidanceAnswers({});
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
@@ -2429,7 +2460,7 @@ export function PlaylistBuilder() {
     const question = guidanceQuestions[guidanceIndex];
     if (!question || !briefRequestId) return;
     const answer = guidanceAnswers[question.id];
-    if (!answer?.optionId && !answer?.customText?.trim()) return;
+    if (!answer?.optionId && !answer?.customText?.trim() && !answer?.skipped) return;
     if (guidanceIndex < guidanceQuestions.length - 1) {
       setGuidanceIndex((current) => Math.min(guidanceQuestions.length - 1, current + 1));
       return;
@@ -2457,6 +2488,7 @@ export function PlaylistBuilder() {
           headers: { "Idempotency-Key": guidanceIdempotencyKey.current },
           body: JSON.stringify({
             answers,
+            questionSetHash: guidanceQuestionSetHash,
             idempotencyKey: guidanceIdempotencyKey.current,
           }),
           signal: controller.signal,
@@ -2476,6 +2508,7 @@ export function PlaylistBuilder() {
       if (finalized.status === "awaiting_answers" && finalized.questions?.length) {
         setBrief(finalized.brief ?? brief);
         setGuidanceQuestions(finalized.questions);
+        setGuidanceQuestionSetHash(finalized.questionSetHash ?? null);
         setGuidanceAnswers({});
         setGuidanceIndex(0);
         setGuidanceSubmission(null);
@@ -2493,6 +2526,22 @@ export function PlaylistBuilder() {
       await startResearchFromBrief(finalized.brief, briefRequestId, expectedTrackCount, controller.signal);
     } catch (caught) {
       if (isAbortError(caught)) return;
+      if (caught instanceof ApiError && caught.code === "stale_guidance_question_set") {
+        const current = await api<BriefResponse>(
+          "/api/v1/brief/" + encodeURIComponent(briefRequestId),
+          { signal: controller.signal },
+        );
+        setBrief(current.brief ?? brief);
+        setGuidanceQuestions(current.questions ?? []);
+        setGuidanceQuestionSetHash(current.questionSetHash ?? null);
+        setGuidanceAnswers({});
+        setGuidanceIndex(0);
+        setGuidanceSubmission(null);
+        guidanceIdempotencyKey.current = null;
+        setBriefFinalizing(false);
+        setError("The guidance changed while you were answering. Review the current questions and try again.");
+        return;
+      }
       setBriefFinalizing(false);
       setError((caught as Error).message);
     } finally {

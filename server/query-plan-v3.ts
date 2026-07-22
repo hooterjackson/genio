@@ -13,24 +13,30 @@ import {
 } from "./selection-plan-v3.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
+import {
+  EVIDENCE_POLICY_VERSION,
+  GUIDANCE_POLICY_VERSION,
+} from "./guidance-contract-v2.ts";
 
 export const LEGACY_QUERY_PLAN_V3_VERSION = 1 as const;
 export const LEGACY_QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
 export const QUERY_PLAN_V3_VERSION = 2 as const;
+export const CONTRACT_QUERY_PLAN_V3_VERSION = 3 as const;
 // Schema 2 refines the query contract; it does not create a new persisted run
 // policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
 
 export type QueryPlanV3SchemaVersion =
   | typeof LEGACY_QUERY_PLAN_V3_VERSION
-  | typeof QUERY_PLAN_V3_VERSION;
+  | typeof QUERY_PLAN_V3_VERSION
+  | typeof CONTRACT_QUERY_PLAN_V3_VERSION;
 
 export function queryPlanV3EmissionSchemaVersion(
   env: NodeJS.ProcessEnv = process.env,
 ): QueryPlanV3SchemaVersion {
-  return env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "2"
-    ? QUERY_PLAN_V3_VERSION
-    : LEGACY_QUERY_PLAN_V3_VERSION;
+  if (env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "3") return CONTRACT_QUERY_PLAN_V3_VERSION;
+  if (env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "2") return QUERY_PLAN_V3_VERSION;
+  return LEGACY_QUERY_PLAN_V3_VERSION;
 }
 
 export type PipelineV3RolloutGroup =
@@ -252,12 +258,22 @@ function distinctConstraints(values: readonly SelectionConstraint[]): SelectionC
 export function createQueryPlanV3(
   plan: SelectionPlanV3,
   graphSnapshotId: string,
-  options: { readonly schemaVersion?: QueryPlanV3SchemaVersion } = {},
+  options: {
+    readonly schemaVersion?: QueryPlanV3SchemaVersion;
+    readonly briefContractVersion?: 1 | 2;
+    readonly executionDeltaHash?: string;
+  } = {},
 ): QueryPlanV3 {
   const requestedSchemaVersion = options.schemaVersion ?? QUERY_PLAN_V3_VERSION;
-  if (requestedSchemaVersion === QUERY_PLAN_V3_VERSION
+  if (requestedSchemaVersion >= QUERY_PLAN_V3_VERSION
     && plan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION) {
-    throw new Error("Schema-2 query plans require the current governed music-concept policy");
+    throw new Error("Typed query plans require the current governed music-concept policy");
+  }
+  if (requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION
+    && (options.briefContractVersion !== 2
+      || typeof options.executionDeltaHash !== "string"
+      || !/^[0-9a-f]{64}$/u.test(options.executionDeltaHash))) {
+    throw new Error("Schema-3 query plans require a contract-2 execution-delta hash");
   }
   if (!plan.confirmed || plan.criticalAmbiguities.some(({ key }) => !plan.resolvedAmbiguityKeys.includes(key))) {
     throw new Error("Critical playlist ambiguity must be resolved before a V3 query plan is created");
@@ -275,7 +291,9 @@ export function createQueryPlanV3(
       .map(({ axis, operator, values }) => ({ axis, operator, values: normalizedValues(values) }))
     )).digest("hex");
   const schemaTwo: QueryPlanV3 = {
-    schemaVersion: QUERY_PLAN_V3_VERSION,
+    schemaVersion: requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION
+      ? CONTRACT_QUERY_PLAN_V3_VERSION
+      : QUERY_PLAN_V3_VERSION,
     pipelineVersion: "corpus_first_v3",
     policyVersion: QUERY_PLAN_V3_POLICY_VERSION,
     engine: engines[0]!,
@@ -335,8 +353,14 @@ export function createQueryPlanV3(
       aliasCollapses: [...(plan.semanticAudit?.aliasCollapses ?? [])],
       contradictions: [...(plan.semanticAudit?.contradictions ?? [])],
     },
+    ...(requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION ? {
+      briefContractVersion: 2 as const,
+      guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
+      evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+      executionDeltaHash: options.executionDeltaHash,
+    } : {}),
   };
-  if ((options.schemaVersion ?? QUERY_PLAN_V3_VERSION) === QUERY_PLAN_V3_VERSION) {
+  if ((options.schemaVersion ?? QUERY_PLAN_V3_VERSION) !== LEGACY_QUERY_PLAN_V3_VERSION) {
     return Object.freeze(schemaTwo);
   }
   const legacy: QueryPlanV3 = {
@@ -370,9 +394,11 @@ export function createRuntimeQueryPlanV3(
   plan: SelectionPlanV3,
   graphSnapshotId: string,
   env: NodeJS.ProcessEnv = process.env,
+  contract: { readonly briefContractVersion?: 1 | 2; readonly executionDeltaHash?: string } = {},
 ): QueryPlanV3 {
   return createQueryPlanV3(plan, graphSnapshotId, {
     schemaVersion: queryPlanV3EmissionSchemaVersion(env),
+    ...contract,
   });
 }
 
@@ -501,8 +527,8 @@ function semanticRoleProjectionMatches(
   ));
 }
 
-function schemaTwoContractValid(row: Partial<QueryPlanV3>): boolean {
-  if (row.schemaVersion !== QUERY_PLAN_V3_VERSION
+function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
+  if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION)
     || row.policyVersion !== QUERY_PLAN_V3_POLICY_VERSION
     || row.semanticPolicyVersion !== "scope_gate_v2_1_2"
     || row.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
@@ -556,6 +582,13 @@ function schemaTwoContractValid(row: Partial<QueryPlanV3>): boolean {
   if ((row.hardConstraints ?? []).some((constraint) => !schemaTwoExecutableHardConstraint(constraint))) {
     return false;
   }
+  if (row.schemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION && (
+    row.briefContractVersion !== 2
+    || row.guidancePolicyVersion !== GUIDANCE_POLICY_VERSION
+    || row.evidencePolicyVersion !== EVIDENCE_POLICY_VERSION
+    || typeof row.executionDeltaHash !== "string"
+    || !/^[a-f0-9]{64}$/u.test(row.executionDeltaHash)
+  )) return false;
   return true;
 }
 
@@ -610,7 +643,7 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
     });
   const schemaValid = (row.schemaVersion === LEGACY_QUERY_PLAN_V3_VERSION
       && row.policyVersion === LEGACY_QUERY_PLAN_V3_POLICY_VERSION)
-    || schemaTwoContractValid(row);
+    || typedQueryPlanContractValid(row);
   return schemaValid
     && row.pipelineVersion === "corpus_first_v3"
     && typeof row.selectionPlanHash === "string"
