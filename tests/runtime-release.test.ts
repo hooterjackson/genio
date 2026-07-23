@@ -23,6 +23,7 @@ describe("public V3 runtime release contract", () => {
       assignmentEnabled: true,
       ownerCanaryEnabled: true,
       productionEvidenceApproved: true,
+      genreSceneEvidenceApproved: false,
       geographicScopeEvidenceApproved: false,
       factualFeasibilityApproved: false,
       schemaVersion: "16",
@@ -56,6 +57,7 @@ describe("public V3 runtime release contract", () => {
     expect(result.assignmentEnabled).toBe(false);
     expect(result.ownerCanaryEnabled).toBe(false);
     expect(result.productionEvidenceApproved).toBe(false);
+    expect(result.genreSceneEvidenceApproved).toBe(false);
     expect(result.geographicScopeEvidenceApproved).toBe(false);
     expect(result.factualFeasibilityApproved).toBe(false);
     expect(result.queryPlanSchemaVersion).toBe("1");

@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.3.3",
+      "releasedAt": "2026-07-23",
+      "title": "Genre retrieval reliability guard",
+      "notes": [
+        "Routes new genre and scene requests, including reggaeton, through the proven Pipeline V2 path until Pipeline V3 genre evidence is explicitly approved.",
+        "Applies the genre safety gate to both public rollout and authenticated owner canaries.",
+        "Classifies zero-candidate Pipeline V3 runs with provider or structured-contract failures as retryable system failures instead of incorrectly claiming that no compatible tracks exist.",
+        "Adds a production-derived Smooth Reggaeton Heat regression covering the exact 50-track request that exposed the reliability gap."
+      ]
+    },
+    {
       "version": "2.3.2",
       "releasedAt": "2026-07-22",
       "title": "Owner-canary geographic safety",

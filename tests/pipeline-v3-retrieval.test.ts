@@ -637,7 +637,10 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
   test("does not let synthetic zero-work scope strategies hide provider loss", async () => {
     const adapters: RetrievalAdaptersV3 = {
       discover: async ({ strategy }) => {
-        if (strategy.kind === "scope_resolution" || strategy.kind === "gap_pass") {
+        if (strategy.kind === "scope_resolution"
+          || strategy.kind === "gap_pass"
+          || strategy.kind === "trusted_containers"
+          || strategy.kind === "qualified_expansion") {
           return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
         }
         throw new Error("provider unavailable");
@@ -653,6 +656,18 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
 
     expect(result.strategies).toContainEqual(expect.objectContaining({
       kind: "scope_resolution",
+      status: "exhausted",
+      rawCandidates: 0,
+      providerFailures: 0,
+    }));
+    expect(result.strategies).toContainEqual(expect.objectContaining({
+      kind: "trusted_containers",
+      status: "exhausted",
+      rawCandidates: 0,
+      providerFailures: 0,
+    }));
+    expect(result.strategies).toContainEqual(expect.objectContaining({
+      kind: "qualified_expansion",
       status: "exhausted",
       rawCandidates: 0,
       providerFailures: 0,

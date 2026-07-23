@@ -452,7 +452,12 @@ describe("query plan V3", () => {
       plan: resolved,
       owner: true,
       stickyKey: "owner",
-      env: { NODE_ENV: "test", PIPELINE_V3_ASSIGNMENT_ENABLED: "true", PIPELINE_V3_OWNER_CANARY: "true" },
+      env: {
+        NODE_ENV: "test",
+        PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+        PIPELINE_V3_OWNER_CANARY: "true",
+        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+      },
     })).toMatchObject({ assigned: true, reason: "owner_canary" });
   });
 
@@ -462,6 +467,7 @@ describe("query plan V3", () => {
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+      PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
     };
     expect(assignPipelineV3({
       plan: confirmed("50 disco songs", 50),
@@ -490,6 +496,7 @@ describe("query plan V3", () => {
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+      PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
     };
     expect(assignPipelineV3({
       plan,
@@ -528,7 +535,11 @@ describe("query plan V3", () => {
       plan: confirmed("Brazilian disco songs", 50),
       owner: false,
       stickyKey: "visitor",
-      env: { ...base, PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true" },
+      env: {
+        ...base,
+        PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+      },
     })).toMatchObject({ assigned: false, reason: "governed_geographic_evidence_required" });
     expect(assignPipelineV3({
       plan: confirmed("Brazilian disco songs", 50),
@@ -537,6 +548,7 @@ describe("query plan V3", () => {
       env: {
         ...base,
         PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
         PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
       },
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
@@ -554,6 +566,42 @@ describe("query plan V3", () => {
         ...base,
         PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
         PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "true",
+      },
+    })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
+  });
+
+  test("holds production reggaeton genre requests on V2 until V3 genre evidence is approved", () => {
+    const plan = confirmed(
+      "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.",
+      50,
+    );
+    const env = {
+      PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+      PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
+      PIPELINE_V3_OWNER_CANARY: "true",
+      PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
+      PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "300",
+    };
+    for (const owner of [false, true]) {
+      expect(assignPipelineV3({
+        plan,
+        owner,
+        stickyKey: owner ? "owner" : "visitor",
+        env,
+      })).toMatchObject({
+        assigned: false,
+        reason: "governed_genre_scene_evidence_required",
+        group: "genre_scene",
+      });
+    }
+    expect(assignPipelineV3({
+      plan,
+      owner: false,
+      stickyKey: "visitor",
+      env: {
+        ...env,
+        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
       },
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
   });

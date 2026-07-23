@@ -1175,6 +1175,19 @@ function finalStopReason(input: {
     && state.rawCandidates === 0
     && state.providerFailures === 0
   ));
+  const rawCandidateCount = input.strategies.reduce(
+    (total, state) => total + state.rawCandidates,
+    0,
+  );
+  // A successful zero-result frontier may establish that no compatible
+  // tracks exist. Provider/contract failures that produced no raw candidates
+  // cannot establish that claim, even when dependent zero-work strategies
+  // exhausted because they had no seed material.
+  if (input.qualifiedCount === 0
+    && input.providerFailureCount > 0
+    && rawCandidateCount === 0) {
+    return "provider_failure";
+  }
   if (input.qualifiedCount === 0 && input.providerFailureCount > 0
     && materialStrategies.length > 0
     && materialStrategies.every((state) => state.status === "provider_error" || state.status === "circuit_open")) {
