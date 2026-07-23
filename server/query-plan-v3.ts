@@ -159,18 +159,29 @@ export function assignPipelineV3(input: {
   if (!input.plan.confirmed || input.plan.criticalAmbiguities.some(({ key }) => !input.plan.resolvedAmbiguityKeys.includes(key))) {
     return { assigned: false, cohort, percentage: 0, group, reason: "guidance_required" };
   }
-  if (input.owner && ownerCanaryAllows(input.plan, group, env)) {
-    return { assigned: true, cohort, percentage: 100, group, reason: "owner_canary" };
-  }
-  if (env.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED !== "true") {
-    return { assigned: false, cohort, percentage: 0, group, reason: "production_evidence_required" };
-  }
   const requiresGeographicEvidence = input.plan.membershipPredicates.some((predicate) => (
     predicate.operator !== "exclude"
     && predicate.geographyRelationship !== null
     && predicate.geographyRelationship !== undefined
     && predicate.geographyRelationship !== "sound_association"
   ));
+  if (input.owner
+    && requiresGeographicEvidence
+    && env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED !== "true") {
+    return {
+      assigned: false,
+      cohort,
+      percentage: 0,
+      group,
+      reason: "governed_geographic_evidence_required",
+    };
+  }
+  if (input.owner && ownerCanaryAllows(input.plan, group, env)) {
+    return { assigned: true, cohort, percentage: 100, group, reason: "owner_canary" };
+  }
+  if (env.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED !== "true") {
+    return { assigned: false, cohort, percentage: 0, group, reason: "production_evidence_required" };
+  }
   if (requiresGeographicEvidence
     && env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED !== "true") {
     return {

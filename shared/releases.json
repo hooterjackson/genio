@@ -2,6 +2,15 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.3.2",
+      "releasedAt": "2026-07-22",
+      "title": "Owner-canary geographic safety",
+      "notes": [
+        "Applies the governed geographic-evidence gate before owner-canary assignment so authenticated QA runs cannot bypass the same production safety rule as public requests.",
+        "Keeps Brazilian geographic-scene playlists on the proven Pipeline V2 path until Pipeline V3 geographic evidence is explicitly approved."
+      ]
+    },
+    {
       "version": "2.3.1",
       "releasedAt": "2026-07-22",
       "title": "Production guidance and geographic evidence safety",

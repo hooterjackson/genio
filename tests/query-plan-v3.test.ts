@@ -447,7 +447,7 @@ describe("query plan V3", () => {
       env: { NODE_ENV: "test", PIPELINE_V3_ASSIGNMENT_ENABLED: "true", PIPELINE_V3_OWNER_CANARY: "true" },
     })).toMatchObject({ assigned: false, reason: "guidance_required" });
 
-    const resolved = confirmed("French jazz", 25);
+    const resolved = confirmed("25 disco songs", 25);
     expect(assignPipelineV3({
       plan: resolved,
       owner: true,
@@ -464,13 +464,13 @@ describe("query plan V3", () => {
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
     };
     expect(assignPipelineV3({
-      plan: confirmed("Brazilian disco songs", 50),
+      plan: confirmed("50 disco songs", 50),
       owner: true,
       stickyKey: "owner",
       env,
     })).toMatchObject({ assigned: true, reason: "owner_canary", group: "genre_scene" });
     expect(assignPipelineV3({
-      plan: confirmed("Brazilian disco songs", 100),
+      plan: confirmed("100 disco songs", 100),
       owner: true,
       stickyKey: "owner",
       env,
@@ -481,6 +481,35 @@ describe("query plan V3", () => {
       stickyKey: "owner",
       env,
     })).toMatchObject({ assigned: false, reason: "production_evidence_required", group: "factual_relationship" });
+  });
+
+  test("geographic evidence safety applies to owner canaries", () => {
+    const plan = confirmed("Brazilian disco songs", 25);
+    const env = {
+      PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+      PIPELINE_V3_OWNER_CANARY: "true",
+      PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
+      PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+    };
+    expect(assignPipelineV3({
+      plan,
+      owner: true,
+      stickyKey: "owner",
+      env,
+    })).toMatchObject({
+      assigned: false,
+      reason: "governed_geographic_evidence_required",
+      group: "genre_scene",
+    });
+    expect(assignPipelineV3({
+      plan,
+      owner: true,
+      stickyKey: "owner",
+      env: {
+        ...env,
+        PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
+      },
+    })).toMatchObject({ assigned: true, reason: "owner_canary", group: "genre_scene" });
   });
 
   test("public rollout requires adjudicated production evidence and a separate factual feasibility gate", () => {
