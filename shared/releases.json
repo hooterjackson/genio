@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.3.1",
+      "releasedAt": "2026-07-22",
+      "title": "Production guidance and geographic evidence safety",
+      "notes": [
+        "Enables contract-2 guidance for public rollout so broad requests can receive subject-specific follow-up questions before research begins.",
+        "Guarantees a deterministic Brazilian-disco focus question when the bounded guidance scout returns no usable subject question.",
+        "Routes public geographic-scene requests through the proven Pipeline V2 evidence path until governed Pipeline V3 geographic evidence is explicitly approved.",
+        "Preserves exact requested counts and membership scope while preventing an unready Pipeline V3 scene predicate from discarding an otherwise valid candidate pool.",
+        "Compiles geographic guidance choices with their actual place, scene, or language value instead of an internal option identifier."
+      ]
+    },
+    {
       "version": "2.3.0",
       "releasedAt": "2026-07-22",
       "title": "Intelligent guidance and quality diagnostics",

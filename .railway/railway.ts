@@ -220,7 +220,7 @@ export default defineRailway(() => {
       ...apiVariables,
       APP_ORIGIN: "https://9enio.com",
       DATABASE_URL: Postgres.env.DATABASE_URL,
-      GUIDANCE_CONTRACT_V2_ENABLED: "false",
+      GUIDANCE_CONTRACT_V2_ENABLED: "true",
       GUIDANCE_CONTRACT_V2_OWNER_CANARY: "true",
       PIPELINE_V2_CURATED_PERCENT: "100",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",

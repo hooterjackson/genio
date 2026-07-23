@@ -256,6 +256,68 @@ test("a billed but invalid question-scout response degrades to a completed brief
   );
 });
 
+test("the exact Brazilian disco request always receives contract-2 guidance when the scout is unavailable", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-brazilian-disco-guidance");
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    error: { message: "Provider temporarily rejected interpretation" },
+  }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-brazilian-disco-guidance",
+      prompt: "brazilian disco playlist",
+      requestedTrackCount: 25,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 2 as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+      reservationId: `reservation-${operation}`,
+    })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-brazilian-disco-guidance",
+  });
+
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-brazilian-disco-guidance",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      questions: [expect.objectContaining({
+        id: "v3-fallback:brazilian_disco_focus",
+        decisionKey: "brazilian_disco_focus",
+        criticality: "optional",
+        options: [
+          expect.objectContaining({ id: "brazilian_disco_staples", recommended: true }),
+          expect.objectContaining({ id: "brazilian_disco_boogie" }),
+          expect.objectContaining({ id: "brazilian_disco_balanced" }),
+        ],
+      })],
+      guidanceContract: expect.objectContaining({
+        requestClassification: "broad_curated",
+        generationMode: "balanced_default",
+        targetTrackCount: 25,
+      }),
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "balanced_default",
+        acceptedQuestionCount: 1,
+      }),
+      error: null,
+    }),
+  );
+});
+
 test("the durable production brief boundary preserves a valid V3 scout sibling", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-v3-boundary");
   const sourceUrls = [

@@ -105,6 +105,7 @@ import {
   criticalAmbiguityAnswersFromGuidanceV3,
   criticalGuidanceQuestionsV3,
   createRunSpecV3,
+  deterministicGuidanceQuestionsV3,
   resolveRunSpecV3,
 } from "./selection-plan-v3.ts";
 import { validateProductionGuidedScoutV3 } from "./pipeline-v3-policy.ts";
@@ -3468,7 +3469,15 @@ export async function processBriefInterpretationJob(
       ].slice(0, 12),
     };
     const criticalQuestions = criticalGuidanceQuestionsV3(v3Spec);
-    const combinedQuestions = combineGuidanceQuestionsV3(criticalQuestions, scout.questions);
+    const deterministicQuestions = contractTwo
+      && criticalQuestions.length === 0
+      && scout.questions.length === 0
+      ? deterministicGuidanceQuestionsV3(v3Spec)
+      : [];
+    const combinedQuestions = combineGuidanceQuestionsV3(
+      criticalQuestions,
+      scout.questions.length > 0 ? scout.questions : deterministicQuestions,
+    );
     const questions = contractTwo
       ? combinedQuestions.map((question) => contractTwoGuidanceQuestion(question, requestClassification))
       : combinedQuestions;
@@ -3479,11 +3488,20 @@ export async function processBriefInterpretationJob(
         proposedQuestionCount: Math.min(3, scout.telemetry.proposedQuestionCount + criticalQuestions.length),
         acceptedQuestionCount: questions.length,
       };
+    } else if (deterministicQuestions.length > 0) {
+      scout.telemetry = {
+        ...scout.telemetry,
+        generationMode: "balanced_default",
+        proposedQuestionCount: Math.min(3, scout.telemetry.proposedQuestionCount + deterministicQuestions.length),
+        acceptedQuestionCount: questions.length,
+      };
     }
     let guidanceContract: PlaylistGuidanceQuestionSetContract | undefined;
     if (contractTwo) {
       const generationMode = criticalQuestions.length > 0
         ? "deterministic_critical"
+        : deterministicQuestions.length > 0
+          ? "balanced_default"
         : scout.telemetry.generationMode;
       const questionSetHash = guidanceQuestionSetHashV2({
         classification: requestClassification,

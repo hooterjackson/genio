@@ -500,6 +500,16 @@ describe("query plan V3", () => {
       owner: false,
       stickyKey: "visitor",
       env: { ...base, PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true" },
+    })).toMatchObject({ assigned: false, reason: "governed_geographic_evidence_required" });
+    expect(assignPipelineV3({
+      plan: confirmed("Brazilian disco songs", 50),
+      owner: false,
+      stickyKey: "visitor",
+      env: {
+        ...base,
+        PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
+      },
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
     expect(assignPipelineV3({
       plan: confirmed("Paulinho da Costa's released performance credits", 25),

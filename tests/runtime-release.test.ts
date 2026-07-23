@@ -7,6 +7,7 @@ describe("public V3 runtime release contract", () => {
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "false",
       PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "false",
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "2",
       GUIDANCE_CONTRACT_V2_ENABLED: "true",
@@ -22,6 +23,7 @@ describe("public V3 runtime release contract", () => {
       assignmentEnabled: true,
       ownerCanaryEnabled: true,
       productionEvidenceApproved: true,
+      geographicScopeEvidenceApproved: false,
       factualFeasibilityApproved: false,
       schemaVersion: "16",
       schemaMinimum: "13",
@@ -54,6 +56,7 @@ describe("public V3 runtime release contract", () => {
     expect(result.assignmentEnabled).toBe(false);
     expect(result.ownerCanaryEnabled).toBe(false);
     expect(result.productionEvidenceApproved).toBe(false);
+    expect(result.geographicScopeEvidenceApproved).toBe(false);
     expect(result.factualFeasibilityApproved).toBe(false);
     expect(result.queryPlanSchemaVersion).toBe("1");
     expect(result.briefContractVersion).toBe("1");

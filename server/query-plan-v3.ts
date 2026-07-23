@@ -58,6 +58,7 @@ export interface PipelineV3Assignment {
     | "guidance_required"
     | "owner_canary"
     | "production_evidence_required"
+    | "governed_geographic_evidence_required"
     | "factual_feasibility_required"
     | "sticky_rollout"
     | "control";
@@ -163,6 +164,22 @@ export function assignPipelineV3(input: {
   }
   if (env.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED !== "true") {
     return { assigned: false, cohort, percentage: 0, group, reason: "production_evidence_required" };
+  }
+  const requiresGeographicEvidence = input.plan.membershipPredicates.some((predicate) => (
+    predicate.operator !== "exclude"
+    && predicate.geographyRelationship !== null
+    && predicate.geographyRelationship !== undefined
+    && predicate.geographyRelationship !== "sound_association"
+  ));
+  if (requiresGeographicEvidence
+    && env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED !== "true") {
+    return {
+      assigned: false,
+      cohort,
+      percentage: 0,
+      group,
+      reason: "governed_geographic_evidence_required",
+    };
   }
   if ((group === "factual_relationship" || group === "exhaustive")
     && env.PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED !== "true") {
