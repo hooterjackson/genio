@@ -108,15 +108,45 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   await publication.acquireAppleWritePermit?.({
     runId: "run-1",
     manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    contractRevisionId: null,
+    contractHash: null,
     publicationVolumeId: "volume-1",
     operation: "append_tracks",
   });
   expect(source.acquireAppleWritePermit).toHaveBeenCalledWith({
     runId: "run-1",
     manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    contractRevisionId: null,
+    contractHash: null,
     publicationVolumeId: "volume-1",
     operation: "append_tracks",
   });
+  const completionFence = {
+    runId: "run-1",
+    manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    contractRevisionId: null,
+    contractHash: null,
+    selectedCount: 1,
+    terminalStatus: "complete" as const,
+    publicationVolumes: [{
+      publicationVolumeId: "volume-1",
+      attempt: 0,
+      applePlaylistId: "p.test",
+      appendedCount: 1,
+      startPosition: 0,
+      endPosition: 0,
+    }],
+    pipelineOutcome: null,
+  };
+  expect("commitPublicationCompletion" in publication).toBe(true);
+  await publication.commitPublicationCompletion?.(completionFence);
+  expect(source.commitPublicationCompletion).toHaveBeenCalledWith(completionFence);
 });
 
 test("production worker refuses startup when provider or encryption secrets are absent", () => {

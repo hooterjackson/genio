@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER,
   BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL,
+  BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL,
   isWorkerCapabilityValid,
   isWorkerPipelineProtocolCompatible,
   minimumWorkerProtocolForPipeline,
@@ -15,11 +16,11 @@ import {
 } from "../server/worker-protocol.ts";
 
 describe("worker pipeline protocol", () => {
-  test("advertises protocol 9 while accepting protocol 8 bridge capacity", () => {
+  test("advertises protocol 10 while accepting protocol 8 bridge capacity", () => {
     const current = { protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION };
     expect(workerPipelineProtocolVersion(current)).toBe(WORKER_PIPELINE_PROTOCOL_VERSION);
     expect(isWorkerPipelineProtocolCompatible(current)).toBe(true);
-    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(9);
+    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(10);
     expect(BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER).toBe(8);
     expect(isWorkerPipelineProtocolCompatible({ protocolVersion: "playlist-pipeline-v8" })).toBe(true);
     expect(isWorkerPipelineProtocolCompatible({ protocolVersion: "playlist-pipeline-v7" })).toBe(false);
@@ -40,6 +41,8 @@ describe("worker pipeline protocol", () => {
     expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 1 })).toBe(6);
     expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 2 })).toBe(8);
     expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 3 })).toBe(9);
+    expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 4 })).toBe(10);
     expect(BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL).toBe(9);
+    expect(BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL).toBe(10);
   });
 });

@@ -4,7 +4,11 @@ import type {
   PlaylistGuidanceTelemetry,
   SelectionPlan,
 } from "../shared/types.ts";
-import { GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
+import {
+  EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  executableCuratedResearchBudgetUsd,
+  GUIDED_SCOUT_BUDGET_USD,
+} from "../shared/product-policy.ts";
 import {
   fastRunServiceLevel,
   isSupportedFastRouteTiming,
@@ -104,7 +108,7 @@ export const FAST_RUN_DEADLINE_MS = 120_000;
 // of every medium playlist into timeout placeholders.
 export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
-export const FAST_CURATED_TARGET_MAXIMUM = 300;
+export const FAST_CURATED_TARGET_MAXIMUM = EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
 export const FAST_POST_MATCH_REFILL_MAX_TOOL_CALLS = 3;
 export const FAST_POST_MATCH_REFILL_MAX_SYNTHESIS_TOKENS = 3_000;
@@ -724,9 +728,7 @@ export function researchExecutionPolicy(
 }
 
 function curatedRunCostCeiling(target: number): number {
-  if (target <= 50) return 0.75;
-  if (target <= 100) return 1.5;
-  return 3;
+  return executableCuratedResearchBudgetUsd(target);
 }
 
 /** Resolve and freeze every mutable policy input used by a Pipeline V2 run. */
@@ -767,7 +769,7 @@ export function createPipelinePolicySnapshot(input: {
     qualified: 0,
     attempted: 0,
     observedQualified: 0,
-    maximumRawGoal: 1_000,
+    maximumRawGoal: Math.min(100_000, Math.max(1_000, requested * 20)),
   }).rawDiscoveryGoal;
   return {
     schemaVersion: 1,

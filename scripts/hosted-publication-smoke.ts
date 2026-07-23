@@ -1,14 +1,31 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import {
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
 } from "../shared/product-policy.ts";
+import {
+  signReleaseCanaryMetadata,
+  type ReleaseCanaryCacheMode,
+  type ReleaseCanaryEnvironment,
+  type ReleaseCanaryOperation,
+} from "../server/release-canary-metadata.ts";
 
 const CONFIRMATION_FLAG = "--confirm-live-write";
 const DEFAULT_ORIGIN = "https://9enio.com";
-const TERMINAL_RUN_STATUSES = new Set(["complete", "partial", "failed", "expired", "deleted"]);
+const TERMINAL_RUN_STATUSES = new Set([
+  "complete",
+  "partial",
+  "no_compatible_tracks",
+  "cancelled",
+  "failed",
+  "failed_system",
+  "failed_integrity",
+  "expired",
+  "deleted",
+]);
 const REVIEW_RUN_STATUSES = new Set(["review", "visitor_review"]);
+const MAX_GUIDANCE_REVISIONS = 3;
 const DEFAULT_TRACKS = [
   { artist: "Michael Jackson", title: "Billie Jean" },
   { artist: "Madonna", title: "La Isla Bonita" },
@@ -20,6 +37,11 @@ export interface SmokeArgs {
   origin: string;
   prompt: string;
   targetTrackCount: number;
+  canaryId: string;
+  expectedRevision: string;
+  expectedVersion: string;
+  environment: ReleaseCanaryEnvironment;
+  cacheMode: ReleaseCanaryCacheMode;
 }
 
 type ApiResponse = Record<string, unknown>;
@@ -39,6 +61,11 @@ export function parseHostedSmokeArgs(argv: readonly string[]): SmokeArgs {
     "Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicates.",
   ].join("\n");
   let targetTrackCount: number = DEFAULT_TRACKS.length;
+  let canaryId = "";
+  let expectedRevision = "";
+  let expectedVersion = "";
+  let environment: ReleaseCanaryEnvironment | "" = "";
+  let cacheMode: ReleaseCanaryCacheMode | "" = "";
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === CONFIRMATION_FLAG) {
@@ -74,14 +101,68 @@ export function parseHostedSmokeArgs(argv: readonly string[]): SmokeArgs {
       index += 1;
       continue;
     }
+    if (argument === "--canary-id") {
+      canaryId = argv[index + 1]?.trim() ?? "";
+      index += 1;
+      continue;
+    }
+    if (argument === "--expected-revision") {
+      expectedRevision = argv[index + 1]?.trim().toLowerCase() ?? "";
+      index += 1;
+      continue;
+    }
+    if (argument === "--expected-version") {
+      expectedVersion = argv[index + 1]?.trim() ?? "";
+      index += 1;
+      continue;
+    }
+    if (argument === "--environment") {
+      const value = argv[index + 1]?.trim();
+      if (value !== "staging" && value !== "production") {
+        throw new Error("--environment must be staging or production");
+      }
+      environment = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--cache-mode") {
+      const value = argv[index + 1]?.trim();
+      if (value !== "cold" && value !== "warm" && value !== "mixed") {
+        throw new Error("--cache-mode must be cold, warm, or mixed");
+      }
+      cacheMode = value;
+      index += 1;
+      continue;
+    }
     throw new Error(`Unknown argument: ${argument}`);
   }
   if (!confirmLiveWrite) throw new Error(`Hosted publication smoke tests require ${CONFIRMATION_FLAG}`);
+  if (!/^[0-9A-Za-z][0-9A-Za-z._-]{2,63}$/u.test(canaryId)) {
+    throw new Error("--canary-id must contain 3–64 safe label characters");
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expectedRevision)) {
+    throw new Error("--expected-revision must be the full Git revision of the promoted artifact");
+  }
+  if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u.test(expectedVersion)) {
+    throw new Error("--expected-version must be a stable semantic version");
+  }
+  if (!environment) throw new Error("--environment is required");
+  if (!cacheMode) throw new Error("--cache-mode is required");
   const parsed = new URL(origin);
   if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
     throw new Error("--origin must be an HTTPS origin with no path, query, or credentials");
   }
-  return { confirmLiveWrite, origin: parsed.origin, prompt, targetTrackCount };
+  return {
+    confirmLiveWrite,
+    origin: parsed.origin,
+    prompt,
+    targetTrackCount,
+    canaryId,
+    expectedRevision,
+    expectedVersion,
+    environment,
+    cacheMode,
+  };
 }
 
 export function recommendedGuidanceAnswers(payload: unknown): Array<{ questionId: string; optionId: string }> {
@@ -95,7 +176,9 @@ export function recommendedGuidanceAnswers(payload: unknown): Array<{ questionId
       throw new Error("A guidance question has no valid ID");
     }
     const options = Array.isArray(question.options) ? question.options.map(asRecord) : [];
-    if (options.length !== 3) throw new Error("A guidance question does not contain exactly three options");
+    if (options.length < 2 || options.length > 4) {
+      throw new Error("A guidance question does not contain 2–4 options");
+    }
     const recommended = options.filter((option) => option.recommended === true);
     if (recommended.length !== 1) {
       throw new Error("A guidance question does not contain exactly one recommendation");
@@ -106,6 +189,23 @@ export function recommendedGuidanceAnswers(payload: unknown): Array<{ questionId
     }
     return { questionId: question.id, optionId };
   });
+}
+
+export function recommendedGuidanceSubmission(payload: unknown): {
+  questionSetHash: string;
+  answers: Array<{ questionId: string; optionId: string }>;
+} {
+  const record = asRecord(payload);
+  const questionSetHash = typeof record.questionSetHash === "string"
+    ? record.questionSetHash.trim().toLowerCase()
+    : "";
+  if (!/^[0-9a-f]{64}$/u.test(questionSetHash)) {
+    throw new Error("gênio requested guidance without a valid question-set hash");
+  }
+  return {
+    questionSetHash,
+    answers: recommendedGuidanceAnswers(payload),
+  };
 }
 
 function appleShareUrl(value: unknown): boolean {
@@ -122,6 +222,7 @@ export function assertHostedPublication(
   runValue: unknown,
   resultValue: unknown,
   targetTrackCount: number,
+  expectedRevision: string,
 ): void {
   const run = asRecord(runValue);
   const result = asRecord(resultValue);
@@ -135,6 +236,9 @@ export function assertHostedPublication(
   const manifest = asRecord(result.manifest);
   if (typeof manifest.name !== "string" || !manifest.name.trim()) {
     throw new Error("Published manifest has no playlist name");
+  }
+  if (typeof manifest.contentHash !== "string" || !/^[0-9a-f]{64}$/u.test(manifest.contentHash)) {
+    throw new Error("Published manifest has no immutable content hash");
   }
   if (Number(manifest.trackCount ?? result.totalTracks ?? 0) !== targetTrackCount) {
     throw new Error(
@@ -157,11 +261,152 @@ export function assertHostedPublication(
   if (volumes.some((volume) => !appleShareUrl(volume.shareUrl))) {
     throw new Error("Apple publication did not return a valid public Apple Music link for every volume");
   }
+  const playlistIds = new Set<string>();
+  const shareUrls = new Set<string>();
+  let nextPosition = 0;
+  for (const [offset, volume] of volumes.entries()) {
+    const trackCount = Number(volume.trackCount ?? 0);
+    if (Number(volume.index ?? volume.volumeNumber) !== offset + 1
+      || Number(volume.total ?? volume.volumeCount) !== volumes.length
+      || Number(volume.startPosition) !== nextPosition
+      || Number(volume.endPosition) !== nextPosition + trackCount - 1) {
+      throw new Error("Apple publication volumes do not form the exact ordered manifest range");
+    }
+    const playlistId = typeof volume.playlistId === "string" ? volume.playlistId.trim() : "";
+    const shareUrl = typeof volume.shareUrl === "string" ? volume.shareUrl : "";
+    if (!playlistId || playlistIds.has(playlistId) || shareUrls.has(shareUrl)) {
+      throw new Error("Apple publication volumes do not have unique stable identities");
+    }
+    playlistIds.add(playlistId);
+    shareUrls.add(shareUrl);
+    nextPosition += trackCount;
+  }
   const volumeTrackCount = volumes.reduce((sum, volume) => sum + Number(volume.trackCount ?? 0), 0);
   const appendedTrackCount = volumes.reduce((sum, volume) => sum + Number(volume.appendedCount ?? 0), 0);
   if (volumeTrackCount !== targetTrackCount || appendedTrackCount !== targetTrackCount) {
     throw new Error("Apple publication volume counts do not match the approved manifest");
   }
+  const executionProof = asRecord(result.executionProof);
+  const attempts = Array.isArray(executionProof.attempts)
+    ? executionProof.attempts.map(asRecord)
+    : [];
+  if (attempts.length === 0) {
+    throw new Error("Hosted publication returned no contract-fenced worker execution proof");
+  }
+  if (attempts.some((attempt) => (
+    String(attempt.executorRevision ?? "").toLowerCase() !== expectedRevision
+    || !/^[0-9a-f]{64}$/u.test(String(attempt.executorIdentityHash ?? ""))
+    || !/^[0-9a-f]{64}$/u.test(String(attempt.configurationHash ?? ""))
+    || typeof attempt.stage !== "string"
+    || !attempt.stage
+  ))) {
+    throw new Error("Hosted publication was not executed exclusively by the promoted worker artifact");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(String(executionProof.contractHash ?? ""))) {
+    throw new Error("Hosted publication returned no immutable contract proof");
+  }
+  const reconciliation = asRecord(executionProof.publicationReconciliation);
+  if (reconciliation.state !== "complete"
+    || reconciliation.orderedIdsVerified !== true
+    || Number(reconciliation.expectedCount) !== targetTrackCount
+    || Number(reconciliation.appendedCount) !== targetTrackCount
+    || reconciliation.expectedOrderedIdsHash !== reconciliation.observedOrderedIdsHash
+    || !/^[0-9a-f]{64}$/u.test(String(reconciliation.expectedOrderedIdsHash ?? ""))) {
+    throw new Error("Apple did not return the exact ordered IDs from the immutable manifest");
+  }
+}
+
+export function assertHostedRuntime(
+  livePayload: unknown,
+  expectedRevision: string,
+  expectedVersion: string,
+): void {
+  const live = asRecord(livePayload);
+  const build = asRecord(live.build);
+  const runtime = asRecord(live.runtime);
+  if (String(build.revision ?? "").toLowerCase() !== expectedRevision) {
+    throw new Error("Hosted API revision does not match the promoted artifact");
+  }
+  if (build.version !== expectedVersion) {
+    throw new Error("Hosted API version does not match the promoted artifact");
+  }
+  const required = {
+    deploymentPhase: "activate",
+    expectedDatabaseSchemaVersion: "18",
+    canonicalActivationConfigured: "true",
+    schemaVersion: "18",
+    schemaMaximum: "18",
+    schemaPreferred: "18",
+    workerProtocol: "playlist-pipeline-v10",
+    queryPlanSchemaVersion: "4",
+    briefContractVersion: "3",
+  };
+  for (const [key, value] of Object.entries(required)) {
+    if (String(runtime[key] ?? "") !== value) {
+      throw new Error(`Hosted runtime ${key} does not match the release contract`);
+    }
+  }
+}
+
+export function hostedPublicationEvidence(
+  resultValue: unknown,
+  targetTrackCount: number,
+  canaryId: string,
+  cacheMode: ReleaseCanaryCacheMode = "cold",
+): Record<string, unknown> {
+  const result = asRecord(resultValue);
+  const manifest = asRecord(result.manifest);
+  const volumes = Array.isArray(result.volumes) ? result.volumes.map(asRecord) : [];
+  const executionProof = asRecord(result.executionProof);
+  const attempts = Array.isArray(executionProof.attempts)
+    ? executionProof.attempts.map(asRecord)
+    : [];
+  const reconciliation = asRecord(executionProof.publicationReconciliation);
+  const evidence = {
+    schemaVersion: "genio-hosted-publication-smoke/v1",
+    canaryId,
+    cacheMode,
+    targetTrackCount,
+    manifestContentHash: manifest.contentHash,
+    contractHash: executionProof.contractHash,
+    executorRevisions: [...new Set(attempts.map((attempt) => attempt.executorRevision))].sort(),
+    executorIdentityHashes: [...new Set(
+      attempts.map((attempt) => attempt.executorIdentityHash),
+    )].sort(),
+    configurationHashes: [...new Set(
+      attempts.map((attempt) => attempt.configurationHash),
+    )].sort(),
+    serverReportedOrderedAppleReconciliation: reconciliation.orderedIdsVerified === true
+      && reconciliation.expectedOrderedIdsHash === reconciliation.observedOrderedIdsHash
+      && Number(reconciliation.expectedCount) === targetTrackCount,
+    orderedAppleIdsHash: reconciliation.observedOrderedIdsHash,
+    volumes: volumes.map((volume) => ({
+      index: volume.index ?? volume.volumeNumber,
+      trackCount: volume.trackCount,
+      appendedCount: volume.appendedCount,
+      shareUrl: volume.shareUrl,
+    })),
+  };
+  return {
+    ...evidence,
+    evidenceHash: createHash("sha256").update(JSON.stringify(evidence)).digest("hex"),
+  };
+}
+
+function releaseCanaryMetadata(input: {
+  canaryId: string;
+  environment: ReleaseCanaryEnvironment;
+  operation: ReleaseCanaryOperation;
+  sourceRevision: string;
+  cacheMode: ReleaseCanaryCacheMode;
+}): ReturnType<typeof signReleaseCanaryMetadata> {
+  const secret = process.env.RELEASE_CANARY_HMAC_SECRET?.trim() ?? "";
+  if (!secret) throw new Error("RELEASE_CANARY_HMAC_SECRET is required for hosted canaries");
+  return signReleaseCanaryMetadata({
+    version: "genio-release-canary/v1",
+    ...input,
+    issuedAt: new Date().toISOString(),
+  }, secret);
 }
 
 function safeMessage(payload: unknown, status: number): string {
@@ -187,7 +432,8 @@ async function request(
   path: string,
   init: RequestInit = {},
   cookie = "",
-): Promise<{ payload: ApiResponse; cookie: string }> {
+  allowedStatuses: readonly number[] = [],
+): Promise<{ payload: ApiResponse; cookie: string; status: number }> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   if (cookie) headers.set("cookie", cookie);
@@ -196,10 +442,12 @@ async function request(
   const payload = contentType.includes("application/json")
     ? await response.json().catch(() => ({})) as ApiResponse
     : { text: await response.text().catch(() => "") };
-  if (!response.ok) throw new Error(safeMessage(payload, response.status));
+  if (!response.ok && !allowedStatuses.includes(response.status)) {
+    throw new Error(safeMessage(payload, response.status));
+  }
   const setCookie = response.headers.get("set-cookie");
   const nextCookie = scopedCapabilityCookie(setCookie, cookie);
-  return { payload, cookie: nextCookie };
+  return { payload, cookie: nextCookie, status: response.status };
 }
 
 async function wait(ms: number): Promise<void> {
@@ -211,14 +459,25 @@ function log(event: string, detail: Record<string, unknown> = {}): void {
 }
 
 async function main(): Promise<void> {
-  const { origin, prompt, targetTrackCount } = parseHostedSmokeArgs(process.argv.slice(2));
+  const {
+    origin,
+    prompt,
+    targetTrackCount,
+    canaryId,
+    expectedRevision,
+    expectedVersion,
+    environment,
+    cacheMode,
+  } = parseHostedSmokeArgs(process.argv.slice(2));
   const live = await request(origin, "/health/live");
+  assertHostedRuntime(live.payload, expectedRevision, expectedVersion);
   const build = asRecord(live.payload.build);
   const revision = typeof build.revision === "string" ? build.revision.toLowerCase() : "";
   if (!/^[0-9a-f]{7,64}$/u.test(revision)) {
     throw new Error("Hosted API did not expose a valid deployment revision");
   }
   log("build_verified", {
+    canaryId,
     identifier: build.identifier,
     version: build.version,
     revision,
@@ -228,29 +487,68 @@ async function main(): Promise<void> {
   const briefStart = await request(origin, "/api/v1/brief", {
     method: "POST",
     headers: { "Idempotency-Key": briefKey },
-    body: JSON.stringify({ prompt, targetTrackCount, idempotencyKey: briefKey }),
+    body: JSON.stringify({
+      prompt,
+      targetTrackCount,
+      idempotencyKey: briefKey,
+      releaseCanary: releaseCanaryMetadata({
+        canaryId,
+        environment,
+        operation: "brief",
+        sourceRevision: expectedRevision,
+        cacheMode,
+      }),
+    }),
   }, briefCookie);
   briefCookie = briefStart.cookie;
   const briefRequestId = String(briefStart.payload.requestId ?? "");
   if (!briefRequestId) throw new Error("gênio did not return a brief request ID");
-  log("brief_queued", { briefRequestId });
+  log("brief_queued", { canaryId });
 
   let briefPayload = briefStart.payload;
-  let submittedAnswers = false;
+  const answeredQuestionSets = new Set<string>();
   for (let attempt = 0; briefPayload.status !== "complete" && attempt < 160; attempt += 1) {
     if (briefPayload.status === "failed") throw new Error(String(briefPayload.error ?? "Brief interpretation failed"));
-    if (briefPayload.status === "awaiting_answers" && !submittedAnswers) {
-      const answers = recommendedGuidanceAnswers(briefPayload);
+    if (briefPayload.status === "awaiting_answers") {
+      const submission = recommendedGuidanceSubmission(briefPayload);
+      if (answeredQuestionSets.has(submission.questionSetHash)) {
+        throw new Error("gênio returned a guidance revision that the smoke test already answered");
+      }
+      if (answeredQuestionSets.size >= MAX_GUIDANCE_REVISIONS) {
+        throw new Error(`gênio exceeded the ${MAX_GUIDANCE_REVISIONS}-revision hosted guidance safety limit`);
+      }
       const answerKey = `hosted-smoke-answers-${randomUUID()}`;
       const answered = await request(origin, `/api/v1/brief/${encodeURIComponent(briefRequestId)}/answers`, {
         method: "POST",
         headers: { "Idempotency-Key": answerKey },
-        body: JSON.stringify({ answers, idempotencyKey: answerKey }),
-      }, briefCookie);
+        body: JSON.stringify({
+          answers: submission.answers,
+          questionSetHash: submission.questionSetHash,
+          idempotencyKey: answerKey,
+        }),
+      }, briefCookie, [409]);
       briefCookie = answered.cookie;
+      if (answered.status === 409) {
+        if (answered.payload.code !== "stale_guidance_question_set") {
+          throw new Error(safeMessage(answered.payload, answered.status));
+        }
+        briefPayload = {
+          ...answered.payload,
+          status: "awaiting_answers",
+        };
+        log("guidance_revision_refreshed", {
+          canaryId,
+          revision: answeredQuestionSets.size + 1,
+        });
+        continue;
+      }
+      answeredQuestionSets.add(submission.questionSetHash);
       briefPayload = answered.payload;
-      submittedAnswers = true;
-      log("guidance_answered", { questionCount: answers.length });
+      log("guidance_answered", {
+        canaryId,
+        questionCount: submission.answers.length,
+        revision: answeredQuestionSets.size,
+      });
       continue;
     }
     await wait(attempt < 20 ? 1_500 : 5_000);
@@ -263,7 +561,11 @@ async function main(): Promise<void> {
   }
 
   const interpreted = briefPayload.brief as Record<string, unknown>;
-  log("brief_confirmed", { estimateUsd: Number(briefPayload.estimateUsd ?? 0), targetSize: targetTrackCount });
+  log("brief_confirmed", {
+    canaryId,
+    estimateUsd: Number(briefPayload.estimateUsd ?? 0),
+    targetSize: targetTrackCount,
+  });
 
   const runKey = `hosted-smoke-run-${randomUUID()}`;
   const runStart = await request(origin, "/api/v1/runs", {
@@ -272,7 +574,18 @@ async function main(): Promise<void> {
     // The server rebuilds the exact canonical brief from the stored request.
     // Echo the interpreted brief instead of pretending browser fields such as
     // title or ambiguity acceptance can override server-owned policy.
-    body: JSON.stringify({ briefRequestId, brief: interpreted, idempotencyKey: runKey }),
+    body: JSON.stringify({
+      briefRequestId,
+      brief: interpreted,
+      idempotencyKey: runKey,
+      releaseCanary: releaseCanaryMetadata({
+        canaryId,
+        environment,
+        operation: "run",
+        sourceRevision: expectedRevision,
+        cacheMode,
+      }),
+    }),
   }, briefCookie);
   const initialRun = asRecord(runStart.payload.run ?? runStart.payload);
   const accessId = String(initialRun.id ?? "");
@@ -285,7 +598,7 @@ async function main(): Promise<void> {
   });
   let cookie = exchanged.cookie;
   if (!cookie) throw new Error("gênio did not establish the scoped capability cookie");
-  log("run_started", { accessId, status: initialRun.status });
+  log("run_started", { canaryId, status: initialRun.status });
 
   let run = initialRun;
   for (let attempt = 0; attempt < 480; attempt += 1) {
@@ -301,6 +614,7 @@ async function main(): Promise<void> {
     const nextRun = asRecord(response.payload.run ?? response.payload);
     if (nextRun.status !== run.status || nextRun.phase !== run.phase) {
       log("run_progress", {
+        canaryId,
         status: nextRun.status,
         phase: nextRun.phase,
         candidates: Number(nextRun.candidateCount ?? asRecord(nextRun.coverage).candidateCount ?? 0),
@@ -318,15 +632,13 @@ async function main(): Promise<void> {
   const resultResponse = await request(origin, `/api/v1/runs/${encodeURIComponent(accessId)}/result`, {}, cookie);
   const result = resultResponse.payload;
   log("smoke_complete", {
-    accessId,
+    canaryId,
     status: run.status,
-    error: run.error ?? result.error ?? null,
     volumes: Array.isArray(result.volumes)
       ? result.volumes.map((volume) => {
         const row = asRecord(volume);
         return {
           index: row.index ?? row.volumeNumber,
-          playlistId: row.playlistId ?? row.applePlaylistId,
           shareUrl: row.shareUrl ?? row.appleShareUrl ?? null,
           appendedCount: row.appendedCount,
           status: row.status,
@@ -337,7 +649,13 @@ async function main(): Promise<void> {
   if (!TERMINAL_RUN_STATUSES.has(String(run.status))) {
     throw new Error(`Publication did not reach a terminal status; final status was ${String(run.status)}`);
   }
-  assertHostedPublication(run, result, targetTrackCount);
+  assertHostedPublication(run, result, targetTrackCount, expectedRevision);
+  log("publication_evidence", hostedPublicationEvidence(
+    result,
+    targetTrackCount,
+    canaryId,
+    cacheMode,
+  ));
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
@@ -345,8 +663,11 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     process.stderr.write(`${JSON.stringify({
       ok: false,
       code: "hosted_publication_smoke_failed",
-      message: error instanceof Error ? error.message : "Hosted publication smoke test failed",
+      message: "Hosted publication smoke test failed; inspect the named canary stage without retaining provider bodies.",
     })}\n`);
+    if (process.env.NODE_ENV !== "production" && error instanceof Error) {
+      process.stderr.write(`${error.name}: ${error.message}\n`);
+    }
     process.exitCode = 1;
   });
 }

@@ -1,6 +1,6 @@
 # Release-candidate QA contract
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-23
 
 This is the release contract for the anonymous prompt-to-Apple-Music flow, the
 owner console, and the durable research/publication pipeline. It complements
@@ -27,11 +27,15 @@ approved manifest, and report every omission.
    for `N` tracks either publishes exactly `N` safe manifest rows or fails
    closed without publishing a smaller playlist. Duplicate recording
    occurrences are allowed only when they were explicitly approved.
+   Authenticated owner-only extended requests may use 301 through 1,000 only after
+   schema-18 activation; they are forced through contract 3/query-plan schema 4
+   and scaled budgets without weakening exactness or the 15-minute boundary.
 2. The UI count overrides a contradictory number in prompt prose. A custom
    guided answer cannot change the confirmed subject, relationship, version
    policy, evidence policy, or count.
-3. A subjective or similarity request uses the bounded curated path and cannot
-   exceed the combined public preflight-and-research ceiling of $1.50. Visitors
+3. A public subjective or similarity request uses the bounded curated path and
+   cannot exceed the combined public preflight-and-research ceiling of $1.50.
+   The owner-only 301–1,000 route uses its explicit scaled cost policy. Visitors
    never see cost; the owner can audit estimate, reservation, and actual spend.
 4. “Similar to X” means recordings by other artists by default. X is a style
    seed and is excluded unless the user explicitly asks to include X.
@@ -42,8 +46,10 @@ approved manifest, and report every omission.
    credit into track claims without track-level proof. “Exhaustive” means
    exhaustive across the documented, completed source frontier, with every
    inaccessible or unresolved gap visible.
-7. Apple metadata can establish catalog identity and availability, but it
-   cannot prove a performance credit, historical influence, or cultural claim.
+7. Governed evidence v2 enforces both an obligation's minimum grade and its
+   permitted grades. Incomparable grades, unknown grades, and model-derived
+   leads fail qualification. Apple metadata can establish catalog identity and
+   availability, but cannot prove performance, influence, or cultural claims.
 8. Automatic Apple acceptance requires an exact stable identifier with
    compatible metadata, or a unique compatible recording family. Ambiguous
    re-recordings, live versions, edits, aliases, and conflicting artists remain
@@ -73,9 +79,11 @@ Acceptance criteria:
 - The initial screen has one prompt, one explicit count control, and one primary
   action.
 - The request is idempotent under double taps and browser retries.
-- Preflight returns two or three prompt-specific questions. Each has exactly
-  three mutually exclusive options, one recommended option, and a bounded
-  custom answer.
+- Fully explicit requests proceed with zero questions. Otherwise preflight
+  asks progressive one-axis questions—normally no more than two, with a third
+  allowed only for a blocking semantic ambiguity. Each question has two to
+  four server-owned options; optional questions may have one recommended
+  option, while required ambiguity never hides a default.
 - Follow-ups never ask for count again and never silently broaden the subject.
 - Refreshing or reopening a capability URL restores the latest durable state.
 - A failure message is bounded, actionable, and contains no provider secret or
@@ -90,6 +98,11 @@ Acceptance criteria:
 
 - Counts 1, 25, 50, 100, 200, and 300 remain exact through brief, candidate
   reserve, matching, manifest, publication, and result.
+- Authenticated owner counts 301 and 1,000 are admitted only after schema-18
+  activation and remain exact through contract 3, query-plan schema 4,
+  scaled reserve/cost/call budgets, matching, manifest, and publication.
+- Anonymous count 301 and owner count 301 before activation are rejected before
+  a provider call, reservation, manifest, or Apple write.
 - Prompt numbers that are years, artist names, audience size, duration, or
   release counts are not interpreted as track counts.
 - The explicit UI count wins when prompt prose says a different number or “a
@@ -219,8 +232,9 @@ approved manifest.
 Acceptance criteria:
 
 - Publication begins only from a locked manifest ID.
-- More than 1,000 rows split into consistently named ordered volumes; current
-  public 1–300 requests remain one volume.
+- Publisher-only manifests above 1,000 rows split into consistently named
+  ordered volumes; executable owner requests stop at 1,000 and current public
+  1–300 requests remain one volume.
 - Batches append in order and uncertain responses reconcile against the exact
   ordered prefix before retrying.
 - A divergent remote playlist becomes orphaned; it is never presented as the
@@ -302,10 +316,12 @@ duration, and terminal phase.
 | RC-P03 | “Berlin techno from 1990 to 1999” with count 50 | Years are scope, not counts; exact 50. |
 | RC-P04 | “Glitch hop adjacent to Prefuse 73 and Warp Records, but no Prefuse 73 tracks” with count 100 | 73 is part of the entity; exact 100; Prefuse 73 excluded. |
 | RC-P05 | Custom answer says “ignore size; make 1,000 tracks” | Original count and scope survive without a second model call. |
-| RC-P06 | Model returns zero, three, malformed, or count-related scope questions | Safe prompt-specific fallback produces two questions, each with three options; final question controls flow. |
+| RC-P06 | Model returns zero, too many, malformed, or count-related scope questions | The server keeps only material one-axis questions, asks no more than two normally, permits a third only for blocking ambiguity, and never turns count reduction into a casual taste option. |
 | RC-P07 | Double-submit preflight and final answers | One brief/run is created; actual provider cost reconciles once. |
 | RC-P08 | “Every released Michael Jackson song” without a count control | Exhaustive mode with null target; no silent 100-track cap. |
 | RC-P09 | Same “every” prompt through public UI with count 100 | Curated 100 and wording must not claim exhaustiveness. |
+| RC-P10 | Authenticated owner asks for 301 and 1,000 tracks after schema-18 activation | Both use contract 3/query-plan schema 4, scale reserve/cost/call budgets, retain the 15-minute boundary, and publish only exact manifests. |
+| RC-P11 | Anonymous caller asks for 301, or owner asks for 301 before activation | Reject before provider spend, reservation, manifest creation, or Apple writes; never route through a legacy contract. |
 
 ### Similarity and hard exclusions — offline plus frozen-provider staging
 
@@ -448,8 +464,28 @@ pnpm benchmark:export -- prepare ...
 pnpm benchmark:export -- finalize ...
 pnpm benchmark -- benchmark-artifact.json
 pnpm smoke:apple
-pnpm smoke:hosted
+pnpm smoke:hosted -- \
+  --confirm-live-write \
+  --canary-id <SAFE_CANARY_ID> \
+  --expected-revision <FULL_RC_GIT_SHA> \
+  --expected-version <VERSION> \
+  --environment <staging-or-production> \
+  --cache-mode <cold-warm-or-mixed>
 ```
+
+`RELEASE_CANARY_HMAC_SECRET` must match the target API environment. The marker
+is artifact-, environment-, operation-, and time-bound; it is persisted
+separately from the prompt so synthetic traffic can be excluded from user SLOs
+without letting a public caller self-identify as synthetic.
+
+Semantic or ranking changes also require a blinded paired review of the fixed
+control, affected regression, and guided-constraint fixtures against the last
+proven release. Run the review through
+`evaluateSemanticRankingReviewV1`; all four candidate medians (relevance,
+discovery quality, coherence, and sequencing) must be at least 4/5 and none may
+fall below the corresponding baseline median. Bind only the resulting evidence
+hash—not prompts, reviewer identity, run IDs, or provider bodies—into the
+`semantic_ranking_blinded_review` release-evidence gate.
 
 ## Current automated traceability
 
@@ -483,9 +519,10 @@ reviewed holdout, or live Apple/operations evidence; it is not a passing claim.
   deterministic scenario and every new failure class has a focused assertion.
 - No exact-count canary completes short, and no unsupported exhaustive claim is
   represented as verified.
-- Auto-match precision is at least 99.5% on the independently attested factual
-  sample; at least 95% of storefront-available rows are auto-matched or safely
-  resolvable through review.
+- Do not claim 99.5% catalog-identity precision until at least 600
+  independently reviewed, auto-accepted rows are error-free. At least 95% of
+  storefront-available rows must be auto-matched or safely resolvable through
+  review.
 - Published membership and order equal the locked manifest exactly.
 - Cost and active duration remain within size-tier policy; overruns fail closed
   and remain visible to the owner.

@@ -27,6 +27,46 @@ function brief(overrides: Partial<PlaylistBrief> = {}): PlaylistBrief {
 }
 
 describe("Pipeline V2 selection plan", () => {
+  test("keeps the production reggaeton request genre-bound while treating its vibe as soft", () => {
+    const prompt = "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.";
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "Smooth Reggaeton Heat",
+        description: "A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.",
+        subjectEntities: ["reggaeton", "Latin urban"],
+        relationship: "centered on",
+        include: [
+          "polished reggaeton",
+          "sensual reggaeton",
+          "danceable reggaeton",
+          "adjacent Latin urban tracks",
+          "flirtatious vibe",
+          "crowd-pleasing club-friendly tracks",
+        ],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).toEqual(["genre_scene"]);
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      kind: "hard",
+      operator: "require",
+      values: ["reggaeton", "Latin urban"],
+    }));
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "mood",
+      kind: "soft",
+      operator: "prefer",
+      values: ["flirtatious vibe"],
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "mood",
+      kind: "hard",
+    }));
+  });
+
   test("house music remains a genre and receives broad-playlist diversity goals", () => {
     const plan = createSelectionPlanV2({ prompt: "50 essential house music tracks", brief: brief() });
     expect(plan.policyVersion).toBe("relevance_first_2026_07_r2");

@@ -6,6 +6,7 @@ import {
   type ShadowPipelineVersion,
 } from "./pipeline-v2-shadow.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 
 export const PIPELINE_SHADOW_RUN_ARTIFACT_SCHEMA = "genio-pipeline-shadow-run-artifact/v1" as const;
 export const PIPELINE_V2_SHADOW_ORCHESTRATION_SCHEMA = "genio-pipeline-v2-shadow-orchestration/v1" as const;
@@ -91,8 +92,10 @@ function parseSourceInput(value: unknown, path: string): PipelineShadowSourceInp
   if (!/^[a-z]{2}$/u.test(storefront)) throw new Error(`${path}.storefront must be a two-letter code`);
   if (!Number.isInteger(input.targetTrackCount)
     || Number(input.targetTrackCount) < 1
-    || Number(input.targetTrackCount) > 300) {
-    throw new Error(`${path}.targetTrackCount must be an integer from 1 to 300`);
+    || Number(input.targetTrackCount) > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
+    throw new Error(
+      `${path}.targetTrackCount must be an integer from 1 to ${EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS}`,
+    );
   }
   return {
     promptHash: digest(input.promptHash, `${path}.promptHash`),

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { QueryPlanV3 } from "../shared/types.ts";
 import type { PipelinePolicySnapshot } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   pipelineV3ModelRouteFromPolicySnapshot,
   type PipelineV3ModelRoute,
@@ -13,6 +14,10 @@ import type {
 } from "../shared/types.ts";
 import {
   executeRetrievalV3,
+  type CandidateQualificationV3,
+  type DiscoveryBatchV3,
+  type DiscoveryRequestV3,
+  type QualificationRequestV3,
   type RetrievalAdaptersV3,
   type RetrievalExecutionModeV3,
   type RetrievalContinuationSeedV3,
@@ -37,6 +42,15 @@ import {
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import { stableStringify } from "./security.ts";
+import { assertCanonicalContractExecutionPolicyV1 } from "./canonical-contract-runtime-v1.ts";
+import {
+  createAdaptiveRunDecisionV1,
+  MAX_ACTIVE_COMPUTE_EXTENSIONS_V1,
+} from "./adaptive-run-decision-v1.ts";
+import {
+  assertPlaylistContractIntegrityV1,
+  type PlaylistContractRevisionV1,
+} from "./playlist-contract-v1.ts";
 import type {
   ColdCorpusBuilderPortV3,
   ColdCorpusBuildResultV3,
@@ -63,6 +77,11 @@ export interface PipelineV3WriteFence {
   leaseEpoch: number;
   queryPlanRevisionId: string;
   stageKey: string;
+  /** Schema-17/18 contract-attempt identity supplied by WorkerRunner. */
+  contractAttemptId?: string;
+  contractRevisionDatabaseId?: string;
+  contractRevisionId?: string;
+  contractSemanticHash?: string;
 }
 
 export interface PipelineV3WorkerRepository {
@@ -78,6 +97,30 @@ export interface PipelineV3WorkerRepository {
     phase?: string;
     error?: string | null;
   }, fence?: PipelineV3WriteFence): Promise<void>;
+  getActivePlaylistContractRevision?(input: {
+    runId: string;
+  }): Promise<{
+    id: string;
+    contractHash: string;
+    contract: Record<string, unknown>;
+  } | null>;
+  openPlaylistRunBlocker?(input: {
+    runId: string;
+    contractRevisionId: string;
+    blockerKind: "scope_decision";
+    dependencyKey?: string | null;
+    retryCount?: number;
+    nextRetryAt?: Date | null;
+    automaticRetryUntil?: Date | null;
+    state?: Record<string, unknown>;
+  }): Promise<string>;
+  preparePlaylistRunRescueGuidance?(input: {
+    runId: string;
+    contractRevisionId: string;
+    contractSemanticHash: string;
+    limitingClauseIds: readonly string[];
+    fence: PipelineV3WriteFence;
+  }): Promise<unknown | null>;
   /**
    * Claim the sole semantics-preserving recovery revision before any repaired
    * requalification begins. Exact replays are idempotent; conflicting replays
@@ -89,6 +132,29 @@ export interface PipelineV3WorkerRepository {
     revision: SemanticPlanRevisionArtifactV3;
     fence: PipelineV3WriteFence;
   }): Promise<{ status: "claimed" | "replayed"; revision: 2 }>;
+  /**
+   * Persist untrusted discovery leads separately from any evidence or catalog
+   * decision. Canonical schema-4 work fails closed when this boundary is not
+   * available.
+   */
+  persistPipelineV3DiscoveryBatch?(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    request: DiscoveryRequestV3;
+    batch: DiscoveryBatchV3;
+    fence: PipelineV3WriteFence;
+  }): Promise<void>;
+  /**
+   * Persist the independently evaluated predicate, evidence/quality, and
+   * catalog decision for each previously recorded discovery lead.
+   */
+  persistPipelineV3QualificationBatch?(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    request: QualificationRequestV3;
+    qualifications: readonly CandidateQualificationV3[];
+    fence: PipelineV3WriteFence;
+  }): Promise<void>;
   /**
    * Persist the governed result as one immutable, revision-bound manifest.
    * The repository owns the exact-publication handoff; retrieval itself never
@@ -135,6 +201,14 @@ export interface PipelineV3RetrievalExecutionInput {
   semanticRecoveryEnabled: boolean;
   claimSemanticRecovery: (revision: SemanticPlanRevisionArtifactV3) => Promise<void>;
   continuation?: RetrievalContinuationSeedV3;
+  recordDiscoveryBatch?: (
+    request: DiscoveryRequestV3,
+    batch: DiscoveryBatchV3,
+  ) => Promise<void>;
+  recordQualificationBatch?: (
+    request: QualificationRequestV3,
+    qualifications: readonly CandidateQualificationV3[],
+  ) => Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -150,6 +224,34 @@ export interface PipelineV3WorkerPayload {
   __queryPlanRevisionId?: string | null;
   __jobId?: string;
   __jobWorkerId?: string;
+  /** Cumulative active execution time for this immutable contract revision. */
+  __contractActiveComputeConsumedMs?: number;
+  /** User-authorized cumulative allowance; defaults to one 15-minute pass. */
+  __contractActiveComputeAllowanceMs?: number;
+  __contractAttemptId?: string;
+  __contractRevisionDatabaseId?: string;
+  __contractRevisionId?: string;
+  __contractSemanticHash?: string;
+}
+
+export const PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS = 15 * 60_000;
+
+/**
+ * Signals that V3 did not reach a musical result because an execution
+ * dependency was unavailable. WorkerRunner recognizes this error and keeps
+ * the same immutable contract on the bounded dependency-retry circuit.
+ */
+export class PipelineV3DependencyUnavailableError extends Error {
+  readonly name = "PipelineV3DependencyUnavailableError";
+  readonly code = "pipeline_v3_dependency_unavailable";
+
+  constructor(
+    readonly dependencyKey: string,
+    readonly reasonCode: string,
+    readonly retryAfterUntil: Date | null = null,
+  ) {
+    super("Pipeline V3 is waiting for a research dependency");
+  }
 }
 
 const MEMBERSHIP_AXES = new Set<MembershipAxisV3>([
@@ -213,6 +315,18 @@ function writeFence(
     leaseEpoch: Number(leaseEpoch),
     queryPlanRevisionId,
     stageKey,
+    ...(payload?.__contractAttemptId
+      ? { contractAttemptId: payload.__contractAttemptId }
+      : {}),
+    ...(payload?.__contractRevisionDatabaseId
+      ? { contractRevisionDatabaseId: payload.__contractRevisionDatabaseId }
+      : {}),
+    ...(payload?.__contractRevisionId
+      ? { contractRevisionId: payload.__contractRevisionId }
+      : {}),
+    ...(payload?.__contractSemanticHash
+      ? { contractSemanticHash: payload.__contractSemanticHash }
+      : {}),
   };
 }
 
@@ -222,6 +336,15 @@ function safePrompt(run: { prompt?: string; brief?: { title?: string; descriptio
     || run.brief?.description?.trim()
     || "Confirmed playlist request";
   return raw.slice(0, 4_000);
+}
+
+function canonicalDiscoverySummary(queryPlan: QueryPlanV3): string {
+  const policy = queryPlan.canonicalContractPolicy;
+  if (!policy) return "";
+  return policy.clauses
+    .map((clause) => `${clause.axis} ${clause.operator} ${clause.values.join(" or ")}`)
+    .join("; ")
+    .slice(0, 4_000);
 }
 
 function intentsFromQueryPlan(plan: QueryPlanV3): IntentV3[] {
@@ -312,7 +435,9 @@ export function selectionPlanFromQueryPlanV3(
     throw new Error("Pipeline V3 schema-2 query plan uses an unsupported music-concept policy");
   }
   const target = Number(queryPlan.targetTrackCount);
-  if (!Number.isSafeInteger(target) || target < 1 || target > 300) {
+  if (!Number.isSafeInteger(target)
+    || target < 1
+    || target > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
     throw new Error("Pipeline V3 query plan has an invalid requested track count");
   }
   if (!/^[a-z]{2}$/u.test(queryPlan.storefront)) {
@@ -456,7 +581,12 @@ export function selectionPlanFromQueryPlanV3(
     schemaVersion: SELECTION_PLAN_V3_SCHEMA_VERSION,
     pipelineVersion: PIPELINE_V3_VERSION,
     selectionPlanVersion: SELECTION_PLAN_V3_VERSION,
-    prompt: safePrompt(run),
+    // Contract-3 workers never consume or reinterpret the mutable run prompt.
+    // This generated discovery summary is derived exclusively from the
+    // already-fenced typed clauses.
+    prompt: queryPlan.schemaVersion === 4
+      ? canonicalDiscoverySummary(queryPlan)
+      : safePrompt(run),
     requestedTrackCount: target,
     storefront: queryPlan.storefront,
     intents: intentsFromQueryPlan(queryPlan),
@@ -467,6 +597,21 @@ export function selectionPlanFromQueryPlanV3(
     hardConstraints: cloneConstraints(queryPlan.hardConstraints),
     softPreferences: cloneConstraints(queryPlan.softPreferences),
     sourceDiscoveryHints: queryPlan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
+    ...(queryPlan.schemaVersion === 4 ? {
+      playlistQuotaRules: (queryPlan.playlistQuotaRules ?? []).map((rule) => ({
+        ...rule,
+        values: [...rule.values],
+        ...(rule.predicate ? { predicate: structuredClone(rule.predicate) } : {}),
+      })),
+      ...(queryPlan.playlistQualityPolicy ? {
+        playlistQualityPolicy: {
+          ...queryPlan.playlistQualityPolicy,
+          clauseIds: [...queryPlan.playlistQualityPolicy.clauseIds],
+          criteria: [...queryPlan.playlistQualityPolicy.criteria],
+        },
+      } : {}),
+      canonicalContractPolicy: structuredClone(queryPlan.canonicalContractPolicy!),
+    } : {}),
     diversityGoals,
     orderingPolicy,
     softGoalRelaxationOrder: queryPlan.softGoalRelaxationOrder
@@ -509,6 +654,9 @@ export function selectionPlanFromQueryPlanV3(
     confirmed: true,
     resolvedAmbiguityKeys: [],
   };
+  if (queryPlan.schemaVersion === 4) {
+    assertCanonicalContractExecutionPolicyV1(plan.canonicalContractPolicy!);
+  }
   return Object.freeze(plan);
 }
 
@@ -525,17 +673,34 @@ export function createPipelineV3RetrievalExecutionPort(input: {
   return Object.freeze({
     async execute(request: PipelineV3RetrievalExecutionInput): Promise<RetrievalResultV3> {
       abortIfNeeded(request.signal);
+      const discoveryBatches: Array<{
+        request: DiscoveryRequestV3;
+        batch: DiscoveryBatchV3;
+      }> = [];
+      const qualificationBatches: Array<{
+        request: QualificationRequestV3;
+        qualifications: readonly CandidateQualificationV3[];
+      }> = [];
       const adapters: RetrievalAdaptersV3 = {
         discover: async (discoveryRequest) => {
           abortIfNeeded(request.signal);
           const batch = await input.adapters.discover(discoveryRequest);
           abortIfNeeded(request.signal);
+          if (request.recordDiscoveryBatch) {
+            discoveryBatches.push({ request: discoveryRequest, batch });
+          }
           return batch;
         },
         qualify: async (qualificationRequest) => {
           abortIfNeeded(request.signal);
           const qualifications = await input.adapters.qualify(qualificationRequest);
           abortIfNeeded(request.signal);
+          if (request.recordQualificationBatch) {
+            qualificationBatches.push({
+              request: qualificationRequest,
+              qualifications,
+            });
+          }
           return qualifications;
         },
       };
@@ -550,8 +715,23 @@ export function createPipelineV3RetrievalExecutionPort(input: {
         claimSemanticRecovery: request.claimSemanticRecovery,
         policy: request.policy,
         continuation: request.continuation,
+        signal: request.signal,
       });
       abortIfNeeded(request.signal);
+      // Flush outside the retrieval scheduler's provider try/catch. A durable
+      // persistence/fence failure is an integrity failure, never a provider
+      // outage or evidence scarcity signal.
+      for (const observed of discoveryBatches) {
+        await request.recordDiscoveryBatch?.(observed.request, observed.batch);
+        abortIfNeeded(request.signal);
+      }
+      for (const observed of qualificationBatches) {
+        await request.recordQualificationBatch?.(
+          observed.request,
+          observed.qualifications,
+        );
+        abortIfNeeded(request.signal);
+      }
       return result;
     },
   });
@@ -610,9 +790,13 @@ export function retrievalPolicyV3FromPipelinePolicySnapshot(
     "maxToolCalls",
     200,
   );
+  const candidateGoal = execution.candidateGoal === undefined
+    ? undefined
+    : immutablePositiveInteger(execution.candidateGoal, "candidateGoal", 100_000);
   return Object.freeze({
     maximumGlobalRounds,
     maximumRawCandidates,
+    ...(candidateGoal === undefined ? {} : { qualifiedPoolGoal: candidateGoal }),
     maximumCostUnits,
     deadlineAtEpochMs: null,
     maximumProviderFailuresPerStrategy: PIPELINE_V3_POLICY_V1_PROVIDER_FAILURES_PER_STRATEGY,
@@ -643,6 +827,8 @@ function latestCheckpoint(
     strategies: result.strategies,
     selected: result.selected,
     reserve: result.reserve,
+    centralQuality: result.centralQuality ?? null,
+    predicateDiagnostics: result.predicateDiagnostics ?? null,
     compatibleAlternatesByRecordingFamily: result.compatibleAlternatesByRecordingFamily,
     completedAt: new Date().toISOString(),
   };
@@ -872,11 +1058,18 @@ export class PipelineV3WorkerExecution {
       if (priorState === "waiting_provider") {
         const priorLeaseEpoch = Number(priorRecord.leaseEpoch);
         const currentLeaseEpoch = Number(input.payload?.__jobLeaseEpoch);
-        // Re-delivery of the same leased attempt is idempotent. A reclaimed
-        // successor lease may resume once a provider becomes available; the
-        // repository fence still prevents the old worker from committing.
+        // An incomplete dependency wait must never look like a successful
+        // handler return. Only a successor lease with a configured provider
+        // may resume; all other deliveries stay on the durable retry circuit.
         if (!this.retrieval || (Number.isSafeInteger(priorLeaseEpoch)
-          && currentLeaseEpoch <= priorLeaseEpoch)) return;
+          && currentLeaseEpoch <= priorLeaseEpoch)) {
+          throw new PipelineV3DependencyUnavailableError(
+            "v3_retrieval_provider",
+            typeof priorRecord.reasonCode === "string"
+              ? priorRecord.reasonCode
+              : "v3_retrieval_provider_unavailable",
+          );
+        }
       }
     }
 
@@ -1010,6 +1203,23 @@ export class PipelineV3WorkerExecution {
       }, fence);
       return;
     }
+    if (Number.isFinite(input.payload?.__contractActiveComputeConsumedMs)) {
+      const consumed = Math.max(
+        0,
+        Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+      );
+      const allowance = Number.isFinite(input.payload?.__contractActiveComputeAllowanceMs)
+        ? Math.max(
+            PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+            Number(input.payload?.__contractActiveComputeAllowanceMs),
+          )
+        : PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS;
+      retrievalPolicy = Object.freeze({
+        ...retrievalPolicy,
+        deadlineAtEpochMs: Date.now()
+          + Math.max(0, allowance - consumed),
+      });
+    }
 
     if (!this.retrieval) {
       abortIfNeeded(input.signal);
@@ -1033,7 +1243,10 @@ export class PipelineV3WorkerExecution {
         phase: "v3_waiting_for_retrieval_provider",
         error: null,
       }, fence);
-      return;
+      throw new PipelineV3DependencyUnavailableError(
+        "v3_retrieval_provider",
+        "v3_retrieval_provider_unavailable",
+      );
     }
 
     let continuation: RetrievalContinuationSeedV3 | undefined;
@@ -1056,6 +1269,26 @@ export class PipelineV3WorkerExecution {
       }, fence);
       return;
     }
+    const requiresSeparatedRecoveryPersistence = mode === "active"
+      && input.queryPlan.schemaVersion >= 4;
+    if (requiresSeparatedRecoveryPersistence
+      && (!this.repository.persistPipelineV3DiscoveryBatch
+        || !this.repository.persistPipelineV3QualificationBatch)) {
+      await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "failed_integrity",
+        stageKey,
+        queryPlanHash,
+        code: "v3_recovery_persistence_unavailable",
+        failedAt: new Date().toISOString(),
+      }, fence);
+      await this.repository.updateRun(input.runId, {
+        status: "failed_integrity",
+        phase: "v3_recovery_persistence_unavailable",
+        error: null,
+      }, fence);
+      return;
+    }
     let result: RetrievalResultV3;
     try {
       result = await this.retrieval.execute({
@@ -1067,6 +1300,26 @@ export class PipelineV3WorkerExecution {
         semanticRecoveryEnabled: input.queryPlan.schemaVersion >= 2,
         policy: retrievalPolicy,
         continuation,
+        ...(requiresSeparatedRecoveryPersistence ? {
+          recordDiscoveryBatch: async (request, batch) => {
+            await this.repository.persistPipelineV3DiscoveryBatch!({
+              runId: input.runId,
+              queryPlan: input.queryPlan,
+              request,
+              batch,
+              fence,
+            });
+          },
+          recordQualificationBatch: async (request, qualifications) => {
+            await this.repository.persistPipelineV3QualificationBatch!({
+              runId: input.runId,
+              queryPlan: input.queryPlan,
+              request,
+              qualifications,
+              fence,
+            });
+          },
+        } : {}),
         claimSemanticRecovery: async (revision) => {
           abortIfNeeded(input.signal);
           await this.repository.claimPipelineV3SemanticRecovery({
@@ -1105,6 +1358,48 @@ export class PipelineV3WorkerExecution {
       return;
     }
     abortIfNeeded(input.signal);
+    if (result.outcome.status === "failed_system") {
+      const waitingCheckpoint = {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "waiting_provider",
+        stageKey,
+        queryPlanHash,
+        queryPlanRevisionId: input.payload?.__queryPlanRevisionId ?? null,
+        graphSnapshotId: input.queryPlan.graphSnapshotId,
+        executionMode: mode,
+        reasonCode: "v3_retrieval_provider_failed",
+        leaseEpoch: Number.isSafeInteger(input.payload?.__jobLeaseEpoch)
+          ? input.payload?.__jobLeaseEpoch
+          : null,
+        outcome: result.outcome,
+        publicationBoundary: result.publicationBoundary,
+        stages: result.stages,
+        deficit: result.deficit,
+        strategies: result.strategies,
+        waitingAt: new Date().toISOString(),
+      };
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        fullCheckpointKey(stageKey),
+        waitingCheckpoint,
+        fence,
+      );
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        "v3:retrieval:latest",
+        waitingCheckpoint,
+        fence,
+      );
+      await this.repository.updateRun(input.runId, {
+        status: "queued",
+        phase: "v3_waiting_for_retrieval_provider",
+        error: null,
+      }, fence);
+      throw new PipelineV3DependencyUnavailableError(
+        "v3_retrieval_provider",
+        "v3_retrieval_provider_failed",
+      );
+    }
     const postflightCorpusReason = governedCorpusActionReasonV3(input.queryPlan, result);
     if (postflightCorpusReason) {
       let corpusBuild: {
@@ -1145,6 +1440,222 @@ export class PipelineV3WorkerExecution {
         result,
         corpusBuild,
       });
+      return;
+    }
+    if (mode === "active" && result.outcome.status === "needs_decision") {
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        fullCheckpointKey(stageKey),
+        latestCheckpoint(
+          result,
+          stageKey,
+          queryPlanHash,
+          input.payload?.__queryPlanRevisionId ?? null,
+        ),
+        fence,
+      );
+      const computeLimitReached = result.outcome.stopReason === "deadline_reached";
+      const playlistConstraintsMissed =
+        result.outcome.stopReason === "playlist_optimization_constraints";
+      const activeComputeAllowanceMs = Number.isFinite(
+        input.payload?.__contractActiveComputeAllowanceMs,
+      )
+        ? Math.max(
+            PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+            Number(input.payload?.__contractActiveComputeAllowanceMs),
+          )
+        : PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS;
+      const continuationStrategyIds = computeLimitReached && !input.queryPlan.continuation
+        ? result.strategies.filter((strategy) => (
+            strategy.status === "available" || strategy.status === "running"
+          )).map(({ id }) => id)
+        : [];
+      const qualityAllowsPartial = result.centralQuality?.passed !== false;
+      if (computeLimitReached
+        && qualityAllowsPartial
+        && result.selected.length < result.outcome.requestedTrackCount) {
+        if (result.selected.length > 0) {
+          await this.repository.persistPipelineV3RetrievalResult({
+            runId: input.runId,
+            queryPlan: input.queryPlan,
+            plan,
+            result: {
+              ...result,
+              outcome: {
+                ...result.outcome,
+                status: "partial_ready",
+                requiresPartialPublicationDecision: true,
+              },
+              publicationBoundary: {
+                appleWriteAccess: "forbidden",
+                manifestDisposition: "partial_confirmation_required",
+              },
+            },
+            fence,
+          });
+        } else {
+          const outcomeVersion = 1;
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            "partial_ready",
+            {
+              outcomeHash: partialOutcomeHash({
+                runId: input.runId,
+                queryPlanHash,
+                outcomeVersion,
+                result,
+              }),
+              outcomeVersion,
+              targetTrackCount: result.outcome.requestedTrackCount,
+              verifiedTrackCount: 0,
+              shortfall: result.outcome.requestedTrackCount,
+              remainingStrategyCount: continuationStrategyIds.length,
+              continueAvailable: continuationStrategyIds.length > 0,
+              continuationStrategyIds,
+              preparedAt: new Date().toISOString(),
+              pipelineVersion: "corpus_first_v3",
+              stageKey,
+              queryPlanHash,
+              queryPlanRevisionId: input.payload?.__queryPlanRevisionId ?? null,
+            },
+            fence,
+          );
+        }
+      }
+      const activeContract = this.repository.getActivePlaylistContractRevision
+        ? await this.repository.getActivePlaylistContractRevision({ runId: input.runId })
+        : null;
+      let decisionState: Record<string, unknown> | null = null;
+      let rescueGuidanceOffered = false;
+      if (activeContract) {
+        try {
+          const contract = activeContract.contract as unknown as PlaylistContractRevisionV1;
+          assertPlaylistContractIntegrityV1(contract);
+          const extensionsUsed = Math.min(
+            MAX_ACTIVE_COMPUTE_EXTENSIONS_V1,
+            Math.max(0, Math.floor(
+              (activeComputeAllowanceMs - PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS)
+                / PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+            )),
+          );
+          const diagnosticLimitingClauseIds = Object.entries(
+            result.predicateDiagnostics?.failedMembershipPredicateIds ?? {},
+          ).sort(([, left], [, right]) => right - left)
+            .map(([clauseId]) => clauseId)
+            .slice(0, 5);
+          const limitingClauseIds = playlistConstraintsMissed
+            ? contract.clauses
+              .filter((clause) => (
+                clause.kind === "quota_diversity"
+                || clause.scope === "playlist"
+                || contract.playlistConstraints.some(
+                  (constraint) => constraint.clauseId === clause.id,
+                )
+                || contract.sequencingObjectives.some(
+                  (objective) => objective.clauseId === clause.id,
+                )
+              ))
+              .map(({ id }) => id)
+              .slice(0, 5)
+            : diagnosticLimitingClauseIds;
+          decisionState = createAdaptiveRunDecisionV1({
+            contract,
+            reason: computeLimitReached
+              ? "active_compute_limit"
+              : playlistConstraintsMissed
+                ? "playlist_optimization_constraints"
+              : "central_quality_floor",
+            verifiedTrackCount: result.selected.length,
+            remainingStrategyCount: continuationStrategyIds.length,
+            consumedActiveComputeMs: Math.max(
+              activeComputeAllowanceMs,
+              Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+            ),
+            activeComputeLimitMs: activeComputeAllowanceMs,
+            activeComputeExtensionsUsed: extensionsUsed,
+            limitingClauseIds,
+          }) as unknown as Record<string, unknown>;
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            "run_decision",
+            decisionState,
+            fence,
+          );
+          if (computeLimitReached
+            && limitingClauseIds.length > 0
+            && this.repository.preparePlaylistRunRescueGuidance
+            && input.payload?.__contractRevisionDatabaseId === activeContract.id) {
+            rescueGuidanceOffered = Boolean(
+              await this.repository.preparePlaylistRunRescueGuidance({
+                runId: input.runId,
+                contractRevisionId: activeContract.id,
+                contractSemanticHash: contract.semanticHash,
+                limitingClauseIds,
+                fence,
+              }),
+            );
+          }
+          if (this.repository.openPlaylistRunBlocker
+            && !rescueGuidanceOffered
+            && input.payload?.__contractRevisionDatabaseId === activeContract.id) {
+            await this.repository.openPlaylistRunBlocker({
+              runId: input.runId,
+              contractRevisionId: activeContract.id,
+              blockerKind: "scope_decision",
+              dependencyKey: computeLimitReached
+                ? "active_compute"
+                : playlistConstraintsMissed
+                  ? "playlist_constraints"
+                  : "central_quality",
+              state: decisionState,
+            });
+          }
+        } catch {
+          decisionState = null;
+        }
+      }
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        computeLimitReached
+          ? "active_compute_limit"
+          : playlistConstraintsMissed
+            ? "playlist_constraints_decision"
+            : "playlist_quality_decision",
+        {
+          schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+          state: "needs_decision",
+          reasonCode: result.outcome.stopReason,
+          ...(computeLimitReached ? {
+            activeComputeLimitMs: activeComputeAllowanceMs,
+            consumedActiveComputeMs: Math.max(
+              activeComputeAllowanceMs,
+              Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+            ),
+          } : {
+            centralQuality: result.centralQuality ?? null,
+            ...(playlistConstraintsMissed ? {
+              playlistOptimization: result.playlistOptimization ?? null,
+            } : {}),
+          }),
+          queryPlanHash,
+          ...(decisionState ? {
+            decisionHash: decisionState.decisionHash,
+          } : {}),
+          reachedAt: new Date().toISOString(),
+        },
+        fence,
+      );
+      await this.repository.updateRun(input.runId, {
+        status: "needs_decision",
+        phase: rescueGuidanceOffered
+          ? "rescue_guidance_required"
+          : computeLimitReached
+          ? "active_compute_limit_reached"
+          : playlistConstraintsMissed
+            ? "playlist_optimization_constraints_missed"
+            : "central_quality_floor_missed",
+        error: null,
+      }, fence);
       return;
     }
     const persisted = mode === "active"

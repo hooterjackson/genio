@@ -2,8 +2,17 @@ import { describe, expect, test } from "vitest";
 import {
   publicBriefStatusView,
   publicResearchRunView,
+  publicRunResolutionView,
 } from "../server/public-api-projections.ts";
-import type { PlaylistBrief, ResearchRunView } from "../shared/types.ts";
+import type {
+  PartialPublicationActionView,
+  PlaylistBrief,
+  ResearchRunView,
+  RunResolutionView,
+} from "../shared/types.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
+import { predicateYieldRescueGuidanceDecisionV3 } from "../server/adaptive-guidance-v3.ts";
+import { publicGuidanceQuestionV3 } from "../server/adaptive-guidance-contract-bridge.ts";
 
 const brief: PlaylistBrief = {
   title: "French jazz",
@@ -38,6 +47,181 @@ function serializedKeys(value: unknown): string[] {
 }
 
 describe("public API projections", () => {
+  const resolution = (
+    nextAction: RunResolutionView["nextAction"],
+    state: RunResolutionView["state"] = "needs_decision",
+  ): RunResolutionView => ({
+    state,
+    nextAction,
+    terminal: false,
+    contractRevisionId: "contract-id",
+    contractRevision: 3,
+    contractHash: "c".repeat(64),
+    blocker: null,
+  });
+
+  test("narrows owner-only and unimplemented run actions to visitor-supported paths", () => {
+    expect(publicRunResolutionView(
+      resolution("answer_rescue_guidance", "needs_input"),
+      null,
+    )).toMatchObject({
+      state: "needs_decision",
+      nextAction: "review_contract",
+    });
+    expect(publicRunResolutionView(
+      resolution("authorize_apple", "blocked_dependency"),
+      null,
+    )).toMatchObject({
+      state: "blocked_dependency",
+      nextAction: "wait_for_dependency",
+    });
+    expect(publicRunResolutionView(
+      resolution("resume_research", "blocked_dependency"),
+      null,
+    )).toMatchObject({
+      state: "needs_decision",
+      nextAction: "review_contract",
+    });
+  });
+
+  test("preserves only a complete hash-bound rescue question action", () => {
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "public-rescue-action",
+      rawPrompt: "50 French jazz tracks from the 1970s",
+      requestedTrackCount: 50,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        {
+          id: "genre:jazz",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["jazz"],
+          source: { provenance: "prompt", text: "Jazz" },
+        },
+        {
+          id: "era:1970s",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "era",
+          operator: "require",
+          values: ["1970s"],
+          source: { provenance: "prompt", text: "Recorded in the 1970s" },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "genre:jazz" },
+          { op: "clause", clauseId: "era:1970s" },
+        ],
+      },
+    });
+    const decision = predicateYieldRescueGuidanceDecisionV3({
+      baseContract: contract,
+      limitingClauseIds: ["era:1970s"],
+    })!;
+    const question = publicGuidanceQuestionV3(decision);
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "French jazz",
+      brief,
+      status: "needs_decision",
+      phase: "rescue_guidance_required",
+      error: null,
+      candidateCount: 31,
+      sourceCount: 4,
+      unresolvedCount: 1,
+      frontier: [],
+      guidanceAction: {
+        kind: "rescue_guidance",
+        questionSetHash: "e".repeat(64),
+        baseContractRevisionId: contract.revisionId,
+        baseContractSemanticHash: contract.semanticHash,
+        questions: [{ ...question, privatePrompt: "do not expose" }],
+        attemptsUsed: 1,
+        maximumAttempts: 2,
+        showEditableInterpretationSummary: false,
+        privateProviderState: "do not expose",
+      },
+      resolution: resolution("answer_rescue_guidance", "needs_input"),
+    } as unknown as ResearchRunView & Record<string, unknown>;
+
+    const view = publicResearchRunView(internal, { id: "public-access-id" });
+    expect(view.guidanceAction).toMatchObject({
+      kind: "rescue_guidance",
+      questionSetHash: "e".repeat(64),
+      questions: [{
+        id: decision.id,
+        trigger: "yield_risk",
+      }],
+      attemptsUsed: 1,
+      maximumAttempts: 2,
+    });
+    expect(view.resolution).toMatchObject({
+      state: "needs_input",
+      nextAction: "answer_rescue_guidance",
+    });
+    expect(serializedKeys(view.guidanceAction)).not.toContain("privatePrompt");
+    expect(serializedKeys(view.guidanceAction)).not.toContain("privateProviderState");
+  });
+
+  test("preserves an actionable canonical capability decision without exposing blocker internals", () => {
+    expect(publicRunResolutionView({
+      ...resolution("review_contract"),
+      blocker: {
+        kind: "scope_decision",
+        nextRetryAt: null,
+        automaticRetryUntil: null,
+        retryCount: 0,
+      },
+    }, null)).toEqual({
+      state: "needs_decision",
+      nextAction: "review_contract",
+      terminal: false,
+      contractRevisionId: "contract-id",
+      contractRevision: 3,
+      contractHash: "c".repeat(64),
+      blocker: {
+        kind: "scope_decision",
+        nextRetryAt: null,
+        automaticRetryUntil: null,
+        retryCount: 0,
+      },
+    });
+  });
+
+  test("advertises the partial decision only when its hash-bound payload is usable", () => {
+    const partialAction: PartialPublicationActionView = {
+      kind: "partial_publication",
+      targetTrackCount: 50,
+      qualifiedTrackCount: 42,
+      remainingStrategyCount: 1,
+      canContinueResearch: true,
+      reasonCode: "frontier_exhausted_under_policy",
+      outcomeVersion: 2,
+      outcomeHash: "a".repeat(64),
+    };
+    expect(publicRunResolutionView(
+      resolution("resume_research", "blocked_dependency"),
+      partialAction,
+    )).toMatchObject({
+      state: "needs_decision",
+      nextAction: "decide_verified_partial",
+    });
+    expect(publicRunResolutionView(
+      resolution("decide_verified_partial"),
+      null,
+    )).toMatchObject({
+      state: "needs_decision",
+      nextAction: "review_contract",
+    });
+  });
+
   test("the capability run payload cannot expose accounting or owner policy fields", () => {
     const internal = {
       id: "canonical-run-id",
@@ -199,6 +383,40 @@ describe("public API projections", () => {
         capabilitySessionId: "private-session",
         costUsd: 0.75,
       },
+      decisionAction: {
+        schemaVersion: "genio-run-decision/v1",
+        decisionHash: "c".repeat(64),
+        contractRevisionId: "pcr1:revision",
+        contractSemanticHash: "d".repeat(64),
+        reason: "active_compute_limit",
+        targetTrackCount: 50,
+        verifiedTrackCount: 43,
+        remainingStrategyCount: 1,
+        consumedActiveComputeMs: 900_000,
+        activeComputeLimitMs: 900_000,
+        activeComputeExtensionsUsed: 0,
+        namedPredicates: [{ clauseId: "prompt:era", label: "1970s only", privateEvidence: "secret" }],
+        interpretationSummary: {
+          mustHave: ["Brazilian disco"],
+          prefer: [],
+          avoid: [],
+          flow: ["Smooth"],
+          count: 50,
+          rawPrompt: "private prompt",
+        },
+        actions: {
+          anotherBoundedPass: true,
+          reviseNamedPredicate: true,
+          reduceCount: true,
+          publishVerifiedPartial: true,
+          pause: true,
+          resumeLater: false,
+          cancel: true,
+          internalOverride: true,
+        },
+        reachedAt: "2026-07-23T12:00:00.000Z",
+        privateProviderState: "secret",
+      },
       explore: {
         eligible: false,
         listed: false,
@@ -232,12 +450,41 @@ describe("public API projections", () => {
       canChange: true,
       reason: "Owner approval is required below 90% fill",
     });
+    expect(view.decisionAction).toMatchObject({
+      kind: "research_boundary",
+      decisionHash: "c".repeat(64),
+      reason: "active_compute_limit",
+      verifiedTrackCount: 43,
+      namedPredicates: [{ clauseId: "prompt:era", label: "1970s only" }],
+      actions: {
+        anotherBoundedPass: true,
+        publishVerifiedPartial: true,
+      },
+    });
     const keys = serializedKeys(view);
     expect(keys).not.toContain("continuationJob");
     expect(keys).not.toContain("capabilitySessionId");
     expect(keys).not.toContain("ownerApproved");
     expect(keys).not.toContain("publicPlaylistId");
+    expect(keys).not.toContain("privateProviderState");
+    expect(keys).not.toContain("privateEvidence");
+    expect(keys).not.toContain("rawPrompt");
+    expect(keys).not.toContain("internalOverride");
     expect(keys.filter((key) => /cost|budget|estimate/iu.test(key))).toEqual([]);
+
+    const expanded = publicResearchRunView({
+      ...internal,
+      partialAction: {
+        ...(internal.partialAction as unknown as Record<string, unknown>),
+        targetTrackCount: 1_000,
+        qualifiedTrackCount: 999,
+      },
+      decisionAction: null,
+    } as unknown as ResearchRunView & Record<string, unknown>, { id: "owner-access-id" });
+    expect(expanded.partialAction).toMatchObject({
+      targetTrackCount: 1_000,
+      qualifiedTrackCount: 999,
+    });
   });
 
   test("invalid or stale-looking action payloads are omitted instead of repaired", () => {

@@ -5,6 +5,17 @@
  */
 export const PUBLIC_PLAYLIST_MINIMUM_TRACKS = 1;
 export const PUBLIC_PLAYLIST_MAXIMUM_TRACKS = 300;
+/**
+ * Authenticated owner/deep work may use the same immutable execution and
+ * publication machinery beyond the anonymous surface. This is an abuse
+ * boundary, not a provider payload size: provider and Apple operations remain
+ * split into their existing bounded batches.
+ */
+export const EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS = 1_000;
+/** Worst-case candidate inventory at the governed 0.25 conversion floor. */
+export const EXECUTABLE_PLAYLIST_MAXIMUM_CANDIDATES = 4_100;
+export const EXECUTABLE_PLAYLIST_MAXIMUM_RESERVE_TRACKS =
+  EXECUTABLE_PLAYLIST_MAXIMUM_CANDIDATES - EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS;
 export const PUBLIC_PLAYLIST_DEFAULT_TRACKS = 50;
 /** Used only for legacy/missing count requests; the current UI always sends a count. */
 export const PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS = 100;
@@ -40,6 +51,22 @@ export function curatedResearchBudgetUsd(requestedTrackCount: number): number {
   if (tracks <= 50) return 0.75;
   if (tracks <= 100) return 1.5;
   return 3;
+}
+
+/**
+ * Preserve every public tier exactly. Above the public boundary, authenticated
+ * owner/deep work scales at $0.01 per requested track and rounds upward to the
+ * next $0.25 so the immutable approval ceiling is never understated.
+ */
+export function executableCuratedResearchBudgetUsd(requestedTrackCount: number): number {
+  if (!Number.isFinite(requestedTrackCount)) return 0;
+  const tracks = Math.floor(requestedTrackCount);
+  if (tracks < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+    || tracks > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) return 0;
+  if (tracks <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS) {
+    return curatedResearchBudgetUsd(tracks);
+  }
+  return Math.ceil(tracks / 25) / 4;
 }
 
 /**

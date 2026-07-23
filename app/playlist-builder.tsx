@@ -10,7 +10,11 @@ import {
   fastRunWindowLabel,
   fastRunWindowPhrase,
 } from "../shared/fast-run-sla.ts";
-import type { RunProgressView } from "../shared/types.ts";
+import type {
+  RunDecisionActionView,
+  RunGuidanceActionView,
+  RunProgressView,
+} from "../shared/types.ts";
 import { BrandIntro } from "./brand-intro";
 import { type PrimaryNavItem } from "./primary-nav";
 import { PublicSiteHeader } from "./public-site-header";
@@ -25,6 +29,8 @@ import {
   partialReadyView,
   publishedTrackCountSummary,
   publishedResultHeading,
+  runResolutionControls,
+  shouldKeepPollingBlockedRun,
   shouldPresentShortfallWithoutError,
   shouldQuietlyClearInitialRunRestore,
   type PartialPublicationAction,
@@ -93,8 +99,24 @@ type ResearchRun = {
   } | null;
   actionRequired?: PartialPublicationAction | null;
   partialAction?: PartialPublicationAction | null;
+  decisionAction?: RunDecisionActionView | null;
+  guidanceAction?: RunGuidanceActionView | null;
   candidateStageCounts?: Partial<Record<string, number>>;
   progress?: RunProgressView;
+  resolution?: {
+    state: "accepted" | "needs_input" | "probing" | "executing" | "blocked_dependency" | "needs_decision" | "ready" | "publishing" | "completed" | "cancelled" | "quarantined";
+    nextAction: "none" | "answer_initial_guidance" | "answer_rescue_guidance" | "wait_for_dependency" | "resume_research" | "authorize_apple" | "decide_verified_partial" | "review_contract" | "contact_support";
+    terminal: boolean;
+    contractRevisionId: string | null;
+    contractRevision: number | null;
+    contractHash: string | null;
+    blocker: {
+      kind: string;
+      nextRetryAt: string | null;
+      automaticRetryUntil: string | null;
+      retryCount: number;
+    } | null;
+  };
   createdAt?: string;
   updatedAt?: string;
 };
@@ -208,7 +230,7 @@ type BriefResponse = {
   status?: string;
   pollAfterMs?: number;
   questions?: GuidedQuestion[];
-  briefContractVersion?: 1 | 2;
+  briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
   error?: string;
 };
@@ -233,7 +255,15 @@ type GuidedQuestion = {
   whyMaterial?: string;
   grounding?: GuidedQuestionGrounding;
   criticality?: "required" | "optional";
+  selectionMode?: "single" | "multiple";
   allowCustom?: boolean;
+  interpretationSummary?: {
+    mustHave: readonly string[];
+    prefer: readonly string[];
+    avoid: readonly string[];
+    flow: readonly string[];
+    count: number;
+  };
   options: GuidedQuestionOption[];
 };
 
@@ -248,6 +278,7 @@ function guidanceSourceLabel(value: string): string {
 type GuidedAnswer = {
   questionId: string;
   optionId?: string;
+  optionIds?: string[];
   customText?: string;
   skipped?: boolean;
 };
@@ -659,6 +690,27 @@ async function copyText(value: string): Promise<void> {
 }
 
 function phaseMessage(run: ResearchRun): string {
+  if (run.resolution?.state === "blocked_dependency") {
+    if (run.status === "waiting_for_apple_authorization"
+      || run.resolution.blocker?.kind === "apple_authorization") {
+      return "Your verified playlist is saved while Apple Music authorization is restored.";
+    }
+    const retryAt = run.resolution.blocker?.nextRetryAt;
+    return retryAt
+      ? `Research is safely paused for a dependency and will retry after ${new Date(retryAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
+      : "Research is safely paused for a dependency. Your progress remains saved.";
+  }
+  if (run.resolution?.state === "needs_input") {
+    return run.resolution.nextAction === "answer_rescue_guidance"
+      ? "A focused scope decision is needed to finish this playlist without weakening its quality."
+      : "Your answer is needed before research can continue.";
+  }
+  if (run.resolution?.state === "needs_decision") {
+    return "Research reached a safe boundary. Review the verified result and choose how to continue.";
+  }
+  if (run.resolution?.state === "quarantined") {
+    return "A technical integrity safeguard paused this job before anything unsafe could be published.";
+  }
   if (run.status === "awaiting_guidance") return "Your answer is needed before research can continue.";
   if (run.status === "partial_ready") return "Choose whether to continue researching or publish the verified tracks.";
   if (run.status === "awaiting_budget") return "Paused for owner budget approval.";
@@ -669,7 +721,7 @@ function phaseMessage(run: ResearchRun): string {
   if (["failed", "failed_system", "failed_integrity"].includes(run.status)) {
     return run.error || "Research stopped before a safe playlist could be prepared.";
   }
-  if (run.status === "no_compatible_tracks") return "Research finished without a compatible Apple Music recording.";
+  if (run.status === "no_compatible_tracks") return "Research reached the current evidence frontier and needs a scope decision.";
   if (run.status === "cancelled") return "This playlist job was cancelled.";
   const requestedTracks = run.brief.targetSize?.min ?? PUBLIC_PLAYLIST_DEFAULT_TRACKS;
   const windowPhrase = fastRunWindowPhrase(requestedTracks);
@@ -704,6 +756,7 @@ function useRunPolling(
   runStatus: string | null,
   autoPublish: boolean,
   actionRequired: boolean,
+  pollWhileBlocked: boolean,
   onRun: (run: ResearchRun) => void,
   onError: (message: string) => void,
 ) {
@@ -719,7 +772,7 @@ function useRunPolling(
       runStatus && (reviewStatuses.has(runStatus) || runStatus === "manifest_ready"),
     );
     if (actionRequired) return;
-    if (runStatus && !automaticHandoff
+    if (runStatus && !automaticHandoff && !pollWhileBlocked
       && (terminalStatuses.has(runStatus) || reviewStatuses.has(runStatus) || runStatus === "manifest_ready")) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -731,10 +784,11 @@ function useRunPolling(
         if (cancelled) return;
         onRunRef.current(next);
         const nextActionRequired = Boolean(partialReadyView(next));
+        const nextBlocked = shouldKeepPollingBlockedRun(next);
         const nextAutomaticHandoff = !nextActionRequired && next.autoPublish === true
           && (reviewStatuses.has(next.status) || next.status === "manifest_ready");
         if (nextActionRequired) return;
-        if (!nextAutomaticHandoff
+        if (!nextAutomaticHandoff && !nextBlocked
           && (terminalStatuses.has(next.status) || reviewStatuses.has(next.status) || next.status === "manifest_ready")) return;
         pollCount += 1;
         timer = setTimeout(poll, pollCount < 60 ? 2000 : 5000);
@@ -755,7 +809,7 @@ function useRunPolling(
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [runId, runStatus, autoPublish, actionRequired]);
+  }, [runId, runStatus, autoPublish, actionRequired, pollWhileBlocked]);
 }
 
 function AppHeader({
@@ -1068,6 +1122,7 @@ function GuidedQuestionScreen({
   onAnswer,
   onBack,
   onNext,
+  mode = "initial",
 }: {
   questions: GuidedQuestion[];
   currentIndex: number;
@@ -1077,6 +1132,7 @@ function GuidedQuestionScreen({
   onAnswer: (answer: GuidedAnswer) => void;
   onBack: () => void;
   onNext: () => void;
+  mode?: "initial" | "rescue";
 }) {
   const question = questions[currentIndex];
   const titleRef = useRef<HTMLHeadingElement>(null);
@@ -1097,8 +1153,13 @@ function GuidedQuestionScreen({
   const customText = currentAnswer?.customText ?? "";
   const orderedOptions = [...question.options]
     .sort((left, right) => Number(right.recommended) - Number(left.recommended))
-    .slice(0, 3);
-  const validAnswer = Boolean(currentAnswer?.optionId || customText.trim() || currentAnswer?.skipped);
+    .slice(0, 4);
+  const validAnswer = Boolean(
+    currentAnswer?.optionId
+    || currentAnswer?.optionIds?.length
+    || customText.trim()
+    || currentAnswer?.skipped,
+  );
   const lastQuestion = currentIndex === questions.length - 1;
   const groupName = "guidance-" + question.id;
   const progress = ((currentIndex + 1) / questions.length) * 100;
@@ -1121,7 +1182,9 @@ function GuidedQuestionScreen({
           <span style={{ width: progress + "%" }} />
         </div>
 
-        <p className="guided-question-kicker">{question.header || "REFINE THE PLAYLIST"}</p>
+        <p className="guided-question-kicker">
+          {mode === "rescue" ? "FOCUSED RESEARCH DECISION" : question.header || "REFINE THE PLAYLIST"}
+        </p>
         <h1
           id={"guidance-title-" + question.id}
           ref={titleRef}
@@ -1152,11 +1215,40 @@ function GuidedQuestionScreen({
             ))}
           </p>
         ) : null}
+        {question.interpretationSummary && (
+          <section
+            className="guided-interpretation-summary"
+            aria-labelledby={"guidance-summary-title-" + question.id}
+            data-testid="guided-interpretation-summary"
+          >
+            <h2 id={"guidance-summary-title-" + question.id}>REVISED INTERPRETATION</h2>
+            {([
+              ["MUST HAVE", question.interpretationSummary.mustHave],
+              ["PREFER", question.interpretationSummary.prefer],
+              ["AVOID", question.interpretationSummary.avoid],
+              ["FLOW", question.interpretationSummary.flow],
+            ] as const).map(([label, values]) => (
+              <div key={label}>
+                <strong>{label}</strong>
+                {values.length > 0
+                  ? <ul>{values.map((value) => <li key={value}>{value}</li>)}</ul>
+                  : <span>NO ADDITIONAL RULE</span>}
+              </div>
+            ))}
+            <div>
+              <strong>COUNT</strong>
+              <span>{question.interpretationSummary.count.toLocaleString()} TRACKS · EXACT</span>
+            </div>
+          </section>
+        )}
 
         <fieldset className="guided-options" disabled={busy || locked}>
           <legend className="sr-only">{question.question}</legend>
           {orderedOptions.map((option, index) => {
-            const selected = currentAnswer?.optionId === option.id;
+            const multiple = question.selectionMode === "multiple";
+            const selected = multiple
+              ? currentAnswer?.optionIds?.includes(option.id) === true
+              : currentAnswer?.optionId === option.id;
             const inputId = `${groupName}-option-${index}`;
             const descriptionId = option.description ? inputId + "-description" : undefined;
             return (
@@ -1168,11 +1260,23 @@ function GuidedQuestionScreen({
               >
                 <input
                   id={inputId}
-                  type="radio"
+                  type={multiple ? "checkbox" : "radio"}
                   name={groupName}
                   value={option.id}
                   checked={selected}
-                  onChange={() => onAnswer({ questionId: question.id, optionId: option.id })}
+                  onChange={() => {
+                    if (!multiple) {
+                      onAnswer({ questionId: question.id, optionId: option.id });
+                      return;
+                    }
+                    const selectedIds = new Set(currentAnswer?.optionIds ?? []);
+                    if (selectedIds.has(option.id)) selectedIds.delete(option.id);
+                    else selectedIds.add(option.id);
+                    onAnswer({
+                      questionId: question.id,
+                      optionIds: [...selectedIds],
+                    });
+                  }}
                   aria-describedby={descriptionId}
                 />
                 <span className="guided-radio" aria-hidden="true" />
@@ -1230,8 +1334,12 @@ function GuidedQuestionScreen({
               />
               <span className="guided-radio" aria-hidden="true" />
               <span className="guided-option-copy">
-                <strong>USE THE BALANCED DEFAULT</strong>
-                <span>Skip this optional preference without changing the playlist scope.</span>
+                <strong>{mode === "rescue" ? "KEEP CURRENT CONTRACT" : "USE THE BALANCED DEFAULT"}</strong>
+                <span>
+                  {mode === "rescue"
+                    ? "Skip this rescue revision without weakening or changing any rule."
+                    : "Skip this optional preference without changing the playlist scope."}
+                </span>
               </span>
             </label>
           )}
@@ -1240,7 +1348,11 @@ function GuidedQuestionScreen({
 
       <div className="guided-question-footer">
         <button className="guided-back" type="button" onClick={onBack} disabled={busy}>
-          ← {locked || currentIndex === 0 ? "EDIT REQUEST" : "BACK"}
+          ← {mode === "rescue"
+            ? "KEEP CURRENT CONTRACT"
+            : locked || currentIndex === 0
+              ? "EDIT REQUEST"
+              : "BACK"}
         </button>
         <button
           className="guided-next"
@@ -1249,11 +1361,11 @@ function GuidedQuestionScreen({
           disabled={busy || !validAnswer}
         >
           {busy
-            ? "FINALIZING..."
+            ? mode === "rescue" ? "APPLYING..." : "FINALIZING..."
             : locked
               ? "RETRY CREATE →"
               : lastQuestion
-                ? "CREATE PLAYLIST →"
+                ? mode === "rescue" ? "APPLY AND CONTINUE →" : "CREATE PLAYLIST →"
                 : "NEXT →"}
         </button>
       </div>
@@ -1279,8 +1391,33 @@ function FinalizingBriefScreen() {
   );
 }
 
-function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
-  const showReset = terminalStatuses.has(run.status);
+function preserveFeedbackSource(): void {
+  try {
+    window.sessionStorage.setItem("9enio.feedback.sourcePath", window.location.pathname);
+  } catch {
+    // The feedback page still accepts a report when storage is unavailable.
+  }
+}
+
+function RunScreen({
+  run,
+  busy,
+  onNew,
+  onRefine,
+  onCancel,
+}: {
+  run: ResearchRun;
+  busy: string;
+  onNew: () => void;
+  onRefine: () => void;
+  onCancel: () => void;
+}) {
+  const showReset = run.resolution ? run.resolution.terminal : terminalStatuses.has(run.status);
+  const controls = runResolutionControls(run);
+  const needsDecision = run.resolution?.state === "needs_decision"
+    || run.resolution?.state === "needs_input"
+    || run.resolution?.state === "quarantined";
+  const dependencyPaused = run.resolution?.state === "blocked_dependency";
   const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
   const automaticHandoff = isAutomaticPlaylistHandoff(run);
   const publishing = automaticHandoff
@@ -1298,7 +1435,15 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
     >
       <div className="flow-body research-body">
         <span className="tag profile-tag">[{profile} · {automaticHandoff ? "ASSEMBLING" : statusLabel(run.status).toUpperCase()}]</span>
-        <h1 id="run-title">{publishing ? "Creating your playlist" : "Researching your playlist"}</h1>
+        <h1 id="run-title">{
+          dependencyPaused
+            ? "Your playlist is safely paused"
+            : publishing
+            ? "Creating your playlist"
+            : needsDecision
+              ? "Your playlist needs a decision"
+              : "Researching your playlist"
+        }</h1>
         <p className="run-subject">{run.brief.title}</p>
         <WorkingIndicator
           stage={work.stage}
@@ -1324,11 +1469,107 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
           }}
           note={work.motion === "active" ? "Progress is saved in Jobs. You can leave this page." : undefined}
         />
+        {run.decisionAction && (
+          <div className="run-decision-panel" data-testid="run-decision-panel">
+            <span>SAFE RESEARCH BOUNDARY</span>
+            <p>
+              {run.decisionAction.reason === "dependency_retry_window_expired"
+                ? "The 24-hour automatic retry window ended. This is a service dependency state, not a claim that the music does not exist."
+                : run.decisionAction.reason === "central_quality_floor"
+                  ? "The count alone was not enough: the central suitability floor was missed, so nothing was published."
+                  : run.decisionAction.reason === "playlist_optimization_constraints"
+                    ? "Qualified tracks were found, but the playlist-level diversity, quota, or sequencing constraints could not all be satisfied. Nothing was published or silently relaxed."
+                  : "Automated research paused without changing your playlist contract."}
+            </p>
+            {run.decisionAction.namedPredicates[0] && (
+              <small>
+                NAMED BOTTLENECK · {run.decisionAction.namedPredicates[0].label}
+              </small>
+            )}
+            <small>
+              COUNT REMAINS EXACT · {run.decisionAction.targetTrackCount.toLocaleString()} TRACKS
+            </small>
+            <section
+              className="guided-interpretation-summary run-decision-interpretation"
+              aria-labelledby="run-boundary-interpretation-title"
+              data-testid="run-boundary-interpretation"
+            >
+              <h2 id="run-boundary-interpretation-title">EDITABLE INTERPRETATION</h2>
+              {([
+                ["MUST HAVE", run.decisionAction.interpretationSummary.mustHave],
+                ["PREFER", run.decisionAction.interpretationSummary.prefer],
+                ["AVOID", run.decisionAction.interpretationSummary.avoid],
+                ["FLOW", run.decisionAction.interpretationSummary.flow],
+              ] as const).map(([label, values]) => (
+                <div key={label}>
+                  <strong>{label}</strong>
+                  {values.length > 0
+                    ? <ul>{values.map((value) => <li key={value}>{value}</li>)}</ul>
+                    : <span>NO ADDITIONAL RULE</span>}
+                </div>
+              ))}
+              <div>
+                <strong>COUNT</strong>
+                <span>{run.decisionAction.targetTrackCount.toLocaleString()} TRACKS · EXACT</span>
+              </div>
+            </section>
+            {run.decisionAction.actions.resumeLater && (
+              <small>PROGRESS IS SAVED · YOU MAY RETURN FROM JOBS AT ANY TIME</small>
+            )}
+          </div>
+        )}
       </div>
 
-      {showReset && (
-        <div className="step-footer">
-          <button className="action-button step-primary" onClick={onNew}>NEW JOB →</button>
+      {(showReset || controls.length > 0) && (
+        <div className="step-footer run-action-footer">
+          {controls.includes("wait_for_retry") && (
+            <p className="run-action-status" role="status">
+              {run.resolution?.blocker?.nextRetryAt
+                ? `AUTOMATIC RETRY SCHEDULED · ${new Date(run.resolution.blocker.nextRetryAt).toLocaleString()}`
+                : run.status === "waiting_for_apple_authorization"
+                  ? "NO ACTION REQUIRED · PUBLICATION RESUMES AFTER THE OWNER RECONNECTS APPLE MUSIC"
+                  : "NO ACTION REQUIRED · PROGRESS IS SAVED FOR THE NEXT AUTOMATIC RETRY"}
+            </p>
+          )}
+          {controls.includes("contact_support") && (
+            <a
+              className="action-button step-primary"
+              href="/feedback"
+              onClick={preserveFeedbackSource}
+            >
+              CONTACT SUPPORT →
+            </a>
+          )}
+          {controls.includes("refine_request") && (
+            <button
+              className={controls.includes("contact_support") ? "quiet-button" : "action-button step-primary"}
+              type="button"
+              onClick={onRefine}
+              disabled={Boolean(busy)}
+            >
+              {run.decisionAction?.actions.reviseNamedPredicate
+                && run.decisionAction.namedPredicates[0]
+                ? `REVISE “${run.decisionAction.namedPredicates[0].label}” →`
+                : run.decisionAction?.actions.reduceCount
+                  ? "CREATE A SEPARATE COUNT REVISION →"
+                  : "REFINE REQUEST →"}
+            </button>
+          )}
+          {controls.includes("cancel_job") && (
+            <button
+              className="text-danger"
+              type="button"
+              onClick={onCancel}
+              disabled={Boolean(busy)}
+            >
+              {busy === "cancel-run" ? "CANCELING..." : "CANCEL JOB"}
+            </button>
+          )}
+          {showReset && controls.length === 0 && (
+            <button className="action-button step-primary" type="button" onClick={onNew}>
+              NEW JOB →
+            </button>
+          )}
         </div>
       )}
     </section>
@@ -1337,6 +1578,7 @@ function RunScreen({ run, onNew }: { run: ResearchRun; onNew: () => void }) {
 
 function PartialDecisionScreen({
   decision,
+  boundary,
   busy,
   onContinueResearch,
   onPublishPartial,
@@ -1344,6 +1586,7 @@ function PartialDecisionScreen({
   onCancel,
 }: {
   decision: PartialReadyView;
+  boundary?: RunDecisionActionView | null;
   busy: string;
   onContinueResearch: () => void;
   onPublishPartial: () => void;
@@ -1351,9 +1594,19 @@ function PartialDecisionScreen({
   onCancel: () => void;
 }) {
   const hasTracks = decision.qualifiedTrackCount > 0;
-  const reason = decision.reasonCode
-    ? statusLabel(decision.reasonCode).replace(/^partial /iu, "")
-    : "The remaining tracks did not clear the current evidence and Apple Music checks.";
+  const reason = boundary?.reason === "active_compute_limit"
+    ? "The active 15-minute research pass completed without changing your contract."
+    : boundary?.reason === "central_quality_floor"
+      ? "The requested count was not allowed through because the central quality floor was missed."
+      : boundary?.reason === "playlist_optimization_constraints"
+        ? "Qualified tracks were found, but the playlist-level diversity, quota, or sequencing constraints could not all be satisfied."
+      : decision.reasonCode
+        ? statusLabel(decision.reasonCode).replace(/^partial /iu, "")
+        : "The remaining tracks did not clear the current evidence and Apple Music checks.";
+  const canRunBoundedPass = decision.canContinueResearch
+    && (boundary ? boundary.actions.anotherBoundedPass : true);
+  const canPublishPartial = hasTracks
+    && (boundary ? boundary.actions.publishVerifiedPartial : true);
 
   return (
     <section
@@ -1386,29 +1639,56 @@ function PartialDecisionScreen({
         <div className="partial-decision-note">
           <span>WHY RESEARCH PAUSED</span>
           <p>{reason} No playlist has been published yet.</p>
-          {decision.canContinueResearch && (
+          {canRunBoundedPass && (
             <small>
-              {decision.remainingStrategyCount.toLocaleString()} additional research {decision.remainingStrategyCount === 1 ? "strategy is" : "strategies are"} available.
+              {decision.remainingStrategyCount.toLocaleString()} additional research {decision.remainingStrategyCount === 1 ? "strategy is" : "strategies are"} available in one more bounded pass.
             </small>
           )}
         </div>
 
+        {boundary?.interpretationSummary && (
+          <section
+            className="guided-interpretation-summary run-decision-interpretation"
+            aria-labelledby="run-decision-interpretation-title"
+            data-testid="run-decision-interpretation"
+          >
+            <h2 id="run-decision-interpretation-title">CURRENT INTERPRETATION</h2>
+            {([
+              ["MUST HAVE", boundary.interpretationSummary.mustHave],
+              ["PREFER", boundary.interpretationSummary.prefer],
+              ["AVOID", boundary.interpretationSummary.avoid],
+              ["FLOW", boundary.interpretationSummary.flow],
+            ] as const).map(([label, values]) => (
+              <div key={label}>
+                <strong>{label}</strong>
+                {values.length > 0
+                  ? <ul>{values.map((value) => <li key={value}>{value}</li>)}</ul>
+                  : <span>NO ADDITIONAL RULE</span>}
+              </div>
+            ))}
+            <div>
+              <strong>COUNT</strong>
+              <span>{boundary.interpretationSummary.count.toLocaleString()} TRACKS · EXACT</span>
+            </div>
+          </section>
+        )}
+
         <div className="partial-decision-actions">
-          {decision.canContinueResearch && (
+          {canRunBoundedPass && (
             <button
               className="action-button step-primary"
               type="button"
               onClick={onContinueResearch}
               disabled={Boolean(busy)}
             >
-              {busy === "continue-research" ? "CONTINUING RESEARCH..." : "CONTINUE RESEARCH →"}
+              {busy === "continue-research" ? "STARTING BOUNDED PASS..." : "RUN ONE MORE BOUNDED PASS →"}
             </button>
           )}
           <button
             className="quiet-button partial-publish-button"
             type="button"
             onClick={onPublishPartial}
-            disabled={!hasTracks || Boolean(busy)}
+            disabled={!canPublishPartial || Boolean(busy)}
           >
             {busy === "publish-partial"
               ? "PREPARING PLAYLIST..."
@@ -1416,9 +1696,21 @@ function PartialDecisionScreen({
                 ? `PUBLISH ${decision.qualifiedTrackCount.toLocaleString()} VERIFIED TRACKS`
                 : "NO VERIFIED TRACKS TO PUBLISH"}
           </button>
-          <button className="quiet-button" type="button" onClick={onChangeRequest} disabled={Boolean(busy)}>
-            {hasTracks ? "CHANGE REQUEST" : "RETRY WITH UPDATED INTERPRETATION"}
-          </button>
+          {boundary?.actions.reviseNamedPredicate && boundary.namedPredicates[0] && (
+            <button className="quiet-button" type="button" onClick={onChangeRequest} disabled={Boolean(busy)}>
+              REVISE “{boundary.namedPredicates[0].label}” →
+            </button>
+          )}
+          {boundary?.actions.reduceCount && (
+            <button className="quiet-button" type="button" onClick={onChangeRequest} disabled={Boolean(busy)}>
+              CREATE A SEPARATE COUNT REVISION →
+            </button>
+          )}
+          {!boundary && (
+            <button className="quiet-button" type="button" onClick={onChangeRequest} disabled={Boolean(busy)}>
+              {hasTracks ? "CHANGE REQUEST" : "RETRY WITH UPDATED INTERPRETATION"}
+            </button>
+          )}
           <button className="text-danger" type="button" onClick={onCancel} disabled={Boolean(busy)}>
             {busy === "cancel-run" ? "CANCELING..." : "CANCEL JOB"}
           </button>
@@ -1935,6 +2227,15 @@ export function PlaylistBuilder() {
   const [guidanceAnswers, setGuidanceAnswers] = useState<Record<string, GuidedAnswer>>({});
   const [guidanceIndex, setGuidanceIndex] = useState(0);
   const [guidanceSubmission, setGuidanceSubmission] = useState<GuidedAnswer[] | null>(null);
+  const [runGuidanceState, setRunGuidanceState] = useState<{
+    questionSetHash: string | null;
+    answers: Record<string, GuidedAnswer>;
+    currentIndex: number;
+  }>({
+    questionSetHash: null,
+    answers: {},
+    currentIndex: 0,
+  });
   const [briefFinalizing, setBriefFinalizing] = useState(false);
   const [run, setRun] = useState<ResearchRun | null>(null);
   const [trackSelection, setTrackSelection] = useState<TrackSelection | null>(null);
@@ -1950,6 +2251,10 @@ export function PlaylistBuilder() {
   const idempotencyKey = useRef<string | null>(null);
   const briefIdempotencyKey = useRef<string | null>(null);
   const guidanceIdempotencyKey = useRef<string | null>(null);
+  const runGuidanceIdempotencyKey = useRef<{
+    questionSetHash: string;
+    value: string;
+  } | null>(null);
   const submittedTrackCountRef = useRef<number | null>(null);
   const publishingRef = useRef(false);
   const matchingRetryAttempted = useRef<Set<string>>(new Set());
@@ -1958,6 +2263,13 @@ export function PlaylistBuilder() {
   const operationRequestRef = useRef<AbortController | null>(null);
   const restoreStartedRef = useRef(false);
   const settleIntro = useCallback(() => setIntroSettled(true), []);
+  const activeRunGuidanceHash = run?.guidanceAction?.questionSetHash ?? null;
+  const runGuidanceAnswers = runGuidanceState.questionSetHash === activeRunGuidanceHash
+    ? runGuidanceState.answers
+    : {};
+  const runGuidanceIndex = runGuidanceState.questionSetHash === activeRunGuidanceHash
+    ? runGuidanceState.currentIndex
+    : 0;
 
   const deleteAbandonedBrief = useCallback((requestId: string) => {
     void api<void>("/api/v1/brief/" + encodeURIComponent(requestId), {
@@ -1988,6 +2300,11 @@ export function PlaylistBuilder() {
     setGuidanceAnswers({});
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
+    setRunGuidanceState({
+      questionSetHash: null,
+      answers: {},
+      currentIndex: 0,
+    });
     setBriefFinalizing(false);
     setRun(null);
     activeRunId.current = null;
@@ -2000,6 +2317,7 @@ export function PlaylistBuilder() {
     idempotencyKey.current = null;
     briefIdempotencyKey.current = null;
     guidanceIdempotencyKey.current = null;
+    runGuidanceIdempotencyKey.current = null;
     submittedTrackCountRef.current = null;
     publishingRef.current = false;
     matchingRetryAttempted.current.clear();
@@ -2031,7 +2349,11 @@ export function PlaylistBuilder() {
     run?.id ?? null,
     run?.status ?? null,
     run?.autoPublish === true,
-    Boolean(partialReadyView(run)),
+    Boolean(partialReadyView(run))
+      || run?.resolution?.state === "needs_input"
+      || run?.resolution?.state === "needs_decision"
+      || run?.resolution?.state === "quarantined",
+    shouldKeepPollingBlockedRun(run),
     updateRun,
     setError,
   );
@@ -2460,7 +2782,10 @@ export function PlaylistBuilder() {
     const question = guidanceQuestions[guidanceIndex];
     if (!question || !briefRequestId) return;
     const answer = guidanceAnswers[question.id];
-    if (!answer?.optionId && !answer?.customText?.trim() && !answer?.skipped) return;
+    if (!answer?.optionId
+      && !answer?.optionIds?.length
+      && !answer?.customText?.trim()
+      && !answer?.skipped) return;
     if (guidanceIndex < guidanceQuestions.length - 1) {
       setGuidanceIndex((current) => Math.min(guidanceQuestions.length - 1, current + 1));
       return;
@@ -2497,6 +2822,16 @@ export function PlaylistBuilder() {
       if (controller.signal.aborted) return;
       if (response.status === "failed") {
         throw new BriefInterpretationError(response.error || "The playlist request could not be finalized.");
+      }
+      if (response.status === "awaiting_answers" && response.questions?.length) {
+        setGuidanceQuestions(response.questions);
+        setGuidanceQuestionSetHash(response.questionSetHash ?? null);
+        setGuidanceAnswers({});
+        setGuidanceIndex(0);
+        setGuidanceSubmission(null);
+        setBriefFinalizing(false);
+        guidanceIdempotencyKey.current = null;
+        return;
       }
 
       const finalized = await waitForBrief(
@@ -2655,6 +2990,102 @@ export function PlaylistBuilder() {
     }
   }
 
+  function answerRunGuidance(answer: GuidedAnswer) {
+    const questionSetHash = run?.guidanceAction?.questionSetHash;
+    if (!questionSetHash) return;
+    setRunGuidanceState((current) => ({
+      questionSetHash,
+      answers: {
+        ...(current.questionSetHash === questionSetHash ? current.answers : {}),
+        [answer.questionId]: answer,
+      },
+      currentIndex: current.questionSetHash === questionSetHash
+        ? current.currentIndex
+        : 0,
+    }));
+  }
+
+  async function continueRunGuidance(explicitAnswers?: GuidedAnswer[]) {
+    const action = run?.guidanceAction;
+    if (!run || !action || operationRequestRef.current) return;
+    const question = action.questions[runGuidanceIndex];
+    if (!question) return;
+    if (!explicitAnswers && runGuidanceIndex < action.questions.length - 1) {
+      setRunGuidanceState((current) => ({
+        questionSetHash: action.questionSetHash,
+        answers: current.questionSetHash === action.questionSetHash
+          ? current.answers
+          : {},
+        currentIndex: Math.min(
+          action.questions.length - 1,
+          current.questionSetHash === action.questionSetHash
+            ? current.currentIndex + 1
+            : 1,
+        ),
+      }));
+      return;
+    }
+    const answers = explicitAnswers
+      ?? action.questions.map((item) => runGuidanceAnswers[item.id]).filter(Boolean);
+    if (answers.length !== action.questions.length) return;
+    const runId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    if (runGuidanceIdempotencyKey.current?.questionSetHash !== action.questionSetHash) {
+      runGuidanceIdempotencyKey.current = {
+        questionSetHash: action.questionSetHash,
+        value: crypto.randomUUID(),
+      };
+    }
+    const guidanceRequestKey = runGuidanceIdempotencyKey.current.value;
+    setBusy("run-guidance");
+    setError("");
+    try {
+      const response = await api<ResearchRun | RunResponse>(
+        "/api/v1/runs/" + encodeURIComponent(runId) + "/guidance/answers",
+        {
+          method: "POST",
+          headers: {
+            "Idempotency-Key": guidanceRequestKey,
+          },
+          body: JSON.stringify({
+            questionSetHash: action.questionSetHash,
+            answers,
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted || activeRunId.current !== runId) return;
+      const next = unwrapRun(response);
+      activeRunId.current = next.id;
+      setRun(next);
+      setBrief(next.brief);
+      setPrompt(next.prompt);
+      setRunGuidanceState({
+        questionSetHash: null,
+        answers: {},
+        currentIndex: 0,
+      });
+      runGuidanceIdempotencyKey.current = null;
+      const query = new URLSearchParams();
+      query.set("run", next.id);
+      window.history.replaceState(
+        null,
+        "",
+        window.location.pathname + "?" + query.toString(),
+      );
+    } catch (caught) {
+      if (!isAbortError(caught) && activeRunId.current === runId) {
+        setError((caught as Error).message);
+      }
+    } finally {
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        setBusy("");
+      }
+    }
+  }
+
   async function continuePartialResearch() {
     if (!run || operationRequestRef.current) return;
     const decision = partialReadyView(run);
@@ -2670,7 +3101,12 @@ export function PlaylistBuilder() {
         {
           method: "POST",
           headers: { "Idempotency-Key": `continue-${runId}-${decision.outcomeVersion ?? "current"}` },
-          body: JSON.stringify({ outcomeVersion: decision.outcomeVersion }),
+          body: JSON.stringify({
+            outcomeVersion: decision.outcomeVersion,
+            ...(run.decisionAction?.decisionHash
+              ? { decisionHash: run.decisionAction.decisionHash }
+              : {}),
+          }),
           signal: controller.signal,
         },
       );
@@ -2961,9 +3397,45 @@ export function PlaylistBuilder() {
       )}
       <ErrorBar message={run && shouldPresentShortfallWithoutError(run) ? "" : error} onDismiss={() => setError("")} />
 
-      {run && partialDecision && !manifest && !result && (
+      {run && run.guidanceAction && !manifest && !result && (
+        <GuidedQuestionScreen
+          questions={run.guidanceAction.questions}
+          currentIndex={runGuidanceIndex}
+          answers={runGuidanceAnswers}
+          busy={Boolean(busy)}
+          locked={false}
+          mode="rescue"
+          onAnswer={answerRunGuidance}
+          onBack={() => {
+            if (runGuidanceIndex > 0) {
+              const questionSetHash = run.guidanceAction!.questionSetHash;
+              setRunGuidanceState((current) => ({
+                questionSetHash,
+                answers: current.questionSetHash === questionSetHash
+                  ? current.answers
+                  : {},
+                currentIndex: Math.max(
+                  0,
+                  current.questionSetHash === questionSetHash
+                    ? current.currentIndex - 1
+                    : 0,
+                ),
+              }));
+              return;
+            }
+            void continueRunGuidance(run.guidanceAction!.questions.map((question) => ({
+              questionId: question.id,
+              skipped: true,
+            })));
+          }}
+          onNext={() => void continueRunGuidance()}
+        />
+      )}
+
+      {run && !run.guidanceAction && partialDecision && !manifest && !result && (
         <PartialDecisionScreen
           decision={partialDecision}
+          boundary={run.decisionAction}
           busy={busy}
           onContinueResearch={() => void continuePartialResearch()}
           onPublishPartial={() => void publishPartialPlaylist()}
@@ -2972,7 +3444,7 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {run && !partialDecision && !run.autoPublish && reviewStatuses.has(run.status) && !manifest && (
+      {run && !run.guidanceAction && !partialDecision && !run.autoPublish && reviewStatuses.has(run.status) && !manifest && (
         <ReviewScreen
           selection={trackSelection}
           busy={busy}
@@ -2981,8 +3453,14 @@ export function PlaylistBuilder() {
         />
       )}
 
-      {run && !partialDecision && (run.autoPublish || !reviewStatuses.has(run.status)) && !manifest && !result && (
-        <RunScreen run={run} onNew={newJob} />
+      {run && !run.guidanceAction && !partialDecision && (run.autoPublish || !reviewStatuses.has(run.status)) && !manifest && !result && (
+        <RunScreen
+          run={run}
+          busy={busy}
+          onNew={newJob}
+          onRefine={retryWithUpdatedInterpretation}
+          onCancel={() => void cancelRun()}
+        />
       )}
 
       {manifest && !result && (

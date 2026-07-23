@@ -60,11 +60,14 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
   let adminPool: Pool;
   let pool: Pool;
   let repository: Repository;
+  let conversionSeedRunId: string;
 
   beforeAll(async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    vi.stubEnv("PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED", "true");
     vi.stubEnv("PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION", "2");
     vi.stubEnv("APPLE_STOREFRONT", "us");
     adminPool = new Pool({
@@ -150,6 +153,14 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
         executionPolicy: {
           kind: string;
           model: string;
+          candidateGoal: number;
+          p10QualifiedToAppleSafeConversionRate: number;
+          conversionRateSampleCount: number;
+          conversionRateSegment: {
+            storefront: string;
+            route: string;
+            sizeTier: string;
+          };
           modelRoute: {
             baselineProviderModelId: string;
             escalationProviderModelId: string;
@@ -176,6 +187,14 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
         executionPolicy: {
           kind: "corpus_first_v3",
           model: "gpt-5.6-luna",
+          candidateGoal: 315,
+          p10QualifiedToAppleSafeConversionRate: 0.5,
+          conversionRateSampleCount: 0,
+          conversionRateSegment: {
+            storefront: "us",
+            route: "corpus_first_v3",
+            sizeTier: "101_300",
+          },
           modelRoute: {
             baselineProviderModelId: "gpt-5.6-luna",
             escalationProviderModelId: "gpt-5.6-terra",
@@ -223,6 +242,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       "UPDATE run_specs SET requested_track_count=100 WHERE run_id=$1",
       [created.runId],
     )).rejects.toThrow(/immutable/u);
+    conversionSeedRunId = created.runId;
 
     const selection = (await pool.query<{
       id: string;
@@ -353,6 +373,62 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     });
   }, 30_000);
 
+  test("freezes the observed storefront/route/size p10 conversion into a successor run", async () => {
+    expect(conversionSeedRunId).toEqual(expect.any(String));
+    await pool.query(
+      `UPDATE research_runs
+       SET status='complete',phase='published',completed_at=now(),updated_at=now()
+       WHERE id=$1`,
+      [conversionSeedRunId],
+    );
+    await pool.query(
+      `INSERT INTO pipeline_outcomes(
+         id,run_id,status,target_track_count,discovered_track_count,
+         qualified_track_count,selected_track_count,published_track_count,
+         exact_count_satisfied,frontier_exhausted,provider_unavailable,
+         reason_codes_json,deficit_snapshot_json,outcome_json,
+         pipeline_version,policy_version,completed_at)
+       VALUES(
+         $1,$2,'complete',150,500,40,150,150,true,false,false,
+         '[]'::jsonb,'[]'::jsonb,
+         '{"stages":{"evidenceEligible":100,"storefrontPlayable":40}}'::jsonb,
+         'corpus_first_v3','corpus_first_v3_policy_v1',now()
+       )`,
+      [randomUUID(), conversionSeedRunId],
+    );
+
+    const clientBucket = `v3-conversion-observation-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Create a fresh 150-track playlist of source-qualified disco recordings",
+      brief: curatedBrief("Disco conversion reserve", 150),
+      estimateUsd: 0,
+      approvedBudgetUsd: 0,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      autoPublish: false,
+      reuseDays: 0,
+      globalLimit: 10,
+      forceFreshResearch: true,
+    });
+    const snapshot = (await pool.query<{
+      execution_policy: {
+        candidateGoal: number;
+        p10QualifiedToAppleSafeConversionRate: number;
+        conversionRateSampleCount: number;
+      };
+    }>(
+      `SELECT pipeline_policy_snapshot_json->'executionPolicy' execution_policy
+       FROM research_runs WHERE id=$1`,
+      [created.runId],
+    )).rows[0]!.execution_policy;
+    expect(snapshot).toMatchObject({
+      candidateGoal: 390,
+      p10QualifiedToAppleSafeConversionRate: 0.4,
+      conversionRateSampleCount: 1,
+    });
+  }, 30_000);
+
   test("keeps an active schema-1 plan authoritative after schema-2 emission activates", async () => {
     vi.stubEnv("PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION", "1");
     const rawPrompt = "Create 25 released disco recordings";
@@ -475,6 +551,19 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
       reuseDays: 0,
       globalLimit: 10,
       forceFreshResearch: true,
+    });
+    expect((await pool.query<{
+      pipeline_version: string;
+      status: string;
+      brief_contract_version: number;
+    }>(
+      `SELECT pipeline_version,status,brief_contract_version
+       FROM research_runs WHERE id=$1`,
+      [created.runId],
+    )).rows[0]).toEqual({
+      pipeline_version: "corpus_first_v3",
+      status: "queued",
+      brief_contract_version: 1,
     });
 
     const result = (await pool.query<{

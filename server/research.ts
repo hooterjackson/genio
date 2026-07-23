@@ -17,6 +17,7 @@ import type {
   SourceRecordInput,
   TrackCandidateInput,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   createOpenAIResponse,
   GUIDANCE_SCOUT_MAX_COST_USD,
@@ -115,6 +116,20 @@ import {
   guidanceQuestionSetHashV2,
   guidanceRequestClassificationV2,
 } from "./guidance-contract-v2.ts";
+import {
+  deterministicGuidanceCandidatesV3,
+  selectGuidanceRoundV3,
+} from "./adaptive-guidance-v3.ts";
+import { publicGuidanceQuestionV3 } from "./adaptive-guidance-contract-bridge.ts";
+import {
+  compilePlaylistContractShadowV1,
+  PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
+} from "./playlist-contract-shadow-bridge-v1.ts";
+import {
+  assertPlaylistContractIntegrityV1,
+  type PlaylistContractRevisionV1,
+} from "./playlist-contract-v1.ts";
+import { assessPlaylistFeasibilityV1 } from "./playlist-feasibility-v1.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -228,7 +243,7 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     answers?: PlaylistGuidanceAnswer[];
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
-    briefContractVersion?: 1 | 2;
+    briefContractVersion?: 1 | 2 | 3;
     questionSetHash?: string | null;
     guidancePreferences?: PlaylistGuidancePreference[];
   } | null>;
@@ -244,6 +259,53 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     error?: string | null;
   }): Promise<void>;
   saveBriefSelectionPlan?(briefRequestId: string, plan: SelectionPlan): Promise<void>;
+  getActivePlaylistContractRevision?(input: {
+    briefRequestId?: string | null;
+    runId?: string | null;
+  }): Promise<{
+    id: string;
+    contractHash: string;
+    contract: Record<string, unknown>;
+  } | null>;
+  preparePlaylistRunRescueGuidance?(input: {
+    runId: string;
+    contractRevisionId: string;
+    contractSemanticHash: string;
+    limitingClauseIds: readonly string[];
+    fence: PipelineV3WriteFence;
+  }): Promise<unknown | null>;
+  savePlaylistContractRevision?(input: {
+    briefRequestId: string;
+    expectedParentRevisionId: string | null;
+    contractHash: string;
+    contract: Record<string, unknown>;
+    compilerVersion: string;
+    ontologyVersion: string;
+    evidencePolicyVersion: string;
+    questionTemplateVersion: string;
+    catalogPolicyVersion: string;
+    locale: string;
+    storefront: string;
+    answerLineageHash: string;
+  }): Promise<{ id: string; contractHash: string; contract: Record<string, unknown> }>;
+  savePlaylistFeasibilitySnapshot?(input: {
+    contractRevisionId: string;
+    phase: "initial";
+    assessment:
+      | "contradictory"
+      | "known_ceiling"
+      | "likely"
+      | "at_risk"
+      | "unknown"
+      | "frontier_exhausted_under_policy";
+    targetCount: number;
+    observedQualifiedCount: number;
+    projectedLowerCount: number | null;
+    projectedUpperCount: number | null;
+    confidence: number | null;
+    reportHash: string;
+    report: Record<string, unknown>;
+  }): Promise<{ id: string; created: boolean }>;
   getRun(runId: string): Promise<ResearchRunRecord>;
   updateRun(runId: string, patch: {
     status?: string;
@@ -3166,7 +3228,11 @@ function requestedTrackCountForV3(
   brief: PlaylistBrief,
 ): number {
   const candidates = [requestedTrackCount, brief.targetSize?.max, brief.targetSize?.min];
-  const count = candidates.find((value) => Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 300);
+  const count = candidates.find((value) => (
+    Number.isInteger(value)
+    && Number(value) >= 1
+    && Number(value) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+  ));
   return count == null ? 50 : Number(count);
 }
 
@@ -3332,7 +3398,160 @@ export async function processBriefInterpretationJob(
       storefront: process.env.APPLE_STOREFRONT ?? "us",
     });
     const contractTwo = request.briefContractVersion === 2;
+    const contractThree = request.briefContractVersion === 3;
     const requestClassification = guidanceRequestClassificationV2(v3Spec);
+    const preliminarySelectionPlan = createSelectionPlanV2({
+      prompt: request.prompt,
+      brief: canonicalBrief,
+      guidancePreferences: request.guidancePreferences ?? [],
+      storefront: process.env.APPLE_STOREFRONT ?? "us",
+    });
+
+    if (contractThree) {
+      if (!repository.getActivePlaylistContractRevision
+        || !repository.savePlaylistContractRevision
+        || !repository.savePlaylistFeasibilitySnapshot) {
+        throw new Error("Contract-3 repository capabilities are unavailable");
+      }
+      const shadow = compilePlaylistContractShadowV1({
+        contractId: `brief:${briefRequestId}`,
+        prompt: request.prompt,
+        brief: canonicalBrief,
+        selectionPlan: preliminarySelectionPlan,
+        locale: "en",
+      });
+      let active = await repository.getActivePlaylistContractRevision({
+        briefRequestId,
+      });
+      if (!active) {
+        active = await repository.savePlaylistContractRevision({
+          briefRequestId,
+          expectedParentRevisionId: null,
+          contractHash: shadow.contract.semanticHash,
+          contract: structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+          compilerVersion: shadow.contract.versions.compiler,
+          ontologyVersion: shadow.contract.versions.ontology,
+          evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+          questionTemplateVersion: shadow.contract.versions.questionTemplates,
+          catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+          locale: shadow.contract.locale,
+          storefront: shadow.contract.storefront,
+          answerLineageHash: createHash("sha256")
+            .update(JSON.stringify(shadow.contract.answerLineage))
+            .digest("hex"),
+        });
+      }
+      const activeContract = active.contract as unknown as PlaylistContractRevisionV1;
+      assertPlaylistContractIntegrityV1(activeContract);
+      if (active.contractHash !== activeContract.semanticHash
+        || activeContract.semanticHash !== shadow.contract.semanticHash) {
+        throw new Error("Canonical contract shadow drifted before guidance");
+      }
+      const feasibility = assessPlaylistFeasibilityV1({
+        contractRevisionId: activeContract.revisionId,
+        contractSemanticHash: activeContract.semanticHash,
+        targetTrackCount: activeContract.requestedTrackCount,
+        scope: preliminarySelectionPlan.scopeKind === "fixed_release_container"
+          ? "closed_set"
+          : "open_world",
+        phase: "preview",
+        dependencyHealth: "healthy",
+        eligibleEstimateLower: null,
+        eligibleEstimateUpper: null,
+        closedSetCapacity: null,
+        discoveredCount: 0,
+        qualifiedCount: 0,
+        storefrontSafeCount: 0,
+        contradictions: [],
+        limitingPredicateIds: [],
+        frontiers: [],
+        activeResearchBudgetExhausted: false,
+        policyVersions: {
+          compiler: activeContract.versions.compiler,
+          ontology: activeContract.versions.ontology,
+          evidence: activeContract.versions.evidencePolicy,
+          bridge: PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
+        },
+      });
+      const feasibilitySnapshot = await repository.savePlaylistFeasibilitySnapshot({
+        contractRevisionId: active.id,
+        phase: "initial",
+        assessment: feasibility.state,
+        targetCount: feasibility.targetTrackCount,
+        observedQualifiedCount: 0,
+        projectedLowerCount: feasibility.eligibleEstimateLower,
+        projectedUpperCount: feasibility.eligibleEstimateUpper,
+        confidence: null,
+        reportHash: feasibility.reportHash,
+        report: structuredClone(feasibility) as unknown as Record<string, unknown>,
+      });
+      const candidates = deterministicGuidanceCandidatesV3({
+        prompt: request.prompt,
+        baseContractRevisionId: activeContract.revisionId,
+        baseContractSemanticHash: activeContract.semanticHash,
+        preservedTrackPredicate: shadow.preservedTrackPredicate,
+        ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+        baseContract: activeContract,
+      });
+      const round = selectGuidanceRoundV3({
+        stage: "initial",
+        requestShape: requestClassification === "precise"
+          ? "fully_explicit"
+          : preliminarySelectionPlan.scopeKind === "fixed_release_container"
+            ? "fixed_list"
+            : preliminarySelectionPlan.scopeKind === "factual_frontier"
+              ? "factual"
+              : "curated",
+        candidates,
+      });
+      const questions = round.decisions.map(publicGuidanceQuestionV3);
+      const generationMode = questions.length > 0
+        ? "deterministic_critical"
+        : "no_material_questions";
+      const guidanceTelemetry: PlaylistGuidanceTelemetry = {
+        generationMode,
+        requestClassification,
+        guidancePolicyVersion: "adaptive_guidance_v3",
+        questionSetHash: round.roundHash,
+        proposedQuestionCount: candidates.length,
+        acceptedQuestionCount: questions.length,
+        webSearchCalls: 0,
+        validationIssues: Object.entries(round.rejectedDecisionReasons)
+          .map(([id, reason]) => `${id}:${reason}`)
+          .slice(0, 12),
+      };
+      const guidanceContract: PlaylistGuidanceQuestionSetContract = {
+        questionSetHash: round.roundHash,
+        requestClassification,
+        generationMode,
+        guidancePolicyVersion: "adaptive_guidance_v3",
+        locale: activeContract.locale,
+        storefront: activeContract.storefront,
+        targetTrackCount: activeContract.requestedTrackCount,
+        explicitConstraintHash: v3Spec.explicitUserConstraintHash,
+        rejectedQuestionReasons: guidanceTelemetry.validationIssues,
+        baseContractRevisionId: activeContract.revisionId,
+        baseContractSemanticHash: activeContract.semanticHash,
+        guidanceRound: "initial",
+        trigger: round.decisions[0]?.trigger ?? "nuance",
+        axis: round.decisions[0]?.axis ?? null,
+        feasibilitySnapshotId: feasibilitySnapshot.id,
+      };
+      const status = questions.length > 0 ? "awaiting_answers" : "complete";
+      await repository.saveBriefSelectionPlan?.(briefRequestId, preliminarySelectionPlan);
+      await repository.saveBriefResult(briefRequestId, {
+        status,
+        expectedStatus: "queued",
+        brief: canonicalBrief,
+        questions,
+        guidanceSourceHints: [],
+        guidanceTelemetry,
+        guidanceContract,
+        ...(status === "complete" ? { estimateUsd: estimateResearchCost(canonicalBrief) } : {}),
+        error: null,
+      });
+      return;
+    }
 
     let scout: {
       questions: PlaylistGuidanceQuestion[];
@@ -3533,12 +3752,7 @@ export async function processBriefInterpretationJob(
       };
     }
     const status = questions.length > 0 ? "awaiting_answers" : "complete";
-    const selectionPlan = createSelectionPlanV2({
-      prompt: request.prompt,
-      brief: canonicalBrief,
-      guidancePreferences: request.guidancePreferences ?? [],
-      storefront: process.env.APPLE_STOREFRONT ?? "us",
-    });
+    const selectionPlan = preliminarySelectionPlan;
     await repository.saveBriefSelectionPlan?.(briefRequestId, selectionPlan);
     await repository.saveBriefResult(briefRequestId, {
       status,

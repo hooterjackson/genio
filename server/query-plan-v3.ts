@@ -7,21 +7,31 @@ import type {
   SelectionConstraint,
 } from "../shared/types.ts";
 import {
+  EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+} from "../shared/product-policy.ts";
+import {
   PIPELINE_V3_MAX_SOURCE_DISCOVERY_HINTS,
   selectionPlanV3Hash,
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
+import { assertCanonicalContractExecutionPolicyV1 } from "./canonical-contract-runtime-v1.ts";
+import {
+  PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
+} from "./playlist-contract-v1.ts";
 import {
   EVIDENCE_POLICY_VERSION,
   GUIDANCE_POLICY_VERSION,
 } from "./guidance-contract-v2.ts";
+import { canonicalContractActivationConfigured } from "./release-deployment-phase.ts";
 
 export const LEGACY_QUERY_PLAN_V3_VERSION = 1 as const;
 export const LEGACY_QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
 export const QUERY_PLAN_V3_VERSION = 2 as const;
 export const CONTRACT_QUERY_PLAN_V3_VERSION = 3 as const;
+export const CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 4 as const;
 // Schema 2 refines the query contract; it does not create a new persisted run
 // policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -29,11 +39,18 @@ export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const
 export type QueryPlanV3SchemaVersion =
   | typeof LEGACY_QUERY_PLAN_V3_VERSION
   | typeof QUERY_PLAN_V3_VERSION
-  | typeof CONTRACT_QUERY_PLAN_V3_VERSION;
+  | typeof CONTRACT_QUERY_PLAN_V3_VERSION
+  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
 
 export function queryPlanV3EmissionSchemaVersion(
   env: NodeJS.ProcessEnv = process.env,
 ): QueryPlanV3SchemaVersion {
+  if (
+    env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "4"
+    && canonicalContractActivationConfigured(env)
+  ) {
+    return CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+  }
   if (env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "3") return CONTRACT_QUERY_PLAN_V3_VERSION;
   if (env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "2") return QUERY_PLAN_V3_VERSION;
   return LEGACY_QUERY_PLAN_V3_VERSION;
@@ -139,7 +156,7 @@ function ownerCanaryAllows(
   );
   const configuredMaximum = Number(env.PIPELINE_V3_OWNER_CANARY_MAX_TRACKS ?? 50);
   const maximumTracks = Number.isSafeInteger(configuredMaximum)
-    ? Math.max(1, Math.min(300, configuredMaximum))
+    ? Math.max(1, Math.min(EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS, configuredMaximum))
     : 50;
   return groups.has(group) && plan.requestedTrackCount <= maximumTracks;
 }
@@ -312,11 +329,22 @@ export function createQueryPlanV3(
   graphSnapshotId: string,
   options: {
     readonly schemaVersion?: QueryPlanV3SchemaVersion;
-    readonly briefContractVersion?: 1 | 2;
+    readonly briefContractVersion?: 1 | 2 | 3;
     readonly executionDeltaHash?: string;
+    readonly playlistContractRevisionId?: string;
+    readonly playlistContractSemanticHash?: string;
+    readonly playlistContractCompilerVersion?: string;
   } = {},
 ): QueryPlanV3 {
   const requestedSchemaVersion = options.schemaVersion ?? QUERY_PLAN_V3_VERSION;
+  if (
+    plan.requestedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+    && requestedSchemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+  ) {
+    throw new Error(
+      "Expanded query plans require schema 4 and a fenced canonical contract revision",
+    );
+  }
   if (requestedSchemaVersion >= QUERY_PLAN_V3_VERSION
     && plan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION) {
     throw new Error("Typed query plans require the current governed music-concept policy");
@@ -326,6 +354,30 @@ export function createQueryPlanV3(
       || typeof options.executionDeltaHash !== "string"
       || !/^[0-9a-f]{64}$/u.test(options.executionDeltaHash))) {
     throw new Error("Schema-3 query plans require a contract-2 execution-delta hash");
+  }
+  if (requestedSchemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    && (options.briefContractVersion !== 3
+      || typeof options.playlistContractRevisionId !== "string"
+      || !options.playlistContractRevisionId.startsWith("pcr1:")
+      || typeof options.playlistContractSemanticHash !== "string"
+      || !/^[0-9a-f]{64}$/u.test(options.playlistContractSemanticHash)
+      || typeof options.playlistContractCompilerVersion !== "string"
+      || options.playlistContractCompilerVersion.length < 1)) {
+    throw new Error("Schema-4 query plans require a fenced canonical contract revision");
+  }
+  if (requestedSchemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION) {
+    if (!plan.canonicalContractPolicy) {
+      throw new Error("Schema-4 query plans require the canonical runtime selection policy");
+    }
+    assertCanonicalContractExecutionPolicyV1(plan.canonicalContractPolicy);
+    if (plan.canonicalContractPolicy.contractRevisionId !== options.playlistContractRevisionId
+      || plan.canonicalContractPolicy.contractSemanticHash !== options.playlistContractSemanticHash
+      || plan.canonicalContractPolicy.contractCompilerVersion
+        !== options.playlistContractCompilerVersion
+      || plan.canonicalContractPolicy.requestedTrackCount !== plan.requestedTrackCount
+      || plan.canonicalContractPolicy.storefront !== plan.storefront) {
+      throw new Error("Schema-4 canonical runtime policy does not match its contract fence");
+    }
   }
   if (!plan.confirmed || plan.criticalAmbiguities.some(({ key }) => !plan.resolvedAmbiguityKeys.includes(key))) {
     throw new Error("Critical playlist ambiguity must be resolved before a V3 query plan is created");
@@ -343,9 +395,11 @@ export function createQueryPlanV3(
       .map(({ axis, operator, values }) => ({ axis, operator, values: normalizedValues(values) }))
     )).digest("hex");
   const schemaTwo: QueryPlanV3 = {
-    schemaVersion: requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION
-      ? CONTRACT_QUERY_PLAN_V3_VERSION
-      : QUERY_PLAN_V3_VERSION,
+    schemaVersion: requestedSchemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      ? CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      : requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION
+        ? CONTRACT_QUERY_PLAN_V3_VERSION
+        : QUERY_PLAN_V3_VERSION,
     pipelineVersion: "corpus_first_v3",
     policyVersion: QUERY_PLAN_V3_POLICY_VERSION,
     engine: engines[0]!,
@@ -411,6 +465,29 @@ export function createQueryPlanV3(
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
       executionDeltaHash: options.executionDeltaHash,
     } : {}),
+    ...(requestedSchemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION ? {
+      briefContractVersion: 3 as const,
+      guidancePolicyVersion: "adaptive_guidance_v3",
+      evidencePolicyVersion: PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
+      playlistContractRevisionId: options.playlistContractRevisionId,
+      playlistContractSemanticHash: options.playlistContractSemanticHash,
+      playlistContractCompilerVersion: options.playlistContractCompilerVersion,
+      playlistQuotaRules: (plan.playlistQuotaRules ?? []).map((rule) => ({
+        ...rule,
+        values: [...rule.values],
+        ...(rule.predicate ? { predicate: structuredClone(rule.predicate) } : {}),
+      })),
+      ...(plan.playlistQualityPolicy ? {
+        playlistQualityPolicy: {
+          ...plan.playlistQualityPolicy,
+          clauseIds: [...plan.playlistQualityPolicy.clauseIds],
+          criteria: [...plan.playlistQualityPolicy.criteria],
+        },
+      } : {}),
+      ...(plan.canonicalContractPolicy ? {
+        canonicalContractPolicy: structuredClone(plan.canonicalContractPolicy),
+      } : {}),
+    } : {}),
   };
   if ((options.schemaVersion ?? QUERY_PLAN_V3_VERSION) !== LEGACY_QUERY_PLAN_V3_VERSION) {
     return Object.freeze(schemaTwo);
@@ -446,7 +523,13 @@ export function createRuntimeQueryPlanV3(
   plan: SelectionPlanV3,
   graphSnapshotId: string,
   env: NodeJS.ProcessEnv = process.env,
-  contract: { readonly briefContractVersion?: 1 | 2; readonly executionDeltaHash?: string } = {},
+  contract: {
+    readonly briefContractVersion?: 1 | 2 | 3;
+    readonly executionDeltaHash?: string;
+    readonly playlistContractRevisionId?: string;
+    readonly playlistContractSemanticHash?: string;
+    readonly playlistContractCompilerVersion?: string;
+  } = {},
 ): QueryPlanV3 {
   return createQueryPlanV3(plan, graphSnapshotId, {
     schemaVersion: queryPlanV3EmissionSchemaVersion(env),
@@ -517,6 +600,98 @@ function sameClause(left: QueryPlanV3SemanticClause, right: QueryPlanV3SemanticC
   return stableStringify(left) === stableStringify(right);
 }
 
+function isCanonicalPlaylistQuotaRule(
+  value: unknown,
+): value is NonNullable<QueryPlanV3["playlistQuotaRules"]>[number] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const rule = value as Partial<NonNullable<QueryPlanV3["playlistQuotaRules"]>[number]>;
+  const count = (candidate: unknown) => candidate === null
+    || (Number.isSafeInteger(candidate) && Number(candidate) >= 0 && Number(candidate) <= 10_000);
+  const ratio = (candidate: unknown) => candidate === null
+    || (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 && candidate <= 1);
+  return typeof rule.id === "string" && /^[A-Za-z0-9._:-]{1,160}$/u.test(rule.id)
+    && typeof rule.clauseId === "string" && /^[A-Za-z0-9._:-]{1,160}$/u.test(rule.clauseId)
+    && rule.axis === "genre"
+    && Array.isArray(rule.values)
+    && rule.values.length > 0
+    && rule.values.length <= 20
+    && rule.values.every((item) => typeof item === "string" && item.trim().length > 0 && item.length <= 240)
+    && count(rule.minimumCount)
+    && count(rule.maximumCount)
+    && ratio(rule.minimumRatio)
+    && ratio(rule.maximumRatio)
+    && (rule.minimumCount !== null
+      || rule.maximumCount !== null
+      || rule.minimumRatio !== null
+      || rule.maximumRatio !== null)
+    && [
+      "authoritative_structured_metadata",
+      "trusted_scoped_container",
+      "track_specific_editorial_assertion",
+      "primary_source",
+      "independent_secondary_source",
+    ].includes(String(rule.evidenceGrade))
+    && (rule.predicate === undefined
+      || (rule.predicate !== null && typeof rule.predicate === "object"));
+}
+
+function isCanonicalPlaylistQualityPolicy(
+  value: unknown,
+): value is NonNullable<QueryPlanV3["playlistQualityPolicy"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Partial<NonNullable<QueryPlanV3["playlistQualityPolicy"]>>;
+  const ratio = (candidate: unknown) => (
+    typeof candidate === "number"
+    && Number.isFinite(candidate)
+    && candidate >= 0
+    && candidate <= 1
+  );
+  return policy.policyVersion === "canonical_central_quality_v1"
+    && Array.isArray(policy.clauseIds)
+    && policy.clauseIds.length > 0
+    && policy.clauseIds.length <= 40
+    && policy.clauseIds.every((id) => (
+      typeof id === "string" && /^[A-Za-z0-9._:-]{1,160}$/u.test(id)
+    ))
+    && Array.isArray(policy.criteria)
+    && policy.criteria.length > 0
+    && policy.criteria.length <= 40
+    && policy.criteria.every((criterion) => (
+      typeof criterion === "string" && criterion.trim().length > 0 && criterion.length <= 240
+    ))
+    && ratio(policy.minimumPassRatio)
+    && ratio(policy.maximumUnknownRatio)
+    && policy.zeroKnownFailures === true
+    && policy.signalDimension === "central_quality"
+    && ratio(policy.passThreshold)
+    && ratio(policy.failThreshold)
+    && Number(policy.failThreshold) < Number(policy.passThreshold)
+    && policy.signalSemantics === "ranking_only_not_factual_evidence";
+}
+
+function isCanonicalContractRuntimePolicy(
+  value: unknown,
+  row: Partial<Pick<QueryPlanV3, "playlistContractRevisionId" | "playlistContractSemanticHash" | "targetTrackCount" | "storefront">>,
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  try {
+    assertCanonicalContractExecutionPolicyV1(
+      value as NonNullable<QueryPlanV3["canonicalContractPolicy"]>,
+    );
+  } catch {
+    return false;
+  }
+  const policy = value as NonNullable<QueryPlanV3["canonicalContractPolicy"]>;
+  return typeof row.playlistContractRevisionId === "string"
+    && typeof row.playlistContractSemanticHash === "string"
+    && typeof row.targetTrackCount === "number"
+    && typeof row.storefront === "string"
+    && policy.contractRevisionId === row.playlistContractRevisionId
+    && policy.contractSemanticHash === row.playlistContractSemanticHash
+    && policy.requestedTrackCount === row.targetTrackCount
+    && policy.storefront === row.storefront;
+}
+
 function membershipOperatorPolarity(operator: string): "positive" | "exclude" | null {
   if (operator === "include" || operator === "require") return "positive";
   if (operator === "exclude") return "exclude";
@@ -580,7 +755,9 @@ function semanticRoleProjectionMatches(
 }
 
 function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
-  if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION)
+  if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION
+      && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION
+      && row.schemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION)
     || row.policyVersion !== QUERY_PLAN_V3_POLICY_VERSION
     || row.semanticPolicyVersion !== "scope_gate_v2_1_2"
     || row.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
@@ -640,6 +817,23 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
     || row.evidencePolicyVersion !== EVIDENCE_POLICY_VERSION
     || typeof row.executionDeltaHash !== "string"
     || !/^[a-f0-9]{64}$/u.test(row.executionDeltaHash)
+  )) return false;
+  if (row.schemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION && (
+    row.briefContractVersion !== 3
+    || row.guidancePolicyVersion !== "adaptive_guidance_v3"
+    || row.evidencePolicyVersion !== PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION
+    || typeof row.playlistContractRevisionId !== "string"
+    || !row.playlistContractRevisionId.startsWith("pcr1:")
+    || typeof row.playlistContractSemanticHash !== "string"
+    || !/^[a-f0-9]{64}$/u.test(row.playlistContractSemanticHash)
+    || typeof row.playlistContractCompilerVersion !== "string"
+    || row.playlistContractCompilerVersion.length < 1
+    || !Array.isArray(row.playlistQuotaRules)
+    || row.playlistQuotaRules.length > 20
+    || !row.playlistQuotaRules.every(isCanonicalPlaylistQuotaRule)
+    || (row.playlistQualityPolicy !== undefined
+      && !isCanonicalPlaylistQualityPolicy(row.playlistQualityPolicy))
+    || !isCanonicalContractRuntimePolicy(row.canonicalContractPolicy, row)
   )) return false;
   return true;
 }
@@ -705,7 +899,11 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
     && /^[a-z]{2}$/u.test(row.storefront)
     && Number.isInteger(row.targetTrackCount)
     && Number(row.targetTrackCount) >= 1
-    && Number(row.targetTrackCount) <= 300
+    && Number(row.targetTrackCount) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+    && (
+      Number(row.targetTrackCount) <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+      || row.schemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    )
     && Array.isArray(row.engines)
     && row.engines.length > 0
     && row.engine === row.engines[0]

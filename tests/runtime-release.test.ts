@@ -4,6 +4,8 @@ import { runtimeReleaseContract } from "../server/runtime-release.ts";
 describe("public V3 runtime release contract", () => {
   test("reports explicit rollout and versioned protocol metadata without secrets", () => {
     const result = runtimeReleaseContract({
+      RELEASE_DEPLOYMENT_PHASE: "expand",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
@@ -20,6 +22,9 @@ describe("public V3 runtime release contract", () => {
 
     expect(result).toMatchObject({
       pipelineVersion: "corpus_first_v3",
+      deploymentPhase: "expand",
+      expectedDatabaseSchemaVersion: "18",
+      canonicalActivationConfigured: false,
       assignmentEnabled: true,
       ownerCanaryEnabled: true,
       productionEvidenceApproved: true,
@@ -27,11 +32,11 @@ describe("public V3 runtime release contract", () => {
       genreSceneEvidenceApproved: false,
       geographicScopeEvidenceApproved: false,
       factualFeasibilityApproved: false,
-      schemaVersion: "16",
+      schemaVersion: "18",
       schemaMinimum: "13",
-      schemaMaximum: "16",
-      schemaPreferred: "16",
-      workerProtocol: "playlist-pipeline-v9",
+      schemaMaximum: "18",
+      schemaPreferred: "18",
+      workerProtocol: "playlist-pipeline-v10",
       minimumWorkerProtocol: "playlist-pipeline-v8",
       queryPlanSchemaVersion: "3",
       briefContractVersion: "2",
@@ -49,6 +54,44 @@ describe("public V3 runtime release contract", () => {
     expect(JSON.stringify(result)).not.toContain("sk-proj");
   });
 
+  test("reports canonical contract-3 and query-plan-4 activation", () => {
+    const result = runtimeReleaseContract({
+      RELEASE_DEPLOYMENT_PHASE: "activate",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GUIDANCE_CONTRACT_V3_ENABLED: "true",
+      GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+    });
+    expect(result).toMatchObject({
+      deploymentPhase: "activate",
+      expectedDatabaseSchemaVersion: "18",
+      canonicalActivationConfigured: true,
+      queryPlanSchemaVersion: "4",
+      briefContractVersion: "3",
+      guidanceContractOwnerCanaryEnabled: true,
+      guidancePolicyVersion: "adaptive_guidance_v3",
+      evidencePolicyVersion: "governed_evidence_v2",
+    });
+  });
+
+  test("reports contract 3 when only a canonical owner or intent cohort is active", () => {
+    const result = runtimeReleaseContract({
+      RELEASE_DEPLOYMENT_PHASE: "activate",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GUIDANCE_CONTRACT_V2_ENABLED: "true",
+      GUIDANCE_CONTRACT_V3_ENABLED: "false",
+      GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+    });
+    expect(result).toMatchObject({
+      canonicalActivationConfigured: true,
+      queryPlanSchemaVersion: "4",
+      briefContractVersion: "3",
+      guidanceContractReggaetonCanaryEnabled: true,
+      guidancePolicyVersion: "adaptive_guidance_v3",
+    });
+  });
+
   test("fails visibly closed to disabled rollout and validated provider defaults", () => {
     const result = runtimeReleaseContract({
       PIPELINE_V3_ASSIGNMENT_ENABLED: "false",
@@ -56,6 +99,9 @@ describe("public V3 runtime release contract", () => {
       PIPELINE_V3_MODEL_CATALOG_VALIDATED_AT: "invalid",
     });
     expect(result.assignmentEnabled).toBe(false);
+    expect(result.deploymentPhase).toBe("unconfigured");
+    expect(result.expectedDatabaseSchemaVersion).toBeNull();
+    expect(result.canonicalActivationConfigured).toBe(false);
     expect(result.ownerCanaryEnabled).toBe(false);
     expect(result.productionEvidenceApproved).toBe(false);
     expect(result.curatedHostedEvidenceApproved).toBe(false);
@@ -72,5 +118,26 @@ describe("public V3 runtime release contract", () => {
     expect(result.baselineProviderModelId).toBe("gpt-5.6-luna");
     expect(result.modelResolutionMode).toBe("provider_managed_alias");
     expect(result.modelCatalogValidatedAt).toBe("2026-07-20T00:00:00.000Z");
+  });
+
+  test("keeps preserved canonical cohort settings inert during bridge and expand", () => {
+    for (const deploymentPhase of ["bridge", "expand"] as const) {
+      const result = runtimeReleaseContract({
+        RELEASE_DEPLOYMENT_PHASE: deploymentPhase,
+        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+        GUIDANCE_CONTRACT_V3_ENABLED: "true",
+        GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
+        GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
+        PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+      });
+      expect(result).toMatchObject({
+        deploymentPhase,
+        canonicalActivationConfigured: false,
+        briefContractVersion: "1",
+        queryPlanSchemaVersion: "1",
+        guidanceContractOwnerCanaryEnabled: false,
+        guidanceContractReggaetonCanaryEnabled: false,
+      });
+    }
   });
 });

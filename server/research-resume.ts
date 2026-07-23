@@ -38,6 +38,12 @@ export function pipelineV3ResearchJob(
     minimumWorkerProtocol: minimumWorkerProtocolForQueryPlan(queryPlan),
     stageKey,
     queueClass,
+    // The provider adapter owns the three immediate attempts inside each
+    // execution. The durable queue needs room for the initial execution, five
+    // circuit slots, and one horizon wake-up that creates an explicit decision
+    // (plus bounded lease-recovery headroom); it must not add a second 1/2/4s
+    // retry ladder around the whole job.
+    maxAttempts: 10,
   };
 }
 
@@ -71,5 +77,6 @@ export function researchResumeJob(
       } : {}),
     },
     dedupeKey: `research:${runId}:${checkpoint}:g${generation}`,
+    maxAttempts: 6,
   };
 }

@@ -149,7 +149,7 @@ describe("research execution policy", () => {
       });
   });
 
-  test("keeps 300-track curated requests bounded and routes only larger work to deep research", () => {
+  test("keeps 300-track public work bounded and scales explicitly admitted larger curated work", () => {
     const exact300 = { ...brief("curated", 300), targetSize: { min: 300, max: 300 } };
 
     expect(researchExecutionPolicy(exact300, {})).toMatchObject({
@@ -161,10 +161,13 @@ describe("research execution policy", () => {
       runDeadlineMs: 360_000,
       matchingReserveMs: 90_000,
     });
-    expect(researchExecutionPolicy({ ...exact300, targetSize: { min: 301, max: 301 } }, {})).toEqual({
-      kind: "deep",
-      version: "deep_v1",
-      model: "gpt-5.6-terra",
+    expect(researchExecutionPolicy({ ...exact300, targetSize: { min: 301, max: 301 } }, {})).toMatchObject({
+      kind: "fast_curated",
+      version: "fast_curated_v3",
+      targetMinimum: 301,
+      targetMaximum: 301,
+      runDeadlineMs: 900_000,
+      matchingReserveMs: 180_000,
     });
   });
 

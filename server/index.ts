@@ -15,13 +15,14 @@ import type { PlaylistBrief } from "../shared/types.ts";
 import {
   PUBLIC_FAST_RESEARCH_BUDGET_USD,
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
-  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
   publicRunBudgetUsd,
 } from "../shared/product-policy.ts";
+import { playlistTrackCountAdmission } from "./playlist-count-policy.ts";
 import {
   canonicalBriefForRequest,
   estimateResearchCost,
+  explicitTrackCount,
   isPlaylistBrief,
   materialAmbiguitiesAccepted,
 } from "./brief-policy.ts";
@@ -74,6 +75,13 @@ import {
   parseSourcePolicyApprovalV3,
 } from "./evidence-graph-owner-api-v3.ts";
 import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
+import { isSmoothReggaetonHeatRequestV3 } from "./adaptive-guidance-v3.ts";
+import { readReleaseCanaryInventory } from "./release-canary-inventory.ts";
+import { authenticateReleaseCanary } from "./release-canary-request.ts";
+import {
+  canonicalContractActivationConfigured,
+  canonicalContractActivationReady,
+} from "./release-deployment-phase.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -102,6 +110,7 @@ const app = Fastify({
         "body.message",
         "body.image",
         "body.image.dataBase64",
+        "body.releaseCanary.signature",
         "res.headers.set-cookie",
       ],
       censor: "[REDACTED]",
@@ -197,6 +206,12 @@ interface WorkerLaneHealthView {
   protocolCompatible?: boolean;
   protocolVersion?: string | number | null;
   compatibleCapacity?: number;
+  executorRevision?: string | null;
+  configurationHash?: string | null;
+  eligibleWorkerCount?: number;
+  eligibleRevisions?: string[];
+  eligibleConfigurationHashes?: string[];
+  lastSeenAt?: string | null;
 }
 
 interface WorkerLaneSystemHealthView {
@@ -318,6 +333,7 @@ app.get("/health/system", async (_request, reply) => {
       ok,
       activationReady,
       database: schemaCompatible ? "ready" : "schema_mismatch",
+      schemaVersion,
       worker: health.worker.worker_id
         ? health.worker.stale
           ? "stale"
@@ -337,11 +353,19 @@ app.get("/health/system", async (_request, reply) => {
           status: workerLaneStatus(health, "interactive"),
           protocolVersion: health.workerLanes.interactive.protocolVersion ?? null,
           compatibleCapacity: health.workerLanes.interactive.compatibleCapacity,
+          eligibleWorkerCount: health.workerLanes.interactive.eligibleWorkerCount ?? 0,
+          eligibleRevisions: health.workerLanes.interactive.eligibleRevisions ?? [],
+          eligibleConfigurationHashes: health.workerLanes.interactive.eligibleConfigurationHashes ?? [],
+          lastSeenAt: health.workerLanes.interactive.lastSeenAt ?? null,
         },
         deep: {
           status: workerLaneStatus(health, "deep"),
           protocolVersion: health.workerLanes.deep.protocolVersion ?? null,
           compatibleCapacity: health.workerLanes.deep.compatibleCapacity,
+          eligibleWorkerCount: health.workerLanes.deep.eligibleWorkerCount ?? 0,
+          eligibleRevisions: health.workerLanes.deep.eligibleRevisions ?? [],
+          eligibleConfigurationHashes: health.workerLanes.deep.eligibleConfigurationHashes ?? [],
+          lastSeenAt: health.workerLanes.deep.lastSeenAt ?? null,
         },
       },
       paused: health.paused.research || health.paused.publishing,
@@ -380,11 +404,19 @@ app.get("/api/v1/system/health", async () => {
         status: workerLaneStatus(health, "interactive"),
         protocolVersion: health.workerLanes.interactive.protocolVersion ?? null,
         compatibleCapacity: health.workerLanes.interactive.compatibleCapacity,
+        eligibleWorkerCount: health.workerLanes.interactive.eligibleWorkerCount ?? 0,
+        eligibleRevisions: health.workerLanes.interactive.eligibleRevisions ?? [],
+        eligibleConfigurationHashes: health.workerLanes.interactive.eligibleConfigurationHashes ?? [],
+        lastSeenAt: health.workerLanes.interactive.lastSeenAt ?? null,
       },
       deep: {
         status: workerLaneStatus(health, "deep"),
         protocolVersion: health.workerLanes.deep.protocolVersion ?? null,
         compatibleCapacity: health.workerLanes.deep.compatibleCapacity,
+        eligibleWorkerCount: health.workerLanes.deep.eligibleWorkerCount ?? 0,
+        eligibleRevisions: health.workerLanes.deep.eligibleRevisions ?? [],
+        eligibleConfigurationHashes: health.workerLanes.deep.eligibleConfigurationHashes ?? [],
+        lastSeenAt: health.workerLanes.deep.lastSeenAt ?? null,
       },
     },
     paused: health.paused,
@@ -416,7 +448,18 @@ app.post<{ Body: unknown }>("/api/v1/feedback", { bodyLimit: FEEDBACK_BODY_BYTES
   return reply.code(result.created ? 201 : 200).send({ received: true, id: result.id });
 });
 
-app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: string } }>("/api/v1/brief", async (request, reply) => {
+app.post<{
+  Body: {
+    prompt?: string;
+    targetTrackCount?: number;
+    idempotencyKey?: string;
+    releaseCanary?: unknown;
+  };
+}>("/api/v1/brief", async (request, reply) => {
+  const releaseCanary = authenticateReleaseCanary(
+    request.body?.releaseCanary,
+    "brief",
+  );
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const caller = identity(request);
@@ -424,23 +467,66 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
   // Anonymous work is always an exact bounded One Command request. An owner
   // may intentionally omit the control to enter the explicit deep path.
   const targetTrackCount = request.body?.targetTrackCount
-    ?? (isOwner(caller) ? undefined : PUBLIC_PLAYLIST_DEFAULT_TRACKS);
-  if (targetTrackCount !== undefined && (
-    !Number.isInteger(targetTrackCount)
-    || targetTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
-    || targetTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
-  )) {
+    ?? (isOwner(caller)
+      ? explicitTrackCount(prompt) ?? undefined
+      : PUBLIC_PLAYLIST_DEFAULT_TRACKS);
+  const preliminaryTrackCountAdmission = playlistTrackCountAdmission({
+    requestedTrackCount: targetTrackCount,
+    owner: isOwner(caller),
+    canonicalActivationReady: false,
+  });
+  if (preliminaryTrackCountAdmission.status === "invalid") {
     throw new HttpError(
       400,
-      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`,
+      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${preliminaryTrackCountAdmission.maximumTrackCount}`,
       "invalid_track_count",
     );
   }
+  const expandedTrackCountRequested = preliminaryTrackCountAdmission.expanded;
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
-  const briefContractVersion = process.env.GUIDANCE_CONTRACT_V2_ENABLED === "true"
-    || (process.env.GUIDANCE_CONTRACT_V2_OWNER_CANARY === "true" && isOwner(caller))
-    ? 2
-    : 1;
+  const canonicalContractCohortRequested = expandedTrackCountRequested
+    || process.env.GUIDANCE_CONTRACT_V3_ENABLED === "true"
+    || (process.env.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true"
+      && isSmoothReggaetonHeatRequestV3(prompt))
+    || (process.env.GUIDANCE_CONTRACT_V3_OWNER_CANARY === "true" && isOwner(caller));
+  const canonicalActivationConfigured = canonicalContractActivationConfigured(process.env);
+  const observedDatabaseSchemaVersion = canonicalActivationConfigured || expandedTrackCountRequested
+    ? await repository.getSchemaVersion()
+    : null;
+  const canonicalActivationReady = canonicalContractActivationReady({
+    environment: process.env,
+    observedDatabaseSchemaVersion,
+  });
+  if (
+    canonicalContractCohortRequested
+    && canonicalActivationConfigured
+    && !canonicalActivationReady
+  ) {
+    throw new HttpError(
+      503,
+      "Canonical playlist contracts are paused until the schema-18 activation check passes",
+      "canonical_contract_activation_not_ready",
+    );
+  }
+  const trackCountAdmission = playlistTrackCountAdmission({
+    requestedTrackCount: targetTrackCount,
+    owner: isOwner(caller),
+    canonicalActivationReady,
+  });
+  if (trackCountAdmission.status === "activation_required") {
+    throw new HttpError(
+      503,
+      "Owner playlist sizes above 300 are paused until the schema-18 activation check passes",
+      "expanded_track_count_activation_not_ready",
+    );
+  }
+  const briefContractVersion = trackCountAdmission.requiredBriefContractVersion
+    ?? (canonicalContractCohortRequested && canonicalActivationReady
+    ? 3
+    : process.env.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+        || (process.env.GUIDANCE_CONTRACT_V2_OWNER_CANARY === "true" && isOwner(caller))
+      ? 2
+      : 1);
   const created = await repository.createBriefRequest({
     prompt,
     requestedTrackCount: targetTrackCount ?? null,
@@ -449,10 +535,18 @@ app.post<{ Body: { prompt?: string; targetTrackCount?: number; idempotencyKey?: 
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
     briefContractVersion,
+    releaseCanary,
+    allowExecutableTrackCount: expandedTrackCountRequested,
   });
   await capabilities.authorizeBrief(request, reply, created.id);
   if (created.status === "queued") {
-    await repository.enqueueJob({ kind: "brief", briefRequestId: created.id, payload: { briefRequestId: created.id }, dedupeKey: `brief:${created.id}` });
+    await repository.enqueueJob({
+      kind: "brief",
+      briefRequestId: created.id,
+      payload: { briefRequestId: created.id },
+      dedupeKey: `brief:${created.id}`,
+      maxAttempts: 6,
+    });
   }
   return reply.code(created.created ? 202 : 200).send({ requestId: created.id, status: created.status, pollAfterMs: 1_500 });
 });
@@ -484,7 +578,14 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
 app.post<{
   Params: { id: string };
   Body: {
-    answers?: Array<{ questionId?: string; optionId?: string; customText?: string; skipped?: boolean }>;
+    answers?: Array<{
+      questionId?: string;
+      optionId?: string;
+      optionIds?: string[];
+      customText?: string;
+      skipped?: boolean;
+      confirmed?: boolean;
+    }>;
     questionSetHash?: string;
     idempotencyKey?: string;
   };
@@ -506,8 +607,12 @@ app.post<{
     answers: request.body.answers.map((answer) => ({
       questionId: typeof answer.questionId === "string" ? answer.questionId : "",
       ...(typeof answer.optionId === "string" ? { optionId: answer.optionId } : {}),
+      ...(Array.isArray(answer.optionIds)
+        ? { optionIds: answer.optionIds.filter((value): value is string => typeof value === "string") }
+        : {}),
       ...(typeof answer.customText === "string" ? { customText: answer.customText } : {}),
       ...(answer.skipped === true ? { skipped: true } : {}),
+      ...(answer.confirmed === true ? { confirmed: true } : {}),
     })),
   });
   if (submitted.status === "stale_question_set") {
@@ -532,6 +637,12 @@ app.post<{
   return reply.code(submitted.created ? 202 : 200).send({
     requestId: briefRequestId,
     status: submitted.status,
+    ...("questionSetHash" in submitted
+      ? {
+          questionSetHash: submitted.questionSetHash,
+          questions: submitted.questions,
+        }
+      : {}),
     pollAfterMs: submitted.status === "finalizing" ? 1_500 : undefined,
   });
 });
@@ -555,7 +666,19 @@ app.post<{ Body: { token?: string; capabilityToken?: string } }>("/api/v1/capabi
   return { runId: session.accessId, expiresAt: session.expiresAt.toISOString() };
 });
 
-app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; targetTrackCount?: number; idempotencyKey?: string } }>("/api/v1/runs", async (request, reply) => {
+app.post<{
+  Body: {
+    briefRequestId?: string;
+    brief?: PlaylistBrief;
+    targetTrackCount?: number;
+    idempotencyKey?: string;
+    releaseCanary?: unknown;
+  };
+}>("/api/v1/runs", async (request, reply) => {
+  const releaseCanary = authenticateReleaseCanary(
+    request.body?.releaseCanary,
+    "run",
+  );
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const caller = identity(request);
@@ -571,14 +694,22 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; targetTrackCo
   }
   const brief = canonicalBriefForRequest(interpreted, interpreted.brief, submittedBrief);
   const submittedTrackCount = request.body?.targetTrackCount;
-  if (submittedTrackCount !== undefined && (
-    !Number.isInteger(submittedTrackCount)
-    || submittedTrackCount < PUBLIC_PLAYLIST_MINIMUM_TRACKS
-    || submittedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
-  )) {
+  const canonicalExactTrackCount = brief.targetSize
+    && brief.targetSize.min === brief.targetSize.max
+    ? brief.targetSize.max
+    : null;
+  const requestedTrackCount = submittedTrackCount
+    ?? interpreted.requestedTrackCount
+    ?? canonicalExactTrackCount;
+  const preliminaryTrackCountAdmission = playlistTrackCountAdmission({
+    requestedTrackCount,
+    owner: isOwner(caller),
+    canonicalActivationReady: false,
+  });
+  if (preliminaryTrackCountAdmission.status === "invalid") {
     throw new HttpError(
       400,
-      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${PUBLIC_PLAYLIST_MAXIMUM_TRACKS}`,
+      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${preliminaryTrackCountAdmission.maximumTrackCount}`,
       "invalid_track_count",
     );
   }
@@ -588,6 +719,26 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; targetTrackCo
       "The selected playlist size changed before research began; return to the request and retry",
       "track_count_mismatch",
     );
+  }
+  if (preliminaryTrackCountAdmission.expanded) {
+    const observedDatabaseSchemaVersion = await repository.getSchemaVersion();
+    const trackCountAdmission = playlistTrackCountAdmission({
+      requestedTrackCount,
+      owner: isOwner(caller),
+      canonicalActivationReady: canonicalContractActivationReady({
+      environment: process.env,
+      observedDatabaseSchemaVersion,
+      }),
+    });
+    if (trackCountAdmission.status !== "accepted"
+      || trackCountAdmission.requiredBriefContractVersion !== 3
+      || interpreted.briefContractVersion !== 3) {
+      throw new HttpError(
+        503,
+        "Owner playlist sizes above 300 are paused until the schema-18 activation check passes",
+        "expanded_track_count_activation_not_ready",
+      );
+    }
   }
   const confirmedEstimateUsd = estimateResearchCost(brief);
   if (!isOwner(caller)) {
@@ -640,7 +791,8 @@ app.post<{ Body: { briefRequestId?: string; brief?: PlaylistBrief; targetTrackCo
     idempotencyKey: key,
     autoPublish: interpreted.requestedTrackCount !== null,
     capabilitySessionId: briefSession.id,
-    forceFreshResearch: isOwner(caller),
+    forceFreshResearch: isOwner(caller) || releaseCanary !== null,
+    releaseCanary,
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
@@ -675,14 +827,85 @@ app.get<{ Params: { id: string } }>("/api/v1/runs/:id/progress", async (request)
     status: run.status,
     phase: run.phase,
     progress: run.progress ?? null,
+    resolution: run.resolution ?? null,
     partialAction: run.partialAction ?? null,
+    decisionAction: run.decisionAction ?? null,
     explore: run.explore ?? null,
   };
 });
 
 app.post<{
   Params: { id: string };
-  Body: { outcomeVersion?: unknown; idempotencyKey?: unknown };
+  Body: {
+    answers?: Array<{
+      questionId?: string;
+      optionId?: string;
+      optionIds?: string[];
+      customText?: string;
+      skipped?: boolean;
+    }>;
+    questionSetHash?: unknown;
+    idempotencyKey?: unknown;
+  };
+}>("/api/v1/runs/:id/guidance/answers", async (request, reply) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  if (!Array.isArray(request.body?.answers)) {
+    throw new HttpError(
+      400,
+      "Playlist guidance answers are required",
+      "invalid_guidance_answers",
+    );
+  }
+  const questionSetHash = typeof request.body?.questionSetHash === "string"
+    ? request.body.questionSetHash.trim().toLowerCase()
+    : "";
+  if (!/^[a-f0-9]{64}$/u.test(questionSetHash)) {
+    throw new HttpError(
+      400,
+      "Playlist guidance question set is invalid",
+      "invalid_guidance_question_set",
+    );
+  }
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(
+    identity(request).clientBucketAliases,
+    "mutation",
+    120,
+    1,
+  );
+  const submitted = await repository.submitPlaylistRunRescueGuidance({
+    runId: session.runId,
+    sourceAccessId: accessId,
+    questionSetHash,
+    idempotencyKey: key,
+    answers: request.body.answers.map((answer) => ({
+      questionId: typeof answer.questionId === "string" ? answer.questionId : "",
+      ...(typeof answer.optionId === "string" ? { optionId: answer.optionId } : {}),
+      ...(Array.isArray(answer.optionIds)
+        ? {
+            optionIds: answer.optionIds.filter(
+              (value): value is string => typeof value === "string",
+            ),
+          }
+        : {}),
+      ...(typeof answer.customText === "string"
+        ? { customText: answer.customText }
+        : {}),
+      ...(answer.skipped === true ? { skipped: true } : {}),
+    })),
+  });
+  const run = await repository.getRunByAccess(submitted.accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return reply.code(submitted.created ? 202 : 200).send({
+    run,
+    revised: submitted.revised,
+  });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: { outcomeVersion?: unknown; decisionHash?: unknown; idempotencyKey?: unknown };
 }>("/api/v1/runs/:id/research/continue", async (request, reply) => {
   await assertNotPaused("research");
   await requireWorkerForNewWork();
@@ -698,6 +921,9 @@ app.post<{
     runId: session.runId,
     outcomeVersion,
     idempotencyKey: key,
+    decisionHash: typeof request.body?.decisionHash === "string"
+      ? request.body.decisionHash.trim().toLowerCase()
+      : null,
   });
   const run = await repository.getRunByAccess(accessId);
   if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
@@ -1295,6 +1521,46 @@ app.get<{ Querystring: { days?: string } }>("/api/v1/owner/quality-diagnostics",
   return repository.getQualityDiagnosticsSummary(Number.isFinite(days) ? days : 30);
 });
 
+app.get<{ Querystring: { hours?: string } }>("/api/v1/owner/playlist-resolution-metrics", async (request) => {
+  owner(request);
+  const requestedHours = Number(request.query?.hours ?? 24);
+  if (!Number.isFinite(requestedHours) || requestedHours < 1 || requestedHours > 24 * 90) {
+    throw new HttpError(400, "Playlist metrics hours must be between 1 and 2160", "invalid_metrics_window");
+  }
+  const windowEndedAt = new Date();
+  const windowStartedAt = new Date(
+    windowEndedAt.getTime() - Math.floor(requestedHours) * 60 * 60_000,
+  );
+  return repository.getPlaylistResolutionMetrics({
+    windowStartedAt,
+    windowEndedAt,
+  });
+});
+
+app.get<{
+  Params: { id: string };
+  Querystring: { environment?: string; sourceRevision?: string };
+}>("/api/v1/owner/release-canaries/:id", async (request) => {
+  owner(request);
+  const environment = request.query?.environment;
+  if (environment !== "staging" && environment !== "production") {
+    throw new HttpError(
+      400,
+      "Release-canary environment is invalid",
+      "invalid_release_canary_scope",
+    );
+  }
+  return readReleaseCanaryInventory({
+    pool: repository.pool,
+    canaryId: request.params.id,
+    environment,
+    sourceRevision: String(request.query?.sourceRevision ?? "").toLowerCase(),
+    executionProof: (runId, manifestId) => (
+      repository.getPublicRunExecutionProof(runId, manifestId)
+    ),
+  });
+});
+
 app.post<{ Params: { id: string } }>("/api/v1/owner/runs/:id/refresh", async (request) => {
   const email = owner(request);
   const runId = uuid(request.params.id, "Run ID");
@@ -1361,6 +1627,44 @@ app.post<{ Body: { paused?: boolean; researchPaused?: boolean; publishingPaused?
     publishingPaused: Boolean(publishingPaused),
     feedbackPaused: Boolean(feedbackPaused),
   };
+});
+
+app.post<{
+  Body: {
+    cohortKey?: string;
+    route?: "catalog_first_v2" | "corpus_first_v3";
+    intentGroup?: string | null;
+    disabled?: boolean;
+    reasonCode?: string | null;
+  };
+}>("/api/v1/owner/pipeline-cohort-control", async (request) => {
+  const email = owner(request);
+  const cohortKey = typeof request.body?.cohortKey === "string" ? request.body.cohortKey : "";
+  const route = request.body?.route;
+  if (route !== "catalog_first_v2" && route !== "corpus_first_v3") {
+    throw new HttpError(400, "Pipeline route is invalid", "invalid_cohort_control");
+  }
+  const disabled = request.body?.disabled === true;
+  await repository.setPipelineCohortKillSwitch({
+    cohortKey,
+    route,
+    intentGroup: typeof request.body?.intentGroup === "string"
+      ? request.body.intentGroup
+      : null,
+    disabled,
+    reasonCode: typeof request.body?.reasonCode === "string"
+      ? request.body.reasonCode
+      : null,
+    changedBy: email,
+  });
+  await repository.recordAudit(email, "pipeline.cohort_control_changed", {
+    cohortKey,
+    route,
+    intentGroup: request.body?.intentGroup ?? null,
+    disabled,
+    reasonCode: disabled ? request.body?.reasonCode ?? "owner_disabled" : null,
+  });
+  return { cohortKey, route, intentGroup: request.body?.intentGroup ?? null, disabled };
 });
 
 app.get("/api/v1/owner/apple/developer-token", async (request) => {

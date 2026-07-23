@@ -1792,6 +1792,93 @@ test("V2 curated discovery grows the persisted pool from a scoped Apple editoria
   }));
 });
 
+test("the production reggaeton request exact-fills from a trusted Latin Urban editorial container", async () => {
+  const prompt = "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.";
+  const reggaetonBrief: PlaylistBrief = {
+    title: "Smooth Reggaeton Heat",
+    description: "A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.",
+    mode: "curated",
+    subjectEntities: ["reggaeton", "Latin urban"],
+    relationship: "centered on",
+    include: [
+      "polished reggaeton",
+      "sensual reggaeton",
+      "danceable reggaeton",
+      "adjacent Latin urban tracks",
+      "flirtatious vibe",
+      "crowd-pleasing club-friendly tracks",
+    ],
+    exclude: [],
+    versionPolicy: "Favor official studio recordings and widely recognized album or single versions.",
+    evidencePolicy: "Use well-documented songs that clearly fit the requested mood and style.",
+    orderingPolicy: "Build a smooth dance arc with varied energy.",
+    targetSize: { min: 50, max: 50 },
+    ambiguities: [],
+  };
+  const editorialSongs: CatalogSong[] = Array.from({ length: 55 }, (_, index) => ({
+    id: `apple-reggaeton-${index}`,
+    name: `Smooth Reggaeton Track ${index + 1}`,
+    artistName: `Latin Urban Artist ${index + 1}`,
+    albumName: `Latin Urban Release ${index + 1}`,
+    releaseDate: "2024-01-01",
+    durationInMillis: 180_000 + index,
+    isrc: `USREG26${String(index).padStart(5, "0")}`,
+  }));
+  const provider: CatalogDiscoveryProvider = {
+    async search() {
+      return {
+        songs: [],
+        artists: [],
+        albums: [],
+        playlists: [{
+          id: "pl.latin-urban-editorial",
+          name: "Latin Urban",
+          curatorName: "Apple Music Urbano Latino",
+          description: "Reggaeton and Latin urban hits.",
+          playlistType: "editorial",
+          url: "https://music.apple.com/us/playlist/latin-urban/pl.latin-urban-editorial",
+        }],
+      };
+    },
+    async playlistTracks() { return { items: editorialSongs, next: null }; },
+    async albumTracks() { return { items: [], next: null }; },
+    async artistTopSongs() { return { items: [], next: null }; },
+    async artistAlbums() { return { items: [], next: null }; },
+    async similarArtists() { return { items: [], next: null }; },
+  };
+  const repository = new V2MemoryMatchingRepository(
+    [],
+    reggaetonBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt,
+    brief: reggaetonBrief,
+    storefront: "us",
+  });
+
+  expect(repository.selectionPlan.intents).toEqual(["genre_scene"]);
+
+  await matchResearchRun(repository, "run-v2-reggaeton-production-regression", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(repository.persistedDiscoveries).toHaveLength(55);
+  expect(repository.matches.filter((match) => match.status === "accepted")).toHaveLength(55);
+  expect(repository.persistedDiscoveries.every((input) => (
+    input.bindings.some((binding) => (
+      binding.bindingKind === "catalog_editorial_membership"
+      && binding.scopeAxis === "genre"
+      && binding.scopeValue === "Latin urban"
+    ))
+  ))).toBe(true);
+  expect(repository.checkpointWrites).toContainEqual(expect.objectContaining({
+    phase: "catalog_matching_outcome",
+    checkpoint: expect.objectContaining({ safePrimaryCount: 55, shortfall: 0 }),
+  }));
+});
+
 test("V2 rejects an artist Essentials playlist whose description only incidentally mentions house music", async () => {
   const houseBrief: PlaylistBrief = {
     title: "House music essentials",

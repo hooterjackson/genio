@@ -17,6 +17,7 @@ export function gatewayBodyLimit(method: string, pathname: string): number {
 
 const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/health\/live$/ },
+  { method: "GET", path: /^\/health\/system$/ },
   { method: "POST", path: /^\/api\/v1\/feedback$/ },
   { method: "POST", path: /^\/api\/v1\/brief$/ },
   { method: "GET", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },

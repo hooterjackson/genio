@@ -7,8 +7,71 @@ import type {
   PartialPublicationActionView,
   PublicResearchRunView,
   ResearchRunView,
+  RunGuidanceActionView,
   RunProgressView,
+  RunResolutionView,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
+import { publicAdaptiveRunDecisionV1 } from "./adaptive-run-decision-v1.ts";
+import {
+  guidanceDecisionV3FromPublicQuestion,
+  publicGuidanceQuestionV3,
+} from "./adaptive-guidance-contract-bridge.ts";
+
+function publicRunGuidanceAction(value: unknown): RunGuidanceActionView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const questionSetHash = publicProgressText(row.questionSetHash, 64).toLowerCase();
+  const baseContractRevisionId = publicProgressText(row.baseContractRevisionId, 160);
+  const baseContractSemanticHash = publicProgressText(
+    row.baseContractSemanticHash,
+    64,
+  ).toLowerCase();
+  const attemptsUsed = publicProgressOptionalCount(row.attemptsUsed);
+  if (row.kind !== "rescue_guidance"
+    || !/^[a-f0-9]{64}$/u.test(questionSetHash)
+    || !baseContractRevisionId
+    || !/^[a-f0-9]{64}$/u.test(baseContractSemanticHash)
+    || attemptsUsed === null
+    || attemptsUsed < 1
+    || attemptsUsed > 2
+    || row.maximumAttempts !== 2
+    || !Array.isArray(row.questions)
+    || row.questions.length < 1
+    || row.questions.length > 1) {
+    return null;
+  }
+  const questions: PlaylistGuidanceQuestion[] = [];
+  try {
+    for (const question of row.questions) {
+      questions.push(publicGuidanceQuestionV3(
+        guidanceDecisionV3FromPublicQuestion(
+          question as PlaylistGuidanceQuestion,
+        ),
+      ));
+    }
+  } catch {
+    return null;
+  }
+  if (questions.some((question) => (
+    question.baseContractRevisionId !== baseContractRevisionId
+    || question.baseContractSemanticHash !== baseContractSemanticHash
+    || question.trigger !== "yield_risk"
+  ))) {
+    return null;
+  }
+  return {
+    kind: "rescue_guidance",
+    questionSetHash,
+    baseContractRevisionId,
+    baseContractSemanticHash,
+    questions,
+    attemptsUsed,
+    maximumAttempts: 2,
+    showEditableInterpretationSummary:
+      row.showEditableInterpretationSummary === true,
+  };
+}
 
 function publicPartialAction(value: unknown): PartialPublicationActionView | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -19,7 +82,9 @@ function publicPartialAction(value: unknown): PartialPublicationActionView | nul
   const outcomeVersion = publicProgressOptionalCount(row.outcomeVersion);
   const outcomeHash = publicProgressText(row.outcomeHash, 64).toLowerCase();
   if (
-    targetTrackCount === null || targetTrackCount < 1 || targetTrackCount > 300
+    targetTrackCount === null
+    || targetTrackCount < 1
+    || targetTrackCount > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
     || qualifiedTrackCount === null || qualifiedTrackCount >= targetTrackCount
     || remainingStrategyCount === null
     || outcomeVersion === null || outcomeVersion < 1
@@ -51,6 +116,53 @@ function publicExplore(value: unknown): ExplorePreferenceView | null {
     listed: row.listed,
     canChange: row.canChange,
     reason: publicProgressText(row.reason, 200) || null,
+  };
+}
+
+/**
+ * The capability-authenticated visitor API must advertise only actions that
+ * the visitor can actually complete. Rescue guidance is preserved only when
+ * its complete hash-bound action is present; generic manual resume and Apple
+ * authorization remain owner/orchestrator operations.
+ */
+export function publicRunResolutionView(
+  resolution: RunResolutionView,
+  partialAction: PartialPublicationActionView | null,
+  guidanceAction: RunGuidanceActionView | null = null,
+): RunResolutionView {
+  let state = resolution.state;
+  let nextAction = resolution.nextAction;
+
+  if (nextAction === "answer_initial_guidance"
+    || (nextAction === "answer_rescue_guidance" && !guidanceAction)) {
+    state = "needs_decision";
+    nextAction = "review_contract";
+  } else if (nextAction === "authorize_apple") {
+    state = "blocked_dependency";
+    nextAction = "wait_for_dependency";
+  } else if (nextAction === "resume_research") {
+    state = "needs_decision";
+    nextAction = partialAction?.canContinueResearch
+      ? "decide_verified_partial"
+      : "review_contract";
+  } else if (nextAction === "decide_verified_partial" && !partialAction) {
+    state = "needs_decision";
+    nextAction = "review_contract";
+  }
+
+  return {
+    state,
+    nextAction,
+    terminal: resolution.terminal,
+    contractRevisionId: resolution.contractRevisionId,
+    contractRevision: resolution.contractRevision,
+    contractHash: resolution.contractHash,
+    blocker: resolution.blocker ? {
+      kind: resolution.blocker.kind,
+      nextRetryAt: resolution.blocker.nextRetryAt,
+      automaticRetryUntil: resolution.blocker.automaticRetryUntil,
+      retryCount: resolution.blocker.retryCount,
+    } : null,
   };
 }
 
@@ -175,6 +287,8 @@ export function publicResearchRunView(
   run: InternalResearchRunView,
   identity?: { id?: string; prompt?: string },
 ): PublicResearchRunView {
+  const partialAction = publicPartialAction(run.partialAction);
+  const guidanceAction = publicRunGuidanceAction(run.guidanceAction);
   return {
     id: identity?.id ?? run.id,
     prompt: identity?.prompt ?? run.prompt,
@@ -193,8 +307,13 @@ export function publicResearchRunView(
     pipelineOutcome: run.pipelineOutcome,
     candidateStageCounts: run.candidateStageCounts,
     progress: run.progress ? publicRunProgressView(run.progress) : undefined,
-    partialAction: publicPartialAction(run.partialAction),
+    partialAction,
+    decisionAction: publicAdaptiveRunDecisionV1(run.decisionAction),
+    guidanceAction,
     explore: publicExplore(run.explore),
+    resolution: run.resolution
+      ? publicRunResolutionView(run.resolution, partialAction, guidanceAction)
+      : undefined,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     completedAt: run.completedAt,
@@ -206,7 +325,7 @@ export function publicBriefStatusView(input: {
   prompt: string;
   requestedTrackCount: number | null;
   status: string;
-  briefContractVersion?: 1 | 2;
+  briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
   brief?: PlaylistBrief;
   questions?: PlaylistGuidanceQuestion[];

@@ -10,6 +10,7 @@ test("budget and crash resumes preserve the durable generation and segment", () 
   })).toEqual({
     kind: "research",
     runId: "run-1",
+    maxAttempts: 6,
     payload: {
       runId: "run-1",
       phase: "gap_analysis",

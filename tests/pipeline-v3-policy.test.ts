@@ -303,6 +303,14 @@ describe("Pipeline V3 model routing", () => {
     expect(policy.executionPolicy).toMatchObject({
       kind: "corpus_first_v3",
       model: "gpt-5.6-terra",
+      candidateGoal: 105,
+      p10QualifiedToAppleSafeConversionRate: 0.5,
+      conversionRateSampleCount: 0,
+      conversionRateSegment: {
+        storefront: "us",
+        route: "corpus_first_v3",
+        sizeTier: "1_50",
+      },
       modelRoute: {
         providerModelId: "gpt-5.6-terra",
         baselineProviderModelId: "gpt-5.6-luna",
@@ -343,6 +351,66 @@ describe("Pipeline V3 model routing", () => {
       /immutable model route failed validation/i,
     );
   });
+
+  test("freezes a conservative observed conversion segment into the candidate reserve", () => {
+    const plan = resolveRunSpecV3(createRunSpecV3({
+      prompt: "100 rare groove recordings",
+      requestedTrackCount: 100,
+      storefront: "br",
+    }), []);
+    const policy = createPipelinePolicySnapshotV3({
+      plan,
+      conversionObservation: {
+        p10QualifiedToAppleSafeConversionRate: 0.4,
+        sampleCount: 83,
+      },
+    });
+    expect(policy.executionPolicy).toMatchObject({
+      candidateGoal: 260,
+      p10QualifiedToAppleSafeConversionRate: 0.4,
+      conversionRateSampleCount: 83,
+      conversionRateSegment: {
+        storefront: "br",
+        route: "corpus_first_v3",
+        sizeTier: "51_100",
+      },
+    });
+  });
+
+  test.each([
+    [301, 3.25, 49, 17],
+    [1_000, 10, 160, 54],
+  ] as const)(
+    "scales owner execution budgets for %i tracks without lowering evidence policy",
+    (requestedTrackCount, maximumCostUsd, maxToolCalls, maxHostedSearchCalls) => {
+      const plan = resolveRunSpecV3(createRunSpecV3({
+        prompt: `${requestedTrackCount} exact rare groove recordings`,
+        requestedTrackCount,
+      }), []);
+      const policy = createPipelinePolicySnapshotV3({
+        plan,
+        conversionObservation: {
+          p10QualifiedToAppleSafeConversionRate: 0.25,
+          sampleCount: 80,
+        },
+      });
+      expect(policy.executionPolicy).toMatchObject({
+        maximumGlobalRounds: maxToolCalls,
+        maximumCostUsd,
+        candidateGoal: requestedTrackCount === 1_000 ? 4_100 : 1_235,
+        conversionRateSegment: {
+          sizeTier: "301_1000",
+        },
+      });
+      expect(policy.requestLimits).toMatchObject({
+        maxToolCalls,
+        maxHostedSearchCalls,
+      });
+      expect(policy.catalogLimits.maximumRawDiscoveryGoal)
+        .toBe(requestedTrackCount * 20);
+      expect(policy.evidencePolicy).toMatch(/never relax eligibility/u);
+    },
+  );
 
   test("routes only local scout contract failures or explicit low confidence to escalation", () => {
     expect(pipelineV3ModelRoutingSignalsFromScoutTelemetry({

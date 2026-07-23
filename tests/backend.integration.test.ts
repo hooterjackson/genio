@@ -292,20 +292,22 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     // The 2.2.2 bridge remains healthy across the active schema and the future
-    // schema-16 expansion, while failing closed outside its declared window.
+    // schema-18 expansion, while failing closed outside its declared window.
     await repository.setSetting("schema_version", "13");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "12");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
-      /supported 13-16, found 12/u,
+      /supported 13-18, found 12/u,
     );
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-16, found 12/u);
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-18, found 12/u);
     await repository.setSetting("schema_version", "16");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "17");
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-16, found 17/u);
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
+    await repository.setSetting("schema_version", "19");
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-18, found 19/u);
     await repository.setSetting("schema_version", "15");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
@@ -363,6 +365,80 @@ databaseDescribe("hosted backend integration", () => {
          AND column_name='selection_rank'`,
     );
     expect(candidateColumns.rows.map((row) => row.column_name)).toEqual(["selection_rank"]);
+  });
+
+  test("provider blocker retries preserve one anchored 24-hour horizon", async () => {
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    const runId = await repository.createRun("Anchored provider blocker", brief, 0, 1);
+    const contractRevisionId = randomUUID();
+    const contractHash = "a".repeat(64);
+    await repository.pool.query(
+      `INSERT INTO playlist_contract_revisions(
+         id,run_id,revision,status,contract_hash,contract_json,compiler_version,
+         ontology_version,evidence_policy_version,question_template_version,
+         catalog_policy_version,locale,storefront,answer_lineage_hash)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'compiler-test','ontology-test',
+         'evidence-test','questions-test','catalog-test','en-US','us',$4)`,
+      [contractRevisionId, runId, contractHash, "b".repeat(64)],
+    );
+    await repository.pool.query(
+      "UPDATE research_runs SET active_playlist_contract_revision_id=$2 WHERE id=$1",
+      [runId, contractRevisionId],
+    );
+    const firstRetryAt = new Date("2026-07-23T12:00:01.000Z");
+    const firstHorizon = new Date("2026-07-24T12:00:00.000Z");
+    const blockerId = await repository.openPlaylistRunBlocker({
+      runId,
+      contractRevisionId,
+      blockerKind: "provider",
+      dependencyKey: "v3_retrieval_provider",
+      retryCount: 1,
+      nextRetryAt: firstRetryAt,
+      automaticRetryUntil: firstHorizon,
+      state: {
+        firstFailureAt: "2026-07-23T12:00:00.000Z",
+        retryLane: "immediate",
+      },
+    });
+    const reopenedId = await repository.openPlaylistRunBlocker({
+      runId,
+      contractRevisionId,
+      blockerKind: "provider",
+      dependencyKey: "v3_retrieval_provider",
+      retryCount: 2,
+      nextRetryAt: new Date("2026-07-23T12:00:03.000Z"),
+      automaticRetryUntil: new Date("2026-07-24T12:05:00.000Z"),
+      state: {
+        retryLane: "immediate",
+        retryOrdinal: 2,
+      },
+    });
+
+    expect(reopenedId).toBe(blockerId);
+    await expect(repository.getActivePlaylistRunBlocker({
+      runId,
+      contractRevisionId,
+      blockerKind: "provider",
+      dependencyKey: "v3_retrieval_provider",
+    })).resolves.toMatchObject({
+      id: blockerId,
+      retryCount: 2,
+      nextRetryAt: new Date("2026-07-23T12:00:03.000Z"),
+      automaticRetryUntil: firstHorizon,
+      state: {
+        firstFailureAt: "2026-07-23T12:00:00.000Z",
+        retryLane: "immediate",
+        retryOrdinal: 2,
+      },
+    });
+    const rows = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count
+       FROM playlist_run_blockers
+       WHERE run_id=$1 AND contract_revision_id=$2
+         AND blocker_kind='provider' AND resolved_at IS NULL`,
+      [runId, contractRevisionId],
+    );
+    expect(rows.rows[0]?.count).toBe(1);
   });
 
   test("Apple catalog cache persists storefront-isolated payloads and provider telemetry", async () => {
@@ -2284,6 +2360,84 @@ databaseDescribe("hosted backend integration", () => {
     })).rejects.toMatchObject({ statusCode: 400, code: "invalid_track_count" });
   });
 
+  test.each([301, 1_000])(
+    "persists activated owner contract-3 size %i through the expanded schema",
+    async (requestedTrackCount) => {
+      await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+      const clientBucket = `owner-expanded-count-${requestedTrackCount}-${randomUUID()}`;
+      const created = await repository.createBriefRequest({
+        prompt: `An authenticated owner playlist with ${requestedTrackCount} tracks`,
+        requestedTrackCount,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion: 3,
+        allowExecutableTrackCount: true,
+      });
+      await expect(repository.getBriefRequest(created.id)).resolves.toMatchObject({
+        requestedTrackCount,
+        briefContractVersion: 3,
+      });
+    },
+  );
+
+  test.each([1, 2] as const)(
+    "rejects expanded durable admission under legacy brief contract %i",
+    async (briefContractVersion) => {
+      const clientBucket = `owner-expanded-contract-${briefContractVersion}-${randomUUID()}`;
+      await expect(repository.createBriefRequest({
+        prompt: "An expanded request with a legacy execution contract",
+        requestedTrackCount: 301,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion,
+        allowExecutableTrackCount: true,
+      })).rejects.toMatchObject({
+        statusCode: 409,
+        code: "expanded_track_count_contract_required",
+      });
+    },
+  );
+
+  test("rejects expanded durable admission until schema 18 is observed", async () => {
+    const schema = vi.spyOn(repository, "getSchemaVersion").mockResolvedValue("17");
+    const clientBucket = `owner-expanded-schema-${randomUUID()}`;
+    try {
+      await expect(repository.createBriefRequest({
+        prompt: "An expanded canonical request before schema activation",
+        requestedTrackCount: 301,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion: 3,
+        allowExecutableTrackCount: true,
+      })).rejects.toMatchObject({
+        statusCode: 503,
+        code: "expanded_track_count_activation_not_ready",
+      });
+    } finally {
+      schema.mockRestore();
+    }
+  });
+
+  test("rejects owner work above the executable 1,000-track boundary", async () => {
+    const clientBucket = `owner-expanded-count-invalid-${randomUUID()}`;
+    await expect(repository.createBriefRequest({
+      prompt: "An authenticated owner playlist above the executable boundary",
+      requestedTrackCount: 1_001,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+      allowExecutableTrackCount: true,
+    })).rejects.toMatchObject({ statusCode: 400, code: "invalid_track_count" });
+  });
+
   test("persists the durable automatic-publication intent on One Command runs", async () => {
     const clientBucket = `auto-publish-${randomUUID()}`;
     const created = await repository.createRunIdempotent({
@@ -3589,6 +3743,7 @@ databaseDescribe("hosted backend integration", () => {
     const first = await repository.runPipelineV2OperationalAlertSweep({ windowEndedAt });
     expect(first.alerts.map((alert) => alert.kind)).toEqual([
       "pipeline_zero_result_spike",
+      "pipeline_shortfall_rate_elevated",
       "pipeline_local_contract_rejections",
       "pipeline_provider_circuit_repeated",
       "pipeline_pagination_loop",
@@ -3601,7 +3756,7 @@ databaseDescribe("hosted backend integration", () => {
       `SELECT kind,count(*)::int count FROM notification_outbox
        WHERE kind LIKE 'pipeline_%' GROUP BY kind ORDER BY kind`,
     );
-    expect(notifications.rows).toHaveLength(6);
+    expect(notifications.rows).toHaveLength(7);
     expect(notifications.rows.every((row) => row.count === 1)).toBe(true);
   });
 
@@ -5990,6 +6145,8 @@ databaseDescribe("hosted backend integration", () => {
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     await repository.pool.query("DELETE FROM worker_heartbeats");
     await repository.updateWorkerHeartbeat("deep-v8", {
+      version: "abcdef0123456789",
+      configurationHash: "1".repeat(64),
       schemaVersion: DATABASE_SCHEMA_VERSION,
       schemaMinimum: DATABASE_SCHEMA_VERSION,
       schemaMaximum: DATABASE_SCHEMA_VERSION,
@@ -6006,6 +6163,9 @@ databaseDescribe("hosted backend integration", () => {
       worker_id: "deep-v8",
       ready: true,
       compatibleCapacity: 1,
+      eligibleWorkerCount: 1,
+      eligibleRevisions: ["abcdef0123456789"],
+      eligibleConfigurationHashes: ["1".repeat(64)],
     });
     expect(deepOnly.workerLanes.interactive).toMatchObject({
       ready: false,
@@ -6013,6 +6173,8 @@ databaseDescribe("hosted backend integration", () => {
     });
 
     await repository.updateWorkerHeartbeat("interactive-v8", {
+      version: "abcdef0123456789",
+      configurationHash: "2".repeat(64),
       schemaVersion: DATABASE_SCHEMA_VERSION,
       schemaMinimum: DATABASE_SCHEMA_VERSION,
       schemaMaximum: DATABASE_SCHEMA_VERSION,
@@ -6028,6 +6190,9 @@ databaseDescribe("hosted backend integration", () => {
       worker_id: "interactive-v8",
       ready: true,
       compatibleCapacity: 2,
+      eligibleWorkerCount: 1,
+      eligibleRevisions: ["abcdef0123456789"],
+      eligibleConfigurationHashes: ["2".repeat(64)],
     });
     expect(bothLanes.workerLanes.deep).toMatchObject({
       worker_id: "deep-v8",

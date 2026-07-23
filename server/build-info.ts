@@ -24,9 +24,12 @@ export function buildInformation(env: NodeJS.ProcessEnv = process.env): BuildInf
     ?? safeVersion(packageMetadata.version)
     ?? "unknown";
   const revision = [
+    // Immutable image promotions set SOURCE_COMMIT_SHA explicitly. Prefer it
+    // over ambient platform Git metadata, which can describe the IaC checkout
+    // rather than the digest-pinned application image actually running.
+    env.SOURCE_COMMIT_SHA,
     env.RAILWAY_GIT_COMMIT_SHA,
     env.GITHUB_SHA,
-    env.SOURCE_COMMIT_SHA,
     env.COMMIT_SHA,
   ].map(safeRevision).find((value): value is string => Boolean(value)) ?? null;
   return {

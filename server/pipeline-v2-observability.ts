@@ -94,6 +94,12 @@ export function buildPipelineStageLedger(input: {
 export type PipelineOperationalAlertKind =
   | "pipeline_zero_result_spike"
   | "pipeline_partial_rate_elevated"
+  | "pipeline_shortfall_rate_elevated"
+  | "pipeline_system_failure"
+  | "pipeline_integrity_failure"
+  | "pipeline_brief_failure"
+  | "pipeline_guidance_failure"
+  | "pipeline_stuck_work"
   | "pipeline_local_contract_rejections"
   | "pipeline_provider_circuit_repeated"
   | "pipeline_pagination_loop"
@@ -106,6 +112,12 @@ export interface PipelineOperationalWindow {
   terminalRuns: number;
   zeroResultRuns: number;
   partialRuns: number;
+  shortfallRuns: number;
+  systemFailureRuns: number;
+  integrityFailureRuns: number;
+  briefFailures: number;
+  guidanceFailures: number;
+  stuckWorkItems: number;
   localContractRejections: number;
   providerCircuitOpenings: number;
   paginationLoops: number;
@@ -173,6 +185,16 @@ export function evaluatePipelineOperationalWindow(
 
   appendRate("pipeline_zero_result_spike", input.zeroResultRuns, 3, 0.15);
   appendRate("pipeline_partial_rate_elevated", input.partialRuns, 5, 0.30);
+  appendRate("pipeline_shortfall_rate_elevated", input.shortfallRuns, 3, 0.15);
+  appendCount("pipeline_system_failure", input.systemFailureRuns, 1);
+  appendCount("pipeline_integrity_failure", input.integrityFailureRuns, 1);
+  appendCount(
+    "pipeline_brief_failure",
+    Math.max(0, count(input.briefFailures) - count(input.guidanceFailures)),
+    1,
+  );
+  appendCount("pipeline_guidance_failure", input.guidanceFailures, 1);
+  appendCount("pipeline_stuck_work", input.stuckWorkItems, 1);
   appendCount("pipeline_local_contract_rejections", input.localContractRejections, 2);
   appendCount("pipeline_provider_circuit_repeated", input.providerCircuitOpenings, 3);
   appendCount("pipeline_pagination_loop", input.paginationLoops, 1);

@@ -2,8 +2,10 @@ import { describe, expect, test, vi } from "vitest";
 import {
   executeRetrievalV3,
   publicTrackScopeAttestationV3,
+  RetrievalDependencyErrorV3,
   retrievalStrategiesForEnginesV3,
   routeRetrievalEnginesV3,
+  validateCanonicalPublicationSetV3,
   type CandidateQualificationV3,
   type QualifiedTrackV3,
   type RawTrackCandidateV3,
@@ -16,6 +18,8 @@ import {
   type IntentV3,
   type SelectionPlanV3,
 } from "../server/selection-plan-v3.ts";
+import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 
 function plan(prompt: string, target = 25): SelectionPlanV3 {
   return resolveRunSpecV3(createRunSpecV3({
@@ -32,6 +36,45 @@ function plan(prompt: string, target = 25): SelectionPlanV3 {
 const DISCO_MEMBERSHIP_PREDICATE_IDS = evidenceMembershipPredicateIdsV3(
   plan("one disco track", 1),
 );
+
+function canonicalDiscoPlan(
+  target: number,
+  patch: Partial<SelectionPlanV3> = {},
+): SelectionPlanV3 {
+  const contract = compilePlaylistContractRevisionV1({
+    contractId: `contract:optimizer:${target}`,
+    rawPrompt: `${target} disco tracks`,
+    requestedTrackCount: target,
+    locale: "en-US",
+    storefront: "us",
+    clauses: [{
+      id: "genre:disco",
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "genre",
+      operator: "require",
+      values: ["disco"],
+      source: { provenance: "prompt", text: "disco" },
+    }],
+    trackPredicate: { op: "clause", clauseId: "genre:disco" },
+  });
+  return {
+    ...plan(`${target} disco tracks`, target),
+    canonicalContractPolicy: canonicalContractExecutionPolicyV1(contract),
+    diversityGoals: {
+      minimumDistinctArtists: null,
+      minimumDistinctAlbums: null,
+      minimumDistinctEras: null,
+      minimumDistinctScenes: null,
+      minimumDistinctGeographies: null,
+      maximumTracksPerArtist: null,
+      maximumTracksPerAlbum: null,
+    },
+    softGoalRelaxationOrder: [],
+    ...patch,
+  };
+}
 
 function planWithIntents(intents: readonly IntentV3[], target = 25): SelectionPlanV3 {
   const base = plan("music for a test playlist", target);
@@ -107,6 +150,24 @@ function qualification(
   };
 }
 
+function canonicalDiscoQualification(
+  value: RawTrackCandidateV3,
+  patch: Partial<CandidateQualificationV3> = {},
+): CandidateQualificationV3 {
+  const base = qualification(value, patch);
+  const bindingId = base.evidence.bindingIds[0]!;
+  return {
+    ...base,
+    canonicalClauseAssessments: {
+      "genre:disco": {
+        status: "pass",
+        evidenceGrade: "track_specific_editorial_assertion",
+        evidenceIds: [bindingId],
+      },
+    },
+  };
+}
+
 function allQualifiedAdapter(batchSize = 20): RetrievalAdaptersV3 {
   let next = 0;
   return {
@@ -178,6 +239,163 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(adapters.qualify).not.toHaveBeenCalled();
   });
 
+  test("uses the canonical Boolean/evidence/unknown policy instead of flattened scope booleans", async () => {
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:retrieval-authority",
+      rawPrompt: "One reggaeton or dembow track, no Bad Bunny.",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: "genre:reggaeton",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["reggaeton"],
+          source: { provenance: "prompt", text: "reggaeton" },
+        },
+        {
+          id: "genre:dembow",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["dembow"],
+          source: { provenance: "prompt", text: "dembow" },
+        },
+        {
+          id: "exclude:bad-bunny",
+          kind: "exclusion",
+          scope: "track",
+          hardness: "hard",
+          axis: "artist",
+          operator: "exclude",
+          values: ["Bad Bunny"],
+          source: { provenance: "prompt", text: "no Bad Bunny" },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          {
+            op: "any",
+            children: [
+              { op: "clause", clauseId: "genre:reggaeton" },
+              { op: "clause", clauseId: "genre:dembow" },
+            ],
+          },
+          { op: "clause", clauseId: "exclude:bad-bunny" },
+        ],
+      },
+      qualityPolicy: {
+        centralSuitabilityClauseIds: [],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+      },
+    });
+    const candidates = [
+      candidate(1, { artist: "Ivy Queen" }),
+      candidate(2, { artist: "Unknown Artist" }),
+      candidate(3, { artist: "Bad Bunny" }),
+    ];
+    let delivered = false;
+    const adapters: RetrievalAdaptersV3 = {
+      discover: vi.fn(async () => {
+        if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
+        delivered = true;
+        return { candidates, nextCursor: null, exhausted: true };
+      }),
+      qualify: vi.fn(async (
+        { candidates: values }: Parameters<RetrievalAdaptersV3["qualify"]>[0],
+      ) => values.map((value: RawTrackCandidateV3, index: number): CandidateQualificationV3 => {
+        const base = qualification(value, {
+          // Deliberately contradictory legacy booleans: contract3 must ignore
+          // these flattened values and execute its Boolean tree below.
+          scope: {
+            passed: false,
+            failedMembershipPredicateIds: ["legacy:flattened"],
+            fit: 0,
+          },
+        });
+        const bindingId = base.evidence.bindingIds[0]!;
+        return {
+          ...base,
+          canonicalClauseAssessments: index === 0
+            ? {
+                "genre:reggaeton": {
+                  status: "pass",
+                  evidenceGrade: "track_specific_editorial_assertion",
+                  evidenceIds: [bindingId],
+                },
+                "genre:dembow": { status: "unknown" },
+                "exclude:bad-bunny": {
+                  status: "fail",
+                  evidenceGrade: "authoritative_structured_metadata",
+                },
+              }
+            : index === 1
+              ? {
+                  "genre:reggaeton": { status: "unknown" },
+                  "genre:dembow": { status: "unknown" },
+                  "exclude:bad-bunny": {
+                    status: "fail",
+                    evidenceGrade: "authoritative_structured_metadata",
+                  },
+                }
+              : {
+                  "genre:reggaeton": {
+                    status: "pass",
+                    evidenceGrade: "track_specific_editorial_assertion",
+                    evidenceIds: [bindingId],
+                  },
+                  "genre:dembow": { status: "unknown" },
+                  "exclude:bad-bunny": {
+                    status: "pass",
+                    evidenceGrade: "authoritative_structured_metadata",
+                  },
+                },
+        };
+      })),
+    };
+    const canonicalPlan: SelectionPlanV3 = {
+      ...plan("legacy prompt that must not control execution", 1),
+      canonicalContractPolicy: canonicalContractExecutionPolicyV1(contract),
+    };
+    const result = await executeRetrievalV3({
+      runId: "canonical-runtime-gate",
+      plan: canonicalPlan,
+      adapters,
+    });
+
+    expect(result.selected.map(({ candidateId }) => candidateId)).toEqual(["candidate-1"]);
+    expect(result.deficit.discardedByReason).toMatchObject({
+      canonical_contract_unknown: 1,
+      canonical_contract_failed: 1,
+    });
+    expect(validateCanonicalPublicationSetV3({
+      plan: canonicalPlan,
+      tracks: result.selected,
+    })).toEqual({ valid: true, reasonCodes: [] });
+    expect(validateCanonicalPublicationSetV3({
+      plan: canonicalPlan,
+      tracks: [{
+        ...result.selected[0]!,
+        canonicalClauseAssessments: {
+          ...result.selected[0]!.canonicalClauseAssessments,
+          "genre:reggaeton": { status: "unknown" },
+        },
+      }],
+    })).toMatchObject({
+      valid: false,
+      reasonCodes: expect.arrayContaining(["canonical_track_unknown"]),
+    });
+  });
+
   test("fills the exact target plus max(10, twenty-percent) qualified reserve", async () => {
     const adapters = allQualifiedAdapter(20);
     const result = await executeRetrievalV3({
@@ -212,6 +430,271 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     }
   });
 
+  test("uses the immutable conversion-derived qualified pool goal when supplied", async () => {
+    const result = await executeRetrievalV3({
+      runId: "conversion-reserve-run",
+      plan: plan("20 storefront-safe disco tracks", 20),
+      adapters: allQualifiedAdapter(50),
+      policy: { qualifiedPoolGoal: 45 },
+    });
+
+    expect(result.outcome).toMatchObject({
+      status: "exact_ready",
+      selectedTrackCount: 20,
+      reserveTrackCount: 25,
+    });
+    expect(result.deficit).toMatchObject({
+      qualifiedPoolGoal: 45,
+      reserveShortfall: 0,
+    });
+  });
+
+  test("does not fill an exact count with a known central-quality failure", async () => {
+    let next = 0;
+    let delivered = false;
+    const qualityPlan: SelectionPlanV3 = {
+      ...plan("10 smooth, polished, danceable disco tracks", 10),
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth", "quality:polished", "quality:danceable"],
+        criteria: ["smooth", "polished", "danceable"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const result = await executeRetrievalV3({
+      runId: "quality-floor-run",
+      plan: qualityPlan,
+      adapters: {
+        discover: async () => {
+          if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
+          delivered = true;
+          return {
+            candidates: Array.from({ length: 10 }, () => candidate(next++)),
+            nextCursor: null,
+            exhausted: true,
+          };
+        },
+        qualify: async ({ candidates }) => candidates.map((value, index) => qualification(value, {
+          rankingSignals: {
+            relevance: 0.9,
+            central_quality: index < 8 ? 0.9 : index === 8 ? 0.6 : 0.2,
+          },
+        })),
+      },
+    });
+
+    expect(result.outcome).toMatchObject({
+      status: "partial_ready",
+      stopReason: "central_quality_floor",
+      selectedTrackCount: 9,
+      shortfall: 1,
+      requiresPartialPublicationDecision: true,
+    });
+    expect(result.selected.some(({ rankingSignals }) => (
+      Number(rankingSignals.central_quality ?? 0) < 0.4
+    ))).toBe(false);
+    expect(result.centralQuality).toMatchObject({
+      passed: true,
+      passCount: 8,
+      failCount: 0,
+      unknownCount: 1,
+    });
+    expect(result.deficit.discardedByReason).toMatchObject({
+      central_quality_failed: 1,
+    });
+  });
+
+  test("does not call a cache-sized qualified pool exact when artist diversity is infeasible", async () => {
+    const diversityPlan = canonicalDiscoPlan(3, {
+      diversityGoals: {
+        minimumDistinctArtists: 3,
+        minimumDistinctAlbums: 3,
+        minimumDistinctEras: null,
+        minimumDistinctScenes: null,
+        minimumDistinctGeographies: null,
+        maximumTracksPerArtist: 1,
+        maximumTracksPerAlbum: 1,
+      },
+    });
+    let delivered = false;
+    const result = await executeRetrievalV3({
+      runId: "optimizer-cache-diversity",
+      plan: diversityPlan,
+      adapters: {
+        discover: async () => {
+          if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
+          delivered = true;
+          return {
+            candidates: Array.from({ length: 3 }, (_, index) => candidate(index, {
+              artist: "One Cached Artist",
+              album: `Cached Album ${index}`,
+              metadata: { cacheHit: true },
+            })),
+            nextCursor: null,
+            exhausted: true,
+          };
+        },
+        qualify: async ({ candidates }) => candidates.map((value, index) => (
+          canonicalDiscoQualification(value, {
+            playlistOptimizationSignals: {
+              familiarityScore: 0.5,
+              discoveryScore: 0.5,
+              eraKeys: ["2020s"],
+              sceneKeys: ["disco"],
+              geographyKeys: ["global"],
+              chronologyPosition: 2020 + index,
+            },
+          })
+        )),
+      },
+    });
+
+    expect(result.stages.canonicalUnique).toBe(3);
+    expect(result.outcome).toMatchObject({
+      status: "needs_decision",
+      stopReason: "playlist_optimization_constraints",
+      selectedTrackCount: 1,
+      shortfall: 2,
+      requiresPartialPublicationDecision: true,
+    });
+    expect(result.playlistOptimization).toMatchObject({
+      exact: false,
+      evidenceQualifiedCandidateCount: 3,
+      distinct: { artists: 1, albums: 1 },
+    });
+    expect(result.playlistOptimization?.unmetConstraints).toEqual(expect.arrayContaining([
+      "exact_count:1/3",
+      "minimum_distinct_artists:1/3",
+      "minimum_distinct_albums:1/3",
+    ]));
+    expect(result.publicationBoundary.manifestDisposition).toBe("no_manifest");
+    expect(validateCanonicalPublicationSetV3({
+      plan: diversityPlan,
+      tracks: result.selected,
+      partialPublicationAuthorized: true,
+    })).toMatchObject({ valid: false });
+  });
+
+  test("replaces a homogeneous cache prefix with lower-ranked qualified diversity", async () => {
+    const diversityPlan = canonicalDiscoPlan(3, {
+      diversityGoals: {
+        minimumDistinctArtists: 3,
+        minimumDistinctAlbums: 3,
+        minimumDistinctEras: null,
+        minimumDistinctScenes: null,
+        minimumDistinctGeographies: null,
+        maximumTracksPerArtist: 1,
+        maximumTracksPerAlbum: 1,
+      },
+    });
+    const candidates = [
+      ...Array.from({ length: 3 }, (_, index) => candidate(index, {
+        artist: "Cached Headliner",
+        album: `Headliner Album ${index}`,
+        metadata: { cacheHit: true },
+      })),
+      candidate(3, { artist: "Artist B", album: "Album B" }),
+      candidate(4, { artist: "Artist C", album: "Album C" }),
+      candidate(5, { artist: "Artist D", album: "Album D" }),
+    ];
+    let delivered = false;
+    const result = await executeRetrievalV3({
+      runId: "optimizer-cache-repair",
+      plan: diversityPlan,
+      adapters: {
+        discover: async () => {
+          if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
+          delivered = true;
+          return { candidates, nextCursor: null, exhausted: true };
+        },
+        qualify: async ({ candidates: values }) => values.map((value, index) => (
+          canonicalDiscoQualification(value, {
+            rankingSignals: { relevance: index < 3 ? 0.99 : 0.7 },
+          })
+        )),
+      },
+    });
+
+    expect(result.outcome).toMatchObject({
+      status: "exact_ready",
+      selectedTrackCount: 3,
+      shortfall: 0,
+    });
+    expect(new Set(result.selected.map(({ artist }) => artist)).size).toBe(3);
+    expect(result.playlistOptimization).toMatchObject({
+      exact: true,
+      evidenceQualifiedCandidateCount: 6,
+      distinct: { artists: 3, albums: 3 },
+    });
+    expect(validateCanonicalPublicationSetV3({
+      plan: diversityPlan,
+      tracks: result.selected,
+    })).toEqual({ valid: true, reasonCodes: [] });
+  });
+
+  test("does not call evidence-qualified exact count success when central quality misses its floor", async () => {
+    const qualityPlan = canonicalDiscoPlan(5, {
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    });
+    let delivered = false;
+    const result = await executeRetrievalV3({
+      runId: "optimizer-central-quality-floor",
+      plan: qualityPlan,
+      adapters: {
+        discover: async () => {
+          if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
+          delivered = true;
+          return {
+            candidates: Array.from({ length: 5 }, (_, index) => candidate(index)),
+            nextCursor: null,
+            exhausted: true,
+          };
+        },
+        qualify: async ({ candidates }) => candidates.map((value, index) => (
+          canonicalDiscoQualification(value, {
+            rankingSignals: {
+              relevance: 0.9,
+              central_quality: index < 4 ? 0.9 : 0.2,
+            },
+          })
+        )),
+      },
+    });
+
+    expect(result.stages.canonicalUnique).toBe(5);
+    expect(result.outcome).toMatchObject({
+      status: "partial_ready",
+      stopReason: "central_quality_floor",
+      selectedTrackCount: 4,
+      shortfall: 1,
+      requiresPartialPublicationDecision: true,
+    });
+    expect(result.playlistOptimization).toMatchObject({
+      exact: false,
+      evidenceQualifiedCandidateCount: 4,
+    });
+    expect(result.playlistOptimization?.unmetConstraints).toContain("exact_count:4/5");
+    expect(result.selected).toHaveLength(4);
+    expect(result.publicationBoundary.manifestDisposition).toBe("partial_confirmation_required");
+  });
+
   test("raises the next raw discovery goal from observed post-filter yield", async () => {
     let next = 0;
     let batchNumber = 0;
@@ -238,6 +721,9 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       runId: "yield-run",
       plan: plan("25 disco tracks", 25),
       adapters,
+      // This assertion isolates the adaptive controller. Portfolio
+      // concurrency is covered independently below.
+      policy: { maximumConcurrentDiscovery: 1 },
     });
 
     expect(result.outcome.status).toBe("exact_ready");
@@ -597,6 +1083,148 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(vi.mocked(adapters.discover).mock.calls.length).toBeLessThanOrEqual(result.strategies.length * 2);
   });
 
+  test("runs genuinely independent discovery dependencies concurrently", async () => {
+    const active = new Map<string, number>();
+    let maximumIndependentCalls = 0;
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        for (const dependencyId of strategy.discoveryDependencyIds) {
+          active.set(dependencyId, (active.get(dependencyId) ?? 0) + 1);
+        }
+        maximumIndependentCalls = Math.max(
+          maximumIndependentCalls,
+          [...active.values()].filter((count) => count > 0).length,
+        );
+        // Yield once so every independently schedulable member of this wave
+        // reaches the adapter before any one call completes.
+        await Promise.resolve();
+        for (const dependencyId of strategy.discoveryDependencyIds) {
+          active.set(dependencyId, (active.get(dependencyId) ?? 1) - 1);
+        }
+        return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
+      },
+      qualify: async () => [],
+    };
+
+    await executeRetrievalV3({
+      runId: "independent-portfolio",
+      plan: plan("disco songs", 25),
+      adapters,
+      policy: { maximumConcurrentDiscovery: 4 },
+    });
+
+    // The first tier contains local orchestration, Apple catalog, and hosted
+    // web work. Apple and hosted web must overlap as independent frontiers.
+    expect(maximumIndependentCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  test("never overlaps strategies that share any discovery dependency", async () => {
+    const active = new Map<string, number>();
+    const maximum = new Map<string, number>();
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        for (const dependencyId of strategy.discoveryDependencyIds) {
+          const count = (active.get(dependencyId) ?? 0) + 1;
+          active.set(dependencyId, count);
+          maximum.set(dependencyId, Math.max(maximum.get(dependencyId) ?? 0, count));
+        }
+        await Promise.resolve();
+        for (const dependencyId of strategy.discoveryDependencyIds) {
+          active.set(dependencyId, (active.get(dependencyId) ?? 1) - 1);
+        }
+        return { candidates: [], nextCursor: null, exhausted: false, costUnits: 0 };
+      },
+      qualify: async () => [],
+    };
+
+    await executeRetrievalV3({
+      runId: "shared-dependency-mutex",
+      plan: planWithIntents(["genre_scene", "similarity"], 25),
+      adapters,
+      policy: { maximumConcurrentDiscovery: 16, maximumGlobalRounds: 100 },
+    });
+
+    expect([...maximum.entries()]).toEqual(expect.arrayContaining([
+      ["hosted_web", 1],
+      ["apple_catalog", 1],
+    ]));
+    expect([...maximum.values()].every((count) => count === 1)).toBe(true);
+  });
+
+  test("counts repeated failures from one shared upstream as one contiguous outage", async () => {
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        if (strategy.discoveryDependencyIds.includes("hosted_web")) {
+          throw new RetrievalDependencyErrorV3("hosted search unavailable", ["hosted_web"]);
+        }
+        return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
+      },
+      qualify: async () => [],
+    };
+
+    const result = await executeRetrievalV3({
+      runId: "shared-upstream-outage",
+      plan: planWithIntents(["genre_scene", "similarity"], 25),
+      adapters,
+      policy: {
+        maximumConcurrentDiscovery: 8,
+        maximumGlobalRounds: 100,
+        maximumProviderFailuresPerStrategy: 1,
+      },
+    });
+
+    const hosted = result.dependencyOutages?.find(({ dependencyId }) => dependencyId === "hosted_web");
+    expect(hosted).toMatchObject({
+      outageCount: 1,
+      active: true,
+      circuitOpen: false,
+    });
+    expect(hosted!.failureAttempts).toBeGreaterThan(1);
+    expect(hosted!.affectedStrategyIds.length).toBeGreaterThan(1);
+  });
+
+  test("does not call an incomplete independent portfolio frontier exhaustion", async () => {
+    let emittedAppleCandidate = false;
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        if (strategy.discoveryDependencyIds.includes("hosted_web")) {
+          throw new RetrievalDependencyErrorV3("hosted search unavailable", ["hosted_web"]);
+        }
+        if (!emittedAppleCandidate && strategy.discoveryDependencyIds.includes("apple_catalog")) {
+          emittedAppleCandidate = true;
+          return {
+            candidates: [candidate(999)],
+            nextCursor: null,
+            exhausted: true,
+            costUnits: 0,
+          };
+        }
+        return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
+      },
+      qualify: async ({ candidates }) => candidates.map((value) => qualification(value)),
+    };
+
+    const result = await executeRetrievalV3({
+      runId: "incomplete-frontier",
+      plan: plan("25 disco songs", 25),
+      adapters,
+      policy: {
+        // Scope resolution plus one Apple/hosted portfolio wave reaches this
+        // generic boundary. The unresolved hosted outage must still win.
+        maximumGlobalRounds: 3,
+        maximumProviderFailuresPerStrategy: 1,
+      },
+    });
+
+    expect(result.qualifiedPool).toHaveLength(1);
+    expect(result.outcome).toMatchObject({
+      status: "failed_system",
+      stopReason: "provider_failure",
+    });
+    expect(result.deficit.primaryShortfallReason).toBe("provider_failure");
+    expect(result.publicationBoundary.manifestDisposition).toBe("blocked_operational_failure");
+  });
+
   test("fences pagination cursor loops as integrity failures", async () => {
     const adapters: RetrievalAdaptersV3 = {
       discover: async () => ({ candidates: [], nextCursor: "repeated", exhausted: false }),
@@ -693,7 +1321,7 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
   });
 
-  test("preserves custom targets through 300 and rejects a hidden cap", async () => {
+  test("preserves custom targets through the executable owner cap", async () => {
     const result = await executeRetrievalV3({
       runId: "three-hundred-run",
       plan: plan("300 broad disco tracks", 300),
@@ -703,12 +1331,37 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(result.reserve).toHaveLength(60);
     expect(result.outcome.requestedTrackCount).toBe(300);
 
-    const invalid = { ...plan("50 tracks", 50), requestedTrackCount: 301 };
+    const thousandPlan = plan("1000 broad disco tracks", 1_000);
+    const thousand = await executeRetrievalV3({
+      runId: "one-thousand-run",
+      plan: {
+        ...thousandPlan,
+        diversityGoals: {
+          minimumDistinctArtists: null,
+          minimumDistinctAlbums: null,
+          minimumDistinctEras: null,
+          minimumDistinctScenes: null,
+          minimumDistinctGeographies: null,
+          maximumTracksPerArtist: null,
+          maximumTracksPerAlbum: null,
+        },
+        orderingPolicy: {
+          ...thousandPlan.orderingPolicy,
+          avoidAdjacentSameArtist: false,
+          avoidAdjacentSameAlbum: false,
+        },
+      },
+      adapters: allQualifiedAdapter(1_200),
+    });
+    expect(thousand.selected).toHaveLength(1_000);
+    expect(thousand.outcome.requestedTrackCount).toBe(1_000);
+
+    const invalid = { ...plan("50 tracks", 50), requestedTrackCount: 1_001 };
     await expect(executeRetrievalV3({
       runId: "invalid-count",
       plan: invalid,
       adapters: allQualifiedAdapter(),
-    })).rejects.toThrow(/between 1 and 300/i);
+    })).rejects.toThrow(/between 1 and 1000/i);
   });
 
   test("uses explicit deadline and budget stop reasons without mislabeling a shortfall", async () => {
@@ -731,7 +1384,49 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       policy: { deadlineAtEpochMs: 100 },
       now: () => 100,
     });
-    expect(deadline.outcome).toMatchObject({ status: "no_compatible_tracks", stopReason: "deadline_reached" });
+    expect(deadline.outcome).toMatchObject({ status: "needs_decision", stopReason: "deadline_reached" });
+    expect(deadline.publicationBoundary).toEqual({
+      appleWriteAccess: "forbidden",
+      manifestDisposition: "no_manifest",
+    });
+  });
+
+  test("aborts provider work that is still in flight at the active-compute deadline", async () => {
+    const startedAt = Date.now();
+    let observedSignal: AbortSignal | undefined;
+    const result = await executeRetrievalV3({
+      runId: "in-flight-deadline-run",
+      plan: plan("50 techno tracks", 50),
+      adapters: {
+        discover: async (request) => {
+          observedSignal = request.signal;
+          if (!request.signal) throw new Error("provider deadline signal missing");
+          await new Promise<void>((_resolve, reject) => {
+            const fallback = setTimeout(
+              () => reject(new Error("provider deadline signal did not abort")),
+              1_000,
+            );
+            request.signal!.addEventListener("abort", () => {
+              clearTimeout(fallback);
+              reject(request.signal!.reason);
+            }, { once: true });
+          });
+          return { candidates: [], nextCursor: null, exhausted: false };
+        },
+        qualify: async () => [],
+      },
+      policy: {
+        deadlineAtEpochMs: startedAt + 25,
+        maximumConcurrentDiscovery: 1,
+      },
+    });
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal?.aborted).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(result.outcome).toMatchObject({
+      status: "needs_decision",
+      stopReason: "deadline_reached",
+    });
   });
 
   test("a continuation preserves qualified tracks and runs only its frozen approved strategy set", async () => {

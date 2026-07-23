@@ -8,7 +8,10 @@ import {
 } from "../server/pipeline-v3-retrieval.ts";
 import {
   governedCorpusActionReasonV3,
+  PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+  PipelineV3DependencyUnavailableError,
   PipelineV3WorkerExecution,
+  createPipelineV3RetrievalExecutionPort,
   retrievalPolicyV3FromPipelinePolicySnapshot,
   selectionPlanFromQueryPlanV3,
   v3RetrievalStageKey,
@@ -25,8 +28,12 @@ import {
   type SelectionPlanV3,
 } from "../server/selection-plan-v3.ts";
 import type { ColdCorpusBuildResultV3 } from "../server/pipeline-v3-corpus-builder.ts";
-import { createPipelinePolicySnapshotV3 } from "../server/pipeline-v3-policy.ts";
+import {
+  createPipelinePolicySnapshotV3,
+  pipelineV3ModelRouteFromPolicySnapshot,
+} from "../server/pipeline-v3-policy.ts";
 import type { SemanticPlanRevisionArtifactV3 } from "../server/pipeline-v3-semantic-recovery.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 
 const GRAPH_SNAPSHOT_ID = "11111111-1111-4111-8111-111111111111";
 const QUERY_PLAN_REVISION_ID = "22222222-2222-4222-8222-222222222222";
@@ -198,6 +205,8 @@ function retrievalResult(
       id: "curated_genre_scene:trusted_scoped_containers",
       engine: "curated_genre_scene",
       kind: "trusted_containers",
+      discoveryDependencyIds: ["apple_catalog"],
+      qualificationDependencyIds: ["apple_catalog"],
       status: "exhausted",
       rounds: 1,
       rawCandidates: canonicalUnique,
@@ -231,6 +240,8 @@ function factualNoCompatibleResult(rawCandidates: number): RetrievalResultV3 {
       id: "factual_relationship:promoted_graph_assertions",
       engine: "factual_relationship",
       kind: "graph_traversal",
+      discoveryDependencyIds: ["governed_evidence_graph"],
+      qualificationDependencyIds: ["apple_catalog"],
       status: "exhausted",
       rounds: 1,
       rawCandidates,
@@ -515,6 +526,7 @@ describe("Pipeline V3 durable worker execution", () => {
       policy: {
         maximumGlobalRounds: 48,
         maximumRawCandidates: 500,
+        qualifiedPoolGoal: 55,
         maximumCostUnits: 48,
         deadlineAtEpochMs: null,
         maximumProviderFailuresPerStrategy: 2,
@@ -558,6 +570,7 @@ describe("Pipeline V3 durable worker execution", () => {
     expect(retrievalPolicyV3FromPipelinePolicySnapshot(snapshot)).toEqual({
       maximumGlobalRounds: 7,
       maximumRawCandidates: 777,
+      qualifiedPoolGoal: 55,
       maximumCostUnits: 9,
       deadlineAtEpochMs: null,
       maximumProviderFailuresPerStrategy: 2,
@@ -576,11 +589,444 @@ describe("Pipeline V3 durable worker execution", () => {
       policy: {
         maximumGlobalRounds: 7,
         maximumRawCandidates: 777,
+        qualifiedPoolGoal: 55,
         maximumCostUnits: 9,
         deadlineAtEpochMs: null,
         maximumProviderFailuresPerStrategy: 2,
       },
     }));
+  });
+
+  test("turns the cumulative 15-minute compute boundary into a decision, not scarcity", async () => {
+    const plan = queryPlan();
+    const repository = new MemoryRepository();
+    const base = retrievalResult("needs_decision", 0);
+    const result: RetrievalResultV3 = {
+      ...base,
+      outcome: {
+        ...base.outcome,
+        status: "needs_decision",
+        stopReason: "deadline_reached",
+      },
+      deficit: {
+        ...base.deficit,
+        primaryShortfallReason: "deadline_reached",
+      },
+      publicationBoundary: {
+        appleWriteAccess: "forbidden",
+        manifestDisposition: "no_manifest",
+      },
+    };
+    const port = execution(result);
+    const exhaustedPayload = {
+      ...payload(plan),
+      __contractActiveComputeConsumedMs: PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+    };
+    const before = Date.now();
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: exhaustedPayload,
+    });
+
+    const deadline = vi.mocked(port.execute).mock.calls[0]?.[0].policy.deadlineAtEpochMs;
+    expect(deadline).toBeTypeOf("number");
+    expect(deadline).toBeGreaterThanOrEqual(before);
+    expect(deadline).toBeLessThanOrEqual(Date.now());
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "needs_decision",
+      phase: "active_compute_limit_reached",
+      error: null,
+    });
+    expect(repository.checkpoints.get("active_compute_limit")).toMatchObject({
+      state: "needs_decision",
+      activeComputeLimitMs: PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+    });
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active"))).toMatchObject({
+      outcome: { status: "needs_decision", stopReason: "deadline_reached" },
+    });
+    assertFenced(repository, plan);
+  });
+
+  test("persists a hash-bound 15-minute decision and a publishable verified partial", async () => {
+    const plan = queryPlan();
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "disco-compute-boundary",
+      rawPrompt: "25 influential disco recordings from the 1970s",
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        {
+          id: "prompt:genre:disco",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["disco"],
+          source: { provenance: "prompt", text: "Disco" },
+        },
+        {
+          id: "prompt:era:1970s",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "era",
+          operator: "require",
+          values: ["1970s"],
+          source: { provenance: "prompt", text: "Recorded in the 1970s" },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "prompt:genre:disco" },
+          { op: "clause", clauseId: "prompt:era:1970s" },
+        ],
+      },
+    });
+    class DecisionRepository extends MemoryRepository {
+      readonly blockers: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async openPlaylistRunBlocker(input: Record<string, unknown>): Promise<string> {
+        this.blockers.push(structuredClone(input));
+        return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      }
+    }
+    const repository = new DecisionRepository();
+    const base = retrievalResult("needs_decision", 12);
+    const result: RetrievalResultV3 = {
+      ...base,
+      outcome: {
+        ...base.outcome,
+        status: "needs_decision",
+        stopReason: "deadline_reached",
+      },
+      deficit: {
+        ...base.deficit,
+        primaryShortfallReason: "deadline_reached",
+      },
+      strategies: base.strategies.map((strategy) => ({
+        ...strategy,
+        status: "available",
+      })),
+      predicateDiagnostics: {
+        qualificationsObserved: 30,
+        scopeFailures: 14,
+        failedMembershipPredicateIds: {
+          "prompt:era:1970s": 14,
+        },
+        appleLookupCount: 12,
+        appleProviderRequestCount: 3,
+        rootCause: "under_discovery",
+        recoveryAttemptCount: 0,
+      },
+    };
+    const port = execution(result);
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: {
+        ...payload(plan),
+        __contractRevisionDatabaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        __contractActiveComputeConsumedMs: PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+      },
+    });
+
+    expect(repository.persisted).toHaveLength(1);
+    expect(repository.persisted[0]?.result.outcome).toMatchObject({
+      status: "partial_ready",
+      selectedTrackCount: 12,
+      requiresPartialPublicationDecision: true,
+    });
+    expect(repository.checkpoints.get("run_decision")).toMatchObject({
+      schemaVersion: "genio-run-decision/v1",
+      reason: "active_compute_limit",
+      verifiedTrackCount: 12,
+      remainingStrategyCount: 1,
+      namedPredicates: [{
+        clauseId: "prompt:era:1970s",
+        label: "Recorded in the 1970s",
+      }],
+      actions: {
+        anotherBoundedPass: true,
+        publishVerifiedPartial: true,
+        reduceCount: true,
+      },
+    });
+    expect(repository.blockers[0]).toMatchObject({
+      blockerKind: "scope_decision",
+      dependencyKey: "active_compute",
+      state: {
+        decisionHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      },
+    });
+  });
+
+  test("maps optimizer constraint failure to an explicit non-publishable decision", async () => {
+    const plan = queryPlan();
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "disco-playlist-constraints",
+      rawPrompt: "25 disco recordings with at least 20 distinct artists",
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        {
+          id: "prompt:genre:disco",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["disco"],
+          source: { provenance: "prompt", text: "Disco" },
+        },
+        {
+          id: "prompt:diversity:artists",
+          kind: "quota_diversity",
+          scope: "playlist",
+          hardness: "hard",
+          axis: "artist_diversity",
+          operator: "balance",
+          values: ["at least 20 distinct artists"],
+          source: { provenance: "prompt", text: "At least 20 distinct artists" },
+        },
+      ],
+      trackPredicate: { op: "clause", clauseId: "prompt:genre:disco" },
+      playlistConstraints: [{
+        id: "quota:distinct-artists",
+        clauseId: "prompt:diversity:artists",
+        predicate: { op: "clause", clauseId: "prompt:genre:disco" },
+        minimumCount: 20,
+        maximumCount: null,
+        minimumRatio: null,
+        maximumRatio: null,
+      }],
+    });
+    class OptimizerDecisionRepository extends MemoryRepository {
+      readonly blockers: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async openPlaylistRunBlocker(input: Record<string, unknown>): Promise<string> {
+        this.blockers.push(structuredClone(input));
+        return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      }
+    }
+    const repository = new OptimizerDecisionRepository();
+    const base = retrievalResult("needs_decision", 18);
+    const result: RetrievalResultV3 = {
+      ...base,
+      outcome: {
+        ...base.outcome,
+        status: "needs_decision",
+        stopReason: "playlist_optimization_constraints",
+        requiresPartialPublicationDecision: true,
+      },
+      deficit: {
+        ...base.deficit,
+        primaryShortfallReason: "playlist_optimization_constraints",
+      },
+      playlistOptimization: {
+        policyVersion: "playlist_optimizer_v1",
+        exact: false,
+        evidenceQualifiedCandidateCount: 25,
+        unmetConstraints: ["minimum_distinct_artists:12/20"],
+        distinct: {
+          artists: 12,
+          albums: 18,
+          eras: 1,
+          scenes: 1,
+          geographies: 1,
+        },
+        familiarTrackCount: 8,
+      },
+      publicationBoundary: {
+        appleWriteAccess: "forbidden",
+        manifestDisposition: "no_manifest",
+      },
+    };
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun("25 disco recordings with at least 20 distinct artists"),
+      queryPlan: plan,
+      payload: {
+        ...payload(plan),
+        __contractRevisionDatabaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      },
+    });
+
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.checkpoints.get("playlist_constraints_decision")).toMatchObject({
+      state: "needs_decision",
+      reasonCode: "playlist_optimization_constraints",
+      playlistOptimization: {
+        exact: false,
+        unmetConstraints: ["minimum_distinct_artists:12/20"],
+      },
+    });
+    expect(repository.checkpoints.get("run_decision")).toMatchObject({
+      reason: "playlist_optimization_constraints",
+      namedPredicates: [{
+        clauseId: "prompt:diversity:artists",
+        label: "At least 20 distinct artists",
+      }],
+      actions: {
+        publishVerifiedPartial: false,
+        reviseNamedPredicate: true,
+        reduceCount: true,
+      },
+    });
+    expect(repository.blockers[0]).toMatchObject({
+      blockerKind: "scope_decision",
+      dependencyKey: "playlist_constraints",
+    });
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "needs_decision",
+      phase: "playlist_optimization_constraints_missed",
+      error: null,
+    });
+  });
+
+  test("offers one fenced predicate rescue before falling back to the 15-minute panel", async () => {
+    const plan = queryPlan();
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "disco-rescue-boundary",
+      rawPrompt: "25 influential disco recordings from the 1970s",
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        {
+          id: "prompt:genre:disco",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["disco"],
+          source: { provenance: "prompt", text: "Disco" },
+        },
+        {
+          id: "prompt:era:1970s",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "era",
+          operator: "require",
+          values: ["1970s"],
+          source: { provenance: "prompt", text: "Recorded in the 1970s" },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "prompt:genre:disco" },
+          { op: "clause", clauseId: "prompt:era:1970s" },
+        ],
+      },
+    });
+    class RescueRepository extends MemoryRepository {
+      readonly rescueInputs: Array<Record<string, unknown>> = [];
+      readonly blockers: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async preparePlaylistRunRescueGuidance(input: Record<string, unknown>) {
+        this.rescueInputs.push(structuredClone(input));
+        return { questionSetHash: "e".repeat(64) };
+      }
+
+      async openPlaylistRunBlocker(input: Record<string, unknown>): Promise<string> {
+        this.blockers.push(structuredClone(input));
+        return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      }
+    }
+    const repository = new RescueRepository();
+    const base = retrievalResult("needs_decision", 12);
+    const result: RetrievalResultV3 = {
+      ...base,
+      outcome: {
+        ...base.outcome,
+        status: "needs_decision",
+        stopReason: "deadline_reached",
+      },
+      deficit: {
+        ...base.deficit,
+        primaryShortfallReason: "deadline_reached",
+      },
+      predicateDiagnostics: {
+        qualificationsObserved: 30,
+        scopeFailures: 14,
+        failedMembershipPredicateIds: {
+          "prompt:era:1970s": 14,
+        },
+        appleLookupCount: 12,
+        appleProviderRequestCount: 3,
+        rootCause: "under_discovery",
+        recoveryAttemptCount: 0,
+      },
+    };
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings from the 1970s"),
+      queryPlan: plan,
+      payload: {
+        ...payload(plan),
+        __contractRevisionDatabaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      },
+    });
+
+    expect(repository.rescueInputs).toHaveLength(1);
+    expect(repository.rescueInputs[0]).toMatchObject({
+      runId: "run-v3",
+      contractRevisionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      contractSemanticHash: contract.semanticHash,
+      limitingClauseIds: ["prompt:era:1970s"],
+      fence: {
+        jobId: JOB_ID,
+        leaseEpoch: 7,
+        queryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+      },
+    });
+    expect(repository.blockers).toHaveLength(0);
+    expect(repository.checkpoints.get("run_decision")).toMatchObject({
+      reason: "active_compute_limit",
+      actions: { reviseNamedPredicate: true },
+    });
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "needs_decision",
+      phase: "rescue_guidance_required",
+      error: null,
+    });
   });
 
   test("fails closed when immutable retrieval ceilings conflict", async () => {
@@ -754,12 +1200,12 @@ describe("Pipeline V3 durable worker execution", () => {
   test("fails closed into a durable waiting state when no retrieval provider is configured", async () => {
     const plan = queryPlan();
     const repository = new MemoryRepository();
-    await new PipelineV3WorkerExecution(repository, null).process({
+    await expect(new PipelineV3WorkerExecution(repository, null).process({
       runId: "run-v3",
       run: workerRun("25 influential disco recordings"),
       queryPlan: plan,
       payload: payload(plan),
-    });
+    })).rejects.toBeInstanceOf(PipelineV3DependencyUnavailableError);
 
     expect(repository.updates.at(-1)?.patch).toEqual({
       status: "queued",
@@ -774,26 +1220,61 @@ describe("Pipeline V3 durable worker execution", () => {
     assertFenced(repository, plan);
   });
 
+  test("keeps provider-failed retrieval on the durable retry path instead of terminalizing failed_system", async () => {
+    const plan = queryPlan();
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("failed_system", 0));
+
+    await expect(new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: payload(plan),
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_dependency_unavailable",
+      dependencyKey: "v3_retrieval_provider",
+      reasonCode: "v3_retrieval_provider_failed",
+    });
+
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "queued",
+      phase: "v3_waiting_for_retrieval_provider",
+      error: null,
+    });
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active"))).toMatchObject({
+      state: "waiting_provider",
+      reasonCode: "v3_retrieval_provider_failed",
+      outcome: { status: "failed_system", stopReason: "provider_failure" },
+      leaseEpoch: 7,
+    });
+    expect(repository.checkpoints.get("v3:retrieval:latest")).toMatchObject({
+      state: "waiting_provider",
+      reasonCode: "v3_retrieval_provider_failed",
+    });
+    assertFenced(repository, plan);
+  });
+
   test("resumes a provider-paused stage only from a successor lease", async () => {
     const plan = queryPlan();
     const repository = new MemoryRepository();
     const originalPayload = payload(plan);
-    await new PipelineV3WorkerExecution(repository, null).process({
+    await expect(new PipelineV3WorkerExecution(repository, null).process({
       runId: "run-v3",
       run: workerRun("25 influential disco recordings"),
       queryPlan: plan,
       payload: originalPayload,
-    });
+    })).rejects.toBeInstanceOf(PipelineV3DependencyUnavailableError);
     expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active")))
       .toMatchObject({ state: "waiting_provider", leaseEpoch: 7 });
 
     const port = execution(retrievalResult("exact_ready", 25));
-    await new PipelineV3WorkerExecution(repository, port).process({
+    await expect(new PipelineV3WorkerExecution(repository, port).process({
       runId: "run-v3",
       run: workerRun("25 influential disco recordings"),
       queryPlan: plan,
       payload: originalPayload,
-    });
+    })).rejects.toBeInstanceOf(PipelineV3DependencyUnavailableError);
     expect(port.execute).not.toHaveBeenCalled();
 
     const successorPayload: PipelineV3WorkerPayload = {
@@ -993,5 +1474,123 @@ describe("Pipeline V3 durable worker execution", () => {
     expect(repository.updates).toHaveLength(0);
     expect(repository.persisted).toHaveLength(0);
     expect(port.execute).not.toHaveBeenCalled();
+  });
+
+  test("flushes separated discovery and qualification observations outside provider classification", async () => {
+    const query = queryPlan(1);
+    const plan = selectionPlanFromQueryPlanV3(query, {
+      prompt: "One influential disco recording",
+    });
+    const rawCandidate = {
+      id: "lead-1",
+      artist: "Test Artist",
+      title: "Test Track",
+      album: "Test Album",
+      sourceObservationIds: ["observation-1"],
+    };
+    const port = createPipelineV3RetrievalExecutionPort({
+      adapters: {
+        discover: vi.fn(async () => ({
+          candidates: [rawCandidate],
+          nextCursor: null,
+          exhausted: true,
+          costUnits: 1,
+        })),
+        qualify: vi.fn(async () => [{
+          candidateId: rawCandidate.id,
+          scope: {
+            passed: false,
+            failedMembershipPredicateIds: ["membership:genre"],
+            fit: 0,
+          },
+          hardConstraints: {
+            passed: true,
+            failedConstraintIds: [],
+          },
+          evidence: {
+            passed: false,
+            bindingIds: [],
+            strength: 0,
+            independentProvenanceRoots: 0,
+          },
+          version: { compatible: true, confidence: 1 },
+          catalog: {
+            lookupAttempted: false,
+            storefrontPlayable: false,
+            appleSongId: null,
+            recordingFamilyKey: null,
+            confidence: 0,
+          },
+          rankingSignals: {},
+          sourceRank: 1,
+        }]),
+      },
+    });
+    const recordDiscoveryBatch = vi.fn(async () => undefined);
+    const recordQualificationBatch = vi.fn(async () => undefined);
+    const snapshot = workerRun("One influential disco recording", 1)
+      .pipelinePolicySnapshot;
+    await port.execute({
+      runId: "run-v3",
+      plan,
+      executionMode: "active",
+      routingHints: { fixedContainer: false },
+      modelRoute: pipelineV3ModelRouteFromPolicySnapshot(snapshot),
+      policy: {
+        maximumGlobalRounds: 1,
+        maximumConcurrentDiscovery: 1,
+        maximumRawCandidates: 10,
+        qualifiedPoolGoal: 1,
+        maximumCostUnits: 10,
+        deadlineAtEpochMs: null,
+        maximumProviderFailuresPerStrategy: 1,
+      },
+      semanticRecoveryEnabled: false,
+      claimSemanticRecovery: vi.fn(async () => undefined),
+      recordDiscoveryBatch,
+      recordQualificationBatch,
+    });
+    expect(recordDiscoveryBatch).toHaveBeenCalledOnce();
+    expect(recordDiscoveryBatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "run-v3",
+        appleWriteAccess: "forbidden",
+      }),
+      expect.objectContaining({ candidates: [rawCandidate] }),
+    );
+    expect(recordQualificationBatch).toHaveBeenCalledOnce();
+    expect(recordQualificationBatch).toHaveBeenCalledWith(
+      expect.objectContaining({ candidates: [rawCandidate] }),
+      expect.arrayContaining([
+        expect.objectContaining({ candidateId: rawCandidate.id }),
+      ]),
+    );
+
+    const persistenceFailure = Object.assign(
+      new Error("contract attempt became stale"),
+      { code: "pipeline_v3_recovery_fence_stale" },
+    );
+    await expect(port.execute({
+      runId: "run-v3",
+      plan,
+      executionMode: "active",
+      routingHints: { fixedContainer: false },
+      modelRoute: pipelineV3ModelRouteFromPolicySnapshot(snapshot),
+      policy: {
+        maximumGlobalRounds: 1,
+        maximumConcurrentDiscovery: 1,
+        maximumRawCandidates: 10,
+        qualifiedPoolGoal: 1,
+        maximumCostUnits: 10,
+        deadlineAtEpochMs: null,
+        maximumProviderFailuresPerStrategy: 1,
+      },
+      semanticRecoveryEnabled: false,
+      claimSemanticRecovery: vi.fn(async () => undefined),
+      recordDiscoveryBatch: vi.fn(async () => {
+        throw persistenceFailure;
+      }),
+      recordQualificationBatch: vi.fn(async () => undefined),
+    })).rejects.toBe(persistenceFailure);
   });
 });

@@ -10,6 +10,7 @@ import type {
   SelectionScopeKind,
   SelectionVersionPolicy,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   effectiveGuidanceGeographyConstraint,
   type PlaylistGuidancePreference,
@@ -28,7 +29,8 @@ export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
-const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
+const MOOD_ACTIVITY_INTENT = /\b(?:mood|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
+const VIBE_INTENT = /\bvibes?\b/iu;
 // `editorial_ranking` is an evidence-bearing intent: every selected track must
 // independently prove the requested ranking or historical claim. Reserve it
 // for requests that actually make such a claim. Lightweight curation words
@@ -39,7 +41,7 @@ const EDITORIAL_RANKING_INTENT = /\b(?:best|greatest|top(?:\s+\d+)?|ranked|ranki
 const EXPLICIT_EDITORIAL_EVIDENCE_INTENT = /\b(?:require|required|must|only)\b[^.;!?\n]{0,100}\b(?:editorial|historical|documented|cited|ranking|ranked|influence)\b|\b(?:editorial|historical|documented|cited)\b[^.;!?\n]{0,100}\bevidence\b/iu;
 const SOFT_EDITORIAL_DESCRIPTOR = /\b(?:essential|iconic|classic|definitive|representative)\b/giu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
-const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggae|classical|country|electronic)\b/iu;
+const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggaet[oó]n|reggae|latin[ -]?urban|dembow|classical|country|electronic)\b/iu;
 const THEME_INTENT_MENTION = /\b(?:(?:songs?|tracks?|recordings?|music)\s+about|lyrics?\s+about|themes?|themed)\b/giu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
@@ -276,11 +278,24 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   // “Essentials” or its description says “recordings by Brazilian artists”.
   const directIntentScope = prompt;
   const intents: ResearchIntent[] = [];
+  const directThemeIntent = hasPositiveThemeIntent(directIntentScope);
+  const physicalHouseTheme = directThemeIntent
+    && /\b(?:a|the|physical)\s+houses?\b|\bhomes?\b/iu.test(directIntentScope)
+    && !/\bhouse\s+music\b/iu.test(directIntentScope);
+  const genreSceneIntent = !physicalHouseTheme
+    && (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship));
   if (brief.mode === "exhaustive" || brief.mode === "hybrid" || EXHAUSTIVE_INTENT.test(directIntentScope)) intents.push("exhaustive");
   if (assertsFactualTrackRelationship(`${brief.relationship} ${prompt}`)) intents.push("factual_relationship");
   if (SIMILARITY_INTENT.test(directIntentScope)) intents.push("similarity");
-  if (MOOD_ACTIVITY_INTENT.test(directIntentScope)) intents.push("mood_activity");
-  const directThemeIntent = hasPositiveThemeIntent(directIntentScope);
+  // A generic "vibe" modifier on an explicit genre request is a soft
+  // curation preference unless the visitor also names a concrete mood or
+  // activity. Treating the word itself as an evidence-bearing intent made
+  // every selected recording prove that mood independently, even when the
+  // immutable plan correctly stored all vibe rules as relaxable preferences.
+  if (MOOD_ACTIVITY_INTENT.test(directIntentScope)
+    || (VIBE_INTENT.test(directIntentScope) && !genreSceneIntent)) {
+    intents.push("mood_activity");
+  }
   if (directThemeIntent) intents.push("theme");
   // Generated descriptions often say “recordings by Brazilian artists” or
   // similar while describing a genre survey. That is not a direct-artist
@@ -290,13 +305,7 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
     || EXPLICIT_EDITORIAL_EVIDENCE_INTENT.test(directIntentScope)) {
     intents.push("editorial_ranking");
   }
-  const physicalHouseTheme = directThemeIntent
-    && /\b(?:a|the|physical)\s+houses?\b|\bhomes?\b/iu.test(directIntentScope)
-    && !/\bhouse\s+music\b/iu.test(directIntentScope);
-  if (!physicalHouseTheme
-    && (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship))) {
-    intents.push("genre_scene");
-  }
+  if (genreSceneIntent) intents.push("genre_scene");
   if (intents.length === 0) intents.push("genre_scene");
   return [...new Set(intents)];
 }
@@ -364,6 +373,9 @@ const GENRE_TERMS: Array<[string, RegExp]> = [
   ["baile funk", /\b(?:baile funk|funk carioca)\b/iu],
   ["hip-hop", /\bhip[ -]?hop\b/iu],
   ["bossa nova", /\bbossa nova\b/iu],
+  ["reggaeton", /\breggaet[oó]n\b/iu],
+  ["Latin urban", /\blatin[ -]?urban\b/iu],
+  ["dembow", /\bdembow\b/iu],
   ["house music", /\bhouse\s+music\b|\bhouse\b(?=\s+(?:anthems?|artists?|classics?|djs?|genre|mixes?|producers?|scene|tracks?))/iu],
   ["drill", /\bdrill\b/iu],
   ["jazz", /\bjazz\b/iu],
@@ -910,7 +922,9 @@ function parsedPlaylistCount(value: string | undefined): number | null {
   const numeric = /^\d{1,3}$/u.test(normalizedValue)
     ? Number.parseInt(normalizedValue, 10)
     : PLAYLIST_COUNT_WORDS.get(normalizedValue);
-  return Number.isSafeInteger(numeric) && Number(numeric) >= 1 && Number(numeric) <= 300
+  return Number.isSafeInteger(numeric)
+    && Number(numeric) >= 1
+    && Number(numeric) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
     ? Number(numeric)
     : null;
 }

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CatalogSong, PipelinePolicyVersion } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   AppleApiError,
   AppleAuthorizationRequiredError,
@@ -138,7 +139,7 @@ export interface CatalogDiscoveryProgressSnapshot {
 
 export interface CatalogDiscoverySizePolicy {
   policyVersion: PipelinePolicyVersion;
-  tier: 25 | 50 | 100 | 200 | 300;
+  tier: 25 | 50 | 100 | 200 | 300 | 500 | 750 | 1_000;
   deadlineMs: number;
   maxPagesPerStrategy: number;
   maxTotalProviderCalls: number;
@@ -330,6 +331,9 @@ const CATALOG_SIZE_POLICIES: readonly CatalogDiscoverySizePolicy[] = Object.free
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 100, deadlineMs: 90_000, maxPagesPerStrategy: 6, maxTotalProviderCalls: 140 }),
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 200, deadlineMs: 180_000, maxPagesPerStrategy: 8, maxTotalProviderCalls: 260 }),
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 300, deadlineMs: 300_000, maxPagesPerStrategy: 10, maxTotalProviderCalls: 400 }),
+  Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 500, deadlineMs: 450_000, maxPagesPerStrategy: 17, maxTotalProviderCalls: 667 }),
+  Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 750, deadlineMs: 675_000, maxPagesPerStrategy: 25, maxTotalProviderCalls: 1_000 }),
+  Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 1_000, deadlineMs: 900_000, maxPagesPerStrategy: 34, maxTotalProviderCalls: 1_334 }),
 ]);
 
 /** Immutable execution limits selected from the requested output tier. */
@@ -341,7 +345,13 @@ export function catalogDiscoverySizePolicy(
     && policyVersion !== "relevance_first_2026_07_r2") {
     throw new Error(`Unsupported catalog discovery policy: ${policyVersion}`);
   }
-  const bounded = Math.max(1, Math.min(300, Math.floor(Number.isFinite(target) ? target : 50)));
+  const bounded = Math.max(
+    1,
+    Math.min(
+      EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+      Math.floor(Number.isFinite(target) ? target : 50),
+    ),
+  );
   const policy = CATALOG_SIZE_POLICIES.find((candidate) => bounded <= candidate.tier) ?? CATALOG_SIZE_POLICIES.at(-1)!;
   return policy.policyVersion === policyVersion ? policy : Object.freeze({ ...policy, policyVersion });
 }

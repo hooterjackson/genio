@@ -1,6 +1,7 @@
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
-  curatedResearchBudgetUsd,
+  EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  executableCuratedResearchBudgetUsd,
   PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
   PUBLIC_PLAYLIST_MISSING_COUNT_TRACKS,
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
@@ -57,7 +58,7 @@ export function estimateResearchCostRange(brief: PlaylistBrief): ResearchCostEst
     // passes, low-context hosted search, and no exhaustive frontier passes.
     // Keep this estimate aligned with researchExecutionPolicy rather than the
     // semantic complexity table used by open-ended deep research.
-    const maximumUsd = curatedResearchBudgetUsd(maximumTracks);
+    const maximumUsd = executableCuratedResearchBudgetUsd(maximumTracks);
     const minimumUsd = maximumTracks <= 50 ? 0.15 : maximumTracks <= 100 ? 0.25 : 0.35;
     add(maximumTracks <= 100 ? "bounded fast cited research" : "large bounded fast cited research", minimumUsd, maximumUsd);
     return {
@@ -229,6 +230,31 @@ export function applyRequestedTrackCount(brief: PlaylistBrief, count: number): P
   };
 }
 
+/** Internal counterpart used only after an authenticated API admission gate. */
+export function applyExecutableRequestedTrackCount(
+  brief: PlaylistBrief,
+  count: number,
+): PlaylistBrief {
+  if (
+    !Number.isInteger(count)
+    || count < PUBLIC_PLAYLIST_MINIMUM_TRACKS
+    || count > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+  ) {
+    throw new Error(
+      `Requested track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS}`,
+    );
+  }
+  const constrained: PlaylistBrief = {
+    ...brief,
+    mode: "curated",
+    targetSize: { min: count, max: count },
+  };
+  return {
+    ...constrained,
+    title: normalizePlaylistTitle(constrained.title, constrained),
+  };
+}
+
 function boundedSubjectiveBrief(prompt: string, brief: PlaylistBrief): PlaylistBrief {
   // Explicit factual enumeration is the only prose-only route into the deep
   // source-frontier workflow. Adjectives such as "long" never qualify.
@@ -256,7 +282,7 @@ export function canonicalBriefForRequest(
       request.prompt,
       preserveExplicitTrackCount(request.prompt, interpreted),
     )
-    : applyRequestedTrackCount(interpreted, request.requestedTrackCount);
+    : applyExecutableRequestedTrackCount(interpreted, request.requestedTrackCount);
   // Similarity semantics depend on the final workload mode. Apply them after
   // exact-count/default normalization so a model's incorrect "exhaustive"
   // label cannot bypass reference-artist exclusion.

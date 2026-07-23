@@ -8,7 +8,10 @@ import type {
   RetrievalOutcomeStatusV3,
   RetrievalResultV3,
 } from "../server/pipeline-v3-retrieval.ts";
-import { publicTrackScopeAttestationV3 } from "../server/pipeline-v3-retrieval.ts";
+import {
+  publicTrackScopeAttestationV3,
+  retrievalStrategiesForEnginesV3,
+} from "../server/pipeline-v3-retrieval.ts";
 import {
   selectionPlanFromQueryPlanV3,
   type PipelineV3WriteFence,
@@ -19,7 +22,17 @@ import {
   manifestContentHash as publisherManifestContentHash,
   publishManifest,
 } from "../server/publisher.ts";
-import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
+import { orderedAppleStableIdsHash } from "../server/publication-reconciliation-persistence.ts";
+import {
+  CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+} from "../server/canonical-publication-revalidation-v1.ts";
+import {
+  createQueryPlanV3,
+  queryPlanV3Hash,
+} from "../server/query-plan-v3.ts";
+import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 import {
   evidenceMembershipPredicateIdsV3,
   selectionPlanV3Hash,
@@ -196,6 +209,8 @@ function retrievalResult(input: {
       id: "curated_genre_scene:trusted_scoped_containers",
       engine: "curated_genre_scene",
       kind: "trusted_containers",
+      discoveryDependencyIds: ["apple_catalog"],
+      qualificationDependencyIds: ["apple_catalog"],
       status: "exhausted",
       rounds: 1,
       rawCandidates: qualifiedPool.length,
@@ -228,6 +243,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY_GROUPS", "genre_scene");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    vi.stubEnv("PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED", "true");
     vi.stubEnv("APPLE_STOREFRONT", "us");
     adminPool = new Pool({
       connectionString: databaseUrl,
@@ -272,6 +289,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     label: string,
     transformSelectionPlan?: (plan: SelectionPlanV3) => SelectionPlanV3,
     rawPrompt = `Create ${target} released recordings in the ${label} music genre`,
+    canonicalRecovery: false | "empty" | "or_membership" = false,
   ): Promise<{
     runId: string;
     accessId: string;
@@ -309,6 +327,203 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         graphSnapshotId,
       });
     }
+    if (canonicalRecovery) {
+      const active = (await pool.query<{
+        selection_plan: SelectionPlanV3;
+        selection_plan_id: string;
+        selection_revision: number;
+        query_plan_id: string;
+        query_revision: number;
+        graph_snapshot_id: string;
+        raw_prompt: string;
+      }>(
+        `SELECT selection.plan_json selection_plan,
+                selection.id selection_plan_id,
+                selection.revision selection_revision,
+                query.id query_plan_id,query.revision query_revision,
+                query.graph_snapshot_id,
+                spec.raw_prompt
+         FROM research_runs run
+         JOIN run_specs spec ON spec.run_id=run.id
+         JOIN run_active_query_plans active ON active.run_id=run.id
+         JOIN query_plan_revisions query
+           ON query.id=active.query_plan_revision_id
+         JOIN selection_plans selection
+           ON selection.id=query.selection_plan_id
+         WHERE run.id=$1`,
+        [created.runId],
+      )).rows[0]!;
+      expect(active?.selection_plan).toBeTruthy();
+      const canonicalClauses = canonicalRecovery === "or_membership"
+        ? [{
+            id: "genre:reggaeton",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "genre",
+            operator: "require" as const,
+            values: ["reggaeton"],
+            source: {
+              provenance: "prompt" as const,
+              text: "reggaeton",
+            },
+          }, {
+            id: "genre:dembow",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "genre",
+            operator: "require" as const,
+            values: ["dembow"],
+            source: {
+              provenance: "prompt" as const,
+              text: "dembow",
+            },
+          }]
+        : [{
+            id: "catalog:storefront-playable",
+            kind: "catalog_version" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "catalog",
+            operator: "require" as const,
+            values: ["storefront playable"],
+            source: {
+              provenance: "system_default" as const,
+              text: "storefront playable",
+            },
+            evidence: {
+              required: true,
+              claim: "The recording is playable in the requested storefront",
+              minimumGrade: "authoritative_structured_metadata" as const,
+              permittedGrades: [
+                "authoritative_structured_metadata" as const,
+              ],
+            },
+            // This fixture isolates publication reconciliation. Production
+            // adapters supply the structured assessment; allowing a missing
+            // fixture assessment avoids manufacturing editorial evidence.
+            unknownPolicy: "allow" as const,
+          }];
+      const contract = compilePlaylistContractRevisionV1({
+        contractId: `run:${created.runId}`,
+        rawPrompt: active.raw_prompt,
+        requestedTrackCount: target,
+        locale: "en-US",
+        storefront: active.selection_plan.storefront,
+        clauses: canonicalClauses,
+        trackPredicate: canonicalRecovery === "or_membership"
+          ? {
+              op: "any",
+              children: canonicalClauses.map(({ id }) => ({
+                op: "clause" as const,
+                clauseId: id,
+              })),
+            }
+          : {
+              op: "clause",
+              clauseId: "catalog:storefront-playable",
+            },
+      });
+      const contractRevision = await repository.savePlaylistContractRevision({
+        runId: created.runId,
+        expectedParentRevisionId: null,
+        contractHash: contract.semanticHash,
+        contract: structuredClone(contract) as unknown as Record<string, unknown>,
+        compilerVersion: contract.versions.compiler,
+        ontologyVersion: contract.versions.ontology,
+        evidencePolicyVersion: contract.versions.evidencePolicy,
+        questionTemplateVersion: contract.versions.questionTemplates,
+        catalogPolicyVersion: contract.versions.catalogPolicy,
+        locale: contract.locale,
+        storefront: contract.storefront,
+        answerLineageHash: sha256Hex(
+          stableStringify(contract.answerLineage),
+        ),
+      });
+      const canonicalSelectionPlan: SelectionPlanV3 = {
+        ...active.selection_plan,
+        canonicalContractPolicy:
+          canonicalContractExecutionPolicyV1(contract),
+      };
+      const canonicalQueryPlan = createQueryPlanV3(
+        canonicalSelectionPlan,
+        active.graph_snapshot_id,
+        {
+          schemaVersion: 4,
+          briefContractVersion: 3,
+          playlistContractRevisionId: contract.revisionId,
+          playlistContractSemanticHash: contract.semanticHash,
+          playlistContractCompilerVersion: contract.versions.compiler,
+        },
+      );
+      const canonicalSelectionHash =
+        selectionPlanV3Hash(canonicalSelectionPlan);
+      const canonicalQueryHash = queryPlanV3Hash(canonicalQueryPlan);
+      const canonicalSelectionPlanId = randomUUID();
+      const canonicalQueryPlanId = randomUUID();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `UPDATE selection_plans SET status='superseded'
+           WHERE run_id=$1 AND status='active'`,
+          [created.runId],
+        );
+        await client.query(
+          `INSERT INTO selection_plans(
+             id,run_id,revision,status,plan_hash,plan_json,
+             pipeline_version,policy_version,confirmed_at)
+           VALUES($1,$2,$3,'active',$4,$5::jsonb,
+             'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+          [
+            canonicalSelectionPlanId,
+            created.runId,
+            active.selection_revision + 1,
+            canonicalSelectionHash,
+            JSON.stringify(canonicalSelectionPlan),
+          ],
+        );
+        await client.query(
+          `INSERT INTO query_plan_revisions(
+             id,run_id,selection_plan_id,revision,parent_revision_id,
+             graph_snapshot_id,engine,status,plan_hash,plan_json,
+             pipeline_version,policy_version,activated_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,'active',$8,$9::jsonb,
+             'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+          [
+            canonicalQueryPlanId,
+            created.runId,
+            canonicalSelectionPlanId,
+            active.query_revision + 1,
+            active.query_plan_id,
+            active.graph_snapshot_id,
+            canonicalQueryPlan.engine,
+            canonicalQueryHash,
+            JSON.stringify(canonicalQueryPlan),
+          ],
+        );
+        await client.query(
+          `UPDATE run_active_query_plans
+           SET query_plan_revision_id=$2,activated_at=now()
+           WHERE run_id=$1`,
+          [created.runId, canonicalQueryPlanId],
+        );
+        await client.query(
+          `UPDATE query_plan_revisions SET status='superseded'
+           WHERE run_id=$1 AND id<>$2 AND status='active'`,
+          [created.runId, canonicalQueryPlanId],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+      expect(contractRevision.contractHash).toBe(canonicalQueryPlan
+        .playlistContractSemanticHash);
+    }
     await new ResearchOrchestrator(repository).enqueue(created.runId);
 
     const active = (await pool.query<{
@@ -341,6 +556,30 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
       [active.job_id],
     )).rows[0]!.lease_epoch);
+    const contractRevision = canonicalRecovery
+      ? await repository.getActivePlaylistContractRevision({
+          runId: created.runId,
+        })
+      : null;
+    const immutableContract = contractRevision?.contract as {
+      revisionId: string;
+      semanticHash: string;
+    } | undefined;
+    const executionAttempt = contractRevision
+      ? await repository.beginPlaylistExecutionAttempt({
+          runId: created.runId,
+          contractRevisionId: contractRevision.id,
+          stage: active.stage_key,
+          dependencyKey: "research",
+          attemptNumber: 1,
+          leaseGeneration: leaseEpoch,
+          executorRevision: "integration-v3-recovery",
+          executorIdentityHash: "e".repeat(64),
+          configurationHash: "d".repeat(64),
+          idempotencyKey:
+            `${active.job_id}:${leaseEpoch}:${contractRevision.id}`,
+        })
+      : null;
     return {
       runId: created.runId,
       accessId: active.access_id,
@@ -352,9 +591,570 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         leaseEpoch,
         queryPlanRevisionId: active.query_plan_id,
         stageKey: active.stage_key,
+        ...(contractRevision && immutableContract && executionAttempt ? {
+          contractAttemptId: executionAttempt.id,
+          contractRevisionDatabaseId: contractRevision.id,
+          contractRevisionId: immutableContract.revisionId,
+          contractSemanticHash: immutableContract.semanticHash,
+        } : {}),
       },
     };
   }
+
+  test("separates untrusted leads from contract-fenced qualification records", async () => {
+    const context = await createLeasedRun(
+      1,
+      "schema-18-separated-recovery",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    expect(context.queryPlan.schemaVersion).toBe(4);
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    )[0]!;
+    const source = qualifiedTrack(
+      "schema-18-separated-recovery",
+      0,
+      positivePredicateIds(context.selectionPlan),
+    );
+    const candidate = {
+      id: source.candidateId,
+      artist: source.artist,
+      title: source.title,
+      album: source.album,
+      sourceObservationIds: [...source.sourceObservationIds],
+    };
+    const discoveryRequest = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+        costUnits: 1,
+      },
+      fence: context.fence,
+    });
+
+    const discovered = (await pool.query<{
+      id: string;
+      contract_revision_id: string;
+      execution_attempt_id: string;
+      status: string;
+      evidence_eligible: boolean;
+      lead_json: Record<string, unknown>;
+    }>(
+      `SELECT id,contract_revision_id,execution_attempt_id,status,
+              evidence_eligible,lead_json
+       FROM playlist_discovery_leads WHERE run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(discovered).toMatchObject({
+      contract_revision_id: context.fence.contractRevisionDatabaseId,
+      execution_attempt_id: context.fence.contractAttemptId,
+      status: "discovered",
+      evidence_eligible: false,
+      lead_json: {
+        schemaVersion: "genio-playlist-discovery-lead/v1",
+        untrusted: true,
+      },
+    });
+    await expect(pool.query(
+      "UPDATE playlist_discovery_leads SET evidence_eligible=true WHERE id=$1",
+      [discovered.id],
+    )).rejects.toThrow();
+
+    await repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: {
+        runId: context.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: context.selectionPlan,
+        engine: strategy.engine,
+        strategy,
+        candidates: [candidate],
+      },
+      qualifications: [{
+        candidateId: candidate.id,
+        scope: {
+          // Schema 4 must execute the canonical OR tree below. This
+          // deliberately contradictory flattened legacy result is retained
+          // only as an audit observation.
+          passed: false,
+          failedMembershipPredicateIds: ["legacy:flattened"],
+          fit: 0,
+        },
+        hardConstraints: {
+          passed: true,
+          failedConstraintIds: [],
+        },
+        evidence: {
+          passed: true,
+          bindingIds: source.evidenceBindingIds,
+          bindings: source.evidenceBindings,
+          strength: source.evidenceStrength,
+          independentProvenanceRoots: source.independentProvenanceRoots,
+        },
+        version: {
+          compatible: true,
+          confidence: source.versionConfidence,
+        },
+        catalog: {
+          lookupAttempted: true,
+          storefrontPlayable: true,
+          appleSongId: source.appleSongId,
+          recordingFamilyKey: source.recordingFamilyKey,
+          confidence: source.catalogConfidence,
+        },
+        canonicalClauseAssessments: {
+          "genre:reggaeton": {
+            status: "pass",
+            evidenceGrade: "track_specific_editorial_assertion",
+            evidenceIds: [...source.evidenceBindingIds],
+          },
+          "genre:dembow": { status: "unknown" },
+        },
+        rankingSignals: source.rankingSignals,
+        sourceRank: source.sourceRank,
+      }],
+      fence: context.fence,
+    });
+
+    const qualification = (await pool.query<{
+      decision: string;
+      predicate_results_json: Record<string, unknown>;
+      evidence_record_ids_json: string[];
+      quality_result_json: Record<string, unknown>;
+      catalog_result_json: Record<string, unknown>;
+      lead_status: string;
+      evidence_eligible: boolean;
+    }>(
+      `SELECT qualification.decision,qualification.predicate_results_json,
+              qualification.evidence_record_ids_json,
+              qualification.quality_result_json,
+              qualification.catalog_result_json,
+              lead.status lead_status,lead.evidence_eligible
+       FROM playlist_qualification_records qualification
+       JOIN playlist_discovery_leads lead
+         ON lead.id=qualification.discovery_lead_id
+       WHERE qualification.run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(qualification).toMatchObject({
+      decision: "qualified",
+      lead_status: "qualified",
+      evidence_eligible: false,
+      predicate_results_json: {
+        scope: { passed: false },
+        hardConstraints: { passed: true },
+        legacyFlattenedAuthoritative: false,
+        canonicalContract: {
+          evaluation: { status: "pass", eligible: true },
+          evidenceIntegrity: { passed: true },
+          assessments: {
+            "genre:reggaeton": { status: "pass" },
+            "genre:dembow": { status: "unknown" },
+          },
+        },
+      },
+      quality_result_json: {
+        evidence: { passed: true },
+      },
+      catalog_result_json: {
+        version: { compatible: true },
+        catalog: {
+          storefrontPlayable: true,
+          appleSongId: source.appleSongId,
+        },
+      },
+    });
+    expect(qualification.evidence_record_ids_json)
+      .toEqual(source.evidenceBindingIds);
+
+    await expect(repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: {
+        ...context.fence,
+        contractSemanticHash: "0".repeat(64),
+      },
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_recovery_fence_stale",
+    });
+
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: `test:${context.runId}`,
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+      disabled: true,
+      reasonCode: "integration_test",
+      changedBy: "integration",
+    });
+    await expect(repository.isPipelineCohortDisabled({
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+    })).resolves.toBe(true);
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: `test:reenable:${context.runId}`,
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+      disabled: false,
+      changedBy: "integration",
+    });
+    await expect(repository.isPipelineCohortDisabled({
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+    })).resolves.toBe(false);
+    await expect(pool.query<{
+      cohort_key: string;
+      disabled: boolean;
+    }>(
+      `SELECT cohort_key,disabled
+       FROM pipeline_cohort_kill_switches
+       WHERE route='corpus_first_v3' AND intent_group='genre_scene'`,
+    )).resolves.toMatchObject({
+      rows: [{
+        cohort_key: `test:reenable:${context.runId}`,
+        disabled: false,
+      }],
+    });
+  }, 120_000);
+
+  test("persists the contract-bound publication reconciliation lifecycle", async () => {
+    const context = await createLeasedRun(
+      1,
+      "disco",
+      undefined,
+      undefined,
+      "empty",
+    );
+    const result = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-publication-reconciliation",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    });
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const locked = await repository.getManifestById(persisted.manifestId!);
+    expect(locked).toBeTruthy();
+    const expectedOrderedIdsHash = orderedAppleStableIdsHash(
+      locked!.tracks.map((track: { catalogId: string }) => track.catalogId),
+    );
+    const base = {
+      runId: context.runId,
+      contractRevisionId: locked!.contractRevisionId!,
+      contractHash: locked!.contractHash!,
+      executionAttemptId: context.fence.contractAttemptId!,
+      jobId: context.fence.jobId,
+      workerId: context.fence.workerId,
+      leaseGeneration: context.fence.leaseEpoch,
+      stageKey: context.fence.stageKey,
+      manifestId: locked!.id,
+      manifestRevisionId: locked!.revisionId!,
+      manifestRevisionHash: locked!.contentHash,
+      expectedOrderedIdsHash,
+      expectedCount: 1,
+      idempotencyKey:
+        `publish:${locked!.id}:${locked!.revisionId}:${locked!.contentHash}`,
+    };
+    await expect(repository.beginPublicationReconciliation(base)).resolves
+      .toMatchObject({
+        state: "preflight",
+        appendedCount: 0,
+        batchCursor: 0,
+      });
+    await expect(repository.beginPublicationReconciliation(base)).resolves
+      .toMatchObject({ state: "preflight" });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "create_pending",
+      appendedCount: 0,
+      batchCursor: 0,
+      detail: { volumeAttempt: 0 },
+    });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "append_pending",
+      applePlaylistId: "p.integration",
+      appendedCount: 1,
+      batchCursor: 1,
+      detail: { volumeAttempt: 0 },
+    });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "reconciling",
+      applePlaylistId: "p.integration",
+      observedOrderedIdsHash: expectedOrderedIdsHash,
+      appendedCount: 1,
+      batchCursor: 1,
+      detail: { exactMembershipVerified: true },
+    });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "complete",
+      applePlaylistId: "p.integration",
+      observedOrderedIdsHash: expectedOrderedIdsHash,
+      appendedCount: 1,
+      batchCursor: 1,
+      detail: { terminalFenceCommitted: true },
+    });
+    const stored = (await pool.query<{
+      state: string;
+      expected_ordered_ids_hash: string;
+      observed_ordered_ids_hash: string;
+      appended_count: number;
+      batch_cursor: number;
+      evidence_eligible_leads: number;
+    }>(
+      `SELECT reconciliation.state,reconciliation.expected_ordered_ids_hash,
+              reconciliation.observed_ordered_ids_hash,
+              reconciliation.appended_count,reconciliation.batch_cursor,
+              (SELECT count(*)::int FROM playlist_discovery_leads lead
+               WHERE lead.run_id=reconciliation.run_id
+                 AND lead.evidence_eligible) evidence_eligible_leads
+       FROM playlist_publication_reconciliations reconciliation
+       WHERE reconciliation.run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(stored).toEqual({
+      state: "complete",
+      expected_ordered_ids_hash: expectedOrderedIdsHash,
+      observed_ordered_ids_hash: expectedOrderedIdsHash,
+      appended_count: 1,
+      batch_cursor: 1,
+      evidence_eligible_leads: 0,
+    });
+    await expect(repository.advancePublicationReconciliation({
+      ...base,
+      state: "append_pending",
+      applePlaylistId: "p.integration",
+      appendedCount: 1,
+      batchCursor: 1,
+    })).rejects.toMatchObject({
+      code: "publication_reconciliation_conflict",
+    });
+    await expect(repository.beginPublicationReconciliation({
+      ...base,
+      manifestRevisionHash: "0".repeat(64),
+      idempotencyKey: `${base.idempotencyKey.slice(0, -1)}0`,
+    })).rejects.toMatchObject({
+      code: "publication_reconciliation_stale",
+    });
+  }, 120_000);
+
+  test("revalidates an unchanged locked canonical manifest from current qualifications immediately before publication", async () => {
+    const context = await createLeasedRun(
+      1,
+      "disco",
+      undefined,
+      undefined,
+      "empty",
+    );
+    const result = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-prepublication-revalidation",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    });
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const locked = await repository.getManifestById(persisted.manifestId!);
+    expect(locked).toMatchObject({
+      revisionId: persisted.manifestRevisionId,
+      contentHash: persisted.manifestHash,
+      contractRevisionId: context.fence.contractRevisionDatabaseId,
+    });
+    const publicationRepository =
+      createPublicationRepositoryFacade(repository);
+    const prepublicationFence = {
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    };
+    await expect(
+      publicationRepository.revalidateCanonicalPublicationManifest!(
+        prepublicationFence,
+      ),
+    ).resolves.toBeUndefined();
+
+    const revoked = await pool.query(
+      `UPDATE playlist_qualification_records
+       SET decision='revoked',revoked_at=now()
+       WHERE run_id=$1 AND candidate_id=$2
+       RETURNING id`,
+      [context.runId, locked!.tracks[0]!.candidateId],
+    );
+    expect(revoked.rowCount).toBe(1);
+    await expect(
+      publicationRepository.revalidateCanonicalPublicationManifest!(
+        prepublicationFence,
+      ),
+    ).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: expect.arrayContaining([
+        "canonical_qualification_projection_missing",
+      ]),
+    });
+  }, 120_000);
+
+  test("refuses to lock an exact reserve repair that breaks a canonical playlist quota", async () => {
+    const context = await createLeasedRun(
+      2,
+      "schema-18-publication-quota-repair",
+      (plan) => ({
+        ...plan,
+        playlistQuotaRules: [{
+          id: "quota:disco",
+          clauseId: "quota:disco",
+          axis: "genre",
+          values: ["disco"],
+          minimumCount: 2,
+          maximumCount: null,
+          minimumRatio: null,
+          maximumRatio: null,
+          evidenceGrade: "authoritative_structured_metadata",
+        }],
+        diversityGoals: {
+          minimumDistinctArtists: null,
+          minimumDistinctAlbums: null,
+          minimumDistinctEras: null,
+          minimumDistinctScenes: null,
+          minimumDistinctGeographies: null,
+          maximumTracksPerArtist: null,
+          maximumTracksPerAlbum: null,
+        },
+        orderingPolicy: {
+          mode: "source_order",
+          goals: [],
+          avoidAdjacentSameArtist: false,
+          avoidAdjacentSameAlbum: false,
+        },
+        softGoalRelaxationOrder: [],
+      }),
+      "2 disco tracks",
+      "empty",
+    );
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 2,
+      selectedCount: 2,
+      reserveCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-publication-quota-repair",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      catalogGenreNames: ["Disco"],
+    }));
+    const reserve = base.reserve.map((track) => ({
+      ...track,
+      catalogGenreNames: ["Latin Pop"],
+    }));
+    const result: RetrievalResultV3 = {
+      ...base,
+      selected,
+      reserve,
+      qualifiedPool: [...selected, ...reserve],
+    };
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const original = await repository.getManifestRevision(
+      context.runId,
+      persisted.manifestRevisionId!,
+    );
+    expect(original).toBeTruthy();
+    const reserveTracks = await repository.getManifestPreflightReserveTracks(
+      persisted.manifestId!,
+      persisted.manifestRevisionId!,
+      context.selectionPlan.storefront,
+    );
+    expect(reserveTracks).toHaveLength(1);
+    const replacementTracks = [
+      {
+        position: 0,
+        candidateId: reserveTracks[0]!.candidateId,
+        recordingFamilyId: reserveTracks[0]!.recordingFamilyId,
+        catalogIdentityId: reserveTracks[0]!.catalogIdentityId,
+        catalogId: reserveTracks[0]!.catalogId,
+        artist: reserveTracks[0]!.artist,
+        title: reserveTracks[0]!.title,
+      },
+      {
+        ...original!.tracks[1]!,
+        position: 1,
+      },
+    ];
+    await expect(repository.createManifestRevision(context.runId, {
+      ...original!,
+      id: "",
+      revision: 2,
+      parentRevisionId: original!.id,
+      status: "locked",
+      reason: "publication_preflight_qualified_reserve_substituted",
+      contentHash: publisherManifestContentHash(replacementTracks),
+      createdAt: new Date().toISOString(),
+      lockedAt: new Date().toISOString(),
+      tracks: replacementTracks,
+      reserveTracks: [],
+    })).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: expect.arrayContaining([
+        "canonical_quota_failed:quota:disco",
+      ]),
+    });
+    await expect(pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM manifest_revisions WHERE manifest_id=$1",
+      [persisted.manifestId],
+    )).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  }, 120_000);
 
   test.each([150, 300])(
     "locks a provenance-bound %i-track manifest and queues exact publication idempotently",

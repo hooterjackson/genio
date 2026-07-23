@@ -8,6 +8,10 @@ export type AppleWriteOperation = "create_playlist" | "append_tracks";
 export interface AppleWritePermitRequest {
   runId: string;
   manifestId: string;
+  manifestRevisionId: string | null;
+  manifestRevisionHash: string;
+  contractRevisionId: string | null;
+  contractHash: string | null;
   publicationVolumeId: string;
   operation: AppleWriteOperation;
 }

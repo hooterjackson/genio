@@ -77,7 +77,9 @@ both pass, it chooses the lower total actual cost. Equal-cost routes are broken
 by aggregate p50 latency. The report includes per-run and aggregate:
 
 - exact-fill behavior;
-- catalog-identity precision (minimum 99.5%);
+- catalog-identity claim eligibility (at least 600 independently reviewed,
+  auto-accepted rows with zero observed identity errors; smaller samples may
+  be reported but cannot support the 99.5% claim);
 - independently adjudicated relevance precision (minimum 95%);
 - evidence coverage and hard-constraint compliance (both 100%);
 - persisted cost versus the size-tier ceiling;

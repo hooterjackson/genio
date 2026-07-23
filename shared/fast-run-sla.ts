@@ -1,4 +1,4 @@
-export type FastRunServiceTier = "standard" | "extended" | "large";
+export type FastRunServiceTier = "standard" | "extended" | "large" | "owner_large";
 
 export interface FastRunServiceLevel {
   tier: FastRunServiceTier;
@@ -29,6 +29,16 @@ const SERVICE_LEVELS: readonly FastRunServiceLevel[] = [
     windowMinutes: 6,
     runDeadlineMs: 360_000,
     matchingReserveMs: 90_000,
+  },
+  {
+    // Internal owner/deep execution ceiling. The anonymous UI never advertises
+    // this as a completion estimate; two minutes remains the interaction SLO
+    // and fifteen active minutes is the immutable compute boundary.
+    tier: "owner_large",
+    maximumTracks: 1_000,
+    windowMinutes: 15,
+    runDeadlineMs: 900_000,
+    matchingReserveMs: 180_000,
   },
 ] as const;
 

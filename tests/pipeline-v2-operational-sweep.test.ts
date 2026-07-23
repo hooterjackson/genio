@@ -20,6 +20,12 @@ describe("Pipeline V2 operational alert sweep", () => {
         terminal_runs: 20,
         zero_result_runs: 3,
         partial_runs: 6,
+        shortfall_runs: 7,
+        system_failure_runs: 1,
+        integrity_failure_runs: 1,
+        brief_failures: 2,
+        guidance_failures: 1,
+        stuck_work_items: 1,
         local_contract_rejections: 2,
         provider_circuit_openings: 3,
         pagination_loops: 1,
@@ -41,15 +47,18 @@ describe("Pipeline V2 operational alert sweep", () => {
     });
 
     expect(query).toHaveBeenCalledWith(
-      expect.stringContaining("FROM pipeline_outcomes"),
+      expect.stringContaining("LEFT JOIN pipeline_outcomes"),
       [new Date("2026-07-19T11:00:00.000Z"), new Date("2026-07-19T12:00:00.000Z")],
     );
     expect(query.mock.calls[0]?.[0]).toContain("FROM apple_catalog_cache_events");
     expect(query.mock.calls[0]?.[0]).toContain("provider_state='circuit_open'");
     expect(query.mock.calls[0]?.[0]).toContain("signal LIKE '%pagination_loop%'");
     expect(query.mock.calls[0]?.[0]).toContain("kind='publication_orphaned'");
-    expect(sweep.alerts).toHaveLength(7);
-    expect(sweep.notificationIds).toHaveLength(7);
+    expect(query.mock.calls[0]?.[0]).toContain("'failed_system','failed_integrity'");
+    expect(query.mock.calls[0]?.[0]).toContain("FROM recent_brief_failures");
+    expect(query.mock.calls[0]?.[0]).toContain("FROM stuck_work");
+    expect(sweep.alerts).toHaveLength(13);
+    expect(sweep.notificationIds).toHaveLength(13);
     expect(enqueueNotification).toHaveBeenCalledWith(
       "pipeline_zero_result_spike",
       expect.objectContaining({
@@ -70,6 +79,12 @@ describe("Pipeline V2 operational alert sweep", () => {
         terminal_runs: 20,
         zero_result_runs: 2,
         partial_runs: 4,
+        shortfall_runs: 2,
+        system_failure_runs: 0,
+        integrity_failure_runs: 0,
+        brief_failures: 0,
+        guidance_failures: 0,
+        stuck_work_items: 0,
         local_contract_rejections: 1,
         provider_circuit_openings: 2,
         pagination_loops: 0,

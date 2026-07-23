@@ -12,6 +12,7 @@ export type RunStatus =
   | "review"
   | "visitor_review"
   | "partial_ready"
+  | "needs_decision"
   | "continuing_research"
   | "manifest_ready"
   | "publishing"
@@ -26,6 +27,99 @@ export type RunStatus =
   | "failed_integrity"
   | "expired"
   | "deleted";
+
+/** Additive public projection; legacy status remains available during rollout. */
+export type NeverDeadEndRunState =
+  | "accepted"
+  | "needs_input"
+  | "probing"
+  | "executing"
+  | "blocked_dependency"
+  | "needs_decision"
+  | "ready"
+  | "publishing"
+  | "completed"
+  | "cancelled"
+  | "quarantined";
+
+export type RunNextAction =
+  | "none"
+  | "answer_initial_guidance"
+  | "answer_rescue_guidance"
+  | "wait_for_dependency"
+  | "resume_research"
+  | "authorize_apple"
+  | "decide_verified_partial"
+  | "review_contract"
+  | "contact_support";
+
+export interface RunResolutionView {
+  state: NeverDeadEndRunState;
+  nextAction: RunNextAction;
+  terminal: boolean;
+  contractRevisionId: string | null;
+  contractRevision: number | null;
+  contractHash: string | null;
+  blocker: {
+    kind: string;
+    nextRetryAt: string | null;
+    automaticRetryUntil: string | null;
+    retryCount: number;
+  } | null;
+}
+
+/** Public-safe, hash-bound decision offered at an automated research boundary. */
+export interface RunDecisionActionView {
+  kind: "research_boundary";
+  decisionHash: string;
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  reason:
+    | "active_compute_limit"
+    | "central_quality_floor"
+    | "playlist_optimization_constraints"
+    | "dependency_retry_window_expired"
+    | "frontier_exhausted_under_policy";
+  targetTrackCount: number;
+  verifiedTrackCount: number;
+  remainingStrategyCount: number;
+  consumedActiveComputeMs: number;
+  activeComputeLimitMs: number;
+  activeComputeExtensionsUsed: number;
+  namedPredicates: Array<{
+    clauseId: string;
+    label: string;
+  }>;
+  interpretationSummary: {
+    mustHave: string[];
+    prefer: string[];
+    avoid: string[];
+    flow: string[];
+    count: number;
+  };
+  actions: {
+    anotherBoundedPass: boolean;
+    reviseNamedPredicate: boolean;
+    reduceCount: boolean;
+    publishVerifiedPartial: boolean;
+    pause: boolean;
+    resumeLater: boolean;
+    cancel: boolean;
+  };
+  reachedAt: string;
+}
+
+/** Public-safe, optimistic-lock-bound clarification offered during research. */
+export interface RunGuidanceActionView {
+  kind: "rescue_guidance";
+  questionSetHash: string;
+  baseContractRevisionId: string;
+  baseContractSemanticHash: string;
+  questions: PlaylistGuidanceQuestion[];
+  attemptsUsed: number;
+  maximumAttempts: 2;
+  showEditableInterpretationSummary: boolean;
+}
 
 export type JobKind =
   | "brief"
@@ -187,6 +281,127 @@ export interface SelectionContentPolicy {
   explicitContent: "allow" | "prefer_clean" | "clean_only";
   instrumental: "allow" | "prefer" | "exclude";
   languages: string[];
+}
+
+/**
+ * A playlist-level distribution rule compiled from the canonical contract.
+ * The rule is immutable execution data; workers may not infer or relax it
+ * from prompt prose.
+ */
+export interface CanonicalPlaylistQuotaRule {
+  id: string;
+  clauseId: string;
+  axis: SelectionConstraintAxis;
+  values: string[];
+  minimumCount: number | null;
+  maximumCount: number | null;
+  minimumRatio: number | null;
+  maximumRatio: number | null;
+  evidenceGrade: CanonicalPlaylistContractEvidenceGradeV1;
+  /** Full tri-state predicate for evidence-backed quota axes. */
+  predicate?: CanonicalPlaylistContractPredicateV1;
+}
+
+/**
+ * Immutable playlist-level suitability floor. The criteria retain the
+ * contract's own wording, while the executable signal remains a ranking-only
+ * judgment and is never presented as factual membership evidence.
+ */
+export interface CanonicalPlaylistQualityPolicy {
+  policyVersion: "canonical_central_quality_v1";
+  clauseIds: string[];
+  criteria: string[];
+  minimumPassRatio: number;
+  maximumUnknownRatio: number;
+  zeroKnownFailures: true;
+  signalDimension: "central_quality";
+  passThreshold: number;
+  failThreshold: number;
+  signalSemantics: "ranking_only_not_factual_evidence";
+}
+
+export type CanonicalPlaylistContractTriStateV1 = "pass" | "fail" | "unknown";
+export type CanonicalPlaylistContractEvidenceGradeV1 =
+  | "authoritative_structured_metadata"
+  | "trusted_scoped_container"
+  | "track_specific_editorial_assertion"
+  | "primary_source"
+  | "independent_secondary_source"
+  | "model_derived_lead";
+
+export type CanonicalPlaylistContractPredicateV1 =
+  | { op: "clause"; clauseId: string }
+  | {
+    op: "all" | "any";
+    children: CanonicalPlaylistContractPredicateV1[];
+  }
+  | {
+    op: "not";
+    child: CanonicalPlaylistContractPredicateV1;
+  }
+  | {
+    op: "except";
+    base: CanonicalPlaylistContractPredicateV1;
+    exceptions: CanonicalPlaylistContractPredicateV1[];
+  }
+  | {
+    op: "alternative";
+    choices: Array<{
+      id: string;
+      priority: number;
+      predicate: CanonicalPlaylistContractPredicateV1;
+    }>;
+  };
+
+/**
+ * The complete selection-grade projection of one immutable contract clause.
+ * It intentionally contains no prompt prose: runtime workers execute this
+ * policy and may use human text only as a discovery hint.
+ */
+export interface CanonicalPlaylistContractClauseV1 {
+  id: string;
+  kind:
+    | "membership"
+    | "factual_relationship"
+    | "suitability"
+    | "exclusion"
+    | "catalog_version";
+  axis: string;
+  operator: "require" | "exclude";
+  values: string[];
+  unknownPolicy: "defer" | "reject" | "allow";
+  evidence: {
+    required: boolean;
+    minimumGrade: CanonicalPlaylistContractEvidenceGradeV1 | null;
+    permittedGrades: CanonicalPlaylistContractEvidenceGradeV1[];
+  };
+}
+
+export interface CanonicalPlaylistContractClauseAssessmentV1 {
+  status: CanonicalPlaylistContractTriStateV1;
+  evidenceGrade?: CanonicalPlaylistContractEvidenceGradeV1 | null;
+  evidenceIds?: string[];
+}
+
+/**
+ * Hash-bound runtime authority for contract-3 selection and publication.
+ * The compatibility SelectionPlan remains useful for discovery routing, but
+ * it can neither add nor remove an eligibility rule once this policy exists.
+ */
+export interface CanonicalPlaylistContractExecutionPolicyV1 {
+  policyVersion: "canonical_contract_runtime_v1";
+  /** Versioned partial-order semantics used to enforce every evidence floor. */
+  evidenceStrengthPolicyVersion: "evidence_strength_partial_order_v1";
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  contractCompilerVersion: string;
+  evidencePolicyVersion: string;
+  catalogPolicyVersion: string;
+  requestedTrackCount: number;
+  storefront: string;
+  clauses: CanonicalPlaylistContractClauseV1[];
+  trackPredicate: CanonicalPlaylistContractPredicateV1;
+  projectionHash: string;
 }
 
 /**
@@ -373,7 +588,7 @@ export interface PipelineV3SourceDiscoveryHint {
 }
 
 export interface QueryPlanV3 {
-  schemaVersion: 1 | 2 | 3;
+  schemaVersion: 1 | 2 | 3 | 4;
   pipelineVersion: "corpus_first_v3";
   policyVersion: "corpus_first_v3_policy_v1" | "corpus_first_v3_policy_v2";
   engine: QueryPlanV3Engine;
@@ -418,6 +633,20 @@ export interface QueryPlanV3 {
   guidancePolicyVersion?: string;
   evidencePolicyVersion?: string;
   executionDeltaHash?: string;
+  /** Contract-3 fencing metadata required by query-plan schema 4. */
+  playlistContractRevisionId?: string;
+  playlistContractSemanticHash?: string;
+  playlistContractCompilerVersion?: string;
+  /** Required execution projection for schema-4 playlist-level quotas. */
+  playlistQuotaRules?: CanonicalPlaylistQuotaRule[];
+  /** Required when the canonical contract declares central suitability. */
+  playlistQualityPolicy?: CanonicalPlaylistQualityPolicy;
+  /**
+   * Sole eligibility authority for schema-4 contract work. Membership,
+   * evidence, exclusion, catalog, and unknown-policy decisions are evaluated
+   * from this hash-bound value instead of prompt text or legacy plan fields.
+   */
+  canonicalContractPolicy?: CanonicalPlaylistContractExecutionPolicyV1;
   continuation?: QueryPlanV3Continuation;
   corpusReview?: QueryPlanV3CorpusReview;
 }
@@ -477,6 +706,18 @@ export type PipelineExecutionPolicySnapshot =
     };
     maximumGlobalRounds: number;
     maximumRawCandidates: number;
+    /**
+     * Frozen qualified-candidate target derived from the storefront/route/size
+     * segment's lower-decile Apple-safe conversion rate.
+     */
+    candidateGoal?: number;
+    p10QualifiedToAppleSafeConversionRate?: number;
+    conversionRateSampleCount?: number;
+    conversionRateSegment?: {
+      storefront: string;
+      route: "corpus_first_v3";
+      sizeTier: "1_50" | "51_100" | "101_300" | "301_1000";
+    };
     reservePercent: number;
     maximumCostUsd: number;
   };
@@ -756,7 +997,7 @@ export interface PlaylistBrief {
   ambiguityAcceptance?: string[];
 }
 
-export type PlaylistBriefContractVersion = 1 | 2;
+export type PlaylistBriefContractVersion = 1 | 2 | 3;
 
 export type PlaylistGuidanceRequestClassification =
   | "precise"
@@ -802,6 +1043,12 @@ export interface PlaylistGuidanceOption {
   feasibility?: PlaylistGuidanceFeasibility;
   /** Deterministic server-owned execution change. Required by contract 2. */
   planDelta?: PlaylistGuidancePlanDelta;
+  /** Contract-3 server-owned operations, fenced to the question's base revision. */
+  contractPatch?: {
+    operations: readonly Record<string, unknown>[];
+    affectedClauseIds: readonly string[];
+    expectedFeasibilityDirection: "narrower" | "neutral" | "broader";
+  };
   /**
    * Machine-readable effect of selecting this answer. Optional only so runs
    * created before the grounded question scout remain readable.
@@ -852,6 +1099,25 @@ export interface PlaylistGuidanceQuestion {
   decisionKey?: string;
   /** Why selecting an answer will materially change the resulting tracks. */
   whyMaterial?: string;
+  /** Contract-3 immutable guidance metadata. */
+  schemaVersion?: 3;
+  policyVersion?: string;
+  questionHash?: string;
+  trigger?: "correctness" | "yield_risk" | "nuance";
+  axis?: string;
+  baseContractRevisionId?: string;
+  baseContractSemanticHash?: string;
+  allowedPatchOperations?: readonly string[];
+  affectedClauseIds?: readonly string[];
+  materialityScore?: number;
+  /** Present for a custom-answer confirmation successor question. */
+  interpretationSummary?: {
+    mustHave: readonly string[];
+    prefer: readonly string[];
+    avoid: readonly string[];
+    flow: readonly string[];
+    count: number;
+  };
   /** Provider-attested web grounding. Optional only for legacy saved runs. */
   grounding?: PlaylistGuidanceGrounding;
   /** Server-owned questions may use an explicit inference instead of a URL. */
@@ -896,6 +1162,13 @@ export interface PlaylistGuidanceQuestionSetContract {
   targetTrackCount: number;
   explicitConstraintHash: string;
   rejectedQuestionReasons: string[];
+  /** Contract-3 question sets are bound to one immutable contract revision. */
+  baseContractRevisionId?: string;
+  baseContractSemanticHash?: string;
+  guidanceRound?: "initial" | "rescue";
+  trigger?: "correctness" | "yield_risk" | "nuance";
+  axis?: string | null;
+  feasibilitySnapshotId?: string | null;
 }
 
 export interface PlaylistGuidanceScoutResult {
@@ -912,10 +1185,14 @@ export interface PlaylistGuidanceAnswer {
   questionId: string;
   /** Select one returned option, or omit this and provide customText. */
   optionId?: string;
+  /** Contract-3 multi-select answer. Mutually exclusive with optionId/customText. */
+  optionIds?: string[];
   /** A bounded custom answer, mutually exclusive with optionId. */
   customText?: string;
   /** Contract-2 optional questions may be skipped explicitly. */
   skipped?: boolean;
+  /** Required after a custom answer recompiles into a hard contract change. */
+  confirmed?: boolean;
 }
 
 export interface SourceRecordInput {
@@ -1238,7 +1515,10 @@ export interface ResearchRunView {
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
   progress?: RunProgressView;
   partialAction?: PartialPublicationActionView | null;
+  decisionAction?: RunDecisionActionView | null;
+  guidanceAction?: RunGuidanceActionView | null;
   explore?: ExplorePreferenceView | null;
+  resolution?: RunResolutionView;
 }
 
 /** Public-safe, hash-bound action required before publishing an underfilled manifest. */
@@ -1289,7 +1569,10 @@ export interface PublicResearchRunView {
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
   progress?: RunProgressView;
   partialAction?: PartialPublicationActionView | null;
+  decisionAction?: RunDecisionActionView | null;
+  guidanceAction?: RunGuidanceActionView | null;
   explore?: ExplorePreferenceView | null;
+  resolution?: RunResolutionView;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string | null;

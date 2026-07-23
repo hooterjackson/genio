@@ -8,6 +8,9 @@
 
 import { createHash } from "node:crypto";
 import type {
+  CanonicalPlaylistContractExecutionPolicyV1,
+  CanonicalPlaylistQualityPolicy,
+  CanonicalPlaylistQuotaRule,
   PipelineV3SourceDiscoveryHint,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
@@ -21,6 +24,7 @@ import type {
   SelectionPlan,
   SelectionScopeKind,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
 import {
   inferSelectionGeographyRelationship,
@@ -95,6 +99,7 @@ export interface MembershipPredicateV3 {
 export type RankingDimensionV3 =
   | "influence"
   | "relevance"
+  | "central_quality"
   | "similarity"
   | "source_rank"
   | "artist_diversity"
@@ -198,6 +203,12 @@ export interface RunSpecV3 {
   readonly orderingPolicy: Readonly<SelectionOrderingPolicy>;
   readonly softGoalRelaxationOrder: readonly string[];
   readonly sourceDiscoveryHints: readonly PipelineV3SourceDiscoveryHint[];
+  /** Present only when an immutable canonical contract owns distribution. */
+  readonly playlistQuotaRules?: readonly CanonicalPlaylistQuotaRule[];
+  /** Present only when an immutable canonical contract owns central quality. */
+  readonly playlistQualityPolicy?: Readonly<CanonicalPlaylistQualityPolicy>;
+  /** Sole selection authority for immutable contract-3 work. */
+  readonly canonicalContractPolicy?: Readonly<CanonicalPlaylistContractExecutionPolicyV1>;
   readonly criticalAmbiguities: readonly CriticalAmbiguityV3[];
   readonly recordingPolicy: RecordingPolicyV3;
   readonly semanticPolicyVersion: typeof SEMANTIC_SCOPE_POLICY_VERSION;
@@ -1177,8 +1188,12 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
 export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   const prompt = normalize(input.prompt);
   if (prompt.length < 2 || prompt.length > 4_000) throw new Error("Playlist prompt must contain 2–4,000 characters");
-  if (!Number.isSafeInteger(input.requestedTrackCount) || input.requestedTrackCount < 1 || input.requestedTrackCount > 300) {
-    throw new Error("Requested track count must be an integer between 1 and 300");
+  if (!Number.isSafeInteger(input.requestedTrackCount)
+    || input.requestedTrackCount < 1
+    || input.requestedTrackCount > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
+    throw new Error(
+      `Requested track count must be an integer between 1 and ${EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS}`,
+    );
   }
   const storefront = (input.storefront ?? "us").trim().toLowerCase();
   if (!/^[a-z]{2}$/u.test(storefront)) throw new Error("Storefront must be a two-letter code");

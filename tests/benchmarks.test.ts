@@ -8,19 +8,34 @@ describe("acceptance benchmark evaluator", () => {
     expect(evaluateHoldoutRecovery(expected, expected.slice(0, 1))).toMatchObject({ recall: 0.5, passed: false });
   });
 
-  test("enforces 99.5% auto-match precision and 95% available-track resolvability", () => {
-    const passing = Array.from({ length: 200 }, () => ({ autoAccepted: true, correct: true, storefrontAvailable: true, resolved: true }));
+  test("withholds the 99.5% identity claim until 600 independently reviewed auto-matches are error-free", () => {
+    const passing = Array.from({ length: 600 }, () => ({ autoAccepted: true, correct: true, storefrontAvailable: true, resolved: true }));
     expect(evaluateMatchingQuality(passing).passed).toBe(true);
     const failing = [...passing];
     failing[0] = { ...failing[0]!, correct: false };
-    expect(evaluateMatchingQuality(failing)).toMatchObject({ precision: 0.995, passed: true });
-    failing[1] = { ...failing[1]!, correct: false };
-    expect(evaluateMatchingQuality(failing).passed).toBe(false);
-    expect(evaluateMatchingQuality(passing.slice(0, 99))).toMatchObject({
-      sampleSize: 99,
-      minimumSampleSize: 100,
+    expect(evaluateMatchingQuality(failing)).toMatchObject({
+      precision: 599 / 600,
+      passed: false,
+    });
+    expect(evaluateMatchingQuality(passing.slice(0, 599))).toMatchObject({
+      sampleSize: 599,
+      minimumSampleSize: 600,
       precision: 1,
       resolvability: 1,
+      passed: false,
+    });
+    const reviewedButNotAccepted = [
+      ...passing.slice(0, 599),
+      {
+        autoAccepted: false,
+        correct: true,
+        storefrontAvailable: true,
+        resolved: true,
+      },
+    ];
+    expect(evaluateMatchingQuality(reviewedButNotAccepted)).toMatchObject({
+      sampleSize: 600,
+      autoAccepted: 599,
       passed: false,
     });
   });

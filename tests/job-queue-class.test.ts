@@ -37,6 +37,21 @@ test("factual and exhaustive V3 query plans route to deep workers", () => {
   expect(isDeepQueryPlan(null)).toBe(false);
 });
 
+test("expanded curated query plans cannot consume the interactive lane", () => {
+  expect(isDeepQueryPlan({
+    targetTrackCount: 300,
+    engines: ["curated_genre_scene"],
+  })).toBe(false);
+  expect(isDeepQueryPlan({
+    targetTrackCount: 301,
+    engines: ["curated_genre_scene"],
+  })).toBe(true);
+  expect(isDeepQueryPlan({
+    targetTrackCount: 1_000,
+    engines: ["curated_genre_scene"],
+  })).toBe(true);
+});
+
 test("legacy and curated work defaults interactive; deep placement must be explicit and verified", () => {
   expect(defaultJobQueueClass({ kind: "research", payload: {} })).toBe("interactive");
   expect(defaultJobQueueClass({ kind: "matching", payload: { fast: false } })).toBe("interactive");

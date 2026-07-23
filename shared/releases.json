@@ -2,6 +2,25 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.0",
+      "releasedAt": "2026-07-23",
+      "title": "Never-dead-end canonical playlists",
+      "notes": [
+        "Executes new canonical work only from immutable contract-3 revisions with typed Boolean predicates, versioned evidence policy, capability negotiation, and stale-worker fencing.",
+        "Enforces governed evidence v2 with a fail-closed partial order: minimum and permitted grades must both hold, incomparable or model-derived leads cannot qualify, and Apple metadata cannot prove factual relationships.",
+        "Asks progressive one-axis guidance questions with server-owned patches, optimistic locking, custom-answer confirmation, editable summaries, and bounded rescue decisions.",
+        "Reports truthful feasibility, dependency pauses, retry paths, explicit scope decisions, and technical quarantine without presenting provider failure as musical scarcity.",
+        "Adds concurrent independent discovery, dynamic Apple-safe reserves, deficit-specific recovery, and constrained playlist optimization for quality, diversity, quotas, and sequencing.",
+        "Persists schema-18 qualification records and revalidates exact membership, evidence, count, quality, quotas, diversity, order, and storefront availability immediately before Apple writes.",
+        "Separates original exact success, guided revision success, approved partial publication, actionable decisions, dependency pauses, quarantine, and cancellation in synthetic-safe metrics.",
+        "Adds authenticated non-reusable canaries, signed 24-hour release evidence, blinded semantic review gates, adversarial failure injection, and ordered Apple reconciliation checks.",
+        "Pins one immutable artifact through fail-closed bridge, expand, and activate phases before cohort rollout, with explicit staging controls and Sites deployment last.",
+        "Adds an authenticated owner-only extended route for 301–1,000 tracks after schema-18 activation, with scaled cost and discovery budgets; public requests remain capped at 300 with the same exactness and time boundary.",
+        "Recognizes reggaeton, Latin urban, and dembow as genre/scene concepts while keeping generic vibe language soft when a request already names its genre, so optional mood cannot become a hard evidence gate.",
+        "Covers the exact Smooth Reggaeton Heat request with one material adjacency question and an executable recommended contract requiring at least 70% core reggaeton."
+      ]
+    },
+    {
       "version": "2.3.4",
       "releasedAt": "2026-07-23",
       "title": "Curated hosted retrieval safety",

@@ -26,9 +26,21 @@ import {
   BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
   WORKER_PIPELINE_PROTOCOL_VERSION,
 } from "./worker-protocol.ts";
+import { ADAPTIVE_GUIDANCE_POLICY_VERSION } from "./adaptive-guidance-v3.ts";
+import { PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION } from "./playlist-contract-v1.ts";
+import {
+  canonicalContractActivationConfigured,
+  canonicalContractCohortConfigured,
+  expectedReleaseDatabaseSchemaVersion,
+  runtimeReleaseDeploymentPhase,
+  type RuntimeReleaseDeploymentPhase,
+} from "./release-deployment-phase.ts";
 
 export interface RuntimeReleaseContract {
   pipelineVersion: "corpus_first_v3";
+  deploymentPhase: RuntimeReleaseDeploymentPhase;
+  expectedDatabaseSchemaVersion: string | null;
+  canonicalActivationConfigured: boolean;
   assignmentEnabled: boolean;
   ownerCanaryEnabled: boolean;
   productionEvidenceApproved: boolean;
@@ -46,6 +58,7 @@ export interface RuntimeReleaseContract {
   queryPlanSchemaVersion: string;
   briefContractVersion: string;
   guidanceContractOwnerCanaryEnabled: boolean;
+  guidanceContractReggaetonCanaryEnabled: boolean;
   guidancePolicyVersion: string;
   evidencePolicyVersion: string;
   queryPlanPolicyVersion: string;
@@ -83,8 +96,13 @@ function safeCatalogValidatedAt(value: string | undefined): string {
 export function runtimeReleaseContract(
   environment: NodeJS.ProcessEnv = process.env,
 ): RuntimeReleaseContract {
+  const canonicalActivationConfigured = canonicalContractActivationConfigured(environment);
+  const canonicalContractActive = canonicalContractCohortConfigured(environment);
   return Object.freeze({
     pipelineVersion: "corpus_first_v3",
+    deploymentPhase: runtimeReleaseDeploymentPhase(environment),
+    expectedDatabaseSchemaVersion: expectedReleaseDatabaseSchemaVersion(environment),
+    canonicalActivationConfigured,
     assignmentEnabled: environment.PIPELINE_V3_ASSIGNMENT_ENABLED === "true",
     ownerCanaryEnabled: environment.PIPELINE_V3_OWNER_CANARY === "true",
     productionEvidenceApproved: environment.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED === "true",
@@ -99,15 +117,30 @@ export function runtimeReleaseContract(
     workerProtocol: WORKER_PIPELINE_PROTOCOL_VERSION,
     minimumWorkerProtocol: BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
     selectionPlanVersion: SELECTION_PLAN_V3_VERSION,
-    queryPlanSchemaVersion: String(environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+    queryPlanSchemaVersion: String(canonicalContractActive
+      ? 4
+      : environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+        ? 3
+        : queryPlanV3EmissionSchemaVersion(environment)),
+    briefContractVersion: String(canonicalContractActive
       ? 3
-      : queryPlanV3EmissionSchemaVersion(environment)),
-    briefContractVersion: String(environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
-      ? BRIEF_CONTRACT_VERSION
-      : 1),
-    guidanceContractOwnerCanaryEnabled: environment.GUIDANCE_CONTRACT_V2_OWNER_CANARY === "true",
-    guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
-    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+      : environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
+        ? BRIEF_CONTRACT_VERSION
+        : 1),
+    guidanceContractOwnerCanaryEnabled: (
+      canonicalActivationConfigured
+      && environment.GUIDANCE_CONTRACT_V3_OWNER_CANARY === "true"
+    )
+      || environment.GUIDANCE_CONTRACT_V2_OWNER_CANARY === "true",
+    guidanceContractReggaetonCanaryEnabled:
+      canonicalActivationConfigured
+      && environment.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true",
+    guidancePolicyVersion: canonicalContractActive
+      ? ADAPTIVE_GUIDANCE_POLICY_VERSION
+      : GUIDANCE_POLICY_VERSION,
+    evidencePolicyVersion: canonicalContractActive
+      ? PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION
+      : EVIDENCE_POLICY_VERSION,
     queryPlanPolicyVersion: QUERY_PLAN_V3_POLICY_VERSION,
     semanticScopePolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
     musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,

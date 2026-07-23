@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   adaptiveFillPlanV3,
   type StageYieldObservationV3,
@@ -26,8 +27,23 @@ import {
   type RetrievalPredicateDiagnosticsV3,
   type SemanticPlanRevisionArtifactV3,
 } from "./pipeline-v3-semantic-recovery.ts";
-import type { SelectionConstraint } from "../shared/types.ts";
+import type {
+  CanonicalPlaylistContractClauseAssessmentV1,
+  CanonicalPlaylistQualityPolicy,
+  CanonicalPlaylistQuotaRule,
+  SelectionConstraint,
+} from "../shared/types.ts";
 import { assertPublicHttpsUrl } from "./security.ts";
+import {
+  evaluateCanonicalContractPredicateV1,
+  evaluateCanonicalContractTrackV1,
+} from "./canonical-contract-runtime-v1.ts";
+import {
+  optimizePlaylistV1,
+  type PlaylistOptimizationCandidateV1,
+  type PlaylistOptimizationConstraintsV1,
+  type PlaylistOptimizationResultV1,
+} from "./playlist-optimizer-v1.ts";
 
 /**
  * Provider-independent orchestration boundary for Pipeline V3 retrieval.
@@ -106,6 +122,39 @@ export type RetrievalStrategyKindV3 =
   | "multilingual_aliases"
   | "deficit_query";
 
+/**
+ * A stable identity for a genuinely independent upstream dependency.
+ *
+ * These ids describe infrastructure/corpus independence, not prompt
+ * diversity. Two strategies that both use hosted search therefore share one
+ * dependency even when their query wording differs. The portfolio scheduler
+ * never runs strategies with an overlapping discovery dependency at the same
+ * time.
+ */
+export type RetrievalUpstreamDependencyIdV3 =
+  | "orchestration_local"
+  | "apple_catalog"
+  | "hosted_web"
+  | "governed_evidence_graph";
+
+/**
+ * Adapters should use this error when a composite strategy can identify the
+ * failed upstream precisely. Unknown errors conservatively implicate every
+ * dependency declared by the strategy.
+ */
+export class RetrievalDependencyErrorV3 extends Error {
+  readonly dependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+
+  constructor(
+    message: string,
+    dependencyIds: readonly RetrievalUpstreamDependencyIdV3[],
+  ) {
+    super(message);
+    this.name = "RetrievalDependencyErrorV3";
+    this.dependencyIds = Object.freeze([...new Set(dependencyIds)]);
+  }
+}
+
 export interface RetrievalStrategyDefinitionV3 {
   readonly id: string;
   readonly engine: RetrievalEngineV3;
@@ -114,6 +163,45 @@ export interface RetrievalStrategyDefinitionV3 {
   readonly maximumRounds: number;
   readonly maximumBatchSize: number;
   readonly zeroQualifiedYieldLimit: 2;
+  /** Dependencies exercised by the concurrent discovery call. */
+  readonly discoveryDependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+  /**
+   * Dependencies exercised while qualifying the returned leads. Qualification
+   * is intentionally committed in deterministic order after concurrent
+   * discovery, so these dependencies are never called concurrently here.
+   */
+  readonly qualificationDependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+}
+
+function strategyDependencyIds(
+  engine: RetrievalEngineV3,
+  kind: RetrievalStrategyKindV3,
+): {
+  discovery: readonly RetrievalUpstreamDependencyIdV3[];
+  qualification: readonly RetrievalUpstreamDependencyIdV3[];
+} {
+  if (kind === "scope_resolution" || kind === "gap_pass") {
+    return { discovery: ["orchestration_local"], qualification: [] };
+  }
+  if (engine === "factual_relationship" || engine === "exhaustive") {
+    return {
+      discovery: ["governed_evidence_graph"],
+      qualification: ["apple_catalog"],
+    };
+  }
+  if (kind === "artist_identity"
+    || kind === "release_enumeration"
+    || kind === "container_enumeration"
+    || kind === "trusted_containers") {
+    return { discovery: ["apple_catalog"], qualification: ["apple_catalog"] };
+  }
+  if (kind === "qualified_expansion") {
+    return {
+      discovery: ["apple_catalog", "hosted_web"],
+      qualification: ["apple_catalog"],
+    };
+  }
+  return { discovery: ["hosted_web"], qualification: ["apple_catalog"] };
 }
 
 function strategy(
@@ -124,6 +212,7 @@ function strategy(
   maximumRounds: number,
   maximumBatchSize = 250,
 ): RetrievalStrategyDefinitionV3 {
+  const dependencies = strategyDependencyIds(engine, kind);
   return Object.freeze({
     id: `${engine}:${id}`,
     engine,
@@ -132,6 +221,8 @@ function strategy(
     maximumRounds,
     maximumBatchSize,
     zeroQualifiedYieldLimit: 2 as const,
+    discoveryDependencyIds: Object.freeze([...dependencies.discovery]),
+    qualificationDependencyIds: Object.freeze([...dependencies.qualification]),
   });
 }
 
@@ -233,7 +324,22 @@ export interface CandidateQualificationV3 {
     readonly releaseYear?: number | null;
     /** Years observed on exact compatible recording-family catalog issues. */
     readonly compatibleReleaseYears?: readonly number[];
+    /** Authoritative catalog genre labels used only for canonical quota proof. */
+    readonly genreNames?: readonly string[];
   };
+  /**
+   * Server-created tri-state assessments for the immutable contract leaves.
+   * A schema-4 worker ignores legacy flattened scope booleans and evaluates
+   * the canonical Boolean predicate from these values.
+   */
+  readonly canonicalClauseAssessments?: Readonly<
+    Record<string, CanonicalPlaylistContractClauseAssessmentV1>
+  >;
+  /**
+   * Server-derived, ranking-only signals for constrained playlist assembly.
+   * These values never satisfy membership or evidence obligations.
+   */
+  readonly playlistOptimizationSignals?: PlaylistOptimizationSignalsV3;
   /** Ranking signals are consumed only after every eligibility stage passes. */
   readonly rankingSignals: Readonly<Partial<Record<RankingObjectiveV3["dimension"], number>>>;
   /** Lower values are stronger source positions. */
@@ -260,6 +366,17 @@ export interface EvidenceBindingReferenceV3 {
    * exact track or that a promoted assertion belongs to the frozen snapshot.
    */
   readonly eligibilityAttestation?: EvidenceEligibilityAttestationV3;
+}
+
+export interface PlaylistOptimizationSignalsV3 {
+  readonly familiarityScore?: number | null;
+  readonly discoveryScore?: number | null;
+  readonly eraKeys?: readonly string[];
+  readonly sceneKeys?: readonly string[];
+  readonly geographyKeys?: readonly string[];
+  readonly energy?: number | null;
+  readonly tempo?: number | null;
+  readonly chronologyPosition?: number | null;
 }
 
 export const PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA =
@@ -405,9 +522,17 @@ export interface QualifiedTrackV3 {
   readonly catalogReleaseYear?: number | null;
   /** Compatible issue years retained so resumed research preserves era proof. */
   readonly catalogCompatibleReleaseYears?: readonly number[];
+  /** Frozen authoritative catalog labels used to re-evaluate quota rules. */
+  readonly catalogGenreNames?: readonly string[];
   readonly sourceObservationIds: readonly string[];
   readonly evidenceBindingIds: readonly string[];
   readonly evidenceBindings?: readonly EvidenceBindingReferenceV3[];
+  /** Retained so publication can re-evaluate the same immutable predicate. */
+  readonly canonicalClauseAssessments?: Readonly<
+    Record<string, CanonicalPlaylistContractClauseAssessmentV1>
+  >;
+  /** Ranking-only values retained so retries and publication revalidation are deterministic. */
+  readonly playlistOptimizationSignals?: PlaylistOptimizationSignalsV3;
   readonly evidenceStrength: number;
   readonly scopeFit: number;
   readonly independentProvenanceRoots: number;
@@ -447,6 +572,12 @@ export interface DiscoveryRequestV3 {
     readonly appleSongId: string;
     readonly recordingFamilyKey: string;
   }[];
+  /**
+   * Combines worker cancellation with the remaining active-compute window.
+   * Live adapters must pass it to every provider request so one slow call
+   * cannot run beyond the immutable contract's compute allowance.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface DiscoveryBatchV3 {
@@ -466,6 +597,8 @@ export interface QualificationRequestV3 {
   readonly engine: RetrievalEngineV3;
   readonly strategy: RetrievalStrategyDefinitionV3;
   readonly candidates: readonly RawTrackCandidateV3[];
+  /** See DiscoveryRequestV3.signal. */
+  readonly signal?: AbortSignal;
 }
 
 export interface RetrievalAdaptersV3 {
@@ -490,6 +623,10 @@ export type CandidateDeficitReasonV3 =
   | "catalog_identity_missing"
   | "catalog_identity_conflict"
   | "duplicate_recording_family"
+  | "central_quality_failed"
+  | "central_quality_unknown_excess"
+  | "canonical_contract_failed"
+  | "canonical_contract_unknown"
   | "adapter_response_overflow"
   | "unknown_qualification_result";
 
@@ -503,12 +640,15 @@ export type RetrievalStopReasonV3 =
   | "maximum_rounds_reached"
   | "maximum_candidates_reached"
   | "provider_failure"
+  | "central_quality_floor"
+  | "playlist_optimization_constraints"
   | "integrity_failure";
 
 export type RetrievalOutcomeStatusV3 =
   | "awaiting_guidance"
   | "exact_ready"
   | "partial_ready"
+  | "needs_decision"
   | "no_compatible_tracks"
   | "failed_system"
   | "failed_integrity";
@@ -525,6 +665,8 @@ export interface RetrievalStrategyReportV3 {
   readonly id: string;
   readonly engine: RetrievalEngineV3;
   readonly kind: RetrievalStrategyKindV3;
+  readonly discoveryDependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+  readonly qualificationDependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
   readonly status: RetrievalStrategyStatusV3;
   readonly rounds: number;
   readonly rawCandidates: number;
@@ -532,6 +674,19 @@ export interface RetrievalStrategyReportV3 {
   readonly consecutiveZeroQualifiedYieldRounds: number;
   readonly providerFailures: number;
   readonly cursor: string | null;
+}
+
+export interface RetrievalDependencyOutageReportV3 {
+  readonly dependencyId: RetrievalUpstreamDependencyIdV3;
+  /**
+   * Contiguous outages, not failed strategy calls. Repeated failures from
+   * strategies sharing one still-unhealthy upstream remain one outage.
+   */
+  readonly outageCount: number;
+  readonly failureAttempts: number;
+  readonly active: boolean;
+  readonly circuitOpen: boolean;
+  readonly affectedStrategyIds: readonly string[];
 }
 
 export interface RetrievalStageCountersV3 {
@@ -578,6 +733,15 @@ export interface RetrievalPublicationBoundaryV3 {
     | "blocked_operational_failure";
 }
 
+export interface PlaylistOptimizationReportV3 {
+  readonly policyVersion: PlaylistOptimizationResultV1["policyVersion"];
+  readonly exact: boolean;
+  readonly evidenceQualifiedCandidateCount: number;
+  readonly unmetConstraints: readonly string[];
+  readonly distinct: PlaylistOptimizationResultV1["distinct"];
+  readonly familiarTrackCount: number;
+}
+
 export interface RetrievalResultV3 {
   readonly schemaVersion: typeof PIPELINE_V3_RETRIEVAL_SCHEMA;
   readonly runId: string;
@@ -591,7 +755,10 @@ export interface RetrievalResultV3 {
   readonly stages: RetrievalStageCountersV3;
   readonly deficit: RetrievalDeficitLedgerV3;
   readonly strategies: readonly RetrievalStrategyReportV3[];
+  readonly dependencyOutages?: readonly RetrievalDependencyOutageReportV3[];
   readonly integrityEvents: readonly string[];
+  readonly centralQuality?: CentralQualityReportV3;
+  readonly playlistOptimization?: PlaylistOptimizationReportV3;
   readonly predicateDiagnostics?: RetrievalPredicateDiagnosticsV3;
   /** Immutable artifacts persisted with the retrieval boundary. */
   readonly semanticPlanRevisions?: readonly SemanticPlanRevisionArtifactV3[];
@@ -615,7 +782,11 @@ export interface RetrievalContinuationSeedV3 {
 
 export interface RetrievalPolicyV3 {
   readonly maximumGlobalRounds: number;
+  /** Maximum genuinely independent discovery calls in one portfolio wave. */
+  readonly maximumConcurrentDiscovery?: number;
   readonly maximumRawCandidates: number;
+  /** Frozen qualified-pool goal; absent only on legacy/direct callers. */
+  readonly qualifiedPoolGoal?: number;
   readonly maximumCostUnits: number;
   readonly deadlineAtEpochMs: number | null;
   readonly maximumProviderFailuresPerStrategy: number;
@@ -623,6 +794,7 @@ export interface RetrievalPolicyV3 {
 
 export const DEFAULT_RETRIEVAL_POLICY_V3: Readonly<RetrievalPolicyV3> = Object.freeze({
   maximumGlobalRounds: 60,
+  maximumConcurrentDiscovery: 4,
   maximumRawCandidates: 5_000,
   maximumCostUnits: 100,
   deadlineAtEpochMs: null,
@@ -641,6 +813,24 @@ interface MutableStrategyStateV3 {
   cursor: string | null;
   seenCursors: Set<string>;
 }
+
+interface MutableDependencyStateV3 {
+  dependencyId: RetrievalUpstreamDependencyIdV3;
+  outageCount: number;
+  failureAttempts: number;
+  active: boolean;
+  circuitOpen: boolean;
+  affectedStrategyIds: Set<string>;
+  unresolvedStrategyIds: Set<string>;
+}
+
+type PendingDiscoveryAttemptV3 = {
+  state: MutableStrategyStateV3;
+  request: DiscoveryRequestV3;
+  result:
+    | { ok: true; batch: DiscoveryBatchV3 }
+    | { ok: false; error: unknown };
+};
 
 interface MutableCountersV3 {
   discovered: number;
@@ -675,6 +865,83 @@ function boundedInteger(value: number, label: string, minimum: number, maximum: 
 
 function boundedFinite(value: number, fallback = 0): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
+}
+
+function normalizedOptimizationSignalKeys(values: readonly string[] | undefined): string[] {
+  return [...new Set((values ?? [])
+    .map((value) => value.normalize("NFKC").replace(/\s+/gu, " ").trim())
+    .filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+}
+
+export function normalizePlaylistOptimizationSignalsV3(
+  input: PlaylistOptimizationSignalsV3 | null | undefined,
+): PlaylistOptimizationSignalsV3 | undefined {
+  if (!input) return undefined;
+  const bounded = (value: number | null | undefined): number | null => (
+    typeof value === "number" && Number.isFinite(value)
+      ? boundedFinite(value)
+      : null
+  );
+  const chronologyPosition = typeof input.chronologyPosition === "number"
+    && Number.isFinite(input.chronologyPosition)
+    ? input.chronologyPosition
+    : null;
+  return {
+    familiarityScore: bounded(input.familiarityScore),
+    discoveryScore: bounded(input.discoveryScore),
+    eraKeys: normalizedOptimizationSignalKeys(input.eraKeys),
+    sceneKeys: normalizedOptimizationSignalKeys(input.sceneKeys),
+    geographyKeys: normalizedOptimizationSignalKeys(input.geographyKeys),
+    energy: bounded(input.energy),
+    tempo: bounded(input.tempo),
+    chronologyPosition,
+  };
+}
+
+function mergePlaylistOptimizationSignalsV3(
+  left: PlaylistOptimizationSignalsV3 | undefined,
+  right: PlaylistOptimizationSignalsV3 | undefined,
+): PlaylistOptimizationSignalsV3 | undefined {
+  const normalizedLeft = normalizePlaylistOptimizationSignalsV3(left);
+  const normalizedRight = normalizePlaylistOptimizationSignalsV3(right);
+  if (!normalizedLeft) return normalizedRight;
+  if (!normalizedRight) return normalizedLeft;
+  const maximum = (a: number | null | undefined, b: number | null | undefined) => (
+    a === null || a === undefined
+      ? b ?? null
+      : b === null || b === undefined
+        ? a
+        : Math.max(a, b)
+  );
+  const chronology = [normalizedLeft.chronologyPosition, normalizedRight.chronologyPosition]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+    .sort((a, b) => a - b)[0] ?? null;
+  return {
+    familiarityScore: maximum(
+      normalizedLeft.familiarityScore,
+      normalizedRight.familiarityScore,
+    ),
+    discoveryScore: maximum(
+      normalizedLeft.discoveryScore,
+      normalizedRight.discoveryScore,
+    ),
+    eraKeys: normalizedOptimizationSignalKeys([
+      ...(normalizedLeft.eraKeys ?? []),
+      ...(normalizedRight.eraKeys ?? []),
+    ]),
+    sceneKeys: normalizedOptimizationSignalKeys([
+      ...(normalizedLeft.sceneKeys ?? []),
+      ...(normalizedRight.sceneKeys ?? []),
+    ]),
+    geographyKeys: normalizedOptimizationSignalKeys([
+      ...(normalizedLeft.geographyKeys ?? []),
+      ...(normalizedRight.geographyKeys ?? []),
+    ]),
+    energy: maximum(normalizedLeft.energy, normalizedRight.energy),
+    tempo: maximum(normalizedLeft.tempo, normalizedRight.tempo),
+    chronologyPosition: chronology,
+  };
 }
 
 function validCandidate(candidate: RawTrackCandidateV3): boolean {
@@ -781,6 +1048,33 @@ function continuationTrackIntegrityReason(
     track.evidenceBindingIds,
     track.evidenceBindings,
   );
+  if (plan.canonicalContractPolicy) {
+    const evaluation = evaluateCanonicalContractTrackV1({
+      policy: plan.canonicalContractPolicy,
+      assessments: track.canonicalClauseAssessments ?? {},
+    });
+    if (!evaluation.eligible) {
+      return evaluation.status === "unknown"
+        ? "canonical_contract_unknown"
+        : "canonical_contract_failed";
+    }
+    const attestedIds = new Set(bindings.map(({ id }) => id));
+    const assessments = track.canonicalClauseAssessments ?? {};
+    const referenced = Object.values(assessments)
+      .flatMap(({ evidenceIds }) => evidenceIds ?? []);
+    const missingRequiredEvidenceReference = plan.canonicalContractPolicy.clauses.some((clause) => {
+      const assessment = assessments[clause.id];
+      return clause.evidence.required
+        && assessment?.status === "pass"
+        && assessment.evidenceGrade !== "authoritative_structured_metadata"
+        && (assessment.evidenceIds?.length ?? 0) === 0;
+    });
+    if (missingRequiredEvidenceReference
+      || referenced.some((id) => !attestedIds.has(id))) {
+      return "evidence_attestation_missing";
+    }
+    return null;
+  }
   if (bindings.length === 0) return "evidence_attestation_missing";
   const supportedPredicates = new Set(bindings.flatMap(bindingPredicateIds));
   if (positiveMembershipPredicateIds(plan).some((id) => !supportedPredicates.has(id))) {
@@ -850,6 +1144,15 @@ function mergeQualifiedTrack(
     sourceObservationIds: observations,
     evidenceBindingIds: bindingIds,
     evidenceBindings: bindings,
+    canonicalClauseAssessments: existing.canonicalClauseAssessments
+      ? structuredClone(existing.canonicalClauseAssessments)
+      : incoming.canonicalClauseAssessments
+        ? structuredClone(incoming.canonicalClauseAssessments)
+        : undefined,
+    playlistOptimizationSignals: mergePlaylistOptimizationSignalsV3(
+      existing.playlistOptimizationSignals,
+      incoming.playlistOptimizationSignals,
+    ),
     evidenceStrength: Math.max(existing.evidenceStrength, incoming.evidenceStrength),
     scopeFit: Math.max(existing.scopeFit, incoming.scopeFit),
     independentProvenanceRoots: Math.max(
@@ -952,6 +1255,178 @@ function normalizeIdentity(value: string): string {
     .toLocaleLowerCase("en-US")
     .replace(/[^a-z0-9]+/gu, " ")
     .trim();
+}
+
+function minimumNullable(...values: Array<number | null | undefined>): number | null {
+  const candidates = values.filter(
+    (value): value is number => Number.isSafeInteger(value) && Number(value) >= 1,
+  );
+  return candidates.length > 0 ? Math.min(...candidates) : null;
+}
+
+function canonicalPassedValuesForAxesV3(
+  track: QualifiedTrackV3,
+  plan: SelectionPlanV3,
+  axes: readonly string[],
+): string[] {
+  const acceptedAxes = new Set(axes);
+  const assessments = track.canonicalClauseAssessments ?? {};
+  return normalizedOptimizationSignalKeys(
+    (plan.canonicalContractPolicy?.clauses ?? []).flatMap((clause) => (
+      clause.operator === "require"
+      && acceptedAxes.has(clause.axis)
+      && assessments[clause.id]?.status === "pass"
+        ? clause.values
+        : []
+    )),
+  );
+}
+
+function familiarityBoundsV3(
+  plan: SelectionPlanV3,
+  target: number,
+): { minimum: number; maximum: number } {
+  const text = plan.rankingObjectives
+    .flatMap(({ values }) => values)
+    .join(" ")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLocaleLowerCase("en-US");
+  if (/\b(?:balanced|anchors?|recognizable anchors?)\b/u.test(text)) {
+    return {
+      minimum: Math.min(target, Math.max(1, Math.ceil(target * 0.2))),
+      maximum: Math.max(1, Math.floor(target * 0.6)),
+    };
+  }
+  if (/\b(?:obscure|deep cuts?|strict documented rarity|genuinely rare)\b/u.test(text)) {
+    return { minimum: 0, maximum: Math.floor(target * 0.25) };
+  }
+  if (/\b(?:familiar|landmarks?|staples?|widely recognized|canonical hits?)\b/u.test(text)) {
+    return { minimum: Math.ceil(target * 0.6), maximum: target };
+  }
+  return { minimum: 0, maximum: target };
+}
+
+function playlistOptimizationConstraintsV3(
+  plan: SelectionPlanV3,
+  target: number,
+): PlaylistOptimizationConstraintsV1 {
+  const hardArtistMaximum = maximumConstraint(plan.hardConstraints, "artist", "hard");
+  const hardAlbumMaximum = maximumConstraint(plan.hardConstraints, "album", "hard");
+  const familiarity = familiarityBoundsV3(plan, target);
+  const quality = plan.playlistQualityPolicy;
+  // Canonical projections have no relaxation ladder: every non-null goal was
+  // compiled from an immutable playlist clause. A legacy plan with a policy
+  // overlaid during mixed-version drain keeps its historical soft goals.
+  const immutableDiversity = plan.softGoalRelaxationOrder.length === 0;
+  return {
+    targetTrackCount: target,
+    maximumTracksPerArtist: minimumNullable(
+      hardArtistMaximum,
+      immutableDiversity ? plan.diversityGoals.maximumTracksPerArtist : null,
+    ),
+    maximumTracksPerAlbum: minimumNullable(
+      hardAlbumMaximum,
+      immutableDiversity ? plan.diversityGoals.maximumTracksPerAlbum : null,
+    ),
+    minimumDistinctArtists: immutableDiversity
+      ? Math.max(0, plan.diversityGoals.minimumDistinctArtists ?? 0)
+      : 0,
+    minimumDistinctAlbums: immutableDiversity
+      ? Math.max(0, plan.diversityGoals.minimumDistinctAlbums ?? 0)
+      : 0,
+    minimumDistinctEras: immutableDiversity
+      ? Math.max(0, plan.diversityGoals.minimumDistinctEras ?? 0)
+      : 0,
+    minimumDistinctScenes: immutableDiversity
+      ? Math.max(0, plan.diversityGoals.minimumDistinctScenes ?? 0)
+      : 0,
+    minimumDistinctGeographies: Math.max(
+      0,
+      immutableDiversity ? plan.diversityGoals.minimumDistinctGeographies ?? 0 : 0,
+    ),
+    minimumFamiliarTracks: familiarity.minimum,
+    maximumFamiliarTracks: familiarity.maximum,
+    minimumCentralQualityPassTracks: quality
+      ? Math.ceil(target * quality.minimumPassRatio)
+      : 0,
+    maximumCentralQualityUnknownTracks: quality
+      ? Math.floor(target * quality.maximumUnknownRatio)
+      : target,
+    zeroCentralQualityFailures: quality?.zeroKnownFailures ?? false,
+    sequencingMode: plan.orderingPolicy.mode,
+    avoidAdjacentSameArtist: plan.orderingPolicy.avoidAdjacentSameArtist,
+    avoidAdjacentSameAlbum: plan.orderingPolicy.avoidAdjacentSameAlbum,
+  };
+}
+
+function playlistOptimizationCandidateV3(
+  track: QualifiedTrackV3,
+  plan: SelectionPlanV3,
+): PlaylistOptimizationCandidateV1 {
+  const signals = normalizePlaylistOptimizationSignalsV3(track.playlistOptimizationSignals);
+  const releaseYear = signals?.chronologyPosition
+    ?? track.catalogReleaseYear
+    ?? track.catalogCompatibleReleaseYears?.[0]
+    ?? null;
+  const derivedEra = typeof releaseYear === "number" && Number.isFinite(releaseYear)
+    ? [`${Math.floor(releaseYear / 10) * 10}s`]
+    : [];
+  const familiarityScore = signals?.familiarityScore
+    ?? (typeof track.rankingSignals.influence === "number"
+      ? boundedFinite(track.rankingSignals.influence)
+      : null);
+  return {
+    id: track.candidateId,
+    recordingFamilyKey: track.recordingFamilyKey,
+    artistKey: normalizeIdentity(track.artist),
+    albumKey: track.album ? normalizeIdentity(`${track.artist}\u0000${track.album}`) : null,
+    relevanceScore: boundedFinite(
+      track.rankingSignals.relevance ?? track.scopeFit,
+      track.scopeFit,
+    ),
+    familiarityScore,
+    discoveryScore: signals?.discoveryScore
+      ?? (familiarityScore === null ? null : 1 - familiarityScore),
+    eraKeys: normalizedOptimizationSignalKeys([
+      ...(signals?.eraKeys ?? []),
+      ...derivedEra,
+      ...canonicalPassedValuesForAxesV3(track, plan, ["era"]),
+    ]),
+    sceneKeys: normalizedOptimizationSignalKeys([
+      ...(signals?.sceneKeys ?? []),
+      ...canonicalPassedValuesForAxesV3(track, plan, ["scene", "subgenre"]),
+    ]),
+    geographyKeys: normalizedOptimizationSignalKeys([
+      ...(signals?.geographyKeys ?? []),
+      ...canonicalPassedValuesForAxesV3(track, plan, ["geography"]),
+    ]),
+    energy: signals?.energy ?? null,
+    tempo: signals?.tempo ?? null,
+    chronologyPosition: releaseYear,
+    centralQualityVerdict: plan.playlistQualityPolicy
+      ? centralQualityVerdictV3(track, plan.playlistQualityPolicy)
+      : "pass",
+  };
+}
+
+function playlistOptimizationReportV3(
+  result: PlaylistOptimizationResultV1,
+  evidenceQualifiedCandidateCount: number,
+  additionalUnmetConstraints: readonly string[] = [],
+): PlaylistOptimizationReportV3 {
+  const unmetConstraints = [...new Set([
+    ...result.unmetConstraints,
+    ...additionalUnmetConstraints,
+  ])];
+  return {
+    policyVersion: result.policyVersion,
+    exact: result.exact && additionalUnmetConstraints.length === 0,
+    evidenceQualifiedCandidateCount,
+    unmetConstraints,
+    distinct: result.distinct,
+    familiarTrackCount: result.familiarTrackCount,
+  };
 }
 
 function maximumConstraint(
@@ -1078,6 +1553,345 @@ function selectBroadCurated(
   return selected;
 }
 
+function quotaText(value: string): string {
+  return value.normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+export function trackMatchesCanonicalQuotaV3(
+  track: QualifiedTrackV3,
+  rule: CanonicalPlaylistQuotaRule,
+  policy?: SelectionPlanV3["canonicalContractPolicy"],
+): boolean {
+  if (rule.predicate && policy) {
+    return evaluateCanonicalContractPredicateV1({
+      policy,
+      predicate: rule.predicate,
+      assessments: track.canonicalClauseAssessments ?? {},
+    }) === "pass";
+  }
+  if (rule.axis !== "genre"
+    || rule.evidenceGrade !== "authoritative_structured_metadata") {
+    return false;
+  }
+  const genres = (track.catalogGenreNames ?? []).map(quotaText).filter(Boolean);
+  return rule.values.some((value) => {
+    const expected = quotaText(value);
+    if (!expected) return false;
+    return genres.some((genre) => (
+      genre === expected
+      || genre.startsWith(`${expected} `)
+      || genre.endsWith(` ${expected}`)
+      || genre.includes(` ${expected} `)
+    ));
+  });
+}
+
+/**
+ * Enforce the immutable distribution rules without filler. The deterministic
+ * repair pass supports intersecting quotas; if the ranked pool cannot produce
+ * the requested size, it returns the largest proven-compliant partial.
+ */
+export function selectWithCanonicalQuotaV3(input: {
+  ranked: readonly QualifiedTrackV3[];
+  target: number;
+  rules: readonly CanonicalPlaylistQuotaRule[];
+  policy?: SelectionPlanV3["canonicalContractPolicy"];
+}): QualifiedTrackV3[] {
+  if (input.rules.length === 0) return input.ranked.slice(0, input.target);
+  const match = new Map<string, boolean[]>();
+  input.ranked.forEach((track) => match.set(
+    track.candidateId,
+    input.rules.map((rule) => trackMatchesCanonicalQuotaV3(track, rule, input.policy)),
+  ));
+  const bounds = (total: number, rule: CanonicalPlaylistQuotaRule) => ({
+    minimum: Math.max(
+      rule.minimumCount ?? 0,
+      rule.minimumRatio === null ? 0 : Math.ceil(total * rule.minimumRatio),
+    ),
+    maximum: Math.min(
+      rule.maximumCount ?? total,
+      rule.maximumRatio === null ? total : Math.floor(total * rule.maximumRatio),
+    ),
+  });
+  const counts = (selected: readonly QualifiedTrackV3[]) => input.rules.map((_, ruleIndex) => (
+    selected.filter((track) => match.get(track.candidateId)?.[ruleIndex]).length
+  ));
+  const compliant = (selected: readonly QualifiedTrackV3[]) => {
+    const observed = counts(selected);
+    return input.rules.every((rule, index) => {
+      const limit = bounds(selected.length, rule);
+      return limit.minimum <= limit.maximum
+        && observed[index]! >= limit.minimum
+        && observed[index]! <= limit.maximum;
+    });
+  };
+
+  for (let total = Math.min(input.target, input.ranked.length); total > 0; total -= 1) {
+    const chosen = new Set(input.ranked.slice(0, total).map(({ candidateId }) => candidateId));
+    const selected = () => input.ranked.filter(({ candidateId }) => chosen.has(candidateId));
+    const outside = () => input.ranked.filter(({ candidateId }) => !chosen.has(candidateId));
+    const maximumRepairs = Math.max(1, input.rules.length * total * 4);
+    for (let attempt = 0; attempt < maximumRepairs && !compliant(selected()); attempt += 1) {
+      const current = selected();
+      const observed = counts(current);
+      const deficitRuleIndex = input.rules.findIndex((rule, index) => (
+        observed[index]! < bounds(total, rule).minimum
+      ));
+      const excessRuleIndex = input.rules.findIndex((rule, index) => (
+        observed[index]! > bounds(total, rule).maximum
+      ));
+      const focus = deficitRuleIndex >= 0 ? deficitRuleIndex : excessRuleIndex;
+      if (focus < 0) break;
+      const needMatch = deficitRuleIndex >= 0;
+      const incoming = outside().find((track) => (
+        Boolean(match.get(track.candidateId)?.[focus]) === needMatch
+      ));
+      const outgoing = [...current].reverse().find((track) => (
+        Boolean(match.get(track.candidateId)?.[focus]) !== needMatch
+      ));
+      if (!incoming || !outgoing) break;
+      chosen.delete(outgoing.candidateId);
+      chosen.add(incoming.candidateId);
+    }
+    const repaired = selected();
+    if (repaired.length === total && compliant(repaired)) return repaired;
+  }
+  return [];
+}
+
+export type CentralQualityVerdictV3 = "pass" | "fail" | "unknown";
+
+export interface CentralQualityReportV3 {
+  readonly policyVersion: "canonical_central_quality_v1";
+  readonly criteria: readonly string[];
+  readonly passed: boolean;
+  readonly passCount: number;
+  readonly failCount: number;
+  readonly unknownCount: number;
+  readonly passRatio: number;
+  readonly unknownRatio: number;
+  readonly reasonCodes: readonly string[];
+}
+
+export function centralQualityVerdictV3(
+  track: QualifiedTrackV3,
+  policy: CanonicalPlaylistQualityPolicy,
+): CentralQualityVerdictV3 {
+  const signal = track.rankingSignals[policy.signalDimension];
+  if (typeof signal !== "number" || !Number.isFinite(signal)) return "unknown";
+  if (signal >= policy.passThreshold) return "pass";
+  if (signal < policy.failThreshold) return "fail";
+  return "unknown";
+}
+
+export function evaluateCentralQualityV3(input: {
+  tracks: readonly QualifiedTrackV3[];
+  policy: CanonicalPlaylistQualityPolicy;
+}): CentralQualityReportV3 {
+  const verdicts = input.tracks.map((track) => centralQualityVerdictV3(track, input.policy));
+  const passCount = verdicts.filter((verdict) => verdict === "pass").length;
+  const failCount = verdicts.filter((verdict) => verdict === "fail").length;
+  const unknownCount = verdicts.filter((verdict) => verdict === "unknown").length;
+  const denominator = input.tracks.length;
+  const passRatio = denominator === 0 ? 0 : passCount / denominator;
+  const unknownRatio = denominator === 0 ? 1 : unknownCount / denominator;
+  const reasonCodes = [
+    ...(input.policy.zeroKnownFailures && failCount > 0
+      ? ["central_quality_known_failure"]
+      : []),
+    ...(passRatio < input.policy.minimumPassRatio
+      ? ["central_suitability_coverage_below_floor"]
+      : []),
+    ...(unknownRatio > input.policy.maximumUnknownRatio
+      ? ["central_suitability_unknown_above_ceiling"]
+      : []),
+  ];
+  return {
+    policyVersion: input.policy.policyVersion,
+    criteria: [...input.policy.criteria],
+    passed: denominator > 0 && reasonCodes.length === 0,
+    passCount,
+    failCount,
+    unknownCount,
+    passRatio,
+    unknownRatio,
+    reasonCodes,
+  };
+}
+
+/**
+ * Remove known quality failures and cap unknown judgments so every returned
+ * prefix can satisfy the immutable playlist-level quality ratios. The
+ * original relative rank is preserved inside the chosen pass/unknown set.
+ */
+export function selectWithCentralQualityV3(input: {
+  ranked: readonly QualifiedTrackV3[];
+  target: number;
+  policy: CanonicalPlaylistQualityPolicy | null | undefined;
+}): {
+  eligible: QualifiedTrackV3[];
+  rejectedFailureCount: number;
+  rejectedUnknownCount: number;
+} {
+  if (!input.policy) {
+    return {
+      eligible: [...input.ranked],
+      rejectedFailureCount: 0,
+      rejectedUnknownCount: 0,
+    };
+  }
+  const passing = input.ranked.filter(
+    (track) => centralQualityVerdictV3(track, input.policy!) === "pass",
+  );
+  const unknown = input.ranked.filter(
+    (track) => centralQualityVerdictV3(track, input.policy!) === "unknown",
+  );
+  const failureCount = input.ranked.length - passing.length - unknown.length;
+  let total = Math.min(input.target, passing.length + unknown.length);
+  while (total > 0) {
+    const minimumPass = Math.ceil(total * input.policy.minimumPassRatio);
+    const maximumUnknown = Math.floor(total * input.policy.maximumUnknownRatio);
+    const passCount = Math.min(passing.length, total);
+    const unknownCount = total - passCount;
+    if (passCount >= minimumPass
+      && unknownCount <= maximumUnknown
+      && unknownCount <= unknown.length) {
+      const chosen = new Set([
+        ...passing.slice(0, passCount).map(({ candidateId }) => candidateId),
+        ...unknown.slice(0, unknownCount).map(({ candidateId }) => candidateId),
+      ]);
+      return {
+        eligible: input.ranked.filter(({ candidateId }) => chosen.has(candidateId)),
+        rejectedFailureCount: failureCount,
+        rejectedUnknownCount: Math.max(0, unknown.length - unknownCount),
+      };
+    }
+    total -= 1;
+  }
+  return {
+    eligible: [],
+    rejectedFailureCount: failureCount,
+    rejectedUnknownCount: unknown.length,
+  };
+}
+
+export interface CanonicalPublicationValidationReportV3 {
+  readonly valid: boolean;
+  readonly reasonCodes: readonly string[];
+}
+
+/**
+ * Re-evaluate the immutable contract immediately before a schema-4 manifest
+ * is allowed to cross the Apple write boundary. The manifest hash freezes the
+ * order; this check proves that the frozen set still satisfies track gates,
+ * exact count (unless separately consented), quotas, central quality, and the
+ * deterministic sequencing rules the current executor can certify.
+ */
+export function validateCanonicalPublicationSetV3(input: {
+  plan: SelectionPlanV3;
+  tracks: readonly QualifiedTrackV3[];
+  partialPublicationAuthorized?: boolean;
+}): CanonicalPublicationValidationReportV3 {
+  const policy = input.plan.canonicalContractPolicy;
+  if (!policy) return { valid: true, reasonCodes: [] };
+  const reasons: string[] = [];
+  if (!input.partialPublicationAuthorized
+    && input.tracks.length !== policy.requestedTrackCount) {
+    reasons.push("canonical_exact_count_mismatch");
+  }
+  if (input.tracks.length > policy.requestedTrackCount) {
+    reasons.push("canonical_count_overflow");
+  }
+  if (new Set(input.tracks.map(({ recordingFamilyKey }) => recordingFamilyKey)).size
+    !== input.tracks.length) {
+    reasons.push("canonical_recording_family_duplicate");
+  }
+  for (const track of input.tracks) {
+    const evaluation = evaluateCanonicalContractTrackV1({
+      policy,
+      assessments: track.canonicalClauseAssessments ?? {},
+    });
+    if (!evaluation.eligible) {
+      reasons.push(evaluation.status === "unknown"
+        ? "canonical_track_unknown"
+        : "canonical_track_failed");
+      break;
+    }
+  }
+  for (const rule of input.plan.playlistQuotaRules ?? []) {
+    const matches = input.tracks.filter((track) => (
+      trackMatchesCanonicalQuotaV3(track, rule, policy)
+    )).length;
+    const ratio = input.tracks.length === 0 ? 0 : matches / input.tracks.length;
+    if ((rule.minimumCount !== null && matches < rule.minimumCount)
+      || (rule.maximumCount !== null && matches > rule.maximumCount)
+      || (rule.minimumRatio !== null && ratio < rule.minimumRatio)
+      || (rule.maximumRatio !== null && ratio > rule.maximumRatio)) {
+      reasons.push(`canonical_quota_failed:${rule.id}`);
+    }
+  }
+  if (input.plan.playlistQualityPolicy
+    && !evaluateCentralQualityV3({
+      tracks: input.tracks,
+      policy: input.plan.playlistQualityPolicy,
+    }).passed) {
+    reasons.push("canonical_central_quality_failed");
+  }
+  if (shouldApplyPlaylistOptimizerV3(input.plan)) {
+    const optimizationTarget = input.partialPublicationAuthorized
+      ? input.tracks.length
+      : policy.requestedTrackCount;
+    if (optimizationTarget === 0) {
+      reasons.push("canonical_playlist_optimization_failed:empty_selection");
+    } else {
+      const optimized = optimizeQualifiedPlaylistV3({
+        ranked: input.tracks,
+        target: optimizationTarget,
+        plan: input.plan,
+      });
+      if (!optimized.report.exact) {
+        reasons.push(...optimized.report.unmetConstraints.map(
+          (reason) => `canonical_playlist_optimization_failed:${reason}`,
+        ));
+      } else if (optimized.selected.some((track, index) => (
+        track.candidateId !== input.tracks[index]?.candidateId
+      ))) {
+        reasons.push("canonical_sequence_optimizer_mismatch");
+      }
+    }
+  }
+  const ordering = input.plan.orderingPolicy;
+  for (let index = 1; index < input.tracks.length; index += 1) {
+    const previous = input.tracks[index - 1]!;
+    const current = input.tracks[index]!;
+    if (ordering.avoidAdjacentSameArtist
+      && normalizeIdentity(previous.artist) === normalizeIdentity(current.artist)) {
+      reasons.push("canonical_sequence_adjacent_artist");
+      break;
+    }
+    if (ordering.avoidAdjacentSameAlbum
+      && previous.album && current.album
+      && normalizeIdentity(previous.album) === normalizeIdentity(current.album)) {
+      reasons.push("canonical_sequence_adjacent_album");
+      break;
+    }
+  }
+  if (ordering.mode === "chronological") {
+    const years = input.tracks.map(({ catalogReleaseYear }) => catalogReleaseYear ?? null);
+    if (years.some((year) => year === null)
+      || years.some((year, index) => (
+        index > 0 && Number(year) < Number(years[index - 1])
+      ))) {
+      reasons.push("canonical_sequence_chronology_unproven");
+    }
+  }
+  return { valid: reasons.length === 0, reasonCodes: [...new Set(reasons)] };
+}
+
 function sequenceBroadCurated(
   tracks: readonly QualifiedTrackV3[],
   ordering: SelectionPlanV3["orderingPolicy"],
@@ -1118,6 +1932,69 @@ function shouldSequenceBroadCurated(
     ].includes(engine));
 }
 
+function shouldApplyPlaylistOptimizerV3(plan: SelectionPlanV3): boolean {
+  // Contract-3 carries explicit (nullable) playlist-level constraints. Legacy
+  // plans predate the optimizer and retain their recorded soft-relaxation
+  // semantics while they drain.
+  return plan.scopeKind === "broad_curated"
+    && plan.canonicalContractPolicy?.policyVersion === "canonical_contract_runtime_v1";
+}
+
+function optimizeQualifiedPlaylistV3(input: {
+  ranked: readonly QualifiedTrackV3[];
+  target: number;
+  plan: SelectionPlanV3;
+}): {
+  selected: QualifiedTrackV3[];
+  report: PlaylistOptimizationReportV3;
+} {
+  const byId = new Map(input.ranked.map((track) => [track.candidateId, track]));
+  const candidates = input.ranked.map((track) => (
+    playlistOptimizationCandidateV3(track, input.plan)
+  ));
+  const constraints = playlistOptimizationConstraintsV3(input.plan, input.target);
+  const initial = optimizePlaylistV1({ candidates, constraints });
+  let final = initial;
+  let additionalUnmetConstraints: string[] = [];
+
+  if (initial.exact && (input.plan.playlistQuotaRules?.length ?? 0) > 0) {
+    const preferredIds = new Set(initial.selected.map(({ id }) => id));
+    const quotaRanked = [
+      ...input.ranked.filter(({ candidateId }) => preferredIds.has(candidateId)),
+      ...input.ranked.filter(({ candidateId }) => !preferredIds.has(candidateId)),
+    ];
+    const quotaSelection = selectWithCanonicalQuotaV3({
+      ranked: quotaRanked,
+      target: input.target,
+      rules: input.plan.playlistQuotaRules ?? [],
+      policy: input.plan.canonicalContractPolicy,
+    });
+    final = optimizePlaylistV1({
+      candidates: quotaSelection.map((track) => (
+        playlistOptimizationCandidateV3(track, input.plan)
+      )),
+      constraints,
+    });
+    if (quotaSelection.length !== input.target) {
+      additionalUnmetConstraints = [
+        `canonical_quota_count:${quotaSelection.length}/${input.target}`,
+      ];
+    }
+  }
+
+  return {
+    selected: final.selected.flatMap(({ id }) => {
+      const track = byId.get(id);
+      return track ? [track] : [];
+    }),
+    report: playlistOptimizationReportV3(
+      final,
+      input.ranked.length,
+      additionalUnmetConstraints,
+    ),
+  };
+}
+
 function stageObservations(counters: MutableCountersV3): StageYieldObservationV3[] {
   return [
     { stage: "discovered", entered: counters.discovered, passed: counters.validCandidates },
@@ -1130,14 +2007,112 @@ function stageObservations(counters: MutableCountersV3): StageYieldObservationV3
   ];
 }
 
-function nextStrategy(states: readonly MutableStrategyStateV3[]): MutableStrategyStateV3 | null {
+function availableStrategies(
+  states: readonly MutableStrategyStateV3[],
+): MutableStrategyStateV3[] {
   const available = states.filter((state) => state.status === "available"
     && state.rounds < state.definition.maximumRounds
     && state.consecutiveZeroQualifiedYieldRounds < state.definition.zeroQualifiedYieldLimit);
   available.sort((left, right) => left.definition.tier - right.definition.tier
     || left.rounds - right.rounds
     || left.ordinal - right.ordinal);
-  return available[0] ?? null;
+  return available;
+}
+
+/**
+ * Select one deterministic portfolio wave from the lowest active tier.
+ *
+ * Query variants backed by the same provider/corpus are not independent and
+ * therefore cannot occupy the same wave. Composite strategies reserve every
+ * dependency they use, so an Apple+hosted expansion cannot overlap either an
+ * Apple catalog traversal or another hosted-search strategy.
+ */
+function nextStrategyWave(
+  states: readonly MutableStrategyStateV3[],
+  maximumConcurrentDiscovery: number,
+): MutableStrategyStateV3[] {
+  const available = availableStrategies(states);
+  const activeTier = available[0]?.definition.tier;
+  if (activeTier === undefined) return [];
+  const localBarrier = available.find((state) => (
+    state.definition.tier === activeTier
+    && state.definition.discoveryDependencyIds.length === 1
+    && state.definition.discoveryDependencyIds[0] === "orchestration_local"
+  ));
+  // Server-local scope/gap transitions are deterministic phase barriers.
+  // Complete them before launching provider work so no provider request is
+  // based on a phase that has not yet committed.
+  if (localBarrier) return [localBarrier];
+  const dependenciesInUse = new Set<RetrievalUpstreamDependencyIdV3>();
+  const selected: MutableStrategyStateV3[] = [];
+  for (const state of available) {
+    if (state.definition.tier !== activeTier) break;
+    if (state.definition.discoveryDependencyIds.some((id) => dependenciesInUse.has(id))) continue;
+    selected.push(state);
+    state.definition.discoveryDependencyIds.forEach((id) => dependenciesInUse.add(id));
+    if (selected.length >= maximumConcurrentDiscovery) break;
+  }
+  return selected;
+}
+
+function mutableDependencyState(
+  dependencies: Map<RetrievalUpstreamDependencyIdV3, MutableDependencyStateV3>,
+  dependencyId: RetrievalUpstreamDependencyIdV3,
+): MutableDependencyStateV3 {
+  const existing = dependencies.get(dependencyId);
+  if (existing) return existing;
+  const created: MutableDependencyStateV3 = {
+    dependencyId,
+    outageCount: 0,
+    failureAttempts: 0,
+    active: false,
+    circuitOpen: false,
+    affectedStrategyIds: new Set(),
+    unresolvedStrategyIds: new Set(),
+  };
+  dependencies.set(dependencyId, created);
+  return created;
+}
+
+function observeDependencyFailure(input: {
+  dependencies: Map<RetrievalUpstreamDependencyIdV3, MutableDependencyStateV3>;
+  dependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+  strategyId: string;
+  circuitOpen?: boolean;
+}): void {
+  for (const dependencyId of input.dependencyIds) {
+    const dependency = mutableDependencyState(input.dependencies, dependencyId);
+    dependency.failureAttempts += 1;
+    if (dependency.unresolvedStrategyIds.size === 0) dependency.outageCount += 1;
+    dependency.unresolvedStrategyIds.add(input.strategyId);
+    dependency.active = true;
+    dependency.circuitOpen ||= input.circuitOpen === true;
+    dependency.affectedStrategyIds.add(input.strategyId);
+  }
+}
+
+function observeDependencySuccess(input: {
+  dependencies: Map<RetrievalUpstreamDependencyIdV3, MutableDependencyStateV3>;
+  dependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+  strategyId: string;
+}): void {
+  for (const dependencyId of input.dependencyIds) {
+    const dependency = mutableDependencyState(input.dependencies, dependencyId);
+    dependency.unresolvedStrategyIds.delete(input.strategyId);
+    dependency.active = dependency.unresolvedStrategyIds.size > 0;
+    if (!dependency.active) dependency.circuitOpen = false;
+    dependency.affectedStrategyIds.add(input.strategyId);
+  }
+}
+
+function failedDependencyIds(
+  error: unknown,
+  declared: readonly RetrievalUpstreamDependencyIdV3[],
+): readonly RetrievalUpstreamDependencyIdV3[] {
+  if (!(error instanceof RetrievalDependencyErrorV3)) return declared;
+  const declaredSet = new Set(declared);
+  const specific = error.dependencyIds.filter((dependencyId) => declaredSet.has(dependencyId));
+  return specific.length > 0 ? specific : declared;
 }
 
 function strategyReport(state: MutableStrategyStateV3): RetrievalStrategyReportV3 {
@@ -1145,6 +2120,8 @@ function strategyReport(state: MutableStrategyStateV3): RetrievalStrategyReportV
     id: state.definition.id,
     engine: state.definition.engine,
     kind: state.definition.kind,
+    discoveryDependencyIds: [...state.definition.discoveryDependencyIds],
+    qualificationDependencyIds: [...state.definition.qualificationDependencyIds],
     status: state.status,
     rounds: state.rounds,
     rawCandidates: state.rawCandidates,
@@ -1155,13 +2132,40 @@ function strategyReport(state: MutableStrategyStateV3): RetrievalStrategyReportV
   };
 }
 
+function dependencyOutageReport(
+  state: MutableDependencyStateV3,
+): RetrievalDependencyOutageReportV3 {
+  return {
+    dependencyId: state.dependencyId,
+    outageCount: state.outageCount,
+    failureAttempts: state.failureAttempts,
+    active: state.active,
+    circuitOpen: state.circuitOpen,
+    affectedStrategyIds: [...state.affectedStrategyIds].sort(),
+  };
+}
+
 function finalStopReason(input: {
   explicit: RetrievalStopReasonV3 | null;
   strategies: readonly MutableStrategyStateV3[];
   providerFailureCount: number;
   integrityFailureCount: number;
   qualifiedCount: number;
+  dependencyOutages: readonly MutableDependencyStateV3[];
 }): RetrievalStopReasonV3 {
+  // A completed exact reserve is valid even if an optional frontier was
+  // briefly degraded; every other unresolved provider outage takes
+  // precedence over generic time/round/budget boundaries.
+  if (input.explicit === "qualified_reserve_satisfied") return input.explicit;
+  // One failed hosted-search dependency remains one operational outage even
+  // when several query strategies share it. A healthy independent frontier
+  // cannot turn that unresolved outage into a scarcity claim.
+  if (input.dependencyOutages.some((dependency) => dependency.active && dependency.circuitOpen)) {
+    return "provider_circuit_open";
+  }
+  if (input.dependencyOutages.some((dependency) => dependency.active)) {
+    return "provider_failure";
+  }
   if (input.explicit) return input.explicit;
   // Scope resolution and gap-pass definitions are orchestration markers in
   // the live adapter. They deliberately return an exhausted zero-work page
@@ -1278,6 +2282,7 @@ function emptyResult(input: {
       primaryShortfallReason: input.stopReason,
     },
     strategies: input.strategies,
+    dependencyOutages: [],
     integrityEvents: input.integrityEvents ?? [],
     predicateDiagnostics: {
       qualificationsObserved: 0,
@@ -1301,7 +2306,21 @@ function validatePolicy(input: Partial<RetrievalPolicyV3>): RetrievalPolicyV3 {
   const merged = { ...DEFAULT_RETRIEVAL_POLICY_V3, ...input };
   return {
     maximumGlobalRounds: boundedInteger(merged.maximumGlobalRounds, "maximumGlobalRounds", 1, 1_000),
+    maximumConcurrentDiscovery: boundedInteger(
+      merged.maximumConcurrentDiscovery ?? DEFAULT_RETRIEVAL_POLICY_V3.maximumConcurrentDiscovery ?? 1,
+      "maximumConcurrentDiscovery",
+      1,
+      16,
+    ),
     maximumRawCandidates: boundedInteger(merged.maximumRawCandidates, "maximumRawCandidates", 1, 100_000),
+    ...(merged.qualifiedPoolGoal === undefined ? {} : {
+      qualifiedPoolGoal: boundedInteger(
+        merged.qualifiedPoolGoal,
+        "qualifiedPoolGoal",
+        1,
+        100_000,
+      ),
+    }),
     maximumCostUnits: Number.isFinite(merged.maximumCostUnits) && merged.maximumCostUnits >= 0
       ? merged.maximumCostUnits
       : (() => { throw new Error("maximumCostUnits must be a non-negative finite number"); })(),
@@ -1336,15 +2355,26 @@ export async function executeRetrievalV3(input: {
   policy?: Partial<RetrievalPolicyV3>;
   continuation?: RetrievalContinuationSeedV3;
   modelRoute?: PipelineV3ModelRoute;
+  signal?: AbortSignal;
   now?: () => number;
 }): Promise<RetrievalResultV3> {
-  const requested = boundedInteger(input.plan.requestedTrackCount, "requestedTrackCount", 1, 300);
+  const requested = boundedInteger(
+    input.plan.requestedTrackCount,
+    "requestedTrackCount",
+    1,
+    EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  );
   let activePlan = input.plan;
   const mode = input.executionMode ?? "active";
   const policy = validatePolicy(input.policy ?? {});
   const now = input.now ?? Date.now;
   const engines = routeRetrievalEnginesV3(input.plan, input.routingHints);
-  const reserveGoal = Math.max(10, Math.ceil(requested * 0.2));
+  const legacyQualifiedPoolGoal = requested + Math.max(10, Math.ceil(requested * 0.2));
+  const qualifiedPoolGoal = Math.max(
+    requested,
+    policy.qualifiedPoolGoal ?? legacyQualifiedPoolGoal,
+  );
+  const reserveGoal = qualifiedPoolGoal - requested;
   const continuationStrategies = new Map(
     (input.continuation?.strategies ?? []).map((strategy) => [strategy.id, strategy]),
   );
@@ -1476,6 +2506,20 @@ export async function executeRetrievalV3(input: {
   const semanticRecoveryQualificationSample: CandidateQualificationV3[] = [];
   const semanticPlanRevisions: SemanticPlanRevisionArtifactV3[] = [];
   const recoveryAudits: PipelineRecoveryAuditArtifactV3[] = [];
+  const dependencyStates = new Map<
+    RetrievalUpstreamDependencyIdV3,
+    MutableDependencyStateV3
+  >();
+  let pendingDiscoveries: PendingDiscoveryAttemptV3[] = [];
+
+  const operationSignal = (): AbortSignal | undefined => {
+    if (policy.deadlineAtEpochMs === null) return input.signal;
+    const remainingMs = Math.max(1, Math.ceil(policy.deadlineAtEpochMs - now()));
+    const deadlineSignal = AbortSignal.timeout(remainingMs);
+    return input.signal
+      ? AbortSignal.any([input.signal, deadlineSignal])
+      : deadlineSignal;
+  };
 
   const observeQualifications = (
     values: readonly CandidateQualificationV3[],
@@ -1497,85 +2541,172 @@ export async function executeRetrievalV3(input: {
   };
 
   while (true) {
-    const currentRankedFamilies = [...families.values()]
-      .map(({ primary }) => primary)
-      .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
-    const currentHardEligible = applyHardAggregateConstraints(
-      currentRankedFamilies,
-      activePlan.hardConstraints,
-    ).eligible.length;
-    const fill = adaptiveFillPlanV3({
-      target: requested,
-      qualified: currentHardEligible,
-      stageObservations: stageObservations(counters),
-      reserve: reserveGoal,
-      maximumRawDiscoveryGoal: policy.maximumRawCandidates,
-    });
-    if (fill.qualifiedPoolDeficit === 0) {
-      stopReason = "qualified_reserve_satisfied";
-      break;
-    }
     if (policy.deadlineAtEpochMs !== null && now() >= policy.deadlineAtEpochMs) {
       stopReason = "deadline_reached";
       break;
     }
-    if (totalCostUnits >= policy.maximumCostUnits) {
-      stopReason = "budget_reached";
-      break;
-    }
-    if (globalRounds >= policy.maximumGlobalRounds) {
-      stopReason = "maximum_rounds_reached";
-      break;
-    }
-    if (seenCandidateIds.size >= policy.maximumRawCandidates) {
-      stopReason = "maximum_candidates_reached";
-      break;
-    }
-    const state = nextStrategy(states);
-    if (!state) break;
+    if (pendingDiscoveries.length === 0) {
+      const currentRankedFamilies = [...families.values()]
+        .map(({ primary }) => primary)
+        .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
+      const currentHardEligible = applyHardAggregateConstraints(
+        currentRankedFamilies,
+        activePlan.hardConstraints,
+      ).eligible.length;
+      const fill = adaptiveFillPlanV3({
+        target: requested,
+        qualified: currentHardEligible,
+        stageObservations: stageObservations(counters),
+        reserve: reserveGoal,
+        maximumRawDiscoveryGoal: policy.maximumRawCandidates,
+      });
+      if (fill.qualifiedPoolDeficit === 0) {
+        stopReason = "qualified_reserve_satisfied";
+        break;
+      }
+      if (totalCostUnits >= policy.maximumCostUnits) {
+        stopReason = "budget_reached";
+        break;
+      }
+      if (globalRounds >= policy.maximumGlobalRounds) {
+        stopReason = "maximum_rounds_reached";
+        break;
+      }
+      if (seenCandidateIds.size >= policy.maximumRawCandidates) {
+        stopReason = "maximum_candidates_reached";
+        break;
+      }
 
-    state.status = "running";
-    state.rounds += 1;
-    globalRounds += 1;
-    const remainingCapacity = policy.maximumRawCandidates - seenCandidateIds.size;
-    const requestedRawCandidateCount = Math.max(1, Math.min(
-      fill.rawDiscoveryGoal,
-      state.definition.maximumBatchSize,
-      remainingCapacity,
-    ));
-    const request: DiscoveryRequestV3 = {
-      runId: input.runId,
-      executionMode: mode,
-      appleWriteAccess: "forbidden",
-      ...(input.modelRoute ? { modelRoute: input.modelRoute } : {}),
-      plan: activePlan,
-      engine: state.definition.engine,
-      strategy: state.definition,
-      strategyRound: state.rounds,
-      cursor: state.cursor,
-      requestedRawCandidateCount,
-      alreadyDiscoveredCandidateIds: [...seenCandidateIds],
-      alreadyDiscoveredTracks: [...seenCandidateTracks.values()],
-      qualifiedRecordingFamilyKeys: [...families.keys()],
-      qualifiedTrackSeeds: [...families.values()].map(({ primary }) => ({
+      const remainingGlobalRounds = policy.maximumGlobalRounds - globalRounds;
+      const remainingCostUnits = policy.maximumCostUnits - totalCostUnits;
+      const concurrencyByKnownBudget = Math.max(1, Math.floor(remainingCostUnits));
+      const maximumWaveSize = Math.min(
+        policy.maximumConcurrentDiscovery ?? DEFAULT_RETRIEVAL_POLICY_V3.maximumConcurrentDiscovery ?? 1,
+        remainingGlobalRounds,
+        concurrencyByKnownBudget,
+      );
+      const wave = nextStrategyWave(states, maximumWaveSize);
+      if (wave.length === 0) break;
+
+      const remainingCapacity = policy.maximumRawCandidates - seenCandidateIds.size;
+      const materialWave = wave.filter((state) => !(
+        state.definition.discoveryDependencyIds.length === 1
+        && state.definition.discoveryDependencyIds[0] === "orchestration_local"
+      ));
+      const totalWaveRawGoal = Math.min(
+        remainingCapacity,
+        Math.max(materialWave.length, fill.rawDiscoveryGoal),
+      );
+      let unallocatedRawGoal = totalWaveRawGoal;
+      let unallocatedMaterialSlots = materialWave.length;
+      const frozenAlreadyDiscoveredCandidateIds = [...seenCandidateIds];
+      const frozenAlreadyDiscoveredTracks = [...seenCandidateTracks.values()];
+      const frozenQualifiedRecordingFamilyKeys = [...families.keys()];
+      const frozenQualifiedTrackSeeds = [...families.values()].map(({ primary }) => ({
         artist: primary.artist,
         title: primary.title,
         appleSongId: primary.appleSongId,
         recordingFamilyKey: primary.recordingFamilyKey,
-      })),
-    };
+      }));
+      const discoverySignal = operationSignal();
+      const requests = wave.map((state): {
+        state: MutableStrategyStateV3;
+        request: DiscoveryRequestV3;
+      } => {
+        state.status = "running";
+        state.rounds += 1;
+        globalRounds += 1;
+        const localOnly = state.definition.discoveryDependencyIds.length === 1
+          && state.definition.discoveryDependencyIds[0] === "orchestration_local";
+        const fairShare = localOnly
+          ? Math.max(1, totalWaveRawGoal)
+          : Math.max(1, Math.ceil(unallocatedRawGoal / unallocatedMaterialSlots));
+        const requestedRawCandidateCount = localOnly
+          ? Math.max(1, Math.min(
+              fairShare,
+              state.definition.maximumBatchSize,
+              remainingCapacity,
+            ))
+          : Math.max(1, Math.min(
+              fairShare,
+              state.definition.maximumBatchSize,
+              unallocatedRawGoal,
+            ));
+        if (!localOnly) {
+          unallocatedRawGoal -= requestedRawCandidateCount;
+          unallocatedMaterialSlots -= 1;
+        }
+        return {
+          state,
+          request: {
+            runId: input.runId,
+            executionMode: mode,
+            appleWriteAccess: "forbidden",
+            ...(input.modelRoute ? { modelRoute: input.modelRoute } : {}),
+            plan: activePlan,
+            engine: state.definition.engine,
+            strategy: state.definition,
+            strategyRound: state.rounds,
+            cursor: state.cursor,
+            requestedRawCandidateCount,
+            alreadyDiscoveredCandidateIds: frozenAlreadyDiscoveredCandidateIds,
+            alreadyDiscoveredTracks: frozenAlreadyDiscoveredTracks,
+            qualifiedRecordingFamilyKeys: frozenQualifiedRecordingFamilyKeys,
+            qualifiedTrackSeeds: frozenQualifiedTrackSeeds,
+            ...(discoverySignal ? { signal: discoverySignal } : {}),
+          },
+        };
+      });
+      pendingDiscoveries = await Promise.all(requests.map(async ({ state, request }) => {
+        try {
+          return {
+            state,
+            request,
+            result: { ok: true, batch: await input.adapters.discover(request) },
+          } satisfies PendingDiscoveryAttemptV3;
+        } catch (error) {
+          return {
+            state,
+            request,
+            result: { ok: false, error },
+          } satisfies PendingDiscoveryAttemptV3;
+        }
+      }));
+      // Promise completion order is irrelevant: all state mutation and
+      // qualification commits below follow the frozen strategy ordinal.
+      pendingDiscoveries.sort((left, right) => left.state.ordinal - right.state.ordinal);
+    }
 
-    let batch: DiscoveryBatchV3;
-    try {
-      batch = await input.adapters.discover(request);
-    } catch (error) {
+    const attempt = pendingDiscoveries.shift()!;
+    const { state, request } = attempt;
+    if (!attempt.result.ok) {
+      const error = attempt.result.error;
+      if (input.signal?.aborted) throw input.signal.reason ?? error;
+      if (request.signal?.aborted && policy.deadlineAtEpochMs !== null) {
+        stopReason = "deadline_reached";
+        pendingDiscoveries = [];
+        break;
+      }
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`discover:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
+      observeDependencyFailure({
+        dependencies: dependencyStates,
+        dependencyIds: failedDependencyIds(error, state.definition.discoveryDependencyIds),
+        strategyId: state.definition.id,
+      });
       state.status = state.providerFailures >= policy.maximumProviderFailuresPerStrategy
         ? "provider_error"
         : "available";
       continue;
+    }
+    const batch = attempt.result.batch;
+    if (batch.providerCircuitOpen !== true) {
+      observeDependencySuccess({
+        dependencies: dependencyStates,
+        dependencyIds: state.definition.discoveryDependencyIds,
+        strategyId: state.definition.id,
+      });
     }
 
     const costUnits = batch.costUnits ?? 0;
@@ -1585,7 +2716,7 @@ export async function executeRetrievalV3(input: {
     } else {
       totalCostUnits += costUnits;
     }
-    const boundedBatch = batch.candidates.slice(0, requestedRawCandidateCount);
+    const boundedBatch = batch.candidates.slice(0, request.requestedRawCandidateCount);
     const overflow = batch.candidates.length - boundedBatch.length;
     for (let index = 0; index < overflow; index += 1) incrementReason(discardedByReason, "adapter_response_overflow");
     if (overflow > 0) integrityEvents.push(`response_overflow:${state.definition.id}:${overflow}`);
@@ -1649,6 +2780,7 @@ export async function executeRetrievalV3(input: {
     }
 
     let qualifications: readonly CandidateQualificationV3[];
+    const qualificationSignal = operationSignal();
     try {
       qualifications = candidates.length === 0
         ? []
@@ -1660,11 +2792,23 @@ export async function executeRetrievalV3(input: {
           engine: state.definition.engine,
           strategy: state.definition,
           candidates,
+          ...(qualificationSignal ? { signal: qualificationSignal } : {}),
         });
     } catch (error) {
+      if (input.signal?.aborted) throw input.signal.reason ?? error;
+      if (qualificationSignal?.aborted && policy.deadlineAtEpochMs !== null) {
+        stopReason = "deadline_reached";
+        pendingDiscoveries = [];
+        break;
+      }
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
+      observeDependencyFailure({
+        dependencies: dependencyStates,
+        dependencyIds: failedDependencyIds(error, state.definition.qualificationDependencyIds),
+        strategyId: state.definition.id,
+      });
       for (let index = 0; index < candidates.length; index += 1) {
         incrementReason(discardedByReason, "qualification_missing");
       }
@@ -1672,6 +2816,13 @@ export async function executeRetrievalV3(input: {
         ? "provider_error"
         : "available";
       continue;
+    }
+    if (appleProviderRequestCountV3(qualifications) > 0) {
+      observeDependencySuccess({
+        dependencies: dependencyStates,
+        dependencyIds: state.definition.qualificationDependencyIds,
+        strategyId: state.definition.id,
+      });
     }
 
     observeQualifications(qualifications);
@@ -1702,6 +2853,7 @@ export async function executeRetrievalV3(input: {
       }, appleLookupCount, appleProviderRequestCount);
       const beforeFailures = predicateFailureCountsV3(semanticRecoveryQualificationSample);
       const replayCandidates = [...rawCandidateLedger.values()].map(({ candidate }) => candidate);
+      const recoverySignal = operationSignal();
       try {
         const repairedQualifications = await input.adapters.qualify({
           runId: input.runId,
@@ -1711,7 +2863,15 @@ export async function executeRetrievalV3(input: {
           engine: state.definition.engine,
           strategy: state.definition,
           candidates: replayCandidates,
+          ...(recoverySignal ? { signal: recoverySignal } : {}),
         });
+        if (appleProviderRequestCountV3(repairedQualifications) > 0) {
+          observeDependencySuccess({
+            dependencies: dependencyStates,
+            dependencyIds: state.definition.qualificationDependencyIds,
+            strategyId: state.definition.id,
+          });
+        }
         observeQualifications(repairedQualifications, { includeInRecoverySample: false });
         activePlan = recoveryProposal.revision.plan;
         semanticPlanRevisions.push(recoveryProposal.revision);
@@ -1733,9 +2893,20 @@ export async function executeRetrievalV3(input: {
           `semantic_recovery:${recoveryProposal.trigger.dominantPredicateId}:${recoveryProposal.revision.transformations.map(({ kind }) => kind).join(",")}`,
         );
       } catch (error) {
+        if (input.signal?.aborted) throw input.signal.reason ?? error;
+        if (recoverySignal?.aborted && policy.deadlineAtEpochMs !== null) {
+          stopReason = "deadline_reached";
+          pendingDiscoveries = [];
+          break;
+        }
         providerFailureCount += 1;
         state.providerFailures += 1;
         integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
+        observeDependencyFailure({
+          dependencies: dependencyStates,
+          dependencyIds: failedDependencyIds(error, state.definition.qualificationDependencyIds),
+          strategyId: state.definition.id,
+        });
         const idempotencyKey = recoveryAuditIdempotencyKeyV3({
           runId: input.runId,
           planHash: recoveryProposal.revision.planHash,
@@ -1794,41 +2965,80 @@ export async function executeRetrievalV3(input: {
       for (const predicate of activePlan.membershipPredicates) {
         if (!failedPredicates.has(predicate.id)) lead?.predicateCoverage.add(predicate.id);
       }
-      if (!qualification.scope.passed) {
-        incrementReason(discardedByReason, "scope_membership_failed");
-        rejectLead("scope_membership_failed");
-        continue;
-      }
-      counters.scopeEligible += 1;
-      if (!qualification.hardConstraints.passed) {
-        incrementReason(discardedByReason, "hard_constraint_failed");
-        rejectLead("hard_constraint_failed");
-        continue;
-      }
-      if (catalogEraConstraintFailuresV3(
-        activePlan,
-        qualification.catalog.releaseYear,
-        qualification.catalog.compatibleReleaseYears,
-      ).length > 0) {
-        incrementReason(discardedByReason, "hard_constraint_failed");
-        rejectLead("hard_constraint_failed");
-        continue;
-      }
-      counters.hardConstraintEligible += 1;
-      if (!qualification.evidence.passed || qualification.evidence.bindingIds.length === 0) {
-        incrementReason(discardedByReason, "evidence_binding_missing");
-        rejectLead("evidence_binding_missing");
-        continue;
-      }
       const attestedBindings = attestedEvidenceBindingsForSelectionV3(
         qualification.evidence.bindingIds,
         qualification.evidence.bindings,
       );
-      if (attestedBindings.length === 0) {
-        incrementReason(discardedByReason, "evidence_attestation_missing");
-        integrityEvents.push(`evidence_attestation_missing:${state.definition.id}:${candidate.id}`);
-        rejectLead("evidence_attestation_missing");
-        continue;
+      const canonicalPolicy = activePlan.canonicalContractPolicy;
+      if (canonicalPolicy) {
+        const evaluation = evaluateCanonicalContractTrackV1({
+          policy: canonicalPolicy,
+          assessments: qualification.canonicalClauseAssessments ?? {},
+        });
+        if (!evaluation.eligible) {
+          const reason = evaluation.status === "unknown"
+            ? "canonical_contract_unknown"
+            : "canonical_contract_failed";
+          incrementReason(discardedByReason, reason);
+          rejectLead(reason);
+          continue;
+        }
+        counters.scopeEligible += 1;
+        counters.hardConstraintEligible += 1;
+        // Evidence ids referenced by a passing canonical assessment must be
+        // present in the attested set. A custom adapter cannot turn an
+        // arbitrary citation id into selection-grade proof.
+        const attestedIds = new Set(attestedBindings.map(({ id }) => id));
+        const referencedEvidenceIds = Object.values(qualification.canonicalClauseAssessments ?? {})
+          .flatMap(({ evidenceIds }) => evidenceIds ?? []);
+        const assessments = qualification.canonicalClauseAssessments ?? {};
+        const missingRequiredEvidenceReference = canonicalPolicy.clauses.some((clause) => {
+          const assessment = assessments[clause.id];
+          return clause.evidence.required
+            && assessment?.status === "pass"
+            && assessment.evidenceGrade !== "authoritative_structured_metadata"
+            && (assessment.evidenceIds?.length ?? 0) === 0;
+        });
+        if (missingRequiredEvidenceReference
+          || referencedEvidenceIds.some((id) => !attestedIds.has(id))) {
+          incrementReason(discardedByReason, "evidence_attestation_missing");
+          integrityEvents.push(`canonical_evidence_attestation_missing:${state.definition.id}:${candidate.id}`);
+          rejectLead("evidence_attestation_missing");
+          continue;
+        }
+      } else {
+        if (!qualification.scope.passed) {
+          incrementReason(discardedByReason, "scope_membership_failed");
+          rejectLead("scope_membership_failed");
+          continue;
+        }
+        counters.scopeEligible += 1;
+        if (!qualification.hardConstraints.passed) {
+          incrementReason(discardedByReason, "hard_constraint_failed");
+          rejectLead("hard_constraint_failed");
+          continue;
+        }
+        if (catalogEraConstraintFailuresV3(
+          activePlan,
+          qualification.catalog.releaseYear,
+          qualification.catalog.compatibleReleaseYears,
+        ).length > 0) {
+          incrementReason(discardedByReason, "hard_constraint_failed");
+          rejectLead("hard_constraint_failed");
+          continue;
+        }
+        counters.hardConstraintEligible += 1;
+        if (!qualification.evidence.passed || qualification.evidence.bindingIds.length === 0) {
+          incrementReason(discardedByReason, "evidence_binding_missing");
+          rejectLead("evidence_binding_missing");
+          continue;
+        }
+        if (attestedBindings.length === 0) {
+          incrementReason(discardedByReason, "evidence_attestation_missing");
+          integrityEvents.push(`evidence_attestation_missing:${state.definition.id}:${candidate.id}`);
+          rejectLead("evidence_attestation_missing");
+          continue;
+        }
       }
       for (const predicateId of attestedBindings.flatMap(bindingPredicateIds)) {
         lead?.predicateCoverage.add(predicateId);
@@ -1871,9 +3081,22 @@ export async function executeRetrievalV3(input: {
         catalogCompatibleReleaseYears: [...new Set(
           qualification.catalog.compatibleReleaseYears ?? [],
         )].sort((left, right) => left - right),
+        catalogGenreNames: [...new Set(
+          (qualification.catalog.genreNames ?? [])
+            .map((value) => value.normalize("NFKC").replace(/\s+/gu, " ").trim())
+            .filter(Boolean),
+        )],
         sourceObservationIds: [...new Set(candidate.sourceObservationIds)],
         evidenceBindingIds: attestedBindings.map(({ id }) => id),
         evidenceBindings: attestedBindings.map((binding) => ({ ...binding })),
+        ...(qualification.canonicalClauseAssessments ? {
+          canonicalClauseAssessments: structuredClone(qualification.canonicalClauseAssessments),
+        } : {}),
+        ...(qualification.playlistOptimizationSignals ? {
+          playlistOptimizationSignals: normalizePlaylistOptimizationSignalsV3(
+            qualification.playlistOptimizationSignals,
+          ),
+        } : {}),
         evidenceStrength: boundedFinite(qualification.evidence.strength),
         scopeFit: boundedFinite(qualification.scope.fit),
         independentProvenanceRoots: Math.max(0, Math.floor(qualification.evidence.independentProvenanceRoots)),
@@ -1931,7 +3154,15 @@ export async function executeRetrievalV3(input: {
       integrityFailureCount += 1;
       integrityEvents.push(`pagination_cursor_loop:${state.definition.id}:${batch.nextCursor}`);
       state.status = "integrity_error";
-    } else if (batch.providerCircuitOpen) state.status = "circuit_open";
+    } else if (batch.providerCircuitOpen) {
+      observeDependencyFailure({
+        dependencies: dependencyStates,
+        dependencyIds: state.definition.discoveryDependencyIds,
+        strategyId: state.definition.id,
+        circuitOpen: true,
+      });
+      state.status = "circuit_open";
+    }
     else if (batch.exhausted
       || state.rounds >= state.definition.maximumRounds
       || state.consecutiveZeroQualifiedYieldRounds >= state.definition.zeroQualifiedYieldLimit) {
@@ -1947,36 +3178,101 @@ export async function executeRetrievalV3(input: {
     providerFailureCount,
     integrityFailureCount,
     qualifiedCount: families.size,
+    dependencyOutages: [...dependencyStates.values()],
   });
   const rankedPool = [...families.values()]
     .map(({ primary }) => primary)
     .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
-  const hardAggregate = applyHardAggregateConstraints(rankedPool, activePlan.hardConstraints);
+  const optimizerActive = shouldApplyPlaylistOptimizerV3(activePlan);
+  const hardAggregate = optimizerActive
+    ? { eligible: rankedPool, rejected: [] }
+    : applyHardAggregateConstraints(rankedPool, activePlan.hardConstraints);
   for (const rejection of hardAggregate.rejected) {
     incrementReason(discardedByReason, "hard_constraint_failed");
     for (const reason of rejection.reasons) incrementReason(discardedByReason, reason);
   }
+  const qualitySelection = selectWithCentralQualityV3({
+    ranked: hardAggregate.eligible,
+    target: requested + reserveGoal,
+    policy: activePlan.playlistQualityPolicy,
+  });
+  if (qualitySelection.rejectedFailureCount > 0) {
+    discardedByReason.central_quality_failed = qualitySelection.rejectedFailureCount;
+  }
+  if (qualitySelection.rejectedUnknownCount > 0) {
+    discardedByReason.central_quality_unknown_excess = qualitySelection.rejectedUnknownCount;
+  }
   const broadCurated = shouldSequenceBroadCurated(engines, activePlan);
-  const rankedSelected = broadCurated
-    ? selectBroadCurated(hardAggregate.eligible, requested, activePlan)
-    : hardAggregate.eligible.slice(0, requested);
-  const selected = broadCurated
-    ? sequenceBroadCurated(rankedSelected, activePlan.orderingPolicy)
-    : rankedSelected;
+  let playlistOptimization: PlaylistOptimizationReportV3 | undefined;
+  let selected: QualifiedTrackV3[];
+  if (optimizerActive) {
+    const optimized = optimizeQualifiedPlaylistV3({
+      ranked: qualitySelection.eligible,
+      target: requested,
+      plan: activePlan,
+    });
+    selected = optimized.selected;
+    playlistOptimization = optimized.report;
+  } else {
+    const quotaRules = activePlan.playlistQuotaRules ?? [];
+    const quotaEligibleSelection = quotaRules.length > 0
+      ? selectWithCanonicalQuotaV3({
+          ranked: qualitySelection.eligible,
+          target: requested,
+          rules: quotaRules,
+          policy: activePlan.canonicalContractPolicy,
+        })
+      : qualitySelection.eligible;
+    const rankedSelected = broadCurated
+      ? selectBroadCurated(quotaEligibleSelection, requested, activePlan)
+      : quotaEligibleSelection.slice(0, requested);
+    selected = broadCurated
+      ? sequenceBroadCurated(rankedSelected, activePlan.orderingPolicy)
+      : rankedSelected;
+  }
   const selectedIds = new Set(selected.map(({ candidateId }) => candidateId));
-  const reserve = hardAggregate.eligible
+  const reserve = qualitySelection.eligible
     .filter(({ candidateId }) => !selectedIds.has(candidateId))
     .slice(0, reserveGoal);
   const shortfall = Math.max(0, requested - selected.length);
-  const status: RetrievalOutcomeStatusV3 = resolvedStopReason === "provider_failure" && selected.length === 0
+  const qualityConstrained = shortfall > 0
+    && activePlan.playlistQualityPolicy !== undefined
+    && qualitySelection.eligible.length < Math.min(requested, hardAggregate.eligible.length);
+  const optimizationConstrained = playlistOptimization !== undefined
+    && !playlistOptimization.exact
+    && !qualityConstrained;
+  const outcomeStopReason: RetrievalStopReasonV3 = qualityConstrained
+    ? "central_quality_floor"
+    : optimizationConstrained
+      ? "playlist_optimization_constraints"
+    : shortfall > 0
+      && (activePlan.playlistQuotaRules?.length ?? 0) > 0
+      && resolvedStopReason === "qualified_reserve_satisfied"
+        ? "frontier_exhausted"
+        : resolvedStopReason;
+  const centralQuality = activePlan.playlistQualityPolicy
+    ? evaluateCentralQualityV3({
+        tracks: selected,
+        policy: activePlan.playlistQualityPolicy,
+      })
+    : undefined;
+  const status: RetrievalOutcomeStatusV3 = (
+    resolvedStopReason === "provider_failure" || resolvedStopReason === "provider_circuit_open"
+  )
     ? "failed_system"
     : resolvedStopReason === "integrity_failure" && selected.length === 0
       ? "failed_integrity"
-      : selected.length === 0
-        ? "no_compatible_tracks"
-        : shortfall > 0
-          ? "partial_ready"
-          : "exact_ready";
+      : resolvedStopReason === "deadline_reached" && selected.length === 0
+        ? "needs_decision"
+        : optimizationConstrained
+          ? "needs_decision"
+        : outcomeStopReason === "central_quality_floor" && selected.length === 0
+          ? "needs_decision"
+        : selected.length === 0
+          ? "no_compatible_tracks"
+          : shortfall > 0
+            ? "partial_ready"
+            : "exact_ready";
   const strategyReports: RetrievalStrategyReportV3[] = states.map(strategyReport);
   const stages: RetrievalStageCountersV3 = {
     ...counters,
@@ -2016,17 +3312,18 @@ export async function executeRetrievalV3(input: {
     engines,
     outcome: {
       status,
-      stopReason: resolvedStopReason,
+      stopReason: outcomeStopReason,
       requestedTrackCount: requested,
-      qualifiedTrackCount: hardAggregate.eligible.length,
+      qualifiedTrackCount: qualitySelection.eligible.length,
       selectedTrackCount: selected.length,
       reserveTrackCount: reserve.length,
       shortfall,
-      requiresPartialPublicationDecision: status === "partial_ready",
+      requiresPartialPublicationDecision: status === "partial_ready"
+        || (status === "needs_decision" && selected.length > 0 && shortfall > 0),
     },
     selected,
     reserve,
-    qualifiedPool: hardAggregate.eligible,
+    qualifiedPool: qualitySelection.eligible,
     compatibleAlternatesByRecordingFamily,
     stages,
     deficit: {
@@ -2036,10 +3333,18 @@ export async function executeRetrievalV3(input: {
       targetShortfall: shortfall,
       reserveShortfall: Math.max(0, reserveGoal - reserve.length),
       discardedByReason,
-      primaryShortfallReason: shortfall > 0 ? resolvedStopReason : null,
+      primaryShortfallReason: shortfall > 0 || optimizationConstrained
+        ? outcomeStopReason
+        : null,
     },
     strategies: strategyReports,
+    dependencyOutages: [...dependencyStates.values()]
+      .filter(({ outageCount }) => outageCount > 0)
+      .sort((left, right) => left.dependencyId.localeCompare(right.dependencyId))
+      .map(dependencyOutageReport),
     integrityEvents,
+    ...(centralQuality ? { centralQuality } : {}),
+    ...(playlistOptimization ? { playlistOptimization } : {}),
     predicateDiagnostics: {
       qualificationsObserved,
       scopeFailures: scopeFailuresObserved,

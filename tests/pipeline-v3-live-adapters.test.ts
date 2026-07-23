@@ -6,6 +6,7 @@ import {
 } from "../server/pipeline-v3-live-adapters.ts";
 import {
   executeRetrievalV3,
+  RetrievalDependencyErrorV3,
   retrievalStrategiesForEnginesV3,
   type DiscoveryRequestV3,
   type EvidenceSourceGovernanceV3,
@@ -145,9 +146,71 @@ describe("Pipeline V3 live read-only adapters", () => {
 
     const batch = await adapters.discover(discoveryRequest(selection, "editorial_tracks"));
 
-    const requestBody = createResponse.mock.calls[0]![0] as any;
+    const requestBody = (createResponse.mock.calls as unknown as Array<[any]>)[0]![0];
     expect(JSON.stringify(requestBody.text.format.schema)).not.toContain('"uniqueItems"');
     expect((batch.candidates[0] as any).metadata.bindings[0].predicateIds).toEqual([predicateId]);
+  });
+
+  test("keeps central suitability on a dedicated ranking-only signal", async () => {
+    const base = plan("10 smooth polished disco songs", 10);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth", "quality:polished"],
+        criteria: ["smooth", "polished"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const predicateId = selection.membershipPredicates.find(({ axis }) => axis === "genre")!.id;
+    const sourceUrl = "https://www.loc.gov/item/disco-history";
+    const citationText = "Chic — Good Times is a disco recording. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async () => ({
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Chic",
+          title: "Good Times",
+          album: null,
+          centralQualityScore: 0.92,
+          sources: [{ url: sourceUrl, predicateIds: [predicateId] }],
+        }],
+      }),
+      output: [
+        { type: "web_search_call", action: { sources: [{ url: sourceUrl }] } },
+        {
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: citationText,
+            annotations: [{
+              type: "url_citation",
+              url: sourceUrl,
+              start_index: markerStart,
+              end_index: markerStart + "[source]".length,
+            }],
+          }],
+        },
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({ createResponse: createResponse as any });
+
+    const batch = await adapters.discover(discoveryRequest(selection, "editorial_tracks"));
+    const requestBody = (createResponse.mock.calls as unknown as Array<[any]>)[0]![0];
+    expect(requestBody.text.format.schema.properties.candidates.items.properties)
+      .toHaveProperty("centralQualityScore");
+    expect(JSON.parse(requestBody.input).centralQualityPolicy.criteria)
+      .toEqual(["smooth", "polished"]);
+    expect((batch.candidates[0] as any).metadata.rankingSignals).toMatchObject({
+      relevance: 0.85,
+      central_quality: 0.92,
+    });
   });
 
   test("verifies recording-version and content policy at the catalog layer instead of demanding citation predicates", async () => {
@@ -546,9 +609,14 @@ describe("Pipeline V3 live read-only adapters", () => {
 
     const outage = vi.fn(async () => { throw new Error("provider_http_503"); });
     const outageAdapters = createPipelineV3LiveAdapters({ createResponse: outage as any, modelRoute: route });
-    await expect(outageAdapters.discover(
+    const outageError = await outageAdapters.discover(
       discoveryRequest(plan("25 disco songs", 25), "editorial_tracks"),
-    )).rejects.toThrow("provider_http_503");
+    ).catch((error: unknown) => error);
+    expect(outageError).toBeInstanceOf(RetrievalDependencyErrorV3);
+    expect(outageError).toMatchObject({
+      message: "provider_http_503",
+      dependencyIds: ["hosted_web"],
+    });
     expect(outage).toHaveBeenCalledTimes(1);
   });
 
@@ -1438,7 +1506,12 @@ describe("Pipeline V3 live read-only adapters", () => {
 
     expect(batch.candidates).toHaveLength(1);
     expect(batch.candidates[0]).toMatchObject({ artist: "Correct Artist", title: "Exact Track" });
-    expect(getAlbumTracks).toHaveBeenCalledWith("us", "album-correct");
+    expect(getAlbumTracks).toHaveBeenCalledWith(
+      "us",
+      "album-correct",
+      null,
+      undefined,
+    );
   });
 
   test("fails closed when no Apple fixed container exactly matches the requested identity", async () => {

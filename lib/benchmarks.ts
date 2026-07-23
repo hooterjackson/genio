@@ -23,7 +23,13 @@ export interface CuratedRatings {
   playlistCoherence: number;
 }
 
-export const MINIMUM_FACTUAL_MATCH_SAMPLE = 100;
+/**
+ * A 99.5% catalog-identity claim is not statistically credible from the old
+ * 100-row fixture. Release evidence requires roughly 600 independently
+ * reviewed, auto-accepted rows with zero observed identity errors before that
+ * claim may be made.
+ */
+export const MINIMUM_FACTUAL_MATCH_SAMPLE = 600;
 
 function trackKey(track: Pick<BenchmarkTrack, "artist" | "title">): string {
   return `${normalizeMusicText(track.artist)}\u0000${normalizeMusicText(track.title)}`;
@@ -50,7 +56,8 @@ export function evaluateMatchingQuality(rows: MatchAuditRow[], minimumSampleSize
     precision,
     resolvability,
     passed: rows.length >= minimumSampleSize
-      && precision !== null && precision >= 0.995
+      && accepted.length >= minimumSampleSize
+      && precision === 1
       && resolvability !== null && resolvability >= 0.95,
   };
 }

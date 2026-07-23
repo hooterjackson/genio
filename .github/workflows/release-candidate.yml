@@ -1,0 +1,138 @@
+name: release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Annotated vX.Y.Z-rc.N tag to build
+        required: true
+        type: string
+  # Bootstrap path: workflow_dispatch is unavailable until this workflow is
+  # present on the default branch. An audited annotated RC tag can run the
+  # workflow from the tagged commit without merging application code or
+  # deploying anything. The workflow only publishes an immutable candidate
+  # image and evidence; Railway/Sites promotion remains a separate approval.
+  push:
+    tags:
+      - "v*.*.*-rc.*"
+
+concurrency:
+  group: release-candidate-${{ github.event_name == 'push' && github.ref_name || inputs.candidate_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CANDIDATE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.candidate_tag }}
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: rc-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      source_revision: ${{ steps.identity.outputs.source_revision }}
+      image: ${{ steps.identity.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_TAG }}
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - name: Verify annotated RC identity
+        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - run: pnpm install --frozen-lockfile
+      - id: identity
+        name: Resolve candidate identity
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source_revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${REPOSITORY_OWNER,,}/genio" >> "$GITHUB_OUTPUT"
+      - name: Run immutable-artifact checks
+        run: |
+          pnpm lint
+          pnpm build
+          pnpm qa:policy:check
+          pnpm test:database:preflight
+          pnpm db:migrate
+          pnpm test:coverage
+          pnpm test:database
+      - name: Install browser engines
+        run: pnpm exec playwright install --with-deps chromium webkit
+      - name: Run browser suite
+        run: pnpm test:e2e
+      - name: Run stitched API-worker-database browser suite
+        run: pnpm test:e2e:system
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.identity.outputs.image }}:${{ steps.identity.outputs.candidate_tag }}
+            ${{ steps.identity.outputs.image }}:sha-${{ steps.identity.outputs.source_revision }}
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ steps.identity.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Write immutable artifact identity
+        env:
+          CANDIDATE_TAG: ${{ steps.identity.outputs.candidate_tag }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ steps.identity.outputs.source_revision }}
+        run: |
+          node -e 'const fs=require("node:fs"); const value={schemaVersion:"genio-release-image/v1",candidateTag:process.env.CANDIDATE_TAG,sourceRevision:process.env.SOURCE_REVISION,image:`${process.env.IMAGE}@${process.env.IMAGE_DIGEST}`}; fs.writeFileSync("release-image.json",JSON.stringify(value,null,2)+"\n",{mode:0o600});'
+          node -e 'const fs=require("node:fs"); const value={schemaVersion:"genio-offline-suite/v1",candidateTag:process.env.CANDIDATE_TAG,sourceRevision:process.env.SOURCE_REVISION,completedAt:new Date().toISOString(),gates:{releaseMetadata:true,lint:true,build:true,policy:true,database:true,unitAndIntegration:true,browser:true,stitchedSystemBrowser:true}}; fs.writeFileSync("release-offline-suite.json",JSON.stringify(value,null,2)+"\n",{mode:0o600});'
+          sha256sum release-offline-suite.json > release-offline-suite.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-image-${{ steps.identity.outputs.candidate_tag }}
+          path: |
+            release-image.json
+            release-offline-suite.json
+            release-offline-suite.sha256
+          if-no-files-found: error
+          retention-days: 7
