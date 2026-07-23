@@ -456,7 +456,7 @@ describe("query plan V3", () => {
         NODE_ENV: "test",
         PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
         PIPELINE_V3_OWNER_CANARY: "true",
-        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
       },
     })).toMatchObject({ assigned: true, reason: "owner_canary" });
   });
@@ -467,7 +467,7 @@ describe("query plan V3", () => {
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
-      PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
     };
     expect(assignPipelineV3({
       plan: confirmed("50 disco songs", 50),
@@ -496,7 +496,7 @@ describe("query plan V3", () => {
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
-      PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
     };
     expect(assignPipelineV3({
       plan,
@@ -538,7 +538,7 @@ describe("query plan V3", () => {
       env: {
         ...base,
         PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
-        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
       },
     })).toMatchObject({ assigned: false, reason: "governed_geographic_evidence_required" });
     expect(assignPipelineV3({
@@ -548,7 +548,7 @@ describe("query plan V3", () => {
       env: {
         ...base,
         PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
-        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
         PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
       },
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
@@ -570,39 +570,51 @@ describe("query plan V3", () => {
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
   });
 
-  test("holds production reggaeton genre requests on V2 until V3 genre evidence is approved", () => {
-    const plan = confirmed(
+  test("holds both production reggaeton classifications on V2 until hosted evidence is approved", () => {
+    const genrePlan = confirmed(
       "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.",
       50,
     );
+    const plans = [
+      { plan: genrePlan, group: "genre_scene" as const },
+      {
+        plan: { ...genrePlan, intents: ["mood_activity" as const] },
+        group: "mood_activity_theme" as const,
+      },
+    ];
     const env = {
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
       PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
       PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
+      PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "100",
       PIPELINE_V3_OWNER_CANARY: "true",
-      PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
+      PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene,mood_activity_theme",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "300",
     };
-    for (const owner of [false, true]) {
+    for (const { plan, group } of plans) {
+      for (const owner of [false, true]) {
+        expect(assignPipelineV3({
+          plan,
+          owner,
+          stickyKey: owner ? "owner" : "visitor",
+          env,
+        })).toMatchObject({
+          assigned: false,
+          reason: "governed_curated_hosted_evidence_required",
+          group,
+        });
+      }
+    }
+    for (const { plan } of plans) {
       expect(assignPipelineV3({
         plan,
-        owner,
-        stickyKey: owner ? "owner" : "visitor",
-        env,
-      })).toMatchObject({
-        assigned: false,
-        reason: "governed_genre_scene_evidence_required",
-        group: "genre_scene",
-      });
+        owner: false,
+        stickyKey: "visitor",
+        env: {
+          ...env,
+          PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+        },
+      })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
     }
-    expect(assignPipelineV3({
-      plan,
-      owner: false,
-      stickyKey: "visitor",
-      env: {
-        ...env,
-        PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
-      },
-    })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
   });
 });

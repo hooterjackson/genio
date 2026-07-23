@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.3.4",
+      "releasedAt": "2026-07-23",
+      "title": "Curated hosted retrieval safety",
+      "notes": [
+        "Extends the production reliability guard across genre, mood/activity, and similarity cohorts because all three use the same strict hosted-source retrieval contract.",
+        "Covers both immutable classifications observed for the exact Smooth Reggaeton Heat request during production replay.",
+        "Keeps these curated requests on Pipeline V2 until the shared Pipeline V3 hosted-retrieval evidence gate is explicitly approved."
+      ]
+    },
+    {
       "version": "2.3.3",
       "releasedAt": "2026-07-23",
       "title": "Genre retrieval reliability guard",

@@ -23,6 +23,7 @@ describe("public V3 runtime release contract", () => {
       assignmentEnabled: true,
       ownerCanaryEnabled: true,
       productionEvidenceApproved: true,
+      curatedHostedEvidenceApproved: false,
       genreSceneEvidenceApproved: false,
       geographicScopeEvidenceApproved: false,
       factualFeasibilityApproved: false,
@@ -57,6 +58,7 @@ describe("public V3 runtime release contract", () => {
     expect(result.assignmentEnabled).toBe(false);
     expect(result.ownerCanaryEnabled).toBe(false);
     expect(result.productionEvidenceApproved).toBe(false);
+    expect(result.curatedHostedEvidenceApproved).toBe(false);
     expect(result.genreSceneEvidenceApproved).toBe(false);
     expect(result.geographicScopeEvidenceApproved).toBe(false);
     expect(result.factualFeasibilityApproved).toBe(false);

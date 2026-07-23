@@ -58,7 +58,7 @@ export interface PipelineV3Assignment {
     | "guidance_required"
     | "owner_canary"
     | "production_evidence_required"
-    | "governed_genre_scene_evidence_required"
+    | "governed_curated_hosted_evidence_required"
     | "governed_geographic_evidence_required"
     | "factual_feasibility_required"
     | "sticky_rollout"
@@ -166,15 +166,18 @@ export function assignPipelineV3(input: {
     && predicate.geographyRelationship !== undefined
     && predicate.geographyRelationship !== "sound_association"
   ));
-  const requiresGenreSceneEvidence = group === "genre_scene"
-    && env.PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED !== "true";
-  if (input.owner && requiresGenreSceneEvidence) {
+  const requiresCuratedHostedEvidence = (
+    group === "genre_scene"
+    || group === "mood_activity_theme"
+    || group === "similarity"
+  ) && env.PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED !== "true";
+  if (input.owner && requiresCuratedHostedEvidence) {
     return {
       assigned: false,
       cohort,
       percentage: 0,
       group,
-      reason: "governed_genre_scene_evidence_required",
+      reason: "governed_curated_hosted_evidence_required",
     };
   }
   if (input.owner
@@ -194,13 +197,13 @@ export function assignPipelineV3(input: {
   if (env.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED !== "true") {
     return { assigned: false, cohort, percentage: 0, group, reason: "production_evidence_required" };
   }
-  if (requiresGenreSceneEvidence) {
+  if (requiresCuratedHostedEvidence) {
     return {
       assigned: false,
       cohort,
       percentage: 0,
       group,
-      reason: "governed_genre_scene_evidence_required",
+      reason: "governed_curated_hosted_evidence_required",
     };
   }
   if (requiresGeographicEvidence

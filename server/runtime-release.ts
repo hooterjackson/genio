@@ -32,6 +32,7 @@ export interface RuntimeReleaseContract {
   assignmentEnabled: boolean;
   ownerCanaryEnabled: boolean;
   productionEvidenceApproved: boolean;
+  curatedHostedEvidenceApproved: boolean;
   genreSceneEvidenceApproved: boolean;
   geographicScopeEvidenceApproved: boolean;
   factualFeasibilityApproved: boolean;
@@ -87,6 +88,7 @@ export function runtimeReleaseContract(
     assignmentEnabled: environment.PIPELINE_V3_ASSIGNMENT_ENABLED === "true",
     ownerCanaryEnabled: environment.PIPELINE_V3_OWNER_CANARY === "true",
     productionEvidenceApproved: environment.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED === "true",
+    curatedHostedEvidenceApproved: environment.PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED === "true",
     genreSceneEvidenceApproved: environment.PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED === "true",
     geographicScopeEvidenceApproved: environment.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED === "true",
     factualFeasibilityApproved: environment.PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED === "true",
