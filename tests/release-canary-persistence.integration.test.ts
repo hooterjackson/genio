@@ -8,6 +8,10 @@ import { readReleaseCanaryInventory } from "../server/release-canary-inventory.t
 import { persistReleaseCanaryMarker } from "../server/release-canary-persistence.ts";
 import type { UnsignedReleaseCanaryMetadata } from "../server/release-canary-metadata.ts";
 import { Repository } from "../server/repository.ts";
+import {
+  applyPlaylistContractPatchV1,
+  compilePlaylistContractRevisionV1,
+} from "../server/playlist-contract-v1.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -43,17 +47,17 @@ async function applyMigrations(pool: Pool): Promise<void> {
 
 function marker(
   operation: "brief" | "run",
-  cacheMode: "cold" | "warm" | "mixed" = "cold",
   canaryId = "rc-2.4.0-reggaeton",
 ): UnsignedReleaseCanaryMetadata {
   return {
     version: "genio-release-canary/v1",
     canaryId,
     environment: "staging",
+    audience: "https://staging.9enio.example",
     operation,
     sourceRevision: "a".repeat(40),
     issuedAt: "2026-07-23T12:00:00.000Z",
-    cacheMode,
+    cacheMode: "reuse_disabled",
   };
 }
 
@@ -92,7 +96,9 @@ databaseDescribe("release-canary durable persistence", () => {
         END LOOP;
       END $$`);
     await pool.query(
-      "INSERT INTO settings(key,value) VALUES('schema_version','18')",
+      `INSERT INTO settings(key,value) VALUES
+         ('schema_version','18'),
+         ('release_manifest_canary_guards_version','1')`,
     );
   });
 
@@ -116,6 +122,8 @@ databaseDescribe("release-canary durable persistence", () => {
           client,
           releaseCanary,
           { operation: "brief", id: briefRequestId },
+          null,
+          { allowMarkerCreation: false },
         );
         await client.query("COMMIT");
       } catch (error) {
@@ -140,6 +148,8 @@ databaseDescribe("release-canary durable persistence", () => {
         first,
         marker("brief"),
         { operation: "brief", id: briefRequestId },
+        null,
+        { allowMarkerCreation: true },
       );
       await first.query("COMMIT");
     } catch (error) {
@@ -154,7 +164,14 @@ databaseDescribe("release-canary durable persistence", () => {
       statusCode: 409,
       code: "release_canary_conflict",
     });
-    await expect(idempotentReplay(marker("brief", "warm"))).rejects.toMatchObject({
+    await expect(idempotentReplay(marker("brief", "different-canary"))).rejects.toMatchObject({
+      statusCode: 409,
+      code: "release_canary_conflict",
+    });
+    await expect(idempotentReplay({
+      ...marker("brief"),
+      audience: "https://other-staging.example",
+    })).rejects.toMatchObject({
       statusCode: 409,
       code: "release_canary_conflict",
     });
@@ -174,6 +191,8 @@ databaseDescribe("release-canary durable persistence", () => {
         conflicting,
         marker("brief"),
         { operation: "brief", id: conflictingBriefId },
+        null,
+        { allowMarkerCreation: true },
       )).rejects.toMatchObject({
         statusCode: 409,
         code: "release_canary_conflict",
@@ -188,7 +207,7 @@ databaseDescribe("release-canary durable persistence", () => {
       [conflictingBriefId],
     )).resolves.toMatchObject({ rowCount: 0 });
     await expect(pool.query(
-      `SELECT canary_id,environment,operation,source_revision,cache_mode,
+      `SELECT canary_id,environment,audience,operation,source_revision,cache_mode,
               brief_request_id,run_id
        FROM release_canary_markers`,
     )).resolves.toMatchObject({
@@ -196,9 +215,10 @@ databaseDescribe("release-canary durable persistence", () => {
       rows: [{
         canary_id: "rc-2.4.0-reggaeton",
         environment: "staging",
+        audience: "https://staging.9enio.example",
         operation: "brief",
         source_revision: "a".repeat(40),
-        cache_mode: "cold",
+        cache_mode: "reuse_disabled",
         brief_request_id: briefRequestId,
         run_id: null,
       }],
@@ -225,8 +245,10 @@ databaseDescribe("release-canary durable persistence", () => {
       await briefClient.query("BEGIN");
       await persistReleaseCanaryMarker(
         briefClient,
-        marker("brief", "cold", "rc-2.4.0-linked"),
+        marker("brief", "rc-2.4.0-linked"),
         { operation: "brief", id: briefRequestId },
+        null,
+        { allowMarkerCreation: true },
       );
       await briefClient.query("COMMIT");
     } catch (error) {
@@ -252,9 +274,10 @@ databaseDescribe("release-canary durable persistence", () => {
       await runClient.query("BEGIN");
       await persistReleaseCanaryMarker(
         runClient,
-        marker("run", "cold", "rc-2.4.0-linked"),
+        marker("run", "rc-2.4.0-linked"),
         { operation: "run", id: runId },
         briefRequestId,
+        { allowMarkerCreation: true },
       );
       await runClient.query("COMMIT");
     } catch (error) {
@@ -286,9 +309,10 @@ databaseDescribe("release-canary durable persistence", () => {
       await ordinaryClient.query("BEGIN");
       await expect(persistReleaseCanaryMarker(
         ordinaryClient,
-        marker("run", "cold", "rc-2.4.0-linked"),
+        marker("run", "rc-2.4.0-linked"),
         { operation: "run", id: ordinaryBriefRunId },
         ordinaryBriefRequestId,
+        { allowMarkerCreation: true },
       )).rejects.toMatchObject({
         statusCode: 409,
         code: "release_canary_conflict",
@@ -398,6 +422,18 @@ databaseDescribe("release-canary durable persistence", () => {
       clientBucketAliases: [ordinaryBucket],
       idempotencyKey: ordinaryBriefKey,
     });
+    await expect(repository.createBriefRequest({
+      prompt: "Build the ordinary metrics fixture",
+      requestedTrackCount: 3,
+      model: "test-model",
+      clientBucket: ordinaryBucket,
+      clientBucketAliases: [ordinaryBucket],
+      idempotencyKey: ordinaryBriefKey,
+      releaseCanary: marker("brief", "rc-2.4.0-ordinary-relabel"),
+    })).rejects.toMatchObject({
+      statusCode: 409,
+      code: "release_canary_conflict",
+    });
     const canaryBrief = await repository.createBriefRequest({
       prompt: "Build the synthetic metrics fixture",
       requestedTrackCount: 3,
@@ -405,7 +441,7 @@ databaseDescribe("release-canary durable persistence", () => {
       clientBucket: canaryBucket,
       clientBucketAliases: [canaryBucket],
       idempotencyKey: canaryBriefKey,
-      releaseCanary: marker("brief", "cold", "rc-2.4.0-metrics"),
+      releaseCanary: marker("brief", "rc-2.4.0-metrics"),
     });
     await expect(repository.createBriefRequest({
       prompt: "Build the synthetic metrics fixture",
@@ -445,6 +481,23 @@ databaseDescribe("release-canary durable persistence", () => {
       reuseDays: 0,
       globalLimit: 100,
     });
+    await expect(repository.createRunIdempotent({
+      prompt: "Build the ordinary metrics fixture",
+      briefRequestId: ordinaryBrief.id,
+      brief: exactBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: ordinaryBucket,
+      clientBucketAliases: [ordinaryBucket],
+      idempotencyKey: ordinaryRunKey,
+      autoPublish: true,
+      reuseDays: 0,
+      globalLimit: 100,
+      releaseCanary: marker("run", "rc-2.4.0-ordinary-relabel"),
+    })).rejects.toMatchObject({
+      statusCode: 409,
+      code: "release_canary_conflict",
+    });
     const canaryRun = await repository.createRunIdempotent({
       prompt: "Build the synthetic metrics fixture",
       briefRequestId: canaryBrief.id,
@@ -456,7 +509,7 @@ databaseDescribe("release-canary durable persistence", () => {
       idempotencyKey: canaryRunKey,
       autoPublish: true,
       globalLimit: 100,
-      releaseCanary: marker("run", "cold", "rc-2.4.0-metrics"),
+      releaseCanary: marker("run", "rc-2.4.0-metrics"),
     });
     await expect(repository.createRunIdempotent({
       prompt: "Build the synthetic metrics fixture",
@@ -582,8 +635,69 @@ databaseDescribe("release-canary durable persistence", () => {
       },
     });
 
+    const baseContract = compilePlaylistContractRevisionV1({
+      contractId: "metrics-guidance-contract",
+      rawPrompt: "Three disco tracks with a smooth flow",
+      requestedTrackCount: 3,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: "genre:disco",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["disco"],
+          source: { provenance: "prompt", text: "disco" },
+        },
+        {
+          id: "flow:smooth",
+          kind: "ranking_preference",
+          scope: "playlist",
+          hardness: "soft",
+          axis: "flow",
+          operator: "prefer",
+          values: ["smooth"],
+          source: { provenance: "prompt", text: "smooth flow" },
+        },
+      ],
+      trackPredicate: { op: "clause", clauseId: "genre:disco" },
+      sequencingObjectives: [{
+        id: "sequence:flow",
+        clauseId: "flow:smooth",
+        dimension: "energy",
+        direction: "smooth",
+        weight: 1,
+        priority: 1,
+      }],
+    });
+    const softContract = applyPlaylistContractPatchV1(baseContract, {
+      baseRevisionId: baseContract.revisionId,
+      baseSemanticHash: baseContract.semanticHash,
+      answerLineage: {
+        questionSetHash: questionSetRows[0]!.questionSetHash,
+        questionId: "flow",
+        answerHash: "e".repeat(64),
+      },
+      operations: [{
+        op: "replace_clause",
+        clauseId: "flow:smooth",
+        clause: {
+          id: "flow:smooth",
+          kind: "ranking_preference",
+          scope: "playlist",
+          hardness: "soft",
+          axis: "flow",
+          operator: "prefer",
+          values: ["chronological"],
+          source: { provenance: "guidance", text: "chronological flow" },
+        },
+      }],
+    });
     const baseContractRevisionId = randomUUID();
-    const resultingContractRevisionId = randomUUID();
+    const softContractRevisionId = randomUUID();
     await pool.query(
       `INSERT INTO playlist_contract_revisions(
          id,brief_request_id,revision,parent_revision_id,status,
@@ -591,19 +705,33 @@ databaseDescribe("release-canary durable persistence", () => {
          evidence_policy_version,question_template_version,
          catalog_policy_version,locale,storefront,answer_lineage_hash)
        VALUES
-         ($1,$3,1,NULL,'superseded',$4,'{}'::jsonb,
-          'metrics-v1','metrics-v1','metrics-v1','metrics-v1',
-          'metrics-v1','en-US','us',$6),
-         ($2,$3,2,$1,'active',$5,'{}'::jsonb,
-          'metrics-v1','metrics-v1','metrics-v1','metrics-v1',
-          'metrics-v1','en-US','us',$7)`,
+         ($1,$3,1,NULL,'superseded',$4,$5::jsonb,
+          $6,$7,$8,$9,$10,$11,$12,$13),
+         ($2,$3,2,$1,'active',$14,$15::jsonb,
+          $16,$17,$18,$19,$20,$21,$22,$23)`,
       [
         baseContractRevisionId,
-        resultingContractRevisionId,
+        softContractRevisionId,
         ordinaryBrief.id,
-        "a".repeat(64),
-        "b".repeat(64),
+        baseContract.semanticHash,
+        JSON.stringify(baseContract),
+        baseContract.versions.compiler,
+        baseContract.versions.ontology,
+        baseContract.versions.evidencePolicy,
+        baseContract.versions.questionTemplates,
+        baseContract.versions.catalogPolicy,
+        baseContract.locale,
+        baseContract.storefront,
         "c".repeat(64),
+        softContract.semanticHash,
+        JSON.stringify(softContract),
+        softContract.versions.compiler,
+        softContract.versions.ontology,
+        softContract.versions.evidencePolicy,
+        softContract.versions.questionTemplates,
+        softContract.versions.catalogPolicy,
+        softContract.locale,
+        softContract.storefront,
         "d".repeat(64),
       ],
     );
@@ -631,16 +759,107 @@ databaseDescribe("release-canary durable persistence", () => {
         "f".repeat(64),
         `answer-${randomUUID()}`,
         baseContractRevisionId,
-        resultingContractRevisionId,
+        softContractRevisionId,
       ],
     );
     await expect(repository.getPlaylistResolutionMetrics({
       windowStartedAt,
       windowEndedAt: new Date(Date.now() + 1_000),
     })).resolves.toMatchObject({
+      denominators: {
+        userAuthorizedScopeOrCountChanges: 0,
+      },
+      outcomes: {
+        originalRequestExactSuccess: 1,
+        guidedExactResolution: 0,
+        nuanceAssistedExactSuccess: 1,
+      },
+    });
+
+    const hardContract = applyPlaylistContractPatchV1(softContract, {
+      baseRevisionId: softContract.revisionId,
+      baseSemanticHash: softContract.semanticHash,
+      answerLineage: {
+        questionSetHash: questionSetRows[0]!.questionSetHash,
+        questionId: "genre",
+        answerHash: "1".repeat(64),
+      },
+      operations: [{
+        op: "replace_clause",
+        clauseId: "genre:disco",
+        clause: {
+          id: "genre:disco",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["funk"],
+          source: { provenance: "guidance", text: "funk" },
+        },
+      }],
+    });
+    const hardContractRevisionId = randomUUID();
+    await pool.query(
+      `UPDATE playlist_contract_revisions
+       SET status='superseded' WHERE id=$1`,
+      [softContractRevisionId],
+    );
+    await pool.query(
+      `INSERT INTO playlist_contract_revisions(
+         id,brief_request_id,revision,parent_revision_id,status,
+         contract_hash,contract_json,compiler_version,ontology_version,
+         evidence_policy_version,question_template_version,
+         catalog_policy_version,locale,storefront,answer_lineage_hash)
+       VALUES($1,$2,3,$3,'active',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        hardContractRevisionId,
+        ordinaryBrief.id,
+        softContractRevisionId,
+        hardContract.semanticHash,
+        JSON.stringify(hardContract),
+        hardContract.versions.compiler,
+        hardContract.versions.ontology,
+        hardContract.versions.evidencePolicy,
+        hardContract.versions.questionTemplates,
+        hardContract.versions.catalogPolicy,
+        hardContract.locale,
+        hardContract.storefront,
+        "2".repeat(64),
+      ],
+    );
+    await pool.query(
+      `INSERT INTO guidance_answer_sets(
+         id,brief_request_id,question_set_id,question_set_hash,
+         normalized_answers_json,answer_hash,execution_delta_json,
+         execution_delta_hash,idempotency_key,base_contract_revision_id,
+         resulting_contract_revision_id)
+       VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb,$8,$9,$10,$11)`,
+      [
+        randomUUID(),
+        ordinaryBrief.id,
+        questionSetRows[0]!.questionSetId,
+        questionSetRows[0]!.questionSetHash,
+        JSON.stringify([{ questionId: "genre", optionId: "funk" }]),
+        "1".repeat(64),
+        JSON.stringify([{ op: "replace_clause", clauseId: "genre:disco" }]),
+        "2".repeat(64),
+        `answer-${randomUUID()}`,
+        softContractRevisionId,
+        hardContractRevisionId,
+      ],
+    );
+    await expect(repository.getPlaylistResolutionMetrics({
+      windowStartedAt,
+      windowEndedAt: new Date(Date.now() + 1_000),
+    })).resolves.toMatchObject({
+      denominators: {
+        userAuthorizedScopeOrCountChanges: 1,
+      },
       outcomes: {
         originalRequestExactSuccess: 0,
         guidedExactResolution: 1,
+        nuanceAssistedExactSuccess: 0,
       },
     });
     await expect(pool.query(
@@ -693,9 +912,49 @@ databaseDescribe("release-canary durable persistence", () => {
       "UPDATE research_runs SET active_playlist_contract_revision_id=$2 WHERE id=$1",
       [runId, contractRevisionId],
     );
+    const selectionPlanId = randomUUID();
+    const graphSnapshotId = randomUUID();
+    const queryPlanRevisionId = randomUUID();
+    await pool.query(
+      `INSERT INTO graph_snapshots(
+         id,status,content_hash,assertion_count,catalog_identity_count,locked_at)
+       VALUES($1,'locked',$2,0,0,now())`,
+      [graphSnapshotId, "8".repeat(64)],
+    );
+    await pool.query(
+      `INSERT INTO selection_plans(
+         id,run_id,revision,status,plan_hash,plan_json,pipeline_version,
+         policy_version,confirmed_at)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,
+         'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+      [selectionPlanId, runId, "9".repeat(64)],
+    );
+    await pool.query(
+      `INSERT INTO query_plan_revisions(
+         id,run_id,selection_plan_id,revision,graph_snapshot_id,engine,status,
+         plan_hash,plan_json,pipeline_version,policy_version,activated_at)
+       VALUES($1,$2,$3,1,$4,'portfolio','active',$5,
+         jsonb_build_object('selectionPlanHash',$6::text),
+         'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+      [
+        queryPlanRevisionId,
+        runId,
+        selectionPlanId,
+        graphSnapshotId,
+        "7".repeat(64),
+        "9".repeat(64),
+      ],
+    );
+    await pool.query(
+      `INSERT INTO run_active_query_plans(
+         run_id,query_plan_revision_id,activated_at)
+       VALUES($1,$2,now())`,
+      [runId, queryPlanRevisionId],
+    );
     const attempt = await repository.beginPlaylistExecutionAttempt({
       runId,
       contractRevisionId,
+      queryPlanRevisionId,
       stage: "publication",
       dependencyKey: "apple",
       attemptNumber: 1,
@@ -743,17 +1002,66 @@ databaseDescribe("release-canary durable persistence", () => {
         `proof-reconcile-${randomUUID()}`,
       ],
     );
+    const questionSetId = randomUUID();
+    await pool.query(
+      `INSERT INTO guidance_question_sets(
+         id,run_id,revision,question_set_hash,request_classification,
+         generation_mode,guidance_policy_version,locale,storefront,
+         target_track_count,explicit_constraint_hash,questions_json,active,
+         base_contract_revision_id)
+       VALUES($1,$2,1,$3,'broad_curated','deterministic',
+         'adaptive_guidance_v3','en-US','us',3,$4,$5::jsonb,false,$6)`,
+      [
+        questionSetId,
+        runId,
+        "2".repeat(64),
+        "3".repeat(64),
+        JSON.stringify([{
+          id: "guidance:proof:breadth",
+          affectedClauseIds: ["guidance:scope:proof"],
+        }]),
+        contractRevisionId,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO guidance_answer_sets(
+         id,run_id,question_set_id,question_set_hash,
+         normalized_answers_json,answer_hash,execution_delta_json,
+         execution_delta_hash,idempotency_key,base_contract_revision_id,
+         resulting_contract_revision_id)
+       VALUES($1,$2,$3,$4,'[]'::jsonb,$5,'[]'::jsonb,$6,$7,$8,$8)`,
+      [
+        randomUUID(),
+        runId,
+        questionSetId,
+        "2".repeat(64),
+        "4".repeat(64),
+        "5".repeat(64),
+        `proof-guidance-${randomUUID()}`,
+        contractRevisionId,
+      ],
+    );
 
     const proof = await repository.getPublicRunExecutionProof(runId, manifestId);
     expect(proof).toMatchObject({
       contractRevision: 1,
       contractHash,
+      answerLineageHash: "b".repeat(64),
+      queryPlanRevisionId,
+      guidanceLineage: [{
+        questionSetHash: "2".repeat(64),
+        baseContractHash: contractHash,
+        resultingContractHash: contractHash,
+        executionDeltaHash: "5".repeat(64),
+        affectedClauseIds: ["guidance:scope:proof"],
+      }],
       attempts: [{
         stage: "publication",
         status: "complete",
         executorRevision: "c".repeat(40),
         executorIdentityHash: "d".repeat(64),
         configurationHash: "e".repeat(64),
+        queryPlanRevisionId: "unverified",
       }],
       publicationReconciliation: {
         state: "complete",

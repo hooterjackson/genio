@@ -3,7 +3,7 @@
   "releases": [
     {
       "version": "2.4.0",
-      "releasedAt": "2026-07-23",
+      "releasedAt": "2026-07-24",
       "title": "Never-dead-end canonical playlists",
       "notes": [
         "Executes new canonical work only from immutable contract-3 revisions with typed Boolean predicates, versioned evidence policy, capability negotiation, and stale-worker fencing.",

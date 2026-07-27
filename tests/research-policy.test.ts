@@ -246,6 +246,10 @@ describe("research execution policy", () => {
     expect(briefInterpretationModel(environment)).toBe("gpt-5.4-mini");
     expect(briefInterpretationModel({ ...environment, OPENAI_BRIEF_MODEL: "brief-snapshot" }))
       .toBe("brief-snapshot");
+    expect(() => briefInterpretationModel({
+      ...environment,
+      OPENAI_BRIEF_MODEL: "sk-secret-looking-model",
+    })).toThrow(/invalid_openai_brief_model/u);
     expect(researchExecutionPolicy(brief("curated", 50), environment)).toMatchObject({
       model: "fast-snapshot",
       runDeadlineMs: 120_000,

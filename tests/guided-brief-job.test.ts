@@ -95,7 +95,7 @@ test("guided finalization reapplies the server-owned exact count after an advers
 
   await processBriefInterpretationJob(repository, { briefRequestId: "brief-guided-job" });
 
-  expect(saveBriefResult).toHaveBeenCalledWith("brief-guided-job", {
+  expect(saveBriefResult).toHaveBeenCalledWith("brief-guided-job", expect.objectContaining({
     status: "complete",
     expectedStatus: "finalizing",
     brief: expect.objectContaining({
@@ -106,9 +106,13 @@ test("guided finalization reapplies the server-owned exact count after an advers
       evidencePolicy: draftBrief.evidencePolicy,
       targetSize: { min: 75, max: 75 },
     }),
+    selectionPlan: expect.objectContaining({
+      requestedTrackCount: 75,
+      minimumQualifiedTrackCount: 75,
+    }),
     estimateUsd: 1.5,
     error: null,
-  });
+  }));
   expect(repository.reserveProviderCost).not.toHaveBeenCalled();
   expect(reconcileProviderCost).not.toHaveBeenCalled();
   expect(releaseProviderCost).not.toHaveBeenCalled();
@@ -312,6 +316,113 @@ test("the exact Brazilian disco request always receives contract-2 guidance when
       guidanceTelemetry: expect.objectContaining({
         generationMode: "balanced_default",
         acceptedQuestionCount: 1,
+      }),
+      error: null,
+    }),
+  );
+});
+
+test("contract-3 keeps a factual possessive ambiguity blocking and suppresses optional flow guidance", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-contract3-possessive");
+  const factualBrief: PlaylistBrief = {
+    title: "Paulinho da Costa relationships",
+    description: "A documented survey of recordings connected to Paulinho da Costa.",
+    mode: "curated",
+    subjectEntities: ["Paulinho da Costa"],
+    relationship: "recordings Paulinho da Costa performed on, created, or influenced",
+    include: ["documented recording-level relationships"],
+    exclude: [],
+    versionPolicy: "Prefer canonical studio recordings.",
+    evidencePolicy: "Require track-specific factual evidence.",
+    orderingPolicy: "Use an editorial listening flow.",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: [],
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    id: "response-contract3-possessive",
+    model: "gpt-5.4-mini",
+    usage: { input_tokens: 320, output_tokens: 160 },
+    output_text: JSON.stringify(factualBrief),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+
+  const saveBriefResult = vi.fn(async () => undefined);
+  const savePlaylistContractRevision = vi.fn(async (input: {
+    contractHash: string;
+    contract: Record<string, unknown>;
+  }) => ({
+    id: "contract3-possessive-base",
+    contractHash: input.contractHash,
+    contract: input.contract,
+  }));
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract3-possessive",
+      prompt: "Paulinho da Costa's 25 most influential songs with a listening flow",
+      requestedTrackCount: 25,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 3 as const,
+    })),
+    reserveProviderCost: vi.fn(async () => ({
+      reservationId: "reservation-contract3-possessive",
+    })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    getActivePlaylistContractRevision: vi.fn(async () => null),
+    savePlaylistContractRevision,
+    savePlaylistFeasibilitySnapshot: vi.fn(async () => ({
+      id: "feasibility-contract3-possessive",
+      created: true,
+    })),
+    saveBriefSelectionPlan: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract3-possessive",
+  });
+
+  expect(savePlaylistContractRevision).toHaveBeenCalledOnce();
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-contract3-possessive",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      questions: [expect.objectContaining({
+        id: "v3-critical:possessive_relationship",
+        axis: "possessive_relationship",
+        trigger: "correctness",
+        criticality: "required",
+        allowCustom: false,
+        options: expect.arrayContaining([
+          expect.objectContaining({
+            id: "subject_performed",
+            recommended: true,
+            contractPatch: expect.objectContaining({
+              operations: expect.arrayContaining([
+                expect.objectContaining({ op: "replace_track_predicate" }),
+              ]),
+            }),
+          }),
+          expect.objectContaining({ id: "subject_created" }),
+          expect.objectContaining({ id: "subject_influenced" }),
+        ]),
+      })],
+      guidanceContract: expect.objectContaining({
+        requestClassification: "critical_ambiguity",
+        generationMode: "deterministic_critical",
+        trigger: "correctness",
+        axis: "possessive_relationship",
+      }),
+      guidanceTelemetry: expect.objectContaining({
+        proposedQuestionCount: 2,
+        acceptedQuestionCount: 1,
+        validationIssues: expect.arrayContaining([
+          "guidance:flow:shape:request_needs_no_guidance",
+        ]),
       }),
       error: null,
     }),

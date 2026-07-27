@@ -20,15 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.7.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm security:secrets
+      - run: pnpm security:dependencies
       - run: pnpm lint
       - run: pnpm build
 
@@ -36,11 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.7.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.19.0
           cache: pnpm
@@ -52,7 +54,7 @@ jobs:
     timeout-minutes: 25
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: needle
           POSTGRES_USER: needle
@@ -72,14 +74,16 @@ jobs:
       GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
       IP_HASH_SECRET: abcdef0123456789abcdef0123456789
       CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      CAPABILITY_PEPPER_VERSION: ci-capability-v1
       SESSION_SECRET: 00112233445566778899aabbccddeeff
       OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: ci-owner-allowlist-v1
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.7.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.19.0
           cache: pnpm
@@ -90,11 +94,55 @@ jobs:
       - run: pnpm test:database
       - name: Upload coverage summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-summary
           path: coverage/coverage-summary.json
           if-no-files-found: ignore
+
+  production-database-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        # Match the immutable Postgres 18 image currently serving production.
+        image: ghcr.io/railwayapp-templates/postgres-ssl:18@sha256:764fabc5fceb7166414c425a57bed8722a08cfb7fff508efb21a86eb31e172a6
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: ci-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      CAPABILITY_PEPPER_VERSION: ci-capability-v1
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: ci-owner-allowlist-v1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:database:preflight
+      - run: pnpm db:migrate
+      - run: pnpm test:database
 
   browser:
     needs: [static]
@@ -106,12 +154,13 @@ jobs:
         project: [mobile-320, mobile-390, mobile-430, desktop]
     env:
       OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: ci-owner-allowlist-v1
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.7.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.19.0
           cache: pnpm
@@ -120,7 +169,7 @@ jobs:
       - run: pnpm test:e2e --project=${{ matrix.project }}
       - name: Upload browser failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: playwright-${{ matrix.project }}
           path: |

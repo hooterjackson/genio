@@ -29,6 +29,21 @@ export interface MusicBrainzIdentityEnrichment {
   source: "cache" | "musicbrainz";
 }
 
+/**
+ * Opaque worker authority carried only to run-scoped persistence. The
+ * enrichment module deliberately does not interpret it; Repository validates
+ * the exact job lease and provider-attempt generation transactionally.
+ */
+export interface MusicBrainzEnrichmentWriteFence {
+  jobId: string;
+  workerId: string;
+  leaseEpoch: number;
+  providerDependencyRetry: boolean;
+  expectedGeneration: string | null;
+  priorFailureCount: number;
+  claimToken: string | null;
+}
+
 interface CachedMusicBrainzIdentity {
   version: typeof MUSICBRAINZ_CACHE_VERSION;
   status: "resolved" | "not_found";
@@ -43,11 +58,16 @@ interface CachedMusicBrainzIdentity {
  * retained.
  */
 export interface MusicBrainzEnrichmentRepository extends Partial<AppleCatalogCacheRepository> {
-  reserveMusicBrainzEnrichmentRequest?(runId: string, maximum: number): Promise<number | null>;
+  reserveMusicBrainzEnrichmentRequest?(
+    runId: string,
+    maximum: number,
+    authority?: MusicBrainzEnrichmentWriteFence | null,
+  ): Promise<number | null>;
   updateCandidateMusicBrainzIdentity?(
     runId: string,
     candidateId: string,
     recordingId: string,
+    authority?: MusicBrainzEnrichmentWriteFence | null,
   ): Promise<void>;
 }
 
@@ -57,6 +77,7 @@ export interface MusicBrainzEnrichmentOptions {
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   throttle?: (signal?: AbortSignal) => Promise<void>;
   timeoutMs?: number;
+  writeFence?: MusicBrainzEnrichmentWriteFence | null;
 }
 
 type EnrichmentCandidate = Pick<TrackCandidateInput,
@@ -311,7 +332,12 @@ export async function enrichMusicBrainzIdentity(
     const cached = cachedResult(entry, now());
     if (cached) {
       if (cached.status === "not_found") return null;
-      await repository.updateCandidateMusicBrainzIdentity(runId, candidate.id, cached.recordingId!);
+      await repository.updateCandidateMusicBrainzIdentity(
+        runId,
+        candidate.id,
+        cached.recordingId!,
+        options.writeFence,
+      );
       return {
         recordingId: cached.recordingId!,
         releaseGroupId: cached.releaseGroupId,
@@ -340,6 +366,7 @@ export async function enrichMusicBrainzIdentity(
       const reserved = await repository.reserveMusicBrainzEnrichmentRequest(
         runId,
         PIPELINE_V2_MUSICBRAINZ_MAX_UNCACHED_REQUESTS,
+        options.writeFence,
       );
       if (reserved === null) return null;
       await throttle(signal);
@@ -394,7 +421,12 @@ export async function enrichMusicBrainzIdentity(
   }
   if (!resolved) return null;
   try {
-    await repository.updateCandidateMusicBrainzIdentity(runId, candidate.id, resolved.recordingId);
+    await repository.updateCandidateMusicBrainzIdentity(
+      runId,
+      candidate.id,
+      resolved.recordingId,
+      options.writeFence,
+    );
   } catch {
     return null;
   }

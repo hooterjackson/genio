@@ -8,10 +8,17 @@ import {
   APPLE_WRITE_GATEWAY_EVENT_BUCKET,
   APPLE_WRITE_GATEWAY_STATE_KEY,
 } from "../server/apple-write-gateway.ts";
+import { orderedAppleStableIdsHash } from "../server/publication-reconciliation-persistence.ts";
+import {
+  canonicalExecutorCapabilityForSchemaV1,
+} from "../server/playlist-contract-backend-capability-v1.ts";
 import { Repository } from "../server/repository.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
+const schema5ExecutorCapability = canonicalExecutorCapabilityForSchemaV1({
+  queryPlanSchemaVersion: 5,
+});
 const migrationDirectory = new URL("../postgres-migrations/", import.meta.url);
 const migrationSql = readdirSync(migrationDirectory)
   .filter((file) => /^\d+_.+\.sql$/u.test(file))
@@ -90,6 +97,7 @@ databaseDescribe("database-backed Apple write gateway", () => {
       manifestRevisionHash,
       contractRevisionId: null,
       contractHash: null,
+      executionFence: null,
       publicationVolumeId,
     } as const;
   };
@@ -101,6 +109,8 @@ databaseDescribe("database-backed Apple write gateway", () => {
     const manifestRevisionId = randomUUID();
     const candidateId = randomUUID();
     const publicationVolumeId = randomUUID();
+    const jobId = randomUUID();
+    const workerId = `publication-completion-worker-${label}`;
     const manifestRevisionHash = "c".repeat(64);
     const contractHash = "d".repeat(64);
     await repository.pool.query(
@@ -170,6 +180,90 @@ databaseDescribe("database-backed Apple write gateway", () => {
          'https://music.apple.com/us/playlist/completion/pl.completion',1,2,now())`,
       [publicationVolumeId, manifestId, manifestRevisionId],
     );
+    await repository.pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,stage_key,status,payload_json,max_attempts,
+         lease_owner,lease_expires_at)
+       VALUES($1,$2,'publication','publication',$3,'catalog_first_v2',
+         10,'publication','leased','{}'::jsonb,3,$4,
+         now()+interval '5 minutes')`,
+      [
+        jobId,
+        runId,
+        `publication-completion:${label}:${runId}`,
+        workerId,
+      ],
+    );
+    // The completion fence is canonical even though this isolated Apple
+    // gateway fixture does not execute retrieval. Bind the job and attempt to
+    // the exact schema-5 executor envelope instead of bypassing the fence.
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET required_executor_capability_hash=$2,
+           required_executor_capability_vector=$3::jsonb
+       WHERE id=$1`,
+      [
+        jobId,
+        schema5ExecutorCapability.hash,
+        JSON.stringify(schema5ExecutorCapability.vector),
+      ],
+    );
+    const leaseGeneration = Number((await repository.pool.query<{
+      lease_epoch: string;
+    }>(
+      "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
+      [jobId],
+    )).rows[0]!.lease_epoch);
+    const attempt = await repository.beginPlaylistExecutionAttempt({
+      runId,
+      contractRevisionId,
+      jobId,
+      workerId,
+      queryPlanRevisionId: null,
+      stage: "publication",
+      dependencyKey: "publication",
+      attemptNumber: 1,
+      leaseGeneration,
+      executorRevision: "apple-write-gateway-integration",
+      executorIdentityHash: "1".repeat(64),
+      executorCapabilityHash: schema5ExecutorCapability.hash,
+      executorCapabilityVector: structuredClone(
+        schema5ExecutorCapability.vector,
+      ) as unknown as Record<string, unknown>,
+      configurationHash: "2".repeat(64),
+      idempotencyKey: `${jobId}:${leaseGeneration}:${contractRevisionId}`,
+    });
+    const executionFence = {
+      executionAttemptId: attempt.id,
+      jobId,
+      workerId,
+      leaseGeneration,
+      stageKey: "publication",
+    };
+    const expectedOrderedIdsHash = orderedAppleStableIdsHash(["101"]);
+    const reconciliationBase = {
+      ...executionFence,
+      runId,
+      contractRevisionId,
+      contractHash,
+      manifestId,
+      manifestRevisionId,
+      manifestRevisionHash,
+      expectedOrderedIdsHash,
+      expectedCount: 1,
+      idempotencyKey:
+        `publish:${manifestId}:${manifestRevisionId}:${manifestRevisionHash}`,
+    };
+    await repository.beginPublicationReconciliation(reconciliationBase);
+    await repository.advancePublicationReconciliation({
+      ...reconciliationBase,
+      state: "reconciling",
+      applePlaylistId: "p.completion",
+      observedOrderedIdsHash: expectedOrderedIdsHash,
+      appendedCount: 1,
+      batchCursor: 1,
+    });
     return {
       runId,
       manifestId,
@@ -177,6 +271,7 @@ databaseDescribe("database-backed Apple write gateway", () => {
       manifestRevisionHash,
       contractRevisionId,
       contractHash,
+      executionFence,
       selectedCount: 1,
       terminalStatus: "complete" as const,
       publicationVolumes: [{
@@ -246,6 +341,86 @@ databaseDescribe("database-backed Apple write gateway", () => {
     await second.release();
   }, 10_000);
 
+  test("holds the execution lease fence through an in-flight Apple mutation", async () => {
+    const fixture = await createCompletionFenceFixture("in-flight-lease-expiry");
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET lease_expires_at=now()+interval '500 milliseconds'
+       WHERE id=$1`,
+      [fixture.executionFence.jobId],
+    );
+    const permit = await repository.acquireAppleWritePermit({
+      runId: fixture.runId,
+      manifestId: fixture.manifestId,
+      manifestRevisionId: fixture.manifestRevisionId,
+      manifestRevisionHash: fixture.manifestRevisionHash,
+      contractRevisionId: fixture.contractRevisionId,
+      contractHash: fixture.contractHash,
+      executionFence: fixture.executionFence,
+      publicationVolumeId:
+        fixture.publicationVolumes[0]!.publicationVolumeId,
+      operation: "append_tracks",
+    });
+
+    let takeoverFinished = false;
+    let takeoverPromise: Promise<unknown> | null = null;
+    try {
+      await delay(650);
+      const expired = await repository.pool.query<{ expired: boolean }>(
+        "SELECT lease_expires_at<=now() expired FROM job_queue WHERE id=$1",
+        [fixture.executionFence.jobId],
+      );
+      expect(expired.rows[0]?.expired).toBe(true);
+
+      takeoverPromise = repository.pool.query(
+        `UPDATE job_queue
+         SET lease_owner='replacement-worker',
+             lease_expires_at=now()+interval '5 minutes'
+         WHERE id=$1`,
+        [fixture.executionFence.jobId],
+      ).then(() => {
+        takeoverFinished = true;
+      });
+      await delay(150);
+      expect(takeoverFinished).toBe(false);
+    } finally {
+      await permit.release();
+      if (takeoverPromise) await takeoverPromise;
+    }
+
+    expect(takeoverFinished).toBe(true);
+    const authority = await repository.pool.query<{
+      lease_owner: string | null;
+      lease_epoch: string;
+      attempt_status: string;
+    }>(
+      `SELECT job.lease_owner,job.lease_epoch::text,attempt.status attempt_status
+       FROM job_queue job
+       JOIN playlist_execution_attempts attempt
+         ON attempt.id=$2 AND attempt.job_id=job.id
+       WHERE job.id=$1`,
+      [
+        fixture.executionFence.jobId,
+        fixture.executionFence.executionAttemptId,
+      ],
+    );
+    expect(authority.rows[0]).toMatchObject({
+      lease_owner: "replacement-worker",
+      lease_epoch: String(fixture.executionFence.leaseGeneration + 1),
+      attempt_status: "discarded",
+    });
+    await expect(repository.commitPublicationCompletion(fixture))
+      .rejects.toMatchObject({ code: "publication_execution_stale" });
+    const run = await repository.pool.query<{ status: string; phase: string }>(
+      "SELECT status,phase FROM research_runs WHERE id=$1",
+      [fixture.runId],
+    );
+    expect(run.rows[0]).toMatchObject({
+      status: "publishing",
+      phase: "apple_publication",
+    });
+  }, 10_000);
+
   test("durably consumes bounded global tokens and records each issued permit", async () => {
     await repository.pool.query(
       "DELETE FROM settings WHERE key=$1",
@@ -281,6 +456,80 @@ databaseDescribe("database-backed Apple write gateway", () => {
       [APPLE_WRITE_GATEWAY_EVENT_BUCKET, APPLE_WRITE_GATEWAY_EVENT_ACTION],
     );
     expect(events.rows[0]?.count).toBe(2);
+  });
+
+  test("rejects a spliced execution-attempt and unrelated live job", async () => {
+    const fixture = await createCompletionFenceFixture("spliced-authority");
+    const unrelatedJobId = randomUUID();
+    await repository.pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,stage_key,status,payload_json,max_attempts,
+         lease_owner,lease_expires_at)
+       VALUES($1,$2,'publication','publication',$3,'catalog_first_v2',
+         10,'publication','leased','{}'::jsonb,3,$4,
+         now()+interval '5 minutes')`,
+      [
+        unrelatedJobId,
+        fixture.runId,
+        `spliced-authority:${fixture.runId}`,
+        fixture.executionFence.workerId,
+      ],
+    );
+    const unrelatedLease = Number((await repository.pool.query<{
+      lease_epoch: string;
+    }>(
+      "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
+      [unrelatedJobId],
+    )).rows[0]!.lease_epoch);
+    expect(unrelatedLease).toBe(fixture.executionFence.leaseGeneration);
+    const splicedFence = {
+      ...fixture.executionFence,
+      jobId: unrelatedJobId,
+    };
+
+    await expect(repository.acquireAppleWritePermit({
+      runId: fixture.runId,
+      manifestId: fixture.manifestId,
+      manifestRevisionId: fixture.manifestRevisionId,
+      manifestRevisionHash: fixture.manifestRevisionHash,
+      contractRevisionId: fixture.contractRevisionId,
+      contractHash: fixture.contractHash,
+      executionFence: splicedFence,
+      publicationVolumeId:
+        fixture.publicationVolumes[0]!.publicationVolumeId,
+      operation: "append_tracks",
+    })).rejects.toMatchObject({ code: "publication_execution_stale" });
+    await expect(repository.commitPublicationCompletion({
+      ...fixture,
+      executionFence: splicedFence,
+    })).rejects.toMatchObject({ code: "publication_execution_stale" });
+  });
+
+  test("rejects Apple mutation and terminal completion after the lease is superseded", async () => {
+    const fixture = await createCompletionFenceFixture("stale-lease");
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET lease_owner='replacement-worker',
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [fixture.executionFence.jobId],
+    );
+
+    await expect(repository.acquireAppleWritePermit({
+      runId: fixture.runId,
+      manifestId: fixture.manifestId,
+      manifestRevisionId: fixture.manifestRevisionId,
+      manifestRevisionHash: fixture.manifestRevisionHash,
+      contractRevisionId: fixture.contractRevisionId,
+      contractHash: fixture.contractHash,
+      executionFence: fixture.executionFence,
+      publicationVolumeId:
+        fixture.publicationVolumes[0]!.publicationVolumeId,
+      operation: "append_tracks",
+    })).rejects.toMatchObject({ code: "publication_execution_stale" });
+    await expect(repository.commitPublicationCompletion(fixture))
+      .rejects.toMatchObject({ code: "publication_execution_stale" });
   });
 
   test("atomically completes only the active reconciled publication attempt", async () => {

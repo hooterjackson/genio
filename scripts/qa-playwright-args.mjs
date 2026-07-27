@@ -5,6 +5,17 @@ export const RESPONSIVE_QA_PROJECTS = Object.freeze([
   "desktop",
 ]);
 
+export const LOCAL_QA_OWNER_ALLOWLIST_VERSION = "browser-qa-owner-v1";
+
+export function qaWebServerEnvironment(environment = process.env) {
+  return {
+    OWNER_EMAIL: environment.OWNER_EMAIL?.trim() || "owner@example.com",
+    OWNER_ALLOWLIST_VERSION:
+      environment.OWNER_ALLOWLIST_VERSION?.trim()
+      || LOCAL_QA_OWNER_ALLOWLIST_VERSION,
+  };
+}
+
 export function normalizePlaywrightArguments(arguments_) {
   return arguments_[0] === "--" ? arguments_.slice(1) : [...arguments_];
 }

@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { qaProcessIsAlive } from "./qa-process-lifecycle.mjs";
 
 const port = process.argv[2];
 const hostname = process.argv[3] || "127.0.0.1";
@@ -13,6 +15,29 @@ const environment = {
   // harness opts in. Never rely on an ambient developer-shell value here.
   GENIO_QA_LOCAL_PREVIEW: "1",
 };
+const leasePath = process.env.GENIO_QA_WEBSERVER_LEASE_PATH?.trim() ?? "";
+const ownershipToken =
+  process.env.GENIO_QA_WEBSERVER_OWNERSHIP_TOKEN?.trim() ?? "";
+const runnerPid = Number.parseInt(
+  process.env.GENIO_QA_RUNNER_PID?.trim() ?? "",
+  10,
+);
+if (Boolean(leasePath) !== Boolean(ownershipToken)) {
+  throw new Error("QA webserver ownership lease is incomplete");
+}
+if (leasePath) {
+  if (!/^[0-9a-f-]{36}$/iu.test(ownershipToken)) {
+    throw new Error("QA webserver ownership token is invalid");
+  }
+  if (!Number.isInteger(runnerPid) || runnerPid < 2) {
+    throw new Error("QA webserver runner PID is invalid");
+  }
+  writeFileSync(
+    leasePath,
+    JSON.stringify({ ownershipToken, pid: process.pid }),
+    { encoding: "utf8", flag: "wx" },
+  );
+}
 
 let currentChild;
 let currentChildPid;
@@ -44,7 +69,22 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-process.once("exit", () => signalChild("SIGKILL"));
+process.once("exit", () => {
+  signalChild("SIGKILL");
+  // The outer QA runner owns this lease. Preserve it until that runner has
+  // verified the entire webserver process group stopped; the wrapper leader
+  // can exit before a descendant in its group does.
+});
+
+const runnerMonitor = leasePath
+  ? setInterval(() => {
+      if (qaProcessIsAlive(runnerPid)) return;
+      receivedSignal = receivedSignal || "SIGTERM";
+      signalChild("SIGKILL");
+      if (!currentChildPid) propagateSignal("SIGTERM");
+    }, 250)
+  : null;
+runnerMonitor?.unref();
 
 function runStage(arguments_) {
   return new Promise((resolve, reject) => {

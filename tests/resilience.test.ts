@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createAdapterRegistry } from "../server/adapters.ts";
 import { processNotificationJob, type NotificationRecord } from "../server/notifications.ts";
-import { createOpenAIResponse } from "../server/openai.ts";
+import {
+  createOpenAIResponse,
+  ProviderRequestError,
+} from "../server/openai.ts";
 import { validateCandidateBatch } from "../server/research.ts";
 import { assertPublicHttpsUrl } from "../server/security.ts";
 import { WorkerRunner, type DurableJob } from "../server/worker-runner.ts";
@@ -185,6 +188,44 @@ describe("bounded provider failure behavior", () => {
     await vi.advanceTimersByTimeAsync(251);
     await rejected;
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  test("OpenAI preserves a long Retry-After boundary for durable scheduling", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "offline-openai-key");
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      error: { message: "come back later" },
+    }), {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "120",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const before = Date.now();
+
+    const error = await createOpenAIResponse({
+      model: "test",
+      input: "offline",
+    }).catch((reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      name: "ProviderRequestError",
+      provider: "openai",
+      status: 429,
+      retriable: true,
+      retryAfterMs: 120_000,
+    });
+    if (!(error instanceof ProviderRequestError)) throw error;
+    expect(error.retryAfterUntil).toBeInstanceOf(Date);
+    if (!error.retryAfterUntil) throw new Error("Retry-After boundary was lost");
+    expect(error.retryAfterUntil.getTime()).toBeGreaterThanOrEqual(
+      before + 120_000,
+    );
+    expect(error.retryAfterUntil.getTime()).toBeLessThanOrEqual(
+      Date.now() + 120_000,
+    );
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   test("a Resend outage leaves the durable outbox record pending with a bounded retry", async () => {

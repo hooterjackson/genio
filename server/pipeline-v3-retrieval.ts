@@ -33,17 +33,30 @@ import type {
   CanonicalPlaylistQuotaRule,
   SelectionConstraint,
 } from "../shared/types.ts";
-import { assertPublicHttpsUrl } from "./security.ts";
+import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
 import {
+  canonicalEvidenceGradeForBindingV1,
   evaluateCanonicalContractPredicateV1,
   evaluateCanonicalContractTrackV1,
 } from "./canonical-contract-runtime-v1.ts";
 import {
+  playlistEvidenceGradeSatisfiesObligationV1,
+  selectQualifyingPlaylistEvidenceGradeV1,
+} from "./playlist-evidence-policy-v1.ts";
+import {
+  activePlaylistOptimizationBudgetV1,
   optimizePlaylistV1,
+  PlaylistOptimizationBudgetExceededErrorV1,
   type PlaylistOptimizationCandidateV1,
   type PlaylistOptimizationConstraintsV1,
   type PlaylistOptimizationResultV1,
 } from "./playlist-optimizer-v1.ts";
+import {
+  assertFixedContainerResolutionProofV1,
+  fixedContainerDirectiveHashV1,
+  type FixedContainerResolutionProofV1,
+} from "./fixed-container-resolution-proof-v1.ts";
+import { MAX_CITATION_EXCERPT_CHARS } from "./citation-attestation.ts";
 
 /**
  * Provider-independent orchestration boundary for Pipeline V3 retrieval.
@@ -137,21 +150,48 @@ export type RetrievalUpstreamDependencyIdV3 =
   | "hosted_web"
   | "governed_evidence_graph";
 
+export type RetrievalDependencyFailureClassV3 =
+  | "transient"
+  | "rate_limited"
+  | "authorization"
+  | "quota"
+  | "invalid_request"
+  | "configuration"
+  | "permanent";
+
+export function retrievalDependencyFailureIsRetryableV3(
+  failureClass: RetrievalDependencyFailureClassV3,
+): boolean {
+  return failureClass === "transient" || failureClass === "rate_limited";
+}
+
 /**
- * Adapters should use this error when a composite strategy can identify the
- * failed upstream precisely. Unknown errors conservatively implicate every
- * dependency declared by the strategy.
+ * Adapters must use this error when a composite strategy can identify a
+ * failed upstream precisely. Untyped errors are technical faults and must
+ * escape retrieval so the worker can retry or quarantine them; they must
+ * never be laundered into provider scarcity.
  */
 export class RetrievalDependencyErrorV3 extends Error {
   readonly dependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
+  readonly retryAfterUntil: Date | null;
+  readonly failureClass: RetrievalDependencyFailureClassV3;
+  readonly retriable: boolean;
 
   constructor(
     message: string,
     dependencyIds: readonly RetrievalUpstreamDependencyIdV3[],
+    retryAfterUntil: Date | null = null,
+    failureClass: RetrievalDependencyFailureClassV3 = "transient",
   ) {
     super(message);
     this.name = "RetrievalDependencyErrorV3";
     this.dependencyIds = Object.freeze([...new Set(dependencyIds)]);
+    this.retryAfterUntil = retryAfterUntil
+      && Number.isFinite(retryAfterUntil.getTime())
+      ? new Date(retryAfterUntil)
+      : null;
+    this.failureClass = failureClass;
+    this.retriable = retrievalDependencyFailureIsRetryableV3(failureClass);
   }
 }
 
@@ -288,6 +328,404 @@ export interface RawTrackCandidateV3 {
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
+export const CENTRAL_QUALITY_CRITERION_OBSERVATION_SCHEMA =
+  "genio-central-quality-criterion-observation/v2" as const;
+
+export type CentralQualityCriterionVerdictV3 =
+  CanonicalPlaylistContractClauseAssessmentV1["status"];
+
+/**
+ * Immutable, policy-bound observation of one server-owned suitability
+ * criterion. The provider may choose only the tri-state verdict; the server
+ * creates every identity and policy binding. These rows are ranking-quality
+ * judgments, never factual membership evidence.
+ */
+export interface CentralQualityCriterionObservationV3 {
+  readonly schemaVersion:
+    typeof CENTRAL_QUALITY_CRITERION_OBSERVATION_SCHEMA;
+  readonly policyVersion: "canonical_central_quality_v1";
+  readonly policyHash: string;
+  readonly criterion: string;
+  readonly verdict: CentralQualityCriterionVerdictV3;
+  readonly sourceKind:
+    | "hosted_web_response"
+    | "governed_evidence_snapshot"
+    | "independent_curator_review";
+  readonly sourceId: string;
+  /**
+   * Source-stage judgments are bound to an exact normalized
+   * artist/title/album triple. Only catalog-bound rows may satisfy policy.
+   */
+  readonly bindingKind: "candidate" | "catalog";
+  readonly candidateIdentityHash: string;
+  /**
+   * Hash of the candidate identity plus exact Apple song and recording-family
+   * identities. Candidate-stage rows intentionally carry null here.
+   */
+  readonly catalogIdentityHash: string | null;
+  readonly observationId: string;
+}
+
+function normalizeCentralQualityIdentityTextV3(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function centralQualityCandidateIdentityHashV3(
+  artist: string,
+  title: string,
+  album: string | null,
+): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      artist: normalizeCentralQualityIdentityTextV3(artist),
+      title: normalizeCentralQualityIdentityTextV3(title),
+      album: album === null
+        ? null
+        : normalizeCentralQualityIdentityTextV3(album) || null,
+    }))
+    .digest("hex");
+}
+
+function centralQualityCatalogIdentityHashV3(input: {
+  candidateIdentityHash: string;
+  appleSongId: string;
+  recordingFamilyKey: string;
+}): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      candidateIdentityHash: input.candidateIdentityHash,
+      appleSongId: input.appleSongId.trim(),
+      recordingFamilyKey: input.recordingFamilyKey.trim(),
+    }))
+    .digest("hex");
+}
+
+export function centralQualityPolicyHashV3(
+  policy: CanonicalPlaylistQualityPolicy,
+): string {
+  return createHash("sha256")
+    .update(stableStringify(policy))
+    .digest("hex");
+}
+
+export function createCentralQualityCriterionObservationV3(input: {
+  policy: CanonicalPlaylistQualityPolicy;
+  criterion: string;
+  verdict: CentralQualityCriterionVerdictV3;
+  sourceKind: CentralQualityCriterionObservationV3["sourceKind"];
+  sourceId: string;
+  artist: string;
+  title: string;
+  album: string | null;
+  catalogIdentity?: {
+    readonly appleSongId: string;
+    readonly recordingFamilyKey: string;
+  } | null;
+}): CentralQualityCriterionObservationV3 {
+  const criterion = input.criterion.normalize("NFKC")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const sourceId = input.sourceId.normalize("NFKC")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (
+    !input.policy.criteria.includes(criterion)
+    || !["pass", "fail", "unknown"].includes(input.verdict)
+    || !sourceId
+    || sourceId.length > 240
+    || !normalizeCentralQualityIdentityTextV3(input.artist)
+    || !normalizeCentralQualityIdentityTextV3(input.title)
+  ) {
+    throw new Error("central_quality_criterion_observation_invalid");
+  }
+  const candidateIdentityHash = centralQualityCandidateIdentityHashV3(
+    input.artist,
+    input.title,
+    input.album,
+  );
+  const catalogIdentity = input.catalogIdentity ?? null;
+  const appleSongId = catalogIdentity?.appleSongId.trim() ?? "";
+  const recordingFamilyKey =
+    catalogIdentity?.recordingFamilyKey.trim() ?? "";
+  if (
+    catalogIdentity
+    && (
+      input.album === null
+      || !normalizeCentralQualityIdentityTextV3(input.album)
+      || !appleSongId
+      || appleSongId.length > 240
+      || !recordingFamilyKey
+      || recordingFamilyKey.length > 320
+    )
+  ) {
+    throw new Error("central_quality_criterion_observation_invalid");
+  }
+  const material = {
+    schemaVersion: CENTRAL_QUALITY_CRITERION_OBSERVATION_SCHEMA,
+    policyVersion: input.policy.policyVersion,
+    policyHash: centralQualityPolicyHashV3(input.policy),
+    criterion,
+    verdict: input.verdict,
+    sourceKind: input.sourceKind,
+    sourceId,
+    bindingKind: catalogIdentity ? "catalog" : "candidate",
+    candidateIdentityHash,
+    catalogIdentityHash: catalogIdentity
+      ? centralQualityCatalogIdentityHashV3({
+          candidateIdentityHash,
+          appleSongId,
+          recordingFamilyKey,
+        })
+      : null,
+  } as const;
+  return Object.freeze({
+    ...material,
+    observationId: createHash("sha256")
+      .update(stableStringify(material))
+      .digest("hex"),
+  });
+}
+
+function centralQualityCandidateCriterionObservationsForPolicyV3(input: {
+  observations: unknown;
+  policy: CanonicalPlaylistQualityPolicy;
+  artist: string;
+  title: string;
+  album: string | null;
+}): CentralQualityCriterionObservationV3[] {
+  if (!Array.isArray(input.observations)) return [];
+  const policyHash = centralQualityPolicyHashV3(input.policy);
+  const candidateIdentityHash = centralQualityCandidateIdentityHashV3(
+    input.artist,
+    input.title,
+    input.album,
+  );
+  const criteria = new Set(input.policy.criteria);
+  // Retain one deterministic immutable representative for every
+  // criterion/verdict/source-kind combination. This bounds persisted proof
+  // without truncating by input order: a known failure anywhere in the
+  // observation set is always retained.
+  const output = new Map<string, CentralQualityCriterionObservationV3>();
+  for (const value of input.observations) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Partial<CentralQualityCriterionObservationV3>;
+    if (
+      row.schemaVersion !== CENTRAL_QUALITY_CRITERION_OBSERVATION_SCHEMA
+      || row.policyVersion !== input.policy.policyVersion
+      || row.policyHash !== policyHash
+      || typeof row.criterion !== "string"
+      || !criteria.has(row.criterion)
+      || !["pass", "fail", "unknown"].includes(String(row.verdict))
+      || ![
+        "hosted_web_response",
+        "governed_evidence_snapshot",
+        "independent_curator_review",
+      ].includes(String(row.sourceKind))
+      || typeof row.sourceId !== "string"
+      || row.sourceId.length < 1
+      || row.sourceId.length > 240
+      || row.bindingKind !== "candidate"
+      || row.candidateIdentityHash !== candidateIdentityHash
+      || row.catalogIdentityHash !== null
+      || typeof row.observationId !== "string"
+    ) continue;
+    let expected: CentralQualityCriterionObservationV3;
+    try {
+      expected = createCentralQualityCriterionObservationV3({
+        policy: input.policy,
+        criterion: row.criterion,
+        verdict: row.verdict as CentralQualityCriterionVerdictV3,
+        sourceKind:
+          row.sourceKind as CentralQualityCriterionObservationV3["sourceKind"],
+        sourceId: row.sourceId,
+        artist: input.artist,
+        title: input.title,
+        album: input.album,
+      });
+    } catch {
+      continue;
+    }
+    if (expected.observationId !== row.observationId) continue;
+    const proofKey = stableStringify([
+      expected.criterion,
+      expected.verdict,
+      expected.sourceKind,
+    ]);
+    const prior = output.get(proofKey);
+    if (!prior || expected.observationId < prior.observationId) {
+      output.set(proofKey, expected);
+    }
+  }
+  return [...output.values()].sort((left, right) => (
+    left.observationId.localeCompare(right.observationId)
+  ));
+}
+
+/**
+ * Reissue candidate-stage quality judgments only after the exact source
+ * artist/title/album triple has been resolved without ambiguity to one Apple
+ * recording family. Album-null, album-mismatched, and multi-family candidates
+ * deliberately yield no proof and therefore remain unknown.
+ */
+export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
+  observations: unknown;
+  policy: CanonicalPlaylistQualityPolicy;
+  candidate: {
+    readonly artist: string;
+    readonly title: string;
+    readonly album: string | null;
+  };
+  catalog: {
+    readonly artist: string;
+    readonly title: string;
+    readonly album: string | null;
+    readonly appleSongId: string;
+    readonly recordingFamilyKey: string;
+  };
+  unambiguous: boolean;
+}): CentralQualityCriterionObservationV3[] {
+  const candidateAlbum = input.candidate.album === null
+    ? ""
+    : normalizeCentralQualityIdentityTextV3(input.candidate.album);
+  const catalogAlbum = input.catalog.album === null
+    ? ""
+    : normalizeCentralQualityIdentityTextV3(input.catalog.album);
+  const appleSongId = input.catalog.appleSongId.trim();
+  const recordingFamilyKey = input.catalog.recordingFamilyKey.trim();
+  if (
+    !input.unambiguous
+    || !candidateAlbum
+    || !catalogAlbum
+    || !appleSongId
+    || appleSongId.length > 240
+    || !recordingFamilyKey
+    || recordingFamilyKey.length > 320
+    || normalizeCentralQualityIdentityTextV3(input.candidate.artist)
+      !== normalizeCentralQualityIdentityTextV3(input.catalog.artist)
+    || normalizeCentralQualityIdentityTextV3(input.candidate.title)
+      !== normalizeCentralQualityIdentityTextV3(input.catalog.title)
+    || candidateAlbum !== catalogAlbum
+  ) return [];
+  const sourceObservations =
+    centralQualityCandidateCriterionObservationsForPolicyV3({
+      observations: input.observations,
+      policy: input.policy,
+      artist: input.candidate.artist,
+      title: input.candidate.title,
+      album: input.candidate.album,
+    });
+  return sourceObservations.map((observation) => (
+    createCentralQualityCriterionObservationV3({
+      policy: input.policy,
+      criterion: observation.criterion,
+      verdict: observation.verdict,
+      sourceKind: observation.sourceKind,
+      sourceId: observation.sourceId,
+      artist: input.catalog.artist,
+      title: input.catalog.title,
+      album: input.catalog.album,
+      catalogIdentity: {
+        appleSongId,
+        recordingFamilyKey,
+      },
+    })
+  ));
+}
+
+/**
+ * Downstream central-quality proof normalizer. Candidate-stage observations
+ * are never accepted here: every row must match the exact catalog recording
+ * that is being selected, persisted, resumed, or published.
+ */
+export function centralQualityCriterionObservationsForPolicyV3(input: {
+  observations: unknown;
+  policy: CanonicalPlaylistQualityPolicy;
+  artist: string;
+  title: string;
+  album: string | null;
+  appleSongId: string;
+  recordingFamilyKey: string;
+}): CentralQualityCriterionObservationV3[] {
+  if (!Array.isArray(input.observations)) return [];
+  const normalizedAlbum = input.album === null
+    ? ""
+    : normalizeCentralQualityIdentityTextV3(input.album);
+  const appleSongId = input.appleSongId.trim();
+  const recordingFamilyKey = input.recordingFamilyKey.trim();
+  if (!normalizedAlbum || !appleSongId || !recordingFamilyKey) return [];
+  const policyHash = centralQualityPolicyHashV3(input.policy);
+  const candidateIdentityHash = centralQualityCandidateIdentityHashV3(
+    input.artist,
+    input.title,
+    input.album,
+  );
+  const catalogIdentityHash = centralQualityCatalogIdentityHashV3({
+    candidateIdentityHash,
+    appleSongId,
+    recordingFamilyKey,
+  });
+  const criteria = new Set(input.policy.criteria);
+  const output = new Map<string, CentralQualityCriterionObservationV3>();
+  for (const value of input.observations) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Partial<CentralQualityCriterionObservationV3>;
+    if (
+      row.schemaVersion !== CENTRAL_QUALITY_CRITERION_OBSERVATION_SCHEMA
+      || row.policyVersion !== input.policy.policyVersion
+      || row.policyHash !== policyHash
+      || typeof row.criterion !== "string"
+      || !criteria.has(row.criterion)
+      || !["pass", "fail", "unknown"].includes(String(row.verdict))
+      || ![
+        "hosted_web_response",
+        "governed_evidence_snapshot",
+        "independent_curator_review",
+      ].includes(String(row.sourceKind))
+      || typeof row.sourceId !== "string"
+      || row.sourceId.length < 1
+      || row.sourceId.length > 240
+      || row.bindingKind !== "catalog"
+      || row.candidateIdentityHash !== candidateIdentityHash
+      || row.catalogIdentityHash !== catalogIdentityHash
+      || typeof row.observationId !== "string"
+    ) continue;
+    let expected: CentralQualityCriterionObservationV3;
+    try {
+      expected = createCentralQualityCriterionObservationV3({
+        policy: input.policy,
+        criterion: row.criterion,
+        verdict: row.verdict as CentralQualityCriterionVerdictV3,
+        sourceKind:
+          row.sourceKind as CentralQualityCriterionObservationV3["sourceKind"],
+        sourceId: row.sourceId,
+        artist: input.artist,
+        title: input.title,
+        album: input.album,
+        catalogIdentity: { appleSongId, recordingFamilyKey },
+      });
+    } catch {
+      continue;
+    }
+    if (expected.observationId !== row.observationId) continue;
+    const proofKey = stableStringify([
+      expected.criterion,
+      expected.verdict,
+      expected.sourceKind,
+    ]);
+    const prior = output.get(proofKey);
+    if (!prior || expected.observationId < prior.observationId) {
+      output.set(proofKey, expected);
+    }
+  }
+  return [...output.values()].sort((left, right) => (
+    left.observationId.localeCompare(right.observationId)
+  ));
+}
+
 export interface CandidateQualificationV3 {
   readonly candidateId: string;
   readonly scope: {
@@ -340,6 +778,13 @@ export interface CandidateQualificationV3 {
    * These values never satisfy membership or evidence obligations.
    */
   readonly playlistOptimizationSignals?: PlaylistOptimizationSignalsV3;
+  /**
+   * Sole proof input for the immutable central-suitability floor. Aggregate
+   * central_quality scores remain ranking-only and cannot substitute for
+   * these policy-bound tri-state observations.
+   */
+  readonly centralQualityCriterionObservations?:
+    readonly CentralQualityCriterionObservationV3[];
   /** Ranking signals are consumed only after every eligibility stage passes. */
   readonly rankingSignals: Readonly<Partial<Record<RankingObjectiveV3["dimension"], number>>>;
   /** Lower values are stronger source positions. */
@@ -359,6 +804,12 @@ export interface EvidenceBindingReferenceV3 {
   readonly supportedPredicateIds?: readonly string[];
   /** Typed, fail-closed source policy. Generic candidate metadata cannot substitute for this contract. */
   readonly governance: EvidenceSourceGovernanceV3;
+  /**
+   * Bounded provider-owned content retained for a selection-grade hosted-web
+   * assertion. It intentionally contains no page body or full provider
+   * response: only the exact cited output span and a safe locator survive.
+   */
+  readonly hostedEvidenceSnapshot?: HostedWebEvidenceSnapshotV3;
   /**
    * Server-issued proof that this binding is eligible to cross the selection
    * boundary. Governance metadata alone describes how a source may be used;
@@ -382,6 +833,40 @@ export interface PlaylistOptimizationSignalsV3 {
 export const PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA =
   "genio-pipeline-v3-evidence-attestation/v1" as const;
 
+export const HOSTED_WEB_EVIDENCE_SNAPSHOT_SCHEMA =
+  "genio-hosted-web-evidence-snapshot/v1" as const;
+
+export const HOSTED_WEB_EVIDENCE_ACQUISITION_POLICY =
+  "hosted-web-evidence-acquisition-v1" as const;
+
+export interface HostedWebEvidenceSnapshotV3 {
+  readonly schemaVersion: typeof HOSTED_WEB_EVIDENCE_SNAPSHOT_SCHEMA;
+  readonly acquisitionPolicyVersion:
+    typeof HOSTED_WEB_EVIDENCE_ACQUISITION_POLICY;
+  readonly sourceUrl: string;
+  readonly excerpt: string;
+  readonly excerptHash: string;
+  readonly providerLocator: {
+    readonly responseId: string;
+    readonly outputItemId: string;
+    readonly contentIndex: number;
+    readonly citationStartIndex: number;
+    readonly citationEndIndex: number;
+    readonly excerptStartIndex: number;
+    readonly excerptEndIndex: number;
+  };
+  readonly acquiredAt: string;
+  readonly storefront: string;
+  readonly freshnessExpiresAt: string;
+  readonly revokedAt: string | null;
+  /** Exact immutable membership predicates supported by this one excerpt. */
+  readonly predicateIds: readonly string[];
+  /** Exact contract obligations this excerpt is allowed to satisfy. */
+  readonly obligationIds: readonly string[];
+  /** Hash of every field above, including the URL and acquisition policy. */
+  readonly snapshotHash: string;
+}
+
 export type EvidenceEligibilityAttestationV3 =
   | {
     readonly schemaVersion: typeof PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA;
@@ -390,6 +875,8 @@ export type EvidenceEligibilityAttestationV3 =
     readonly providerAttested: true;
     readonly sourcePolicyVersion: EvidenceSourceGovernanceV3["policyVersion"];
     readonly sourceUrlHash: string;
+    /** Required when the attested source is a hosted-web evidence snapshot. */
+    readonly sourceSnapshotHash?: string;
   }
   | {
     readonly schemaVersion: typeof PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA;
@@ -413,6 +900,12 @@ export interface EvidenceSourceGovernanceV3 {
   readonly cachePolicy: "excerpt_only" | "full_document_permitted";
   readonly retentionPolicy: "ninety_days" | "durable_public_corpus" | "license_term";
   readonly freshnessPolicy: "immutable_revision" | "revalidate_30d" | "revalidate_90d";
+  /** Persisted provider/corpus expiry. New evidence producers always set it. */
+  readonly freshnessExpiresAt?: string | null;
+  /** Exact acquisition instant for bounded hosted evidence. */
+  readonly acquiredAt?: string | null;
+  /** A non-null timestamp revokes this source for all future selection. */
+  readonly revokedAt?: string | null;
   readonly sourceHash: string;
   readonly sourceRevision: string;
 }
@@ -421,8 +914,438 @@ function sha256EvidenceValue(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const SAFE_PROVIDER_LOCATOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/u;
+const SAFE_EVIDENCE_OBLIGATION_ID = /^[^\u0000-\u001f\u007f]{1,240}$/u;
+const HOSTED_EVIDENCE_FUTURE_SKEW_MS = 5 * 60_000;
+export const HOSTED_WEB_EVIDENCE_MAX_ID_COUNT = 32;
+export const HOSTED_WEB_EVIDENCE_MAX_JSON_BYTES = 24 * 1_024;
+export const HOSTED_WEB_EVIDENCE_MAX_FRESHNESS_MS =
+  30 * 24 * 60 * 60_000;
+export const EVIDENCE_GOVERNANCE_MAX_JSON_BYTES = 8 * 1_024;
+export const EVIDENCE_ATTESTATION_MAX_JSON_BYTES = 4 * 1_024;
+export const EVIDENCE_BINDING_MAX_JSON_BYTES = 48 * 1_024;
+const HOSTED_WEB_EVIDENCE_SNAPSHOT_KEYS = [
+  "schemaVersion",
+  "acquisitionPolicyVersion",
+  "sourceUrl",
+  "excerpt",
+  "excerptHash",
+  "providerLocator",
+  "acquiredAt",
+  "storefront",
+  "freshnessExpiresAt",
+  "revokedAt",
+  "predicateIds",
+  "obligationIds",
+  "snapshotHash",
+] as const;
+const HOSTED_WEB_EVIDENCE_PROVIDER_LOCATOR_KEYS = [
+  "responseId",
+  "outputItemId",
+  "contentIndex",
+  "citationStartIndex",
+  "citationEndIndex",
+  "excerptStartIndex",
+  "excerptEndIndex",
+] as const;
+const EVIDENCE_GOVERNANCE_REQUIRED_KEYS = [
+  "policyVersion",
+  "useScope",
+  "approvalState",
+  "accessMethod",
+  "licenseState",
+  "licenseVersion",
+  "termsVersion",
+  "attribution",
+  "cachePolicy",
+  "retentionPolicy",
+  "freshnessPolicy",
+  "sourceHash",
+  "sourceRevision",
+] as const;
+const EVIDENCE_GOVERNANCE_ALLOWED_KEYS = [
+  ...EVIDENCE_GOVERNANCE_REQUIRED_KEYS,
+  "freshnessExpiresAt",
+  "acquiredAt",
+  "revokedAt",
+] as const;
+const APPROVED_SOURCE_ATTESTATION_REQUIRED_KEYS = [
+  "schemaVersion",
+  "kind",
+  "exactTrackScope",
+  "providerAttested",
+  "sourcePolicyVersion",
+  "sourceUrlHash",
+] as const;
+const APPROVED_SOURCE_ATTESTATION_ALLOWED_KEYS = [
+  ...APPROVED_SOURCE_ATTESTATION_REQUIRED_KEYS,
+  "sourceSnapshotHash",
+] as const;
+const GRAPH_ASSERTION_ATTESTATION_KEYS = [
+  "schemaVersion",
+  "kind",
+  "exactTrackScope",
+  "promoted",
+  "graphSnapshotId",
+  "assertionId",
+  "observationId",
+] as const;
+const EVIDENCE_BINDING_REQUIRED_KEYS = [
+  "id",
+  "url",
+  "provenanceRoot",
+  "strength",
+  "sourceRank",
+  "kind",
+  "governance",
+] as const;
+const EVIDENCE_BINDING_ALLOWED_KEYS = [
+  ...EVIDENCE_BINDING_REQUIRED_KEYS,
+  "predicateIds",
+  "supportedPredicateIds",
+  "hostedEvidenceSnapshot",
+  "eligibilityAttestation",
+] as const;
+
+function hasExactOwnKeys(
+  value: object,
+  expected: readonly string[],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length
+    && keys.every((key) => (
+      typeof key === "string" && expected.includes(key)
+    ));
+}
+
+function hasOnlyOwnKeys(
+  value: object,
+  allowed: readonly string[],
+  required: readonly string[],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.every((key) => (
+    typeof key === "string" && allowed.includes(key)
+  )) && required.every((key) => Object.hasOwn(value, key));
+}
+
+function boundedJsonByteLength(value: unknown): number | null {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  } catch {
+    return null;
+  }
+}
+
+function canonicalEvidenceIds(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => (
+    SAFE_EVIDENCE_OBLIGATION_ID.test(value)
+  )))].sort();
+}
+
+function canonicalIsoInstant(value: string): boolean {
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
+}
+
+function canonicalStorefront(value: string): string {
+  const normalized = value.normalize("NFKC").trim().toLowerCase();
+  if (!/^[a-z]{2}$/u.test(normalized)) {
+    throw new Error("Hosted evidence storefront is invalid");
+  }
+  return normalized;
+}
+
+function hostedWebEvidenceSnapshotRevisionPayloadV3(
+  snapshot: Omit<HostedWebEvidenceSnapshotV3, "snapshotHash">,
+): readonly unknown[] {
+  return [
+    snapshot.schemaVersion,
+    snapshot.acquisitionPolicyVersion,
+    snapshot.sourceUrl,
+    snapshot.excerpt,
+    snapshot.excerptHash,
+    [
+      snapshot.providerLocator.responseId,
+      snapshot.providerLocator.outputItemId,
+      snapshot.providerLocator.contentIndex,
+      snapshot.providerLocator.citationStartIndex,
+      snapshot.providerLocator.citationEndIndex,
+      snapshot.providerLocator.excerptStartIndex,
+      snapshot.providerLocator.excerptEndIndex,
+    ],
+    snapshot.acquiredAt,
+    snapshot.storefront,
+    snapshot.freshnessExpiresAt,
+    snapshot.revokedAt,
+    snapshot.predicateIds,
+    snapshot.obligationIds,
+  ];
+}
+
+export function hostedWebEvidenceSnapshotHashV3(
+  snapshot: Omit<HostedWebEvidenceSnapshotV3, "snapshotHash">,
+): string {
+  return sha256EvidenceValue(JSON.stringify(
+    hostedWebEvidenceSnapshotRevisionPayloadV3(snapshot),
+  ));
+}
+
+export function createHostedWebEvidenceSnapshotV3(input: {
+  sourceUrl: string;
+  excerpt: string;
+  responseId: string;
+  outputItemId: string;
+  contentIndex: number;
+  citationStartIndex: number;
+  citationEndIndex: number;
+  excerptStartIndex: number;
+  excerptEndIndex: number;
+  acquiredAt: string;
+  storefront: string;
+  freshnessExpiresAt: string;
+  revokedAt?: string | null;
+  predicateIds: readonly string[];
+  obligationIds?: readonly string[];
+}): HostedWebEvidenceSnapshotV3 {
+  if (!Array.isArray(input.predicateIds)
+    || !Array.isArray(input.obligationIds ?? input.predicateIds)
+    || input.predicateIds.length > HOSTED_WEB_EVIDENCE_MAX_ID_COUNT
+    || (input.obligationIds ?? input.predicateIds).length
+      > HOSTED_WEB_EVIDENCE_MAX_ID_COUNT) {
+    throw new Error("Hosted evidence snapshot is invalid");
+  }
+  const sourceUrl = assertPublicHttpsUrl(input.sourceUrl).toString();
+  const excerpt = input.excerpt;
+  const predicateIds = canonicalEvidenceIds(input.predicateIds);
+  const obligationIds = canonicalEvidenceIds(
+    input.obligationIds ?? input.predicateIds,
+  );
+  const storefront = canonicalStorefront(input.storefront);
+  if (excerpt.length < 8 || excerpt.length > MAX_CITATION_EXCERPT_CHARS
+    || excerpt.trim() !== excerpt
+    || !SAFE_PROVIDER_LOCATOR_ID.test(input.responseId)
+    || !SAFE_PROVIDER_LOCATOR_ID.test(input.outputItemId)
+    || !Number.isSafeInteger(input.contentIndex)
+    || input.contentIndex < 0
+    || input.contentIndex > 1_000
+    || !Number.isSafeInteger(input.citationStartIndex)
+    || !Number.isSafeInteger(input.citationEndIndex)
+    || !Number.isSafeInteger(input.excerptStartIndex)
+    || !Number.isSafeInteger(input.excerptEndIndex)
+    || input.citationStartIndex < input.excerptStartIndex
+    || input.citationEndIndex <= input.citationStartIndex
+    || input.citationEndIndex > input.excerptEndIndex
+    || input.excerptEndIndex - input.excerptStartIndex !== excerpt.length
+    // A canonical unknown-term discovery hint deliberately has no executable
+    // membership obligation. Its exact-track citation may remain a lead with
+    // two explicitly empty ID sets, but one side may never silently omit IDs
+    // carried by the other.
+    || (predicateIds.length === 0) !== (obligationIds.length === 0)
+    || !canonicalIsoInstant(input.acquiredAt)
+    || !canonicalIsoInstant(input.freshnessExpiresAt)
+    || Date.parse(input.freshnessExpiresAt) <= Date.parse(input.acquiredAt)
+    || Date.parse(input.freshnessExpiresAt) - Date.parse(input.acquiredAt)
+      > HOSTED_WEB_EVIDENCE_MAX_FRESHNESS_MS
+    || (input.revokedAt !== null && input.revokedAt !== undefined
+      && !canonicalIsoInstant(input.revokedAt))) {
+    throw new Error("Hosted evidence snapshot is invalid");
+  }
+  const snapshotWithoutHash: Omit<HostedWebEvidenceSnapshotV3, "snapshotHash"> = {
+    schemaVersion: HOSTED_WEB_EVIDENCE_SNAPSHOT_SCHEMA,
+    acquisitionPolicyVersion: HOSTED_WEB_EVIDENCE_ACQUISITION_POLICY,
+    sourceUrl,
+    excerpt,
+    excerptHash: sha256EvidenceValue(excerpt),
+    providerLocator: {
+      responseId: input.responseId,
+      outputItemId: input.outputItemId,
+      contentIndex: input.contentIndex,
+      citationStartIndex: input.citationStartIndex,
+      citationEndIndex: input.citationEndIndex,
+      excerptStartIndex: input.excerptStartIndex,
+      excerptEndIndex: input.excerptEndIndex,
+    },
+    acquiredAt: input.acquiredAt,
+    storefront,
+    freshnessExpiresAt: input.freshnessExpiresAt,
+    revokedAt: input.revokedAt ?? null,
+    predicateIds,
+    obligationIds,
+  };
+  const snapshot = {
+    ...snapshotWithoutHash,
+    providerLocator: Object.freeze({ ...snapshotWithoutHash.providerLocator }),
+    predicateIds: Object.freeze([...predicateIds]),
+    obligationIds: Object.freeze([...obligationIds]),
+    snapshotHash: hostedWebEvidenceSnapshotHashV3(snapshotWithoutHash),
+  };
+  const byteLength = boundedJsonByteLength(snapshot);
+  if (byteLength === null || byteLength > HOSTED_WEB_EVIDENCE_MAX_JSON_BYTES) {
+    throw new Error("Hosted evidence snapshot is invalid");
+  }
+  return Object.freeze(snapshot);
+}
+
+export interface EvidenceAttestationValidationContextV3 {
+  readonly requireHostedEvidenceSnapshot?: boolean;
+  readonly storefront?: string;
+  readonly requiredObligationIds?: readonly string[];
+  readonly nowEpochMs?: number;
+}
+
+export function hostedWebEvidenceSnapshotIsValidV3(
+  snapshot: HostedWebEvidenceSnapshotV3 | null | undefined,
+  context: EvidenceAttestationValidationContextV3 = {},
+): snapshot is HostedWebEvidenceSnapshotV3 {
+  if (!snapshot
+    || typeof snapshot !== "object"
+    || Array.isArray(snapshot)
+    || !hasExactOwnKeys(snapshot, HOSTED_WEB_EVIDENCE_SNAPSHOT_KEYS)
+    || !snapshot.providerLocator
+    || typeof snapshot.providerLocator !== "object"
+    || Array.isArray(snapshot.providerLocator)
+    || !hasExactOwnKeys(
+      snapshot.providerLocator,
+      HOSTED_WEB_EVIDENCE_PROVIDER_LOCATOR_KEYS,
+    )
+    || !Array.isArray(snapshot.predicateIds)
+    || !Array.isArray(snapshot.obligationIds)
+    || snapshot.predicateIds.length > HOSTED_WEB_EVIDENCE_MAX_ID_COUNT
+    || snapshot.obligationIds.length > HOSTED_WEB_EVIDENCE_MAX_ID_COUNT
+    || (boundedJsonByteLength(snapshot) ?? Number.POSITIVE_INFINITY)
+      > HOSTED_WEB_EVIDENCE_MAX_JSON_BYTES
+    || snapshot.schemaVersion !== HOSTED_WEB_EVIDENCE_SNAPSHOT_SCHEMA
+    || snapshot.acquisitionPolicyVersion
+      !== HOSTED_WEB_EVIDENCE_ACQUISITION_POLICY) return false;
+  let recreated: HostedWebEvidenceSnapshotV3;
+  try {
+    recreated = createHostedWebEvidenceSnapshotV3({
+      sourceUrl: snapshot.sourceUrl,
+      excerpt: snapshot.excerpt,
+      responseId: snapshot.providerLocator.responseId,
+      outputItemId: snapshot.providerLocator.outputItemId,
+      contentIndex: snapshot.providerLocator.contentIndex,
+      citationStartIndex: snapshot.providerLocator.citationStartIndex,
+      citationEndIndex: snapshot.providerLocator.citationEndIndex,
+      excerptStartIndex: snapshot.providerLocator.excerptStartIndex,
+      excerptEndIndex: snapshot.providerLocator.excerptEndIndex,
+      acquiredAt: snapshot.acquiredAt,
+      storefront: snapshot.storefront,
+      freshnessExpiresAt: snapshot.freshnessExpiresAt,
+      revokedAt: snapshot.revokedAt,
+      predicateIds: snapshot.predicateIds,
+      obligationIds: snapshot.obligationIds,
+    });
+  } catch {
+    return false;
+  }
+  const now = context.nowEpochMs ?? Date.now();
+  const requiredObligationIds = canonicalEvidenceIds(
+    context.requiredObligationIds ?? [],
+  );
+  return snapshot.snapshotHash === recreated.snapshotHash
+    && snapshot.excerptHash === recreated.excerptHash
+    && JSON.stringify(snapshot.predicateIds)
+      === JSON.stringify(recreated.predicateIds)
+    && JSON.stringify(snapshot.obligationIds)
+      === JSON.stringify(recreated.obligationIds)
+    && (context.storefront === undefined
+      || snapshot.storefront === canonicalStorefront(context.storefront))
+    && requiredObligationIds.every((id) => (
+      snapshot.obligationIds.includes(id)
+      && snapshot.predicateIds.includes(id)
+    ))
+    && snapshot.revokedAt === null
+    && Date.parse(snapshot.acquiredAt) <= now + HOSTED_EVIDENCE_FUTURE_SKEW_MS
+    && Date.parse(snapshot.freshnessExpiresAt) > now;
+}
+
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function canonicalOptionalInstant(value: unknown): boolean {
+  return value === undefined
+    || value === null
+    || (typeof value === "string" && canonicalIsoInstant(value));
+}
+
+export function evidenceEligibilityAttestationIsValidShapeV3(
+  attestation: EvidenceEligibilityAttestationV3 | null | undefined,
+): attestation is EvidenceEligibilityAttestationV3 {
+  if (!attestation
+    || typeof attestation !== "object"
+    || Array.isArray(attestation)
+    || (boundedJsonByteLength(attestation) ?? Number.POSITIVE_INFINITY)
+      > EVIDENCE_ATTESTATION_MAX_JSON_BYTES
+    || attestation.schemaVersion
+      !== PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA) return false;
+  if (attestation.kind === "approved_exact_track_scope_source") {
+    return hasOnlyOwnKeys(
+      attestation,
+      APPROVED_SOURCE_ATTESTATION_ALLOWED_KEYS,
+      APPROVED_SOURCE_ATTESTATION_REQUIRED_KEYS,
+    )
+      && attestation.exactTrackScope === true
+      && attestation.providerAttested === true
+      && attestation.sourcePolicyVersion === "evidence-source-governance-v3"
+      && /^[0-9a-f]{64}$/u.test(attestation.sourceUrlHash)
+      && (attestation.sourceSnapshotHash === undefined
+        || /^[0-9a-f]{64}$/u.test(attestation.sourceSnapshotHash));
+  }
+  if (attestation.kind === "frozen_promoted_graph_assertion") {
+    return hasExactOwnKeys(attestation, GRAPH_ASSERTION_ATTESTATION_KEYS)
+      && attestation.exactTrackScope === true
+      && attestation.promoted === true
+      && [attestation.graphSnapshotId, attestation.assertionId,
+        attestation.observationId].every((value) => (
+          typeof value === "string"
+          && value.trim() === value
+          && value.length > 0
+          && value.length <= 160
+        ));
+  }
+  return false;
+}
+
+function evidenceBindingHasBoundedShapeV3(
+  binding: EvidenceBindingReferenceV3,
+): boolean {
+  const predicateIds = binding.predicateIds;
+  const supportedPredicateIds = binding.supportedPredicateIds;
+  return hasOnlyOwnKeys(
+    binding,
+    EVIDENCE_BINDING_ALLOWED_KEYS,
+    EVIDENCE_BINDING_REQUIRED_KEYS,
+  )
+    && (boundedJsonByteLength(binding) ?? Number.POSITIVE_INFINITY)
+      <= EVIDENCE_BINDING_MAX_JSON_BYTES
+    && typeof binding.url !== "undefined"
+    && typeof binding.strength === "number"
+    && Number.isFinite(binding.strength)
+    && typeof binding.sourceRank === "number"
+    && Number.isFinite(binding.sourceRank)
+    && nonEmpty(binding.kind)
+    && binding.kind.length <= 160
+    && (!predicateIds || (
+      Array.isArray(predicateIds)
+      && predicateIds.length <= HOSTED_WEB_EVIDENCE_MAX_ID_COUNT
+      && predicateIds.every((id) => (
+        typeof id === "string"
+        && id.trim() === id
+        && SAFE_EVIDENCE_OBLIGATION_ID.test(id)
+      ))
+    ))
+    && (!supportedPredicateIds || (
+      Array.isArray(supportedPredicateIds)
+      && supportedPredicateIds.length <= HOSTED_WEB_EVIDENCE_MAX_ID_COUNT
+      && supportedPredicateIds.every((id) => (
+        typeof id === "string"
+        && id.trim() === id
+        && SAFE_EVIDENCE_OBLIGATION_ID.test(id)
+      ))
+    ));
 }
 
 /**
@@ -434,13 +1357,48 @@ function nonEmpty(value: unknown): value is string {
 export function evidenceSourceGovernanceIsApprovedV3(
   governance: EvidenceSourceGovernanceV3 | null | undefined,
 ): governance is EvidenceSourceGovernanceV3 {
-  if (!governance || governance.policyVersion !== "evidence-source-governance-v3"
+  if (!governance
+    || typeof governance !== "object"
+    || Array.isArray(governance)
+    || !hasOnlyOwnKeys(
+      governance,
+      EVIDENCE_GOVERNANCE_ALLOWED_KEYS,
+      EVIDENCE_GOVERNANCE_REQUIRED_KEYS,
+    )
+    || (boundedJsonByteLength(governance) ?? Number.POSITIVE_INFINITY)
+      > EVIDENCE_GOVERNANCE_MAX_JSON_BYTES
+    || governance.policyVersion !== "evidence-source-governance-v3"
     || governance.approvalState !== "approved"
+    || !["run_local", "durable_corpus"].includes(governance.useScope)
+    || ![
+      "hosted_web_search",
+      "structured_adapter",
+      "public_api",
+      "owner_import",
+      "manual_entry",
+    ].includes(governance.accessMethod)
+    || !["citation_only", "reusable", "permission_recorded"]
+      .includes(governance.licenseState)
     || !nonEmpty(governance.licenseVersion)
+    || governance.licenseVersion.length > 512
     || !nonEmpty(governance.termsVersion)
+    || governance.termsVersion.length > 512
     || !nonEmpty(governance.attribution)
+    || governance.attribution.length > 2_000
+    || !["excerpt_only", "full_document_permitted"]
+      .includes(governance.cachePolicy)
+    || !["ninety_days", "durable_public_corpus", "license_term"]
+      .includes(governance.retentionPolicy)
+    || !["immutable_revision", "revalidate_30d", "revalidate_90d"]
+      .includes(governance.freshnessPolicy)
+    || !canonicalOptionalInstant(governance.freshnessExpiresAt)
+    || !canonicalOptionalInstant(governance.acquiredAt)
+    || !canonicalOptionalInstant(governance.revokedAt)
     || !/^[0-9a-f]{64}$/u.test(governance.sourceHash)
-    || !nonEmpty(governance.sourceRevision)) return false;
+    || !/^[0-9a-f]{64}$/u.test(governance.sourceRevision)
+    || governance.sourceRevision !== governance.sourceHash
+    || (governance.revokedAt !== undefined
+      && governance.revokedAt !== null)) return false;
   return governance.useScope === "durable_corpus"
     ? governance.licenseState !== "citation_only"
       && ["durable_public_corpus", "license_term"].includes(governance.retentionPolicy)
@@ -449,8 +1407,14 @@ export function evidenceSourceGovernanceIsApprovedV3(
 
 export function publicTrackScopeAttestationV3(
   sourceUrl: string,
+  hostedEvidenceSnapshot?: HostedWebEvidenceSnapshotV3,
 ): Extract<EvidenceEligibilityAttestationV3, { kind: "approved_exact_track_scope_source" }> {
   const normalizedUrl = assertPublicHttpsUrl(sourceUrl).toString();
+  if (hostedEvidenceSnapshot
+    && (!hostedWebEvidenceSnapshotIsValidV3(hostedEvidenceSnapshot)
+      || hostedEvidenceSnapshot.sourceUrl !== normalizedUrl)) {
+    throw new Error("Hosted evidence attestation snapshot is invalid");
+  }
   return Object.freeze({
     schemaVersion: PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA,
     kind: "approved_exact_track_scope_source",
@@ -458,16 +1422,42 @@ export function publicTrackScopeAttestationV3(
     providerAttested: true,
     sourcePolicyVersion: "evidence-source-governance-v3",
     sourceUrlHash: sha256EvidenceValue(normalizedUrl),
+    ...(hostedEvidenceSnapshot
+      ? { sourceSnapshotHash: hostedEvidenceSnapshot.snapshotHash }
+      : {}),
   });
 }
 
 export function evidenceBindingIsAttestedForSelectionV3(
   binding: EvidenceBindingReferenceV3 | null | undefined,
+  context: EvidenceAttestationValidationContextV3 = {},
 ): binding is EvidenceBindingReferenceV3 & { eligibilityAttestation: EvidenceEligibilityAttestationV3 } {
-  if (!binding || !nonEmpty(binding.id) || !nonEmpty(binding.provenanceRoot)
+  if (!binding
+    || typeof binding !== "object"
+    || Array.isArray(binding)
+    || !evidenceBindingHasBoundedShapeV3(binding)
+    || !nonEmpty(binding.id)
+    || binding.id.length > 240
+    || !nonEmpty(binding.provenanceRoot)
+    || binding.provenanceRoot.length > 240
     || !evidenceSourceGovernanceIsApprovedV3(binding.governance)
-    || !binding.eligibilityAttestation
-    || binding.eligibilityAttestation.schemaVersion !== PIPELINE_V3_EVIDENCE_ATTESTATION_SCHEMA) return false;
+    || !evidenceEligibilityAttestationIsValidShapeV3(
+      binding.eligibilityAttestation,
+    )) return false;
+  const requiredObligationIds = canonicalEvidenceIds(
+    context.requiredObligationIds ?? [],
+  );
+  const bindingObligationIds = canonicalEvidenceIds(
+    binding.predicateIds ?? binding.supportedPredicateIds ?? [],
+  );
+  if (requiredObligationIds.some((id) => !bindingObligationIds.includes(id))) {
+    return false;
+  }
+  if (binding.governance.freshnessPolicy !== "immutable_revision"
+    && binding.governance.freshnessExpiresAt !== undefined) {
+    const expiresAt = Date.parse(binding.governance.freshnessExpiresAt ?? "");
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return false;
+  }
   let normalizedUrl: string;
   try {
     if (!binding.url) return false;
@@ -477,10 +1467,29 @@ export function evidenceBindingIsAttestedForSelectionV3(
   }
   const attestation = binding.eligibilityAttestation;
   if (attestation.kind === "approved_exact_track_scope_source") {
+    const hostedSnapshotRequired = context.requireHostedEvidenceSnapshot === true
+      && binding.governance.accessMethod === "hosted_web_search";
+    const snapshot = binding.hostedEvidenceSnapshot;
+    const hostedSnapshotValid = !hostedSnapshotRequired && !snapshot
+      ? true
+      : hostedWebEvidenceSnapshotIsValidV3(snapshot, context)
+        && snapshot.sourceUrl === normalizedUrl
+        && binding.governance.accessMethod === "hosted_web_search"
+        && binding.governance.sourceHash === snapshot.snapshotHash
+        && binding.governance.sourceRevision === snapshot.snapshotHash
+        && binding.governance.acquiredAt === snapshot.acquiredAt
+        && binding.governance.freshnessExpiresAt
+          === snapshot.freshnessExpiresAt
+        && binding.governance.revokedAt === snapshot.revokedAt
+        && attestation.sourceSnapshotHash === snapshot.snapshotHash
+        && JSON.stringify(canonicalEvidenceIds(
+          binding.predicateIds ?? binding.supportedPredicateIds ?? [],
+        )) === JSON.stringify(snapshot.predicateIds);
     return attestation.exactTrackScope === true
       && attestation.providerAttested === true
       && attestation.sourcePolicyVersion === binding.governance.policyVersion
-      && attestation.sourceUrlHash === sha256EvidenceValue(normalizedUrl);
+      && attestation.sourceUrlHash === sha256EvidenceValue(normalizedUrl)
+      && hostedSnapshotValid;
   }
   return binding.kind === "governed_graph"
     && binding.governance.useScope === "durable_corpus"
@@ -494,14 +1503,318 @@ export function evidenceBindingIsAttestedForSelectionV3(
 export function attestedEvidenceBindingsForSelectionV3(
   bindingIds: readonly string[],
   bindings: readonly EvidenceBindingReferenceV3[] | null | undefined,
+  context: EvidenceAttestationValidationContextV3 = {},
 ): Array<EvidenceBindingReferenceV3 & { eligibilityAttestation: EvidenceEligibilityAttestationV3 }> {
   const permittedIds = new Set(bindingIds.filter(nonEmpty));
   const attested = (bindings ?? []).filter(
     (binding): binding is EvidenceBindingReferenceV3 & { eligibilityAttestation: EvidenceEligibilityAttestationV3 } => (
-      permittedIds.has(binding.id) && evidenceBindingIsAttestedForSelectionV3(binding)
+      permittedIds.has(binding.id)
+      && evidenceBindingIsAttestedForSelectionV3(binding, context)
     ),
   );
   return [...new Map(attested.map((binding) => [binding.id, binding])).values()];
+}
+
+export interface CanonicalRequiredEvidenceIntegrityV3 {
+  readonly passed: boolean;
+  readonly missingRequiredClauseIds: readonly string[];
+  readonly unattestedEvidenceIds: readonly string[];
+  readonly obligationMismatchClauseIds: readonly string[];
+  readonly evidenceGradeMismatchClauseIds: readonly string[];
+  readonly attestedBindings: readonly (
+    EvidenceBindingReferenceV3 & {
+      eligibilityAttestation: EvidenceEligibilityAttestationV3;
+    }
+  )[];
+}
+
+type CanonicalPredicateV3 = NonNullable<
+  SelectionPlanV3["canonicalContractPolicy"]
+>["trackPredicate"];
+type CanonicalTriStateV3 = ReturnType<
+  typeof evaluateCanonicalContractTrackV1
+>["status"];
+
+function canonicalInvertedStatusV3(
+  status: CanonicalTriStateV3,
+): CanonicalTriStateV3 {
+  return status === "pass" ? "fail" : status === "fail" ? "pass" : "unknown";
+}
+
+function canonicalAllStatusV3(
+  statuses: readonly CanonicalTriStateV3[],
+): CanonicalTriStateV3 {
+  if (statuses.includes("fail")) return "fail";
+  return statuses.includes("unknown") ? "unknown" : "pass";
+}
+
+function canonicalAnyStatusV3(
+  statuses: readonly CanonicalTriStateV3[],
+): CanonicalTriStateV3 {
+  if (statuses.includes("pass")) return "pass";
+  return statuses.includes("unknown") ? "unknown" : "fail";
+}
+
+function canonicalPredicateStatusWithMaskedEvidenceProofV3(input: {
+  predicate: CanonicalPredicateV3;
+  clauseStatuses: Readonly<Record<string, CanonicalTriStateV3>>;
+  unprovenClauseIds: ReadonlySet<string>;
+  restoredClauseIds: ReadonlySet<string>;
+}): CanonicalTriStateV3 {
+  const evaluate = (predicate: CanonicalPredicateV3): CanonicalTriStateV3 => {
+    if (predicate.op === "clause") {
+      return input.unprovenClauseIds.has(predicate.clauseId)
+        && !input.restoredClauseIds.has(predicate.clauseId)
+        ? "unknown"
+        : input.clauseStatuses[predicate.clauseId] ?? "unknown";
+    }
+    if (predicate.op === "not") {
+      return canonicalInvertedStatusV3(evaluate(predicate.child));
+    }
+    if (predicate.op === "except") {
+      return canonicalAllStatusV3([
+        evaluate(predicate.base),
+        canonicalInvertedStatusV3(canonicalAnyStatusV3(
+          predicate.exceptions.map(evaluate),
+        )),
+      ]);
+    }
+    if (predicate.op === "alternative") {
+      return canonicalAnyStatusV3(predicate.choices
+        .slice()
+        .sort((left, right) => (
+          left.priority - right.priority || left.id.localeCompare(right.id)
+        ))
+        .map(({ predicate: choice }) => evaluate(choice)));
+    }
+    const children = predicate.children.map(evaluate);
+    return predicate.op === "all"
+      ? canonicalAllStatusV3(children)
+      : canonicalAnyStatusV3(children);
+  };
+  return evaluate(input.predicate);
+}
+
+/**
+ * Returns one inclusion-minimal set of unproven leaves whose facts the
+ * currently passing Boolean tree actually relies on. Every unproven leaf is
+ * masked simultaneously first. In particular, a policy-level reject/allow
+ * cannot become a factual leaf that NOT or EXCEPT turns into proof.
+ */
+function canonicalEvidenceProofWitnessClauseIdsV3(input: {
+  policy: NonNullable<SelectionPlanV3["canonicalContractPolicy"]>;
+  assessments:
+    | CandidateQualificationV3["canonicalClauseAssessments"]
+    | QualifiedTrackV3["canonicalClauseAssessments"];
+  unprovenClauseIds: ReadonlySet<string>;
+}): Set<string> {
+  const assessments = input.assessments ?? {};
+  const baseline = evaluateCanonicalContractTrackV1({
+    policy: input.policy,
+    assessments,
+  });
+  if (!baseline.eligible || input.unprovenClauseIds.size === 0) {
+    return new Set();
+  }
+  const ordered = input.policy.clauses
+    .filter(({ id }) => input.unprovenClauseIds.has(id))
+    // Prefer a branch where the caller supplied evidence, so a wrong
+    // obligation is reported as such instead of an arbitrary empty sibling.
+    .sort((left, right) => (
+      (assessments[left.id]?.evidenceIds?.length ?? 0)
+        - (assessments[right.id]?.evidenceIds?.length ?? 0)
+      || left.id.localeCompare(right.id)
+    ))
+    .map(({ id }) => id);
+  const statusWith = (
+    restoredClauseIds: ReadonlySet<string>,
+  ): CanonicalTriStateV3 => (
+    canonicalPredicateStatusWithMaskedEvidenceProofV3({
+      predicate: input.policy.trackPredicate,
+      clauseStatuses: baseline.clauseStatuses,
+      unprovenClauseIds: input.unprovenClauseIds,
+      restoredClauseIds,
+    })
+  );
+  if (statusWith(new Set()) === "pass") return new Set();
+  let witness = new Set(ordered);
+  for (const clauseId of ordered) {
+    const withoutClause = new Set(witness);
+    withoutClause.delete(clauseId);
+    if (statusWith(withoutClause) === "pass") witness = withoutClause;
+  }
+  return witness;
+}
+
+/**
+ * Proves every half of canonical external evidence: the assessment references
+ * an attested binding, that exact binding is hash-bound to the clause it is
+ * being used to satisfy, and its server-derived evidence grade is the exact
+ * deterministic grade recorded by the assessment. A globally valid citation
+ * cannot be borrowed for a different obligation or relabeled as a stronger
+ * source class.
+ */
+export function canonicalRequiredEvidenceIntegrityV3(input: {
+  policy: NonNullable<SelectionPlanV3["canonicalContractPolicy"]>;
+  assessments:
+    | CandidateQualificationV3["canonicalClauseAssessments"]
+    | QualifiedTrackV3["canonicalClauseAssessments"];
+  bindingIds: readonly string[];
+  bindings: readonly EvidenceBindingReferenceV3[] | null | undefined;
+  storefront: string;
+}): CanonicalRequiredEvidenceIntegrityV3 {
+  const attestedBindings = attestedEvidenceBindingsForSelectionV3(
+    input.bindingIds,
+    input.bindings,
+    {
+      requireHostedEvidenceSnapshot: true,
+      storefront: input.storefront,
+    },
+  );
+  const attestedIds = new Set(attestedBindings.map(({ id }) => id));
+  const obligationBoundBindings = (
+    clauseId: string,
+    evidenceIds: readonly string[],
+  ): typeof attestedBindings => {
+    if (evidenceIds.length === 0) return [];
+    const bound = attestedEvidenceBindingsForSelectionV3(
+      evidenceIds,
+      input.bindings,
+      {
+        requireHostedEvidenceSnapshot: true,
+        storefront: input.storefront,
+        requiredObligationIds: [clauseId],
+      },
+    );
+    const byId = new Map(bound.map((binding) => [binding.id, binding]));
+    return evidenceIds.every((evidenceId) => byId.has(evidenceId))
+      ? evidenceIds.map((evidenceId) => byId.get(evidenceId)!)
+      : [];
+  };
+  const assessments = input.assessments ?? {};
+  const obligationBoundEvidence = (
+    clauseId: string,
+    evidenceIds: readonly string[],
+  ): boolean => (
+    evidenceIds.length > 0
+    && obligationBoundBindings(clauseId, evidenceIds).length
+      === evidenceIds.length
+  );
+  const evidenceIdsByClause = new Map<string, readonly string[]>();
+  const derivedEvidenceGradeByClause = new Map<string, string | null>();
+  const gradeEligibleClauseIds = new Set<string>();
+  const unprovenClauseIds = new Set<string>();
+  for (const clause of input.policy.clauses) {
+    const assessment = assessments[clause.id];
+    const evidenceIds = [...new Set(
+      (assessment?.evidenceIds ?? [])
+        .filter((id) => typeof id === "string" && id.trim().length > 0),
+    )];
+    evidenceIdsByClause.set(clause.id, evidenceIds);
+    const gradeEligible = playlistEvidenceGradeSatisfiesObligationV1({
+      grade: assessment?.evidenceGrade,
+      obligation: clause.evidence,
+      evidencePolicyVersion: input.policy.evidencePolicyVersion,
+      strengthPolicyVersion: input.policy.evidenceStrengthPolicyVersion,
+    });
+    if (gradeEligible) gradeEligibleClauseIds.add(clause.id);
+    const boundBindings = obligationBoundBindings(clause.id, evidenceIds);
+    const derivedEvidenceGrade = boundBindings.length === evidenceIds.length
+      && evidenceIds.length > 0
+      ? selectQualifyingPlaylistEvidenceGradeV1({
+          grades: boundBindings.map((binding) => (
+            canonicalEvidenceGradeForBindingV1({
+              kind: binding.kind,
+              accessMethod: binding.governance.accessMethod,
+            })
+          )),
+          obligation: clause.evidence,
+          evidencePolicyVersion: input.policy.evidencePolicyVersion,
+          strengthPolicyVersion:
+            input.policy.evidenceStrengthPolicyVersion,
+        })
+      : null;
+    derivedEvidenceGradeByClause.set(clause.id, derivedEvidenceGrade);
+    const externalEvidenceGradeMatches = derivedEvidenceGrade !== null
+      && derivedEvidenceGrade === assessment?.evidenceGrade;
+    const permittedPositiveStructuredMetadataWithoutBinding =
+      assessment?.status === "pass"
+      && evidenceIds.length === 0
+      && assessment.evidenceGrade
+        === "authoritative_structured_metadata";
+    const proofComplete = assessment?.status === "pass"
+      ? gradeEligible && (
+        permittedPositiveStructuredMetadataWithoutBinding
+        || externalEvidenceGradeMatches
+      )
+      : assessment?.status === "fail"
+        // A negative observation is never self-authenticating, including when
+        // its asserted grade is structured/catalog metadata.
+        ? gradeEligible && externalEvidenceGradeMatches
+        : false;
+    if (!proofComplete) unprovenClauseIds.add(clause.id);
+  }
+  const baseline = evaluateCanonicalContractTrackV1({
+    policy: input.policy,
+    assessments,
+  });
+  const evidentialPredicateStatus =
+    canonicalPredicateStatusWithMaskedEvidenceProofV3({
+      predicate: input.policy.trackPredicate,
+      clauseStatuses: baseline.clauseStatuses,
+      unprovenClauseIds,
+      restoredClauseIds: new Set(),
+    });
+  const evidenceProofWitnessClauseIds =
+    canonicalEvidenceProofWitnessClauseIdsV3({
+      policy: input.policy,
+      assessments,
+      unprovenClauseIds,
+    });
+  const missingRequiredClauseIds: string[] = [];
+  const unattestedEvidenceIds = new Set<string>();
+  const obligationMismatchClauseIds: string[] = [];
+  const evidenceGradeMismatchClauseIds: string[] = [];
+  for (const clause of input.policy.clauses) {
+    const assessment = assessments[clause.id];
+    const evidenceIds = evidenceIdsByClause.get(clause.id) ?? [];
+    for (const evidenceId of evidenceIds) {
+      if (!attestedIds.has(evidenceId)) unattestedEvidenceIds.add(evidenceId);
+    }
+    const requiresExternalEvidence = (clause.evidence.required
+      && assessment?.status === "pass"
+      && !(assessment.evidenceGrade
+          === "authoritative_structured_metadata"
+        && evidenceIds.length === 0))
+      || evidenceProofWitnessClauseIds.has(clause.id);
+    if (!requiresExternalEvidence) continue;
+    if (evidenceIds.length === 0
+      || (evidenceProofWitnessClauseIds.has(clause.id)
+        && !gradeEligibleClauseIds.has(clause.id))) {
+      missingRequiredClauseIds.push(clause.id);
+      continue;
+    }
+    if (!obligationBoundEvidence(clause.id, evidenceIds)) {
+      obligationMismatchClauseIds.push(clause.id);
+      continue;
+    }
+    if (derivedEvidenceGradeByClause.get(clause.id)
+      !== assessment?.evidenceGrade) {
+      evidenceGradeMismatchClauseIds.push(clause.id);
+    }
+  }
+  return {
+    passed: evidentialPredicateStatus === "pass"
+      && missingRequiredClauseIds.length === 0
+      && unattestedEvidenceIds.size === 0
+      && obligationMismatchClauseIds.length === 0
+      && evidenceGradeMismatchClauseIds.length === 0,
+    missingRequiredClauseIds,
+    unattestedEvidenceIds: [...unattestedEvidenceIds],
+    obligationMismatchClauseIds,
+    evidenceGradeMismatchClauseIds,
+    attestedBindings,
+  };
 }
 
 export function qualifiedTrackHasAttestedEvidenceV3(track: QualifiedTrackV3): boolean {
@@ -527,12 +1840,24 @@ export interface QualifiedTrackV3 {
   readonly sourceObservationIds: readonly string[];
   readonly evidenceBindingIds: readonly string[];
   readonly evidenceBindings?: readonly EvidenceBindingReferenceV3[];
+  readonly discoveryDependencyIds?: readonly RetrievalUpstreamDependencyIdV3[];
+  readonly provenanceRoots?: readonly string[];
+  readonly cacheOrigin?:
+    | "live"
+    | "fresh_cache"
+    | "governed_snapshot"
+    | "orchestration_local"
+    | "unknown";
+  readonly sourceFreshUntil?: string | null;
   /** Retained so publication can re-evaluate the same immutable predicate. */
   readonly canonicalClauseAssessments?: Readonly<
     Record<string, CanonicalPlaylistContractClauseAssessmentV1>
   >;
   /** Ranking-only values retained so retries and publication revalidation are deterministic. */
   readonly playlistOptimizationSignals?: PlaylistOptimizationSignalsV3;
+  /** Persisted verbatim through checkpoint, continuation, and publication. */
+  readonly centralQualityCriterionObservations?:
+    readonly CentralQualityCriterionObservationV3[];
   readonly evidenceStrength: number;
   readonly scopeFit: number;
   readonly independentProvenanceRoots: number;
@@ -584,9 +1909,23 @@ export interface DiscoveryBatchV3 {
   readonly candidates: readonly RawTrackCandidateV3[];
   readonly nextCursor: string | null;
   readonly exhausted: boolean;
+  /** Hash-bound identity and enumeration truth for typed fixed containers. */
+  readonly fixedContainerResolution?: FixedContainerResolutionProofV1;
   readonly providerCircuitOpen?: boolean;
   /** Opaque accounting units bounded by the orchestration policy. */
   readonly costUnits?: number;
+  /**
+   * Server-adapter-owned provenance. Candidate/provider metadata is untrusted
+   * and cannot choose a cache classification or extend freshness.
+   */
+  readonly provenance?: {
+    readonly cacheOrigin:
+      | "live"
+      | "fresh_cache"
+      | "governed_snapshot"
+      | "orchestration_local";
+    readonly sourceFreshUntil: string | null;
+  };
 }
 
 export interface QualificationRequestV3 {
@@ -611,6 +1950,7 @@ export interface RetrievalAdaptersV3 {
 export type CandidateDeficitReasonV3 =
   | "invalid_candidate_shape"
   | "candidate_already_seen"
+  | "stale_cache_lead"
   | "qualification_missing"
   | "scope_membership_failed"
   | "hard_constraint_failed"
@@ -674,10 +2014,13 @@ export interface RetrievalStrategyReportV3 {
   readonly consecutiveZeroQualifiedYieldRounds: number;
   readonly providerFailures: number;
   readonly cursor: string | null;
+  readonly fixedContainerResolution?: FixedContainerResolutionProofV1;
 }
 
 export interface RetrievalDependencyOutageReportV3 {
   readonly dependencyId: RetrievalUpstreamDependencyIdV3;
+  /** Typed cause retained through checkpoints and durable worker retries. */
+  readonly failureClass?: RetrievalDependencyFailureClassV3;
   /**
    * Contiguous outages, not failed strategy calls. Repeated failures from
    * strategies sharing one still-unhealthy upstream remain one outage.
@@ -686,6 +2029,8 @@ export interface RetrievalDependencyOutageReportV3 {
   readonly failureAttempts: number;
   readonly active: boolean;
   readonly circuitOpen: boolean;
+  /** Exact provider-owned retry boundary, retained as an absolute instant. */
+  readonly retryAfterUntil?: string | null;
   readonly affectedStrategyIds: readonly string[];
 }
 
@@ -773,11 +2118,25 @@ export interface RetrievalResultV3 {
  * recordings remain in the pool so the successor result is cumulative.
  */
 export interface RetrievalContinuationSeedV3 {
+  /** False for an optimizer-only successor lease; no discovery/qualification call may run. */
+  readonly providerCallPermitted?: boolean;
   readonly approvedStrategyIds: readonly string[];
+  /** Semantics-preserving active plan snapshot when recovery preceded compute retry. */
+  readonly selectionPlan?: SelectionPlanV3;
   readonly qualifiedTracks: readonly QualifiedTrackV3[];
   readonly compatibleAlternatesByRecordingFamily: Readonly<Record<string, readonly QualifiedTrackV3[]>>;
   readonly stages: RetrievalStageCountersV3;
   readonly strategies: readonly RetrievalStrategyReportV3[];
+}
+
+export class RetrievalPlaylistOptimizationBudgetExceededErrorV3
+  extends PlaylistOptimizationBudgetExceededErrorV1 {
+  constructor(
+    message: string,
+    readonly retrySeed: RetrievalContinuationSeedV3,
+  ) {
+    super(message);
+  }
 }
 
 export interface RetrievalPolicyV3 {
@@ -785,6 +2144,8 @@ export interface RetrievalPolicyV3 {
   /** Maximum genuinely independent discovery calls in one portfolio wave. */
   readonly maximumConcurrentDiscovery?: number;
   readonly maximumRawCandidates: number;
+  /** Frozen pre-catalog/evidence discovery input target. */
+  readonly candidateGoal?: number;
   /** Frozen qualified-pool goal; absent only on legacy/direct callers. */
   readonly qualifiedPoolGoal?: number;
   readonly maximumCostUnits: number;
@@ -812,6 +2173,7 @@ interface MutableStrategyStateV3 {
   providerFailures: number;
   cursor: string | null;
   seenCursors: Set<string>;
+  fixedContainerResolution: FixedContainerResolutionProofV1 | null;
 }
 
 interface MutableDependencyStateV3 {
@@ -822,6 +2184,8 @@ interface MutableDependencyStateV3 {
   circuitOpen: boolean;
   affectedStrategyIds: Set<string>;
   unresolvedStrategyIds: Set<string>;
+  retryAfterUntilByStrategy: Map<string, Date>;
+  failureClassByStrategy: Map<string, RetrievalDependencyFailureClassV3>;
 }
 
 type PendingDiscoveryAttemptV3 = {
@@ -852,8 +2216,51 @@ interface RawCandidateLedgerEntryV3 {
   candidate: RawTrackCandidateV3;
   candidateIds: Set<string>;
   strategyId: string;
+  discoveryDependencyIds: Set<RetrievalUpstreamDependencyIdV3>;
+  provenanceRoots: Set<string>;
+  cacheOrigin:
+    | "live"
+    | "fresh_cache"
+    | "governed_snapshot"
+    | "orchestration_local"
+    | "unknown";
+  sourceFreshUntil: string | null;
   predicateCoverage: Set<string>;
   rejectionCode: string | null;
+}
+
+const CACHE_ORIGINS_V3 = new Set([
+  "live", "fresh_cache", "governed_snapshot", "orchestration_local",
+]);
+
+function discoveryCacheOriginV3(
+  dependencyIds: readonly RetrievalUpstreamDependencyIdV3[],
+  provenance: DiscoveryBatchV3["provenance"],
+): RawCandidateLedgerEntryV3["cacheOrigin"] {
+  if (dependencyIds.includes("governed_evidence_graph")) return "governed_snapshot";
+  if (dependencyIds.length === 1 && dependencyIds[0] === "orchestration_local") {
+    return "orchestration_local";
+  }
+  if (provenance && CACHE_ORIGINS_V3.has(provenance.cacheOrigin)) {
+    return provenance.cacheOrigin;
+  }
+  // An adapter that omitted or malformed server-owned provenance has not
+  // proved a live observation. Keep it explicitly unattributed so the
+  // cache/concentration policy can fail closed; candidate-supplied metadata
+  // is never consulted here.
+  return "unknown";
+}
+
+function discoveryFreshUntilV3(
+  provenance: DiscoveryBatchV3["provenance"],
+  observedAtEpochMs = Date.now(),
+): string | null {
+  const value = provenance?.sourceFreshUntil;
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed > observedAtEpochMs
+    ? new Date(parsed).toISOString()
+    : null;
 }
 
 function boundedInteger(value: number, label: string, minimum: number, maximum: number): number {
@@ -1034,7 +2441,18 @@ function continuationTrackIntegrityReason(
     || !nonEmpty(track.appleSongId)
     || !nonEmpty(track.recordingFamilyKey)) return "catalog_identity_missing";
   if (!(track.catalogConfidence > 0)) return "storefront_unavailable";
-  if (!(track.versionConfidence > 0)) return "version_incompatible";
+  if (track.cacheOrigin === "fresh_cache") {
+    const expiresAt = Date.parse(track.sourceFreshUntil ?? "");
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      return "stale_cache_lead";
+    }
+  }
+  // Schema-4 catalog/version leaves are part of the canonical Boolean tree.
+  // The legacy flattened version confidence is not an independent gate for
+  // OR/NOT/EXCEPT contracts.
+  if (!plan.canonicalContractPolicy && !(track.versionConfidence > 0)) {
+    return "version_incompatible";
+  }
 
   if (catalogEraConstraintFailuresV3(
     plan,
@@ -1047,6 +2465,10 @@ function continuationTrackIntegrityReason(
   const bindings = attestedEvidenceBindingsForSelectionV3(
     track.evidenceBindingIds,
     track.evidenceBindings,
+    plan.canonicalContractPolicy ? {
+      requireHostedEvidenceSnapshot: true,
+      storefront: plan.storefront,
+    } : {},
   );
   if (plan.canonicalContractPolicy) {
     const evaluation = evaluateCanonicalContractTrackV1({
@@ -1058,19 +2480,14 @@ function continuationTrackIntegrityReason(
         ? "canonical_contract_unknown"
         : "canonical_contract_failed";
     }
-    const attestedIds = new Set(bindings.map(({ id }) => id));
-    const assessments = track.canonicalClauseAssessments ?? {};
-    const referenced = Object.values(assessments)
-      .flatMap(({ evidenceIds }) => evidenceIds ?? []);
-    const missingRequiredEvidenceReference = plan.canonicalContractPolicy.clauses.some((clause) => {
-      const assessment = assessments[clause.id];
-      return clause.evidence.required
-        && assessment?.status === "pass"
-        && assessment.evidenceGrade !== "authoritative_structured_metadata"
-        && (assessment.evidenceIds?.length ?? 0) === 0;
+    const evidenceIntegrity = canonicalRequiredEvidenceIntegrityV3({
+      policy: plan.canonicalContractPolicy,
+      assessments: track.canonicalClauseAssessments,
+      bindingIds: track.evidenceBindingIds,
+      bindings: track.evidenceBindings,
+      storefront: plan.storefront,
     });
-    if (missingRequiredEvidenceReference
-      || referenced.some((id) => !attestedIds.has(id))) {
+    if (!evidenceIntegrity.passed) {
       return "evidence_attestation_missing";
     }
     return null;
@@ -1123,6 +2540,11 @@ function mergeQualifiedTrack(
     const key = dimension as RankingObjectiveV3["dimension"];
     rankingSignals[key] = Math.max(rankingSignals[key] ?? 0, value ?? 0);
   }
+  const centralQualityCriterionObservations = [...new Map([
+    ...(existing.centralQualityCriterionObservations ?? []),
+    ...(incoming.centralQualityCriterionObservations ?? []),
+  ].map((observation) => [observation.observationId, observation])).values()]
+    .sort((left, right) => left.observationId.localeCompare(right.observationId));
   const provenanceRoots = new Set(bindings.map(({ provenanceRoot }) => provenanceRoot)).size;
   const canonicalReleaseYear = (candidateReleaseYear: number | null, compatibleReleaseYears: readonly number[]) => (
     [candidateReleaseYear, ...compatibleReleaseYears]
@@ -1144,6 +2566,31 @@ function mergeQualifiedTrack(
     sourceObservationIds: observations,
     evidenceBindingIds: bindingIds,
     evidenceBindings: bindings,
+    discoveryDependencyIds: [...new Set([
+      ...(existing.discoveryDependencyIds ?? []),
+      ...(incoming.discoveryDependencyIds ?? []),
+    ])].sort(),
+    provenanceRoots: [...new Set([
+      ...(existing.provenanceRoots ?? []),
+      ...(incoming.provenanceRoots ?? []),
+      ...bindings.map(({ provenanceRoot }) => provenanceRoot),
+    ])].sort(),
+    cacheOrigin: existing.cacheOrigin === "live" || incoming.cacheOrigin === "live"
+      ? "live"
+      : existing.cacheOrigin === "fresh_cache" || incoming.cacheOrigin === "fresh_cache"
+        ? "fresh_cache"
+        : existing.cacheOrigin === "governed_snapshot"
+            || incoming.cacheOrigin === "governed_snapshot"
+          ? "governed_snapshot"
+          : existing.cacheOrigin === "orchestration_local"
+              || incoming.cacheOrigin === "orchestration_local"
+            ? "orchestration_local"
+            : "unknown",
+    sourceFreshUntil: [
+      existing.sourceFreshUntil,
+      incoming.sourceFreshUntil,
+    ].filter((value): value is string => typeof value === "string")
+      .sort()[0] ?? null,
     canonicalClauseAssessments: existing.canonicalClauseAssessments
       ? structuredClone(existing.canonicalClauseAssessments)
       : incoming.canonicalClauseAssessments
@@ -1153,6 +2600,9 @@ function mergeQualifiedTrack(
       existing.playlistOptimizationSignals,
       incoming.playlistOptimizationSignals,
     ),
+    ...(centralQualityCriterionObservations.length > 0 ? {
+      centralQualityCriterionObservations,
+    } : {}),
     evidenceStrength: Math.max(existing.evidenceStrength, incoming.evidenceStrength),
     scopeFit: Math.max(existing.scopeFit, incoming.scopeFit),
     independentProvenanceRoots: Math.max(
@@ -1183,6 +2633,8 @@ function mergeQualifiedTrack(
       || track.versionConfidence > existing.versionConfidence
       || track.catalogConfidence > existing.catalogConfidence
       || track.sourceRank < existing.sourceRank
+      || centralQualityCriterionObservations.length
+        > (existing.centralQualityCriterionObservations?.length ?? 0)
       || Object.entries(track.rankingSignals).some(([dimension, value]) => (
         (value ?? 0) > (existing.rankingSignals[dimension as RankingObjectiveV3["dimension"]] ?? 0)
       )),
@@ -1259,7 +2711,7 @@ function normalizeIdentity(value: string): string {
 
 function minimumNullable(...values: Array<number | null | undefined>): number | null {
   const candidates = values.filter(
-    (value): value is number => Number.isSafeInteger(value) && Number(value) >= 1,
+    (value): value is number => Number.isSafeInteger(value) && Number(value) >= 0,
   );
   return candidates.length > 0 ? Math.min(...candidates) : null;
 }
@@ -1315,6 +2767,7 @@ function playlistOptimizationConstraintsV3(
   const hardAlbumMaximum = maximumConstraint(plan.hardConstraints, "album", "hard");
   const familiarity = familiarityBoundsV3(plan, target);
   const quality = plan.playlistQualityPolicy;
+  const openWorldCurated = plan.scopeKind === "broad_curated";
   // Canonical projections have no relaxation ladder: every non-null goal was
   // compiled from an immutable playlist clause. A legacy plan with a policy
   // overlaid during mixed-version drain keeps its historical soft goals.
@@ -1329,6 +2782,19 @@ function playlistOptimizationConstraintsV3(
       hardAlbumMaximum,
       immutableDiversity ? plan.diversityGoals.maximumTracksPerAlbum : null,
     ),
+    // These portfolio concentration guards protect open-world curation. A
+    // fixed container, artist catalogue, or factual enumeration can
+    // legitimately come from one authoritative source/dependency and must not
+    // be converted into a false policy shortfall for doing so.
+    maximumTracksPerSource: openWorldCurated
+      ? Math.max(2, Math.ceil(target * 0.6))
+      : null,
+    maximumTracksPerDependency: openWorldCurated
+      ? Math.max(3, Math.ceil(target * 0.85))
+      : null,
+    maximumFreshCacheTracks: openWorldCurated
+      ? Math.max(1, Math.floor(target * 0.5))
+      : null,
     minimumDistinctArtists: immutableDiversity
       ? Math.max(0, plan.diversityGoals.minimumDistinctArtists ?? 0)
       : 0,
@@ -1354,6 +2820,18 @@ function playlistOptimizationConstraintsV3(
       ? Math.floor(target * quality.maximumUnknownRatio)
       : target,
     zeroCentralQualityFailures: quality?.zeroKnownFailures ?? false,
+    canonicalQuotaRules: (plan.playlistQuotaRules ?? []).map((rule) => ({
+      id: rule.id,
+      minimumCount: Math.max(
+        rule.minimumCount ?? 0,
+        rule.minimumRatio === null ? 0 : Math.ceil(target * rule.minimumRatio),
+      ),
+      maximumCount: Math.min(
+        target,
+        rule.maximumCount ?? target,
+        rule.maximumRatio === null ? target : Math.floor(target * rule.maximumRatio),
+      ),
+    })),
     sequencingMode: plan.orderingPolicy.mode,
     avoidAdjacentSameArtist: plan.orderingPolicy.avoidAdjacentSameArtist,
     avoidAdjacentSameAlbum: plan.orderingPolicy.avoidAdjacentSameAlbum,
@@ -1376,9 +2854,21 @@ function playlistOptimizationCandidateV3(
     ?? (typeof track.rankingSignals.influence === "number"
       ? boundedFinite(track.rankingSignals.influence)
       : null);
+  const provenanceRoots = normalizedOptimizationSignalKeys(
+    track.provenanceRoots,
+  );
+  const evidenceProvenanceRoots = normalizedOptimizationSignalKeys(
+    track.evidenceBindings?.map(({ provenanceRoot }) => provenanceRoot),
+  );
+  const dependencyIds = normalizedOptimizationSignalKeys(
+    track.discoveryDependencyIds,
+  );
   return {
     id: track.candidateId,
     recordingFamilyKey: track.recordingFamilyKey,
+    sourceOrder: Number.isSafeInteger(track.sourceRank) && track.sourceRank >= 0
+      ? track.sourceRank
+      : Number.MAX_SAFE_INTEGER,
     artistKey: normalizeIdentity(track.artist),
     albumKey: track.album ? normalizeIdentity(`${track.artist}\u0000${track.album}`) : null,
     relevanceScore: boundedFinite(
@@ -1401,12 +2891,24 @@ function playlistOptimizationCandidateV3(
       ...(signals?.geographyKeys ?? []),
       ...canonicalPassedValuesForAxesV3(track, plan, ["geography"]),
     ]),
+    sourceKeys: provenanceRoots.length > 0
+      ? provenanceRoots
+      : evidenceProvenanceRoots.length > 0
+        ? evidenceProvenanceRoots
+        : ["__unattributed_source"],
+    dependencyKeys: dependencyIds.length > 0
+      ? dependencyIds
+      : ["__unattributed_dependency"],
+    cacheOrigin: track.cacheOrigin ?? "unknown",
     energy: signals?.energy ?? null,
     tempo: signals?.tempo ?? null,
     chronologyPosition: releaseYear,
     centralQualityVerdict: plan.playlistQualityPolicy
       ? centralQualityVerdictV3(track, plan.playlistQualityPolicy)
       : "pass",
+    canonicalQuotaRuleIds: (plan.playlistQuotaRules ?? []).filter((rule) => (
+      trackMatchesCanonicalQuotaV3(track, rule, plan.canonicalContractPolicy)
+    )).map(({ id }) => id),
   };
 }
 
@@ -1440,7 +2942,7 @@ function maximumConstraint(
       && constraint.operator === "maximum")
     .flatMap((constraint) => constraint.values)
     .map(Number)
-    .filter((value) => Number.isSafeInteger(value) && value >= 1);
+    .filter((value) => Number.isSafeInteger(value) && value >= 0);
   return limits.length > 0 ? Math.min(...limits) : null;
 }
 
@@ -1590,10 +3092,24 @@ export function trackMatchesCanonicalQuotaV3(
   });
 }
 
+export class CanonicalQuotaOptimizationBudgetExceededErrorV3
+  extends PlaylistOptimizationBudgetExceededErrorV1 {
+}
+
 /**
  * Enforce the immutable distribution rules without filler. The deterministic
- * repair pass supports intersecting quotas; if the ranked pool cannot produce
+ * optimizer supports intersecting quotas; if the ranked pool cannot produce
  * the requested size, it returns the largest proven-compliant partial.
+ *
+ * Quota selection is a bounded 0/1 feasibility problem. A one-rule-at-a-time
+ * swap repair can oscillate between overlapping rules (for example A-only and
+ * B-only) even when A+B or an A/B intersection is feasible. The exact search
+ * below considers the complete rule vector at every branch, includes stronger
+ * ranked candidates first, and prunes branches that can no longer reach a
+ * lower bound or avoid an upper bound. A bounded, strictly improving repair is
+ * retained for unusually large/adversarial pools after the exact node budget
+ * is exhausted. That fallback never returns a non-compliant set and cannot
+ * oscillate because every accepted swap strictly decreases total violation.
  */
 export function selectWithCanonicalQuotaV3(input: {
   ranked: readonly QualifiedTrackV3[];
@@ -1602,10 +3118,8 @@ export function selectWithCanonicalQuotaV3(input: {
   policy?: SelectionPlanV3["canonicalContractPolicy"];
 }): QualifiedTrackV3[] {
   if (input.rules.length === 0) return input.ranked.slice(0, input.target);
-  const match = new Map<string, boolean[]>();
-  input.ranked.forEach((track) => match.set(
-    track.candidateId,
-    input.rules.map((rule) => trackMatchesCanonicalQuotaV3(track, rule, input.policy)),
+  const matches = input.ranked.map((track) => (
+    input.rules.map((rule) => trackMatchesCanonicalQuotaV3(track, rule, input.policy))
   ));
   const bounds = (total: number, rule: CanonicalPlaylistQuotaRule) => ({
     minimum: Math.max(
@@ -1617,48 +3131,183 @@ export function selectWithCanonicalQuotaV3(input: {
       rule.maximumRatio === null ? total : Math.floor(total * rule.maximumRatio),
     ),
   });
-  const counts = (selected: readonly QualifiedTrackV3[]) => input.rules.map((_, ruleIndex) => (
-    selected.filter((track) => match.get(track.candidateId)?.[ruleIndex]).length
+  const countsForIndices = (selected: readonly number[]) => input.rules.map((_, ruleIndex) => (
+    selected.reduce(
+      (count, trackIndex) => count + (matches[trackIndex]?.[ruleIndex] ? 1 : 0),
+      0,
+    )
   ));
-  const compliant = (selected: readonly QualifiedTrackV3[]) => {
-    const observed = counts(selected);
+  const compliant = (selected: readonly number[], total: number) => {
+    const observed = countsForIndices(selected);
     return input.rules.every((rule, index) => {
-      const limit = bounds(selected.length, rule);
+      const limit = bounds(total, rule);
       return limit.minimum <= limit.maximum
         && observed[index]! >= limit.minimum
         && observed[index]! <= limit.maximum;
     });
   };
 
-  for (let total = Math.min(input.target, input.ranked.length); total > 0; total -= 1) {
-    const chosen = new Set(input.ranked.slice(0, total).map(({ candidateId }) => candidateId));
-    const selected = () => input.ranked.filter(({ candidateId }) => chosen.has(candidateId));
-    const outside = () => input.ranked.filter(({ candidateId }) => !chosen.has(candidateId));
-    const maximumRepairs = Math.max(1, input.rules.length * total * 4);
-    for (let attempt = 0; attempt < maximumRepairs && !compliant(selected()); attempt += 1) {
-      const current = selected();
-      const observed = counts(current);
-      const deficitRuleIndex = input.rules.findIndex((rule, index) => (
-        observed[index]! < bounds(total, rule).minimum
-      ));
-      const excessRuleIndex = input.rules.findIndex((rule, index) => (
-        observed[index]! > bounds(total, rule).maximum
-      ));
-      const focus = deficitRuleIndex >= 0 ? deficitRuleIndex : excessRuleIndex;
-      if (focus < 0) break;
-      const needMatch = deficitRuleIndex >= 0;
-      const incoming = outside().find((track) => (
-        Boolean(match.get(track.candidateId)?.[focus]) === needMatch
-      ));
-      const outgoing = [...current].reverse().find((track) => (
-        Boolean(match.get(track.candidateId)?.[focus]) !== needMatch
-      ));
-      if (!incoming || !outgoing) break;
-      chosen.delete(outgoing.candidateId);
-      chosen.add(incoming.candidateId);
+  const suffixMatches = input.rules.map((_, ruleIndex) => {
+    const suffix = new Array<number>(input.ranked.length + 1).fill(0);
+    for (let index = input.ranked.length - 1; index >= 0; index -= 1) {
+      suffix[index] = suffix[index + 1]! + (matches[index]?.[ruleIndex] ? 1 : 0);
     }
-    const repaired = selected();
-    if (repaired.length === total && compliant(repaired)) return repaired;
+    return suffix;
+  });
+  const activeBudget = activePlaylistOptimizationBudgetV1();
+  let remainingExactNodes = activeBudget.maximumExactNodes;
+  let remainingRepairEvaluations = activeBudget.maximumExactWorkUnits;
+  let optimizationBudgetExhausted = false;
+
+  const exactSelection = (total: number): {
+    selected: number[] | null;
+    exhausted: boolean;
+  } => {
+    const limits = input.rules.map((rule) => bounds(total, rule));
+    if (limits.some(({ minimum, maximum }) => minimum > maximum)) {
+      return { selected: null, exhausted: false };
+    }
+    const globallyInfeasible = limits.some((limit, ruleIndex) => {
+      const matching = suffixMatches[ruleIndex]![0]!;
+      const nonMatching = input.ranked.length - matching;
+      return Math.min(total, matching) < limit.minimum
+        || Math.max(0, total - nonMatching) > limit.maximum;
+    });
+    if (globallyInfeasible) return { selected: null, exhausted: false };
+    const selected: number[] = [];
+    const observed = input.rules.map(() => 0);
+    let exhausted = false;
+
+    const search = (index: number): boolean => {
+      remainingExactNodes -= 1;
+      if (remainingExactNodes < 0) {
+        exhausted = true;
+        optimizationBudgetExhausted = true;
+        return false;
+      }
+      const needed = total - selected.length;
+      const available = input.ranked.length - index;
+      if (needed < 0 || available < needed) return false;
+      for (let ruleIndex = 0; ruleIndex < input.rules.length; ruleIndex += 1) {
+        const limit = limits[ruleIndex]!;
+        const current = observed[ruleIndex]!;
+        if (current > limit.maximum) return false;
+        const matchingAvailable = suffixMatches[ruleIndex]![index]!;
+        if (current + Math.min(needed, matchingAvailable) < limit.minimum) return false;
+        const nonMatchingAvailable = available - matchingAvailable;
+        const forcedAdditionalMatches = Math.max(0, needed - nonMatchingAvailable);
+        if (current + forcedAdditionalMatches > limit.maximum) return false;
+      }
+      if (needed === 0) return true;
+      if (index >= input.ranked.length) return false;
+
+      // Include-first DFS returns the lexicographically earliest ranked
+      // feasible subset, preserving the immutable rank preference exactly.
+      selected.push(index);
+      for (let ruleIndex = 0; ruleIndex < input.rules.length; ruleIndex += 1) {
+        if (matches[index]?.[ruleIndex]) observed[ruleIndex]! += 1;
+      }
+      if (search(index + 1)) return true;
+      for (let ruleIndex = 0; ruleIndex < input.rules.length; ruleIndex += 1) {
+        if (matches[index]?.[ruleIndex]) observed[ruleIndex]! -= 1;
+      }
+      selected.pop();
+      if (exhausted) return false;
+      return search(index + 1);
+    };
+
+    return search(0)
+      ? { selected: [...selected], exhausted: false }
+      : { selected: null, exhausted };
+  };
+
+  const violation = (
+    selected: readonly number[],
+    total: number,
+  ): number => {
+    const observed = countsForIndices(selected);
+    return input.rules.reduce((score, rule, index) => {
+      const limit = bounds(total, rule);
+      if (limit.minimum > limit.maximum) return score + total + 1;
+      return score
+        + Math.max(0, limit.minimum - observed[index]!)
+        + Math.max(0, observed[index]! - limit.maximum);
+    }, 0);
+  };
+
+  const deterministicRepair = (total: number): number[] | null => {
+    const selected = Array.from({ length: total }, (_, index) => index);
+    if (selected.length !== total) return null;
+    let currentViolation = violation(selected, total);
+    if (currentViolation === 0) return selected;
+    const selectedSet = new Set(selected);
+    const maximumRounds = Math.max(1, input.rules.length * total * 2);
+    const MAX_SWAP_EVALUATIONS_PER_ROUND = 250_000;
+    for (let round = 0; round < maximumRounds; round += 1) {
+      if (remainingRepairEvaluations <= 0) break;
+      let best: { outgoing: number; incoming: number; score: number } | null = null;
+      let evaluated = 0;
+      // Consider weaker selected ranks first for removal, while considering
+      // stronger outside ranks first for admission. Ties therefore remain
+      // deterministic and minimize rank loss.
+      for (let outgoingIndex = selected.length - 1; outgoingIndex >= 0; outgoingIndex -= 1) {
+        const outgoing = selected[outgoingIndex]!;
+        for (let incoming = 0; incoming < input.ranked.length; incoming += 1) {
+          if (selectedSet.has(incoming)) continue;
+          evaluated += 1;
+          remainingRepairEvaluations -= 1;
+          if (evaluated > MAX_SWAP_EVALUATIONS_PER_ROUND
+            || remainingRepairEvaluations < 0) break;
+          const proposal = [...selected];
+          proposal[outgoingIndex] = incoming;
+          proposal.sort((left, right) => left - right);
+          const score = violation(proposal, total);
+          if (score < currentViolation && (
+            best === null
+            || score < best.score
+            || (score === best.score && incoming < best.incoming)
+            || (score === best.score && incoming === best.incoming && outgoing > best.outgoing)
+          )) {
+            best = { outgoing, incoming, score };
+          }
+        }
+        if (evaluated > MAX_SWAP_EVALUATIONS_PER_ROUND
+          || remainingRepairEvaluations < 0) break;
+      }
+      if (!best) break;
+      selectedSet.delete(best.outgoing);
+      selectedSet.add(best.incoming);
+      const position = selected.indexOf(best.outgoing);
+      selected[position] = best.incoming;
+      selected.sort((left, right) => left - right);
+      currentViolation = best.score;
+      if (currentViolation === 0) return selected;
+    }
+    return null;
+  };
+
+  for (let total = Math.min(input.target, input.ranked.length); total > 0; total -= 1) {
+    if (remainingExactNodes <= 0) optimizationBudgetExhausted = true;
+    const exact = remainingExactNodes > 0
+      ? exactSelection(total)
+      : { selected: null, exhausted: true };
+    if (exact.selected && compliant(exact.selected, total)) {
+      return exact.selected.map((index) => input.ranked[index]!);
+    }
+    if (exact.exhausted || remainingExactNodes <= 0) {
+      const repaired = deterministicRepair(total);
+      if (repaired && compliant(repaired, total)) {
+        return repaired.map((index) => input.ranked[index]!);
+      }
+    }
+  }
+  // An optimizer budget is an operational boundary, never evidence that the
+  // musical contract is infeasible. Surface it as retryable/technical work
+  // instead of falsely returning an empty policy result.
+  if (optimizationBudgetExhausted) {
+    throw new CanonicalQuotaOptimizationBudgetExceededErrorV3(
+      "Canonical quota optimization exhausted its bounded search budget",
+    );
   }
   return [];
 }
@@ -1681,11 +3330,31 @@ export function centralQualityVerdictV3(
   track: QualifiedTrackV3,
   policy: CanonicalPlaylistQualityPolicy,
 ): CentralQualityVerdictV3 {
-  const signal = track.rankingSignals[policy.signalDimension];
-  if (typeof signal !== "number" || !Number.isFinite(signal)) return "unknown";
-  if (signal >= policy.passThreshold) return "pass";
-  if (signal < policy.failThreshold) return "fail";
-  return "unknown";
+  const observations = centralQualityCriterionObservationsForPolicyV3({
+    observations: track.centralQualityCriterionObservations,
+    policy,
+    artist: track.artist,
+    title: track.title,
+    album: track.album,
+    appleSongId: track.appleSongId,
+    recordingFamilyKey: track.recordingFamilyKey,
+  });
+  const byCriterion = new Map<string, CentralQualityCriterionVerdictV3[]>();
+  for (const observation of observations) {
+    byCriterion.set(observation.criterion, [
+      ...(byCriterion.get(observation.criterion) ?? []),
+      observation.verdict,
+    ]);
+  }
+  let hasUnknownCriterion = false;
+  for (const criterion of policy.criteria) {
+    const verdicts = byCriterion.get(criterion) ?? [];
+    // Known failure dominates every later pass or aggregate score. This is
+    // the zeroKnownFailures invariant at its lowest executable boundary.
+    if (verdicts.includes("fail")) return "fail";
+    if (!verdicts.includes("pass")) hasUnknownCriterion = true;
+  }
+  return hasUnknownCriterion ? "unknown" : "pass";
 }
 
 export function evaluateCentralQualityV3(input: {
@@ -1785,7 +3454,7 @@ export interface CanonicalPublicationValidationReportV3 {
 }
 
 /**
- * Re-evaluate the immutable contract immediately before a schema-4 manifest
+ * Re-evaluate the immutable contract immediately before a canonical manifest
  * is allowed to cross the Apple write boundary. The manifest hash freezes the
  * order; this check proves that the frozen set still satisfies track gates,
  * exact count (unless separately consented), quotas, central quality, and the
@@ -1819,6 +3488,16 @@ export function validateCanonicalPublicationSetV3(input: {
       reasons.push(evaluation.status === "unknown"
         ? "canonical_track_unknown"
         : "canonical_track_failed");
+      break;
+    }
+    if (!canonicalRequiredEvidenceIntegrityV3({
+      policy,
+      assessments: track.canonicalClauseAssessments,
+      bindingIds: track.evidenceBindingIds,
+      bindings: track.evidenceBindings,
+      storefront: input.plan.storefront,
+    }).passed) {
+      reasons.push("canonical_track_evidence_invalid");
       break;
     }
   }
@@ -1936,8 +3615,22 @@ function shouldApplyPlaylistOptimizerV3(plan: SelectionPlanV3): boolean {
   // Contract-3 carries explicit (nullable) playlist-level constraints. Legacy
   // plans predate the optimizer and retain their recorded soft-relaxation
   // semantics while they drain.
-  return plan.scopeKind === "broad_curated"
-    && plan.canonicalContractPolicy?.policyVersion === "canonical_contract_runtime_v1";
+  if (plan.canonicalContractPolicy?.policyVersion !== "canonical_contract_runtime_v1") {
+    return false;
+  }
+  if (plan.scopeKind === "broad_curated"
+    || (plan.playlistQuotaRules?.length ?? 0) > 0
+    || plan.playlistQualityPolicy !== undefined) {
+    return true;
+  }
+  const diversity = plan.diversityGoals;
+  return diversity.maximumTracksPerArtist !== null
+    || diversity.maximumTracksPerAlbum !== null
+    || (diversity.minimumDistinctArtists ?? 0) > 0
+    || (diversity.minimumDistinctAlbums ?? 0) > 0
+    || (diversity.minimumDistinctEras ?? 0) > 0
+    || (diversity.minimumDistinctScenes ?? 0) > 0
+    || (diversity.minimumDistinctGeographies ?? 0) > 0;
 }
 
 function optimizeQualifiedPlaylistV3(input: {
@@ -1953,34 +3646,11 @@ function optimizeQualifiedPlaylistV3(input: {
     playlistOptimizationCandidateV3(track, input.plan)
   ));
   const constraints = playlistOptimizationConstraintsV3(input.plan, input.target);
-  const initial = optimizePlaylistV1({ candidates, constraints });
-  let final = initial;
-  let additionalUnmetConstraints: string[] = [];
-
-  if (initial.exact && (input.plan.playlistQuotaRules?.length ?? 0) > 0) {
-    const preferredIds = new Set(initial.selected.map(({ id }) => id));
-    const quotaRanked = [
-      ...input.ranked.filter(({ candidateId }) => preferredIds.has(candidateId)),
-      ...input.ranked.filter(({ candidateId }) => !preferredIds.has(candidateId)),
-    ];
-    const quotaSelection = selectWithCanonicalQuotaV3({
-      ranked: quotaRanked,
-      target: input.target,
-      rules: input.plan.playlistQuotaRules ?? [],
-      policy: input.plan.canonicalContractPolicy,
-    });
-    final = optimizePlaylistV1({
-      candidates: quotaSelection.map((track) => (
-        playlistOptimizationCandidateV3(track, input.plan)
-      )),
-      constraints,
-    });
-    if (quotaSelection.length !== input.target) {
-      additionalUnmetConstraints = [
-        `canonical_quota_count:${quotaSelection.length}/${input.target}`,
-      ];
-    }
-  }
+  // Quotas are part of the same bounded search state as diversity,
+  // concentration, quality, and sequencing. Solving a preferred diversity set
+  // first and then replacing it with the first quota-compliant set can discard
+  // the only jointly feasible composition and manufacture a false shortfall.
+  const final = optimizePlaylistV1({ candidates, constraints });
 
   return {
     selected: final.selected.flatMap(({ id }) => {
@@ -1989,10 +3659,24 @@ function optimizeQualifiedPlaylistV3(input: {
     }),
     report: playlistOptimizationReportV3(
       final,
-      input.ranked.length,
-      additionalUnmetConstraints,
+      new Set(input.ranked.map(({ recordingFamilyKey }) => recordingFamilyKey)).size,
     ),
   };
+}
+
+/** Recompute the deterministic optimizer report for an already ordered set. */
+export function evaluatePlaylistOptimizationV3(input: {
+  plan: SelectionPlanV3;
+  tracks: readonly QualifiedTrackV3[];
+}): PlaylistOptimizationReportV3 | null {
+  if (!shouldApplyPlaylistOptimizerV3(input.plan) || input.tracks.length === 0) {
+    return null;
+  }
+  return optimizeQualifiedPlaylistV3({
+    ranked: input.tracks,
+    target: input.tracks.length,
+    plan: input.plan,
+  }).report;
 }
 
 function stageObservations(counters: MutableCountersV3): StageYieldObservationV3[] {
@@ -2069,6 +3753,8 @@ function mutableDependencyState(
     circuitOpen: false,
     affectedStrategyIds: new Set(),
     unresolvedStrategyIds: new Set(),
+    retryAfterUntilByStrategy: new Map(),
+    failureClassByStrategy: new Map(),
   };
   dependencies.set(dependencyId, created);
   return created;
@@ -2079,6 +3765,8 @@ function observeDependencyFailure(input: {
   dependencyIds: readonly RetrievalUpstreamDependencyIdV3[];
   strategyId: string;
   circuitOpen?: boolean;
+  retryAfterUntil?: Date | null;
+  failureClass?: RetrievalDependencyFailureClassV3;
 }): void {
   for (const dependencyId of input.dependencyIds) {
     const dependency = mutableDependencyState(input.dependencies, dependencyId);
@@ -2088,6 +3776,21 @@ function observeDependencyFailure(input: {
     dependency.active = true;
     dependency.circuitOpen ||= input.circuitOpen === true;
     dependency.affectedStrategyIds.add(input.strategyId);
+    dependency.failureClassByStrategy.set(
+      input.strategyId,
+      input.failureClass ?? "transient",
+    );
+    if (input.retryAfterUntil !== undefined) {
+      if (input.retryAfterUntil
+        && Number.isFinite(input.retryAfterUntil.getTime())) {
+        dependency.retryAfterUntilByStrategy.set(
+          input.strategyId,
+          new Date(input.retryAfterUntil),
+        );
+      } else {
+        dependency.retryAfterUntilByStrategy.delete(input.strategyId);
+      }
+    }
   }
 }
 
@@ -2099,20 +3802,79 @@ function observeDependencySuccess(input: {
   for (const dependencyId of input.dependencyIds) {
     const dependency = mutableDependencyState(input.dependencies, dependencyId);
     dependency.unresolvedStrategyIds.delete(input.strategyId);
+    dependency.retryAfterUntilByStrategy.delete(input.strategyId);
+    dependency.failureClassByStrategy.delete(input.strategyId);
     dependency.active = dependency.unresolvedStrategyIds.size > 0;
     if (!dependency.active) dependency.circuitOpen = false;
     dependency.affectedStrategyIds.add(input.strategyId);
   }
 }
 
+function retryAfterUntilFromError(error: RetrievalDependencyErrorV3): Date | null {
+  return error.retryAfterUntil ? new Date(error.retryAfterUntil) : null;
+}
+
+function latestDependencyRetryAfterUntil(
+  state: MutableDependencyStateV3,
+): Date | null {
+  const latest = [...state.retryAfterUntilByStrategy.values()]
+    .reduce<Date | null>((current, candidate) => (
+      !current || candidate.getTime() > current.getTime()
+        ? candidate
+        : current
+    ), null);
+  return latest ? new Date(latest) : null;
+}
+
 function failedDependencyIds(
-  error: unknown,
+  error: RetrievalDependencyErrorV3,
   declared: readonly RetrievalUpstreamDependencyIdV3[],
 ): readonly RetrievalUpstreamDependencyIdV3[] {
-  if (!(error instanceof RetrievalDependencyErrorV3)) return declared;
   const declaredSet = new Set(declared);
   const specific = error.dependencyIds.filter((dependencyId) => declaredSet.has(dependencyId));
   return specific.length > 0 ? specific : declared;
+}
+
+function fixedContainerResolutionProgressValid(
+  state: MutableStrategyStateV3,
+  proof: FixedContainerResolutionProofV1,
+  plan: SelectionPlanV3,
+): boolean {
+  try {
+    assertFixedContainerResolutionProofV1(proof);
+  } catch {
+    return false;
+  }
+  if (state.definition.engine !== "fixed_container"
+    || state.definition.kind !== "container_enumeration") return false;
+  const directive = plan.executionDirectives?.fixedContainer;
+  if (directive && (
+    proof.contractSemanticHash !== plan.canonicalContractPolicy?.contractSemanticHash
+    || proof.directiveHash !== fixedContainerDirectiveHashV1(directive)
+    || proof.storefront !== plan.storefront.toLocaleLowerCase("en-US")
+  )) return false;
+  const prior = state.fixedContainerResolution;
+  if (!prior) return true;
+  return prior.contractSemanticHash === proof.contractSemanticHash
+    && prior.directiveHash === proof.directiveHash
+    && prior.storefront === proof.storefront
+    && prior.exactMatchCardinality === proof.exactMatchCardinality
+    && prior.resolvedResourceId === proof.resolvedResourceId
+    && prior.resolvedResourceKind === proof.resolvedResourceKind
+    && stableIdentity(prior.requested) === stableIdentity(proof.requested)
+    && proof.pageCount >= prior.pageCount
+    && proof.enumeratedTrackCount >= prior.enumeratedTrackCount
+    && !(prior.enumerationComplete && !proof.enumerationComplete);
+}
+
+function stableIdentity(
+  identity: FixedContainerResolutionProofV1["requested"],
+): string {
+  return [
+    identity.kind,
+    identity.name,
+    identity.artistName ?? "",
+  ].join("\u0000");
 }
 
 function strategyReport(state: MutableStrategyStateV3): RetrievalStrategyReportV3 {
@@ -2129,18 +3891,33 @@ function strategyReport(state: MutableStrategyStateV3): RetrievalStrategyReportV
     consecutiveZeroQualifiedYieldRounds: state.consecutiveZeroQualifiedYieldRounds,
     providerFailures: state.providerFailures,
     cursor: state.cursor,
+    ...(state.fixedContainerResolution ? {
+      fixedContainerResolution: state.fixedContainerResolution,
+    } : {}),
   };
 }
 
 function dependencyOutageReport(
   state: MutableDependencyStateV3,
 ): RetrievalDependencyOutageReportV3 {
+  const retryAfterUntil = latestDependencyRetryAfterUntil(state);
+  const activeFailureClasses = [...state.unresolvedStrategyIds]
+    .flatMap((strategyId) => {
+      const failureClass = state.failureClassByStrategy.get(strategyId);
+      return failureClass ? [failureClass] : [];
+    });
+  const failureClass: RetrievalDependencyFailureClassV3 =
+    activeFailureClasses.includes("rate_limited")
+      ? "rate_limited"
+      : activeFailureClasses[0] ?? "transient";
   return {
     dependencyId: state.dependencyId,
+    failureClass,
     outageCount: state.outageCount,
     failureAttempts: state.failureAttempts,
     active: state.active,
     circuitOpen: state.circuitOpen,
+    retryAfterUntil: retryAfterUntil?.toISOString() ?? null,
     affectedStrategyIds: [...state.affectedStrategyIds].sort(),
   };
 }
@@ -2153,6 +3930,10 @@ function finalStopReason(input: {
   qualifiedCount: number;
   dependencyOutages: readonly MutableDependencyStateV3[];
 }): RetrievalStopReasonV3 {
+  // Identity, checkpoint, cursor, or adapter integrity is a technical
+  // quarantine condition. A coincident exact pool or provider outage cannot
+  // make a corrupted retrieval result publishable.
+  if (input.integrityFailureCount > 0) return "integrity_failure";
   // A completed exact reserve is valid even if an optional frontier was
   // briefly degraded; every other unresolved provider outage takes
   // precedence over generic time/round/budget boundaries.
@@ -2313,6 +4094,14 @@ function validatePolicy(input: Partial<RetrievalPolicyV3>): RetrievalPolicyV3 {
       16,
     ),
     maximumRawCandidates: boundedInteger(merged.maximumRawCandidates, "maximumRawCandidates", 1, 100_000),
+    ...(merged.candidateGoal === undefined ? {} : {
+      candidateGoal: boundedInteger(
+        merged.candidateGoal,
+        "candidateGoal",
+        1,
+        100_000,
+      ),
+    }),
     ...(merged.qualifiedPoolGoal === undefined ? {} : {
       qualifiedPoolGoal: boundedInteger(
         merged.qualifiedPoolGoal,
@@ -2364,11 +4153,21 @@ export async function executeRetrievalV3(input: {
     1,
     EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
   );
-  let activePlan = input.plan;
+  const continuationPlan = input.continuation?.selectionPlan;
+  if (continuationPlan && (
+    continuationPlan.requestedTrackCount !== input.plan.requestedTrackCount
+    || continuationPlan.storefront !== input.plan.storefront
+    || continuationPlan.explicitUserConstraintHash !== input.plan.explicitUserConstraintHash
+    || stableStringify(continuationPlan.canonicalContractPolicy ?? null)
+      !== stableStringify(input.plan.canonicalContractPolicy ?? null)
+  )) {
+    throw new Error("Compute continuation selection plan changed the immutable contract");
+  }
+  let activePlan = continuationPlan ?? input.plan;
   const mode = input.executionMode ?? "active";
   const policy = validatePolicy(input.policy ?? {});
   const now = input.now ?? Date.now;
-  const engines = routeRetrievalEnginesV3(input.plan, input.routingHints);
+  const engines = routeRetrievalEnginesV3(activePlan, input.routingHints);
   const legacyQualifiedPoolGoal = requested + Math.max(10, Math.ceil(requested * 0.2));
   const qualifiedPoolGoal = Math.max(
     requested,
@@ -2378,7 +4177,8 @@ export async function executeRetrievalV3(input: {
   const continuationStrategies = new Map(
     (input.continuation?.strategies ?? []).map((strategy) => [strategy.id, strategy]),
   );
-  const approvedContinuationStrategies = input.continuation
+  const computeOnlyContinuation = input.continuation?.providerCallPermitted === false;
+  const approvedContinuationStrategies = input.continuation && !computeOnlyContinuation
     ? new Set(input.continuation.approvedStrategyIds)
     : null;
   const definitions = retrievalStrategiesForEnginesV3(engines);
@@ -2395,7 +4195,9 @@ export async function executeRetrievalV3(input: {
     return {
       definition,
       ordinal,
-      status: approved
+      status: computeOnlyContinuation
+        ? "exhausted"
+        : approved
         ? "available"
         : approvedContinuationStrategies
           ? (prior?.status === "available" || prior?.status === "running" ? "exhausted" : prior?.status ?? "exhausted")
@@ -2407,10 +4209,11 @@ export async function executeRetrievalV3(input: {
       providerFailures: prior?.providerFailures ?? 0,
       cursor: prior?.cursor ?? null,
       seenCursors: new Set<string>(prior?.cursor ? [prior.cursor] : []),
+      fixedContainerResolution: prior?.fixedContainerResolution ?? null,
     };
   });
 
-  if (!input.plan.confirmed) {
+  if (!activePlan.confirmed) {
     return emptyResult({
       runId: input.runId,
       mode,
@@ -2425,10 +4228,11 @@ export async function executeRetrievalV3(input: {
 
   const discardedByReason: Partial<Record<CandidateDeficitReasonV3, number>> = {};
   const integrityEvents: string[] = [];
+  let integrityFailureCount = 0;
   const appleIdToFamily = new Map<string, string>();
   const rawSeedTracks = input.continuation?.qualifiedTracks ?? [];
   const seedTracks = rawSeedTracks.flatMap((track) => {
-    const integrityReason = continuationTrackIntegrityReason(track, input.plan);
+    const integrityReason = continuationTrackIntegrityReason(track, activePlan);
     if (integrityReason) {
       incrementReason(discardedByReason, integrityReason);
       integrityEvents.push(`continuation_seed_rejected:${integrityReason}:${track.candidateId}`);
@@ -2438,10 +4242,18 @@ export async function executeRetrievalV3(input: {
     if (existingFamily && existingFamily !== track.recordingFamilyKey) {
       incrementReason(discardedByReason, "catalog_identity_conflict");
       integrityEvents.push(`continuation_seed_rejected:catalog_identity_conflict:${track.candidateId}`);
+      integrityFailureCount += 1;
       return [];
     }
     appleIdToFamily.set(track.appleSongId, track.recordingFamilyKey);
-    const bindings = attestedEvidenceBindingsForSelectionV3(track.evidenceBindingIds, track.evidenceBindings);
+    const bindings = attestedEvidenceBindingsForSelectionV3(
+      track.evidenceBindingIds,
+      track.evidenceBindings,
+      activePlan.canonicalContractPolicy ? {
+        requireHostedEvidenceSnapshot: true,
+        storefront: activePlan.storefront,
+      } : {},
+    );
     return [{
       ...track,
       evidenceBindingIds: bindings.map(({ id }) => id),
@@ -2457,11 +4269,15 @@ export async function executeRetrievalV3(input: {
     appleIdToFamily.set(track.appleSongId, track.recordingFamilyKey);
     const alternates = input.continuation?.compatibleAlternatesByRecordingFamily[track.recordingFamilyKey]
       ?.filter((alternate) => alternate.appleSongId !== track.appleSongId
-        && continuationTrackIntegrityReason(alternate, input.plan) === null)
+        && continuationTrackIntegrityReason(alternate, activePlan) === null)
       .map((alternate) => {
         const bindings = attestedEvidenceBindingsForSelectionV3(
           alternate.evidenceBindingIds,
           alternate.evidenceBindings,
+          activePlan.canonicalContractPolicy ? {
+            requireHostedEvidenceSnapshot: true,
+            storefront: activePlan.storefront,
+          } : {},
         );
         return {
           ...alternate,
@@ -2469,16 +4285,17 @@ export async function executeRetrievalV3(input: {
           evidenceBindings: bindings.map((binding) => ({ ...binding })),
         };
       }) ?? [];
-    addQualifiedToFamily(families, { ...track }, input.plan.rankingObjectives);
+    addQualifiedToFamily(families, { ...track }, activePlan.rankingObjectives);
     for (const alternate of alternates) {
       const existingFamily = appleIdToFamily.get(alternate.appleSongId);
       if (existingFamily && existingFamily !== alternate.recordingFamilyKey) {
         incrementReason(discardedByReason, "catalog_identity_conflict");
         integrityEvents.push(`continuation_alternate_rejected:catalog_identity_conflict:${alternate.candidateId}`);
+        integrityFailureCount += 1;
         continue;
       }
       appleIdToFamily.set(alternate.appleSongId, alternate.recordingFamilyKey);
-      addQualifiedToFamily(families, alternate, input.plan.rankingObjectives);
+      addQualifiedToFamily(families, alternate, activePlan.rankingObjectives);
     }
   }
   const priorStages = input.continuation?.stages;
@@ -2496,7 +4313,6 @@ export async function executeRetrievalV3(input: {
   let totalCostUnits = 0;
   let stopReason: RetrievalStopReasonV3 | null = null;
   let providerFailureCount = 0;
-  let integrityFailureCount = 0;
   let qualificationsObserved = 0;
   let scopeFailuresObserved = 0;
   let appleLookupCount = 0;
@@ -2540,19 +4356,56 @@ export async function executeRetrievalV3(input: {
     }
   };
 
+  const optimizeWithRetrySeed = (
+    ranked: readonly QualifiedTrackV3[],
+    target: number,
+  ) => {
+    try {
+      return optimizeQualifiedPlaylistV3({ ranked, target, plan: activePlan });
+    } catch (error) {
+      if (!(error instanceof PlaylistOptimizationBudgetExceededErrorV1)) throw error;
+      const qualifiedTracks = [...families.values()]
+        .flatMap(({ primary, alternates }) => [primary, ...alternates])
+        .sort((left, right) => compareQualified(
+          left,
+          right,
+          activePlan.rankingObjectives,
+        ));
+      throw new RetrievalPlaylistOptimizationBudgetExceededErrorV3(
+        error.message,
+        {
+          providerCallPermitted: false,
+          approvedStrategyIds: [],
+          selectionPlan: activePlan,
+          qualifiedTracks,
+          compatibleAlternatesByRecordingFamily: {},
+          stages: {
+            ...counters,
+            selected: 0,
+            reserve: 0,
+          },
+          strategies: states.map(strategyReport),
+        },
+      );
+    }
+  };
+
   while (true) {
     if (policy.deadlineAtEpochMs !== null && now() >= policy.deadlineAtEpochMs) {
       stopReason = "deadline_reached";
       break;
     }
     if (pendingDiscoveries.length === 0) {
-      const currentRankedFamilies = [...families.values()]
-        .map(({ primary }) => primary)
+      const optimizerActive = shouldApplyPlaylistOptimizerV3(activePlan);
+      const currentRankedRepresentations = [...families.values()]
+        .flatMap(({ primary, alternates }) => (
+          optimizerActive ? [primary, ...alternates] : [primary]
+        ))
         .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
-      const currentHardEligible = applyHardAggregateConstraints(
-        currentRankedFamilies,
+      const currentHardEligible = new Set(applyHardAggregateConstraints(
+        currentRankedRepresentations,
         activePlan.hardConstraints,
-      ).eligible.length;
+      ).eligible.map(({ recordingFamilyKey }) => recordingFamilyKey)).size;
       const fill = adaptiveFillPlanV3({
         target: requested,
         qualified: currentHardEligible,
@@ -2561,8 +4414,21 @@ export async function executeRetrievalV3(input: {
         maximumRawDiscoveryGoal: policy.maximumRawCandidates,
       });
       if (fill.qualifiedPoolDeficit === 0) {
-        stopReason = "qualified_reserve_satisfied";
-        break;
+        // Playlist-level ratios and count ceilings are immutable at the
+        // requested playlist size. The reserve is replacement inventory, not
+        // an enlarged playlist: evaluating quota ratios against
+        // requested+reserve can manufacture a contradiction (for example,
+        // exactly one of two tracks but at least half of a 12-row pool).
+        const diversityCapacity = optimizerActive
+          ? optimizeWithRetrySeed(
+              currentRankedRepresentations,
+              requested,
+            ).report.exact
+          : true;
+        if (diversityCapacity) {
+          stopReason = "qualified_reserve_satisfied";
+          break;
+        }
       }
       if (totalCostUnits >= policy.maximumCostUnits) {
         stopReason = "budget_reached";
@@ -2593,9 +4459,19 @@ export async function executeRetrievalV3(input: {
         state.definition.discoveryDependencyIds.length === 1
         && state.definition.discoveryDependencyIds[0] === "orchestration_local"
       ));
+      const remainingCandidateInputGoal = policy.candidateGoal === undefined
+        ? fill.rawDiscoveryGoal
+        : Math.max(0, policy.candidateGoal - counters.evidenceEligible);
+      // The P10 conversion target sizes evidence-eligible discovery input. It
+      // is neither an Apple-safe pool requirement nor a reason to issue one
+      // oversized wave. Observe yield incrementally and stop as soon as the
+      // much smaller storefront-safe target plus repair reserve is satisfied.
+      const boundedDiscoveryGoal = remainingCandidateInputGoal > 0
+        ? Math.min(fill.rawDiscoveryGoal, remainingCandidateInputGoal)
+        : fill.rawDiscoveryGoal;
       const totalWaveRawGoal = Math.min(
         remainingCapacity,
-        Math.max(materialWave.length, fill.rawDiscoveryGoal),
+        Math.max(materialWave.length, boundedDiscoveryGoal),
       );
       let unallocatedRawGoal = totalWaveRawGoal;
       let unallocatedMaterialSlots = materialWave.length;
@@ -2687,6 +4563,8 @@ export async function executeRetrievalV3(input: {
         pendingDiscoveries = [];
         break;
       }
+      if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
+      if (!error.retriable) throw error;
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`discover:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -2694,6 +4572,8 @@ export async function executeRetrievalV3(input: {
         dependencies: dependencyStates,
         dependencyIds: failedDependencyIds(error, state.definition.discoveryDependencyIds),
         strategyId: state.definition.id,
+        retryAfterUntil: retryAfterUntilFromError(error),
+        failureClass: error.failureClass,
       });
       state.status = state.providerFailures >= policy.maximumProviderFailuresPerStrategy
         ? "provider_error"
@@ -2707,6 +4587,27 @@ export async function executeRetrievalV3(input: {
         dependencyIds: state.definition.discoveryDependencyIds,
         strategyId: state.definition.id,
       });
+    }
+    const typedFixedContainer = activePlan.executionDirectives?.fixedContainer;
+    if (batch.fixedContainerResolution) {
+      if (!fixedContainerResolutionProgressValid(
+        state,
+        batch.fixedContainerResolution,
+        activePlan,
+      )) {
+        integrityFailureCount += 1;
+        integrityEvents.push(`invalid_fixed_container_resolution_proof:${state.definition.id}`);
+        state.status = "integrity_error";
+        continue;
+      }
+      state.fixedContainerResolution = batch.fixedContainerResolution;
+    } else if (typedFixedContainer
+      && state.definition.engine === "fixed_container"
+      && state.definition.kind === "container_enumeration") {
+      integrityFailureCount += 1;
+      integrityEvents.push(`missing_fixed_container_resolution_proof:${state.definition.id}`);
+      state.status = "integrity_error";
+      continue;
     }
 
     const costUnits = batch.costUnits ?? 0;
@@ -2730,6 +4631,15 @@ export async function executeRetrievalV3(input: {
         incrementReason(discardedByReason, "invalid_candidate_shape");
         continue;
       }
+      const serverCacheOrigin = discoveryCacheOriginV3(
+        state.definition.discoveryDependencyIds,
+        batch.provenance,
+      );
+      const serverFreshUntil = discoveryFreshUntilV3(batch.provenance, now());
+      if (serverCacheOrigin === "fresh_cache" && serverFreshUntil === null) {
+        incrementReason(discardedByReason, "stale_cache_lead");
+        continue;
+      }
       const candidateIdWasSeen = seenCandidateIds.has(candidate.id);
       if (!candidateIdWasSeen) seenCandidateIds.add(candidate.id);
       const identityKey = rawCandidateIdentityKey(candidate);
@@ -2737,6 +4647,16 @@ export async function executeRetrievalV3(input: {
       if (existing) {
         existing.candidateIds.add(candidate.id);
         existing.strategyId = state.definition.id;
+        state.definition.discoveryDependencyIds.forEach((id) => (
+          existing.discoveryDependencyIds.add(id)
+        ));
+        const incomingOrigin = discoveryCacheOriginV3(
+          state.definition.discoveryDependencyIds,
+          batch.provenance,
+        );
+        if (incomingOrigin === "live") existing.cacheOrigin = "live";
+        existing.sourceFreshUntil = existing.sourceFreshUntil
+          ?? serverFreshUntil;
         const merged = mergeRawCandidate(existing.candidate, candidate);
         existing.candidate = merged.candidate;
         if (!merged.improved) {
@@ -2768,6 +4688,15 @@ export async function executeRetrievalV3(input: {
         candidate: { ...candidate, sourceObservationIds: [...new Set(candidate.sourceObservationIds)] },
         candidateIds: new Set([candidate.id]),
         strategyId: state.definition.id,
+        discoveryDependencyIds: new Set(
+          state.definition.discoveryDependencyIds,
+        ),
+        provenanceRoots: new Set(),
+        cacheOrigin: discoveryCacheOriginV3(
+          state.definition.discoveryDependencyIds,
+          batch.provenance,
+        ),
+        sourceFreshUntil: serverFreshUntil,
         predicateCoverage: new Set(),
         rejectionCode: null,
       });
@@ -2801,6 +4730,8 @@ export async function executeRetrievalV3(input: {
         pendingDiscoveries = [];
         break;
       }
+      if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
+      if (!error.retriable) throw error;
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -2808,6 +4739,8 @@ export async function executeRetrievalV3(input: {
         dependencies: dependencyStates,
         dependencyIds: failedDependencyIds(error, state.definition.qualificationDependencyIds),
         strategyId: state.definition.id,
+        retryAfterUntil: retryAfterUntilFromError(error),
+        failureClass: error.failureClass,
       });
       for (let index = 0; index < candidates.length; index += 1) {
         incrementReason(discardedByReason, "qualification_missing");
@@ -2899,6 +4832,8 @@ export async function executeRetrievalV3(input: {
           pendingDiscoveries = [];
           break;
         }
+        if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
+        if (!error.retriable) throw error;
         providerFailureCount += 1;
         state.providerFailures += 1;
         integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -2906,6 +4841,8 @@ export async function executeRetrievalV3(input: {
           dependencies: dependencyStates,
           dependencyIds: failedDependencyIds(error, state.definition.qualificationDependencyIds),
           strategyId: state.definition.id,
+          retryAfterUntil: retryAfterUntilFromError(error),
+          failureClass: error.failureClass,
         });
         const idempotencyKey = recoveryAuditIdempotencyKeyV3({
           runId: input.runId,
@@ -2968,6 +4905,10 @@ export async function executeRetrievalV3(input: {
       const attestedBindings = attestedEvidenceBindingsForSelectionV3(
         qualification.evidence.bindingIds,
         qualification.evidence.bindings,
+        activePlan.canonicalContractPolicy ? {
+          requireHostedEvidenceSnapshot: true,
+          storefront: activePlan.storefront,
+        } : {},
       );
       const canonicalPolicy = activePlan.canonicalContractPolicy;
       if (canonicalPolicy) {
@@ -2985,22 +4926,14 @@ export async function executeRetrievalV3(input: {
         }
         counters.scopeEligible += 1;
         counters.hardConstraintEligible += 1;
-        // Evidence ids referenced by a passing canonical assessment must be
-        // present in the attested set. A custom adapter cannot turn an
-        // arbitrary citation id into selection-grade proof.
-        const attestedIds = new Set(attestedBindings.map(({ id }) => id));
-        const referencedEvidenceIds = Object.values(qualification.canonicalClauseAssessments ?? {})
-          .flatMap(({ evidenceIds }) => evidenceIds ?? []);
-        const assessments = qualification.canonicalClauseAssessments ?? {};
-        const missingRequiredEvidenceReference = canonicalPolicy.clauses.some((clause) => {
-          const assessment = assessments[clause.id];
-          return clause.evidence.required
-            && assessment?.status === "pass"
-            && assessment.evidenceGrade !== "authoritative_structured_metadata"
-            && (assessment.evidenceIds?.length ?? 0) === 0;
+        const evidenceIntegrity = canonicalRequiredEvidenceIntegrityV3({
+          policy: canonicalPolicy,
+          assessments: qualification.canonicalClauseAssessments,
+          bindingIds: qualification.evidence.bindingIds,
+          bindings: qualification.evidence.bindings,
+          storefront: activePlan.storefront,
         });
-        if (missingRequiredEvidenceReference
-          || referencedEvidenceIds.some((id) => !attestedIds.has(id))) {
+        if (!evidenceIntegrity.passed) {
           incrementReason(discardedByReason, "evidence_attestation_missing");
           integrityEvents.push(`canonical_evidence_attestation_missing:${state.definition.id}:${candidate.id}`);
           rejectLead("evidence_attestation_missing");
@@ -3043,8 +4976,11 @@ export async function executeRetrievalV3(input: {
       for (const predicateId of attestedBindings.flatMap(bindingPredicateIds)) {
         lead?.predicateCoverage.add(predicateId);
       }
+      attestedBindings.forEach(({ provenanceRoot }) => (
+        lead?.provenanceRoots.add(provenanceRoot)
+      ));
       counters.evidenceEligible += 1;
-      if (!qualification.version.compatible) {
+      if (!canonicalPolicy && !qualification.version.compatible) {
         incrementReason(discardedByReason, "version_incompatible");
         rejectLead("version_incompatible");
         continue;
@@ -3089,6 +5025,23 @@ export async function executeRetrievalV3(input: {
         sourceObservationIds: [...new Set(candidate.sourceObservationIds)],
         evidenceBindingIds: attestedBindings.map(({ id }) => id),
         evidenceBindings: attestedBindings.map((binding) => ({ ...binding })),
+        discoveryDependencyIds: [...(lead?.discoveryDependencyIds
+          ?? state.definition.discoveryDependencyIds)].sort(),
+        provenanceRoots: [...new Set(attestedBindings.map(
+          ({ provenanceRoot }) => provenanceRoot,
+        ))].sort(),
+        cacheOrigin: lead?.cacheOrigin
+          ?? discoveryCacheOriginV3(
+            state.definition.discoveryDependencyIds,
+            batch.provenance,
+          ),
+        sourceFreshUntil: [
+          lead?.sourceFreshUntil ?? null,
+          ...attestedBindings.map(
+            ({ governance }) => governance.freshnessExpiresAt ?? null,
+          ),
+        ].filter((value): value is string => typeof value === "string")
+          .sort()[0] ?? null,
         ...(qualification.canonicalClauseAssessments ? {
           canonicalClauseAssessments: structuredClone(qualification.canonicalClauseAssessments),
         } : {}),
@@ -3096,6 +5049,20 @@ export async function executeRetrievalV3(input: {
           playlistOptimizationSignals: normalizePlaylistOptimizationSignalsV3(
             qualification.playlistOptimizationSignals,
           ),
+        } : {}),
+        ...(activePlan.playlistQualityPolicy ? {
+          centralQualityCriterionObservations:
+            centralQualityCriterionObservationsForPolicyV3({
+              observations:
+                qualification.centralQualityCriterionObservations,
+              policy: activePlan.playlistQualityPolicy,
+              artist: candidate.artist.trim(),
+              title: candidate.title.trim(),
+              album: candidate.album?.trim() || null,
+              appleSongId: qualification.catalog.appleSongId,
+              recordingFamilyKey:
+                qualification.catalog.recordingFamilyKey,
+            }),
         } : {}),
         evidenceStrength: boundedFinite(qualification.evidence.strength),
         scopeFit: boundedFinite(qualification.scope.fit),
@@ -3180,10 +5147,12 @@ export async function executeRetrievalV3(input: {
     qualifiedCount: families.size,
     dependencyOutages: [...dependencyStates.values()],
   });
-  const rankedPool = [...families.values()]
-    .map(({ primary }) => primary)
-    .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
   const optimizerActive = shouldApplyPlaylistOptimizerV3(activePlan);
+  const rankedPool = [...families.values()]
+    .flatMap(({ primary, alternates }) => (
+      optimizerActive ? [primary, ...alternates] : [primary]
+    ))
+    .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
   const hardAggregate = optimizerActive
     ? { eligible: rankedPool, rejected: [] }
     : applyHardAggregateConstraints(rankedPool, activePlan.hardConstraints);
@@ -3191,11 +5160,30 @@ export async function executeRetrievalV3(input: {
     incrementReason(discardedByReason, "hard_constraint_failed");
     for (const reason of rejection.reasons) incrementReason(discardedByReason, reason);
   }
-  const qualitySelection = selectWithCentralQualityV3({
-    ranked: hardAggregate.eligible,
-    target: requested + reserveGoal,
-    policy: activePlan.playlistQualityPolicy,
-  });
+  // The canonical optimizer jointly enforces quality, quota, diversity, and
+  // concentration constraints. Giving it only a rank-truncated quality
+  // prefix can erase a lower-ranked quota/diversity-essential candidate even
+  // though the complete evidence-qualified pool has an exact solution.
+  // Remove only known quality failures here and let the joint optimizer choose
+  // the permitted pass/unknown composition. Legacy selection retains its
+  // historical bounded prefix behavior while draining.
+  const qualitySelection = optimizerActive && activePlan.playlistQualityPolicy
+    ? {
+        eligible: hardAggregate.eligible.filter((track) => (
+          centralQualityVerdictV3(track, activePlan.playlistQualityPolicy!)
+            !== "fail"
+        )),
+        rejectedFailureCount: hardAggregate.eligible.filter((track) => (
+          centralQualityVerdictV3(track, activePlan.playlistQualityPolicy!)
+            === "fail"
+        )).length,
+        rejectedUnknownCount: 0,
+      }
+    : selectWithCentralQualityV3({
+        ranked: hardAggregate.eligible,
+        target: requested + reserveGoal,
+        policy: activePlan.playlistQualityPolicy,
+      });
   if (qualitySelection.rejectedFailureCount > 0) {
     discardedByReason.central_quality_failed = qualitySelection.rejectedFailureCount;
   }
@@ -3206,11 +5194,10 @@ export async function executeRetrievalV3(input: {
   let playlistOptimization: PlaylistOptimizationReportV3 | undefined;
   let selected: QualifiedTrackV3[];
   if (optimizerActive) {
-    const optimized = optimizeQualifiedPlaylistV3({
-      ranked: qualitySelection.eligible,
-      target: requested,
-      plan: activePlan,
-    });
+    const optimized = optimizeWithRetrySeed(
+      qualitySelection.eligible,
+      requested,
+    );
     selected = optimized.selected;
     playlistOptimization = optimized.report;
   } else {
@@ -3230,19 +5217,38 @@ export async function executeRetrievalV3(input: {
       ? sequenceBroadCurated(rankedSelected, activePlan.orderingPolicy)
       : rankedSelected;
   }
-  const selectedIds = new Set(selected.map(({ candidateId }) => candidateId));
-  const reserve = qualitySelection.eligible
-    .filter(({ candidateId }) => !selectedIds.has(candidateId))
-    .slice(0, reserveGoal);
+  const selectedFamilies = new Set(selected.map(({ recordingFamilyKey }) => (
+    recordingFamilyKey
+  )));
+  const reserveFamilies = new Set<string>();
+  const reserve = qualitySelection.eligible.filter(({ recordingFamilyKey }) => {
+    if (selectedFamilies.has(recordingFamilyKey)
+      || reserveFamilies.has(recordingFamilyKey)) {
+      return false;
+    }
+    reserveFamilies.add(recordingFamilyKey);
+    return true;
+  }).slice(0, reserveGoal);
   const shortfall = Math.max(0, requested - selected.length);
+  const qualityOptimizerConstraint = playlistOptimization?.unmetConstraints.some(
+    (reason) => reason.startsWith("minimum_central_quality_pass_tracks:")
+      || reason.startsWith("maximum_central_quality_unknown_tracks:")
+      || reason.startsWith("central_quality_known_failures:"),
+  ) ?? false;
   const qualityConstrained = shortfall > 0
     && activePlan.playlistQualityPolicy !== undefined
-    && qualitySelection.eligible.length < Math.min(requested, hardAggregate.eligible.length);
+    && (
+      qualitySelection.eligible.length
+        < Math.min(requested, hardAggregate.eligible.length)
+      || qualityOptimizerConstraint
+    );
   const optimizationConstrained = playlistOptimization !== undefined
     && !playlistOptimization.exact
     && !qualityConstrained;
-  const outcomeStopReason: RetrievalStopReasonV3 = qualityConstrained
-    ? "central_quality_floor"
+  const outcomeStopReason: RetrievalStopReasonV3 = resolvedStopReason === "integrity_failure"
+    ? "integrity_failure"
+    : qualityConstrained
+      ? "central_quality_floor"
     : optimizationConstrained
       ? "playlist_optimization_constraints"
     : shortfall > 0
@@ -3260,7 +5266,7 @@ export async function executeRetrievalV3(input: {
     resolvedStopReason === "provider_failure" || resolvedStopReason === "provider_circuit_open"
   )
     ? "failed_system"
-    : resolvedStopReason === "integrity_failure" && selected.length === 0
+    : resolvedStopReason === "integrity_failure"
       ? "failed_integrity"
       : resolvedStopReason === "deadline_reached" && selected.length === 0
         ? "needs_decision"
@@ -3279,10 +5285,19 @@ export async function executeRetrievalV3(input: {
     selected: selected.length,
     reserve: reserve.length,
   };
+  const selectedAppleIdByFamily = new Map(selected.map((track) => [
+    track.recordingFamilyKey,
+    track.appleSongId,
+  ]));
   const compatibleAlternatesByRecordingFamily = Object.fromEntries(
-    [...families.entries()]
-      .filter(([, { alternates }]) => alternates.length > 0)
-      .map(([family, { alternates }]) => [family, alternates]),
+    [...families.entries()].flatMap(([family, { primary, alternates }]) => {
+      const selectedAppleId = selectedAppleIdByFamily.get(family);
+      if (!selectedAppleId) return [];
+      const compatible = [primary, ...alternates].filter(({ appleSongId }) => (
+        appleSongId !== selectedAppleId
+      ));
+      return compatible.length > 0 ? [[family, compatible] as const] : [];
+    }),
   );
   const candidateLeads: PipelineCandidateLeadArtifactV3[] = [...rawCandidateLedger.values()]
     .slice(0, policy.maximumRawCandidates)
@@ -3296,6 +5311,10 @@ export async function executeRetrievalV3(input: {
       citationHashes: citationHashesV3(entry.candidate),
       predicateCoverage: [...entry.predicateCoverage].sort().slice(0, 64),
       rejectionCode: entry.rejectionCode,
+      discoveryDependencyIds: [...entry.discoveryDependencyIds].sort(),
+      provenanceRoots: [...entry.provenanceRoots].sort(),
+      cacheOrigin: entry.cacheOrigin,
+      sourceFreshUntil: entry.sourceFreshUntil,
     }));
   const diagnosticsRootCause = recoveryAudits.some(({ rootCause }) => rootCause === "semantic_contract")
     ? "semantic_contract" as const

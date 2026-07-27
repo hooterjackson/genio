@@ -83,6 +83,9 @@ function runtimeProjection(
     storefront: policy.storefront,
     clauses: [...policy.clauses].sort((left, right) => left.id.localeCompare(right.id)),
     trackPredicate: policy.trackPredicate,
+    ...(policy.executionDirectives ? {
+      executionDirectives: policy.executionDirectives,
+    } : {}),
   };
 }
 
@@ -145,6 +148,9 @@ export function canonicalContractExecutionPolicyV1(
     storefront: contract.storefront,
     clauses,
     trackPredicate,
+    ...(contract.executionDirectives ? {
+      executionDirectives: structuredClone(contract.executionDirectives),
+    } : {}),
   } satisfies Omit<CanonicalPlaylistContractExecutionPolicyV1, "projectionHash">;
   return Object.freeze({
     ...base,
@@ -189,6 +195,95 @@ export function assertCanonicalContractExecutionPolicyV1(
   for (const id of predicateClauseIds(policy.trackPredicate)) {
     if (!ids.has(id)) throw new Error("unknown_canonical_contract_runtime_clause");
   }
+  const directives = policy.executionDirectives;
+  if (directives) {
+    if (!directives.fixedContainer
+      && !directives.similarity
+      && !directives.exactArtistIdentityExclusions) {
+      throw new Error("empty_canonical_contract_execution_directives");
+    }
+    if (directives.fixedContainer) {
+      const fixed = directives.fixedContainer;
+      const clause = policy.clauses.find(({ id }) => id === fixed.membershipClauseId);
+      if (!["album", "playlist"].includes(fixed.kind)
+        || typeof fixed.name !== "string" || !fixed.name.trim()
+        || (fixed.artistName !== null
+          && (typeof fixed.artistName !== "string" || !fixed.artistName.trim()))
+        || !clause
+        || clause.kind !== "membership"
+        || clause.axis !== fixed.kind
+        || clause.operator !== "require"
+        || clause.values.length !== 1
+        || clause.values[0] !== fixed.name) {
+        throw new Error("invalid_canonical_fixed_container_directive");
+      }
+    }
+    if (directives.similarity) {
+      const similarity = directives.similarity;
+      if (!Array.isArray(similarity.seedArtists) || similarity.seedArtists.length === 0
+        || similarity.seedArtists.some((value) => typeof value !== "string" || !value.trim())
+        || !Array.isArray(similarity.excludedArtists)
+        || similarity.excludedArtists.some((value) => typeof value !== "string" || !value.trim())
+        || typeof similarity.rankingClauseId !== "string" || !similarity.rankingClauseId
+        || !Array.isArray(similarity.exactArtistExclusionClauseIds)
+        || (similarity.excludedArtists.length === 0
+          ? similarity.exactArtistExclusionClauseIds.length !== 0
+          : similarity.exactArtistExclusionClauseIds.length === 0)) {
+        throw new Error("invalid_canonical_similarity_directive");
+      }
+      const excluded = similarity.exactArtistExclusionClauseIds.flatMap((id) => {
+        const clause = policy.clauses.find((candidate) => candidate.id === id);
+        if (!clause
+          || clause.kind !== "exclusion"
+          || clause.axis !== "artist"
+          || clause.operator !== "exclude") {
+          throw new Error("invalid_canonical_similarity_exclusion_directive");
+        }
+        return clause.values;
+      }).map((value) => value.toLocaleLowerCase("en-US")).sort();
+      const expectedExcluded = similarity.excludedArtists
+        .map((value) => value.toLocaleLowerCase("en-US")).sort();
+      if (stableStringify(excluded) !== stableStringify(expectedExcluded)) {
+        throw new Error("canonical_similarity_exclusion_directive_mismatch");
+      }
+    }
+    if (directives.exactArtistIdentityExclusions) {
+      const exact = directives.exactArtistIdentityExclusions;
+      if (!Array.isArray(exact.bindings) || exact.bindings.length === 0
+        || exact.bindings.some((binding) => (
+          !binding || typeof binding !== "object"
+          || typeof binding.clauseId !== "string" || !binding.clauseId.trim()
+          || typeof binding.catalogArtistId !== "string"
+          || !/^\d{1,32}$/u.test(binding.catalogArtistId)
+          || typeof binding.displayName !== "string" || !binding.displayName.trim()
+          || binding.storefront !== policy.storefront
+        ))) {
+        throw new Error("invalid_canonical_exact_artist_identity_directive");
+      }
+      if (new Set(exact.bindings.map(({ clauseId }) => clauseId)).size
+        !== exact.bindings.length) {
+        throw new Error("duplicate_canonical_exact_artist_identity_directive");
+      }
+      const excluded = exact.bindings.flatMap((binding) => {
+        const clause = policy.clauses.find(
+          (candidate) => candidate.id === binding.clauseId,
+        );
+        if (!clause
+          || clause.kind !== "exclusion"
+          || clause.axis !== "artist"
+          || clause.operator !== "exclude") {
+          throw new Error("invalid_canonical_exact_artist_identity_exclusion");
+        }
+        return clause.values;
+      }).map((value) => value.toLocaleLowerCase("en-US")).sort();
+      const expectedExcluded = exact.bindings
+        .map(({ displayName }) => displayName.toLocaleLowerCase("en-US"))
+        .sort();
+      if (stableStringify(excluded) !== stableStringify(expectedExcluded)) {
+        throw new Error("canonical_exact_artist_identity_directive_mismatch");
+      }
+    }
+  }
   const expected = sha256Hex(stableStringify(runtimeProjection({
     policyVersion: policy.policyVersion,
     evidenceStrengthPolicyVersion: policy.evidenceStrengthPolicyVersion,
@@ -201,6 +296,9 @@ export function assertCanonicalContractExecutionPolicyV1(
     storefront: policy.storefront,
     clauses: policy.clauses,
     trackPredicate: policy.trackPredicate,
+    ...(policy.executionDirectives ? {
+      executionDirectives: policy.executionDirectives,
+    } : {}),
   })));
   if (expected !== policy.projectionHash) {
     throw new Error("canonical_contract_runtime_projection_hash_mismatch");

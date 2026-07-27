@@ -632,6 +632,35 @@ summary:focus-visible {
   line-height: 1.55;
 }
 
+.guidance-history-trigger {
+  margin: 1rem 0 0;
+  width: 100%;
+}
+
+.guidance-history-list {
+  display: grid;
+  gap: 0.75rem;
+  margin: 1.5rem 0;
+}
+
+.guidance-history-list > button {
+  align-items: flex-start;
+  display: grid;
+  gap: 0.35rem;
+  justify-items: start;
+  text-align: left;
+  width: 100%;
+}
+
+.guidance-history-list > button[aria-pressed="true"] {
+  border-color: var(--accent, #ff5a36);
+}
+
+.guidance-history-list span,
+.guidance-history-list small {
+  white-space: normal;
+}
+
 .guided-options {
   margin-top: 34px;
   gap: 12px;

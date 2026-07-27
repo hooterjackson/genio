@@ -1,0 +1,19 @@
+diff --git a/minimatch.js b/minimatch.js
+index 2e4a058a130dceebf83a7bd435f5d22b765ac836..a97b5d8a8ee79b7dd3cee7cfa5cc69c1a8ef7394 100644
+--- a/minimatch.js
++++ b/minimatch.js
+@@ -7,7 +7,13 @@ var path = (function () { try { return require('path') } catch (e) {}}()) || {
+ minimatch.sep = path.sep
+ 
+ var GLOBSTAR = minimatch.GLOBSTAR = Minimatch.GLOBSTAR = {}
+-var expand = require('brace-expansion')
++// brace-expansion <=4 exported the expansion function directly, while
++// brace-expansion >=5 exposes it as a named CommonJS export. Accept both so
++// this legacy minimatch release can consume the patched modern dependency.
++var braceExpansion = require('brace-expansion')
++var expand = typeof braceExpansion === 'function'
++  ? braceExpansion
++  : braceExpansion.expand
+ 
+ var plTypes = {
+   '!': { open: '(?:(?!(?:', close: '))[^/]*?)'},

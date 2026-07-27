@@ -14,6 +14,11 @@ import {
   workerPipelineProtocolVersion,
   WORKER_PIPELINE_PROTOCOL_VERSION,
 } from "../server/worker-protocol.ts";
+import { PLAYLIST_OPTIMIZER_POLICY_VERSION } from "../server/playlist-optimizer-v1.ts";
+import {
+  canonicalExecutorCapabilityEnvelopeIsValidV1,
+} from "../server/playlist-contract-backend-capability-v1.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 
 describe("worker pipeline protocol", () => {
   test("advertises protocol 10 while accepting protocol 8 bridge capacity", () => {
@@ -44,5 +49,18 @@ describe("worker pipeline protocol", () => {
     expect(minimumWorkerProtocolForQueryPlan({ schemaVersion: 4 })).toBe(10);
     expect(BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL).toBe(9);
     expect(BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL).toBe(10);
+  });
+
+  test("binds optimizer semantics into every advertised canonical executor capability", () => {
+    for (const capability of WORKER_PIPELINE_CAPABILITY.canonicalExecutorCapabilities ?? []) {
+      expect(capability.vector.playlistOptimizerPolicyVersion)
+        .toBe(PLAYLIST_OPTIMIZER_POLICY_VERSION);
+      expect(canonicalExecutorCapabilityEnvelopeIsValidV1(capability)).toBe(true);
+
+      const oldEvidence = structuredClone(capability);
+      oldEvidence.vector.playlistOptimizerPolicyVersion = "playlist_optimizer_v1";
+      expect(canonicalExecutorCapabilityEnvelopeIsValidV1(oldEvidence)).toBe(false);
+      expect(sha256Hex(stableStringify(oldEvidence.vector))).not.toBe(capability.hash);
+    }
   });
 });

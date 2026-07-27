@@ -46,9 +46,9 @@ import type {
   AdvancePublicationReconciliationInput,
   BeginPublicationReconciliationInput,
   DurablePublicationReconciliation,
+  PublicationExecutionFence,
 } from "../server/publication-reconciliation-persistence.ts";
 import {
-  CANONICAL_PUBLICATION_REVALIDATION_ERROR,
   CanonicalPublicationRevalidationRequiredErrorV1,
 } from "../server/canonical-publication-revalidation-v1.ts";
 
@@ -77,6 +77,16 @@ const validAuthorization: AppleAuthorizationRecord = {
   storefront: "us",
   status: "valid",
 };
+
+function canonicalPublicationExecutionFence(): PublicationExecutionFence {
+  return {
+    executionAttemptId: "88888888-8888-4888-8888-888888888881",
+    jobId: "99999999-9999-4999-8999-999999999991",
+    workerId: "canonical-publication-test-worker",
+    leaseGeneration: 1,
+    stageKey: "publication",
+  };
+}
 
 const originalAppleEnvironment = {
   teamId: process.env.APPLE_TEAM_ID,
@@ -399,6 +409,38 @@ describe("Apple Music client failure classification", () => {
       });
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
+
+  test("safe Apple GETs preserve a long Retry-After boundary for the durable circuit", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      errors: [{ title: "Rate limited" }],
+    }), {
+      status: 429,
+      headers: { "retry-after": "120" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const before = Date.now();
+
+    const error = await new AppleMusicClient("private-user-token")
+      .validateAuthorization()
+      .catch((reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      name: "AppleApiError",
+      status: 429,
+      retriable: true,
+      retryAfterMs: 120_000,
+    });
+    if (!(error instanceof AppleApiError)) throw error;
+    expect(error.retryAfterUntil).toBeInstanceOf(Date);
+    if (!error.retryAfterUntil) throw new Error("Retry-After boundary was lost");
+    expect(error.retryAfterUntil.getTime()).toBeGreaterThanOrEqual(
+      before + 120_000,
+    );
+    expect(error.retryAfterUntil.getTime()).toBeLessThanOrEqual(
+      Date.now() + 120_000,
+    );
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
 });
 
 test("worker recovery queues exactly the current unverified Apple authorization generation", async () => {
@@ -678,6 +720,26 @@ function durablePublicationHarness(input: {
   repository.updateRun.mockImplementation(async (_runId: string, patch: Record<string, unknown>) => {
     if (run) run = { ...run, ...patch } as typeof run;
   });
+  repository.commitCanonicalPublicationPreflightDecision.mockImplementation(
+    async () => {
+      if (run) {
+        run = {
+          ...run,
+          status: "needs_decision",
+          phase: "publication_contract_revalidation_required",
+          error: null,
+        };
+      }
+    },
+  );
+  repository.updateCanonicalPublicationRun.mockImplementation(
+    async (_authority: BeginPublicationReconciliationInput, patch: {
+      status: "publishing" | "waiting_for_apple_authorization";
+      phase: "apple_publication" | "apple_reauthorization";
+    }) => {
+      if (run) run = { ...run, ...patch, error: null } as typeof run;
+    },
+  );
   repository.createPublicationVolume.mockImplementation(async (volume: Record<string, unknown>) => {
     const stored: any = {
       id: `volume-${volumes.length + 1}`,
@@ -1390,6 +1452,13 @@ test("the production publisher completes a locked manifest through the real Appl
     manifestRevisionHash: productionManifest.contentHash,
     contractRevisionId: productionManifest.contractRevisionId,
     contractHash: productionManifest.contractHash,
+    executionFence: {
+      executionAttemptId: "88888888-8888-4888-8888-888888888888",
+      jobId: "99999999-9999-4999-8999-999999999999",
+      workerId: "publisher-test-worker",
+      leaseGeneration: 1,
+      stageKey: "publication",
+    },
     selectedCount: 3,
     terminalStatus: "complete",
     publicationVolumes: [{
@@ -1419,6 +1488,17 @@ test("the production publisher completes a locked manifest through the real Appl
       "reconciling",
       "complete",
     ]));
+  const acquireAppleWritePermit =
+    harness.repository.acquireAppleWritePermit as ReturnType<typeof vi.fn>;
+  expect(acquireAppleWritePermit.mock.calls.every(
+    ([input]) => input.executionFence?.executionAttemptId
+      === "88888888-8888-4888-8888-888888888888"
+      && input.executionFence?.jobId
+        === "99999999-9999-4999-8999-999999999999"
+      && input.executionFence?.workerId === "publisher-test-worker"
+      && input.executionFence?.leaseGeneration === 1
+      && input.executionFence?.stageKey === "publication",
+  )).toBe(true);
 });
 
 test("a safe non-empty manifest publishes as partial instead of failing on a count shortfall", async () => {
@@ -1561,7 +1641,12 @@ test("V3 rejects an unconsented short manifest before any Apple request or playl
   });
   vi.stubGlobal("fetch", fetchMock);
 
-  await expect(publishManifest(harness.repository, productionManifest.id))
+  await expect(publishManifest(
+    harness.repository,
+    productionManifest.id,
+    undefined,
+    canonicalPublicationExecutionFence(),
+  ))
     .rejects.toBeInstanceOf(PartialPublicationDecisionRequiredError);
   expect(fetchMock).not.toHaveBeenCalled();
   expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
@@ -1943,7 +2028,12 @@ test("canonical preflight revalidates unchanged Apple inventory and makes revoke
   });
   vi.stubGlobal("fetch", fetchMock);
 
-  await expect(publishManifest(harness.repository, productionManifest.id))
+  await expect(publishManifest(
+    harness.repository,
+    productionManifest.id,
+    undefined,
+    canonicalPublicationExecutionFence(),
+  ))
     .resolves.toEqual({
       status: "needs_decision",
       manifestId: productionManifest.id,
@@ -1960,15 +2050,26 @@ test("canonical preflight revalidates unchanged Apple inventory and makes revoke
   });
   expect(harness.repository.createManifestRevision).not.toHaveBeenCalled();
   expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
-  expect(harness.repository.openPlaylistRunBlocker).toHaveBeenCalledWith(
+  expect(
+    harness.repository.commitCanonicalPublicationPreflightDecision,
+  ).toHaveBeenCalledWith(
     expect.objectContaining({
-      runId: productionManifest.runId,
-      dependencyKey: "publication_revalidation",
-      state: expect.objectContaining({
+      authority: expect.objectContaining({
+        runId: productionManifest.runId,
+        manifestRevisionId: productionManifest.revisionId,
+      }),
+      pipelineOutcome: expect.objectContaining({
+        frontierExhausted: false,
+        publishedTrackCount: 0,
         reasonCodes: ["canonical_qualification_projection_missing"],
       }),
+      omittedCandidateIds: [],
+      reasonCodes: ["canonical_qualification_projection_missing"],
     }),
   );
+  expect(harness.repository.openPlaylistRunBlocker).not.toHaveBeenCalled();
+  expect(harness.repository.savePipelineOutcome).not.toHaveBeenCalled();
+  expect(harness.repository.updateRun).not.toHaveBeenCalled();
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });
 
@@ -2046,29 +2147,40 @@ test("canonical preflight moves to a visible decision without Apple writes when 
   });
   vi.stubGlobal("fetch", fetchMock);
 
-  await expect(publishManifest(harness.repository, productionManifest.id))
+  await expect(publishManifest(
+    harness.repository,
+    productionManifest.id,
+    undefined,
+    canonicalPublicationExecutionFence(),
+  ))
     .resolves.toEqual({
       status: "needs_decision",
       manifestId: productionManifest.id,
       volumes: [],
     });
-  expect(harness.repository.openPlaylistRunBlocker).toHaveBeenCalledWith({
-    runId: productionManifest.runId,
-    contractRevisionId: productionManifest.contractRevisionId,
-    blockerKind: "scope_decision",
-    dependencyKey: "publication_revalidation",
-    retryCount: 0,
-    nextRetryAt: null,
-    automaticRetryUntil: null,
-    state: expect.objectContaining({
-      reasonCode: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+  expect(
+    harness.repository.commitCanonicalPublicationPreflightDecision,
+  ).toHaveBeenCalledWith(expect.objectContaining({
+    authority: expect.objectContaining({
+      runId: productionManifest.runId,
+      manifestRevisionId: productionManifest.revisionId,
+    }),
+    pipelineOutcome: expect.objectContaining({
+      frontierExhausted: false,
       reasonCodes: [
         "canonical_quota_failed:quota:core",
         "canonical_sequence_optimizer_mismatch",
       ],
-      nextAction: "review_contract",
     }),
-  });
+    omittedCandidateIds: [],
+    reasonCodes: [
+      "canonical_quota_failed:quota:core",
+      "canonical_sequence_optimizer_mismatch",
+    ],
+  }));
+  expect(harness.repository.openPlaylistRunBlocker).not.toHaveBeenCalled();
+  expect(harness.repository.savePipelineOutcome).not.toHaveBeenCalled();
+  expect(harness.repository.updateRun).not.toHaveBeenCalled();
   expect(harness.run).toMatchObject({
     status: "needs_decision",
     phase: "publication_contract_revalidation_required",
@@ -2076,6 +2188,308 @@ test("canonical preflight moves to a visible decision without Apple writes when 
   });
   expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
   expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("canonical catalog loss after ready becomes a retryable decision, never frontier exhaustion or an abandoned manifest", async () => {
+  const base = lockedManifest(1, "manifest-v3-catalog-loss-after-ready");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "corpus_first_v3",
+    policyVersion: "corpus_first_v3_policy_v1",
+    selectionPlan: {
+      requestedTrackCount: 1,
+    } as LockedManifest["selectionPlan"],
+    revisionId: "11111111-1111-4111-8111-111111111119",
+    revision: 1,
+    contractRevisionId: "22222222-2222-4222-8222-222222222229",
+    contractHash: "e".repeat(64),
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  harness.repository.getPublicationGuard = vi.fn(async () => ({
+    requestedTrackCount: 1,
+    enforcement: "required" as const,
+    currentOutcomeHash: null,
+    decision: null,
+  }));
+  harness.volumes.push({
+    id: "canonical-incomplete-volume",
+    manifestId: productionManifest.id,
+    manifestRevisionId: productionManifest.revisionId,
+    volumeNumber: 1,
+    volumeCount: 1,
+    startPosition: 0,
+    endPosition: 0,
+    status: "appending",
+    applePlaylistId: "p.canonical-incomplete",
+    appleShareUrl: null,
+    appendedCount: 0,
+    attempt: 0,
+  });
+  vi.mocked(harness.repository.getManifestPreflightTracks!).mockResolvedValue([{
+    position: 0,
+    candidateId: base.tracks[0]!.candidateId,
+    catalogId: base.tracks[0]!.catalogId,
+    artist: base.tracks[0]!.artist,
+    title: base.tracks[0]!.title,
+    recordingFamilyId: "family-1",
+    catalogIdentityId: "identity-101",
+    alternates: [],
+  }]);
+  vi.mocked(harness.repository.getManifestPreflightReserveTracks!)
+    .mockResolvedValue([]);
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/catalog/us/songs") {
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    }
+    throw new Error(`No Apple mutation was expected: ${url.pathname}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(publishManifest(
+    harness.repository,
+    productionManifest.id,
+    undefined,
+    canonicalPublicationExecutionFence(),
+  ))
+    .resolves.toEqual({
+      status: "needs_decision",
+      manifestId: productionManifest.id,
+      volumes: [],
+    });
+  expect(harness.run).toMatchObject({
+    status: "needs_decision",
+    phase: "publication_contract_revalidation_required",
+    error: null,
+  });
+  expect(
+    harness.repository.commitCanonicalPublicationPreflightDecision,
+  ).toHaveBeenCalledWith(
+    expect.objectContaining({
+      authority: expect.objectContaining({
+        runId: productionManifest.runId,
+        manifestRevisionId: productionManifest.revisionId,
+      }),
+      pipelineOutcome: expect.objectContaining({
+        status: "partial_evidence_shortfall",
+        frontierExhausted: false,
+        publishedTrackCount: 0,
+        reasonCodes: expect.arrayContaining([
+          "publication_catalog_availability_changed",
+        ]),
+      }),
+      omittedCandidateIds: [base.tracks[0]!.candidateId],
+      reasonCodes: expect.arrayContaining([
+        "publication_catalog_availability_changed",
+      ]),
+    }),
+  );
+  expect(harness.repository.openPlaylistRunBlocker).not.toHaveBeenCalled();
+  expect(harness.repository.savePipelineOutcome).not.toHaveBeenCalled();
+  expect(harness.repository.updateRun).not.toHaveBeenCalled();
+  expect(harness.repository.hidePublicPlaylistsForRun)
+    .not.toHaveBeenCalled();
+  expect(harness.repository.retirePublicationVolume).not.toHaveBeenCalled();
+  expect(harness.repository.markManifestRevisionStatus).not.toHaveBeenCalled();
+  expect(harness.volumes).toHaveLength(1);
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("a canonical lease lost during the catalog read commits no empty-preflight decision or legacy side effect", async () => {
+  const base = lockedManifest(1, "manifest-v3-catalog-loss-race");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "corpus_first_v3",
+    policyVersion: "corpus_first_v3_policy_v1",
+    selectionPlan: {
+      requestedTrackCount: 1,
+    } as LockedManifest["selectionPlan"],
+    revisionId: "11111111-1111-4111-8111-111111111129",
+    revision: 1,
+    contractRevisionId: "22222222-2222-4222-8222-222222222239",
+    contractHash: "f".repeat(64),
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  harness.repository.getPublicationGuard = vi.fn(async () => ({
+    requestedTrackCount: 1,
+    enforcement: "required" as const,
+    currentOutcomeHash: null,
+    decision: null,
+  }));
+  vi.mocked(harness.repository.getManifestPreflightTracks!).mockResolvedValue([{
+    position: 0,
+    candidateId: base.tracks[0]!.candidateId,
+    catalogId: base.tracks[0]!.catalogId,
+    artist: base.tracks[0]!.artist,
+    title: base.tracks[0]!.title,
+    recordingFamilyId: "family-1",
+    catalogIdentityId: "identity-101",
+    alternates: [],
+  }]);
+  vi.mocked(harness.repository.getManifestPreflightReserveTracks!)
+    .mockResolvedValue([]);
+  let leaseCurrent = true;
+  let canonicalDecisionWrites = 0;
+  harness.repository.commitCanonicalPublicationPreflightDecision = vi.fn(
+    async () => {
+      if (!leaseCurrent) {
+        throw Object.assign(new Error("publication_execution_stale"), {
+          code: "publication_execution_stale",
+        });
+      }
+      canonicalDecisionWrites += 1;
+    },
+  );
+  let resolveCatalogRead: ((response: Response) => void) | null = null;
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/catalog/us/songs") {
+      return await new Promise<Response>((resolve) => {
+        resolveCatalogRead = resolve;
+      });
+    }
+    throw new Error(`No Apple mutation was expected: ${url.pathname}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const publication = publishManifest(
+    harness.repository,
+    productionManifest.id,
+    undefined,
+    canonicalPublicationExecutionFence(),
+  );
+  await vi.waitFor(() => expect(resolveCatalogRead).not.toBeNull());
+  leaseCurrent = false;
+  resolveCatalogRead!(new Response(JSON.stringify({ data: [] }), {
+    status: 200,
+  }));
+
+  await expect(publication).rejects.toMatchObject({
+    code: "publication_execution_stale",
+  });
+  expect(canonicalDecisionWrites).toBe(0);
+  expect(harness.run).toMatchObject({
+    status: "manifest_ready",
+    phase: "manifest",
+  });
+  expect(harness.repository.updateRun).not.toHaveBeenCalled();
+  expect(harness.repository.savePipelineOutcome).not.toHaveBeenCalled();
+  expect(harness.repository.openPlaylistRunBlocker).not.toHaveBeenCalled();
+  expect(harness.repository.hidePublicPlaylistsForRun).not.toHaveBeenCalled();
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
+});
+
+test("a canonical lease lost during the catalog read cannot persist or supersede a repaired revision", async () => {
+  const base = lockedManifest(2, "manifest-v3-repair-race");
+  const productionManifest: LockedManifest = {
+    ...base,
+    pipelineVersion: "corpus_first_v3",
+    policyVersion: "corpus_first_v3_policy_v1",
+    selectionPlan: {
+      requestedTrackCount: 2,
+    } as LockedManifest["selectionPlan"],
+    revisionId: "11111111-1111-4111-8111-111111111139",
+    revision: 1,
+    contractRevisionId: "22222222-2222-4222-8222-222222222249",
+    contractHash: "a".repeat(64),
+  };
+  const harness = durablePublicationHarness({ manifest: productionManifest });
+  harness.repository.getPublicationGuard = vi.fn(async () => ({
+    requestedTrackCount: 2,
+    enforcement: "required" as const,
+    currentOutcomeHash: null,
+    decision: null,
+  }));
+  vi.mocked(harness.repository.getManifestPreflightTracks!).mockResolvedValue(
+    base.tracks.map((track, index) => ({
+      position: index,
+      candidateId: track.candidateId,
+      catalogId: track.catalogId,
+      artist: track.artist,
+      title: track.title,
+      recordingFamilyId: `family-${index + 1}`,
+      catalogIdentityId: `identity-${track.catalogId}`,
+      alternates: [],
+    })),
+  );
+  vi.mocked(harness.repository.getManifestPreflightReserveTracks!)
+    .mockResolvedValue([{
+      position: 0,
+      candidateId: "reserve-candidate-3",
+      catalogId: "303",
+      artist: "Reserve Artist",
+      title: "Reserve Track",
+      recordingFamilyId: "family-3",
+      catalogIdentityId: "identity-303",
+      alternates: [],
+      evidenceEligible: true,
+      hardConstraintsSatisfied: true,
+      versionCompatible: true,
+      qualified: true,
+    }]);
+  let leaseCurrent = true;
+  let repairedRevisionWrites = 0;
+  harness.repository.createManifestRevision = vi.fn(async (
+    _runId: string,
+    _revision: unknown,
+    options?: { publicationAuthority?: BeginPublicationReconciliationInput },
+  ) => {
+    expect(options?.publicationAuthority).toMatchObject({
+      manifestRevisionId: productionManifest.revisionId,
+      leaseGeneration: 1,
+    });
+    if (!leaseCurrent) {
+      throw Object.assign(new Error("publication_execution_stale"), {
+        code: "publication_execution_stale",
+      });
+    }
+    repairedRevisionWrites += 1;
+    return "should-not-persist";
+  });
+  let resolveCatalogRead: ((response: Response) => void) | null = null;
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/catalog/us/songs") {
+      return await new Promise<Response>((resolve) => {
+        resolveCatalogRead = resolve;
+      });
+    }
+    throw new Error(`No Apple mutation was expected: ${url.pathname}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const publication = publishManifest(
+    harness.repository,
+    productionManifest.id,
+    undefined,
+    canonicalPublicationExecutionFence(),
+  );
+  await vi.waitFor(() => expect(resolveCatalogRead).not.toBeNull());
+  leaseCurrent = false;
+  resolveCatalogRead!(new Response(JSON.stringify({
+    data: ["102", "303"].map((id) => ({
+      id,
+      attributes: { isrc: `USAAA2000${id}` },
+    })),
+  }), { status: 200 }));
+
+  await expect(publication).rejects.toMatchObject({
+    code: "publication_execution_stale",
+  });
+  expect(repairedRevisionWrites).toBe(0);
+  expect(harness.repository.createManifestRevision).toHaveBeenCalledTimes(1);
+  expect(harness.repository.getManifestRevision).not.toHaveBeenCalled();
+  expect(harness.repository.markManifestRevisionStatus).not.toHaveBeenCalled();
+  expect(
+    harness.repository.commitCanonicalPublicationPreflightDecision,
+  ).not.toHaveBeenCalled();
+  expect(harness.repository.createPublicationVolume).not.toHaveBeenCalled();
+  expect(harness.repository.updateRun).not.toHaveBeenCalled();
+  expect(harness.run).toMatchObject({
+    status: "manifest_ready",
+    phase: "manifest",
+  });
 });
 
 test("V2 storefront preflight returns no-compatible as a non-error without creating Apple state", async () => {

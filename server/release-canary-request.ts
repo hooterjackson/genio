@@ -1,5 +1,6 @@
 import { buildInformation } from "./build-info.ts";
 import {
+  releaseCanaryAudience,
   verifyReleaseCanaryMetadata,
   type ReleaseCanaryOperation,
   type UnsignedReleaseCanaryMetadata,
@@ -34,7 +35,20 @@ export function authenticateReleaseCanary(
   if (value === undefined) return null;
   const secret = environment.RELEASE_CANARY_HMAC_SECRET?.trim() ?? "";
   const revision = buildInformation(environment).revision;
-  if (secret.length < 32 || !revision || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(revision)) {
+  let expectedAudience = "";
+  try {
+    expectedAudience = releaseCanaryAudience(environment.APP_ORIGIN?.trim() ?? "");
+  } catch {
+    // The signed marker contains a bearer-equivalent release capability.
+    // Refuse it unless the runtime can bind that capability to its exact
+    // public origin.
+  }
+  if (
+    secret.length < 32
+    || !revision
+    || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(revision)
+    || !expectedAudience
+  ) {
     throw new HttpError(
       503,
       "Release-canary verification is not configured",
@@ -46,6 +60,7 @@ export function authenticateReleaseCanary(
     return verifyReleaseCanaryMetadata(value, {
       secret,
       expectedEnvironment,
+      expectedAudience,
       expectedOperation: operation,
       expectedSourceRevision: revision,
       now,

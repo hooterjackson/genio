@@ -104,6 +104,10 @@ function maxDate(left: Date, right: Date | null | undefined): Date {
   return right.getTime() > left.getTime() ? right : left;
 }
 
+function minDate(left: Date, right: Date): Date {
+  return right.getTime() < left.getTime() ? right : left;
+}
+
 /**
  * Decide the next durable dependency transition without performing I/O.
  * Immediate retries are bounded to three. Durable attempts are anchored to
@@ -169,7 +173,15 @@ export function decideDependencyCircuitV1(
     const baseDelay = DEPENDENCY_IMMEDIATE_RETRY_DELAYS_MS_V1[immediateAttemptsCompleted]!;
     const due = new Date(input.lastFailureAt.getTime()
       + Math.round(baseDelay * jitterMultiplier(input.jitterUnit, 0.25)));
-    const nextRetryAt = maxDate(due, input.retryAfterUntil);
+    // A provider may ask us not to call it until after the product's automatic
+    // retry window. Wake at the product horizon in that case so orchestration
+    // can present the required decision without making another provider call.
+    // The absolute Retry-After remains part of the persisted blocker state for
+    // a later user-authorized resume.
+    const nextRetryAt = minDate(
+      maxDate(due, input.retryAfterUntil),
+      automaticRetryUntil,
+    );
     return {
       state: "blocked_dependency",
       retryLane: "immediate",
@@ -194,7 +206,10 @@ export function decideDependencyCircuitV1(
   const baseDelay = DEPENDENCY_DURABLE_RETRY_DELAYS_MS_V1[durableAttemptsCompleted]!;
   const scheduled = new Date(input.circuitOpenedAt.getTime()
     + Math.round(baseDelay * jitterMultiplier(input.jitterUnit, 0.1)));
-  const nextRetryAt = maxDate(scheduled, input.retryAfterUntil);
+  const nextRetryAt = minDate(
+    maxDate(scheduled, input.retryAfterUntil),
+    automaticRetryUntil,
+  );
   return {
     state: "blocked_dependency",
     retryLane: "durable",

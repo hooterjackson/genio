@@ -27,6 +27,13 @@ export type PartialReadyRun = {
     selectedTrackCount?: number;
     reasonCodes?: string[];
   } | null;
+  decisionAction?: {
+    reason?: string;
+    decisionHash?: string;
+    actions?: {
+      resumeLater?: boolean;
+    };
+  } | null;
   resolution?: {
     state?: string;
     nextAction?: string;
@@ -34,6 +41,8 @@ export type PartialReadyRun = {
     blocker?: {
       kind?: string;
       nextRetryAt?: string | null;
+      automaticRetryUntil?: string | null;
+      versionHash?: string | null;
     } | null;
   } | null;
 };
@@ -53,6 +62,7 @@ export type PartialReadyView = {
 
 export type RunResolutionControl =
   | "wait_for_retry"
+  | "resume_dependency"
   | "refine_request"
   | "contact_support"
   | "cancel_job";
@@ -77,8 +87,18 @@ export function runResolutionControls(
     case "review_contract":
     case "answer_initial_guidance":
     case "answer_rescue_guidance":
-    case "resume_research":
       return ["refine_request", "cancel_job"];
+    case "resume_research":
+      return resolution.state === "needs_decision"
+        && resolution.blocker?.kind === "provider"
+        && typeof resolution.blocker.versionHash === "string"
+        && /^[a-f0-9]{64}$/u.test(resolution.blocker.versionHash)
+        && run?.decisionAction?.reason === "dependency_retry_window_expired"
+        && run.decisionAction.actions?.resumeLater === true
+        && typeof run.decisionAction.decisionHash === "string"
+        && /^[a-f0-9]{64}$/u.test(run.decisionAction.decisionHash)
+        ? ["resume_dependency", "refine_request", "cancel_job"]
+        : ["refine_request", "cancel_job"];
     case "decide_verified_partial":
       // A malformed or stale partial action cannot power the explicit
       // decision API, so fall back to a fresh contract revision.

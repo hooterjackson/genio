@@ -309,6 +309,7 @@ export function createPipelinePolicySnapshotV3(input: {
       ),
       maximumRawCandidates,
       candidateGoal: conversion.candidateGoal,
+      qualifiedPoolGoal: target + conversion.reserveTrackCount,
       p10QualifiedToAppleSafeConversionRate: conversion.clampedConversionRate,
       conversionRateSampleCount,
       conversionRateSegment: {

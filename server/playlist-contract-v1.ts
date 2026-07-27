@@ -166,6 +166,34 @@ export interface PlaylistContractAnswerLineageV1 {
   readonly answerHash: string;
 }
 
+export interface PlaylistContractExecutionDirectivesV1 {
+  readonly fixedContainer: {
+    readonly kind: "album" | "playlist";
+    readonly name: string;
+    readonly artistName: string | null;
+    readonly membershipClauseId: string;
+  } | null;
+  readonly similarity: {
+    readonly seedArtists: readonly string[];
+    readonly excludedArtists: readonly string[];
+    readonly rankingClauseId: string;
+    readonly exactArtistExclusionClauseIds: readonly string[];
+  } | null;
+  /**
+   * Exact named-artist exclusions which are independent of a similarity seed.
+   * This marker is the sole authority for treating the bound artist clauses
+   * as closed-world catalog identity checks.
+   */
+  readonly exactArtistIdentityExclusions?: {
+    readonly bindings: readonly {
+      readonly clauseId: string;
+      readonly catalogArtistId: string;
+      readonly displayName: string;
+      readonly storefront: string;
+    }[];
+  } | null;
+}
+
 export interface PlaylistContractDraftV1 {
   readonly contractId: string;
   readonly rawPrompt: string;
@@ -178,6 +206,8 @@ export interface PlaylistContractDraftV1 {
   readonly playlistConstraints?: readonly PlaylistQuotaConstraintV1[];
   readonly sequencingObjectives?: readonly PlaylistSequencingObjectiveV1[];
   readonly qualityPolicy?: Partial<PlaylistContractQualityPolicyV1>;
+  /** Optional so historical schema-1 contracts remain byte-for-byte verifiable. */
+  readonly executionDirectives?: PlaylistContractExecutionDirectivesV1;
 }
 
 export interface PlaylistContractRevisionV1 {
@@ -199,6 +229,8 @@ export interface PlaylistContractRevisionV1 {
   readonly playlistConstraints: readonly PlaylistQuotaConstraintV1[];
   readonly sequencingObjectives: readonly PlaylistSequencingObjectiveV1[];
   readonly qualityPolicy: PlaylistContractQualityPolicyV1;
+  /** Optional so historical schema-1 contracts remain byte-for-byte verifiable. */
+  readonly executionDirectives?: PlaylistContractExecutionDirectivesV1;
   readonly answerLineage: readonly PlaylistContractAnswerLineageV1[];
 }
 
@@ -210,7 +242,18 @@ export type PlaylistContractPatchOperationV1 =
   | { readonly op: "set_requested_track_count"; readonly count: number }
   | { readonly op: "set_playlist_constraints"; readonly constraints: readonly PlaylistQuotaConstraintV1[] }
   | { readonly op: "set_sequencing_objectives"; readonly objectives: readonly PlaylistSequencingObjectiveV1[] }
-  | { readonly op: "set_quality_policy"; readonly policy: PlaylistContractQualityPolicyV1 };
+  | { readonly op: "set_quality_policy"; readonly policy: PlaylistContractQualityPolicyV1 }
+  | {
+    readonly op: "set_exact_artist_identity_exclusions";
+    readonly directive: {
+      readonly bindings: readonly {
+        readonly clauseId: string;
+        readonly catalogArtistId: string;
+        readonly displayName: string;
+        readonly storefront: string;
+      }[];
+    } | null;
+  };
 
 export interface PlaylistContractPatchV1 {
   readonly baseRevisionId: string;
@@ -612,12 +655,139 @@ function normalizeQualityPolicy(
   };
 }
 
+function normalizedDirectiveValues(values: readonly string[], name: string): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    const clean = normalizedText(value, name, 500);
+    const key = clean.toLocaleLowerCase("en-US");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(clean);
+  }
+  return output.sort((left, right) => left.localeCompare(right));
+}
+
+function normalizedExecutionDirectives(
+  value: PlaylistContractExecutionDirectivesV1 | undefined,
+): PlaylistContractExecutionDirectivesV1 | undefined {
+  if (!value) return undefined;
+  const fixedContainer = value.fixedContainer === null
+    ? null
+    : {
+        kind: value.fixedContainer.kind,
+        name: normalizedText(value.fixedContainer.name, "fixed_container_name", 500),
+        artistName: value.fixedContainer.artistName === null
+          ? null
+          : normalizedText(value.fixedContainer.artistName, "fixed_container_artist", 500),
+        membershipClauseId: normalizedId(
+          value.fixedContainer.membershipClauseId,
+          "fixed_container_membership_clause_id",
+        ),
+      };
+  if (fixedContainer && fixedContainer.kind !== "album" && fixedContainer.kind !== "playlist") {
+    throw new Error("invalid_fixed_container_kind");
+  }
+  const similarity = value.similarity === null
+    ? null
+    : {
+        seedArtists: normalizedDirectiveValues(
+          value.similarity.seedArtists,
+          "similarity_seed_artist",
+        ),
+        excludedArtists: normalizedDirectiveValues(
+          value.similarity.excludedArtists,
+          "similarity_excluded_artist",
+        ),
+        rankingClauseId: normalizedId(
+          value.similarity.rankingClauseId,
+          "similarity_ranking_clause_id",
+        ),
+        exactArtistExclusionClauseIds: [...new Set(
+          value.similarity.exactArtistExclusionClauseIds.map((id) => (
+            normalizedId(id, "similarity_exclusion_clause_id")
+          )),
+        )].sort(),
+      };
+  if (similarity && similarity.seedArtists.length === 0) {
+    throw new Error("similarity_directive_requires_seed");
+  }
+  if (similarity && (
+    similarity.excludedArtists.length === 0
+      ? similarity.exactArtistExclusionClauseIds.length !== 0
+      : similarity.exactArtistExclusionClauseIds.length === 0
+  )) {
+    throw new Error("similarity_exclusion_directive_mismatch");
+  }
+  const exactArtistIdentityExclusions = value.exactArtistIdentityExclusions == null
+    ? null
+    : {
+        bindings: value.exactArtistIdentityExclusions.bindings.map((binding) => ({
+          clauseId: normalizedId(
+            binding.clauseId,
+            "exact_artist_identity_clause_id",
+          ),
+          catalogArtistId: normalizedText(
+            binding.catalogArtistId,
+            "exact_artist_identity_catalog_id",
+            32,
+          ),
+          displayName: normalizedText(
+            binding.displayName,
+            "exact_artist_identity_name",
+            500,
+          ),
+          storefront: normalizedText(
+            binding.storefront,
+            "exact_artist_identity_storefront",
+            20,
+          ).toLocaleLowerCase("en-US"),
+        })).sort((left, right) => (
+          left.clauseId.localeCompare(right.clauseId)
+            || left.catalogArtistId.localeCompare(right.catalogArtistId)
+        )),
+      };
+  if (exactArtistIdentityExclusions
+    && exactArtistIdentityExclusions.bindings.length === 0) {
+    throw new Error("empty_exact_artist_identity_exclusions");
+  }
+  if (exactArtistIdentityExclusions
+    && new Set(exactArtistIdentityExclusions.bindings.map(({ clauseId }) => clauseId))
+      .size !== exactArtistIdentityExclusions.bindings.length) {
+    throw new Error("duplicate_exact_artist_identity_exclusion_clause");
+  }
+  if (exactArtistIdentityExclusions
+    && exactArtistIdentityExclusions.bindings.some(({ catalogArtistId }) => (
+      !/^\d{1,32}$/u.test(catalogArtistId)
+    ))) {
+    throw new Error("invalid_exact_artist_identity_catalog_id");
+  }
+  if (!fixedContainer && !similarity && !exactArtistIdentityExclusions) {
+    throw new Error("empty_execution_directives");
+  }
+  return {
+    fixedContainer,
+    similarity,
+    ...(value.exactArtistIdentityExclusions !== undefined
+      ? { exactArtistIdentityExclusions }
+      : {}),
+  };
+}
+
+function sameDirectiveValues(left: readonly string[], right: readonly string[]): boolean {
+  return stableStringify(normalizedDirectiveValues(left, "directive_comparison"))
+    === stableStringify(normalizedDirectiveValues(right, "directive_comparison"));
+}
+
 function validateContractStructure(input: {
+  requestedTrackCount: number;
+  storefront: string;
   clauses: readonly PlaylistContractClauseV1[];
   trackPredicate: PlaylistPredicateV1;
   playlistConstraints: readonly PlaylistQuotaConstraintV1[];
   sequencingObjectives: readonly PlaylistSequencingObjectiveV1[];
   qualityPolicy: PlaylistContractQualityPolicyV1;
+  executionDirectives?: PlaylistContractExecutionDirectivesV1;
 }): void {
   const byId = new Map(input.clauses.map((clause) => [clause.id, clause]));
   if (byId.size !== input.clauses.length) throw new Error("duplicate_playlist_contract_clause");
@@ -646,6 +816,106 @@ function validateContractStructure(input: {
       throw new Error("model_lead_cannot_qualify_hard_clause");
     }
   }
+  const minimumDiversityAxes = new Set([
+    "minimum-distinct-artists",
+    "minimum-distinct-albums",
+    "minimum-distinct-eras",
+    "minimum-distinct-scenes",
+    "minimum-distinct-geographies",
+  ]);
+  const maximumDiversityAxes = new Set([
+    "maximum-tracks-per-artist",
+    "maximum-tracks-per-album",
+  ]);
+  const observedDiversityAxes = new Set<string>();
+  for (const clause of input.clauses) {
+    const minimum = minimumDiversityAxes.has(clause.axis);
+    const maximum = maximumDiversityAxes.has(clause.axis);
+    if (!minimum && !maximum) continue;
+    if (clause.kind !== "quota_diversity"
+      || clause.scope !== "playlist"
+      || clause.values.length !== 1
+      || (minimum && clause.operator !== "balance")
+      || (maximum && clause.operator !== "limit")) {
+      throw new Error("invalid_playlist_diversity_clause");
+    }
+    if (observedDiversityAxes.has(clause.axis)) {
+      throw new Error("duplicate_playlist_diversity_axis");
+    }
+    observedDiversityAxes.add(clause.axis);
+    const count = Number(clause.values[0]);
+    if (!Number.isSafeInteger(count)
+      || (minimum && (count < 0 || count > input.requestedTrackCount))
+      || (maximum && count < 1)) {
+      throw new Error("contradictory_playlist_diversity_clause");
+    }
+  }
+  if (input.executionDirectives?.fixedContainer) {
+    const directive = input.executionDirectives.fixedContainer;
+    const clause = byId.get(directive.membershipClauseId);
+    if (!clause
+      || clause.kind !== "membership"
+      || clause.scope !== "track"
+      || clause.hardness !== "hard"
+      || clause.operator !== "require"
+      || clause.axis !== directive.kind
+      || !sameDirectiveValues(clause.values, [directive.name])
+      || !predicateClauseIds(input.trackPredicate).has(clause.id)) {
+      throw new Error("fixed_container_directive_clause_mismatch");
+    }
+  }
+  if (input.executionDirectives?.similarity) {
+    const directive = input.executionDirectives.similarity;
+    const rankingClause = byId.get(directive.rankingClauseId);
+    if (!rankingClause
+      || rankingClause.kind !== "ranking_preference"
+      || rankingClause.scope !== "track"
+      || rankingClause.hardness !== "soft"
+      || rankingClause.operator !== "prefer"
+      || rankingClause.axis !== "similarity"
+      || !sameDirectiveValues(rankingClause.values, directive.seedArtists)) {
+      throw new Error("similarity_directive_ranking_clause_mismatch");
+    }
+    const exclusionValues = directive.exactArtistExclusionClauseIds.flatMap((id) => {
+      const clause = byId.get(id);
+      if (!clause
+        || clause.kind !== "exclusion"
+        || clause.scope !== "track"
+        || clause.hardness !== "hard"
+        || clause.operator !== "exclude"
+        || clause.axis !== "artist"
+        || !predicateClauseIds(input.trackPredicate).has(id)) {
+        throw new Error("similarity_directive_exclusion_clause_mismatch");
+      }
+      return clause.values;
+    });
+    if (!sameDirectiveValues(exclusionValues, directive.excludedArtists)) {
+      throw new Error("similarity_directive_excluded_artist_mismatch");
+    }
+  }
+  if (input.executionDirectives?.exactArtistIdentityExclusions) {
+    const directive = input.executionDirectives.exactArtistIdentityExclusions;
+    const exclusionValues = directive.bindings.flatMap((binding) => {
+      const clause = byId.get(binding.clauseId);
+      if (!clause
+        || clause.kind !== "exclusion"
+        || clause.scope !== "track"
+        || clause.hardness !== "hard"
+        || clause.operator !== "exclude"
+        || clause.axis !== "artist"
+        || !predicateClauseIds(input.trackPredicate).has(binding.clauseId)
+        || binding.storefront !== input.storefront) {
+        throw new Error("exact_artist_identity_exclusion_clause_mismatch");
+      }
+      return clause.values;
+    });
+    if (!sameDirectiveValues(
+      exclusionValues,
+      directive.bindings.map(({ displayName }) => displayName),
+    )) {
+      throw new Error("exact_artist_identity_excluded_artist_mismatch");
+    }
+  }
   const trackIds = predicateClauseIds(input.trackPredicate);
   for (const id of trackIds) {
     const clause = byId.get(id);
@@ -654,6 +924,12 @@ function validateContractStructure(input: {
       throw new Error("non_track_clause_in_track_predicate");
     }
     if (clause.hardness !== "hard") throw new Error("soft_clause_cannot_gate_track_eligibility");
+    if (clause.operator !== "require" && clause.operator !== "exclude") {
+      throw new Error("unsupported_hard_track_clause_operator");
+    }
+    if (clause.kind === "exclusion" && clause.operator !== "exclude") {
+      throw new Error("exclusion_clause_requires_exclude_operator");
+    }
   }
   for (const quota of input.playlistConstraints) {
     const quotaClause = byId.get(quota.clauseId);
@@ -662,9 +938,30 @@ function validateContractStructure(input: {
     }
     for (const id of predicateClauseIds(quota.predicate)) {
       const clause = byId.get(id);
-      if (!clause || clause.scope !== "track" || !TRACK_PREDICATE_KINDS.has(clause.kind)) {
+      if (!clause
+        || clause.scope !== "track"
+        || clause.hardness !== "hard"
+        || !TRACK_PREDICATE_KINDS.has(clause.kind)
+        || (clause.operator !== "require" && clause.operator !== "exclude")
+        || (clause.kind === "exclusion" && clause.operator !== "exclude")) {
         throw new Error("invalid_quota_predicate_clause");
       }
+    }
+    const effectiveMinimum = Math.max(
+      quota.minimumCount ?? 0,
+      quota.minimumRatio === null
+        ? 0
+        : Math.ceil(input.requestedTrackCount * quota.minimumRatio),
+    );
+    const effectiveMaximum = Math.min(
+      input.requestedTrackCount,
+      quota.maximumCount ?? input.requestedTrackCount,
+      quota.maximumRatio === null
+        ? input.requestedTrackCount
+        : Math.floor(input.requestedTrackCount * quota.maximumRatio),
+    );
+    if (effectiveMinimum > effectiveMaximum) {
+      throw new Error("contradictory_quota_for_requested_count");
     }
   }
   for (const objective of input.sequencingObjectives) {
@@ -675,7 +972,13 @@ function validateContractStructure(input: {
   }
   for (const id of input.qualityPolicy.centralSuitabilityClauseIds) {
     const clause = byId.get(id);
-    if (!clause || clause.kind !== "suitability") throw new Error("invalid_central_suitability_clause");
+    if (!clause
+      || clause.kind !== "suitability"
+      || clause.scope !== "track"
+      || clause.hardness !== "soft"
+      || clause.operator !== "prefer") {
+      throw new Error("invalid_central_suitability_clause");
+    }
   }
   const referenced = new Set(trackIds);
   input.playlistConstraints.forEach((quota) => (
@@ -704,6 +1007,7 @@ interface FinalizeContractInput {
   readonly playlistConstraints: readonly PlaylistQuotaConstraintV1[];
   readonly sequencingObjectives: readonly PlaylistSequencingObjectiveV1[];
   readonly qualityPolicy: PlaylistContractQualityPolicyV1;
+  readonly executionDirectives?: PlaylistContractExecutionDirectivesV1;
   readonly answerLineage: readonly PlaylistContractAnswerLineageV1[];
 }
 
@@ -728,6 +1032,9 @@ function semanticProjection(input: Omit<
     sequencingObjectives: [...input.sequencingObjectives]
       .sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id)),
     qualityPolicy: input.qualityPolicy,
+    ...(input.executionDirectives ? {
+      executionDirectives: input.executionDirectives,
+    } : {}),
   };
 }
 
@@ -769,6 +1076,9 @@ function finalizeContract(input: FinalizeContractInput): PlaylistContractRevisio
     playlistConstraints: copyPlain(input.playlistConstraints),
     sequencingObjectives: copyPlain(input.sequencingObjectives),
     qualityPolicy: copyPlain(input.qualityPolicy),
+    ...(input.executionDirectives ? {
+      executionDirectives: copyPlain(input.executionDirectives),
+    } : {}),
     answerLineage: copyPlain(input.answerLineage),
   });
 }
@@ -806,6 +1116,7 @@ export function compilePlaylistContractRevisionV1(
   const playlistConstraints = (draft.playlistConstraints ?? []).map(normalizeQuotaConstraint);
   const sequencingObjectives = (draft.sequencingObjectives ?? []).map(normalizeSequencingObjective);
   const qualityPolicy = normalizeQualityPolicy(draft.qualityPolicy, clauses);
+  const executionDirectives = normalizedExecutionDirectives(draft.executionDirectives);
   return finalizeContract({
     contractId: normalizedId(draft.contractId, "contract_id"),
     revision: 1,
@@ -821,6 +1132,7 @@ export function compilePlaylistContractRevisionV1(
     playlistConstraints,
     sequencingObjectives,
     qualityPolicy,
+    ...(executionDirectives ? { executionDirectives } : {}),
     answerLineage: [],
   });
 }
@@ -863,6 +1175,9 @@ export function applyPlaylistContractPatchV1(
   let playlistConstraints = copyPlain([...base.playlistConstraints]);
   let sequencingObjectives = copyPlain([...base.sequencingObjectives]);
   let qualityPolicy = copyPlain(base.qualityPolicy);
+  let executionDirectives = base.executionDirectives
+    ? copyPlain(base.executionDirectives)
+    : undefined;
 
   for (const operation of patch.operations) {
     if (operation.op === "add_clause") {
@@ -887,6 +1202,18 @@ export function applyPlaylistContractPatchV1(
       sequencingObjectives = operation.objectives.map(normalizeSequencingObjective);
     } else if (operation.op === "set_quality_policy") {
       qualityPolicy = normalizeQualityPolicy(operation.policy, clauses);
+    } else if (operation.op === "set_exact_artist_identity_exclusions") {
+      const existing = executionDirectives ?? {
+        fixedContainer: null,
+        similarity: null,
+      };
+      executionDirectives = operation.directive === null
+        && !existing.fixedContainer && !existing.similarity
+        ? undefined
+        : normalizedExecutionDirectives({
+            ...existing,
+            exactArtistIdentityExclusions: operation.directive,
+          });
     }
   }
 
@@ -905,9 +1232,88 @@ export function applyPlaylistContractPatchV1(
     playlistConstraints,
     sequencingObjectives,
     qualityPolicy,
+    ...(executionDirectives ? {
+      executionDirectives,
+    } : {}),
     answerLineage: [...base.answerLineage, normalizedLineage(patch.answerLineage)],
   });
   if (next.semanticHash === base.semanticHash) throw new Error("contract_patch_did_not_change_semantics");
+  return next;
+}
+
+/**
+ * Replace an earlier guidance answer without replaying its patch against the
+ * current contract. The replacement is compiled against the immutable
+ * historical base, while the resulting revision is fenced as a child of the
+ * active revision. This intentionally drops the replaced answer and every
+ * dependent later answer from the executable lineage.
+ */
+export function rebasePlaylistContractPatchV1(input: {
+  active: PlaylistContractRevisionV1;
+  historicalBase: PlaylistContractRevisionV1;
+  replacementPatch: PlaylistContractPatchV1;
+}): PlaylistContractRevisionV1 {
+  assertPlaylistContractIntegrityV1(input.active);
+  assertPlaylistContractIntegrityV1(input.historicalBase);
+  if (input.active.contractId !== input.historicalBase.contractId
+    || input.active.rawPrompt !== input.historicalBase.rawPrompt
+    || input.active.locale !== input.historicalBase.locale
+    || input.active.storefront !== input.historicalBase.storefront
+    || stableStringify(input.active.versions)
+      !== stableStringify(input.historicalBase.versions)) {
+    throw new Error("historical_playlist_contract_not_in_active_lineage");
+  }
+  const historicalLineage = input.historicalBase.answerLineage;
+  if (historicalLineage.length > input.active.answerLineage.length
+    || historicalLineage.some((entry, index) => (
+      stableStringify(entry)
+        !== stableStringify(input.active.answerLineage[index])
+    ))) {
+    throw new Error("historical_playlist_contract_not_in_active_lineage");
+  }
+  if (input.replacementPatch.baseRevisionId
+      !== input.historicalBase.revisionId
+    || input.replacementPatch.baseSemanticHash
+      !== input.historicalBase.semanticHash) {
+    throw new Error("stale_playlist_contract_revision");
+  }
+  const revised = input.replacementPatch.operations.length > 0
+    ? applyPlaylistContractPatchV1(
+        input.historicalBase,
+        input.replacementPatch,
+      )
+    : {
+        ...input.historicalBase,
+        answerLineage: [
+          ...input.historicalBase.answerLineage,
+          normalizedLineage(input.replacementPatch.answerLineage),
+        ],
+      };
+  const next = finalizeContract({
+    contractId: input.active.contractId,
+    revision: input.active.revision + 1,
+    parentRevisionId: input.active.revisionId,
+    parentSemanticHash: input.active.semanticHash,
+    versions: revised.versions,
+    rawPrompt: revised.rawPrompt,
+    requestedTrackCount: revised.requestedTrackCount,
+    locale: revised.locale,
+    storefront: revised.storefront,
+    clauses: revised.clauses,
+    trackPredicate: revised.trackPredicate,
+    playlistConstraints: revised.playlistConstraints,
+    sequencingObjectives: revised.sequencingObjectives,
+    qualityPolicy: revised.qualityPolicy,
+    ...(revised.executionDirectives ? {
+      executionDirectives: revised.executionDirectives,
+    } : {}),
+    answerLineage: revised.answerLineage,
+  });
+  if (next.semanticHash === input.active.semanticHash
+    && stableStringify(next.answerLineage)
+      === stableStringify(input.active.answerLineage)) {
+    throw new Error("guidance_revision_did_not_change_contract");
+  }
   return next;
 }
 

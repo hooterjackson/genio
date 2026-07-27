@@ -304,6 +304,7 @@ describe("Pipeline V3 model routing", () => {
       kind: "corpus_first_v3",
       model: "gpt-5.6-terra",
       candidateGoal: 105,
+      qualifiedPoolGoal: 55,
       p10QualifiedToAppleSafeConversionRate: 0.5,
       conversionRateSampleCount: 0,
       conversionRateSegment: {
@@ -367,6 +368,7 @@ describe("Pipeline V3 model routing", () => {
     });
     expect(policy.executionPolicy).toMatchObject({
       candidateGoal: 260,
+      qualifiedPoolGoal: 110,
       p10QualifiedToAppleSafeConversionRate: 0.4,
       conversionRateSampleCount: 83,
       conversionRateSegment: {
@@ -398,6 +400,8 @@ describe("Pipeline V3 model routing", () => {
         maximumGlobalRounds: maxToolCalls,
         maximumCostUsd,
         candidateGoal: requestedTrackCount === 1_000 ? 4_100 : 1_235,
+        qualifiedPoolGoal: requestedTrackCount
+          + Math.max(5, Math.ceil(requestedTrackCount * 0.1)),
         conversionRateSegment: {
           sizeTier: "301_1000",
         },

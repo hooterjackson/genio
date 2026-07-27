@@ -35,6 +35,34 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
     listResearchContainers: (...args: Parameters<ResearchRepository["listResearchContainers"]>) => source.listResearchContainers(...args),
     getResearchCheckpoint: (...args: Parameters<ResearchRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<ResearchRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
+    ...(source.claimResearchProviderRetry ? {
+      claimResearchProviderRetry: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["claimResearchProviderRetry"]>
+        >
+      ) => source.claimResearchProviderRetry!(...args),
+    } : {}),
+    ...(source.persistResearchProviderBlocker ? {
+      persistResearchProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["persistResearchProviderBlocker"]>
+        >
+      ) => source.persistResearchProviderBlocker!(...args),
+    } : {}),
+    ...(source.validateResearchProviderAttempt ? {
+      validateResearchProviderAttempt: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["validateResearchProviderAttempt"]>
+        >
+      ) => source.validateResearchProviderAttempt!(...args),
+    } : {}),
+    ...(source.resolveResearchProviderBlocker ? {
+      resolveResearchProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["resolveResearchProviderBlocker"]>
+        >
+      ) => source.resolveResearchProviderBlocker!(...args),
+    } : {}),
     ...(source.getActivePlaylistContractRevision ? {
       getActivePlaylistContractRevision: (
         ...args: Parameters<NonNullable<ResearchRepository["getActivePlaylistContractRevision"]>>
@@ -62,6 +90,15 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
       persistPipelineV3QualificationBatch: (
         ...args: Parameters<NonNullable<ResearchRepository["persistPipelineV3QualificationBatch"]>>
       ) => source.persistPipelineV3QualificationBatch!(...args),
+    } : {}),
+    ...(source.validatePipelineV3ContinuationQualifications ? {
+      validatePipelineV3ContinuationQualifications: (
+        ...args: Parameters<
+          NonNullable<
+            ResearchRepository["validatePipelineV3ContinuationQualifications"]
+          >
+        >
+      ) => source.validatePipelineV3ContinuationQualifications!(...args),
     } : {}),
     persistPipelineV3RetrievalResult: (
       ...args: Parameters<ResearchRepository["persistPipelineV3RetrievalResult"]>
@@ -111,6 +148,27 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
     } : {}),
     ...(source.savePipelineOutcome ? {
       savePipelineOutcome: (...args: Parameters<NonNullable<MatchingRepository["savePipelineOutcome"]>>) => source.savePipelineOutcome!(...args),
+    } : {}),
+    ...(source.persistCatalogProviderBlocker ? {
+      persistCatalogProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<MatchingRepository["persistCatalogProviderBlocker"]>
+        >
+      ) => source.persistCatalogProviderBlocker!(...args),
+    } : {}),
+    ...(source.claimCatalogProviderRetry ? {
+      claimCatalogProviderRetry: (
+        ...args: Parameters<
+          NonNullable<MatchingRepository["claimCatalogProviderRetry"]>
+        >
+      ) => source.claimCatalogProviderRetry!(...args),
+    } : {}),
+    ...(source.resolveCatalogProviderBlocker ? {
+      resolveCatalogProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<MatchingRepository["resolveCatalogProviderBlocker"]>
+        >
+      ) => source.resolveCatalogProviderBlocker!(...args),
     } : {}),
     ...(source.getPipelineStageCounts ? {
       getPipelineStageCounts: (...args: Parameters<NonNullable<MatchingRepository["getPipelineStageCounts"]>>) => source.getPipelineStageCounts!(...args),

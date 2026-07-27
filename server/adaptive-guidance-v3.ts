@@ -1,5 +1,8 @@
 import { sha256Hex, stableStringify } from "./security.ts";
-import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
+import {
+  customGuidanceTrackCountAdmission,
+  type CustomGuidanceTrackCountAuthorityV1,
+} from "./playlist-count-policy.ts";
 import type {
   PlaylistContractClauseDraftV1,
   PlaylistContractPatchV1,
@@ -12,8 +15,17 @@ import type {
 import {
   applyPlaylistContractPatchV1,
 } from "./playlist-contract-v1.ts";
+import {
+  exactArtistExclusionIntentsV1,
+  type ResolvedExactArtistIdentityV1,
+} from "./exact-artist-identity-v1.ts";
+import type {
+  CriticalAmbiguityV3,
+} from "./selection-plan-v3.ts";
 
 export const ADAPTIVE_GUIDANCE_POLICY_VERSION = "adaptive_guidance_v3" as const;
+const FLOW_GUIDANCE_CLAUSE_ID = "guidance:flow:objective";
+const FLOW_GUIDANCE_SEQUENCE_ID = "guidance:flow:sequence";
 
 export type GuidanceTriggerV3 = "correctness" | "yield_risk" | "nuance";
 export type GuidanceCriticalityV3 = "required" | "optional";
@@ -302,7 +314,10 @@ export function smoothReggaetonHeatGuidanceDecisionV3(input: {
     trigger: "correctness",
     criticality: "required",
     selectionMode: "single",
-    allowCustom: true,
+    // This axis is compiled only through the server-owned options below.
+    // Free text can express a scope the typed reggaeton compiler cannot
+    // represent, so do not advertise a custom path that must later reject.
+    allowCustom: false,
     baseContractRevisionId: input.baseContractRevisionId,
     baseContractSemanticHash: input.baseContractSemanticHash,
     whyMaterial: "This determines which non-reggaeton recordings may enter while preserving a core reggaeton majority.",
@@ -425,6 +440,591 @@ function predicateWithRequiredClause(
   };
 }
 
+function predicateWithGuidedScope(
+  preserved: PlaylistPredicateV1 | null,
+  clauseIds: readonly string[],
+  composition: "all" | "any" = "all",
+): PlaylistPredicateV1 {
+  if (clauseIds.length === 0) throw new Error("critical_guidance_scope_is_empty");
+  const scope: PlaylistPredicateV1 = clauseIds.length === 1
+    ? { op: "clause", clauseId: clauseIds[0]! }
+    : {
+      op: composition,
+      children: clauseIds.map((clauseId) => ({ op: "clause", clauseId })),
+    };
+  if (!preserved) return scope;
+  return {
+    op: "all",
+    children: [preserved, scope],
+  };
+}
+
+function criticalMembershipClause(input: {
+  id: string;
+  axis: string;
+  value: string;
+  sourceText: string;
+  conceptId?: string;
+  expectedKind?: "genre" | "theme";
+  relationship?: string;
+}): PlaylistContractClauseDraftV1 {
+  return {
+    id: input.id,
+    kind: "membership",
+    scope: "track",
+    hardness: "hard",
+    axis: input.axis,
+    operator: "require",
+    values: [
+      input.value,
+      ...(input.relationship ? [`relationship:${input.relationship}`] : []),
+    ],
+    ...(input.conceptId && input.expectedKind ? {
+      conceptInputs: [{
+        text: input.value,
+        expectedKind: input.expectedKind,
+        selectedConceptId: input.conceptId,
+      }],
+    } : {}),
+    source: {
+      provenance: "guidance",
+      text: input.sourceText,
+    },
+    unknownPolicy: "defer",
+  };
+}
+
+function criticalFactualClause(input: {
+  id: string;
+  value: string;
+  relationship: string;
+  sourceText: string;
+}): PlaylistContractClauseDraftV1 {
+  return {
+    id: input.id,
+    kind: "factual_relationship",
+    scope: "track",
+    hardness: "hard",
+    axis: "factual_relationship",
+    operator: "require",
+    values: [input.value, `relationship:${input.relationship}`],
+    source: {
+      provenance: "guidance",
+      text: input.sourceText,
+    },
+    unknownPolicy: "defer",
+  };
+}
+
+function criticalAmbiguityClauseMatches(
+  ambiguity: CriticalAmbiguityV3,
+  clause: PlaylistContractRevisionV1["clauses"][number],
+): boolean {
+  if (clause.scope !== "track") return false;
+  const axis = normalizedKey(clause.axis);
+  const material = normalizedKey([
+    clause.axis,
+    ...clause.values,
+    ...clause.concepts.map(({ originalText }) => originalText),
+    clause.source.text,
+  ].join(" "));
+  if (ambiguity.key === "house_semantics") {
+    return ["genre", "subgenre", "scene", "theme"].includes(axis)
+      && /\b(?:house|houses|home|homes)\b/u.test(material);
+  }
+  if (ambiguity.key === "french_jazz_scope") {
+    return ["geography", "scene", "language"].includes(axis)
+      && /\b(?:french|france)\b/u.test(material);
+  }
+  if (ambiguity.key === "geographic_genre_scope") {
+    if (!["geography", "scene", "language"].includes(axis)) return false;
+    const values = [
+      ambiguity.geographicLabel,
+      ambiguity.sceneValue,
+      ambiguity.originValue,
+      ambiguity.languageValue,
+    ].flatMap((value) => value ? [normalizedKey(value)] : []);
+    return values.some((value) => material.includes(value));
+  }
+  if (ambiguity.key === "possessive_relationship") {
+    return axis === "relationship" || axis === "factual_relationship";
+  }
+  const namesBrazilianFunk = /\b(?:brazilian funk|funk carioca|baile funk|brazilian soul(?:-| )?funk|samba(?:-| )?funk)\b/u
+    .test(material);
+  if (["genre", "subgenre", "scene"].includes(axis)) {
+    return namesBrazilianFunk;
+  }
+  if (axis === "geography") {
+    return /\bbrazil(?:ian)?\b/u.test(material);
+  }
+  return (axis === "relationship" || axis === "factual_relationship")
+    && namesBrazilianFunk;
+}
+
+function criticalAmbiguousScopeClauseMatches(
+  ambiguity: CriticalAmbiguityV3,
+  clause: PlaylistContractRevisionV1["clauses"][number],
+): boolean {
+  if (criticalAmbiguityClauseMatches(ambiguity, clause)) return true;
+  const axis = normalizedKey(clause.axis);
+  // Some shadow-migrated clauses intentionally contain only a generic
+  // unresolved token (for example “funk”). The bridge identifies those exact
+  // clause IDs, while the V3 ambiguity key supplies the semantic axis needed
+  // to prevent one question from deleting another question's scope.
+  if (ambiguity.key === "house_semantics") {
+    return ["genre", "subgenre", "scene", "theme"].includes(axis);
+  }
+  if (ambiguity.key === "french_jazz_scope"
+    || ambiguity.key === "geographic_genre_scope") {
+    return ["geography", "scene", "language"].includes(axis);
+  }
+  if (ambiguity.key === "possessive_relationship") {
+    return axis === "relationship" || axis === "factual_relationship";
+  }
+  return ["genre", "subgenre", "scene", "geography", "relationship", "factual_relationship"]
+    .includes(axis);
+}
+
+function ambiguousContentLanguageLabels(ambiguity: CriticalAmbiguityV3): string[] {
+  if (ambiguity.key === "french_jazz_scope") return ["french", "france"];
+  if (ambiguity.key !== "geographic_genre_scope") return [];
+  return [
+    ambiguity.geographicLabel,
+    ambiguity.languageValue,
+    ambiguity.originValue,
+  ].flatMap((value) => value ? [normalizedKey(value)] : []);
+}
+
+function isAmbiguousMigratedContentLanguage(
+  ambiguity: CriticalAmbiguityV3,
+  value: string,
+): boolean {
+  const normalizedValue = normalizedKey(value);
+  if (!normalizedValue.startsWith("language:")) return false;
+  const language = normalizedValue.slice("language:".length).trim();
+  return ambiguousContentLanguageLabels(ambiguity).some((label) => (
+    language === label
+    || language.startsWith(`${label} `)
+    || language.endsWith(` ${label}`)
+  ));
+}
+
+function sanitizedContentClauseDraft(
+  clause: PlaylistContractRevisionV1["clauses"][number],
+  values: readonly string[],
+): PlaylistContractClauseDraftV1 {
+  return {
+    id: clause.id,
+    kind: clause.kind,
+    scope: clause.scope,
+    hardness: clause.hardness,
+    axis: clause.axis,
+    operator: clause.operator,
+    values,
+    source: {
+      provenance: clause.source.provenance,
+      text: clause.source.text,
+      spans: clause.source.spans,
+    },
+    evidence: {
+      required: clause.evidence.required,
+      claim: clause.evidence.claim,
+      minimumGrade: clause.evidence.minimumGrade,
+      permittedGrades: clause.evidence.permittedGrades,
+    },
+    unknownPolicy: clause.unknownPolicy,
+  };
+}
+
+interface CriticalAmbiguityContractCleanupV3 {
+  readonly removedClauseIds: readonly string[];
+  readonly preScopeOperations: readonly PlaylistContractPatchOperationV1[];
+  readonly affectedClauseIds: readonly string[];
+}
+
+function criticalAmbiguityContractCleanup(input: {
+  ambiguity: CriticalAmbiguityV3;
+  baseContract: PlaylistContractRevisionV1;
+  ambiguousScopeClauseIds: readonly string[];
+}): CriticalAmbiguityContractCleanupV3 {
+  const explicitAmbiguousIds = new Set(input.ambiguousScopeClauseIds);
+  const removedClauseIds: string[] = [];
+  const preScopeOperations: PlaylistContractPatchOperationV1[] = [];
+  const affectedClauseIds: string[] = [];
+  for (const clause of input.baseContract.clauses) {
+    const explicitAmbiguity = explicitAmbiguousIds.has(clause.id)
+      && criticalAmbiguousScopeClauseMatches(input.ambiguity, clause);
+    if (criticalAmbiguityClauseMatches(input.ambiguity, clause) || explicitAmbiguity) {
+      removedClauseIds.push(clause.id);
+      affectedClauseIds.push(clause.id);
+      preScopeOperations.push({ op: "remove_clause", clauseId: clause.id });
+      continue;
+    }
+    if (clause.source.provenance !== "migration"
+      || normalizedKey(clause.axis) !== "content") continue;
+    const retainedValues = clause.values.filter((value) => (
+      !isAmbiguousMigratedContentLanguage(input.ambiguity, value)
+    ));
+    if (retainedValues.length === clause.values.length) continue;
+    affectedClauseIds.push(clause.id);
+    const retainsHardPolicy = retainedValues.some((value) => (
+      value !== "explicit-content:allow" && value !== "instrumental:allow"
+    ));
+    if (!retainsHardPolicy) {
+      removedClauseIds.push(clause.id);
+      preScopeOperations.push({ op: "remove_clause", clauseId: clause.id });
+    } else {
+      preScopeOperations.push({
+        op: "replace_clause",
+        clauseId: clause.id,
+        clause: sanitizedContentClauseDraft(clause, retainedValues),
+      });
+    }
+  }
+  return {
+    removedClauseIds: uniqueSorted(removedClauseIds),
+    preScopeOperations,
+    affectedClauseIds: uniqueSorted(affectedClauseIds),
+  };
+}
+
+interface CriticalAmbiguityOptionDraftV3 {
+  id: string;
+  label: string;
+  description: string;
+  recommended: boolean;
+  expectedFeasibilityDirection: GuidanceFeasibilityDirectionV3;
+  clauses: readonly PlaylistContractClauseDraftV1[];
+  composition?: "all" | "any";
+}
+
+/**
+ * Project every server-detected V3 blocking ambiguity into an immutable
+ * contract decision. Unlike the legacy research-preference questions, each
+ * option carries the complete typed patch that removes only the unresolved
+ * interpretation and composes the chosen hard scope with every preserved
+ * catalog, evidence, exclusion, count, quality, and sequencing rule.
+ */
+export function criticalAmbiguityGuidanceDecisionV3(input: {
+  ambiguity: CriticalAmbiguityV3;
+  baseContract: PlaylistContractRevisionV1;
+  ambiguousScopeClauseIds?: readonly string[];
+}): GuidanceDecisionV3 {
+  const { ambiguity, baseContract } = input;
+  const cleanup = criticalAmbiguityContractCleanup({
+    ambiguity,
+    baseContract,
+    ambiguousScopeClauseIds: input.ambiguousScopeClauseIds ?? [],
+  });
+  const preserved = predicateWithoutClauseIds(
+    baseContract.trackPredicate,
+    new Set(cleanup.removedClauseIds),
+  );
+  let header: string;
+  let question: string;
+  let whyMaterial: string;
+  let options: readonly CriticalAmbiguityOptionDraftV3[];
+
+  if (ambiguity.key === "house_semantics") {
+    header = "Meaning";
+    question = "What does “house” mean here?";
+    whyMaterial = "The answer changes playlist membership, not merely its ordering.";
+    const genreClause = criticalMembershipClause({
+      id: "guidance:critical:house-semantics:genre",
+      axis: "genre",
+      value: "house music",
+      conceptId: "genre:house-music",
+      expectedKind: "genre",
+      sourceText: "Require recordings in the house-music genre.",
+    });
+    const themeClause = criticalMembershipClause({
+      id: "guidance:critical:house-semantics:theme",
+      axis: "theme",
+      value: "houses and homes",
+      conceptId: "theme:houses-and-homes",
+      expectedKind: "theme",
+      sourceText: "Require songs whose subject is houses, homes, or domestic space.",
+    });
+    options = [
+      {
+        id: "house_genre",
+        label: "House music",
+        description: "Use recordings in the electronic dance-music genre.",
+        recommended: true,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [genreClause],
+      },
+      {
+        id: "house_theme",
+        label: "Houses and homes",
+        description: "Use songs whose subject is houses, homes, or domestic space.",
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [themeClause],
+      },
+      {
+        id: "house_both",
+        label: "Both",
+        description: "Require house music whose lyrical subject also concerns houses or homes.",
+        recommended: false,
+        expectedFeasibilityDirection: "narrower",
+        clauses: [genreClause, themeClause],
+        composition: "all",
+      },
+    ];
+  } else if (
+    ambiguity.key === "french_jazz_scope"
+    || ambiguity.key === "geographic_genre_scope"
+  ) {
+    const french = ambiguity.key === "french_jazz_scope";
+    const geographicLabel = french
+      ? "French"
+      : ambiguity.geographicLabel ?? "Geographic";
+    const genreLabel = french ? "jazz" : ambiguity.genreLabel ?? "music";
+    const originValue = french ? "France" : ambiguity.originValue;
+    const sceneValue = french ? "French jazz scene" : ambiguity.sceneValue;
+    const languageValue = french ? "French" : ambiguity.languageValue;
+    if (!originValue || !sceneValue || !languageValue) {
+      throw new Error("critical_geography_metadata_is_incomplete");
+    }
+    header = french ? "French jazz" : `${geographicLabel} ${genreLabel}`;
+    question = french
+      ? "Which French relationship should define the tracks?"
+      : `Which ${geographicLabel} relationship should define the tracks?`;
+    whyMaterial = "Artist origin, scene participation, and language produce substantially different catalogues.";
+    const prefix = french
+      ? "guidance:critical:french-jazz-scope"
+      : "guidance:critical:geographic-genre-scope";
+    options = [
+      {
+        id: french ? "french_artist_origin" : "geographic_artist_origin",
+        label: `${geographicLabel} artists`,
+        description: `Require principal artists from ${originValue}.`,
+        recommended: true,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [criticalMembershipClause({
+          id: `${prefix}:artist-origin`,
+          axis: "geography",
+          value: originValue,
+          relationship: "artist_origin",
+          sourceText: `Require a documented principal-artist origin in ${originValue}.`,
+        })],
+      },
+      {
+        id: french ? "french_scene" : "geographic_scene",
+        label: `${geographicLabel} scene`,
+        description: `Include recordings connected to the ${sceneValue}.`,
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [criticalMembershipClause({
+          id: `${prefix}:scene`,
+          axis: "scene",
+          value: sceneValue,
+          relationship: "label_or_venue_scene",
+          sourceText: `Require a documented connection to the ${sceneValue}.`,
+        })],
+      },
+      {
+        id: french ? "french_language" : "geographic_language",
+        label: `${languageValue} language`,
+        description: `Require ${languageValue}-language vocal recordings.`,
+        recommended: false,
+        expectedFeasibilityDirection: "narrower",
+        clauses: [criticalMembershipClause({
+          id: `${prefix}:language`,
+          axis: "language",
+          value: languageValue,
+          relationship: "language",
+          sourceText: `Require documented ${languageValue}-language vocals.`,
+        })],
+      },
+    ];
+  } else if (ambiguity.key === "possessive_relationship") {
+    const subject = normalized(
+      ambiguity.subjectValue
+        ?? baseContract.rawPrompt.match(
+          /\b([a-z0-9][a-z0-9 .&-]{1,80})['’]s\s+(?:\d+\s+)?(?:most\s+)?(?:influential|essential|important|best)\s+(?:songs?|tracks?|recordings?)\b/iu,
+        )?.[1]
+        ?? "",
+    );
+    if (!subject) throw new Error("critical_possessive_subject_is_missing");
+    header = "Relationship";
+    question = "How must the named person relate to each recording?";
+    whyMaterial = "Performance, authorship, and influence are different factual claims with different evidence.";
+    const clause = (
+      suffix: string,
+      value: string,
+      relationship: string,
+      sourceText: string,
+    ) => criticalFactualClause({
+      id: `guidance:critical:possessive-relationship:${suffix}`,
+      value: `${subject}: ${value}`,
+      relationship,
+      sourceText,
+    });
+    options = [
+      {
+        id: "subject_performed",
+        label: "Performed on it",
+        description: "Require evidence that the subject performed on the exact recording.",
+        recommended: true,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [clause(
+          "performed",
+          "performed on the exact recording",
+          "subject_performed",
+          `Require evidence that ${subject} performed on the exact recording.`,
+        )],
+      },
+      {
+        id: "subject_created",
+        label: "Wrote or produced it",
+        description: "Require an authorship, composition, arrangement, or production credit.",
+        recommended: false,
+        expectedFeasibilityDirection: "narrower",
+        clauses: [clause(
+          "created",
+          "wrote, composed, arranged, or produced the exact recording",
+          "subject_created",
+          `Require an authorship, composition, arrangement, or production credit for ${subject}.`,
+        )],
+      },
+      {
+        id: "subject_influenced",
+        label: "Influenced it",
+        description: "Require documented influence rather than a direct recording credit.",
+        recommended: false,
+        expectedFeasibilityDirection: "broader",
+        clauses: [clause(
+          "influenced",
+          "documentably influenced the exact recording",
+          "subject_influenced",
+          `Require track-specific evidence that ${subject} influenced the recording.`,
+        )],
+      },
+    ];
+  } else {
+    header = "Brazilian funk";
+    question = "Which Brazilian funk tradition should define the playlist?";
+    whyMaterial = "Funk carioca and Brazilian soul/funk have different histories, artists, and recordings.";
+    const carioca = criticalMembershipClause({
+      id: "guidance:critical:brazilian-funk:funk-carioca",
+      axis: "genre",
+      value: "funk carioca",
+      conceptId: "genre:funk-carioca",
+      expectedKind: "genre",
+      sourceText: "Require funk carioca or baile-funk lineage.",
+    });
+    const soulFunk = criticalMembershipClause({
+      id: "guidance:critical:brazilian-funk:soul-funk",
+      axis: "genre",
+      value: "Brazilian soul-funk",
+      conceptId: "genre:brazilian-soul-funk",
+      expectedKind: "genre",
+      sourceText: "Require Brazilian soul, funk, or samba-funk lineage.",
+    });
+    options = [
+      {
+        id: "funk_carioca",
+        label: "Funk carioca",
+        description: "Focus on baile funk and its related scenes.",
+        recommended: true,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [carioca],
+      },
+      {
+        id: "brazilian_soul_funk",
+        label: "Soul and samba-funk",
+        description: "Focus on Brazilian soul, funk, and samba-funk traditions.",
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        clauses: [soulFunk],
+      },
+      {
+        id: "both_funk_traditions",
+        label: "Both traditions",
+        description: "Build a cross-tradition survey with evidence for either lineage.",
+        recommended: false,
+        expectedFeasibilityDirection: "broader",
+        clauses: [carioca, soulFunk],
+        composition: "any",
+      },
+    ];
+  }
+
+  const permittedOptionIds = new Set(
+    ambiguity.optionIds.filter((optionId) => optionId !== "custom"),
+  );
+  if (options.some(({ id }) => !permittedOptionIds.has(id))) {
+    throw new Error("critical_guidance_option_drift");
+  }
+  const potentialClauseIds = options.flatMap(({ clauses }) => (
+    clauses.map(({ id }) => id)
+  ));
+  const affectedClauseIds = uniqueSorted([
+    ...cleanup.affectedClauseIds,
+    ...potentialClauseIds,
+  ]);
+  const buildOperations = (
+    option: CriticalAmbiguityOptionDraftV3,
+  ): PlaylistContractPatchOperationV1[] => {
+    const selectedClauseIds = option.clauses.map(({ id }) => id);
+    return [
+      ...cleanup.preScopeOperations,
+      ...option.clauses.map((clause) => ({
+        op: "add_clause" as const,
+        clause,
+      })),
+      {
+        op: "replace_track_predicate" as const,
+        predicate: predicateWithGuidedScope(
+          preserved,
+          selectedClauseIds,
+          option.composition ?? "all",
+        ),
+      },
+    ];
+  };
+  return createGuidanceDecisionV3({
+    id: `v3-critical:${ambiguity.key}`,
+    header,
+    question,
+    axis: ambiguity.key,
+    trigger: "correctness",
+    criticality: "required",
+    selectionMode: "single",
+    // Critical ambiguity axes use server-owned typed patches. The generic
+    // custom compiler currently supports count/content/exclusion/quota/flow,
+    // not these semantic membership forks.
+    allowCustom: false,
+    baseContractRevisionId: baseContract.revisionId,
+    baseContractSemanticHash: baseContract.semanticHash,
+    whyMaterial,
+    allowedPatchOperations: [
+      "add_clause",
+      "remove_clause",
+      "replace_clause",
+      "replace_track_predicate",
+    ],
+    affectedClauseIds,
+    materialityScore: 100,
+    options: options.map((option) => ({
+      id: option.id,
+      label: option.label,
+      description: option.description,
+      recommended: option.recommended,
+      expectedFeasibilityDirection: option.expectedFeasibilityDirection,
+      patch: {
+        affectedClauseIds: uniqueSorted([
+          ...cleanup.affectedClauseIds,
+          ...option.clauses.map(({ id }) => id),
+        ]),
+        operations: buildOperations(option),
+      },
+    })),
+  });
+}
+
 function frenchJazzRelationshipClause(input: {
   id: string;
   axis: "geography" | "scene" | "language";
@@ -509,7 +1109,7 @@ export function frenchJazzGuidanceDecisionV3(input: {
     trigger: "correctness",
     criticality: "required",
     selectionMode: "single",
-    allowCustom: true,
+    allowCustom: false,
     baseContractRevisionId: input.baseContract.revisionId,
     baseContractSemanticHash: input.baseContract.semanticHash,
     whyMaterial: "Artist origin, scene association, recording location, and language describe different eligible recordings and require different evidence.",
@@ -622,7 +1222,7 @@ export function rareScopeGuidanceDecisionV3(input: {
     trigger: "yield_risk",
     criticality: "optional",
     selectionMode: "single",
-    allowCustom: true,
+    allowCustom: false,
     baseContractRevisionId: input.baseContract.revisionId,
     baseContractSemanticHash: input.baseContract.semanticHash,
     whyMaterial: "The count stays fixed. This choice changes discovery order and ranking, but never permits filler or weakens any hard musical constraint.",
@@ -684,13 +1284,17 @@ export function flowNuanceGuidanceDecisionV3(input: {
     || /\b(?:chronological|smooth(?:ly)?|contrast|editorial order)\b/iu.test(input.prompt)) {
     return null;
   }
-  const clauseId = "guidance:flow:objective";
+  const clauseId = FLOW_GUIDANCE_CLAUSE_ID;
+  const clauseOperation = input.baseContract.clauses.some(({ id }) => (
+    id === clauseId
+  ))
+    ? "replace_clause"
+    : "add_clause";
   const operation = (
     direction: PlaylistSequencingObjectiveV1["direction"],
     label: string,
-  ): PlaylistContractPatchOperationV1[] => [{
-    op: "add_clause",
-    clause: {
+  ): PlaylistContractPatchOperationV1[] => {
+    const clause: PlaylistContractClauseDraftV1 = {
       id: clauseId,
       kind: "ranking_preference",
       scope: "playlist",
@@ -699,18 +1303,22 @@ export function flowNuanceGuidanceDecisionV3(input: {
       operator: "prefer",
       values: [label],
       source: { provenance: "guidance", text: label },
-    },
-  }, {
-    op: "set_sequencing_objectives",
-    objectives: [{
-      id: "guidance:flow:sequence",
-      clauseId,
-      dimension: "playlist_flow",
-      direction,
-      weight: 1,
-      priority: 1,
-    }],
-  }];
+    };
+    const clausePatch: PlaylistContractPatchOperationV1 = clauseOperation === "replace_clause"
+      ? { op: "replace_clause", clauseId, clause }
+      : { op: "add_clause", clause };
+    return [clausePatch, {
+      op: "set_sequencing_objectives",
+      objectives: [{
+        id: FLOW_GUIDANCE_SEQUENCE_ID,
+        clauseId,
+        dimension: "playlist_flow",
+        direction,
+        weight: 1,
+        priority: 1,
+      }],
+    }];
+  };
   return createGuidanceDecisionV3({
     id: "guidance:flow:shape",
     header: "Listening flow",
@@ -723,7 +1331,10 @@ export function flowNuanceGuidanceDecisionV3(input: {
     baseContractRevisionId: input.baseContract.revisionId,
     baseContractSemanticHash: input.baseContract.semanticHash,
     whyMaterial: "This changes the final sequence after every track has qualified; it does not change eligibility.",
-    allowedPatchOperations: ["add_clause", "set_sequencing_objectives"],
+    allowedPatchOperations: [
+      clauseOperation,
+      "set_sequencing_objectives",
+    ],
     affectedClauseIds: [clauseId],
     materialityScore: 55,
     options: [
@@ -762,15 +1373,28 @@ export function deterministicGuidanceCandidatesV3(input: {
   preservedTrackPredicate: PlaylistPredicateV1 | null;
   ambiguousScopeClauseIds: readonly string[];
   baseContract?: PlaylistContractRevisionV1;
+  criticalAmbiguities?: readonly CriticalAmbiguityV3[];
 }): GuidanceDecisionV3[] {
   const reggaeton = smoothReggaetonHeatGuidanceDecisionV3(input);
-  if (reggaeton) return [reggaeton];
-  if (!input.baseContract) return [];
+  if (!input.baseContract) return reggaeton ? [reggaeton] : [];
+  const criticalAmbiguities = input.criticalAmbiguities ?? [];
+  const critical = criticalAmbiguities.map((ambiguity) => (
+    criticalAmbiguityGuidanceDecisionV3({
+      ambiguity,
+      baseContract: input.baseContract!,
+      ambiguousScopeClauseIds: input.ambiguousScopeClauseIds,
+    })
+  ));
+  const criticalKeys = new Set(criticalAmbiguities.map(({ key }) => key));
   return [
-    frenchJazzGuidanceDecisionV3({
-      prompt: input.prompt,
-      baseContract: input.baseContract,
-    }),
+    ...(reggaeton ? [reggaeton] : []),
+    ...critical,
+    ...(criticalKeys.has("french_jazz_scope")
+      ? []
+      : [frenchJazzGuidanceDecisionV3({
+          prompt: input.prompt,
+          baseContract: input.baseContract,
+        })]),
     rareScopeGuidanceDecisionV3({
       prompt: input.prompt,
       baseContract: input.baseContract,
@@ -1039,6 +1663,16 @@ export function selectGuidanceRoundV3(
   const eligible = input.candidates.filter((candidate) => {
     assertGuidanceDecisionV3(candidate);
     const axis = normalizedKey(candidate.axis);
+    const blockingSemanticAmbiguity = candidate.trigger === "correctness"
+      && candidate.criticality === "required";
+    // Fixed lists, factual scopes, and already-complete requests suppress
+    // optional taste/nuance questions. A server-detected blocking semantic
+    // ambiguity is different: request shape cannot silently choose its
+    // membership or evidence relationship.
+    if (input.requestShape !== "curated" && !blockingSemanticAmbiguity) {
+      rejectedDecisionReasons[candidate.id] = "request_needs_no_guidance";
+      return false;
+    }
     if (explicitAxes.has(axis)) {
       rejectedDecisionReasons[candidate.id] = "axis_already_explicit";
       return false;
@@ -1050,13 +1684,6 @@ export function selectGuidanceRoundV3(
     if ((attempts[candidate.axis] ?? attempts[axis] ?? 0) >= 2) {
       rejectedDecisionReasons[candidate.id] = "clarification_attempt_limit";
       showEditableInterpretationSummary = true;
-      return false;
-    }
-    if (
-      input.requestShape !== "curated"
-      && !(candidate.trigger === "correctness" && candidate.criticality === "required")
-    ) {
-      rejectedDecisionReasons[candidate.id] = "request_needs_no_optional_guidance";
       return false;
     }
     return true;
@@ -1087,13 +1714,14 @@ export function selectGuidanceRoundV3(
         }
         optionalNuanceCount += 1;
       }
-      const blockingCount = selected.filter((value) => (
-        value.trigger === "correctness" && value.criticality === "required"
-      )).length;
+      const blockingSemanticAmbiguity = candidate.trigger === "correctness"
+        && candidate.criticality === "required";
+      const canUseThirdInitialSlot = input.stage === "initial"
+        && selected.length === 2
+        && blockingSemanticAmbiguity;
       const maximum = input.stage === "rescue"
         ? 1
-        : blockingCount >= 2
-          || (candidate.trigger === "correctness" && candidate.criticality === "required" && blockingCount >= 1)
+        : canUseThirdInitialSlot
           ? 3
           : 2;
       if (selected.length >= maximum) {
@@ -1350,6 +1978,69 @@ function clauseUpsertOperation(
     : { op: "add_clause", clause };
 }
 
+function conflictsWithRequiredArtistV3(
+  base: PlaylistContractRevisionV1,
+  artistName: string,
+): boolean {
+  const artistKey = normalizedKey(artistName);
+  return base.clauses.some((clause) => (
+    clause.kind === "membership"
+    && clause.scope === "track"
+    && clause.hardness === "hard"
+    && clause.axis === "artist"
+    && clause.operator === "require"
+    && predicateReferencesClause(base.trackPredicate, clause.id)
+    && [
+      ...clause.values,
+      ...clause.concepts.flatMap((concept) => [
+        concept.originalText,
+        ...concept.candidates
+          .filter(({ conceptId }) => conceptId === concept.selectedConceptId)
+          .map(({ label }) => label),
+      ]),
+    ].some((value) => normalizedKey(value) === artistKey)
+  ));
+}
+
+/**
+ * Reject deterministic custom-text contradictions before any provider lookup.
+ * Proper-name candidates remain inert here; only a later server-owned catalog
+ * resolution may authorize the executable exact-identity directive.
+ */
+export function preflightCustomGuidanceTextV3(input: {
+  base: PlaylistContractRevisionV1;
+  customText: string;
+  trackCountAuthority?: CustomGuidanceTrackCountAuthorityV1 | null;
+}): ReturnType<typeof exactArtistExclusionIntentsV1> {
+  const normalizedText = normalized(input.customText);
+  if (!normalizedText || normalizedText.length > 500) {
+    throw new Error("invalid_custom_guidance_text");
+  }
+  const exactArtistIntent = exactArtistExclusionIntentsV1(normalizedText);
+  if (exactArtistIntent.status === "needs_clarification") {
+    throw new Error(
+      `custom_artist_exclusion_requires_clarification:${exactArtistIntent.reason}`,
+    );
+  }
+  if (exactArtistIntent.status === "candidates"
+    && exactArtistIntent.candidates.some(({ inputText }) => (
+      conflictsWithRequiredArtistV3(input.base, inputText)
+    ))) {
+    throw new Error("custom_guidance_conflicts_with_existing_hard_predicate");
+  }
+  const requestedCount = normalizedText.match(
+    /\b(\d+)\s+(?:tracks?|songs?|recordings?)\b/iu,
+  );
+  if (requestedCount && input.trackCountAuthority
+    && customGuidanceTrackCountAdmission({
+      requestedTrackCount: Number(requestedCount[1]),
+      authority: input.trackCountAuthority,
+    }).status !== "accepted") {
+    throw new Error("invalid_custom_requested_count");
+  }
+  return exactArtistIntent;
+}
+
 /**
  * Deterministic, deliberately small custom-input compiler. New prose is
  * accepted only through server-owned recognizers; the text itself never
@@ -1360,6 +2051,8 @@ function clauseUpsertOperation(
 export function recompileCustomGuidanceTextV3(input: {
   base: PlaylistContractRevisionV1;
   customText: string;
+  trackCountAuthority?: CustomGuidanceTrackCountAuthorityV1 | null;
+  resolvedExactArtistIdentities?: readonly ResolvedExactArtistIdentityV1[];
 }): ServerRecompiledCustomGuidanceV3 {
   const normalizedText = normalized(input.customText);
   if (!normalizedText || normalizedText.length > 500) throw new Error("invalid_custom_guidance_text");
@@ -1367,6 +2060,10 @@ export function recompileCustomGuidanceTextV3(input: {
   const affectedClauseIds = new Set<string>();
   const hardChangeReasons = new Set<string>();
   let nextPredicate = input.base.trackPredicate;
+  const exactArtistIntent = preflightCustomGuidanceTextV3({
+    base: input.base,
+    customText: normalizedText,
+  });
 
   const cleanOnly = /\b(?:clean(?:\s+versions?)?|no\s+explicit(?:\s+lyrics|\s+content)?)\b/iu.test(normalizedText);
   if (cleanOnly) {
@@ -1398,54 +2095,69 @@ export function recompileCustomGuidanceTextV3(input: {
     hardChangeReasons.add("content_policy_changed");
   }
 
-  const excludedArtist = normalizedText.match(
-    /\b(?:no|without|exclude|excluding)\s+((?:bad bunny)|[\p{L}\p{N}][\p{L}\p{N}'’.-]*(?:\s+[\p{L}\p{N}][\p{L}\p{N}'’.-]*){0,4})\b/iu,
-  )?.[1]?.trim();
-  if (excludedArtist && !/\bexplicit(?:\s+lyrics|\s+content)?\b/iu.test(excludedArtist)) {
-    const safeArtist = excludedArtist.normalize("NFKC").replace(/\s+/gu, " ").trim();
-    const excludedArtistKey = normalizedKey(safeArtist);
-    const conflictsWithRequiredArtist = input.base.clauses.some((clause) => (
-      clause.kind === "membership"
-      && clause.scope === "track"
-      && clause.hardness === "hard"
-      && clause.axis === "artist"
-      && clause.operator === "require"
-      && predicateReferencesClause(input.base.trackPredicate, clause.id)
-      && [
-        ...clause.values,
-        ...clause.concepts.flatMap((concept) => [
-          concept.originalText,
-          ...concept.candidates
-            .filter(({ conceptId }) => conceptId === concept.selectedConceptId)
-            .map(({ label }) => label),
-        ]),
-      ].some((value) => normalizedKey(value) === excludedArtistKey)
-    ));
-    if (conflictsWithRequiredArtist) {
-      throw new Error("custom_guidance_conflicts_with_existing_hard_predicate");
+  if (exactArtistIntent.status === "candidates") {
+    const existingBindings =
+      input.base.executionDirectives?.exactArtistIdentityExclusions?.bindings
+      ?? [];
+    const nextBindings = [...existingBindings];
+    for (const candidate of exactArtistIntent.candidates) {
+      const resolved = (input.resolvedExactArtistIdentities ?? []).filter((identity) => (
+        normalizedKey(identity.inputText) === normalizedKey(candidate.inputText)
+        && identity.storefront === input.base.storefront
+        && /^\d{1,32}$/u.test(identity.catalogArtistId)
+        && identity.displayName.trim().length > 0
+        && normalizedKey(identity.displayName)
+          === normalizedKey(candidate.inputText)
+      ));
+      if (resolved.length !== 1) {
+        throw new Error("custom_artist_exclusion_requires_catalog_identity");
+      }
+      const identity = resolved[0]!;
+      const safeArtist = identity.displayName
+        .normalize("NFKC").replace(/\s+/gu, " ").trim();
+      if (conflictsWithRequiredArtistV3(input.base, safeArtist)) {
+        throw new Error("custom_guidance_conflicts_with_existing_hard_predicate");
+      }
+      const clauseId = `guidance:custom:exclude:${sha256Hex(normalizedKey(safeArtist)).slice(0, 16)}`;
+      const clause: PlaylistContractClauseDraftV1 = {
+        id: clauseId,
+        kind: "exclusion",
+        scope: "track",
+        hardness: "hard",
+        axis: "artist",
+        operator: "exclude",
+        values: [safeArtist],
+        source: { provenance: "guidance", text: `No recordings by ${safeArtist}` },
+        evidence: {
+          required: true,
+          minimumGrade: "authoritative_structured_metadata",
+          permittedGrades: ["authoritative_structured_metadata"],
+        },
+        unknownPolicy: "reject",
+      };
+      operations.push(clauseUpsertOperation(input.base, clause));
+      const binding = {
+        clauseId,
+        catalogArtistId: identity.catalogArtistId,
+        displayName: safeArtist,
+        storefront: identity.storefront,
+      };
+      const existingIndex = nextBindings.findIndex(
+        (candidateBinding) => candidateBinding.clauseId === clauseId,
+      );
+      if (existingIndex >= 0) nextBindings[existingIndex] = binding;
+      else nextBindings.push(binding);
+      affectedClauseIds.add(clauseId);
+      if (!predicateReferencesClause(nextPredicate, clauseId)) {
+        nextPredicate = predicateWithRequiredClause(nextPredicate, clauseId);
+      }
     }
-    const clauseId = `guidance:custom:exclude:${sha256Hex(normalizedKey(safeArtist)).slice(0, 16)}`;
-    const clause: PlaylistContractClauseDraftV1 = {
-      id: clauseId,
-      kind: "exclusion",
-      scope: "track",
-      hardness: "hard",
-      axis: "artist",
-      operator: "exclude",
-      values: [safeArtist],
-      source: { provenance: "guidance", text: `No recordings by ${safeArtist}` },
-      evidence: {
-        required: true,
-        minimumGrade: "authoritative_structured_metadata",
-        permittedGrades: ["authoritative_structured_metadata"],
+    operations.push({
+      op: "set_exact_artist_identity_exclusions",
+      directive: {
+        bindings: nextBindings,
       },
-      unknownPolicy: "reject",
-    };
-    operations.push(clauseUpsertOperation(input.base, clause));
-    affectedClauseIds.add(clauseId);
-    if (!predicateReferencesClause(nextPredicate, clauseId)) {
-      nextPredicate = predicateWithRequiredClause(nextPredicate, clauseId);
-    }
+    });
     hardChangeReasons.add("exclusion_changed");
   }
 
@@ -1499,12 +2211,13 @@ export function recompileCustomGuidanceTextV3(input: {
     hardChangeReasons.add("playlist_quota_changed");
   }
 
-  const requestedCount = normalizedText.match(/\b(\d{1,3})\s+(?:tracks?|songs?|recordings?)\b/iu);
+  const requestedCount = normalizedText.match(/\b(\d+)\s+(?:tracks?|songs?|recordings?)\b/iu);
   if (requestedCount) {
     const count = Number(requestedCount[1]);
-    if (!Number.isSafeInteger(count)
-      || count < 1
-      || count > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
+    if (customGuidanceTrackCountAdmission({
+      requestedTrackCount: count,
+      authority: input.trackCountAuthority,
+    }).status !== "accepted") {
       throw new Error("invalid_custom_requested_count");
     }
     if (count !== input.base.requestedTrackCount) {
@@ -1520,7 +2233,7 @@ export function recompileCustomGuidanceTextV3(input: {
           : /\beditorial\b/iu.test(normalizedText) ? "editorial"
             : null;
   if (flowDirection) {
-    const clauseId = "guidance:custom:flow";
+    const clauseId = FLOW_GUIDANCE_CLAUSE_ID;
     operations.push(clauseUpsertOperation(input.base, {
       id: clauseId,
       kind: "ranking_preference",
@@ -1534,7 +2247,7 @@ export function recompileCustomGuidanceTextV3(input: {
     operations.push({
       op: "set_sequencing_objectives",
       objectives: [{
-        id: "guidance:custom:flow",
+        id: FLOW_GUIDANCE_SEQUENCE_ID,
         clauseId,
         dimension: "playlist_flow",
         direction: flowDirection,
@@ -1635,6 +2348,151 @@ export function customGuidanceConfirmationDecisionV3(input: {
           operations: [],
         },
       },
+    ],
+  });
+}
+
+export interface ExactArtistIdentityGuidanceCandidateV3 {
+  catalogArtistId: string;
+  displayName: string;
+  storefront: string;
+  profileUrl?: string;
+  genreNames?: readonly string[];
+}
+
+/**
+ * Convert an Apple exact-name ambiguity into one immutable, server-owned
+ * correctness question. Every identity option contains the full custom-text
+ * patch; the stable ID never comes from the browser.
+ */
+export function exactArtistIdentityAmbiguityGuidanceDecisionV3(input: {
+  base: PlaylistContractRevisionV1;
+  customText: string;
+  inputText: string;
+  candidates: readonly ExactArtistIdentityGuidanceCandidateV3[];
+  trackCountAuthority?: CustomGuidanceTrackCountAuthorityV1 | null;
+}): GuidanceDecisionV3 {
+  const intent = exactArtistExclusionIntentsV1(input.customText);
+  if (intent.status !== "candidates"
+    || intent.candidates.length !== 1
+    || normalizedKey(intent.candidates[0]!.inputText)
+      !== normalizedKey(input.inputText)) {
+    throw new Error("exact_artist_ambiguity_requires_one_axis");
+  }
+  if (input.candidates.length < 2 || input.candidates.length > 3) {
+    throw new Error("exact_artist_ambiguity_requires_two_to_three_candidates");
+  }
+  const candidateIds = input.candidates.map(({ catalogArtistId }) => (
+    catalogArtistId.trim()
+  ));
+  if (new Set(candidateIds).size !== candidateIds.length
+    || candidateIds.some((value) => !/^\d{1,32}$/u.test(value))) {
+    throw new Error("invalid_exact_artist_ambiguity_candidates");
+  }
+  const expectedArtistKey = normalizedKey(input.inputText);
+  const candidates = input.candidates.map((candidate) => {
+    const displayName = normalized(candidate.displayName);
+    const storefront = normalized(candidate.storefront)
+      .toLocaleLowerCase("en-US");
+    if (displayName.length > 160
+      || normalizedKey(displayName) !== expectedArtistKey
+      || storefront !== input.base.storefront) {
+      throw new Error("exact_artist_ambiguity_candidate_mismatch");
+    }
+    const compiled = recompileCustomGuidanceTextV3({
+      base: input.base,
+      customText: input.customText,
+      trackCountAuthority: input.trackCountAuthority,
+      resolvedExactArtistIdentities: [{
+        inputText: intent.candidates[0]!.inputText,
+        catalogArtistId: candidate.catalogArtistId.trim(),
+        displayName,
+        storefront,
+      }],
+    });
+    const genres = [...new Set((candidate.genreNames ?? [])
+      .map((value) => normalized(value).slice(0, 80))
+      .filter(Boolean))]
+      .slice(0, 4);
+    return {
+      candidate: {
+        catalogArtistId: candidate.catalogArtistId.trim(),
+        displayName,
+        storefront,
+        genreNames: genres,
+      },
+      compiled,
+    };
+  });
+  const summary = candidates[0]!.compiled.summary;
+  if (candidates.some(({ compiled }) => (
+    stableStringify(compiled.summary) !== stableStringify(summary)
+  ))) {
+    throw new Error("exact_artist_ambiguity_summary_mismatch");
+  }
+  const affectedClauseIds = uniqueSorted(candidates.flatMap(({ compiled }) => (
+    compiled.affectedClauseIds
+  )));
+  const allowedPatchOperations = uniqueSorted(candidates.flatMap(({ compiled }) => (
+    compiled.operations.map(({ op }) => op)
+  )));
+  const decisionId = `guidance:artist-identity:${sha256Hex(stableStringify({
+    base: input.base.semanticHash,
+    customText: normalized(input.customText),
+    inputText: normalized(input.inputText),
+    identities: candidates.map(({ candidate }) => ({
+      id: candidate.catalogArtistId,
+      name: candidate.displayName,
+      storefront: candidate.storefront,
+    })),
+  })).slice(0, 20)}`;
+  return createGuidanceDecisionV3({
+    id: decisionId,
+    header: "Choose exact artist",
+    question: `Which Apple Music artist named “${normalized(input.inputText)}” should be excluded?`,
+    axis: "exact_artist_identity",
+    trigger: "correctness",
+    criticality: "required",
+    selectionMode: "single",
+    allowCustom: false,
+    baseContractRevisionId: input.base.revisionId,
+    baseContractSemanticHash: input.base.semanticHash,
+    whyMaterial: "The same artist name maps to multiple Apple Music identities. Choose one stable profile, or keep the current interpretation unchanged.",
+    allowedPatchOperations,
+    affectedClauseIds,
+    materialityScore: 100,
+    interpretationSummary: summary,
+    options: [
+      {
+        id: "keep_current_interpretation",
+        label: "Keep current interpretation",
+        description: "Do not add this artist exclusion. You can edit the artist wording separately.",
+        recommended: true,
+        expectedFeasibilityDirection: "neutral",
+        patch: {
+          affectedClauseIds: [],
+          operations: [],
+        },
+      },
+      ...candidates.map(({ candidate, compiled }) => {
+        const genres = candidate.genreNames?.length
+          ? ` Genres: ${candidate.genreNames.join(", ")}.`
+          : "";
+        return {
+          id: `exclude_artist_${sha256Hex(stableStringify({
+            id: candidate.catalogArtistId,
+            storefront: candidate.storefront,
+          })).slice(0, 16)}`,
+          label: `${candidate.displayName} · ${candidate.catalogArtistId}`,
+          description: `Exclude Apple Music artist ${candidate.catalogArtistId}.${genres}`,
+          recommended: false,
+          expectedFeasibilityDirection: "narrower" as const,
+          patch: {
+            affectedClauseIds: compiled.affectedClauseIds,
+            operations: compiled.operations,
+          },
+        };
+      }),
     ],
   });
 }

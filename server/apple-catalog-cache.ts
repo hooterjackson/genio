@@ -150,6 +150,7 @@ function isCatalogSong(value: unknown): value is CatalogSong {
     && typeof value.name === "string"
     && typeof value.artistName === "string"
     && typeof value.albumName === "string"
+    && (value.artistIds === undefined || isStringArray(value.artistIds))
     && isOptionalString(value.url)
     && (value.contentRating === undefined || value.contentRating === "clean" || value.contentRating === "explicit")
     && (value.genreNames === undefined || isStringArray(value.genreNames));

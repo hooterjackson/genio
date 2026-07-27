@@ -58,6 +58,49 @@ describe("never-dead-end policy", () => {
     })).toMatchObject({ retry: false, nextRetryAt: null, needsDecision: true });
   });
 
+  test("anchors all V2 durable slots and turns slot exhaustion or long Retry-After into a decision-only wake", () => {
+    const blockedAt = new Date("2026-07-23T00:00:00.000Z");
+    const expected = [
+      "2026-07-23T00:05:00.000Z",
+      "2026-07-23T00:30:00.000Z",
+      "2026-07-23T02:00:00.000Z",
+      "2026-07-23T06:00:00.000Z",
+      "2026-07-23T12:00:00.000Z",
+    ];
+    expected.forEach((timestamp, retryCount) => {
+      expect(dependencyRetryDecision({
+        blockedAt,
+        retryCount,
+        now: new Date("2026-07-23T00:01:00.000Z"),
+      })).toMatchObject({
+        retry: true,
+        nextRetryAt: new Date(timestamp),
+        needsDecision: false,
+        decisionOnlyWake: false,
+      });
+    });
+    expect(dependencyRetryDecision({
+      blockedAt,
+      retryCount: 5,
+      now: new Date("2026-07-23T12:00:01.000Z"),
+    })).toMatchObject({
+      retry: false,
+      nextRetryAt: new Date("2026-07-24T00:00:00.000Z"),
+      needsDecision: false,
+      decisionOnlyWake: true,
+    });
+    expect(dependencyRetryDecision({
+      blockedAt,
+      retryCount: 0,
+      now: new Date("2026-07-23T00:01:00.000Z"),
+      retryAfterUntil: new Date("2026-07-25T00:00:00.000Z"),
+    })).toMatchObject({
+      retry: false,
+      nextRetryAt: new Date("2026-07-24T00:00:00.000Z"),
+      decisionOnlyWake: true,
+    });
+  });
+
   test("sizes curated reserves from conservative conversion while clamping outliers", () => {
     expect(curatedCandidateGoal({ target: 50, p10QualifiedToAppleSafeRate: 0.5 })).toBe(105);
     expect(curatedCandidateGoal({ target: 50, p10QualifiedToAppleSafeRate: 0.01 })).toBe(205);

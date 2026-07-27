@@ -8,6 +8,16 @@ The anonymous browser is untrusted. Sites is the only browser-facing gateway; Ra
 
 Run creation returns a random capability in a URL fragment. Fragments are not sent in HTTP requests. The client exchanges it once, receives a scoped `HttpOnly`, `Secure`, `SameSite=Strict` cookie, and clears the fragment with `history.replaceState`. The database stores only peppered hashes. A browser session may hold access to multiple runs, but every run route verifies its individual session-to-access mapping. A one-use transfer capability adds only its specific run to the receiving session. Deleting one run access preserves the session’s other jobs; an empty session is revoked and its cookie is cleared.
 
+Capability-pepper rotation is a bounded dual-read/single-write migration. The
+API mints every new token and session hash with the current pepper, while one
+previous pepper may verify existing hashes until an explicit deadline no later
+than the active session TTL. Current and previous hash candidates are checked
+in one repository operation; responses never reveal which generation matched.
+Public runtime identity contains only SHA-256 identities of non-secret version
+labels, never a pepper or a pepper-derived digest. Once the deadline passes,
+legacy verification stops and readiness reports that the previous variables
+need cleanup.
+
 Capabilities authorize specific run accesses, not identity. Daily HMAC-derived client buckets enforce abuse limits without storing raw IP addresses. Only trusted Sites/Cloudflare client-IP metadata may be used.
 
 ## Signed gateway

@@ -1,6 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import {
+  inspectReleaseWorktree,
+  readReleaseGitStatus,
+} from "./check-release-git-state.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const packageMetadata = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
@@ -108,6 +112,18 @@ if (exactTag && !new RegExp(
 }
 
 if (requiredTag && typeof packageMetadata.version === "string") {
+  try {
+    const worktree = inspectReleaseWorktree({
+      readStatus: () => readReleaseGitStatus(root),
+    });
+    if (!worktree.clean) {
+      errors.push(
+        `Release-tag validation requires a clean worktree; found ${worktree.changedPathCount} changed path(s)`,
+      );
+    }
+  } catch {
+    errors.push("Could not verify that the release worktree is clean");
+  }
   try {
     const tags = execFileSync("git", ["tag", "--points-at", "HEAD"], { cwd: root, encoding: "utf8" })
       .split("\n").map((tag) => tag.trim()).filter(Boolean);

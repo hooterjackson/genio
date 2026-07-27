@@ -1,0 +1,382 @@
+name: stable release
+
+on:
+  # repository_dispatch workflows are loaded only from the repository's default
+  # branch. Signed finalization evidence and a distinct signed authorization
+  # are supplied in client_payload; an RC cannot provide its own verifier.
+  repository_dispatch:
+    types: [genio-stable-release]
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+permissions:
+  attestations: read
+  contents: write
+  packages: read
+
+jobs:
+  publish:
+    environment: stable-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}
+      IMAGE_DIGEST: ${{ github.event.client_payload.image_digest }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          # The only ref-writing credential is the job-scoped GitHub Actions
+          # installation token whose Integration ID is verified below.
+          token: ${{ github.token }}
+          persist-credentials: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+      - id: target
+        name: Resolve the exact annotated RC on the trusted default branch
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          node -e 'const fs=require("node:fs"); const tag=process.env.CANDIDATE_TAG??""; const match=/^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/.exec(tag); if(!match) throw new Error("candidate tag is invalid"); const digest=process.env.IMAGE_DIGEST??""; if(!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error("image digest is invalid"); fs.appendFileSync(process.env.GITHUB_OUTPUT,`version=${match[1]}\nstable_tag=v${match[1]}\n`);'
+          git fetch --force --tags origin
+          test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
+          SOURCE_REVISION="$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")"
+          test "$SOURCE_REVISION" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test "$SOURCE_REVISION" = "$GITHUB_SHA"
+          test "v$(node -p 'require(\"./package.json\").version')-rc." = "${CANDIDATE_TAG%-rc.*}-rc."
+          IMAGE_REPOSITORY="ghcr.io/${REPOSITORY_OWNER,,}/genio"
+          echo "source_revision=$SOURCE_REVISION" >> "$GITHUB_OUTPUT"
+          echo "image_reference=$IMAGE_REPOSITORY@$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+      - id: protection
+        name: Require protected branch, environment, tag ruleset, and dispatcher
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          STABLE_RELEASE_CONTROL_PLANE_TOKEN: ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN }}
+          STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
+        with:
+          github-token: ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN }}
+          script: |
+            if (!process.env.STABLE_RELEASE_CONTROL_PLANE_TOKEN) {
+              core.setFailed("protected stable-release control-plane token is missing");
+              return;
+            }
+            const clientPayload = context.payload.client_payload ?? {};
+            const clientPayloadKeys = Object.keys(clientPayload).sort();
+            const expectedClientPayloadKeys = [
+              "candidate_tag",
+              "finalization_evidence_b64url",
+              "image_digest",
+              "protected_baseline_metadata_b64url",
+              "stable_authorization_b64url",
+            ];
+            if (
+              clientPayloadKeys.length > 10
+              || JSON.stringify(clientPayloadKeys)
+                !== JSON.stringify(expectedClientPayloadKeys)
+              || Buffer.byteLength(JSON.stringify(clientPayload), "utf8")
+                >= 64 * 1024
+            ) {
+              core.setFailed(
+                "stable release dispatch exceeds GitHub limits or has unexpected inputs",
+              );
+              return;
+            }
+            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            if (!["admin", "maintain"].includes(permission.data.permission)) {
+              core.setFailed("stable release dispatch requires maintain or admin permission");
+              return;
+            }
+            const defaultBranch = context.payload.repository.default_branch;
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+            if (!branch.data.protected) {
+              core.setFailed("the default branch is not protected");
+              return;
+            }
+            const protection = await github.rest.repos.getBranchProtection({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+            const requiredChecks = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
+            const githubActionsApp = await github.rest.apps.getBySlug({
+              app_slug: "github-actions",
+            });
+            const githubActionsAppId = Number(githubActionsApp.data.id);
+            if (
+              githubActionsApp.data.slug !== "github-actions"
+              || !Number.isSafeInteger(githubActionsAppId)
+              || githubActionsAppId <= 0
+            ) {
+              core.setFailed("GitHub Actions Integration identity is invalid");
+              return;
+            }
+            const configuredChecks =
+              protection.data.required_status_checks?.checks ?? [];
+            if (
+              protection.data.required_status_checks?.strict !== true
+              || requiredChecks.some((name) =>
+                !configuredChecks.some((check) =>
+                  check.context === name
+                  && check.app_id === githubActionsApp.data.id
+                )
+              )
+              || (
+                protection.data.required_pull_request_reviews
+                  ?.required_approving_review_count ?? 0
+              ) < 1
+              || protection.data.enforce_admins?.enabled !== true
+            ) {
+              core.setFailed(
+                "default-branch protection lacks app-bound checks, approval, or admin enforcement",
+              );
+              return;
+            }
+            const environment = await github.request(
+              "GET /repos/{owner}/{repo}/environments/{environment_name}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment_name: "stable-release",
+              },
+            );
+            if (
+              environment.data.name !== "stable-release"
+              || environment.data.deployment_branch_policy?.protected_branches
+                !== true
+              || environment.data.deployment_branch_policy?.custom_branch_policies
+                !== false
+            ) {
+              core.setFailed(
+                "stable-release environment lacks protected-branch policy",
+              );
+              return;
+            }
+            const immutableReleases = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: {
+                  "X-GitHub-Api-Version": "2026-03-10",
+                },
+              },
+            );
+            if (immutableReleases.data.enabled !== true) {
+              core.setFailed("repository immutable releases are not enabled");
+              return;
+            }
+            const rulesetId = Number(process.env.STABLE_TAG_RULESET_ID);
+            if (
+              !Number.isSafeInteger(rulesetId)
+              || rulesetId <= 0
+            ) {
+              core.setFailed(
+                "protected stable tag ruleset identity is missing",
+              );
+              return;
+            }
+            const ruleset = await github.request(
+              "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ruleset_id: rulesetId,
+              },
+            );
+            const ruleTypes = new Set(
+              (ruleset.data.rules ?? []).map(({ type }) => type),
+            );
+            const bypassActors = ruleset.data.bypass_actors ?? [];
+            const exactBypass =
+              bypassActors.length === 1
+              && bypassActors[0]?.actor_type === "Integration"
+              && Number(bypassActors[0]?.actor_id) === githubActionsAppId
+              && bypassActors[0]?.bypass_mode === "always";
+            const includePatterns =
+              [...(ruleset.data.conditions?.ref_name?.include ?? [])].sort();
+            const excludePatterns =
+              [...(ruleset.data.conditions?.ref_name?.exclude ?? [])].sort();
+            if (
+              ruleset.data.target !== "tag"
+              || ruleset.data.enforcement !== "active"
+              || JSON.stringify(includePatterns)
+                !== JSON.stringify(["refs/tags/v*"])
+              || JSON.stringify(excludePatterns)
+                !== JSON.stringify(["refs/tags/v*-rc.*"])
+              || ruleTypes.size !== 3
+              || !["creation", "update", "deletion"].every((type) =>
+                ruleTypes.has(type)
+              )
+              || !exactBypass
+            ) {
+              core.setFailed(
+                "stable tag ruleset is inactive, incomplete, or has an unapproved bypass",
+              );
+              return;
+            }
+            core.setOutput("github_actions_app_id", String(githubActionsAppId));
+            core.setOutput("stable_tag_ruleset_id", String(rulesetId));
+      - name: Materialize independently signed release inputs
+        env:
+          FINALIZATION_EVIDENCE_B64URL: ${{ github.event.client_payload.finalization_evidence_b64url }}
+          PROTECTED_BASELINE_METADATA_B64URL: ${{ github.event.client_payload.protected_baseline_metadata_b64url }}
+          STABLE_AUTHORIZATION_B64URL: ${{ github.event.client_payload.stable_authorization_b64url }}
+          RELEASE_VERIFICATION_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_VERIFICATION_PUBLIC_KEY_B64URL }}
+          STABLE_AUTHORIZER_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL }}
+        run: |
+          node -e 'const fs=require("node:fs"); const inputs=[["FINALIZATION_EVIDENCE_B64URL","finalization-evidence.json"],["PROTECTED_BASELINE_METADATA_B64URL","protected-semantic-baseline.json"],["STABLE_AUTHORIZATION_B64URL","stable-authorization.json"],["RELEASE_VERIFICATION_PUBLIC_KEY_B64URL","release-verification-public-key.pem"],["STABLE_AUTHORIZER_PUBLIC_KEY_B64URL","stable-authorizer-public-key.pem"]]; for(const [name,path] of inputs){const value=process.env[name]??""; if(!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} must be unpadded base64url`); const decoded=Buffer.from(value,"base64url"); if(decoded.length===0||decoded.toString("base64url")!==value) throw new Error(`${name} is not canonical base64url`); fs.writeFileSync(path,decoded,{mode:0o600,flag:"wx"});}'
+      - id: verify
+        name: Verify finalization evidence and distinct stable authorization
+        env:
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}
+          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
+          EXPECTED_VERSION: ${{ steps.target.outputs.version }}
+          EXPECTED_REVISION: ${{ steps.target.outputs.source_revision }}
+          EXPECTED_IMAGE_REFERENCE: ${{ steps.target.outputs.image_reference }}
+        run: |
+          node --experimental-transform-types scripts/verify-stable-release.ts \
+            --confirm-stable-release-consumption \
+            --finalization-evidence finalization-evidence.json \
+            --protected-baseline-metadata protected-semantic-baseline.json \
+            --release-verification-key release-verification-public-key.pem \
+            --stable-authorization stable-authorization.json \
+            --stable-authorization-verification-key stable-authorizer-public-key.pem \
+            --expected-rc-tag "$CANDIDATE_TAG" \
+            --expected-version "$EXPECTED_VERSION" \
+            --expected-revision "$EXPECTED_REVISION" \
+            --expected-image-digest "$IMAGE_DIGEST" \
+            --expected-image-reference "$EXPECTED_IMAGE_REFERENCE" \
+            --output stable-release-consumer.json
+          node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync("stable-release-consumer.json","utf8")); fs.appendFileSync(process.env.GITHUB_OUTPUT,`finalization_hash=${value.finalizationEvidencePayloadHash}\nbaseline_hash=${value.protectedBaselineMetadataHash}\nauthorization_hash=${value.stableAuthorizationPayloadHash}\n`);'
+      - name: Verify exact GHCR image provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REFERENCE: ${{ steps.target.outputs.image_reference }}
+          SOURCE_REVISION: ${{ steps.target.outputs.source_revision }}
+        run: |
+          gh attestation verify "oci://$IMAGE_REFERENCE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --source-digest "$SOURCE_REVISION" \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --deny-self-hosted-runners \
+            --no-public-good \
+            --format json > stable-image-attestation.json
+      - name: Create the immutable stable tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_TAG: ${{ steps.target.outputs.stable_tag }}
+          SOURCE_REVISION: ${{ steps.target.outputs.source_revision }}
+          FINALIZATION_HASH: ${{ steps.verify.outputs.finalization_hash }}
+          BASELINE_HASH: ${{ steps.verify.outputs.baseline_hash }}
+          AUTHORIZATION_HASH: ${{ steps.verify.outputs.authorization_hash }}
+          VERIFIED_GITHUB_ACTIONS_APP_ID: ${{ steps.protection.outputs.github_actions_app_id }}
+          VERIFIED_STABLE_TAG_RULESET_ID: ${{ steps.protection.outputs.stable_tag_ruleset_id }}
+        run: |
+          node -e 'const fs=require("node:fs"); if(!/^[1-9]\d*$/.test(process.env.VERIFIED_GITHUB_ACTIONS_APP_ID??"")||!/^[1-9]\d*$/.test(process.env.VERIFIED_STABLE_TAG_RULESET_ID??"")) throw new Error("verified stable tag write principal is missing"); const lines=[`gênio stable release ${process.env.STABLE_TAG}`,"",`RC: ${process.env.CANDIDATE_TAG}`,`Source-Revision: ${process.env.SOURCE_REVISION}`,`Image-Digest: ${process.env.IMAGE_DIGEST}`,`Finalization-Evidence-SHA256: ${process.env.FINALIZATION_HASH}`,`Protected-Semantic-Baseline-SHA256: ${process.env.BASELINE_HASH}`,`Stable-Authorization-SHA256: ${process.env.AUTHORIZATION_HASH}`,`Tag-Ruleset-ID: ${process.env.VERIFIED_STABLE_TAG_RULESET_ID}`,`Tag-Bypass-Integration-ID: ${process.env.VERIFIED_GITHUB_ACTIONS_APP_ID}`,""]; fs.writeFileSync("stable-release-notes.txt",lines.join("\n"),{mode:0o600,flag:"wx"});'
+          if git ls-remote --exit-code --tags origin "refs/tags/$STABLE_TAG" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
+            test "$(git cat-file -t "refs/tags/$STABLE_TAG")" = "tag"
+            test "$(git rev-parse "refs/tags/$STABLE_TAG^{}")" = "$SOURCE_REVISION"
+            node -e 'const fs=require("node:fs"); const cp=require("node:child_process"); const raw=cp.execFileSync("git",["cat-file","tag",`refs/tags/${process.env.STABLE_TAG}`],{encoding:"utf8"}); const separator=raw.indexOf("\n\n"); if(separator<0) throw new Error("existing stable tag is malformed"); const actual=raw.slice(separator+2); const expected=fs.readFileSync("stable-release-notes.txt","utf8"); if(actual!==expected) throw new Error("existing stable tag annotation is not the exact verified release annotation");'
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag --annotate "$STABLE_TAG" --cleanup=verbatim \
+              --file stable-release-notes.txt "$SOURCE_REVISION"
+            git push origin "refs/tags/$STABLE_TAG"
+          fi
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > stable-release-api.json 2>/dev/null; then
+            gh release create "$STABLE_TAG" \
+              --draft \
+              --verify-tag \
+              --target "$SOURCE_REVISION" \
+              --title "$STABLE_TAG" \
+              --notes-file stable-release-notes.txt
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > stable-release-api.json
+          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-release-notes.txt","utf8"); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.prerelease||(!release.draft&&release.immutable!==true)) throw new Error("GitHub Release identity or body does not exactly match the verified stable release");'
+          mkdir existing-release-assets
+          for ASSET in \
+            finalization-evidence.json \
+            protected-semantic-baseline.json \
+            stable-authorization.json \
+            stable-image-attestation.json \
+            stable-release-consumer.json; do
+            if ASSET_NAME="$ASSET" node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); process.exit((release.assets??[]).some(({name})=>name===process.env.ASSET_NAME)?0:1)'; then
+              gh release download "$STABLE_TAG" \
+                --dir existing-release-assets \
+                --pattern "$ASSET" \
+                --clobber
+            fi
+          done
+          node --experimental-transform-types scripts/stable-release-assets.ts \
+            --release stable-release-api.json \
+            --expected-directory . \
+            --downloaded-directory existing-release-assets \
+            --output stable-release-asset-plan.json
+          if node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.exit(plan.missing.length+plan.replace.length>0?0:1)'; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+              > stable-release-before-reconcile.json
+            node -e 'const fs=require("node:fs"); const before=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const current=JSON.parse(fs.readFileSync("stable-release-before-reconcile.json","utf8")); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); if(current.id!==before.id||current.id!==plan.releaseId||current.tag_name!==before.tag_name||current.target_commitish!==before.target_commitish||current.name!==before.name||current.body!==before.body||current.prerelease||!current.draft) throw new Error("stable release left the verified draft state before asset reconciliation");'
+            for ASSET in $(node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.stdout.write(plan.replace.join("\n"))'); do
+              gh release delete-asset "$STABLE_TAG" "$ASSET" --yes
+              gh release upload "$STABLE_TAG" "$ASSET"
+            done
+            for ASSET in $(node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.stdout.write(plan.missing.join("\n"))'); do
+              gh release upload "$STABLE_TAG" "$ASSET"
+            done
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > stable-release-api.json
+          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-release-notes.txt","utf8"); const expectedAssets=["finalization-evidence.json","protected-semantic-baseline.json","stable-authorization.json","stable-image-attestation.json","stable-release-consumer.json"]; const actualAssets=(release.assets??[]).map(({name})=>name).sort(); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.prerelease||JSON.stringify(actualAssets)!==JSON.stringify(expectedAssets)) throw new Error("GitHub Release identity, body, or assets do not exactly match the verified stable release");'
+          mkdir exact-release-assets
+          gh release download "$STABLE_TAG" \
+            --dir exact-release-assets \
+            --pattern finalization-evidence.json \
+            --pattern protected-semantic-baseline.json \
+            --pattern stable-authorization.json \
+            --pattern stable-release-consumer.json \
+            --pattern stable-image-attestation.json
+          cmp finalization-evidence.json exact-release-assets/finalization-evidence.json
+          cmp protected-semantic-baseline.json exact-release-assets/protected-semantic-baseline.json
+          cmp stable-authorization.json exact-release-assets/stable-authorization.json
+          cmp stable-release-consumer.json exact-release-assets/stable-release-consumer.json
+          cmp stable-image-attestation.json exact-release-assets/stable-image-attestation.json
+          node --experimental-transform-types scripts/stable-release-assets.ts \
+            --release stable-release-api.json \
+            --expected-directory . \
+            --downloaded-directory exact-release-assets \
+            --output stable-release-final-asset-plan.json
+          node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-final-asset-plan.json","utf8")); if(plan.missing.length||plan.replace.length||plan.verified.length!==5) throw new Error("stable release asset reconciliation did not converge exactly");'
+          if node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); process.exit(release.draft?0:1)'; then
+            gh release edit "$STABLE_TAG" --draft=false
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > published-stable-release-api.json
+          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("published-stable-release-api.json","utf8")); if(release.draft||release.prerelease||release.immutable!==true) throw new Error("stable GitHub Release is not published and immutable");'

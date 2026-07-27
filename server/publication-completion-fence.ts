@@ -1,4 +1,5 @@
 import type { PipelineOutcome } from "../shared/types.ts";
+import type { PublicationExecutionFence } from "./publication-reconciliation-persistence.ts";
 
 /**
  * The durable generation of one Apple playlist volume. `attempt` changes
@@ -26,6 +27,11 @@ export interface PublicationCompletionFence {
   manifestRevisionHash: string;
   contractRevisionId: string | null;
   contractHash: string | null;
+  /**
+   * Canonical publications must still own this exact lease when terminal
+   * state is committed. Legacy V1/V2 bridge publications use null.
+   */
+  executionFence: PublicationExecutionFence | null;
   selectedCount: number;
   terminalStatus: "complete" | "partial";
   publicationVolumes: PublicationCompletionVolumeFence[];

@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { UnsignedReleaseCanaryMetadata } from "./release-canary-metadata.ts";
+import {
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION,
+} from "./release-deployment-phase.ts";
 import { HttpError } from "./security.ts";
 
 export interface ReleaseCanaryMarkerOwner {
@@ -8,9 +12,19 @@ export interface ReleaseCanaryMarkerOwner {
   id: string;
 }
 
+export interface ReleaseCanaryMarkerPersistenceOptions {
+  /**
+   * True only inside the transaction that created the owner row. A matching
+   * durable marker may be replayed with the default false value, but an
+   * unmarked ordinary owner may never acquire a marker after creation.
+   */
+  allowMarkerCreation?: boolean;
+}
+
 interface StoredReleaseCanaryMarker {
   canary_id: string;
   environment: string;
+  audience: string;
   operation: string;
   source_revision: string;
   cache_mode: string;
@@ -29,6 +43,7 @@ function matches(
 ): boolean {
   return row.canary_id === marker.canaryId
     && row.environment === marker.environment
+    && row.audience === marker.audience
     && row.operation === marker.operation
     && row.source_revision === marker.sourceRevision
     && row.cache_mode === marker.cacheMode
@@ -55,12 +70,23 @@ export async function persistReleaseCanaryMarker(
   marker: UnsignedReleaseCanaryMetadata | null | undefined,
   owner: ReleaseCanaryMarkerOwner,
   linkedBriefRequestId?: string | null,
+  options: ReleaseCanaryMarkerPersistenceOptions = {},
 ): Promise<void> {
   if (marker && marker.operation !== owner.operation) conflict();
   const schema = await client.query<{ available: boolean }>(
-    `SELECT to_regclass(
-       quote_ident(current_schema()) || '.release_canary_markers'
-     ) IS NOT NULL available`,
+    `SELECT (
+       to_regclass(
+         quote_ident(current_schema()) || '.release_canary_markers'
+       ) IS NOT NULL
+       AND EXISTS (
+         SELECT 1 FROM settings
+         WHERE key=$1 AND value=$2
+       )
+     ) available`,
+    [
+      CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+      CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION,
+    ],
   );
   if (!schema.rows[0]?.available) {
     if (marker) {
@@ -77,7 +103,7 @@ export async function persistReleaseCanaryMarker(
       if (marker) conflict();
     } else {
       const linkedBrief = await client.query<StoredReleaseCanaryMarker>(
-        `SELECT canary_id,environment,operation,source_revision,cache_mode,
+        `SELECT canary_id,environment,audience,operation,source_revision,cache_mode,
                 brief_request_id,run_id
          FROM release_canary_markers
          WHERE brief_request_id=$1
@@ -90,6 +116,7 @@ export async function persistReleaseCanaryMarker(
         briefMarker.operation !== "brief"
         || briefMarker.canary_id !== marker.canaryId
         || briefMarker.environment !== marker.environment
+        || briefMarker.audience !== marker.audience
         || briefMarker.source_revision !== marker.sourceRevision
         || briefMarker.cache_mode !== marker.cacheMode
       )) {
@@ -99,7 +126,7 @@ export async function persistReleaseCanaryMarker(
   }
   const target = owner.operation === "brief"
     ? await client.query<StoredReleaseCanaryMarker>(
-      `SELECT canary_id,environment,operation,source_revision,cache_mode,
+      `SELECT canary_id,environment,audience,operation,source_revision,cache_mode,
               brief_request_id,run_id
        FROM release_canary_markers
        WHERE brief_request_id=$1
@@ -107,7 +134,7 @@ export async function persistReleaseCanaryMarker(
       [owner.id],
     )
     : await client.query<StoredReleaseCanaryMarker>(
-      `SELECT canary_id,environment,operation,source_revision,cache_mode,
+      `SELECT canary_id,environment,audience,operation,source_revision,cache_mode,
               brief_request_id,run_id
        FROM release_canary_markers
        WHERE run_id=$1
@@ -120,18 +147,20 @@ export async function persistReleaseCanaryMarker(
     return;
   }
   if (!marker) return;
+  if (options.allowMarkerCreation !== true) conflict();
 
   const inserted = await client.query<{ id: string }>(
     `INSERT INTO release_canary_markers(
-       id,canary_id,environment,operation,source_revision,cache_mode,
+       id,canary_id,environment,audience,operation,source_revision,cache_mode,
        brief_request_id,run_id)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
      ON CONFLICT(canary_id,environment,operation,source_revision) DO NOTHING
      RETURNING id`,
     [
       randomUUID(),
       marker.canaryId,
       marker.environment,
+      marker.audience,
       marker.operation,
       marker.sourceRevision,
       marker.cacheMode,
@@ -142,7 +171,7 @@ export async function persistReleaseCanaryMarker(
   if (inserted.rows[0]) return;
 
   const scoped = await client.query<StoredReleaseCanaryMarker>(
-    `SELECT canary_id,environment,operation,source_revision,cache_mode,
+    `SELECT canary_id,environment,audience,operation,source_revision,cache_mode,
             brief_request_id,run_id
      FROM release_canary_markers
      WHERE canary_id=$1 AND environment=$2 AND operation=$3

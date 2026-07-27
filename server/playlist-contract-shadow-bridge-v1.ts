@@ -8,6 +8,7 @@ import {
   compilePlaylistContractRevisionV1,
   type PlaylistContractClauseDraftV1,
   type PlaylistContractDraftV1,
+  type PlaylistContractExecutionDirectivesV1,
   type PlaylistContractRevisionV1,
   type PlaylistPredicateV1,
 } from "./playlist-contract-v1.ts";
@@ -19,6 +20,10 @@ import {
 import {
   SHADOW_PLAYLIST_EVIDENCE_POLICY_VERSION,
 } from "./playlist-evidence-policy-v1.ts";
+import {
+  REFERENCE_ARTIST_EXCLUSION_PREFIX,
+  excludedReferenceArtists,
+} from "./similarity-policy.ts";
 
 export const PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION = "selection_plan_shadow_bridge_v1" as const;
 export const PLAYLIST_CONTRACT_SHADOW_EVIDENCE_POLICY_VERSION =
@@ -305,6 +310,8 @@ export function buildPlaylistContractShadowDraftV1(
   const centralSuitabilityClauseIds: string[] = [];
   const seenSuitability = new Set<string>();
   const usedClauseIds = new Set<string>();
+  let fixedContainerDirective: PlaylistContractExecutionDirectivesV1["fixedContainer"] = null;
+  let similarityDirective: PlaylistContractExecutionDirectivesV1["similarity"] = null;
 
   const addClause = (clause: PlaylistContractClauseDraftV1): void => {
     if (usedClauseIds.has(clause.id)) throw new Error(`duplicate_bridge_clause:${clause.id}`);
@@ -433,10 +440,114 @@ export function buildPlaylistContractShadowDraftV1(
     });
   }
 
+  if (input.selectionPlan.scopeKind === "fixed_release_container") {
+    const identity = input.selectionPlan.fixedContainerIdentity;
+    if (!identity) throw new Error("fixed_container_identity_unresolved");
+    const membershipClauseId = "bridge:membership:fixed-container";
+    addClause({
+      id: membershipClauseId,
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: identity.kind,
+      operator: "require",
+      values: [identity.name],
+      source: promptSource(input.prompt, identity.name),
+      evidence: {
+        required: true,
+        minimumGrade: "trusted_scoped_container",
+        permittedGrades: [
+          "authoritative_structured_metadata",
+          "trusted_scoped_container",
+        ],
+      },
+      unknownPolicy: "reject",
+    });
+    hardTrackClauseIds.push(membershipClauseId);
+    fixedContainerDirective = {
+      kind: identity.kind,
+      name: identity.name,
+      artistName: identity.artistName,
+      membershipClauseId,
+    };
+  }
+
+  if (input.selectionPlan.intents.includes("similarity")) {
+    const seedArtists = unique(input.selectionPlan.referenceRecordings);
+    if (seedArtists.length === 0) throw new Error("similarity_seed_unresolved");
+    const rankingClauseId = "bridge:ranking:similarity-seed";
+    addClause({
+      id: rankingClauseId,
+      kind: "ranking_preference",
+      scope: "track",
+      hardness: "soft",
+      axis: "similarity",
+      operator: "prefer",
+      values: seedArtists,
+      source: {
+        provenance: "migration",
+        text: `Confirmed similarity seed: ${seedArtists.join(", ")}`,
+      },
+    });
+    const excludedArtists = unique(excludedReferenceArtists(input.brief));
+    const exactArtistExclusionClauseIds: string[] = [];
+    if (excludedArtists.length > 0) {
+      const exclusionClauseId = "bridge:exclusion:similarity-seed-artist";
+      addClause({
+        id: exclusionClauseId,
+        kind: "exclusion",
+        scope: "track",
+        hardness: "hard",
+        axis: "artist",
+        operator: "exclude",
+        values: excludedArtists,
+        source: {
+          provenance: "migration",
+          text: `Exclude exact reference-artist credits: ${excludedArtists.join(", ")}`,
+        },
+        evidence: {
+          required: true,
+          minimumGrade: "authoritative_structured_metadata",
+          permittedGrades: ["authoritative_structured_metadata"],
+        },
+        unknownPolicy: "reject",
+      });
+      hardTrackClauseIds.push(exclusionClauseId);
+      exactArtistExclusionClauseIds.push(exclusionClauseId);
+    }
+    similarityDirective = {
+      seedArtists,
+      excludedArtists,
+      rankingClauseId,
+      exactArtistExclusionClauseIds,
+    };
+  }
+
   for (const [constraintIndex, constraint] of input.selectionPlan.constraints.entries()) {
     if (POLICY_OWNED_AXES.has(constraint.axis)) continue;
     const values = unique(constraint.values);
     if (values.length === 0) continue;
+    if (
+      constraint.axis === "relationship"
+      && isNegativeConstraint(constraint)
+      && values.every((value) => value.startsWith(REFERENCE_ARTIST_EXCLUSION_PREFIX))
+    ) {
+      // The typed exact-artist clause above is the sole execution path for this
+      // rule. Retaining the prose-shaped relationship exclusion would create a
+      // contradictory second authority and reject unrelated recordings.
+      continue;
+    }
+    if (
+      fixedContainerDirective
+      && constraint.axis === "relationship"
+      && constraint.kind === "hard"
+      && !isNegativeConstraint(constraint)
+    ) {
+      // Exact container membership already proves the track-to-release
+      // relationship. Keeping model-authored relationship prose as another
+      // hard leaf would require Apple to repeat that sentence per track.
+      continue;
+    }
     const clauseId = `bridge:constraint:${safeId(constraint.id)}:${constraintIndex + 1}`;
     const resolutions = conceptResolutionFor(constraint.axis, values);
     for (const resolution of resolutions) {
@@ -632,6 +743,12 @@ export function buildPlaylistContractShadowDraftV1(
         maximumUnknownRatio: 0.2,
         zeroKnownFailures: true,
       },
+      ...(fixedContainerDirective || similarityDirective ? {
+        executionDirectives: {
+          fixedContainer: fixedContainerDirective,
+          similarity: similarityDirective,
+        },
+      } : {}),
     },
     preservedTrackPredicate,
     ambiguousScopeClauseIds,

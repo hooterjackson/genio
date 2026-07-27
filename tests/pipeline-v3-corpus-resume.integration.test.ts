@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import * as databaseSchema from "../db/schema.ts";
 import { PgEvidenceGraphRepositoryV3 } from "../server/evidence-graph-repository-v3.ts";
 import { EvidenceGraphServiceV3 } from "../server/evidence-graph-service-v3.ts";
 import { COLD_CORPUS_BUILDER_SCHEMA_V3 } from "../server/pipeline-v3-corpus-builder.ts";
@@ -85,7 +87,10 @@ databaseDescribe("Pipeline V3 cold corpus review and resume", () => {
          assertion_count=0,catalog_identity_count=0,locked_at=now() WHERE id=$1`,
       [rootSnapshotId, "a".repeat(64)],
     );
-    repository = new Repository({ pool, db: {} } as never);
+    repository = new Repository({
+      pool,
+      db: drizzle(pool, { schema: databaseSchema }),
+    });
     graph = new EvidenceGraphServiceV3(new PgEvidenceGraphRepositoryV3(pool));
   }, 30_000);
 

@@ -170,6 +170,80 @@ describe("public API projections", () => {
     expect(serializedKeys(view.guidanceAction)).not.toContain("privateProviderState");
   });
 
+  test("projects a zero-question clarification-limit summary as an explicit decision", () => {
+    const internal = {
+      id: "clarification-limit-run",
+      prompt: "French jazz",
+      brief,
+      status: "needs_decision",
+      phase: "interpretation_summary_required",
+      error: null,
+      candidateCount: 31,
+      sourceCount: 4,
+      unresolvedCount: 1,
+      frontier: [],
+      guidanceAction: {
+        kind: "interpretation_summary",
+        questionSetHash: "f".repeat(64),
+        baseContractRevisionId: "pcr1:clarification-limit",
+        baseContractSemanticHash: "d".repeat(64),
+        questions: [],
+        attemptsUsed: 2,
+        maximumAttempts: 2,
+        showEditableInterpretationSummary: true,
+        reason: "clarification_attempt_limit",
+        axis: "french_jazz_scope",
+        interpretationSummary: {
+          mustHave: ["Jazz", "Artists from France"],
+          prefer: ["Editorial balance"],
+          avoid: [],
+          flow: ["Smooth"],
+          count: 50,
+          privatePrompt: "do not expose",
+        },
+        actions: {
+          changeEarlierAnswer: true,
+          reviewContract: true,
+          resumeLater: true,
+          cancel: true,
+        },
+        privateProviderState: "do not expose",
+      },
+      resolution: resolution("review_contract"),
+    } as unknown as ResearchRunView & Record<string, unknown>;
+
+    const view = publicResearchRunView(internal, { id: "public-access-id" });
+    expect(view.guidanceAction).toEqual({
+      kind: "interpretation_summary",
+      questionSetHash: "f".repeat(64),
+      baseContractRevisionId: "pcr1:clarification-limit",
+      baseContractSemanticHash: "d".repeat(64),
+      questions: [],
+      attemptsUsed: 2,
+      maximumAttempts: 2,
+      showEditableInterpretationSummary: true,
+      reason: "clarification_attempt_limit",
+      axis: "french_jazz_scope",
+      interpretationSummary: {
+        mustHave: ["Jazz", "Artists from France"],
+        prefer: ["Editorial balance"],
+        avoid: [],
+        flow: ["Smooth"],
+        count: 50,
+      },
+      actions: {
+        changeEarlierAnswer: true,
+        reviewContract: true,
+        resumeLater: true,
+        cancel: true,
+      },
+    });
+    expect(serializedKeys(view.guidanceAction)).not.toContain("privatePrompt");
+    expect(serializedKeys(view.guidanceAction)).not.toContain(
+      "privateProviderState",
+    );
+  });
+
   test("preserves an actionable canonical capability decision without exposing blocker internals", () => {
     expect(publicRunResolutionView({
       ...resolution("review_contract"),
@@ -178,6 +252,7 @@ describe("public API projections", () => {
         nextRetryAt: null,
         automaticRetryUntil: null,
         retryCount: 0,
+        versionHash: null,
       },
     }, null)).toEqual({
       state: "needs_decision",
@@ -191,6 +266,68 @@ describe("public API projections", () => {
         nextRetryAt: null,
         automaticRetryUntil: null,
         retryCount: 0,
+        versionHash: null,
+      },
+    });
+  });
+
+  test("preserves only a hash-bound retained provider resume action", () => {
+    const versionHash = "9".repeat(64);
+    expect(publicRunResolutionView({
+      ...resolution("resume_research"),
+      blocker: {
+        kind: "provider",
+        nextRetryAt: null,
+        automaticRetryUntil: "2026-07-24T12:00:00.000Z",
+        retryCount: 8,
+        versionHash,
+      },
+    }, null)).toMatchObject({
+      state: "needs_decision",
+      nextAction: "resume_research",
+      blocker: {
+        kind: "provider",
+        versionHash,
+      },
+    });
+    expect(publicRunResolutionView({
+      ...resolution("resume_research"),
+      blocker: {
+        kind: "provider",
+        nextRetryAt: null,
+        automaticRetryUntil: "2026-07-24T12:00:00.000Z",
+        retryCount: 8,
+        versionHash: null,
+      },
+    }, null)).toMatchObject({
+      state: "needs_decision",
+      nextAction: "review_contract",
+    });
+  });
+
+  test("projects a retryable V2 provider failure as a visible dependency pause", () => {
+    expect(publicRunResolutionView({
+      ...resolution("wait_for_dependency", "blocked_dependency"),
+      blocker: {
+        kind: "provider",
+        nextRetryAt: "2026-07-24T12:05:00.000Z",
+        automaticRetryUntil: "2026-07-25T12:00:00.000Z",
+        retryCount: 1,
+        versionHash: null,
+      },
+    }, null)).toEqual({
+      state: "blocked_dependency",
+      nextAction: "wait_for_dependency",
+      terminal: false,
+      contractRevisionId: "contract-id",
+      contractRevision: 3,
+      contractHash: "c".repeat(64),
+      blocker: {
+        kind: "provider",
+        nextRetryAt: "2026-07-24T12:05:00.000Z",
+        automaticRetryUntil: "2026-07-25T12:00:00.000Z",
+        retryCount: 1,
+        versionHash: null,
       },
     });
   });
@@ -331,7 +468,8 @@ describe("public API projections", () => {
     const view = publicBriefStatusView({
       requestId: "brief-id",
       prompt: "French jazz",
-      requestedTrackCount: 50,
+      requestedTrackCount: 60,
+      originalRequestedTrackCount: 50,
       status: "complete",
       briefContractVersion: 2,
       questionSetHash: "a".repeat(64),
@@ -347,7 +485,8 @@ describe("public API projections", () => {
     expect(view).toMatchObject({
       requestId: "brief-id",
       prompt: "French jazz",
-      requestedTrackCount: 50,
+      requestedTrackCount: 60,
+      originalRequestedTrackCount: 50,
       status: "complete",
       briefContractVersion: 2,
       questionSetHash: "a".repeat(64),

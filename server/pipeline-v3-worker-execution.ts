@@ -13,19 +13,38 @@ import type {
   SelectionScopeKind,
 } from "../shared/types.ts";
 import {
+  evaluatePlaylistOptimizationV3,
   executeRetrievalV3,
+  RetrievalDependencyErrorV3,
+  RetrievalPlaylistOptimizationBudgetExceededErrorV3,
   type CandidateQualificationV3,
   type DiscoveryBatchV3,
   type DiscoveryRequestV3,
   type QualificationRequestV3,
+  type QualifiedTrackV3,
   type RetrievalAdaptersV3,
   type RetrievalExecutionModeV3,
   type RetrievalContinuationSeedV3,
+  type RetrievalDependencyFailureClassV3,
   type RetrievalPolicyV3,
   type RetrievalResultV3,
   type RetrievalRoutingHintsV3,
 } from "./pipeline-v3-retrieval.ts";
-import { queryPlanV3Hash } from "./query-plan-v3.ts";
+import {
+  playlistOptimizationBudgetForPassV1,
+  PlaylistOptimizationBudgetExceededErrorV1,
+  withPlaylistOptimizationBudgetV1,
+} from "./playlist-optimizer-v1.ts";
+import {
+  isCanonicalQueryPlanV3SchemaVersion,
+  queryPlanV3Hash,
+  queryPlanV3RequiresLegacyCanonicalExecutor,
+} from "./query-plan-v3.ts";
+import {
+  assertPipelineV3ConceptDiscoveryHints,
+  clonePipelineV3ConceptDiscoveryHints,
+  executableQueryPlanClauseIdsV3,
+} from "./pipeline-v3-concept-discovery-hint.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import {
   PIPELINE_V3_VERSION,
@@ -56,6 +75,16 @@ import type {
   ColdCorpusBuildResultV3,
 } from "./pipeline-v3-corpus-builder.ts";
 import type { SemanticPlanRevisionArtifactV3 } from "./pipeline-v3-semantic-recovery.ts";
+import {
+  assessPlaylistRuntimeFeasibilityV1,
+  playlistRuntimeNoCompatibleDispositionV1,
+  type PlaylistFeasibilityReportV1,
+  type PlaylistRuntimeNoCompatibleDispositionV1,
+} from "./playlist-feasibility-v1.ts";
+import {
+  canonicalExecutionIntegrityError,
+  CanonicalExecutionIntegrityError,
+} from "./canonical-execution-integrity.ts";
 
 /**
  * Durable worker boundary for Pipeline V3 retrieval.
@@ -97,6 +126,13 @@ export interface PipelineV3WorkerRepository {
     phase?: string;
     error?: string | null;
   }, fence?: PipelineV3WriteFence): Promise<void>;
+  quarantineCanonicalExecution?(input: {
+    runId: string;
+    jobId: string;
+    workerId: string;
+    leaseGeneration: number;
+    reasonCode: string;
+  }): Promise<boolean>;
   getActivePlaylistContractRevision?(input: {
     runId: string;
   }): Promise<{
@@ -113,6 +149,7 @@ export interface PipelineV3WorkerRepository {
     nextRetryAt?: Date | null;
     automaticRetryUntil?: Date | null;
     state?: Record<string, unknown>;
+    fence?: PipelineV3WriteFence;
   }): Promise<string>;
   preparePlaylistRunRescueGuidance?(input: {
     runId: string;
@@ -155,6 +192,27 @@ export interface PipelineV3WorkerRepository {
     qualifications: readonly CandidateQualificationV3[];
     fence: PipelineV3WriteFence;
   }): Promise<void>;
+  /**
+   * Before a canonical continuation trusts checkpoint tracks, re-read the
+   * authoritative final qualification rows and recompute their stable
+   * identity and qualification hashes.
+   */
+  validatePipelineV3ContinuationQualifications?(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    tracks: readonly QualifiedTrackV3[];
+  }): Promise<void>;
+  /**
+   * Persist the observed retrieval frontier, dependency, and budget evidence
+   * before a canonical run may describe an empty result as musical scarcity.
+   */
+  persistPipelineV3RuntimeFeasibilitySnapshot?(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    phase: "initial" | "recovery";
+    report: PlaylistFeasibilityReportV1;
+    fence: PipelineV3WriteFence;
+  }): Promise<{ id: string; created: boolean }>;
   /**
    * Persist the governed result as one immutable, revision-bound manifest.
    * The repository owns the exact-publication handoff; retrieval itself never
@@ -244,14 +302,181 @@ export const PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS = 15 * 60_000;
 export class PipelineV3DependencyUnavailableError extends Error {
   readonly name = "PipelineV3DependencyUnavailableError";
   readonly code = "pipeline_v3_dependency_unavailable";
+  readonly retryAfterUntil: Date | null;
+  readonly retriable: boolean;
 
   constructor(
     readonly dependencyKey: string,
     readonly reasonCode: string,
-    readonly retryAfterUntil: Date | null = null,
+    retryAfterUntil: Date | null = null,
+    readonly failureClass: RetrievalDependencyFailureClassV3 = "transient",
   ) {
     super("Pipeline V3 is waiting for a research dependency");
+    this.retryAfterUntil = retryAfterUntil
+      && Number.isFinite(retryAfterUntil.getTime())
+      ? new Date(retryAfterUntil)
+      : null;
+    this.retriable = failureClass === "transient"
+      || failureClass === "rate_limited";
   }
+}
+
+/**
+ * A deterministic local-compute boundary, deliberately distinct from a
+ * provider outage. The persisted pass number lets one successor lease run a
+ * larger bounded search; exhaustion of that pass is a technical quarantine,
+ * never evidence of musical scarcity or a dependency incident.
+ */
+export class PipelineV3OptimizerComputeBudgetError extends Error {
+  readonly name = "PipelineV3OptimizerComputeBudgetError";
+  readonly code = "optimizer_search_budget_exhausted";
+
+  constructor(
+    readonly budgetPass: number,
+    readonly retriable: boolean,
+  ) {
+    super("Playlist optimization exhausted its bounded technical compute budget");
+  }
+}
+
+function parsedRetryAfterUntil(value: unknown): Date | null {
+  const timestamp = value instanceof Date
+    ? value.getTime()
+    : typeof value === "string"
+      ? Date.parse(value)
+      : Number.NaN;
+  return Number.isFinite(timestamp) ? new Date(timestamp) : null;
+}
+
+function parsedRetrievalDependencyFailureClass(
+  value: unknown,
+): RetrievalDependencyFailureClassV3 {
+  return value === "transient"
+    || value === "rate_limited"
+    || value === "authorization"
+    || value === "quota"
+    || value === "invalid_request"
+    || value === "configuration"
+    || value === "permanent"
+    ? value
+    : "transient";
+}
+
+function retrievalFailureClass(
+  result: RetrievalResultV3,
+): RetrievalDependencyFailureClassV3 {
+  const active = (result.dependencyOutages ?? [])
+    .filter(({ active: isActive }) => isActive)
+    .map(({ failureClass }) => (
+      parsedRetrievalDependencyFailureClass(failureClass)
+    ));
+  const nonRetryable = active.find((failureClass) => (
+    failureClass !== "transient" && failureClass !== "rate_limited"
+  ));
+  return nonRetryable
+    ?? (active.includes("rate_limited")
+    ? "rate_limited"
+    : active[0] ?? "transient");
+}
+
+function retrievalRetryAfterUntil(result: RetrievalResultV3): Date | null {
+  return (result.dependencyOutages ?? [])
+    .filter(({ active }) => active)
+    .reduce<Date | null>((latest, outage) => {
+      const candidate = parsedRetryAfterUntil(outage.retryAfterUntil);
+      return candidate && (!latest || candidate.getTime() > latest.getTime())
+        ? candidate
+        : latest;
+    }, null);
+}
+
+export interface PipelineV3RuntimeFeasibilityAssessment {
+  readonly report: PlaylistFeasibilityReportV1;
+  readonly scope: "open_world" | "closed_set";
+  readonly noCompatibleDisposition: PlaylistRuntimeNoCompatibleDispositionV1;
+}
+
+/**
+ * Bind feasibility truth to the exact retrieval ledger that produced an
+ * outcome. This helper is pure so the same rules are exercised by unit tests
+ * and by the fenced repository boundary.
+ */
+export function assessPipelineV3RuntimeFeasibility(input: {
+  queryPlan: QueryPlanV3;
+  result: RetrievalResultV3;
+  policy: RetrievalPolicyV3;
+  activeComputeConsumedMs: number;
+  activeComputeAllowanceMs: number;
+}): PipelineV3RuntimeFeasibilityAssessment {
+  if (input.queryPlan.schemaVersion < 4
+    || !input.queryPlan.playlistContractRevisionId
+    || !input.queryPlan.playlistContractSemanticHash
+    || !Number.isSafeInteger(input.queryPlan.targetTrackCount)
+    || Number(input.queryPlan.targetTrackCount) < 1) {
+    throw new Error("Pipeline V3 runtime feasibility requires a canonical query plan");
+  }
+  const scope = input.queryPlan.engines.includes("fixed_container")
+    ? "closed_set" as const
+    : "open_world" as const;
+  const limitingPredicateIds = Object.entries(
+    input.result.predicateDiagnostics?.failedMembershipPredicateIds ?? {},
+  ).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([predicateId]) => predicateId)
+    .slice(0, 20);
+  const report = assessPlaylistRuntimeFeasibilityV1({
+    contractRevisionId: input.queryPlan.playlistContractRevisionId,
+    contractSemanticHash: input.queryPlan.playlistContractSemanticHash,
+    targetTrackCount: Number(input.queryPlan.targetTrackCount),
+    scope,
+    stopReason: input.result.outcome.stopReason,
+    discoveredCount: input.result.stages.discovered,
+    qualifiedCount: input.result.outcome.qualifiedTrackCount,
+    storefrontSafeCount: input.result.stages.storefrontPlayable,
+    contradictions: input.queryPlan.semanticAuditMetadata?.contradictions ?? [],
+    limitingPredicateIds,
+    strategies: input.result.strategies.map((strategy) => ({
+      id: strategy.id,
+      status: strategy.status,
+      rounds: strategy.rounds,
+      rawCandidates: strategy.rawCandidates,
+      newQualifiedFamilies: strategy.newQualifiedFamilies,
+      discoveryDependencyIds: strategy.discoveryDependencyIds,
+      ...(strategy.fixedContainerResolution ? {
+        fixedContainerResolution: strategy.fixedContainerResolution,
+      } : {}),
+    })),
+    dependencyOutages: (input.result.dependencyOutages ?? []).map((outage) => ({
+      dependencyId: outage.dependencyId,
+      active: outage.active,
+      circuitOpen: outage.circuitOpen,
+      failureAttempts: outage.failureAttempts,
+      affectedStrategyIds: outage.affectedStrategyIds,
+    })),
+    budgets: {
+      activeComputeConsumedMs: Math.max(0, Math.floor(input.activeComputeConsumedMs)),
+      activeComputeAllowanceMs: Math.max(1, Math.floor(input.activeComputeAllowanceMs)),
+      maximumGlobalRounds: input.policy.maximumGlobalRounds,
+      maximumRawCandidates: input.policy.maximumRawCandidates,
+      maximumCostUnits: input.policy.maximumCostUnits,
+      qualifiedPoolGoal: input.policy.qualifiedPoolGoal ?? null,
+    },
+    policyVersions: {
+      queryPlanPolicy: input.queryPlan.policyVersion,
+      semanticPolicy: input.queryPlan.semanticPolicyVersion ?? "legacy",
+      musicConceptPolicy: input.queryPlan.musicConceptPolicyVersion ?? "legacy",
+      guidancePolicy: input.queryPlan.guidancePolicyVersion ?? "legacy",
+      evidencePolicy: input.queryPlan.evidencePolicyVersion ?? "legacy",
+      playlistContractCompiler: input.queryPlan.playlistContractCompilerVersion ?? "unknown",
+    },
+  });
+  return {
+    report,
+    scope,
+    noCompatibleDisposition: playlistRuntimeNoCompatibleDispositionV1({
+      report,
+      scope,
+    }),
+  };
 }
 
 const MEMBERSHIP_AXES = new Set<MembershipAxisV3>([
@@ -265,6 +490,8 @@ const MEMBERSHIP_AXES = new Set<MembershipAxisV3>([
   "mood",
   "activity",
   "artist",
+  "album",
+  "playlist",
   "track",
   "label",
   "venue",
@@ -341,9 +568,17 @@ function safePrompt(run: { prompt?: string; brief?: { title?: string; descriptio
 function canonicalDiscoverySummary(queryPlan: QueryPlanV3): string {
   const policy = queryPlan.canonicalContractPolicy;
   if (!policy) return "";
-  return policy.clauses
-    .map((clause) => `${clause.axis} ${clause.operator} ${clause.values.join(" or ")}`)
-    .join("; ")
+  return [
+    ...policy.clauses.map(
+      (clause) => `${clause.axis} ${clause.operator} ${clause.values.join(" or ")}`,
+    ),
+    ...(queryPlan.executionDirectives?.fixedContainer
+      ? [`fixed ${queryPlan.executionDirectives.fixedContainer.kind} ${queryPlan.executionDirectives.fixedContainer.name}`]
+      : []),
+    ...(queryPlan.executionDirectives?.similarity
+      ? [`similarity seeds ${queryPlan.executionDirectives.similarity.seedArtists.join(" or ")}`]
+      : []),
+  ].join("; ")
     .slice(0, 4_000);
 }
 
@@ -429,6 +664,10 @@ export function selectionPlanFromQueryPlanV3(
   queryPlan: QueryPlanV3,
   run: { prompt?: string; brief?: { title?: string; description?: string } },
 ): SelectionPlanV3 {
+  assertPipelineV3ConceptDiscoveryHints(
+    queryPlan.conceptDiscoveryHints ?? [],
+    executableQueryPlanClauseIdsV3(queryPlan),
+  );
   if (queryPlan.schemaVersion >= 2
     && (queryPlan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
       || queryPlan.semanticAuditMetadata?.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION)) {
@@ -584,7 +823,7 @@ export function selectionPlanFromQueryPlanV3(
     // Contract-3 workers never consume or reinterpret the mutable run prompt.
     // This generated discovery summary is derived exclusively from the
     // already-fenced typed clauses.
-    prompt: queryPlan.schemaVersion === 4
+    prompt: isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)
       ? canonicalDiscoverySummary(queryPlan)
       : safePrompt(run),
     requestedTrackCount: target,
@@ -597,7 +836,10 @@ export function selectionPlanFromQueryPlanV3(
     hardConstraints: cloneConstraints(queryPlan.hardConstraints),
     softPreferences: cloneConstraints(queryPlan.softPreferences),
     sourceDiscoveryHints: queryPlan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
-    ...(queryPlan.schemaVersion === 4 ? {
+    conceptDiscoveryHints: clonePipelineV3ConceptDiscoveryHints(
+      queryPlan.conceptDiscoveryHints,
+    ),
+    ...(isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion) ? {
       playlistQuotaRules: (queryPlan.playlistQuotaRules ?? []).map((rule) => ({
         ...rule,
         values: [...rule.values],
@@ -611,6 +853,9 @@ export function selectionPlanFromQueryPlanV3(
         },
       } : {}),
       canonicalContractPolicy: structuredClone(queryPlan.canonicalContractPolicy!),
+      ...(queryPlan.executionDirectives ? {
+        executionDirectives: structuredClone(queryPlan.executionDirectives),
+      } : {}),
     } : {}),
     diversityGoals,
     orderingPolicy,
@@ -654,7 +899,7 @@ export function selectionPlanFromQueryPlanV3(
     confirmed: true,
     resolvedAmbiguityKeys: [],
   };
-  if (queryPlan.schemaVersion === 4) {
+  if (isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)) {
     assertCanonicalContractExecutionPolicyV1(plan.canonicalContractPolicy!);
   }
   return Object.freeze(plan);
@@ -793,10 +1038,28 @@ export function retrievalPolicyV3FromPipelinePolicySnapshot(
   const candidateGoal = execution.candidateGoal === undefined
     ? undefined
     : immutablePositiveInteger(execution.candidateGoal, "candidateGoal", 100_000);
+  const qualifiedPoolGoal = execution.qualifiedPoolGoal === undefined
+    ? candidateGoal
+    : immutablePositiveInteger(
+        execution.qualifiedPoolGoal,
+        "qualifiedPoolGoal",
+        100_000,
+      );
+  if (candidateGoal !== undefined
+    && qualifiedPoolGoal !== undefined
+    && qualifiedPoolGoal > candidateGoal) {
+    throw new Error("Pipeline V3 immutable retrieval policy has an inverted candidate reserve");
+  }
   return Object.freeze({
     maximumGlobalRounds,
     maximumRawCandidates,
-    ...(candidateGoal === undefined ? {} : { qualifiedPoolGoal: candidateGoal }),
+    // Snapshots emitted before qualifiedPoolGoal existed used candidateGoal as
+    // the final safe pool. Preserve those in-flight contracts exactly. New
+    // snapshots carry both values and use candidateGoal only for discovery.
+    ...(execution.qualifiedPoolGoal === undefined || candidateGoal === undefined
+      ? {}
+      : { candidateGoal }),
+    ...(qualifiedPoolGoal === undefined ? {} : { qualifiedPoolGoal }),
     maximumCostUnits,
     deadlineAtEpochMs: null,
     maximumProviderFailuresPerStrategy: PIPELINE_V3_POLICY_V1_PROVIDER_FAILURES_PER_STRATEGY,
@@ -809,13 +1072,16 @@ function fullCheckpointKey(stageKey: string): string {
 
 function latestCheckpoint(
   result: RetrievalResultV3,
+  plan: SelectionPlanV3,
   stageKey: string,
   queryPlanHash: string,
   queryPlanRevisionId: string | null,
 ): Record<string, unknown> {
   return {
     schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
-    state: "complete",
+    state: result.outcome.status === "failed_integrity"
+      ? "failed_integrity"
+      : "complete",
     stageKey,
     queryPlanHash,
     queryPlanRevisionId,
@@ -828,6 +1094,10 @@ function latestCheckpoint(
     selected: result.selected,
     reserve: result.reserve,
     centralQuality: result.centralQuality ?? null,
+    playlistOptimization: evaluatePlaylistOptimizationV3({
+      plan,
+      tracks: result.selected,
+    }),
     predicateDiagnostics: result.predicateDiagnostics ?? null,
     compatibleAlternatesByRecordingFamily: result.compatibleAlternatesByRecordingFamily,
     completedAt: new Date().toISOString(),
@@ -999,10 +1269,32 @@ export class PipelineV3WorkerExecution {
       || Array.isArray(source.compatibleAlternatesByRecordingFamily)) {
       throw new Error("Pipeline V3 continuation source failed integrity validation");
     }
+    const qualifiedTracks = [
+      ...source.selected,
+      ...source.reserve,
+    ] as RetrievalContinuationSeedV3["qualifiedTracks"];
+    if (queryPlan.schemaVersion >= 4) {
+      if (!this.repository.validatePipelineV3ContinuationQualifications) {
+        throw new Error(
+          "Pipeline V3 continuation qualification integrity is unavailable",
+        );
+      }
+      await this.repository.validatePipelineV3ContinuationQualifications({
+        runId,
+        queryPlan,
+        tracks: qualifiedTracks,
+      });
+    }
     return {
       approvedStrategyIds: [...continuation.strategyIds],
-      qualifiedTracks: [...source.selected, ...source.reserve] as RetrievalContinuationSeedV3["qualifiedTracks"],
-      compatibleAlternatesByRecordingFamily: source.compatibleAlternatesByRecordingFamily as RetrievalContinuationSeedV3["compatibleAlternatesByRecordingFamily"],
+      qualifiedTracks,
+      // Canonical continuation validation currently authenticates only the
+      // selected/reserve qualification rows. Older checkpoints may contain
+      // convenience alternates that were never persisted or hash-bound. Do
+      // not let those untrusted rows re-enter ranking for schema-4+ work.
+      compatibleAlternatesByRecordingFamily: queryPlan.schemaVersion >= 4
+        ? {}
+        : source.compatibleAlternatesByRecordingFamily as RetrievalContinuationSeedV3["compatibleAlternatesByRecordingFamily"],
       stages: source.stages as unknown as RetrievalContinuationSeedV3["stages"],
       strategies: source.strategies as RetrievalContinuationSeedV3["strategies"],
     };
@@ -1021,6 +1313,7 @@ export class PipelineV3WorkerExecution {
   }): Promise<void> {
     const mode: RetrievalExecutionModeV3 = input.payload?.v3ExecutionMode === "shadow" ? "shadow" : "active";
     const stageKey = v3RetrievalStageKey(input.queryPlan, mode);
+    const queryPlanHash = queryPlanV3Hash(input.queryPlan);
     const suppliedStageKey = input.payload?.__jobStageKey ?? input.payload?.stageExecutionKey;
     // Durable writes are fenced by the stage identity that was actually
     // leased from job_queue.  If it differs from the recomputed query-plan
@@ -1047,13 +1340,76 @@ export class PipelineV3WorkerExecution {
       return;
     }
 
+    let optimizerBudgetPass = 1;
+    let optimizerRetryContinuation: RetrievalContinuationSeedV3 | undefined;
     const prior = await this.repository.getResearchCheckpoint(input.runId, fullCheckpointKey(stageKey));
     if (prior && typeof prior === "object" && !Array.isArray(prior)) {
       const priorRecord = prior as Record<string, unknown>;
       const priorState = priorRecord.state;
+      if (priorState === "failed_integrity"
+        && priorRecord.code === "v3_retrieval_provider_non_retryable") {
+        const parsedFailureClass = parsedRetrievalDependencyFailureClass(
+          priorRecord.failureClass,
+        );
+        const failureClass: RetrievalDependencyFailureClassV3 =
+          parsedFailureClass === "transient"
+            || parsedFailureClass === "rate_limited"
+            ? "permanent"
+            : parsedFailureClass;
+        // A crash may occur after the fenced checkpoint but before the run
+        // status/quarantine writes. Re-drive only the durable quarantine on
+        // the successor lease; never call the provider or report this
+        // operator fault as a completed stage.
+        throw new PipelineV3DependencyUnavailableError(
+          "v3_retrieval_provider",
+          typeof priorRecord.reasonCode === "string"
+            ? priorRecord.reasonCode
+            : `v3_retrieval_provider_${failureClass}`,
+          null,
+          failureClass,
+        );
+      }
       if (priorState === "complete"
         || priorState === "owner_action_required" || priorState === "failed_integrity") {
         return;
+      }
+      if (priorState === "waiting_compute"
+        && priorRecord.code === "optimizer_search_budget_exhausted") {
+        const priorBudgetPass = Number(priorRecord.budgetPass);
+        if (!Number.isSafeInteger(priorBudgetPass)
+          || priorBudgetPass < 1
+          || priorBudgetPass > 2) {
+          throw new Error("Pipeline V3 optimizer budget checkpoint is invalid");
+        }
+        if (priorBudgetPass >= 2) {
+          throw new PipelineV3OptimizerComputeBudgetError(2, false);
+        }
+        const retrySeed = priorRecord.optimizerRetrySeed;
+        if (priorRecord.stageKey !== stageKey
+          || priorRecord.queryPlanHash !== queryPlanHash
+          || !retrySeed
+          || typeof retrySeed !== "object"
+          || Array.isArray(retrySeed)) {
+          throw new Error("Pipeline V3 optimizer retry checkpoint is invalid");
+        }
+        const retryRecord = retrySeed as Record<string, unknown>;
+        if (retryRecord.providerCallPermitted !== false
+          || !Array.isArray(retryRecord.approvedStrategyIds)
+          || retryRecord.approvedStrategyIds.length !== 0
+          || !Array.isArray(retryRecord.qualifiedTracks)
+          || retryRecord.qualifiedTracks.length === 0
+          || retryRecord.qualifiedTracks.length > 5_000
+          || !Array.isArray(retryRecord.strategies)
+          || !retryRecord.stages
+          || typeof retryRecord.stages !== "object"
+          || Array.isArray(retryRecord.stages)
+          || !retryRecord.compatibleAlternatesByRecordingFamily
+          || typeof retryRecord.compatibleAlternatesByRecordingFamily !== "object"
+          || Array.isArray(retryRecord.compatibleAlternatesByRecordingFamily)) {
+          throw new Error("Pipeline V3 optimizer retry checkpoint is invalid");
+        }
+        optimizerRetryContinuation = retrySeed as RetrievalContinuationSeedV3;
+        optimizerBudgetPass = priorBudgetPass + 1;
       }
       if (priorState === "waiting_provider") {
         const priorLeaseEpoch = Number(priorRecord.leaseEpoch);
@@ -1068,12 +1424,67 @@ export class PipelineV3WorkerExecution {
             typeof priorRecord.reasonCode === "string"
               ? priorRecord.reasonCode
               : "v3_retrieval_provider_unavailable",
+            parsedRetryAfterUntil(priorRecord.retryAfterUntil),
+            parsedRetrievalDependencyFailureClass(priorRecord.failureClass),
           );
         }
       }
     }
 
-    const queryPlanHash = queryPlanV3Hash(input.queryPlan);
+    if (queryPlanV3RequiresLegacyCanonicalExecutor(input.queryPlan)) {
+      const recordedAt = new Date().toISOString();
+      const checkpoint = {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "owner_action_required",
+        actionKind: "canonical_successor",
+        reasonCode: "legacy_canonical_executor_required",
+        stageKey,
+        queryPlanHash,
+        queryPlanRevisionId: input.payload?.__queryPlanRevisionId ?? null,
+        executionMode: mode,
+        engines: input.queryPlan.engines,
+        requestedTrackCount: input.queryPlan.targetTrackCount,
+        requiredQueryPlanSchemaVersion: 5,
+        actions: ["create_user_authored_revision", "cancel"],
+        automaticResume: false,
+        recordedAt,
+      };
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        fullCheckpointKey(stageKey),
+        checkpoint,
+        fence,
+      );
+      if (mode === "active") {
+        const contractRevisionDatabaseId =
+          input.payload?.__contractRevisionDatabaseId;
+        if (!contractRevisionDatabaseId || !this.repository.openPlaylistRunBlocker) {
+          await this.repository.updateRun(input.runId, {
+            status: "failed_integrity",
+            phase: "legacy_canonical_executor_fence_unavailable",
+            error: null,
+          }, fence);
+          return;
+        }
+        await this.repository.openPlaylistRunBlocker({
+          runId: input.runId,
+          contractRevisionId: contractRevisionDatabaseId,
+          blockerKind: "scope_decision",
+          dependencyKey: "legacy_schema4_executor",
+          retryCount: 0,
+          nextRetryAt: null,
+          automaticRetryUntil: null,
+          state: checkpoint,
+          fence,
+        });
+        await this.repository.updateRun(input.runId, {
+          status: "needs_decision",
+          phase: "legacy_canonical_successor_required",
+          error: null,
+        }, fence);
+      }
+      return;
+    }
     let modelRoute: PipelineV3ModelRoute;
     try {
       modelRoute = pipelineV3ModelRouteFromPolicySnapshot(input.run.pipelinePolicySnapshot);
@@ -1231,6 +1642,7 @@ export class PipelineV3WorkerExecution {
         graphSnapshotId: input.queryPlan.graphSnapshotId,
         executionMode: mode,
         reasonCode: "v3_retrieval_provider_unavailable",
+        failureClass: "transient",
         leaseEpoch: Number.isSafeInteger(input.payload?.__jobLeaseEpoch)
           ? input.payload?.__jobLeaseEpoch
           : null,
@@ -1251,7 +1663,8 @@ export class PipelineV3WorkerExecution {
 
     let continuation: RetrievalContinuationSeedV3 | undefined;
     try {
-      continuation = await this.continuationSeed(input.runId, input.queryPlan);
+      continuation = optimizerRetryContinuation
+        ?? await this.continuationSeed(input.runId, input.queryPlan);
     } catch {
       abortIfNeeded(input.signal);
       await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
@@ -1289,50 +1702,162 @@ export class PipelineV3WorkerExecution {
       }, fence);
       return;
     }
+    if (requiresSeparatedRecoveryPersistence
+      && !this.repository.persistPipelineV3RuntimeFeasibilitySnapshot) {
+      await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "failed_integrity",
+        stageKey,
+        queryPlanHash,
+        code: "v3_runtime_feasibility_persistence_unavailable",
+        failedAt: new Date().toISOString(),
+      }, fence);
+      await this.repository.updateRun(input.runId, {
+        status: "failed_integrity",
+        phase: "v3_runtime_feasibility_persistence_unavailable",
+        error: null,
+      }, fence);
+      return;
+    }
+    const recordNonRetryableProviderFailure = async (
+      failureClass: RetrievalDependencyFailureClassV3,
+      reasonCode: string,
+    ): Promise<void> => {
+      const checkpoint = {
+        schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+        state: "failed_integrity",
+        stageKey,
+        queryPlanHash,
+        queryPlanRevisionId: input.payload?.__queryPlanRevisionId ?? null,
+        graphSnapshotId: input.queryPlan.graphSnapshotId,
+        executionMode: mode,
+        code: "v3_retrieval_provider_non_retryable",
+        reasonCode,
+        failureClass,
+        retryable: false,
+        nextAction: "contact_support",
+        failedAt: new Date().toISOString(),
+      };
+      abortIfNeeded(input.signal);
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        fullCheckpointKey(stageKey),
+        checkpoint,
+        fence,
+      );
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        "v3:retrieval:latest",
+        checkpoint,
+        fence,
+      );
+      abortIfNeeded(input.signal);
+      await this.repository.updateRun(input.runId, {
+        status: "failed_integrity",
+        phase: `v3_retrieval_provider_${failureClass}`,
+        error: null,
+      }, fence);
+    };
     let result: RetrievalResultV3;
     try {
-      result = await this.retrieval.execute({
-        runId: input.runId,
-        plan,
-        executionMode: mode,
-        routingHints: { fixedContainer: input.queryPlan.engines.includes("fixed_container") },
-        modelRoute,
-        semanticRecoveryEnabled: input.queryPlan.schemaVersion >= 2,
-        policy: retrievalPolicy,
-        continuation,
-        ...(requiresSeparatedRecoveryPersistence ? {
-          recordDiscoveryBatch: async (request, batch) => {
-            await this.repository.persistPipelineV3DiscoveryBatch!({
+      result = await withPlaylistOptimizationBudgetV1(
+        playlistOptimizationBudgetForPassV1(optimizerBudgetPass),
+        () => this.retrieval!.execute({
+          runId: input.runId,
+          plan,
+          executionMode: mode,
+          routingHints: { fixedContainer: input.queryPlan.engines.includes("fixed_container") },
+          modelRoute,
+          semanticRecoveryEnabled: input.queryPlan.schemaVersion >= 2,
+          policy: retrievalPolicy,
+          continuation,
+          ...(requiresSeparatedRecoveryPersistence ? {
+            recordDiscoveryBatch: async (request, batch) => {
+              await this.repository.persistPipelineV3DiscoveryBatch!({
+                runId: input.runId,
+                queryPlan: input.queryPlan,
+                request,
+                batch,
+                fence,
+              });
+            },
+            recordQualificationBatch: async (request, qualifications) => {
+              await this.repository.persistPipelineV3QualificationBatch!({
+                runId: input.runId,
+                queryPlan: input.queryPlan,
+                request,
+                qualifications,
+                fence,
+              });
+            },
+          } : {}),
+          claimSemanticRecovery: async (revision) => {
+            abortIfNeeded(input.signal);
+            await this.repository.claimPipelineV3SemanticRecovery({
               runId: input.runId,
               queryPlan: input.queryPlan,
-              request,
-              batch,
+              revision,
               fence,
             });
+            abortIfNeeded(input.signal);
           },
-          recordQualificationBatch: async (request, qualifications) => {
-            await this.repository.persistPipelineV3QualificationBatch!({
-              runId: input.runId,
-              queryPlan: input.queryPlan,
-              request,
-              qualifications,
-              fence,
-            });
-          },
-        } : {}),
-        claimSemanticRecovery: async (revision) => {
-          abortIfNeeded(input.signal);
-          await this.repository.claimPipelineV3SemanticRecovery({
-            runId: input.runId,
-            queryPlan: input.queryPlan,
-            revision,
-            fence,
-          });
-          abortIfNeeded(input.signal);
-        },
-        signal: input.signal,
-      });
+          signal: input.signal,
+        }),
+      );
     } catch (error) {
+      if (error instanceof PlaylistOptimizationBudgetExceededErrorV1) {
+        const optimizerRetrySeed =
+          error instanceof RetrievalPlaylistOptimizationBudgetExceededErrorV3
+            ? error.retrySeed
+            : null;
+        const retryable = optimizerBudgetPass < 2 && optimizerRetrySeed !== null;
+        abortIfNeeded(input.signal);
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          fullCheckpointKey(stageKey),
+          {
+            schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+            state: "waiting_compute",
+            stageKey,
+            queryPlanHash,
+            code: error.code,
+            retryable,
+            budgetPass: optimizerBudgetPass,
+            maximumBudgetPasses: 2,
+            nextBudgetPass: retryable
+              ? optimizerBudgetPass + 1
+              : null,
+            providerCallPermitted: false,
+            optimizerRetrySeed,
+            failedAt: new Date().toISOString(),
+          },
+          fence,
+        );
+        abortIfNeeded(input.signal);
+        await this.repository.updateRun(input.runId, {
+          status: "recovering",
+          phase: error.code,
+          error: null,
+        }, fence);
+        throw new PipelineV3OptimizerComputeBudgetError(
+          optimizerBudgetPass,
+          retryable,
+        );
+      }
+      if (error instanceof RetrievalDependencyErrorV3) {
+        if (!error.retriable) {
+          await recordNonRetryableProviderFailure(
+            error.failureClass,
+            `v3_retrieval_provider_${error.failureClass}`,
+          );
+        }
+        throw new PipelineV3DependencyUnavailableError(
+          "v3_retrieval_provider",
+          `v3_retrieval_provider_${error.failureClass}`,
+          error.retryAfterUntil,
+          error.failureClass,
+        );
+      }
       const code = error && typeof error === "object" && "code" in error
         ? String((error as { code?: unknown }).code ?? "")
         : "";
@@ -1358,7 +1883,94 @@ export class PipelineV3WorkerExecution {
       return;
     }
     abortIfNeeded(input.signal);
+    const governedCorpusActionPending = governedCorpusActionReasonV3(
+      input.queryPlan,
+      result,
+    );
+    let runtimeFeasibility: PipelineV3RuntimeFeasibilityAssessment | null = null;
+    let runtimeFeasibilityDecisionRequired = false;
+    if (requiresSeparatedRecoveryPersistence) {
+      const activeComputeAllowanceMs = Number.isFinite(
+        input.payload?.__contractActiveComputeAllowanceMs,
+      )
+        ? Math.max(
+            PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
+            Number(input.payload?.__contractActiveComputeAllowanceMs),
+          )
+        : PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS;
+      const priorActiveComputeMs = Math.max(
+        0,
+        Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+      );
+      runtimeFeasibility = assessPipelineV3RuntimeFeasibility({
+        queryPlan: input.queryPlan,
+        result,
+        policy: retrievalPolicy,
+        activeComputeConsumedMs: priorActiveComputeMs
+          + Math.max(0, Date.now() - Date.parse(startedAt)),
+        activeComputeAllowanceMs,
+      });
+      await this.repository.persistPipelineV3RuntimeFeasibilitySnapshot!({
+        runId: input.runId,
+        queryPlan: input.queryPlan,
+        phase: input.queryPlan.continuation
+          || (result.semanticPlanRevisions?.length ?? 0) > 0
+          || (result.recoveryAudits?.length ?? 0) > 0
+          ? "recovery"
+          : "initial",
+        report: runtimeFeasibility.report,
+        fence,
+      });
+      if (result.outcome.status === "no_compatible_tracks"
+        && !governedCorpusActionPending) {
+        if (runtimeFeasibility.noCompatibleDisposition === "dependency_pause") {
+          result = {
+            ...result,
+            outcome: {
+              ...result.outcome,
+              status: "failed_system",
+              stopReason: runtimeFeasibility.report.dependencyHealth === "unavailable"
+                ? "provider_circuit_open"
+                : "provider_failure",
+            },
+            publicationBoundary: {
+              appleWriteAccess: "forbidden",
+              manifestDisposition: "blocked_operational_failure",
+            },
+          };
+        } else if (runtimeFeasibility.noCompatibleDisposition === "actionable_decision") {
+          runtimeFeasibilityDecisionRequired = true;
+          result = {
+            ...result,
+            outcome: {
+              ...result.outcome,
+              status: "needs_decision",
+              stopReason: "frontier_exhausted",
+              requiresPartialPublicationDecision: false,
+            },
+            publicationBoundary: {
+              appleWriteAccess: "forbidden",
+              manifestDisposition: "no_manifest",
+            },
+          };
+        }
+      }
+    }
     if (result.outcome.status === "failed_system") {
+      const retryAfterUntil = retrievalRetryAfterUntil(result);
+      const failureClass = retrievalFailureClass(result);
+      if (failureClass !== "transient" && failureClass !== "rate_limited") {
+        await recordNonRetryableProviderFailure(
+          failureClass,
+          `v3_retrieval_provider_${failureClass}`,
+        );
+        throw new PipelineV3DependencyUnavailableError(
+          "v3_retrieval_provider",
+          `v3_retrieval_provider_${failureClass}`,
+          retryAfterUntil,
+          failureClass,
+        );
+      }
       const waitingCheckpoint = {
         schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
         state: "waiting_provider",
@@ -1376,6 +1988,9 @@ export class PipelineV3WorkerExecution {
         stages: result.stages,
         deficit: result.deficit,
         strategies: result.strategies,
+        dependencyOutages: result.dependencyOutages ?? [],
+        retryAfterUntil: retryAfterUntil?.toISOString() ?? null,
+        failureClass,
         waitingAt: new Date().toISOString(),
       };
       await this.repository.saveResearchCheckpoint(
@@ -1398,9 +2013,12 @@ export class PipelineV3WorkerExecution {
       throw new PipelineV3DependencyUnavailableError(
         "v3_retrieval_provider",
         "v3_retrieval_provider_failed",
+        retryAfterUntil,
+        failureClass,
       );
     }
-    const postflightCorpusReason = governedCorpusActionReasonV3(input.queryPlan, result);
+    const postflightCorpusReason = governedCorpusActionPending
+      ?? governedCorpusActionReasonV3(input.queryPlan, result);
     if (postflightCorpusReason) {
       let corpusBuild: {
         sourceDocumentCount: number;
@@ -1448,6 +2066,7 @@ export class PipelineV3WorkerExecution {
         fullCheckpointKey(stageKey),
         latestCheckpoint(
           result,
+          plan,
           stageKey,
           queryPlanHash,
           input.payload?.__queryPlanRevisionId ?? null,
@@ -1525,12 +2144,26 @@ export class PipelineV3WorkerExecution {
       const activeContract = this.repository.getActivePlaylistContractRevision
         ? await this.repository.getActivePlaylistContractRevision({ runId: input.runId })
         : null;
+      const canonicalDecision = isCanonicalQueryPlanV3SchemaVersion(
+        input.queryPlan.schemaVersion,
+      );
+      if (canonicalDecision && !activeContract) {
+        throw new CanonicalExecutionIntegrityError(
+          "decision_active_contract_missing",
+        );
+      }
       let decisionState: Record<string, unknown> | null = null;
       let rescueGuidanceOffered = false;
       if (activeContract) {
-        try {
           const contract = activeContract.contract as unknown as PlaylistContractRevisionV1;
-          assertPlaylistContractIntegrityV1(contract);
+          try {
+            assertPlaylistContractIntegrityV1(contract);
+          } catch (error) {
+            throw canonicalExecutionIntegrityError(
+              error,
+              "decision_contract_integrity_invalid",
+            );
+          }
           const extensionsUsed = Math.min(
             MAX_ACTIVE_COMPUTE_EXTENSIONS_V1,
             Math.max(0, Math.floor(
@@ -1543,7 +2176,9 @@ export class PipelineV3WorkerExecution {
           ).sort(([, left], [, right]) => right - left)
             .map(([clauseId]) => clauseId)
             .slice(0, 5);
-          const limitingClauseIds = playlistConstraintsMissed
+          const limitingClauseIds = runtimeFeasibilityDecisionRequired
+            ? (runtimeFeasibility?.report.limitingPredicateIds ?? []).slice(0, 5)
+            : playlistConstraintsMissed
             ? contract.clauses
               .filter((clause) => (
                 clause.kind === "quota_diversity"
@@ -1560,17 +2195,22 @@ export class PipelineV3WorkerExecution {
             : diagnosticLimitingClauseIds;
           decisionState = createAdaptiveRunDecisionV1({
             contract,
-            reason: computeLimitReached
+            reason: runtimeFeasibilityDecisionRequired
+              ? "runtime_feasibility_unknown"
+              : computeLimitReached
               ? "active_compute_limit"
               : playlistConstraintsMissed
                 ? "playlist_optimization_constraints"
               : "central_quality_floor",
             verifiedTrackCount: result.selected.length,
             remainingStrategyCount: continuationStrategyIds.length,
-            consumedActiveComputeMs: Math.max(
-              activeComputeAllowanceMs,
-              Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
-            ),
+            consumedActiveComputeMs: runtimeFeasibilityDecisionRequired
+              ? runtimeFeasibility?.report.runtimeEvidence?.budgets
+                .activeComputeConsumedMs ?? 0
+              : Math.max(
+                  activeComputeAllowanceMs,
+                  Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+                ),
             activeComputeLimitMs: activeComputeAllowanceMs,
             activeComputeExtensionsUsed: extensionsUsed,
             limitingClauseIds,
@@ -1602,21 +2242,23 @@ export class PipelineV3WorkerExecution {
               runId: input.runId,
               contractRevisionId: activeContract.id,
               blockerKind: "scope_decision",
-              dependencyKey: computeLimitReached
+              dependencyKey: runtimeFeasibilityDecisionRequired
+                ? "runtime_feasibility"
+                : computeLimitReached
                 ? "active_compute"
                 : playlistConstraintsMissed
                   ? "playlist_constraints"
                   : "central_quality",
               state: decisionState,
+              fence,
             });
           }
-        } catch {
-          decisionState = null;
-        }
       }
       await this.repository.saveResearchCheckpoint(
         input.runId,
-        computeLimitReached
+        runtimeFeasibilityDecisionRequired
+          ? "runtime_feasibility_decision"
+          : computeLimitReached
           ? "active_compute_limit"
           : playlistConstraintsMissed
             ? "playlist_constraints_decision"
@@ -1625,6 +2267,12 @@ export class PipelineV3WorkerExecution {
           schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
           state: "needs_decision",
           reasonCode: result.outcome.stopReason,
+          ...(runtimeFeasibilityDecisionRequired ? {
+            feasibilityState: runtimeFeasibility?.report.state ?? "unknown",
+            feasibilityReportHash: runtimeFeasibility?.report.reportHash ?? null,
+            limitingPredicateIds:
+              runtimeFeasibility?.report.limitingPredicateIds ?? [],
+          } : {}),
           ...(computeLimitReached ? {
             activeComputeLimitMs: activeComputeAllowanceMs,
             consumedActiveComputeMs: Math.max(
@@ -1649,6 +2297,8 @@ export class PipelineV3WorkerExecution {
         status: "needs_decision",
         phase: rescueGuidanceOffered
           ? "rescue_guidance_required"
+          : runtimeFeasibilityDecisionRequired
+            ? "runtime_feasibility_unknown"
           : computeLimitReached
           ? "active_compute_limit_reached"
           : playlistConstraintsMissed
@@ -1678,6 +2328,7 @@ export class PipelineV3WorkerExecution {
       fullCheckpointKey(stageKey),
       latestCheckpoint(
         result,
+        plan,
         stageKey,
         queryPlanHash,
         input.payload?.__queryPlanRevisionId ?? null,
@@ -1687,6 +2338,9 @@ export class PipelineV3WorkerExecution {
     abortIfNeeded(input.signal);
     await this.repository.saveResearchCheckpoint(input.runId, "v3:retrieval:latest", {
       schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+      state: result.outcome.status === "failed_integrity"
+        ? "failed_integrity"
+        : "complete",
       stageKey,
       queryPlanHash,
       graphSnapshotId: input.queryPlan.graphSnapshotId,
@@ -1701,6 +2355,24 @@ export class PipelineV3WorkerExecution {
       publicationState: persisted.publicationState,
       completedAt: new Date().toISOString(),
     }, fence);
+
+    let canonicalIntegrityQuarantined = false;
+    if (mode === "active"
+      && result.outcome.status === "failed_integrity"
+      && isCanonicalQueryPlanV3SchemaVersion(input.queryPlan.schemaVersion)
+      && this.repository.quarantineCanonicalExecution
+      && typeof input.payload?.__jobId === "string"
+      && typeof input.payload?.__jobWorkerId === "string"
+      && Number.isSafeInteger(input.payload?.__jobLeaseEpoch)) {
+      canonicalIntegrityQuarantined = await this.repository
+        .quarantineCanonicalExecution({
+          runId: input.runId,
+          jobId: input.payload.__jobId,
+          workerId: input.payload.__jobWorkerId,
+          leaseGeneration: Number(input.payload.__jobLeaseEpoch),
+          reasonCode: "v3_retrieval_integrity_failure",
+        });
+    }
 
     if (mode === "shadow") {
       abortIfNeeded(input.signal);
@@ -1782,11 +2454,13 @@ export class PipelineV3WorkerExecution {
         error: null,
       }, fence);
     } else if (state === "failed_integrity") {
-      await this.repository.updateRun(input.runId, {
-        status: "failed_integrity",
-        phase: "v3_retrieval_integrity_failure",
-        error: null,
-      }, fence);
+      if (!canonicalIntegrityQuarantined) {
+        await this.repository.updateRun(input.runId, {
+          status: "failed_integrity",
+          phase: "v3_retrieval_integrity_failure",
+          error: null,
+        }, fence);
+      }
     } else {
       await this.repository.updateRun(input.runId, {
         status: "failed_system",

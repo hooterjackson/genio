@@ -811,6 +811,15 @@ function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
 
 function contentPolicyFor(brief: PlaylistBrief): SelectionPlan["contentPolicy"] {
   const scope = [brief.versionPolicy, ...brief.include, ...brief.exclude].join(" ");
+  const languages = unique([
+    brief.relationship,
+    ...brief.include,
+    ...brief.subjectEntities,
+  ].flatMap((value) => (
+    parseSelectionGeographyConstraints(value)
+      .filter(({ relationship }) => relationship === "language")
+      .map(({ value: language }) => language)
+  )));
   return {
     explicitContent: /clean(?:\s+versions?)?\s+only|no explicit|exclude explicit/iu.test(scope)
       ? "clean_only"
@@ -822,10 +831,11 @@ function contentPolicyFor(brief: PlaylistBrief): SelectionPlan["contentPolicy"] 
       : /prefer instrumental|instrumental only/iu.test(scope)
         ? "prefer"
         : "allow",
-    languages: unique([
-      ...brief.include,
-      ...brief.subjectEntities,
-    ].filter((value) => /language|english|french|portuguese|spanish|german|japanese/iu.test(value))),
+    // Language is an exact typed relationship, never an adjective substring.
+    // In particular, “French jazz” is still unresolved geography/scene/
+    // language scope and must not become an unsatisfiable catalog-language
+    // policy before the listener answers that question.
+    languages,
   };
 }
 
@@ -852,6 +862,45 @@ function fixedReleaseContainerScope(prompt: string, brief: PlaylistBrief): boole
   return FIXED_RELEASE_CONTAINER.test(prompt)
     || FIXED_RELEASE_CONTAINER.test(interpretedScope)
     || (brief.subjectEntities.length >= 2 && POSSESSIVE_CONTAINER_REFERENCE.test(prompt));
+}
+
+function fixedContainerIdentity(
+  prompt: string,
+  brief: PlaylistBrief,
+): SelectionPlan["fixedContainerIdentity"] {
+  const compact = prompt.normalize("NFKC").replace(/\s+/gu, " ").trim();
+  const explicit = compact.match(
+    /\b(?:from|on|off)\s+(?:the\s+)?(album|ep|lp|mixtape|soundtrack|compilation|box\s+set|playlist)\s+(?:called\s+|named\s+|titled\s+)?["“]?(.+?)["”]?(?:\s+by\s+(.+?))?(?=\s*(?:,\s*(?:exactly\s+)?\d+\s+(?:songs?|tracks?)|\s+(?:with|containing)\s+\d+\s+(?:songs?|tracks?)|[.!?]|$))/iu,
+  ) ?? compact.match(
+    /\b(album|ep|lp|mixtape|soundtrack|compilation|box\s+set|playlist)\s+(?:called\s+|named\s+|titled\s+)?["“]?(.+?)["”]?(?:\s+by\s+(.+?))?(?=\s*(?:,\s*(?:exactly\s+)?\d+\s+(?:songs?|tracks?)|\s+(?:with|containing)\s+\d+\s+(?:songs?|tracks?)|[.!?]|$))/iu,
+  );
+  if (explicit) {
+    const rawKind = normalized(explicit[1] ?? "");
+    const name = (explicit[2] ?? "").replace(/^["“]|["”]$/gu, "").trim();
+    const artistName = (explicit[3] ?? "").replace(/[.!?]+$/gu, "").trim() || null;
+    if (name) {
+      return {
+        kind: rawKind === "playlist" ? "playlist" : "album",
+        name,
+        artistName,
+      };
+    }
+  }
+
+  const possessive = compact.match(
+    /\b(?:songs?|tracks?|recordings?)\s+(?:from|on|off)\s+(.+?)['’]s\s+(.+?)(?=\s*(?:,\s*(?:exactly\s+)?\d+\s+(?:songs?|tracks?)|[.!?]|$))/iu,
+  );
+  if (possessive) {
+    const artistName = possessive[1]!.trim();
+    const name = possessive[2]!.trim();
+    if (artistName && name) return { kind: "album", name, artistName };
+  }
+
+  // A fixed scope without a deterministically compiled identity must not enter
+  // canonical fixed-container execution. Subject entities remain discovery
+  // hints and cannot silently become an album identity.
+  void brief;
+  return undefined;
 }
 
 function selectionScopeKind(
@@ -952,6 +1001,9 @@ export function createSelectionPlanV2(input: {
   const guidance = input.guidancePreferences ?? [];
   const intents = intentSet(input.prompt, input.brief);
   const scopeKind = selectionScopeKind(input.prompt, intents, input.brief);
+  const compiledFixedContainerIdentity = scopeKind === "fixed_release_container"
+    ? fixedContainerIdentity(input.prompt, input.brief)
+    : undefined;
   const requestedTrackCount = Math.max(1, Math.floor(input.brief.targetSize?.min ?? 50));
   const reserveTrackCount = Math.max(5, Math.ceil(requestedTrackCount * 0.1));
   const fixedScope = scopeKind !== "broad_curated";
@@ -984,6 +1036,9 @@ export function createSelectionPlanV2(input: {
     policyVersion: PIPELINE_V2_SELECTION_PLAN_VERSION,
     intents,
     scopeKind,
+    ...(compiledFixedContainerIdentity ? {
+      fixedContainerIdentity: compiledFixedContainerIdentity,
+    } : {}),
     storefront: (input.storefront ?? "us").toLocaleLowerCase("en-US"),
     requestedTrackCount,
     minimumQualifiedTrackCount: requestedTrackCount,

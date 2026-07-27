@@ -56,12 +56,12 @@ describe("query plan V3", () => {
   });
 
   test.each([301, 1_000])(
-    "rejects expanded target %i outside the canonical schema-4 fence",
+    "rejects expanded target %i outside a canonical contract fence",
     (target) => {
       expect(() => createQueryPlanV3(
         confirmed(`${target} exact disco tracks`, target),
         "00000000-0000-4000-8000-000000000001",
-      )).toThrow(/schema 4.*canonical contract/iu);
+      )).toThrow(/canonical schema.*fenced contract revision/iu);
       const publicQuery = createQueryPlanV3(
         confirmed("300 exact disco tracks", 300),
         "00000000-0000-4000-8000-000000000001",
@@ -155,7 +155,7 @@ describe("query plan V3", () => {
     expect(isQueryPlanV3({ ...query, briefContractVersion: 1 })).toBe(false);
   });
 
-  test("schema 4 fences a 1,000-track execution to one immutable canonical contract revision", () => {
+  test("schema 5 fences a 1,000-track execution to one immutable canonical contract revision", () => {
     const contract = compilePlaylistContractRevisionV1({
       contractId: "contract:query-plan-disco",
       rawPrompt: "1,000 disco songs",
@@ -201,14 +201,14 @@ describe("query plan V3", () => {
     const contractRevisionId = contract.revisionId;
     const contractSemanticHash = contract.semanticHash;
     const query = createQueryPlanV3(plan, snapshot, {
-      schemaVersion: 4,
+      schemaVersion: 5,
       briefContractVersion: 3,
       playlistContractRevisionId: contractRevisionId,
       playlistContractSemanticHash: contractSemanticHash,
       playlistContractCompilerVersion: contract.versions.compiler,
     });
     expect(query).toMatchObject({
-      schemaVersion: 4,
+      schemaVersion: 5,
       briefContractVersion: 3,
       guidancePolicyVersion: "adaptive_guidance_v3",
       evidencePolicyVersion: "governed_evidence_v2",
@@ -224,17 +224,23 @@ describe("query plan V3", () => {
     });
     expect(isQueryPlanV3(query)).toBe(true);
     expect(queryPlanV3EmissionSchemaVersion({
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
     })).toBe(1);
     expect(queryPlanV3EmissionSchemaVersion({
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      NODE_ENV: "production",
+      RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
       RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
-    })).toBe(4);
+      RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+      RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+      RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXECUTION_ENABLED: "true",
+    })).toBe(5);
     expect(() => createQueryPlanV3(plan, snapshot, {
-      schemaVersion: 4,
+      schemaVersion: 5,
       briefContractVersion: 3,
-    })).toThrow(/canonical contract revision/iu);
+    })).toThrow(/canonical.*fenced contract revision/iu);
     expect(isQueryPlanV3({
       ...query,
       playlistContractSemanticHash: "tampered",

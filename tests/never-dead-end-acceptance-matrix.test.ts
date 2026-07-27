@@ -326,7 +326,7 @@ describe("never-dead-end adversarial acceptance matrix", () => {
     },
   );
 
-  test("keeps schema-18 writes expand-only enough for the schema-13 bridge binary to remain healthy", () => {
+  test("keeps every schema-18 migration expand-only enough for the schema-13 bridge binary to remain healthy", () => {
     const schema17 = readFileSync(
       new URL("../postgres-migrations/0016_playlist_contract_foundation.sql", import.meta.url),
       "utf8",
@@ -335,7 +335,20 @@ describe("never-dead-end adversarial acceptance matrix", () => {
       new URL("../postgres-migrations/0017_playlist_recovery_foundation.sql", import.meta.url),
       "utf8",
     );
-    for (const migration of [schema17, schema18]) {
+    const releaseGuards = readFileSync(
+      new URL("../postgres-migrations/0018_release_manifest_canary_guards.sql", import.meta.url),
+      "utf8",
+    );
+    const executionHardening = readFileSync(
+      new URL("../postgres-migrations/0019_canonical_execution_hardening.sql", import.meta.url),
+      "utf8",
+    );
+    for (const migration of [
+      schema17,
+      schema18,
+      releaseGuards,
+      executionHardening,
+    ]) {
       expect(migration).not.toMatch(/\bDROP\s+TABLE\b/iu);
       expect(migration).not.toMatch(/\bDROP\s+COLUMN\b/iu);
       expect(migration).not.toMatch(/\bTRUNCATE\b/iu);
@@ -343,6 +356,15 @@ describe("never-dead-end adversarial acceptance matrix", () => {
     expect(schema17).not.toMatch(/\bDELETE\s+FROM\b/iu);
     expect([...schema18.matchAll(/\bDELETE\s+FROM\s+([a-z_]+)/giu)]
       .map((match) => match[1])).toEqual(["pipeline_cohort_kill_switches"]);
+    expect(releaseGuards).toContain(
+      "VALUES('release_manifest_canary_guards_version','1',now())",
+    );
+    expect(executionHardening).toContain(
+      "VALUES('canonical_execution_hardening_version','1',now())",
+    );
+    expect(executionHardening).not.toContain(
+      "VALUES('release_manifest_canary_guards_version'",
+    );
     expect(isDatabaseSchemaVersionCompatible(
       "18",
       DATABASE_SCHEMA_V13_BRIDGE_SUPPORT,

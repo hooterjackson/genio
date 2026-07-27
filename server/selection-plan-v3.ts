@@ -9,8 +9,10 @@
 import { createHash } from "node:crypto";
 import type {
   CanonicalPlaylistContractExecutionPolicyV1,
+  CanonicalPlaylistExecutionDirectivesV1,
   CanonicalPlaylistQualityPolicy,
   CanonicalPlaylistQuotaRule,
+  PipelineV3ConceptDiscoveryHint,
   PipelineV3SourceDiscoveryHint,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
@@ -76,6 +78,8 @@ export type MembershipAxisV3 =
   | "mood"
   | "activity"
   | "artist"
+  | "album"
+  | "playlist"
   | "track"
   | "label"
   | "venue"
@@ -183,6 +187,8 @@ export interface CriticalAmbiguityV3 {
   readonly sceneValue?: string;
   readonly originValue?: string;
   readonly languageValue?: string;
+  /** Exact named subject for possessive factual-relationship questions. */
+  readonly subjectValue?: string;
 }
 
 export interface RunSpecV3 {
@@ -203,12 +209,16 @@ export interface RunSpecV3 {
   readonly orderingPolicy: Readonly<SelectionOrderingPolicy>;
   readonly softGoalRelaxationOrder: readonly string[];
   readonly sourceDiscoveryHints: readonly PipelineV3SourceDiscoveryHint[];
+  /** Immutable, untrusted concept leads; never selection or ranking policy. */
+  readonly conceptDiscoveryHints: readonly PipelineV3ConceptDiscoveryHint[];
   /** Present only when an immutable canonical contract owns distribution. */
   readonly playlistQuotaRules?: readonly CanonicalPlaylistQuotaRule[];
   /** Present only when an immutable canonical contract owns central quality. */
   readonly playlistQualityPolicy?: Readonly<CanonicalPlaylistQualityPolicy>;
   /** Sole selection authority for immutable contract-3 work. */
   readonly canonicalContractPolicy?: Readonly<CanonicalPlaylistContractExecutionPolicyV1>;
+  /** Typed discovery identity; canonical workers never reconstruct it from prompt prose. */
+  readonly executionDirectives?: Readonly<CanonicalPlaylistExecutionDirectivesV1>;
   readonly criticalAmbiguities: readonly CriticalAmbiguityV3[];
   readonly recordingPolicy: RecordingPolicyV3;
   readonly semanticPolicyVersion: typeof SEMANTIC_SCOPE_POLICY_VERSION;
@@ -1168,6 +1178,7 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       summary: "The possessive does not say whether the subject performed, wrote, produced, or merely influenced the recordings.",
       blocking: true,
       optionIds: ["subject_performed", "subject_created", "subject_influenced", "custom"],
+      subjectValue: possessive[1]!.trim(),
     });
   }
 
@@ -1505,6 +1516,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     orderingPolicy,
     softGoalRelaxationOrder,
     sourceDiscoveryHints: sanitizePipelineV3SourceDiscoveryHints(input.guidanceSourceHints),
+    conceptDiscoveryHints: [],
     criticalAmbiguities: ambiguities,
     recordingPolicy: recordingPolicyForInput(input),
     semanticPolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,

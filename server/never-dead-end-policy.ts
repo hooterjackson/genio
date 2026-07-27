@@ -122,28 +122,59 @@ export interface DependencyRetryDecision {
   nextRetryAt: Date | null;
   automaticRetryUntil: Date;
   needsDecision: boolean;
+  /** True when the queued wake may transition state but must not call a provider. */
+  decisionOnlyWake: boolean;
 }
 
 export function dependencyRetryDecision(input: {
   blockedAt: Date;
   retryCount: number;
   now?: Date;
+  retryAfterUntil?: Date | null;
 }): DependencyRetryDecision {
   const now = input.now ?? new Date();
   const automaticRetryUntil = new Date(input.blockedAt.getTime() + DEPENDENCY_AUTOMATIC_RETRY_WINDOW_MS);
   if (now.getTime() >= automaticRetryUntil.getTime()) {
-    return { retry: false, nextRetryAt: null, automaticRetryUntil, needsDecision: true };
+    return {
+      retry: false,
+      nextRetryAt: null,
+      automaticRetryUntil,
+      needsDecision: true,
+      decisionOnlyWake: false,
+    };
   }
-  const index = Math.max(0, Math.min(
-    DEPENDENCY_RETRY_DELAYS_MS.length - 1,
-    Math.floor(input.retryCount),
-  ));
-  const scheduled = new Date(input.blockedAt.getTime() + DEPENDENCY_RETRY_DELAYS_MS[index]!);
+  const index = Math.max(0, Math.floor(input.retryCount));
+  const retryDelay = DEPENDENCY_RETRY_DELAYS_MS[index];
+  if (retryDelay === undefined) {
+    return {
+      retry: false,
+      nextRetryAt: automaticRetryUntil,
+      automaticRetryUntil,
+      needsDecision: false,
+      decisionOnlyWake: true,
+    };
+  }
+  const scheduled = new Date(input.blockedAt.getTime() + retryDelay);
+  const providerRetryAt = Math.max(
+    scheduled.getTime(),
+    now.getTime(),
+    input.retryAfterUntil?.getTime() ?? 0,
+  );
+  if (providerRetryAt >= automaticRetryUntil.getTime()) {
+    return {
+      retry: false,
+      nextRetryAt: automaticRetryUntil,
+      automaticRetryUntil,
+      needsDecision: false,
+      decisionOnlyWake: true,
+    };
+  }
   return {
     retry: true,
-    nextRetryAt: scheduled.getTime() > now.getTime() ? scheduled : now,
+    nextRetryAt: new Date(providerRetryAt),
     automaticRetryUntil,
     needsDecision: false,
+    decisionOnlyWake: false,
   };
 }
 
@@ -162,6 +193,14 @@ export function curatedCandidateGoal(input: {
 export interface BackendCapabilityDeclaration {
   backend: string;
   predicateOperators: readonly string[];
+  /**
+   * Exact hard-clause shapes for which the backend can establish that a
+   * positive claim is absent from a closed-world source. Entries are
+   * `<clause-operator>:<clause-kind>:<axis>`. Generic Boolean NOT/EXCEPT
+   * support is insufficient: an open-world semantic source can prove a
+   * positive genre assertion, but cannot prove that no such assertion exists.
+   */
+  closedWorldNegativePredicates?: readonly string[];
   evidenceGrades: readonly string[];
   supportsQuotas: boolean;
   supportsSequencing: boolean;
@@ -179,14 +218,20 @@ export interface BackendCapabilityDeclaration {
   /** A quota backend must support both the Boolean shape and the governed metadata axis. */
   quotaPredicateOperators?: readonly string[];
   quotaAxes?: readonly string[];
+  /** Exact canonical clause shapes accepted as quota predicate leaves. */
+  quotaPredicateLeafShapes?: readonly string[];
   /** Catalog-version clauses include recording/version and content-policy gates. */
   catalogPolicyAxes?: readonly string[];
   sequencingDirections?: readonly string[];
   sequencingDimensions?: readonly string[];
+  /** Typed discovery/routing semantics supported without prompt reparsing. */
+  executionFeatures?: readonly string[];
 }
 
 export interface ContractCapabilityRequirements {
   predicateOperators: readonly string[];
+  /** Closed-world negative proof required by NOT/EXCEPT or an exclusion leaf. */
+  negativePredicateRequirements?: readonly string[];
   evidenceGrades: readonly string[];
   requiresQuotas: boolean;
   requiresSequencing: boolean;
@@ -201,9 +246,11 @@ export interface ContractCapabilityRequirements {
   locale?: string;
   quotaPredicateOperators?: readonly string[];
   quotaAxes?: readonly string[];
+  quotaPredicateLeafShapes?: readonly string[];
   catalogPolicyAxes?: readonly string[];
   sequencingDirections?: readonly string[];
   sequencingDimensions?: readonly string[];
+  executionFeatures?: readonly string[];
 }
 
 export interface BackendCapabilityResult {
@@ -216,6 +263,9 @@ export function backendSupportsContract(
   contract: ContractCapabilityRequirements,
 ): BackendCapabilityResult {
   const operators = new Set(backend.predicateOperators);
+  const closedWorldNegatives = new Set(
+    backend.closedWorldNegativePredicates ?? [],
+  );
   const evidence = new Set(backend.evidenceGrades);
   const missingVersion = (
     required: number | string | undefined,
@@ -226,6 +276,9 @@ export function backendSupportsContract(
     : [`${label}:${required}`];
   const missing = [
     ...contract.predicateOperators.filter((value) => !operators.has(value)).map((value) => `operator:${value}`),
+    ...(contract.negativePredicateRequirements ?? [])
+      .filter((value) => !closedWorldNegatives.has(value))
+      .map((value) => `negative_predicate:${value}`),
     ...contract.evidenceGrades.filter((value) => !evidence.has(value)).map((value) => `evidence:${value}`),
     ...missingVersion(
       contract.contractSchemaVersion,
@@ -261,6 +314,9 @@ export function backendSupportsContract(
     } else {
       const quotaOperators = new Set(backend.quotaPredicateOperators ?? []);
       const quotaAxes = new Set(backend.quotaAxes ?? []);
+      const quotaLeafShapes = new Set(
+        backend.quotaPredicateLeafShapes ?? [],
+      );
       missing.push(
         ...(contract.quotaPredicateOperators ?? [])
           .filter((value) => !quotaOperators.has(value))
@@ -268,6 +324,9 @@ export function backendSupportsContract(
         ...(contract.quotaAxes ?? [])
           .filter((value) => !quotaAxes.has(value))
           .map((value) => `quota_axis:${value}`),
+        ...(contract.quotaPredicateLeafShapes ?? [])
+          .filter((value) => !quotaLeafShapes.has(value))
+          .map((value) => `quota_leaf:${value}`),
       );
     }
   }
@@ -275,6 +334,10 @@ export function backendSupportsContract(
   missing.push(...(contract.catalogPolicyAxes ?? [])
     .filter((value) => !catalogAxes.has(value))
     .map((value) => `catalog_policy:${value}`));
+  const executionFeatures = new Set(backend.executionFeatures ?? []);
+  missing.push(...(contract.executionFeatures ?? [])
+    .filter((value) => !executionFeatures.has(value))
+    .map((value) => `execution_feature:${value}`));
   if (contract.requiresSequencing) {
     if (!backend.supportsSequencing) {
       missing.push("feature:sequencing");

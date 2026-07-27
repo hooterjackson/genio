@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import type { ReleaseDeploymentPhase } from "../server/release-deployment-phase.ts";
 
-type MigrationVerificationPhase = Exclude<ReleaseDeploymentPhase, "activate">;
+type MigrationVerificationPhase = Extract<
+  ReleaseDeploymentPhase,
+  "bridge" | "expand"
+>;
 type JsonRecord = Record<string, unknown>;
 
 export interface ReleaseMigrationVerificationArgs {
@@ -10,6 +13,9 @@ export interface ReleaseMigrationVerificationArgs {
   expectedRevision: string;
   expectedVersion: string;
   expectedSchemaVersion: string;
+  expectedDatabaseCapabilityVersion: "2" | null;
+  expectedReleaseManifestCanaryGuardsVersion: "1" | null;
+  expectedCanonicalExecutionHardeningVersion: "1" | null;
   phase: MigrationVerificationPhase;
   samples: number;
   intervalMs: number;
@@ -29,6 +35,7 @@ export interface ReleaseMigrationObservation {
   observedAt: string;
   apiVersion: string | null;
   apiRevision: string | null;
+  apiConfigurationHash: string | null;
   deploymentPhase: string | null;
   expectedDatabaseSchemaVersion: string | null;
   canonicalActivationConfigured: boolean;
@@ -40,6 +47,9 @@ export interface ReleaseMigrationObservation {
   readyHttpStatus: number;
   ready: boolean;
   databaseSchemaVersion: string | null;
+  databaseCapabilityVersion: string | null;
+  releaseManifestCanaryGuardsVersion: string | null;
+  canonicalExecutionHardeningVersion: string | null;
   systemHttpStatus: number;
   systemOk: boolean;
   activationReady: boolean;
@@ -51,7 +61,7 @@ export interface ReleaseMigrationObservation {
 }
 
 export interface ReleaseMigrationPhaseEvidence {
-  schemaVersion: "genio-release-migration-phase/v1";
+  schemaVersion: "genio-release-migration-phase/v2";
   generatedAt: string;
   expiresAt: string;
   origin: string;
@@ -59,9 +69,14 @@ export interface ReleaseMigrationPhaseEvidence {
     revision: string;
     version: string;
     databaseSchemaVersion: string;
+    databaseCapabilityVersion: "2" | null;
+    releaseManifestCanaryGuardsVersion: "1" | null;
+    canonicalExecutionHardeningVersion: "1" | null;
     phase: MigrationVerificationPhase;
     samples: number;
+    minimumObservationSpanMs: 30_000;
   };
+  observationSpanMs: number;
   passed: boolean;
   violations: string[];
   observations: ReleaseMigrationObservation[];
@@ -136,11 +151,28 @@ function integer(value: string | undefined, name: string, minimum: number, maxim
 export function parseReleaseMigrationVerificationArgs(
   argv: readonly string[],
 ): ReleaseMigrationVerificationArgs {
+  const acceptedOptions = new Set([
+    "--origin",
+    "--expected-revision",
+    "--expected-version",
+    "--expected-schema",
+    "--expected-capability",
+    "--expected-manifest-canary-guards",
+    "--expected-canonical-hardening",
+    "--phase",
+    "--samples",
+    "--interval-seconds",
+  ]);
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 2) {
     const name = argv[index] ?? "";
     const value = argv[index + 1] ?? "";
-    if (!name.startsWith("--") || !value || value.startsWith("--")) {
+    if (
+      !acceptedOptions.has(name)
+      || !value
+      || value.startsWith("--")
+      || values.has(name)
+    ) {
       throw new Error(`Invalid release migration verification argument: ${name || "(missing)"}`);
     }
     values.set(name, value);
@@ -155,6 +187,52 @@ export function parseReleaseMigrationVerificationArgs(
   }
   if (phase === "expand" && expectedSchemaVersion !== "18") {
     throw new Error("expand verification requires --expected-schema 18");
+  }
+  const expectedCapabilityValue = values.get("--expected-capability");
+  if (
+    expectedCapabilityValue !== "2"
+    && expectedCapabilityValue !== "none"
+  ) {
+    throw new Error("--expected-capability must be 2 or none");
+  }
+  const expectedDatabaseCapabilityVersion =
+    expectedCapabilityValue === "2" ? "2" : null;
+  const expectedManifestCanaryGuardsValue =
+    values.get("--expected-manifest-canary-guards");
+  if (
+    expectedManifestCanaryGuardsValue !== "1"
+    && expectedManifestCanaryGuardsValue !== "none"
+  ) {
+    throw new Error("--expected-manifest-canary-guards must be 1 or none");
+  }
+  const expectedReleaseManifestCanaryGuardsVersion =
+    expectedManifestCanaryGuardsValue === "1" ? "1" : null;
+  const expectedCanonicalHardeningValue =
+    values.get("--expected-canonical-hardening");
+  if (
+    expectedCanonicalHardeningValue !== "1"
+    && expectedCanonicalHardeningValue !== "none"
+  ) {
+    throw new Error("--expected-canonical-hardening must be 1 or none");
+  }
+  const expectedCanonicalExecutionHardeningVersion =
+    expectedCanonicalHardeningValue === "1" ? "1" : null;
+  const schema18 = expectedSchemaVersion === "18";
+  if (
+    (schema18 && (
+      expectedDatabaseCapabilityVersion !== "2"
+      || expectedReleaseManifestCanaryGuardsVersion !== "1"
+      || expectedCanonicalExecutionHardeningVersion !== "1"
+    ))
+    || (!schema18 && (
+      expectedDatabaseCapabilityVersion !== null
+      || expectedReleaseManifestCanaryGuardsVersion !== null
+      || expectedCanonicalExecutionHardeningVersion !== null
+    ))
+  ) {
+    throw new Error(
+      "schema 18 requires composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
+    );
   }
   const expectedRevision = (values.get("--expected-revision") ?? "").toLowerCase();
   if (!REVISION.test(expectedRevision)) {
@@ -186,12 +264,15 @@ export function parseReleaseMigrationVerificationArgs(
     expectedRevision,
     expectedVersion,
     expectedSchemaVersion,
+    expectedDatabaseCapabilityVersion,
+    expectedReleaseManifestCanaryGuardsVersion,
+    expectedCanonicalExecutionHardeningVersion,
     phase,
     samples: integer(values.get("--samples") ?? "2", "--samples", 2, 5),
     intervalMs: integer(
       values.get("--interval-seconds") ?? "30",
       "--interval-seconds",
-      0,
+      30,
       120,
     ) * 1_000,
   };
@@ -211,10 +292,17 @@ export function releaseMigrationObservation(input: {
   const ready = record(input.readyPayload);
   const system = record(input.systemPayload);
   const lanes = record(system.workerLanes);
+  const releaseManifestCanaryGuardsVersion = text(
+    ready.releaseManifestCanaryGuardsVersion,
+  );
+  const canonicalExecutionHardeningVersion = text(
+    ready.canonicalExecutionHardeningVersion,
+  );
   return {
     observedAt: input.observedAt,
     apiVersion: text(build.version ?? live.version, 64),
     apiRevision: text(build.revision ?? live.revision, 64)?.toLowerCase() ?? null,
+    apiConfigurationHash: text(live.configurationHash, 64)?.toLowerCase() ?? null,
     deploymentPhase: text(runtime.deploymentPhase),
     expectedDatabaseSchemaVersion: text(runtime.expectedDatabaseSchemaVersion),
     canonicalActivationConfigured: runtime.canonicalActivationConfigured === true,
@@ -226,6 +314,13 @@ export function releaseMigrationObservation(input: {
     readyHttpStatus: input.readyHttpStatus,
     ready: ready.ok === true && ready.database === true,
     databaseSchemaVersion: text(ready.schemaVersion),
+    databaseCapabilityVersion:
+      releaseManifestCanaryGuardsVersion === "1"
+      && canonicalExecutionHardeningVersion === "1"
+        ? "2"
+        : null,
+    releaseManifestCanaryGuardsVersion,
+    canonicalExecutionHardeningVersion,
     systemHttpStatus: input.systemHttpStatus,
     systemOk: system.ok === true,
     activationReady: system.activationReady === true,
@@ -242,6 +337,9 @@ export function buildReleaseMigrationPhaseEvidence(input: {
   expectedRevision: string;
   expectedVersion: string;
   expectedDatabaseSchemaVersion: string;
+  expectedDatabaseCapabilityVersion: "2" | null;
+  expectedReleaseManifestCanaryGuardsVersion: "1" | null;
+  expectedCanonicalExecutionHardeningVersion: "1" | null;
   phase: MigrationVerificationPhase;
   expectedSamples: number;
   observations: readonly ReleaseMigrationObservation[];
@@ -256,6 +354,7 @@ export function buildReleaseMigrationPhaseEvidence(input: {
     interactive: Number.NEGATIVE_INFINITY,
     deep: Number.NEGATIVE_INFINITY,
   };
+  const observationTimes: number[] = [];
   let previousObservedAt = Number.NEGATIVE_INFINITY;
   for (const [index, observation] of input.observations.entries()) {
     const label = `sample_${index + 1}`;
@@ -263,12 +362,17 @@ export function buildReleaseMigrationPhaseEvidence(input: {
     if (!Number.isFinite(observedAt) || observedAt <= previousObservedAt) {
       violations.push(`${label}:observation_timestamp_not_advanced`);
     }
+    if (Number.isFinite(observedAt)) observationTimes.push(observedAt);
     previousObservedAt = observedAt;
     if (observation.apiVersion !== input.expectedVersion) {
       violations.push(`${label}:api_version:${observation.apiVersion ?? "missing"}`);
     }
     if (observation.apiRevision !== input.expectedRevision) {
       violations.push(`${label}:api_revision:${observation.apiRevision ?? "missing"}`);
+    }
+    if (!observation.apiConfigurationHash
+      || !/^[0-9a-f]{64}$/u.test(observation.apiConfigurationHash)) {
+      violations.push(`${label}:api_configuration_unproven`);
     }
     if (observation.deploymentPhase !== input.phase) {
       violations.push(`${label}:deployment_phase:${observation.deploymentPhase ?? "missing"}`);
@@ -290,6 +394,7 @@ export function buildReleaseMigrationPhaseEvidence(input: {
     if (
       observation.runtimeBriefContractVersion === "3"
       || observation.runtimeQueryPlanSchemaVersion === "4"
+      || observation.runtimeQueryPlanSchemaVersion === "5"
     ) {
       violations.push(`${label}:canonical_emission_not_disabled`);
     }
@@ -300,6 +405,30 @@ export function buildReleaseMigrationPhaseEvidence(input: {
       || observation.systemDatabaseSchemaVersion !== input.expectedDatabaseSchemaVersion
     ) {
       violations.push(`${label}:database_schema_not_ready`);
+    }
+    if (
+      observation.databaseCapabilityVersion
+        !== input.expectedDatabaseCapabilityVersion
+    ) {
+      violations.push(
+        `${label}:database_capability:${observation.databaseCapabilityVersion ?? "missing"}`,
+      );
+    }
+    if (
+      observation.releaseManifestCanaryGuardsVersion
+        !== input.expectedReleaseManifestCanaryGuardsVersion
+    ) {
+      violations.push(
+        `${label}:manifest_canary_guards:${observation.releaseManifestCanaryGuardsVersion ?? "missing"}`,
+      );
+    }
+    if (
+      observation.canonicalExecutionHardeningVersion
+        !== input.expectedCanonicalExecutionHardeningVersion
+    ) {
+      violations.push(
+        `${label}:canonical_execution_hardening:${observation.canonicalExecutionHardeningVersion ?? "missing"}`,
+      );
     }
     if (observation.systemHttpStatus !== 200 || !observation.systemOk || !observation.activationReady) {
       violations.push(`${label}:worker_lanes_not_ready`);
@@ -337,8 +466,32 @@ export function buildReleaseMigrationPhaseEvidence(input: {
       previousHeartbeat[laneName] = lastSeenAt;
     }
   }
+  const apiConfigurationHashes = new Set(
+    input.observations.map(({ apiConfigurationHash }) => apiConfigurationHash),
+  );
+  if (apiConfigurationHashes.size !== 1) {
+    violations.push("api_configuration_changed_during_observation");
+  }
+  for (const laneName of ["interactive", "deep"] as const) {
+    const laneConfigurationHashes = new Set(input.observations.flatMap(
+      (observation) => observation.workerLanes[laneName].eligibleConfigurationHashes,
+    ));
+    if (laneConfigurationHashes.size !== 1) {
+      violations.push(`${laneName}_configuration_changed_during_observation`);
+    }
+  }
+  const observationSpanMs = observationTimes.length < 2
+    ? 0
+    : Math.max(
+      0,
+      observationTimes[observationTimes.length - 1]!
+        - observationTimes[0]!,
+    );
+  if (observationSpanMs < 30_000) {
+    violations.push(`observation_span_too_short:${observationSpanMs}/30000`);
+  }
   const unsigned = {
-    schemaVersion: "genio-release-migration-phase/v1" as const,
+    schemaVersion: "genio-release-migration-phase/v2" as const,
     generatedAt,
     expiresAt: new Date(Date.parse(generatedAt) + EVIDENCE_TTL_MS).toISOString(),
     origin: input.origin,
@@ -346,9 +499,16 @@ export function buildReleaseMigrationPhaseEvidence(input: {
       revision: input.expectedRevision,
       version: input.expectedVersion,
       databaseSchemaVersion: input.expectedDatabaseSchemaVersion,
+      databaseCapabilityVersion: input.expectedDatabaseCapabilityVersion,
+      releaseManifestCanaryGuardsVersion:
+        input.expectedReleaseManifestCanaryGuardsVersion,
+      canonicalExecutionHardeningVersion:
+        input.expectedCanonicalExecutionHardeningVersion,
       phase: input.phase,
       samples: input.expectedSamples,
+      minimumObservationSpanMs: 30_000 as const,
     },
+    observationSpanMs,
     passed: violations.length === 0,
     violations,
     observations: [...input.observations],
@@ -359,12 +519,19 @@ export function buildReleaseMigrationPhaseEvidence(input: {
   };
 }
 
-async function response(url: string): Promise<{ status: number; json: unknown }> {
+async function response(
+  url: string,
+  deadlineAt: number,
+): Promise<{ status: number; json: unknown }> {
+  const timeoutMs = Math.min(15_000, deadlineAt - Date.now());
+  if (timeoutMs <= 0) {
+    throw new Error("release migration phase verification exceeded its deadline");
+  }
   const value = await fetch(url, {
     cache: "no-store",
     redirect: "error",
     headers: { "cache-control": "no-cache", pragma: "no-cache" },
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const body = await value.text();
   let json: unknown = {};
@@ -376,16 +543,23 @@ async function response(url: string): Promise<{ status: number; json: unknown }>
   return { status: value.status, json };
 }
 
-async function main(): Promise<void> {
-  const args = parseReleaseMigrationVerificationArgs(process.argv.slice(2));
+export async function collectReleaseMigrationPhaseEvidence(
+  args: ReleaseMigrationVerificationArgs,
+  deadlineAt = Date.now()
+    + args.samples * 45_000
+    + Math.max(0, args.samples - 1) * args.intervalMs,
+): Promise<ReleaseMigrationPhaseEvidence> {
   const observations: ReleaseMigrationObservation[] = [];
   for (let index = 0; index < args.samples; index += 1) {
+    if (Date.now() >= deadlineAt) {
+      throw new Error("release migration phase verification exceeded its deadline");
+    }
     const nonce = randomUUID();
     const observedAt = new Date().toISOString();
     const [live, ready, system] = await Promise.all([
-      response(`${args.origin}/health/live?release-migration=${nonce}`),
-      response(`${args.origin}/health/ready?release-migration=${nonce}`),
-      response(`${args.origin}/health/system?release-migration=${nonce}`),
+      response(`${args.origin}/health/live?release-migration=${nonce}`, deadlineAt),
+      response(`${args.origin}/health/ready?release-migration=${nonce}`, deadlineAt),
+      response(`${args.origin}/health/system?release-migration=${nonce}`, deadlineAt),
     ]);
     if (live.status !== 200) throw new Error(`API liveness probe returned HTTP ${live.status}`);
     observations.push(releaseMigrationObservation({
@@ -397,18 +571,33 @@ async function main(): Promise<void> {
       systemHttpStatus: system.status,
     }));
     if (index + 1 < args.samples && args.intervalMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, args.intervalMs));
+      const delay = Math.min(args.intervalMs, deadlineAt - Date.now());
+      if (delay !== args.intervalMs) {
+        throw new Error("release migration phase verification exceeded its deadline");
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
-  const evidence = buildReleaseMigrationPhaseEvidence({
+  return buildReleaseMigrationPhaseEvidence({
     origin: args.origin,
     expectedRevision: args.expectedRevision,
     expectedVersion: args.expectedVersion,
     expectedDatabaseSchemaVersion: args.expectedSchemaVersion,
+    expectedDatabaseCapabilityVersion:
+      args.expectedDatabaseCapabilityVersion,
+    expectedReleaseManifestCanaryGuardsVersion:
+      args.expectedReleaseManifestCanaryGuardsVersion,
+    expectedCanonicalExecutionHardeningVersion:
+      args.expectedCanonicalExecutionHardeningVersion,
     phase: args.phase,
     expectedSamples: args.samples,
     observations,
   });
+}
+
+async function main(): Promise<void> {
+  const args = parseReleaseMigrationVerificationArgs(process.argv.slice(2));
+  const evidence = await collectReleaseMigrationPhaseEvidence(args);
   process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
   if (!evidence.passed) process.exitCode = 1;
 }

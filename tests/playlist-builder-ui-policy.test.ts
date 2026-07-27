@@ -196,6 +196,54 @@ describe("never-dead-end run controls", () => {
     expect(shouldKeepPollingBlockedRun(run)).toBe(false);
   });
 
+  it("offers Resume later only for a hash-bound retained dependency decision", () => {
+    const eligible = {
+      status: "needs_decision",
+      phase: "dependency_retry_window_expired",
+      decisionAction: {
+        reason: "dependency_retry_window_expired",
+        decisionHash: "a".repeat(64),
+        actions: { resumeLater: true },
+      },
+      resolution: {
+        state: "needs_decision",
+        nextAction: "resume_research",
+        terminal: false,
+        blocker: {
+          kind: "provider",
+          nextRetryAt: null,
+          automaticRetryUntil: "2026-07-24T12:00:00.000Z",
+          versionHash: "b".repeat(64),
+        },
+      },
+    };
+    expect(runResolutionControls(eligible)).toEqual([
+      "resume_dependency",
+      "refine_request",
+      "cancel_job",
+    ]);
+    expect(runResolutionControls({
+      ...eligible,
+      resolution: {
+        ...eligible.resolution,
+        blocker: {
+          ...eligible.resolution.blocker,
+          versionHash: null,
+        },
+      },
+    })).toEqual(["refine_request", "cancel_job"]);
+    expect(runResolutionControls({
+      ...eligible,
+      resolution: {
+        ...eligible.resolution,
+        blocker: {
+          ...eligible.resolution.blocker,
+          kind: "scope_decision",
+        },
+      },
+    })).toEqual(["refine_request", "cancel_job"]);
+  });
+
   it("does not expose a fake partial action when the signed decision is absent", () => {
     expect(runResolutionControls({
       status: "partial_ready",

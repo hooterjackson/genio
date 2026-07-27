@@ -6,6 +6,7 @@ import {
   evaluatePlaylistContractTrackV1,
   evaluatePlaylistQualityV1,
   evaluatePlaylistQuotasV1,
+  rebasePlaylistContractPatchV1,
   type PlaylistClauseAssessmentV1,
   type PlaylistContractClauseDraftV1,
   type PlaylistContractDraftV1,
@@ -115,6 +116,97 @@ const editorialPass = {
 } as const satisfies PlaylistClauseAssessmentV1;
 
 describe("immutable playlist contract revision v1", () => {
+  test("replaces an earlier answer from its historical base and drops dependent lineage", () => {
+    const base = compileFixture();
+    const first = applyPlaylistContractPatchV1(base, {
+      baseRevisionId: base.revisionId,
+      baseSemanticHash: base.semanticHash,
+      answerLineage: {
+        questionSetHash: "1".repeat(64),
+        questionId: "guidance:scope",
+        answerHash: "2".repeat(64),
+      },
+      operations: [{
+        op: "replace_clause",
+        clauseId: "suitability:smooth",
+        clause: {
+          id: "suitability:smooth",
+          kind: "suitability",
+          scope: "track",
+          hardness: "soft",
+          axis: "suitability",
+          operator: "prefer",
+          values: ["silky"],
+          source: { provenance: "guidance", text: "silky" },
+        },
+      }],
+    });
+    const active = applyPlaylistContractPatchV1(first, {
+      baseRevisionId: first.revisionId,
+      baseSemanticHash: first.semanticHash,
+      answerLineage: {
+        questionSetHash: "3".repeat(64),
+        questionId: "guidance:flow",
+        answerHash: "4".repeat(64),
+      },
+      operations: [{
+        op: "replace_clause",
+        clauseId: "suitability:polished",
+        clause: {
+          id: "suitability:polished",
+          kind: "suitability",
+          scope: "track",
+          hardness: "soft",
+          axis: "suitability",
+          operator: "prefer",
+          values: ["glossy"],
+          source: { provenance: "guidance", text: "glossy" },
+        },
+      }],
+    });
+    const replacement = rebasePlaylistContractPatchV1({
+      active,
+      historicalBase: base,
+      replacementPatch: {
+        baseRevisionId: base.revisionId,
+        baseSemanticHash: base.semanticHash,
+        answerLineage: {
+          questionSetHash: "5".repeat(64),
+          questionId: "guidance:scope",
+          answerHash: "6".repeat(64),
+        },
+        operations: [{
+          op: "replace_clause",
+          clauseId: "suitability:smooth",
+          clause: {
+            id: "suitability:smooth",
+            kind: "suitability",
+            scope: "track",
+            hardness: "soft",
+            axis: "suitability",
+            operator: "prefer",
+            values: ["warm"],
+            source: { provenance: "guidance", text: "warm" },
+          },
+        }],
+      },
+    });
+    expect(replacement.parentRevisionId).toBe(active.revisionId);
+    expect(replacement.parentSemanticHash).toBe(active.semanticHash);
+    expect(replacement.revision).toBe(active.revision + 1);
+    expect(replacement.requestedTrackCount).toBe(active.requestedTrackCount);
+    expect(replacement.answerLineage).toEqual([{
+      questionSetHash: "5".repeat(64),
+      questionId: "guidance:scope",
+      answerHash: "6".repeat(64),
+    }]);
+    expect(replacement.clauses.find(({ id }) => id === "suitability:smooth")
+      ?.values).toEqual(["warm"]);
+    expect(replacement.clauses.find(({ id }) => id === "suitability:polished")
+      ?.values).toEqual(["polished"]);
+    expect(() => assertPlaylistContractIntegrityV1(replacement)).not.toThrow();
+  });
+
   test("compiles hard scope, soft suitability, version snapshots, and semantic identity", () => {
     const contract = compileFixture();
     expect(contract).toMatchObject({
@@ -150,6 +242,35 @@ describe("immutable playlist contract revision v1", () => {
       hardMembership("genre:other", "Other", "dembow"),
     )).toThrow();
     expect(() => assertPlaylistContractIntegrityV1(contract)).not.toThrow();
+  });
+
+  test("rejects a zero per-artist maximum instead of silently weakening it", () => {
+    const draft = smoothReggaetonDraft();
+    expect(() => compilePlaylistContractRevisionV1({
+      ...draft,
+      clauses: [...draft.clauses, {
+        id: "diversity:max-artist-zero",
+        kind: "quota_diversity",
+        scope: "playlist",
+        hardness: "hard",
+        axis: "maximum-tracks-per-artist",
+        operator: "limit",
+        values: ["0"],
+        source: { provenance: "guidance", text: "At most zero tracks per artist" },
+      }],
+    })).toThrow("contradictory_playlist_diversity_clause");
+  });
+
+  test("rejects count and ratio quotas that conflict at the immutable requested count", () => {
+    const draft = smoothReggaetonDraft();
+    expect(() => compilePlaylistContractRevisionV1({
+      ...draft,
+      playlistConstraints: draft.playlistConstraints?.map((constraint) => ({
+        ...constraint,
+        minimumCount: 40,
+        maximumRatio: 0.75,
+      })),
+    })).toThrow("contradictory_quota_for_requested_count");
   });
 
   test("uses canonical ordering for semantic hashes without conflating revision identity", () => {

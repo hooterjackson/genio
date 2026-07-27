@@ -120,6 +120,26 @@ describe("dependency circuit v1", () => {
     }
   });
 
+  test("caps a longer Retry-After at the decision-only 24-hour wake", () => {
+    const automaticRetryUntil = new Date(
+      firstFailureAt.getTime() + DEPENDENCY_AUTOMATIC_WINDOW_MS_V1,
+    );
+    const retryAfterUntil = new Date(automaticRetryUntil.getTime() + 24 * 60 * 60_000);
+    expect(decideDependencyCircuitV1(circuit({
+      immediateAttemptsCompleted: 3,
+      durableAttemptsCompleted: 0,
+      lastFailureAt: circuitOpenedAt,
+      retryAfterUntil,
+      now: circuitOpenedAt,
+    }))).toMatchObject({
+      state: "blocked_dependency",
+      retryLane: "durable",
+      nextRetryAt: automaticRetryUntil,
+      shouldRetryNow: false,
+      automaticRetryUntil,
+    });
+  });
+
   test("waits without inventing a sixth durable retry, then requires a decision at 24h", () => {
     const beforeDeadline = new Date(
       firstFailureAt.getTime() + DEPENDENCY_AUTOMATIC_WINDOW_MS_V1 - 1,

@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import * as databaseSchema from "../db/schema.ts";
 import { Repository } from "../server/repository.ts";
 import { ResearchOrchestrator } from "../server/research.ts";
 import { sha256Hex, stableStringify } from "../server/security.ts";
@@ -90,7 +92,10 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
        WHERE id=$1`,
       [snapshotId, "a".repeat(64)],
     );
-    repository = new Repository({ pool, db: {} } as never);
+    repository = new Repository({
+      pool,
+      db: drizzle(pool, { schema: databaseSchema }),
+    });
   }, 30_000);
 
   afterAll(async () => {
@@ -154,6 +159,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
           kind: string;
           model: string;
           candidateGoal: number;
+          qualifiedPoolGoal: number;
           p10QualifiedToAppleSafeConversionRate: number;
           conversionRateSampleCount: number;
           conversionRateSegment: {
@@ -188,6 +194,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
           kind: "corpus_first_v3",
           model: "gpt-5.6-luna",
           candidateGoal: 315,
+          qualifiedPoolGoal: 165,
           p10QualifiedToAppleSafeConversionRate: 0.5,
           conversionRateSampleCount: 0,
           conversionRateSegment: {
@@ -414,6 +421,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     const snapshot = (await pool.query<{
       execution_policy: {
         candidateGoal: number;
+        qualifiedPoolGoal: number;
         p10QualifiedToAppleSafeConversionRate: number;
         conversionRateSampleCount: number;
       };
@@ -424,6 +432,7 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
     )).rows[0]!.execution_policy;
     expect(snapshot).toMatchObject({
       candidateGoal: 390,
+      qualifiedPoolGoal: 165,
       p10QualifiedToAppleSafeConversionRate: 0.4,
       conversionRateSampleCount: 1,
     });

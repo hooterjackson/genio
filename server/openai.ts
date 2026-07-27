@@ -39,6 +39,7 @@ import {
 const OPENAI_BASE = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_IMMEDIATE_PROVIDER_RETRY_WAIT_MS = 15_000;
 
 export const GUIDANCE_SCOUT_MAX_TOOL_CALLS = 1;
 // Reasoning tokens count against max_output_tokens in the Responses API. The
@@ -76,8 +77,32 @@ export interface OpenAIRequestContext {
   onUsage?: (event: ProviderUsageEvent) => void | Promise<void>;
 }
 
+export type ProviderRequestFailureClass =
+  | "transient"
+  | "rate_limited"
+  | "authorization"
+  | "quota"
+  | "invalid_request"
+  | "configuration"
+  | "permanent";
+
+function defaultProviderRequestFailureClass(
+  status: number | null,
+  retriable: boolean,
+): ProviderRequestFailureClass {
+  if (retriable) return status === 429 ? "rate_limited" : "transient";
+  if (status === 401 || status === 403) return "authorization";
+  if (status === 429) return "quota";
+  if (status === 404) return "configuration";
+  if (status !== null && status >= 400 && status < 500) {
+    return "invalid_request";
+  }
+  return status === null ? "configuration" : "permanent";
+}
+
 export class ProviderRequestError extends Error {
   readonly name = "ProviderRequestError";
+  readonly failureClass: ProviderRequestFailureClass;
 
   constructor(
     message: string,
@@ -85,8 +110,12 @@ export class ProviderRequestError extends Error {
     readonly status: number | null,
     readonly retriable: boolean,
     readonly retryAfterMs: number | null = null,
+    readonly retryAfterUntil: Date | null = null,
+    failureClass: ProviderRequestFailureClass | null = null,
   ) {
     super(message);
+    this.failureClass = failureClass
+      ?? defaultProviderRequestFailureClass(status, retriable);
   }
 }
 
@@ -99,15 +128,36 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
   }, { once: true });
 });
 
-function retryDelay(response: Response | null, attempt: number): number {
+function retryBoundary(
+  response: Response | null,
+  attempt: number,
+): { delayMs: number; retryAfterUntil: Date | null } {
   const header = response?.headers.get("retry-after");
   if (header) {
     const seconds = Number(header);
-    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1_000, 250), 15_000);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      const now = Date.now();
+      const retryAfterMs = seconds * 1_000;
+      return {
+        delayMs: Math.max(retryAfterMs, 250),
+        retryAfterUntil: new Date(now + retryAfterMs),
+      };
+    }
     const date = Date.parse(header);
-    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 250), 15_000);
+    if (Number.isFinite(date)) {
+      return {
+        delayMs: Math.max(date - Date.now(), 250),
+        retryAfterUntil: new Date(date),
+      };
+    }
   }
-  return Math.min(500 * 2 ** attempt + Math.floor(Math.random() * 250), 8_000);
+  return {
+    delayMs: Math.min(
+      500 * 2 ** attempt + Math.floor(Math.random() * 250),
+      8_000,
+    ),
+    retryAfterUntil: null,
+  };
 }
 
 async function boundedJson(response: Response): Promise<any> {
@@ -163,13 +213,47 @@ async function openAIRequest(
       // can take over. Ordinary 429s retain bounded exponential retry.
       const quotaUnavailable = response.status === 429 && providerCode === "insufficient_quota";
       const retriable = !quotaUnavailable && (response.status === 429 || response.status >= 500);
-      const error = new ProviderRequestError(message, "openai", response.status, retriable, retriable ? retryDelay(response, attempt) : null);
+      const retry = retriable
+        ? retryBoundary(response, attempt)
+        : { delayMs: null, retryAfterUntil: null };
+      const error = new ProviderRequestError(
+        message,
+        "openai",
+        response.status,
+        retriable,
+        retry.delayMs,
+        retry.retryAfterUntil,
+        quotaUnavailable
+          ? "quota"
+          : response.status === 429
+            ? "rate_limited"
+            : response.status >= 500
+              ? "transient"
+              : response.status === 401 || response.status === 403
+                ? "authorization"
+                : response.status === 404
+                  ? "configuration"
+                  : "invalid_request",
+      );
       if (!retriable || attempt === 2) throw error;
+      // A provider-owned boundary longer than the immediate lane belongs on
+      // the durable dependency circuit. Retrying early would violate
+      // Retry-After, while sleeping here would consume the active job lease.
+      if (retry.retryAfterUntil
+        && retry.retryAfterUntil.getTime() - Date.now()
+          > MAX_IMMEDIATE_PROVIDER_RETRY_WAIT_MS) {
+        throw error;
+      }
       lastError = error;
       await wait(error.retryAfterMs!, context.signal);
     } catch (error) {
       if (error instanceof ProviderRequestError) {
         if (!error.retriable || attempt === 2) throw error;
+        if (error.retryAfterUntil
+          && error.retryAfterUntil.getTime() - Date.now()
+            > MAX_IMMEDIATE_PROVIDER_RETRY_WAIT_MS) {
+          throw error;
+        }
         lastError = error;
         continue;
       }
@@ -178,7 +262,7 @@ async function openAIRequest(
       if (attempt === 2) {
         throw new ProviderRequestError("OpenAI could not be reached after three attempts", "openai", null, true);
       }
-      await wait(retryDelay(response, attempt), context.signal);
+      await wait(retryBoundary(response, attempt).delayMs, context.signal);
     }
   }
   throw lastError instanceof Error ? lastError : new Error("OpenAI request failed");

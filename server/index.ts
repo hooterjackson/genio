@@ -10,7 +10,12 @@ import {
 } from "./owner.ts";
 import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog-import.ts";
 import { Repository } from "./repository.ts";
-import { HttpError, sha256Hex, stableStringify } from "./security.ts";
+import {
+  capabilityPepperRotationStatus,
+  HttpError,
+  sha256Hex,
+  stableStringify,
+} from "./security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
   PUBLIC_FAST_RESEARCH_BUDGET_USD,
@@ -18,7 +23,12 @@ import {
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
   publicRunBudgetUsd,
 } from "../shared/product-policy.ts";
-import { playlistTrackCountAdmission } from "./playlist-count-policy.ts";
+import {
+  AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+  playlistTrackCountAdmission,
+  PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+  type CustomGuidanceTrackCountAuthorityV1,
+} from "./playlist-count-policy.ts";
 import {
   canonicalBriefForRequest,
   estimateResearchCost,
@@ -42,10 +52,28 @@ import {
   DATABASE_SCHEMA_SUPPORT,
   isDatabaseSchemaVersionCompatible,
 } from "../db/index.ts";
-import { appleAuthorizationGeneration, appleAuthorizationJobDedupeKey } from "./apple.ts";
+import {
+  appleAuthorizationGeneration,
+  appleAuthorizationJobDedupeKey,
+  searchAppleCatalogResources,
+} from "./apple.ts";
+import {
+  type ResolvedExactArtistIdentityV1,
+} from "./exact-artist-identity-v1.ts";
+import {
+  customArtistNeedsInputMessageV1,
+  resolveCustomArtistIdentitiesV1,
+  type CustomArtistIdentityResolutionV1,
+} from "./custom-guidance-artist-resolution-v1.ts";
+import {
+  submitBriefGuidanceAnswersV1,
+} from "./brief-guidance-submission-v1.ts";
 import { initialApprovedBudgetUsd, readCostConfiguration } from "./cost-config.ts";
 import { buildInformation } from "./build-info.ts";
-import { runtimeReleaseContract } from "./runtime-release.ts";
+import {
+  apiReleaseConfigurationHash,
+  runtimeReleaseContract,
+} from "./runtime-release.ts";
 import {
   BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
   WORKER_PIPELINE_PROTOCOL_VERSION,
@@ -79,9 +107,19 @@ import { isSmoothReggaetonHeatRequestV3 } from "./adaptive-guidance-v3.ts";
 import { readReleaseCanaryInventory } from "./release-canary-inventory.ts";
 import { authenticateReleaseCanary } from "./release-canary-request.ts";
 import {
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
   canonicalContractActivationConfigured,
   canonicalContractActivationReady,
+  releaseDatabaseReadinessReady,
+  releaseExecutionConfigured,
 } from "./release-deployment-phase.ts";
+import {
+  parseReleaseManifestCanaryMarker,
+  RELEASE_MANIFEST_CANARY_MAX_TRACKS,
+  RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+} from "./release-manifest-canary.ts";
+import { createPublicRolloutAssignmentV1 } from "./public-rollout-assignment.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -92,6 +130,29 @@ const evidenceGraphServiceV3 = new EvidenceGraphServiceV3(evidenceGraphRepositor
 const capabilities = new CapabilityService(repository);
 const verifyGateway = createGatewayVerifier(repository);
 const gatewayIdentities = new WeakMap<FastifyRequest, GatewayIdentity>();
+
+async function resolveCustomArtistIdentities(input: {
+  customTexts: readonly string[];
+  storefront: string;
+}): Promise<CustomArtistIdentityResolutionV1> {
+  return resolveCustomArtistIdentitiesV1({
+    ...input,
+    search: async (storefront, query, next) => {
+      const page = await searchAppleCatalogResources(
+        storefront,
+        query,
+        ["artists"],
+        25,
+        undefined,
+        next,
+      );
+      return {
+        artists: page.artists,
+        next: page.next?.artists ?? null,
+      };
+    },
+  });
+}
 
 const app = Fastify({
   bodyLimit: MAX_BODY_BYTES,
@@ -141,6 +202,16 @@ app.addHook("onRequest", async (request, reply) => {
 app.addHook("preHandler", async (request) => {
   if (!request.url.startsWith("/api/v1/")) return;
   gatewayIdentities.set(request, await verifyGateway(request));
+  if (
+    !releaseExecutionConfigured(process.env)
+    && ["DELETE", "PATCH", "POST", "PUT"].includes(request.method)
+  ) {
+    throw new HttpError(
+      503,
+      "Fresh staging bootstrap is read-only until schema readiness is verified",
+      "release_bootstrap_execution_disabled",
+    );
+  }
 });
 
 function identity(request: FastifyRequest): GatewayIdentity {
@@ -188,6 +259,33 @@ function candidateIds(value: unknown): string[] | undefined {
 
 async function sessionForAccess(request: FastifyRequest, accessId: string): Promise<RunCapabilitySessionView> {
   return capabilities.authenticateForAccess(request, accessId);
+}
+
+async function customGuidanceTrackCountAuthorityForRequest(
+  request: FastifyRequest,
+): Promise<CustomGuidanceTrackCountAuthorityV1> {
+  if (!isOwner(identity(request))) {
+    return PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1;
+  }
+  const [
+    observedDatabaseSchemaVersion,
+    observedDatabaseCapabilityVersion,
+    observedCanonicalExecutionHardeningVersion,
+  ] = await Promise.all([
+    repository.getSchemaVersion(),
+    repository.getSetting(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING),
+    repository.getSetting(
+      CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+    ),
+  ]);
+  return canonicalContractActivationReady({
+    environment: process.env,
+    observedDatabaseSchemaVersion,
+    observedDatabaseCapabilityVersion,
+    observedCanonicalExecutionHardeningVersion,
+  })
+    ? AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1
+    : PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1;
 }
 
 async function requireWorkerForNewWork(): Promise<void> {
@@ -244,14 +342,36 @@ async function assertNotPaused(kind: "research" | "publishing" | "feedback"): Pr
 }
 
 async function enqueueResearchResume(runId: string): Promise<void> {
-  const [run, saved] = await Promise.all([
+  const [run, saved, manifestCanaryMarker] = await Promise.all([
     repository.getRun(runId),
     repository.getResearchCheckpoint(runId, "resume") as Promise<ResearchResumeCheckpoint | null>,
+    repository.getResearchCheckpoint(runId, RELEASE_MANIFEST_CANARY_MARKER_PHASE),
   ]);
   const pipeline = persistedWorkerPipeline(run);
   if (pipeline.route === "corpus_first_v3") {
-    await repository.enqueueJob(pipelineV3ResearchJob(runId, pipeline.queryPlan!));
+    const marker = manifestCanaryMarker === null
+      ? null
+      : parseReleaseManifestCanaryMarker(manifestCanaryMarker);
+    if (manifestCanaryMarker !== null && !marker) {
+      throw new HttpError(
+        409,
+        "Manifest-only release canary authority is malformed",
+        "release_manifest_canary_integrity",
+      );
+    }
+    await repository.enqueueJob(pipelineV3ResearchJob(
+      runId,
+      pipeline.queryPlan!,
+      marker ? "shadow" : "active",
+    ));
     return;
+  }
+  if (manifestCanaryMarker !== null) {
+    throw new HttpError(
+      409,
+      "Manifest-only release canaries require Pipeline V3",
+      "release_manifest_canary_contract_invalid",
+    );
   }
   const policy = researchExecutionPolicyForRun(run);
   let fast = false;
@@ -302,38 +422,86 @@ app.get("/health/live", async () => {
     version: build.version,
     revision: build.revision,
     build,
+    configurationHash: apiReleaseConfigurationHash(),
     runtime: { ...runtime, graphSnapshot },
   };
 });
 
 app.get("/health/ready", async (_request, reply) => {
   const ok = await repository.ping();
+  const capabilityPepper = capabilityPepperRotationStatus();
   const schemaVersion = ok ? await repository.getSchemaVersion() : null;
-  const schemaCompatible = ok && isDatabaseSchemaVersionCompatible(schemaVersion);
-  if (!schemaCompatible) return reply.code(503).send({
+  const releaseManifestCanaryGuardsVersion = ok
+    ? await repository.getSetting(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING)
+    : null;
+  const canonicalExecutionHardeningVersion = ok
+    ? await repository.getSetting(
+      CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+    )
+    : null;
+  const deploymentDatabaseReady = releaseDatabaseReadinessReady({
+    environment: process.env,
+    observedDatabaseSchemaVersion: schemaVersion,
+    observedDatabaseCapabilityVersion: releaseManifestCanaryGuardsVersion,
+    observedCanonicalExecutionHardeningVersion:
+      canonicalExecutionHardeningVersion,
+  });
+  const schemaCompatible = ok
+    && isDatabaseSchemaVersionCompatible(schemaVersion)
+    && deploymentDatabaseReady;
+  if (!schemaCompatible || !capabilityPepper.ready) return reply.code(503).send({
     ok: false,
     database: ok,
     schemaVersion,
+    releaseManifestCanaryGuardsVersion,
+    canonicalExecutionHardeningVersion,
     schemaSupport: DATABASE_SCHEMA_SUPPORT,
+    capabilityPepper,
   });
-  return { ok: true, database: true, schemaVersion, schemaSupport: DATABASE_SCHEMA_SUPPORT };
+  return {
+    ok: true,
+    database: true,
+    schemaVersion,
+    releaseManifestCanaryGuardsVersion,
+    canonicalExecutionHardeningVersion,
+    schemaSupport: DATABASE_SCHEMA_SUPPORT,
+    capabilityPepper,
+  };
 });
 
 app.get("/health/system", async (_request, reply) => {
   try {
+    const capabilityPepper = capabilityPepperRotationStatus();
     const health = await repository.getSystemHealth();
     const schemaVersion = health.database.schemaVersion;
-    const schemaCompatible = isDatabaseSchemaVersionCompatible(schemaVersion);
+    const releaseManifestCanaryGuardsVersion =
+      health.database.releaseManifestCanaryGuardsVersion ?? null;
+    const canonicalExecutionHardeningVersion =
+      health.database.canonicalExecutionHardeningVersion ?? null;
+    const deploymentDatabaseReady = releaseDatabaseReadinessReady({
+      environment: process.env,
+      observedDatabaseSchemaVersion: schemaVersion,
+      observedDatabaseCapabilityVersion: releaseManifestCanaryGuardsVersion,
+      observedCanonicalExecutionHardeningVersion:
+        canonicalExecutionHardeningVersion,
+    });
+    const schemaCompatible = isDatabaseSchemaVersionCompatible(schemaVersion)
+      && deploymentDatabaseReady;
     // Public/API readiness depends on the interactive lane. The deep lane is
     // a separate activation prerequisite so a missing deep worker cannot take
     // otherwise healthy interactive traffic offline during staged rollout.
-    const ok = schemaCompatible && workerLaneReady(health, "interactive");
+    const ok = schemaCompatible
+      && capabilityPepper.ready
+      && workerLaneReady(health, "interactive");
     const activationReady = ok && workerLaneReady(health, "deep");
     return reply.code(ok ? 200 : 503).send({
       ok,
       activationReady,
       database: schemaCompatible ? "ready" : "schema_mismatch",
       schemaVersion,
+      releaseManifestCanaryGuardsVersion,
+      canonicalExecutionHardeningVersion,
+      capabilityPepper,
       worker: health.worker.worker_id
         ? health.worker.stale
           ? "stale"
@@ -354,6 +522,7 @@ app.get("/health/system", async (_request, reply) => {
           protocolVersion: health.workerLanes.interactive.protocolVersion ?? null,
           compatibleCapacity: health.workerLanes.interactive.compatibleCapacity,
           eligibleWorkerCount: health.workerLanes.interactive.eligibleWorkerCount ?? 0,
+          eligibleIdentityCount: health.workerLanes.interactive.eligibleIdentityCount ?? 0,
           eligibleRevisions: health.workerLanes.interactive.eligibleRevisions ?? [],
           eligibleConfigurationHashes: health.workerLanes.interactive.eligibleConfigurationHashes ?? [],
           lastSeenAt: health.workerLanes.interactive.lastSeenAt ?? null,
@@ -363,6 +532,7 @@ app.get("/health/system", async (_request, reply) => {
           protocolVersion: health.workerLanes.deep.protocolVersion ?? null,
           compatibleCapacity: health.workerLanes.deep.compatibleCapacity,
           eligibleWorkerCount: health.workerLanes.deep.eligibleWorkerCount ?? 0,
+          eligibleIdentityCount: health.workerLanes.deep.eligibleIdentityCount ?? 0,
           eligibleRevisions: health.workerLanes.deep.eligibleRevisions ?? [],
           eligibleConfigurationHashes: health.workerLanes.deep.eligibleConfigurationHashes ?? [],
           lastSeenAt: health.workerLanes.deep.lastSeenAt ?? null,
@@ -386,11 +556,28 @@ app.get("/health/system", async (_request, reply) => {
 app.get("/api/health", async () => ({ ok: await repository.ping(), service: "needle-hosted-api" }));
 
 app.get("/api/v1/system/health", async () => {
+  const capabilityPepper = capabilityPepperRotationStatus();
   const health = await repository.getSystemHealth();
-  const ok = workerLaneReady(health, "interactive");
+  const deploymentDatabaseReady = releaseDatabaseReadinessReady({
+    environment: process.env,
+    observedDatabaseSchemaVersion: health.database.schemaVersion,
+    observedDatabaseCapabilityVersion:
+      health.database.releaseManifestCanaryGuardsVersion ?? null,
+    observedCanonicalExecutionHardeningVersion:
+      health.database.canonicalExecutionHardeningVersion ?? null,
+  });
+  const ok = deploymentDatabaseReady
+    && capabilityPepper.ready
+    && workerLaneReady(health, "interactive");
   return {
     ok,
     activationReady: ok && workerLaneReady(health, "deep"),
+    schemaVersion: health.database.schemaVersion,
+    releaseManifestCanaryGuardsVersion:
+      health.database.releaseManifestCanaryGuardsVersion ?? null,
+    canonicalExecutionHardeningVersion:
+      health.database.canonicalExecutionHardeningVersion ?? null,
+    capabilityPepper,
     worker: {
       stale: health.worker.stale,
       schemaCompatible: health.worker.schemaCompatible,
@@ -405,6 +592,7 @@ app.get("/api/v1/system/health", async () => {
         protocolVersion: health.workerLanes.interactive.protocolVersion ?? null,
         compatibleCapacity: health.workerLanes.interactive.compatibleCapacity,
         eligibleWorkerCount: health.workerLanes.interactive.eligibleWorkerCount ?? 0,
+        eligibleIdentityCount: health.workerLanes.interactive.eligibleIdentityCount ?? 0,
         eligibleRevisions: health.workerLanes.interactive.eligibleRevisions ?? [],
         eligibleConfigurationHashes: health.workerLanes.interactive.eligibleConfigurationHashes ?? [],
         lastSeenAt: health.workerLanes.interactive.lastSeenAt ?? null,
@@ -414,6 +602,7 @@ app.get("/api/v1/system/health", async () => {
         protocolVersion: health.workerLanes.deep.protocolVersion ?? null,
         compatibleCapacity: health.workerLanes.deep.compatibleCapacity,
         eligibleWorkerCount: health.workerLanes.deep.eligibleWorkerCount ?? 0,
+        eligibleIdentityCount: health.workerLanes.deep.eligibleIdentityCount ?? 0,
         eligibleRevisions: health.workerLanes.deep.eligibleRevisions ?? [],
         eligibleConfigurationHashes: health.workerLanes.deep.eligibleConfigurationHashes ?? [],
         lastSeenAt: health.workerLanes.deep.lastSeenAt ?? null,
@@ -484,18 +673,47 @@ app.post<{
   }
   const expandedTrackCountRequested = preliminaryTrackCountAdmission.expanded;
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
+  const publicRolloutDatabaseAuthority = !isOwner(caller)
+    && releaseCanary === null
+    && Number.isSafeInteger(targetTrackCount)
+    ? await repository.getPublicRolloutDatabaseAuthority()
+    : null;
+  const publicRolloutAssignment = !isOwner(caller)
+    && releaseCanary === null
+    && Number.isSafeInteger(targetTrackCount)
+    ? createPublicRolloutAssignmentV1({
+        prompt,
+        requestedTrackCount: Number(targetTrackCount),
+        stickyKey: caller.clientBucket,
+        databaseAuthority: publicRolloutDatabaseAuthority,
+      })
+    : null;
   const canonicalContractCohortRequested = expandedTrackCountRequested
+    || publicRolloutAssignment?.assigned === true
     || process.env.GUIDANCE_CONTRACT_V3_ENABLED === "true"
     || (process.env.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true"
       && isSmoothReggaetonHeatRequestV3(prompt))
     || (process.env.GUIDANCE_CONTRACT_V3_OWNER_CANARY === "true" && isOwner(caller));
   const canonicalActivationConfigured = canonicalContractActivationConfigured(process.env);
-  const observedDatabaseSchemaVersion = canonicalActivationConfigured || expandedTrackCountRequested
-    ? await repository.getSchemaVersion()
-    : null;
+  const [
+    observedDatabaseSchemaVersion,
+    observedDatabaseCapabilityVersion,
+    observedCanonicalExecutionHardeningVersion,
+  ] =
+    canonicalActivationConfigured || expandedTrackCountRequested
+      ? await Promise.all([
+        repository.getSchemaVersion(),
+        repository.getSetting(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING),
+        repository.getSetting(
+          CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+        ),
+      ])
+      : [null, null, null];
   const canonicalActivationReady = canonicalContractActivationReady({
     environment: process.env,
     observedDatabaseSchemaVersion,
+    observedDatabaseCapabilityVersion,
+    observedCanonicalExecutionHardeningVersion,
   });
   if (
     canonicalContractCohortRequested
@@ -535,6 +753,7 @@ app.post<{
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
     briefContractVersion,
+    publicRolloutAssignment,
     releaseCanary,
     allowExecutableTrackCount: expandedTrackCountRequested,
   });
@@ -556,15 +775,22 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
   await capabilities.authenticateForBrief(request, briefRequestId);
   const brief = await repository.getBriefRequest(briefRequestId);
   if (!brief) return reply.code(404).send({ error: "Brief request not found", code: "brief_not_found" });
+  const executionRequestedTrackCount = brief.executionRequestedTrackCount
+    ?? brief.requestedTrackCount;
+  const executionContext = {
+    ...brief,
+    requestedTrackCount: executionRequestedTrackCount,
+  };
   const canonicalBrief = brief.status === "complete" && isPlaylistBrief(brief.brief)
-    ? canonicalBriefForRequest(brief, brief.brief)
+    ? canonicalBriefForRequest(executionContext, brief.brief)
     : ["awaiting_answers", "finalizing"].includes(brief.status) && isPlaylistBrief(brief.brief)
-      ? canonicalBriefForRequest(brief, brief.brief)
+      ? canonicalBriefForRequest(executionContext, brief.brief)
     : undefined;
   return publicBriefStatusView({
     requestId: brief.id,
     prompt: brief.prompt,
-    requestedTrackCount: brief.requestedTrackCount,
+    requestedTrackCount: executionRequestedTrackCount,
+    originalRequestedTrackCount: brief.requestedTrackCount,
     status: brief.status,
     briefContractVersion: brief.briefContractVersion,
     questionSetHash: brief.questionSetHash,
@@ -592,29 +818,123 @@ app.post<{
 }>("/api/v1/brief/:id/answers", async (request, reply) => {
   const briefRequestId = uuid(request.params.id, "Brief request ID");
   await capabilities.authenticateForBrief(request, briefRequestId);
-  await assertNotPaused("research");
-  await requireWorkerForNewWork();
   if (!Array.isArray(request.body?.answers)) {
     throw new HttpError(400, "Playlist answers are required", "invalid_guidance_answers");
   }
   const key = idempotencyKey(request, request.body?.idempotencyKey);
-  const submitted = await repository.submitBriefAnswers({
-    briefRequestId,
-    idempotencyKey: key,
-    questionSetHash: typeof request.body?.questionSetHash === "string"
-      ? request.body.questionSetHash.trim()
-      : undefined,
-    answers: request.body.answers.map((answer) => ({
-      questionId: typeof answer.questionId === "string" ? answer.questionId : "",
-      ...(typeof answer.optionId === "string" ? { optionId: answer.optionId } : {}),
-      ...(Array.isArray(answer.optionIds)
-        ? { optionIds: answer.optionIds.filter((value): value is string => typeof value === "string") }
-        : {}),
-      ...(typeof answer.customText === "string" ? { customText: answer.customText } : {}),
-      ...(answer.skipped === true ? { skipped: true } : {}),
-      ...(answer.confirmed === true ? { confirmed: true } : {}),
-    })),
+  const submittedAnswers = request.body.answers.map((answer) => ({
+    questionId: typeof answer.questionId === "string" ? answer.questionId : "",
+    ...(typeof answer.optionId === "string" ? { optionId: answer.optionId } : {}),
+    ...(Array.isArray(answer.optionIds)
+      ? { optionIds: answer.optionIds.filter((value): value is string => typeof value === "string") }
+      : {}),
+    ...(typeof answer.customText === "string" ? { customText: answer.customText } : {}),
+    ...(answer.skipped === true ? { skipped: true } : {}),
+    ...(answer.confirmed === true ? { confirmed: true } : {}),
+  }));
+  const customTexts = submittedAnswers.flatMap((answer) => (
+    typeof answer.customText === "string" ? [answer.customText] : []
+  ));
+  const questionSetHash = typeof request.body.questionSetHash === "string"
+    ? request.body.questionSetHash.trim()
+    : undefined;
+  const outcome = await submitBriefGuidanceAnswersV1({
+    customTexts,
+    preflight: (customTrackCountAuthority) => (
+      repository.preflightBriefAnswers({
+        briefRequestId,
+        idempotencyKey: key,
+        questionSetHash,
+        answers: submittedAnswers,
+        ...(customTrackCountAuthority
+          ? { customTrackCountAuthority }
+          : {}),
+      })
+    ),
+    authorizeNewWork: async () => {
+      await assertNotPaused("research");
+      await requireWorkerForNewWork();
+      return customGuidanceTrackCountAuthorityForRequest(request);
+    },
+    resolveCustomArtistIdentities,
+    submit: ({
+      authority,
+      resolvedExactArtistIdentities,
+    }) => repository.submitBriefAnswers({
+      briefRequestId,
+      idempotencyKey: key,
+      questionSetHash,
+      answers: submittedAnswers,
+      customTrackCountAuthority: authority,
+      resolvedExactArtistIdentities,
+    }),
+    submitAmbiguity: ({ authority, ambiguity }) => (
+      repository.submitBriefAnswers({
+        briefRequestId,
+        idempotencyKey: key,
+        questionSetHash,
+        answers: submittedAnswers,
+        customTrackCountAuthority: authority,
+        exactArtistIdentityAmbiguity: {
+          inputText: ambiguity.inputText,
+          candidates: ambiguity.candidates ?? [],
+        },
+      })
+    ),
   });
+  if (outcome.status === "stale_question_set") {
+    return reply.code(409).send({
+      error: "Playlist guidance changed; review the current questions before answering",
+      code: "stale_guidance_question_set",
+      requestId: briefRequestId,
+      questionSetHash: outcome.questionSetHash,
+      questions: outcome.questions,
+    });
+  }
+  if (outcome.status === "blocked_dependency") {
+    return reply
+      .header(
+        "retry-after",
+        String(Math.ceil(outcome.retryAfterMs / 1_000)),
+      )
+      .code(503)
+      .send({
+        requestId: briefRequestId,
+        status: "blocked_dependency",
+        code: "artist_identity_resolution_retryable",
+        error: "Apple artist verification is temporarily unavailable. Your current playlist interpretation is unchanged.",
+        nextAction: "retry",
+        retryAfterMs: outcome.retryAfterMs,
+        questionSetHash: outcome.questionSetHash,
+        questions: outcome.questions,
+      });
+  }
+  if (outcome.status === "technical_quarantine") {
+    return reply.code(503).send({
+      requestId: briefRequestId,
+      status: "quarantined",
+      code: "artist_identity_resolution_configuration",
+      error: "Apple artist verification needs operator attention. Your current playlist interpretation is unchanged.",
+      nextAction: "contact_support",
+      reason: outcome.reason,
+      questionSetHash: outcome.questionSetHash,
+      questions: outcome.questions,
+    });
+  }
+  if (outcome.status === "needs_input") {
+    return reply.code(409).send({
+      requestId: briefRequestId,
+      status: "needs_input",
+      code: "exact_artist_identity_clarification_required",
+      error: customArtistNeedsInputMessageV1(outcome),
+      nextAction: "edit_interpretation",
+      reason: outcome.reason,
+      questionSetHash: outcome.questionSetHash,
+      questions: outcome.questions,
+      artistCandidates: outcome.candidates,
+    });
+  }
+  const submitted = outcome.submission;
   if (submitted.status === "stale_question_set") {
     return reply.code(409).send({
       error: "Playlist guidance changed; review the current questions before answering",
@@ -625,8 +945,8 @@ app.post<{
     });
   }
   if (submitted.status === "finalizing") {
-    // Also repair a crash after the durable answer transaction but before the
-    // queue handoff when an identical idempotent request is repeated.
+    // The dedupe key repairs a crash after the durable answer transaction but
+    // before queue handoff, including an identical prior replay.
     await repository.enqueueJob({
       kind: "brief",
       briefRequestId,
@@ -673,12 +993,28 @@ app.post<{
     targetTrackCount?: number;
     idempotencyKey?: string;
     releaseCanary?: unknown;
+    manifestOnly?: boolean;
   };
 }>("/api/v1/runs", async (request, reply) => {
   const releaseCanary = authenticateReleaseCanary(
     request.body?.releaseCanary,
     "run",
   );
+  const manifestOnly = request.body?.manifestOnly === true;
+  if (request.body?.manifestOnly !== undefined && !manifestOnly) {
+    throw new HttpError(
+      400,
+      "manifestOnly must be true when present",
+      "invalid_manifest_canary_mode",
+    );
+  }
+  if (manifestOnly && releaseCanary?.environment !== "staging") {
+    throw new HttpError(
+      403,
+      "Manifest-only live-provider canaries are available only in staging",
+      "release_manifest_canary_staging_only",
+    );
+  }
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const caller = identity(request);
@@ -692,15 +1028,32 @@ app.post<{
   if (submittedBrief !== undefined && !isPlaylistBrief(submittedBrief)) {
     throw new HttpError(400, "Confirmed playlist brief is invalid", "invalid_brief");
   }
-  const brief = canonicalBriefForRequest(interpreted, interpreted.brief, submittedBrief);
+  const executionRequestedTrackCount = interpreted.executionRequestedTrackCount
+    ?? interpreted.requestedTrackCount;
+  const brief = canonicalBriefForRequest(
+    { ...interpreted, requestedTrackCount: executionRequestedTrackCount },
+    interpreted.brief,
+    submittedBrief,
+  );
   const submittedTrackCount = request.body?.targetTrackCount;
   const canonicalExactTrackCount = brief.targetSize
     && brief.targetSize.min === brief.targetSize.max
     ? brief.targetSize.max
     : null;
   const requestedTrackCount = submittedTrackCount
-    ?? interpreted.requestedTrackCount
+    ?? executionRequestedTrackCount
     ?? canonicalExactTrackCount;
+  if (manifestOnly && (
+    !Number.isSafeInteger(requestedTrackCount)
+    || Number(requestedTrackCount) < 1
+    || Number(requestedTrackCount) > RELEASE_MANIFEST_CANARY_MAX_TRACKS
+  )) {
+    throw new HttpError(
+      400,
+      `Manifest-only live-provider canaries require an exact count from 1 through ${RELEASE_MANIFEST_CANARY_MAX_TRACKS}`,
+      "release_manifest_canary_count_invalid",
+    );
+  }
   const preliminaryTrackCountAdmission = playlistTrackCountAdmission({
     requestedTrackCount,
     owner: isOwner(caller),
@@ -713,7 +1066,8 @@ app.post<{
       "invalid_track_count",
     );
   }
-  if (submittedTrackCount !== undefined && submittedTrackCount !== interpreted.requestedTrackCount) {
+  if (submittedTrackCount !== undefined
+    && submittedTrackCount !== executionRequestedTrackCount) {
     throw new HttpError(
       409,
       "The selected playlist size changed before research began; return to the request and retry",
@@ -721,13 +1075,26 @@ app.post<{
     );
   }
   if (preliminaryTrackCountAdmission.expanded) {
-    const observedDatabaseSchemaVersion = await repository.getSchemaVersion();
+    const [
+      observedDatabaseSchemaVersion,
+      observedDatabaseCapabilityVersion,
+      observedCanonicalExecutionHardeningVersion,
+    ] =
+      await Promise.all([
+        repository.getSchemaVersion(),
+        repository.getSetting(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING),
+        repository.getSetting(
+          CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+        ),
+      ]);
     const trackCountAdmission = playlistTrackCountAdmission({
       requestedTrackCount,
       owner: isOwner(caller),
       canonicalActivationReady: canonicalContractActivationReady({
-      environment: process.env,
-      observedDatabaseSchemaVersion,
+        environment: process.env,
+        observedDatabaseSchemaVersion,
+        observedDatabaseCapabilityVersion,
+        observedCanonicalExecutionHardeningVersion,
       }),
     });
     if (trackCountAdmission.status !== "accepted"
@@ -742,20 +1109,20 @@ app.post<{
   }
   const confirmedEstimateUsd = estimateResearchCost(brief);
   if (!isOwner(caller)) {
-    if (interpreted.requestedTrackCount === null) {
+    if (executionRequestedTrackCount === null) {
       throw new HttpError(409, "A public playlist requires an exact track count", "brief_not_ready");
     }
     const policy = researchExecutionPolicy(brief, process.env, interpreted.selectionPlan);
     if (
       policy.kind !== "fast_curated"
-      || brief.targetSize?.min !== interpreted.requestedTrackCount
-      || brief.targetSize?.max !== interpreted.requestedTrackCount
+      || brief.targetSize?.min !== executionRequestedTrackCount
+      || brief.targetSize?.max !== executionRequestedTrackCount
       || confirmedEstimateUsd > PUBLIC_FAST_RESEARCH_BUDGET_USD
     ) {
       throw new HttpError(409, "The public playlist scope exceeds the bounded research profile", "brief_not_ready");
     }
   }
-  const automaticOneCommand = interpreted.requestedTrackCount !== null;
+  const automaticOneCommand = executionRequestedTrackCount !== null;
   if (!automaticOneCommand && !materialAmbiguitiesAccepted(brief, interpreted.brief.ambiguities)) {
     throw new HttpError(
       409,
@@ -768,7 +1135,7 @@ app.post<{
   const publicRunBudget = publicRunBudgetUsd(
     confirmedEstimateUsd,
     briefActualCostUsd,
-    interpreted.requestedTrackCount ?? brief.targetSize?.max ?? undefined,
+    executionRequestedTrackCount ?? brief.targetSize?.max ?? undefined,
   );
   if (!isOwner(caller) && publicRunBudget <= 0) {
     throw new HttpError(
@@ -789,10 +1156,11 @@ app.post<{
     clientBucket: caller.clientBucket,
     clientBucketAliases: caller.clientBucketAliases,
     idempotencyKey: key,
-    autoPublish: interpreted.requestedTrackCount !== null,
+    autoPublish: !manifestOnly && executionRequestedTrackCount !== null,
     capabilitySessionId: briefSession.id,
     forceFreshResearch: isOwner(caller) || releaseCanary !== null,
     releaseCanary,
+    releaseManifestCanary: manifestOnly,
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
@@ -815,6 +1183,12 @@ app.get<{ Params: { id: string } }>("/api/v1/runs/:id", async (request) => {
   const run = await repository.getRunByAccess(accessId);
   if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
   return run;
+});
+
+app.get<{ Params: { id: string } }>("/api/v1/runs/:id/manifest-canary-evidence", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  await sessionForAccess(request, accessId);
+  return repository.getReleaseManifestCanaryEvidenceByAccess(accessId);
 });
 
 app.get<{ Params: { id: string } }>("/api/v1/runs/:id/progress", async (request) => {
@@ -903,6 +1277,237 @@ app.post<{
   });
 });
 
+app.get<{
+  Params: { id: string };
+}>("/api/v1/runs/:id/guidance/history", async (request) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  return repository.getPlaylistGuidanceHistory({
+    runId: session.runId,
+    sourceAccessId: accessId,
+  });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: {
+    answerSetId?: unknown;
+    questionId?: unknown;
+    answer?: {
+      optionId?: unknown;
+      optionIds?: unknown;
+      customText?: unknown;
+      skipped?: unknown;
+    };
+    expectedContractRevisionId?: unknown;
+    expectedContractSemanticHash?: unknown;
+    historyVersion?: unknown;
+    confirmationHash?: unknown;
+    confirmed?: unknown;
+    idempotencyKey?: unknown;
+  };
+}>("/api/v1/runs/:id/guidance/revisions", async (request, reply) => {
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  const answerSetId = uuid(
+    typeof request.body?.answerSetId === "string"
+      ? request.body.answerSetId
+      : "",
+    "Guidance answer",
+  );
+  const questionId = typeof request.body?.questionId === "string"
+    ? request.body.questionId.normalize("NFKC").trim()
+    : "";
+  if (!/^[A-Za-z0-9][A-Za-z0-9:._/-]{0,159}$/u.test(questionId)) {
+    throw new HttpError(
+      400,
+      "Guidance question is invalid",
+      "invalid_guidance_question",
+    );
+  }
+  const expectedContractRevisionId = uuid(
+    typeof request.body?.expectedContractRevisionId === "string"
+      ? request.body.expectedContractRevisionId
+      : "",
+    "Contract revision",
+  );
+  const expectedContractSemanticHash =
+    typeof request.body?.expectedContractSemanticHash === "string"
+      ? request.body.expectedContractSemanticHash.trim().toLowerCase()
+      : "";
+  const historyVersion = typeof request.body?.historyVersion === "string"
+    ? request.body.historyVersion.trim().toLowerCase()
+    : "";
+  if (!/^[a-f0-9]{64}$/u.test(expectedContractSemanticHash)
+    || !/^[a-f0-9]{64}$/u.test(historyVersion)) {
+    throw new HttpError(
+      400,
+      "Guidance history fence is invalid",
+      "invalid_guidance_history",
+    );
+  }
+  const answer = request.body?.answer;
+  if (!answer || typeof answer !== "object") {
+    throw new HttpError(
+      400,
+      "A replacement guidance answer is required",
+      "invalid_guidance_answers",
+    );
+  }
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  const normalizedRevisionAnswer = {
+    questionId,
+    ...(typeof answer.optionId === "string"
+      ? { optionId: answer.optionId }
+      : {}),
+    ...(Array.isArray(answer.optionIds)
+      ? {
+          optionIds: answer.optionIds.filter(
+            (value): value is string => typeof value === "string",
+          ),
+        }
+      : {}),
+    ...(typeof answer.customText === "string"
+      ? { customText: answer.customText }
+      : {}),
+    ...(answer.skipped === true ? { skipped: true } : {}),
+  };
+  const preflight = await repository.preflightPlaylistGuidanceRevision({
+    runId: session.runId,
+    sourceAccessId: accessId,
+    answerSetId,
+    questionId,
+    expectedContractRevisionId,
+    expectedContractSemanticHash,
+    historyVersion,
+    idempotencyKey: key,
+    answer: normalizedRevisionAnswer,
+    // Authority is creation-time server state and is intentionally excluded
+    // from the request hash. The durable replay read must precede readiness.
+    customTrackCountAuthority:
+      PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+  });
+  if (preflight.status === "prior") {
+    const priorRun = await repository.getRunByAccess(preflight.accessId);
+    if (!priorRun) {
+      throw new HttpError(
+        404,
+        "Research run not found",
+        "run_not_found",
+      );
+    }
+    return reply.code(200).send({
+      status: "revised",
+      run: priorRun,
+    });
+  }
+  const caller = identity(request);
+  await repository.consumeRateLimit(
+    caller.clientBucketAliases,
+    "mutation",
+    120,
+    1,
+  );
+  const customTrackCountAuthority =
+    await customGuidanceTrackCountAuthorityForRequest(request);
+  let resolvedExactArtistIdentities: ResolvedExactArtistIdentityV1[] = [];
+  if (typeof answer.customText === "string") {
+    const resolution = await resolveCustomArtistIdentities({
+      customTexts: [answer.customText],
+      storefront: preflight.storefront,
+    });
+    if (resolution.status !== "ready") {
+      const concurrent = await repository.preflightPlaylistGuidanceRevision({
+        runId: session.runId,
+        sourceAccessId: accessId,
+        answerSetId,
+        questionId,
+        expectedContractRevisionId,
+        expectedContractSemanticHash,
+        historyVersion,
+        idempotencyKey: key,
+        answer: normalizedRevisionAnswer,
+        customTrackCountAuthority,
+      });
+      if (concurrent.status === "prior") {
+        const priorRun = await repository.getRunByAccess(concurrent.accessId);
+        if (!priorRun) {
+          throw new HttpError(
+            404,
+            "Research run not found",
+            "run_not_found",
+          );
+        }
+        return reply.code(200).send({
+          status: "revised",
+          run: priorRun,
+        });
+      }
+    }
+    if (resolution.status === "blocked_dependency") {
+      return reply
+        .header(
+          "retry-after",
+          String(Math.ceil(resolution.retryAfterMs / 1_000)),
+        )
+        .code(503)
+        .send({
+          status: "blocked_dependency",
+          code: "artist_identity_resolution_retryable",
+          error: "Apple artist verification is temporarily unavailable. The saved playlist interpretation is unchanged.",
+          nextAction: "retry",
+          retryAfterMs: resolution.retryAfterMs,
+        });
+    }
+    if (resolution.status === "technical_quarantine") {
+      return reply.code(503).send({
+        status: "quarantined",
+        code: "artist_identity_resolution_configuration",
+        error: "Apple artist verification needs operator attention. The saved playlist interpretation is unchanged.",
+        nextAction: "contact_support",
+        reason: resolution.reason,
+      });
+    }
+    if (resolution.status === "needs_input") {
+      return reply.code(409).send({
+        status: "needs_input",
+        code: "exact_artist_identity_clarification_required",
+        error: customArtistNeedsInputMessageV1(resolution),
+        nextAction: "edit_interpretation",
+        reason: resolution.reason,
+        artistCandidates: resolution.candidates,
+      });
+    }
+    resolvedExactArtistIdentities = resolution.identities;
+  }
+  const revised = await repository.revisePlaylistGuidanceAnswer({
+    runId: session.runId,
+    sourceAccessId: accessId,
+    answerSetId,
+    questionId,
+    expectedContractRevisionId,
+    expectedContractSemanticHash,
+    historyVersion,
+    idempotencyKey: key,
+    answer: normalizedRevisionAnswer,
+    ...(typeof request.body?.confirmationHash === "string"
+      ? { confirmationHash: request.body.confirmationHash }
+      : {}),
+    confirmed: request.body?.confirmed === true,
+    customTrackCountAuthority,
+    resolvedExactArtistIdentities,
+  });
+  if (revised.status === "needs_confirmation") {
+    return reply.code(200).send(revised);
+  }
+  const run = await repository.getRunByAccess(revised.accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return reply.code(revised.created ? 202 : 200).send({
+    status: "revised",
+    run,
+  });
+});
+
 app.post<{
   Params: { id: string };
   Body: { outcomeVersion?: unknown; decisionHash?: unknown; idempotencyKey?: unknown };
@@ -928,6 +1533,74 @@ app.post<{
   const run = await repository.getRunByAccess(accessId);
   if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
   return reply.code(continuation.queued ? 202 : 200).send(run);
+});
+
+app.post<{
+  Params: { id: string };
+  Body: {
+    expectedContractRevisionId?: unknown;
+    expectedContractSemanticHash?: unknown;
+    decisionHash?: unknown;
+    blockerVersion?: unknown;
+    idempotencyKey?: unknown;
+  };
+}>("/api/v1/runs/:id/dependency/resume", async (request, reply) => {
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(
+    identity(request).clientBucketAliases,
+    "mutation",
+    120,
+    1,
+  );
+  const expectedContractRevisionId = uuid(
+    request.body?.expectedContractRevisionId,
+    "Contract revision ID",
+  );
+  const expectedContractSemanticHash = typeof request.body
+    ?.expectedContractSemanticHash === "string"
+    ? request.body.expectedContractSemanticHash.trim().toLowerCase()
+    : "";
+  const decisionHash = typeof request.body?.decisionHash === "string"
+    ? request.body.decisionHash.trim().toLowerCase()
+    : "";
+  const blockerVersion = typeof request.body?.blockerVersion === "string"
+    ? request.body.blockerVersion.trim().toLowerCase()
+    : "";
+  if (![
+    expectedContractSemanticHash,
+    decisionHash,
+    blockerVersion,
+  ].every((value) => /^[a-f0-9]{64}$/u.test(value))) {
+    throw new HttpError(
+      400,
+      "Dependency resume fence is invalid",
+      "invalid_dependency_resume_state",
+    );
+  }
+  const resumed = await repository.resumePlaylistDependencyDecision({
+    runId: session.runId,
+    sourceAccessId: accessId,
+    capabilitySessionId: session.id,
+    expectedContractRevisionId,
+    expectedContractSemanticHash,
+    expectedDecisionHash: decisionHash,
+    expectedBlockerVersion: blockerVersion,
+    idempotencyKey: key,
+  });
+  const run = await repository.getRunByAccess(accessId);
+  if (!run) throw new HttpError(404, "Research run not found", "run_not_found");
+  return reply.code(resumed.queued ? 202 : 200).send({
+    run,
+    dependencyResume: {
+      queued: resumed.queued,
+      authorizationHash: resumed.authorizationHash,
+      resumeAt: resumed.resumeAt.toISOString(),
+    },
+  });
 });
 
 app.post<{
@@ -1176,13 +1849,25 @@ async function ownerCorpusAction<T>(action: () => Promise<T>): Promise<T> {
 
 app.get("/api/v1/owner/status", async (request) => {
   owner(request);
+  const capabilityPepper = capabilityPepperRotationStatus();
   const health = await repository.getSystemHealth();
-  const ok = workerLaneReady(health, "interactive");
+  const deploymentDatabaseReady = releaseDatabaseReadinessReady({
+    environment: process.env,
+    observedDatabaseSchemaVersion: health.database.schemaVersion,
+    observedDatabaseCapabilityVersion:
+      health.database.releaseManifestCanaryGuardsVersion ?? null,
+    observedCanonicalExecutionHardeningVersion:
+      health.database.canonicalExecutionHardeningVersion ?? null,
+  });
+  const ok = deploymentDatabaseReady
+    && capabilityPepper.ready
+    && workerLaneReady(health, "interactive");
   return {
     ok,
     activationReady: ok && workerLaneReady(health, "deep"),
     paused: health.paused.research || health.paused.publishing || health.paused.feedback,
     database: "ready",
+    capabilityPepper,
     worker: health.worker.worker_id
       ? health.worker.stale || !health.worker.schemaCompatible || !health.worker.protocolCompatible
         ? "stale"

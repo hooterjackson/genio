@@ -111,6 +111,160 @@ function contract(input: Parameters<typeof draft>[0] = {}): PlaylistContractRevi
   return compilePlaylistContractRevisionV1(draft(input));
 }
 
+function semanticNegativeContract(input: {
+  axis: "genre" | "scene" | "language";
+  operator: "not" | "except";
+}): PlaylistContractRevisionV1 {
+  const semanticId = `semantic:${input.axis}`;
+  const semanticClause = {
+    id: semanticId,
+    kind: "membership" as const,
+    scope: "track" as const,
+    hardness: "hard" as const,
+    axis: input.axis,
+    operator: "require" as const,
+    values: [input.axis === "genre"
+      ? "reggaeton"
+      : input.axis === "scene"
+        ? "Bristol scene"
+        : "French"],
+    source: { provenance: "prompt" as const, text: `not ${input.axis}` },
+  };
+  const availability = {
+    id: "catalog:available",
+    kind: "catalog_version" as const,
+    scope: "track" as const,
+    hardness: "hard" as const,
+    axis: "storefront_availability",
+    operator: "require" as const,
+    values: ["available"],
+    source: { provenance: "system_default" as const, text: "available" },
+  };
+  return compilePlaylistContractRevisionV1({
+    contractId: `contract:semantic-negative:${input.operator}:${input.axis}`,
+    rawPrompt: `Create a playlist excluding ${input.axis}.`,
+    requestedTrackCount: 20,
+    locale: "en-US",
+    storefront: "us",
+    clauses: input.operator === "not"
+      ? [semanticClause]
+      : [semanticClause, availability],
+    trackPredicate: input.operator === "not"
+      ? { op: "not", child: { op: "clause", clauseId: semanticId } }
+      : {
+          op: "except",
+          base: { op: "clause", clauseId: availability.id },
+          exceptions: [{ op: "clause", clauseId: semanticId }],
+        },
+    playlistConstraints: [],
+    sequencingObjectives: [],
+    qualityPolicy: {
+      centralSuitabilityClauseIds: [],
+      minimumPassRatio: 0.8,
+      maximumUnknownRatio: 0.2,
+      zeroKnownFailures: true,
+    },
+  });
+}
+
+function unsupportedQuotaContract(
+  shape: "exact_exclusion" | "not" | "except",
+): PlaylistContractRevisionV1 {
+  const quotaPredicate: PlaylistPredicateV1 = shape === "exact_exclusion"
+    ? { op: "clause", clauseId: "exclude:bad-bunny" }
+    : shape === "not"
+      ? {
+          op: "not",
+          child: { op: "clause", clauseId: "membership:dembow" },
+        }
+      : {
+          op: "except",
+          base: { op: "clause", clauseId: "membership:reggaeton" },
+          exceptions: [{ op: "clause", clauseId: "membership:dembow" }],
+        };
+  return compilePlaylistContractRevisionV1({
+    contractId: `contract:unsupported-quota:${shape}`,
+    rawPrompt: "Create a governed reggaeton playlist.",
+    requestedTrackCount: 20,
+    locale: "en-US",
+    storefront: "us",
+    clauses: [
+      {
+        id: "membership:reggaeton",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["reggaeton"],
+        source: { provenance: "prompt", text: "reggaeton" },
+      },
+      ...(shape !== "exact_exclusion" ? [{
+        id: "membership:dembow",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["dembow"],
+        source: { provenance: "prompt", text: "dembow" },
+      } as const] : []),
+      ...(shape === "exact_exclusion" ? [{
+        id: "exclude:bad-bunny",
+        kind: "exclusion",
+        scope: "track",
+        hardness: "hard",
+        axis: "artist",
+        operator: "exclude",
+        values: ["Bad Bunny"],
+        source: { provenance: "guidance", text: "No Bad Bunny" },
+      } as const] : []),
+      {
+        id: "quota:shape",
+        kind: "quota_diversity",
+        scope: "playlist",
+        hardness: "hard",
+        axis: "distribution",
+        operator: "limit",
+        values: [shape],
+        source: { provenance: "guidance", text: shape },
+      },
+    ],
+    trackPredicate: shape === "exact_exclusion"
+      ? {
+          op: "all",
+          children: [
+            { op: "clause", clauseId: "membership:reggaeton" },
+            { op: "clause", clauseId: "exclude:bad-bunny" },
+          ],
+        }
+      : { op: "clause", clauseId: "membership:reggaeton" },
+    playlistConstraints: [{
+      id: `quota:${shape}`,
+      clauseId: "quota:shape",
+      predicate: quotaPredicate,
+      minimumCount: 1,
+      maximumCount: null,
+      minimumRatio: null,
+      maximumRatio: null,
+    }],
+    ...(shape === "exact_exclusion" ? {
+      executionDirectives: {
+        fixedContainer: null,
+        similarity: null,
+        exactArtistIdentityExclusions: {
+          bindings: [{
+            clauseId: "exclude:bad-bunny",
+            catalogArtistId: "1126808565",
+            displayName: "Bad Bunny",
+            storefront: "us",
+          }],
+        },
+      },
+    } : {}),
+  });
+}
+
 function without(
   capability: BackendCapabilityDeclaration,
   update: Partial<BackendCapabilityDeclaration>,
@@ -131,9 +285,11 @@ describe("playlist-contract backend capability negotiation", () => {
       locale: "en-us",
       storefront: "us",
       predicateOperators: ["all", "clause"],
+      negativePredicateRequirements: [],
       requiresQuotas: true,
       quotaPredicateOperators: ["clause"],
       quotaAxes: ["genre"],
+      quotaPredicateLeafShapes: ["require:membership:track:hard"],
       catalogPolicyAxes: ["recording_version"],
       requiresSequencing: true,
       sequencingDirections: ["smooth"],
@@ -174,6 +330,81 @@ describe("playlist-contract backend capability negotiation", () => {
     });
     expect(result.backend?.backend).toBe("corpus_first_v3");
     expect(result.result).toEqual({ supported: true, missing: [] });
+  });
+
+  test.each([
+    ["not", "genre"],
+    ["not", "scene"],
+    ["not", "language"],
+    ["except", "genre"],
+    ["except", "scene"],
+    ["except", "language"],
+  ] as const)(
+    "fails capability negotiation for open-world semantic %s over %s",
+    (operator, axis) => {
+      const value = semanticNegativeContract({ axis, operator });
+      expect(playlistContractCapabilityRequirementsV1(value))
+        .toMatchObject({
+          negativePredicateRequirements: [`require:membership:${axis}`],
+        });
+      const result = negotiatePlaylistContractBackendV1({
+        contract: value,
+        backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+      });
+      expect(result.backend).toBeNull();
+      expect(result.result.missing).toContain(
+        `corpus_first_v3:negative_predicate:require:membership:${axis}`,
+      );
+    },
+  );
+
+  test("retains NOT/EXCEPT for closed Apple version and content metadata", () => {
+    const noLive = contract({
+      quota: false,
+      predicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "membership:reggaeton" },
+          {
+            op: "not",
+            child: { op: "clause", clauseId: "catalog:recording_version" },
+          },
+        ],
+      },
+    });
+    const cleanExceptExplicit = contract({
+      quota: false,
+      catalogAxis: "content",
+      predicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "membership:reggaeton" },
+          {
+            op: "except",
+            base: { op: "clause", clauseId: "catalog:content" },
+            exceptions: [{ op: "clause", clauseId: "catalog:content" }],
+          },
+        ],
+      },
+    });
+    expect(playlistContractCapabilityRequirementsV1(noLive))
+      .toMatchObject({
+        negativePredicateRequirements: [
+          "require:catalog_version:recording_version",
+        ],
+      });
+    expect(negotiatePlaylistContractBackendV1({
+      contract: noLive,
+      backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+    }).result).toEqual({ supported: true, missing: [] });
+    expect(playlistContractCapabilityRequirementsV1(cleanExceptExplicit)
+      .negativePredicateRequirements).toEqual([
+        "require:catalog_version:content",
+      ]);
+    expect(negotiatePlaylistContractBackendV1({
+      contract: cleanExceptExplicit,
+      backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+    }).result).toEqual({ supported: true, missing: [] });
   });
 
   test("fails closed for unsupported quota, storefront, version, and content policy", () => {
@@ -219,6 +450,23 @@ describe("playlist-contract backend capability negotiation", () => {
       "corpus_first_v3:evidence_strength_policy:evidence_strength_partial_order_v1",
     );
   });
+
+  test.each([
+    ["exact_exclusion", "quota_leaf:exclude:exclusion:track:hard"],
+    ["not", "quota_operator:not"],
+    ["except", "quota_operator:except"],
+  ] as const)(
+    "rejects unsupported %s quota shape before execution projection",
+    (shape, missing) => {
+      const value = unsupportedQuotaContract(shape);
+      const result = negotiatePlaylistContractBackendV1({
+        contract: value,
+        backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+      });
+      expect(result.backend).toBeNull();
+      expect(result.result.missing).toContain(`corpus_first_v3:${missing}`);
+    },
+  );
 
   test("does not reinterpret a selection-incompatible discovery backend as failover", () => {
     const discoveryOnlyV2 = without(CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY, {

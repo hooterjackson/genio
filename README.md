@@ -10,7 +10,7 @@ The public flow starts with one prompt and an explicit track count. Fully explic
 
 gênio uses **exhaustive** to mean exhaustive across the sources it can prove it searched. Inaccessible sources and unresolved gaps remain visible.
 
-Curated prompts such as “100 most influential…” use a bounded cited profile with structured extraction, concurrent evidence qualification, and Apple catalog lookup. The public One Command surface accepts 1–300 tracks, researches a conversion-rate reserve to absorb catalog losses, and never silently publishes fewer tracks than requested. An authenticated owner-only extended route may execute 301–1,000 tracks after schema-18 activation; it always uses contract 3 and query-plan schema 4, with scaled reserves and approved budgets but the same exactness, evidence, and 15-minute active-compute boundary. Two minutes is a progress SLO, not a semantic timeout; dependency and user waits do not consume active compute. A short verified result requires an explicit user decision.
+Curated prompts such as “100 most influential…” use a bounded cited profile with structured extraction, concurrent evidence qualification, and Apple catalog lookup. The public One Command surface accepts 1–300 tracks, researches a conversion-rate reserve to absorb catalog losses, and never silently publishes fewer tracks than requested. An authenticated owner-only extended route may execute 301–1,000 tracks after schema-18 activation; newly accepted work always uses contract 3 and directive-aware query-plan schema 5, with scaled reserves and approved budgets but the same exactness, evidence, and 15-minute active-compute boundary. Historical schema-4 work remains drain-only and cannot be reinterpreted. Two minutes is a progress SLO, not a semantic timeout; dependency and user waits do not consume active compute. A short verified result requires an explicit user decision.
 
 ## Architecture
 
@@ -48,12 +48,16 @@ pnpm test:e2e
 Formal releases use semantic versioning and checked-in patch notes. Run
 `pnpm release:new -- patch|minor|major --title "…" --note "…"`, commit the
 result, and create an annotated `vX.Y.Z-rc.N` tag. The release-candidate
-workflow checks that exact tag—using its audited tag bootstrap before manual
-dispatch is available—builds one container, and records its immutable digest;
-Railway accepts only that digest through `GENIO_RELEASE_IMAGE`. Staging and
-owner-only production canaries must produce signed, unexpired evidence before
-the final stable tag is created. The current release, date, live API build, and
-complete note history are shown at `/about`.
+workflow is loaded only from the protected default branch and runs only after
+an administrator or maintainer sends the explicit
+`genio-release-candidate` repository dispatch. A tag push alone never runs
+release code. The workflow verifies that exact annotated RC points to the
+current merged default-branch SHA with trusted CI provenance, builds one
+container, and records its immutable digest; Railway accepts only that digest
+through `GENIO_RELEASE_IMAGE`. Staging and owner-only production canaries must
+produce signed, unexpired evidence before the separately authorized stable
+workflow can create the final tag and immutable GitHub Release. The current
+release, date, live API build, and complete note history are shown at `/about`.
 
 `pnpm test` without `DATABASE_URL` is the credential-free deterministic suite.
 Postgres integration requires a disposable Postgres 17 database, migration,

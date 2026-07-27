@@ -1,4 +1,8 @@
 import { sha256Hex, stableStringify } from "./security.ts";
+import {
+  fixedContainerResolutionProvesClosedSetV1,
+  type FixedContainerResolutionProofV1,
+} from "./fixed-container-resolution-proof-v1.ts";
 
 export const PLAYLIST_FEASIBILITY_POLICY_VERSION = "playlist_feasibility_v1" as const;
 
@@ -23,9 +27,46 @@ export interface PlaylistFeasibilityFrontierV1 {
    * this key. Several prompts sent to one provider are therefore one frontier.
    */
   dependencyKey: string;
+  /**
+   * Complete dependency set for composite strategies. Frontier proof may
+   * combine only strategies whose sets are disjoint; a hosted+catalog query
+   * is not independent from either a hosted-only or catalog-only query.
+   */
+  dependencyKeys?: readonly string[];
   status: "not_started" | "active" | "complete" | "unavailable";
   discoveredCount: number;
   qualifiedCount: number;
+}
+
+export interface PlaylistRuntimeFeasibilityBudgetV1 {
+  stopReason: string;
+  activeComputeConsumedMs: number;
+  activeComputeAllowanceMs: number;
+  observedStrategyRounds: number;
+  maximumGlobalRounds: number;
+  maximumRawCandidates: number;
+  maximumCostUnits: number;
+  qualifiedPoolGoal: number | null;
+  deadlineReached: boolean;
+}
+
+export interface PlaylistRuntimeFeasibilityEvidenceV1 {
+  source: "pipeline_v3_retrieval";
+  discoveredCount: number;
+  qualifiedCount: number;
+  storefrontSafeCount: number;
+  activeResearchBudgetExhausted: boolean;
+  dependencyOutages: readonly {
+    dependencyKey: string;
+    active: boolean;
+    circuitOpen: boolean;
+    failureAttempts: number;
+    affectedFrontierIds: readonly string[];
+  }[];
+  frontiers: readonly PlaylistFeasibilityFrontierV1[];
+  /** Added append-only; absent only on historical runtime reports. */
+  fixedContainerResolution?: FixedContainerResolutionProofV1 | null;
+  budgets: PlaylistRuntimeFeasibilityBudgetV1;
 }
 
 export interface PlaylistFeasibilityObservationV1 {
@@ -51,6 +92,7 @@ export interface PlaylistFeasibilityObservationV1 {
   frontiers: readonly PlaylistFeasibilityFrontierV1[];
   activeResearchBudgetExhausted: boolean;
   policyVersions: Readonly<Record<string, string>>;
+  runtimeEvidence?: PlaylistRuntimeFeasibilityEvidenceV1 | null;
 }
 
 export interface PlaylistFeasibilityFrontierProofV1 {
@@ -78,8 +120,54 @@ export interface PlaylistFeasibilityReportV1 {
   reasonCodes: string[];
   limitingPredicateIds: string[];
   frontierProof: PlaylistFeasibilityFrontierProofV1 | null;
+  runtimeEvidence: PlaylistRuntimeFeasibilityEvidenceV1 | null;
   reportHash: string;
 }
+
+export interface PlaylistRuntimeFeasibilityInputV1 {
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  targetTrackCount: number;
+  scope: "open_world" | "closed_set";
+  stopReason: string;
+  discoveredCount: number;
+  qualifiedCount: number;
+  storefrontSafeCount: number;
+  contradictions: readonly string[];
+  limitingPredicateIds: readonly string[];
+  strategies: readonly {
+    id: string;
+    status:
+      | "available"
+      | "running"
+      | "exhausted"
+      | "circuit_open"
+      | "provider_error"
+      | "integrity_error";
+    rounds: number;
+    rawCandidates: number;
+    newQualifiedFamilies: number;
+    discoveryDependencyIds: readonly string[];
+    fixedContainerResolution?: FixedContainerResolutionProofV1;
+  }[];
+  dependencyOutages: readonly {
+    dependencyId: string;
+    active: boolean;
+    circuitOpen: boolean;
+    failureAttempts: number;
+    affectedStrategyIds: readonly string[];
+  }[];
+  budgets: Omit<
+    PlaylistRuntimeFeasibilityBudgetV1,
+    "stopReason" | "observedStrategyRounds" | "deadlineReached"
+  >;
+  policyVersions: Readonly<Record<string, string>>;
+}
+
+export type PlaylistRuntimeNoCompatibleDispositionV1 =
+  | "allow"
+  | "dependency_pause"
+  | "actionable_decision";
 
 function nonNegativeInteger(value: number, field: string): void {
   if (!Number.isInteger(value) || value < 0) {
@@ -159,18 +247,57 @@ function validateObservation(input: PlaylistFeasibilityObservationV1): void {
     }
     nonNegativeInteger(frontier.discoveredCount, "frontier_discovered_count");
     nonNegativeInteger(frontier.qualifiedCount, "frontier_qualified_count");
+    if ((frontier.dependencyKeys ?? [frontier.dependencyKey])
+      .some((value) => !value.trim())) {
+      throw new Error("invalid_frontier_dependency");
+    }
   }
+}
+
+function independentCompletedFrontiers(
+  frontiers: readonly PlaylistFeasibilityFrontierV1[],
+): PlaylistFeasibilityFrontierV1[] {
+  const completed = [...frontiers]
+    .filter((frontier) => frontier.status === "complete")
+    .sort((left, right) => left.id.localeCompare(right.id));
+  let best: PlaylistFeasibilityFrontierV1[] = [];
+  const search = (
+    index: number,
+    selected: PlaylistFeasibilityFrontierV1[],
+    usedDependencies: Set<string>,
+  ): void => {
+    if (selected.length + completed.length - index <= best.length) return;
+    if (index >= completed.length) {
+      if (selected.length > best.length) best = [...selected];
+      return;
+    }
+    const frontier = completed[index]!;
+    const keys = normalizedUnique(
+      frontier.dependencyKeys ?? [frontier.dependencyKey],
+    ).filter((key) => key !== "orchestration_local");
+    if (keys.length > 0 && keys.every((key) => !usedDependencies.has(key))) {
+      const nextDependencies = new Set(usedDependencies);
+      keys.forEach((key) => nextDependencies.add(key));
+      search(index + 1, [...selected, frontier], nextDependencies);
+    }
+    search(index + 1, selected, usedDependencies);
+  };
+  search(0, [], new Set());
+  return best;
 }
 
 function buildFrontierProof(
   input: PlaylistFeasibilityObservationV1,
 ): PlaylistFeasibilityFrontierProofV1 | null {
-  const completed = input.frontiers.filter((frontier) => frontier.status === "complete");
-  const dependencyKeys = normalizedUnique(completed.map((frontier) => frontier.dependencyKey));
+  const completed = independentCompletedFrontiers(input.frontiers);
+  const dependencyKeys = normalizedUnique(completed.flatMap((frontier) => (
+    frontier.dependencyKeys ?? [frontier.dependencyKey]
+  )).filter((key) => key !== "orchestration_local"));
   if (
     input.phase !== "bounded_research"
     || !input.activeResearchBudgetExhausted
     || input.dependencyHealth !== "healthy"
+    || completed.length < 2
     || dependencyKeys.length < 2
     || input.storefrontSafeCount >= input.targetTrackCount
   ) {
@@ -260,9 +387,176 @@ export function assessPlaylistFeasibilityV1(
     reasonCodes: normalizedUnique(reasonCodes),
     limitingPredicateIds,
     frontierProof,
+    runtimeEvidence: input.runtimeEvidence ?? null,
   };
   return {
     ...body,
     reportHash: sha256Hex(stableStringify(body)),
   };
+}
+
+function runtimeFrontierStatus(
+  input: PlaylistRuntimeFeasibilityInputV1["strategies"][number],
+): PlaylistFeasibilityFrontierV1["status"] {
+  if (input.status === "exhausted") return "complete";
+  if (input.status === "available" || input.status === "running") {
+    return input.rounds > 0 ? "active" : "not_started";
+  }
+  return "unavailable";
+}
+
+function runtimeDependencyHealth(
+  input: PlaylistRuntimeFeasibilityInputV1,
+): PlaylistFeasibilityDependencyHealthV1 {
+  if (input.dependencyOutages.some((outage) => outage.active && outage.circuitOpen)
+    || input.strategies.some((strategy) => strategy.status === "circuit_open")) {
+    return "unavailable";
+  }
+  if (input.dependencyOutages.some((outage) => outage.active)
+    || input.strategies.some((strategy) => strategy.status === "provider_error")) {
+    return "degraded";
+  }
+  return "healthy";
+}
+
+function runtimeBudgetExhausted(stopReason: string): boolean {
+  return [
+    "frontier_exhausted",
+    "budget_reached",
+    "deadline_reached",
+    "maximum_rounds_reached",
+    "maximum_candidates_reached",
+  ].includes(stopReason);
+}
+
+/**
+ * Convert the actual V3 retrieval ledger into the same immutable feasibility
+ * report used by guidance. Observed counts are never promoted to open-world
+ * inventory estimates unless they already cover the requested count.
+ */
+export function assessPlaylistRuntimeFeasibilityV1(
+  input: PlaylistRuntimeFeasibilityInputV1,
+): PlaylistFeasibilityReportV1 {
+  const frontiers: PlaylistFeasibilityFrontierV1[] = input.strategies.map(
+    (strategy) => {
+      const dependencyKeys = normalizedUnique(strategy.discoveryDependencyIds);
+      return {
+        id: strategy.id,
+        dependencyKey: dependencyKeys.join("+") || "orchestration_local",
+        dependencyKeys,
+        status: runtimeFrontierStatus(strategy),
+        discoveredCount: strategy.rawCandidates,
+        qualifiedCount: strategy.newQualifiedFamilies,
+      };
+    },
+  );
+  const dependencyHealth = runtimeDependencyHealth(input);
+  const activeResearchBudgetExhausted = runtimeBudgetExhausted(input.stopReason);
+  const materialFrontiers = frontiers
+    .filter((frontier) => !frontier.dependencyKeys?.includes("orchestration_local"));
+  const everyMaterialFrontierComplete = materialFrontiers.length > 0
+    && materialFrontiers.every((frontier) => frontier.status === "complete");
+  const fixedContainerResolution = input.strategies
+    .map((strategy) => strategy.fixedContainerResolution ?? null)
+    .find((proof): proof is FixedContainerResolutionProofV1 => proof !== null)
+    ?? null;
+  const fixedContainerClosedSetProven = input.scope === "closed_set"
+    && fixedContainerResolutionProvesClosedSetV1(
+      fixedContainerResolution,
+      input.contractSemanticHash,
+    );
+  const closedSetCapacity = input.scope === "closed_set"
+    && fixedContainerClosedSetProven
+    && everyMaterialFrontierComplete
+    && activeResearchBudgetExhausted
+    ? input.storefrontSafeCount
+    : null;
+  const observedInventoryCoversTarget =
+    input.storefrontSafeCount >= input.targetTrackCount;
+  const eligibleEstimateLower = observedInventoryCoversTarget
+    || closedSetCapacity !== null
+    ? input.storefrontSafeCount
+    : null;
+  const eligibleEstimateUpper = observedInventoryCoversTarget
+    || closedSetCapacity !== null
+    ? input.storefrontSafeCount
+    : null;
+  const observedStrategyRounds = input.strategies.reduce(
+    (total, strategy) => total + strategy.rounds,
+    0,
+  );
+  const runtimeEvidence: PlaylistRuntimeFeasibilityEvidenceV1 = {
+    source: "pipeline_v3_retrieval",
+    discoveredCount: input.discoveredCount,
+    qualifiedCount: input.qualifiedCount,
+    storefrontSafeCount: input.storefrontSafeCount,
+    activeResearchBudgetExhausted,
+    dependencyOutages: input.dependencyOutages.map((outage) => ({
+      dependencyKey: outage.dependencyId,
+      active: outage.active,
+      circuitOpen: outage.circuitOpen,
+      failureAttempts: outage.failureAttempts,
+      affectedFrontierIds: normalizedUnique(outage.affectedStrategyIds),
+    })).sort((left, right) => left.dependencyKey.localeCompare(right.dependencyKey)),
+    frontiers,
+    budgets: {
+      ...input.budgets,
+      stopReason: input.stopReason,
+      observedStrategyRounds,
+      deadlineReached: input.stopReason === "deadline_reached",
+    },
+    fixedContainerResolution,
+  };
+  return assessPlaylistFeasibilityV1({
+    contractRevisionId: input.contractRevisionId,
+    contractSemanticHash: input.contractSemanticHash,
+    targetTrackCount: input.targetTrackCount,
+    scope: input.scope,
+    phase: "bounded_research",
+    dependencyHealth,
+    eligibleEstimateLower,
+    eligibleEstimateUpper,
+    closedSetCapacity,
+    discoveredCount: input.discoveredCount,
+    qualifiedCount: input.qualifiedCount,
+    storefrontSafeCount: input.storefrontSafeCount,
+    contradictions: input.contradictions,
+    limitingPredicateIds: input.limitingPredicateIds,
+    frontiers,
+    activeResearchBudgetExhausted,
+    policyVersions: input.policyVersions,
+    runtimeEvidence,
+  });
+}
+
+export function playlistRuntimeNoCompatibleDispositionV1(input: {
+  report: PlaylistFeasibilityReportV1;
+  scope: "open_world" | "closed_set";
+}): PlaylistRuntimeNoCompatibleDispositionV1 {
+  if (input.report.dependencyHealth !== "healthy") return "dependency_pause";
+  if (input.scope === "open_world"
+    && input.report.state === "frontier_exhausted_under_policy"
+    && input.report.frontierProof !== null) {
+    return "allow";
+  }
+  if (input.scope === "closed_set"
+    && input.report.state === "known_ceiling"
+    && input.report.runtimeEvidence?.activeResearchBudgetExhausted === true) {
+    return "allow";
+  }
+  return "actionable_decision";
+}
+
+export function assertPlaylistFeasibilityReportIntegrityV1(
+  report: PlaylistFeasibilityReportV1,
+): void {
+  const { reportHash, ...body } = report;
+  if (!/^[a-f0-9]{64}$/u.test(reportHash)
+    || sha256Hex(stableStringify(body)) !== reportHash) {
+    throw new Error("invalid_playlist_feasibility_report_hash");
+  }
+  if (!report.runtimeEvidence
+    || report.runtimeEvidence.source !== "pipeline_v3_retrieval") {
+    throw new Error("runtime_feasibility_evidence_required");
+  }
 }

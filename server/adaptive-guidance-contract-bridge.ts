@@ -12,6 +12,7 @@ import type {
   PlaylistContractPatchOperationV1,
   PlaylistContractPatchV1,
   PlaylistContractRevisionV1,
+  PlaylistPredicateV1,
 } from "./playlist-contract-v1.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
 
@@ -127,6 +128,117 @@ export function guidanceDecisionV3FromPublicQuestion(
   return decision;
 }
 
+function predicateWithoutClauseIds(
+  predicate: PlaylistPredicateV1,
+  removedClauseIds: ReadonlySet<string>,
+): PlaylistPredicateV1 | null {
+  if (predicate.op === "clause") {
+    return removedClauseIds.has(predicate.clauseId) ? null : predicate;
+  }
+  if (predicate.op === "not") {
+    const child = predicateWithoutClauseIds(predicate.child, removedClauseIds);
+    return child ? { op: "not", child } : null;
+  }
+  if (predicate.op === "except") {
+    const base = predicateWithoutClauseIds(predicate.base, removedClauseIds);
+    if (!base) return null;
+    const exceptions = predicate.exceptions.flatMap((value) => {
+      const next = predicateWithoutClauseIds(value, removedClauseIds);
+      return next ? [next] : [];
+    });
+    return exceptions.length > 0 ? { op: "except", base, exceptions } : base;
+  }
+  if (predicate.op === "alternative") {
+    const choices = predicate.choices.flatMap((choice) => {
+      const next = predicateWithoutClauseIds(choice.predicate, removedClauseIds);
+      return next ? [{ ...choice, predicate: next }] : [];
+    });
+    if (choices.length === 0) return null;
+    if (choices.length === 1) return choices[0]!.predicate;
+    return { op: "alternative", choices };
+  }
+  const children = predicate.children.flatMap((value) => {
+    const next = predicateWithoutClauseIds(value, removedClauseIds);
+    return next ? [next] : [];
+  });
+  if (children.length === 0) return null;
+  if (children.length === 1) return children[0]!;
+  return { op: predicate.op, children };
+}
+
+function predicateClauseIds(
+  predicate: PlaylistPredicateV1,
+  output = new Set<string>(),
+): Set<string> {
+  if (predicate.op === "clause") output.add(predicate.clauseId);
+  else if (predicate.op === "not") predicateClauseIds(predicate.child, output);
+  else if (predicate.op === "except") {
+    predicateClauseIds(predicate.base, output);
+    predicate.exceptions.forEach((value) => predicateClauseIds(value, output));
+  } else if (predicate.op === "alternative") {
+    predicate.choices.forEach(({ predicate: value }) => (
+      predicateClauseIds(value, output)
+    ));
+  } else {
+    predicate.children.forEach((value) => predicateClauseIds(value, output));
+  }
+  return output;
+}
+
+function composeGuidanceRoundOperations(
+  base: PlaylistContractRevisionV1,
+  operations: readonly PlaylistContractPatchOperationV1[],
+): PlaylistContractPatchOperationV1[] {
+  const predicateOperations = operations.filter(
+    (operation): operation is Extract<
+      PlaylistContractPatchOperationV1,
+      { op: "replace_track_predicate" }
+    > => operation.op === "replace_track_predicate",
+  );
+  if (predicateOperations.length <= 1) return [...operations];
+
+  const removedClauseIds = new Set(operations.flatMap((operation) => (
+    operation.op === "remove_clause" ? [operation.clauseId] : []
+  )));
+  const baseClauseIds = predicateClauseIds(base.trackPredicate);
+  const addedClauseIds = new Set(operations.flatMap((operation) => (
+    operation.op === "add_clause" ? [operation.clause.id] : []
+  )));
+  const guidedScopes = predicateOperations.flatMap(({ predicate }) => {
+    const scope = predicateWithoutClauseIds(predicate, baseClauseIds);
+    if (!scope) return [];
+    const unownedClauseId = [...predicateClauseIds(scope)].find(
+      (clauseId) => !addedClauseIds.has(clauseId),
+    );
+    if (unownedClauseId) {
+      throw new Error("conflicting_contract3_guidance_predicates");
+    }
+    return [scope];
+  }).filter((scope, index, all) => (
+    all.findIndex((candidate) => (
+      stableStringify(candidate) === stableStringify(scope)
+    )) === index
+  ));
+  const preserved = predicateWithoutClauseIds(
+    base.trackPredicate,
+    removedClauseIds,
+  );
+  const children = [
+    ...(preserved ? [preserved] : []),
+    ...guidedScopes,
+  ];
+  if (children.length === 0) {
+    throw new Error("empty_contract3_guidance_predicate");
+  }
+  const predicate = children.length === 1
+    ? children[0]!
+    : { op: "all" as const, children };
+  return [
+    ...operations.filter(({ op }) => op !== "replace_track_predicate"),
+    { op: "replace_track_predicate", predicate },
+  ];
+}
+
 export function compileGuidanceRoundPatchV3(input: {
   base: PlaylistContractRevisionV1;
   questionSetHash: string;
@@ -156,7 +268,10 @@ export function compileGuidanceRoundPatchV3(input: {
   if (accepted.some(({ compiled }) => compiled.state === "required_answer_missing")) {
     throw new Error("required_contract3_answer_missing");
   }
-  const operations = accepted.flatMap(({ compiled }) => compiled.operations);
+  const operations = composeGuidanceRoundOperations(
+    input.base,
+    accepted.flatMap(({ compiled }) => compiled.operations),
+  );
   if (operations.length === 0) return null;
   const answerHash = sha256Hex(stableStringify(accepted.map(({ decision, compiled }) => ({
     questionHash: decision.questionHash,

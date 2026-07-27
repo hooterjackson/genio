@@ -7,16 +7,18 @@ import {
 const secret = "release-canary-secret-with-at-least-32-bytes";
 const sourceRevision = "a".repeat(40);
 const issuedAt = "2026-07-23T12:00:00.000Z";
+const audience = "https://staging.9enio.example";
 
 function signed() {
   return signReleaseCanaryMetadata({
     version: "genio-release-canary/v1",
     canaryId: "affected-regression",
     environment: "staging",
+    audience,
     operation: "brief",
     sourceRevision,
     issuedAt,
-    cacheMode: "cold",
+    cacheMode: "reuse_disabled",
   }, secret);
 }
 
@@ -25,12 +27,13 @@ describe("release canary metadata", () => {
     expect(verifyReleaseCanaryMetadata(signed(), {
       secret,
       expectedEnvironment: "staging",
+      expectedAudience: audience,
       expectedOperation: "brief",
       expectedSourceRevision: sourceRevision,
       now: "2026-07-23T12:04:59.000Z",
     })).toMatchObject({
       canaryId: "affected-regression",
-      cacheMode: "cold",
+      cacheMode: "reuse_disabled",
     });
   });
 
@@ -41,6 +44,7 @@ describe("release canary metadata", () => {
     }, {
       secret,
       expectedEnvironment: "staging",
+      expectedAudience: audience,
       expectedOperation: "brief",
       expectedSourceRevision: sourceRevision,
       now: "2026-07-23T12:01:00.000Z",
@@ -48,6 +52,7 @@ describe("release canary metadata", () => {
     expect(() => verifyReleaseCanaryMetadata(signed(), {
       secret,
       expectedEnvironment: "staging",
+      expectedAudience: audience,
       expectedOperation: "run",
       expectedSourceRevision: sourceRevision,
       now: "2026-07-23T12:01:00.000Z",
@@ -55,6 +60,7 @@ describe("release canary metadata", () => {
     expect(() => verifyReleaseCanaryMetadata(signed(), {
       secret,
       expectedEnvironment: "staging",
+      expectedAudience: audience,
       expectedOperation: "brief",
       expectedSourceRevision: sourceRevision,
       now: "2026-07-23T12:05:01.000Z",
@@ -68,6 +74,7 @@ describe("release canary metadata", () => {
     }, {
       secret,
       expectedEnvironment: "staging",
+      expectedAudience: audience,
       expectedOperation: "brief",
       expectedSourceRevision: sourceRevision,
       now: "2026-07-23T12:01:00.000Z",
@@ -76,10 +83,22 @@ describe("release canary metadata", () => {
       version: "genio-release-canary/v1",
       canaryId: "fixed-control",
       environment: "production",
+      audience: "https://9enio.com",
       operation: "run",
       sourceRevision,
       issuedAt,
-      cacheMode: "warm",
+      cacheMode: "reuse_disabled",
     }, "short")).toThrow(/too_short/u);
+  });
+
+  test("rejects a marker replayed to another origin", () => {
+    expect(() => verifyReleaseCanaryMetadata(signed(), {
+      secret,
+      expectedEnvironment: "staging",
+      expectedAudience: "https://attacker.example",
+      expectedOperation: "brief",
+      expectedSourceRevision: sourceRevision,
+      now: "2026-07-23T12:01:00.000Z",
+    })).toThrow(/scope/u);
   });
 });

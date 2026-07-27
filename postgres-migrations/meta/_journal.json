@@ -127,6 +127,20 @@
       "when": 1785297600000,
       "tag": "0017_playlist_recovery_foundation",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1785384000000,
+      "tag": "0018_release_manifest_canary_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785470400000,
+      "tag": "0019_canonical_execution_hardening",
+      "breakpoints": true
     }
   ]
 }

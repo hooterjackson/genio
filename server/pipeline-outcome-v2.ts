@@ -21,8 +21,9 @@ export interface CatalogDiscoveryOutcomeDisposition {
 
 /**
  * Deterministic translation from catalog-frontier completion into the public
- * completeness vocabulary. A zero-track result remains a non-system outcome,
- * while its reason code retains the exact cause for operations and replay.
+ * completeness vocabulary. Zero tracks may be described as compatible
+ * scarcity only after a healthy, bounded frontier actually exhausted.
+ * Provider failure remains an operational outcome regardless of track count.
  */
 export function catalogDiscoveryOutcomeDisposition(input: {
   stoppedBecause: CatalogDiscoveryStopReason;
@@ -99,13 +100,25 @@ export function catalogDiscoveryOutcomeDisposition(input: {
         providerUnavailable: false,
       }
     : typed[input.stoppedBecause];
-  return {
-    status: safeTrackCount === 0 && disposition.partialStatus !== "cancelled"
+  const zeroTrackProviderUnavailable = safeTrackCount === 0 && (
+    disposition.providerUnavailable
+    || input.stoppedBecause === "provider_call_limit"
+    || input.stoppedBecause === "timed_out"
+  );
+  const zeroTrackStatus: PipelineOutcomeStatus = zeroTrackProviderUnavailable
+    ? "failed_system"
+    : disposition.frontierExhausted
+      && disposition.partialStatus !== "cancelled"
       ? "no_compatible_tracks"
+      : disposition.partialStatus;
+  return {
+    status: safeTrackCount === 0
+      ? zeroTrackStatus
       : disposition.partialStatus,
     reasonCode: disposition.reasonCode,
     frontierExhausted: disposition.frontierExhausted,
-    providerUnavailable: disposition.providerUnavailable,
+    providerUnavailable: disposition.providerUnavailable
+      || zeroTrackProviderUnavailable,
   };
 }
 

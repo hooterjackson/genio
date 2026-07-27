@@ -1,5 +1,9 @@
 import type { Pool } from "pg";
 import type { ReleaseCanaryEnvironment } from "./release-canary-metadata.ts";
+import {
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION,
+} from "./release-deployment-phase.ts";
 import { HttpError } from "./security.ts";
 
 export interface SafeReleaseCanaryExecutionProof {
@@ -34,7 +38,7 @@ export interface ReleaseCanaryInventory {
   readyForReleaseEvidence: boolean;
   operations: Array<{
     operation: "brief" | "run";
-    cacheMode: "cold" | "warm" | "mixed";
+    cacheMode: "reuse_disabled";
     status: string;
     phase?: string;
     acceptedAt: string;
@@ -44,7 +48,7 @@ export interface ReleaseCanaryInventory {
 
 interface InventoryRow {
   operation: "brief" | "run";
-  cache_mode: "cold" | "warm" | "mixed";
+  cache_mode: "reuse_disabled";
   created_at: Date;
   request_status: string;
   run_phase: string | null;
@@ -85,10 +89,20 @@ export async function readReleaseCanaryInventory(input: {
   ): Promise<SafeReleaseCanaryExecutionProof | null>;
 }): Promise<ReleaseCanaryInventory> {
   validateScope(input);
-  const schema = await input.pool.query<{ value: string }>(
-    "SELECT value FROM settings WHERE key='schema_version'",
+  const schema = await input.pool.query<{
+    schema_version: string | null;
+    capability_version: string | null;
+  }>(
+    `SELECT
+       (SELECT value FROM settings WHERE key='schema_version') schema_version,
+       (SELECT value FROM settings WHERE key=$1) capability_version`,
+    [CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING],
   );
-  if (Number(schema.rows[0]?.value ?? 0) < 18) {
+  if (
+    Number(schema.rows[0]?.schema_version ?? 0) < 18
+    || schema.rows[0]?.capability_version
+      !== CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
+  ) {
     return {
       schemaAvailable: false,
       canaryId: input.canaryId,
@@ -120,6 +134,7 @@ export async function readReleaseCanaryInventory(input: {
      ) manifest ON true
      WHERE marker.canary_id=$1 AND marker.environment=$2
        AND marker.source_revision=$3
+       AND marker.cache_mode='reuse_disabled'
      ORDER BY CASE marker.operation WHEN 'brief' THEN 0 ELSE 1 END`,
     [input.canaryId, input.environment, input.sourceRevision],
   );
@@ -140,7 +155,9 @@ export async function readReleaseCanaryInventory(input: {
   const run = operations.find(({ operation }) => operation === "run");
   const proof = run?.executionProof;
   const readyForReleaseEvidence = brief?.status === "complete"
+    && brief.cacheMode === "reuse_disabled"
     && run?.status === "complete"
+    && run.cacheMode === "reuse_disabled"
     && proof != null
     && proof.attempts.length > 0
     && proof.attempts.every((attempt) => (

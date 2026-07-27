@@ -20,6 +20,7 @@ import {
 } from "./pipeline-v2-policy.ts";
 import { APPLE_CATALOG_CACHE_TTL_MS } from "./apple-catalog-cache.ts";
 import { requiresFactualFrontier } from "./factual-frontier-policy.ts";
+import { resolveBriefInterpretationModel } from "./brief-model.ts";
 
 type Environment = Record<string, string | undefined>;
 
@@ -671,7 +672,7 @@ export function briefInterpretationModel(environment: Environment = process.env)
   // Brief interpretation is a short, schema-constrained classification task.
   // GPT-5.4 mini is faster and 25% cheaper than Luna at the published rates;
   // cited web synthesis stays on Luna.
-  return environment.OPENAI_BRIEF_MODEL?.trim() || "gpt-5.4-mini";
+  return resolveBriefInterpretationModel(environment);
 }
 
 /**

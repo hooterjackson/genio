@@ -31,18 +31,58 @@ describe("Pipeline V2 terminal outcomes", () => {
     },
   );
 
-  test("keeps a zero-track catalog result non-fatal without losing its typed cause", () => {
+  test("keeps a zero-track provider outage operational instead of claiming scarcity", () => {
     expect(catalogDiscoveryOutcomeDisposition({
       stoppedBecause: "provider_circuit_open",
       safeTrackCount: 0,
       targetTrackCount: 25,
     })).toEqual({
-      status: "no_compatible_tracks",
+      status: "failed_system",
       reasonCode: "apple_provider_circuit_open",
       frontierExhausted: false,
       providerUnavailable: true,
     });
   });
+
+  test.each([
+    ["provider_degraded", "apple_provider_degraded"],
+    ["provider_circuit_open", "apple_provider_circuit_open"],
+    ["provider_call_limit", "catalog_provider_call_limit"],
+    ["timed_out", "catalog_discovery_timed_out"],
+  ] as const)(
+    "never maps zero-track %s to no compatible tracks",
+    (stoppedBecause, reasonCode) => {
+      expect(catalogDiscoveryOutcomeDisposition({
+        stoppedBecause,
+        safeTrackCount: 0,
+        targetTrackCount: 25,
+      })).toEqual({
+        status: "failed_system",
+        reasonCode,
+        frontierExhausted: false,
+        providerUnavailable: true,
+      });
+    },
+  );
+
+  test.each([
+    ["zero_yield_exhausted", "catalog_zero_yield_frontier_exhausted"],
+    ["frontier_exhausted", "catalog_frontier_exhausted"],
+  ] as const)(
+    "allows zero-track scarcity only after healthy %s",
+    (stoppedBecause, reasonCode) => {
+      expect(catalogDiscoveryOutcomeDisposition({
+        stoppedBecause,
+        safeTrackCount: 0,
+        targetTrackCount: 25,
+      })).toEqual({
+        status: "no_compatible_tracks",
+        reasonCode,
+        frontierExhausted: true,
+        providerUnavailable: false,
+      });
+    },
+  );
 
   test("persists a safe catalog shortfall as a typed partial", () => {
     const outcome = buildPipelineOutcome({

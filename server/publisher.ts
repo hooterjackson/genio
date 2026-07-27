@@ -123,14 +123,19 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
     startPosition: number;
     endPosition: number;
     status?: string;
+    publicationAuthority?: BeginPublicationReconciliationInput;
   }): Promise<any>;
   retirePublicationVolume(input: {
     manifestId: string;
     publicationVolumeId: string;
     applePlaylistId?: string | null;
     reason: string;
+    publicationAuthority?: BeginPublicationReconciliationInput;
   }): Promise<string | null>;
-  hidePublicPlaylistsForRun(runId: string): Promise<number>;
+  hidePublicPlaylistsForRun(
+    runId: string,
+    publicationAuthority?: BeginPublicationReconciliationInput,
+  ): Promise<number>;
   updatePublicationVolume(volumeId: string, patch: {
     status?: string;
     applePlaylistId?: string | null;
@@ -139,12 +144,13 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
     attemptDelta?: number;
     lastError?: string | null;
     publishedAt?: Date | null;
-  }): Promise<void>;
+  }, publicationAuthority?: BeginPublicationReconciliationInput): Promise<void>;
   markPlaylistOrphan(input: {
     manifestId?: string | null;
     publicationVolumeId?: string | null;
     applePlaylistId: string;
     reason: string;
+    publicationAuthority?: BeginPublicationReconciliationInput;
   }): Promise<string>;
   updateRun(runId: string, patch: { status?: string; phase?: string; error?: string | null }): Promise<void>;
   enqueueNotification(kind: string, payload: Record<string, unknown>): Promise<string>;
@@ -163,11 +169,21 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
     manifestRevisionHash: string;
     partialPublicationAuthorized: boolean;
   }): Promise<void>;
-  createManifestRevision?(runId: string, revision: ManifestRevision): Promise<string>;
+  createManifestRevision?(
+    runId: string,
+    revision: ManifestRevision,
+    options?: {
+      publicationAuthority?: BeginPublicationReconciliationInput;
+      supersedeRevisionId?: string;
+    },
+  ): Promise<string>;
   getManifestRevision?(runId: string, revisionId: string): Promise<ManifestRevision | null>;
   markManifestRevisionStatus?(runId: string, revisionId: string, status: ManifestRevisionStatus): Promise<void>;
   getPipelineOutcome?(runId: string): Promise<PipelineOutcome | null>;
-  savePipelineOutcome?(runId: string, outcome: PipelineOutcome): Promise<void>;
+  savePipelineOutcome?(
+    runId: string,
+    outcome: PipelineOutcome,
+  ): Promise<PipelineOutcome | void>;
   getPipelineStageCounts?(runId: string): Promise<PipelineStageCounts>;
   appendCandidateStageEvents?(
     runId: string,
@@ -221,6 +237,24 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
   advancePublicationReconciliation?(
     input: AdvancePublicationReconciliationInput,
   ): Promise<DurablePublicationReconciliation>;
+  /**
+   * Atomically convert a canonical publication-time catalog loss into a
+   * visible decision while the exact attempt/job/lease and immutable
+   * contract/manifest authority are still current.
+   */
+  commitCanonicalPublicationPreflightDecision?(input: {
+    authority: BeginPublicationReconciliationInput;
+    pipelineOutcome: PipelineOutcome;
+    omittedCandidateIds: readonly string[];
+    reasonCodes: readonly string[];
+  }): Promise<void>;
+  updateCanonicalPublicationRun?(
+    authority: BeginPublicationReconciliationInput,
+    patch: {
+      status: "publishing" | "waiting_for_apple_authorization";
+      phase: "apple_publication" | "apple_reauthorization";
+    },
+  ): Promise<void>;
   openPlaylistRunBlocker?(input: {
     runId: string;
     contractRevisionId: string;
@@ -502,6 +536,7 @@ async function preflightLockedManifest(
   client: PublicationAppleClient,
   manifest: LockedManifest,
   storefront: string,
+  publicationAuthority?: BeginPublicationReconciliationInput,
   signal?: AbortSignal,
 ): Promise<PublicationPreflight> {
   // V1 remains readable while expand/contract rollout drains legacy jobs.
@@ -558,7 +593,7 @@ async function preflightLockedManifest(
 
   const now = new Date().toISOString();
   const nextRevisionNumber = Math.max(1, Number(manifest.revision ?? 0) + 1);
-  const revisionId = await createManifestRevision!(manifest.runId, {
+  const revisionDraft: ManifestRevision = {
     id: "",
     manifestId: manifest.id,
     revision: nextRevisionNumber,
@@ -596,12 +631,24 @@ async function preflightLockedManifest(
       versionCompatible: track.versionCompatible,
       qualified: track.qualified,
     })),
-  });
+  };
+  const revisionId = publicationAuthority
+    ? await createManifestRevision!(
+        manifest.runId,
+        revisionDraft,
+        {
+          publicationAuthority,
+          supersedeRevisionId: activeRevisionId!,
+        },
+      )
+    : await createManifestRevision!(manifest.runId, revisionDraft);
   const persisted = await getManifestRevision!(manifest.runId, revisionId);
   if (!persisted || persisted.status !== "locked" || persisted.contentHash !== result.contentHash) {
     throw new Error("The replacement manifest revision was not durably locked");
   }
-  await markManifestRevisionStatus!(manifest.runId, activeRevisionId!, "superseded");
+  if (!publicationAuthority) {
+    await markManifestRevisionStatus!(manifest.runId, activeRevisionId!, "superseded");
+  }
   return {
     manifest: lockedManifestFromRevision(manifest, persisted),
     omittedCount: result.omittedCandidateIds.length,
@@ -794,12 +841,40 @@ async function loadVolumes(
     .map((row) => normalizeVolume(row, manifest));
 }
 
+async function updatePublicationVolumeWithAuthority(
+  repository: PublicationRepository,
+  volumeId: string,
+  patch: Parameters<PublicationRepository["updatePublicationVolume"]>[1],
+  publicationAuthority?: BeginPublicationReconciliationInput,
+): Promise<void> {
+  if (publicationAuthority) {
+    await repository.updatePublicationVolume(
+      volumeId,
+      patch,
+      publicationAuthority,
+    );
+    return;
+  }
+  await repository.updatePublicationVolume(volumeId, patch);
+}
+
+async function hidePublicPlaylistsWithAuthority(
+  repository: PublicationRepository,
+  runId: string,
+  publicationAuthority?: BeginPublicationReconciliationInput,
+): Promise<number> {
+  return publicationAuthority
+    ? repository.hidePublicPlaylistsForRun(runId, publicationAuthority)
+    : repository.hidePublicPlaylistsForRun(runId);
+}
+
 async function retirePublicationVolume(
   repository: PublicationRepository,
   manifest: LockedManifest,
   volume: PublicationVolume,
   reason: string,
   signal?: AbortSignal,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<void> {
   signal?.throwIfAborted();
   const orphanId = await repository.retirePublicationVolume({
@@ -807,6 +882,7 @@ async function retirePublicationVolume(
     publicationVolumeId: volume.id,
     applePlaylistId: volume.playlistId,
     reason,
+    ...(publicationAuthority ? { publicationAuthority } : {}),
   });
   // A null result means another publisher already retired this row while this
   // worker was refreshing its view. Treat that as successful reconciliation.
@@ -846,6 +922,7 @@ async function persistPlannedPublicationVolume(
   planned: PlannedPublicationVolume,
   manifestRevisionId: string | null,
   signal?: AbortSignal,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<PublicationVolume> {
   let conflict: unknown;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -859,6 +936,7 @@ async function persistPlannedPublicationVolume(
         startPosition: planned.startPosition,
         endPosition: planned.endPosition,
         status: "queued",
+        ...(publicationAuthority ? { publicationAuthority } : {}),
       });
     } catch (error) {
       if (publicationConflictCode(error) !== "publication_revision_conflict") throw error;
@@ -870,13 +948,18 @@ async function persistPlannedPublicationVolume(
     if (exact) return exact;
     const occupying = refreshed.find((volume) => volume.volumeIndex === planned.volumeIndex);
     if (occupying) {
-      await repository.hidePublicPlaylistsForRun(manifest.runId);
+      await hidePublicPlaylistsWithAuthority(
+        repository,
+        manifest.runId,
+        publicationAuthority,
+      );
       await retirePublicationVolume(
         repository,
         manifest,
         occupying,
         "Publication volume conflicted with the active immutable manifest revision",
         signal,
+        publicationAuthority,
       );
     }
   }
@@ -889,6 +972,7 @@ async function getOrCreateVolumes(
   manifest: LockedManifest,
   plan: readonly PlannedPublicationVolume[],
   signal?: AbortSignal,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<PublicationVolume[]> {
   const isV2 = Boolean(manifest.pipelineVersion && manifest.pipelineVersion !== "legacy_v1");
   if (isV2 && !manifest.revisionId) {
@@ -906,7 +990,13 @@ async function getOrCreateVolumes(
       && volume.endPosition === planned!.endPosition;
     return !(revisionMatches && rangeMatches);
   });
-  if (obsolete.length > 0) await repository.hidePublicPlaylistsForRun(manifest.runId);
+  if (obsolete.length > 0) {
+    await hidePublicPlaylistsWithAuthority(
+      repository,
+      manifest.runId,
+      publicationAuthority,
+    );
+  }
   for (const volume of obsolete) {
     const revisionMatches = volume.manifestRevisionId === activeRevisionId;
     await retirePublicationVolume(
@@ -917,6 +1007,7 @@ async function getOrCreateVolumes(
         ? "Publication volume is outside the immutable manifest revision plan"
         : "Publication volume belongs to a superseded manifest revision",
       signal,
+      publicationAuthority,
     );
   }
 
@@ -933,6 +1024,7 @@ async function getOrCreateVolumes(
         planned,
         activeRevisionId,
         signal,
+        publicationAuthority,
       );
     }
     result.push(volume);
@@ -945,6 +1037,7 @@ async function withAppleWritePermit<T>(
   manifest: LockedManifest,
   volume: PublicationVolume,
   operation: AppleWritePermitRequest["operation"],
+  executionFence: PublicationExecutionFence | undefined,
   signal: AbortSignal | undefined,
   mutation: () => Promise<T>,
 ): Promise<T> {
@@ -964,6 +1057,7 @@ async function withAppleWritePermit<T>(
     manifestRevisionHash: manifest.contentHash,
     contractRevisionId: manifest.contractRevisionId ?? null,
     contractHash: manifest.contractHash ?? null,
+    executionFence: executionFence ?? null,
     publicationVolumeId: volume.id,
     operation,
   }, signal);
@@ -985,7 +1079,9 @@ async function ensureApplePlaylist(
   manifest: LockedManifest,
   volume: PublicationVolume,
   expectedAuthorization: AuthorizationIdentity,
+  executionFence?: PublicationExecutionFence,
   signal?: AbortSignal,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<PublicationVolume> {
   await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
   if (volume.playlistId) return volume;
@@ -994,7 +1090,12 @@ async function ensureApplePlaylist(
   if (recovered?.id) {
     const playlistId = String(recovered.id);
     signal?.throwIfAborted();
-    await repository.updatePublicationVolume(volume.id, { applePlaylistId: playlistId, status: "appending" });
+    await updatePublicationVolumeWithAuthority(
+      repository,
+      volume.id,
+      { applePlaylistId: playlistId, status: "appending" },
+      publicationAuthority,
+    );
     return { ...volume, playlistId, status: "appending" };
   }
 
@@ -1006,15 +1107,21 @@ async function ensureApplePlaylist(
       manifest,
       volume,
       "create_playlist",
+      executionFence,
       signal,
       () => client.createLibraryPlaylist(volume.name, description, signal),
     );
     signal?.throwIfAborted();
-    await repository.updatePublicationVolume(volume.id, {
-      applePlaylistId: created.id,
-      appleShareUrl: created.url,
-      status: "appending",
-    });
+    await updatePublicationVolumeWithAuthority(
+      repository,
+      volume.id,
+      {
+        applePlaylistId: created.id,
+        appleShareUrl: created.url,
+        status: "appending",
+      },
+      publicationAuthority,
+    );
     return { ...volume, playlistId: created.id, shareUrl: created.url, description, status: "appending" };
   } catch (error) {
     if (error instanceof AppleApiError && error.uncertainMutation) {
@@ -1022,7 +1129,12 @@ async function ensureApplePlaylist(
       if (afterFailure?.id) {
         const playlistId = String(afterFailure.id);
         signal?.throwIfAborted();
-        await repository.updatePublicationVolume(volume.id, { applePlaylistId: playlistId, status: "appending" });
+        await updatePublicationVolumeWithAuthority(
+          repository,
+          volume.id,
+          { applePlaylistId: playlistId, status: "appending" },
+          publicationAuthority,
+        );
         return { ...volume, playlistId, description, status: "appending" };
       }
     }
@@ -1036,6 +1148,7 @@ async function abandonDivergedPlaylist(
   observedIds: readonly string[],
   expectedIds: readonly string[],
   signal?: AbortSignal,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<PublicationVolume> {
   const mismatchIndex = observedIds.findIndex((catalogId, index) => catalogId !== expectedIds[index]);
   const position = mismatchIndex >= 0 ? mismatchIndex : Math.min(observedIds.length, expectedIds.length);
@@ -1044,7 +1157,8 @@ async function abandonDivergedPlaylist(
   process.stderr.write(`[needle-worker] ${reason}\n`);
   return abandonPlaylist(repository, volume,
     reason,
-    signal);
+    signal,
+    publicationAuthority);
 }
 
 async function abandonPlaylist(
@@ -1052,6 +1166,7 @@ async function abandonPlaylist(
   volume: PublicationVolume,
   reason: string,
   signal?: AbortSignal,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<PublicationVolume> {
   signal?.throwIfAborted();
   if (!volume.playlistId) throw new Error("Cannot orphan a publication without an Apple playlist ID");
@@ -1060,6 +1175,7 @@ async function abandonPlaylist(
     publicationVolumeId: volume.id,
     applePlaylistId: volume.playlistId,
     reason,
+    ...(publicationAuthority ? { publicationAuthority } : {}),
   });
   await repository.enqueueNotification("publication_orphaned", {
     deduplicationKey: `publication-orphaned:${volume.playlistId}`,
@@ -1072,13 +1188,18 @@ async function abandonPlaylist(
   signal?.throwIfAborted();
   const attempt = volume.attempt + 1;
   if (attempt > MAX_REPLACEMENTS) throw new Error(`Publication volume ${volume.volumeIndex + 1} diverged too many times`);
-  await repository.updatePublicationVolume(volume.id, {
-    attemptDelta: 1,
-    applePlaylistId: null,
-    appleShareUrl: null,
-    appendedCount: 0,
-    status: "queued",
-  });
+  await updatePublicationVolumeWithAuthority(
+    repository,
+    volume.id,
+    {
+      attemptDelta: 1,
+      applePlaylistId: null,
+      appleShareUrl: null,
+      appendedCount: 0,
+      status: "queued",
+    },
+    publicationAuthority,
+  );
   return { ...volume, attempt, playlistId: null, shareUrl: null, appendedCount: 0, status: "queued" };
 }
 
@@ -1101,12 +1222,23 @@ export async function appendExactVolume(
   expectedAuthorization: AuthorizationIdentity,
   signal?: AbortSignal,
   recordProgress?: (progress: PublicationVolumeProgress) => Promise<void>,
+  executionFence?: PublicationExecutionFence,
+  publicationAuthority?: BeginPublicationReconciliationInput,
 ): Promise<PublicationVolume> {
   let volume = originalVolume;
 
   for (;;) {
     await assertPublicationControl(repository, expectedAuthorization, signal, manifest.runId);
-    volume = await ensureApplePlaylist(repository, client, manifest, volume, expectedAuthorization, signal);
+    volume = await ensureApplePlaylist(
+      repository,
+      client,
+      manifest,
+      volume,
+      expectedAuthorization,
+      executionFence,
+      signal,
+      publicationAuthority,
+    );
     const playlistId = volume.playlistId!;
     let submittedCount = Math.max(0, Math.min(Math.floor(volume.appendedCount), expected.length));
     await recordProgress?.({
@@ -1128,6 +1260,7 @@ export async function appendExactVolume(
           volume,
           "Apple no longer returned the stored library playlist resource",
           signal,
+          publicationAuthority,
         );
         continue;
       }
@@ -1144,14 +1277,26 @@ export async function appendExactVolume(
       observedOrderedIds: visible,
     });
     if (initial.diverged) {
-      volume = await abandonDivergedPlaylist(repository, volume, initial.ids, expected, signal);
+      volume = await abandonDivergedPlaylist(
+        repository,
+        volume,
+        initial.ids,
+        expected,
+        signal,
+        publicationAuthority,
+      );
       continue;
     }
 
     const advanceSubmittedCount = async (nextCount: number): Promise<void> => {
       const boundedCount = Math.max(0, Math.min(Math.floor(nextCount), expected.length));
       if (boundedCount <= submittedCount) return;
-      await repository.updatePublicationVolume(volume.id, { appendedCount: boundedCount, status: "appending" });
+      await updatePublicationVolumeWithAuthority(
+        repository,
+        volume.id,
+        { appendedCount: boundedCount, status: "appending" },
+        publicationAuthority,
+      );
       submittedCount = boundedCount;
       volume = { ...volume, appendedCount: boundedCount, status: "appending" };
       await recordProgress?.({
@@ -1176,6 +1321,7 @@ export async function appendExactVolume(
           manifest,
           volume,
           "append_tracks",
+          executionFence,
           signal,
           () => client.appendCatalogTracks(playlistId, batch, signal),
         );
@@ -1204,12 +1350,20 @@ export async function appendExactVolume(
               volume,
               "Apple append outcome remained uncertain after bounded reconciliation",
               signal,
+              publicationAuthority,
             );
             break;
           }
           visible = observation.ids;
           if (observation.diverged) {
-            volume = await abandonDivergedPlaylist(repository, volume, visible, expected, signal);
+            volume = await abandonDivergedPlaylist(
+              repository,
+              volume,
+              visible,
+              expected,
+              signal,
+              publicationAuthority,
+            );
             break;
           }
           await advanceSubmittedCount(visible.length);
@@ -1220,7 +1374,14 @@ export async function appendExactVolume(
         const observation = await observeStablePrefix(client, playlistId, expected, signal, submittedCount);
         const reconciled = observation.ids;
         if (observation.diverged) {
-          volume = await abandonDivergedPlaylist(repository, volume, reconciled, expected, signal);
+          volume = await abandonDivergedPlaylist(
+            repository,
+            volume,
+            reconciled,
+            expected,
+            signal,
+            publicationAuthority,
+          );
           break;
         }
         visible = reconciled;
@@ -1248,7 +1409,14 @@ export async function appendExactVolume(
         observedOrderedIds: visible,
       });
       if (observation.diverged) {
-        volume = await abandonDivergedPlaylist(repository, volume, visible, expected, signal);
+        volume = await abandonDivergedPlaylist(
+          repository,
+          volume,
+          visible,
+          expected,
+          signal,
+          publicationAuthority,
+        );
         break;
       }
       await advanceSubmittedCount(visible.length);
@@ -1263,21 +1431,33 @@ export async function appendExactVolume(
     try {
       shareUrl = await client.pollStableShareUrl(playlistId, sharePollAttempts(), SHARE_POLL_MS, signal);
     } catch (error) {
-      await repository.updatePublicationVolume(volume.id, {
-        appendedCount: submittedCount,
-        status: "waiting_for_share_url",
-        lastError: error instanceof Error ? error.message : "Apple did not expose a stable share link",
-      });
+      await updatePublicationVolumeWithAuthority(
+        repository,
+        volume.id,
+        {
+          appendedCount: submittedCount,
+          status: "waiting_for_share_url",
+          lastError: error instanceof Error
+            ? error.message
+            : "Apple did not expose a stable share link",
+        },
+        publicationAuthority,
+      );
       throw error;
     }
     signal?.throwIfAborted();
-    await repository.updatePublicationVolume(volume.id, {
-      appendedCount: submittedCount,
-      appleShareUrl: shareUrl,
-      status: "complete",
-      lastError: null,
-      publishedAt: new Date(),
-    });
+    await updatePublicationVolumeWithAuthority(
+      repository,
+      volume.id,
+      {
+        appendedCount: submittedCount,
+        appleShareUrl: shareUrl,
+        status: "complete",
+        lastError: null,
+        publishedAt: new Date(),
+      },
+      publicationAuthority,
+    );
     await recordProgress?.({
       state: "reconciling",
       volumeId: volume.id,
@@ -1324,37 +1504,45 @@ export async function publishManifest(
   let reconciliationAppendedCount = 0;
   let reconciliationBatchCursor = 0;
   let reconciliationComplete = false;
-  const ensureReconciliation = async (): Promise<
-    BeginPublicationReconciliationInput | null
-  > => {
-    const contractRevisionId = manifest.contractRevisionId ?? null;
-    const contractHash = manifest.contractHash ?? null;
-    const manifestRevisionId = manifest.revisionId ?? null;
+  const canonicalAuthorityFor = (
+    candidate: LockedManifest,
+  ): BeginPublicationReconciliationInput | null => {
+    const contractRevisionId = candidate.contractRevisionId ?? null;
+    const contractHash = candidate.contractHash ?? null;
+    const manifestRevisionId = candidate.revisionId ?? null;
     const canonical = Boolean(contractRevisionId || contractHash);
     if (!canonical) return null;
     if (!contractRevisionId
       || !contractHash
       || !manifestRevisionId
-      || !executionFence
-      || !repository.beginPublicationReconciliation
+      || !executionFence) {
+      throw new Error("Canonical publication execution authority is unavailable");
+    }
+    return {
+      ...executionFence,
+      runId: candidate.runId,
+      contractRevisionId,
+      contractHash,
+      manifestId: candidate.id,
+      manifestRevisionId,
+      manifestRevisionHash: candidate.contentHash,
+      expectedOrderedIdsHash: orderedAppleStableIdsHash(
+        candidate.tracks.map(({ catalogId }) => catalogId),
+      ),
+      expectedCount: candidate.tracks.length,
+      idempotencyKey:
+        `publish:${candidate.id}:${manifestRevisionId}:${candidate.contentHash}`,
+    };
+  };
+  const ensureReconciliation = async (): Promise<
+    BeginPublicationReconciliationInput | null
+  > => {
+    const next = canonicalAuthorityFor(manifest);
+    if (!next) return null;
+    if (!repository.beginPublicationReconciliation
       || !repository.advancePublicationReconciliation) {
       throw new Error("Canonical publication reconciliation persistence is unavailable");
     }
-    const expectedOrderedIdsHash = orderedAppleStableIdsHash(
-      manifest.tracks.map(({ catalogId }) => catalogId),
-    );
-    const next: BeginPublicationReconciliationInput = {
-      ...executionFence,
-      runId: manifest.runId,
-      contractRevisionId,
-      contractHash,
-      manifestId: manifest.id,
-      manifestRevisionId,
-      manifestRevisionHash: manifest.contentHash,
-      expectedOrderedIdsHash,
-      expectedCount: manifest.tracks.length,
-      idempotencyKey: `publish:${manifest.id}:${manifestRevisionId}:${manifest.contentHash}`,
-    };
     if (!reconciliationBase
       || reconciliationBase.idempotencyKey !== next.idempotencyKey) {
       const stored = await repository.beginPublicationReconciliation(next);
@@ -1384,18 +1572,82 @@ export async function publishManifest(
     const { client, authorization } = await authorizedAppleClient(repository);
     activeAuthorization = authorization;
     await assertPublicationControl(repository, authorization, signal, manifest.runId);
-    const preflight = await preflightLockedManifest(repository, client, manifest, authorization.storefront, signal);
+    const preflightAuthority = canonicalAuthorityFor(manifest);
+    const preflight = await preflightLockedManifest(
+      repository,
+      client,
+      manifest,
+      authorization.storefront,
+      preflightAuthority ?? undefined,
+      signal,
+    );
     preflightOmittedCount = preflight.omittedCount;
     preflightReasonCodes = preflight.reasonCodes;
     if (!preflight.manifest) {
-      await appendPublicationCandidateStages(
-        repository,
-        manifest,
-        preflight.omittedCandidateIds,
-        "rejected",
-        "publication_preflight_no_compatible_identity",
-      );
+      if (!preflightAuthority) {
+        await appendPublicationCandidateStages(
+          repository,
+          manifest,
+          preflight.omittedCandidateIds,
+          "rejected",
+          "publication_preflight_no_compatible_identity",
+        );
+      }
       const target = manifest.selectionPlan?.requestedTrackCount ?? manifest.tracks.length;
+      const stageCounts = manifest.pipelineVersion === "catalog_first_v2"
+        && repository.getPipelineStageCounts
+        ? await repository.getPipelineStageCounts(manifest.runId)
+        : undefined;
+      const discoveredTrackCount = stageCounts?.discovered ?? Math.max(
+        manifest.tracks.length,
+        priorPipelineOutcome?.discoveredTrackCount ?? 0,
+      );
+      const qualifiedTrackCount = stageCounts?.claim_verified ?? Math.max(
+        manifest.tracks.length,
+        Math.min(discoveredTrackCount, priorPipelineOutcome?.qualifiedTrackCount ?? 0),
+      );
+      const selectedTrackCount = stageCounts?.manifested ?? Math.max(
+        manifest.tracks.length,
+        Math.min(qualifiedTrackCount, priorPipelineOutcome?.selectedTrackCount ?? 0),
+      );
+      if (preflightAuthority) {
+        // A catalog identity disappearing after `ready` is a publication-time
+        // availability change, not evidence that the requested music does not
+        // exist and not proof that research exhausted an open-world frontier.
+        // Commit every resulting database mutation behind the exact source
+        // revision and execution lease. A cancellation, successor contract,
+        // or reclaimed job during the Apple read therefore leaves zero writes.
+        if (!repository.commitCanonicalPublicationPreflightDecision) {
+          throw new Error(
+            "Canonical publication preflight decision fencing is unavailable",
+          );
+        }
+        const reasonCodes = [
+          "publication_catalog_availability_changed",
+          ...(preflightReasonCodes.length > 0
+            ? preflightReasonCodes
+            : ["preflight_no_compatible_tracks"]),
+        ];
+        await repository.commitCanonicalPublicationPreflightDecision({
+          authority: preflightAuthority,
+          pipelineOutcome: buildPipelineOutcome({
+            pipelineVersion: manifest.pipelineVersion ?? "legacy_v1",
+            policyVersion: manifest.policyVersion ?? "legacy_v1",
+            status: "partial_evidence_shortfall",
+            targetTrackCount: target,
+            discoveredTrackCount,
+            qualifiedTrackCount,
+            selectedTrackCount,
+            publishedTrackCount: 0,
+            frontierExhausted: false,
+            reasonCodes,
+            stageCounts,
+          }),
+          omittedCandidateIds: preflight.omittedCandidateIds,
+          reasonCodes,
+        });
+        return { status: "needs_decision", manifestId, volumes: [] };
+      }
       const priorVolumes = await loadVolumes(repository, manifest);
       if (priorVolumes.length > 0) {
         await repository.hidePublicPlaylistsForRun(manifest.runId);
@@ -1418,18 +1670,6 @@ export async function publishManifest(
         error: null,
       });
       if (repository.savePipelineOutcome) {
-        const stageCounts = manifest.pipelineVersion === "catalog_first_v2"
-          && repository.getPipelineStageCounts
-          ? await repository.getPipelineStageCounts(manifest.runId)
-          : undefined;
-        const discoveredTrackCount = stageCounts?.discovered ?? Math.max(
-          manifest.tracks.length,
-          priorPipelineOutcome?.discoveredTrackCount ?? 0,
-        );
-        const qualifiedTrackCount = stageCounts?.claim_verified ?? Math.max(
-          manifest.tracks.length,
-          Math.min(discoveredTrackCount, priorPipelineOutcome?.qualifiedTrackCount ?? 0),
-        );
         await repository.savePipelineOutcome(manifest.runId, buildPipelineOutcome({
           pipelineVersion: manifest.pipelineVersion ?? "legacy_v1",
           policyVersion: manifest.policyVersion ?? "legacy_v1",
@@ -1437,10 +1677,7 @@ export async function publishManifest(
           targetTrackCount: target,
           discoveredTrackCount,
           qualifiedTrackCount,
-          selectedTrackCount: stageCounts?.manifested ?? Math.max(
-            manifest.tracks.length,
-            Math.min(qualifiedTrackCount, priorPipelineOutcome?.selectedTrackCount ?? 0),
-          ),
+          selectedTrackCount,
           publishedTrackCount: 0,
           frontierExhausted: true,
           reasonCodes: preflightReasonCodes.length > 0 ? preflightReasonCodes : ["preflight_no_compatible_tracks"],
@@ -1481,10 +1718,30 @@ export async function publishManifest(
           && Number(requestedTrackCount) > manifest.tracks.length,
       });
     }
-    await ensureReconciliation();
-    await repository.updateRun(manifest.runId, { status: "publishing", phase: "apple_publication", error: null });
+    const publicationAuthority = await ensureReconciliation();
+    if (publicationAuthority) {
+      if (!repository.updateCanonicalPublicationRun) {
+        throw new Error("Canonical publication run fencing is unavailable");
+      }
+      await repository.updateCanonicalPublicationRun(publicationAuthority, {
+        status: "publishing",
+        phase: "apple_publication",
+      });
+    } else {
+      await repository.updateRun(manifest.runId, {
+        status: "publishing",
+        phase: "apple_publication",
+        error: null,
+      });
+    }
     const plan = planPublicationVolumes(manifest.tracks);
-    const volumes = await getOrCreateVolumes(repository, manifest, plan, signal);
+    const volumes = await getOrCreateVolumes(
+      repository,
+      manifest,
+      plan,
+      signal,
+      publicationAuthority ?? undefined,
+    );
     await advanceReconciliation({
       state: "create_pending",
       applePlaylistId: null,
@@ -1536,6 +1793,8 @@ export async function publishManifest(
             },
           });
         },
+        executionFence,
+        publicationAuthority ?? undefined,
       ));
     }
     await advanceReconciliation({
@@ -1646,6 +1905,7 @@ export async function publishManifest(
         manifestRevisionHash: manifest.contentHash,
         contractRevisionId: manifest.contractRevisionId ?? null,
         contractHash: manifest.contractHash ?? null,
+        executionFence: executionFence ?? null,
         selectedCount: manifest.tracks.length,
         terminalStatus,
         publicationVolumes,
@@ -1711,7 +1971,10 @@ export async function publishManifest(
       : "";
     if (code === CANONICAL_PUBLICATION_REVALIDATION_ERROR) {
       const contractRevisionId = manifest.contractRevisionId ?? null;
-      if (!contractRevisionId || !repository.openPlaylistRunBlocker) {
+      const authority = canonicalAuthorityFor(manifest);
+      if (!contractRevisionId
+        || !authority
+        || !repository.commitCanonicalPublicationPreflightDecision) {
         throw new Error(
           "Canonical publication revalidation cannot persist its required decision",
           { cause: error },
@@ -1721,29 +1984,31 @@ export async function publishManifest(
         instanceof CanonicalPublicationRevalidationRequiredErrorV1
         ? error.reasonCodes
         : [];
-      await repository.openPlaylistRunBlocker({
-        runId: manifest.runId,
-        contractRevisionId,
-        blockerKind: "scope_decision",
-        dependencyKey: "publication_revalidation",
-        retryCount: 0,
-        nextRetryAt: null,
-        automaticRetryUntil: null,
-        state: {
-          schemaVersion: "genio-publication-revalidation-decision/v1",
-          stage: "publication_preflight",
-          reasonCode: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
-          reasonCodes: reasonCodes.slice(0, 32),
-          manifestId: manifest.id,
-          manifestRevisionId: manifest.revisionId ?? null,
-          manifestRevisionHash: manifest.contentHash,
-          nextAction: "review_contract",
-        },
-      });
-      await repository.updateRun(manifest.runId, {
-        status: "needs_decision",
-        phase: "publication_contract_revalidation_required",
-        error: null,
+      const target = manifest.selectionPlan?.requestedTrackCount
+        ?? manifest.tracks.length;
+      await repository.commitCanonicalPublicationPreflightDecision({
+        authority,
+        pipelineOutcome: buildPipelineOutcome({
+          pipelineVersion: manifest.pipelineVersion ?? "legacy_v1",
+          policyVersion: manifest.policyVersion ?? "legacy_v1",
+          status: "partial_evidence_shortfall",
+          targetTrackCount: target,
+          discoveredTrackCount: Math.max(
+            manifest.tracks.length,
+            priorPipelineOutcome?.discoveredTrackCount ?? 0,
+          ),
+          qualifiedTrackCount: manifest.tracks.length,
+          selectedTrackCount: manifest.tracks.length,
+          publishedTrackCount: 0,
+          frontierExhausted: false,
+          reasonCodes: reasonCodes.length > 0
+            ? [...reasonCodes]
+            : [CANONICAL_PUBLICATION_REVALIDATION_ERROR],
+        }),
+        omittedCandidateIds: [],
+        reasonCodes: reasonCodes.length > 0
+          ? reasonCodes
+          : [CANONICAL_PUBLICATION_REVALIDATION_ERROR],
       });
       return { status: "needs_decision", manifestId, volumes: [] };
     }
@@ -1777,14 +2042,29 @@ export async function publishManifest(
         }
       }
       await repository.updateAppleAuthorizationStatus("reauthorization_required", error.message);
-      await repository.updateRun(manifest.runId, {
-        status: "waiting_for_apple_authorization",
-        phase: "apple_reauthorization",
-        error: null,
-      });
+      if (reconciliationBase) {
+        if (!repository.updateCanonicalPublicationRun) {
+          throw new Error("Canonical publication run fencing is unavailable");
+        }
+        await repository.updateCanonicalPublicationRun(reconciliationBase, {
+          status: "waiting_for_apple_authorization",
+          phase: "apple_reauthorization",
+        });
+      } else {
+        await repository.updateRun(manifest.runId, {
+          status: "waiting_for_apple_authorization",
+          phase: "apple_reauthorization",
+          error: null,
+        });
+      }
       for (const volume of await loadVolumes(repository, manifest)) {
         if (volume.status !== "complete") {
-          await repository.updatePublicationVolume(volume.id, { status: "waiting_for_owner" });
+          await updatePublicationVolumeWithAuthority(
+            repository,
+            volume.id,
+            { status: "waiting_for_owner" },
+            reconciliationBase ?? undefined,
+          );
         }
       }
       await repository.enqueueNotification("apple_reauthorization_required", {
@@ -1800,6 +2080,7 @@ export async function publishManifest(
       "manifest_contract_stale",
       "manifest_revision_stale",
       "publication_attempt_stale",
+      "publication_execution_stale",
       "publication_reconciliation_stale",
       "publication_reconciliation_conflict",
     ].includes(code);

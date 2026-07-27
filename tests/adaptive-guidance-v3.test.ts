@@ -4,7 +4,10 @@ import {
   compileGuidanceSelectionV3,
   createGuidanceDecisionV3,
   customGuidanceConfirmationDecisionV3,
+  criticalAmbiguityGuidanceDecisionV3,
   deterministicGuidanceCandidatesV3,
+  exactArtistIdentityAmbiguityGuidanceDecisionV3,
+  flowNuanceGuidanceDecisionV3,
   frenchJazzGuidanceDecisionV3,
   guidanceContractPatchV1,
   isSmoothReggaetonHeatRequestV3,
@@ -25,6 +28,31 @@ import {
   applyPlaylistContractPatchV1,
   compilePlaylistContractRevisionV1,
 } from "../server/playlist-contract-v1.ts";
+import {
+  projectPlaylistContractExecutionV1,
+} from "../server/playlist-contract-execution-bridge-v1.ts";
+import {
+  AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+} from "../server/playlist-count-policy.ts";
+import {
+  evaluateCanonicalContractTrackV1,
+} from "../server/canonical-contract-runtime-v1.ts";
+import {
+  compileGuidanceRoundPatchV3,
+  publicGuidanceQuestionV3,
+} from "../server/adaptive-guidance-contract-bridge.ts";
+import {
+  compilePlaylistContractShadowV1,
+} from "../server/playlist-contract-shadow-bridge-v1.ts";
+import {
+  createSelectionPlanV2,
+} from "../server/selection-plan-v2.ts";
+import {
+  createRunSpecV3,
+} from "../server/selection-plan-v3.ts";
+import type {
+  PlaylistBrief,
+} from "../shared/types.ts";
 
 function decision(input: {
   id: string;
@@ -120,6 +148,7 @@ describe("adaptive guidance v3", () => {
       axis: "adjacent_latin_urban_scope",
       trigger: "correctness",
       criticality: "required",
+      allowCustom: false,
       options: [
         {
           id: "core_reggaeton_only",
@@ -213,6 +242,572 @@ describe("adaptive guidance v3", () => {
     ]));
   });
 
+  test("projects a bare-house ambiguity into one required typed contract revision", () => {
+    const prompt = "Make me a 25-track house playlist";
+    const base = compilePlaylistContractRevisionV1({
+      contractId: "ambiguous-house",
+      rawPrompt: prompt,
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        {
+          id: "prompt:ambiguous-house",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["house"],
+          source: { provenance: "prompt", text: "house" },
+        },
+        {
+          id: "prompt:era",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "era",
+          operator: "require",
+          values: ["1990s onward"],
+          source: { provenance: "migration", text: "1990s onward" },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "prompt:ambiguous-house" },
+          { op: "clause", clauseId: "prompt:era" },
+        ],
+      },
+    });
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 25 });
+    const candidates = deterministicGuidanceCandidatesV3({
+      prompt,
+      baseContractRevisionId: base.revisionId,
+      baseContractSemanticHash: base.semanticHash,
+      preservedTrackPredicate: base.trackPredicate,
+      ambiguousScopeClauseIds: ["prompt:ambiguous-house"],
+      baseContract: base,
+      criticalAmbiguities: spec.criticalAmbiguities,
+    });
+    const round = selectGuidanceRoundV3({
+      stage: "initial",
+      requestShape: "curated",
+      candidates,
+    });
+    expect(round.decisions).toHaveLength(1);
+    expect(round.decisions[0]).toMatchObject({
+      id: "v3-critical:house_semantics",
+      axis: "house_semantics",
+      trigger: "correctness",
+      criticality: "required",
+      options: [
+        expect.objectContaining({ id: "house_genre", recommended: true }),
+        expect.objectContaining({ id: "house_theme" }),
+        expect.objectContaining({ id: "house_both" }),
+      ],
+    });
+
+    const selected = compileGuidanceSelectionV3(round.decisions[0]!, {
+      optionIds: ["house_theme"],
+    });
+    const revised = applyPlaylistContractPatchV1(base, guidanceContractPatchV1({
+      decision: round.decisions[0]!,
+      questionSetHash: round.roundHash,
+      accepted: {
+        answerHash: selected.answerHash,
+        executableOperations: selected.operations,
+      },
+    })!);
+    expect(revised.requestedTrackCount).toBe(25);
+    expect(revised.clauses.map(({ id }) => id)).not.toContain(
+      "prompt:ambiguous-house",
+    );
+    expect(revised.clauses).toContainEqual(expect.objectContaining({
+      id: "guidance:critical:house-semantics:theme",
+      axis: "theme",
+      hardness: "hard",
+      values: ["houses and homes"],
+    }));
+    expect(JSON.stringify(revised.trackPredicate)).toContain("prompt:era");
+    expect(JSON.stringify(revised.trackPredicate)).toContain(
+      "guidance:critical:house-semantics:theme",
+    );
+    expect(JSON.stringify(revised.trackPredicate)).not.toContain(
+      "prompt:ambiguous-house",
+    );
+  });
+
+  test("keeps a factual possessive blocker while suppressing its optional flow question", () => {
+    const prompt = "Paulinho da Costa's 25 most influential songs with a listening flow";
+    const base = compilePlaylistContractRevisionV1({
+      contractId: "possessive-factual",
+      rawPrompt: prompt,
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [{
+        id: "prompt:ambiguous-relationship",
+        kind: "factual_relationship",
+        scope: "track",
+        hardness: "hard",
+        axis: "relationship",
+        operator: "require",
+        values: ["Paulinho da Costa's influential songs"],
+        source: {
+          provenance: "prompt",
+          text: "Paulinho da Costa's 25 most influential songs",
+        },
+      }],
+      trackPredicate: {
+        op: "clause",
+        clauseId: "prompt:ambiguous-relationship",
+      },
+    });
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 25 });
+    const candidates = deterministicGuidanceCandidatesV3({
+      prompt,
+      baseContractRevisionId: base.revisionId,
+      baseContractSemanticHash: base.semanticHash,
+      preservedTrackPredicate: base.trackPredicate,
+      ambiguousScopeClauseIds: [],
+      baseContract: base,
+      criticalAmbiguities: spec.criticalAmbiguities,
+    });
+    expect(candidates.map(({ id }) => id)).toEqual([
+      "v3-critical:possessive_relationship",
+      "guidance:flow:shape",
+    ]);
+    const round = selectGuidanceRoundV3({
+      stage: "initial",
+      requestShape: "factual",
+      candidates,
+    });
+    expect(round.decisions.map(({ id }) => id)).toEqual([
+      "v3-critical:possessive_relationship",
+    ]);
+    expect(round.rejectedDecisionReasons).toMatchObject({
+      "guidance:flow:shape": "request_needs_no_guidance",
+    });
+
+    const decision = criticalAmbiguityGuidanceDecisionV3({
+      ambiguity: spec.criticalAmbiguities[0]!,
+      baseContract: base,
+    });
+    expect(decision.allowCustom).toBe(false);
+    const selected = compileGuidanceSelectionV3(decision, {
+      optionIds: ["subject_created"],
+    });
+    const revised = applyPlaylistContractPatchV1(base, guidanceContractPatchV1({
+      decision,
+      questionSetHash: round.roundHash,
+      accepted: {
+        answerHash: selected.answerHash,
+        executableOperations: selected.operations,
+      },
+    })!);
+    expect(revised.clauses.map(({ id }) => id)).not.toContain(
+      "prompt:ambiguous-relationship",
+    );
+    expect(revised.clauses).toContainEqual(expect.objectContaining({
+      id: "guidance:critical:possessive-relationship:created",
+      kind: "factual_relationship",
+      axis: "factual_relationship",
+      values: expect.arrayContaining([
+        "paulinho da costa: wrote, composed, arranged, or produced the exact recording",
+      ]),
+    }));
+  });
+
+  test("composes two required correctness answers without reviving either removed ambiguity", () => {
+    const prompt =
+      "French jazz: Paulinho da Costa's 25 most influential songs";
+    const base = compilePlaylistContractRevisionV1({
+      contractId: "multi-critical-round",
+      rawPrompt: prompt,
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [{
+        id: "prompt:jazz",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["jazz"],
+        source: { provenance: "prompt", text: "jazz" },
+      }, {
+        id: "prompt:ambiguous-french",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "geography",
+        operator: "require",
+        values: ["French"],
+        source: { provenance: "prompt", text: "French jazz" },
+      }, {
+        id: "prompt:ambiguous-relationship",
+        kind: "factual_relationship",
+        scope: "track",
+        hardness: "hard",
+        axis: "relationship",
+        operator: "require",
+        values: ["Paulinho da Costa's influential songs"],
+        source: {
+          provenance: "prompt",
+          text: "Paulinho da Costa's 25 most influential songs",
+        },
+      }],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: "prompt:jazz" },
+          { op: "clause", clauseId: "prompt:ambiguous-french" },
+          { op: "clause", clauseId: "prompt:ambiguous-relationship" },
+        ],
+      },
+    });
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 25 });
+    expect(spec.criticalAmbiguities.map(({ key }) => key)).toEqual([
+      "french_jazz_scope",
+      "possessive_relationship",
+    ]);
+    const candidates = deterministicGuidanceCandidatesV3({
+      prompt,
+      baseContractRevisionId: base.revisionId,
+      baseContractSemanticHash: base.semanticHash,
+      preservedTrackPredicate: base.trackPredicate,
+      ambiguousScopeClauseIds: [],
+      baseContract: base,
+      criticalAmbiguities: spec.criticalAmbiguities,
+    });
+    const round = selectGuidanceRoundV3({
+      stage: "initial",
+      requestShape: "factual",
+      candidates,
+    });
+    expect(round.decisions.map(({ id }) => id)).toEqual([
+      "v3-critical:french_jazz_scope",
+      "v3-critical:possessive_relationship",
+    ]);
+    const patch = compileGuidanceRoundPatchV3({
+      base,
+      questionSetHash: round.roundHash,
+      questions: round.decisions.map(publicGuidanceQuestionV3),
+      answers: [{
+        questionId: "v3-critical:french_jazz_scope",
+        optionId: "french_artist_origin",
+      }, {
+        questionId: "v3-critical:possessive_relationship",
+        optionId: "subject_performed",
+      }],
+    });
+    const revised = applyPlaylistContractPatchV1(base, patch!);
+    expect(revised.clauses.map(({ id }) => id)).not.toEqual(
+      expect.arrayContaining([
+        "prompt:ambiguous-french",
+        "prompt:ambiguous-relationship",
+      ]),
+    );
+    expect(revised.clauses).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "guidance:critical:french-jazz-scope:artist-origin",
+        axis: "geography",
+      }),
+      expect.objectContaining({
+        id: "guidance:critical:possessive-relationship:performed",
+        axis: "factual_relationship",
+      }),
+    ]));
+    const predicate = JSON.stringify(revised.trackPredicate);
+    expect(predicate).toContain("prompt:jazz");
+    expect(predicate).toContain(
+      "guidance:critical:french-jazz-scope:artist-origin",
+    );
+    expect(predicate).toContain(
+      "guidance:critical:possessive-relationship:performed",
+    );
+    expect(predicate).not.toContain("prompt:ambiguous-french");
+    expect(predicate).not.toContain("prompt:ambiguous-relationship");
+  });
+
+  test("replaces every bare Brazilian scope gate before projecting the chosen funk tradition", () => {
+    const prompt = "Brazilian funk essentials";
+    const requestBrief: PlaylistBrief = {
+      title: "Brazilian funk essentials",
+      description: "An essential survey of Brazilian funk.",
+      mode: "curated",
+      subjectEntities: ["Brazilian funk", "Brazil"],
+      relationship: "is documented as Brazilian funk",
+      include: ["Brazilian funk recordings"],
+      exclude: [],
+      versionPolicy: "Prefer canonical studio recordings.",
+      evidencePolicy: "Require documented genre membership.",
+      orderingPolicy: "Use an editorial sequence.",
+      targetSize: { min: 50, max: 50 },
+      ambiguities: [],
+    };
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: requestBrief,
+      storefront: "us",
+    });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: "ambiguous-brazilian-funk",
+      prompt,
+      brief: requestBrief,
+      selectionPlan,
+      locale: "en",
+    });
+    expect(shadow.contract.clauses).toContainEqual(expect.objectContaining({
+      axis: "geography",
+      hardness: "hard",
+      values: expect.arrayContaining(["Brazilian"]),
+    }));
+    const spec = createRunSpecV3({ prompt, requestedTrackCount: 50 });
+    const question = deterministicGuidanceCandidatesV3({
+      prompt,
+      baseContractRevisionId: shadow.contract.revisionId,
+      baseContractSemanticHash: shadow.contract.semanticHash,
+      preservedTrackPredicate: shadow.preservedTrackPredicate,
+      ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+      baseContract: shadow.contract,
+      criticalAmbiguities: spec.criticalAmbiguities,
+    }).find(({ id }) => id === "v3-critical:brazilian_funk_semantics");
+    expect(question).toBeDefined();
+    const selected = compileGuidanceSelectionV3(question!, {
+      optionIds: ["funk_carioca"],
+    });
+    const revised = applyPlaylistContractPatchV1(
+      shadow.contract,
+      guidanceContractPatchV1({
+        decision: question!,
+        questionSetHash: "b".repeat(64),
+        accepted: {
+          answerHash: selected.answerHash,
+          executableOperations: selected.operations,
+        },
+      })!,
+    );
+    expect(revised.clauses).toContainEqual(expect.objectContaining({
+      id: "guidance:critical:brazilian-funk:funk-carioca",
+      axis: "genre",
+      hardness: "hard",
+      values: ["funk carioca"],
+    }));
+    expect(revised.clauses.some((clause) => (
+      clause.scope === "track"
+      && ["geography", "relationship", "factual_relationship"].includes(
+        clause.axis,
+      )
+      && /\bbrazil(?:ian)?\b/iu.test([
+        ...clause.values,
+        clause.source.text,
+      ].join(" "))
+    ))).toBe(false);
+
+    const projected = projectPlaylistContractExecutionV1({
+      contract: revised,
+      basePlan: selectionPlan,
+    });
+    expect(projected.selectionPlanV3.membershipPredicates).toContainEqual(
+      expect.objectContaining({
+        axis: "genre",
+        operator: "require",
+        values: ["funk carioca"],
+      }),
+    );
+    expect(projected.selectionPlanV3.membershipPredicates.some((predicate) => (
+      ["geography", "factual_relationship"].includes(predicate.axis)
+      && /\bbrazil(?:ian)?\b/iu.test(predicate.values.join(" "))
+    ))).toBe(false);
+    expect(projected.plan.constraints.some((constraint) => (
+      ["geography", "relationship"].includes(constraint.axis)
+      && /\bbrazil(?:ian)?\b/iu.test(constraint.values.join(" "))
+    ))).toBe(false);
+  });
+
+  test.each([
+    ["french_artist_origin", "geography", "France"],
+    ["french_scene", "scene", "French jazz scene"],
+    ["french_language", "language", "French"],
+  ] as const)(
+    "projects realistic French-jazz answer %s without retaining a fabricated content-language gate",
+    (optionId, expectedAxis, expectedValue) => {
+      const prompt = "Build exactly 50 French jazz tracks across eras and scenes.";
+      const requestBrief: PlaylistBrief = {
+        title: "French Jazz Across Eras",
+        description: "A broad survey of French jazz across eras and scenes.",
+        mode: "curated",
+        subjectEntities: ["French jazz"],
+        relationship: "is representative of French jazz",
+        include: [
+          "French jazz artists across multiple eras, cities, and stylistic scenes.",
+        ],
+        exclude: [],
+        versionPolicy: "Prefer canonical studio recordings.",
+        evidencePolicy: "Require documented track-level scope evidence.",
+        orderingPolicy: "Use a coherent editorial sequence.",
+        targetSize: { min: 50, max: 50 },
+        ambiguities: [],
+      };
+      const selectionPlan = createSelectionPlanV2({
+        prompt,
+        brief: requestBrief,
+        storefront: "fr",
+      });
+      expect(selectionPlan.contentPolicy.languages).toEqual([]);
+      const shadow = compilePlaylistContractShadowV1({
+        contractId: `french-jazz-${optionId}`,
+        prompt,
+        brief: requestBrief,
+        selectionPlan,
+        locale: "en",
+      });
+      expect(shadow.contract.clauses.some((clause) => (
+        clause.axis === "content"
+        && clause.values.some((value) => value.startsWith("language:"))
+      ))).toBe(false);
+
+      // Exercise already-persisted Contract-3 revisions from the buggy
+      // compiler as well as newly compiled shadows. The answer must remove
+      // this migrated false gate before adding the chosen typed relationship.
+      const legacyBuggyContract = applyPlaylistContractPatchV1(shadow.contract, {
+        baseRevisionId: shadow.contract.revisionId,
+        baseSemanticHash: shadow.contract.semanticHash,
+        answerLineage: {
+          questionSetHash: "c".repeat(64),
+          questionId: "legacy:migration",
+          answerHash: "d".repeat(64),
+        },
+        operations: [{
+          op: "add_clause",
+          clause: {
+            id: "bridge:catalog:content-policy",
+            kind: "catalog_version",
+            scope: "track",
+            hardness: "hard",
+            axis: "content",
+            operator: "require",
+            values: [
+              "explicit-content:allow",
+              "instrumental:allow",
+              "language:French jazz",
+            ],
+            source: {
+              provenance: "migration",
+              text: requestBrief.include[0]!,
+            },
+            evidence: {
+              required: true,
+              minimumGrade: "authoritative_structured_metadata",
+              permittedGrades: ["authoritative_structured_metadata"],
+            },
+            unknownPolicy: "reject",
+          },
+        }, {
+          op: "replace_track_predicate",
+          predicate: {
+            op: "all",
+            children: [
+              shadow.contract.trackPredicate,
+              {
+                op: "clause",
+                clauseId: "bridge:catalog:content-policy",
+              },
+            ],
+          },
+        }],
+      });
+      const spec = createRunSpecV3({
+        prompt,
+        requestedTrackCount: 50,
+        storefront: "fr",
+      });
+      const question = criticalAmbiguityGuidanceDecisionV3({
+        ambiguity: spec.criticalAmbiguities.find(
+          ({ key }) => key === "french_jazz_scope",
+        )!,
+        baseContract: legacyBuggyContract,
+        ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+      });
+      const selected = compileGuidanceSelectionV3(question, {
+        optionIds: [optionId],
+      });
+      const revised = applyPlaylistContractPatchV1(
+        legacyBuggyContract,
+        guidanceContractPatchV1({
+          decision: question,
+          questionSetHash: "e".repeat(64),
+          accepted: {
+            answerHash: selected.answerHash,
+            executableOperations: selected.operations,
+          },
+        })!,
+      );
+      expect(revised.clauses.some((clause) => (
+        clause.axis === "content"
+        && clause.values.some((value) => value.startsWith("language:"))
+      ))).toBe(false);
+      const guided = revised.clauses.find((clause) => (
+        clause.id.startsWith("guidance:critical:french-jazz-scope:")
+      ));
+      expect(guided).toMatchObject({
+        axis: expectedAxis,
+        hardness: "hard",
+        values: expect.arrayContaining([expectedValue]),
+      });
+
+      const projection = projectPlaylistContractExecutionV1({
+        contract: revised,
+        basePlan: selectionPlan,
+      });
+      const runtimeLanguageClauses = projection.canonicalContractPolicy.clauses
+        .filter(({ axis }) => axis === "language");
+      expect(runtimeLanguageClauses).toHaveLength(
+        optionId === "french_language" ? 1 : 0,
+      );
+      if (optionId === "french_language") {
+        expect(runtimeLanguageClauses[0]).toMatchObject({
+          values: expect.arrayContaining(["French"]),
+          evidence: {
+            minimumGrade: "trusted_scoped_container",
+            permittedGrades: expect.arrayContaining([
+              "trusted_scoped_container",
+              "track_specific_editorial_assertion",
+            ]),
+          },
+        });
+      }
+      expect(projection.selectionPlanV3.membershipPredicates).toContainEqual(
+        expect.objectContaining({
+          axis: expectedAxis,
+          values: [expectedValue],
+          source: "guided_answer",
+        }),
+      );
+      expect(projection.selectionPlanV3.catalogPolicies.some((policy) => (
+        policy.values.some((value) => value.startsWith("language:"))
+      ))).toBe(false);
+
+      const assessments = Object.fromEntries(
+        projection.canonicalContractPolicy.clauses.map((clause) => [
+          clause.id,
+          {
+            status: "pass" as const,
+            evidenceGrade: clause.evidence.minimumGrade
+              ?? clause.evidence.permittedGrades[0]!,
+          },
+        ]),
+      );
+      expect(evaluateCanonicalContractTrackV1({
+        policy: projection.canonicalContractPolicy,
+        assessments,
+      })).toMatchObject({ status: "pass", eligible: true });
+    },
+  );
+
   test("creates deterministic hash-bound server-owned decisions", () => {
     const first = decision({ id: "depth", axis: "discovery_depth", trigger: "nuance" });
     const second = decision({ id: "depth", axis: "discovery_depth", trigger: "nuance" });
@@ -264,19 +859,81 @@ describe("adaptive guidance v3", () => {
     });
   });
 
-  test("asks no optional questions for fixed, factual, or fully explicit requests", () => {
+  test("suppresses optional guidance but preserves required correctness blockers for precise requests", () => {
     const optional = decision({
       id: "depth",
       axis: "depth",
       trigger: "nuance",
     });
+    const required = decision({
+      id: "scope",
+      axis: "scope",
+      trigger: "correctness",
+      criticality: "required",
+    });
     for (const requestShape of ["fixed_list", "factual", "fully_explicit"] as const) {
-      expect(selectGuidanceRoundV3({
+      const round = selectGuidanceRoundV3({
         stage: "initial",
         requestShape,
-        candidates: [optional],
-      }).decisions).toEqual([]);
+        candidates: [optional, required],
+      });
+      expect(round.decisions.map(({ id }) => id)).toEqual(["scope"]);
+      expect(round.rejectedDecisionReasons).toEqual({
+        depth: "request_needs_no_guidance",
+      });
     }
+  });
+
+  test("uses a third initial slot only for a required correctness ambiguity", () => {
+    const first = decision({
+      id: "scope",
+      axis: "scope",
+      trigger: "correctness",
+      criticality: "required",
+      materialityScore: 100,
+    });
+    const second = decision({
+      id: "geography",
+      axis: "geography",
+      trigger: "correctness",
+      criticality: "required",
+      materialityScore: 90,
+    });
+    const optionalThird = decision({
+      id: "depth",
+      axis: "depth",
+      trigger: "nuance",
+      materialityScore: 80,
+    });
+    const optionalRound = selectGuidanceRoundV3({
+      stage: "initial",
+      requestShape: "curated",
+      candidates: [first, second, optionalThird],
+    });
+    expect(optionalRound.decisions.map(({ id }) => id)).toEqual([
+      "scope",
+      "geography",
+    ]);
+    expect(optionalRound.rejectedDecisionReasons.depth).toBe(
+      "round_question_limit",
+    );
+
+    const blockingThird = decision({
+      id: "language",
+      axis: "language",
+      trigger: "correctness",
+      criticality: "required",
+      materialityScore: 80,
+    });
+    expect(selectGuidanceRoundV3({
+      stage: "initial",
+      requestShape: "curated",
+      candidates: [first, second, blockingThird],
+    }).decisions.map(({ id }) => id)).toEqual([
+      "scope",
+      "geography",
+      "language",
+    ]);
   });
 
   test("does not repeat explicit/answered axes and stops after two failed clarification attempts", () => {
@@ -569,6 +1226,7 @@ describe("adaptive guidance v3", () => {
       question: "What should “French” mean for this jazz playlist?",
       trigger: "correctness",
       criticality: "required",
+      allowCustom: false,
       options: [
         { id: "french_jazz_scene", recommended: true },
         { id: "french_artist_origin" },
@@ -622,6 +1280,7 @@ describe("adaptive guidance v3", () => {
     expect(question).toMatchObject({
       trigger: "yield_risk",
       criticality: "optional",
+      allowCustom: false,
     });
     expect(question?.options[0]).toMatchObject({
       id: "strict_documented_rarity",
@@ -636,6 +1295,231 @@ describe("adaptive guidance v3", () => {
       ambiguousScopeClauseIds: [],
       baseContract: base,
     }).map(({ id }) => id)).toContain("guidance:rare-scope:breadth");
+  });
+
+  test("offers custom input only on a production axis backed by typed compilation", () => {
+    const base = compilePlaylistContractRevisionV1({
+      contractId: "custom-flow-axis",
+      rawPrompt: "Build 25 disco tracks with a listening journey",
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [{
+        id: "prompt:disco",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["disco"],
+        source: { provenance: "prompt", text: "disco" },
+      }],
+      trackPredicate: { op: "clause", clauseId: "prompt:disco" },
+    });
+    const flow = flowNuanceGuidanceDecisionV3({
+      prompt: base.rawPrompt,
+      baseContract: base,
+    });
+    expect(flow).toMatchObject({
+      axis: "playlist_flow",
+      criticality: "optional",
+      allowCustom: true,
+      allowedPatchOperations: expect.arrayContaining([
+        "add_clause",
+        "set_sequencing_objectives",
+      ]),
+      affectedClauseIds: ["guidance:flow:objective"],
+    });
+    expect(compileCustomGuidanceAnswerV3({
+      decision: flow!,
+      customText: "Use a smooth flow",
+      serverCompiled: null,
+      confirmed: false,
+    })).toMatchObject({
+      state: "needs_recompile",
+      executableOperations: null,
+    });
+    const compiledFlow = recompileCustomGuidanceTextV3({
+      base,
+      customText: "Use a smooth flow",
+    });
+    expect(compiledFlow).toMatchObject({
+      affectedClauseIds: ["guidance:flow:objective"],
+      hardChangeReasons: [],
+      operations: [
+        expect.objectContaining({
+          op: "add_clause",
+          clause: expect.objectContaining({
+            id: "guidance:flow:objective",
+          }),
+        }),
+        expect.objectContaining({
+          op: "set_sequencing_objectives",
+          objectives: [expect.objectContaining({
+            id: "guidance:flow:sequence",
+            clauseId: "guidance:flow:objective",
+            direction: "smooth",
+          })],
+        }),
+      ],
+    });
+    const compiledAnswer = compileCustomGuidanceAnswerV3({
+      decision: flow!,
+      customText: "Use a smooth flow",
+      serverCompiled: compiledFlow,
+      confirmed: false,
+    });
+    expect(compiledAnswer).toMatchObject({
+      state: "accepted",
+      hardChangeReasons: [],
+      executableOperations: compiledFlow.operations,
+    });
+
+    // The persisted custom-answer path still presents the server-owned
+    // interpretation summary for explicit confirmation before creating the
+    // successor, even though flow itself is a soft change.
+    const confirmation = customGuidanceConfirmationDecisionV3({
+      base,
+      compiled: compiledFlow,
+    });
+    const confirmed = compileGuidanceSelectionV3(confirmation, {
+      optionIds: ["apply_revised_interpretation"],
+    });
+    const successor = applyPlaylistContractPatchV1(
+      base,
+      guidanceContractPatchV1({
+        decision: confirmation,
+        questionSetHash: "9".repeat(64),
+        accepted: {
+          answerHash: confirmed.answerHash,
+          executableOperations: confirmed.operations,
+        },
+      })!,
+    );
+    expect(successor).toMatchObject({
+      revision: 2,
+      sequencingObjectives: [{
+        id: "guidance:flow:sequence",
+        clauseId: "guidance:flow:objective",
+        direction: "smooth",
+      }],
+    });
+
+    const repeatedFlow = flowNuanceGuidanceDecisionV3({
+      prompt: "Keep shaping this listening journey",
+      baseContract: successor,
+    })!;
+    expect(repeatedFlow).toMatchObject({
+      allowCustom: true,
+      allowedPatchOperations: expect.arrayContaining([
+        "replace_clause",
+        "set_sequencing_objectives",
+      ]),
+      affectedClauseIds: ["guidance:flow:objective"],
+    });
+    const repeatedCompiled = recompileCustomGuidanceTextV3({
+      base: successor,
+      customText: "Use a high-contrast flow",
+    });
+    expect(repeatedCompiled).toMatchObject({
+      affectedClauseIds: ["guidance:flow:objective"],
+      operations: [
+        expect.objectContaining({
+          op: "replace_clause",
+          clauseId: "guidance:flow:objective",
+          clause: expect.objectContaining({
+            id: "guidance:flow:objective",
+          }),
+        }),
+        expect.objectContaining({
+          op: "set_sequencing_objectives",
+          objectives: [expect.objectContaining({
+            id: "guidance:flow:sequence",
+            clauseId: "guidance:flow:objective",
+            direction: "contrast",
+          })],
+        }),
+      ],
+    });
+    expect(() => compileCustomGuidanceAnswerV3({
+      decision: repeatedFlow,
+      customText: "Use a high-contrast flow",
+      serverCompiled: repeatedCompiled,
+      confirmed: false,
+    })).not.toThrow();
+    for (const { decision, compiled } of [
+      { decision: flow!, compiled: compiledFlow },
+      { decision: repeatedFlow, compiled: repeatedCompiled },
+    ]) {
+      expect(compiled.operations.every(({ op }) => (
+        decision.allowedPatchOperations.includes(op)
+      ))).toBe(true);
+      expect(compiled.affectedClauseIds.every((clauseId) => (
+        decision.affectedClauseIds.includes(clauseId)
+      ))).toBe(true);
+    }
+    const repeatedConfirmation = customGuidanceConfirmationDecisionV3({
+      base: successor,
+      compiled: repeatedCompiled,
+    });
+    const repeatedConfirmed = compileGuidanceSelectionV3(
+      repeatedConfirmation,
+      { optionIds: ["apply_revised_interpretation"] },
+    );
+    const repeatedSuccessor = applyPlaylistContractPatchV1(
+      successor,
+      guidanceContractPatchV1({
+        decision: repeatedConfirmation,
+        questionSetHash: "8".repeat(64),
+        accepted: {
+          answerHash: repeatedConfirmed.answerHash,
+          executableOperations: repeatedConfirmed.operations,
+        },
+      })!,
+    );
+    expect(repeatedSuccessor).toMatchObject({
+      revision: 3,
+      sequencingObjectives: [{
+        id: "guidance:flow:sequence",
+        clauseId: "guidance:flow:objective",
+        direction: "contrast",
+      }],
+    });
+    expect(repeatedSuccessor.clauses.filter(
+      ({ id }) => id === "guidance:flow:objective",
+    )).toHaveLength(1);
+
+    const unsupported = [
+      smoothReggaetonHeatGuidanceDecisionV3({
+        prompt: SMOOTH_REGGAETON_HEAT_PROMPT,
+        baseContractRevisionId: base.revisionId,
+        baseContractSemanticHash: base.semanticHash,
+        preservedTrackPredicate: base.trackPredicate,
+        ambiguousScopeClauseIds: [],
+      }),
+      rareScopeGuidanceDecisionV3({
+        prompt: "100 rare disco deep cuts",
+        baseContract: compilePlaylistContractRevisionV1({
+          contractId: "unsupported-rare-custom-axis",
+          rawPrompt: "100 rare disco deep cuts",
+          requestedTrackCount: 100,
+          locale: "en",
+          storefront: "us",
+          clauses: base.clauses.map((clause) => ({
+            id: clause.id,
+            kind: clause.kind,
+            scope: clause.scope,
+            hardness: clause.hardness,
+            axis: clause.axis,
+            operator: clause.operator,
+            values: clause.values,
+            source: clause.source,
+          })),
+          trackPredicate: base.trackPredicate,
+        }),
+      }),
+    ];
+    expect(unsupported.every((decision) => decision?.allowCustom === false)).toBe(true);
   });
 
   test("recompiles custom hard rules into a reviewable successor summary before execution", () => {
@@ -661,9 +1545,39 @@ describe("adaptive guidance v3", () => {
       }],
       trackPredicate: { op: "clause", clauseId: "prompt:reggaeton" },
     });
+    expect(recompileCustomGuidanceTextV3({
+      base,
+      customText: "300 tracks with smooth flow",
+    }).previewContract.requestedTrackCount).toBe(300);
+    for (const count of [301, 999, 1_000, 1_001]) {
+      expect(() => recompileCustomGuidanceTextV3({
+        base,
+        customText: `${count} tracks with smooth flow`,
+      })).toThrow("invalid_custom_requested_count");
+    }
+    for (const count of [301, 999, 1_000]) {
+      expect(recompileCustomGuidanceTextV3({
+        base,
+        customText: `${count} tracks with smooth flow`,
+        trackCountAuthority:
+          AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      }).previewContract.requestedTrackCount).toBe(count);
+    }
+    expect(() => recompileCustomGuidanceTextV3({
+      base,
+      customText: "1001 tracks with smooth flow",
+      trackCountAuthority:
+        AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+    })).toThrow("invalid_custom_requested_count");
     const compiled = recompileCustomGuidanceTextV3({
       base,
       customText: "mostly women, clean, no Bad Bunny",
+      resolvedExactArtistIdentities: [{
+        inputText: "Bad Bunny",
+        catalogArtistId: "1126808565",
+        displayName: "Bad Bunny",
+        storefront: "us",
+      }],
     });
     expect(compiled.hardChangeReasons).toEqual([
       "content_policy_changed",
@@ -678,6 +1592,15 @@ describe("adaptive guidance v3", () => {
       "Clean versions only",
       "At least 51% Tracks by women artists",
     ]));
+    expect(compiled.previewContract.executionDirectives
+      ?.exactArtistIdentityExclusions).toEqual({
+      bindings: [{
+        clauseId: expect.stringMatching(/^guidance:custom:exclude:/u),
+        catalogArtistId: "1126808565",
+        displayName: "Bad Bunny",
+        storefront: "us",
+      }],
+    });
 
     const confirmation = customGuidanceConfirmationDecisionV3({ base, compiled });
     expect(confirmation).toMatchObject({
@@ -720,5 +1643,122 @@ describe("adaptive guidance v3", () => {
         executableOperations: kept.operations,
       },
     })).toBeNull();
+  });
+
+  test("compiles stable artist ambiguity profiles into fenced full custom patches", () => {
+    const base = compilePlaylistContractRevisionV1({
+      contractId: "custom-artist-ambiguity",
+      rawPrompt: "50 polished reggaeton tracks",
+      requestedTrackCount: 50,
+      locale: "en",
+      storefront: "us",
+      clauses: [{
+        id: "prompt:reggaeton",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["reggaeton"],
+        source: { provenance: "prompt", text: "reggaeton" },
+      }],
+      trackPredicate: { op: "clause", clauseId: "prompt:reggaeton" },
+    });
+    const originalSemanticHash = base.semanticHash;
+    const decision = exactArtistIdentityAmbiguityGuidanceDecisionV3({
+      base,
+      customText: "mostly women, clean, no Bad Bunny.",
+      inputText: "Bad Bunny",
+      candidates: [
+        {
+          catalogArtistId: "1126808565",
+          displayName: "Bad Bunny",
+          storefront: "us",
+          genreNames: ["Latin"],
+        },
+        {
+          catalogArtistId: "998877",
+          displayName: "Bad Bunny",
+          storefront: "us",
+        },
+      ],
+    });
+
+    expect(decision).toMatchObject({
+      axis: "exact_artist_identity",
+      trigger: "correctness",
+      criticality: "required",
+      allowCustom: false,
+      interpretationSummary: {
+        avoid: ["No recordings by Bad Bunny"],
+        mustHave: expect.arrayContaining([
+          "Clean versions only",
+          "At least 51% Tracks by women artists",
+        ]),
+      },
+      options: [
+        {
+          id: "keep_current_interpretation",
+          recommended: true,
+          patch: { operations: [] },
+        },
+        {
+          recommended: false,
+          patch: {
+            operations: expect.arrayContaining([
+              expect.objectContaining({
+                op: "set_exact_artist_identity_exclusions",
+                directive: {
+                  bindings: [expect.objectContaining({
+                    catalogArtistId: "1126808565",
+                    storefront: "us",
+                  })],
+                },
+              }),
+            ]),
+          },
+        },
+        {
+          recommended: false,
+          patch: {
+            operations: expect.arrayContaining([
+              expect.objectContaining({
+                op: "set_exact_artist_identity_exclusions",
+                directive: {
+                  bindings: [expect.objectContaining({
+                    catalogArtistId: "998877",
+                    storefront: "us",
+                  })],
+                },
+              }),
+            ]),
+          },
+        },
+      ],
+    });
+    expect(base.semanticHash).toBe(originalSemanticHash);
+
+    const selected = compileGuidanceSelectionV3(decision, {
+      optionIds: [decision.options[1]!.id],
+    });
+    const revised = applyPlaylistContractPatchV1(
+      base,
+      guidanceContractPatchV1({
+        decision,
+        questionSetHash: "a".repeat(64),
+        accepted: {
+          answerHash: selected.answerHash,
+          executableOperations: selected.operations,
+        },
+      })!,
+    );
+    expect(revised.executionDirectives?.exactArtistIdentityExclusions)
+      .toMatchObject({
+        bindings: [{
+          catalogArtistId: "1126808565",
+          displayName: "Bad Bunny",
+          storefront: "us",
+        }],
+      });
   });
 });

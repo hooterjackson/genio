@@ -1,7 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { ResearchOrchestrator, processBriefInterpretationJob, type ResearchRepository } from "./research.ts";
-import { processMatchingJob, type MatchingRepository } from "./matching-service.ts";
+import {
+  ResearchOrchestrator,
+  ResearchProviderBlockedError,
+  processBriefInterpretationJob,
+  type ResearchRepository,
+} from "./research.ts";
+import {
+  CatalogProviderBlockedError,
+  processMatchingJob,
+  type MatchingRepository,
+} from "./matching-service.ts";
 import { processPublicationJob, PublicationPausedError, type PublicationRepository } from "./publisher.ts";
 import { processNotificationJob, type NotificationRepository } from "./notifications.ts";
 import {
@@ -38,6 +47,8 @@ import type { PipelineVersion } from "../shared/types.ts";
 import {
   createPipelineV3RetrievalExecutionPort,
   PipelineV3DependencyUnavailableError,
+  PipelineV3OptimizerComputeBudgetError,
+  type PipelineV3WriteFence,
   type PipelineV3RetrievalExecutionPort,
 } from "./pipeline-v3-worker-execution.ts";
 import {
@@ -56,6 +67,14 @@ import {
   type WorkerQueueClass,
 } from "./job-queue-class.ts";
 import { runtimeReleaseContract } from "./runtime-release.ts";
+import {
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+  releaseDatabaseReadinessReady,
+  releaseExecutionConfigured,
+  runtimeReleaseDeploymentPhase,
+} from "./release-deployment-phase.ts";
+import { buildInformation } from "./build-info.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
 import {
   DEPENDENCY_DURABLE_RETRY_DELAYS_MS_V1,
@@ -66,6 +85,10 @@ import {
   assertPlaylistContractIntegrityV1,
   type PlaylistContractRevisionV1,
 } from "./playlist-contract-v1.ts";
+import {
+  CanonicalExecutionIntegrityError,
+  canonicalExecutionIntegrityError,
+} from "./canonical-execution-integrity.ts";
 
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_RENEW_MS = 60_000;
@@ -75,6 +98,61 @@ const DEFAULT_CONTROL_INTERVAL_MS = 5_000;
 const PIPELINE_OBSERVABILITY_MAX_CATCHUP_HOURS = 24;
 const WORKER_CONFIGURATION_ENV_KEYS = [
   "NODE_ENV",
+  "RELEASE_ENVIRONMENT",
+  "RELEASE_DEPLOYMENT_PHASE",
+  "RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION",
+  "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
+  "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
+  "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+  "RELEASE_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED",
+  "RELEASE_EXECUTION_ENABLED",
+  "RELEASE_SECRET_VERSIONS_HASH",
+  "RELEASE_VERIFIED_CANDIDATE_EVIDENCE_HASH",
+  "RELEASE_BRIDGE_CONVERGENCE_EVIDENCE_HASH",
+  "RELEASE_EXPAND_CONVERGENCE_EVIDENCE_HASH",
+  "RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH",
+  "RELEASE_PUBLIC_ROLLOUT_STAGE",
+  "RELEASE_PUBLIC_ROLLOUT_OPERATION",
+  "RELEASE_PUBLIC_ROLLOUT_INTENT_GROUP",
+  "RELEASE_PUBLIC_ROLLOUT_FROM_PERCENT",
+  "RELEASE_PUBLIC_ROLLOUT_TO_PERCENT",
+  "RELEASE_PREVIOUS_PUBLIC_ROLLOUT_EVIDENCE_HASH",
+  "QA_STAGING_CONTROL_HASH",
+  "RESULT_REUSE_DAYS",
+  "RETENTION_DAYS",
+  "APPLE_SHARE_URL_TIMEOUT_SECONDS",
+  "APPLE_STOREFRONT",
+  "APP_MONTHLY_COST_LIMIT_USD",
+  "AUTO_RUN_COST_LIMIT_USD",
+  "COST_TIMEZONE",
+  "OPENAI_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_OUTPUT_USD_PER_MILLION",
+  "OPENAI_TERRA_INPUT_USD_PER_MILLION",
+  "OPENAI_TERRA_OUTPUT_USD_PER_MILLION",
+  "OPENAI_OUTPUT_USD_PER_MILLION",
+  "OPENAI_WEB_SEARCH_USD",
+  "OPENAI_MAX_BRIEF_RESERVATION_USD",
+  "OPENAI_MAX_RESPONSE_RESERVATION_USD",
+  "OPENAI_MIN_BRIEF_RESERVATION_USD",
+  "OPENAI_MIN_RESPONSE_RESERVATION_USD",
+  "OPENAI_RESUME_CONTEXT_FALLBACK_TOKENS",
+  "OPENAI_BRIEF_MODEL",
+  "OPENAI_FAST_MODEL",
+  "OPENAI_DEEP_MODEL",
+  "OPENAI_CURATED_LUNA_SNAPSHOT",
+  "OPENAI_CURATED_TERRA_SNAPSHOT",
+  "OPENAI_TIMEOUT_MS",
+  "GUIDANCE_SCOUT_TIMEOUT_MS",
+  "APPLE_WRITE_TOKEN_CAPACITY",
+  "APPLE_WRITE_TOKEN_REFILL_PER_SECOND",
+  "APPLE_WRITE_LOCK_WAIT_MS",
+  "ENABLE_DISCOGS_ADAPTER",
+  "MUSICBRAINZ_CONTACT",
+  "APPLE_KEY_ID",
+  "APPLE_MEDIA_ID",
+  "APPLE_TEAM_ID",
+  "APPLE_TOKEN_ENCRYPTION_KEY_ID",
   "PIPELINE_V2_OWNER_CANARY",
   "PIPELINE_V2_CURATED_PERCENT",
   "PIPELINE_V2_SIMILARITY_PERCENT",
@@ -166,8 +244,11 @@ export interface DurableJob {
   minimumWorkerProtocol: number;
   /** Present on schema-14 jobs; optional while schema-13 bridge workers drain. */
   queryPlanRevisionId?: string | null;
+  requiredExecutorCapabilityHash?: string | null;
+  requiredExecutorCapabilityVector?: Record<string, unknown> | null;
   stageKey?: string;
   leaseEpoch?: number;
+  leaseExpiresAt?: Date | null;
 }
 
 export interface WorkerQueueRepository {
@@ -196,6 +277,22 @@ export interface WorkerQueueRepository {
   }): Promise<void>;
   getSetting(key: string): Promise<string | null>;
   getRunControlState(runId: string): Promise<{ status: string; phase: string } | null>;
+  quarantineCanonicalExecution?(input: {
+    runId: string;
+    jobId: string;
+    workerId: string;
+    leaseGeneration: number;
+    reasonCode: string;
+  }): Promise<boolean>;
+  markPipelineV2ProviderDependencyDecision?(input: {
+    runId: string;
+    dependencyKey: "openai_research" | "apple_catalog";
+    expectedGeneration: string;
+    priorFailureCount: number;
+    jobId: string;
+    workerId: string;
+    leaseEpoch: number;
+  }): Promise<boolean>;
   runRetentionSweep(limit?: number): Promise<number>;
   runPipelineV2OperationalAlertSweep(input?: {
     windowHours?: number;
@@ -204,15 +301,21 @@ export interface WorkerQueueRepository {
   beginPlaylistExecutionAttempt?(input: {
     runId: string;
     contractRevisionId: string;
+    jobId?: string | null;
+    workerId?: string | null;
+    queryPlanRevisionId?: string | null;
     stage: string;
     dependencyKey?: string | null;
     attemptNumber: number;
     leaseGeneration: number;
     executorRevision: string;
     executorIdentityHash: string;
+    executorCapabilityHash?: string | null;
+    executorCapabilityVector?: Record<string, unknown> | null;
     configurationHash: string;
     idempotencyKey: string;
     checkpointCursor?: string | null;
+    leaseExpiresAt?: Date | null;
   }): Promise<{ id: string; created: boolean; activeComputeMs?: number }>;
   getPlaylistActiveComputeAllowanceMs?(input: {
     runId: string;
@@ -222,6 +325,8 @@ export interface WorkerQueueRepository {
     attemptId: string;
     runId: string;
     contractRevisionId: string;
+    jobId?: string | null;
+    workerId?: string | null;
     leaseGeneration: number;
     status: "blocked" | "complete" | "cancelled" | "failed";
     blockerKind?: string | null;
@@ -249,6 +354,7 @@ export interface WorkerQueueRepository {
     nextRetryAt?: Date | null;
     automaticRetryUntil?: Date | null;
     state?: Record<string, unknown>;
+    fence?: PipelineV3WriteFence;
   }): Promise<string>;
   getActivePlaylistRunBlocker?(input: {
     runId: string;
@@ -263,10 +369,38 @@ export interface WorkerQueueRepository {
     createdAt: Date;
     state: Record<string, unknown>;
   } | null>;
+  getExpiredPlaylistProviderBlocker?(input: {
+    runId: string;
+    contractRevisionId: string;
+    now: Date;
+  }): Promise<{
+    id: string;
+    dependencyKey: string;
+    retryCount: number;
+    nextRetryAt: Date | null;
+    automaticRetryUntil: Date;
+    createdAt: Date;
+    state: Record<string, unknown>;
+  } | null>;
+  markPlaylistDependencyDecision?(input: {
+    runId: string;
+    contractRevisionId: string;
+    jobId: string;
+    workerId: string;
+    leaseGeneration: number;
+    attemptId: string;
+    queryPlanRevisionId: string;
+    stageKey: string;
+    dependencyKey: string;
+    retryCount: number;
+    automaticRetryUntil: Date;
+    state: Record<string, unknown>;
+  }): Promise<string>;
   resolvePlaylistRunBlockers?(input: {
     runId: string;
     contractRevisionId: string;
-    blockerKind?: "provider" | "apple_authorization";
+    blockerKind?: "provider" | "apple_authorization" | "budget";
+    fence?: PipelineV3WriteFence;
   }): Promise<number>;
 }
 
@@ -281,6 +415,7 @@ export type WorkerRepository = WorkerQueueRepository
 export type JobHandler = (payload: Record<string, unknown>, signal: AbortSignal) => Promise<void>;
 
 export interface WorkerRunnerOptions {
+  environment?: NodeJS.ProcessEnv;
   workerId?: string;
   version?: string;
   concurrency?: number;
@@ -300,10 +435,8 @@ export interface WorkerRunnerOptions {
 export function workerExecutorRevision(
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
-  return environment.SOURCE_COMMIT_SHA
-    ?? environment.RAILWAY_GIT_COMMIT_SHA
-    ?? environment.APP_VERSION
-    ?? "development";
+  const build = buildInformation(environment);
+  return build.revision ?? build.version ?? "development";
 }
 
 const wait = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
@@ -339,6 +472,18 @@ function validRetryDate(value: unknown): Date | null {
 function deterministicRetryJitter(jobId: string, retryCount: number): number {
   const digest = sha256Hex(`${jobId}:${retryCount}`);
   return Number.parseInt(digest.slice(0, 8), 16) / 0xffff_ffff;
+}
+
+function providerFailureQuarantineReason(
+  error: PipelineV3DependencyUnavailableError,
+): string {
+  switch (error.failureClass) {
+    case "authorization": return "provider_authorization_failure";
+    case "quota": return "provider_quota_failure";
+    case "invalid_request": return "provider_invalid_request_failure";
+    case "configuration": return "provider_configuration_failure";
+    default: return "provider_permanent_failure";
+  }
 }
 
 export function defaultJobHandlers(
@@ -423,6 +568,7 @@ export function assertProductionWorkerSecrets(
 }
 
 export class WorkerRunner {
+  private readonly environment: NodeJS.ProcessEnv;
   readonly workerId: string;
   private readonly version: string;
   private readonly concurrency: number;
@@ -448,8 +594,9 @@ export class WorkerRunner {
   private startedAt = new Date().toISOString();
 
   constructor(private readonly repository: WorkerRepository, options: WorkerRunnerOptions = {}) {
-    this.workerId = options.workerId ?? `${process.env.RAILWAY_REPLICA_ID ?? "local"}-${randomUUID()}`;
-    this.version = options.version ?? workerExecutorRevision();
+    this.environment = options.environment ?? process.env;
+    this.workerId = options.workerId ?? `${this.environment.RAILWAY_REPLICA_ID ?? "local"}-${randomUUID()}`;
+    this.version = options.version ?? workerExecutorRevision(this.environment);
     this.concurrency = Math.min(Math.max(options.concurrency ?? 2, 1), 2);
     this.leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
     this.renewMs = options.renewMs ?? DEFAULT_RENEW_MS;
@@ -458,8 +605,9 @@ export class WorkerRunner {
     this.controlIntervalMs = options.controlIntervalMs ?? DEFAULT_CONTROL_INTERVAL_MS;
     this.pipelineCapability = options.pipelineCapability ?? WORKER_PIPELINE_CAPABILITY;
     this.schemaSupport = options.schemaSupport ?? DATABASE_SCHEMA_SUPPORT;
-    this.queueClass = options.queueClass ?? parseWorkerQueueClass(process.env.WORKER_QUEUE_CLASS);
+    this.queueClass = options.queueClass ?? parseWorkerQueueClass(this.environment.WORKER_QUEUE_CLASS);
     this.configurationHash = workerConfigurationHash({
+      environment: this.environment,
       queueClass: this.queueClass,
       concurrency: this.concurrency,
       leaseMs: this.leaseMs,
@@ -481,7 +629,12 @@ export class WorkerRunner {
   }
 
   async run(): Promise<void> {
-    assertProductionWorkerSecrets(process.env, this.queueClass);
+    if (!releaseExecutionConfigured(this.environment)) {
+      throw new Error(
+        "Workers cannot start during the fresh staging bootstrap phase",
+      );
+    }
+    assertProductionWorkerSecrets(this.environment, this.queueClass);
     await this.repository.ensureSchemaVersion(this.schemaSupport);
     await this.heartbeat();
     await this.enforceControls();
@@ -506,6 +659,7 @@ export class WorkerRunner {
           // cannot safely read. The 2.2.2 bridge accepts schemas 13..16 while
           // continuing to prefer the active schema 15 until migration.
           await this.repository.ensureSchemaVersion(this.schemaSupport);
+          await this.assertReleaseDatabaseReadiness();
           const job = await this.repository.leaseNextJob(
             this.workerId,
             this.leaseMs,
@@ -545,7 +699,41 @@ export class WorkerRunner {
     await Promise.allSettled([...this.active.values()].map((item) => item.promise));
   }
 
+  private async assertReleaseDatabaseReadiness(): Promise<void> {
+    // Keep the pre-release local development contract intact. Hosted phases
+    // always take the authoritative database path below.
+    if (runtimeReleaseDeploymentPhase(this.environment) === "unconfigured"
+      && releaseExecutionConfigured(this.environment)) {
+      return;
+    }
+    const [
+      observedDatabaseSchemaVersion,
+      observedDatabaseCapabilityVersion,
+      observedCanonicalExecutionHardeningVersion,
+    ] =
+      await Promise.all([
+        this.repository.getSchemaVersion(),
+        this.repository.getSetting(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING),
+        this.repository.getSetting(
+          CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+        ),
+      ]);
+    if (!releaseDatabaseReadinessReady({
+      environment: this.environment,
+      observedDatabaseSchemaVersion,
+      observedDatabaseCapabilityVersion,
+      observedCanonicalExecutionHardeningVersion,
+    })) {
+      throw new Error(
+        "Worker release database readiness check failed; refusing durable mutations",
+      );
+    }
+  }
+
   private async heartbeat(): Promise<void> {
+    // Heartbeats enqueue maintenance work, so they share the same
+    // authoritative release-phase fence as ordinary queue leasing.
+    await this.assertReleaseDatabaseReadiness();
     const observedSchemaVersion = await this.repository.getSchemaVersion();
     await this.repository.updateWorkerHeartbeat(this.workerId, {
       startedAt: this.startedAt,
@@ -560,6 +748,9 @@ export class WorkerRunner {
       protocolVersion: this.pipelineCapability.protocolVersion,
       protocolNumber: this.pipelineCapability.protocolNumber,
       pipelineVersions: [...this.pipelineCapability.pipelineVersions],
+      canonicalExecutorCapabilities: (
+        this.pipelineCapability.canonicalExecutorCapabilities ?? []
+      ).map(({ hash, vector }) => ({ hash, vector })),
       queueClass: this.queueClass,
       configurationHash: this.configurationHash,
       capacity: this.concurrency,
@@ -681,6 +872,8 @@ export class WorkerRunner {
         attemptId: contractAttempt.id,
         runId: job.runId,
         contractRevisionId: contractAttempt.contractDatabaseId,
+        jobId: job.id,
+        workerId: this.workerId,
         leaseGeneration: contractAttempt.leaseGeneration,
         status,
         blockerKind: blockerKind ?? null,
@@ -695,6 +888,24 @@ export class WorkerRunner {
         contractRevisionId: contractAttempt.contractDatabaseId,
         leaseGeneration: contractAttempt.leaseGeneration,
       });
+    };
+    const contractWriteFence = (): PipelineV3WriteFence => {
+      if (!contractAttempt || !job.runId || !job.queryPlanRevisionId) {
+        throw new CanonicalExecutionIntegrityError(
+          "worker_blocker_fence_incomplete",
+        );
+      }
+      return {
+        jobId: job.id,
+        workerId: this.workerId,
+        leaseEpoch: contractAttempt.leaseGeneration,
+        queryPlanRevisionId: job.queryPlanRevisionId,
+        stageKey: job.stageKey || "default",
+        contractAttemptId: contractAttempt.id,
+        contractRevisionDatabaseId: contractAttempt.contractDatabaseId,
+        contractRevisionId: contractAttempt.contractRevisionId,
+        contractSemanticHash: contractAttempt.contractSemanticHash,
+      };
     };
     const renewal = setInterval(() => {
       void this.repository.renewJobLease(job.id, this.workerId, this.leaseMs, job.leaseEpoch).then((renewed) => {
@@ -719,9 +930,28 @@ export class WorkerRunner {
       if (job.runId
         && this.repository.getActivePlaylistContractRevision
         && this.repository.beginPlaylistExecutionAttempt) {
+        if (job.requiredExecutorCapabilityHash) {
+          const advertised = (
+            this.pipelineCapability.canonicalExecutorCapabilities ?? []
+          ).find(({ hash, vector }) => (
+            hash === job.requiredExecutorCapabilityHash
+            && stableStringify(vector)
+              === stableStringify(job.requiredExecutorCapabilityVector)
+          ));
+          if (!advertised) {
+            throw new CanonicalExecutionIntegrityError(
+              "executor_capability_mismatch",
+            );
+          }
+        }
         const activeContract = await this.repository.getActivePlaylistContractRevision({
           runId: job.runId,
         });
+        if (job.requiredExecutorCapabilityHash && !activeContract) {
+          throw new CanonicalExecutionIntegrityError(
+            "active_contract_missing",
+          );
+        }
         const revisionId = activeContract?.contract?.revisionId;
         const semanticHash = activeContract?.contract?.semanticHash;
         if (activeContract
@@ -729,19 +959,38 @@ export class WorkerRunner {
           && typeof semanticHash === "string"
           && /^[a-f0-9]{64}$/u.test(semanticHash)) {
           const playlistContract = activeContract.contract as unknown as PlaylistContractRevisionV1;
-          assertPlaylistContractIntegrityV1(playlistContract);
+          try {
+            assertPlaylistContractIntegrityV1(playlistContract);
+          } catch (error) {
+            throw canonicalExecutionIntegrityError(
+              error,
+              "contract_json_invalid",
+            );
+          }
           const leaseGeneration = Number.isSafeInteger(job.leaseEpoch) ? Number(job.leaseEpoch) : 0;
+          const executorCapability = (
+            this.pipelineCapability.canonicalExecutorCapabilities ?? []
+          ).find(({ hash }) => hash === job.requiredExecutorCapabilityHash);
           const attempt = await this.repository.beginPlaylistExecutionAttempt({
             runId: job.runId,
             contractRevisionId: activeContract.id,
+            jobId: job.id,
+            workerId: this.workerId,
+            queryPlanRevisionId: job.queryPlanRevisionId ?? null,
             stage: job.stageKey || job.kind,
             dependencyKey: job.kind,
             attemptNumber: Math.max(1, job.attempts),
             leaseGeneration,
             executorRevision: this.version,
             executorIdentityHash: sha256Hex(this.workerId),
+            executorCapabilityHash: executorCapability?.hash ?? null,
+            executorCapabilityVector: executorCapability
+              ? executorCapability.vector as unknown as Record<string, unknown>
+              : null,
             configurationHash: this.configurationHash,
             idempotencyKey: `${job.id}:${leaseGeneration}:${activeContract.id}`,
+            checkpointCursor: job.stageKey || null,
+            leaseExpiresAt: job.leaseExpiresAt ?? null,
           });
           contractAttempt = {
             id: attempt.id,
@@ -762,6 +1011,125 @@ export class WorkerRunner {
                 contractRevisionId: activeContract.id,
               });
           }
+        }
+      }
+      const researchDecisionOnly =
+        job.payload.researchProviderDecisionOnly === true;
+      const catalogDecisionOnly = job.payload.providerDecisionOnly === true;
+      if (job.pipelineVersion === "catalog_first_v2"
+        && (researchDecisionOnly || catalogDecisionOnly)) {
+        if (!job.runId
+          || researchDecisionOnly === catalogDecisionOnly
+          || !this.repository.markPipelineV2ProviderDependencyDecision) {
+          throw new NonRetriableJobError(
+            "V2 provider decision wake is missing its transition authority",
+          );
+        }
+        const expectedGeneration = researchDecisionOnly
+          ? job.payload.researchProviderBlockerGeneration
+          : job.payload.providerBlockerGeneration;
+        const priorFailureCount = Number(researchDecisionOnly
+          ? job.payload.researchProviderBlockerFailureCount
+          : job.payload.providerBlockerFailureCount);
+        if (typeof expectedGeneration !== "string"
+          || !Number.isSafeInteger(priorFailureCount)
+          || priorFailureCount < 1) {
+          throw new NonRetriableJobError(
+            "V2 provider decision wake has invalid generation metadata",
+          );
+        }
+        const transitioned = await this.repository
+          .markPipelineV2ProviderDependencyDecision({
+            runId: job.runId,
+            dependencyKey: researchDecisionOnly
+              ? "openai_research"
+              : "apple_catalog",
+            expectedGeneration,
+            priorFailureCount,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseEpoch: Number(job.leaseEpoch ?? 0),
+          });
+        if (!await finishContractAttempt(
+          transitioned ? "blocked" : "cancelled",
+          transitioned
+            ? "dependency_decision"
+            : "stale_dependency_decision",
+        )) return;
+        await this.repository.completeJob(
+          job.id,
+          this.workerId,
+          job.leaseEpoch,
+        );
+        return;
+      }
+      if (contractAttempt
+        && job.runId
+        && job.queryPlanRevisionId
+        && this.repository.getExpiredPlaylistProviderBlocker
+        && this.repository.openPlaylistRunBlocker) {
+        const decisionAt = new Date();
+        const expired = await this.repository.getExpiredPlaylistProviderBlocker({
+          runId: job.runId,
+          contractRevisionId: contractAttempt.contractDatabaseId,
+          now: decisionAt,
+        });
+        if (expired) {
+          const runDecision = createAdaptiveRunDecisionV1({
+            contract: contractAttempt.contract,
+            reason: "dependency_retry_window_expired",
+            verifiedTrackCount: 0,
+            remainingStrategyCount: 0,
+            reachedAt: decisionAt,
+          });
+          const decisionState = {
+            ...expired.state,
+            ...runDecision,
+            stage: job.stageKey || job.kind,
+            reasonCode: typeof expired.state.reasonCode === "string"
+              ? expired.state.reasonCode
+              : "dependency_retry_window_expired",
+            firstFailureAt: typeof expired.state.firstFailureAt === "string"
+              ? expired.state.firstFailureAt
+              : expired.createdAt.toISOString(),
+            retryAfterUntil: typeof expired.state.retryAfterUntil === "string"
+              ? expired.state.retryAfterUntil
+              : null,
+            nextAction: "resume_revise_or_cancel",
+            automaticResume: false,
+          };
+          if (this.repository.markPlaylistDependencyDecision
+            && job.queryPlanRevisionId) {
+            await this.repository.markPlaylistDependencyDecision({
+              runId: job.runId,
+              contractRevisionId: contractAttempt.contractDatabaseId,
+              jobId: job.id,
+              workerId: this.workerId,
+              leaseGeneration: contractAttempt.leaseGeneration,
+              attemptId: contractAttempt.id,
+              queryPlanRevisionId: job.queryPlanRevisionId,
+              stageKey: job.stageKey || job.kind,
+              dependencyKey: expired.dependencyKey,
+              retryCount: expired.retryCount,
+              automaticRetryUntil: expired.automaticRetryUntil,
+              state: decisionState,
+            });
+          } else {
+            await this.repository.openPlaylistRunBlocker({
+              runId: job.runId,
+              contractRevisionId: contractAttempt.contractDatabaseId,
+              blockerKind: "provider",
+              dependencyKey: expired.dependencyKey,
+              retryCount: expired.retryCount,
+              nextRetryAt: null,
+              automaticRetryUntil: expired.automaticRetryUntil,
+              state: decisionState,
+              fence: contractWriteFence(),
+            });
+          }
+          if (!await finishContractAttempt("blocked", "dependency_decision")) return;
+          await this.repository.completeJob(job.id, this.workerId, job.leaseEpoch);
+          return;
         }
       }
       await handler({
@@ -810,17 +1178,31 @@ export class WorkerRunner {
         return;
       }
       if (!await finishContractAttempt("complete")) return;
-      if (contractAttempt && job.runId && this.repository.resolvePlaylistRunBlockers) {
+      // The generic blocker APIs are fenced by a V3 query-plan revision. V2
+      // provider lanes resolve their opaque generation inside the matching or
+      // research transaction and must not be sent through this V3-only fence.
+      if (contractAttempt
+        && job.runId
+        && job.queryPlanRevisionId
+        && this.repository.resolvePlaylistRunBlockers) {
         await Promise.all([
           this.repository.resolvePlaylistRunBlockers({
             runId: job.runId,
             contractRevisionId: contractAttempt.contractDatabaseId,
             blockerKind: "provider",
+            fence: contractWriteFence(),
           }),
           this.repository.resolvePlaylistRunBlockers({
             runId: job.runId,
             contractRevisionId: contractAttempt.contractDatabaseId,
             blockerKind: "apple_authorization",
+            fence: contractWriteFence(),
+          }),
+          this.repository.resolvePlaylistRunBlockers({
+            runId: job.runId,
+            contractRevisionId: contractAttempt.contractDatabaseId,
+            blockerKind: "budget",
+            fence: contractWriteFence(),
           }),
         ]);
       }
@@ -828,6 +1210,36 @@ export class WorkerRunner {
     } catch (error) {
       if (leaseLost) {
         await discardContractAttempt();
+        return;
+      }
+      if (error instanceof CatalogProviderBlockedError
+        || error instanceof ResearchProviderBlockedError) {
+        if (!await finishContractAttempt("blocked", "dependency_retry")) return;
+        await this.repository.completeJob(
+          job.id,
+          this.workerId,
+          job.leaseEpoch,
+        );
+        return;
+      }
+      if (error instanceof CanonicalExecutionIntegrityError) {
+        await finishContractAttempt("failed", "integrity");
+        if (job.runId && this.repository.quarantineCanonicalExecution) {
+          await this.repository.quarantineCanonicalExecution({
+            runId: job.runId,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseGeneration: Number(job.leaseEpoch ?? 0),
+            reasonCode: error.reasonCode,
+          });
+        }
+        await this.repository.failJob(
+          job.id,
+          this.workerId,
+          "Canonical execution was quarantined by an integrity fence.",
+          null,
+          job.leaseEpoch,
+        );
         return;
       }
       if (process.env.NODE_ENV === "test" && process.env.GENIO_SYSTEM_E2E === "1") {
@@ -850,6 +1262,7 @@ export class WorkerRunner {
         const reason = error instanceof PublicationPausedError ? error.message : "Deferred by owner control";
         if (contractAttempt
           && job.runId
+          && job.queryPlanRevisionId
           && error instanceof PublicationPausedError
           && this.repository.openPlaylistRunBlocker) {
           await this.repository.openPlaylistRunBlocker({
@@ -861,6 +1274,7 @@ export class WorkerRunner {
             nextRetryAt: null,
             automaticRetryUntil: null,
             state: { stage: job.stageKey || job.kind, nextAction: "authorize_apple" },
+            fence: contractWriteFence(),
           });
         }
         await finishContractAttempt(
@@ -876,9 +1290,108 @@ export class WorkerRunner {
         );
         return;
       }
+      if (error instanceof PipelineV3OptimizerComputeBudgetError) {
+        const retryAt = error.retriable && job.attempts < job.maxAttempts
+          ? new Date(Date.now() + 5 * 60_000)
+          : null;
+        if (contractAttempt
+          && job.runId
+          && job.queryPlanRevisionId
+          && this.repository.openPlaylistRunBlocker) {
+          await this.repository.openPlaylistRunBlocker({
+            runId: job.runId,
+            contractRevisionId: contractAttempt.contractDatabaseId,
+            blockerKind: "budget",
+            dependencyKey: "playlist_optimizer_compute",
+            retryCount: error.budgetPass,
+            nextRetryAt: retryAt,
+            automaticRetryUntil: null,
+            state: {
+              stage: job.stageKey || job.kind,
+              reasonCode: error.code,
+              technical: true,
+              providerCallPermitted: false,
+              budgetPass: error.budgetPass,
+              maximumBudgetPasses: 2,
+              nextBudgetPass: retryAt ? error.budgetPass + 1 : null,
+              nextAction: retryAt ? "wait_for_compute" : "contact_support",
+              automaticResume: retryAt !== null,
+            },
+            fence: contractWriteFence(),
+          });
+        }
+        if (retryAt) {
+          if (!await finishContractAttempt(
+            "blocked",
+            "optimizer_compute_retry",
+          )) return;
+          await this.repository.failJob(
+            job.id,
+            this.workerId,
+            "Playlist optimization needs one larger bounded compute pass.",
+            retryAt,
+            job.leaseEpoch,
+          );
+          return;
+        }
+        if (!await finishContractAttempt(
+          "failed",
+          "optimizer_compute_quarantine",
+        )) return;
+        if (contractAttempt
+          && job.runId
+          && this.repository.quarantineCanonicalExecution) {
+          await this.repository.quarantineCanonicalExecution({
+            runId: job.runId,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseGeneration: contractAttempt.leaseGeneration,
+            reasonCode: "optimizer_compute_budget_exhausted",
+          });
+        }
+        await this.repository.failJob(
+          job.id,
+          this.workerId,
+          "Playlist optimization exhausted its bounded technical compute budget.",
+          null,
+          job.leaseEpoch,
+        );
+        return;
+      }
+      if (error instanceof PipelineV3DependencyUnavailableError
+        && !error.retriable) {
+        // Authentication, quota, invalid-request, and configuration faults do
+        // not heal by replaying the immutable request. Quarantine immediately
+        // with a stable operator-facing reason instead of placing the run on
+        // the transient 24-hour dependency circuit.
+        if (!await finishContractAttempt(
+          "failed",
+          "provider_configuration_quarantine",
+        )) return;
+        if (contractAttempt
+          && job.runId
+          && this.repository.quarantineCanonicalExecution) {
+          await this.repository.quarantineCanonicalExecution({
+            runId: job.runId,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseGeneration: contractAttempt.leaseGeneration,
+            reasonCode: providerFailureQuarantineReason(error),
+          });
+        }
+        await this.repository.failJob(
+          job.id,
+          this.workerId,
+          "Research provider configuration requires operator attention.",
+          null,
+          job.leaseEpoch,
+        );
+        return;
+      }
       if (error instanceof PipelineV3DependencyUnavailableError
         && contractAttempt
         && job.runId
+        && job.queryPlanRevisionId
         && this.repository.openPlaylistRunBlocker) {
         const previous = this.repository.getActivePlaylistRunBlocker
           ? await this.repository.getActivePlaylistRunBlocker({
@@ -895,6 +1408,15 @@ export class WorkerRunner {
           ?? now;
         const circuitOpenedAt = validRetryDate(priorState.circuitOpenedAt)
           ?? firstFailureAt;
+        const priorRetryAfterUntil = validRetryDate(
+          priorState.retryAfterUntil,
+        );
+        const retryAfterUntil = error.retryAfterUntil
+          && (!priorRetryAfterUntil
+            || error.retryAfterUntil.getTime()
+              >= priorRetryAfterUntil.getTime())
+          ? error.retryAfterUntil
+          : priorRetryAfterUntil;
         const priorRetryCount = Number.isSafeInteger(previous?.retryCount)
           ? Math.max(0, Number(previous?.retryCount))
           : 0;
@@ -928,13 +1450,15 @@ export class WorkerRunner {
             activeContractSemanticHash: contractAttempt.contractSemanticHash,
             cancelled: false,
           },
-          failureClass: "transient",
+          failureClass: error.failureClass === "rate_limited"
+            ? "rate_limited"
+            : "transient",
           firstFailureAt,
           lastFailureAt: now,
           circuitOpenedAt,
           immediateAttemptsCompleted,
           durableAttemptsCompleted,
-          retryAfterUntil: error.retryAfterUntil,
+          retryAfterUntil,
           jitterUnit: deterministicRetryJitter(job.id, priorRetryCount),
           now,
         });
@@ -946,31 +1470,49 @@ export class WorkerRunner {
             remainingStrategyCount: 0,
             reachedAt: now,
           });
-          if (this.repository.resolvePlaylistRunBlockers) {
-            await this.repository.resolvePlaylistRunBlockers({
+          const decisionState = {
+            ...priorState,
+            ...runDecision,
+            stage: job.stageKey || job.kind,
+            reasonCode: error.reasonCode,
+            firstFailureAt: firstFailureAt.toISOString(),
+            circuitOpenedAt: circuitOpenedAt.toISOString(),
+            lastFailureAt: now.toISOString(),
+            retryAfterUntil: retryAfterUntil?.toISOString() ?? null,
+            failureClass: error.failureClass,
+            nextAction: decision.nextAction,
+            automaticResume: false,
+          };
+          if (this.repository.markPlaylistDependencyDecision
+            && job.queryPlanRevisionId) {
+            await this.repository.markPlaylistDependencyDecision({
+              runId: job.runId,
+              contractRevisionId: contractAttempt.contractDatabaseId,
+              jobId: job.id,
+              workerId: this.workerId,
+              leaseGeneration: contractAttempt.leaseGeneration,
+              attemptId: contractAttempt.id,
+              queryPlanRevisionId: job.queryPlanRevisionId,
+              stageKey: job.stageKey || job.kind,
+              dependencyKey: error.dependencyKey,
+              retryCount: priorRetryCount,
+              automaticRetryUntil: decision.automaticRetryUntil,
+              state: decisionState,
+            });
+          } else {
+            await this.repository.openPlaylistRunBlocker({
               runId: job.runId,
               contractRevisionId: contractAttempt.contractDatabaseId,
               blockerKind: "provider",
+              dependencyKey: error.dependencyKey,
+              retryCount: priorRetryCount,
+              nextRetryAt: null,
+              automaticRetryUntil: decision.automaticRetryUntil,
+              state: decisionState,
+              fence: contractWriteFence(),
             });
           }
-          await this.repository.openPlaylistRunBlocker({
-            runId: job.runId,
-            contractRevisionId: contractAttempt.contractDatabaseId,
-            blockerKind: "scope_decision",
-            dependencyKey: error.dependencyKey,
-            retryCount: priorRetryCount,
-            nextRetryAt: null,
-            automaticRetryUntil: decision.automaticRetryUntil,
-            state: {
-              ...runDecision,
-              stage: job.stageKey || job.kind,
-              reasonCode: error.reasonCode,
-              firstFailureAt: firstFailureAt.toISOString(),
-              lastFailureAt: now.toISOString(),
-              nextAction: decision.nextAction,
-            },
-          });
-          if (!await finishContractAttempt("blocked", "scope_decision")) return;
+          if (!await finishContractAttempt("blocked", "dependency_decision")) return;
           await this.repository.completeJob(job.id, this.workerId, job.leaseEpoch);
           return;
         }
@@ -995,6 +1537,8 @@ export class WorkerRunner {
               firstFailureAt: firstFailureAt.toISOString(),
               circuitOpenedAt: circuitOpenedAt.toISOString(),
               lastFailureAt: now.toISOString(),
+              retryAfterUntil: retryAfterUntil?.toISOString() ?? null,
+              failureClass: error.failureClass,
               retryLane: decision.retryLane,
               retryOrdinal: decision.retryOrdinal,
               immediateAttemptsCompleted,
@@ -1003,6 +1547,7 @@ export class WorkerRunner {
                 : durableAttemptsCompleted,
               nextAction: "wait_for_dependency",
             },
+            fence: contractWriteFence(),
           });
           if (!await finishContractAttempt("blocked", "dependency_retry")) return;
           await this.repository.failJob(
@@ -1022,30 +1567,69 @@ export class WorkerRunner {
         && error instanceof AppleApiError
         && !error.retriable;
       const retryAt = error instanceof NonRetriableJobError || providerRejectedAuthorization ? null : retryAtFor(job);
-      if (contractAttempt && job.runId && this.repository.openPlaylistRunBlocker) {
-        const blockerKind = error instanceof PublicationPausedError
-          ? "apple_authorization" as const
-          : retryAt
-            ? "provider" as const
-            : error instanceof NonRetriableJobError
-              ? "integrity" as const
-              : "scope_decision" as const;
-        await this.repository.openPlaylistRunBlocker({
-          runId: job.runId,
-          contractRevisionId: contractAttempt.contractDatabaseId,
-          blockerKind,
-          dependencyKey: job.kind,
-          retryCount: job.attempts,
-          nextRetryAt: retryAt,
-          automaticRetryUntil: retryAt
-            ? new Date(Date.now() + 24 * 60 * 60_000)
-            : new Date(),
-          state: {
-            stage: job.stageKey || job.kind,
-            attempt: job.attempts,
-            nextAction: retryAt ? "wait_for_dependency" : "review_contract",
-          },
-        });
+      if (contractAttempt && job.runId) {
+        if (providerRejectedAuthorization
+          && job.queryPlanRevisionId
+          && this.repository.openPlaylistRunBlocker) {
+          await this.repository.openPlaylistRunBlocker({
+            runId: job.runId,
+            contractRevisionId: contractAttempt.contractDatabaseId,
+            blockerKind: "apple_authorization",
+            dependencyKey: "apple_music",
+            retryCount: job.attempts,
+            nextRetryAt: null,
+            automaticRetryUntil: null,
+            state: {
+              stage: job.stageKey || job.kind,
+              attempt: job.attempts,
+              nextAction: "authorize_apple",
+            },
+            fence: contractWriteFence(),
+          });
+          await finishContractAttempt("blocked", "apple_authorization");
+          await this.repository.failJob(
+            job.id,
+            this.workerId,
+            message,
+            null,
+            job.leaseEpoch,
+          );
+          return;
+        }
+
+        // Only the typed dependency error enters the provider circuit above.
+        // Unexpected/programmer/system faults use bounded technical retries
+        // without claiming provider scarcity or asking to revise the user's
+        // musical contract. Exhaustion quarantines the exact leased run.
+        if (retryAt) {
+          await finishContractAttempt("failed", "technical_retry");
+          await this.repository.failJob(
+            job.id,
+            this.workerId,
+            message,
+            retryAt,
+            job.leaseEpoch,
+          );
+          return;
+        }
+        await finishContractAttempt("failed", "technical_quarantine");
+        if (this.repository.quarantineCanonicalExecution) {
+          await this.repository.quarantineCanonicalExecution({
+            runId: job.runId,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseGeneration: Number(job.leaseEpoch ?? 0),
+            reasonCode: "unexpected_system_failure",
+          });
+        }
+        await this.repository.failJob(
+          job.id,
+          this.workerId,
+          message,
+          null,
+          job.leaseEpoch,
+        );
+        return;
       }
       await finishContractAttempt(retryAt ? "blocked" : "failed", retryAt ? "dependency_retry" : null);
       await this.repository.failJob(
@@ -1066,6 +1650,11 @@ class NonRetriableJobError extends Error {
 }
 
 async function runExecutableWorker(): Promise<void> {
+  if (!releaseExecutionConfigured(process.env)) {
+    throw new Error(
+      "Workers cannot initialize during the fresh staging bootstrap phase",
+    );
+  }
   const repository = new Repository();
   const governedGraph = new PgPipelineV3GovernedGraphReadRepository(repository.pool);
   // Every V3 provider surface must share the same durable reservation and

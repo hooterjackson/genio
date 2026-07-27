@@ -268,6 +268,7 @@ export interface CuratedCatalogDiscoveryResult {
   totalQualifiedCount: number;
   totalAttemptedCount: number;
   stoppedBecause: CatalogDiscoveryStopReason;
+  retryAfterUntil?: string | null;
   progress: CatalogDiscoveryProgressSnapshot;
 }
 
@@ -302,6 +303,7 @@ interface PageResult {
   searchNext: Partial<Record<AppleCatalogSearchType, string>>;
   failedReason: string | null;
   failureClass: "transient" | "permanent" | "invalid_cursor" | null;
+  retryAfterUntil?: string | null;
 }
 
 const ROUND_ORDER: readonly CatalogDiscoveryRound[] = ["A", "B", "C", "D"];
@@ -867,6 +869,11 @@ async function fetchPage(
     return { item, songs: [], artists: page.items, albums: [], playlists: [], next: page.next, searchNext: {}, failedReason: null, failureClass: null };
   } catch (error) {
     const classified = classifyCatalogProviderFailure(error, signal);
+    const retryAfterUntil = error instanceof AppleApiError
+      && error.retryAfterUntil
+      && Number.isFinite(error.retryAfterUntil.getTime())
+      ? error.retryAfterUntil.toISOString()
+      : null;
     return {
       item,
       songs: [],
@@ -877,6 +884,7 @@ async function fetchPage(
       searchNext: {},
       failedReason: classified.reasonCode,
       failureClass: classified.failureClass,
+      retryAfterUntil,
     };
   }
 }
@@ -967,6 +975,10 @@ export async function discoverCuratedAppleCatalog(
     candidates.set(restored.song.id, restored);
   }
   let providerCallCount = request.resumeProgress?.providerCallCount ?? 0;
+  // Keep the wire value as a string. TypeScript cannot observe assignments to
+  // an outer Date made inside the async page-scheduler callback, which would
+  // otherwise incorrectly narrow the final value to `never`.
+  let retryAfterUntil: string | null = null;
   let checkpointSequence = request.resumeProgress?.sequence ?? 0;
   const roundsCompleted: CatalogDiscoveryRound[] = [...(request.resumeProgress?.roundsCompleted ?? [])];
   const restoredEligibleCount = [...candidates.values()].filter((candidate) => candidate.eligible).length;
@@ -1134,6 +1146,16 @@ export async function discoverCuratedAppleCatalog(
         const item = page.item;
         item.pagesAttempted += 1;
         if (page.failedReason) {
+          const pageRetryAfterUntil = page.retryAfterUntil
+            ? new Date(page.retryAfterUntil)
+            : null;
+          if (pageRetryAfterUntil
+            && Number.isFinite(pageRetryAfterUntil.getTime())
+            && (!retryAfterUntil
+              || pageRetryAfterUntil.getTime()
+                > new Date(retryAfterUntil).getTime())) {
+            retryAfterUntil = pageRetryAfterUntil.toISOString();
+          }
           item.status = page.failureClass === "invalid_cursor" ? "invalid_cursor" : "failed";
           item.lastReasonCode = page.failedReason;
           item.retryable = page.failureClass === "transient";
@@ -1447,6 +1469,7 @@ export async function discoverCuratedAppleCatalog(
     totalQualifiedCount,
     totalAttemptedCount,
     stoppedBecause,
+    retryAfterUntil,
     progress,
   };
 }

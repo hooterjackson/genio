@@ -3,15 +3,14 @@ import type {
   CanonicalPlaylistContractPredicateV1,
   CanonicalPlaylistQualityPolicy,
   CanonicalPlaylistQuotaRule,
+  PipelineV3ConceptDiscoveryHint,
   SelectionConstraint,
   SelectionConstraintAxis,
   SelectionPlan,
 } from "../shared/types.ts";
 import type {
-  RecordingVersionClass,
   ResearchArchetype,
   ResearchIntent,
-  SelectionContentPolicy,
   SelectionDiversityGoals,
   SelectionGeographyConstraint,
   SelectionOrderingPolicy,
@@ -33,6 +32,13 @@ import { sha256Hex, stableStringify } from "./security.ts";
 import {
   MUSIC_CONCEPT_POLICY_VERSION,
 } from "./music-concepts-v3.ts";
+import {
+  PIPELINE_V3_CONCEPT_DISCOVERY_HINT_PROVENANCE,
+  PIPELINE_V3_CONCEPT_DISCOVERY_HINT_USAGE,
+  PIPELINE_V3_MAX_CONCEPT_DISCOVERY_HINTS,
+  assertPipelineV3ConceptDiscoveryHints,
+  pipelineV3ConceptDiscoveryHintKey,
+} from "./pipeline-v3-concept-discovery-hint.ts";
 import {
   PIPELINE_V3_VERSION,
   SEMANTIC_PLAN_V3_1_VERSION,
@@ -198,6 +204,8 @@ const V3_MEMBERSHIP_AXES = new Set<MembershipAxisV3>([
   "mood",
   "activity",
   "artist",
+  "album",
+  "playlist",
   "track",
   "label",
   "venue",
@@ -298,20 +306,24 @@ function canonicalEngines(
 ): IntentEngineV3[] {
   const axes = new Set(predicates.map(({ axis }) => axis));
   const engines = new Set<IntentEngineV3>();
+  if (contract.executionDirectives?.fixedContainer) engines.add("fixed_container");
   if (axes.has("factual_relationship")) engines.add("factual_relationship");
-  if (contract.clauses.some((clause) => (
-    clause.scope === "track"
-    && clause.hardness === "hard"
-    && clause.axis === "album"
-  ))) engines.add("fixed_container");
   if (axes.has("artist") && axes.size === 1) engines.add("artist_catalogue");
   if ([...axes].some((axis) => ["mood", "activity", "theme"].includes(axis))) {
+    engines.add("mood_activity_theme");
+  }
+  // Contract 3 intentionally moves subjective mood/activity requirements out
+  // of the hard per-track predicate and into the playlist-level central
+  // suitability floor. They still require the mood/activity execution lane;
+  // deriving engines only from hard membership axes silently dropped that
+  // lane for requests such as "dark ambient for sleep".
+  if (contract.qualityPolicy.centralSuitabilityClauseIds.length > 0) {
     engines.add("mood_activity_theme");
   }
   if ([...axes].some((axis) => ["genre", "subgenre", "scene", "geography", "language"].includes(axis))) {
     engines.add("curated_genre_scene");
   }
-  if (contract.clauses.some((clause) => clause.axis === "similarity")) engines.add("similarity");
+  if (contract.executionDirectives?.similarity) engines.add("similarity");
   if (engines.size === 0) engines.add("curated_genre_scene");
   return [...engines];
 }
@@ -386,34 +398,34 @@ function canonicalOrderingPolicy(
     ? contract.clauses.find(({ id }) => id === objective.clauseId)
     : null;
   const goals = clause ? executionValues(clause) : [];
+  const sourceOrdered = [
+    ...goals,
+    clause?.source.text ?? "",
+  ].some((value) => (
+    /\b(?:source[_ -]?order|keep (?:the )?source order)\b/iu.test(value.trim())
+  ));
+  const resolvedMode: SelectionOrderingPolicy["mode"] = sourceOrdered
+    ? "source_order"
+    : mode;
   return {
-    mode,
+    mode: resolvedMode,
     goals,
     avoidAdjacentSameArtist: goals.some((value) => /avoid adjacent same artist/iu.test(value)),
     avoidAdjacentSameAlbum: goals.some((value) => /avoid adjacent same album/iu.test(value)),
   };
 }
 
-function canonicalRecordingPolicy(
-  contract: PlaylistContractRevisionV1,
-): SelectionPlanV3["recordingPolicy"] {
-  const clause = contract.clauses.find((value) => value.axis === "recording_version");
-  const v3Allowed = new Set<SelectionPlanV3["recordingPolicy"]["allowedVersions"][number]>([
+function canonicalRecordingPolicy(): SelectionPlanV3["recordingPolicy"] {
+  // Catalog/version clauses remain leaves of canonicalContractPolicy. This
+  // compatibility field is deliberately permissive so nested OR/NOT/EXCEPT
+  // leaves cannot be flattened into a second unconditional gate.
+  return {
+    allowedVersions: [
     "canonical", "clean", "explicit", "live", "remix", "radio_edit",
     "extended", "acoustic", "instrumental",
-  ]);
-  const allowed = (clause?.values ?? []).flatMap((value) => {
-    const [operation, version] = value.split(":");
-    return operation === "allow" && v3Allowed.has(
-      version as SelectionPlanV3["recordingPolicy"]["allowedVersions"][number],
-    )
-      ? [version as SelectionPlanV3["recordingPolicy"]["allowedVersions"][number]]
-      : [];
-  });
-  return {
-    allowedVersions: allowed.length > 0 ? allowed : ["canonical"],
-    preferCanonicalStudio: (clause?.values ?? []).includes("prefer:canonical"),
-    excludeKaraokeTributeAndCovers: !(clause?.values ?? []).includes("allow:karaoke-and-tributes"),
+    ],
+    preferCanonicalStudio: false,
+    excludeKaraokeTributeAndCovers: false,
   };
 }
 
@@ -482,6 +494,60 @@ function canonicalRankingObjectives(
   return objectives;
 }
 
+/**
+ * Preserve only non-resolved concepts whose clause has no executable role.
+ * These values may widen discovery, but never enter a predicate, evidence
+ * obligation, ranking objective, quota, quality floor, or sequencing rule.
+ */
+function canonicalConceptDiscoveryHints(
+  contract: PlaylistContractRevisionV1,
+): PipelineV3ConceptDiscoveryHint[] {
+  const executableClauseIds = new Set(
+    predicateClauseIds(contract.trackPredicate, new Set()),
+  );
+  contract.playlistConstraints.forEach(({ clauseId, predicate }) => {
+    executableClauseIds.add(clauseId);
+    predicateClauseIds(predicate, new Set()).forEach((id) => executableClauseIds.add(id));
+  });
+  contract.sequencingObjectives.forEach(({ clauseId }) => executableClauseIds.add(clauseId));
+  contract.qualityPolicy.centralSuitabilityClauseIds.forEach((id) => (
+    executableClauseIds.add(id)
+  ));
+  for (const clause of contract.clauses) {
+    if (clause.kind === "ranking_preference" || clause.kind === "suitability") {
+      executableClauseIds.add(clause.id);
+    }
+  }
+
+  const byKey = new Map<string, PipelineV3ConceptDiscoveryHint>();
+  for (const clause of contract.clauses) {
+    if (executableClauseIds.has(clause.id)) continue;
+    for (const concept of clause.concepts) {
+      if (concept.status !== "discovery_only" && concept.status !== "unresolved") continue;
+      const hint: PipelineV3ConceptDiscoveryHint = {
+        clauseId: clause.id,
+        axis: clause.axis,
+        originalText: concept.originalText,
+        normalizedText: concept.normalizedText,
+        status: concept.status,
+        ontologyVersion: concept.ontologyVersion,
+        unresolvedTermId: concept.unresolvedTermId,
+        provenance: PIPELINE_V3_CONCEPT_DISCOVERY_HINT_PROVENANCE,
+        untrusted: true,
+        usage: PIPELINE_V3_CONCEPT_DISCOVERY_HINT_USAGE,
+      };
+      const key = pipelineV3ConceptDiscoveryHintKey(hint);
+      if (!byKey.has(key)) byKey.set(key, hint);
+    }
+  }
+  const hints = [...byKey.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .slice(0, PIPELINE_V3_MAX_CONCEPT_DISCOVERY_HINTS)
+    .map(([, hint]) => hint);
+  assertPipelineV3ConceptDiscoveryHints(hints, executableClauseIds);
+  return hints;
+}
+
 function canonicalSelectionPlanV3(input: {
   contract: PlaylistContractRevisionV1;
   policy: CanonicalPlaylistContractExecutionPolicyV1;
@@ -490,7 +556,7 @@ function canonicalSelectionPlanV3(input: {
 }): SelectionPlanV3 {
   const predicates = canonicalMembershipPredicates(input.contract);
   const semantic = canonicalSemanticClauses(predicates);
-  const semanticClauses = semantic.filter(({ role }) => role === "membership");
+  const semanticClauses = semantic;
   const catalogPolicies = semantic.filter(({ role }) => role === "catalog_policy");
   const engines = canonicalEngines(input.contract, predicates);
   const scopeKind = canonicalScopeKind(engines);
@@ -523,6 +589,7 @@ function canonicalSelectionPlanV3(input: {
     orderingPolicy: canonicalOrderingPolicy(input.contract),
     softGoalRelaxationOrder: [],
     sourceDiscoveryHints: [],
+    conceptDiscoveryHints: canonicalConceptDiscoveryHints(input.contract),
     playlistQuotaRules: input.quotaRules.map((rule) => ({ ...rule, values: [...rule.values] })),
     ...(input.qualityPolicy ? {
       playlistQualityPolicy: {
@@ -532,8 +599,11 @@ function canonicalSelectionPlanV3(input: {
       },
     } : {}),
     canonicalContractPolicy: structuredClone(input.policy),
+    ...(input.contract.executionDirectives ? {
+      executionDirectives: structuredClone(input.contract.executionDirectives),
+    } : {}),
     criticalAmbiguities: [],
-    recordingPolicy: canonicalRecordingPolicy(input.contract),
+    recordingPolicy: canonicalRecordingPolicy(),
     semanticPolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
     musicConceptPolicyVersion: MUSIC_CONCEPT_POLICY_VERSION,
     semanticClauses,
@@ -572,7 +642,11 @@ function canonicalCompatibilityPlanV2(
   const constraints = contract.clauses.flatMap((clause): SelectionConstraint[] => {
     const axis = selectionAxis(clause);
     const values = executionValues(clause);
-    if (!axis || values.length === 0 || clause.axis === "storefront_availability") return [];
+    if (!axis
+      || values.length === 0
+      || ["storefront_availability", "recording_version", "content"].includes(clause.axis)) {
+      return [];
+    }
     const hard = referenced.has(clause.id) && clause.hardness === "hard";
     if (!hard && clause.kind !== "ranking_preference") return [];
     return [{
@@ -609,41 +683,6 @@ function canonicalCompatibilityPlanV2(
   })) as ResearchArchetype[];
   const diversityGoals = canonicalDiversityGoals(contract);
   const orderingPolicy = canonicalOrderingPolicy(contract);
-  const recordingClause = contract.clauses.find(({ axis }) => axis === "recording_version");
-  const allRecordingVersions = new Set<RecordingVersionClass>([
-    "canonical", "remaster", "radio_edit", "extended", "remix", "live",
-    "acoustic", "clean", "explicit", "instrumental", "karaoke", "cover",
-    "alternate", "unknown",
-  ]);
-  const allowedVersions = (recordingClause?.values ?? []).flatMap((value) => {
-    const [operation, version] = value.split(":");
-    return operation === "allow" && allRecordingVersions.has(version as RecordingVersionClass)
-      ? [version as RecordingVersionClass]
-      : [];
-  });
-  const preferredVersions = (recordingClause?.values ?? []).flatMap((value) => {
-    const [operation, version] = value.split(":");
-    return operation === "prefer" && allRecordingVersions.has(version as RecordingVersionClass)
-      ? [version as RecordingVersionClass]
-      : [];
-  });
-  const contentClause = contract.clauses.find(({ axis }) => axis === "content");
-  const contentText = (contentClause?.values ?? []).join(" ").toLocaleLowerCase("en-US");
-  const contentPolicy: SelectionContentPolicy = {
-    explicitContent: contentText.includes("explicit-content:clean_only")
-      ? "clean_only"
-      : contentText.includes("explicit-content:prefer_clean")
-        ? "prefer_clean"
-        : "allow",
-    instrumental: contentText.includes("instrumental:exclude")
-      ? "exclude"
-      : contentText.includes("instrumental:prefer")
-        ? "prefer"
-        : "allow",
-    languages: (contentClause?.values ?? []).flatMap((value) => (
-      value.startsWith("language:") ? [value.slice("language:".length)] : []
-    )),
-  };
   const geographyConstraints: SelectionGeographyConstraint[] = constraints
     .filter(({ axis }) => axis === "geography")
     .flatMap((constraint) => constraint.values.map((value) => ({
@@ -660,6 +699,13 @@ function canonicalCompatibilityPlanV2(
     policyVersion: "relevance_first_2026_07_r2",
     intents,
     scopeKind: canonicalScopeKind(engines),
+    ...(contract.executionDirectives?.fixedContainer ? {
+      fixedContainerIdentity: {
+        kind: contract.executionDirectives.fixedContainer.kind,
+        name: contract.executionDirectives.fixedContainer.name,
+        artistName: contract.executionDirectives.fixedContainer.artistName,
+      },
+    } : {}),
     archetypes,
     storefront: contract.storefront,
     requestedTrackCount: contract.requestedTrackCount,
@@ -670,19 +716,28 @@ function canonicalCompatibilityPlanV2(
     similarityDimensions: valuesFor("relationship"),
     labels: valuesFor("label"),
     venues: valuesFor("venue"),
-    referenceRecordings: valuesFor("track"),
+    referenceRecordings: contract.executionDirectives?.similarity
+      ? [...contract.executionDirectives.similarity.seedArtists]
+      : valuesFor("track"),
     softGoalRelaxationOrder: [],
     diversityGoals,
     evidencePolicy: contract.versions.evidencePolicy,
     versionPolicy: {
-      preferred: preferredVersions,
-      allowed: allowedVersions.length > 0 ? allowedVersions : ["canonical"],
-      excludeCompilations: !(recordingClause?.values ?? []).includes("allow:compilations"),
-      excludeKaraokeAndTributes:
-        !(recordingClause?.values ?? []).includes("allow:karaoke-and-tributes"),
+      preferred: [],
+      allowed: [
+        "canonical", "remaster", "radio_edit", "extended", "remix", "live",
+        "acoustic", "clean", "explicit", "instrumental", "karaoke", "cover",
+        "alternate", "unknown",
+      ],
+      excludeCompilations: false,
+      excludeKaraokeAndTributes: false,
     },
     orderingPolicy,
-    contentPolicy,
+    contentPolicy: {
+      explicitContent: "allow",
+      instrumental: "allow",
+      languages: [],
+    },
     legacyConstraintAxes: {
       genres: valuesFor("genre"),
       scenes: valuesFor("scene"),

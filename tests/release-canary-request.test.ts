@@ -5,16 +5,18 @@ import { authenticateReleaseCanary } from "../server/release-canary-request.ts";
 const secret = "release-canary-test-secret-with-at-least-32-bytes";
 const revision = "a".repeat(40);
 const issuedAt = "2026-07-23T12:00:00.000Z";
+const audience = "https://staging.9enio.example";
 
 function marker(operation: "brief" | "run" = "brief") {
   return signReleaseCanaryMetadata({
     version: "genio-release-canary/v1",
     canaryId: "rc-2.4.0-reggaeton",
     environment: "staging",
+    audience,
     operation,
     sourceRevision: revision,
     issuedAt,
-    cacheMode: "cold",
+    cacheMode: "reuse_disabled",
   }, secret);
 }
 
@@ -23,6 +25,7 @@ const environment = {
   RELEASE_ENVIRONMENT: "staging",
   SOURCE_COMMIT_SHA: revision,
   APP_VERSION: "2.4.0",
+  APP_ORIGIN: audience,
 };
 
 describe("authenticated release canary requests", () => {
@@ -40,6 +43,7 @@ describe("authenticated release canary requests", () => {
       canaryId: "rc-2.4.0-reggaeton",
       operation: "brief",
       sourceRevision: revision,
+      audience,
     });
   });
 
@@ -68,6 +72,12 @@ describe("authenticated release canary requests", () => {
       { ...environment, SOURCE_COMMIT_SHA: "b".repeat(40) },
       "2026-07-23T12:03:00.000Z",
     )).toThrowError(expect.objectContaining({ code: "invalid_release_canary" }));
+    expect(() => authenticateReleaseCanary(
+      marker(),
+      "brief",
+      { ...environment, APP_ORIGIN: "https://other.example" },
+      "2026-07-23T12:03:00.000Z",
+    )).toThrowError(expect.objectContaining({ code: "invalid_release_canary" }));
   });
 
   test("fails closed when a marker is supplied to an unconfigured runtime", () => {
@@ -76,6 +86,7 @@ describe("authenticated release canary requests", () => {
     expect(() => authenticateReleaseCanary(marker(), "brief", {
       RELEASE_CANARY_HMAC_SECRET: secret,
       SOURCE_COMMIT_SHA: revision,
+      APP_ORIGIN: audience,
     })).toThrowError(expect.objectContaining({ code: "release_canary_unavailable" }));
   });
 });

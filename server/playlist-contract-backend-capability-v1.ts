@@ -24,9 +24,11 @@ import {
   type ContractCapabilityRequirements,
 } from "./never-dead-end-policy.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
+import type { CanonicalExecutorCapabilityVectorV1 } from "../shared/types.ts";
+import { PLAYLIST_OPTIMIZER_POLICY_VERSION } from "./playlist-optimizer-v1.ts";
 
 export const PLAYLIST_CONTRACT_BACKEND_CAPABILITY_VERSION =
-  "playlist_contract_backend_capability_v2" as const;
+  "playlist_contract_backend_capability_v6" as const;
 
 function predicateOperators(
   predicate: PlaylistPredicateV1,
@@ -59,6 +61,89 @@ function predicateClauseIds(
   } else {
     predicate.children.forEach((value) => predicateClauseIds(value, output));
   }
+  return output;
+}
+
+/**
+ * Collect leaves whose raw positive assertion must be proven absent for the
+ * complete predicate to pass. Clause-level exclusions invert the raw
+ * assessment once; NOT and EXCEPT invert the Boolean branch again. Keeping
+ * both pieces of polarity prevents a backend from claiming generic NOT
+ * support when its evidence source is open-world.
+ */
+function negativePredicateRequirements(
+  predicate: PlaylistPredicateV1,
+  clauses: ReadonlyMap<string, PlaylistContractRevisionV1["clauses"][number]>,
+  exactIdentityExclusionClauseIds: ReadonlySet<string>,
+  output = new Set<string>(),
+  negated = false,
+): Set<string> {
+  if (predicate.op === "clause") {
+    const clause = clauses.get(predicate.clauseId);
+    if (!clause) return output;
+    const clauseExcludes = clause.kind === "exclusion"
+      || clause.operator === "exclude";
+    if (negated !== clauseExcludes) {
+      output.add([
+        clause.operator,
+        clause.kind,
+        clause.axis,
+        ...(exactIdentityExclusionClauseIds.has(clause.id)
+          ? ["exact_identity"]
+          : []),
+      ].join(":"));
+    }
+    return output;
+  }
+  if (predicate.op === "not") {
+    return negativePredicateRequirements(
+      predicate.child,
+      clauses,
+      exactIdentityExclusionClauseIds,
+      output,
+      !negated,
+    );
+  }
+  if (predicate.op === "except") {
+    negativePredicateRequirements(
+      predicate.base,
+      clauses,
+      exactIdentityExclusionClauseIds,
+      output,
+      negated,
+    );
+    predicate.exceptions.forEach((value) => (
+      negativePredicateRequirements(
+        value,
+        clauses,
+        exactIdentityExclusionClauseIds,
+        output,
+        !negated,
+      )
+    ));
+    return output;
+  }
+  if (predicate.op === "alternative") {
+    predicate.choices.forEach(({ predicate: value }) => (
+      negativePredicateRequirements(
+        value,
+        clauses,
+        exactIdentityExclusionClauseIds,
+        output,
+        negated,
+      )
+    ));
+    return output;
+  }
+  predicate.children.forEach((value) => (
+    negativePredicateRequirements(
+      value,
+      clauses,
+      exactIdentityExclusionClauseIds,
+      output,
+      negated,
+    )
+  ));
   return output;
 }
 
@@ -117,6 +202,19 @@ export function playlistContractCapabilityRequirementsV1(
   assertPlaylistContractIntegrityV1(contract);
   const operators = predicateOperators(contract.trackPredicate);
   const byId = new Map(contract.clauses.map((clause) => [clause.id, clause]));
+  const exactIdentityExclusionClauseIds = new Set(
+    [
+      ...(contract.executionDirectives?.similarity
+        ?.exactArtistExclusionClauseIds ?? []),
+      ...(contract.executionDirectives?.exactArtistIdentityExclusions
+        ?.bindings.map(({ clauseId }) => clauseId) ?? []),
+    ],
+  );
+  const negativeRequirements = negativePredicateRequirements(
+    contract.trackPredicate,
+    byId,
+    exactIdentityExclusionClauseIds,
+  );
   if (operators.has("any") && everyAnyIsSameAxisMembership(contract.trackPredicate, byId)) {
     operators.delete("any");
     operators.add("any_same_axis_membership");
@@ -124,6 +222,7 @@ export function playlistContractCapabilityRequirementsV1(
   const referencedClauseIds = predicateClauseIds(contract.trackPredicate);
   const quotaOperators = new Set<string>();
   const quotaClauseIds = new Set<string>();
+  const quotaPredicateLeafShapes = new Set<string>();
   for (const quota of contract.playlistConstraints) {
     predicateOperators(quota.predicate).forEach((value) => {
       operators.add(value);
@@ -132,7 +231,22 @@ export function playlistContractCapabilityRequirementsV1(
     predicateClauseIds(quota.predicate).forEach((value) => {
       referencedClauseIds.add(value);
       quotaClauseIds.add(value);
+      const clause = byId.get(value);
+      if (clause) {
+        quotaPredicateLeafShapes.add([
+          clause.operator,
+          clause.kind,
+          clause.scope,
+          clause.hardness,
+        ].join(":"));
+      }
     });
+    negativePredicateRequirements(
+      quota.predicate,
+      byId,
+      exactIdentityExclusionClauseIds,
+      negativeRequirements,
+    );
     referencedClauseIds.add(quota.clauseId);
   }
   contract.qualityPolicy.centralSuitabilityClauseIds.forEach((value) => (
@@ -165,14 +279,29 @@ export function playlistContractCapabilityRequirementsV1(
     locale: contract.locale,
     storefront: contract.storefront,
     predicateOperators: sorted(operators),
+    negativePredicateRequirements: sorted(negativeRequirements),
     evidenceGrades: sorted(evidenceGrades),
     requiresQuotas: contract.playlistConstraints.length > 0,
     quotaPredicateOperators: sorted(quotaOperators),
     quotaAxes: sorted(quotaAxes),
+    quotaPredicateLeafShapes: sorted(quotaPredicateLeafShapes),
     catalogPolicyAxes: sorted(catalogPolicyAxes),
     requiresSequencing: contract.sequencingObjectives.length > 0,
     sequencingDirections: sorted(contract.sequencingObjectives.map(({ direction }) => direction)),
     sequencingDimensions: sorted(contract.sequencingObjectives.map(({ dimension }) => dimension)),
+    executionFeatures: sorted([
+      ...(contract.executionDirectives?.fixedContainer
+        ? ["fixed_container_identity_v1"]
+        : []),
+      ...(contract.executionDirectives?.similarity
+        ? ["similarity_seed_v1"]
+        : []),
+      ...((contract.executionDirectives?.similarity?.excludedArtists.length
+        || contract.executionDirectives?.exactArtistIdentityExclusions
+          ?.bindings.length)
+        ? ["exact_artist_exclusion_v1"]
+        : []),
+    ]),
   };
 }
 
@@ -208,6 +337,19 @@ Readonly<BackendCapabilityDeclaration> = Object.freeze({
     "except",
     "alternative",
   ],
+  closedWorldNegativePredicates: [
+    // These leaves are evaluated from complete Apple catalog facts, so a
+    // non-match is selection-grade negative evidence.
+    "require:catalog_version:content",
+    "require:catalog_version:recording_version",
+    "exclude:catalog_version:content",
+    "exclude:catalog_version:recording_version",
+    "exclude:exclusion:content",
+    "exclude:exclusion:recording_version",
+    // A typed similarity or standalone catalog-identity directive proves this
+    // is an exact named-artist exclusion, not an open-ended semantic category.
+    "exclude:exclusion:artist:exact_identity",
+  ],
   evidenceGrades: [
     "authoritative_structured_metadata",
     "trusted_scoped_container",
@@ -217,7 +359,11 @@ Readonly<BackendCapabilityDeclaration> = Object.freeze({
     "model_derived_lead",
   ],
   supportsQuotas: true,
-  quotaPredicateOperators: ["clause", "all", "any", "not", "except", "alternative"],
+  // The current bridge projects one complete canonical leaf. More complex
+  // quota predicates remain valid contracts but fail capability negotiation
+  // before projection until a certified full-predicate adapter ships.
+  quotaPredicateOperators: ["clause"],
+  quotaPredicateLeafShapes: ["require:membership:track:hard"],
   quotaAxes: [
     "genre",
     "scene",
@@ -235,9 +381,68 @@ Readonly<BackendCapabilityDeclaration> = Object.freeze({
   supportsSequencing: true,
   sequencingDirections: ["ascending", "smooth", "contrast", "editorial"],
   sequencingDimensions: ["playlist_flow"],
+  executionFeatures: [
+    "fixed_container_identity_v1",
+    "similarity_seed_v1",
+    "exact_artist_exclusion_v1",
+  ],
   locales: "all",
   storefronts: "all",
 });
+
+export interface CanonicalExecutorCapabilityEnvelopeV1 {
+  readonly hash: string;
+  readonly vector: CanonicalExecutorCapabilityVectorV1;
+}
+
+/**
+ * Bind backend semantics to the query-plan decoder that will consume them.
+ * Schema 4 and schema 5 are intentionally distinct capabilities even when
+ * every other backend declaration is identical.
+ */
+export function canonicalExecutorCapabilityForSchemaV1(input: {
+  queryPlanSchemaVersion: number;
+  backend?: BackendCapabilityDeclaration;
+}): CanonicalExecutorCapabilityEnvelopeV1 {
+  if (!Number.isSafeInteger(input.queryPlanSchemaVersion)
+    || input.queryPlanSchemaVersion < 4) {
+    throw new Error("canonical_executor_query_plan_schema_invalid");
+  }
+  const backend = input.backend ?? CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY;
+  const vector: CanonicalExecutorCapabilityVectorV1 = {
+    version: "canonical_executor_capability_vector_v1",
+    queryPlanSchemaVersion: input.queryPlanSchemaVersion,
+    backendCapabilityVersion: PLAYLIST_CONTRACT_BACKEND_CAPABILITY_VERSION,
+    playlistOptimizerPolicyVersion: PLAYLIST_OPTIMIZER_POLICY_VERSION,
+    backend: backend.backend,
+    backendDeclaration: structuredClone(
+      backend as unknown as Record<string, unknown>,
+    ),
+  };
+  return Object.freeze({
+    hash: sha256Hex(stableStringify(vector)),
+    vector: Object.freeze(vector),
+  });
+}
+
+export function canonicalExecutorCapabilityEnvelopeIsValidV1(
+  value: unknown,
+): value is CanonicalExecutorCapabilityEnvelopeV1 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<CanonicalExecutorCapabilityEnvelopeV1>;
+  if (typeof row.hash !== "string" || !/^[a-f0-9]{64}$/u.test(row.hash)
+    || !row.vector || typeof row.vector !== "object"
+    || row.vector.version !== "canonical_executor_capability_vector_v1"
+    || !Number.isSafeInteger(row.vector.queryPlanSchemaVersion)
+    || row.vector.queryPlanSchemaVersion < 4
+    || typeof row.vector.backendCapabilityVersion !== "string"
+    || row.vector.playlistOptimizerPolicyVersion !== PLAYLIST_OPTIMIZER_POLICY_VERSION
+    || typeof row.vector.backend !== "string"
+    || !row.vector.backendDeclaration
+    || typeof row.vector.backendDeclaration !== "object"
+    || Array.isArray(row.vector.backendDeclaration)) return false;
+  return sha256Hex(stableStringify(row.vector)) === row.hash;
+}
 
 export interface PlaylistContractBackendNegotiationV1 {
   readonly backend: BackendCapabilityDeclaration | null;

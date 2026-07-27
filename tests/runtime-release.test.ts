@@ -1,9 +1,14 @@
 import { describe, expect, test } from "vitest";
-import { runtimeReleaseContract } from "../server/runtime-release.ts";
+import {
+  apiReleaseConfigurationHash,
+  releaseOwnerAllowlistVersion,
+  runtimeReleaseContract,
+} from "../server/runtime-release.ts";
 
 describe("public V3 runtime release contract", () => {
   test("reports explicit rollout and versioned protocol metadata without secrets", () => {
     const result = runtimeReleaseContract({
+      RELEASE_ENVIRONMENT: "staging",
       RELEASE_DEPLOYMENT_PHASE: "expand",
       RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
@@ -22,6 +27,8 @@ describe("public V3 runtime release contract", () => {
 
     expect(result).toMatchObject({
       pipelineVersion: "corpus_first_v3",
+      releaseEnvironment: "staging",
+      ownerAllowlistVersion: null,
       deploymentPhase: "expand",
       expectedDatabaseSchemaVersion: "18",
       canonicalActivationConfigured: false,
@@ -54,19 +61,56 @@ describe("public V3 runtime release contract", () => {
     expect(JSON.stringify(result)).not.toContain("sk-proj");
   });
 
-  test("reports canonical contract-3 and query-plan-4 activation", () => {
+  test("requires a versioned owner allowlist in release environments", () => {
+    expect(() => runtimeReleaseContract({
+      RELEASE_ENVIRONMENT: "production",
+      OWNER_EMAIL: "owner@example.com",
+    })).toThrow(/OWNER_ALLOWLIST_VERSION is required/u);
+    expect(releaseOwnerAllowlistVersion({
+      RELEASE_ENVIRONMENT: "staging",
+      OWNER_EMAIL: "owner@example.com",
+      OWNER_ALLOWLIST_VERSION: "owner-allowlist-v2",
+    })).toBe("owner-allowlist-v2");
+    expect(() => releaseOwnerAllowlistVersion({
+      RELEASE_ENVIRONMENT: "staging",
+      OWNER_EMAIL: "owner@example.com",
+      OWNER_ALLOWLIST_VERSION: "owner email",
+    })).toThrow(/safe non-secret release label/u);
+    const firstHash = apiReleaseConfigurationHash({
+      RELEASE_ENVIRONMENT: "production",
+      OWNER_EMAIL: "first-owner@example.com",
+      OWNER_ALLOWLIST_VERSION: "owner-allowlist-v2",
+    });
+    expect(apiReleaseConfigurationHash({
+      RELEASE_ENVIRONMENT: "production",
+      OWNER_EMAIL: "second-owner@example.com",
+      OWNER_ALLOWLIST_VERSION: "owner-allowlist-v2",
+    })).toBe(firstHash);
+    expect(JSON.stringify(runtimeReleaseContract({
+      RELEASE_ENVIRONMENT: "production",
+      OWNER_EMAIL: "first-owner@example.com",
+      OWNER_ALLOWLIST_VERSION: "owner-allowlist-v2",
+    }))).not.toContain("first-owner@example.com");
+  });
+
+  test("reports canonical contract-3 and query-plan-5 activation", () => {
     const result = runtimeReleaseContract({
+      RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
       RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+      RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+      RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXECUTION_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
     });
     expect(result).toMatchObject({
       deploymentPhase: "activate",
       expectedDatabaseSchemaVersion: "18",
       canonicalActivationConfigured: true,
-      queryPlanSchemaVersion: "4",
+      queryPlanSchemaVersion: "5",
       briefContractVersion: "3",
       guidanceContractOwnerCanaryEnabled: true,
       guidancePolicyVersion: "adaptive_guidance_v3",
@@ -76,16 +120,21 @@ describe("public V3 runtime release contract", () => {
 
   test("reports contract 3 when only a canonical owner or intent cohort is active", () => {
     const result = runtimeReleaseContract({
+      RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
       RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+      RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+      RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXECUTION_ENABLED: "true",
       GUIDANCE_CONTRACT_V2_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_ENABLED: "false",
       GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
     });
     expect(result).toMatchObject({
       canonicalActivationConfigured: true,
-      queryPlanSchemaVersion: "4",
+      queryPlanSchemaVersion: "5",
       briefContractVersion: "3",
       guidanceContractReggaetonCanaryEnabled: true,
       guidancePolicyVersion: "adaptive_guidance_v3",
@@ -99,6 +148,7 @@ describe("public V3 runtime release contract", () => {
       PIPELINE_V3_MODEL_CATALOG_VALIDATED_AT: "invalid",
     });
     expect(result.assignmentEnabled).toBe(false);
+    expect(result.releaseEnvironment).toBe("development");
     expect(result.deploymentPhase).toBe("unconfigured");
     expect(result.expectedDatabaseSchemaVersion).toBeNull();
     expect(result.canonicalActivationConfigured).toBe(false);
@@ -120,15 +170,27 @@ describe("public V3 runtime release contract", () => {
     expect(result.modelCatalogValidatedAt).toBe("2026-07-20T00:00:00.000Z");
   });
 
+  test("uses the execution model resolver and never reports a silent fallback", () => {
+    expect(runtimeReleaseContract({
+      OPENAI_BRIEF_MODEL: "brief-snapshot",
+    }).briefProviderModelId).toBe("brief-snapshot");
+    expect(() => runtimeReleaseContract({
+      OPENAI_BRIEF_MODEL: "sk-secret-looking-model",
+    })).toThrow(/invalid_openai_brief_model/u);
+  });
+
   test("keeps preserved canonical cohort settings inert during bridge and expand", () => {
     for (const deploymentPhase of ["bridge", "expand"] as const) {
       const result = runtimeReleaseContract({
         RELEASE_DEPLOYMENT_PHASE: deploymentPhase,
         RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+        RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+        RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+        RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
         GUIDANCE_CONTRACT_V3_ENABLED: "true",
         GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
         GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
-        PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "4",
+        PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
       });
       expect(result).toMatchObject({
         deploymentPhase,

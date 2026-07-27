@@ -35,6 +35,8 @@ import {
   catalogRecoveryDeadlineMs,
   matchResearchRun,
   musicScopePhraseMatches,
+  type CatalogProviderBlockerV2,
+  type CatalogProviderJobAuthorityV2,
   type MatchingRepository,
 } from "../server/matching-service.ts";
 import { RETRYABLE_CATALOG_MATCH_BASES } from "../server/catalog-match-recovery.ts";
@@ -42,6 +44,10 @@ import {
   CATALOG_DISCOVERY_PROGRESS_VERSION,
   type CatalogDiscoveryProvider,
 } from "../server/catalog-discovery-v2.ts";
+import {
+  AppleProviderControl,
+  createControlledCatalogDiscoveryProvider,
+} from "../server/apple-provider-control.ts";
 import { createFastRouteCheckpoint, researchExecutionPolicy } from "../server/research-policy.ts";
 import { catalogRecordingVersionClass } from "../server/pipeline-v2-policy.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
@@ -50,7 +56,8 @@ import {
   evaluatePipelineV2ManifestShadow,
   type ShadowManifestCandidate,
 } from "../server/pipeline-v2-shadow.ts";
-import { sha256Hex } from "../server/security.ts";
+import { buildPipelineOutcome, mergePipelineOutcomes } from "../server/pipeline-outcome-v2.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 
 const brief: PlaylistBrief = {
   title: "Matching policy test",
@@ -201,6 +208,12 @@ class MemoryMatchingRepository implements MatchingRepository {
   readonly automaticRefills: Array<{ runId: string; storefront: string; additionalCandidateGoal: number; currentGeneration: number }> = [];
   readonly automaticPublications: string[] = [];
   readonly pipelineOutcomes: PipelineOutcome[] = [];
+  readonly providerBlockers: Array<{
+    runId: string;
+    blocker: CatalogProviderBlockerV2;
+    outcome: PipelineOutcome;
+  }> = [];
+  readonly resolvedProviderBlockers: string[] = [];
   automaticRecoveryState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
   automaticRefillState: "queued" | "in_flight" | "not_needed" | "exhausted" = "not_needed";
 
@@ -255,7 +268,42 @@ class MemoryMatchingRepository implements MatchingRepository {
     return this.automaticRefillState;
   }
   async queueAutomaticPublication(runId: string) { this.automaticPublications.push(runId); }
-  async savePipelineOutcome(_runId: string, outcome: PipelineOutcome) { this.pipelineOutcomes.push(outcome); }
+  async savePipelineOutcome(_runId: string, outcome: PipelineOutcome) {
+    this.pipelineOutcomes.push(outcome);
+    return outcome;
+  }
+  async persistCatalogProviderBlocker(
+    runId: string,
+    blocker: CatalogProviderBlockerV2,
+    outcome: PipelineOutcome,
+  ) {
+    this.providerBlockers.push({
+      runId,
+      blocker: structuredClone(blocker),
+      outcome: structuredClone(outcome),
+    });
+    await this.savePipelineOutcome(runId, outcome);
+    await this.saveResearchCheckpoint(
+      runId,
+      "catalog_provider_blocker_v2",
+      blocker,
+    );
+    await this.updateRun(runId, {
+      status: "failed_system",
+      phase: "catalog_provider_blocked_retry_scheduled",
+      error: null,
+    });
+  }
+  async resolveCatalogProviderBlocker(
+    runId: string,
+    _outcome: PipelineOutcome,
+    _authority: CatalogProviderJobAuthorityV2,
+  ) {
+    void _outcome;
+    void _authority;
+    this.resolvedProviderBlockers.push(runId);
+    return true;
+  }
 }
 
 class V2MemoryMatchingRepository extends MemoryMatchingRepository {
@@ -375,6 +423,86 @@ class V2MemoryMatchingRepository extends MemoryMatchingRepository {
   }
 }
 
+class StaleOutcomeMatchingRepository extends MemoryMatchingRepository {
+  readonly deficitLedger: PipelineDeficitLedgerEntry[] = [];
+  partialPreparation: {
+    targetTrackCount: number;
+    verifiedTrackCount: number;
+    remainingStrategyCount?: number;
+    matchingAttemptKey?: string;
+    matchingSnapshotHash?: string;
+    pipelineOutcomeHash?: string;
+  } | null = null;
+
+  constructor(
+    candidates: Candidate[],
+    runBrief: PlaylistBrief,
+    staleOutcome: PipelineOutcome,
+  ) {
+    super(candidates, runBrief, new Map(), undefined, true);
+    this.pipelineOutcomes.push(staleOutcome);
+  }
+
+  override async getRun() {
+    return {
+      ...(await super.getRun()),
+      pipelineVersion: "catalog_first_v2" as const,
+      policyVersion: "relevance_first_2026_07" as const,
+      selectionPlan: null,
+    };
+  }
+
+  async getPipelineStageCounts() {
+    return {
+      discovered: this.candidates.length,
+      scope_qualified: 38,
+      claim_verified: 38,
+      version_compatible: 38,
+      catalog_resolved: 25,
+      playable: 25,
+      canonicalized: 25,
+      quota_eligible: 0,
+      sequenced: 0,
+      manifested: 0,
+      published: 0,
+    };
+  }
+
+  override async savePipelineOutcome(_runId: string, outcome: PipelineOutcome) {
+    const current = this.pipelineOutcomes[0];
+    const merged = current ? mergePipelineOutcomes(current, outcome) : outcome;
+    this.pipelineOutcomes.splice(0, this.pipelineOutcomes.length, merged);
+    return merged;
+  }
+
+  async savePipelineDeficitLedger(
+    _runId: string,
+    entries: readonly PipelineDeficitLedgerEntry[],
+    _options: Pick<SelectionPlan, "pipelineVersion" | "policyVersion"> & { mode: "append" | "replace" },
+  ) {
+    void _options;
+    this.deficitLedger.splice(0, this.deficitLedger.length, ...structuredClone(entries));
+  }
+
+  async preparePartialPublication(
+    runId: string,
+    input: NonNullable<Parameters<NonNullable<MatchingRepository["preparePartialPublication"]>>[1]>,
+  ) {
+    this.partialPreparation = structuredClone(input);
+    await this.saveResearchCheckpoint(runId, "partial_ready", {
+      ...input,
+      outcomeHash: sha256Hex(stableStringify(input)),
+      outcomeVersion: 1,
+      shortfall: input.targetTrackCount - input.verifiedTrackCount,
+    });
+    await this.updateRun(runId, {
+      status: "partial_ready",
+      phase: "partial_confirmation_required",
+      error: null,
+    });
+  }
+}
+
 function lastMatchingCheckpoint(repository: MemoryMatchingRepository): Record<string, unknown> | undefined {
   return [...repository.checkpoints].reverse().find((checkpoint): checkpoint is Record<string, unknown> => (
     typeof checkpoint === "object" && checkpoint !== null && "complete" in checkpoint
@@ -435,17 +563,33 @@ test("Pipeline V2 applies MusicBrainz identity before recording-family canonical
   const catalogSong = { ...song, isrc: undefined };
   vi.mocked(searchAppleCatalog).mockResolvedValue([catalogSong]);
   const repository = new V2MemoryMatchingRepository([row]);
-  const musicBrainzEnricher = vi.fn(async () => ({
-    recordingId: "11111111-1111-4111-8111-111111111111",
-    releaseGroupId: "22222222-2222-4222-8222-222222222222",
-    source: "musicbrainz" as const,
-  }));
+  const musicBrainzEnricher = vi.fn(async (...args: unknown[]) => {
+    void args;
+    return {
+      recordingId: "11111111-1111-4111-8111-111111111111",
+      releaseGroupId: "22222222-2222-4222-8222-222222222222",
+      source: "musicbrainz" as const,
+    };
+  });
+  const providerJobAuthority = {
+    jobId: "11111111-1111-4111-8111-111111111112",
+    workerId: "matching-worker",
+    leaseEpoch: 4,
+    providerDependencyRetry: false,
+    expectedGeneration: null,
+    priorFailureCount: 0,
+    claimToken: "22222222-2222-4222-8222-222222222223",
+  };
 
   await matchResearchRun(repository, "run-musicbrainz-family", "us", undefined, {
     musicBrainzEnricher,
+    providerJobAuthority,
   });
 
   expect(musicBrainzEnricher).toHaveBeenCalledOnce();
+  expect(musicBrainzEnricher.mock.calls[0]?.[5]).toEqual({
+    writeFence: providerJobAuthority,
+  });
   expect(repository.families).toHaveLength(1);
   expect(repository.families[0]).toMatchObject({
     familyKey: "mbid:11111111-1111-4111-8111-111111111111",
@@ -2581,11 +2725,55 @@ test("V2 catalog checkpoints keep transient failures retryable and recovery resu
     retryAttempt: 1,
     stoppedBecause: "provider_degraded",
   });
+  expect(repository.providerBlockers).toHaveLength(1);
+  expect(repository.providerBlockers[0]).toMatchObject({
+    runId: "run-v2-retry",
+    blocker: {
+      schemaVersion: 1,
+      kind: "provider",
+      dependencyKey: "apple_catalog",
+      reasonCode: "apple_provider_degraded",
+      storefront: "us",
+      failureCount: 1,
+      needsDecision: false,
+    },
+    outcome: {
+      status: "failed_system",
+      providerUnavailable: true,
+      frontierExhausted: false,
+      qualifiedTrackCount: 1,
+      selectedTrackCount: 0,
+      publishedTrackCount: 0,
+      reasonCodes: ["apple_provider_degraded"],
+    },
+  });
+  const firstBlocker = repository.providerBlockers[0]!.blocker;
+  expect(Date.parse(firstBlocker.nextRetryAt!))
+    .toBe(Date.parse(firstBlocker.openedAt) + 5 * 60_000);
+  expect(Date.parse(firstBlocker.automaticRetryUntil))
+    .toBe(Date.parse(firstBlocker.openedAt) + 24 * 60 * 60_000);
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "failed_system",
+    phase: "catalog_provider_blocked_retry_scheduled",
+    error: null,
+  });
+  expect(repository.updates).not.toContainEqual(expect.objectContaining({
+    status: "no_compatible_tracks",
+  }));
 
   degraded = false;
   await matchResearchRun(repository, "run-v2-retry", "us", undefined, {
     retryIncomplete: true,
     catalogDiscoveryProvider: provider,
+    providerJobAuthority: {
+      jobId: "provider-retry-job",
+      workerId: "provider-retry-worker",
+      leaseEpoch: 2,
+      providerDependencyRetry: true,
+      expectedGeneration: "provider-generation",
+      priorFailureCount: 1,
+      claimToken: "provider-claim",
+    },
   });
   const second = repository.checkpointWrites.filter((write) => write.phase === "catalog_discovery_v2").at(-1)?.checkpoint;
   expect(second).toMatchObject({
@@ -2601,6 +2789,73 @@ test("V2 catalog checkpoints keep transient failures retryable and recovery resu
     candidateId: "v2-retry",
     status: "accepted",
     song: expect.objectContaining({ id: "apple-1" }),
+  }));
+  expect(repository.resolvedProviderBlockers).toContain("run-v2-retry");
+});
+
+test("V2 persists a zero-safe-track circuit opening as a retryable system dependency", async () => {
+  const circuitCandidate = candidate("v2-circuit", "editorial");
+  circuitCandidate.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "genre",
+    scopeValue: "Test scene",
+    relationship: "represents the scene",
+    confidence: 0.95,
+    sourceUrl: "https://example.com/circuit",
+    sourceRecordId: "source-circuit",
+    researchContainerId: null,
+    citationAttestationId: "citation-circuit",
+    provenancePath: [{ kind: "provenance_root", id: "circuit-source" }],
+    note: "Circuit fixture.",
+  }];
+  const rawProvider: CatalogDiscoveryProvider = {
+    ...emptyCatalogDiscoveryProvider(),
+    async search() {
+      throw new AppleApiError("temporary Apple outage", 503, true);
+    },
+  };
+  const provider = createControlledCatalogDiscoveryProvider(
+    rawProvider,
+    new AppleProviderControl({
+      initialConcurrency: 1,
+      minimumConcurrency: 1,
+      maximumConcurrency: 1,
+      transientFailureThreshold: 2,
+      circuitCooldownMs: 1_000,
+    }),
+  );
+  const circuitBrief = sceneBrief(1);
+  const repository = new V2MemoryMatchingRepository(
+    [circuitCandidate],
+    circuitBrief,
+    new Map([["fast:route:fast_curated_v3", routeCheckpoint()]]),
+  );
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "Test scene",
+    brief: circuitBrief,
+    storefront: "us",
+  });
+
+  await matchResearchRun(repository, "run-v2-circuit", "us", undefined, {
+    fast: true,
+    catalogDiscoveryProvider: provider,
+  });
+
+  expect(repository.providerBlockers).toHaveLength(1);
+  expect(repository.providerBlockers[0]).toMatchObject({
+    blocker: {
+      reasonCode: "apple_provider_circuit_open",
+      dependencyKey: "apple_catalog",
+    },
+    outcome: {
+      status: "failed_system",
+      providerUnavailable: true,
+      frontierExhausted: false,
+    },
+  });
+  expect(repository.updates).not.toContainEqual(expect.objectContaining({
+    status: "no_compatible_tracks",
   }));
 });
 
@@ -3015,6 +3270,104 @@ test("One Command pauses with an immutable partial decision after bounded shortf
   expect(repository.automaticPublications).toEqual([]);
 });
 
+test("terminal shortfall reconciles a stale 38/25 outcome to the 49 accepted identities used by the UI", async () => {
+  const exactBrief = { ...curatedBrief, targetSize: { min: 50, max: 50 } };
+  const candidates = Array.from({ length: 49 }, (_, index) => {
+    const item = candidate(`candidate-${String(index + 1).padStart(2, "0")}`, "verified");
+    item.title = `Accepted Track ${String(index + 1).padStart(2, "0")}`;
+    item.isrc = `USAAA26${String(index + 1).padStart(5, "0")}`;
+    return item;
+  });
+  const staleOutcome = buildPipelineOutcome({
+    pipelineVersion: "catalog_first_v2",
+    policyVersion: "relevance_first_2026_07",
+    status: "partial_catalog_degraded",
+    targetTrackCount: 50,
+    discoveredTrackCount: 88,
+    qualifiedTrackCount: 38,
+    selectedTrackCount: 0,
+    publishedTrackCount: 0,
+    reasonCodes: ["catalog_provider_call_limit"],
+    stageCounts: {
+      discovered: 88,
+      scope_qualified: 38,
+      claim_verified: 38,
+      version_compatible: 38,
+      catalog_resolved: 25,
+      playable: 25,
+      canonicalized: 25,
+      quota_eligible: 0,
+      sequenced: 0,
+      manifested: 0,
+      published: 0,
+    },
+  });
+  const repository = new StaleOutcomeMatchingRepository(candidates, exactBrief, staleOutcome);
+  repository.matches.push(...candidates.map((item, index) => ({
+    candidateId: item.id,
+    status: "accepted" as const,
+    basis: "strict accepted fixture",
+    score: 1,
+    song: {
+      ...song,
+      id: `apple-${String(index + 1).padStart(2, "0")}`,
+      name: item.title,
+      isrc: item.isrc ?? undefined,
+    },
+    alternatives: [],
+  })));
+
+  await matchResearchRun(repository, "run-stale-outcome", "us");
+
+  const outcome = repository.pipelineOutcomes[0]!;
+  const outcomeHash = sha256Hex(stableStringify(outcome));
+  expect(outcome).toMatchObject({
+    qualifiedTrackCount: 49,
+    selectedTrackCount: 0,
+    publishedTrackCount: 0,
+    reasonCodes: expect.arrayContaining([
+      "catalog_provider_call_limit",
+      "catalog_exact_fill_shortfall_after_bounded_recovery",
+    ]),
+  });
+  for (const stage of ["catalog_resolved", "playable", "canonicalized"] as const) {
+    expect(outcome.deficits.find((entry) => entry.stage === stage)).toMatchObject({
+      actualCount: 49,
+      deficitCount: 1,
+    });
+    expect(repository.deficitLedger.find((entry) => entry.stage === stage)).toMatchObject({
+      actualCount: 49,
+      deficitCount: 1,
+      detail: {
+        matchingAttemptKey: "catalog_matching:us:0:0",
+        matchingSnapshotHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        pipelineOutcomeHash: outcomeHash,
+      },
+    });
+  }
+  expect(repository.partialPreparation).toMatchObject({
+    targetTrackCount: 50,
+    verifiedTrackCount: 49,
+    matchingAttemptKey: "catalog_matching:us:0:0",
+    matchingSnapshotHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    pipelineOutcomeHash: outcomeHash,
+  });
+  const matchingCheckpoint = repository.checkpointWrites
+    .filter(({ phase }) => phase === "catalog_matching_outcome")
+    .at(-1)?.checkpoint;
+  expect(matchingCheckpoint).toMatchObject({
+    safePrimaryCount: 49,
+    shortfall: 1,
+    matchingAttemptKey: repository.partialPreparation?.matchingAttemptKey,
+    matchingSnapshotHash: repository.partialPreparation?.matchingSnapshotHash,
+    pipelineOutcomeHash: outcomeHash,
+  });
+  expect(repository.updates.at(-1)).toMatchObject({
+    status: "partial_ready",
+    phase: "partial_confirmation_required",
+  });
+});
+
 test("One Command queues bounded Apple recovery before terminalizing a retryable shortfall", async () => {
   const exactBrief = { ...brief, targetSize: { min: 2, max: 2 } };
   const repository = new MemoryMatchingRepository([], exactBrief, new Map(), undefined, true);
@@ -3181,6 +3534,62 @@ test("fast matching converts a transient Apple failure into an explicit review o
     basis: expect.stringContaining("temporarily unavailable"),
   });
   expect(repository.matches[1]).toMatchObject({ candidateId: "completed", status: "accepted" });
+});
+
+test("factual V2 keeps verified candidates behind a provider blocker when every Apple lookup is transient", async () => {
+  vi.mocked(lookupAppleCatalogByIsrc).mockRejectedValue(
+    new AppleApiError("Apple overloaded", 503, true),
+  );
+  vi.mocked(searchAppleCatalog).mockRejectedValue(
+    new AppleApiError("Apple overloaded", 503, true),
+  );
+  const verified = candidate("factual-transient", "verified");
+  verified.scopeBindings = [{
+    bindingKind: "track_specific_source",
+    eligibility: "qualifying",
+    scopeAxis: "factual_relationship",
+    scopeValue: "performed on",
+    relationship: "Test Artist performed on this recording",
+    confidence: 0.99,
+    sourceUrl: "https://example.com/factual-transient",
+    sourceRecordId: "source-factual-transient",
+    researchContainerId: null,
+    citationAttestationId: "citation-factual-transient",
+    provenancePath: [{
+      kind: "provenance_root",
+      id: "factual-transient-source",
+    }],
+    note: "Exact track-specific session credit.",
+  }];
+  const repository = new V2MemoryMatchingRepository([verified], brief);
+  repository.selectionPlan = createSelectionPlanV2({
+    prompt: "all documented recordings Test Artist performed on",
+    brief,
+    storefront: "us",
+  });
+
+  await matchResearchRun(repository, "run-v2-factual-transient", "us");
+
+  expect(repository.providerBlockers).toHaveLength(1);
+  expect(repository.providerBlockers[0]).toMatchObject({
+    blocker: {
+      dependencyKey: "apple_catalog",
+      reasonCode: "apple_lookup_transient",
+      safeTrackCount: 0,
+    },
+    outcome: {
+      status: "failed_system",
+      providerUnavailable: true,
+      frontierExhausted: false,
+      selectedTrackCount: 0,
+      publishedTrackCount: 0,
+    },
+  });
+  expect(repository.providerBlockers[0]!.outcome.qualifiedTrackCount)
+    .toBeGreaterThan(0);
+  expect(repository.updates).not.toContainEqual(expect.objectContaining({
+    status: "no_compatible_tracks",
+  }));
 });
 
 test("fast matching records a genuine elapsed deadline for later recovery without calling Apple", async () => {

@@ -1,8 +1,11 @@
 import type { ManifestRevisionTrack } from "../shared/types.ts";
 import {
+  centralQualityCriterionObservationsForPolicyV3,
   validateCanonicalPublicationSetV3,
+  type EvidenceBindingReferenceV3,
   type PlaylistOptimizationSignalsV3,
   type QualifiedTrackV3,
+  type RetrievalUpstreamDependencyIdV3,
 } from "./pipeline-v3-retrieval.ts";
 import type { SelectionPlanV3 } from "./selection-plan-v3.ts";
 
@@ -34,6 +37,7 @@ export interface PersistedCanonicalQualificationV1 {
   revokedAt: string | Date | null;
   predicateResults: unknown;
   evidenceRecordIds: unknown;
+  evidenceBindings?: readonly EvidenceBindingReferenceV3[];
   qualityResult: unknown;
   catalogResult: unknown;
 }
@@ -64,6 +68,20 @@ function stringArray(value: unknown): string[] {
         typeof item === "string" && item.trim().length > 0
       )).map((item) => item.trim()))]
     : [];
+}
+
+function dependencyIdArray(value: unknown): RetrievalUpstreamDependencyIdV3[] {
+  const allowed = new Set<RetrievalUpstreamDependencyIdV3>([
+    "orchestration_local",
+    "apple_catalog",
+    "hosted_web",
+    "governed_evidence_graph",
+  ]);
+  return stringArray(value).filter(
+    (item): item is RetrievalUpstreamDependencyIdV3 => (
+      allowed.has(item as RetrievalUpstreamDependencyIdV3)
+    ),
+  );
 }
 
 function numberArray(value: unknown): number[] {
@@ -103,6 +121,7 @@ function optimizationSignals(value: unknown): PlaylistOptimizationSignalsV3 | un
 function reconstructTrack(
   manifestTrack: ManifestRevisionTrack,
   qualification: PersistedCanonicalQualificationV1,
+  qualityPolicy: SelectionPlanV3["playlistQualityPolicy"],
 ): QualifiedTrackV3 | null {
   if (qualification.decision !== "qualified"
     || qualification.revokedAt !== null
@@ -114,6 +133,7 @@ function reconstructTrack(
   const canonical = objectValue(predicate?.canonicalContract);
   const assessments = objectValue(canonical?.assessments);
   const quality = objectValue(qualification.qualityResult);
+  const provenance = objectValue(quality?.provenance);
   const evidence = objectValue(quality?.evidence);
   const catalogEnvelope = objectValue(qualification.catalogResult);
   const nestedCatalog = objectValue(catalogEnvelope?.catalog);
@@ -134,6 +154,17 @@ function reconstructTrack(
   const projectedSignals = optimizationSignals(
     quality?.playlistOptimizationSignals,
   );
+  const centralQualityCriterionObservations = qualityPolicy
+    ? centralQualityCriterionObservationsForPolicyV3({
+        observations: quality?.centralQualityCriterionObservations,
+        policy: qualityPolicy,
+        artist: qualification.artist,
+        title: qualification.title,
+        album: qualification.album,
+        appleSongId,
+        recordingFamilyKey,
+      })
+    : [];
   return {
     candidateId: manifestTrack.candidateId,
     title: qualification.title,
@@ -146,10 +177,27 @@ function reconstructTrack(
     catalogGenreNames: stringArray(catalog.genreNames),
     sourceObservationIds: [],
     evidenceBindingIds: evidenceRecordIds,
+    evidenceBindings: structuredClone(qualification.evidenceBindings ?? []),
+    discoveryDependencyIds: dependencyIdArray(provenance?.dependencyIds),
+    provenanceRoots: stringArray(provenance?.provenanceRoots),
+    ...([
+      "live",
+      "fresh_cache",
+      "governed_snapshot",
+      "orchestration_local",
+    ].includes(String(provenance?.cacheOrigin ?? "")) ? {
+      cacheOrigin: provenance!.cacheOrigin as QualifiedTrackV3["cacheOrigin"],
+      sourceFreshUntil: typeof provenance?.sourceFreshUntil === "string"
+        ? provenance.sourceFreshUntil
+        : null,
+    } : {}),
     canonicalClauseAssessments:
       structuredClone(assessments) as QualifiedTrackV3["canonicalClauseAssessments"],
     ...(projectedSignals ? {
       playlistOptimizationSignals: projectedSignals,
+    } : {}),
+    ...(qualityPolicy ? {
+      centralQualityCriterionObservations,
     } : {}),
     evidenceStrength: finiteNumber(
       quality?.evidenceStrength ?? evidence?.strength,
@@ -217,7 +265,11 @@ export function revalidateCanonicalManifestRevisionV1(input: {
       reasons.push("canonical_qualification_projection_missing");
       return [];
     }
-    const track = reconstructTrack(manifestTrack, qualification);
+    const track = reconstructTrack(
+      manifestTrack,
+      qualification,
+      input.plan.playlistQualityPolicy,
+    );
     if (!track) {
       reasons.push("canonical_qualification_projection_invalid");
       return [];

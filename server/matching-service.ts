@@ -96,6 +96,12 @@ import {
   type MusicBrainzIdentityEnrichment,
   type MusicBrainzEnrichmentRepository,
 } from "./musicbrainz-enrichment-v2.ts";
+import { sha256Hex, stableStringify } from "./security.ts";
+import type { PipelineStageCounts } from "./pipeline-v2-observability.ts";
+import {
+  DEPENDENCY_AUTOMATIC_RETRY_WINDOW_MS,
+  DEPENDENCY_RETRY_DELAYS_MS,
+} from "./never-dead-end-policy.ts";
 
 interface Candidate extends TrackCandidateInput {
   id: string;
@@ -131,12 +137,59 @@ interface MatchingOutcomeCheckpoint {
   artistShortfall: number;
   semanticGeographyMismatchCount?: number;
   refillSuppressedReason?: "deterministic_geography_evidence_semantics" | null;
+  matchingAttemptKey?: string;
+  matchingSnapshotHash?: string;
+  pipelineOutcomeHash?: string;
   status: "complete" | "shortfall";
   updatedAt: string;
 }
 
 type AutomaticCatalogRecoveryState = "queued" | "in_flight" | "not_needed" | "exhausted";
 type AutomaticCandidateRefillState = "queued" | "in_flight" | "not_needed" | "exhausted";
+
+export interface CatalogProviderBlockerV2 {
+  schemaVersion: 1;
+  kind: "provider";
+  dependencyKey: "apple_catalog";
+  reasonCode:
+    | "apple_provider_circuit_open"
+    | "apple_provider_degraded"
+    | "catalog_provider_call_limit"
+    | "catalog_discovery_timed_out"
+    | "apple_lookup_transient"
+    | "apple_lookup_timed_out";
+  storefront: string;
+  safeTrackCount: 0;
+  failureCount: number;
+  retryAfterUntil: string | null;
+  nextRetryAt: string | null;
+  automaticRetryUntil: string;
+  needsDecision: boolean;
+  openedAt: string;
+  updatedAt: string;
+}
+
+export interface CatalogProviderJobAuthorityV2 {
+  jobId: string;
+  workerId: string;
+  leaseEpoch: number;
+  providerDependencyRetry: boolean;
+  expectedGeneration: string | null;
+  priorFailureCount: number;
+  claimToken: string | null;
+}
+
+/**
+ * Internal worker control signal: the provider dependency transition already
+ * committed atomically and the current leased job must complete as blocked,
+ * without WorkerRunner's generic "successful handler" blocker cleanup.
+ */
+export class CatalogProviderBlockedError extends Error {
+  constructor() {
+    super("Apple catalog dependency is durably blocked");
+    this.name = "CatalogProviderBlockedError";
+  }
+}
 
 export interface MatchingRepository extends Partial<AppleCatalogCacheRepository>, MusicBrainzEnrichmentRepository {
   getRun(runId: string): Promise<{
@@ -151,18 +204,37 @@ export interface MatchingRepository extends Partial<AppleCatalogCacheRepository>
     queryPlan?: QueryPlanV3 | null;
     pipelinePolicySnapshot?: PipelinePolicySnapshot | null;
   }>;
-  updateRun(runId: string, patch: { status?: string; phase?: string; error?: string | null }): Promise<void>;
+  updateRun(
+    runId: string,
+    patch: { status?: string; phase?: string; error?: string | null },
+    fence?: CatalogProviderJobAuthorityV2,
+  ): Promise<void>;
   listCandidates(runId: string): Promise<Candidate[]>;
   listMatches(runId: string): Promise<ExistingMatch[]>;
-  saveMatch(runId: string, match: CatalogMatchResult): Promise<void>;
-  saveTimeoutMatches(runId: string, candidateIds: string[], basis: string): Promise<void>;
+  saveMatch(
+    runId: string,
+    match: CatalogMatchResult,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<void>;
+  saveTimeoutMatches(
+    runId: string,
+    candidateIds: string[],
+    basis: string,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<void>;
   getResearchCheckpoint(runId: string, phase: string): Promise<unknown | null>;
-  saveResearchCheckpoint(runId: string, phase: string, checkpoint: unknown): Promise<void>;
+  saveResearchCheckpoint(
+    runId: string,
+    phase: string,
+    checkpoint: unknown,
+    authority?: CatalogProviderJobAuthorityV2,
+  ): Promise<void>;
   queueAutomaticCatalogRecovery(
     runId: string,
     storefront: string,
     currentGeneration: number,
     currentRefillGeneration?: number,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<AutomaticCatalogRecoveryState>;
   queueAutomaticCandidateRefill(
     runId: string,
@@ -170,17 +242,56 @@ export interface MatchingRepository extends Partial<AppleCatalogCacheRepository>
     additionalCandidateGoal: number,
     currentRefillGeneration: number,
     diversity?: { desiredArtistCount: number; representedArtists: string[] },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<AutomaticCandidateRefillState>;
-  queueAutomaticPublication(runId: string): Promise<void>;
+  queueAutomaticPublication(
+    runId: string,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<void>;
   preparePartialPublication?(
     runId: string,
     input: {
       targetTrackCount: number;
       verifiedTrackCount: number;
       remainingStrategyCount?: number;
+      matchingAttemptKey?: string;
+      matchingSnapshotHash?: string;
+      pipelineOutcomeHash?: string;
     },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void>;
-  savePipelineOutcome?(runId: string, outcome: PipelineOutcome): Promise<void>;
+  savePipelineOutcome?(
+    runId: string,
+    outcome: PipelineOutcome,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<PipelineOutcome | void>;
+  /**
+   * Atomically persists the V2 provider blocker, its next scheduled matching
+   * retry, and the retryable system run state.
+   */
+  persistCatalogProviderBlocker?(
+    runId: string,
+    blocker: CatalogProviderBlockerV2,
+    outcome: PipelineOutcome,
+    authority: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<{ generation: string } | void>;
+  /**
+   * Atomically claim either an ordinary matching attempt with no active
+   * provider pause or the exact due retry generation carried by the job.
+   */
+  claimCatalogProviderRetry?(
+    runId: string,
+    authority: CatalogProviderJobAuthorityV2,
+  ): Promise<{ claimToken: string } | null>;
+  /**
+   * Resolve the exact retained Apple dependency generation together with its
+   * recovered outcome, safe run transition, and queued-retry cancellation.
+   */
+  resolveCatalogProviderBlocker?(
+    runId: string,
+    outcome: PipelineOutcome,
+    authority: CatalogProviderJobAuthorityV2,
+  ): Promise<boolean>;
   getPipelineStageCounts?(runId: string): Promise<import("./pipeline-v2-observability.ts").PipelineStageCounts>;
   upsertRecordingFamily?(
     runId: string,
@@ -188,28 +299,37 @@ export interface MatchingRepository extends Partial<AppleCatalogCacheRepository>
       RecordingFamily,
       "familyKey" | "canonicalArtist" | "canonicalTitle" | "versionClass" | "metadata" | "pipelineVersion" | "policyVersion"
     > & { id?: string },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<string>;
   attachCandidateToRecordingFamily?(
     runId: string,
     recordingFamilyId: string,
     candidateId: string,
     relationship?: string,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void>;
-  upsertAlternateCatalogIdentity?(runId: string, input: AlternateCatalogIdentity): Promise<string>;
+  upsertAlternateCatalogIdentity?(
+    runId: string,
+    input: AlternateCatalogIdentity,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<string>;
   appendCandidateStageEvents?(
     runId: string,
     events: readonly CandidateStageEvent[],
     versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void>;
   savePipelineDeficitLedger?(
     runId: string,
     entries: readonly PipelineDeficitLedgerEntry[],
     options: Pick<SelectionPlan, "pipelineVersion" | "policyVersion"> & { mode: "append" | "replace" },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void>;
   persistCatalogDiscoveredCandidates?(
     runId: string,
     candidates: readonly CatalogDiscoveredCandidateInput[],
     versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<CatalogDiscoveredCandidateResult[]>;
 }
 
@@ -227,6 +347,64 @@ function supportsAppleCatalogCache(
 
 const MATCHING_OUTCOME_CHECKPOINT = "catalog_matching_outcome";
 const V2_CATALOG_DISCOVERY_CHECKPOINT = "catalog_discovery_v2";
+export const V2_CATALOG_PROVIDER_BLOCKER_CHECKPOINT =
+  "catalog_provider_blocker_v2";
+
+function catalogProviderBlockerV2(input: {
+  stoppedBecause:
+    | "provider_circuit_open"
+    | "provider_degraded"
+    | "provider_call_limit"
+    | "timed_out"
+    | "lookup_transient"
+    | "lookup_timed_out";
+  storefront: string;
+  failureCount: number;
+  retryAfterUntil?: Date | null;
+  now?: Date;
+}): CatalogProviderBlockerV2 {
+  const now = input.now ?? new Date();
+  const failureCount = Math.max(1, Math.min(20, Math.floor(input.failureCount)));
+  const retryDelay = DEPENDENCY_RETRY_DELAYS_MS[Math.min(
+    failureCount - 1,
+    DEPENDENCY_RETRY_DELAYS_MS.length - 1,
+  )]!;
+  const automaticRetryUntil = new Date(
+    now.getTime() + DEPENDENCY_AUTOMATIC_RETRY_WINDOW_MS,
+  );
+  const retryAfterUntil = input.retryAfterUntil
+    && Number.isFinite(input.retryAfterUntil.getTime())
+    ? input.retryAfterUntil
+    : null;
+  return {
+    schemaVersion: 1,
+    kind: "provider",
+    dependencyKey: "apple_catalog",
+    reasonCode: {
+      provider_circuit_open: "apple_provider_circuit_open",
+      provider_degraded: "apple_provider_degraded",
+      provider_call_limit: "catalog_provider_call_limit",
+      timed_out: "catalog_discovery_timed_out",
+      lookup_transient: "apple_lookup_transient",
+      lookup_timed_out: "apple_lookup_timed_out",
+    }[input.stoppedBecause] as CatalogProviderBlockerV2["reasonCode"],
+    storefront: input.storefront,
+    safeTrackCount: 0,
+    failureCount,
+    retryAfterUntil: retryAfterUntil?.toISOString() ?? null,
+    nextRetryAt: new Date(Math.min(
+      Math.max(
+        now.getTime() + retryDelay,
+        retryAfterUntil?.getTime() ?? 0,
+      ),
+      automaticRetryUntil.getTime(),
+    )).toISOString(),
+    automaticRetryUntil: automaticRetryUntil.toISOString(),
+    needsDecision: false,
+    openedAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+  };
+}
 // catalog_matches.score is numeric(8,6), so 100 is not representable.
 const EXACT_CATALOG_MATCH_SCORE = 99.999999;
 // Trusted Apple editorial rows already carry the catalog identity we need.
@@ -394,6 +572,7 @@ async function persistCatalogResolution(
   match: CatalogMatchResult,
   storefront: string,
   musicBrainzIdentity: MusicBrainzIdentityEnrichment | null = null,
+  providerAuthority?: CatalogProviderJobAuthorityV2 | null,
 ): Promise<void> {
   const versions = run.pipelineVersion && run.policyVersion
     ? { pipelineVersion: run.pipelineVersion, policyVersion: run.policyVersion }
@@ -457,7 +636,7 @@ async function persistCatalogResolution(
           ? VERSION_POLICY_CONFLICT_BASIS
           : `catalog_${match.status}`,
         detail: { basis: match.basis },
-      }]), versions);
+      }]), versions, providerAuthority);
     }
     return;
   }
@@ -467,7 +646,7 @@ async function persistCatalogResolution(
       toStage: "rejected",
       reasonCode: "catalog_match_missing_eligible_evidence",
       detail: { appleSongId: match.song.id, basis: match.basis },
-    }]), versions);
+    }]), versions, providerAuthority);
     return;
   }
 
@@ -493,7 +672,7 @@ async function persistCatalogResolution(
           toStage: "eligible",
           reasonCode: "catalog_identity_accepted",
           detail: { appleSongId: match.song.id },
-        }]), versions);
+        }]), versions, providerAuthority);
     return;
   }
 
@@ -517,11 +696,18 @@ async function persistCatalogResolution(
         : {}),
     },
     ...versions,
-  });
-  await repository.attachCandidateToRecordingFamily(runId, familyId, candidate.id, "primary_match");
+  }, providerAuthority);
+  await repository.attachCandidateToRecordingFamily(
+    runId,
+    familyId,
+    candidate.id,
+    "primary_match",
+    providerAuthority,
+  );
   await repository.upsertAlternateCatalogIdentity(
     runId,
     catalogIdentityInput(familyId, match.song, storefront, true, musicBrainzRecordingId),
+    providerAuthority,
   );
   const compatibleAlternates = match.alternatives
     .filter((alternate) => compatibleCatalogAlternate(match.song!, alternate))
@@ -530,6 +716,7 @@ async function persistCatalogResolution(
     await repository.upsertAlternateCatalogIdentity(
       runId,
       catalogIdentityInput(familyId, alternate, storefront, false, musicBrainzRecordingId),
+      providerAuthority,
     );
   }
   const identityDetail = {
@@ -553,7 +740,7 @@ async function persistCatalogResolution(
         toStage: "eligible",
         reasonCode: "catalog_identity_accepted",
         detail: identityDetail,
-      }]), versions);
+      }]), versions, providerAuthority);
 }
 
 function isSafePrimaryMatch(match: ExistingMatch, automatic: boolean): boolean {
@@ -771,14 +958,83 @@ async function resumeOrIgnoreAutomaticHandoff(
   repository: MatchingRepository,
   runId: string,
   run: { status: string; autoPublish?: boolean },
+  providerAuthority?: CatalogProviderJobAuthorityV2 | null,
 ): Promise<boolean> {
   if (!run.autoPublish) return false;
   if (AUTOMATIC_HANDOFF_TERMINAL_STATUSES.has(run.status)) return true;
   if (run.status === "manifest_ready") {
-    await repository.queueAutomaticPublication(runId);
+    await repository.queueAutomaticPublication(runId, providerAuthority);
     return true;
   }
   return false;
+}
+
+function matchingCompletionStageCounts(input: {
+  observed: PipelineStageCounts | undefined;
+  discoveredCount: number;
+  safePrimaryCount: number;
+}): PipelineStageCounts {
+  const observed = input.observed ?? {};
+  const safePrimaryCount = Math.max(0, Math.floor(input.safePrimaryCount));
+  const discovered = Math.max(
+    safePrimaryCount,
+    Math.max(0, Math.floor(input.discoveredCount)),
+    Number(observed.discovered ?? 0),
+  );
+  const atLeastSafe = (stage: keyof PipelineStageCounts): number => Math.min(
+    discovered,
+    Math.max(safePrimaryCount, Number(observed[stage] ?? 0)),
+  );
+  return {
+    ...observed,
+    discovered,
+    // A strict safe primary has already passed each of these boundaries.
+    // Stage-event lag must not make the durable terminal outcome report less
+    // progress than the exact identities used by the partial decision UI.
+    scope_qualified: atLeastSafe("scope_qualified"),
+    claim_verified: atLeastSafe("claim_verified"),
+    version_compatible: atLeastSafe("version_compatible"),
+    catalog_resolved: atLeastSafe("catalog_resolved"),
+    playable: atLeastSafe("playable"),
+    canonicalized: atLeastSafe("canonicalized"),
+  };
+}
+
+function matchingAttemptKey(input: {
+  storefront: string;
+  recoveryGeneration: number;
+  refillGeneration: number;
+}): string {
+  return [
+    "catalog_matching",
+    input.storefront,
+    Math.max(0, Math.floor(input.recoveryGeneration)),
+    Math.max(0, Math.floor(input.refillGeneration)),
+  ].join(":");
+}
+
+function matchingSnapshotHash(input: {
+  runId: string;
+  attemptKey: string;
+  pipelineVersion: PipelineVersion;
+  policyVersion: PipelinePolicyVersion;
+  targetTrackCount: number;
+  safeMatches: readonly ExistingMatch[];
+}): string {
+  return sha256Hex(stableStringify({
+    schemaVersion: 1,
+    runId: input.runId,
+    attemptKey: input.attemptKey,
+    pipelineVersion: input.pipelineVersion,
+    policyVersion: input.policyVersion,
+    targetTrackCount: input.targetTrackCount,
+    safeCatalogIdentities: input.safeMatches.map((match) => [
+      match.candidateId,
+      match.song?.id ?? "",
+    ]).sort((left, right) => (
+      left[0]!.localeCompare(right[0]!) || left[1]!.localeCompare(right[1]!)
+    )),
+  }));
 }
 
 async function finalizeMatchingOutcome(
@@ -795,12 +1051,18 @@ async function finalizeMatchingOutcome(
   storefront: string,
   currentRecoveryGeneration = 0,
   currentRefillGeneration = 0,
+  providerAuthority?: CatalogProviderJobAuthorityV2 | null,
 ): Promise<void> {
   // A matching lease may be replayed after its automatic handoff committed.
   // Re-read state before any mutation so the replay can never regress a
   // publishing or completed playlist back into visitor review.
   const latest = run.autoPublish ? await repository.getRun(runId) : run;
-  if (await resumeOrIgnoreAutomaticHandoff(repository, runId, latest)) return;
+  if (await resumeOrIgnoreAutomaticHandoff(
+    repository,
+    runId,
+    latest,
+    providerAuthority,
+  )) return;
   const brief = latest.brief;
   const candidates = await repository.listCandidates(runId);
   const candidatesById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
@@ -882,7 +1144,12 @@ async function finalizeMatchingOutcome(
     status: shortfall > 0 || artistShortfall > 0 ? "shortfall" : "complete",
     updatedAt: new Date().toISOString(),
   };
-  await repository.saveResearchCheckpoint(runId, MATCHING_OUTCOME_CHECKPOINT, checkpoint);
+  await repository.saveResearchCheckpoint(
+    runId,
+    MATCHING_OUTCOME_CHECKPOINT,
+    checkpoint,
+    providerAuthority ?? undefined,
+  );
   if (latest.pipelineVersion && latest.policyVersion && repository.savePipelineDeficitLedger) {
     const observedAt = new Date().toISOString();
     const deficits: PipelineDeficitLedgerEntry[] = [];
@@ -916,8 +1183,104 @@ async function finalizeMatchingOutcome(
       pipelineVersion: latest.pipelineVersion,
       policyVersion: latest.policyVersion,
       mode: "replace",
-    });
+    }, providerAuthority);
   }
+
+  const persistShortfallAccounting = async (): Promise<{
+    matchingAttemptKey?: string;
+    matchingSnapshotHash?: string;
+    pipelineOutcomeHash?: string;
+  }> => {
+    if (targetMinimum === null || shortfall <= 0
+      || !latest.pipelineVersion || !latest.policyVersion
+      || !repository.savePipelineOutcome) {
+      return {};
+    }
+    const completedAt = new Date().toISOString();
+    const attemptKey = matchingAttemptKey({
+      storefront,
+      recoveryGeneration: currentRecoveryGeneration,
+      refillGeneration: currentRefillGeneration,
+    });
+    const snapshotHash = matchingSnapshotHash({
+      runId,
+      attemptKey,
+      pipelineVersion: latest.pipelineVersion,
+      policyVersion: latest.policyVersion,
+      targetTrackCount: targetMinimum,
+      safeMatches: uniqueSafePrimaryMatches,
+    });
+    const observedStageCounts = repository.getPipelineStageCounts
+      ? await repository.getPipelineStageCounts(runId)
+      : undefined;
+    const stageCounts = matchingCompletionStageCounts({
+      observed: observedStageCounts,
+      discoveredCount: candidates.length,
+      safePrimaryCount,
+    });
+    const proposedOutcome = buildPipelineOutcome({
+      pipelineVersion: latest.pipelineVersion,
+      policyVersion: latest.policyVersion,
+      status: "partial_catalog_degraded",
+      targetTrackCount: targetMinimum,
+      discoveredTrackCount: stageCounts.discovered ?? candidates.length,
+      qualifiedTrackCount: Math.min(
+        stageCounts.discovered ?? candidates.length,
+        Math.max(safePrimaryCount, Number(stageCounts.claim_verified ?? 0)),
+      ),
+      selectedTrackCount: Number(stageCounts.manifested ?? 0),
+      publishedTrackCount: Number(stageCounts.published ?? 0),
+      frontierExhausted: false,
+      reasonCodes: ["catalog_exact_fill_shortfall_after_bounded_recovery"],
+      stageCounts,
+      completedAt,
+    });
+    const persistedOutcome = await repository.savePipelineOutcome(
+      runId,
+      proposedOutcome,
+      providerAuthority,
+    );
+    const authoritativeOutcome = persistedOutcome ?? proposedOutcome;
+    const pipelineOutcomeHash = sha256Hex(stableStringify(authoritativeOutcome));
+    const alignedCheckpoint: MatchingOutcomeCheckpoint = {
+      ...checkpoint,
+      matchingAttemptKey: attemptKey,
+      matchingSnapshotHash: snapshotHash,
+      pipelineOutcomeHash,
+      updatedAt: completedAt,
+    };
+    await repository.saveResearchCheckpoint(
+      runId,
+      MATCHING_OUTCOME_CHECKPOINT,
+      alignedCheckpoint,
+      providerAuthority ?? undefined,
+    );
+    if (repository.savePipelineDeficitLedger) {
+      await repository.savePipelineDeficitLedger(
+        runId,
+        authoritativeOutcome.deficits.map((entry) => ({
+          ...entry,
+          detail: {
+            ...entry.detail,
+            matchingAttemptKey: attemptKey,
+            matchingSnapshotHash: snapshotHash,
+            pipelineOutcomeHash,
+          },
+        })),
+        {
+          pipelineVersion: latest.pipelineVersion,
+          policyVersion: latest.policyVersion,
+          mode: "replace",
+        },
+        providerAuthority,
+      );
+    }
+    return {
+      matchingAttemptKey: attemptKey,
+      matchingSnapshotHash: snapshotHash,
+      pipelineOutcomeHash,
+    };
+  };
 
   if (latest.autoPublish) {
     const exactTarget = targetMinimum !== null
@@ -930,6 +1293,7 @@ async function finalizeMatchingOutcome(
         storefront,
         currentRecoveryGeneration,
         currentRefillGeneration,
+        providerAuthority,
       );
       if (recovery === "queued" || recovery === "in_flight") return;
     }
@@ -960,6 +1324,7 @@ async function finalizeMatchingOutcome(
             desiredArtistCount,
             representedArtists: representedArtistLabels,
           },
+          providerAuthority,
         );
         if (refill === "queued" || refill === "in_flight") return;
       }
@@ -971,22 +1336,24 @@ async function finalizeMatchingOutcome(
       // visitor can inspect an immutable count, but do not let any Apple write
       // begin until a hash-bound partial publication decision is recorded.
       if (safePrimaryCount > 0) {
+        const accounting = await persistShortfallAccounting();
         await repository.updateRun(runId, {
           status: "visitor_review",
           phase: "exception_review",
           error: null,
-        });
+        }, providerAuthority ?? undefined);
         if (repository.preparePartialPublication) {
           await repository.preparePartialPublication(runId, {
             targetTrackCount: targetMinimum ?? safePrimaryCount,
             verifiedTrackCount: safePrimaryCount,
-          });
+            ...accounting,
+          }, providerAuthority);
         } else {
           await repository.updateRun(runId, {
             status: "partial_ready",
             phase: "partial_confirmation_required",
             error: null,
-          });
+          }, providerAuthority ?? undefined);
         }
         return;
       }
@@ -995,7 +1362,7 @@ async function finalizeMatchingOutcome(
         status: "no_compatible_tracks",
         phase: "catalog_matching_empty",
         error: null,
-      });
+      }, providerAuthority ?? undefined);
       if (repository.savePipelineOutcome) {
         const stageCounts = latest.pipelineVersion === "catalog_first_v2"
           && repository.getPipelineStageCounts
@@ -1006,19 +1373,23 @@ async function finalizeMatchingOutcome(
           discoveredTrackCount,
           stageCounts?.claim_verified ?? 0,
         );
-        await repository.savePipelineOutcome(runId, buildPipelineOutcome({
-          pipelineVersion: latest.pipelineVersion ?? "legacy_v1",
-          policyVersion: latest.policyVersion ?? "legacy_v1",
-          status: "no_compatible_tracks",
-          targetTrackCount: targetMinimum ?? 0,
-          discoveredTrackCount,
-          qualifiedTrackCount,
-          selectedTrackCount: 0,
-          publishedTrackCount: 0,
-          frontierExhausted: true,
-          reasonCodes: ["catalog_recovery_exhausted_without_compatible_tracks"],
-          stageCounts,
-        }));
+        await repository.savePipelineOutcome(
+          runId,
+          buildPipelineOutcome({
+            pipelineVersion: latest.pipelineVersion ?? "legacy_v1",
+            policyVersion: latest.policyVersion ?? "legacy_v1",
+            status: "no_compatible_tracks",
+            targetTrackCount: targetMinimum ?? 0,
+            discoveredTrackCount,
+            qualifiedTrackCount,
+            selectedTrackCount: 0,
+            publishedTrackCount: 0,
+            frontierExhausted: true,
+            reasonCodes: ["catalog_recovery_exhausted_without_compatible_tracks"],
+            stageCounts,
+          }),
+          providerAuthority,
+        );
       }
       return;
     }
@@ -1033,11 +1404,17 @@ async function finalizeMatchingOutcome(
       status: "visitor_review",
       phase: "catalog_matching_shortfall",
       error: `Apple Music matching found ${safePrimaryCount} safe unique catalog ${safePrimaryCount === 1 ? "match" : "matches"} for the required ${targetMinimum}; ${shortfall} remain unresolved.`,
-    });
+    }, providerAuthority ?? undefined);
     return;
   }
-  await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review", error: null });
-  if (latest.autoPublish) await repository.queueAutomaticPublication(runId);
+  await repository.updateRun(
+    runId,
+    { status: "visitor_review", phase: "exception_review", error: null },
+    providerAuthority ?? undefined,
+  );
+  if (latest.autoPublish) {
+    await repository.queueAutomaticPublication(runId, providerAuthority);
+  }
 }
 
 function boundedEnvironmentInteger(name: string, fallback: number, minimum: number, maximum: number): number {
@@ -1730,10 +2107,11 @@ async function resolveV2CatalogFrontier(
   provider: CatalogDiscoveryProvider,
   signal?: AbortSignal,
   routeDeadlineAt?: string,
-): Promise<{ handoffPending: boolean }> {
+  providerAuthority: CatalogProviderJobAuthorityV2 | null = null,
+): Promise<{ handoffPending: boolean; providerBlocked: boolean }> {
   const plan = run.selectionPlan;
   if (!plan || plan.pipelineVersion !== "catalog_first_v2" || pipelineV2Route(plan) !== "curated_catalog") {
-    return { handoffPending: false };
+    return { handoffPending: false, providerBlocked: false };
   }
   const inputFingerprint = catalogDiscoveryFingerprint(plan, candidates);
   const prior = await repository.getResearchCheckpoint(runId, V2_CATALOG_DISCOVERY_CHECKPOINT) as V2CatalogDiscoveryCheckpoint | null;
@@ -1743,7 +2121,7 @@ async function resolveV2CatalogFrontier(
   // Checkpoints written before schemaVersion/state existed are terminal
   // summaries. Continue to honor their complete/retryable contract.
   if (priorIsTerminal && prior?.complete && !prior.retryable && sameFingerprint) {
-    return { handoffPending: false };
+    return { handoffPending: false, providerBlocked: false };
   }
   const runningProgress = resumableRunningCatalogProgress(
     prior,
@@ -1871,7 +2249,7 @@ async function resolveV2CatalogFrontier(
               progress,
               trustedPlaylists: [...trustedPlaylists.values()],
               updatedAt: new Date().toISOString(),
-            });
+            }, providerAuthority ?? undefined);
             // A page only becomes resumable after its durable write succeeds.
             lastRunningProgress = progress;
           } catch (error) {
@@ -1934,13 +2312,22 @@ async function resolveV2CatalogFrontier(
       // The exact Apple identity is the critical handoff. Save it before
       // recording-family enrichment and stage bookkeeping so a crash or an
       // exhausted route can resume from a usable catalog result.
-      await repository.saveMatch(runId, match);
+      await repository.saveMatch(runId, match, providerAuthority);
       existingCandidateIds.add(candidate.id);
       if (match.status === "accepted" && match.song) {
         acceptedCatalogIds.add(match.song.id);
         resolvedCount += 1;
       }
-      await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
+      await persistCatalogResolution(
+        repository,
+        runId,
+        run,
+        candidate,
+        match,
+        storefront,
+        null,
+        providerAuthority,
+      );
     };
 
     // Resolve research candidates returned by the catalog frontier first.
@@ -1959,7 +2346,7 @@ async function resolveV2CatalogFrontier(
             score: EXACT_CATALOG_MATCH_SCORE,
             song: existingAccepted.song,
             alternatives: existingAccepted.alternatives ?? [],
-          }, storefront);
+          }, storefront, null, providerAuthority);
         }
         continue;
       }
@@ -1979,13 +2366,22 @@ async function resolveV2CatalogFrontier(
       }
       if (match.status !== "accepted" || !match.song) continue;
       if (match.status === "accepted" && match.song && acceptedCatalogIds.has(match.song.id)) continue;
-      await repository.saveMatch(runId, match);
+      await repository.saveMatch(runId, match, providerAuthority);
       existingCandidateIds.add(candidate.id);
       if (match.status === "accepted" && match.song) {
         acceptedCatalogIds.add(match.song.id);
         resolvedCount += 1;
       }
-      await persistCatalogResolution(repository, runId, run, candidate, match, storefront);
+      await persistCatalogResolution(
+        repository,
+        runId,
+        run,
+        candidate,
+        match,
+        storefront,
+        null,
+        providerAuthority,
+      );
     }
 
     // Keep exact editorial discoveries even when an earlier research
@@ -2028,7 +2424,7 @@ async function resolveV2CatalogFrontier(
         const persistedChunk = await repository.persistCatalogDiscoveredCandidates(runId, chunk, {
           pipelineVersion: plan.pipelineVersion,
           policyVersion: plan.policyVersion,
-        });
+        }, providerAuthority);
         persistedDiscoveries.push(...persistedChunk);
         for (const persisted of persistedChunk) {
           const input = inputByAppleId.get(persisted.appleSongId);
@@ -2068,12 +2464,19 @@ async function resolveV2CatalogFrontier(
     )).length;
     const durableGoalSatisfied = durableAcceptedCatalogIds.size >= discovery.qualifiedGoal;
     const handoffPending = !durableGoalSatisfied && handoffPendingCount > 0;
+    const disposition = catalogDiscoveryOutcomeDisposition({
+      stoppedBecause: discovery.stoppedBecause,
+      safeTrackCount: durableAcceptedCatalogIds.size,
+      targetTrackCount: plan.requestedTrackCount,
+    });
+    const providerBlocked = disposition.providerUnavailable
+      && durableAcceptedCatalogIds.size === 0;
     const providerRetryable = retryAttempt < 3 && !discoveryGoalSatisfied
       && (transientFailureCount > 0
         || discovery.stoppedBecause === "provider_call_limit"
         || discovery.stoppedBecause === "provider_degraded"
         || discovery.stoppedBecause === "provider_circuit_open");
-    const retryable = handoffPending || providerRetryable;
+    const retryable = handoffPending || providerRetryable || providerBlocked;
 
     // Discovery completion is only meaningful after its qualified Apple rows
     // have crossed the durable candidate/match boundary. A fast-route deadline
@@ -2106,26 +2509,37 @@ async function resolveV2CatalogFrontier(
       frontier: discovery.frontier,
       trustedPlaylists: [...trustedPlaylists.values()],
       updatedAt: new Date().toISOString(),
-    });
-    if (!discoveryGoalSatisfied && !handoffPending && repository.savePipelineOutcome) {
+    }, providerAuthority ?? undefined);
+    if ((!discoveryGoalSatisfied || providerAuthority?.providerDependencyRetry)
+      && !handoffPending) {
+      if (!repository.savePipelineOutcome) {
+        throw new Error(
+          "Pipeline outcome persistence is unavailable for this V2 run",
+        );
+      }
       const stageCounts = repository.getPipelineStageCounts
         ? await repository.getPipelineStageCounts(runId)
         : undefined;
-      const disposition = catalogDiscoveryOutcomeDisposition({
-        stoppedBecause: discovery.stoppedBecause,
-        safeTrackCount: acceptedCatalogIds.size,
-        targetTrackCount: plan.requestedTrackCount,
-      });
-      await repository.savePipelineOutcome(runId, buildPipelineOutcome({
+      const discoveredTrackCount = Math.max(
+        candidates.length,
+        discovery.totalAttemptedCount,
+        Number(stageCounts?.discovered ?? 0),
+      );
+      const qualifiedTrackCount = Math.min(
+        discoveredTrackCount,
+        Math.max(
+          eligibleCandidates.length,
+          discovery.totalQualifiedCount,
+          Number(stageCounts?.claim_verified ?? 0),
+        ),
+      );
+      const outcome = buildPipelineOutcome({
         pipelineVersion: plan.pipelineVersion,
         policyVersion: plan.policyVersion,
         status: disposition.status,
         targetTrackCount: plan.requestedTrackCount,
-        discoveredTrackCount: Math.max(candidates.length, discovery.totalAttemptedCount),
-        qualifiedTrackCount: Math.min(
-          Math.max(candidates.length, discovery.totalAttemptedCount),
-          discovery.totalQualifiedCount,
-        ),
+        discoveredTrackCount,
+        qualifiedTrackCount,
         // Catalog acceptance precedes quota selection, sequencing, and
         // manifest lock. Reporting every accepted Apple identity as selected
         // makes an early discovery shortfall look more complete than the
@@ -2137,9 +2551,50 @@ async function resolveV2CatalogFrontier(
         providerUnavailable: disposition.providerUnavailable,
         reasonCodes: [disposition.reasonCode],
         stageCounts,
-      }));
+      });
+      if (providerBlocked) {
+        if (!repository.persistCatalogProviderBlocker) {
+          throw new Error(
+            "Catalog provider blocker persistence is unavailable for this V2 run",
+          );
+        }
+        await repository.persistCatalogProviderBlocker(
+          runId,
+          catalogProviderBlockerV2({
+            stoppedBecause: discovery.stoppedBecause as
+              | "provider_circuit_open"
+              | "provider_degraded"
+              | "provider_call_limit"
+              | "timed_out",
+            storefront,
+            failureCount: providerAuthority?.providerDependencyRetry
+              ? providerAuthority.priorFailureCount + 1
+              : 1,
+            retryAfterUntil: discovery.retryAfterUntil
+              ? new Date(discovery.retryAfterUntil)
+              : null,
+          }),
+          outcome,
+          providerAuthority,
+        );
+        return { handoffPending: false, providerBlocked: true };
+      }
+      if (providerAuthority?.providerDependencyRetry
+        && repository.resolveCatalogProviderBlocker) {
+        await repository.resolveCatalogProviderBlocker(
+          runId,
+          outcome,
+          providerAuthority,
+        );
+      } else {
+        await repository.savePipelineOutcome(
+          runId,
+          outcome,
+          providerAuthority,
+        );
+      }
     }
-    return { handoffPending };
+    return { handoffPending, providerBlocked: false };
   } catch (error) {
     if (signal?.aborted) throw error;
     // Never replace the last acknowledged page with a coarse summary when a
@@ -2169,14 +2624,19 @@ async function resolveV2CatalogFrontier(
         errorOrigin: "local_contract",
         trustedPlaylists: [...trustedPlaylists.values()],
         updatedAt: new Date().toISOString(),
-      });
+      }, providerAuthority ?? undefined);
       throw error;
     }
+    const stoppedBecause = discoverySignal.aborted
+      ? "timed_out" as const
+      : "provider_degraded" as const;
+    const retryableProviderStop = stoppedBecause === "provider_degraded"
+      || stoppedBecause === "timed_out";
     await repository.saveResearchCheckpoint(runId, V2_CATALOG_DISCOVERY_CHECKPOINT, {
       schemaVersion: 2,
       state: "terminal",
-      complete: retryAttempt >= 3,
-      retryable: retryAttempt < 3,
+      complete: !retryableProviderStop && retryAttempt >= 3,
+      retryable: retryableProviderStop || retryAttempt < 3,
       attempt,
       retryAttempt,
       inputFingerprint,
@@ -2186,13 +2646,68 @@ async function resolveV2CatalogFrontier(
         attemptedCount: lastRunningProgress.totalAttemptedCount,
         frontier: lastRunningProgress.frontier,
       } : {}),
-      stoppedBecause: discoverySignal.aborted ? "timed_out" : "provider_degraded",
+      stoppedBecause,
       resolvedCount: 0,
       errorOrigin: "catalog",
       trustedPlaylists: [...trustedPlaylists.values()],
       updatedAt: new Date().toISOString(),
+    }, providerAuthority ?? undefined);
+    const disposition = catalogDiscoveryOutcomeDisposition({
+      stoppedBecause,
+      safeTrackCount: acceptedCatalogIds.size,
+      targetTrackCount: plan.requestedTrackCount,
     });
-    return { handoffPending: false };
+    const providerBlocked = disposition.providerUnavailable
+      && acceptedCatalogIds.size === 0;
+    if (providerBlocked) {
+      if (!repository.persistCatalogProviderBlocker) {
+        throw new Error(
+          "Catalog provider blocker persistence is unavailable for this V2 run",
+        );
+      }
+      const stageCounts = repository.getPipelineStageCounts
+        ? await repository.getPipelineStageCounts(runId)
+        : undefined;
+      const discoveredTrackCount = Math.max(
+        candidates.length,
+        Number(lastRunningProgress?.totalAttemptedCount ?? 0),
+        Number(stageCounts?.discovered ?? 0),
+      );
+      const qualifiedTrackCount = Math.min(
+        discoveredTrackCount,
+        Math.max(
+          eligibleCandidates.length,
+          Number(lastRunningProgress?.totalQualifiedCount ?? 0),
+          Number(stageCounts?.claim_verified ?? 0),
+        ),
+      );
+      await repository.persistCatalogProviderBlocker(
+        runId,
+        catalogProviderBlockerV2({
+          stoppedBecause,
+          storefront,
+          failureCount: providerAuthority?.providerDependencyRetry
+            ? providerAuthority.priorFailureCount + 1
+            : 1,
+        }),
+        buildPipelineOutcome({
+          pipelineVersion: plan.pipelineVersion,
+          policyVersion: plan.policyVersion,
+          status: disposition.status,
+          targetTrackCount: plan.requestedTrackCount,
+          discoveredTrackCount,
+          qualifiedTrackCount,
+          selectedTrackCount: stageCounts?.manifested ?? 0,
+          publishedTrackCount: stageCounts?.published ?? 0,
+          frontierExhausted: false,
+          providerUnavailable: true,
+          reasonCodes: [disposition.reasonCode],
+          stageCounts,
+        }),
+        providerAuthority,
+      );
+    }
+    return { handoffPending: false, providerBlocked };
   }
 }
 
@@ -2211,6 +2726,7 @@ export async function matchResearchRun(
     refillGeneration?: number;
     catalogDiscoveryProvider?: CatalogDiscoveryProvider;
     musicBrainzEnricher?: typeof enrichMusicBrainzIdentity;
+    providerJobAuthority?: CatalogProviderJobAuthorityV2 | null;
   } = {},
 ): Promise<void> {
   const run = await repository.getRun(runId);
@@ -2219,7 +2735,12 @@ export async function matchResearchRun(
     ? persistedStorefront.toLowerCase()
     : storefront.toLowerCase();
   if (!/^[a-z]{2}$/i.test(normalizedStorefront)) throw new Error("Apple storefront must be a two-letter code");
-  if (await resumeOrIgnoreAutomaticHandoff(repository, runId, run)) return;
+  if (await resumeOrIgnoreAutomaticHandoff(
+    repository,
+    runId,
+    run,
+    options.providerJobAuthority,
+  )) return;
   const recovery = options.retryIncomplete === true;
   const refillGeneration = Number.isInteger(options.refillGeneration)
     ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, Number(options.refillGeneration)))
@@ -2241,6 +2762,7 @@ export async function matchResearchRun(
       normalizedStorefront,
       options.recoveryGeneration,
       refillGeneration,
+      options.providerJobAuthority,
     );
     return;
   }
@@ -2274,7 +2796,12 @@ export async function matchResearchRun(
       const confirmedAt = new Date(run.createdAt);
       if (Number.isFinite(confirmedAt.getTime())) {
         route = createFastRouteCheckpoint(executionPolicy, confirmedAt);
-        await repository.saveResearchCheckpoint(runId, routeKey, route);
+        await repository.saveResearchCheckpoint(
+          runId,
+          routeKey,
+          route,
+          options.providerJobAuthority ?? undefined,
+        );
       }
     }
     if (!route) throw new Error("Fast matching is missing its immutable confirmation deadline");
@@ -2295,13 +2822,16 @@ export async function matchResearchRun(
       ? routeDeadlineAt
       : undefined;
   let deadlineExhausted = false;
+  let transientProviderFailureCount = 0;
+  let timedOutProviderFailureCount = 0;
+  let providerRetryAfterUntil: Date | null = null;
 
   signal?.throwIfAborted();
   await repository.updateRun(runId, {
     status: "matching",
     phase: recovery ? "catalog_matching_recovery" : "catalog_matching",
     error: null,
-  });
+  }, options.providerJobAuthority ?? undefined);
   let allCandidates = await repository.listCandidates(runId);
   let existingMatches = await repository.listMatches(runId);
   if (run.selectionPlan?.pipelineVersion === "catalog_first_v2"
@@ -2327,6 +2857,7 @@ export async function matchResearchRun(
       discoveryProvider,
       signal,
       deadlineAt,
+      options.providerJobAuthority ?? null,
     );
     if (catalogFrontier.handoffPending) {
       // Returning successfully would finalize the matching job and can turn a
@@ -2334,6 +2865,13 @@ export async function matchResearchRun(
       // restores the checkpoint with a fresh handoff-only window; the provider
       // frontier is not queried again.
       throw new Error("Qualified Apple catalog identities are awaiting durable handoff");
+    }
+    if (catalogFrontier.providerBlocked) {
+      // The provider dependency, outcome, scheduled retry, and public blocker
+      // were committed atomically. Continuing into ordinary zero-match
+      // finalization would overwrite that retryable outage as musical scarcity.
+      if (options.providerJobAuthority) throw new CatalogProviderBlockedError();
+      return;
     }
     // Discovery can atomically grow the candidate pool. Refresh both sides of
     // the join before the ordinary matcher calculates its remaining work.
@@ -2387,8 +2925,10 @@ export async function matchResearchRun(
           runId,
           timeoutCandidates.map((candidate) => candidate.id),
           RETRYABLE_CATALOG_MATCH_BASES[0],
+          options.providerJobAuthority,
         );
       }
+      timedOutProviderFailureCount += timeoutCandidates.length;
       await repository.saveResearchCheckpoint(runId, checkpointPhase, {
         nextIndex: recovery ? work.length : allCandidates.length,
         storefront: normalizedStorefront,
@@ -2398,7 +2938,7 @@ export async function matchResearchRun(
         completedAt: new Date().toISOString(),
         timedOutCandidateCount: timeoutCandidates.length,
         updatedAt: new Date().toISOString(),
-      });
+      }, options.providerJobAuthority ?? undefined);
       deadlineExhausted = true;
       break;
     }
@@ -2424,12 +2964,22 @@ export async function matchResearchRun(
                   : undefined,
               ),
               failure: null,
+              retryAfterUntil: null,
             };
           } catch (error) {
             if (signal?.aborted) throw error;
             const failure = fastLookupFailure(error, lookupSignal, signal);
             if (!failure) throw error;
-            return { songs: [] as CatalogSong[], failure };
+            const retryAfterUntil = error instanceof AppleApiError
+              && error.retryAfterUntil
+              && Number.isFinite(error.retryAfterUntil.getTime())
+              ? error.retryAfterUntil
+              : null;
+            return {
+              songs: [] as CatalogSong[],
+              failure,
+              retryAfterUntil,
+            };
           }
         }));
 
@@ -2440,6 +2990,14 @@ export async function matchResearchRun(
       const workIndex = batchStart + offset;
       const { candidate, originalIndex } = batch[offset]!;
       const lookup = lookups[offset]!;
+      if (lookup.failure === "transient") transientProviderFailureCount += 1;
+      if (lookup.failure === "deadline") timedOutProviderFailureCount += 1;
+      if (lookup.retryAfterUntil
+        && (!providerRetryAfterUntil
+          || lookup.retryAfterUntil.getTime()
+            > providerRetryAfterUntil.getTime())) {
+        providerRetryAfterUntil = lookup.retryAfterUntil;
+      }
       let match = lookup.failure
         ? {
             candidateId: candidate.id,
@@ -2480,7 +3038,11 @@ export async function matchResearchRun(
             : ineligibleEvidenceBasis(run.brief, candidate),
         };
       }
-      await repository.saveMatch(runId, match);
+      await repository.saveMatch(
+        runId,
+        match,
+        options.providerJobAuthority,
+      );
       const musicBrainzIdentity = run.pipelineVersion === "catalog_first_v2"
         ? await (options.musicBrainzEnricher ?? enrichMusicBrainzIdentity)(
           repository,
@@ -2488,6 +3050,7 @@ export async function matchResearchRun(
           candidate,
           match,
           signal,
+          { writeFence: options.providerJobAuthority ?? null },
         )
         : null;
       if (musicBrainzIdentity) candidate.musicbrainzId = musicBrainzIdentity.recordingId;
@@ -2499,6 +3062,7 @@ export async function matchResearchRun(
         match,
         normalizedStorefront,
         musicBrainzIdentity,
+        options.providerJobAuthority,
       );
       if (match.status === "accepted" && match.song) acceptedCatalogIds.add(match.song.id);
       await repository.saveResearchCheckpoint(runId, checkpointPhase, {
@@ -2508,7 +3072,7 @@ export async function matchResearchRun(
         deadlineAt,
         startedAt,
         updatedAt: new Date().toISOString(),
-      });
+      }, options.providerJobAuthority ?? undefined);
     }
   }
   if (!deadlineExhausted) {
@@ -2520,7 +3084,122 @@ export async function matchResearchRun(
       startedAt,
       completedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    });
+    }, options.providerJobAuthority ?? undefined);
+  }
+  if (run.selectionPlan?.pipelineVersion === "catalog_first_v2") {
+    const latestCandidates = await repository.listCandidates(runId);
+    const candidatesById = new Map(
+      latestCandidates.map((candidate) => [candidate.id, candidate]),
+    );
+    const latestMatches = await repository.listMatches(runId);
+    const safeMatches = latestMatches
+      .filter((match) => isSafePrimaryMatch(match, run.autoPublish === true))
+      .filter((match) => matchSatisfiesV2HardEligibility(
+        run,
+        candidatesById.get(match.candidateId),
+        match,
+      ));
+    const safeTrackCount = partitionUniqueRecordingFamilies(
+      safeMatches,
+      (match) => recordingFamilyKey({
+        song: match.song!,
+        musicBrainzRecordingId:
+          candidatesById.get(match.candidateId)?.musicbrainzId,
+      }),
+    ).unique.length;
+    const retryableProviderFailureCount = transientProviderFailureCount
+      + timedOutProviderFailureCount;
+    const targetTrackCount = Math.max(
+      1,
+      Number(run.selectionPlan.requestedTrackCount),
+    );
+    const stageCounts = repository.getPipelineStageCounts
+      ? await repository.getPipelineStageCounts(runId)
+      : undefined;
+    const discoveredTrackCount = Math.max(
+      latestCandidates.length,
+      Number(stageCounts?.discovered ?? 0),
+    );
+    const evidenceEligibleCount = latestCandidates.filter((candidate) => (
+      isEvidenceEligible(run.brief, candidate, run.selectionPlan)
+    )).length;
+    const qualifiedTrackCount = Math.min(
+      discoveredTrackCount,
+      Math.max(
+        evidenceEligibleCount,
+        Number(stageCounts?.claim_verified ?? 0),
+      ),
+    );
+    if (safeTrackCount === 0 && retryableProviderFailureCount > 0) {
+      if (!repository.persistCatalogProviderBlocker) {
+        throw new Error(
+          "Catalog provider blocker persistence is unavailable for this V2 run",
+        );
+      }
+      const timedOut = timedOutProviderFailureCount > 0
+        && transientProviderFailureCount === 0;
+      const reasonCode = timedOut
+        ? "apple_lookup_timed_out"
+        : "apple_lookup_transient";
+      await repository.persistCatalogProviderBlocker(
+        runId,
+        catalogProviderBlockerV2({
+          stoppedBecause: timedOut ? "lookup_timed_out" : "lookup_transient",
+          storefront: normalizedStorefront,
+          failureCount:
+            (options.providerJobAuthority?.priorFailureCount ?? 0) + 1,
+          retryAfterUntil: providerRetryAfterUntil,
+        }),
+        buildPipelineOutcome({
+          pipelineVersion: run.selectionPlan.pipelineVersion,
+          policyVersion: run.selectionPlan.policyVersion,
+          status: "failed_system",
+          targetTrackCount,
+          discoveredTrackCount,
+          qualifiedTrackCount,
+          selectedTrackCount: 0,
+          publishedTrackCount: 0,
+          frontierExhausted: false,
+          providerUnavailable: true,
+          reasonCodes: [reasonCode],
+          stageCounts,
+        }),
+        options.providerJobAuthority ?? null,
+      );
+      if (options.providerJobAuthority) throw new CatalogProviderBlockedError();
+      return;
+    }
+    if (options.providerJobAuthority?.providerDependencyRetry
+      && repository.resolveCatalogProviderBlocker) {
+      const recoveredOutcome = buildPipelineOutcome({
+        pipelineVersion: run.selectionPlan.pipelineVersion,
+        policyVersion: run.selectionPlan.policyVersion,
+        status: safeTrackCount === 0
+          ? "no_compatible_tracks"
+          : "partial_evidence_shortfall",
+        targetTrackCount,
+        discoveredTrackCount,
+        qualifiedTrackCount: Math.max(
+          safeTrackCount,
+          qualifiedTrackCount,
+        ),
+        selectedTrackCount: 0,
+        publishedTrackCount: 0,
+        frontierExhausted: safeTrackCount === 0,
+        providerUnavailable: false,
+        reasonCodes: [
+          safeTrackCount === 0
+            ? "catalog_recovery_exhausted_without_compatible_tracks"
+            : "apple_catalog_provider_recovered",
+        ],
+      });
+      await repository.resolveCatalogProviderBlocker(
+        runId,
+        recoveredOutcome,
+        options.providerJobAuthority,
+      );
+      if (safeTrackCount === 0) return;
+    }
   }
   await finalizeMatchingOutcome(
     repository,
@@ -2529,6 +3208,7 @@ export async function matchResearchRun(
     normalizedStorefront,
     options.recoveryGeneration,
     refillGeneration,
+    options.providerJobAuthority,
   );
 }
 
@@ -2536,6 +3216,54 @@ export async function processMatchingJob(repository: MatchingRepository, payload
   const runId = typeof payload.runId === "string" ? payload.runId : "";
   const storefront = typeof payload.storefront === "string" ? payload.storefront : process.env.APPLE_STOREFRONT ?? "br";
   if (!runId) throw new Error("Matching job payload is invalid");
+  const providerDependencyRetry = payload.providerDependencyRetry === true;
+  const providerBlockerGeneration =
+    typeof payload.providerBlockerGeneration === "string"
+      ? payload.providerBlockerGeneration
+      : null;
+  const providerBlockerFailureCount = Number(
+    payload.providerBlockerFailureCount ?? 0,
+  );
+  const jobId = typeof payload.__jobId === "string" ? payload.__jobId : "";
+  const workerId = typeof payload.__jobWorkerId === "string"
+    ? payload.__jobWorkerId
+    : "";
+  const leaseEpoch = Number(payload.__jobLeaseEpoch);
+  const providerJobAuthority: CatalogProviderJobAuthorityV2 | null =
+    jobId && workerId && Number.isSafeInteger(leaseEpoch) && leaseEpoch >= 1
+      ? {
+          jobId,
+          workerId,
+          leaseEpoch,
+          providerDependencyRetry,
+          expectedGeneration: providerDependencyRetry
+            ? providerBlockerGeneration
+            : null,
+          priorFailureCount: providerDependencyRetry
+            && Number.isSafeInteger(providerBlockerFailureCount)
+            && providerBlockerFailureCount >= 1
+            ? providerBlockerFailureCount
+            : 0,
+          claimToken: null,
+        }
+      : null;
+  if (providerDependencyRetry
+    && (!providerJobAuthority
+      || !providerJobAuthority.expectedGeneration
+      || providerJobAuthority.priorFailureCount < 1)) {
+    throw new Error("Catalog provider retry authority is invalid");
+  }
+  if (repository.claimCatalogProviderRetry) {
+    if (!providerJobAuthority) {
+      throw new Error("Matching worker lease authority is unavailable");
+    }
+    const claimed = await repository.claimCatalogProviderRetry(
+      runId,
+      providerJobAuthority,
+    );
+    if (!claimed) throw new CatalogProviderBlockedError();
+    providerJobAuthority.claimToken = claimed.claimToken;
+  }
   await matchResearchRun(repository, runId, storefront, signal, {
     fast: payload.fast === true,
     fastConfirmedAt: typeof payload.fastConfirmedAt === "string" ? payload.fastConfirmedAt : undefined,
@@ -2548,5 +3276,6 @@ export async function processMatchingJob(repository: MatchingRepository, payload
     refillGeneration: Number.isInteger(payload.refillGeneration)
       ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, Number(payload.refillGeneration)))
       : 0,
+    providerJobAuthority,
   });
 }

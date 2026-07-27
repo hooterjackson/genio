@@ -313,6 +313,7 @@ function eligibleEvidence(assertion: FrozenAssertionRevision): EligibleEvidence[
         cachePolicy: source.cachePolicy as "excerpt_only" | "full_document_permitted",
         retentionPolicy: source.retentionPolicy as "durable_public_corpus" | "license_term",
         freshnessPolicy: source.freshnessPolicy,
+        freshnessExpiresAt: source.freshnessExpiresAt?.toISOString() ?? null,
         sourceHash: source.contentHash,
         sourceRevision: source.sourceRevision,
       } satisfies EvidenceSourceGovernanceV3,

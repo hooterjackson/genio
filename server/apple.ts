@@ -162,6 +162,7 @@ export class AppleApiError extends Error {
     readonly retriable: boolean,
     readonly uncertainMutation = false,
     readonly retryAfterMs: number | null = null,
+    readonly retryAfterUntil: Date | null = null,
   ) {
     super(message);
   }
@@ -299,15 +300,36 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
   }, { once: true });
 });
 
-function retryDelay(response: Response | null, attempt: number): number {
+const MAX_IMMEDIATE_PROVIDER_RETRY_WAIT_MS = 15_000;
+
+function retryBoundary(
+  response: Response | null,
+  attempt: number,
+): { delayMs: number; retryAfterUntil: Date | null } {
   const header = response?.headers.get("retry-after")?.trim() ?? "";
   const retryAfterSeconds = Number(header);
   if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
-    return Math.min(retryAfterSeconds * 1_000, 15_000);
+    const now = Date.now();
+    const retryAfterMs = retryAfterSeconds * 1_000;
+    return {
+      delayMs: retryAfterMs,
+      retryAfterUntil: new Date(now + retryAfterMs),
+    };
   }
   const retryAt = Date.parse(header);
-  if (Number.isFinite(retryAt)) return Math.min(Math.max(0, retryAt - Date.now()), 15_000);
-  return Math.min(500 * 2 ** attempt + Math.floor(Math.random() * 250), 8_000);
+  if (Number.isFinite(retryAt)) {
+    return {
+      delayMs: Math.max(0, retryAt - Date.now()),
+      retryAfterUntil: new Date(retryAt),
+    };
+  }
+  return {
+    delayMs: Math.min(
+      500 * 2 ** attempt + Math.floor(Math.random() * 250),
+      8_000,
+    ),
+    retryAfterUntil: null,
+  };
 }
 
 async function parsePayload(response: Response): Promise<any> {
@@ -362,21 +384,34 @@ export class AppleMusicClient {
         }
         const detail = payload?.errors?.[0]?.detail ?? payload?.errors?.[0]?.title ?? `Apple Music request failed (${response.status})`;
         const retriable = response.status === 429 || response.status >= 500;
-        const delayMs = retriable ? retryDelay(response, attempt) : null;
+        const retry = retriable
+          ? retryBoundary(response, attempt)
+          : { delayMs: null, retryAfterUntil: null };
         const error = new AppleApiError(
           detail,
           response.status,
           retriable,
           method !== "GET" && retriable,
-          delayMs,
+          retry.delayMs,
+          retry.retryAfterUntil,
         );
         if (!retriable || attempt === maxAttempts - 1) throw error;
+        if (retry.retryAfterUntil
+          && retry.retryAfterUntil.getTime() - Date.now()
+            > MAX_IMMEDIATE_PROVIDER_RETRY_WAIT_MS) {
+          throw error;
+        }
         lastError = error;
-        await wait(delayMs!, options.signal);
+        await wait(retry.delayMs!, options.signal);
       } catch (error) {
         if (error instanceof AppleAuthorizationRequiredError) throw error;
         if (error instanceof AppleApiError) {
           if (!error.retriable || attempt === maxAttempts - 1) throw error;
+          if (error.retryAfterUntil
+            && error.retryAfterUntil.getTime() - Date.now()
+              > MAX_IMMEDIATE_PROVIDER_RETRY_WAIT_MS) {
+            throw error;
+          }
           lastError = error;
           continue;
         }
@@ -385,7 +420,7 @@ export class AppleMusicClient {
         if (!retrySafe || attempt === maxAttempts - 1) {
           throw new AppleApiError("Apple Music could not be reached", null, true, method !== "GET");
         }
-        await wait(retryDelay(response, attempt), options.signal);
+        await wait(retryBoundary(response, attempt).delayMs, options.signal);
       }
     }
     throw lastError instanceof Error ? lastError : new AppleApiError("Apple Music request failed", null, true);
@@ -775,10 +810,27 @@ function stringGenres(value: unknown): string[] {
 function appleSongs(items: unknown, limit = 100): CatalogSong[] {
   return (Array.isArray(items) ? items : []).slice(0, limit).map((item: any) => {
     const contentRating = item.attributes?.contentRating;
+    const relationshipArtistIds = Array.isArray(
+      item.relationships?.artists?.data,
+    )
+      ? item.relationships.artists.data.flatMap((artist: any) => (
+          typeof artist?.id === "string" && artist.id.trim()
+            ? [artist.id.trim()]
+            : []
+        ))
+      : [];
+    const artistUrlId = typeof item.attributes?.artistUrl === "string"
+      ? item.attributes.artistUrl.match(/\/(\d+)(?:[/?#]|$)/u)?.[1] ?? null
+      : null;
+    const artistIds = [...new Set([
+      ...relationshipArtistIds,
+      ...(artistUrlId ? [artistUrlId] : []),
+    ])];
     return {
       id: String(item.id),
       name: item.attributes?.name ?? "",
       artistName: item.attributes?.artistName ?? "",
+      ...(artistIds.length > 0 ? { artistIds } : {}),
       albumName: item.attributes?.albumName ?? "",
       genreNames: stringGenres(item.attributes?.genreNames),
       releaseDate: item.attributes?.releaseDate,

@@ -8,6 +8,10 @@ import {
   isCrossSiteMutation,
   matchGatewayRoute,
 } from "./gateway-policy.ts";
+import {
+  sitesGatewayReleaseConfigurationHash,
+  sitesOwnerAllowlistVersion,
+} from "./release-identity.ts";
 
 interface Env {
   ASSETS: Fetcher;
@@ -25,6 +29,7 @@ interface Env {
   GATEWAY_PREVIOUS_HMAC_SECRET?: string;
   IP_HASH_SECRET?: string;
   OWNER_EMAIL?: string;
+  OWNER_ALLOWLIST_VERSION?: string;
 }
 
 interface ExecutionContext {
@@ -51,6 +56,7 @@ function localPreviewEnvironment(environment: Env | undefined): Env {
     GATEWAY_PREVIOUS_HMAC_SECRET: variables.GATEWAY_PREVIOUS_HMAC_SECRET,
     IP_HASH_SECRET: variables.IP_HASH_SECRET,
     OWNER_EMAIL: variables.OWNER_EMAIL,
+    OWNER_ALLOWLIST_VERSION: variables.OWNER_ALLOWLIST_VERSION,
   } as Env;
 }
 
@@ -152,7 +158,13 @@ function normalizeOwnerEmail(value: string | null): string {
   return value?.trim().toLowerCase() ?? "";
 }
 
-function safeResponse(response: Response, isApi = false, isLocal = false): Response {
+function safeResponse(
+  response: Response,
+  isApi = false,
+  isLocal = false,
+  sitesConfigurationHash?: string,
+  ownerAllowlistVersion?: string | null,
+): Response {
   const headers = new Headers(response.headers);
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
@@ -172,6 +184,12 @@ function safeResponse(response: Response, isApi = false, isLocal = false): Respo
       "frame-src https://music.apple.com https://*.apple.com",
   );
   if (isApi) headers.set("Cache-Control", "no-store");
+  if (sitesConfigurationHash) {
+    headers.set("X-Genio-Sites-Configuration-Hash", sitesConfigurationHash);
+  }
+  if (ownerAllowlistVersion) {
+    headers.set("X-Genio-Owner-Allowlist-Version", ownerAllowlistVersion);
+  }
   if (!isLocal) headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   return new Response(response.body, {
     status: response.status,
@@ -393,6 +411,14 @@ const worker = {
   async fetch(request: Request, suppliedEnvironment: Env | undefined, ctx: ExecutionContext): Promise<Response> {
     const env = localPreviewEnvironment(suppliedEnvironment);
     const url = new URL(request.url);
+    let ownerAllowlistVersion: string | null;
+    let sitesConfigurationHash: string;
+    try {
+      ownerAllowlistVersion = sitesOwnerAllowlistVersion(env);
+      sitesConfigurationHash = await sitesGatewayReleaseConfigurationHash(env);
+    } catch {
+      return jsonError(503, "Owner allowlist release identity is not configured.");
+    }
 
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
@@ -403,7 +429,13 @@ const worker = {
           return result.response();
         },
       }, allowedWidths);
-      return safeResponse(response, false, url.hostname === "localhost" || url.hostname === "127.0.0.1");
+      return safeResponse(
+        response,
+        false,
+        url.hostname === "localhost" || url.hostname === "127.0.0.1",
+        sitesConfigurationHash,
+        ownerAllowlistVersion,
+      );
     }
 
     if (
@@ -415,6 +447,8 @@ const worker = {
         await gateway(request, env, url),
         true,
         url.hostname === "localhost" || url.hostname === "127.0.0.1",
+        sitesConfigurationHash,
+        ownerAllowlistVersion,
       );
     }
 
@@ -427,13 +461,13 @@ const worker = {
         return safeResponse(new Response("Owner allowlist is not configured.", {
           status: 503,
           headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
-        }), false, url.hostname === "localhost" || url.hostname === "127.0.0.1");
+        }), false, url.hostname === "localhost" || url.hostname === "127.0.0.1", sitesConfigurationHash, ownerAllowlistVersion);
       }
       if (expectedOwner && authenticatedEmail && authenticatedEmail !== expectedOwner) {
         return safeResponse(new Response("Owner access denied.", {
           status: 403,
           headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
-        }), false, url.hostname === "localhost" || url.hostname === "127.0.0.1");
+        }), false, url.hostname === "localhost" || url.hostname === "127.0.0.1", sitesConfigurationHash, ownerAllowlistVersion);
       }
       if (authenticatedEmail === expectedOwner) {
         ownerHeaders.set("x-needle-owner-verified", "1");
@@ -442,6 +476,8 @@ const worker = {
         await handler.fetch(new Request(request, { headers: ownerHeaders }), env, ctx),
         false,
         url.hostname === "localhost" || url.hostname === "127.0.0.1",
+        sitesConfigurationHash,
+        ownerAllowlistVersion,
       );
     }
 
@@ -449,6 +485,8 @@ const worker = {
       await handler.fetch(request, env, ctx),
       false,
       url.hostname === "localhost" || url.hostname === "127.0.0.1",
+      sitesConfigurationHash,
+      ownerAllowlistVersion,
     );
   },
 };

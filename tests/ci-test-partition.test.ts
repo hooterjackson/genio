@@ -8,6 +8,8 @@ const releaseWorkflowUrl = new URL(
   "../.github/workflows/release-candidate.yml",
   import.meta.url,
 );
+const productionPostgresImage =
+  "ghcr.io/railwayapp-templates/postgres-ssl:18@sha256:764fabc5fceb7166414c425a57bed8722a08cfb7fff508efb21a86eb31e172a6";
 
 describe("CI unit and PostgreSQL test partition", () => {
   test("keeps every database integration file out of parallel coverage and in the serial DB gate", async () => {
@@ -18,7 +20,7 @@ describe("CI unit and PostgreSQL test partition", () => {
       .filter((name) => name.endsWith(".integration.test.ts"))
       .sort();
 
-    expect(integrationFiles).toHaveLength(14);
+    expect(integrationFiles).toHaveLength(16);
     expect(packageJson.scripts?.["test:coverage"]).toContain(
       "--exclude 'tests/*.integration.test.ts'",
     );
@@ -36,5 +38,40 @@ describe("CI unit and PostgreSQL test partition", () => {
     const databaseIndex = workflow.indexOf("pnpm test:database", coverageIndex + 1);
     expect(coverageIndex).toBeGreaterThan(-1);
     expect(databaseIndex).toBeGreaterThan(coverageIndex);
+  });
+
+  test.each([
+    [
+      "pull-request",
+      ciWorkflowUrl,
+      "production-database-compatibility",
+      "browser",
+    ],
+    [
+      "release-candidate",
+      releaseWorkflowUrl,
+      "validate_production_database",
+      "validate_system",
+    ],
+  ])("%s workflow reruns every serialized integration test on the exact production Postgres 18 image", async (
+    _name,
+    url,
+    jobName,
+    nextJobName,
+  ) => {
+    const workflow = await readFile(url, "utf8");
+    const start = workflow.indexOf(`  ${jobName}:\n`);
+    expect(start).toBeGreaterThan(-1);
+    const nextJob = workflow.indexOf(`\n  ${nextJobName}:\n`, start + 1);
+    expect(nextJob).toBeGreaterThan(start);
+    const section = workflow.slice(
+      start,
+      nextJob,
+    );
+    expect(section).toContain(`image: ${productionPostgresImage}`);
+    expect(section).toContain("pnpm test:database:preflight");
+    expect(section).toContain("pnpm db:migrate");
+    expect(section).toContain("pnpm test:database");
+    expect(section).not.toContain("pnpm test:coverage");
   });
 });

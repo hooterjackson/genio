@@ -28,15 +28,87 @@ function publicRunGuidanceAction(value: unknown): RunGuidanceActionView | null {
     64,
   ).toLowerCase();
   const attemptsUsed = publicProgressOptionalCount(row.attemptsUsed);
-  if (row.kind !== "rescue_guidance"
-    || !/^[a-f0-9]{64}$/u.test(questionSetHash)
+  if (!/^[a-f0-9]{64}$/u.test(questionSetHash)
     || !baseContractRevisionId
     || !/^[a-f0-9]{64}$/u.test(baseContractSemanticHash)
     || attemptsUsed === null
     || attemptsUsed < 1
     || attemptsUsed > 2
     || row.maximumAttempts !== 2
-    || !Array.isArray(row.questions)
+    || !Array.isArray(row.questions)) {
+    return null;
+  }
+  if (row.kind === "interpretation_summary") {
+    const summary = row.interpretationSummary;
+    const actions = row.actions;
+    const reason = row.reason;
+    const axis = row.axis === null
+      ? null
+      : publicProgressText(row.axis, 80);
+    if (row.questions.length !== 0
+      || row.showEditableInterpretationSummary !== true
+      || !["clarification_attempt_limit", "rescue_question_limit"].includes(
+        String(reason),
+      )
+      || (row.axis !== null && !axis)
+      || !summary
+      || typeof summary !== "object"
+      || Array.isArray(summary)
+      || !actions
+      || typeof actions !== "object"
+      || Array.isArray(actions)) {
+      return null;
+    }
+    const summaryRow = summary as Record<string, unknown>;
+    const actionRow = actions as Record<string, unknown>;
+    const count = publicProgressOptionalCount(summaryRow.count);
+    const textList = (value: unknown): string[] | null => {
+      if (!Array.isArray(value) || value.length > 100) return null;
+      const output = value.map((item) => publicProgressText(item, 500));
+      return output.some((item) => !item) ? null : output;
+    };
+    const mustHave = textList(summaryRow.mustHave);
+    const prefer = textList(summaryRow.prefer);
+    const avoid = textList(summaryRow.avoid);
+    const flow = textList(summaryRow.flow);
+    if (count === null
+      || count < 1
+      || count > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+      || !mustHave || !prefer || !avoid || !flow
+      || actionRow.changeEarlierAnswer !== true
+      || actionRow.reviewContract !== true
+      || actionRow.resumeLater !== true
+      || actionRow.cancel !== true) {
+      return null;
+    }
+    return {
+      kind: "interpretation_summary",
+      questionSetHash,
+      baseContractRevisionId,
+      baseContractSemanticHash,
+      questions: [],
+      attemptsUsed,
+      maximumAttempts: 2,
+      showEditableInterpretationSummary: true,
+      reason: reason as "clarification_attempt_limit" | "rescue_question_limit",
+      axis,
+      interpretationSummary: {
+        mustHave,
+        prefer,
+        avoid,
+        flow,
+        count,
+      },
+      actions: {
+        changeEarlierAnswer: true,
+        reviewContract: true,
+        resumeLater: true,
+        cancel: true,
+      },
+    };
+  }
+  if (row.kind !== "rescue_guidance"
+    || row.showEditableInterpretationSummary !== false
     || row.questions.length < 1
     || row.questions.length > 1) {
     return null;
@@ -68,8 +140,7 @@ function publicRunGuidanceAction(value: unknown): RunGuidanceActionView | null {
     questions,
     attemptsUsed,
     maximumAttempts: 2,
-    showEditableInterpretationSummary:
-      row.showEditableInterpretationSummary === true,
+    showEditableInterpretationSummary: false,
   };
 }
 
@@ -122,8 +193,10 @@ function publicExplore(value: unknown): ExplorePreferenceView | null {
 /**
  * The capability-authenticated visitor API must advertise only actions that
  * the visitor can actually complete. Rescue guidance is preserved only when
- * its complete hash-bound action is present; generic manual resume and Apple
- * authorization remain owner/orchestrator operations.
+ * its complete hash-bound action is present. A dependency resume is preserved
+ * only when the retained provider blocker carries its optimistic-lock hash;
+ * generic manual resume and Apple authorization remain owner/orchestrator
+ * operations.
  */
 export function publicRunResolutionView(
   resolution: RunResolutionView,
@@ -141,10 +214,16 @@ export function publicRunResolutionView(
     state = "blocked_dependency";
     nextAction = "wait_for_dependency";
   } else if (nextAction === "resume_research") {
-    state = "needs_decision";
-    nextAction = partialAction?.canContinueResearch
-      ? "decide_verified_partial"
-      : "review_contract";
+    const dependencyResume = resolution.state === "needs_decision"
+      && resolution.blocker?.kind === "provider"
+      && typeof resolution.blocker.versionHash === "string"
+      && /^[a-f0-9]{64}$/u.test(resolution.blocker.versionHash);
+    if (!dependencyResume) {
+      state = "needs_decision";
+      nextAction = partialAction?.canContinueResearch
+        ? "decide_verified_partial"
+        : "review_contract";
+    }
   } else if (nextAction === "decide_verified_partial" && !partialAction) {
     state = "needs_decision";
     nextAction = "review_contract";
@@ -162,6 +241,7 @@ export function publicRunResolutionView(
       nextRetryAt: resolution.blocker.nextRetryAt,
       automaticRetryUntil: resolution.blocker.automaticRetryUntil,
       retryCount: resolution.blocker.retryCount,
+      versionHash: resolution.blocker.versionHash,
     } : null,
   };
 }
@@ -324,6 +404,7 @@ export function publicBriefStatusView(input: {
   requestId: string;
   prompt: string;
   requestedTrackCount: number | null;
+  originalRequestedTrackCount?: number | null;
   status: string;
   briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
@@ -337,6 +418,7 @@ export function publicBriefStatusView(input: {
     requestId: input.requestId,
     prompt: input.prompt,
     requestedTrackCount: input.requestedTrackCount,
+    originalRequestedTrackCount: input.originalRequestedTrackCount,
     status: input.status,
     briefContractVersion: input.briefContractVersion,
     questionSetHash: input.questionSetHash,

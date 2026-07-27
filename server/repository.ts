@@ -55,7 +55,9 @@ import type {
 } from "../shared/types.ts";
 import {
   assignPipelineV3,
+  CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
   createQueryPlanV3,
+  isCanonicalQueryPlanV3SchemaVersion,
   isQueryPlanV3,
   queryPlanV3EmissionSchemaVersion,
   queryPlanV3Hash,
@@ -78,6 +80,29 @@ import {
   v3RetrievalStageKey,
   type PipelineV3WriteFence,
 } from "./pipeline-v3-worker-execution.ts";
+import type {
+  CatalogProviderBlockerV2,
+  CatalogProviderJobAuthorityV2,
+} from "./matching-service.ts";
+import type {
+  ResearchProviderBlockerV2,
+  ResearchProviderJobAuthorityV2,
+} from "./research.ts";
+import {
+  buildReleaseManifestCanaryEvidence,
+  createReleaseManifestCanaryMarker,
+  parseReleaseManifestCanaryMarker,
+  RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+  type ReleaseManifestCanaryEvidenceV1,
+} from "./release-manifest-canary.ts";
+import {
+  CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION,
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION,
+  CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION,
+} from "./release-deployment-phase.ts";
+import { CanonicalExecutionIntegrityError } from "./canonical-execution-integrity.ts";
 import type { ColdCorpusBuildResultV3 } from "./pipeline-v3-corpus-builder.ts";
 import {
   buildSemanticEquivalentRecoveryPlanV3,
@@ -99,6 +124,9 @@ import {
 } from "./apple-write-gateway.ts";
 import {
   attestedEvidenceBindingsForSelectionV3,
+  centralQualityCriterionObservationsForPolicyV3,
+  canonicalRequiredEvidenceIntegrityV3,
+  evidenceBindingIsAttestedForSelectionV3,
   normalizePlaylistOptimizationSignalsV3,
   validateCanonicalPublicationSetV3,
 } from "./pipeline-v3-retrieval.ts";
@@ -147,6 +175,10 @@ import {
   PUBLIC_PLAYLIST_MINIMUM_TRACKS,
 } from "../shared/product-policy.ts";
 import {
+  customGuidanceTrackCountAdmission,
+  type CustomGuidanceTrackCountAuthorityV1,
+} from "./playlist-count-policy.ts";
+import {
   candidateIdentityKey,
   compactEvidenceNote,
   duplicateClusterKey,
@@ -158,6 +190,7 @@ import {
 import {
   applyPlaylistContractPatchV1,
   assertPlaylistContractIntegrityV1,
+  rebasePlaylistContractPatchV1,
   type PlaylistContractPatchV1,
   type PlaylistContractRevisionV1,
 } from "./playlist-contract-v1.ts";
@@ -168,20 +201,48 @@ import {
 } from "./adaptive-run-decision-v1.ts";
 import { evaluateCanonicalContractTrackV1 } from "./canonical-contract-runtime-v1.ts";
 import {
+  assertPublicRolloutAssignmentDatabaseAuthorityV1,
+  assertPublicRolloutExecutionEligibilityV1,
+  assertPublicRolloutExecutionGroupV1,
+  parsePublicRolloutAssignmentV1,
+  type PublicRolloutDatabaseAuthorityV1,
+  type PersistedPublicRolloutAssignmentV1,
+} from "./public-rollout-assignment.ts";
+import {
   compileGuidanceRoundPatchV3,
+  guidanceDecisionV3FromPublicQuestion,
   publicGuidanceQuestionV3,
 } from "./adaptive-guidance-contract-bridge.ts";
 import {
+  createGuidanceDecisionV3,
   customGuidanceConfirmationDecisionV3,
+  exactArtistIdentityAmbiguityGuidanceDecisionV3,
+  playlistInterpretationSummaryV1,
+  preflightCustomGuidanceTextV3,
   predicateYieldRescueGuidanceDecisionV3,
   recompileCustomGuidanceTextV3,
   selectGuidanceRoundV3,
+  type ExactArtistIdentityGuidanceCandidateV3,
 } from "./adaptive-guidance-v3.ts";
+import type {
+  ResolvedExactArtistIdentityV1,
+} from "./exact-artist-identity-v1.ts";
+import {
+  assertPlaylistFeasibilityReportIntegrityV1,
+  type PlaylistFeasibilityReportV1,
+} from "./playlist-feasibility-v1.ts";
 import { projectPlaylistContractExecutionV1 } from "./playlist-contract-execution-bridge-v1.ts";
 import {
+  canonicalExecutorCapabilityForSchemaV1,
   CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY,
   negotiatePlaylistContractBackendV1,
 } from "./playlist-contract-backend-capability-v1.ts";
+import {
+  decideDependencyResumeV1,
+  dependencyResumeAuthorizationHashV1,
+  dependencyResumeBlockerVersionV1,
+  DEPENDENCY_RESUME_AUTHORIZATION_VERSION,
+} from "./dependency-resume-v1.ts";
 import { normalizeMusicText } from "../lib/matching.ts";
 import { manifestContentHash } from "./manifest-integrity.ts";
 import type { PublicationCompletionFence } from "./publication-completion-fence.ts";
@@ -194,6 +255,7 @@ import {
 } from "./publication-reconciliation-persistence.ts";
 import {
   assertCanonicalManifestRevisionV1,
+  CANONICAL_PUBLICATION_REVALIDATION_ERROR,
   CanonicalPublicationRevalidationRequiredErrorV1,
   type PersistedCanonicalQualificationV1,
 } from "./canonical-publication-revalidation-v1.ts";
@@ -203,7 +265,10 @@ import {
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
-import { manifestDescriptionForBrief } from "./brief-policy.ts";
+import {
+  applyExecutableRequestedTrackCount,
+  manifestDescriptionForBrief,
+} from "./brief-policy.ts";
 import { appendPlaylistTitleSuffix, normalizePlaylistTitle } from "./playlist-title.ts";
 import { resolvePublicationCompleteness } from "./publication-completeness.ts";
 import { selectionFallsBelowRequiredMinimum } from "./catalog-selection-policy.ts";
@@ -259,7 +324,11 @@ import {
   type WorkerPipelineCapability,
   workerPipelineProtocolVersion,
 } from "./worker-protocol.ts";
-import { projectNeverDeadEndRun } from "./never-dead-end-policy.ts";
+import {
+  DEPENDENCY_RETRY_DELAYS_MS,
+  dependencyRetryDecision,
+  projectNeverDeadEndRun,
+} from "./never-dead-end-policy.ts";
 import {
   automaticFailureFingerprint,
   classifyAutomaticBriefFailure,
@@ -286,7 +355,12 @@ import {
   type PlaylistGuidancePreference,
 } from "./guidance-context.ts";
 import { compileGuidanceExecutionDeltaV2 } from "./guidance-contract-v2.ts";
-import { assignPipelineV2, createSelectionPlanV2, pipelineRolloutStickyKey } from "./selection-plan-v2.ts";
+import {
+  assignPipelineV2,
+  createSelectionPlanV2,
+  pipelineRolloutStickyKey,
+  pipelineV2Route,
+} from "./selection-plan-v2.ts";
 import {
   catalogContentRating,
   catalogRecordingVersionClass,
@@ -375,8 +449,21 @@ const FEEDBACK_STORAGE_LIMIT_BYTES = Math.max(
   Math.min(1024 * 1024 * 1024, Number(process.env.FEEDBACK_STORAGE_LIMIT_BYTES ?? 100 * 1024 * 1024) || 100 * 1024 * 1024),
 );
 const AUTOMATIC_FAILURE_DIAGNOSTIC_LIMIT_BYTES = 128 * 1024;
+const CAPABILITY_HASH = /^[a-f0-9]{64}$/u;
 
 const PRIVATE_DIAGNOSTIC_KEY = /(authorization|bearer|bucket|cookie|credential|email|header|key|password|provider.?body|raw.?response|secret|stack|token)/iu;
+
+function capabilityHashCandidates(values: readonly string[]): string[] {
+  const hashes = [...new Set(values)];
+  if (
+    hashes.length < 1
+    || hashes.length > 2
+    || hashes.some((value) => !CAPABILITY_HASH.test(value))
+  ) {
+    throw new Error("Capability verification hashes are invalid");
+  }
+  return hashes;
+}
 
 /**
  * Keep automatic reports useful without turning them into a second raw-log
@@ -580,6 +667,8 @@ export interface JobView {
   pipelineVersion: PipelineVersion;
   minimumWorkerProtocol: number;
   queryPlanRevisionId: string | null;
+  requiredExecutorCapabilityHash: string | null;
+  requiredExecutorCapabilityVector: Record<string, unknown> | null;
   stageKey: string;
   leaseEpoch: number;
   leaseOwner: string | null;
@@ -652,6 +741,7 @@ export interface PublicationVolumeInput {
   startPosition: number;
   endPosition: number;
   status?: string;
+  publicationAuthority?: BeginPublicationReconciliationInput;
 }
 
 export interface PublicationQueueResult {
@@ -699,6 +789,31 @@ function finiteMoney(value: number, field: string): number {
 function date(value: unknown): Date | null {
   if (!value) return null;
   return value instanceof Date ? value : new Date(String(value));
+}
+
+function pipelineV2ProviderRetrySchedule(input: {
+  openedAt: Date;
+  failureCount: number;
+  now: Date;
+  retryAfterUntil?: Date | null;
+}): {
+  automaticRetryUntil: Date;
+  nextRetryAt: Date | null;
+  needsDecision: boolean;
+  decisionOnlyWake: boolean;
+} {
+  const decision = dependencyRetryDecision({
+    blockedAt: input.openedAt,
+    retryCount: input.failureCount - 1,
+    now: input.now,
+    retryAfterUntil: input.retryAfterUntil,
+  });
+  return {
+    automaticRetryUntil: decision.automaticRetryUntil,
+    nextRetryAt: decision.nextRetryAt,
+    needsDecision: decision.needsDecision,
+    decisionOnlyWake: decision.decisionOnlyWake,
+  };
 }
 
 function progressCount(value: unknown): number {
@@ -871,6 +986,8 @@ function pipelineV3CanonicalPredicateProjection(
     | CandidateQualificationV3["canonicalClauseAssessments"]
     | QualifiedTrackV3["canonicalClauseAssessments"],
   selectionGradeEvidenceIds: readonly string[],
+  obligationMismatchClauseIdsInput: readonly string[] = [],
+  evidenceGradeMismatchClauseIdsInput: readonly string[] = [],
 ): {
   policyVersion: string;
   policyProjectionHash: string;
@@ -884,6 +1001,8 @@ function pipelineV3CanonicalPredicateProjection(
     passed: boolean;
     missingRequiredClauseIds: string[];
     unattestedEvidenceIds: string[];
+    obligationMismatchClauseIds: string[];
+    evidenceGradeMismatchClauseIds: string[];
   };
 } {
   // Only immutable contract leaves may enter the persisted assessment. Extra
@@ -920,6 +1039,12 @@ function pipelineV3CanonicalPredicateProjection(
   });
   const unattestedEvidenceIds = referencedEvidenceIds
     .filter((id) => !attestedIds.has(id));
+  const obligationMismatchClauseIds = [...new Set(
+    obligationMismatchClauseIdsInput,
+  )].sort();
+  const evidenceGradeMismatchClauseIds = [...new Set(
+    evidenceGradeMismatchClauseIdsInput,
+  )].sort();
   return {
     policyVersion: policy.policyVersion,
     policyProjectionHash: policy.projectionHash,
@@ -932,9 +1057,13 @@ function pipelineV3CanonicalPredicateProjection(
     evidenceIntegrity: {
       passed:
         missingRequiredClauseIds.length === 0
-        && unattestedEvidenceIds.length === 0,
+        && unattestedEvidenceIds.length === 0
+        && obligationMismatchClauseIds.length === 0
+        && evidenceGradeMismatchClauseIds.length === 0,
       missingRequiredClauseIds,
       unattestedEvidenceIds,
+      obligationMismatchClauseIds,
+      evidenceGradeMismatchClauseIds,
     },
   };
 }
@@ -949,16 +1078,32 @@ function pipelineV3QualificationDecision(
   const attestedBindings = attestedEvidenceBindingsForSelectionV3(
     qualification.evidence.bindingIds,
     qualification.evidence.bindings,
+    queryPlan.canonicalContractPolicy ? {
+      requireHostedEvidenceSnapshot: true,
+      storefront: queryPlan.storefront,
+    } : {},
   );
   const membershipPassed = canonical
-    ? canonical.evaluation.eligible && canonical.evidenceIntegrity.passed
+    ? canonical.evaluation.eligible
+      && canonical.evidenceIntegrity.passed
+      && Boolean(queryPlan.canonicalContractPolicy)
+      && canonicalRequiredEvidenceIntegrityV3({
+        policy: queryPlan.canonicalContractPolicy!,
+        assessments: qualification.canonicalClauseAssessments,
+        bindingIds: qualification.evidence.bindingIds,
+        bindings: qualification.evidence.bindings,
+        storefront: queryPlan.storefront,
+      }).passed
     : qualification.scope.passed
       && qualification.hardConstraints.passed
       && qualification.evidence.passed
       && qualification.evidence.bindingIds.length > 0
       && attestedBindings.length > 0;
   const passed = membershipPassed
-    && qualification.version.compatible
+    // A canonical version/content clause has already been evaluated inside
+    // the hash-bound tri-state tree. The compatibility boolean is the
+    // schema-1/2 global catalog policy and must not flatten OR/NOT/EXCEPT.
+    && (canonical !== null || qualification.version.compatible)
     && qualification.catalog.storefrontPlayable
     && Boolean(qualification.catalog.appleSongId)
     && Boolean(qualification.catalog.recordingFamilyKey);
@@ -966,13 +1111,20 @@ function pipelineV3QualificationDecision(
   const decisiveMembershipFailure = canonical
     ? canonical.evaluation.status === "fail"
       || !canonical.evidenceIntegrity.passed
+      || !canonicalRequiredEvidenceIntegrityV3({
+        policy: queryPlan.canonicalContractPolicy!,
+        assessments: qualification.canonicalClauseAssessments,
+        bindingIds: qualification.evidence.bindingIds,
+        bindings: qualification.evidence.bindings,
+        storefront: queryPlan.storefront,
+      }).passed
     : !qualification.scope.passed
       || !qualification.hardConstraints.passed
       || !qualification.evidence.passed
       || qualification.evidence.bindingIds.length === 0
       || (qualification.evidence.passed && attestedBindings.length === 0);
   const decisiveFailure = decisiveMembershipFailure
-    || !qualification.version.compatible
+    || (canonical === null && !qualification.version.compatible)
     || qualification.catalog.lookupAttempted === true
     || qualification.catalog.storefrontPlayable === false;
   // A passing OR/NOT canonical tree is authoritative for schema 4. Legacy
@@ -986,6 +1138,17 @@ function pipelineV3QualificationProjection(
   candidate: RawTrackCandidateV3,
   qualification: CandidateQualificationV3,
   queryPlan: QueryPlanV3,
+  provenance?: {
+    dependencyIds: readonly string[];
+    provenanceRoots: readonly string[];
+    cacheOrigin:
+      | "live"
+      | "fresh_cache"
+      | "governed_snapshot"
+      | "orchestration_local"
+      | "unknown";
+    sourceFreshUntil: Date | null;
+  },
 ): {
   decision: "qualified" | "failed" | "unknown";
   stableIdentityHash: string;
@@ -998,12 +1161,27 @@ function pipelineV3QualificationProjection(
   const attestedBindings = attestedEvidenceBindingsForSelectionV3(
     qualification.evidence.bindingIds,
     qualification.evidence.bindings,
+    queryPlan.canonicalContractPolicy ? {
+      requireHostedEvidenceSnapshot: true,
+      storefront: queryPlan.storefront,
+    } : {},
   );
+  const canonicalEvidenceIntegrity = queryPlan.canonicalContractPolicy
+    ? canonicalRequiredEvidenceIntegrityV3({
+      policy: queryPlan.canonicalContractPolicy,
+      assessments: qualification.canonicalClauseAssessments,
+      bindingIds: qualification.evidence.bindingIds,
+      bindings: qualification.evidence.bindings,
+      storefront: queryPlan.storefront,
+    })
+    : null;
   const canonical = queryPlan.canonicalContractPolicy
     ? pipelineV3CanonicalPredicateProjection(
         queryPlan.canonicalContractPolicy,
         qualification.canonicalClauseAssessments,
         attestedBindings.map(({ id }) => id),
+        canonicalEvidenceIntegrity?.obligationMismatchClauseIds ?? [],
+        canonicalEvidenceIntegrity?.evidenceGradeMismatchClauseIds ?? [],
       )
     : null;
   const decision = pipelineV3QualificationDecision(
@@ -1033,8 +1211,38 @@ function pipelineV3QualificationProjection(
       independentProvenanceRoots:
         qualification.evidence.independentProvenanceRoots,
     },
+    hostedEvidenceSnapshots: attestedBindings.flatMap((binding) => (
+      binding.hostedEvidenceSnapshot
+        ? [structuredClone(binding.hostedEvidenceSnapshot)]
+        : []
+    )),
     rankingSignals: qualification.rankingSignals,
+    ...(queryPlan.playlistQualityPolicy ? {
+      centralQualityCriterionObservations:
+        centralQualityCriterionObservationsForPolicyV3({
+          observations:
+            qualification.centralQualityCriterionObservations,
+          policy: queryPlan.playlistQualityPolicy,
+          artist: candidate.artist,
+          title: candidate.title,
+          album: candidate.album,
+          appleSongId: qualification.catalog.appleSongId ?? "",
+          recordingFamilyKey:
+            qualification.catalog.recordingFamilyKey ?? "",
+        }),
+    } : {}),
     sourceRank: qualification.sourceRank,
+    ...(provenance ? {
+      provenance: {
+        dependencyIds: [...new Set(provenance.dependencyIds)].sort(),
+        provenanceRoots: [...new Set([
+          ...provenance.provenanceRoots,
+          ...attestedBindings.map(({ provenanceRoot }) => provenanceRoot),
+        ])].sort(),
+        cacheOrigin: provenance.cacheOrigin,
+        sourceFreshUntil: provenance.sourceFreshUntil?.toISOString() ?? null,
+      },
+    } : {}),
     ...(qualification.playlistOptimizationSignals ? {
       playlistOptimizationSignals: normalizePlaylistOptimizationSignalsV3(
         qualification.playlistOptimizationSignals,
@@ -1146,6 +1354,11 @@ async function persistPipelineOutcomeTransaction(
   client: PoolClient,
   runId: string,
   incoming: PipelineOutcome,
+  transition:
+    | "provider_block"
+    | "provider_recovered"
+    | "research_provider_block"
+    | null = null,
 ): Promise<PipelineOutcome> {
   const selectedRun = await client.query<{
     pipeline_version: string;
@@ -1160,15 +1373,87 @@ async function persistPipelineOutcomeTransaction(
   if (run.pipeline_version !== incoming.pipelineVersion || run.policy_version !== incoming.policyVersion) {
     throw new HttpError(409, "Pipeline outcome versions do not match the immutable run", "pipeline_policy_mismatch");
   }
+  const providerCheckpoint = await client.query<{
+    phase: string;
+    state_json: Record<string, unknown>;
+  }>(
+    `SELECT phase,state_json FROM research_checkpoints
+     WHERE run_id=$1
+       AND phase IN (
+         'catalog_provider_blocker_v2',
+         'research_provider_blocker_v2'
+       )
+       AND state_json->>'resolvedAt' IS NULL
+     ORDER BY updated_at DESC,phase
+     LIMIT 1
+     FOR SHARE`,
+    [runId],
+  );
+  const providerState = providerCheckpoint.rows[0]?.state_json ?? {};
+  const providerCheckpointPhase = providerCheckpoint.rows[0]?.phase ?? null;
+  const unresolvedProviderGeneration =
+    providerState.resolvedAt == null
+      && typeof providerState.generation === "string"
+      && UUID_PATTERN.test(providerState.generation)
+      ? providerState.generation
+      : null;
+  if (unresolvedProviderGeneration && transition === null) {
+    throw new HttpError(
+      409,
+      "Resolve the active catalog provider generation before changing its outcome",
+      "catalog_provider_transition_required",
+    );
+  }
+  const transitionCheckpointPhase = transition === "research_provider_block"
+    ? "research_provider_blocker_v2"
+    : transition === "provider_block" || transition === "provider_recovered"
+      ? "catalog_provider_blocker_v2"
+      : null;
+  if (unresolvedProviderGeneration
+    && transitionCheckpointPhase !== providerCheckpointPhase) {
+    throw new HttpError(
+      409,
+      "The active provider generation must recover before another provider outcome can change",
+      "catalog_provider_transition_required",
+    );
+  }
+  if ((transition === "provider_block"
+      || transition === "research_provider_block")
+    && (incoming.status !== "failed_system"
+      || incoming.providerUnavailable !== true
+      || incoming.frontierExhausted !== false
+      || incoming.selectedTrackCount !== 0
+      || incoming.publishedTrackCount !== 0)) {
+    throw new HttpError(
+      409,
+      "Provider block outcome is invalid",
+      "invalid_catalog_provider_transition",
+    );
+  }
+  if (transition === "provider_recovered"
+    && (providerCheckpointPhase !== "catalog_provider_blocker_v2"
+      || !unresolvedProviderGeneration
+      || incoming.providerUnavailable
+      || incoming.status === "failed_system")) {
+    throw new HttpError(
+      409,
+      "Catalog provider recovery outcome is invalid",
+      "invalid_catalog_provider_transition",
+    );
+  }
   const selectedOutcome = await client.query<{ outcome_json: PipelineOutcome }>(
     "SELECT outcome_json FROM pipeline_outcomes WHERE run_id=$1 FOR UPDATE",
     [runId],
   );
   let merged: PipelineOutcome;
   try {
-    merged = selectedOutcome.rows[0]
-      ? mergePipelineOutcomes(selectedOutcome.rows[0].outcome_json, incoming)
-      : incoming;
+    merged = transition === "provider_block"
+      || transition === "provider_recovered"
+      || transition === "research_provider_block"
+      ? incoming
+      : selectedOutcome.rows[0]
+        ? mergePipelineOutcomes(selectedOutcome.rows[0].outcome_json, incoming)
+        : incoming;
   } catch (error) {
     throw new HttpError(
       409,
@@ -1223,6 +1508,338 @@ async function persistPipelineOutcomeTransaction(
     [runId, serializedOutcome],
   );
   return merged;
+}
+
+async function assertCatalogProviderJobLease(
+  client: PoolClient,
+  runId: string,
+  authority: CatalogProviderJobAuthorityV2,
+): Promise<Record<string, unknown>> {
+  const leased = await client.query<{
+    payload_json: Record<string, unknown>;
+  }>(
+    `SELECT payload_json
+     FROM job_queue
+     WHERE id=$1 AND run_id=$2 AND kind='matching'
+       AND pipeline_version='catalog_first_v2'
+       AND status='leased' AND lease_owner=$3 AND lease_epoch=$4
+       AND lease_expires_at>now() AND available_at<=now()
+     FOR UPDATE`,
+    [
+      authority.jobId,
+      runId,
+      authority.workerId,
+      authority.leaseEpoch,
+    ],
+  );
+  const payload = leased.rows[0]?.payload_json;
+  const payloadGeneration = typeof payload?.providerBlockerGeneration === "string"
+    ? payload.providerBlockerGeneration
+    : null;
+  const payloadFailureCount = Number(payload?.providerBlockerFailureCount ?? 0);
+  if (!payload
+    || authority.providerDependencyRetry
+      !== (payload.providerDependencyRetry === true)
+    || (authority.providerDependencyRetry
+      && (
+        !authority.expectedGeneration
+        || payloadGeneration !== authority.expectedGeneration
+        || !Number.isSafeInteger(authority.priorFailureCount)
+        || authority.priorFailureCount < 1
+        || payloadFailureCount !== authority.priorFailureCount
+      ))
+    || (!authority.providerDependencyRetry
+      && (
+        authority.expectedGeneration !== null
+        || authority.priorFailureCount !== 0
+      ))) {
+    throw new HttpError(
+      409,
+      "Catalog provider retry lease is stale",
+      "catalog_provider_retry_stale",
+    );
+  }
+  return payload;
+}
+
+async function assertCatalogProviderAttemptClaim(
+  client: PoolClient,
+  runId: string,
+  authority: CatalogProviderJobAuthorityV2,
+): Promise<void> {
+  if (!authority.claimToken || !UUID_PATTERN.test(authority.claimToken)) {
+    throw new HttpError(
+      409,
+      "Catalog provider attempt claim is missing",
+      "catalog_provider_retry_stale",
+    );
+  }
+  const claim = await client.query<{ state_json: Record<string, unknown> }>(
+    `SELECT state_json FROM research_checkpoints
+     WHERE run_id=$1 AND phase='catalog_provider_attempt_v2'
+     FOR UPDATE`,
+    [runId],
+  );
+  const state = claim.rows[0]?.state_json ?? {};
+  if (state.claimToken !== authority.claimToken
+    || state.jobId !== authority.jobId
+    || Number(state.leaseEpoch) !== authority.leaseEpoch
+    || state.workerId !== authority.workerId
+    || state.expectedGeneration !== authority.expectedGeneration) {
+    throw new HttpError(
+      409,
+      "Catalog provider attempt claim was superseded",
+      "catalog_provider_retry_stale",
+    );
+  }
+}
+
+async function assertResearchProviderJobLease(
+  client: PoolClient,
+  runId: string,
+  authority: ResearchProviderJobAuthorityV2,
+): Promise<{ payload: Record<string, unknown>; queueClass: JobQueueClass }> {
+  const leased = await client.query<{
+    payload_json: Record<string, unknown>;
+    queue_class: JobQueueClass;
+  }>(
+    `SELECT payload_json,queue_class
+     FROM job_queue
+     WHERE id=$1 AND run_id=$2 AND kind='research'
+       AND pipeline_version='catalog_first_v2'
+       AND status='leased' AND lease_owner=$3 AND lease_epoch=$4
+       AND lease_expires_at>now() AND available_at<=now()
+     FOR UPDATE`,
+    [
+      authority.jobId,
+      runId,
+      authority.workerId,
+      authority.leaseEpoch,
+    ],
+  );
+  const row = leased.rows[0];
+  const payload = row?.payload_json;
+  const payloadGeneration =
+    typeof payload?.researchProviderBlockerGeneration === "string"
+      ? payload.researchProviderBlockerGeneration
+      : null;
+  const payloadFailureCount = Number(
+    payload?.researchProviderBlockerFailureCount ?? 0,
+  );
+  if (!payload
+    || authority.providerDependencyRetry
+      !== (payload.researchProviderDependencyRetry === true)
+    || (authority.providerDependencyRetry
+      && (
+        !authority.expectedGeneration
+        || payloadGeneration !== authority.expectedGeneration
+        || !Number.isSafeInteger(authority.priorFailureCount)
+        || authority.priorFailureCount < 1
+        || payloadFailureCount !== authority.priorFailureCount
+      ))
+    || (!authority.providerDependencyRetry
+      && (
+        authority.expectedGeneration !== null
+        || authority.priorFailureCount !== 0
+      ))) {
+    throw new HttpError(
+      409,
+      "Research provider retry lease is stale",
+      "research_provider_retry_stale",
+    );
+  }
+  return {
+    payload,
+    queueClass: row!.queue_class,
+  };
+}
+
+async function assertResearchProviderAttemptClaim(
+  client: PoolClient,
+  runId: string,
+  authority: ResearchProviderJobAuthorityV2,
+): Promise<void> {
+  if (!authority.claimToken || !UUID_PATTERN.test(authority.claimToken)) {
+    throw new HttpError(
+      409,
+      "Research provider attempt claim is missing",
+      "research_provider_retry_stale",
+    );
+  }
+  const claim = await client.query<{ state_json: Record<string, unknown> }>(
+    `SELECT state_json FROM research_checkpoints
+     WHERE run_id=$1 AND phase='research_provider_attempt_v2'
+     FOR UPDATE`,
+    [runId],
+  );
+  const state = claim.rows[0]?.state_json ?? {};
+  if (state.claimToken !== authority.claimToken
+    || state.jobId !== authority.jobId
+    || Number(state.leaseEpoch) !== authority.leaseEpoch
+    || state.workerId !== authority.workerId
+    || state.expectedGeneration !== authority.expectedGeneration) {
+    throw new HttpError(
+      409,
+      "Research provider attempt claim was superseded",
+      "research_provider_retry_stale",
+    );
+  }
+}
+
+type PipelineWorkerWriteFence =
+  | PipelineV3WriteFence
+  | ResearchProviderJobAuthorityV2
+  | CatalogProviderJobAuthorityV2;
+
+async function assertResearchProviderWriteFence(
+  client: PoolClient,
+  runId: string,
+  authority: ResearchProviderJobAuthorityV2,
+): Promise<void> {
+  const run = await client.query(
+    `SELECT id FROM research_runs
+     WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+    [runId],
+  );
+  if (!run.rows[0]) {
+    throw new HttpError(404, "Research run not found", "run_not_found");
+  }
+  await assertResearchProviderJobLease(client, runId, authority);
+  await assertResearchProviderAttemptClaim(client, runId, authority);
+  const blocker = await client.query<{ state_json: Record<string, unknown> }>(
+    `SELECT state_json FROM research_checkpoints
+     WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+     FOR SHARE`,
+    [runId],
+  );
+  const state = blocker.rows[0]?.state_json ?? {};
+  const activeGeneration = state.resolvedAt == null
+    && typeof state.generation === "string"
+    && UUID_PATTERN.test(state.generation)
+    ? state.generation
+    : null;
+  const resolvedByExactAuthority = state.resolvedAt != null
+    && state.generation === authority.expectedGeneration
+    && Number(state.failureCount) === authority.priorFailureCount
+    && state.resolvedByJobId === authority.jobId
+    && Number(state.resolvedByLeaseEpoch) === authority.leaseEpoch;
+  if (authority.providerDependencyRetry
+    ? !resolvedByExactAuthority
+      && (activeGeneration !== authority.expectedGeneration
+        || Number(state.failureCount) !== authority.priorFailureCount)
+    : activeGeneration !== null) {
+    throw new HttpError(
+      409,
+      "Research provider write generation is stale",
+      "research_provider_retry_stale",
+    );
+  }
+}
+
+async function assertCatalogProviderWriteFence(
+  client: PoolClient,
+  runId: string,
+  authority: CatalogProviderJobAuthorityV2,
+): Promise<void> {
+  const run = await client.query(
+    `SELECT id FROM research_runs
+     WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+    [runId],
+  );
+  if (!run.rows[0]) {
+    throw new HttpError(404, "Research run not found", "run_not_found");
+  }
+  await assertCatalogProviderJobLease(client, runId, authority);
+  await assertCatalogProviderAttemptClaim(client, runId, authority);
+  const blockers = await client.query<{
+    phase: string;
+    state_json: Record<string, unknown>;
+  }>(
+    `SELECT phase,state_json FROM research_checkpoints
+     WHERE run_id=$1
+       AND phase IN (
+         'catalog_provider_blocker_v2',
+         'research_provider_blocker_v2'
+       )
+     FOR SHARE`,
+    [runId],
+  );
+  const researchState = blockers.rows.find(
+    ({ phase }) => phase === "research_provider_blocker_v2",
+  )?.state_json ?? {};
+  if (researchState.resolvedAt == null
+    && typeof researchState.generation === "string"
+    && UUID_PATTERN.test(researchState.generation)) {
+    throw new HttpError(
+      409,
+      "Catalog provider write is fenced by factual research recovery",
+      "catalog_provider_retry_stale",
+    );
+  }
+  const catalogState = blockers.rows.find(
+    ({ phase }) => phase === "catalog_provider_blocker_v2",
+  )?.state_json ?? {};
+  const activeGeneration = catalogState.resolvedAt == null
+    && typeof catalogState.generation === "string"
+    && UUID_PATTERN.test(catalogState.generation)
+    ? catalogState.generation
+    : null;
+  const resolvedByExactAuthority = catalogState.resolvedAt != null
+    && catalogState.generation === authority.expectedGeneration
+    && Number(catalogState.failureCount) === authority.priorFailureCount
+    && catalogState.resolvedByJobId === authority.jobId
+    && Number(catalogState.resolvedByLeaseEpoch) === authority.leaseEpoch;
+  if (authority.providerDependencyRetry
+    ? !resolvedByExactAuthority
+      && (activeGeneration !== authority.expectedGeneration
+        || Number(catalogState.failureCount) !== authority.priorFailureCount)
+    : activeGeneration !== null) {
+    throw new HttpError(
+      409,
+      "Catalog provider write generation is stale",
+      "catalog_provider_retry_stale",
+    );
+  }
+}
+
+async function assertPipelineWorkerWriteFence(
+  repository: Repository,
+  client: PoolClient,
+  runId: string,
+  fence: PipelineWorkerWriteFence,
+): Promise<void> {
+  if ("queryPlanRevisionId" in fence) {
+    await repository.assertPipelineV3WriteFence(client, runId, fence);
+    return;
+  }
+  const job = await client.query<{ kind: string }>(
+    `SELECT kind FROM job_queue
+     WHERE id=$1 AND run_id=$2
+       AND kind IN ('research','matching')
+     FOR SHARE`,
+    [fence.jobId, runId],
+  );
+  if (job.rows[0]?.kind === "research") {
+    await assertResearchProviderWriteFence(
+      client,
+      runId,
+      fence as ResearchProviderJobAuthorityV2,
+    );
+    return;
+  }
+  if (job.rows[0]?.kind === "matching") {
+    await assertCatalogProviderWriteFence(
+      client,
+      runId,
+      fence as CatalogProviderJobAuthorityV2,
+    );
+    return;
+  }
+  throw new HttpError(
+    409,
+    "Provider write fence does not identify an active pipeline job",
+    "provider_write_fence_stale",
+  );
 }
 
 function boundedPipelineBatch<T>(items: readonly T[], maximum: number, field: string): readonly T[] {
@@ -1627,6 +2244,335 @@ interface ManifestScopeBindingProof {
   provenancePath: Array<{ kind: string; id: string; label?: string }>;
 }
 
+interface PersistedPipelineV3EvidenceBindingRow {
+  candidate_id: string;
+  source_url: string;
+  provenance_root: string;
+  binding_kind: string;
+  confidence: number | string;
+  provenance_path_json: unknown;
+}
+
+interface PersistedPipelineV3QualificationEvidenceRow {
+  candidate_id: string;
+  stable_identity_hash: string;
+  qualification_hash: string;
+  decision: string;
+  recording_family_key: string;
+  predicate_results_json: unknown;
+  evidence_record_ids_json: unknown;
+  quality_result_json: unknown;
+  catalog_result_json: unknown;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function exactRecordKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length
+    && keys.every((key) => (
+      typeof key === "string" && expected.includes(key)
+    ));
+}
+
+function persistedPipelineV3EvidenceBinding(
+  row: PersistedPipelineV3EvidenceBindingRow,
+): EvidenceBindingReferenceV3 | null {
+  let pathByteLength: number;
+  try {
+    pathByteLength = Buffer.byteLength(
+      JSON.stringify(row.provenance_path_json),
+      "utf8",
+    );
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(row.provenance_path_json)
+    || row.provenance_path_json.length < 3
+    || row.provenance_path_json.length > 68
+    || pathByteLength > 64 * 1_024) return null;
+  const path = row.provenance_path_json
+    .map(recordValue)
+    .filter((value): value is Record<string, unknown> => value !== null);
+  if (path.length !== row.provenance_path_json.length
+    || path.some((step) => {
+      if (step.kind === "evidence_eligibility_attestation") {
+        return !exactRecordKeys(step, ["kind", "attestation"]);
+      }
+      if (step.kind === "evidence_source_governance") {
+        return !exactRecordKeys(step, ["kind", "governance"]);
+      }
+      if (step.kind === "hosted_web_evidence_snapshot") {
+        return !exactRecordKeys(step, ["kind", "snapshot"]);
+      }
+      if (step.kind === "pipeline_v3_binding") {
+        return !exactRecordKeys(step, [
+          "kind",
+          "id",
+          "label",
+          "predicateIds",
+          "sourcePredicateIds",
+        ]);
+      }
+      if (step.kind === "source_observation") {
+        return !exactRecordKeys(step, ["kind", "id"]);
+      }
+      return true;
+    })) return null;
+  const bindingStep = path.find(({ kind }) => kind === "pipeline_v3_binding");
+  const governanceStep = path.find(
+    ({ kind }) => kind === "evidence_source_governance",
+  );
+  const attestationStep = path.find(
+    ({ kind }) => kind === "evidence_eligibility_attestation",
+  );
+  const snapshotStep = path.find(
+    ({ kind }) => kind === "hosted_web_evidence_snapshot",
+  );
+  const governance = recordValue(governanceStep?.governance);
+  const eligibilityAttestation = recordValue(attestationStep?.attestation);
+  const hostedEvidenceSnapshot = recordValue(snapshotStep?.snapshot);
+  if (path.filter(({ kind }) => kind === "pipeline_v3_binding").length !== 1
+    || path.filter(
+      ({ kind }) => kind === "evidence_source_governance",
+    ).length !== 1
+    || path.filter(
+      ({ kind }) => kind === "evidence_eligibility_attestation",
+    ).length !== 1
+    || path.filter(
+      ({ kind }) => kind === "hosted_web_evidence_snapshot",
+    ).length > 1
+    || typeof bindingStep?.id !== "string"
+    || !governance
+    || !eligibilityAttestation) return null;
+  const rowPredicateIds = Array.isArray(bindingStep.predicateIds)
+    ? bindingStep.predicateIds.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  const sourcePredicateIds = Array.isArray(bindingStep.sourcePredicateIds)
+    ? bindingStep.sourcePredicateIds.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  if (rowPredicateIds.length !== 1
+    || sourcePredicateIds.length < 1
+    || sourcePredicateIds.length > 32
+    || new Set(sourcePredicateIds).size !== sourcePredicateIds.length
+    || sourcePredicateIds.some((id) => id.trim() !== id || id.length > 240)
+    || !sourcePredicateIds.includes(rowPredicateIds[0]!)) return null;
+  const binding: EvidenceBindingReferenceV3 = {
+    id: bindingStep.id,
+    url: row.source_url,
+    provenanceRoot: row.provenance_root,
+    strength: Number(row.confidence),
+    sourceRank: 0,
+    kind: row.binding_kind,
+    predicateIds: sourcePredicateIds,
+    governance: governance as unknown as EvidenceBindingReferenceV3["governance"],
+    ...(hostedEvidenceSnapshot ? {
+      hostedEvidenceSnapshot:
+        hostedEvidenceSnapshot as unknown as NonNullable<
+          EvidenceBindingReferenceV3["hostedEvidenceSnapshot"]
+        >,
+    } : {}),
+    eligibilityAttestation:
+      eligibilityAttestation as unknown as EvidenceEligibilityAttestationV3,
+  };
+  return evidenceBindingIsAttestedForSelectionV3(binding, {
+      requireHostedEvidenceSnapshot: true,
+    })
+    ? binding
+    : null;
+}
+
+function canonicalAssessmentEvidenceReferences(
+  predicateResults: unknown,
+): Array<{ obligationId: string; evidenceId: string }> {
+  const root = recordValue(predicateResults);
+  const canonical = recordValue(root?.canonicalContract);
+  const assessments = recordValue(canonical?.assessments);
+  if (!assessments) return [];
+  return Object.entries(assessments).flatMap(([obligationId, raw]) => {
+    const assessment = recordValue(raw);
+    return Array.isArray(assessment?.evidenceIds)
+      ? assessment.evidenceIds.flatMap((value) => (
+          typeof value === "string" && value.trim()
+            ? [{ obligationId, evidenceId: value }]
+            : []
+        ))
+      : [];
+  });
+}
+
+function persistedPipelineV3EvidenceBindingIndex(
+  rows: readonly PersistedPipelineV3EvidenceBindingRow[],
+): {
+  bindingsByCandidate: Map<string, EvidenceBindingReferenceV3[]>;
+  reason: string | null;
+} {
+  const bindingsByCandidate =
+    new Map<string, EvidenceBindingReferenceV3[]>();
+  for (const row of rows) {
+    const binding = persistedPipelineV3EvidenceBinding(row);
+    if (!binding) {
+      return {
+        bindingsByCandidate,
+        reason: "canonical_evidence_binding_invalid",
+      };
+    }
+    const candidateBindings = bindingsByCandidate.get(row.candidate_id) ?? [];
+    const sameId = candidateBindings.find(({ id }) => id === binding.id);
+    if (sameId) {
+      if (stableStringify(sameId) !== stableStringify(binding)) {
+        return {
+          bindingsByCandidate,
+          reason: "canonical_evidence_binding_ambiguous",
+        };
+      }
+      continue;
+    }
+    candidateBindings.push(binding);
+    bindingsByCandidate.set(row.candidate_id, candidateBindings);
+  }
+  return { bindingsByCandidate, reason: null };
+}
+
+function persistedQualificationProjectionIntegrityReason(
+  qualification: PersistedPipelineV3QualificationEvidenceRow,
+): string | null {
+  if (qualification.decision !== "qualified"
+    || !/^[0-9a-f]{64}$/u.test(qualification.stable_identity_hash)
+    || !/^[0-9a-f]{64}$/u.test(qualification.qualification_hash)
+    || typeof qualification.recording_family_key !== "string"
+    || qualification.recording_family_key.trim().length === 0
+    || !Array.isArray(qualification.evidence_record_ids_json)
+    || qualification.evidence_record_ids_json.length > 128
+    || qualification.evidence_record_ids_json.some((value) => (
+      typeof value !== "string" || value.trim() !== value || value.length === 0
+    ))
+    || new Set(qualification.evidence_record_ids_json).size
+      !== qualification.evidence_record_ids_json.length) {
+    return "canonical_qualification_projection_invalid";
+  }
+  const stableIdentityHash = sha256Hex(stableStringify({
+    kind: "recording_family",
+    recordingFamilyKey: qualification.recording_family_key,
+  }));
+  if (stableIdentityHash !== qualification.stable_identity_hash) {
+    return "canonical_stable_identity_hash_invalid";
+  }
+  const qualificationHash = sha256Hex(stableStringify({
+    decision: qualification.decision,
+    stableIdentityHash,
+    predicateResults: qualification.predicate_results_json,
+    evidenceRecordIds: qualification.evidence_record_ids_json,
+    qualityResult: qualification.quality_result_json,
+    catalogResult: qualification.catalog_result_json,
+  }));
+  return qualificationHash === qualification.qualification_hash
+    ? null
+    : "canonical_qualification_hash_invalid";
+}
+
+function persistedCanonicalEvidenceIntegrityReason(input: {
+  storefront: string;
+  canonicalPolicy: NonNullable<
+    SelectionPlanV3["canonicalContractPolicy"]
+  >;
+  candidateIds: readonly string[];
+  qualifications: readonly PersistedPipelineV3QualificationEvidenceRow[];
+  bindings: readonly PersistedPipelineV3EvidenceBindingRow[];
+}): string | null {
+  const latestQualification = new Map<string, PersistedPipelineV3QualificationEvidenceRow>();
+  for (const qualification of input.qualifications) {
+    if (latestQualification.has(qualification.candidate_id)) {
+      return "canonical_qualification_projection_ambiguous";
+    }
+    const integrityReason =
+      persistedQualificationProjectionIntegrityReason(qualification);
+    if (integrityReason) return integrityReason;
+    latestQualification.set(qualification.candidate_id, qualification);
+  }
+  const bindingIndex =
+    persistedPipelineV3EvidenceBindingIndex(input.bindings);
+  if (bindingIndex.reason) return bindingIndex.reason;
+  const { bindingsByCandidate } = bindingIndex;
+  for (const candidateId of input.candidateIds) {
+    const qualification = latestQualification.get(candidateId);
+    if (!qualification) return "canonical_qualification_projection_missing";
+    const references = canonicalAssessmentEvidenceReferences(
+      qualification.predicate_results_json,
+    );
+    const evidenceRecordIds = new Set(
+      qualification.evidence_record_ids_json as string[],
+    );
+    if (references.some(({ evidenceId }) => !evidenceRecordIds.has(evidenceId))) {
+      return "canonical_evidence_reference_missing";
+    }
+    const root = recordValue(qualification.predicate_results_json);
+    const canonical = recordValue(root?.canonicalContract);
+    const assessments = recordValue(canonical?.assessments);
+    if (!assessments) return "canonical_predicate_projection_invalid";
+    for (const clause of input.canonicalPolicy.clauses) {
+      const assessment = recordValue(assessments[clause.id]);
+      if (clause.evidence.required
+        && assessment?.status === "pass"
+        && assessment.evidenceGrade
+          !== "authoritative_structured_metadata") {
+        const clauseEvidenceIds = Array.isArray(assessment.evidenceIds)
+          ? assessment.evidenceIds.filter(
+              (value): value is string => (
+                typeof value === "string" && value.trim().length > 0
+              ),
+            )
+          : [];
+        if (clauseEvidenceIds.length === 0) {
+          return "canonical_evidence_reference_missing";
+        }
+      }
+    }
+    const quality = recordValue(qualification.quality_result_json);
+    const qualitySnapshots = Array.isArray(quality?.hostedEvidenceSnapshots)
+      ? quality.hostedEvidenceSnapshots
+        .map(recordValue)
+        .filter((value): value is Record<string, unknown> => value !== null)
+      : [];
+    if (qualitySnapshots.length > 64) {
+      return "canonical_hosted_evidence_snapshot_invalid";
+    }
+    for (const reference of references) {
+      const binding = (bindingsByCandidate.get(candidateId) ?? []).find(
+        (candidateBinding) => (
+          candidateBinding.id === reference.evidenceId
+          && evidenceBindingIsAttestedForSelectionV3(candidateBinding, {
+            requireHostedEvidenceSnapshot: true,
+            storefront: input.storefront,
+            requiredObligationIds: [reference.obligationId],
+          })
+        ),
+      );
+      if (!binding) return "canonical_evidence_binding_invalid";
+      if (binding.governance.accessMethod === "hosted_web_search") {
+        const snapshot = binding.hostedEvidenceSnapshot;
+        if (!snapshot || !qualitySnapshots.some((qualitySnapshot) => (
+          stableStringify(qualitySnapshot) === stableStringify(snapshot)
+        ))) {
+          return "canonical_hosted_evidence_snapshot_invalid";
+        }
+      }
+    }
+  }
+  return null;
+}
+
 interface ManifestSelectionRow {
   candidate_id: string;
   recording_family_id: string | null;
@@ -1843,15 +2789,22 @@ export interface SavePlaylistFeasibilitySnapshotInput {
 export interface BeginPlaylistExecutionAttemptInput {
   runId: string;
   contractRevisionId: string;
+  jobId?: string | null;
+  /** Exact durable-lease owner. Required once schema-19 hardening is active. */
+  workerId?: string | null;
+  queryPlanRevisionId?: string | null;
   stage: string;
   dependencyKey?: string | null;
   attemptNumber: number;
   leaseGeneration: number;
   executorRevision: string;
   executorIdentityHash: string;
+  executorCapabilityHash?: string | null;
+  executorCapabilityVector?: Record<string, unknown> | null;
   configurationHash: string;
   idempotencyKey: string;
   checkpointCursor?: string | null;
+  leaseExpiresAt?: Date | null;
 }
 
 export interface OpenPlaylistRunBlockerInput {
@@ -1870,6 +2823,41 @@ export interface OpenPlaylistRunBlockerInput {
   nextRetryAt?: Date | null;
   automaticRetryUntil?: Date | null;
   state?: Record<string, unknown>;
+  /** Required for worker-originated canonical writes; omitted for user/API decisions. */
+  fence?: PipelineV3WriteFence;
+}
+
+export interface MarkPlaylistDependencyDecisionInput {
+  runId: string;
+  contractRevisionId: string;
+  jobId: string;
+  workerId: string;
+  leaseGeneration: number;
+  attemptId: string;
+  queryPlanRevisionId: string;
+  stageKey: string;
+  dependencyKey: string;
+  retryCount: number;
+  automaticRetryUntil: Date;
+  state: Record<string, unknown>;
+}
+
+export interface ResumePlaylistDependencyDecisionInput {
+  runId: string;
+  sourceAccessId: string;
+  capabilitySessionId: string;
+  expectedContractRevisionId: string;
+  expectedContractSemanticHash: string;
+  expectedDecisionHash: string;
+  expectedBlockerVersion: string;
+  idempotencyKey: string;
+}
+
+export interface ResumePlaylistDependencyDecisionResult {
+  queued: boolean;
+  jobId: string;
+  authorizationHash: string;
+  resumeAt: Date;
 }
 
 export interface CreateCanonicalRunSuccessorInput {
@@ -1881,9 +2869,41 @@ export interface CreateCanonicalRunSuccessorInput {
   expectedContractRevisionId: string;
   expectedContractSemanticHash: string;
   patch: PlaylistContractPatchV1;
+  /** A replacement compiled from an immutable historical base. */
+  preparedSuccessorContract?: PlaylistContractRevisionV1;
+  guidanceRevision?: {
+    revisionRequestHash: string;
+    sourceAnswerSetId: string;
+    sourceQuestionSetId: string;
+    historicalBaseContractRevisionId: string;
+    questions: PlaylistGuidanceQuestion[];
+    normalizedAnswers: PlaylistGuidanceAnswer[];
+    invalidatedAnswerSetIds: string[];
+    invalidatedContractRevisionIds: string[];
+    reofferedQuestionSet: {
+      questionSetHash: string;
+      questions: PlaylistGuidanceQuestion[];
+      sourceQuestionSetId: string;
+      trigger: "correctness" | "yield_risk" | "nuance";
+      axis: string | null;
+      showEditableInterpretationSummary: boolean;
+      summaryReason: "clarification_attempt_limit" | null;
+    } | null;
+  };
+  /**
+   * Rescue answers consume a single active question-set authority. Keeping this
+   * material on the successor request lets the repository fence, persist, and
+   * deactivate that authority in the same transaction as the successor.
+   */
+  rescueGuidanceAnswer?: {
+    questionSetId: string;
+    questionSetHash: string;
+    normalizedAnswers: PlaylistGuidanceAnswer[];
+  };
   idempotencyKey: string;
   trigger:
     | "rescue_guidance"
+    | "guidance_answer_revision"
     | "named_predicate_revision"
     | "count_revision";
 }
@@ -1895,6 +2915,39 @@ export interface CanonicalRunSuccessorResult {
   queryPlanRevisionId: string | null;
   created: boolean;
   status: "queued" | "awaiting_budget" | "needs_decision";
+}
+
+export interface PlaylistGuidanceHistoryItem {
+  answerSetId: string;
+  questionSetHash: string;
+  question: {
+    id: string;
+    header: string;
+    question: string;
+    criticality: "required" | "optional";
+    selectionMode: "single" | "multiple";
+    allowCustom: boolean;
+    options: Array<{
+      id: string;
+      label: string;
+      description: string;
+      recommended: boolean;
+    }>;
+  };
+  selectedOptionIds: string[];
+  selectedOptionLabels: string[];
+  hadCustomAnswer: boolean;
+  skipped: boolean;
+  axis: string | null;
+  trigger: "correctness" | "yield_risk" | "nuance";
+  acceptedAt: string;
+}
+
+export interface PlaylistGuidanceHistoryView {
+  activeContractRevisionId: string;
+  activeContractSemanticHash: string;
+  historyVersion: string;
+  items: PlaylistGuidanceHistoryItem[];
 }
 
 function eraConstraintSatisfied(row: ManifestSelectionRow, constraint: SelectionConstraint): boolean {
@@ -1999,6 +3052,53 @@ function manifestConstraintRules(plan: SelectionPlan): ConstraintRule[] {
   return [...byId.values()];
 }
 
+function assertCustomGuidanceTrackCountAdmission(
+  requestedTrackCount: number,
+  authority: CustomGuidanceTrackCountAuthorityV1 | null | undefined,
+): void {
+  const admission = customGuidanceTrackCountAdmission({
+    requestedTrackCount,
+    authority,
+  });
+  if (admission.status !== "accepted") {
+    throw new HttpError(
+      400,
+      `Track count must be an integer from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${admission.maximumTrackCount}`,
+      "invalid_track_count",
+    );
+  }
+}
+
+function throwCustomGuidanceCompilationHttpError(error: unknown): never {
+  if (error instanceof HttpError) throw error;
+  const reason = error instanceof Error ? error.message : "";
+  if (reason === "custom_guidance_conflicts_with_existing_hard_predicate") {
+    throw new HttpError(
+      409,
+      "That custom answer conflicts with an existing required playlist rule. Review the interpretation before changing either rule.",
+      "custom_guidance_conflicts_with_existing_hard_predicate",
+    );
+  }
+  if (reason.startsWith("custom_artist_exclusion_requires_")) {
+    throw new HttpError(
+      409,
+      "Name one exact Apple Music artist for this exclusion, or edit it as a separate semantic playlist rule.",
+      "exact_artist_identity_clarification_required",
+    );
+  }
+  throw new HttpError(
+    400,
+    reason === "invalid_custom_requested_count"
+      ? "Track count is outside the authorized playlist range"
+      : reason === "custom_guidance_requires_supported_music_terms"
+      ? "That custom answer needs a clearer music rule. Edit the interpretation or choose one of the provided options."
+      : "That custom answer could not be compiled safely",
+    reason === "invalid_custom_requested_count"
+      ? "invalid_track_count"
+      : "custom_guidance_not_compilable",
+  );
+}
+
 function normalizedGuidanceAnswers(
   questions: readonly PlaylistGuidanceQuestion[],
   submitted: readonly PlaylistGuidanceAnswer[],
@@ -2063,6 +3163,186 @@ function normalizedGuidanceAnswers(
     }
     return { questionId: question.id, customText: safeCustomText };
   });
+}
+
+function guidanceRevisionRequestHash(input: {
+  sourceAccessId: string;
+  expectedContractRevisionId: string;
+  expectedContractSemanticHash: string;
+  historyVersion: string;
+  answerSetId: string;
+  questionId: string;
+  answer: PlaylistGuidanceAnswer;
+  customTrackCountAuthority: CustomGuidanceTrackCountAuthorityV1;
+}): string {
+  return sha256Hex(stableStringify({
+    operation: "guidance_answer_revision_v1",
+    sourceAccessId: input.sourceAccessId,
+    expectedContractRevisionId: input.expectedContractRevisionId,
+    expectedContractSemanticHash: input.expectedContractSemanticHash,
+    historyVersion: input.historyVersion,
+    answerSetId: input.answerSetId,
+    questionId: input.questionId,
+    answer: {
+      ...(typeof input.answer.optionId === "string"
+        ? { optionId: input.answer.optionId }
+        : {}),
+      ...(Array.isArray(input.answer.optionIds)
+        ? { optionIds: [...input.answer.optionIds].sort() }
+        : {}),
+      ...(typeof input.answer.customText === "string"
+        ? {
+            customText: input.answer.customText
+              .normalize("NFKC").replace(/\s+/gu, " ").trim(),
+          }
+        : {}),
+      skipped: input.answer.skipped === true,
+    },
+  }));
+}
+
+export function regeneratedDependentGuidanceRound(input: {
+  base: PlaylistContractRevisionV1;
+  questions: readonly PlaylistGuidanceQuestion[];
+  stage: "initial" | "rescue";
+  clarificationAttemptsByAxis?: Readonly<Record<string, number>>;
+}): {
+  questionSetHash: string;
+  questions: PlaylistGuidanceQuestion[];
+  trigger: "correctness" | "yield_risk" | "nuance";
+  axis: string | null;
+  showEditableInterpretationSummary: boolean;
+  summaryReason: "clarification_attempt_limit" | null;
+} | null {
+  const candidates = input.questions.flatMap((question) => {
+    let prior;
+    try {
+      prior = guidanceDecisionV3FromPublicQuestion(question);
+    } catch {
+      return [];
+    }
+    const decision = createGuidanceDecisionV3({
+      id: prior.id,
+      header: prior.header,
+      question: prior.question,
+      axis: prior.axis,
+      trigger: prior.trigger,
+      criticality: prior.criticality,
+      selectionMode: prior.selectionMode,
+      allowCustom: prior.allowCustom,
+      baseContractRevisionId: input.base.revisionId,
+      baseContractSemanticHash: input.base.semanticHash,
+      whyMaterial: prior.whyMaterial,
+      allowedPatchOperations: prior.allowedPatchOperations,
+      affectedClauseIds: prior.affectedClauseIds,
+      materialityScore: prior.materialityScore,
+      ...(prior.interpretationSummary ? {
+        interpretationSummary: playlistInterpretationSummaryV1(input.base),
+      } : {}),
+      options: prior.options.map((option) => ({
+        ...option,
+        patch: {
+          operations: structuredClone(option.patch.operations),
+          affectedClauseIds: [...option.patch.affectedClauseIds],
+        },
+      })),
+    });
+    const semanticOutcomes = new Set<string>();
+    for (const option of decision.options) {
+      if (option.patch.operations.length === 0) {
+        semanticOutcomes.add(input.base.semanticHash);
+        continue;
+      }
+      try {
+        semanticOutcomes.add(applyPlaylistContractPatchV1(input.base, {
+          baseRevisionId: input.base.revisionId,
+          baseSemanticHash: input.base.semanticHash,
+          answerLineage: {
+            questionSetHash: sha256Hex(`dependent-question:${decision.questionHash}`),
+            questionId: decision.id,
+            answerHash: sha256Hex(`dependent-option:${decision.questionHash}:${option.id}`),
+          },
+          operations: option.patch.operations,
+        }).semanticHash);
+      } catch (error) {
+        if (error instanceof Error
+          && error.message === "contract_patch_did_not_change_semantics") {
+          semanticOutcomes.add(input.base.semanticHash);
+          continue;
+        }
+        // A patch which no longer applies proves that this copied axis cannot
+        // safely be re-offered against the successor.
+        return [];
+      }
+    }
+    return semanticOutcomes.size >= 2 ? [decision] : [];
+  });
+  if (candidates.length === 0) return null;
+  const round = selectGuidanceRoundV3({
+    stage: input.stage,
+    requestShape: "curated",
+    candidates,
+    rescueQuestionsAlreadyAsked: 0,
+    clarificationAttemptsByAxis: input.clarificationAttemptsByAxis,
+  });
+  if (round.decisions.length === 0) {
+    if (!round.showEditableInterpretationSummary) return null;
+    const limited = candidates.find((candidate) => (
+      round.rejectedDecisionReasons[candidate.id]
+        === "clarification_attempt_limit"
+    ));
+    return {
+      questionSetHash: round.roundHash,
+      questions: [],
+      trigger: limited?.trigger ?? "correctness",
+      axis: limited?.axis ?? null,
+      showEditableInterpretationSummary: true,
+      summaryReason: "clarification_attempt_limit",
+    };
+  }
+  return {
+    questionSetHash: round.roundHash,
+    questions: round.decisions.map(publicGuidanceQuestionV3),
+    trigger: round.decisions[0]!.trigger,
+    axis: round.decisions.length === 1 ? round.decisions[0]!.axis : null,
+    showEditableInterpretationSummary: false,
+    summaryReason: null,
+  };
+}
+
+function runInterpretationSummaryAction(input: {
+  contract: PlaylistContractRevisionV1;
+  questionSetHash: string;
+  attemptsUsed: number;
+  reason: "clarification_attempt_limit" | "rescue_question_limit";
+  axis: string | null;
+}): RunGuidanceActionView {
+  const summary = playlistInterpretationSummaryV1(input.contract);
+  return {
+    kind: "interpretation_summary",
+    questionSetHash: input.questionSetHash,
+    baseContractRevisionId: input.contract.revisionId,
+    baseContractSemanticHash: input.contract.semanticHash,
+    questions: [],
+    attemptsUsed: Math.min(2, Math.max(1, input.attemptsUsed)),
+    maximumAttempts: 2,
+    showEditableInterpretationSummary: true,
+    reason: input.reason,
+    axis: input.axis,
+    interpretationSummary: {
+      mustHave: [...summary.mustHave],
+      prefer: [...summary.prefer],
+      avoid: [...summary.avoid],
+      flow: [...summary.flow],
+      count: summary.count,
+    },
+    actions: {
+      changeEarlierAnswer: true,
+      reviewContract: true,
+      resumeLater: true,
+      cancel: true,
+    },
+  };
 }
 
 async function markTerminalPublicationVolumes(
@@ -2215,6 +3495,8 @@ function normalizedQueryPlanV3Invariant(
       geographyRelationship: constraint.geographyRelationship ?? null,
     })),
     sourceDiscoveryHints: queryPlan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
+    conceptDiscoveryHints: (queryPlan.conceptDiscoveryHints ?? [])
+      .map((hint) => ({ ...hint })),
     scopeKind: queryPlan.scopeKind ?? compatibilityFallback?.scopeKind ?? null,
     diversityGoals: queryPlan.diversityGoals ?? compatibilityFallback?.diversityGoals ?? null,
     orderingPolicy: queryPlan.orderingPolicy ?? compatibilityFallback?.orderingPolicy ?? null,
@@ -2317,6 +3599,12 @@ function queryPlanV3ExecutionProjection(
       geographyRelationship: constraint.geographyRelationship ?? null,
     })),
     sourceDiscoveryHints: plan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
+    ...((plan.conceptDiscoveryHints ?? []).length > 0 ? {
+      conceptDiscoveryHints: (plan.conceptDiscoveryHints ?? [])
+        .map((hint) => ({ ...hint })),
+    } : {
+      conceptDiscoveryHints: undefined,
+    }),
     scopeKind: plan.scopeKind,
     diversityGoals: { ...plan.diversityGoals },
     orderingPolicy: { ...plan.orderingPolicy, goals: [...plan.orderingPolicy.goals] },
@@ -2362,7 +3650,7 @@ function queryPlanV3ExecutionProjection(
           aliasCollapses: [...(plan.semanticAudit?.aliasCollapses ?? [])],
           contradictions: [...(plan.semanticAudit?.contradictions ?? [])],
         },
-      ...(template.schemaVersion === 4 ? {
+      ...(isCanonicalQueryPlanV3SchemaVersion(template.schemaVersion) ? {
         playlistQuotaRules: (plan.playlistQuotaRules ?? []).map((rule) => ({
           ...rule,
           values: [...rule.values],
@@ -2518,6 +3806,25 @@ export class Repository {
       [ownerId],
     );
     const row = result.rows[0];
+    if (row) {
+      const contract = row.contract_json as unknown as PlaylistContractRevisionV1;
+      try {
+        assertPlaylistContractIntegrityV1(contract);
+      } catch {
+        throw new CanonicalExecutionIntegrityError("contract_json_invalid");
+      }
+      if (row.contract_hash !== contract.semanticHash
+        || Number(row.revision) !== contract.revision
+        || row.compiler_version !== contract.versions.compiler
+        || row.ontology_version !== contract.versions.ontology
+        || row.evidence_policy_version !== contract.versions.evidencePolicy
+        || row.question_template_version !== contract.versions.questionTemplates
+        || row.catalog_policy_version !== contract.versions.catalogPolicy
+        || row.locale !== contract.locale
+        || row.storefront !== contract.storefront) {
+        throw new CanonicalExecutionIntegrityError("contract_storage_mismatch");
+      }
+    }
     return row ? {
       id: row.id,
       revision: Number(row.revision),
@@ -2534,6 +3841,59 @@ export class Repository {
       answerLineageHash: row.answer_lineage_hash,
       createdAt: row.created_at.toISOString(),
     } : null;
+  }
+
+  async quarantineCanonicalExecution(input: {
+    runId: string;
+    jobId: string;
+    workerId: string;
+    leaseGeneration: number;
+    reasonCode: string;
+  }): Promise<boolean> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) return false;
+    return this.transaction(async (client) => {
+      const authority = await client.query<{
+        contract_revision_id: string | null;
+      }>(
+        `SELECT run.active_playlist_contract_revision_id contract_revision_id
+         FROM job_queue job
+         JOIN research_runs run ON run.id=job.run_id
+         WHERE job.id=$1 AND job.run_id=$2 AND job.status='leased'
+           AND job.lease_owner=$3 AND job.lease_epoch=$4
+         FOR UPDATE OF job,run`,
+        [input.jobId, input.runId, input.workerId, input.leaseGeneration],
+      );
+      const row = authority.rows[0];
+      if (!row) return false;
+      await client.query(
+        `UPDATE research_runs
+         SET status='quarantined',phase='canonical_integrity_quarantine',
+             error=NULL,completed_at=NULL,updated_at=now()
+         WHERE id=$1 AND deleted_at IS NULL
+           AND status NOT IN ('complete','cancelled','deleted')`,
+        [input.runId],
+      );
+      if (row.contract_revision_id) {
+        await client.query(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,'integrity','canonical_contract',0,NULL,NULL,$4::jsonb)`,
+          [
+            randomUUID(),
+            input.runId,
+            row.contract_revision_id,
+            JSON.stringify({
+              stage: "canonical_integrity_quarantine",
+              reasonCode: input.reasonCode.slice(0, 120),
+              nextAction: "contact_support",
+              retryable: false,
+            }),
+          ],
+        );
+      }
+      return true;
+    });
   }
 
   async savePlaylistContractRevision(
@@ -2795,6 +4155,89 @@ export class Repository {
     throw new HttpError(409, "Playlist feasibility revision is stale", "stale_playlist_contract");
   }
 
+  async persistPipelineV3RuntimeFeasibilitySnapshot(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    phase: "initial" | "recovery";
+    report: PlaylistFeasibilityReportV1;
+    fence: PipelineV3WriteFence;
+  }): Promise<{ id: string; created: boolean }> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 18) {
+      throw new HttpError(
+        503,
+        "Runtime feasibility persistence is unavailable",
+        "pipeline_v3_recovery_schema_unavailable",
+      );
+    }
+    try {
+      assertPlaylistFeasibilityReportIntegrityV1(input.report);
+    } catch {
+      throw new HttpError(
+        409,
+        "Runtime feasibility report failed integrity validation",
+        "pipeline_v3_runtime_feasibility_invalid",
+      );
+    }
+    if (input.queryPlan.schemaVersion < 4
+      || input.report.contractRevisionId
+        !== input.queryPlan.playlistContractRevisionId
+      || input.report.contractSemanticHash
+        !== input.queryPlan.playlistContractSemanticHash
+      || input.report.targetTrackCount !== input.queryPlan.targetTrackCount
+      || input.report.runtimeEvidence?.source !== "pipeline_v3_retrieval") {
+      throw new HttpError(
+        409,
+        "Runtime feasibility report does not match the canonical query plan",
+        "pipeline_v3_runtime_feasibility_stale",
+      );
+    }
+    return this.transaction(async (client) => {
+      const authority = await this.assertPipelineV3RecoveryPersistenceFence(
+        client,
+        input,
+      );
+      const id = randomUUID();
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO playlist_feasibility_snapshots(
+           id,contract_revision_id,phase,assessment,target_count,
+           observed_qualified_count,projected_lower_count,projected_upper_count,
+           confidence,report_hash,report_json)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10::jsonb)
+         ON CONFLICT(contract_revision_id,report_hash) DO NOTHING
+         RETURNING id`,
+        [
+          id,
+          authority.contractRevisionId,
+          input.phase,
+          input.report.state,
+          input.report.targetTrackCount,
+          input.report.runtimeEvidence!.qualifiedCount,
+          input.report.eligibleEstimateLower,
+          input.report.eligibleEstimateUpper,
+          input.report.reportHash,
+          JSON.stringify(input.report),
+        ],
+      );
+      if (inserted.rows[0]) {
+        return { id: inserted.rows[0].id, created: true };
+      }
+      const existing = await client.query<{ id: string }>(
+        `SELECT id
+         FROM playlist_feasibility_snapshots
+         WHERE contract_revision_id=$1 AND report_hash=$2`,
+        [authority.contractRevisionId, input.report.reportHash],
+      );
+      if (!existing.rows[0]) {
+        throw new HttpError(
+          409,
+          "Runtime feasibility report belongs to a stale contract",
+          "pipeline_v3_runtime_feasibility_stale",
+        );
+      }
+      return { id: existing.rows[0].id, created: false };
+    });
+  }
+
   async getPlaylistActiveComputeAllowanceMs(input: {
     runId: string;
     contractRevisionId: string;
@@ -2834,39 +4277,177 @@ export class Repository {
     if (!/^[a-f0-9]{64}$/u.test(input.executorIdentityHash)) {
       throw new HttpError(400, "Executor identity hash is invalid", "invalid_executor_identity_hash");
     }
-    const id = randomUUID();
-    const inserted = await this.pool.query<{ id: string }>(
-      `INSERT INTO playlist_execution_attempts(
-         id,run_id,contract_revision_id,stage,dependency_key,attempt_number,
-         lease_generation,executor_revision,executor_identity_hash,configuration_hash,
-         idempotency_key,checkpoint_cursor,status)
-       SELECT $1,run.id,contract.id,$4,$5,$6,$7,$8,$9,$10,$11,$12,'running'
-       FROM research_runs run
-       JOIN playlist_contract_revisions contract
-         ON contract.id=run.active_playlist_contract_revision_id
-       WHERE run.id=$2 AND contract.id=$3 AND run.deleted_at IS NULL
-       ON CONFLICT(idempotency_key) DO NOTHING
-       RETURNING id`,
-      [
-        id,
-        input.runId,
-        input.contractRevisionId,
-        input.stage,
-        input.dependencyKey ?? null,
-        input.attemptNumber,
-        input.leaseGeneration,
-        input.executorRevision,
-        input.executorIdentityHash,
-        input.configurationHash,
-        input.idempotencyKey,
-        input.checkpointCursor ?? null,
-      ],
+    if (!input.stage.trim() || input.stage.length > 80) {
+      throw new HttpError(400, "Execution stage is invalid", "invalid_execution_stage");
+    }
+    const queryPlanFenceCapability = await this.pool.query<{ value: string }>(
+      "SELECT value FROM settings WHERE key=$1",
+      [CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING],
     );
+    const supportsQueryPlanFence =
+      queryPlanFenceCapability.rows[0]?.value
+        === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    if (supportsQueryPlanFence && (
+      typeof input.jobId !== "string"
+      || !UUID_PATTERN.test(input.jobId)
+      || typeof input.workerId !== "string"
+      || !input.workerId.trim()
+      || input.workerId.length > 160
+      || typeof input.executorCapabilityHash !== "string"
+      || !/^[a-f0-9]{64}$/u.test(input.executorCapabilityHash)
+      || !input.executorCapabilityVector
+      || typeof input.executorCapabilityVector !== "object"
+      || sha256Hex(stableStringify(input.executorCapabilityVector))
+        !== input.executorCapabilityHash
+    )) {
+      throw new HttpError(
+        409,
+        "Canonical execution capability fence is invalid",
+        "executor_capability_mismatch",
+      );
+    }
+    const id = randomUUID();
+    const inserted = supportsQueryPlanFence
+      ? await this.transaction(async (client) => {
+        // Lock and prove the exact live lease before mutating any predecessor
+        // attempt. Without this authority check, a stale generation could
+        // discard the newer worker's running attempt and then fail its own
+        // insert.
+        const authority = await client.query<{ id: string }>(
+          `SELECT job.id
+           FROM research_runs run
+           JOIN playlist_contract_revisions contract
+             ON contract.id=run.active_playlist_contract_revision_id
+           JOIN job_queue job ON job.id=$4 AND job.run_id=run.id
+           LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+           WHERE run.id=$1 AND contract.id=$2 AND run.deleted_at IS NULL
+             AND job.status='leased'
+             AND job.lease_owner=$3
+             AND job.lease_epoch=$5::bigint
+             AND job.lease_expires_at>now()
+             AND job.query_plan_revision_id IS NOT DISTINCT FROM $6::uuid
+             AND job.stage_key=$7
+             AND ($6::uuid IS NULL OR active.query_plan_revision_id=$6)
+             AND job.required_executor_capability_hash=$8::varchar(64)
+             AND job.required_executor_capability_vector=$9::jsonb
+           FOR UPDATE OF job`,
+          [
+            input.runId,
+            input.contractRevisionId,
+            input.workerId,
+            input.jobId,
+            input.leaseGeneration,
+            input.queryPlanRevisionId ?? null,
+            input.stage,
+            input.executorCapabilityHash,
+            JSON.stringify(input.executorCapabilityVector),
+          ],
+        );
+        if (!authority.rows[0]) {
+          throw new HttpError(
+            409,
+            "Playlist execution lease fence was lost",
+            "job_lease_lost",
+          );
+        }
+        await client.query(
+          `UPDATE playlist_execution_attempts
+           SET completed_at=LEAST(last_active_at,COALESCE(lease_expires_at,last_active_at)),
+               active_compute_ms=active_compute_ms + GREATEST(
+                 0,
+                 floor(EXTRACT(EPOCH FROM (
+                   LEAST(last_active_at,COALESCE(lease_expires_at,last_active_at))
+                     -last_active_at
+                 ))*1000)::bigint
+               ),
+               status='discarded'
+           WHERE job_id=$1 AND status='running' AND lease_generation<>$2`,
+          [input.jobId, input.leaseGeneration],
+        );
+        return client.query<{ id: string }>(
+          `INSERT INTO playlist_execution_attempts(
+             id,run_id,contract_revision_id,job_id,query_plan_revision_id,stage,
+             dependency_key,attempt_number,lease_generation,executor_revision,
+             executor_identity_hash,executor_capability_hash,
+             executor_capability_vector,configuration_hash,idempotency_key,
+             checkpoint_cursor,status,lease_expires_at,last_active_at)
+           SELECT $1,run.id,contract.id,job.id,$5,$6::text,$7,$8,$9::int,$10,$11,$12::varchar(64),
+                  $13::jsonb,$14,$15,$16,'running',job.lease_expires_at,now()
+           FROM research_runs run
+           JOIN playlist_contract_revisions contract
+             ON contract.id=run.active_playlist_contract_revision_id
+           JOIN job_queue job ON job.id=$4 AND job.run_id=run.id
+           LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+           WHERE run.id=$2 AND contract.id=$3 AND run.deleted_at IS NULL
+             AND job.status='leased' AND job.lease_owner=$17
+             AND job.lease_epoch=$9::bigint AND job.lease_expires_at>now()
+             AND job.query_plan_revision_id IS NOT DISTINCT FROM $5::uuid
+             AND job.stage_key=$6::text
+             AND ($5::uuid IS NULL OR active.query_plan_revision_id=$5)
+             AND job.required_executor_capability_hash=$12::varchar(64)
+             AND job.required_executor_capability_vector=$13::jsonb
+           ON CONFLICT(idempotency_key) DO NOTHING
+           RETURNING id`,
+          [
+            id,
+            input.runId,
+            input.contractRevisionId,
+            input.jobId,
+            input.queryPlanRevisionId ?? null,
+            input.stage,
+            input.dependencyKey ?? null,
+            input.attemptNumber,
+            input.leaseGeneration,
+            input.executorRevision,
+            input.executorIdentityHash,
+            input.executorCapabilityHash,
+            JSON.stringify(input.executorCapabilityVector),
+            input.configurationHash,
+            input.idempotencyKey,
+            input.checkpointCursor ?? null,
+            input.workerId,
+          ],
+        );
+      })
+      : await this.pool.query<{ id: string }>(
+        `INSERT INTO playlist_execution_attempts(
+           id,run_id,contract_revision_id,stage,dependency_key,attempt_number,
+           lease_generation,executor_revision,executor_identity_hash,configuration_hash,
+           idempotency_key,checkpoint_cursor,status)
+         SELECT $1,run.id,contract.id,$5,$6,$7,$8,$9,$10,$11,$12,$13,'running'
+         FROM research_runs run
+         JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+         LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+         WHERE run.id=$2 AND contract.id=$3 AND run.deleted_at IS NULL
+           AND ($4::uuid IS NULL OR active.query_plan_revision_id=$4)
+         ON CONFLICT(idempotency_key) DO NOTHING
+         RETURNING id`,
+        [
+          id,
+          input.runId,
+          input.contractRevisionId,
+          input.queryPlanRevisionId ?? null,
+          input.stage,
+          input.dependencyKey ?? null,
+          input.attemptNumber,
+          input.leaseGeneration,
+          input.executorRevision,
+          input.executorIdentityHash,
+          input.configurationHash,
+          input.idempotencyKey,
+          input.checkpointCursor ?? null,
+        ],
+      );
     const activeComputeMs = async (): Promise<number> => {
       const usage = await this.pool.query<{ active_compute_ms: number }>(
-        `SELECT COALESCE(sum(
-           EXTRACT(EPOCH FROM (COALESCE(completed_at,now())-started_at))*1000
-         ),0)::float8 active_compute_ms
+        supportsQueryPlanFence
+          ? `SELECT COALESCE(sum(active_compute_ms),0)::float8 active_compute_ms
+         FROM playlist_execution_attempts
+         WHERE run_id=$1 AND contract_revision_id=$2`
+          : `SELECT COALESCE(sum(
+             EXTRACT(EPOCH FROM (COALESCE(completed_at,now())-started_at))*1000
+           ),0)::float8 active_compute_ms
          FROM playlist_execution_attempts
          WHERE run_id=$1 AND contract_revision_id=$2`,
         [input.runId, input.contractRevisionId],
@@ -2884,23 +4465,41 @@ export class Repository {
       id: string;
       run_id: string;
       contract_revision_id: string;
+      query_plan_revision_id: string | null;
       stage: string;
       lease_generation: number;
       executor_identity_hash: string;
+      executor_capability_hash: string | null;
+      executor_capability_vector: Record<string, unknown> | null;
       configuration_hash: string;
     }>(
-      `SELECT id,run_id,contract_revision_id,stage,lease_generation,
-              executor_identity_hash,configuration_hash
-       FROM playlist_execution_attempts WHERE idempotency_key=$1`,
+      supportsQueryPlanFence
+        ? `SELECT id,run_id,contract_revision_id,query_plan_revision_id,stage,lease_generation,
+                  executor_identity_hash,executor_capability_hash,
+                  executor_capability_vector,configuration_hash
+           FROM playlist_execution_attempts WHERE idempotency_key=$1`
+        : `SELECT id,run_id,contract_revision_id,NULL::uuid query_plan_revision_id,
+                  stage,lease_generation,executor_identity_hash,
+                  NULL::varchar executor_capability_hash,
+                  NULL::jsonb executor_capability_vector,configuration_hash
+           FROM playlist_execution_attempts WHERE idempotency_key=$1`,
       [input.idempotencyKey],
     );
     const row = existing.rows[0];
     if (!row) throw new HttpError(409, "Execution contract revision is stale", "stale_playlist_contract");
     if (row.run_id !== input.runId
       || row.contract_revision_id !== input.contractRevisionId
+      || (supportsQueryPlanFence
+        && row.query_plan_revision_id !== (input.queryPlanRevisionId ?? null))
       || row.stage !== input.stage
       || Number(row.lease_generation) !== input.leaseGeneration
       || row.executor_identity_hash !== input.executorIdentityHash
+      || (supportsQueryPlanFence
+        && (
+          row.executor_capability_hash !== input.executorCapabilityHash
+          || stableStringify(row.executor_capability_vector)
+            !== stableStringify(input.executorCapabilityVector)
+        ))
       || row.configuration_hash !== input.configurationHash) {
       throw new HttpError(409, "Execution idempotency key was reused", "execution_idempotency_conflict");
     }
@@ -2915,21 +4514,43 @@ export class Repository {
     attemptId: string;
     runId: string;
     contractRevisionId: string;
+    jobId?: string | null;
+    workerId?: string | null;
     leaseGeneration: number;
     status: "blocked" | "complete" | "cancelled" | "failed";
     blockerKind?: string | null;
     checkpointCursor?: string | null;
   }): Promise<{ accepted: boolean; discarded: boolean }> {
     if (Number(await this.getSchemaVersion() ?? 0) < 17) return { accepted: true, discarded: false };
+    const tracksActiveIntervals = await this.getSetting(
+      CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+    ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
     const result = await this.pool.query(
       `UPDATE playlist_execution_attempts attempt
        SET status=$5,blocker_kind=$6,checkpoint_cursor=COALESCE($7,checkpoint_cursor),
            completed_at=now()
+           ${tracksActiveIntervals ? `,last_active_at=now(),
+             active_compute_ms=active_compute_ms + GREATEST(
+               0,
+               floor(EXTRACT(EPOCH FROM (now()-last_active_at))*1000)::bigint
+             )` : ""}
        FROM research_runs run
+       ${tracksActiveIntervals ? `JOIN job_queue job ON job.id=$8
+         AND job.run_id=run.id
+         AND job.lease_owner=$9
+         AND job.lease_epoch=$4
+         AND job.status='leased'
+         AND job.lease_expires_at>now()` : ""}
        WHERE attempt.id=$1 AND attempt.run_id=$2 AND attempt.contract_revision_id=$3
          AND attempt.lease_generation=$4 AND attempt.status='running'
          AND run.id=attempt.run_id
-         AND run.active_playlist_contract_revision_id=attempt.contract_revision_id`,
+         AND run.active_playlist_contract_revision_id=attempt.contract_revision_id
+         ${tracksActiveIntervals ? `AND attempt.job_id=job.id
+           AND attempt.stage=job.stage_key
+           AND attempt.executor_capability_hash
+             =job.required_executor_capability_hash
+           AND attempt.executor_capability_vector
+             =job.required_executor_capability_vector` : ""}`,
       [
         input.attemptId,
         input.runId,
@@ -2938,12 +4559,27 @@ export class Repository {
         input.status,
         input.blockerKind ?? null,
         input.checkpointCursor ?? null,
+        ...(tracksActiveIntervals ? [
+          input.jobId ?? null,
+          input.workerId ?? null,
+        ] : []),
       ],
     );
     if ((result.rowCount ?? 0) === 1) return { accepted: true, discarded: false };
     const discarded = await this.pool.query(
       `UPDATE playlist_execution_attempts
-       SET status='discarded',completed_at=now()
+       SET status='discarded',
+           completed_at=${tracksActiveIntervals
+             ? "LEAST(last_active_at,COALESCE(lease_expires_at,last_active_at))"
+             : "now()"}
+           ${tracksActiveIntervals ? `,
+             active_compute_ms=active_compute_ms + GREATEST(
+               0,
+               floor(EXTRACT(EPOCH FROM (
+                 LEAST(last_active_at,COALESCE(lease_expires_at,last_active_at))
+                   -last_active_at
+               ))*1000)::bigint
+             )` : ""}
        WHERE id=$1 AND run_id=$2 AND contract_revision_id=$3
          AND lease_generation=$4 AND status='running'`,
       [input.attemptId, input.runId, input.contractRevisionId, input.leaseGeneration],
@@ -2958,9 +4594,23 @@ export class Repository {
     leaseGeneration: number;
   }): Promise<boolean> {
     if (Number(await this.getSchemaVersion() ?? 0) < 17) return true;
+    const tracksActiveIntervals = await this.getSetting(
+      CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+    ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
     const result = await this.pool.query(
       `UPDATE playlist_execution_attempts
-       SET status='discarded',completed_at=now()
+       SET status='discarded',
+           completed_at=${tracksActiveIntervals
+             ? "LEAST(last_active_at,COALESCE(lease_expires_at,last_active_at))"
+             : "now()"}
+           ${tracksActiveIntervals ? `,
+             active_compute_ms=active_compute_ms + GREATEST(
+               0,
+               floor(EXTRACT(EPOCH FROM (
+                 LEAST(last_active_at,COALESCE(lease_expires_at,last_active_at))
+                   -last_active_at
+               ))*1000)::bigint
+             )` : ""}
        WHERE id=$1 AND run_id=$2 AND contract_revision_id=$3
          AND lease_generation=$4 AND status='running'`,
       [input.attemptId, input.runId, input.contractRevisionId, input.leaseGeneration],
@@ -3015,6 +4665,795 @@ export class Repository {
     } : null;
   }
 
+  /**
+   * Load a provider blocker whose bounded automatic window has elapsed.
+   * Workers call this before invoking user/provider code so the 24-hour wake is
+   * a decision-only transition even when a longer Retry-After is still active.
+   */
+  async getExpiredPlaylistProviderBlocker(input: {
+    runId: string;
+    contractRevisionId: string;
+    now: Date;
+  }): Promise<{
+    id: string;
+    dependencyKey: string;
+    retryCount: number;
+    nextRetryAt: Date | null;
+    automaticRetryUntil: Date;
+    createdAt: Date;
+    state: Record<string, unknown>;
+  } | null> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) return null;
+    if (!Number.isFinite(input.now.getTime())) {
+      throw new HttpError(400, "Dependency decision time is invalid", "invalid_dependency_decision_time");
+    }
+    const result = await this.pool.query<{
+      id: string;
+      dependency_key: string;
+      retry_count: number;
+      next_retry_at: Date | null;
+      automatic_retry_until: Date;
+      created_at: Date;
+      state_json: Record<string, unknown>;
+    }>(
+      `SELECT blocker.id,blocker.dependency_key,blocker.retry_count,
+              blocker.next_retry_at,blocker.automatic_retry_until,
+              blocker.created_at,blocker.state_json
+       FROM playlist_run_blockers blocker
+       JOIN research_runs run
+         ON run.id=blocker.run_id
+        AND run.active_playlist_contract_revision_id=blocker.contract_revision_id
+       WHERE blocker.run_id=$1 AND blocker.contract_revision_id=$2
+         AND blocker.blocker_kind='provider'
+         AND blocker.dependency_key IS NOT NULL
+         AND blocker.automatic_retry_until IS NOT NULL
+         AND blocker.automatic_retry_until <= $3
+         AND blocker.resolved_at IS NULL AND run.deleted_at IS NULL
+       ORDER BY blocker.automatic_retry_until,blocker.created_at,blocker.id
+       LIMIT 1`,
+      [input.runId, input.contractRevisionId, input.now],
+    );
+    const row = result.rows[0];
+    return row ? {
+      id: row.id,
+      dependencyKey: row.dependency_key,
+      retryCount: Number(row.retry_count),
+      nextRetryAt: row.next_retry_at,
+      automaticRetryUntil: row.automatic_retry_until,
+      createdAt: row.created_at,
+      state: row.state_json ?? {},
+    } : null;
+  }
+
+  /**
+   * Atomically turns an expired provider retry circuit into a visitor-visible
+   * decision without discarding the blocker facts needed for a later,
+   * semantics-preserving resume.
+   */
+  private async dependencyResumeDatabaseCapabilityAvailable(): Promise<boolean> {
+    const result = await this.pool.query<{ key: string; value: string }>(
+      "SELECT key,value FROM settings WHERE key=ANY($1::text[])",
+      [[
+        "schema_version",
+        CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
+        CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+      ]],
+    );
+    const values = new Map(
+      result.rows.map(({ key, value }) => [key, value]),
+    );
+    return Number(values.get("schema_version") ?? 0)
+        >= Number(CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION)
+      && values.get(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING)
+        === CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
+      && values.get(CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING)
+        === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+  }
+
+  async markPlaylistDependencyDecision(
+    input: MarkPlaylistDependencyDecisionInput,
+  ): Promise<string> {
+    if (!await this.dependencyResumeDatabaseCapabilityAvailable()) {
+      throw new HttpError(
+        503,
+        "Dependency decision fencing is unavailable",
+        "dependency_resume_unavailable",
+      );
+    }
+    if (!Number.isSafeInteger(input.leaseGeneration)
+      || input.leaseGeneration < 0
+      || !Number.isSafeInteger(input.retryCount)
+      || input.retryCount < 0
+      || !Number.isFinite(input.automaticRetryUntil.getTime())) {
+      throw new HttpError(
+        409,
+        "Dependency decision fence is invalid",
+        "invalid_dependency_resume_state",
+      );
+    }
+    const decision = publicAdaptiveRunDecisionV1(input.state);
+    if (!decision
+      || decision.reason !== "dependency_retry_window_expired"
+      || decision.actions.resumeLater !== true
+      || input.state.nextAction !== "resume_revise_or_cancel"
+      || input.state.stage !== input.stageKey) {
+      throw new HttpError(
+        409,
+        "Dependency decision state is invalid",
+        "invalid_dependency_resume_state",
+      );
+    }
+    return this.transaction(async (client) => {
+      const authority = await client.query<{
+        contract_hash: string;
+        contract_json: PlaylistContractRevisionV1;
+      }>(
+        `SELECT contract.contract_hash,contract.contract_json
+         FROM research_runs run
+         JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+          AND contract.id=$2 AND contract.status='active'
+         JOIN run_active_query_plans active_plan
+           ON active_plan.run_id=run.id
+          AND active_plan.query_plan_revision_id=$7
+         JOIN query_plan_revisions query_plan
+           ON query_plan.id=active_plan.query_plan_revision_id
+          AND query_plan.status='active'
+         JOIN job_queue job
+           ON job.id=$3 AND job.run_id=run.id
+          AND job.query_plan_revision_id=query_plan.id
+          AND job.stage_key=$8
+          AND job.status='leased'
+          AND job.lease_owner=$4
+          AND job.lease_epoch=$5
+          AND job.lease_expires_at>now()
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=$6 AND attempt.run_id=run.id
+          AND attempt.contract_revision_id=contract.id
+          AND attempt.job_id=job.id
+          AND attempt.query_plan_revision_id=query_plan.id
+          AND attempt.stage=job.stage_key
+          AND attempt.lease_generation=job.lease_epoch
+          AND attempt.status='running'
+          AND attempt.executor_capability_hash
+            =job.required_executor_capability_hash
+          AND attempt.executor_capability_vector
+            =job.required_executor_capability_vector
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+           AND run.status IN ('researching','continuing_research','queued')
+         FOR UPDATE OF run,contract,active_plan,query_plan,job,attempt`,
+        [
+          input.runId,
+          input.contractRevisionId,
+          input.jobId,
+          input.workerId,
+          input.leaseGeneration,
+          input.attemptId,
+          input.queryPlanRevisionId,
+          input.stageKey,
+        ],
+      );
+      const active = authority.rows[0];
+      if (!active) {
+        throw new HttpError(
+          409,
+          "Dependency decision belongs to stale execution work",
+          "dependency_resume_stale",
+        );
+      }
+      try {
+        assertPlaylistContractIntegrityV1(active.contract_json);
+      } catch {
+        throw new HttpError(
+          409,
+          "Dependency decision contract failed integrity validation",
+          "dependency_resume_contract_conflict",
+        );
+      }
+      if (active.contract_hash !== active.contract_json.semanticHash
+        || decision.contractRevisionId !== active.contract_json.revisionId
+        || decision.contractSemanticHash !== active.contract_json.semanticHash) {
+        throw new HttpError(
+          409,
+          "Dependency decision contract changed",
+          "dependency_resume_contract_conflict",
+        );
+      }
+      const prior = await client.query<{ id: string }>(
+        `SELECT id
+         FROM playlist_run_blockers
+         WHERE run_id=$1 AND contract_revision_id=$2
+           AND blocker_kind='provider' AND dependency_key=$3
+           AND resolved_at IS NULL
+         ORDER BY created_at,id
+         LIMIT 1
+         FOR UPDATE`,
+        [input.runId, input.contractRevisionId, input.dependencyKey],
+      );
+      let blockerId = prior.rows[0]?.id ?? randomUUID();
+      if (prior.rows[0]) {
+        const updated = await client.query<{ id: string }>(
+          `UPDATE playlist_run_blockers
+           SET retry_count=GREATEST(retry_count,$2),
+               next_retry_at=NULL,
+               automatic_retry_until=LEAST(
+                 COALESCE(automatic_retry_until,$3),
+                 $3
+               ),
+               state_json=state_json || $4::jsonb,
+               updated_at=now()
+           WHERE id=$1 AND resolved_at IS NULL
+           RETURNING id`,
+          [
+            blockerId,
+            input.retryCount,
+            input.automaticRetryUntil,
+            JSON.stringify(input.state),
+          ],
+        );
+        if (!updated.rows[0]) {
+          throw new HttpError(
+            409,
+            "Dependency decision changed",
+            "dependency_resume_stale",
+          );
+        }
+      } else {
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,'provider',$4,$5,NULL,$6,$7::jsonb)
+           RETURNING id`,
+          [
+            blockerId,
+            input.runId,
+            input.contractRevisionId,
+            input.dependencyKey,
+            input.retryCount,
+            input.automaticRetryUntil,
+            JSON.stringify(input.state),
+          ],
+        );
+        blockerId = inserted.rows[0]!.id;
+      }
+      const updatedRun = await client.query(
+        `UPDATE research_runs
+         SET status='needs_decision',
+             phase='dependency_retry_window_expired',
+             error=NULL,
+             completed_at=NULL,
+             updated_at=now()
+         WHERE id=$1 AND active_playlist_contract_revision_id=$2
+           AND status IN ('researching','continuing_research','queued')`,
+        [input.runId, input.contractRevisionId],
+      );
+      if ((updatedRun.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Dependency decision changed",
+          "dependency_resume_stale",
+        );
+      }
+      return blockerId;
+    });
+  }
+
+  /**
+   * Consume one capability-authenticated visitor authorization to retry the
+   * exact active canonical plan after its 24-hour dependency window. This
+   * creates no successor contract and performs no prompt interpretation.
+   */
+  async resumePlaylistDependencyDecision(
+    input: ResumePlaylistDependencyDecisionInput,
+  ): Promise<ResumePlaylistDependencyDecisionResult> {
+    if (!await this.dependencyResumeDatabaseCapabilityAvailable()) {
+      throw new HttpError(
+        503,
+        "Dependency resume fencing is unavailable",
+        "dependency_resume_unavailable",
+      );
+    }
+    const authorizationPhase =
+      `dependency_resume_v1:${input.expectedDecisionHash.slice(0, 48)}`;
+    return this.transaction(async (client) => {
+      const runResult = await client.query<{
+        status: string;
+        phase: string;
+        contract_revision_id: string;
+        contract_status: string;
+        contract_hash: string;
+        contract_json: PlaylistContractRevisionV1;
+      }>(
+        `SELECT run.status,run.phase,
+                contract.id contract_revision_id,
+                contract.status contract_status,
+                contract.contract_hash,
+                contract.contract_json
+         FROM research_runs run
+         JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+         FOR UPDATE OF run,contract`,
+        [input.runId],
+      );
+      const run = runResult.rows[0];
+      if (!run) {
+        throw new HttpError(404, "Research run not found", "run_not_found");
+      }
+      const access = await client.query(
+        `SELECT 1
+         FROM capability_sessions session
+         JOIN capability_session_accesses grant_row
+           ON grant_row.session_id=session.id
+          AND grant_row.run_id=$2
+          AND grant_row.access_id=$3
+         JOIN run_accesses access_row
+           ON access_row.id=grant_row.access_id
+          AND access_row.run_id=grant_row.run_id
+         WHERE session.id=$1
+           AND session.revoked_at IS NULL
+           AND session.expires_at>now()
+           AND access_row.deleted_at IS NULL
+           AND access_row.expires_at>now()
+         FOR KEY SHARE OF session,access_row`,
+        [input.capabilitySessionId, input.runId, input.sourceAccessId],
+      );
+      if (!access.rows[0]) {
+        throw new HttpError(401, "Session has expired", "capability_required");
+      }
+      if (run.phase === "superseded_by_contract_revision") {
+        throw new HttpError(
+          409,
+          "Superseded research cannot be resumed",
+          "dependency_resume_stale",
+        );
+      }
+      if (run.status === "cancelled"
+        || run.phase === "visitor_cancelled"
+        || run.phase === "owner_cancelled") {
+        throw new HttpError(
+          409,
+          "Cancelled research cannot be resumed",
+          "dependency_resume_cancelled",
+        );
+      }
+      if (run.status === "failed_integrity") {
+        throw new HttpError(
+          409,
+          "Quarantined research cannot be resumed",
+          "dependency_resume_quarantined",
+        );
+      }
+
+      const prior = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json
+         FROM research_checkpoints
+         WHERE run_id=$1
+           AND (
+             phase=$2
+             OR (
+               state_json->>'schemaVersion'=$3
+               AND state_json->>'idempotencyKey'=$4
+             )
+           )
+         ORDER BY (phase=$2) DESC,updated_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [
+          input.runId,
+          authorizationPhase,
+          DEPENDENCY_RESUME_AUTHORIZATION_VERSION,
+          input.idempotencyKey,
+        ],
+      );
+      const priorState = prior.rows[0]?.state_json;
+      if (priorState) {
+        const same = priorState.schemaVersion
+            === DEPENDENCY_RESUME_AUTHORIZATION_VERSION
+          && priorState.runId === input.runId
+          && priorState.sourceAccessId === input.sourceAccessId
+          && priorState.capabilitySessionId === input.capabilitySessionId
+          && priorState.idempotencyKey === input.idempotencyKey
+          && priorState.contractRevisionId
+            === input.expectedContractRevisionId
+          && priorState.contractSemanticHash
+            === input.expectedContractSemanticHash
+          && priorState.decisionHash === input.expectedDecisionHash
+          && priorState.blockerVersion === input.expectedBlockerVersion
+          && typeof priorState.authorizationHash === "string"
+          && typeof priorState.jobId === "string"
+          && typeof priorState.resumeAt === "string";
+        if (!same) {
+          throw new HttpError(
+            409,
+            "Dependency resume authorization was already consumed",
+            priorState.idempotencyKey === input.idempotencyKey
+              ? "idempotency_conflict"
+              : "dependency_resume_stale",
+          );
+        }
+        const job = await client.query<{
+          id: string;
+          available_at: Date;
+        }>(
+          `SELECT id,available_at
+           FROM job_queue
+           WHERE id=$1 AND run_id=$2
+             AND query_plan_revision_id=$3::uuid`,
+          [
+            priorState.jobId,
+            input.runId,
+            typeof priorState.queryPlanRevisionId === "string"
+              ? priorState.queryPlanRevisionId
+              : null,
+          ],
+        );
+        if (!job.rows[0]) {
+          throw new HttpError(
+            409,
+            "Dependency resume authorization lost its queued job",
+            "dependency_resume_integrity",
+          );
+        }
+        const resumeAt = date(priorState.resumeAt);
+        if (!resumeAt || !Number.isFinite(resumeAt.getTime())) {
+          throw new HttpError(
+            409,
+            "Dependency resume authorization failed integrity validation",
+            "dependency_resume_integrity",
+          );
+        }
+        const authorizationHash = typeof priorState.queryPlanRevisionId === "string"
+          && typeof priorState.queryPlanHash === "string"
+          && typeof priorState.blockerId === "string"
+          && typeof priorState.dependencyKey === "string"
+          && typeof priorState.stageKey === "string"
+          ? dependencyResumeAuthorizationHashV1({
+              runId: input.runId,
+              sourceAccessId: input.sourceAccessId,
+              capabilitySessionId: input.capabilitySessionId,
+              idempotencyKey: input.idempotencyKey,
+              contractRevisionId: input.expectedContractRevisionId,
+              contractSemanticHash: input.expectedContractSemanticHash,
+              queryPlanRevisionId: priorState.queryPlanRevisionId,
+              queryPlanHash: priorState.queryPlanHash,
+              blockerId: priorState.blockerId,
+              blockerVersion: input.expectedBlockerVersion,
+              decisionHash: input.expectedDecisionHash,
+              dependencyKey: priorState.dependencyKey,
+              stageKey: priorState.stageKey,
+              resumeAt,
+            })
+          : null;
+        if (!authorizationHash
+          || authorizationHash !== priorState.authorizationHash) {
+          throw new HttpError(
+            409,
+            "Dependency resume authorization failed integrity validation",
+            "dependency_resume_integrity",
+          );
+        }
+        return {
+          queued: false,
+          jobId: job.rows[0].id,
+          authorizationHash,
+          resumeAt,
+        };
+      }
+
+      if (run.contract_revision_id !== input.expectedContractRevisionId
+        || run.contract_status !== "active") {
+        throw new HttpError(
+          409,
+          "The playlist contract changed; review the latest run",
+          "dependency_resume_stale",
+        );
+      }
+      try {
+        assertPlaylistContractIntegrityV1(run.contract_json);
+      } catch {
+        throw new HttpError(
+          409,
+          "The active playlist contract failed integrity validation",
+          "dependency_resume_contract_conflict",
+        );
+      }
+      if (run.contract_hash !== run.contract_json.semanticHash
+        || run.contract_hash !== input.expectedContractSemanticHash) {
+        throw new HttpError(
+          409,
+          "The playlist contract changed; review the latest run",
+          "dependency_resume_contract_conflict",
+        );
+      }
+
+      const planResult = await client.query<{
+        id: string;
+        status: string;
+        plan_hash: string;
+        plan_json: QueryPlanV3;
+      }>(
+        `SELECT plan.id,plan.status,plan.plan_hash,plan.plan_json
+         FROM run_active_query_plans active
+         JOIN query_plan_revisions plan
+           ON plan.id=active.query_plan_revision_id
+         WHERE active.run_id=$1
+         FOR UPDATE OF active,plan`,
+        [input.runId],
+      );
+      const plan = planResult.rows[0];
+      if (!plan
+        || !isQueryPlanV3(plan.plan_json)
+        || queryPlanV3Hash(plan.plan_json) !== plan.plan_hash
+        || plan.plan_json.schemaVersion
+          < CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION) {
+        throw new HttpError(
+          409,
+          "The active research plan failed integrity validation",
+          "dependency_resume_executor_conflict",
+        );
+      }
+      const expectedExecutor = canonicalExecutorCapabilityForSchemaV1({
+        queryPlanSchemaVersion: plan.plan_json.schemaVersion,
+      });
+      const stageKey = v3RetrievalStageKey(plan.plan_json, "active");
+      const blockerResult = await client.query<{
+        id: string;
+        contract_revision_id: string;
+        blocker_kind: string;
+        dependency_key: string;
+        retry_count: number;
+        automatic_retry_until: Date;
+        resolved_at: Date | null;
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT id,contract_revision_id,blocker_kind,dependency_key,
+                retry_count,automatic_retry_until,resolved_at,state_json
+         FROM playlist_run_blockers
+         WHERE run_id=$1 AND contract_revision_id=$2
+           AND blocker_kind='provider'
+           AND automatic_retry_until IS NOT NULL
+           AND resolved_at IS NULL
+         ORDER BY automatic_retry_until,created_at,id
+         LIMIT 1
+         FOR UPDATE`,
+        [input.runId, input.expectedContractRevisionId],
+      );
+      const blocker = blockerResult.rows[0];
+      if (!blocker) {
+        throw new HttpError(
+          409,
+          "The dependency decision is no longer active",
+          "dependency_resume_stale",
+        );
+      }
+      const retryAfterUntil = blocker.state_json.retryAfterUntil == null
+        ? null
+        : date(blocker.state_json.retryAfterUntil);
+      const decision = publicAdaptiveRunDecisionV1(blocker.state_json);
+      const eligibility = decideDependencyResumeV1({
+        now: new Date(),
+        runStatus: run.status,
+        runPhase: run.phase,
+        activeContractRevisionId: run.contract_revision_id,
+        activeContractSemanticRevisionId: run.contract_json.revisionId,
+        activeContractSemanticHash: run.contract_json.semanticHash,
+        expectedContractRevisionId: input.expectedContractRevisionId,
+        expectedContractSemanticHash: input.expectedContractSemanticHash,
+        expectedDecisionHash: input.expectedDecisionHash,
+        expectedBlockerVersion: input.expectedBlockerVersion,
+        blocker: {
+          id: blocker.id,
+          contractRevisionId: blocker.contract_revision_id,
+          dependencyKey: blocker.dependency_key,
+          retryCount: Number(blocker.retry_count),
+          automaticRetryUntil: blocker.automatic_retry_until,
+          retryAfterUntil: retryAfterUntil ?? (
+            blocker.state_json.retryAfterUntil == null
+              ? null
+              : new Date(Number.NaN)
+          ),
+          stageKey: typeof blocker.state_json.stage === "string"
+            ? blocker.state_json.stage
+            : "",
+          decisionHash: typeof blocker.state_json.decisionHash === "string"
+            ? blocker.state_json.decisionHash
+            : "",
+          nextAction: typeof blocker.state_json.nextAction === "string"
+            ? blocker.state_json.nextAction
+            : "",
+          kind: blocker.blocker_kind,
+          resolved: blocker.resolved_at !== null,
+        },
+        decision,
+        queryPlan: {
+          status: plan.status,
+          schemaVersion: Number(plan.plan_json.schemaVersion),
+          playlistContractRevisionId:
+            plan.plan_json.playlistContractRevisionId ?? null,
+          playlistContractSemanticHash:
+            plan.plan_json.playlistContractSemanticHash ?? null,
+          stageKey,
+          expectedStageKey: stageKey,
+          executorCapabilityHash:
+            plan.plan_json.executorCapabilityHash ?? null,
+          expectedExecutorCapabilityHash: expectedExecutor.hash,
+          executorCapabilityMatches:
+            stableStringify(plan.plan_json.executorCapabilityVector ?? null)
+              === stableStringify(expectedExecutor.vector),
+        },
+      });
+      if (eligibility.state !== "eligible") {
+        throw new HttpError(
+          409,
+          eligibility.reasonCode === "dependency_resume_not_ready"
+            ? "This dependency decision is not ready to resume"
+            : "The dependency decision changed; review the latest run",
+          eligibility.reasonCode,
+        );
+      }
+
+      const concurrentJobs = await client.query<{ id: string }>(
+        `SELECT id
+         FROM job_queue
+         WHERE run_id=$1 AND status IN ('queued','retry','leased')
+         ORDER BY created_at,id
+         LIMIT 1
+         FOR UPDATE`,
+        [input.runId],
+      );
+      const runningAttempts = await client.query<{ id: string }>(
+        `SELECT id
+         FROM playlist_execution_attempts
+         WHERE run_id=$1 AND contract_revision_id=$2
+           AND status IN ('queued','running')
+         ORDER BY created_at,id
+         LIMIT 1
+         FOR UPDATE`,
+        [input.runId, input.expectedContractRevisionId],
+      );
+      if (concurrentJobs.rows[0] || runningAttempts.rows[0]) {
+        throw new HttpError(
+          409,
+          "Research work is already active; refresh the run",
+          "dependency_resume_conflict",
+        );
+      }
+
+      const jobId = randomUUID();
+      const authorizationHash = dependencyResumeAuthorizationHashV1({
+        runId: input.runId,
+        sourceAccessId: input.sourceAccessId,
+        capabilitySessionId: input.capabilitySessionId,
+        idempotencyKey: input.idempotencyKey,
+        contractRevisionId: input.expectedContractRevisionId,
+        contractSemanticHash: input.expectedContractSemanticHash,
+        queryPlanRevisionId: plan.id,
+        queryPlanHash: plan.plan_hash,
+        blockerId: blocker.id,
+        blockerVersion: eligibility.blockerVersion,
+        decisionHash: input.expectedDecisionHash,
+        dependencyKey: blocker.dependency_key,
+        stageKey,
+        resumeAt: eligibility.resumeAt,
+      });
+      const queueClass: JobQueueClass = isDeepQueryPlan(plan.plan_json)
+        ? "deep"
+        : "interactive";
+      const inserted = await client.query<{
+        id: string;
+        required_executor_capability_hash: string | null;
+        required_executor_capability_vector: Record<string, unknown> | null;
+      }>(
+        `INSERT INTO job_queue(
+           id,run_id,kind,dedupe_key,payload_json,available_at,max_attempts,
+           pipeline_version,minimum_worker_protocol,query_plan_revision_id,
+           stage_key,queue_class)
+         VALUES(
+           $1,$2,'research',$3,$4::jsonb,$5,10,'corpus_first_v3',$6,$7,$8,$9
+         )
+         RETURNING id,required_executor_capability_hash,
+                   required_executor_capability_vector`,
+        [
+          jobId,
+          input.runId,
+          `dependency-resume:${input.runId}:${input.expectedDecisionHash}`
+            .slice(0, 160),
+          JSON.stringify({
+            runId: input.runId,
+            phase: "v3_retrieval",
+            v3ExecutionMode: "active",
+            stageExecutionKey: stageKey,
+            dependencyResumeAuthorizationHash: authorizationHash,
+            dependencyKey: blocker.dependency_key,
+          }),
+          eligibility.resumeAt,
+          minimumWorkerProtocolForQueryPlan(plan.plan_json),
+          plan.id,
+          stageKey,
+          queueClass,
+        ],
+      );
+      const queuedJob = inserted.rows[0];
+      if (!queuedJob
+        || queuedJob.required_executor_capability_hash
+          !== expectedExecutor.hash
+        || stableStringify(queuedJob.required_executor_capability_vector)
+          !== stableStringify(expectedExecutor.vector)) {
+        throw new HttpError(
+          409,
+          "The resume job could not be bound to the exact executor",
+          "dependency_resume_executor_conflict",
+        );
+      }
+      const checkpoint = {
+        schemaVersion: DEPENDENCY_RESUME_AUTHORIZATION_VERSION,
+        runId: input.runId,
+        sourceAccessId: input.sourceAccessId,
+        capabilitySessionId: input.capabilitySessionId,
+        idempotencyKey: input.idempotencyKey,
+        contractRevisionId: input.expectedContractRevisionId,
+        contractSemanticHash: input.expectedContractSemanticHash,
+        queryPlanRevisionId: plan.id,
+        queryPlanHash: plan.plan_hash,
+        executorCapabilityHash: expectedExecutor.hash,
+        blockerId: blocker.id,
+        blockerVersion: eligibility.blockerVersion,
+        decisionHash: input.expectedDecisionHash,
+        authorizationHash,
+        dependencyKey: blocker.dependency_key,
+        stageKey,
+        jobId: queuedJob.id,
+        resumeAt: eligibility.resumeAt.toISOString(),
+        authorizedAt: new Date().toISOString(),
+      };
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,$2,$3::jsonb)`,
+        [input.runId, authorizationPhase, JSON.stringify(checkpoint)],
+      );
+      const resolved = await client.query(
+        `UPDATE playlist_run_blockers
+         SET resolved_at=now(),updated_at=now()
+         WHERE id=$1 AND run_id=$2 AND contract_revision_id=$3
+           AND blocker_kind='provider' AND resolved_at IS NULL
+           AND state_json->>'decisionHash'=$4`,
+        [
+          blocker.id,
+          input.runId,
+          input.expectedContractRevisionId,
+          input.expectedDecisionHash,
+        ],
+      );
+      const resumed = await client.query(
+        `UPDATE research_runs
+         SET status='queued',phase='dependency_resume_scheduled',
+             error=NULL,completed_at=NULL,updated_at=now()
+         WHERE id=$1
+           AND active_playlist_contract_revision_id=$2
+           AND status='needs_decision'
+           AND phase='dependency_retry_window_expired'`,
+        [input.runId, input.expectedContractRevisionId],
+      );
+      if ((resolved.rowCount ?? 0) !== 1 || (resumed.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "The dependency decision changed; review the latest run",
+          "dependency_resume_stale",
+        );
+      }
+      return {
+        queued: true,
+        jobId: queuedJob.id,
+        authorizationHash,
+        resumeAt: eligibility.resumeAt,
+      };
+    });
+  }
+
   async openPlaylistRunBlocker(
     input: OpenPlaylistRunBlockerInput,
   ): Promise<string> {
@@ -3022,6 +5461,9 @@ export class Repository {
       throw new HttpError(503, "Playlist blocker storage is not ready", "playlist_contract_schema_unavailable");
     }
     return this.transaction(async (client) => {
+      if (input.fence) {
+        await this.assertPipelineV3WriteFence(client, input.runId, input.fence);
+      }
       const active = await client.query<{ id: string }>(
         `SELECT run.id
          FROM research_runs run
@@ -3100,18 +5542,25 @@ export class Repository {
     runId: string;
     contractRevisionId: string;
     blockerKind?: OpenPlaylistRunBlockerInput["blockerKind"];
+    /** Required for worker-originated canonical writes. */
+    fence?: PipelineV3WriteFence;
   }): Promise<number> {
     if (Number(await this.getSchemaVersion() ?? 0) < 17) return 0;
-    const result = await this.pool.query(
-      `UPDATE playlist_run_blockers SET resolved_at=now(),updated_at=now()
-       WHERE run_id=$1 AND contract_revision_id=$2 AND resolved_at IS NULL
-         AND ($3::varchar IS NULL OR blocker_kind=$3)`,
-      [input.runId, input.contractRevisionId, input.blockerKind ?? null],
-    );
-    return result.rowCount ?? 0;
+    return this.transaction(async (client) => {
+      if (input.fence) {
+        await this.assertPipelineV3WriteFence(client, input.runId, input.fence);
+      }
+      const result = await client.query(
+        `UPDATE playlist_run_blockers SET resolved_at=now(),updated_at=now()
+         WHERE run_id=$1 AND contract_revision_id=$2 AND resolved_at IS NULL
+           AND ($3::varchar IS NULL OR blocker_kind=$3)`,
+        [input.runId, input.contractRevisionId, input.blockerKind ?? null],
+      );
+      return result.rowCount ?? 0;
+    });
   }
 
-  private async assertPipelineV3WriteFence(
+  async assertPipelineV3WriteFence(
     client: PoolClient,
     runId: string,
     fence: PipelineV3WriteFence,
@@ -3145,6 +5594,39 @@ export class Repository {
         })}`);
       }
       throw new HttpError(409, "Pipeline V3 worker lease was lost", "job_lease_lost");
+    }
+    if (fence.contractAttemptId) {
+      const attempt = await client.query<{ id: string }>(
+        `SELECT attempt.id
+         FROM playlist_execution_attempts attempt
+         JOIN job_queue job ON job.id=$2
+         WHERE attempt.id=$1
+           AND attempt.job_id=job.id
+           AND attempt.run_id=$3
+           AND attempt.contract_revision_id=$4
+           AND attempt.query_plan_revision_id=job.query_plan_revision_id
+           AND attempt.stage=job.stage_key
+           AND attempt.lease_generation=job.lease_epoch
+           AND attempt.status IN ('running','blocked','complete')
+           AND attempt.executor_capability_hash
+             =job.required_executor_capability_hash
+           AND attempt.executor_capability_vector
+             =job.required_executor_capability_vector
+         FOR UPDATE OF attempt`,
+        [
+          fence.contractAttemptId,
+          fence.jobId,
+          runId,
+          fence.contractRevisionDatabaseId ?? null,
+        ],
+      );
+      if (!attempt.rows[0]) {
+        throw new HttpError(
+          409,
+          "Pipeline V3 execution attempt fence was lost",
+          "job_lease_lost",
+        );
+      }
     }
   }
 
@@ -3280,6 +5762,9 @@ export class Repository {
       Math.min(500, input.request.requestedRawCandidateCount),
       "Pipeline V3 discovery leads",
     );
+    const supportsSourceDiversity = await this.getSetting(
+      CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+    ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
     await this.transaction(async (client) => {
       const authority = await this.assertPipelineV3RecoveryPersistenceFence(
         client,
@@ -3290,6 +5775,18 @@ export class Repository {
         .slice(0, 120) || "orchestration_local";
       const provider = input.request.strategy.discoveryDependencyIds[0]
         ?.slice(0, 80) || "orchestration_local";
+      const cacheOrigin = input.request.strategy.discoveryDependencyIds
+        .includes("governed_evidence_graph")
+        ? "governed_snapshot"
+        : input.request.strategy.discoveryDependencyIds.length === 1
+          && input.request.strategy.discoveryDependencyIds[0]
+            === "orchestration_local"
+          ? "orchestration_local"
+          : input.batch.provenance?.cacheOrigin ?? "unknown";
+      const sourceFreshUntil = input.batch.provenance?.sourceFreshUntil
+        && Number.isFinite(Date.parse(input.batch.provenance.sourceFreshUntil))
+        ? new Date(input.batch.provenance.sourceFreshUntil)
+        : null;
       for (const candidate of input.batch.candidates) {
         if (!candidate.id?.trim()
           || !candidate.artist?.trim()
@@ -3325,7 +5822,26 @@ export class Repository {
           strategyRound: input.request.strategyRound,
         };
         await client.query(
-          `INSERT INTO playlist_discovery_leads(
+          supportsSourceDiversity
+            ? `INSERT INTO playlist_discovery_leads(
+             id,run_id,contract_revision_id,execution_attempt_id,provider,
+             dependency_key,dependency_ids,provenance_roots,cache_origin,
+             source_fresh_until,strategy_id,identity_hint_hash,lead_json,status,
+             evidence_eligible)
+           VALUES($1,$2,$3,$4,$5,$6,$7::text[],$8::text[],$9,$10,$11,$12,
+                  $13::jsonb,'discovered',false)
+           ON CONFLICT(
+             run_id,contract_revision_id,provider,strategy_id,identity_hint_hash
+           ) DO UPDATE SET
+             execution_attempt_id=EXCLUDED.execution_attempt_id,
+             dependency_ids=EXCLUDED.dependency_ids,
+             provenance_roots=EXCLUDED.provenance_roots,
+             cache_origin=EXCLUDED.cache_origin,
+             source_fresh_until=EXCLUDED.source_fresh_until,
+             lead_json=EXCLUDED.lead_json,
+             updated_at=now()
+           WHERE playlist_discovery_leads.evidence_eligible=false`
+            : `INSERT INTO playlist_discovery_leads(
              id,run_id,contract_revision_id,execution_attempt_id,provider,
              dependency_key,strategy_id,identity_hint_hash,lead_json,status,
              evidence_eligible)
@@ -3337,7 +5853,21 @@ export class Repository {
              lead_json=EXCLUDED.lead_json,
              updated_at=now()
            WHERE playlist_discovery_leads.evidence_eligible=false`,
-          [
+          supportsSourceDiversity ? [
+            leadId,
+            input.runId,
+            authority.contractRevisionId,
+            authority.executionAttemptId,
+            provider,
+            dependencyKey,
+            [...input.request.strategy.discoveryDependencyIds],
+            [],
+            cacheOrigin,
+            sourceFreshUntil,
+            input.request.strategy.id,
+            identityHintHash,
+            JSON.stringify(lead),
+          ] : [
             leadId,
             input.runId,
             authority.contractRevisionId,
@@ -3395,11 +5925,27 @@ export class Repository {
         client,
         input,
       );
+      const supportsSourceDiversity = await this.getSetting(
+        CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+      ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
       for (const qualification of input.qualifications) {
         const candidate = candidateById.get(qualification.candidateId)!;
         const identityHintHash = pipelineV3LeadIdentityHash(candidate);
-        const lead = await client.query<{ id: string }>(
-          `SELECT id FROM playlist_discovery_leads
+        const lead = await client.query<{
+          id: string;
+          dependency_ids?: string[];
+          provenance_roots?: string[];
+          cache_origin?:
+            | "live"
+            | "fresh_cache"
+            | "governed_snapshot"
+            | "orchestration_local"
+            | "unknown";
+          source_fresh_until?: Date | null;
+        }>(
+          `SELECT id${supportsSourceDiversity
+            ? ",dependency_ids,provenance_roots,cache_origin,source_fresh_until"
+            : ""} FROM playlist_discovery_leads
            WHERE run_id=$1 AND contract_revision_id=$2
              AND identity_hint_hash=$3 AND evidence_eligible=false
            ORDER BY updated_at DESC,id DESC LIMIT 1 FOR UPDATE`,
@@ -3416,6 +5962,12 @@ export class Repository {
           candidate,
           qualification,
           input.queryPlan,
+          supportsSourceDiversity ? {
+            dependencyIds: lead.rows[0].dependency_ids ?? [],
+            provenanceRoots: lead.rows[0].provenance_roots ?? [],
+            cacheOrigin: lead.rows[0].cache_origin ?? "unknown",
+            sourceFreshUntil: lead.rows[0].source_fresh_until ?? null,
+          } : undefined,
         );
         await client.query(
           `INSERT INTO playlist_qualification_records(
@@ -3463,6 +6015,258 @@ export class Repository {
     });
   }
 
+  async validatePipelineV3ContinuationQualifications(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    tracks: readonly QualifiedTrackV3[];
+  }): Promise<void> {
+    const policy = input.queryPlan.canonicalContractPolicy;
+    if (!policy || input.queryPlan.schemaVersion < 4) {
+      throw new HttpError(
+        409,
+        "Canonical continuation qualification policy is unavailable",
+        "pipeline_v3_continuation_qualification_invalid",
+      );
+    }
+    boundedPipelineBatch(
+      input.tracks,
+      5_000,
+      "Pipeline V3 continuation qualification tracks",
+    );
+    const familyKeys = [...new Set(
+      input.tracks.map(({ recordingFamilyKey }) => recordingFamilyKey),
+    )];
+    if (familyKeys.length !== input.tracks.length) {
+      throw new HttpError(
+        409,
+        "Canonical continuation recording identities are ambiguous",
+        "pipeline_v3_continuation_qualification_invalid",
+      );
+    }
+    await this.transaction(async (client) => {
+      const contract = await client.query<{
+        id: string;
+        contract_hash: string;
+        contract_json: PlaylistContractRevisionV1;
+        query_plan_json: QueryPlanV3;
+        selection_plan_json: SelectionPlanV3;
+      }>(
+        `SELECT contract.id,contract.contract_hash,contract.contract_json,
+                query.plan_json query_plan_json,
+                selection.plan_json selection_plan_json
+         FROM research_runs run
+         JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+          AND contract.status='active'
+         JOIN run_active_query_plans active ON active.run_id=run.id
+         JOIN query_plan_revisions query
+           ON query.id=active.query_plan_revision_id
+          AND query.status='active'
+         JOIN selection_plans selection
+           ON selection.id=query.selection_plan_id
+          AND selection.status='active'
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+         FOR SHARE OF run,contract,query,selection`,
+        [input.runId],
+      );
+      const authority = contract.rows[0];
+      if (!authority
+        || authority.contract_hash
+          !== input.queryPlan.playlistContractSemanticHash
+        || authority.contract_json.revisionId
+          !== input.queryPlan.playlistContractRevisionId
+        || stableStringify(input.queryPlan)
+          !== stableStringify(authority.query_plan_json)
+        || stableStringify(policy)
+          !== stableStringify(
+            authority.query_plan_json.canonicalContractPolicy,
+          )
+        || stableStringify(policy)
+          !== stableStringify(
+            authority.selection_plan_json.canonicalContractPolicy,
+          )) {
+        throw new HttpError(
+          409,
+          "Canonical continuation contract authority is stale",
+          "pipeline_v3_continuation_qualification_invalid",
+        );
+      }
+      const qualifications = await client.query<
+        PersistedPipelineV3QualificationEvidenceRow
+      >(
+        `SELECT qualification.candidate_id,
+                qualification.stable_identity_hash,
+                qualification.qualification_hash,
+                qualification.decision,
+                family.family_key recording_family_key,
+                qualification.predicate_results_json,
+                qualification.evidence_record_ids_json,
+                qualification.quality_result_json,
+                qualification.catalog_result_json
+         FROM playlist_qualification_records qualification
+         JOIN track_candidates candidate
+           ON candidate.id=qualification.candidate_id
+          AND candidate.run_id=qualification.run_id
+         JOIN recording_families family
+           ON family.id=candidate.recording_family_id
+          AND family.run_id=qualification.run_id
+         WHERE qualification.run_id=$1
+           AND qualification.contract_revision_id=$2
+           AND family.family_key=ANY($3::text[])
+           AND qualification.decision='qualified'
+           AND qualification.revoked_at IS NULL
+         ORDER BY qualification.candidate_id,
+                  qualification.qualified_at DESC,qualification.id DESC
+         FOR SHARE OF qualification,candidate,family`,
+        [input.runId, authority.id, familyKeys],
+      );
+      const familyRows = new Map(
+        qualifications.rows.map((row) => [row.recording_family_key, row]),
+      );
+      if (qualifications.rows.length !== familyKeys.length
+        || familyRows.size !== familyKeys.length) {
+        throw new HttpError(
+          409,
+          "Canonical continuation has no single authoritative qualification",
+          "pipeline_v3_continuation_qualification_invalid",
+        );
+      }
+      const candidateIds = qualifications.rows.map(
+        ({ candidate_id }) => candidate_id,
+      );
+      const persistedEvidence = await client.query<
+        PersistedPipelineV3EvidenceBindingRow
+      >(
+        `SELECT binding.candidate_id,binding.source_url,
+                source.provenance_root,binding.binding_kind,
+                binding.confidence,binding.provenance_path_json
+         FROM track_scope_bindings binding
+         JOIN source_records source
+           ON source.id=binding.source_record_id
+          AND source.run_id=binding.run_id
+          AND source.url=binding.source_url
+         WHERE binding.run_id=$1
+           AND binding.candidate_id=ANY($2::uuid[])
+           AND binding.eligibility='qualifying'
+           AND binding.pipeline_version='corpus_first_v3'
+         ORDER BY binding.candidate_id,binding.id
+         FOR SHARE OF binding,source`,
+        [input.runId, candidateIds],
+      );
+      const evidenceIntegrityReason = persistedCanonicalEvidenceIntegrityReason({
+        storefront: input.queryPlan.storefront,
+        canonicalPolicy: policy,
+        candidateIds,
+        qualifications: qualifications.rows,
+        bindings: persistedEvidence.rows,
+      });
+      if (evidenceIntegrityReason) {
+        throw new HttpError(
+          409,
+          `Canonical continuation qualification is corrupt (${evidenceIntegrityReason})`,
+          "pipeline_v3_continuation_qualification_invalid",
+        );
+      }
+      for (const track of input.tracks) {
+        const row = familyRows.get(track.recordingFamilyKey);
+        if (!row || !canonicalRequiredEvidenceIntegrityV3({
+          policy,
+          assessments: track.canonicalClauseAssessments,
+          bindingIds: track.evidenceBindingIds,
+          bindings: track.evidenceBindings,
+          storefront: input.queryPlan.storefront,
+        }).passed) {
+          throw new HttpError(
+            409,
+            "Canonical continuation checkpoint evidence is invalid",
+            "pipeline_v3_continuation_qualification_invalid",
+          );
+        }
+        const persistedCatalog = recordValue(row.catalog_result_json);
+        const persistedPredicateRoot =
+          recordValue(row.predicate_results_json);
+        const persistedCanonical = recordValue(
+          persistedPredicateRoot?.canonicalContract,
+        );
+        const checkpointAssessments = Object.fromEntries(
+          policy.clauses.flatMap((clause) => {
+            const assessment =
+              track.canonicalClauseAssessments?.[clause.id];
+            return assessment
+              ? [[clause.id, structuredClone(assessment)]]
+              : [];
+          }),
+        );
+        const persistedSnapshots = Array.isArray(
+          recordValue(row.quality_result_json)?.hostedEvidenceSnapshots,
+        )
+          ? (recordValue(row.quality_result_json)!
+              .hostedEvidenceSnapshots as unknown[])
+            .map(recordValue)
+            .flatMap((snapshot) => (
+              typeof snapshot?.snapshotHash === "string"
+                ? [snapshot.snapshotHash]
+                : []
+            ))
+            .sort()
+          : [];
+        const checkpointSnapshots = (track.evidenceBindings ?? [])
+          .flatMap((binding) => (
+            binding.hostedEvidenceSnapshot
+              ? [binding.hostedEvidenceSnapshot.snapshotHash]
+              : []
+          ))
+          .sort();
+        const qualityPolicy = input.queryPlan.playlistQualityPolicy;
+        const persistedQuality = recordValue(row.quality_result_json);
+        const persistedCentralQualityObservations = qualityPolicy
+          ? centralQualityCriterionObservationsForPolicyV3({
+              observations:
+                persistedQuality?.centralQualityCriterionObservations,
+              policy: qualityPolicy,
+              artist: track.artist,
+              title: track.title,
+              album: track.album,
+              appleSongId: track.appleSongId,
+              recordingFamilyKey: track.recordingFamilyKey,
+            })
+          : [];
+        const checkpointCentralQualityObservations = qualityPolicy
+          ? centralQualityCriterionObservationsForPolicyV3({
+              observations:
+                track.centralQualityCriterionObservations,
+              policy: qualityPolicy,
+              artist: track.artist,
+              title: track.title,
+              album: track.album,
+              appleSongId: track.appleSongId,
+              recordingFamilyKey: track.recordingFamilyKey,
+            })
+          : [];
+        if (persistedCatalog?.recordingFamilyKey
+            !== track.recordingFamilyKey
+          || persistedCatalog.appleSongId !== track.appleSongId
+          || stableStringify(persistedCanonical?.assessments ?? null)
+            !== stableStringify(checkpointAssessments)
+          || stableStringify(
+            [...new Set(track.evidenceBindingIds)].sort(),
+          ) !== stableStringify(
+            [...(row.evidence_record_ids_json as string[])].sort(),
+          )
+          || stableStringify(persistedSnapshots)
+            !== stableStringify(checkpointSnapshots)
+          || stableStringify(persistedCentralQualityObservations)
+            !== stableStringify(checkpointCentralQualityObservations)) {
+          throw new HttpError(
+            409,
+            "Canonical continuation checkpoint diverges from its qualification",
+            "pipeline_v3_continuation_qualification_invalid",
+          );
+        }
+      }
+    });
+  }
+
   async ping(): Promise<boolean> {
     try {
       await this.pool.query("SELECT 1");
@@ -3493,6 +6297,50 @@ export class Repository {
   async getSetting(key: string): Promise<string | null> {
     const rows = await this.db.select({ value: settings.value }).from(settings).where(eq(settings.key, key)).limit(1);
     return rows[0]?.value ?? null;
+  }
+
+  async getPublicRolloutDatabaseAuthority(): Promise<
+    PublicRolloutDatabaseAuthorityV1 | null
+  > {
+    const keys = [
+      "public_rollout_state:global",
+      "public_rollout_state:genre_scene",
+      "public_rollout_state:mood_activity_theme",
+      "public_rollout_state:similarity",
+      "public_rollout_state:artist_catalogue",
+      "public_rollout_state:fixed_container",
+      "public_rollout_state:factual_relationship",
+      "public_rollout_state:exhaustive",
+    ] as const;
+    const result = await this.pool.query<{ key: string; value: string }>(
+      "SELECT key,value FROM settings WHERE key=ANY($1::text[])",
+      [keys],
+    );
+    const values = new Map(result.rows.map((row) => [row.key, row.value]));
+    const globalValue = values.get("public_rollout_state:global");
+    if (!globalValue) return null;
+    const parse = (value: string, label: string): unknown => {
+      try {
+        return JSON.parse(value);
+      } catch {
+        throw new HttpError(
+          503,
+          `Public rollout ${label} database authority is corrupt`,
+          "public_rollout_database_authority_invalid",
+        );
+      }
+    };
+    return {
+      global: parse(globalValue, "global"),
+      intents: Object.fromEntries(
+        keys.slice(1).flatMap((key) => {
+          const value = values.get(key);
+          return value
+            ? [[key.slice("public_rollout_state:".length), parse(value, key)]]
+            : [];
+        }),
+      ),
+    } as PublicRolloutDatabaseAuthorityV1;
   }
 
   async setSetting(key: string, value: string): Promise<void> {
@@ -3577,6 +6425,7 @@ export class Repository {
       attempt_status: string;
       attempt_stage: string;
       attempt_lease_generation: number;
+      attempt_idempotency_key: string;
       job_id: string;
       job_status: string;
       job_lease_owner: string | null;
@@ -3602,6 +6451,7 @@ export class Repository {
               attempt.contract_revision_id attempt_contract_revision_id,
               attempt.status attempt_status,attempt.stage attempt_stage,
               attempt.lease_generation attempt_lease_generation,
+              attempt.idempotency_key attempt_idempotency_key,
               job.id job_id,job.status job_status,
               job.lease_owner job_lease_owner,
               job.lease_epoch job_lease_epoch,job.stage_key job_stage_key
@@ -3651,6 +6501,8 @@ export class Repository {
       || row.attempt_status !== "running"
       || row.attempt_stage !== input.stageKey
       || Number(row.attempt_lease_generation) !== input.leaseGeneration
+      || row.attempt_idempotency_key
+        !== `${input.jobId}:${input.leaseGeneration}:${input.contractRevisionId}`
       || row.job_id !== input.jobId
       || row.job_status !== "leased"
       || row.job_lease_owner !== input.workerId
@@ -3771,33 +6623,173 @@ export class Repository {
         [input.idempotencyKey],
       );
       const row = stored.rows[0];
-      if (!row
-        || row.run_id !== input.runId
-        || row.contract_revision_id !== input.contractRevisionId
-        || row.execution_attempt_id !== input.executionAttemptId
-        || row.manifest_id !== input.manifestId
-        || row.manifest_revision_id !== input.manifestRevisionId
-        || row.expected_ordered_ids_hash !== input.expectedOrderedIdsHash
-        || Number(row.expected_count) !== input.expectedCount
-        || row.reconciliation_json.manifestRevisionHash
-          !== input.manifestRevisionHash
-        || row.reconciliation_json.contractHash !== input.contractHash
-        || row.reconciliation_json.jobId !== input.jobId
-        || row.reconciliation_json.workerId !== input.workerId
-        || Number(row.reconciliation_json.leaseGeneration)
-          !== input.leaseGeneration
-        || row.reconciliation_json.stageKey !== input.stageKey) {
+      const immutableIdentityMatches = Boolean(row)
+        && row!.run_id === input.runId
+        && row!.contract_revision_id === input.contractRevisionId
+        && row!.manifest_id === input.manifestId
+        && row!.manifest_revision_id === input.manifestRevisionId
+        && row!.expected_ordered_ids_hash === input.expectedOrderedIdsHash
+        && Number(row!.expected_count) === input.expectedCount
+        && row!.reconciliation_json.manifestRevisionHash
+          === input.manifestRevisionHash
+        && row!.reconciliation_json.contractHash === input.contractHash;
+      if (!immutableIdentityMatches) {
         throw new HttpError(
           409,
           "Publication reconciliation idempotency key was reused",
           "publication_reconciliation_conflict",
         );
       }
+      const sameAuthority = row!.execution_attempt_id === input.executionAttemptId
+        && row!.reconciliation_json.jobId === input.jobId
+        && row!.reconciliation_json.workerId === input.workerId
+        && Number(row!.reconciliation_json.leaseGeneration)
+          === input.leaseGeneration
+        && row!.reconciliation_json.stageKey === input.stageKey;
+      if (!sameAuthority) {
+        const previousAttemptId = row!.execution_attempt_id;
+        const previousJobId = typeof row!.reconciliation_json.jobId === "string"
+          ? row!.reconciliation_json.jobId
+          : "";
+        const previousWorkerId = typeof row!.reconciliation_json.workerId === "string"
+          ? row!.reconciliation_json.workerId
+          : "";
+        const previousLeaseGeneration = Number(
+          row!.reconciliation_json.leaseGeneration,
+        );
+        const previousStageKey =
+          typeof row!.reconciliation_json.stageKey === "string"
+            ? row!.reconciliation_json.stageKey
+            : "";
+        if (!UUID_PATTERN.test(previousAttemptId)
+          || !UUID_PATTERN.test(previousJobId)
+          || !previousWorkerId
+          || !Number.isSafeInteger(previousLeaseGeneration)
+          || previousLeaseGeneration < 1
+          || !previousStageKey
+          || previousAttemptId === input.executionAttemptId) {
+          throw new HttpError(
+            409,
+            "Publication reconciliation authority is inconsistent",
+            "publication_reconciliation_conflict",
+          );
+        }
+        let priorAttempt: {
+          status: string;
+          lease_generation: number;
+          stage: string;
+          idempotency_key: string;
+        } | undefined;
+        let priorJob: {
+          status: string;
+          lease_owner: string | null;
+          lease_epoch: number;
+          lease_active: boolean;
+          stage_key: string;
+        } | undefined;
+        try {
+          priorAttempt = (await client.query<{
+            status: string;
+            lease_generation: number;
+            stage: string;
+            idempotency_key: string;
+          }>(
+            `SELECT status,lease_generation,stage,idempotency_key
+             FROM playlist_execution_attempts
+             WHERE id=$1 FOR UPDATE NOWAIT`,
+            [previousAttemptId],
+          )).rows[0];
+          priorJob = (await client.query<{
+            status: string;
+            lease_owner: string | null;
+            lease_epoch: number;
+            lease_active: boolean;
+            stage_key: string;
+          }>(
+            `SELECT status,lease_owner,lease_epoch,
+                    lease_expires_at>now() lease_active,stage_key
+             FROM job_queue WHERE id=$1 FOR UPDATE NOWAIT`,
+            [previousJobId],
+          )).rows[0];
+        } catch (error) {
+          if (error && typeof error === "object"
+            && "code" in error
+            && (error as { code?: unknown }).code === "55P03") {
+            throw new HttpError(
+              409,
+              "Publication reconciliation is still owned by an active attempt",
+              "publication_reconciliation_active",
+            );
+          }
+          throw error;
+        }
+        if (!priorAttempt
+          || Number(priorAttempt.lease_generation)
+            !== previousLeaseGeneration
+          || priorAttempt.stage !== previousStageKey
+          || priorAttempt.idempotency_key
+            !== `${previousJobId}:${previousLeaseGeneration}:${input.contractRevisionId}`) {
+          throw new HttpError(
+            409,
+            "Publication reconciliation authority is inconsistent",
+            "publication_reconciliation_conflict",
+          );
+        }
+        const priorLeaseStillActive = priorAttempt.status === "running"
+          && priorJob?.status === "leased"
+          && priorJob.lease_owner === previousWorkerId
+          && Number(priorJob.lease_epoch) === previousLeaseGeneration
+          && priorJob.stage_key === previousStageKey
+          && priorJob.lease_active === true;
+        if (priorLeaseStillActive) {
+          throw new HttpError(
+            409,
+            "Publication reconciliation is still owned by an active attempt",
+            "publication_reconciliation_active",
+          );
+        }
+        await client.query(
+          `UPDATE playlist_execution_attempts
+           SET status='discarded',completed_at=COALESCE(completed_at,now())
+           WHERE id=$1 AND status='running'`,
+          [previousAttemptId],
+        );
+        await client.query(
+          `UPDATE playlist_publication_reconciliations
+           SET execution_attempt_id=$2,
+               reconciliation_json=reconciliation_json || $3::jsonb,
+               updated_at=now()
+           WHERE id=$1`,
+          [
+            row!.id,
+            input.executionAttemptId,
+            JSON.stringify({
+              jobId: input.jobId,
+              workerId: input.workerId,
+              leaseGeneration: input.leaseGeneration,
+              stageKey: input.stageKey,
+              adoptedFrom: {
+                executionAttemptId: previousAttemptId,
+                jobId: previousJobId,
+                leaseGeneration: previousLeaseGeneration,
+              },
+            }),
+          ],
+        );
+      }
+      await client.query(
+        `UPDATE research_runs
+         SET status='publishing',phase='apple_publication',error=NULL,
+             updated_at=now()
+         WHERE id=$1 AND status='waiting_for_apple_authorization'
+           AND phase='apple_reauthorization'`,
+        [input.runId],
+      );
       return {
-        id: row.id,
-        state: row.state,
-        appendedCount: Number(row.appended_count),
-        batchCursor: Number(row.batch_cursor),
+        id: row!.id,
+        state: row!.state,
+        appendedCount: Number(row!.appended_count),
+        batchCursor: Number(row!.batch_cursor),
       };
     });
   }
@@ -3964,6 +6956,161 @@ export class Repository {
     });
   }
 
+  async commitCanonicalPublicationPreflightDecision(input: {
+    authority: BeginPublicationReconciliationInput;
+    pipelineOutcome: PipelineOutcome;
+    omittedCandidateIds: readonly string[];
+    reasonCodes: readonly string[];
+  }): Promise<void> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 18) {
+      throw new HttpError(
+        503,
+        "Canonical publication decision fencing is unavailable",
+        "publication_reconciliation_unavailable",
+      );
+    }
+    boundedPipelineBatch(
+      input.omittedCandidateIds,
+      EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+      "Publication preflight omitted candidates",
+    );
+    const reasonCodes = [...new Set(input.reasonCodes)]
+      .filter((value) => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim().slice(0, 120))
+      .slice(0, 32);
+    if (reasonCodes.length === 0
+      || input.pipelineOutcome.publishedTrackCount !== 0
+      || input.pipelineOutcome.frontierExhausted) {
+      throw new HttpError(
+        400,
+        "Canonical publication preflight decision is invalid",
+        "invalid_publication_reconciliation",
+      );
+    }
+    await this.transaction(async (client) => {
+      await this.assertPublicationReconciliationAuthority(
+        client,
+        input.authority,
+      );
+      // V3's locked manifest remains immutable when catalog availability
+      // changes after `ready`. Candidate-stage rejection is a V2 lifecycle
+      // event; applying it to canonical V3 would corrupt the qualification
+      // history that the visible decision is intended to preserve.
+      if (input.pipelineOutcome.pipelineVersion === "catalog_first_v2"
+        && input.omittedCandidateIds.length > 0) {
+        await advanceCandidateStagesTransaction(
+          client,
+          input.authority.runId,
+          [...new Set(input.omittedCandidateIds)].map((candidateId) => ({
+            candidateId,
+            stages: [{
+              toStage: "rejected",
+              reasonCode: "publication_preflight_no_compatible_identity",
+              detail: {
+                manifestId: input.authority.manifestId,
+                revisionId: input.authority.manifestRevisionId,
+              },
+            }],
+          })),
+          {
+            pipelineVersion: input.pipelineOutcome.pipelineVersion,
+            policyVersion: input.pipelineOutcome.policyVersion,
+          },
+        );
+      }
+      await client.query(
+        `UPDATE public_playlists
+         SET status='hidden',hidden_at=COALESCE(hidden_at,now()),updated_at=now()
+         WHERE run_id=$1 AND status='listed' AND hidden_at IS NULL`,
+        [input.authority.runId],
+      );
+      await persistPipelineOutcomeTransaction(
+        client,
+        input.authority.runId,
+        input.pipelineOutcome,
+      );
+      const state = {
+        schemaVersion: "genio-publication-revalidation-decision/v1",
+        stage: "publication_preflight",
+        reasonCode: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+        reasonCodes,
+        manifestId: input.authority.manifestId,
+        manifestRevisionId: input.authority.manifestRevisionId,
+        manifestRevisionHash: input.authority.manifestRevisionHash,
+        nextAction: "review_contract",
+      };
+      const existing = await client.query<{ id: string }>(
+        `SELECT id FROM playlist_run_blockers
+         WHERE run_id=$1 AND contract_revision_id=$2
+           AND blocker_kind='scope_decision'
+           AND dependency_key='publication_revalidation'
+           AND resolved_at IS NULL
+         ORDER BY created_at,id LIMIT 1 FOR UPDATE`,
+        [input.authority.runId, input.authority.contractRevisionId],
+      );
+      if (existing.rows[0]) {
+        await client.query(
+          `UPDATE playlist_run_blockers
+           SET state_json=$2::jsonb,next_retry_at=NULL,
+               automatic_retry_until=NULL,updated_at=now()
+           WHERE id=$1`,
+          [existing.rows[0].id, JSON.stringify(state)],
+        );
+      } else {
+        await client.query(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,'scope_decision','publication_revalidation',
+             0,NULL,NULL,$4::jsonb)`,
+          [
+            randomUUID(),
+            input.authority.runId,
+            input.authority.contractRevisionId,
+            JSON.stringify(state),
+          ],
+        );
+      }
+      await client.query(
+        `UPDATE research_runs
+         SET status='needs_decision',
+             phase='publication_contract_revalidation_required',
+             error=NULL,updated_at=now()
+         WHERE id=$1`,
+        [input.authority.runId],
+      );
+    });
+  }
+
+  async updateCanonicalPublicationRun(
+    authority: BeginPublicationReconciliationInput,
+    patch: {
+      status: "publishing" | "waiting_for_apple_authorization";
+      phase: "apple_publication" | "apple_reauthorization";
+    },
+  ): Promise<void> {
+    const valid = (patch.status === "publishing"
+        && patch.phase === "apple_publication")
+      || (patch.status === "waiting_for_apple_authorization"
+        && patch.phase === "apple_reauthorization");
+    if (!valid) {
+      throw new HttpError(
+        400,
+        "Canonical publication run transition is invalid",
+        "invalid_publication_reconciliation",
+      );
+    }
+    await this.transaction(async (client) => {
+      await this.assertPublicationReconciliationAuthority(client, authority);
+      await client.query(
+        `UPDATE research_runs
+         SET status=$2::varchar,phase=$3,error=NULL,updated_at=now()
+         WHERE id=$1`,
+        [authority.runId, patch.status, patch.phase],
+      );
+    });
+  }
+
   /**
    * Reserve one Apple mutation token and retain a database session advisory
    * lock until the caller finishes the external write. The lock serializes
@@ -3974,6 +7121,16 @@ export class Repository {
     input: AppleWritePermitRequest,
     signal?: AbortSignal,
   ): Promise<AppleWritePermit> {
+    const executionFence = input.executionFence;
+    const executionFenceValid = executionFence !== null
+      && UUID_PATTERN.test(executionFence.executionAttemptId)
+      && UUID_PATTERN.test(executionFence.jobId)
+      && Boolean(executionFence.workerId.trim())
+      && executionFence.workerId.length <= 160
+      && Number.isSafeInteger(executionFence.leaseGeneration)
+      && executionFence.leaseGeneration >= 1
+      && Boolean(executionFence.stageKey.trim())
+      && executionFence.stageKey.length <= 160;
     if (!input.runId || !input.manifestId || !input.publicationVolumeId
       || !/^[a-f0-9]{64}$/iu.test(input.manifestRevisionHash)
       || (input.manifestRevisionId !== null
@@ -3981,6 +7138,7 @@ export class Repository {
       || (input.contractRevisionId !== null
         && !/^[0-9a-f]{8}-[0-9a-f-]{27,}$/iu.test(input.contractRevisionId))
       || (input.contractHash !== null && !/^[a-f0-9]{64}$/iu.test(input.contractHash))
+      || (executionFence !== null && !executionFenceValid)
       || !["create_playlist", "append_tracks"].includes(input.operation)) {
       throw new Error("Apple write permit request is invalid");
     }
@@ -3999,6 +7157,7 @@ export class Repository {
       signal?.throwIfAborted();
       const client = await this.pool.connect();
       let locked = false;
+      let transactionOpen = false;
       try {
         const lock = await client.query<{ acquired: boolean }>(
           "SELECT pg_try_advisory_lock(hashtextextended($1,0)) acquired",
@@ -4018,6 +7177,7 @@ export class Repository {
 
         let tokenWaitMs = 0;
         await client.query("BEGIN");
+        transactionOpen = true;
         try {
           const publication = await client.query<{
             run_status: string;
@@ -4086,6 +7246,97 @@ export class Repository {
               code: "manifest_contract_stale",
             });
           }
+          if (contractRequired) {
+            if (!executionFenceValid || !executionFence) {
+              throw Object.assign(new Error("Canonical Apple write execution fence is missing"), {
+                code: "publication_execution_stale",
+              });
+            }
+            const authority = await client.query<{
+              attempt_contract_revision_id: string;
+              attempt_status: string;
+              attempt_stage: string;
+              attempt_lease_generation: number;
+              attempt_idempotency_key: string;
+              job_status: string;
+              job_lease_owner: string | null;
+              job_lease_epoch: number;
+              job_stage_key: string;
+              job_lease_active: boolean;
+            }>(
+              `SELECT attempt.contract_revision_id attempt_contract_revision_id,
+                      attempt.status attempt_status,attempt.stage attempt_stage,
+                      attempt.lease_generation attempt_lease_generation,
+                      attempt.idempotency_key attempt_idempotency_key,
+                      job.status job_status,job.lease_owner job_lease_owner,
+                      job.lease_epoch job_lease_epoch,job.stage_key job_stage_key,
+                      job.lease_expires_at>now() job_lease_active
+               FROM playlist_execution_attempts attempt
+               JOIN job_queue job ON job.id=$2 AND job.run_id=attempt.run_id
+               WHERE attempt.id=$1 AND attempt.run_id=$3
+               FOR SHARE OF attempt,job`,
+              [
+                executionFence.executionAttemptId,
+                executionFence.jobId,
+                input.runId,
+              ],
+            );
+            const active = authority.rows[0];
+            if (!active
+              || active.attempt_contract_revision_id !== input.contractRevisionId
+              || active.attempt_status !== "running"
+              || active.attempt_stage !== executionFence.stageKey
+              || Number(active.attempt_lease_generation)
+                !== executionFence.leaseGeneration
+              || active.attempt_idempotency_key
+                !== `${executionFence.jobId}:${executionFence.leaseGeneration}:${input.contractRevisionId}`
+              || active.job_status !== "leased"
+              || active.job_lease_owner !== executionFence.workerId
+              || Number(active.job_lease_epoch) !== executionFence.leaseGeneration
+              || active.job_stage_key !== executionFence.stageKey
+              || active.job_lease_active !== true) {
+              throw Object.assign(new Error("Apple write execution fence is stale"), {
+                code: "publication_execution_stale",
+              });
+            }
+            const reconciliation = await client.query<{
+              execution_attempt_id: string;
+              state: DurablePublicationReconciliationState;
+              reconciliation_json: Record<string, unknown>;
+            }>(
+              `SELECT execution_attempt_id,state,reconciliation_json
+               FROM playlist_publication_reconciliations
+               WHERE run_id=$1 AND contract_revision_id=$2
+                 AND manifest_id=$3 AND manifest_revision_id=$4
+               FOR SHARE`,
+              [
+                input.runId,
+                input.contractRevisionId,
+                input.manifestId,
+                input.manifestRevisionId,
+              ],
+            );
+            const progress = reconciliation.rows[0];
+            if (!progress
+              || progress.execution_attempt_id
+                !== executionFence.executionAttemptId
+              || ![
+                "preflight",
+                "create_pending",
+                "append_pending",
+                "reconciling",
+                "authorization_blocked",
+              ].includes(progress.state)
+              || progress.reconciliation_json.jobId !== executionFence.jobId
+              || progress.reconciliation_json.workerId !== executionFence.workerId
+              || Number(progress.reconciliation_json.leaseGeneration)
+                !== executionFence.leaseGeneration
+              || progress.reconciliation_json.stageKey !== executionFence.stageKey) {
+              throw Object.assign(new Error("Apple write reconciliation fence is stale"), {
+                code: "publication_execution_stale",
+              });
+            }
+          }
           const stored = await client.query<{ value: string }>(
             "SELECT value FROM settings WHERE key=$1 FOR UPDATE",
             [APPLE_WRITE_GATEWAY_STATE_KEY],
@@ -4121,9 +7372,13 @@ export class Repository {
               [APPLE_WRITE_GATEWAY_EVENT_BUCKET, APPLE_WRITE_GATEWAY_EVENT_ACTION],
             );
           }
-          await client.query("COMMIT");
+          if (tokenWaitMs > 0) {
+            await client.query("COMMIT");
+            transactionOpen = false;
+          }
         } catch (error) {
           await client.query("ROLLBACK");
+          transactionOpen = false;
           throw error;
         }
 
@@ -4146,16 +7401,41 @@ export class Repository {
             if (released) return;
             released = true;
             try {
-              await client.query(
-                "SELECT pg_advisory_unlock(hashtextextended($1,0))",
-                [APPLE_WRITE_GATEWAY_LOCK],
-              );
+              if (transactionOpen) {
+                try {
+                  await client.query("COMMIT");
+                } catch (error) {
+                  try {
+                    await client.query("ROLLBACK");
+                  } catch {
+                    // Preserve the commit failure.
+                  }
+                  throw error;
+                } finally {
+                  transactionOpen = false;
+                }
+              }
             } finally {
-              client.release();
+              try {
+                await client.query(
+                  "SELECT pg_advisory_unlock(hashtextextended($1,0))",
+                  [APPLE_WRITE_GATEWAY_LOCK],
+                );
+              } finally {
+                client.release();
+              }
             }
           },
         };
       } catch (error) {
+        if (transactionOpen) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // The connection may already be gone; release below remains safe.
+          }
+          transactionOpen = false;
+        }
         if (locked) {
           try {
             await client.query(
@@ -4674,12 +7954,28 @@ export class Repository {
   }
 
   async captureAutomaticBriefFailure(briefRequestId: string): Promise<{ id: string; created: boolean } | null> {
+    const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
     const result = await this.pool.query<Record<string, unknown>>(
-      `SELECT id,prompt,requested_track_count,model,status,error,brief_json,
-              questions_json,answers_json,guidance_source_hints_json,guidance_telemetry_json,
-              guidance_preferences_json,pipeline_version,policy_version,selection_plan_json,
-              estimate_usd,created_at,updated_at
-       FROM brief_requests WHERE id=$1`,
+      schemaVersion >= 17
+        ? `SELECT brief.id,brief.prompt,brief.requested_track_count,brief.model,
+                  brief.status,brief.error,brief.brief_json,brief.questions_json,
+                  brief.answers_json,brief.guidance_source_hints_json,
+                  brief.guidance_telemetry_json,brief.guidance_preferences_json,
+                  brief.pipeline_version,brief.policy_version,brief.selection_plan_json,
+                  brief.estimate_usd,brief.created_at,brief.updated_at,
+                  brief.brief_contract_version,
+                  brief.active_playlist_contract_revision_id,
+                  active_contract.contract_json active_playlist_contract_json
+           FROM brief_requests brief
+           LEFT JOIN playlist_contract_revisions active_contract
+             ON active_contract.id=brief.active_playlist_contract_revision_id
+            AND active_contract.status='active'
+           WHERE brief.id=$1`
+        : `SELECT id,prompt,requested_track_count,model,status,error,brief_json,
+                  questions_json,answers_json,guidance_source_hints_json,guidance_telemetry_json,
+                  guidance_preferences_json,pipeline_version,policy_version,selection_plan_json,
+                  estimate_usd,created_at,updated_at
+           FROM brief_requests WHERE id=$1`,
       [briefRequestId],
     );
     const row = result.rows[0];
@@ -4699,7 +7995,55 @@ export class Repository {
       errorCode: "brief_interpretation_failed",
       terminalGeneration,
     });
-    const requestedTrackCount = Number(row.requested_track_count);
+    const submittedRequestedTrackCount = Number(row.requested_track_count);
+    const originalRequestedTrackCount = Number.isSafeInteger(submittedRequestedTrackCount)
+      && submittedRequestedTrackCount >= PUBLIC_PLAYLIST_MINIMUM_TRACKS
+      && submittedRequestedTrackCount <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+      ? submittedRequestedTrackCount
+      : null;
+    let executionRequestedTrackCount = originalRequestedTrackCount;
+    let executionStorefront: string | null = null;
+    let trackCountSource: "submitted_request" | "active_contract" | "invalid_active_contract" =
+      "submitted_request";
+    let activeContractIntegrityValid: boolean | null = null;
+    if (
+      schemaVersion >= 17
+      && typeof row.active_playlist_contract_revision_id === "string"
+      && row.active_playlist_contract_revision_id.length > 0
+    ) {
+      // A contract pointer is execution authority. If its row is missing,
+      // superseded, or corrupt, never turn the original submission count into
+      // a misleading replay scenario for the successor failure.
+      executionRequestedTrackCount = null;
+      trackCountSource = "invalid_active_contract";
+      activeContractIntegrityValid = false;
+      if (
+        row.active_playlist_contract_json
+        && typeof row.active_playlist_contract_json === "object"
+        && !Array.isArray(row.active_playlist_contract_json)
+      ) {
+        try {
+          const activeContract =
+            row.active_playlist_contract_json as PlaylistContractRevisionV1;
+          assertPlaylistContractIntegrityV1(activeContract);
+          if (
+            Number.isSafeInteger(activeContract.requestedTrackCount)
+            && activeContract.requestedTrackCount >= PUBLIC_PLAYLIST_MINIMUM_TRACKS
+            && activeContract.requestedTrackCount <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+            && typeof activeContract.storefront === "string"
+            && activeContract.storefront.length > 0
+            && activeContract.storefront.length <= 16
+          ) {
+            executionRequestedTrackCount = activeContract.requestedTrackCount;
+            executionStorefront = activeContract.storefront;
+            trackCountSource = "active_contract";
+            activeContractIntegrityValid = true;
+          }
+        } catch {
+          // Preserve the failure report, but quarantine its replay count.
+        }
+      }
+    }
     const diagnostics: AutomaticFailureDiagnostics = {
       schemaVersion: 1,
       failureClass,
@@ -4708,8 +8052,8 @@ export class Repository {
       runAccessId: null,
       briefRequestId,
       prompt: String(row.prompt ?? "").slice(0, 2_000),
-      requestedTrackCount: Number.isInteger(requestedTrackCount) ? requestedTrackCount : null,
-      storefront: null,
+      requestedTrackCount: executionRequestedTrackCount,
+      storefront: executionStorefront,
       status,
       phase: "brief_failed",
       rootCause: "brief_interpretation_failed",
@@ -4720,7 +8064,9 @@ export class Repository {
       runtime: {
         appVersion: build.identifier,
         buildRevision: build.revision,
-        databaseSchemaVersion: String(await this.getSchemaVersion() ?? "unknown"),
+        databaseSchemaVersion: Number.isFinite(schemaVersion) && schemaVersion > 0
+          ? String(schemaVersion)
+          : "unknown",
         workerProtocol: release.workerProtocol,
         promptVersion: release.promptVersion,
         configuredModel: typeof row.model === "string" ? row.model.slice(0, 120) : null,
@@ -4739,6 +8085,15 @@ export class Repository {
           preferenceCount: countDiagnosticItems(row.guidance_preferences_json),
           telemetryPresent: Boolean(row.guidance_telemetry_json),
           briefPresent: Boolean(row.brief_json),
+        },
+        trackCountAuthority: {
+          originalRequestedTrackCount,
+          executionRequestedTrackCount,
+          source: trackCountSource,
+          activeContractIntegrityValid,
+          briefContractVersion: Number.isSafeInteger(Number(row.brief_contract_version))
+            ? Number(row.brief_contract_version)
+            : null,
         },
         estimateUsd: Number(row.estimate_usd ?? 0),
         createdAt: date(row.created_at)?.toISOString() ?? null,
@@ -5116,6 +8471,7 @@ export class Repository {
     clientBucketAliases: string[];
     idempotencyKey?: string | null;
     briefContractVersion?: 1 | 2 | 3;
+    publicRolloutAssignment?: PersistedPublicRolloutAssignmentV1 | null;
     releaseCanary?: UnsignedReleaseCanaryMetadata | null;
     /** Set only after authenticated owner + activated-schema admission. */
     allowExecutableTrackCount?: boolean;
@@ -5131,6 +8487,19 @@ export class Repository {
       : input.briefContractVersion === 2
         ? 2
         : 1;
+    const publicRolloutAssignment = parsePublicRolloutAssignmentV1(
+      input.publicRolloutAssignment ?? null,
+    );
+    if (
+      publicRolloutAssignment
+      && (publicRolloutAssignment.assigned !== (briefContractVersion === 3))
+    ) {
+      throw new HttpError(
+        409,
+        "The signed public rollout assignment does not match its brief contract",
+        "public_rollout_contract_mismatch",
+      );
+    }
     const expandedTrackCount = requestedTrackCount !== null
       && Number.isSafeInteger(requestedTrackCount)
       && requestedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS;
@@ -5162,21 +8531,67 @@ export class Repository {
     return this.transaction(async (client) => {
       if (input.idempotencyKey) {
         await lockClientAliases(client, `brief:${input.idempotencyKey}`, input.clientBucketAliases);
-        const existing = await client.query<{ id: string; status: string; prompt: string; requested_track_count: number | null; brief_contract_version: number }>(
-          "SELECT id,status,prompt,requested_track_count,brief_contract_version FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
+        const existing = await client.query<{ id: string; status: string; prompt: string; requested_track_count: number | null; brief_contract_version: number; public_rollout_assignment_json: unknown }>(
+          "SELECT id,status,prompt,requested_track_count,brief_contract_version,public_rollout_assignment_json FROM brief_requests WHERE client_bucket = ANY($1::text[]) AND idempotency_key = $2 AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
           [input.clientBucketAliases, input.idempotencyKey],
         );
         if (existing.rows[0]) {
           const prior = existing.rows[0];
           const priorTrackCount = prior.requested_track_count == null ? null : Number(prior.requested_track_count);
-          if (prior.prompt !== prompt || priorTrackCount !== requestedTrackCount
-            || Number(prior.brief_contract_version) !== briefContractVersion) {
+          let priorPublicRolloutAssignment:
+            | PersistedPublicRolloutAssignmentV1
+            | null;
+          try {
+            priorPublicRolloutAssignment = parsePublicRolloutAssignmentV1(
+              prior.public_rollout_assignment_json,
+            );
+          } catch {
+            throw new HttpError(
+              409,
+              "The persisted public rollout assignment is not valid",
+              "public_rollout_contract_mismatch",
+            );
+          }
+          const priorBriefContractVersion =
+            Number(prior.brief_contract_version);
+          if (
+            priorPublicRolloutAssignment
+            && priorPublicRolloutAssignment.assigned
+              !== (priorBriefContractVersion === 3)
+          ) {
+            throw new HttpError(
+              409,
+              "The persisted public rollout assignment does not match its brief contract",
+              "public_rollout_contract_mismatch",
+            );
+          }
+          // Prompt and count are the visitor's idempotent request semantics.
+          // Contract/routing metadata is server-derived. During a Railway
+          // overlap the old and new API revisions can legitimately compute
+          // different signed rollout evidence/stages (and therefore a
+          // different contract version) for the same retry. Return the exact
+          // persisted request instead of turning a safe retry into a conflict.
+          // For non-rollout briefs, an explicit contract-version change
+          // remains a real conflict.
+          const crossesPublicRollout =
+            priorPublicRolloutAssignment !== null
+            || publicRolloutAssignment !== null;
+          if (
+            prior.prompt !== prompt
+            || priorTrackCount !== requestedTrackCount
+            || (
+              !crossesPublicRollout
+              && priorBriefContractVersion !== briefContractVersion
+            )
+          ) {
             throw new HttpError(409, "Idempotency key was already used for a different playlist request", "idempotency_conflict");
           }
           await persistReleaseCanaryMarker(
             client,
             input.releaseCanary,
             { operation: "brief", id: prior.id },
+            null,
+            { allowMarkerCreation: false },
           );
           return { id: prior.id, status: prior.status, created: false };
         }
@@ -5184,14 +8599,25 @@ export class Repository {
       const id = randomUUID();
       await client.query(
         `INSERT INTO brief_requests(id,prompt,requested_track_count,model,status,client_bucket,idempotency_key,
-           brief_contract_version,expires_at)
-         VALUES($1,$2,$3,$4,'queued',$5,$6,$7,now()+interval '24 hours')`,
-        [id, prompt, requestedTrackCount, input.model, input.clientBucket, input.idempotencyKey ?? null, briefContractVersion],
+           brief_contract_version,public_rollout_assignment_json,expires_at)
+         VALUES($1,$2,$3,$4,'queued',$5,$6,$7,$8,now()+interval '24 hours')`,
+        [
+          id,
+          prompt,
+          requestedTrackCount,
+          input.model,
+          input.clientBucket,
+          input.idempotencyKey ?? null,
+          briefContractVersion,
+          publicRolloutAssignment,
+        ],
       );
       await persistReleaseCanaryMarker(
         client,
         input.releaseCanary,
         { operation: "brief", id },
+        null,
+        { allowMarkerCreation: true },
       );
       return { id, status: "queued", created: true };
     });
@@ -5201,9 +8627,12 @@ export class Repository {
     const result = await this.pool.query(
       `SELECT id,prompt,requested_track_count,model,status,brief_json,questions_json,answers_json,
               guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
-              brief_contract_version,active_guidance_question_set_id,
+              brief_contract_version,public_rollout_assignment_json,active_guidance_question_set_id,
               (SELECT question_set_hash FROM guidance_question_sets
                WHERE id=brief_requests.active_guidance_question_set_id) question_set_hash,
+              (SELECT contract_json FROM playlist_contract_revisions
+               WHERE id=brief_requests.active_playlist_contract_revision_id
+                 AND status='active') active_playlist_contract_json,
               pipeline_version,policy_version,selection_plan_json,
               estimate_usd,error,client_bucket,expires_at,created_at,updated_at
        FROM brief_requests WHERE id=$1 AND expires_at>now()`,
@@ -5211,10 +8640,27 @@ export class Repository {
     );
     const row = result.rows[0];
     if (!row) return null;
+    const briefContractVersion = Number(row.brief_contract_version ?? 1) === 3
+      ? 3
+      : Number(row.brief_contract_version ?? 1) === 2
+        ? 2
+        : 1;
+    const originalRequestedTrackCount = row.requested_track_count == null
+      ? null
+      : Number(row.requested_track_count);
+    let executionRequestedTrackCount = originalRequestedTrackCount;
+    if (briefContractVersion === 3 && row.active_playlist_contract_json) {
+      assertPlaylistContractIntegrityV1(row.active_playlist_contract_json);
+      executionRequestedTrackCount = Number(
+        row.active_playlist_contract_json.requestedTrackCount,
+      );
+    }
     return {
       id: row.id,
       prompt: row.prompt,
-      requestedTrackCount: row.requested_track_count == null ? null : Number(row.requested_track_count),
+      requestedTrackCount: originalRequestedTrackCount,
+      originalRequestedTrackCount,
+      executionRequestedTrackCount,
       model: row.model,
       status: row.status,
       brief: row.brief_json,
@@ -5223,11 +8669,11 @@ export class Repository {
       guidanceSourceHints: row.guidance_source_hints_json ?? [],
       guidanceTelemetry: row.guidance_telemetry_json ?? null,
       guidancePreferences: row.guidance_preferences_json ?? [],
-      briefContractVersion: Number(row.brief_contract_version ?? 1) === 3
-        ? 3
-        : Number(row.brief_contract_version ?? 1) === 2
-          ? 2
-          : 1,
+      briefContractVersion,
+      publicRolloutAssignment: parsePublicRolloutAssignmentV1(
+        row.public_rollout_assignment_json ?? null,
+      ),
+      activePlaylistContract: row.active_playlist_contract_json ?? null,
       questionSetHash: typeof row.question_set_hash === "string" ? row.question_set_hash : null,
       pipelineVersion: row.pipeline_version ?? "legacy_v1",
       policyVersion: row.policy_version ?? "legacy_v1",
@@ -5313,6 +8759,7 @@ export class Repository {
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
     guidanceContract?: PlaylistGuidanceQuestionSetContract;
+    selectionPlan?: SelectionPlan;
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void> {
@@ -5327,8 +8774,12 @@ export class Repository {
         `UPDATE brief_requests SET status=$2,brief_json=$3,questions_json=COALESCE($4,questions_json),
                 guidance_source_hints_json=COALESCE($5,guidance_source_hints_json),
                 guidance_telemetry_json=CASE WHEN $6::boolean THEN $7 ELSE guidance_telemetry_json END,
-                estimate_usd=$8,error=$9,updated_at=now()
-         WHERE id=$1 AND expires_at>now() AND ($10::varchar IS NULL OR status=$10::varchar)
+                estimate_usd=$8,error=$9,
+                pipeline_version=COALESCE($10::varchar,pipeline_version),
+                policy_version=COALESCE($11::varchar,policy_version),
+                selection_plan_json=COALESCE($12::jsonb,selection_plan_json),
+                updated_at=now()
+         WHERE id=$1 AND expires_at>now() AND ($13::varchar IS NULL OR status=$13::varchar)
          RETURNING brief_contract_version,active_playlist_contract_revision_id`,
         [
           id,
@@ -5340,6 +8791,9 @@ export class Repository {
           result.guidanceTelemetry === undefined ? null : JSON.stringify(result.guidanceTelemetry),
           result.estimateUsd == null ? null : finiteMoney(result.estimateUsd, "Estimate"),
           persistedError,
+          result.selectionPlan?.pipelineVersion ?? null,
+          result.selectionPlan?.policyVersion ?? null,
+          result.selectionPlan == null ? null : JSON.stringify(result.selectionPlan),
           result.expectedStatus ?? null,
         ],
       );
@@ -5417,11 +8871,258 @@ export class Repository {
     if (result.rowCount === 0) throw new HttpError(404, "Brief request not found", "brief_not_found");
   }
 
+  async preflightBriefAnswers(input: {
+    briefRequestId: string;
+    idempotencyKey: string;
+    questionSetHash?: string;
+    answers: PlaylistGuidanceAnswer[];
+    customTrackCountAuthority?: CustomGuidanceTrackCountAuthorityV1;
+  }): Promise<
+    | {
+        status: "ready";
+        contractVersion: 1 | 2 | 3;
+        storefront: string | null;
+        questionSetHash: string | null;
+        questions: PlaylistGuidanceQuestion[];
+      }
+    | {
+        status: "prior";
+        resultStatus: "finalizing" | "complete";
+      }
+    | {
+        status: "prior_awaiting_answers";
+        questionSetHash: string;
+        questions: PlaylistGuidanceQuestion[];
+      }
+    | {
+        status: "stale_question_set";
+        questionSetHash: string;
+        questions: PlaylistGuidanceQuestion[];
+      }
+  > {
+    const selected = await this.pool.query<{
+      status: string;
+      questions_json: PlaylistGuidanceQuestion[] | null;
+      answers_idempotency_key: string | null;
+      answers_hash: string | null;
+      brief_contract_version: number;
+      active_guidance_question_set_id: string | null;
+      active_playlist_contract_revision_id: string | null;
+      question_set_hash: string | null;
+      contract_questions_json: PlaylistGuidanceQuestion[] | null;
+      parent_question_set_id: string | null;
+      playlist_contract_json: PlaylistContractRevisionV1 | null;
+    }>(
+      `SELECT brief.status,brief.questions_json,
+              brief.answers_idempotency_key,brief.answers_hash,
+              brief.brief_contract_version,
+              brief.active_guidance_question_set_id,
+              brief.active_playlist_contract_revision_id,
+              question_set.question_set_hash,
+              question_set.questions_json contract_questions_json,
+              question_set.parent_question_set_id,
+              playlist_contract.contract_json playlist_contract_json
+       FROM brief_requests brief
+       LEFT JOIN guidance_question_sets question_set
+         ON question_set.id=brief.active_guidance_question_set_id
+           AND question_set.active
+       LEFT JOIN playlist_contract_revisions playlist_contract
+         ON playlist_contract.id=brief.active_playlist_contract_revision_id
+           AND playlist_contract.status='active'
+       WHERE brief.id=$1 AND brief.expires_at>now()`,
+      [input.briefRequestId],
+    );
+    const brief = selected.rows[0];
+    if (!brief) {
+      throw new HttpError(404, "Brief request not found", "brief_not_found");
+    }
+    const contractVersion: 1 | 2 | 3 =
+      Number(brief.brief_contract_version) === 3
+        ? 3
+        : Number(brief.brief_contract_version) === 2
+          ? 2
+          : 1;
+    const questions = contractVersion >= 2
+      && Array.isArray(brief.contract_questions_json)
+      ? brief.contract_questions_json
+      : Array.isArray(brief.questions_json) ? brief.questions_json : [];
+    if (contractVersion === 3 && brief.playlist_contract_json) {
+      assertPlaylistContractIntegrityV1(brief.playlist_contract_json);
+    }
+    const pendingProposal = contractVersion === 3
+      ? (await this.pool.query<{
+          question_set_id: string;
+          question_set_hash: string;
+          source_questions_json: PlaylistGuidanceQuestion[];
+          answer_hash: string;
+          base_contract_revision_id: string | null;
+          resulting_contract_revision_id: string | null;
+        }>(
+          `SELECT proposal.question_set_id,proposal.question_set_hash,
+                  source.questions_json source_questions_json,
+                  proposal.answer_hash,proposal.base_contract_revision_id,
+                  proposal.resulting_contract_revision_id
+           FROM guidance_answer_sets proposal
+           JOIN guidance_question_sets source
+             ON source.id=proposal.question_set_id
+            AND source.brief_request_id=proposal.brief_request_id
+           WHERE proposal.brief_request_id=$1
+             AND proposal.idempotency_key=$2
+             AND proposal.execution_delta_json->>'schema'
+               ='exact_artist_identity_ambiguity/v1'
+           LIMIT 1`,
+          [input.briefRequestId, input.idempotencyKey],
+        )).rows[0]
+      : undefined;
+    if (pendingProposal) {
+      if (input.questionSetHash !== pendingProposal.question_set_hash) {
+        throw new HttpError(
+          409,
+          "Idempotency key was already used for different playlist answers",
+          "idempotency_conflict",
+        );
+      }
+      const sourceQuestions = Array.isArray(pendingProposal.source_questions_json)
+        ? pendingProposal.source_questions_json
+        : [];
+      const proposalAnswers = normalizedGuidanceAnswers(
+        sourceQuestions,
+        input.answers,
+        contractVersion,
+      );
+      const proposalAnswerHash = sha256Hex(stableStringify({
+        questionSetHash: pendingProposal.question_set_hash,
+        answers: proposalAnswers,
+      }));
+      if (proposalAnswerHash !== pendingProposal.answer_hash) {
+        throw new HttpError(
+          409,
+          "Idempotency key was already used for different playlist answers",
+          "idempotency_conflict",
+        );
+      }
+      if (brief.status === "finalizing" || brief.status === "complete") {
+        return {
+          status: "prior",
+          resultStatus: brief.status,
+        };
+      }
+      if (brief.status !== "awaiting_answers"
+        || pendingProposal.resulting_contract_revision_id !== null
+        || !brief.active_guidance_question_set_id
+        || !brief.question_set_hash
+        || brief.parent_question_set_id !== pendingProposal.question_set_id
+        || brief.active_playlist_contract_revision_id
+          !== pendingProposal.base_contract_revision_id) {
+        throw new HttpError(
+          409,
+          "The saved artist choice is no longer the active guidance step",
+          "stale_guidance_question_set",
+        );
+      }
+      return {
+        status: "prior_awaiting_answers",
+        questionSetHash: brief.question_set_hash,
+        questions,
+      };
+    }
+    if (contractVersion >= 2
+      && (!brief.question_set_hash
+        || input.questionSetHash !== brief.question_set_hash)) {
+      return {
+        status: "stale_question_set",
+        questionSetHash: brief.question_set_hash ?? "",
+        questions,
+      };
+    }
+    const answers = normalizedGuidanceAnswers(
+      questions,
+      input.answers,
+      contractVersion,
+    );
+    const answersHash = sha256Hex(stableStringify({
+      questionSetHash: contractVersion >= 2
+        ? brief.question_set_hash
+        : null,
+      answers,
+    }));
+    if (brief.answers_idempotency_key !== null) {
+      if (brief.answers_idempotency_key !== input.idempotencyKey
+        || brief.answers_hash !== answersHash) {
+        throw new HttpError(
+          409,
+          "Idempotency key was already used for different playlist answers",
+          "idempotency_conflict",
+        );
+      }
+      if (brief.status !== "finalizing" && brief.status !== "complete") {
+        throw new HttpError(
+          409,
+          "Playlist answers cannot be submitted in this state",
+          "brief_not_ready",
+        );
+      }
+      return {
+        status: "prior",
+        resultStatus: brief.status,
+      };
+    }
+    if (brief.status !== "awaiting_answers") {
+      throw new HttpError(
+        409,
+        "Playlist questions are not ready for answers",
+        "brief_not_ready",
+      );
+    }
+    if (contractVersion === 3 && brief.playlist_contract_json) {
+      const customAnswers = answers.filter((answer) => (
+        typeof answer.customText === "string"
+      ));
+      if (customAnswers.length > 1) {
+        throw new HttpError(
+          400,
+          "Review one custom playlist change at a time",
+          "custom_guidance_one_axis_required",
+        );
+      }
+      if (customAnswers[0]) {
+        try {
+          preflightCustomGuidanceTextV3({
+            base: brief.playlist_contract_json,
+            customText: customAnswers[0].customText!,
+            trackCountAuthority: input.customTrackCountAuthority,
+          });
+        } catch (error) {
+          throwCustomGuidanceCompilationHttpError(error);
+        }
+      }
+      if (input.customTrackCountAuthority) {
+        assertCustomGuidanceTrackCountAdmission(
+          brief.playlist_contract_json.requestedTrackCount,
+          input.customTrackCountAuthority,
+        );
+      }
+    }
+    return {
+      status: "ready",
+      contractVersion,
+      storefront: brief.playlist_contract_json?.storefront ?? null,
+      questionSetHash: brief.question_set_hash,
+      questions,
+    };
+  }
+
   async submitBriefAnswers(input: {
     briefRequestId: string;
     idempotencyKey: string;
     questionSetHash?: string;
     answers: PlaylistGuidanceAnswer[];
+    customTrackCountAuthority: CustomGuidanceTrackCountAuthorityV1;
+    resolvedExactArtistIdentities?: readonly ResolvedExactArtistIdentityV1[];
+    exactArtistIdentityAmbiguity?: {
+      inputText: string;
+      candidates: readonly ExactArtistIdentityGuidanceCandidateV3[];
+    };
   }): Promise<
     | {
         status: "awaiting_answers";
@@ -5442,13 +9143,15 @@ export class Repository {
         brief_contract_version: number;
         active_guidance_question_set_id: string | null;
         question_set_hash: string | null;
+        question_set_axis: string | null;
         contract_questions_json: PlaylistGuidanceQuestion[] | null;
         active_playlist_contract_revision_id: string | null;
         playlist_contract_json: PlaylistContractRevisionV1 | null;
       }>(
         `SELECT brief.status,brief.questions_json,brief.answers_idempotency_key,brief.answers_hash,
                 brief.brief_contract_version,brief.active_guidance_question_set_id,
-                question_set.question_set_hash,question_set.questions_json contract_questions_json,
+                question_set.question_set_hash,question_set.axis question_set_axis,
+                question_set.questions_json contract_questions_json,
                 brief.active_playlist_contract_revision_id,
                 playlist_contract.contract_json playlist_contract_json
          FROM brief_requests brief
@@ -5503,6 +9206,12 @@ export class Repository {
       if (brief.status !== "awaiting_answers") {
         throw new HttpError(409, "Playlist questions are not ready for answers", "brief_not_ready");
       }
+      if (contractVersion === 3 && brief.playlist_contract_json) {
+        assertCustomGuidanceTrackCountAdmission(
+          brief.playlist_contract_json.requestedTrackCount,
+          input.customTrackCountAuthority,
+        );
+      }
       if (contractVersion === 2) {
         if (!brief.active_guidance_question_set_id || !brief.question_set_hash) {
           throw new HttpError(409, "Playlist guidance contract is incomplete", "guidance_contract_incomplete");
@@ -5548,31 +9257,35 @@ export class Repository {
           }
           let confirmation;
           try {
-            const compiled = recompileCustomGuidanceTextV3({
-              base: baseContract,
-              customText: customAnswers[0]!.customText!,
-            });
-            confirmation = customGuidanceConfirmationDecisionV3({
-              base: baseContract,
-              compiled,
-            });
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : "";
-            if (reason
-              === "custom_guidance_conflicts_with_existing_hard_predicate") {
-              throw new HttpError(
-                409,
-                "That custom answer conflicts with an existing required playlist rule. Review the interpretation before changing either rule.",
-                "custom_guidance_conflicts_with_existing_hard_predicate",
+            if (input.exactArtistIdentityAmbiguity) {
+              confirmation =
+                exactArtistIdentityAmbiguityGuidanceDecisionV3({
+                  base: baseContract,
+                  customText: customAnswers[0]!.customText!,
+                  inputText: input.exactArtistIdentityAmbiguity.inputText,
+                  candidates:
+                    input.exactArtistIdentityAmbiguity.candidates,
+                  trackCountAuthority: input.customTrackCountAuthority,
+                });
+            } else {
+              const compiled = recompileCustomGuidanceTextV3({
+                base: baseContract,
+                customText: customAnswers[0]!.customText!,
+                trackCountAuthority: input.customTrackCountAuthority,
+                resolvedExactArtistIdentities:
+                  input.resolvedExactArtistIdentities,
+              });
+              assertCustomGuidanceTrackCountAdmission(
+                compiled.previewContract.requestedTrackCount,
+                input.customTrackCountAuthority,
               );
+              confirmation = customGuidanceConfirmationDecisionV3({
+                base: baseContract,
+                compiled,
+              });
             }
-            throw new HttpError(
-              400,
-              reason === "custom_guidance_requires_supported_music_terms"
-                ? "That custom answer needs a clearer music rule. Edit the interpretation or choose one of the provided options."
-                : "That custom answer could not be compiled safely",
-              "custom_guidance_not_compilable",
-            );
+          } catch (error) {
+            throwCustomGuidanceCompilationHttpError(error);
           }
           const confirmationRound = selectGuidanceRoundV3({
             stage: "initial",
@@ -5587,10 +9300,52 @@ export class Repository {
               "custom_guidance_confirmation_unavailable",
             );
           }
-          await client.query(
+          if (input.exactArtistIdentityAmbiguity) {
+            const proposalDelta = {
+              schema: "exact_artist_identity_ambiguity/v1",
+              questionHash: confirmation.questionHash,
+              options: confirmation.options.map((option) => ({
+                optionId: option.id,
+                affectedClauseIds: option.patch.affectedClauseIds,
+                operations: option.patch.operations,
+              })),
+            };
+            await client.query(
+              `INSERT INTO guidance_answer_sets(
+                 id,brief_request_id,question_set_id,question_set_hash,
+                 normalized_answers_json,raw_custom_answers_json,answer_hash,
+                 execution_delta_json,execution_delta_hash,idempotency_key,
+                 base_contract_revision_id)
+               VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8::jsonb,$9,$10,$11)`,
+              [
+                randomUUID(),
+                input.briefRequestId,
+                brief.active_guidance_question_set_id,
+                brief.question_set_hash,
+                JSON.stringify(answers),
+                JSON.stringify(customAnswers.map((answer) => ({
+                  questionId: answer.questionId,
+                  customText: answer.customText,
+                }))),
+                answersHash,
+                JSON.stringify(proposalDelta),
+                sha256Hex(stableStringify(proposalDelta)),
+                input.idempotencyKey,
+                brief.active_playlist_contract_revision_id,
+              ],
+            );
+          }
+          const deactivated = await client.query(
             "UPDATE guidance_question_sets SET active=false WHERE id=$1 AND active",
             [brief.active_guidance_question_set_id],
           );
+          if (deactivated.rowCount !== 1) {
+            throw new HttpError(
+              409,
+              "The custom interpretation changed while it was being compiled",
+              "stale_guidance_question_set",
+            );
+          }
           const nextQuestionSetRevision = await client.query<{ revision: number }>(
             "SELECT COALESCE(max(revision),0)+1 revision FROM guidance_question_sets WHERE brief_request_id=$1",
             [input.briefRequestId],
@@ -5607,7 +9362,7 @@ export class Repository {
                     guidance_policy_version,locale,storefront,target_track_count,
                     explicit_constraint_hash,'[]'::jsonb,$5::jsonb,true,
                     base_contract_revision_id,id,feasibility_snapshot_id,
-                    guidance_round,'correctness','custom_contract_revision'
+                    guidance_round,$7,$8
              FROM guidance_question_sets
              WHERE id=$1 AND brief_request_id=$6
              RETURNING id`,
@@ -5618,6 +9373,8 @@ export class Repository {
               confirmationRound.roundHash,
               JSON.stringify(confirmationQuestions),
               input.briefRequestId,
+              confirmation.trigger,
+              confirmation.axis,
             ],
           );
           if (!inserted.rows[0]) {
@@ -5627,7 +9384,7 @@ export class Repository {
               "stale_guidance_question_set",
             );
           }
-          await client.query(
+          const pointed = await client.query(
             `UPDATE brief_requests
              SET active_guidance_question_set_id=$2,questions_json=$3::jsonb,
                  guidance_telemetry_json=COALESCE(guidance_telemetry_json,'{}'::jsonb)
@@ -5639,15 +9396,25 @@ export class Repository {
                         'acceptedQuestionCount',1
                       ),
                  status='awaiting_answers',updated_at=now()
-             WHERE id=$1 AND active_playlist_contract_revision_id=$5`,
+             WHERE id=$1
+               AND active_playlist_contract_revision_id=$5
+               AND active_guidance_question_set_id=$6`,
             [
               input.briefRequestId,
               nextQuestionSetId,
               JSON.stringify(confirmationQuestions),
               confirmationRound.roundHash,
               brief.active_playlist_contract_revision_id,
+              brief.active_guidance_question_set_id,
             ],
           );
+          if (pointed.rowCount !== 1) {
+            throw new HttpError(
+              409,
+              "The custom interpretation changed while it was being compiled",
+              "stale_guidance_question_set",
+            );
+          }
           return {
             status: "awaiting_answers",
             created: true,
@@ -5677,9 +9444,15 @@ export class Repository {
         const nextContract = patch
           ? applyPlaylistContractPatchV1(baseContract, patch)
           : baseContract;
+        assertCustomGuidanceTrackCountAdmission(
+          nextContract.requestedTrackCount,
+          input.customTrackCountAuthority,
+        );
         const executionDelta = patch?.operations ?? [];
         const executionDeltaHash = sha256Hex(stableStringify(executionDelta));
         const answerSetId = randomUUID();
+        let resultingContractRevisionId =
+          brief.active_playlist_contract_revision_id;
         await client.query(
           `INSERT INTO guidance_answer_sets(
              id,brief_request_id,question_set_id,question_set_hash,normalized_answers_json,
@@ -5708,6 +9481,7 @@ export class Repository {
             [input.briefRequestId],
           );
           const nextId = randomUUID();
+          resultingContractRevisionId = nextId;
           await client.query(
             `INSERT INTO playlist_contract_revisions(
                id,brief_request_id,revision,parent_revision_id,status,contract_hash,
@@ -5751,6 +9525,32 @@ export class Repository {
              WHERE id=$1`,
             [input.briefRequestId, nextId],
           );
+        }
+        if (brief.question_set_axis === "exact_artist_identity") {
+          const boundProposal = await client.query(
+            `UPDATE guidance_answer_sets proposal
+             SET resulting_contract_revision_id=$3
+             FROM guidance_question_sets child
+             WHERE child.id=$1
+               AND child.axis='exact_artist_identity'
+               AND proposal.brief_request_id=$2
+               AND proposal.question_set_id=child.parent_question_set_id
+               AND proposal.resulting_contract_revision_id IS NULL
+               AND proposal.execution_delta_json->>'schema'
+                 ='exact_artist_identity_ambiguity/v1'`,
+            [
+              brief.active_guidance_question_set_id,
+              input.briefRequestId,
+              resultingContractRevisionId,
+            ],
+          );
+          if (boundProposal.rowCount !== 1) {
+            throw new HttpError(
+              409,
+              "The saved artist-identity guidance lineage failed integrity validation",
+              "guidance_history_integrity",
+            );
+          }
         }
       }
       await client.query(
@@ -5802,9 +9602,22 @@ export class Repository {
     capabilitySessionId?: string;
     forceFreshResearch?: boolean;
     releaseCanary?: UnsignedReleaseCanaryMetadata | null;
+    releaseManifestCanary?: boolean;
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
+    if (input.releaseManifestCanary && (
+      process.env.RELEASE_ENVIRONMENT !== "staging"
+      || input.releaseCanary?.environment !== "staging"
+      || input.releaseCanary.operation !== "run"
+      || input.autoPublish === true
+    )) {
+      throw new HttpError(
+        409,
+        "Manifest-only release canaries require an authenticated staging run with publication disabled",
+        "release_manifest_canary_scope_invalid",
+      );
+    }
     let guidanceSourceHints: PlaylistGuidanceSourceHint[] = [];
     let guidanceTelemetry: PlaylistGuidanceTelemetry | null = null;
     let guidancePreferences: PlaylistGuidancePreference[] = [];
@@ -5812,6 +9625,7 @@ export class Repository {
     let briefRequestedTrackCount: number | null = null;
     let selectionPlan: SelectionPlan | null = null;
     let briefContractVersion: 1 | 2 | 3 = 1;
+    let publicRolloutAssignment: PersistedPublicRolloutAssignmentV1 | null = null;
     let activePlaylistContractDatabaseId: string | null = null;
     let activePlaylistContract: PlaylistContractRevisionV1 | null = null;
     let guidanceExecutionDeltaHash = compileGuidanceExecutionDeltaV2([], []).hash;
@@ -5825,12 +9639,14 @@ export class Repository {
         selection_plan_json: SelectionPlan | null;
         requested_track_count: number | null;
         brief_contract_version: number;
+        public_rollout_assignment_json: unknown;
         execution_delta_hash: string | null;
         active_playlist_contract_revision_id: string | null;
         playlist_contract_json: PlaylistContractRevisionV1 | null;
       }>(
         `SELECT guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
            answers_json,selection_plan_json,requested_track_count,brief_contract_version,
+           public_rollout_assignment_json,
            (SELECT execution_delta_hash FROM guidance_answer_sets
             WHERE brief_request_id=brief_requests.id ORDER BY accepted_at DESC LIMIT 1) execution_delta_hash,
            active_playlist_contract_revision_id,
@@ -5859,6 +9675,41 @@ export class Repository {
         : Number(row.brief_contract_version) === 2
           ? 2
           : 1;
+      publicRolloutAssignment = parsePublicRolloutAssignmentV1(
+        row.public_rollout_assignment_json,
+      );
+      if (publicRolloutAssignment?.assigned) {
+        const authority = await this.pool.query<{ value: string }>(
+          "SELECT value FROM settings WHERE key=$1",
+          [
+            `public_rollout_authority:${publicRolloutAssignment.rolloutEvidenceHash}`,
+          ],
+        );
+        try {
+          assertPublicRolloutAssignmentDatabaseAuthorityV1(
+            publicRolloutAssignment,
+            authority.rows[0]?.value
+              ? JSON.parse(authority.rows[0].value)
+              : null,
+          );
+        } catch {
+          throw new HttpError(
+            409,
+            "The persisted public rollout assignment has no verified database lineage",
+            "public_rollout_database_authority_mismatch",
+          );
+        }
+      }
+      if (
+        publicRolloutAssignment
+        && publicRolloutAssignment.assigned !== (briefContractVersion === 3)
+      ) {
+        throw new HttpError(
+          409,
+          "The persisted public rollout assignment does not match its canonical contract",
+          "public_rollout_contract_mismatch",
+        );
+      }
       if (briefContractVersion === 2 && typeof row.execution_delta_hash === "string") {
         guidanceExecutionDeltaHash = row.execution_delta_hash;
       }
@@ -5876,6 +9727,9 @@ export class Repository {
       }
     }
     const exactRequestedTrackCount = (() => {
+      if (briefContractVersion === 3 && activePlaylistContract) {
+        return activePlaylistContract.requestedTrackCount;
+      }
       if (Number.isInteger(briefRequestedTrackCount)
         && Number(briefRequestedTrackCount) >= PUBLIC_PLAYLIST_MINIMUM_TRACKS
         && Number(briefRequestedTrackCount) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
@@ -5892,6 +9746,13 @@ export class Repository {
           ? minimum
           : null;
     })();
+    const executionBrief = briefContractVersion === 3
+      && exactRequestedTrackCount !== null
+      ? applyExecutableRequestedTrackCount(
+          input.brief,
+          exactRequestedTrackCount,
+        )
+      : input.brief;
     // Rebuild a stale typed plan before constructing V3. The immutable V3
     // request consumes this confirmed parser output so geographic, language,
     // era, inclusion, exclusion, subject, and relationship axes survive the
@@ -5900,7 +9761,17 @@ export class Repository {
       selectionPlan.requestedTrackCount !== exactRequestedTrackCount
       || selectionPlan.minimumQualifiedTrackCount !== exactRequestedTrackCount
     )) {
-      selectionPlan = null;
+      selectionPlan = briefContractVersion === 3
+        ? {
+            ...selectionPlan,
+            requestedTrackCount: exactRequestedTrackCount,
+            minimumQualifiedTrackCount: exactRequestedTrackCount,
+            reserveTrackCount: Math.max(
+              10,
+              Math.ceil(exactRequestedTrackCount * 0.2),
+            ),
+          }
+        : null;
       repairedStoredSelectionPlan = true;
     }
     if (briefContractVersion === 3 && !selectionPlan) {
@@ -5912,7 +9783,7 @@ export class Repository {
     }
     const baseSelectionPlan = selectionPlan ?? createSelectionPlanV2({
       prompt: input.prompt,
-      brief: input.brief,
+      brief: executionBrief,
       guidancePreferences,
       storefront: process.env.APPLE_STOREFRONT ?? "us",
     });
@@ -5943,7 +9814,9 @@ export class Repository {
     const supportsGroundedRecoveryAudit = schemaVersion >= 15;
     let selectionPlanV3: SelectionPlanV3 | null = null;
     let contractExecutionPause: {
+      blockerKind: "provider" | "scope_decision";
       dependencyKey: string;
+      phase: "contract_execution_paused" | "public_rollout_successor_required";
       state: Record<string, unknown>;
     } | null = null;
     if (supportsImmutableRunSpec
@@ -5964,7 +9837,7 @@ export class Repository {
                 prompt: input.prompt,
                 requestedTrackCount: exactRequestedTrackCount,
                 storefront: process.env.APPLE_STOREFRONT ?? "us",
-                brief: input.brief,
+                brief: executionBrief,
                 typedSelectionPlan: proposedSelectionPlan,
                 guidanceSourceHints,
               });
@@ -5987,6 +9860,19 @@ export class Repository {
             "v3_guidance_required",
           );
         }
+        let publicRolloutCapabilityChanged = false;
+        try {
+          assertPublicRolloutExecutionGroupV1(
+            publicRolloutAssignment,
+            assignmentV3.group,
+          );
+          assertPublicRolloutExecutionEligibilityV1(
+            publicRolloutAssignment,
+            assignmentV3.reason,
+          );
+        } catch {
+          publicRolloutCapabilityChanged = true;
+        }
         // Contract-3 has already been accepted as the user's immutable
         // execution contract and the bridge above proved that the shipped V3
         // backend supports every capability it uses. Do not then strand that
@@ -5999,21 +9885,60 @@ export class Repository {
           route: "corpus_first_v3",
           intentGroup: assignmentV3.group,
         });
-        if (canonicalBackendAssigned && cohortDisabled) {
+        if (publicRolloutCapabilityChanged) {
+          // Confirmation may legitimately move a sticky pre-brief assignment
+          // to another intent/capability. Preserve that accepted immutable
+          // contract as a visible decision and offer a separate, explicit
+          // control successor; repeatedly submitting the same selected
+          // assignment would only produce an opaque conflict loop.
+          selectionPlanV3 = confirmedV3;
+          contractExecutionPause = {
+            blockerKind: "scope_decision",
+            dependencyKey: "public_rollout:control_successor",
+            phase: "public_rollout_successor_required",
+            state: {
+              reasonCode: "public_rollout_successor_required",
+              route: "corpus_first_v3",
+              assignedIntentGroup: publicRolloutAssignment?.intentGroup ?? null,
+              confirmedIntentGroup: assignmentV3.group,
+              assignmentReason: assignmentV3.reason,
+              rolloutEvidenceHash:
+                publicRolloutAssignment?.rolloutEvidenceHash ?? null,
+              sourceRolloutAssignment: publicRolloutAssignment,
+              actions: [
+                "create_user_authored_revision",
+                "cancel",
+              ],
+              automaticResume: false,
+            },
+          };
+        } else if (canonicalBackendAssigned && cohortDisabled) {
           // The contract remains valid and fully projected. Persist it as a
           // visible dependency pause rather than discarding the plan and
           // returning a transient 503 after the user already accepted it.
           selectionPlanV3 = confirmedV3;
           contractExecutionPause = {
+            blockerKind: "scope_decision",
             dependencyKey: "pipeline_cohort:corpus_first_v3",
+            phase: "contract_execution_paused",
             state: {
               reasonCode: "contract_execution_cohort_paused",
               route: "corpus_first_v3",
               intentGroup: assignmentV3.group,
-              actions: ["wait_for_dependency", "cancel"],
+              actions: [
+                "create_user_authored_revision",
+                "cancel",
+              ],
+              automaticResume: false,
             },
           };
-        } else if ((canonicalBackendAssigned || assignmentV3.assigned)
+        } else if ((
+          canonicalBackendAssigned
+          || (
+            publicRolloutAssignment === null
+            && assignmentV3.assigned
+          )
+        )
           && !cohortDisabled) {
           selectionPlanV3 = confirmedV3;
         }
@@ -6064,7 +9989,7 @@ export class Repository {
           storefront: activePlaylistContract.storefront,
         }))
       : sha256Hex(stableStringify({
-          brief: input.brief,
+          brief: executionBrief,
           guidancePreferences,
           selectionPlan,
           selectionPlanV3,
@@ -6073,7 +9998,7 @@ export class Repository {
             guidanceExecutionDeltaHash,
           } : {}),
           researchPolicy: researchPolicyFingerprint(
-            input.brief,
+            executionBrief,
             process.env,
             selectionPlan,
             modelRoutingSignals,
@@ -6093,7 +10018,7 @@ export class Repository {
         conversionObservation: v3ConversionObservation,
       })
       : selectionPlan == null ? null : createPipelinePolicySnapshot({
-        brief: input.brief,
+        brief: executionBrief,
         selectionPlan,
         environment: process.env,
         modelRoutingSignals,
@@ -6104,7 +10029,7 @@ export class Repository {
     // FastResearchPolicy by downstream helpers.
     const executionPolicy = selectionPlanV3 || contractCapabilityDecision
       ? null
-      : researchExecutionPolicy(input.brief, process.env, selectionPlan, modelRoutingSignals);
+      : researchExecutionPolicy(executionBrief, process.env, selectionPlan, modelRoutingSignals);
     const v3ApprovedBudgetUsd = pipelinePolicySnapshot?.executionPolicy.kind === "corpus_first_v3"
       ? pipelinePolicySnapshot.executionPolicy.maximumCostUsd
       : null;
@@ -6116,7 +10041,10 @@ export class Repository {
       : selectionPlanV3?.selectionPlanVersion === "selection_plan_v3"
       ? "corpus_first_v3_policy_v1"
       : selectionPlan?.policyVersion ?? "legacy_v1";
-    const runSpecStorefront = (process.env.APPLE_STOREFRONT ?? "us").trim().toLowerCase();
+    const runSpecStorefront = briefContractVersion === 3
+      && activePlaylistContract
+      ? activePlaylistContract.storefront
+      : (process.env.APPLE_STOREFRONT ?? "us").trim().toLowerCase();
     const runSpecGuidanceSourceHints = selectionPlanV3?.sourceDiscoveryHints ?? [];
     const runSpecHash = briefContractVersion === 3 && activePlaylistContract
       ? sha256Hex(stableStringify({
@@ -6185,7 +10113,7 @@ export class Repository {
           );
         }
       }
-      if (repairedStoredSelectionPlan && input.briefRequestId && selectionPlanV3 === null) {
+      if (repairedStoredSelectionPlan && input.briefRequestId) {
         await client.query(
           `UPDATE brief_requests SET pipeline_version=$2,policy_version=$3,
              selection_plan_json=$4,updated_at=now()
@@ -6206,17 +10134,23 @@ export class Repository {
         brief_hash: string;
         auto_publish: boolean;
         brief_request_id: string | null;
+        manifest_only: boolean;
       }>(
-        `SELECT a.id AS access_id,a.run_id,a.prompt,a.brief_request_id,r.status,r.brief_hash,r.auto_publish
+        `SELECT a.id AS access_id,a.run_id,a.prompt,a.brief_request_id,r.status,r.brief_hash,r.auto_publish,
+                EXISTS(
+                  SELECT 1 FROM research_checkpoints checkpoint
+                  WHERE checkpoint.run_id=r.id AND checkpoint.phase=$3
+                ) manifest_only
          FROM run_accesses a JOIN research_runs r ON r.id=a.run_id
          WHERE a.client_bucket=ANY($1::text[]) AND a.idempotency_key=$2 AND a.deleted_at IS NULL ORDER BY a.created_at DESC LIMIT 1`,
-        [input.clientBucketAliases, input.idempotencyKey],
+        [input.clientBucketAliases, input.idempotencyKey, RELEASE_MANIFEST_CANARY_MARKER_PHASE],
       );
       if (existing.rows[0]) {
         const prior = existing.rows[0];
         if (prior.prompt !== input.prompt
           || prior.brief_hash !== briefHash
           || prior.auto_publish !== (input.autoPublish === true)
+          || prior.manifest_only !== (input.releaseManifestCanary === true)
           || prior.brief_request_id !== (input.briefRequestId ?? null)) {
           throw new HttpError(
             409,
@@ -6237,6 +10171,7 @@ export class Repository {
           input.releaseCanary,
           { operation: "run", id: prior.run_id },
           prior.brief_request_id,
+          { allowMarkerCreation: false },
         );
         return {
           runId: prior.run_id,
@@ -6292,11 +10227,11 @@ export class Repository {
         const phase = contractCapabilityDecision
           ? "capability_decision_required"
           : contractExecutionPause
-            ? "contract_execution_paused"
+            ? contractExecutionPause.phase
           : status === "awaiting_budget"
             ? "budget_gate"
             : "queued";
-        const canonicalPrompt = `${input.brief.title}: ${input.brief.description}`.slice(0, 2_000);
+        const canonicalPrompt = `${executionBrief.title}: ${executionBrief.description}`.slice(0, 2_000);
         let v3GraphSnapshotId: string | null = null;
         let v3QueryPlan: QueryPlanV3 | null = null;
         if (selectionPlanV3) {
@@ -6316,7 +10251,7 @@ export class Repository {
           const emittedSchema = queryPlanV3EmissionSchemaVersion(process.env);
           v3QueryPlan = briefContractVersion === 3 && activePlaylistContract
             ? createQueryPlanV3(selectionPlanV3, v3GraphSnapshotId, {
-              schemaVersion: 4,
+              schemaVersion: CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
               briefContractVersion,
               playlistContractRevisionId: activePlaylistContract.revisionId,
               playlistContractSemanticHash: activePlaylistContract.semanticHash,
@@ -6332,6 +10267,21 @@ export class Repository {
               schemaVersion: emittedSchema >= 3 ? 2 : emittedSchema,
             });
         }
+        if (input.releaseManifestCanary && (
+          briefContractVersion !== 3
+          || !activePlaylistContract
+          || !selectionPlanV3
+          || !v3QueryPlan
+          || v3QueryPlan.schemaVersion
+            !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+          || v3QueryPlan.briefContractVersion !== 3
+        )) {
+          throw new HttpError(
+            409,
+            "Manifest-only release canaries require an active contract-3/schema-5 Pipeline V3 plan",
+            "release_manifest_canary_contract_invalid",
+          );
+        }
         const insertedRun = await client.query<{ created_at: Date }>(
          `INSERT INTO research_runs(
              id,prompt,brief_json,guidance_source_hints_json,guidance_telemetry_json,
@@ -6346,7 +10296,7 @@ export class Repository {
           [
             runId,
             canonicalPrompt,
-            input.brief,
+            executionBrief,
             JSON.stringify(guidanceSourceHints),
             guidanceTelemetry == null ? null : JSON.stringify(guidanceTelemetry),
             JSON.stringify(guidancePreferences),
@@ -6409,11 +10359,12 @@ export class Repository {
             `INSERT INTO playlist_run_blockers(
                id,run_id,contract_revision_id,blocker_kind,dependency_key,retry_count,
                next_retry_at,automatic_retry_until,state_json)
-             VALUES($1,$2,$3,'provider',$4,0,NULL,NULL,$5::jsonb)`,
+             VALUES($1,$2,$3,$4,$5,0,NULL,NULL,$6::jsonb)`,
             [
               randomUUID(),
               runId,
               activePlaylistContractDatabaseId,
+              contractExecutionPause.blockerKind,
               contractExecutionPause.dependencyKey,
               JSON.stringify(contractExecutionPause.state),
             ],
@@ -6451,6 +10402,30 @@ export class Repository {
              VALUES($1,$2,now())`,
             [runId, queryPlanRevisionId],
           );
+          if (input.releaseManifestCanary && input.releaseCanary) {
+            const stageKey = v3RetrievalStageKey(v3QueryPlan, "shadow");
+            const marker = createReleaseManifestCanaryMarker({
+              canaryId: input.releaseCanary.canaryId,
+              cacheMode: input.releaseCanary.cacheMode,
+              sourceRevision: input.releaseCanary.sourceRevision,
+              queryPlanHash: queryHash,
+              queryPlanRevisionId,
+              contractRevisionDatabaseId: activePlaylistContractDatabaseId!,
+              contractRevisionId: activePlaylistContract!.revisionId,
+              contractSemanticHash: activePlaylistContract!.semanticHash,
+              stageKey,
+              requestedTrackCount: selectionPlanV3.requestedTrackCount,
+            });
+            await client.query(
+              `INSERT INTO research_checkpoints(run_id,phase,state_json)
+               VALUES($1,$2,$3::jsonb)`,
+              [
+                runId,
+                RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+                JSON.stringify(marker),
+              ],
+            );
+          }
           if (supportsGroundedRecoveryAudit && selectionPlanV3.userGoal && selectionPlanV3.semanticAudit) {
             const goalJson = JSON.stringify(selectionPlanV3.userGoal);
             const goalHash = createHash("sha256").update(goalJson).digest("hex");
@@ -6502,6 +10477,7 @@ export class Repository {
         input.releaseCanary,
         { operation: "run", id: runId },
         input.briefRequestId,
+        { allowMarkerCreation: true },
       );
       return { runId, accessId, status, created: !reused, reused };
     });
@@ -6560,6 +10536,10 @@ export class Repository {
         questions_json: PlaylistGuidanceQuestion[];
         active: boolean;
         base_contract_revision_id: string | null;
+        generation_mode: string;
+        trigger: "correctness" | "yield_risk" | "nuance";
+        axis: string | null;
+        rejected_question_reasons_json: unknown;
         created_at: Date;
       }>(
         `WITH RECURSIVE lineage(run_id) AS (
@@ -6576,6 +10556,8 @@ export class Repository {
          SELECT questions.id,questions.run_id,questions.revision,
                 questions.question_set_hash,questions.questions_json,
                 questions.active,questions.base_contract_revision_id,
+                questions.generation_mode,questions.trigger,questions.axis,
+                questions.rejected_question_reasons_json,
                 questions.created_at
          FROM guidance_question_sets questions
          JOIN lineage ON lineage.run_id=questions.run_id
@@ -6584,7 +10566,10 @@ export class Repository {
          FOR UPDATE OF questions`,
         [input.runId],
       );
-      const attemptsUsed = history.rows.length;
+      const attemptRows = history.rows.filter(
+        ({ generation_mode }) => generation_mode !== "interpretation_summary",
+      );
+      const attemptsUsed = attemptRows.length;
       const current = history.rows.find((questionSet) => (
         questionSet.run_id === input.runId
         &&
@@ -6592,6 +10577,24 @@ export class Repository {
         && questionSet.base_contract_revision_id === input.contractRevisionId
       ));
       if (current) {
+        if (current.generation_mode === "interpretation_summary") {
+          const metadata = current.rejected_question_reasons_json
+            && typeof current.rejected_question_reasons_json === "object"
+            && !Array.isArray(current.rejected_question_reasons_json)
+            ? current.rejected_question_reasons_json as Record<string, unknown>
+            : {};
+          const reason = metadata.summaryReason
+            === "clarification_attempt_limit"
+            ? "clarification_attempt_limit"
+            : "rescue_question_limit";
+          return runInterpretationSummaryAction({
+            contract: row.contract_json,
+            questionSetHash: current.question_set_hash,
+            attemptsUsed,
+            reason,
+            axis: current.axis,
+          });
+        }
         return {
           kind: "rescue_guidance",
           questionSetHash: current.question_set_hash,
@@ -6604,13 +10607,123 @@ export class Repository {
         };
       }
       const alreadyAskedForRevision = history.rows.some(
-        (questionSet) => questionSet.base_contract_revision_id === input.contractRevisionId,
+        (questionSet) => (
+          questionSet.generation_mode !== "interpretation_summary"
+          && questionSet.base_contract_revision_id === input.contractRevisionId
+        ),
       );
-      if (attemptsUsed >= 2 || alreadyAskedForRevision) return null;
       const candidate = predicateYieldRescueGuidanceDecisionV3({
         baseContract: row.contract_json,
         limitingClauseIds: input.limitingClauseIds,
       });
+      const axis = candidate?.axis ?? attemptRows[0]?.axis ?? null;
+      const normalizedAxis = axis?.normalize("NFKC").replace(/\s+/gu, " ")
+        .trim().toLocaleLowerCase("en-US") ?? "";
+      const attemptsOnAxis = normalizedAxis
+        ? attemptRows.filter((questionSet) => (
+            questionSet.axis?.normalize("NFKC").replace(/\s+/gu, " ").trim()
+              .toLocaleLowerCase("en-US") === normalizedAxis
+          )).length
+        : 0;
+      const summaryReason = attemptsOnAxis >= 2
+        ? "clarification_attempt_limit" as const
+        : attemptsUsed >= 2 || alreadyAskedForRevision
+          ? "rescue_question_limit" as const
+          : null;
+      if (summaryReason) {
+        const questionSetHash = sha256Hex(stableStringify({
+          kind: "interpretation_summary",
+          contractSemanticHash: row.contract_json.semanticHash,
+          axis,
+          attemptsUsed,
+          reason: summaryReason,
+        }));
+        const questionSetId = randomUUID();
+        const revision = Math.max(
+          0,
+          ...history.rows
+            .filter((questionSet) => questionSet.run_id === input.runId)
+            .map((questionSet) => Number(questionSet.revision)),
+        ) + 1;
+        await client.query(
+          "UPDATE guidance_question_sets SET active=false WHERE run_id=$1 AND active",
+          [input.runId],
+        );
+        await client.query(
+          `INSERT INTO guidance_question_sets(
+             id,brief_request_id,run_id,revision,question_set_hash,
+             request_classification,generation_mode,guidance_policy_version,
+             locale,storefront,target_track_count,explicit_constraint_hash,
+             rejected_question_reasons_json,questions_json,active,
+             base_contract_revision_id,parent_question_set_id,
+             feasibility_snapshot_id,guidance_round,trigger,axis)
+           VALUES($1,NULL,$2,$3,$4,'broad_curated','interpretation_summary',
+                  'adaptive_guidance_v3',$5,$6,$7,$8,$9::jsonb,'[]'::jsonb,true,
+                  $10,$11,NULL,'rescue','yield_risk',$12)`,
+          [
+            questionSetId,
+            input.runId,
+            revision,
+            questionSetHash,
+            row.contract_json.locale,
+            row.contract_json.storefront,
+            row.contract_json.requestedTrackCount,
+            sha256Hex(stableStringify({
+              trackPredicate: row.contract_json.trackPredicate,
+              playlistConstraints: row.contract_json.playlistConstraints,
+              requestedTrackCount: row.contract_json.requestedTrackCount,
+            })),
+            JSON.stringify({ summaryReason }),
+            input.contractRevisionId,
+            history.rows[0]?.id ?? null,
+            axis,
+          ],
+        );
+        await client.query(
+          `UPDATE playlist_run_blockers
+           SET resolved_at=now(),updated_at=now()
+           WHERE run_id=$1 AND resolved_at IS NULL
+             AND blocker_kind IN ('guidance','scope_decision')`,
+          [input.runId],
+        );
+        await client.query(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,'scope_decision',$4,0,NULL,NULL,$5::jsonb)`,
+          [
+            randomUUID(),
+            input.runId,
+            input.contractRevisionId,
+            `interpretation-summary:${axis ?? "rescue"}`.slice(0, 120),
+            JSON.stringify({
+              reasonCode: summaryReason,
+              guidanceRound: "rescue",
+              axis,
+              questionSetHash,
+              contractSemanticHash: row.contract_json.semanticHash,
+              attemptsUsed,
+              showEditableInterpretationSummary: true,
+              interpretationSummary:
+                playlistInterpretationSummaryV1(row.contract_json),
+            }),
+          ],
+        );
+        await client.query(
+          `UPDATE research_runs
+           SET status='needs_decision',phase='interpretation_summary_required',
+               error=NULL,updated_at=now()
+           WHERE id=$1`,
+          [input.runId],
+        );
+        return runInterpretationSummaryAction({
+          contract: row.contract_json,
+          questionSetHash,
+          attemptsUsed,
+          reason: summaryReason,
+          axis,
+        });
+      }
       if (!candidate) return null;
       const round = selectGuidanceRoundV3({
         stage: "rescue",
@@ -6705,7 +10818,7 @@ export class Repository {
         questions,
         attemptsUsed: attemptsUsed + 1,
         maximumAttempts: 2,
-        showEditableInterpretationSummary: round.showEditableInterpretationSummary,
+        showEditableInterpretationSummary: false,
       };
     });
   }
@@ -6720,9 +10833,14 @@ export class Repository {
       contract_revision_id: string;
       contract_json: PlaylistContractRevisionV1;
       attempts_used: number;
+      generation_mode: string;
+      axis: string | null;
+      rejected_question_reasons_json: unknown;
     }>(
       `SELECT questions.question_set_hash,questions.questions_json,
               contract.id contract_revision_id,contract.contract_json,
+              questions.generation_mode,questions.axis,
+              questions.rejected_question_reasons_json,
               (
                 WITH RECURSIVE lineage(run_id) AS (
                   SELECT run.id
@@ -6740,6 +10858,7 @@ export class Repository {
                 FROM guidance_question_sets history
                 JOIN lineage ON lineage.run_id=history.run_id
                 WHERE history.guidance_round='rescue'
+                  AND history.generation_mode<>'interpretation_summary'
               ) attempts_used
        FROM research_runs run
        JOIN playlist_contract_revisions contract
@@ -6760,6 +10879,23 @@ export class Repository {
     } catch {
       return null;
     }
+    if (row.generation_mode === "interpretation_summary") {
+      const metadata = row.rejected_question_reasons_json
+        && typeof row.rejected_question_reasons_json === "object"
+        && !Array.isArray(row.rejected_question_reasons_json)
+        ? row.rejected_question_reasons_json as Record<string, unknown>
+        : {};
+      const reason = metadata.summaryReason === "clarification_attempt_limit"
+        ? "clarification_attempt_limit"
+        : "rescue_question_limit";
+      return runInterpretationSummaryAction({
+        contract: row.contract_json,
+        questionSetHash: row.question_set_hash,
+        attemptsUsed: Number(row.attempts_used),
+        reason,
+        axis: row.axis,
+      });
+    }
     return {
       kind: "rescue_guidance",
       questionSetHash: row.question_set_hash,
@@ -6769,6 +10905,819 @@ export class Repository {
       attemptsUsed: Math.min(2, Math.max(1, Number(row.attempts_used))),
       maximumAttempts: 2,
       showEditableInterpretationSummary: false,
+    };
+  }
+
+  async getPlaylistGuidanceHistory(input: {
+    runId: string;
+    sourceAccessId: string;
+  }): Promise<PlaylistGuidanceHistoryView> {
+    const active = await this.pool.query<{
+      contract_revision_id: string;
+      contract_hash: string;
+    }>(
+      `SELECT contract.id contract_revision_id,contract.contract_hash
+       FROM run_accesses access
+       JOIN research_runs run
+         ON run.id=access.run_id AND run.deleted_at IS NULL
+       JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+       WHERE access.id=$1 AND access.run_id=$2
+         AND access.deleted_at IS NULL AND access.expires_at>now()`,
+      [input.sourceAccessId, input.runId],
+    );
+    const authority = active.rows[0];
+    if (!authority) {
+      throw new HttpError(
+        409,
+        "The playlist access no longer maps to this run",
+        "stale_source_run_access",
+      );
+    }
+    const history = await this.pool.query<{
+      answer_set_id: string;
+      question_set_hash: string;
+      normalized_answers_json: PlaylistGuidanceAnswer[];
+      questions_json: PlaylistGuidanceQuestion[];
+      trigger: string;
+      axis: string | null;
+      accepted_at: Date;
+      contract_depth: number;
+    }>(
+      `WITH RECURSIVE contract_lineage(id,parent_revision_id,depth) AS (
+         SELECT contract.id,contract.parent_revision_id,0
+         FROM playlist_contract_revisions contract
+         WHERE contract.id=$1
+         UNION ALL
+         SELECT parent.id,parent.parent_revision_id,lineage.depth+1
+         FROM contract_lineage lineage
+         JOIN playlist_contract_revisions parent
+           ON parent.id=lineage.parent_revision_id
+       )
+       SELECT answers.id answer_set_id,answers.question_set_hash,
+              answers.normalized_answers_json,questions.questions_json,
+              questions.trigger,questions.axis,answers.accepted_at,
+              lineage.depth contract_depth
+       FROM guidance_answer_sets answers
+       JOIN guidance_question_sets questions
+         ON questions.id=answers.question_set_id
+       JOIN contract_lineage lineage
+         ON lineage.id=answers.resulting_contract_revision_id
+       WHERE answers.invalidated_at IS NULL
+       ORDER BY lineage.depth DESC,answers.accepted_at,answers.id`,
+      [authority.contract_revision_id],
+    );
+    const items = history.rows.flatMap((row): PlaylistGuidanceHistoryItem[] => {
+      const answers = Array.isArray(row.normalized_answers_json)
+        ? row.normalized_answers_json
+        : [];
+      return (Array.isArray(row.questions_json) ? row.questions_json : [])
+        .flatMap((question) => {
+          if (question.schemaVersion !== 3
+            || typeof question.questionHash !== "string") return [];
+          const answer = answers.find((candidate) => (
+            candidate.questionId === question.id
+          ));
+          if (!answer) return [];
+          const selectedOptionIds = [
+            ...(typeof answer.optionId === "string" ? [answer.optionId] : []),
+            ...(Array.isArray(answer.optionIds) ? answer.optionIds : []),
+          ];
+          const selectedOptionLabels = selectedOptionIds.flatMap((optionId) => {
+            const option = question.options.find((candidate) => (
+              candidate.id === optionId
+            ));
+            return option ? [option.label] : [];
+          });
+          return [{
+            answerSetId: row.answer_set_id,
+            questionSetHash: row.question_set_hash,
+            question: {
+              id: question.id,
+              header: question.header,
+              question: question.question,
+              criticality: question.criticality === "required"
+                ? "required"
+                : "optional",
+              selectionMode: question.selectionMode === "multiple"
+                ? "multiple"
+                : "single",
+              allowCustom: question.allowCustom === true,
+              options: question.options.map((option) => ({
+                id: option.id,
+                label: option.label,
+                description: option.description ?? "",
+                recommended: option.recommended === true,
+              })),
+            },
+            selectedOptionIds,
+            selectedOptionLabels,
+            hadCustomAnswer: typeof answer.customText === "string",
+            skipped: answer.skipped === true,
+            axis: typeof row.axis === "string" ? row.axis : null,
+            trigger: row.trigger === "correctness"
+              || row.trigger === "yield_risk"
+              ? row.trigger
+              : "nuance",
+            acceptedAt: row.accepted_at.toISOString(),
+          }];
+        });
+    });
+    return {
+      activeContractRevisionId: authority.contract_revision_id,
+      activeContractSemanticHash: authority.contract_hash,
+      historyVersion: sha256Hex(stableStringify({
+        activeContractRevisionId: authority.contract_revision_id,
+        activeContractSemanticHash: authority.contract_hash,
+        items: items.map((item) => ({
+          answerSetId: item.answerSetId,
+          questionId: item.question.id,
+          selectedOptionIds: item.selectedOptionIds,
+          hadCustomAnswer: item.hadCustomAnswer,
+          skipped: item.skipped,
+        })),
+      })),
+      items,
+    };
+  }
+
+  async preflightPlaylistGuidanceRevision(input: {
+    runId: string;
+    sourceAccessId: string;
+    answerSetId: string;
+    questionId: string;
+    answer: PlaylistGuidanceAnswer;
+    expectedContractRevisionId: string;
+    expectedContractSemanticHash: string;
+    historyVersion: string;
+    idempotencyKey: string;
+    customTrackCountAuthority: CustomGuidanceTrackCountAuthorityV1;
+  }): Promise<
+    | {
+        status: "prior";
+        runId: string;
+        accessId: string;
+      }
+    | {
+        status: "ready";
+        storefront: string;
+      }
+  > {
+    const revisionRequestHash = guidanceRevisionRequestHash(input);
+    const prior = await this.pool.query<{
+      access_id: string;
+      run_id: string;
+      state_json: Record<string, unknown>;
+    }>(
+      `SELECT successor_access.id access_id,successor.id run_id,
+              checkpoint.state_json
+       FROM run_accesses source_access
+       JOIN run_accesses successor_access
+         ON successor_access.client_bucket=source_access.client_bucket
+        AND successor_access.idempotency_key=$2
+        AND successor_access.deleted_at IS NULL
+       JOIN research_runs successor
+         ON successor.id=successor_access.run_id
+        AND successor.deleted_at IS NULL
+       JOIN research_checkpoints checkpoint
+         ON checkpoint.run_id=successor.id
+        AND checkpoint.phase='canonical_predecessor'
+       WHERE source_access.id=$1
+         AND source_access.deleted_at IS NULL
+         AND checkpoint.state_json->>'sourceAccessId'=$1::text
+       ORDER BY successor_access.created_at DESC LIMIT 1`,
+      [input.sourceAccessId, input.idempotencyKey],
+    );
+    if (prior.rows[0]) {
+      if (prior.rows[0].state_json.guidanceRevisionRequestHash
+        !== revisionRequestHash) {
+        throw new HttpError(
+          409,
+          "Idempotency key was already used for another guidance revision",
+          "idempotency_conflict",
+        );
+      }
+      return {
+        status: "prior",
+        runId: prior.rows[0].run_id,
+        accessId: prior.rows[0].access_id,
+      };
+    }
+    const publicHistory = await this.getPlaylistGuidanceHistory({
+      runId: input.runId,
+      sourceAccessId: input.sourceAccessId,
+    });
+    if (publicHistory.activeContractRevisionId
+        !== input.expectedContractRevisionId
+      || publicHistory.activeContractSemanticHash
+        !== input.expectedContractSemanticHash
+      || publicHistory.historyVersion !== input.historyVersion) {
+      throw new HttpError(
+        409,
+        "The playlist interpretation changed in another tab",
+        "stale_guidance_history",
+      );
+    }
+    const targetHistoryItem = publicHistory.items.find((item) => (
+      item.answerSetId === input.answerSetId
+      && item.question.id === input.questionId
+    ));
+    if (!targetHistoryItem
+      || input.answer.questionId !== input.questionId) {
+      throw new HttpError(
+        409,
+        "That earlier answer is no longer active",
+        "stale_guidance_history",
+      );
+    }
+    if (typeof input.answer.customText === "string") {
+      if (targetHistoryItem.question.allowCustom !== true
+        || targetHistoryItem.axis === null) {
+        throw new HttpError(
+          400,
+          "This guidance axis does not accept custom revisions",
+          "custom_guidance_not_allowed",
+        );
+      }
+      const targetShape = await this.pool.query<{ question_count: number }>(
+        `SELECT jsonb_array_length(questions.questions_json)::int
+                  question_count
+         FROM guidance_answer_sets answers
+         JOIN guidance_question_sets questions
+           ON questions.id=answers.question_set_id
+         WHERE answers.id=$1 AND answers.invalidated_at IS NULL`,
+        [input.answerSetId],
+      );
+      if (targetShape.rows[0]?.question_count !== 1) {
+        throw new HttpError(
+          400,
+          "Edit this custom rule from a single-axis guidance decision",
+          "custom_guidance_one_axis_required",
+        );
+      }
+    }
+    const active = await this.getActivePlaylistContractRevision({
+      runId: input.runId,
+    });
+    if (!active
+      || active.id !== input.expectedContractRevisionId
+      || active.contractHash !== input.expectedContractSemanticHash) {
+      throw new HttpError(
+        409,
+        "The playlist interpretation changed in another tab",
+        "stale_guidance_history",
+      );
+    }
+    if (typeof input.answer.customText === "string") {
+      try {
+        preflightCustomGuidanceTextV3({
+          base: active.contract as unknown as PlaylistContractRevisionV1,
+          customText: input.answer.customText,
+          trackCountAuthority: input.customTrackCountAuthority,
+        });
+      } catch (error) {
+        throwCustomGuidanceCompilationHttpError(error);
+      }
+    }
+    return { status: "ready", storefront: active.storefront };
+  }
+
+  async revisePlaylistGuidanceAnswer(input: {
+    runId: string;
+    sourceAccessId: string;
+    answerSetId: string;
+    questionId: string;
+    answer: PlaylistGuidanceAnswer;
+    expectedContractRevisionId: string;
+    expectedContractSemanticHash: string;
+    historyVersion: string;
+    confirmationHash?: string | null;
+    confirmed?: boolean;
+    idempotencyKey: string;
+    customTrackCountAuthority: CustomGuidanceTrackCountAuthorityV1;
+    resolvedExactArtistIdentities?: readonly ResolvedExactArtistIdentityV1[];
+  }): Promise<
+    | {
+        status: "needs_confirmation";
+        confirmationHash: string;
+        interpretationSummary: ReturnType<typeof playlistInterpretationSummaryV1>;
+        hardChangeReasons: string[];
+      }
+    | {
+        status: "revised";
+        runId: string;
+        accessId: string;
+        created: boolean;
+      }
+  > {
+    const revisionRequestHash = guidanceRevisionRequestHash(input);
+    const preflight = await this.preflightPlaylistGuidanceRevision(input);
+    if (preflight.status === "prior") {
+      return {
+        status: "revised",
+        runId: preflight.runId,
+        accessId: preflight.accessId,
+        created: false,
+      };
+    }
+    const selected = await this.pool.query<{
+      answer_set_id: string;
+      question_set_id: string;
+      question_set_hash: string;
+      normalized_answers_json: PlaylistGuidanceAnswer[];
+      questions_json: PlaylistGuidanceQuestion[];
+      answer_hash: string;
+      execution_delta_json: PlaylistContractPatchV1["operations"];
+      execution_delta_hash: string;
+      historical_base_contract_revision_id: string;
+      historical_base_contract: PlaylistContractRevisionV1;
+      resulting_contract_revision_id: string;
+      resulting_contract: PlaylistContractRevisionV1;
+      contract_depth: number;
+      base_contract_depth: number;
+    }>(
+      `WITH RECURSIVE contract_lineage(
+         id,parent_revision_id,contract_json,depth
+       ) AS (
+         SELECT contract.id,contract.parent_revision_id,
+                contract.contract_json,0
+         FROM playlist_contract_revisions contract
+         WHERE contract.id=$1
+         UNION ALL
+         SELECT parent.id,parent.parent_revision_id,
+                parent.contract_json,lineage.depth+1
+         FROM contract_lineage lineage
+         JOIN playlist_contract_revisions parent
+           ON parent.id=lineage.parent_revision_id
+       )
+       SELECT answers.id answer_set_id,
+              questions.id question_set_id,
+              answers.question_set_hash,
+              answers.normalized_answers_json,questions.questions_json,
+              answers.answer_hash,answers.execution_delta_json,
+              answers.execution_delta_hash,
+              base.id historical_base_contract_revision_id,
+              base.contract_json historical_base_contract,
+              answers.resulting_contract_revision_id,
+              resulting.contract_json resulting_contract,
+              lineage.depth contract_depth,
+              base_lineage.depth base_contract_depth
+       FROM guidance_answer_sets answers
+       JOIN guidance_question_sets questions
+         ON questions.id=answers.question_set_id
+       JOIN playlist_contract_revisions base
+         ON base.id=answers.base_contract_revision_id
+       JOIN contract_lineage lineage
+         ON lineage.id=answers.resulting_contract_revision_id
+       JOIN playlist_contract_revisions resulting
+         ON resulting.id=answers.resulting_contract_revision_id
+       JOIN contract_lineage base_lineage
+         ON base_lineage.id=base.id
+       WHERE answers.id=$2 AND answers.invalidated_at IS NULL`,
+      [input.expectedContractRevisionId, input.answerSetId],
+    );
+    const target = selected.rows[0];
+    const targetQuestion = target?.questions_json.find((question) => (
+      question.id === input.questionId && question.schemaVersion === 3
+    ));
+    if (!target || !targetQuestion) {
+      throw new HttpError(
+        409,
+        "That earlier answer is no longer active",
+        "stale_guidance_history",
+      );
+    }
+    const active = await this.pool.query<{
+      contract_json: PlaylistContractRevisionV1;
+    }>(
+      `SELECT contract.contract_json
+       FROM research_runs run
+       JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+       WHERE run.id=$1 AND run.deleted_at IS NULL
+         AND contract.id=$2 AND contract.contract_hash=$3`,
+      [
+        input.runId,
+        input.expectedContractRevisionId,
+        input.expectedContractSemanticHash,
+      ],
+    );
+    const activeContract = active.rows[0]?.contract_json;
+    if (!activeContract) {
+      throw new HttpError(
+        409,
+        "The playlist interpretation changed in another tab",
+        "stale_guidance_history",
+      );
+    }
+    assertCustomGuidanceTrackCountAdmission(
+      activeContract.requestedTrackCount,
+      input.customTrackCountAuthority,
+    );
+    let historicalIntegrityValid = true;
+    try {
+      assertPlaylistContractIntegrityV1(activeContract);
+      assertPlaylistContractIntegrityV1(
+        target.historical_base_contract,
+      );
+      assertPlaylistContractIntegrityV1(target.resulting_contract);
+      const resultingLineage = target.resulting_contract.answerLineage;
+      const resultingAnswer = resultingLineage.at(-1);
+      const baseIsAncestor = target.historical_base_contract_revision_id
+          === target.resulting_contract_revision_id
+        || target.base_contract_depth > target.contract_depth;
+      const executionDeltaHash = sha256Hex(stableStringify(
+        target.execution_delta_json,
+      ));
+      const normalizedStoredAnswers = normalizedGuidanceAnswers(
+        target.questions_json,
+        target.normalized_answers_json,
+        3,
+      );
+      const legacyAnswerEnvelopeHash = sha256Hex(stableStringify({
+        questionSetHash: target.question_set_hash,
+        answers: normalizedStoredAnswers,
+      }));
+      const storedCustom = normalizedStoredAnswers.filter(
+        (answer) => typeof answer.customText === "string",
+      );
+      let expectedOperations: PlaylistContractPatchV1["operations"] = [];
+      let expectedLineageAnswerHash: string | null = null;
+      if (storedCustom.length === 1) {
+        // Custom prose is untrusted historical display data. The accepted,
+        // hash-bound typed delta already contains any resolved catalog
+        // identity bindings and is the only replay authority.
+        expectedOperations = target.execution_delta_json;
+        expectedLineageAnswerHash = resultingAnswer?.answerHash ?? null;
+      } else if (storedCustom.length === 0) {
+        const expectedPatch = compileGuidanceRoundPatchV3({
+          base: target.historical_base_contract,
+          questionSetHash: target.question_set_hash,
+          questions: target.questions_json,
+          answers: normalizedStoredAnswers,
+        });
+        expectedOperations = expectedPatch?.operations ?? [];
+        expectedLineageAnswerHash = expectedPatch?.answerLineage.answerHash
+          ?? resultingAnswer?.answerHash
+          ?? null;
+      } else {
+        historicalIntegrityValid = false;
+      }
+      const projected = expectedOperations.length > 0
+        && resultingAnswer
+        ? applyPlaylistContractPatchV1(
+            target.historical_base_contract,
+            {
+              baseRevisionId: target.historical_base_contract.revisionId,
+              baseSemanticHash: target.historical_base_contract.semanticHash,
+              answerLineage: {
+                ...resultingAnswer,
+                questionSetHash: target.question_set_hash,
+              },
+              operations: expectedOperations,
+            },
+          )
+        : target.historical_base_contract;
+      historicalIntegrityValid &&= baseIsAncestor
+        && target.execution_delta_hash === executionDeltaHash
+        && stableStringify(target.execution_delta_json)
+          === stableStringify(expectedOperations)
+        && projected.semanticHash === target.resulting_contract.semanticHash
+        && (
+          target.historical_base_contract_revision_id
+            === target.resulting_contract_revision_id
+          || (
+            resultingAnswer?.questionSetHash === target.question_set_hash
+            && resultingAnswer.answerHash === expectedLineageAnswerHash
+          )
+        )
+        && (
+          target.answer_hash === resultingAnswer?.answerHash
+          || target.answer_hash === legacyAnswerEnvelopeHash
+        );
+    } catch {
+      historicalIntegrityValid = false;
+    }
+    if (!historicalIntegrityValid) {
+      const quarantined = await this.pool.query(
+        `UPDATE research_runs run
+         SET status='failed_integrity',
+             phase='guidance_history_integrity_quarantine',
+             error=NULL,updated_at=now()
+         FROM playlist_contract_revisions contract,
+              run_accesses access
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+           AND run.active_playlist_contract_revision_id=$2
+           AND contract.id=run.active_playlist_contract_revision_id
+           AND contract.contract_hash=$3
+           AND access.id=$4 AND access.run_id=run.id
+           AND access.deleted_at IS NULL AND access.expires_at>now()
+         RETURNING run.id`,
+        [
+          input.runId,
+          input.expectedContractRevisionId,
+          input.expectedContractSemanticHash,
+          input.sourceAccessId,
+        ],
+      );
+      if (!quarantined.rows[0]) {
+        throw new HttpError(
+          409,
+          "The playlist interpretation changed in another tab",
+          "stale_guidance_history",
+        );
+      }
+      throw new HttpError(
+        409,
+        "The saved guidance lineage failed integrity validation",
+        "guidance_history_integrity",
+      );
+    }
+
+    let replacementPatch: PlaylistContractPatchV1;
+    let normalizedAnswers: PlaylistGuidanceAnswer[];
+    if (typeof input.answer.customText === "string") {
+      if (target.questions_json.length !== 1
+        || targetQuestion.allowCustom !== true) {
+        throw new HttpError(
+          400,
+          "Edit this custom rule from a single-axis guidance decision",
+          "custom_guidance_one_axis_required",
+        );
+      }
+      let compiled;
+      try {
+        compiled = recompileCustomGuidanceTextV3({
+          base: target.historical_base_contract,
+          customText: input.answer.customText,
+          trackCountAuthority: input.customTrackCountAuthority,
+          resolvedExactArtistIdentities:
+            input.resolvedExactArtistIdentities,
+        });
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        const reason = error instanceof Error ? error.message : "";
+        if (reason.startsWith("custom_artist_exclusion_requires_")) {
+          throw new HttpError(
+            409,
+            "Name one exact Apple Music artist for this exclusion, or edit it as a separate semantic playlist rule.",
+            "exact_artist_identity_clarification_required",
+          );
+        }
+        throw new HttpError(
+          400,
+          reason === "invalid_custom_requested_count"
+            ? "Track count is outside the authorized playlist range"
+            : reason === "custom_guidance_requires_supported_music_terms"
+            ? "That custom answer needs a clearer music rule"
+            : "That custom answer could not be compiled safely",
+          reason === "invalid_custom_requested_count"
+            ? "invalid_track_count"
+            : "custom_guidance_not_compilable",
+        );
+      }
+      const questionSetHash = sha256Hex(stableStringify({
+        kind: "historical_guidance_custom_revision_v1",
+        sourceQuestionSetHash: target.question_set_hash,
+        questionId: input.questionId,
+        operations: compiled.operations,
+      }));
+      const answerHash = sha256Hex(stableStringify({
+        questionSetHash,
+        questionId: input.questionId,
+        normalizedText: compiled.normalizedText,
+        operations: compiled.operations,
+      }));
+      replacementPatch = {
+        baseRevisionId: target.historical_base_contract.revisionId,
+        baseSemanticHash: target.historical_base_contract.semanticHash,
+        answerLineage: {
+          questionSetHash,
+          questionId: input.questionId,
+          answerHash,
+        },
+        operations: compiled.operations,
+      };
+      normalizedAnswers = [{
+        questionId: input.questionId,
+        customText: compiled.normalizedText,
+      }];
+      const confirmationHash = sha256Hex(stableStringify({
+        activeContractRevisionId: input.expectedContractRevisionId,
+        activeContractSemanticHash: input.expectedContractSemanticHash,
+        historyVersion: input.historyVersion,
+        answerSetId: input.answerSetId,
+        questionId: input.questionId,
+        replacementPatch,
+      }));
+      const preview = rebasePlaylistContractPatchV1({
+        active: activeContract,
+        historicalBase: target.historical_base_contract,
+        replacementPatch,
+      });
+      assertCustomGuidanceTrackCountAdmission(
+        preview.requestedTrackCount,
+        input.customTrackCountAuthority,
+      );
+      if (preview.requestedTrackCount !== activeContract.requestedTrackCount) {
+        throw new HttpError(
+          409,
+          "Track count changes require a separate explicit count revision",
+          "count_revision_required",
+        );
+      }
+      if (compiled.hardChangeReasons.length > 0
+        && (
+          input.confirmed !== true
+          || input.confirmationHash !== confirmationHash
+        )) {
+        return {
+          status: "needs_confirmation",
+          confirmationHash,
+          interpretationSummary: playlistInterpretationSummaryV1(preview),
+          hardChangeReasons: compiled.hardChangeReasons,
+        };
+      }
+    } else {
+      const replacementAnswers = target.normalized_answers_json.map((answer) => (
+        answer.questionId === input.questionId
+          ? { ...input.answer, questionId: input.questionId }
+          : answer
+      ));
+      normalizedAnswers = normalizedGuidanceAnswers(
+        target.questions_json,
+        replacementAnswers,
+        3,
+      );
+      try {
+        const compiled = compileGuidanceRoundPatchV3({
+          base: target.historical_base_contract,
+          questionSetHash: target.question_set_hash,
+          questions: target.questions_json,
+          answers: normalizedAnswers,
+        });
+        replacementPatch = compiled ?? {
+          baseRevisionId: target.historical_base_contract.revisionId,
+          baseSemanticHash: target.historical_base_contract.semanticHash,
+          answerLineage: {
+            questionSetHash: target.question_set_hash,
+            questionId: `guidance-round:${target.question_set_hash.slice(0, 24)}`,
+            answerHash: sha256Hex(stableStringify({
+              questionSetHash: target.question_set_hash,
+              answers: normalizedAnswers,
+            })),
+          },
+          operations: [],
+        };
+      } catch {
+        throw new HttpError(
+          409,
+          "That earlier answer cannot be applied to its historical contract",
+          "guidance_revision_invalid",
+        );
+      }
+    }
+    let preparedSuccessorContract;
+    try {
+      preparedSuccessorContract = rebasePlaylistContractPatchV1({
+        active: activeContract,
+        historicalBase: target.historical_base_contract,
+        replacementPatch,
+      });
+    } catch {
+      throw new HttpError(
+        409,
+        "That answer does not create a different playlist interpretation",
+        "guidance_revision_no_change",
+      );
+    }
+    if (preparedSuccessorContract.requestedTrackCount
+      !== activeContract.requestedTrackCount) {
+      throw new HttpError(
+        409,
+        "Track count changes require a separate explicit count revision",
+        "count_revision_required",
+      );
+    }
+    assertCustomGuidanceTrackCountAdmission(
+      preparedSuccessorContract.requestedTrackCount,
+      input.customTrackCountAuthority,
+    );
+
+    const dependent = await this.pool.query<{
+      answer_set_id: string;
+      resulting_contract_revision_id: string;
+      question_set_id: string;
+      questions_json: PlaylistGuidanceQuestion[];
+      guidance_round: string;
+      trigger: string;
+      axis: string | null;
+      contract_depth: number;
+    }>(
+      `WITH RECURSIVE contract_lineage(id,parent_revision_id,depth) AS (
+         SELECT contract.id,contract.parent_revision_id,0
+         FROM playlist_contract_revisions contract WHERE contract.id=$1
+         UNION ALL
+         SELECT parent.id,parent.parent_revision_id,lineage.depth+1
+         FROM contract_lineage lineage
+         JOIN playlist_contract_revisions parent
+           ON parent.id=lineage.parent_revision_id
+       )
+       SELECT answers.id answer_set_id,
+              answers.resulting_contract_revision_id,
+              questions.id question_set_id,questions.questions_json,
+              questions.guidance_round,questions.trigger,questions.axis,
+              lineage.depth contract_depth
+       FROM guidance_answer_sets answers
+       JOIN guidance_question_sets questions
+         ON questions.id=answers.question_set_id
+       JOIN contract_lineage lineage
+         ON lineage.id=answers.resulting_contract_revision_id
+       WHERE answers.invalidated_at IS NULL
+         AND lineage.depth <= $2
+       ORDER BY lineage.depth DESC,answers.accepted_at,answers.id`,
+      [input.expectedContractRevisionId, target.contract_depth],
+    );
+    const invalidatedRows = dependent.rows;
+    const firstDependent = invalidatedRows.find((row) => (
+      row.answer_set_id !== target.answer_set_id
+      && row.contract_depth < target.contract_depth
+    ));
+    const clarificationAttemptsByAxis: Record<string, number> = {};
+    if (firstDependent) {
+      const attemptRows = await this.pool.query<{
+        axis: string | null;
+        generation_mode: string;
+      }>(
+        `WITH RECURSIVE question_ancestry(
+           id,parent_question_set_id,axis,generation_mode
+         ) AS (
+           SELECT id,parent_question_set_id,axis,generation_mode
+           FROM guidance_question_sets
+           WHERE id=$1
+           UNION
+           SELECT parent.id,parent.parent_question_set_id,
+                  parent.axis,parent.generation_mode
+           FROM question_ancestry current
+           JOIN guidance_question_sets parent
+             ON parent.id=current.parent_question_set_id
+         )
+         SELECT axis,generation_mode FROM question_ancestry`,
+        [firstDependent.question_set_id],
+      );
+      for (const row of attemptRows.rows) {
+        if (!row.axis || row.generation_mode === "interpretation_summary") {
+          continue;
+        }
+        const axis = row.axis.normalize("NFKC").replace(/\s+/gu, " ").trim()
+          .toLocaleLowerCase("en-US");
+        if (!axis || axis === "earlier_answer_revision") continue;
+        clarificationAttemptsByAxis[axis] =
+          (clarificationAttemptsByAxis[axis] ?? 0) + 1;
+      }
+    }
+    const reoffered = firstDependent
+      ? regeneratedDependentGuidanceRound({
+          base: preparedSuccessorContract,
+          questions: firstDependent.questions_json,
+          stage: firstDependent.guidance_round === "rescue"
+            ? "rescue"
+            : "initial",
+          clarificationAttemptsByAxis,
+        })
+      : null;
+    const successor = await this.createCanonicalRunSuccessor({
+      runId: input.runId,
+      sourceAccessId: input.sourceAccessId,
+      expectedContractRevisionId: input.expectedContractRevisionId,
+      expectedContractSemanticHash: input.expectedContractSemanticHash,
+      patch: replacementPatch,
+      preparedSuccessorContract,
+      guidanceRevision: {
+        revisionRequestHash,
+        sourceAnswerSetId: target.answer_set_id,
+        sourceQuestionSetId: target.question_set_id,
+        historicalBaseContractRevisionId:
+          target.historical_base_contract_revision_id,
+        questions: target.questions_json,
+        normalizedAnswers,
+        invalidatedAnswerSetIds: invalidatedRows.map((row) => row.answer_set_id),
+        invalidatedContractRevisionIds: invalidatedRows.map(
+          (row) => row.resulting_contract_revision_id,
+        ),
+        reofferedQuestionSet: reoffered && firstDependent ? {
+          ...reoffered,
+          sourceQuestionSetId: firstDependent.question_set_id,
+        } : null,
+      },
+      idempotencyKey: input.idempotencyKey,
+      trigger: "guidance_answer_revision",
+    });
+    return {
+      status: "revised",
+      runId: successor.runId,
+      accessId: successor.accessId,
+      created: successor.created,
     };
   }
 
@@ -6873,6 +11822,10 @@ export class Repository {
     const executionDeltaHash = sha256Hex(stableStringify(executionDelta));
     if (!patch) {
       const created = await this.transaction(async (client) => {
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1))",
+          [`canonical-successor:${input.runId}:${input.sourceAccessId}`],
+        );
         const authority = await client.query<{
           active: boolean;
           active_playlist_contract_revision_id: string | null;
@@ -6989,34 +11942,14 @@ export class Repository {
       expectedContractRevisionId: row.base_contract_revision_id,
       expectedContractSemanticHash: row.contract_hash,
       patch,
+      rescueGuidanceAnswer: {
+        questionSetId: row.id,
+        questionSetHash: input.questionSetHash,
+        normalizedAnswers: answers,
+      },
       idempotencyKey: input.idempotencyKey,
       trigger: "rescue_guidance",
     });
-    await this.pool.query(
-      `INSERT INTO guidance_answer_sets(
-         id,brief_request_id,run_id,question_set_id,question_set_hash,
-         normalized_answers_json,raw_custom_answers_json,answer_hash,
-         execution_delta_json,execution_delta_hash,idempotency_key,
-         base_contract_revision_id,resulting_contract_revision_id,
-         resulting_query_plan_revision_id)
-       VALUES($1,NULL,$2,$3,$4,$5::jsonb,'[]'::jsonb,$6,$7::jsonb,$8,$9,
-              $10,$11,$12)
-       ON CONFLICT(run_id,idempotency_key) DO NOTHING`,
-      [
-        randomUUID(),
-        input.runId,
-        row.id,
-        input.questionSetHash,
-        JSON.stringify(answers),
-        answerHash,
-        JSON.stringify(executionDelta),
-        executionDeltaHash,
-        input.idempotencyKey,
-        row.base_contract_revision_id,
-        successor.contractRevisionId,
-        successor.queryPlanRevisionId,
-      ],
-    );
     return {
       runId: successor.runId,
       accessId: successor.accessId,
@@ -7044,6 +11977,26 @@ export class Repository {
       );
     }
     const patch = structuredClone(input.patch);
+    const preparedSuccessorContract = input.preparedSuccessorContract
+      ? structuredClone(input.preparedSuccessorContract)
+      : null;
+    const guidanceRevision = input.guidanceRevision
+      ? structuredClone(input.guidanceRevision)
+      : null;
+    const rescueGuidanceAnswer = input.rescueGuidanceAnswer
+      ? structuredClone(input.rescueGuidanceAnswer)
+      : null;
+    if (rescueGuidanceAnswer && (
+      input.trigger !== "rescue_guidance"
+      || rescueGuidanceAnswer.questionSetHash
+        !== patch.answerLineage.questionSetHash
+    )) {
+      throw new HttpError(
+        409,
+        "Playlist rescue guidance does not match the executable patch",
+        "stale_guidance_question_set",
+      );
+    }
     const requestHash = sha256Hex(stableStringify({
       operation: "canonical_run_successor_v1",
       sourceRunId: input.runId,
@@ -7052,6 +12005,8 @@ export class Repository {
       expectedContractSemanticHash: input.expectedContractSemanticHash,
       trigger: input.trigger,
       patch,
+      preparedSuccessorContract,
+      guidanceRevision,
     }));
 
     return this.transaction(async (client) => {
@@ -7163,6 +12118,58 @@ export class Repository {
         };
       }
 
+      if (rescueGuidanceAnswer) {
+        const authority = await client.query<{
+          run_id: string | null;
+          question_set_hash: string;
+          base_contract_revision_id: string | null;
+          guidance_round: string;
+          active: boolean;
+        }>(
+          `SELECT run_id,question_set_hash,base_contract_revision_id,
+                  guidance_round,active
+           FROM guidance_question_sets
+           WHERE id=$1
+           FOR UPDATE`,
+          [rescueGuidanceAnswer.questionSetId],
+        );
+        const questionSet = authority.rows[0];
+        if (!questionSet?.active
+          || questionSet.run_id !== input.runId
+          || questionSet.question_set_hash
+            !== rescueGuidanceAnswer.questionSetHash
+          || questionSet.base_contract_revision_id
+            !== input.expectedContractRevisionId
+          || questionSet.guidance_round !== "rescue"
+          || row.status !== "needs_decision"
+          || row.active_playlist_contract_revision_id
+            !== input.expectedContractRevisionId
+          || row.contract_hash !== input.expectedContractSemanticHash
+          || row.contract_json.semanticHash
+            !== input.expectedContractSemanticHash
+          || row.contract_status !== "active") {
+          throw new HttpError(
+            409,
+            "Playlist guidance changed before this answer was submitted",
+            "stale_guidance_question_set",
+          );
+        }
+        const consumed = await client.query<{ id: string }>(
+          `UPDATE guidance_question_sets
+           SET active=false
+           WHERE id=$1 AND active
+           RETURNING id`,
+          [rescueGuidanceAnswer.questionSetId],
+        );
+        if (!consumed.rows[0]) {
+          throw new HttpError(
+            409,
+            "Playlist guidance changed before this answer was submitted",
+            "stale_guidance_question_set",
+          );
+        }
+      }
+
       const revisableStatuses = new Set([
         "awaiting_guidance",
         "researching",
@@ -7190,7 +12197,27 @@ export class Repository {
 
       let successorContract: PlaylistContractRevisionV1;
       try {
-        successorContract = applyPlaylistContractPatchV1(row.contract_json, patch);
+        if (preparedSuccessorContract) {
+          assertPlaylistContractIntegrityV1(preparedSuccessorContract);
+          if (preparedSuccessorContract.contractId
+              !== row.contract_json.contractId
+            || preparedSuccessorContract.revision
+              !== row.contract_json.revision + 1
+            || preparedSuccessorContract.parentRevisionId
+              !== row.contract_json.revisionId
+            || preparedSuccessorContract.parentSemanticHash
+              !== row.contract_json.semanticHash
+            || patch.answerLineage.answerHash
+              !== preparedSuccessorContract.answerLineage.at(-1)?.answerHash) {
+            throw new Error("prepared_successor_contract_parent_mismatch");
+          }
+          successorContract = preparedSuccessorContract;
+        } else {
+          successorContract = applyPlaylistContractPatchV1(
+            row.contract_json,
+            patch,
+          );
+        }
       } catch (error) {
         if (error instanceof Error
           && error.message === "stale_playlist_contract_revision") {
@@ -7212,6 +12239,31 @@ export class Repository {
           400,
           `Track count must be from ${PUBLIC_PLAYLIST_MINIMUM_TRACKS} to ${EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS}`,
           "invalid_track_count",
+        );
+      }
+      if (guidanceRevision
+        && successorContract.requestedTrackCount
+          !== row.contract_json.requestedTrackCount) {
+        throw new HttpError(
+          409,
+          "Track count changes require a separate explicit count revision",
+          "count_revision_required",
+        );
+      }
+      const publishedAuthority = await client.query<{ id: string }>(
+        `SELECT revision.id
+         FROM manifests manifest
+         JOIN manifest_revisions revision
+           ON revision.manifest_id=manifest.id
+         WHERE manifest.run_id=$1 AND revision.status='published'
+         LIMIT 1 FOR SHARE OF revision`,
+        [input.runId],
+      );
+      if (publishedAuthority.rows[0]) {
+        throw new HttpError(
+          409,
+          "A published playlist cannot be silently replaced by guidance",
+          "published_guidance_revision_requires_new_request",
         );
       }
 
@@ -7284,7 +12336,7 @@ export class Repository {
         }
         selectionPlanV3 = projection.selectionPlanV3;
         queryPlan = createQueryPlanV3(selectionPlanV3, graphSnapshotId, {
-          schemaVersion: 4,
+          schemaVersion: CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
           briefContractVersion: 3,
           playlistContractRevisionId: successorContract.revisionId,
           playlistContractSemanticHash: successorContract.semanticHash,
@@ -7308,12 +12360,19 @@ export class Repository {
         : Number(row.estimated_cost_usd);
       const approvedBudgetUsd = Number(row.approved_budget_usd);
       const successorStatus: CanonicalRunSuccessorResult["status"] =
-        capabilityDecision
+        guidanceRevision?.reofferedQuestionSet
+          ? "needs_decision"
+          : capabilityDecision
           ? "needs_decision"
           : approvedBudgetUsd + 0.000001 < requiredBudgetUsd
             ? "awaiting_budget"
             : "queued";
-      const successorPhase = capabilityDecision
+      const successorPhase = guidanceRevision?.reofferedQuestionSet
+        ? guidanceRevision.reofferedQuestionSet
+            .showEditableInterpretationSummary
+          ? "interpretation_summary_required"
+          : "dependent_guidance_required"
+        : capabilityDecision
         ? "capability_decision_required"
         : successorStatus === "awaiting_budget"
           ? "budget_gate"
@@ -7343,6 +12402,12 @@ export class Repository {
       const successorContractDatabaseId = randomUUID();
       const selectionPlanId = selectionPlanV3 ? randomUUID() : null;
       const queryPlanRevisionId = queryPlan ? randomUUID() : null;
+      const guidanceAuditQuestionSetId = guidanceRevision
+        ? randomUUID()
+        : null;
+      const reofferedQuestionSetId = guidanceRevision?.reofferedQuestionSet
+        ? randomUUID()
+        : null;
       const nextBrief: PlaylistBrief = {
         ...structuredClone(row.brief_json),
         targetSize: {
@@ -7526,6 +12591,141 @@ export class Repository {
         ],
       );
 
+      if (rescueGuidanceAnswer) {
+        const executionDeltaHash = sha256Hex(stableStringify(
+          patch.operations,
+        ));
+        await client.query(
+          `INSERT INTO guidance_answer_sets(
+             id,brief_request_id,run_id,question_set_id,question_set_hash,
+             normalized_answers_json,raw_custom_answers_json,answer_hash,
+             execution_delta_json,execution_delta_hash,idempotency_key,
+             base_contract_revision_id,resulting_contract_revision_id,
+             resulting_selection_plan_id,resulting_query_plan_revision_id)
+           VALUES($1,NULL,$2,$3,$4,$5::jsonb,'[]'::jsonb,$6,$7::jsonb,$8,$9,
+                  $10,$11,$12,$13)`,
+          [
+            randomUUID(),
+            input.runId,
+            rescueGuidanceAnswer.questionSetId,
+            rescueGuidanceAnswer.questionSetHash,
+            JSON.stringify(rescueGuidanceAnswer.normalizedAnswers),
+            patch.answerLineage.answerHash,
+            JSON.stringify(patch.operations),
+            executionDeltaHash,
+            idempotencyKey,
+            input.expectedContractRevisionId,
+            successorContractDatabaseId,
+            selectionPlanId,
+            queryPlanRevisionId,
+          ],
+        );
+      }
+
+      if (guidanceRevision && guidanceAuditQuestionSetId) {
+        const executionDeltaHash = sha256Hex(stableStringify(
+          patch.operations,
+        ));
+        await client.query(
+          `INSERT INTO guidance_question_sets(
+             id,brief_request_id,run_id,revision,question_set_hash,
+             request_classification,generation_mode,guidance_policy_version,
+             locale,storefront,target_track_count,explicit_constraint_hash,
+             rejected_question_reasons_json,questions_json,active,
+             base_contract_revision_id,parent_question_set_id,
+             feasibility_snapshot_id,guidance_round,trigger,axis)
+           VALUES($1,NULL,$2,1,$3,'broad_curated','deterministic_critical',
+                  'adaptive_guidance_v3',$4,$5,$6,$7,'[]'::jsonb,$8::jsonb,
+                  false,$9,$10,NULL,'rescue','correctness',
+                  'earlier_answer_revision')`,
+          [
+            guidanceAuditQuestionSetId,
+            successorRunId,
+            patch.answerLineage.questionSetHash,
+            successorContract.locale,
+            successorContract.storefront,
+            successorContract.requestedTrackCount,
+            sha256Hex(stableStringify({
+              historicalBaseContractRevisionId:
+                guidanceRevision.historicalBaseContractRevisionId,
+              affectedClauseIds: guidanceRevision.questions.flatMap(
+                (question) => question.affectedClauseIds ?? [],
+              ),
+            })),
+            JSON.stringify(guidanceRevision.questions),
+            guidanceRevision.historicalBaseContractRevisionId,
+            guidanceRevision.sourceQuestionSetId,
+          ],
+        );
+        await client.query(
+          `INSERT INTO guidance_answer_sets(
+             id,brief_request_id,run_id,question_set_id,question_set_hash,
+             normalized_answers_json,raw_custom_answers_json,answer_hash,
+             execution_delta_json,execution_delta_hash,idempotency_key,
+             base_contract_revision_id,resulting_contract_revision_id,
+             resulting_selection_plan_id,resulting_query_plan_revision_id)
+           VALUES($1,NULL,$2,$3,$4,$5::jsonb,'[]'::jsonb,$6,$7::jsonb,$8,
+                  $9,$10,$11,$12,$13)`,
+          [
+            randomUUID(),
+            successorRunId,
+            guidanceAuditQuestionSetId,
+            patch.answerLineage.questionSetHash,
+            JSON.stringify(guidanceRevision.normalizedAnswers),
+            patch.answerLineage.answerHash,
+            JSON.stringify(patch.operations),
+            executionDeltaHash,
+            idempotencyKey,
+            guidanceRevision.historicalBaseContractRevisionId,
+            successorContractDatabaseId,
+            selectionPlanId,
+            queryPlanRevisionId,
+          ],
+        );
+      }
+
+      if (guidanceRevision?.reofferedQuestionSet
+        && reofferedQuestionSetId) {
+        const reoffered = guidanceRevision.reofferedQuestionSet;
+        await client.query(
+          `INSERT INTO guidance_question_sets(
+             id,brief_request_id,run_id,revision,question_set_hash,
+             request_classification,generation_mode,guidance_policy_version,
+             locale,storefront,target_track_count,explicit_constraint_hash,
+           rejected_question_reasons_json,questions_json,active,
+           base_contract_revision_id,parent_question_set_id,
+           feasibility_snapshot_id,guidance_round,trigger,axis)
+           VALUES($1,NULL,$2,2,$3,'broad_curated',$4,
+                  'adaptive_guidance_v3',$5,$6,$7,$8,$9::jsonb,$10::jsonb,
+                  true,$11,$12,NULL,'rescue',$13,$14)`,
+          [
+            reofferedQuestionSetId,
+            successorRunId,
+            reoffered.questionSetHash,
+            reoffered.showEditableInterpretationSummary
+              ? "interpretation_summary"
+              : "deterministic_critical",
+            successorContract.locale,
+            successorContract.storefront,
+            successorContract.requestedTrackCount,
+            sha256Hex(stableStringify({
+              contractSemanticHash: successorContract.semanticHash,
+              questionHashes: reoffered.questions.map(
+                (question) => question.questionHash,
+              ),
+            })),
+            JSON.stringify(reoffered.summaryReason
+              ? { summaryReason: reoffered.summaryReason }
+              : []),
+            JSON.stringify(reoffered.questions),
+            successorContractDatabaseId,
+            guidanceAuditQuestionSetId,
+            reoffered.trigger,
+            reoffered.axis,
+          ],
+        );
+      }
+
       await client.query(
         `INSERT INTO research_checkpoints(run_id,phase,state_json)
          VALUES($1,'canonical_predecessor',$2::jsonb)`,
@@ -7539,6 +12739,10 @@ export class Repository {
             sourceContractSemanticHash: input.expectedContractSemanticHash,
             sourceQueryPlanRevisionId: sourceQuery?.id ?? null,
             trigger: input.trigger,
+            ...(guidanceRevision ? {
+              guidanceRevisionRequestHash:
+                guidanceRevision.revisionRequestHash,
+            } : {}),
           }),
         ],
       );
@@ -7572,6 +12776,13 @@ export class Repository {
            AND NOT (answer_hash=ANY($2::text[]))`,
         [input.runId, lineageAnswerHashes],
       );
+      if (guidanceRevision?.invalidatedAnswerSetIds.length) {
+        await client.query(
+          `UPDATE guidance_answer_sets SET invalidated_at=now()
+           WHERE id=ANY($1::uuid[]) AND invalidated_at IS NULL`,
+          [guidanceRevision.invalidatedAnswerSetIds],
+        );
+      }
       await client.query(
         `UPDATE guidance_answer_sets SET
            resulting_contract_revision_id=COALESCE(
@@ -7601,6 +12812,14 @@ export class Repository {
          WHERE contract_revision_id=$1 AND invalidated_at IS NULL`,
         [input.expectedContractRevisionId],
       );
+      if (guidanceRevision?.invalidatedContractRevisionIds.length) {
+        await client.query(
+          `UPDATE playlist_feasibility_snapshots SET invalidated_at=now()
+           WHERE contract_revision_id=ANY($1::uuid[])
+             AND invalidated_at IS NULL`,
+          [guidanceRevision.invalidatedContractRevisionIds],
+        );
+      }
 
       if (row.contract_run_id === input.runId) {
         await client.query(
@@ -7617,6 +12836,15 @@ export class Repository {
       await client.query(
         `UPDATE query_plan_revisions SET status='superseded'
          WHERE run_id=$1 AND status='active'`,
+        [input.runId],
+      );
+      await client.query(
+        `UPDATE manifest_revisions revision
+         SET status='superseded'
+         FROM manifests manifest
+         WHERE revision.manifest_id=manifest.id
+           AND manifest.run_id=$1
+           AND revision.status IN ('draft','locked')`,
         [input.runId],
       );
       await client.query(
@@ -7652,7 +12880,43 @@ export class Repository {
         [input.runId, successorContractDatabaseId],
       );
 
-      if (capabilityDecision) {
+      if (guidanceRevision?.reofferedQuestionSet) {
+        const reoffered = guidanceRevision.reofferedQuestionSet;
+        await client.query(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,$4,$5,0,NULL,NULL,$6::jsonb)`,
+          [
+            randomUUID(),
+            successorRunId,
+            successorContractDatabaseId,
+            reoffered.showEditableInterpretationSummary
+              ? "scope_decision"
+              : "guidance",
+            `${reoffered.showEditableInterpretationSummary
+              ? "interpretation-summary"
+              : "reoffered"}:${reoffered.axis
+              ?? "dependent"}`.slice(0, 120),
+            JSON.stringify({
+              reasonCode: reoffered.showEditableInterpretationSummary
+                ? reoffered.summaryReason
+                : "dependent_guidance_reoffered",
+              questionSetHash:
+                reoffered.questionSetHash,
+              sourceQuestionSetId:
+                reoffered.sourceQuestionSetId,
+              contractSemanticHash: successorContract.semanticHash,
+              showEditableInterpretationSummary:
+                reoffered.showEditableInterpretationSummary,
+              interpretationSummary:
+                reoffered.showEditableInterpretationSummary
+                  ? playlistInterpretationSummaryV1(successorContract)
+                  : null,
+            }),
+          ],
+        );
+      } else if (capabilityDecision) {
         await client.query(
           `INSERT INTO playlist_run_blockers(
              id,run_id,contract_revision_id,blocker_kind,dependency_key,
@@ -8045,7 +13309,7 @@ export class Repository {
     approvedBudget?: number;
     noNewGapPasses?: number;
     error?: string | null;
-  }, fence?: PipelineV3WriteFence): Promise<void> {
+  }, fence?: PipelineWorkerWriteFence): Promise<void> {
     const costDelta = values.costDelta == null ? 0 : finiteMoney(values.costDelta, "Cost delta");
     const persistedError = values.error === undefined
       ? undefined
@@ -8080,7 +13344,7 @@ export class Repository {
     ];
     const result = fence
       ? await this.transaction(async (client) => {
-        await this.assertPipelineV3WriteFence(client, id, fence);
+        await assertPipelineWorkerWriteFence(this, client, id, fence);
         return await client.query(sql, parameters);
       })
       : await this.pool.query(sql, parameters);
@@ -8530,26 +13794,45 @@ export class Repository {
       contract_revision_id: string | null;
       contract_revision: number | null;
       contract_hash: string | null;
+      blocker_id: string | null;
       blocker_kind: string | null;
+      dependency_key: string | null;
       retry_count: number | null;
       next_retry_at: Date | null;
       automatic_retry_until: Date | null;
       blocker_state_json: Record<string, unknown> | null;
+      provider_checkpoint_state: Record<string, unknown> | null;
     }>(
       `SELECT
          contract.id contract_revision_id,
          contract.revision contract_revision,
          contract.contract_hash,
+         blocker.id blocker_id,
          blocker.blocker_kind,
+         blocker.dependency_key,
          blocker.retry_count,
          blocker.next_retry_at,
          blocker.automatic_retry_until,
-         blocker.state_json blocker_state_json
+         blocker.state_json blocker_state_json,
+         provider_checkpoint.state_json provider_checkpoint_state
        FROM research_runs run
        LEFT JOIN playlist_contract_revisions contract
          ON contract.id=run.active_playlist_contract_revision_id
        LEFT JOIN LATERAL (
-         SELECT blocker_kind,retry_count,next_retry_at,automatic_retry_until,state_json
+         SELECT checkpoint.state_json
+         FROM research_checkpoints checkpoint
+         WHERE checkpoint.run_id=run.id
+           AND checkpoint.phase IN (
+             'catalog_provider_blocker_v2',
+             'research_provider_blocker_v2'
+           )
+           AND checkpoint.state_json->>'resolvedAt' IS NULL
+         ORDER BY checkpoint.updated_at DESC,checkpoint.phase
+         LIMIT 1
+       ) provider_checkpoint ON true
+       LEFT JOIN LATERAL (
+         SELECT id,blocker_kind,dependency_key,retry_count,next_retry_at,
+                automatic_retry_until,state_json
          FROM playlist_run_blockers
          WHERE run_id=run.id AND resolved_at IS NULL
            AND (
@@ -8563,32 +13846,151 @@ export class Repository {
       [runId],
     );
     const row = result.rows[0];
-    const blockerKind = row?.blocker_kind ?? null;
+    const providerCheckpointState = row?.provider_checkpoint_state ?? {};
+    const providerCheckpointNextRetryAt = date(
+      providerCheckpointState.nextRetryAt,
+    );
+    const providerCheckpointAutomaticRetryUntil = date(
+      providerCheckpointState.automaticRetryUntil,
+    );
+    const providerCheckpointOpenedAt = date(
+      providerCheckpointState.openedAt,
+    );
+    const providerCheckpointFailureCount = Number(
+      providerCheckpointState.failureCount,
+    );
+    const providerCheckpointDependencyKey =
+      providerCheckpointState.dependencyKey;
+    const providerCheckpointReasonCode =
+      providerCheckpointState.reasonCode;
+    const providerCheckpointIdentityValid =
+      providerCheckpointDependencyKey === "apple_catalog"
+        ? (
+            (
+              providerCheckpointReasonCode === "apple_provider_circuit_open"
+              || providerCheckpointReasonCode === "apple_provider_degraded"
+              || providerCheckpointReasonCode
+                === "catalog_provider_call_limit"
+              || providerCheckpointReasonCode
+                === "catalog_discovery_timed_out"
+              || providerCheckpointReasonCode === "apple_lookup_transient"
+              || providerCheckpointReasonCode === "apple_lookup_timed_out"
+            )
+            && typeof providerCheckpointState.storefront === "string"
+            && /^[a-z]{2}$/u.test(providerCheckpointState.storefront)
+          )
+        : providerCheckpointDependencyKey === "openai_research"
+          && providerCheckpointReasonCode
+            === "research_provider_unavailable";
+    const providerCheckpointNextRetryAtValid =
+      providerCheckpointNextRetryAt !== null
+      && Number.isFinite(providerCheckpointNextRetryAt.getTime());
+    const providerCheckpointAutomaticRetryUntilValid =
+      providerCheckpointAutomaticRetryUntil !== null
+      && Number.isFinite(providerCheckpointAutomaticRetryUntil.getTime());
+    const providerCheckpointOpenedAtValid = providerCheckpointOpenedAt !== null
+      && Number.isFinite(providerCheckpointOpenedAt.getTime());
+    const providerCheckpoint = row?.blocker_kind == null
+      && providerCheckpointState.schemaVersion === 1
+      && providerCheckpointState.kind === "provider"
+      && providerCheckpointIdentityValid
+      && typeof providerCheckpointState.needsDecision === "boolean"
+      && providerCheckpointState.resolvedAt == null
+      && (providerCheckpointState.nextRetryAt == null
+        || providerCheckpointNextRetryAtValid)
+      && providerCheckpointAutomaticRetryUntilValid
+      && providerCheckpointOpenedAtValid
+      && providerCheckpointAutomaticRetryUntil!.getTime()
+        > providerCheckpointOpenedAt!.getTime()
+      && Number.isSafeInteger(providerCheckpointFailureCount)
+      && providerCheckpointFailureCount >= 1
+      && providerCheckpointFailureCount <= 20
+      ? {
+          nextRetryAt: providerCheckpointNextRetryAtValid
+            ? providerCheckpointNextRetryAt
+            : null,
+          automaticRetryUntil: providerCheckpointAutomaticRetryUntil!,
+          failureCount: providerCheckpointFailureCount,
+          needsDecision: providerCheckpointState.needsDecision === true
+            || providerCheckpointAutomaticRetryUntil.getTime() <= Date.now(),
+        }
+      : null;
+    const blockerKind = row?.blocker_kind
+      ?? (providerCheckpoint ? "provider" : null);
+    const blockerState = row?.blocker_state_json ?? {};
+    const blockerRetryAfter = date(blockerState.retryAfterUntil);
+    const blockerRetryAfterValid = blockerState.retryAfterUntil == null
+      || (blockerRetryAfter !== null
+        && Number.isFinite(blockerRetryAfter.getTime()));
     const guidanceRound = row?.blocker_state_json?.guidanceRound === "rescue"
       ? "rescue"
       : "initial";
-    const projected = blockerKind === "provider"
-      ? { state: "blocked_dependency" as const, nextAction: "wait_for_dependency" as const, terminal: false }
-      : blockerKind === "apple_authorization"
-        ? { state: "blocked_dependency" as const, nextAction: "authorize_apple" as const, terminal: false }
-        : blockerKind === "guidance"
+    const providerRetryWindowExpired = blockerKind === "provider"
+      && row?.automatic_retry_until instanceof Date
+      && Number.isFinite(row.automatic_retry_until.getTime())
+      && row.automatic_retry_until.getTime() <= Date.now();
+    const canonicalProviderDecision = providerRetryWindowExpired
+      && typeof row?.blocker_id === "string"
+      && blockerState.nextAction === "resume_revise_or_cancel"
+      && publicAdaptiveRunDecisionV1(blockerState)?.reason
+        === "dependency_retry_window_expired";
+    let projected: Pick<
+      RunResolutionView,
+      "state" | "nextAction" | "terminal"
+    >;
+    if (blockerKind === "provider") {
+      projected = canonicalProviderDecision
+        ? {
+            state: "needs_decision",
+            nextAction: "resume_research",
+            terminal: false,
+          }
+        : providerRetryWindowExpired || providerCheckpoint?.needsDecision
           ? {
-              state: "needs_input" as const,
-              nextAction: guidanceRound === "rescue"
-                ? "answer_rescue_guidance" as const
-                : "answer_initial_guidance" as const,
+              state: "needs_decision",
+              nextAction: "review_contract",
               terminal: false,
             }
-          : blockerKind === "scope_decision" || blockerKind === "budget"
-            ? { state: "needs_decision" as const, nextAction: "review_contract" as const, terminal: false }
-            : blockerKind === "integrity" || blockerKind === "publication_reconciliation"
-              ? { state: "quarantined" as const, nextAction: "contact_support" as const, terminal: false }
-              : projectNeverDeadEndRun({
-                  status,
-                  phase,
-                  retryableDependency: false,
-                  rescueQuestionsAvailable: true,
-                });
+          : {
+              state: "blocked_dependency",
+              nextAction: "wait_for_dependency",
+              terminal: false,
+            };
+    } else if (blockerKind === "apple_authorization") {
+      projected = {
+        state: "blocked_dependency",
+        nextAction: "authorize_apple",
+        terminal: false,
+      };
+    } else if (blockerKind === "guidance") {
+      projected = {
+        state: "needs_input",
+        nextAction: guidanceRound === "rescue"
+          ? "answer_rescue_guidance"
+          : "answer_initial_guidance",
+        terminal: false,
+      };
+    } else if (blockerKind === "scope_decision" || blockerKind === "budget") {
+      projected = {
+        state: "needs_decision",
+        nextAction: "review_contract",
+        terminal: false,
+      };
+    } else if (blockerKind === "integrity"
+      || blockerKind === "publication_reconciliation") {
+      projected = {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+      };
+    } else {
+      projected = projectNeverDeadEndRun({
+        status,
+        phase,
+        retryableDependency: false,
+        rescueQuestionsAvailable: true,
+      });
+    }
     return {
       ...projected,
       contractRevisionId: row?.contract_revision_id ?? null,
@@ -8596,9 +13998,37 @@ export class Repository {
       contractHash: row?.contract_hash ?? null,
       blocker: blockerKind ? {
         kind: blockerKind,
-        nextRetryAt: row?.next_retry_at?.toISOString() ?? null,
-        automaticRetryUntil: row?.automatic_retry_until?.toISOString() ?? null,
-        retryCount: Number(row?.retry_count ?? 0),
+        nextRetryAt: row?.next_retry_at?.toISOString()
+          ?? providerCheckpoint?.nextRetryAt?.toISOString()
+          ?? null,
+        automaticRetryUntil: row?.automatic_retry_until?.toISOString()
+          ?? providerCheckpoint?.automaticRetryUntil.toISOString()
+          ?? null,
+        retryCount: Number(
+          row?.retry_count
+          ?? providerCheckpoint?.failureCount
+          ?? 0,
+        ),
+        versionHash: canonicalProviderDecision
+          && row?.blocker_id
+          && row.dependency_key
+          && row.automatic_retry_until
+          && typeof blockerState.stage === "string"
+          && typeof blockerState.decisionHash === "string"
+          && typeof blockerState.nextAction === "string"
+          && blockerRetryAfterValid
+          ? dependencyResumeBlockerVersionV1({
+              id: row.blocker_id,
+              contractRevisionId: row.contract_revision_id!,
+              dependencyKey: row.dependency_key,
+              retryCount: Number(row.retry_count ?? 0),
+              automaticRetryUntil: row.automatic_retry_until,
+              retryAfterUntil: blockerRetryAfter,
+              stageKey: blockerState.stage,
+              decisionHash: blockerState.decisionHash,
+              nextAction: blockerState.nextAction,
+            })
+          : null,
       } : null,
     };
   }
@@ -8624,9 +14054,10 @@ export class Repository {
          FROM playlist_run_blockers
          WHERE run_id=run.id
            AND contract_revision_id=run.active_playlist_contract_revision_id
-           AND blocker_kind='scope_decision'
+           AND blocker_kind IN ('scope_decision','provider')
            AND resolved_at IS NULL
-         ORDER BY created_at DESC,id DESC
+         ORDER BY CASE blocker_kind WHEN 'provider' THEN 0 ELSE 1 END,
+                  created_at DESC,id DESC
          LIMIT 1
        ) blocker ON true
        WHERE run.id=$1 AND run.deleted_at IS NULL`,
@@ -8959,6 +14390,141 @@ export class Repository {
     });
   }
 
+  async getReleaseManifestCanaryEvidenceByAccess(
+    accessId: string,
+  ): Promise<ReleaseManifestCanaryEvidenceV1> {
+    const selected = await this.pool.query<{
+      run_id: string;
+      status: string;
+      phase: string;
+      pipeline_version: PipelineVersion;
+      auto_publish: boolean;
+      query_plan_json: unknown;
+      query_plan_revision_id: string | null;
+      stored_query_plan_hash: string | null;
+      active_contract_revision_database_id: string | null;
+      active_contract_revision_id: string | null;
+      active_contract_semantic_hash: string | null;
+      marker_json: unknown;
+      manifest_rows: number;
+      matching_jobs: number;
+      publication_jobs: number;
+      publication_volume_rows: number;
+    }>(
+      `SELECT run.id run_id,run.status,run.phase,run.pipeline_version,run.auto_publish,
+              query.plan_json query_plan_json,
+              active.query_plan_revision_id,
+              query.plan_hash stored_query_plan_hash,
+              run.active_playlist_contract_revision_id active_contract_revision_database_id,
+              contract.contract_json->>'revisionId' active_contract_revision_id,
+              contract.contract_hash active_contract_semantic_hash,
+              marker.state_json marker_json,
+              (SELECT count(*)::int FROM manifests WHERE run_id=run.id) manifest_rows,
+              (SELECT count(*)::int FROM job_queue
+               WHERE run_id=run.id AND kind='matching') matching_jobs,
+              (SELECT count(*)::int FROM job_queue
+               WHERE run_id=run.id AND kind='publication') publication_jobs,
+              (SELECT count(*)::int FROM publication_volumes volume
+               JOIN manifests manifest ON manifest.id=volume.manifest_id
+               WHERE manifest.run_id=run.id) publication_volume_rows
+       FROM run_accesses access
+       JOIN research_runs run ON run.id=access.run_id AND run.deleted_at IS NULL
+       LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+       LEFT JOIN query_plan_revisions query ON query.id=active.query_plan_revision_id
+       LEFT JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+       LEFT JOIN research_checkpoints marker
+         ON marker.run_id=run.id AND marker.phase=$2
+       WHERE access.id=$1 AND access.deleted_at IS NULL AND access.expires_at>now()`,
+      [accessId, RELEASE_MANIFEST_CANARY_MARKER_PHASE],
+    );
+    const row = selected.rows[0];
+    if (!row) throw new HttpError(404, "Research run not found", "run_not_found");
+    const marker = parseReleaseManifestCanaryMarker(row.marker_json);
+    if (!marker) {
+      throw new HttpError(
+        409,
+        "This run is not a valid staging manifest-only release canary",
+        "release_manifest_canary_unavailable",
+      );
+    }
+    const [checkpoint, attempts] = await Promise.all([
+      this.getResearchCheckpoint(row.run_id, marker.stageKey),
+      this.pool.query<{
+        stage: string;
+        contract_revision_id: string;
+        query_plan_revision_id: string;
+        executor_revision: string;
+        executor_identity_hash: string;
+        configuration_hash: string;
+        status: "complete";
+        completed_at: Date;
+      }>(
+        `SELECT stage,contract_revision_id,query_plan_revision_id,
+                executor_revision,executor_identity_hash,configuration_hash,
+                status,completed_at
+         FROM playlist_execution_attempts
+         WHERE run_id=$1 AND contract_revision_id=$2
+           AND query_plan_revision_id=$3 AND stage=$4
+           AND status='complete' AND completed_at IS NOT NULL
+         ORDER BY completed_at,id`,
+        [
+          row.run_id,
+          marker.contractRevisionDatabaseId,
+          marker.queryPlanRevisionId,
+          marker.stageKey,
+        ],
+      ),
+    ]);
+    if (!isQueryPlanV3(row.query_plan_json)) {
+      throw new HttpError(
+        409,
+        "The manifest-only canary query plan is unavailable",
+        "release_manifest_canary_integrity",
+      );
+    }
+    try {
+      return buildReleaseManifestCanaryEvidence({
+        marker,
+        runStatus: row.status,
+        runPhase: row.phase,
+        pipelineVersion: row.pipeline_version,
+        autoPublish: row.auto_publish,
+        queryPlan: row.query_plan_json,
+        activeQueryPlanRevisionId: row.query_plan_revision_id,
+        storedQueryPlanHash: row.stored_query_plan_hash,
+        activeContractRevisionDatabaseId:
+          row.active_contract_revision_database_id,
+        activeContractRevisionId: row.active_contract_revision_id,
+        activeContractSemanticHash: row.active_contract_semantic_hash,
+        checkpoint,
+        attempts: attempts.rows.map((attempt) => ({
+          stage: attempt.stage,
+          contractRevisionDatabaseId: attempt.contract_revision_id,
+          queryPlanRevisionId: attempt.query_plan_revision_id,
+          executorRevision: attempt.executor_revision,
+          executorIdentityHash: attempt.executor_identity_hash,
+          configurationHash: attempt.configuration_hash,
+          status: attempt.status,
+          completedAt: attempt.completed_at.toISOString(),
+        })),
+        zeroWriteCounts: {
+          autoPublish: row.auto_publish,
+          manifestRows: Number(row.manifest_rows),
+          matchingJobs: Number(row.matching_jobs),
+          publicationJobs: Number(row.publication_jobs),
+          publicationVolumeRows: Number(row.publication_volume_rows),
+        },
+      });
+    } catch (error) {
+      throw new HttpError(
+        409,
+        error instanceof Error ? error.message : "Manifest-only canary evidence is invalid",
+        "release_manifest_canary_incomplete",
+      );
+    }
+  }
+
   async listRunsForCapabilitySession(sessionId: string, limit = 50): Promise<ResearchRunHistoryItem[]> {
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), 50));
     const result = await this.pool.query(
@@ -9152,13 +14718,29 @@ export class Repository {
     return ids;
   }
 
-  async addSources(runId: string, sources: SourceRecordInput[]): Promise<Map<string, string>> {
-    return this.transaction((client) => this.addSourcesInTransaction(client, runId, sources));
+  async addSources(
+    runId: string,
+    sources: SourceRecordInput[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<Map<string, string>> {
+    return this.transaction(async (client) => {
+      if (authority) {
+        await assertResearchProviderWriteFence(client, runId, authority);
+      }
+      return this.addSourcesInTransaction(client, runId, sources);
+    });
   }
 
-  async addCitationAttestations(runId: string, attestations: readonly HostedCitationAttestation[]): Promise<void> {
+  async addCitationAttestations(
+    runId: string,
+    attestations: readonly HostedCitationAttestation[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<void> {
     if (attestations.length === 0) return;
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertResearchProviderWriteFence(client, runId, authority);
+      }
       for (const raw of attestations.slice(0, 1_000)) {
         const sourceUrl = assertPublicHttpsUrl(raw.sourceUrl).toString();
         if (!raw.responseId || raw.responseId.length > 240 || !raw.outputItemId || raw.outputItemId.length > 240
@@ -9633,8 +15215,25 @@ export class Repository {
     return added;
   }
 
-  async addCandidates(runId: string, candidates: TrackCandidateInput[], sourceIds: Map<string, string>, verificationPhase = "unverified"): Promise<number> {
-    return this.transaction((client) => this.addCandidatesInTransaction(client, runId, candidates, sourceIds, verificationPhase));
+  async addCandidates(
+    runId: string,
+    candidates: TrackCandidateInput[],
+    sourceIds: Map<string, string>,
+    verificationPhase = "unverified",
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<number> {
+    return this.transaction(async (client) => {
+      if (authority) {
+        await assertResearchProviderWriteFence(client, runId, authority);
+      }
+      return this.addCandidatesInTransaction(
+        client,
+        runId,
+        candidates,
+        sourceIds,
+        verificationPhase,
+      );
+    });
   }
 
   private async upsertFrontierInTransaction(client: PoolClient, runId: string, items: SourceFrontierItem[]): Promise<void> {
@@ -9649,8 +15248,17 @@ export class Repository {
     }
   }
 
-  async upsertFrontier(runId: string, items: SourceFrontierItem[]): Promise<void> {
-    await this.transaction((client) => this.upsertFrontierInTransaction(client, runId, items));
+  async upsertFrontier(
+    runId: string,
+    items: SourceFrontierItem[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<void> {
+    await this.transaction(async (client) => {
+      if (authority) {
+        await assertResearchProviderWriteFence(client, runId, authority);
+      }
+      await this.upsertFrontierInTransaction(client, runId, items);
+    });
   }
 
   /**
@@ -10350,8 +15958,15 @@ export class Repository {
     return { candidateCount: run.candidateCount, eligibleCandidateCount, sourceCount: run.sourceCount, unresolvedCount: run.unresolvedCount, frontier: run.frontier, containers, existingKeys: keys.rows.map((row) => row.canonical_key) };
   }
 
-  async upsertResearchContainers(runId: string, items: ResearchContainerInput[]): Promise<void> {
+  async upsertResearchContainers(
+    runId: string,
+    items: ResearchContainerInput[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<void> {
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertResearchProviderWriteFence(client, runId, authority);
+      }
       for (const item of items) {
         await client.query(
           `INSERT INTO research_containers(
@@ -10510,9 +16125,16 @@ export class Repository {
       }));
   }
 
-  async saveMatch(runId: string, match: CatalogMatchResult): Promise<void> {
+  async saveMatch(
+    runId: string,
+    match: CatalogMatchResult,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<void> {
     const normalizedScore = normalizedCatalogMatchScore(match.score);
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query("SELECT id FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
       const candidate = await client.query(
@@ -10553,13 +16175,21 @@ export class Repository {
     });
   }
 
-  async saveTimeoutMatches(runId: string, candidateIds: string[], basis: string): Promise<void> {
+  async saveTimeoutMatches(
+    runId: string,
+    candidateIds: string[],
+    basis: string,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<void> {
     if (candidateIds.length === 0) return;
     const uniqueCandidateIds = [...new Set(candidateIds)];
     if (uniqueCandidateIds.length !== candidateIds.length) {
       throw new HttpError(409, "Timed-out catalog candidates must be unique", "catalog_candidate_duplicate");
     }
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query("SELECT id FROM research_runs WHERE id=$1 FOR UPDATE", [runId]);
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
       const scoped = await client.query<{ id: string }>(
@@ -10858,6 +16488,7 @@ export class Repository {
     storefront: string,
     currentGeneration: number,
     currentRefillGeneration = 0,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<"queued" | "in_flight" | "not_needed" | "exhausted"> {
     if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
     const generation = Number.isInteger(currentGeneration)
@@ -10867,6 +16498,9 @@ export class Repository {
       ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, currentRefillGeneration))
       : 0;
     return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query<{ auto_publish: boolean; status: string; brief_json: PlaylistBrief }>(
         "SELECT auto_publish,status,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
@@ -10960,6 +16594,7 @@ export class Repository {
       desiredArtistCount: 0,
       representedArtists: [],
     },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<"queued" | "in_flight" | "not_needed" | "exhausted"> {
     if (!/^[a-z]{2}$/iu.test(storefront)) throw new HttpError(400, "Apple storefront is invalid", "invalid_storefront");
     const boundedGoal = Math.max(1, Math.min(120, Math.floor(additionalCandidateGoal)));
@@ -10967,6 +16602,9 @@ export class Repository {
       ? Math.max(0, Math.min(FAST_POST_MATCH_REFILL_LIMIT, currentRefillGeneration))
       : 0;
     return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query<{ auto_publish: boolean; status: string; brief_json: PlaylistBrief }>(
         "SELECT auto_publish,status,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
@@ -11122,8 +16760,12 @@ export class Repository {
   async finalizeCatalogSelection(
     runId: string,
     input: CatalogSelectionInput,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<PlaylistManifest & { contentHash: string; lockedAt: string }> {
     return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const runResult = await client.query<{ status: string; phase: string; brief_json: PlaylistBrief }>(
         "SELECT status,phase,brief_json FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
@@ -12322,7 +17964,7 @@ export class Repository {
       const contractPolicy = plan?.canonicalContractPolicy;
       const queryContractPolicy = queryPlan?.canonicalContractPolicy;
       const contractBound = Boolean(
-        queryPlan?.schemaVersion === 4
+        isCanonicalQueryPlanV3SchemaVersion(queryPlan?.schemaVersion)
         && contractPolicy
         && queryContractPolicy
         && row.active_contract_revision_id
@@ -12352,6 +17994,10 @@ export class Repository {
           === stableStringify(plan),
       );
       if (!contractBound) fail("canonical_publication_contract_stale");
+      if (!contractPolicy) fail("canonical_publication_contract_stale");
+      const canonicalPolicy = contractPolicy as NonNullable<
+        SelectionPlanV3["canonicalContractPolicy"]
+      >;
       if (row.revision_content_hash !== input.manifestRevisionHash) {
         fail("canonical_manifest_revision_hash_stale");
       }
@@ -12391,10 +18037,12 @@ export class Repository {
 
       const qualifications = await client.query<{
         candidate_id: string;
+        stable_identity_hash: string;
+        qualification_hash: string;
         artist: string;
         title: string;
         album: string | null;
-        family_key: string;
+        recording_family_key: string;
         decision: string;
         revoked_at: Date | null;
         predicate_results_json: unknown;
@@ -12402,8 +18050,13 @@ export class Repository {
         quality_result_json: unknown;
         catalog_result_json: unknown;
       }>(
-        `SELECT qualification.candidate_id,candidate.artist,candidate.title,
-                candidate.album,family.family_key,qualification.decision,
+        `SELECT qualification.candidate_id,
+                qualification.stable_identity_hash,
+                qualification.qualification_hash,
+                candidate.artist,candidate.title,
+                candidate.album,
+                family.family_key recording_family_key,
+                qualification.decision,
                 qualification.revoked_at,
                 qualification.predicate_results_json,
                 qualification.evidence_record_ids_json,
@@ -12422,8 +18075,6 @@ export class Repository {
            AND lower(qualification.storefront)=lower($4)
            AND qualification.decision='qualified'
            AND qualification.revoked_at IS NULL
-           AND qualification.quality_result_json->>'verdict'='pass'
-           AND qualification.catalog_result_json->>'verdict'='pass'
          ORDER BY qualification.candidate_id,
                   qualification.qualified_at DESC,qualification.id DESC
          FOR SHARE OF qualification,candidate,family`,
@@ -12434,17 +18085,54 @@ export class Repository {
           plan.storefront,
         ],
       );
+      const persistedEvidence = await client.query<
+        PersistedPipelineV3EvidenceBindingRow
+      >(
+        `SELECT binding.candidate_id,binding.source_url,
+                source.provenance_root,binding.binding_kind,
+                binding.confidence,binding.provenance_path_json
+         FROM track_scope_bindings binding
+         JOIN source_records source
+           ON source.id=binding.source_record_id
+          AND source.run_id=binding.run_id
+          AND source.url=binding.source_url
+         WHERE binding.run_id=$1
+           AND binding.candidate_id=ANY($2::uuid[])
+           AND binding.eligibility='qualifying'
+           AND binding.pipeline_version='corpus_first_v3'
+         ORDER BY binding.candidate_id,binding.id
+         FOR SHARE OF binding,source`,
+        [
+          input.runId,
+          manifestTracks.map(({ candidateId }) => candidateId),
+        ],
+      );
+      const evidenceIntegrityReason = persistedCanonicalEvidenceIntegrityReason({
+        storefront: plan.storefront,
+        canonicalPolicy,
+        candidateIds: manifestTracks.map(({ candidateId }) => candidateId),
+        qualifications: qualifications.rows,
+        bindings: persistedEvidence.rows,
+      });
+      if (evidenceIntegrityReason) fail(evidenceIntegrityReason);
+      const persistedBindingsByCandidate =
+        persistedPipelineV3EvidenceBindingIndex(
+          persistedEvidence.rows,
+        ).bindingsByCandidate;
       const currentQualifications: PersistedCanonicalQualificationV1[] =
         qualifications.rows.map((qualification) => ({
           candidateId: qualification.candidate_id,
           artist: qualification.artist,
           title: qualification.title,
           album: qualification.album,
-          recordingFamilyKey: qualification.family_key,
+          recordingFamilyKey: qualification.recording_family_key,
           decision: qualification.decision,
           revokedAt: qualification.revoked_at,
           predicateResults: qualification.predicate_results_json,
           evidenceRecordIds: qualification.evidence_record_ids_json,
+          evidenceBindings: persistedBindingsByCandidate.get(
+            qualification.candidate_id,
+          ) ?? [],
           qualityResult: qualification.quality_result_json,
           catalogResult: qualification.catalog_result_json,
         }));
@@ -12571,23 +18259,127 @@ export class Repository {
       }
       const revisionContract = await this.pool.query<{
         selection_plan_snapshot_json: SelectionPlanV3;
+        query_plan_json: QueryPlanV3 | null;
+        contract_revision_id: string | null;
       }>(
-        `SELECT selection_plan_snapshot_json
-         FROM manifest_revisions
-         WHERE id=$1 AND manifest_id=$2 AND pipeline_version='corpus_first_v3'`,
+        `SELECT revision.selection_plan_snapshot_json,
+                query.plan_json query_plan_json,
+                manifest.contract_revision_id
+         FROM manifest_revisions revision
+         JOIN manifests manifest
+           ON manifest.id=revision.manifest_id
+         LEFT JOIN query_plan_revisions query
+           ON query.id=revision.query_plan_revision_id
+         WHERE revision.id=$1 AND revision.manifest_id=$2
+           AND revision.pipeline_version='corpus_first_v3'`,
         [input.manifestRevisionId, input.manifestId],
       );
       const selectionPlan = revisionContract.rows[0]?.selection_plan_snapshot_json;
-      const requiredPredicates = selectionPlan
-        ? evidenceMembershipPredicatesV3(selectionPlan)
-        : [];
-      if (!selectionPlan || requiredPredicates.length === 0) {
+      const guardQueryPlan = revisionContract.rows[0]?.query_plan_json;
+      if (!selectionPlan) {
         throw new HttpError(
           409,
           "Pipeline V3 publication is blocked because its immutable membership contract is missing",
           "pipeline_v3_evidence_attestation_missing",
         );
       }
+      const canonicalTreeGuard = isCanonicalQueryPlanV3SchemaVersion(
+        guardQueryPlan?.schemaVersion,
+      )
+        && Boolean(selectionPlan.canonicalContractPolicy)
+        && Boolean(guardQueryPlan.canonicalContractPolicy);
+      if (canonicalTreeGuard) {
+        const canonicalPolicy = selectionPlan.canonicalContractPolicy;
+        const contractRevisionId =
+          revisionContract.rows[0]?.contract_revision_id;
+        const manifestTracks = await this.pool.query<{ candidate_id: string }>(
+          `SELECT candidate_id
+           FROM manifest_revision_tracks
+           WHERE manifest_revision_id=$1
+           ORDER BY position`,
+          [input.manifestRevisionId],
+        );
+        if (!canonicalPolicy
+          || !contractRevisionId
+          || manifestTracks.rows.length !== input.selectedCount) {
+          throw new HttpError(
+            409,
+            "Pipeline V3 canonical evidence authority is incomplete",
+            "pipeline_v3_evidence_attestation_missing",
+          );
+        }
+        const candidateIds = manifestTracks.rows.map(
+          ({ candidate_id }) => candidate_id,
+        );
+        const [qualifications, persistedEvidence] = await Promise.all([
+          this.pool.query<PersistedPipelineV3QualificationEvidenceRow>(
+            `SELECT qualification.candidate_id,
+                    qualification.stable_identity_hash,
+                    qualification.qualification_hash,
+                    qualification.decision,
+                    family.family_key recording_family_key,
+                    qualification.predicate_results_json,
+                    qualification.evidence_record_ids_json,
+                    qualification.quality_result_json,
+                    qualification.catalog_result_json
+             FROM playlist_qualification_records qualification
+             JOIN track_candidates candidate
+               ON candidate.id=qualification.candidate_id
+              AND candidate.run_id=qualification.run_id
+             JOIN recording_families family
+               ON family.id=candidate.recording_family_id
+              AND family.run_id=qualification.run_id
+             WHERE qualification.run_id=$1
+               AND qualification.contract_revision_id=$2
+               AND qualification.candidate_id=ANY($3::uuid[])
+               AND qualification.decision='qualified'
+               AND qualification.revoked_at IS NULL
+             ORDER BY qualification.candidate_id,
+                      qualification.qualified_at DESC,qualification.id DESC`,
+            [input.runId, contractRevisionId, candidateIds],
+          ),
+          this.pool.query<PersistedPipelineV3EvidenceBindingRow>(
+            `SELECT binding.candidate_id,binding.source_url,
+                    source.provenance_root,binding.binding_kind,
+                    binding.confidence,binding.provenance_path_json
+             FROM track_scope_bindings binding
+             JOIN source_records source
+               ON source.id=binding.source_record_id
+              AND source.run_id=binding.run_id
+              AND source.url=binding.source_url
+             WHERE binding.run_id=$1
+               AND binding.candidate_id=ANY($2::uuid[])
+               AND binding.eligibility='qualifying'
+               AND binding.pipeline_version='corpus_first_v3'
+             ORDER BY binding.candidate_id,binding.id`,
+            [input.runId, candidateIds],
+          ),
+        ]);
+        const evidenceIntegrityReason =
+          persistedCanonicalEvidenceIntegrityReason({
+            storefront: selectionPlan.storefront,
+            canonicalPolicy,
+            candidateIds,
+            qualifications: qualifications.rows,
+            bindings: persistedEvidence.rows,
+          });
+        if (evidenceIntegrityReason) {
+          throw new HttpError(
+            409,
+            `Pipeline V3 canonical hosted evidence is missing, stale, revoked, or corrupt (${evidenceIntegrityReason})`,
+            "pipeline_v3_evidence_attestation_missing",
+          );
+        }
+      }
+      if (!canonicalTreeGuard) {
+        const requiredPredicates = evidenceMembershipPredicatesV3(selectionPlan);
+        if (requiredPredicates.length === 0) {
+          throw new HttpError(
+            409,
+            "Pipeline V3 publication is blocked because its immutable membership contract is missing",
+            "pipeline_v3_evidence_attestation_missing",
+          );
+        }
       const evidence = await this.pool.query<{
         position: number;
         candidate_id: string;
@@ -12665,6 +18457,7 @@ export class Repository {
           "Pipeline V3 publication is blocked because every manifest track must attest every required membership predicate",
           "pipeline_v3_evidence_attestation_missing",
         );
+      }
       }
     }
     if (!shortManifestRequiresDecision(requestedTrackCount, input.selectedCount)) {
@@ -12760,35 +18553,52 @@ export class Repository {
 
   async createPublicationVolume(input: PublicationVolumeInput): Promise<any> {
     const id = randomUUID();
-    const result = await this.pool.query(
-      `INSERT INTO publication_volumes(
-         id,manifest_id,manifest_revision_id,volume_number,volume_count,start_position,end_position,status)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT(manifest_id,volume_number) DO UPDATE SET updated_at=now()
-       WHERE publication_volumes.manifest_revision_id IS NOT DISTINCT FROM EXCLUDED.manifest_revision_id
-         AND publication_volumes.volume_count=EXCLUDED.volume_count
-         AND publication_volumes.start_position=EXCLUDED.start_position
-         AND publication_volumes.end_position=EXCLUDED.end_position
-       RETURNING *`,
-      [
-        id,
-        input.manifestId,
-        input.manifestRevisionId ?? null,
-        input.volumeNumber,
-        input.volumeCount,
-        input.startPosition,
-        input.endPosition,
-        input.status ?? "queued",
-      ],
-    );
-    if (!result.rows[0]) {
-      throw new HttpError(
-        409,
-        "Publication volume belongs to a different manifest revision or immutable range",
-        "publication_revision_conflict",
+    return this.transaction(async (client) => {
+      if (input.publicationAuthority) {
+        await this.assertPublicationReconciliationAuthority(
+          client,
+          input.publicationAuthority,
+        );
+        if (input.publicationAuthority.manifestId !== input.manifestId
+          || input.publicationAuthority.manifestRevisionId
+            !== (input.manifestRevisionId ?? null)) {
+          throw new HttpError(
+            409,
+            "Publication volume authority is stale",
+            "publication_reconciliation_stale",
+          );
+        }
+      }
+      const result = await client.query(
+        `INSERT INTO publication_volumes(
+           id,manifest_id,manifest_revision_id,volume_number,volume_count,start_position,end_position,status)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT(manifest_id,volume_number) DO UPDATE SET updated_at=now()
+         WHERE publication_volumes.manifest_revision_id IS NOT DISTINCT FROM EXCLUDED.manifest_revision_id
+           AND publication_volumes.volume_count=EXCLUDED.volume_count
+           AND publication_volumes.start_position=EXCLUDED.start_position
+           AND publication_volumes.end_position=EXCLUDED.end_position
+         RETURNING *`,
+        [
+          id,
+          input.manifestId,
+          input.manifestRevisionId ?? null,
+          input.volumeNumber,
+          input.volumeCount,
+          input.startPosition,
+          input.endPosition,
+          input.status ?? "queued",
+        ],
       );
-    }
-    return result.rows[0];
+      if (!result.rows[0]) {
+        throw new HttpError(
+          409,
+          "Publication volume belongs to a different manifest revision or immutable range",
+          "publication_revision_conflict",
+        );
+      }
+      return result.rows[0];
+    });
   }
 
   async retirePublicationVolume(input: {
@@ -12796,12 +18606,32 @@ export class Repository {
     publicationVolumeId: string;
     applePlaylistId?: string | null;
     reason: string;
+    publicationAuthority?: BeginPublicationReconciliationInput;
   }): Promise<string | null> {
     return this.transaction(async (client) => {
+      if (input.publicationAuthority) {
+        await this.assertPublicationReconciliationAuthority(
+          client,
+          input.publicationAuthority,
+        );
+        if (input.publicationAuthority.manifestId !== input.manifestId) {
+          throw new HttpError(
+            409,
+            "Publication retirement authority is stale",
+            "publication_reconciliation_stale",
+          );
+        }
+      }
       const locked = await client.query<{ apple_playlist_id: string | null }>(
         `SELECT apple_playlist_id FROM publication_volumes
-         WHERE id=$1 AND manifest_id=$2 FOR UPDATE`,
-        [input.publicationVolumeId, input.manifestId],
+         WHERE id=$1 AND manifest_id=$2
+           AND ($3::uuid IS NULL OR manifest_revision_id=$3)
+         FOR UPDATE`,
+        [
+          input.publicationVolumeId,
+          input.manifestId,
+          input.publicationAuthority?.manifestRevisionId ?? null,
+        ],
       );
       if (!locked.rows[0]) return null;
       const applePlaylistId = locked.rows[0].apple_playlist_id ?? input.applePlaylistId;
@@ -12826,13 +18656,31 @@ export class Repository {
     });
   }
 
-  async hidePublicPlaylistsForRun(runId: string): Promise<number> {
-    const result = await this.pool.query(
-      `UPDATE public_playlists SET status='hidden',hidden_at=COALESCE(hidden_at,now()),updated_at=now()
-       WHERE run_id=$1 AND status='listed' AND hidden_at IS NULL`,
-      [runId],
-    );
-    return result.rowCount ?? 0;
+  async hidePublicPlaylistsForRun(
+    runId: string,
+    publicationAuthority?: BeginPublicationReconciliationInput,
+  ): Promise<number> {
+    return this.transaction(async (client) => {
+      if (publicationAuthority) {
+        await this.assertPublicationReconciliationAuthority(
+          client,
+          publicationAuthority,
+        );
+        if (publicationAuthority.runId !== runId) {
+          throw new HttpError(
+            409,
+            "Public listing authority is stale",
+            "publication_reconciliation_stale",
+          );
+        }
+      }
+      const result = await client.query(
+        `UPDATE public_playlists SET status='hidden',hidden_at=COALESCE(hidden_at,now()),updated_at=now()
+         WHERE run_id=$1 AND status='listed' AND hidden_at IS NULL`,
+        [runId],
+      );
+      return result.rowCount ?? 0;
+    });
   }
 
   async updatePublicationVolume(id: string, patch: {
@@ -12843,16 +18691,43 @@ export class Repository {
     attemptDelta?: number;
     lastError?: string | null;
     publishedAt?: Date | null;
-  }): Promise<void> {
+  }, publicationAuthority?: BeginPublicationReconciliationInput): Promise<void> {
     const persistedLastError = sanitizeOptionalFailure(patch.lastError, "publication");
-    const result = await this.pool.query(
-      `UPDATE publication_volumes SET status=COALESCE($2,status),apple_playlist_id=CASE WHEN $3::boolean THEN $4 ELSE apple_playlist_id END,
-       apple_share_url=CASE WHEN $5::boolean THEN $6 ELSE apple_share_url END,appended_count=COALESCE($7,appended_count),
-       attempt=attempt+$8,last_error=CASE WHEN $9::boolean THEN $10 ELSE last_error END,
-       published_at=CASE WHEN $11::boolean THEN $12 ELSE published_at END,updated_at=now() WHERE id=$1`,
-      [id, patch.status ?? null, patch.applePlaylistId !== undefined, patch.applePlaylistId ?? null, patch.appleShareUrl !== undefined, patch.appleShareUrl ?? null, patch.appendedCount ?? null, patch.attemptDelta ?? 0, patch.lastError !== undefined, persistedLastError ?? null, patch.publishedAt !== undefined, patch.publishedAt ?? null],
-    );
-    if (!result.rowCount) throw new HttpError(404, "Publication volume not found", "publication_not_found");
+    await this.transaction(async (client) => {
+      if (publicationAuthority) {
+        await this.assertPublicationReconciliationAuthority(
+          client,
+          publicationAuthority,
+        );
+      }
+      const result = await client.query(
+        `UPDATE publication_volumes SET status=COALESCE($2,status),apple_playlist_id=CASE WHEN $3::boolean THEN $4 ELSE apple_playlist_id END,
+         apple_share_url=CASE WHEN $5::boolean THEN $6 ELSE apple_share_url END,appended_count=COALESCE($7,appended_count),
+         attempt=attempt+$8,last_error=CASE WHEN $9::boolean THEN $10 ELSE last_error END,
+         published_at=CASE WHEN $11::boolean THEN $12 ELSE published_at END,updated_at=now()
+         WHERE id=$1
+           AND ($13::uuid IS NULL OR (
+             manifest_id=$14 AND manifest_revision_id=$13
+           ))`,
+        [
+          id,
+          patch.status ?? null,
+          patch.applePlaylistId !== undefined,
+          patch.applePlaylistId ?? null,
+          patch.appleShareUrl !== undefined,
+          patch.appleShareUrl ?? null,
+          patch.appendedCount ?? null,
+          patch.attemptDelta ?? 0,
+          patch.lastError !== undefined,
+          persistedLastError ?? null,
+          patch.publishedAt !== undefined,
+          patch.publishedAt ?? null,
+          publicationAuthority?.manifestRevisionId ?? null,
+          publicationAuthority?.manifestId ?? null,
+        ],
+      );
+      if (!result.rowCount) throw new HttpError(404, "Publication volume not found", "publication_not_found");
+    });
   }
 
   /**
@@ -12864,6 +18739,16 @@ export class Repository {
     const supportsPublicationReconciliation =
       Number(await this.getSchemaVersion() ?? 0) >= 18;
     const contractPairComplete = (input.contractRevisionId === null) === (input.contractHash === null);
+    const executionFence = input.executionFence;
+    const executionFenceValid = executionFence !== null
+      && UUID_PATTERN.test(executionFence.executionAttemptId)
+      && UUID_PATTERN.test(executionFence.jobId)
+      && Boolean(executionFence.workerId.trim())
+      && executionFence.workerId.length <= 160
+      && Number.isSafeInteger(executionFence.leaseGeneration)
+      && executionFence.leaseGeneration >= 1
+      && Boolean(executionFence.stageKey.trim())
+      && executionFence.stageKey.length <= 160;
     const validVolumes = input.publicationVolumes.length > 0
       && input.publicationVolumes.every((volume) => (
         /^[0-9a-f]{8}-[0-9a-f-]{27,}$/iu.test(volume.publicationVolumeId)
@@ -12887,6 +18772,7 @@ export class Repository {
         && !/^[0-9a-f]{8}-[0-9a-f-]{27,}$/iu.test(input.contractRevisionId))
       || (input.contractHash !== null && !/^[a-f0-9]{64}$/iu.test(input.contractHash))
       || !contractPairComplete
+      || (executionFence !== null && !executionFenceValid)
       || !Number.isInteger(input.selectedCount)
       || input.selectedCount < 1
       || input.selectedCount > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
@@ -13062,6 +18948,118 @@ export class Repository {
           "manifest_contract_stale",
         );
       }
+      let publicationReconciliationId: string | null = null;
+      if (contractRequired) {
+        if (!supportsPublicationReconciliation
+          || !executionFenceValid
+          || !executionFence
+          || !input.contractRevisionId
+          || !input.manifestRevisionId) {
+          throw new HttpError(
+            409,
+            "Canonical publication completion execution fence is missing",
+            "publication_execution_stale",
+          );
+        }
+        const authority = await client.query<{
+          attempt_contract_revision_id: string;
+          attempt_status: string;
+          attempt_stage: string;
+          attempt_lease_generation: number;
+          attempt_idempotency_key: string;
+          job_status: string;
+          job_lease_owner: string | null;
+          job_lease_epoch: number;
+          job_stage_key: string;
+          job_lease_active: boolean;
+        }>(
+          `SELECT attempt.contract_revision_id attempt_contract_revision_id,
+                  attempt.status attempt_status,attempt.stage attempt_stage,
+                  attempt.lease_generation attempt_lease_generation,
+                  attempt.idempotency_key attempt_idempotency_key,
+                  job.status job_status,job.lease_owner job_lease_owner,
+                  job.lease_epoch job_lease_epoch,job.stage_key job_stage_key,
+                  job.lease_expires_at>now() job_lease_active
+           FROM playlist_execution_attempts attempt
+           JOIN job_queue job ON job.id=$2 AND job.run_id=attempt.run_id
+           WHERE attempt.id=$1 AND attempt.run_id=$3
+           FOR UPDATE OF attempt,job`,
+          [
+            executionFence.executionAttemptId,
+            executionFence.jobId,
+            input.runId,
+          ],
+        );
+        const active = authority.rows[0];
+        if (!active
+          || active.attempt_contract_revision_id !== input.contractRevisionId
+          || active.attempt_status !== "running"
+          || active.attempt_stage !== executionFence.stageKey
+          || Number(active.attempt_lease_generation)
+            !== executionFence.leaseGeneration
+          || active.attempt_idempotency_key
+            !== `${executionFence.jobId}:${executionFence.leaseGeneration}:${input.contractRevisionId}`
+          || active.job_status !== "leased"
+          || active.job_lease_owner !== executionFence.workerId
+          || Number(active.job_lease_epoch) !== executionFence.leaseGeneration
+          || active.job_stage_key !== executionFence.stageKey
+          || active.job_lease_active !== true) {
+          throw new HttpError(
+            409,
+            "Publication completion execution fence is stale",
+            "publication_execution_stale",
+          );
+        }
+        const reconciliation = await client.query<{
+          id: string;
+          execution_attempt_id: string;
+          state: DurablePublicationReconciliationState;
+          expected_ordered_ids_hash: string;
+          observed_ordered_ids_hash: string | null;
+          expected_count: number;
+          appended_count: number;
+          batch_cursor: number;
+          reconciliation_json: Record<string, unknown>;
+        }>(
+          `SELECT id,execution_attempt_id,state,expected_ordered_ids_hash,
+                  observed_ordered_ids_hash,expected_count,appended_count,
+                  batch_cursor,reconciliation_json
+           FROM playlist_publication_reconciliations
+           WHERE run_id=$1 AND contract_revision_id=$2
+             AND manifest_id=$3 AND manifest_revision_id=$4
+           FOR UPDATE`,
+          [
+            input.runId,
+            input.contractRevisionId,
+            input.manifestId,
+            input.manifestRevisionId,
+          ],
+        );
+        const progress = reconciliation.rows[0];
+        if (!progress
+          || progress.execution_attempt_id !== executionFence.executionAttemptId
+          || !["reconciling", "complete"].includes(progress.state)
+          || Number(progress.expected_count) !== input.selectedCount
+          || Number(progress.appended_count) !== input.selectedCount
+          || Number(progress.batch_cursor) !== input.selectedCount
+          || progress.observed_ordered_ids_hash
+            !== progress.expected_ordered_ids_hash
+          || progress.reconciliation_json.manifestRevisionHash
+            !== input.manifestRevisionHash
+          || progress.reconciliation_json.contractHash !== input.contractHash
+          || progress.reconciliation_json.jobId !== executionFence.jobId
+          || progress.reconciliation_json.workerId !== executionFence.workerId
+          || Number(progress.reconciliation_json.leaseGeneration)
+            !== executionFence.leaseGeneration
+          || progress.reconciliation_json.stageKey !== executionFence.stageKey) {
+          throw new HttpError(
+            409,
+            "Publication completion reconciliation fence is stale or incomplete",
+            "publication_execution_stale",
+          );
+        }
+        publicationReconciliationId = progress.id;
+      }
 
       const volumeResult = await client.query<{
         id: string;
@@ -13226,9 +19224,7 @@ export class Repository {
         );
       }
 
-      if (supportsPublicationReconciliation
-        && input.contractRevisionId
-        && input.manifestRevisionId) {
+      if (publicationReconciliationId) {
         await client.query(
           `UPDATE playlist_publication_reconciliations
            SET state='complete',
@@ -13236,21 +19232,16 @@ export class Repository {
                appended_count=expected_count,batch_cursor=expected_count,
                completed_at=COALESCE(completed_at,now()),updated_at=now(),
                reconciliation_json=reconciliation_json
-                 || $4::jsonb
-           WHERE run_id=$1 AND contract_revision_id=$2
-             AND manifest_id=$3 AND manifest_revision_id=$5
-             AND state NOT IN ('cancelled','quarantined')`,
+                 || $2::jsonb
+           WHERE id=$1 AND state NOT IN ('cancelled','quarantined')`,
           [
-            input.runId,
-            input.contractRevisionId,
-            input.manifestId,
+            publicationReconciliationId,
             JSON.stringify({
               terminalFence: "commit_publication_completion",
               manifestRevisionHash: input.manifestRevisionHash,
               publicationVolumeIds: input.publicationVolumes
                 .map(({ publicationVolumeId }) => publicationVolumeId),
             }),
-            input.manifestRevisionId,
           ],
         );
       }
@@ -13543,12 +19534,34 @@ export class Repository {
     return result.rowCount ?? 0;
   }
 
-  async markPlaylistOrphan(input: { manifestId?: string | null; publicationVolumeId?: string | null; applePlaylistId: string; reason: string }): Promise<string> {
+  async markPlaylistOrphan(input: {
+    manifestId?: string | null;
+    publicationVolumeId?: string | null;
+    applePlaylistId: string;
+    reason: string;
+    publicationAuthority?: BeginPublicationReconciliationInput;
+  }): Promise<string> {
     const id = randomUUID();
-    await this.pool.query(
-      "INSERT INTO orphan_playlists(id,manifest_id,publication_volume_id,apple_playlist_id,reason) VALUES($1,$2,$3,$4,$5)",
-      [id, input.manifestId ?? null, input.publicationVolumeId ?? null, input.applePlaylistId, sanitizeFailure(input.reason, "publication")],
-    );
+    await this.transaction(async (client) => {
+      if (input.publicationAuthority) {
+        await this.assertPublicationReconciliationAuthority(
+          client,
+          input.publicationAuthority,
+        );
+        if (input.publicationAuthority.manifestId
+          !== (input.manifestId ?? null)) {
+          throw new HttpError(
+            409,
+            "Publication orphan authority is stale",
+            "publication_reconciliation_stale",
+          );
+        }
+      }
+      await client.query(
+        "INSERT INTO orphan_playlists(id,manifest_id,publication_volume_id,apple_playlist_id,reason) VALUES($1,$2,$3,$4,$5)",
+        [id, input.manifestId ?? null, input.publicationVolumeId ?? null, input.applePlaylistId, sanitizeFailure(input.reason, "publication")],
+      );
+    });
     return id;
   }
 
@@ -13582,9 +19595,16 @@ export class Repository {
     dedupeKey: string;
   }): Promise<boolean> {
     const result = await this.pool.query<{ id: string }>(
-      `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
-       SELECT $1,m.run_id,'publication',$4,$5,6
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,query_plan_revision_id,stage_key,payload_json,
+         max_attempts)
+       SELECT $1,m.run_id,'publication','publication',$4,
+              COALESCE(r.pipeline_version,'legacy_v1'),
+              CASE WHEN r.brief_contract_version=3 THEN 10 ELSE 4 END,
+              active.query_plan_revision_id,'publication',$5,6
        FROM manifests m JOIN research_runs r ON r.id=m.run_id
+       LEFT JOIN run_active_query_plans active ON active.run_id=m.run_id
        WHERE m.id=$2 AND m.run_id=$3 AND r.status='waiting_for_apple_authorization' AND r.deleted_at IS NULL
        ON CONFLICT(kind,dedupe_key) DO NOTHING RETURNING id`,
       [randomUUID(), input.manifestId, input.runId, input.dedupeKey.slice(0, 160), { manifestId: input.manifestId }],
@@ -13604,6 +19624,7 @@ export class Repository {
     clientBucket: string;
     clientBucketAliases: string[];
     rateLimit?: number;
+    matchingAuthority?: CatalogProviderJobAuthorityV2 | null;
   }): Promise<PublicationQueueResult> {
     // Refuse a short manifest before it can even enter the Apple write queue.
     // The publisher repeats this check immediately before every write because
@@ -13654,6 +19675,13 @@ export class Repository {
       }
     }
     return this.transaction(async (client) => {
+      if (input.matchingAuthority) {
+        await assertCatalogProviderWriteFence(
+          client,
+          input.runId,
+          input.matchingAuthority,
+        );
+      }
       const runResult = await client.query<{ status: string; phase: string }>(
         "SELECT status,phase FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [input.runId],
@@ -13765,7 +19793,10 @@ export class Repository {
    * isolated publication worker. This is the durable server-side continuation
    * for One Command runs, so closing the browser cannot interrupt publication.
    */
-  async queueAutomaticPublication(runId: string): Promise<void> {
+  async queueAutomaticPublication(
+    runId: string,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<void> {
     let manifest: Awaited<ReturnType<Repository["finalizeCatalogSelection"]>>;
     try {
       manifest = await this.finalizeCatalogSelection(runId, {
@@ -13773,7 +19804,7 @@ export class Repository {
         excludedCandidateIds: [],
         overrides: [],
         automatic: true,
-      });
+      }, authority);
     } catch (error) {
       if (error instanceof HttpError && error.code === "empty_manifest") {
         const run = await this.getRunRow(runId);
@@ -13789,18 +19820,23 @@ export class Repository {
             discoveredTrackCount,
             Number(stageCounts.claim_verified ?? stageCounts.scope_qualified ?? 0),
           );
-          await this.pool.query(
-            `WITH rejected AS (
-               UPDATE catalog_matches SET status='unsupported',
-                 basis='Pipeline V2 manifest eligibility rejected every catalog match',
-                 reviewed_at=now()
-               WHERE run_id=$1 AND status='accepted'
-               RETURNING candidate_id
-             )
-             UPDATE track_candidates SET outcome='unsupported'
-             WHERE run_id=$1 AND id IN (SELECT candidate_id FROM rejected)`,
-            [runId],
-          );
+          await this.transaction(async (client) => {
+            if (authority) {
+              await assertCatalogProviderWriteFence(client, runId, authority);
+            }
+            await client.query(
+              `WITH rejected AS (
+                 UPDATE catalog_matches SET status='unsupported',
+                   basis='Pipeline V2 manifest eligibility rejected every catalog match',
+                   reviewed_at=now()
+                 WHERE run_id=$1 AND status='accepted'
+                 RETURNING candidate_id
+               )
+               UPDATE track_candidates SET outcome='unsupported'
+               WHERE run_id=$1 AND id IN (SELECT candidate_id FROM rejected)`,
+              [runId],
+            );
+          });
           const outcome = buildPipelineOutcome({
             pipelineVersion: plan.pipelineVersion,
             policyVersion: plan.policyVersion,
@@ -13814,17 +19850,17 @@ export class Repository {
             reasonCodes: ["manifest_hard_constraints_rejected_all"],
             stageCounts,
           });
-          await this.savePipelineOutcome(runId, outcome);
+          await this.savePipelineOutcome(runId, outcome, authority);
           await this.savePipelineDeficitLedger(runId, outcome.deficits, {
             pipelineVersion: plan.pipelineVersion,
             policyVersion: plan.policyVersion,
             mode: "append",
-          });
+          }, authority);
           await this.updateRun(runId, {
             status: "no_compatible_tracks",
             phase: "manifest_policy_empty",
             error: null,
-          });
+          }, authority ?? undefined);
           return;
         }
       }
@@ -13851,7 +19887,7 @@ export class Repository {
         targetTrackCount: publicationGuard.requestedTrackCount,
         verifiedTrackCount: publicationManifest.tracks.length,
         remainingStrategyCount: 0,
-      });
+      }, authority);
       return;
     }
     const apple = await this.getAppleAuthorization();
@@ -13865,6 +19901,7 @@ export class Repository {
       // gates. Reapplying the manual 10/day publication bucket would strand a
       // completed research run after manifest lock without adding abuse value.
       rateLimit: Number.POSITIVE_INFINITY,
+      matchingAuthority: authority,
     });
     if (publication.state === "waiting_for_apple_authorization") {
       await this.enqueueNotification("apple_reauthorization_required", {
@@ -13887,10 +19924,17 @@ export class Repository {
       targetTrackCount: number;
       verifiedTrackCount: number;
       remainingStrategyCount?: number;
+      matchingAttemptKey?: string;
+      matchingSnapshotHash?: string;
+      pipelineOutcomeHash?: string;
     },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void> {
     const targetTrackCount = Math.max(1, Math.floor(input.targetTrackCount));
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query<{ status: string }>(
         "SELECT status FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
@@ -13898,6 +19942,31 @@ export class Repository {
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
       if (["publishing", "complete", "partial"].includes(run.rows[0].status)) {
         throw new HttpError(409, "Playlist publication has already started", "publication_already_started");
+      }
+      if (input.pipelineOutcomeHash !== undefined) {
+        if (!/^[a-f0-9]{64}$/u.test(input.pipelineOutcomeHash)
+          || !/^[a-f0-9]{64}$/u.test(input.matchingSnapshotHash ?? "")
+          || !input.matchingAttemptKey?.startsWith("catalog_matching:")) {
+          throw new HttpError(
+            409,
+            "Matching completion evidence is invalid",
+            "matching_outcome_evidence_invalid",
+          );
+        }
+        const storedOutcome = await client.query<{ outcome_json: PipelineOutcome }>(
+          "SELECT outcome_json FROM pipeline_outcomes WHERE run_id=$1 FOR SHARE",
+          [runId],
+        );
+        const storedHash = storedOutcome.rows[0]
+          ? sha256Hex(stableStringify(storedOutcome.rows[0].outcome_json))
+          : null;
+        if (storedHash !== input.pipelineOutcomeHash) {
+          throw new HttpError(
+            409,
+            "The matching outcome changed before the partial decision was prepared",
+            "matching_outcome_stale",
+          );
+        }
       }
       const selection = await client.query<{ candidate_id: string; catalog_id: string }>(
         `SELECT candidate_id,catalog_id FROM catalog_matches
@@ -13922,6 +19991,11 @@ export class Repository {
         runId,
         outcomeVersion,
         targetTrackCount,
+        ...(input.pipelineOutcomeHash ? {
+          matchingAttemptKey: input.matchingAttemptKey,
+          matchingSnapshotHash: input.matchingSnapshotHash,
+          pipelineOutcomeHash: input.pipelineOutcomeHash,
+        } : {}),
         tracks: selection.rows.map((row) => [row.candidate_id, row.catalog_id]),
       }));
       await client.query(
@@ -13935,6 +20009,11 @@ export class Repository {
           shortfall: Math.max(0, targetTrackCount - verifiedTrackCount),
           remainingStrategyCount,
           continueAvailable: remainingStrategyCount > 0,
+          ...(input.pipelineOutcomeHash ? {
+            matchingAttemptKey: input.matchingAttemptKey,
+            matchingSnapshotHash: input.matchingSnapshotHash,
+            pipelineOutcomeHash: input.pipelineOutcomeHash,
+          } : {}),
           preparedAt: new Date().toISOString(),
         })],
       );
@@ -14053,6 +20132,11 @@ export class Repository {
         targetTrackCount: checkpoint.targetTrackCount,
         manifestId: manifest.id,
         manifestHash: manifest.contentHash,
+        ...(typeof checkpointRecord?.pipelineOutcomeHash === "string" ? {
+          matchingAttemptKey: checkpointRecord.matchingAttemptKey,
+          matchingSnapshotHash: checkpointRecord.matchingSnapshotHash,
+          pipelineOutcomeHash: checkpointRecord.pipelineOutcomeHash,
+        } : {}),
         tracks: manifest.tracks.map((track: { candidateId: string; catalogId: string }) => (
           [track.candidateId, track.catalogId]
         )),
@@ -14705,6 +20789,7 @@ export class Repository {
     queryPlanRevisionId?: string | null;
     stageKey?: string;
     queueClass?: JobQueueClass;
+    workerWriteFence?: ResearchProviderJobAuthorityV2;
   }): Promise<{ id: string; created: boolean }> {
     const id = randomUUID();
     const dedupeKey = input.dedupeKey ?? input.runId ?? input.briefRequestId ?? randomUUID();
@@ -14723,17 +20808,43 @@ export class Repository {
           pipeline_version: PipelineVersion;
           query_plan_revision_id: string | null;
           query_plan_json: unknown;
+          release_manifest_canary_marker: unknown | null;
         }>(
-          `SELECT r.pipeline_version,a.query_plan_revision_id,q.plan_json query_plan_json
+          `SELECT r.pipeline_version,a.query_plan_revision_id,q.plan_json query_plan_json,
+                  marker.state_json release_manifest_canary_marker
            FROM research_runs r
            LEFT JOIN run_active_query_plans a ON a.run_id=r.id
            LEFT JOIN query_plan_revisions q ON q.id=a.query_plan_revision_id
+           LEFT JOIN research_checkpoints marker
+             ON marker.run_id=r.id AND marker.phase=$2
            WHERE r.id=$1`,
-          [input.runId],
+          [input.runId, RELEASE_MANIFEST_CANARY_MARKER_PHASE],
         );
         if (run.rows[0]) {
           pipelineVersion = run.rows[0].pipeline_version;
           queryPlanRevisionId ??= run.rows[0].query_plan_revision_id;
+          const manifestCanary = parseReleaseManifestCanaryMarker(
+            run.rows[0].release_manifest_canary_marker,
+          );
+          if (run.rows[0].release_manifest_canary_marker !== null && !manifestCanary) {
+            throw new HttpError(
+              409,
+              "Manifest-only release canary authority is malformed",
+              "release_manifest_canary_integrity",
+            );
+          }
+          if (manifestCanary && (
+            input.kind !== "research"
+            || input.payload?.v3ExecutionMode !== "shadow"
+            || input.stageKey !== manifestCanary.stageKey
+            || input.payload?.stageExecutionKey !== manifestCanary.stageKey
+          )) {
+            throw new HttpError(
+              409,
+              "Manifest-only release canaries cannot enqueue Apple matching or publication work",
+              "release_manifest_canary_write_forbidden",
+            );
+          }
           if (pipelineVersion === "corpus_first_v3" && isQueryPlanV3(run.rows[0].query_plan_json)) {
             activeQueryPlan = run.rows[0].query_plan_json;
           }
@@ -14767,58 +20878,78 @@ export class Repository {
         input.minimumWorkerProtocol ?? pipelineMinimum,
         planMinimum,
       );
-      const result = await this.pool.query<{
-        id: string;
-        inserted: boolean;
-      }>(
-        `INSERT INTO job_queue(
-           id,run_id,brief_request_id,kind,dedupe_key,payload_json,available_at,max_attempts,
-           pipeline_version,minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class
-         )
-         VALUES($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now()),$8,$9,$10,$11,$12,$13)
-         ON CONFLICT(kind,dedupe_key) DO UPDATE SET
-           run_id=EXCLUDED.run_id,
-           brief_request_id=EXCLUDED.brief_request_id,
-           payload_json=EXCLUDED.payload_json,
-           pipeline_version=EXCLUDED.pipeline_version,
-           minimum_worker_protocol=EXCLUDED.minimum_worker_protocol,
-           query_plan_revision_id=EXCLUDED.query_plan_revision_id,
-           stage_key=EXCLUDED.stage_key,
-           queue_class=EXCLUDED.queue_class,
-           status='queued',
-           attempts=0,
-           max_attempts=EXCLUDED.max_attempts,
-           available_at=EXCLUDED.available_at,
-           lease_owner=NULL,
-           lease_expires_at=NULL,
-           last_error=NULL,
-           completed_at=NULL,
-           updated_at=now()
-         WHERE job_queue.status IN ('failed','cancelled')
-            OR (job_queue.status='complete' AND EXCLUDED.kind='apple_authorization')
-         RETURNING id,(xmax=0) AS inserted`,
-        [
-          id,
-          input.runId ?? null,
-          input.briefRequestId ?? null,
-          input.kind,
-          dedupeKey.slice(0, 160),
-          input.payload ?? {},
-          input.availableAt ?? null,
-          input.maxAttempts ?? 3,
-          pipelineVersion,
-          minimumWorkerProtocol,
-          queryPlanRevisionId,
-          (input.stageKey ?? "default").slice(0, 160),
-          queueClass,
-        ],
-      );
-      if (result.rows[0]) return { id: result.rows[0].id, created: result.rows[0].inserted };
-      const existing = await this.pool.query<{ id: string }>(
-        "SELECT id FROM job_queue WHERE kind=$1 AND dedupe_key=$2",
-        [input.kind, dedupeKey.slice(0, 160)],
-      );
-      return { id: existing.rows[0]!.id, created: false };
+      const persist = async (client: PoolClient | Pool) => {
+        const result = await client.query<{
+          id: string;
+          inserted: boolean;
+        }>(
+          `INSERT INTO job_queue(
+             id,run_id,brief_request_id,kind,dedupe_key,payload_json,available_at,max_attempts,
+             pipeline_version,minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class
+           )
+           VALUES($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now()),$8,$9,$10,$11,$12,$13)
+           ON CONFLICT(kind,dedupe_key) DO UPDATE SET
+             run_id=EXCLUDED.run_id,
+             brief_request_id=EXCLUDED.brief_request_id,
+             payload_json=EXCLUDED.payload_json,
+             pipeline_version=EXCLUDED.pipeline_version,
+             minimum_worker_protocol=EXCLUDED.minimum_worker_protocol,
+             query_plan_revision_id=EXCLUDED.query_plan_revision_id,
+             stage_key=EXCLUDED.stage_key,
+             queue_class=EXCLUDED.queue_class,
+             status='queued',
+             attempts=0,
+             max_attempts=EXCLUDED.max_attempts,
+             available_at=EXCLUDED.available_at,
+             lease_owner=NULL,
+             lease_expires_at=NULL,
+             last_error=NULL,
+             completed_at=NULL,
+             updated_at=now()
+           WHERE job_queue.status IN ('failed','cancelled')
+              OR (job_queue.status='complete' AND EXCLUDED.kind='apple_authorization')
+           RETURNING id,(xmax=0) AS inserted`,
+          [
+            id,
+            input.runId ?? null,
+            input.briefRequestId ?? null,
+            input.kind,
+            dedupeKey.slice(0, 160),
+            input.payload ?? {},
+            input.availableAt ?? null,
+            input.maxAttempts ?? 3,
+            pipelineVersion,
+            minimumWorkerProtocol,
+            queryPlanRevisionId,
+            (input.stageKey ?? "default").slice(0, 160),
+            queueClass,
+          ],
+        );
+        if (result.rows[0]) {
+          return { id: result.rows[0].id, created: result.rows[0].inserted };
+        }
+        const existing = await client.query<{ id: string }>(
+          "SELECT id FROM job_queue WHERE kind=$1 AND dedupe_key=$2",
+          [input.kind, dedupeKey.slice(0, 160)],
+        );
+        return { id: existing.rows[0]!.id, created: false };
+      };
+      if (!input.workerWriteFence) return persist(this.pool);
+      if (!input.runId) {
+        throw new HttpError(
+          409,
+          "Worker-fenced jobs require a research run",
+          "research_provider_retry_stale",
+        );
+      }
+      return this.transaction(async (client) => {
+        await assertResearchProviderWriteFence(
+          client,
+          input.runId!,
+          input.workerWriteFence!,
+        );
+        return persist(client);
+      });
     }
     const result = await this.pool.query<{ id: string; inserted: boolean }>(
       `INSERT INTO job_queue(id,run_id,brief_request_id,kind,dedupe_key,payload_json,available_at,max_attempts)
@@ -14856,6 +20987,16 @@ export class Repository {
       throw new HttpError(400, "Worker lease capability is invalid", "invalid_worker_capability");
     }
     const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
+    const supportsExecutorCapabilityFence = schemaVersion >= 18
+      && await this.getSetting(
+        CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+      ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    const executorCapabilities = JSON.stringify(
+      (capability.canonicalExecutorCapabilities ?? []).map(({ hash, vector }) => ({
+        hash,
+        vector,
+      })),
+    );
     const queueClasses = queueClassesForWorker(workerQueueClass);
     if (schemaVersion < 14 && workerQueueClass === "deep") return null;
     const queuePredicate = schemaVersion >= 14 ? " AND queue_class=ANY($10::varchar[])" : "";
@@ -14864,6 +21005,42 @@ export class Repository {
       : "";
     const publicationPriority = schemaVersion >= 14
       ? "WHEN candidate.queue_class='publication' THEN -1"
+      : "";
+    const candidateExecutorCapabilityPredicate = supportsExecutorCapabilityFence
+      ? ` AND (
+           NOT EXISTS (
+             SELECT 1 FROM query_plan_revisions executor_plan
+             WHERE executor_plan.id=candidate.query_plan_revision_id
+               AND COALESCE((executor_plan.plan_json->>'schemaVersion')::int,1)>=4
+           )
+           OR (
+             candidate.required_executor_capability_hash IS NOT NULL
+             AND candidate.required_executor_capability_vector IS NOT NULL
+             AND EXISTS (
+               SELECT 1 FROM jsonb_array_elements($4::jsonb) advertised
+               WHERE advertised->>'hash'=candidate.required_executor_capability_hash
+                 AND advertised->'vector'=candidate.required_executor_capability_vector
+             )
+           )
+         )`
+      : "";
+    const exhaustedExecutorCapabilityPredicate = supportsExecutorCapabilityFence
+      ? ` AND (
+           NOT EXISTS (
+             SELECT 1 FROM query_plan_revisions executor_plan
+             WHERE executor_plan.id=job_queue.query_plan_revision_id
+               AND COALESCE((executor_plan.plan_json->>'schemaVersion')::int,1)>=4
+           )
+           OR (
+             job_queue.required_executor_capability_hash IS NOT NULL
+             AND job_queue.required_executor_capability_vector IS NOT NULL
+             AND EXISTS (
+               SELECT 1 FROM jsonb_array_elements($11::jsonb) advertised
+               WHERE advertised->>'hash'=job_queue.required_executor_capability_hash
+                 AND advertised->'vector'=job_queue.required_executor_capability_vector
+             )
+           )
+         )`
       : "";
     // Derive the effective fence from both immutable contracts at lease time.
     // This protects work queued during a rolling migration even if an older
@@ -14952,6 +21129,7 @@ export class Repository {
              AND ${exhaustedEffectiveMinimumWorkerProtocol}<=$8
              AND pipeline_version=ANY($9::varchar[])
              ${queuePredicate}
+             ${exhaustedExecutorCapabilityPredicate}
            ORDER BY lease_expires_at,id
            FOR UPDATE SKIP LOCKED
            LIMIT 20
@@ -14980,6 +21158,7 @@ export class Repository {
           capability.protocolNumber,
           [...capability.pipelineVersions],
           ...(schemaVersion >= 14 ? [queueClasses] : []),
+          ...(supportsExecutorCapabilityFence ? [executorCapabilities] : []),
         ],
       );
       for (const job of exhausted.rows) {
@@ -15061,6 +21240,7 @@ export class Repository {
            AND ${effectiveMinimumWorkerProtocol}<=$1
            AND candidate.pipeline_version=ANY($2::varchar[])
            ${candidateQueuePredicate}
+           ${candidateExecutorCapabilityPredicate}
            AND NOT (candidate.kind IN ('brief','research','matching') AND COALESCE((SELECT value='true' FROM settings WHERE key='research_paused'),false))
            AND NOT (candidate.kind='publication' AND COALESCE((SELECT value='true' FROM settings WHERE key='publishing_paused'),false))
            AND NOT (
@@ -15103,6 +21283,7 @@ export class Repository {
           capability.protocolNumber,
           [...capability.pipelineVersions],
           ...(schemaVersion >= 14 ? [queueClasses] : []),
+          ...(supportsExecutorCapabilityFence ? [executorCapabilities] : []),
         ],
       );
       const job = selected.rows[0];
@@ -15126,6 +21307,10 @@ export class Repository {
         pipelineVersion: row.pipeline_version,
         minimumWorkerProtocol: Number(job.effective_minimum_worker_protocol ?? row.minimum_worker_protocol),
         queryPlanRevisionId: row.query_plan_revision_id ?? null,
+        requiredExecutorCapabilityHash:
+          row.required_executor_capability_hash ?? null,
+        requiredExecutorCapabilityVector:
+          row.required_executor_capability_vector ?? null,
         stageKey: typeof row.stage_key === "string" ? row.stage_key : "default",
         leaseEpoch: Number(row.lease_epoch ?? 0),
         leaseOwner: row.lease_owner,
@@ -15147,6 +21332,65 @@ export class Repository {
   async renewJobLease(jobId: string, workerId: string, leaseMs: number, leaseEpoch?: number): Promise<boolean> {
     const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
     const expiresAt = new Date(Date.now() + Math.max(30_000, leaseMs));
+    const tracksActiveIntervals = schemaVersion >= 14
+      && await this.getSetting(
+        CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+      ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    if (tracksActiveIntervals) {
+      const result = await this.pool.query<{ id: string }>(
+        `WITH lease_clock AS (
+           SELECT now() observed_at,$3::timestamptz renewed_until
+         ),
+         renewed AS (
+           UPDATE job_queue job
+           SET lease_expires_at=clock.renewed_until,updated_at=clock.observed_at
+           FROM lease_clock clock
+           WHERE job.id=$1 AND job.lease_owner=$2 AND job.status='leased'
+             AND job.lease_expires_at>clock.observed_at
+             AND (
+               job.pipeline_version<>'corpus_first_v3'
+               OR ($4::bigint IS NOT NULL AND job.lease_epoch=$4)
+             )
+           RETURNING job.id,job.lease_epoch,job.query_plan_revision_id,
+                     job.stage_key,job.required_executor_capability_hash,
+                     job.required_executor_capability_vector
+         ),
+         accrued AS (
+           UPDATE playlist_execution_attempts attempt
+           SET active_compute_ms=attempt.active_compute_ms + GREATEST(
+                 0,
+                 floor(EXTRACT(EPOCH FROM (
+                   LEAST(
+                     clock.observed_at,
+                     COALESCE(attempt.lease_expires_at,clock.observed_at)
+                   )-attempt.last_active_at
+                 ))*1000)::bigint
+               ),
+               last_active_at=clock.observed_at,
+               lease_expires_at=clock.renewed_until
+           FROM renewed job,lease_clock clock
+           WHERE attempt.job_id=job.id
+             AND attempt.status='running'
+             AND attempt.lease_generation=job.lease_epoch
+             AND attempt.query_plan_revision_id
+               IS NOT DISTINCT FROM job.query_plan_revision_id
+             AND attempt.stage=job.stage_key
+             AND attempt.executor_capability_hash
+               IS NOT DISTINCT FROM job.required_executor_capability_hash
+             AND attempt.executor_capability_vector
+               IS NOT DISTINCT FROM job.required_executor_capability_vector
+           RETURNING attempt.id
+         )
+         SELECT id FROM renewed`,
+        [
+          jobId,
+          workerId,
+          expiresAt,
+          Number.isSafeInteger(leaseEpoch) ? leaseEpoch : null,
+        ],
+      );
+      return Boolean(result.rowCount);
+    }
     const result = schemaVersion >= 14
       ? await this.pool.query(
         `UPDATE job_queue SET lease_expires_at=$3,updated_at=now()
@@ -15367,7 +21611,7 @@ export class Repository {
     runId: string,
     phase: string,
     state: unknown,
-    fence?: PipelineV3WriteFence,
+    fence?: PipelineWorkerWriteFence,
   ): Promise<void> {
     const persist = async (client: PoolClient | Pool) => {
       await client.query(
@@ -15381,7 +21625,7 @@ export class Repository {
       return;
     }
     await this.transaction(async (client) => {
-      await this.assertPipelineV3WriteFence(client, runId, fence);
+      await assertPipelineWorkerWriteFence(this, client, runId, fence);
       await persist(client);
     });
   }
@@ -15391,10 +21635,17 @@ export class Repository {
    * used instead of an in-memory counter so worker restarts and retries cannot
    * reset the five-request Pipeline V2 ceiling.
    */
-  async reserveMusicBrainzEnrichmentRequest(runId: string, maximum: number): Promise<number | null> {
+  async reserveMusicBrainzEnrichmentRequest(
+    runId: string,
+    maximum: number,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<number | null> {
     const boundedMaximum = Math.min(5, Math.max(0, Math.floor(maximum)));
     if (!Number.isFinite(boundedMaximum) || boundedMaximum < 1) return null;
     return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query(
         "SELECT id FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         [runId],
@@ -15438,13 +21689,24 @@ export class Repository {
     runId: string,
     candidateId: string,
     recordingId: string,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void> {
     if (!UUID_PATTERN.test(recordingId)) return;
-    await this.pool.query(
-      `UPDATE track_candidates SET musicbrainz_id=$3
-       WHERE id=$2 AND run_id=$1 AND (musicbrainz_id IS NULL OR musicbrainz_id=$3)`,
-      [runId, candidateId, recordingId.toLowerCase()],
-    );
+    const persist = async (client: PoolClient | Pool) => {
+      await client.query(
+        `UPDATE track_candidates SET musicbrainz_id=$3
+         WHERE id=$2 AND run_id=$1 AND (musicbrainz_id IS NULL OR musicbrainz_id=$3)`,
+        [runId, candidateId, recordingId.toLowerCase()],
+      );
+    };
+    if (!authority) {
+      await persist(this.pool);
+      return;
+    }
+    await this.transaction(async (client) => {
+      await assertCatalogProviderWriteFence(client, runId, authority);
+      await persist(client);
+    });
   }
 
   async getAppleCatalogCacheEntry(
@@ -15717,9 +21979,1691 @@ export class Repository {
   }
 
   /** Store a final or partial outcome without collapsing its deficit history. */
-  async savePipelineOutcome(runId: string, outcome: PipelineOutcome): Promise<void> {
-    await this.transaction(async (client) => {
-      await persistPipelineOutcomeTransaction(client, runId, outcome);
+  async savePipelineOutcome(
+    runId: string,
+    outcome: PipelineOutcome,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<PipelineOutcome> {
+    return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
+      return persistPipelineOutcomeTransaction(client, runId, outcome);
+    });
+  }
+
+  /**
+   * Consume the one V2 queue item scheduled at the anchored 24-hour horizon.
+   * This path has no provider claim token and therefore cannot invoke either
+   * research or catalog I/O; it only turns the durable blocker into the
+   * explicit user decision promised by the never-dead-end contract.
+   */
+  async markPipelineV2ProviderDependencyDecision(input: {
+    runId: string;
+    dependencyKey: "openai_research" | "apple_catalog";
+    expectedGeneration: string;
+    priorFailureCount: number;
+    jobId: string;
+    workerId: string;
+    leaseEpoch: number;
+  }): Promise<boolean> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) return false;
+    if (!UUID_PATTERN.test(input.expectedGeneration)
+      || !Number.isSafeInteger(input.priorFailureCount)
+      || input.priorFailureCount < 1) return false;
+    return this.transaction(async (client) => {
+      const authority = {
+        jobId: input.jobId,
+        workerId: input.workerId,
+        leaseEpoch: input.leaseEpoch,
+        providerDependencyRetry: true,
+        expectedGeneration: input.expectedGeneration,
+        priorFailureCount: input.priorFailureCount,
+        claimToken: null,
+      };
+      if (input.dependencyKey === "openai_research") {
+        const leased = await assertResearchProviderJobLease(
+          client,
+          input.runId,
+          authority,
+        );
+        if (leased.payload.researchProviderDecisionOnly !== true) return false;
+      } else {
+        const payload = await assertCatalogProviderJobLease(
+          client,
+          input.runId,
+          authority,
+        );
+        if (payload.providerDecisionOnly !== true) return false;
+      }
+
+      const checkpointPhase = input.dependencyKey === "openai_research"
+        ? "research_provider_blocker_v2"
+        : "catalog_provider_blocker_v2";
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase=$2 FOR UPDATE`,
+        [input.runId, checkpointPhase],
+      );
+      const priorState = checkpoint.rows[0]?.state_json ?? {};
+      const automaticRetryUntil = date(priorState.automaticRetryUntil);
+      const nextRetryAt = date(priorState.nextRetryAt);
+      const now = new Date();
+      if (priorState.generation !== input.expectedGeneration
+        || Number(priorState.failureCount) !== input.priorFailureCount
+        || priorState.decisionOnlyWake !== true
+        || !automaticRetryUntil
+        || !Number.isFinite(automaticRetryUntil.getTime())
+        || automaticRetryUntil.getTime() > now.getTime()
+        || !nextRetryAt
+        || nextRetryAt.getTime() !== automaticRetryUntil.getTime()) {
+        return false;
+      }
+      const state = {
+        ...priorState,
+        nextRetryAt: null,
+        needsDecision: true,
+        decisionOnlyWake: false,
+        providerCallPermitted: false,
+        nextAction: "resume_revise_or_cancel",
+        automaticResume: false,
+        decidedAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      };
+      await client.query(
+        `UPDATE research_checkpoints
+         SET state_json=$3::jsonb,updated_at=now()
+         WHERE run_id=$1 AND phase=$2`,
+        [input.runId, checkpointPhase, JSON.stringify(state)],
+      );
+      await client.query(
+        `UPDATE playlist_run_blockers
+         SET next_retry_at=NULL,state_json=$4::jsonb,updated_at=now()
+         WHERE run_id=$1 AND blocker_kind='provider'
+           AND dependency_key=$2 AND resolved_at IS NULL
+           AND state_json->>'generation'=$3`,
+        [
+          input.runId,
+          input.dependencyKey,
+          input.expectedGeneration,
+          JSON.stringify(state),
+        ],
+      );
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now()
+         WHERE run_id=$1 AND status='queued' AND id<>$2
+           AND (
+             ($3='openai_research' AND kind='research'
+               AND payload_json->>'researchProviderDependencyRetry'='true')
+             OR ($3='apple_catalog' AND kind='matching'
+               AND payload_json->>'providerDependencyRetry'='true')
+           )`,
+        [input.runId, input.jobId, input.dependencyKey],
+      );
+      const transitioned = await client.query(
+        `UPDATE research_runs
+         SET status='needs_decision',phase='dependency_retry_window_expired',
+             error=NULL,completed_at=NULL,updated_at=now()
+         WHERE id=$1 AND deleted_at IS NULL
+           AND pipeline_version='catalog_first_v2'
+           AND status IN (
+             'queued','researching','ready_for_matching','matching',
+             'resolving_catalog','continuing_research','failed_system',
+             'needs_decision'
+           )`,
+        [input.runId],
+      );
+      return (transitioned.rowCount ?? 0) === 1;
+    });
+  }
+
+  async claimResearchProviderRetry(
+    runId: string,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<{ claimToken: string } | null> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) {
+      throw new HttpError(
+        503,
+        "Research provider retry storage is not ready",
+        "playlist_contract_schema_unavailable",
+      );
+    }
+    return this.transaction(async (client) => {
+      const run = await client.query<{
+        status: string;
+        pipeline_version: string;
+        selection_plan_json: SelectionPlan | null;
+      }>(
+        `SELECT status,pipeline_version,selection_plan_json
+         FROM research_runs
+         WHERE id=$1 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [runId],
+      );
+      const current = run.rows[0];
+      if (!current
+        || current.pipeline_version !== "catalog_first_v2"
+        || !current.selection_plan_json) {
+        throw new HttpError(
+          409,
+          "Research provider attempt does not match an active V2 run",
+          "research_provider_retry_stale",
+        );
+      }
+      if (![
+        "queued",
+        "researching",
+        "continuing_research",
+        "ready_for_matching",
+        "matching",
+        "failed_system",
+      ].includes(current.status)) return null;
+      const leased = await assertResearchProviderJobLease(client, runId, authority);
+      if (leased.payload.researchProviderDecisionOnly === true) return null;
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const state = checkpoint.rows[0]?.state_json ?? {};
+      const activeGeneration = state.resolvedAt == null
+        && typeof state.generation === "string"
+        && UUID_PATTERN.test(state.generation)
+        ? state.generation
+        : null;
+      if (authority.providerDependencyRetry) {
+        const nextRetryAt = date(state.nextRetryAt);
+        if (!activeGeneration
+          || activeGeneration !== authority.expectedGeneration
+          || Number(state.failureCount) !== authority.priorFailureCount
+          || !nextRetryAt
+          || !Number.isFinite(nextRetryAt.getTime())) return null;
+      } else if (activeGeneration) {
+        // The current blocker generation, not a reclaimed predecessor, owns
+        // the next provider call.
+        return null;
+      }
+      const existingClaim = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='research_provider_attempt_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const existingClaimState = existingClaim.rows[0]?.state_json ?? {};
+      if (existingClaimState.jobId === authority.jobId
+        && existingClaimState.workerId === authority.workerId
+        && Number(existingClaimState.leaseEpoch) === authority.leaseEpoch
+        && existingClaimState.expectedGeneration === authority.expectedGeneration
+        && typeof existingClaimState.claimToken === "string"
+        && UUID_PATTERN.test(existingClaimState.claimToken)) {
+        // Duplicate delivery of the same exact lease is one idempotent
+        // invocation authority. Rotating its token would manufacture a stale
+        // writer while the original provider call was still in flight.
+        return { claimToken: existingClaimState.claimToken };
+      }
+      const claimToken = randomUUID();
+      const claimState = {
+        schemaVersion: 1,
+        claimToken,
+        jobId: authority.jobId,
+        workerId: authority.workerId,
+        leaseEpoch: authority.leaseEpoch,
+        expectedGeneration: authority.expectedGeneration,
+        providerDependencyRetry: authority.providerDependencyRetry,
+        claimedAt: new Date().toISOString(),
+      };
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'research_provider_attempt_v2',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE
+           SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [runId, JSON.stringify(claimState)],
+      );
+      if (authority.providerDependencyRetry) {
+        await client.query(
+          `UPDATE research_checkpoints
+           SET state_json=state_json || $3::jsonb,updated_at=now()
+           WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+             AND state_json->>'generation'=$2
+             AND state_json->>'resolvedAt' IS NULL`,
+          [
+            runId,
+            authority.expectedGeneration,
+            JSON.stringify({
+              claimedAt: claimState.claimedAt,
+              claimToken,
+              claimedJobId: authority.jobId,
+              claimedLeaseEpoch: authority.leaseEpoch,
+            }),
+          ],
+        );
+      }
+      return { claimToken };
+    });
+  }
+
+  /**
+   * Recheck the exact research lease and its opaque claim immediately after a
+   * provider pass. Provider I/O cannot share the database transaction, so this
+   * is the commit fence that prevents a slower, superseded worker from
+   * advancing the run after a peer has opened a newer outage generation.
+   */
+  async validateResearchProviderAttempt(
+    runId: string,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<boolean> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) return false;
+    try {
+      return await this.transaction(async (client) => {
+        await assertResearchProviderJobLease(client, runId, authority);
+        await assertResearchProviderAttemptClaim(client, runId, authority);
+        const checkpoint = await client.query<{
+          state_json: Record<string, unknown>;
+        }>(
+          `SELECT state_json FROM research_checkpoints
+           WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+           FOR UPDATE`,
+          [runId],
+        );
+        const state = checkpoint.rows[0]?.state_json ?? {};
+        const activeGeneration = state.resolvedAt == null
+          && typeof state.generation === "string"
+          && UUID_PATTERN.test(state.generation)
+          ? state.generation
+          : null;
+        if (authority.providerDependencyRetry) {
+          return activeGeneration === authority.expectedGeneration
+            && Number(state.failureCount) === authority.priorFailureCount;
+        }
+        return activeGeneration === null;
+      });
+    } catch (error) {
+      if (error instanceof HttpError
+        && error.code === "research_provider_retry_stale") return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Factual V2 research is open-world. A hosted research outage therefore
+   * commits a durable provider blocker and an exact successor generation; it
+   * must never advance preserved candidates to matching or claim scarcity.
+   */
+  async persistResearchProviderBlocker(
+    runId: string,
+    blocker: ResearchProviderBlockerV2,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<{ generation: string }> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) {
+      throw new HttpError(
+        503,
+        "Research provider blocker storage is not ready",
+        "playlist_contract_schema_unavailable",
+      );
+    }
+    const phaseValid = [
+      "scope_resolution",
+      "source_discovery",
+      "container_discovery",
+      "container_enumeration",
+      "track_verification",
+      "catalog_enrichment",
+      "gap_analysis",
+    ].includes(blocker.phase);
+    const retryAfterUntilInput = date(blocker.retryAfterUntil);
+    const openedAtInput = date(blocker.openedAt);
+    const updatedAtInput = date(blocker.updatedAt);
+    if (blocker.schemaVersion !== 1
+      || blocker.kind !== "provider"
+      || blocker.dependencyKey !== "openai_research"
+      || blocker.reasonCode !== "research_provider_unavailable"
+      || !phaseValid
+      || !Number.isSafeInteger(blocker.gapAttempt)
+      || blocker.gapAttempt < 0
+      || !Number.isSafeInteger(blocker.researchGeneration)
+      || blocker.researchGeneration < 0
+      || !Number.isSafeInteger(blocker.segment)
+      || blocker.segment < 0
+      || !Number.isSafeInteger(blocker.eligibleCandidateCount)
+      || blocker.eligibleCandidateCount < 0
+      || !Number.isSafeInteger(blocker.failureCount)
+      || blocker.failureCount < 1
+      || blocker.failureCount > 20
+      || (blocker.retryAfterUntil !== null
+        && (!retryAfterUntilInput
+          || !Number.isFinite(retryAfterUntilInput.getTime())))
+      || !openedAtInput
+      || !Number.isFinite(openedAtInput.getTime())
+      || !updatedAtInput
+      || !Number.isFinite(updatedAtInput.getTime())) {
+      throw new HttpError(
+        409,
+        "Research provider blocker state is invalid",
+        "invalid_research_provider_blocker",
+      );
+    }
+    return this.transaction(async (client) => {
+      const run = await client.query<{
+        active_playlist_contract_revision_id: string | null;
+        active_contract_id: string | null;
+        pipeline_version: string;
+        policy_version: PipelinePolicyVersion;
+        selection_plan_json: SelectionPlan | null;
+        status: string;
+      }>(
+        `SELECT run.active_playlist_contract_revision_id,
+                contract.id active_contract_id,run.pipeline_version,
+                run.policy_version,run.selection_plan_json,run.status
+         FROM research_runs run
+         LEFT JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+          AND contract.status='active'
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+         FOR UPDATE OF run`,
+        [runId],
+      );
+      const active = run.rows[0];
+      if (!active
+        || active.pipeline_version !== "catalog_first_v2"
+        || !active.selection_plan_json
+        || pipelineV2Route(active.selection_plan_json)
+          !== "factual_frontier"
+        || (active.active_playlist_contract_revision_id !== null
+          && active.active_contract_id
+            !== active.active_playlist_contract_revision_id)
+        || ![
+          "queued",
+          "researching",
+          "continuing_research",
+          "failed_system",
+        ].includes(active.status)) {
+        throw new HttpError(
+          409,
+          "Research provider blocker does not match the active factual V2 run",
+          "research_provider_blocker_stale",
+        );
+      }
+      const leased = await assertResearchProviderJobLease(
+        client,
+        runId,
+        authority,
+      );
+      await assertResearchProviderAttemptClaim(client, runId, authority);
+      if (leased.payload.phase !== blocker.phase
+        || Number(leased.payload.gapAttempt ?? 0) !== blocker.gapAttempt
+        || Number(leased.payload.generation ?? 0)
+          !== blocker.researchGeneration
+        || Number(leased.payload.segment ?? 0) !== blocker.segment) {
+        throw new HttpError(
+          409,
+          "Research provider blocker does not match the leased pass",
+          "research_provider_retry_stale",
+        );
+      }
+
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const storedState = checkpoint.rows[0]?.state_json ?? {};
+      const checkpointState = typeof storedState.resolvedAt === "string"
+        ? {}
+        : storedState;
+      const activeGeneration =
+        typeof checkpointState.generation === "string"
+        && UUID_PATTERN.test(checkpointState.generation)
+          ? checkpointState.generation
+          : null;
+      const priorFailureCount = Number(checkpointState.failureCount ?? 0);
+      if (authority.providerDependencyRetry
+        ? (
+            !activeGeneration
+            || activeGeneration !== authority.expectedGeneration
+            || !Number.isSafeInteger(priorFailureCount)
+            || priorFailureCount !== authority.priorFailureCount
+          )
+        : activeGeneration !== null) {
+        throw new HttpError(
+          409,
+          "Research provider generation changed before reblock",
+          "research_provider_retry_stale",
+        );
+      }
+
+      const existing: {
+        rows: Array<{
+          id: string;
+          retry_count: number;
+          created_at: Date;
+          state_json: Record<string, unknown>;
+        }>;
+      } = active.active_contract_id
+        ? await client.query<{
+            id: string;
+            retry_count: number;
+            created_at: Date;
+            state_json: Record<string, unknown>;
+          }>(
+            `SELECT id,retry_count,created_at,state_json
+             FROM playlist_run_blockers
+             WHERE run_id=$1 AND contract_revision_id=$2
+               AND blocker_kind='provider'
+               AND dependency_key='openai_research'
+               AND resolved_at IS NULL
+             ORDER BY created_at,id
+             LIMIT 1
+             FOR UPDATE`,
+            [runId, active.active_contract_id],
+          )
+        : { rows: [] };
+      const prior = existing.rows[0] ?? null;
+      if (prior
+        && prior.state_json.generation !== authority.expectedGeneration) {
+        throw new HttpError(
+          409,
+          "Canonical research provider generation changed",
+          "research_provider_retry_stale",
+        );
+      }
+      const storedBlockerOpenedAt = date(prior?.state_json.openedAt);
+      const storedCheckpointOpenedAt = date(checkpointState.openedAt);
+      const proposedOpenedAt = openedAtInput!;
+      const openedAt = (
+        storedBlockerOpenedAt
+          && Number.isFinite(storedBlockerOpenedAt.getTime())
+          ? storedBlockerOpenedAt
+          : null
+      ) ?? (
+        storedCheckpointOpenedAt
+          && Number.isFinite(storedCheckpointOpenedAt.getTime())
+          ? storedCheckpointOpenedAt
+          : null
+      ) ?? prior?.created_at ?? proposedOpenedAt;
+      const now = new Date();
+      const failureCount = authority.providerDependencyRetry
+        ? authority.priorFailureCount + 1
+        : 1;
+      if (blocker.failureCount !== failureCount) {
+        throw new HttpError(
+          409,
+          "Research provider failure count is stale",
+          "research_provider_retry_stale",
+        );
+      }
+      const retryAfterUntil = retryAfterUntilInput;
+      const retrySchedule = pipelineV2ProviderRetrySchedule({
+        openedAt,
+        failureCount,
+        now,
+        retryAfterUntil,
+      });
+      const {
+        automaticRetryUntil,
+        nextRetryAt,
+        needsDecision,
+        decisionOnlyWake,
+      } = retrySchedule;
+      const generation = randomUUID();
+      const state: ResearchProviderBlockerV2 & Record<string, unknown> = {
+        ...blocker,
+        generation,
+        failureCount,
+        openedAt: openedAt.toISOString(),
+        updatedAt: now.toISOString(),
+        nextRetryAt: nextRetryAt?.toISOString() ?? null,
+        automaticRetryUntil: automaticRetryUntil.toISOString(),
+        needsDecision,
+        stage: `research:${blocker.phase}`,
+        firstFailureAt: openedAt.toISOString(),
+        lastFailureAt: now.toISOString(),
+        retryLane: "durable",
+        retryOrdinal: Math.min(failureCount, 5),
+        durableAttemptsCompleted: Math.min(failureCount, 5),
+        decisionOnlyWake,
+        providerCallPermitted: !decisionOnlyWake && !needsDecision,
+        nextAction: needsDecision
+          ? "resume_revise_or_cancel"
+          : "wait_for_dependency",
+        automaticResume: !needsDecision,
+      };
+
+      if (prior) {
+        const updated = await client.query(
+          `UPDATE playlist_run_blockers
+           SET retry_count=$2,next_retry_at=$3,automatic_retry_until=$4,
+               state_json=$5::jsonb,updated_at=now()
+           WHERE id=$1 AND resolved_at IS NULL`,
+          [
+            prior.id,
+            failureCount,
+            nextRetryAt,
+            automaticRetryUntil,
+            JSON.stringify(state),
+          ],
+        );
+        if ((updated.rowCount ?? 0) !== 1) {
+          throw new HttpError(
+            409,
+            "Research provider blocker changed during persistence",
+            "research_provider_blocker_stale",
+          );
+        }
+      } else if (active.active_contract_id) {
+        await client.query(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,'provider','openai_research',$4,$5,$6,$7::jsonb)`,
+          [
+            randomUUID(),
+            runId,
+            active.active_contract_id,
+            failureCount,
+            nextRetryAt,
+            automaticRetryUntil,
+            JSON.stringify(state),
+          ],
+        );
+      }
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'research_provider_blocker_v2',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE
+           SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [runId, JSON.stringify(state)],
+      );
+      const eligibleCandidateCount = Math.max(
+        0,
+        blocker.eligibleCandidateCount,
+      );
+      await persistPipelineOutcomeTransaction(
+        client,
+        runId,
+        buildPipelineOutcome({
+          pipelineVersion: "catalog_first_v2",
+          policyVersion: active.policy_version,
+          status: "failed_system",
+          targetTrackCount: active.selection_plan_json.requestedTrackCount,
+          discoveredTrackCount: eligibleCandidateCount,
+          qualifiedTrackCount: eligibleCandidateCount,
+          selectedTrackCount: 0,
+          publishedTrackCount: 0,
+          frontierExhausted: false,
+          providerUnavailable: true,
+          reasonCodes: ["research_provider_unavailable"],
+          completedAt: now.toISOString(),
+        }),
+        "research_provider_block",
+      );
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'resume',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE
+           SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [
+          runId,
+          JSON.stringify({
+            phase: blocker.phase,
+            gapAttempt: blocker.gapAttempt,
+            generation: blocker.researchGeneration,
+            segment: blocker.segment,
+            status: "paused",
+            boundary: "provider_error",
+            providerBlockerGeneration: generation,
+            eligibleCandidateCount: blocker.eligibleCandidateCount,
+            updatedAt: now.toISOString(),
+          }),
+        ],
+      );
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now()
+         WHERE run_id=$1 AND kind='research' AND status='queued'
+           AND payload_json->>'researchProviderDependencyRetry'='true'`,
+        [runId],
+      );
+      // Research is the authority for factual-frontier completion. Any queued
+      // matching handoff belongs to a stale pre-outage view of that frontier.
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now()
+         WHERE run_id=$1 AND kind='matching' AND status='queued'`,
+        [runId],
+      );
+      // Revoke already-leased peers as part of the same run lock. Every V2
+      // candidate/match/checkpoint write now rechecks this exact lease and
+      // opaque attempt token transactionally, so no in-flight peer can mutate
+      // the preserved frontier after this blocker generation commits.
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now(),
+             lease_owner=NULL,lease_expires_at=NULL
+         WHERE run_id=$1
+           AND (
+             (kind='matching' AND status='leased')
+             OR (kind='research' AND status='leased' AND id<>$2)
+           )`,
+        [runId, authority.jobId],
+      );
+      if (nextRetryAt) {
+        const retryPayload = {
+          ...leased.payload,
+          runId,
+          phase: blocker.phase,
+          gapAttempt: blocker.gapAttempt,
+          generation: blocker.researchGeneration,
+          segment: blocker.segment,
+          researchProviderDependencyRetry: true,
+          researchProviderBlockerGeneration: generation,
+          researchProviderBlockerFailureCount: failureCount,
+          researchProviderDecisionOnly: decisionOnlyWake,
+          automatic: true,
+        };
+        await client.query(
+          `INSERT INTO job_queue(
+             id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+             minimum_worker_protocol,stage_key,payload_json,max_attempts,
+             available_at)
+           VALUES($1,$2,'research',$3,$4,'catalog_first_v2',$5,
+             'research_provider_dependency_retry',$6::jsonb,1,$7)
+           ON CONFLICT(kind,dedupe_key) DO NOTHING`,
+          [
+            randomUUID(),
+            runId,
+            leased.queueClass,
+            `research-provider-retry:${runId}:${generation}`,
+            minimumWorkerProtocolForPipeline("catalog_first_v2"),
+            JSON.stringify(retryPayload),
+            nextRetryAt,
+          ],
+        );
+      }
+      const transitioned = await client.query(
+        `UPDATE research_runs
+         SET status=$3,phase=$4,error=NULL,completed_at=NULL,updated_at=now()
+         WHERE id=$1
+           AND active_playlist_contract_revision_id
+             IS NOT DISTINCT FROM $2::uuid
+           AND status IN (
+             'queued','researching','continuing_research','failed_system'
+           )`,
+        [
+          runId,
+          active.active_contract_id,
+          needsDecision ? "needs_decision" : "failed_system",
+          needsDecision
+            ? "dependency_retry_window_expired"
+            : "research_provider_blocked_retry_scheduled",
+        ],
+      );
+      if ((transitioned.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Research provider blocker could not fence the active run",
+          "research_provider_blocker_stale",
+        );
+      }
+      return { generation };
+    });
+  }
+
+  async resolveResearchProviderBlocker(
+    runId: string,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<boolean> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) return false;
+    if (!authority.providerDependencyRetry
+      || !authority.expectedGeneration) {
+      throw new HttpError(
+        409,
+        "Research provider recovery transition is invalid",
+        "invalid_research_provider_transition",
+      );
+    }
+    return this.transaction(async (client) => {
+      const run = await client.query<{
+        active_playlist_contract_revision_id: string | null;
+        active_contract_id: string | null;
+        pipeline_version: string;
+        selection_plan_json: SelectionPlan | null;
+        status: string;
+      }>(
+        `SELECT run.active_playlist_contract_revision_id,
+                contract.id active_contract_id,run.pipeline_version,
+                run.selection_plan_json,run.status
+         FROM research_runs run
+         LEFT JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+          AND contract.status='active'
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+         FOR UPDATE OF run`,
+        [runId],
+      );
+      const active = run.rows[0];
+      if (!active
+        || active.pipeline_version !== "catalog_first_v2"
+        || !active.selection_plan_json
+        || pipelineV2Route(active.selection_plan_json)
+          !== "factual_frontier"
+        || (active.active_playlist_contract_revision_id !== null
+          && active.active_contract_id
+            !== active.active_playlist_contract_revision_id)
+        || active.status !== "failed_system") {
+        throw new HttpError(
+          409,
+          "Research provider recovery cannot change this run state",
+          "research_provider_retry_stale",
+        );
+      }
+      const leased = await assertResearchProviderJobLease(
+        client,
+        runId,
+        authority,
+      );
+      await assertResearchProviderAttemptClaim(client, runId, authority);
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const state = checkpoint.rows[0]?.state_json ?? {};
+      if (state.resolvedAt != null
+        || state.generation !== authority.expectedGeneration
+        || Number(state.failureCount) !== authority.priorFailureCount) {
+        throw new HttpError(
+          409,
+          "Research provider recovery generation is stale",
+          "research_provider_retry_stale",
+        );
+      }
+      const resolvedAt = new Date();
+      if (active.active_contract_id) {
+        const resolved = await client.query(
+          `UPDATE playlist_run_blockers
+           SET resolved_at=$4,updated_at=now()
+           WHERE run_id=$1 AND contract_revision_id=$2
+             AND blocker_kind='provider'
+             AND dependency_key='openai_research'
+             AND state_json->>'generation'=$3
+             AND resolved_at IS NULL`,
+          [
+            runId,
+            active.active_contract_id,
+            authority.expectedGeneration,
+            resolvedAt,
+          ],
+        );
+        if ((resolved.rowCount ?? 0) !== 1) {
+          throw new HttpError(
+            409,
+            "Canonical research provider recovery generation is stale",
+            "research_provider_retry_stale",
+          );
+        }
+      }
+      const clearedOutcome = await client.query(
+        `DELETE FROM pipeline_outcomes
+         WHERE run_id=$1
+           AND status='failed_system'
+           AND provider_unavailable=true
+           AND reason_codes_json @> '["research_provider_unavailable"]'::jsonb`,
+        [runId],
+      );
+      if ((clearedOutcome.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Research provider recovery outcome changed before resolution",
+          "research_provider_retry_stale",
+        );
+      }
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now()
+         WHERE run_id=$1 AND kind='research' AND status='queued'
+           AND payload_json->>'researchProviderDependencyRetry'='true'`,
+        [runId],
+      );
+      const recoveryPayload = {
+        ...leased.payload,
+        runId,
+        researchProviderDependencyRetry: false,
+        researchProviderBlockerGeneration: null,
+        researchProviderBlockerFailureCount: 0,
+        researchProviderRecoveryWatchdog: true,
+        automatic: true,
+      };
+      // Resolution makes the current max-attempts=1 retry non-replayable. Keep
+      // an ordinary, delayed continuation in the same transaction so a worker
+      // crash between recovery and the next checkpoint cannot strand the run.
+      await client.query(
+        `INSERT INTO job_queue(
+           id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+           minimum_worker_protocol,stage_key,payload_json,max_attempts,
+           available_at)
+         VALUES($1,$2,'research',$3,$4,'catalog_first_v2',$5,
+           'research_provider_recovery_watchdog',$6::jsonb,3,$7)
+         ON CONFLICT(kind,dedupe_key) DO NOTHING`,
+        [
+          randomUUID(),
+          runId,
+          leased.queueClass,
+          `research-provider-recovered:${runId}:${authority.expectedGeneration}`,
+          minimumWorkerProtocolForPipeline("catalog_first_v2"),
+          JSON.stringify(recoveryPayload),
+          new Date(resolvedAt.getTime() + DEPENDENCY_RETRY_DELAYS_MS[0]!),
+        ],
+      );
+      const checkpointResolved = await client.query(
+        `UPDATE research_checkpoints
+         SET state_json=state_json || $3::jsonb,updated_at=now()
+         WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+           AND state_json->>'generation'=$2
+           AND state_json->>'resolvedAt' IS NULL`,
+        [
+          runId,
+          authority.expectedGeneration,
+          JSON.stringify({
+            nextRetryAt: null,
+            needsDecision: false,
+            automaticResume: false,
+            resolvedAt: resolvedAt.toISOString(),
+            resolvedByJobId: authority.jobId,
+            resolvedByLeaseEpoch: authority.leaseEpoch,
+          }),
+        ],
+      );
+      if ((checkpointResolved.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Research provider checkpoint changed during recovery",
+          "research_provider_retry_stale",
+        );
+      }
+      const phase = typeof leased.payload.phase === "string"
+        ? leased.payload.phase.slice(0, 80)
+        : "researching";
+      const transitioned = await client.query(
+        `UPDATE research_runs
+         SET status='researching',phase=$3,error=NULL,completed_at=NULL,
+             pipeline_outcome_json=NULL,updated_at=now()
+         WHERE id=$1
+           AND active_playlist_contract_revision_id
+             IS NOT DISTINCT FROM $2::uuid
+           AND status='failed_system'`,
+        [runId, active.active_contract_id, phase],
+      );
+      if ((transitioned.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Research provider recovery lost its run fence",
+          "research_provider_retry_stale",
+        );
+      }
+      return true;
+    });
+  }
+
+  async claimCatalogProviderRetry(
+    runId: string,
+    authority: CatalogProviderJobAuthorityV2,
+  ): Promise<{ claimToken: string } | null> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) {
+      throw new HttpError(
+        503,
+        "Catalog provider retry storage is not ready",
+        "playlist_contract_schema_unavailable",
+      );
+    }
+    return this.transaction(async (client) => {
+      const run = await client.query<{
+        status: string;
+        pipeline_version: string;
+      }>(
+        `SELECT status,pipeline_version FROM research_runs
+         WHERE id=$1 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [runId],
+      );
+      const current = run.rows[0];
+      if (!current) {
+        throw new HttpError(
+          409,
+          "Catalog provider retry does not match an active V2 run",
+          "catalog_provider_retry_stale",
+        );
+      }
+      if (current.pipeline_version !== "catalog_first_v2") {
+        if (authority.providerDependencyRetry) {
+          throw new HttpError(
+            409,
+            "Catalog provider retry cannot execute on this pipeline",
+            "catalog_provider_retry_stale",
+          );
+        }
+        return { claimToken: randomUUID() };
+      }
+      if (![
+        "queued",
+        "researching",
+        "ready_for_matching",
+        "matching",
+        "resolving_catalog",
+        "continuing_research",
+        "failed_system",
+      ].includes(current.status)) return null;
+      const leasedPayload = await assertCatalogProviderJobLease(
+        client,
+        runId,
+        authority,
+      );
+      if (leasedPayload.providerDecisionOnly === true) return null;
+      const researchProviderCheckpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const researchProviderState =
+        researchProviderCheckpoint.rows[0]?.state_json ?? {};
+      if (researchProviderState.resolvedAt == null
+        && typeof researchProviderState.generation === "string"
+        && UUID_PATTERN.test(researchProviderState.generation)) {
+        // Research provider recovery owns the factual contract. Matching is
+        // not allowed to reinterpret its preserved candidate inventory.
+        return null;
+      }
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const state = checkpoint.rows[0]?.state_json ?? {};
+      const activeGeneration = state.resolvedAt == null
+        && typeof state.generation === "string"
+        && UUID_PATTERN.test(state.generation)
+        ? state.generation
+        : null;
+      if (authority.providerDependencyRetry) {
+        const nextRetryAt = date(state.nextRetryAt);
+        if (!activeGeneration
+          || activeGeneration !== authority.expectedGeneration
+          || Number(state.failureCount) !== authority.priorFailureCount
+          || !nextRetryAt
+          || !Number.isFinite(nextRetryAt.getTime())) return null;
+      } else if (activeGeneration) {
+        // A reclaimed predecessor or parallel ordinary matcher may complete,
+        // but only the exact future generation is allowed to call Apple.
+        return null;
+      }
+      const existingClaim = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='catalog_provider_attempt_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const existingClaimState = existingClaim.rows[0]?.state_json ?? {};
+      if (existingClaimState.jobId === authority.jobId
+        && existingClaimState.workerId === authority.workerId
+        && Number(existingClaimState.leaseEpoch) === authority.leaseEpoch
+        && existingClaimState.expectedGeneration === authority.expectedGeneration
+        && typeof existingClaimState.claimToken === "string"
+        && UUID_PATTERN.test(existingClaimState.claimToken)) {
+        return { claimToken: existingClaimState.claimToken };
+      }
+      const claimToken = randomUUID();
+      const claimState = {
+        schemaVersion: 1,
+        claimToken,
+        jobId: authority.jobId,
+        workerId: authority.workerId,
+        leaseEpoch: authority.leaseEpoch,
+        expectedGeneration: authority.expectedGeneration,
+        providerDependencyRetry: authority.providerDependencyRetry,
+        claimedAt: new Date().toISOString(),
+      };
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'catalog_provider_attempt_v2',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE
+           SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [runId, JSON.stringify(claimState)],
+      );
+      if (authority.providerDependencyRetry) {
+        await client.query(
+          `UPDATE research_checkpoints
+           SET state_json=state_json || $3::jsonb,updated_at=now()
+           WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+             AND state_json->>'generation'=$2
+             AND state_json->>'resolvedAt' IS NULL`,
+          [
+            runId,
+            authority.expectedGeneration,
+            JSON.stringify({
+              claimedAt: claimState.claimedAt,
+              claimToken,
+              claimedJobId: authority.jobId,
+              claimedLeaseEpoch: authority.leaseEpoch,
+            }),
+          ],
+        );
+      }
+      return { claimToken };
+    });
+  }
+
+  /**
+   * Commit the V2 Apple dependency state as one recovery boundary. The
+   * operational outcome, provider blocker, retry checkpoint, next matching
+   * job, and public run state must either all become durable or all roll back;
+   * otherwise a worker crash can turn an outage into a false zero-result run.
+   */
+  async persistCatalogProviderBlocker(
+    runId: string,
+    blocker: CatalogProviderBlockerV2,
+    outcome: PipelineOutcome,
+    jobAuthority: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<{ generation: string }> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) {
+      throw new HttpError(
+        503,
+        "Catalog provider blocker storage is not ready",
+        "playlist_contract_schema_unavailable",
+      );
+    }
+    const openedAt = date(blocker.openedAt);
+    const updatedAt = date(blocker.updatedAt);
+    const proposedNextRetryAt = blocker.nextRetryAt == null
+      ? null
+      : date(blocker.nextRetryAt);
+    const proposedRetryAfterUntil = blocker.retryAfterUntil == null
+      ? null
+      : date(blocker.retryAfterUntil);
+    const proposedAutomaticRetryUntil = date(blocker.automaticRetryUntil);
+    const openedAtValid = openedAt !== null
+      && Number.isFinite(openedAt.getTime());
+    const updatedAtValid = updatedAt !== null
+      && Number.isFinite(updatedAt.getTime());
+    const proposedNextRetryAtValid = proposedNextRetryAt !== null
+      && Number.isFinite(proposedNextRetryAt.getTime());
+    const proposedRetryAfterUntilValid = proposedRetryAfterUntil !== null
+      && Number.isFinite(proposedRetryAfterUntil.getTime());
+    const proposedAutomaticRetryUntilValid =
+      proposedAutomaticRetryUntil !== null
+      && Number.isFinite(proposedAutomaticRetryUntil.getTime());
+    if (blocker.schemaVersion !== 1
+      || blocker.kind !== "provider"
+      || blocker.dependencyKey !== "apple_catalog"
+      || ![
+        "apple_provider_circuit_open",
+        "apple_provider_degraded",
+        "catalog_provider_call_limit",
+        "catalog_discovery_timed_out",
+        "apple_lookup_transient",
+        "apple_lookup_timed_out",
+      ].includes(blocker.reasonCode)
+      || !/^[a-z]{2}$/u.test(blocker.storefront)
+      || blocker.safeTrackCount !== 0
+      || !Number.isSafeInteger(blocker.failureCount)
+      || blocker.failureCount < 1
+      || blocker.failureCount > 20
+      || typeof blocker.needsDecision !== "boolean"
+      || !openedAtValid
+      || !updatedAtValid
+      || !proposedAutomaticRetryUntilValid
+      || (blocker.nextRetryAt !== null && !proposedNextRetryAtValid)
+      || (blocker.retryAfterUntil !== null
+        && !proposedRetryAfterUntilValid)
+      || proposedAutomaticRetryUntil!.getTime() <= openedAt!.getTime()
+      || outcome.pipelineVersion !== "catalog_first_v2"
+      || outcome.status !== "failed_system"
+      || outcome.providerUnavailable !== true
+      || outcome.frontierExhausted !== false
+      || outcome.selectedTrackCount !== 0
+      || outcome.publishedTrackCount !== 0
+      || !jobAuthority) {
+      throw new HttpError(
+        409,
+        "Catalog provider blocker state is invalid",
+        "invalid_catalog_provider_blocker",
+      );
+    }
+
+    return this.transaction(async (client) => {
+      const authorityResult = await client.query<{
+        active_playlist_contract_revision_id: string | null;
+        active_contract_id: string | null;
+        pipeline_version: string;
+        policy_version: string;
+        status: string;
+      }>(
+        `SELECT run.active_playlist_contract_revision_id,
+                contract.id active_contract_id,
+                run.pipeline_version,run.policy_version,run.status
+         FROM research_runs run
+         LEFT JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+          AND contract.status='active'
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+           AND run.pipeline_version='catalog_first_v2'
+         FOR UPDATE OF run`,
+        [runId],
+      );
+      const active = authorityResult.rows[0];
+      if (!active
+        || (active.active_playlist_contract_revision_id !== null
+          && active.active_contract_id
+            !== active.active_playlist_contract_revision_id)
+        || active.pipeline_version !== outcome.pipelineVersion
+        || active.policy_version !== outcome.policyVersion
+        || ![
+          "queued",
+          "researching",
+          "ready_for_matching",
+          "matching",
+          "resolving_catalog",
+          "continuing_research",
+          "failed_system",
+        ].includes(active.status)) {
+        throw new HttpError(
+          409,
+          "Catalog provider blocker does not match the active V2 contract",
+          "catalog_provider_blocker_stale",
+        );
+      }
+      await assertCatalogProviderJobLease(
+        client,
+        runId,
+        jobAuthority,
+      );
+      await assertCatalogProviderAttemptClaim(client, runId, jobAuthority);
+
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json
+         FROM research_checkpoints
+         WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const storedCheckpointState = checkpoint.rows[0]?.state_json ?? {};
+      const checkpointState = typeof storedCheckpointState.resolvedAt === "string"
+        ? {}
+        : storedCheckpointState;
+      const activeGeneration =
+        typeof checkpointState.generation === "string"
+        && UUID_PATTERN.test(checkpointState.generation)
+          ? checkpointState.generation
+          : null;
+      const checkpointFailureCount = Number(
+        checkpointState.failureCount ?? 0,
+      );
+      if (jobAuthority.providerDependencyRetry
+        ? (
+            !activeGeneration
+            || activeGeneration !== jobAuthority.expectedGeneration
+            || !Number.isSafeInteger(checkpointFailureCount)
+            || checkpointFailureCount !== jobAuthority.priorFailureCount
+          )
+        : activeGeneration !== null) {
+        throw new HttpError(
+          409,
+          "Catalog provider generation changed before reblock",
+          "catalog_provider_retry_stale",
+        );
+      }
+      const existing: {
+        rows: Array<{
+          id: string;
+          retry_count: number;
+          automatic_retry_until: Date | null;
+          created_at: Date;
+          state_json: Record<string, unknown>;
+        }>;
+      } = active.active_contract_id
+        ? await client.query<{
+            id: string;
+            retry_count: number;
+            automatic_retry_until: Date | null;
+            created_at: Date;
+            state_json: Record<string, unknown>;
+          }>(
+            `SELECT id,retry_count,automatic_retry_until,created_at,state_json
+             FROM playlist_run_blockers
+             WHERE run_id=$1 AND contract_revision_id=$2
+               AND blocker_kind='provider' AND dependency_key='apple_catalog'
+               AND resolved_at IS NULL
+             ORDER BY created_at,id
+             LIMIT 1
+             FOR UPDATE`,
+            [runId, active.active_contract_id],
+          )
+        : { rows: [] };
+      const prior = existing.rows[0] ?? null;
+      const priorGeneration = typeof prior?.state_json?.generation === "string"
+        ? prior.state_json.generation
+        : null;
+      if (prior
+        && priorGeneration !== jobAuthority.expectedGeneration) {
+        throw new HttpError(
+          409,
+          "Canonical provider blocker generation changed",
+          "catalog_provider_retry_stale",
+        );
+      }
+      const storedBlockerOpenedAt = date(prior?.state_json?.openedAt);
+      const storedCheckpointOpenedAt = date(checkpointState.openedAt);
+      const priorOpenedAt = (
+        storedBlockerOpenedAt
+          && Number.isFinite(storedBlockerOpenedAt.getTime())
+          ? storedBlockerOpenedAt
+          : null
+      ) ?? (
+        storedCheckpointOpenedAt
+          && Number.isFinite(storedCheckpointOpenedAt.getTime())
+          ? storedCheckpointOpenedAt
+          : null
+      )
+        ?? prior?.created_at
+        ?? openedAt!;
+      const now = new Date();
+      const failureCount = jobAuthority.providerDependencyRetry
+        ? jobAuthority.priorFailureCount + 1
+        : 1;
+      if (blocker.failureCount !== failureCount) {
+        throw new HttpError(
+          409,
+          "Catalog provider failure count is stale",
+          "catalog_provider_retry_stale",
+        );
+      }
+      const retrySchedule = pipelineV2ProviderRetrySchedule({
+        openedAt: priorOpenedAt,
+        failureCount,
+        now,
+        retryAfterUntil: proposedRetryAfterUntil,
+      });
+      const {
+        automaticRetryUntil,
+        nextRetryAt,
+        needsDecision,
+        decisionOnlyWake,
+      } = retrySchedule;
+      const generation = randomUUID();
+      const state: CatalogProviderBlockerV2 & Record<string, unknown> = {
+        ...blocker,
+        generation,
+        failureCount,
+        nextRetryAt: nextRetryAt?.toISOString() ?? null,
+        automaticRetryUntil: automaticRetryUntil.toISOString(),
+        needsDecision,
+        openedAt: priorOpenedAt.toISOString(),
+        updatedAt: now.toISOString(),
+        stage: "catalog_matching",
+        firstFailureAt: priorOpenedAt.toISOString(),
+        circuitOpenedAt: priorOpenedAt.toISOString(),
+        lastFailureAt: now.toISOString(),
+        retryLane: "durable",
+        retryOrdinal: Math.min(
+          failureCount,
+          5,
+        ),
+        durableAttemptsCompleted: Math.min(failureCount, 5),
+        decisionOnlyWake,
+        providerCallPermitted: !decisionOnlyWake && !needsDecision,
+        nextAction: needsDecision
+          ? "resume_revise_or_cancel"
+          : "wait_for_dependency",
+        automaticResume: !needsDecision,
+      };
+
+      await persistPipelineOutcomeTransaction(
+        client,
+        runId,
+        outcome,
+        "provider_block",
+      );
+      if (prior) {
+        const updated = await client.query(
+          `UPDATE playlist_run_blockers
+           SET retry_count=$2,next_retry_at=$3,automatic_retry_until=$4,
+               state_json=$5::jsonb,updated_at=now()
+           WHERE id=$1 AND resolved_at IS NULL`,
+          [
+            prior.id,
+            failureCount,
+            nextRetryAt,
+            automaticRetryUntil,
+            JSON.stringify(state),
+          ],
+        );
+        if ((updated.rowCount ?? 0) !== 1) {
+          throw new HttpError(
+            409,
+            "Catalog provider blocker changed during persistence",
+            "catalog_provider_blocker_stale",
+          );
+        }
+      } else if (active.active_contract_id) {
+        await client.query(
+          `INSERT INTO playlist_run_blockers(
+             id,run_id,contract_revision_id,blocker_kind,dependency_key,
+             retry_count,next_retry_at,automatic_retry_until,state_json)
+           VALUES($1,$2,$3,'provider','apple_catalog',$4,$5,$6,$7::jsonb)`,
+          [
+            randomUUID(),
+            runId,
+            active.active_contract_id,
+            failureCount,
+            nextRetryAt,
+            automaticRetryUntil,
+            JSON.stringify(state),
+          ],
+        );
+      }
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'catalog_provider_blocker_v2',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE
+           SET state_json=EXCLUDED.state_json,updated_at=now()`,
+        [runId, JSON.stringify(state)],
+      );
+
+      const dedupeKey = `catalog-provider-retry:${runId}:${generation}`;
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now()
+         WHERE run_id=$1 AND kind='matching' AND status='queued'
+           AND payload_json->>'providerDependencyRetry'='true'`,
+        [runId],
+      );
+      if (nextRetryAt) {
+        await client.query(
+          `INSERT INTO job_queue(
+             id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+             minimum_worker_protocol,stage_key,payload_json,max_attempts,
+             available_at)
+           VALUES($1,$2,'matching','interactive',$3,'catalog_first_v2',$4,
+             'catalog_matching_dependency_retry',$5::jsonb,1,$6)
+           ON CONFLICT(kind,dedupe_key) DO NOTHING`,
+          [
+            randomUUID(),
+            runId,
+            dedupeKey,
+            minimumWorkerProtocolForPipeline("catalog_first_v2"),
+            JSON.stringify({
+              runId,
+              storefront: blocker.storefront,
+              retryIncomplete: true,
+              recoveryGeneration: Math.min(3, failureCount),
+              providerDependencyRetry: true,
+              providerBlockerGeneration: generation,
+              providerBlockerFailureCount: failureCount,
+              providerDecisionOnly: decisionOnlyWake,
+              automatic: true,
+            }),
+            nextRetryAt,
+          ],
+        );
+      }
+      const updatedRun = await client.query(
+        `UPDATE research_runs
+         SET status=$3::varchar,
+             phase=$4,
+             error=NULL,completed_at=NULL,updated_at=now()
+         WHERE id=$1
+           AND active_playlist_contract_revision_id IS NOT DISTINCT FROM $2::uuid
+           AND status IN (
+             'queued','researching','ready_for_matching','matching',
+             'resolving_catalog','continuing_research','failed_system'
+           )`,
+        [
+          runId,
+          active.active_contract_id,
+          needsDecision ? "needs_decision" : "failed_system",
+          needsDecision
+            ? "dependency_retry_window_expired"
+            : "catalog_provider_blocked_retry_scheduled",
+        ],
+      );
+      if ((updatedRun.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Catalog provider blocker could not fence the active run",
+          "catalog_provider_blocker_stale",
+        );
+      }
+      return { generation };
+    });
+  }
+
+  /** Resolve one exact V2 Apple generation together with its recovered state. */
+  async resolveCatalogProviderBlocker(
+    runId: string,
+    outcome: PipelineOutcome,
+    jobAuthority: CatalogProviderJobAuthorityV2,
+  ): Promise<boolean> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 17) return false;
+    if (!jobAuthority.providerDependencyRetry
+      || !jobAuthority.expectedGeneration
+      || outcome.pipelineVersion !== "catalog_first_v2"
+      || outcome.providerUnavailable
+      || outcome.status === "failed_system"
+      || outcome.selectedTrackCount !== 0
+      || outcome.publishedTrackCount !== 0) {
+      throw new HttpError(
+        409,
+        "Catalog provider recovery transition is invalid",
+        "invalid_catalog_provider_transition",
+      );
+    }
+    return this.transaction(async (client) => {
+      const activeResult = await client.query<{
+        active_playlist_contract_revision_id: string | null;
+        active_contract_id: string | null;
+        pipeline_version: string;
+        policy_version: string;
+        status: string;
+      }>(
+        `SELECT run.active_playlist_contract_revision_id,
+                contract.id active_contract_id,
+                run.pipeline_version,run.policy_version,run.status
+         FROM research_runs run
+         LEFT JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+          AND contract.status='active'
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+         FOR UPDATE OF run`,
+        [runId],
+      );
+      const active = activeResult.rows[0];
+      if (!active
+        || active.pipeline_version !== outcome.pipelineVersion
+        || active.policy_version !== outcome.policyVersion
+        || (active.active_playlist_contract_revision_id !== null
+          && active.active_contract_id
+            !== active.active_playlist_contract_revision_id)
+        || ![
+          "failed_system",
+          "matching",
+          "resolving_catalog",
+        ].includes(active.status)) {
+        throw new HttpError(
+          409,
+          "Catalog provider recovery cannot change this run state",
+          "catalog_provider_retry_stale",
+        );
+      }
+      const leasedPayload = await assertCatalogProviderJobLease(
+        client,
+        runId,
+        jobAuthority,
+      );
+      await assertCatalogProviderAttemptClaim(client, runId, jobAuthority);
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+         FOR UPDATE`,
+        [runId],
+      );
+      const state = checkpoint.rows[0]?.state_json ?? {};
+      if (state.resolvedAt != null
+        || state.generation !== jobAuthority.expectedGeneration
+        || Number(state.failureCount) !== jobAuthority.priorFailureCount) {
+        throw new HttpError(
+          409,
+          "Catalog provider recovery generation is stale",
+          "catalog_provider_retry_stale",
+        );
+      }
+      const resolvedAt = new Date();
+      await persistPipelineOutcomeTransaction(
+        client,
+        runId,
+        outcome,
+        "provider_recovered",
+      );
+      if (active.active_contract_id) {
+        const resolved = await client.query(
+          `UPDATE playlist_run_blockers
+           SET resolved_at=$4,updated_at=now()
+           WHERE run_id=$1 AND contract_revision_id=$2
+             AND blocker_kind='provider' AND dependency_key='apple_catalog'
+             AND state_json->>'generation'=$3
+             AND resolved_at IS NULL`,
+          [
+            runId,
+            active.active_contract_id,
+            jobAuthority.expectedGeneration,
+            resolvedAt,
+          ],
+        );
+        if ((resolved.rowCount ?? 0) !== 1) {
+          throw new HttpError(
+            409,
+            "Canonical provider recovery generation is stale",
+            "catalog_provider_retry_stale",
+          );
+        }
+      }
+      await client.query(
+        `UPDATE job_queue
+         SET status='cancelled',completed_at=now(),updated_at=now()
+         WHERE run_id=$1 AND kind='matching' AND status='queued'
+           AND payload_json->>'providerDependencyRetry'='true'`,
+        [runId],
+      );
+      if (outcome.status !== "no_compatible_tracks") {
+        const recoveryPayload = {
+          ...leasedPayload,
+          runId,
+          providerDependencyRetry: false,
+          providerBlockerGeneration: null,
+          providerBlockerFailureCount: 0,
+          catalogProviderRecoveryWatchdog: true,
+          automatic: true,
+        };
+        // The exact retry is max-attempts=1. Atomically retain an ordinary
+        // delayed matcher so a crash after blocker resolution but before final
+        // matching/finalization still has a durable recovery path.
+        await client.query(
+          `INSERT INTO job_queue(
+             id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+             minimum_worker_protocol,stage_key,payload_json,max_attempts,
+             available_at)
+           VALUES($1,$2,'matching','interactive',$3,'catalog_first_v2',$4,
+             'catalog_provider_recovery_watchdog',$5::jsonb,3,$6)
+           ON CONFLICT(kind,dedupe_key) DO NOTHING`,
+          [
+            randomUUID(),
+            runId,
+            `catalog-provider-recovered:${runId}:${jobAuthority.expectedGeneration}`,
+            minimumWorkerProtocolForPipeline("catalog_first_v2"),
+            JSON.stringify(recoveryPayload),
+            new Date(resolvedAt.getTime() + DEPENDENCY_RETRY_DELAYS_MS[0]!),
+          ],
+        );
+      }
+      const checkpointResolved = await client.query(
+        `UPDATE research_checkpoints
+         SET state_json=state_json || $3::jsonb,updated_at=now()
+         WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+           AND state_json->>'generation'=$2
+           AND state_json->>'resolvedAt' IS NULL`,
+        [
+          runId,
+          jobAuthority.expectedGeneration,
+          JSON.stringify({
+            nextRetryAt: null,
+            needsDecision: false,
+            automaticResume: false,
+            resolvedAt: resolvedAt.toISOString(),
+            resolvedByJobId: jobAuthority.jobId,
+            resolvedByLeaseEpoch: jobAuthority.leaseEpoch,
+            recoveredOutcomeStatus: outcome.status,
+          }),
+        ],
+      );
+      if ((checkpointResolved.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Catalog provider checkpoint changed during recovery",
+          "catalog_provider_retry_stale",
+        );
+      }
+      const terminalScarcity = outcome.status === "no_compatible_tracks";
+      const transitioned = await client.query(
+        `UPDATE research_runs
+         SET status=$3,phase=$4,error=NULL,
+             completed_at=CASE WHEN $5::boolean
+               THEN COALESCE(completed_at,now()) ELSE NULL END,
+             updated_at=now()
+         WHERE id=$1
+           AND active_playlist_contract_revision_id
+             IS NOT DISTINCT FROM $2::uuid
+           AND status IN ('failed_system','matching','resolving_catalog')`,
+        [
+          runId,
+          active.active_contract_id,
+          terminalScarcity ? "no_compatible_tracks" : "matching",
+          terminalScarcity
+            ? "catalog_matching_empty_recovered"
+            : "catalog_provider_recovered",
+          terminalScarcity,
+        ],
+      );
+      if ((transitioned.rowCount ?? 0) !== 1) {
+        throw new HttpError(
+          409,
+          "Catalog provider recovery lost its run fence",
+          "catalog_provider_retry_stale",
+        );
+      }
+      return true;
     });
   }
 
@@ -15996,9 +23940,10 @@ export class Repository {
       RecordingFamily,
       "familyKey" | "canonicalArtist" | "canonicalTitle" | "versionClass" | "metadata" | "pipelineVersion" | "policyVersion"
     > & { id?: string },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<string> {
     const id = input.id ?? randomUUID();
-    const result = await this.pool.query<{ id: string }>(
+    const persist = async (client: PoolClient | Pool) => client.query<{ id: string }>(
       `INSERT INTO recording_families(
          id,run_id,family_key,canonical_artist,canonical_title,version_class,metadata_json,
          pipeline_version,policy_version)
@@ -16021,6 +23966,12 @@ export class Repository {
         input.policyVersion,
       ],
     );
+    const result = authority
+      ? await this.transaction(async (client) => {
+          await assertCatalogProviderWriteFence(client, runId, authority);
+          return persist(client);
+        })
+      : await persist(this.pool);
     if (!result.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
     return result.rows[0].id;
   }
@@ -16030,8 +23981,12 @@ export class Repository {
     recordingFamilyId: string,
     candidateId: string,
     relationship = "member",
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void> {
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const owned = await client.query(
         `SELECT rf.id FROM recording_families rf
          JOIN track_candidates tc ON tc.id=$3 AND tc.run_id=rf.run_id
@@ -16053,11 +24008,18 @@ export class Repository {
     });
   }
 
-  async upsertAlternateCatalogIdentity(runId: string, input: AlternateCatalogIdentity): Promise<string> {
+  async upsertAlternateCatalogIdentity(
+    runId: string,
+    input: AlternateCatalogIdentity,
+    authority?: CatalogProviderJobAuthorityV2 | null,
+  ): Promise<string> {
     if (!Number.isFinite(input.identityConfidence) || input.identityConfidence < 0 || input.identityConfidence > 1) {
       throw new HttpError(400, "Catalog identity confidence must be between zero and one", "invalid_catalog_identity");
     }
     return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const family = await client.query(
         "SELECT id FROM recording_families WHERE id=$1 AND run_id=$2 FOR UPDATE",
         [input.recordingFamilyId, runId],
@@ -16207,10 +24169,14 @@ export class Repository {
     runId: string,
     candidates: readonly CatalogDiscoveredCandidateInput[],
     versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<CatalogDiscoveredCandidateResult[]> {
     boundedPipelineBatch(candidates, 200, "Catalog-discovered candidates");
     if (candidates.length === 0) return [];
     return this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query<{
         pipeline_version: string | null;
         policy_version: string | null;
@@ -16458,9 +24424,13 @@ export class Repository {
     runId: string,
     events: readonly CandidateStageEvent[],
     versions: Pick<SelectionPlan, "pipelineVersion" | "policyVersion">,
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void> {
     boundedPipelineBatch(events, 500, "Candidate stage events");
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const candidateIds = [...new Set(events.map((event) => event.candidateId))];
       if (candidateIds.length > 0) {
         const owned = await client.query<{ count: number }>(
@@ -16529,9 +24499,13 @@ export class Repository {
     runId: string,
     entries: readonly PipelineDeficitLedgerEntry[],
     options: Pick<SelectionPlan, "pipelineVersion" | "policyVersion"> & { mode: "append" | "replace" },
+    authority?: CatalogProviderJobAuthorityV2 | null,
   ): Promise<void> {
     boundedPipelineBatch(entries, 200, "Pipeline deficit ledger");
     await this.transaction(async (client) => {
+      if (authority) {
+        await assertCatalogProviderWriteFence(client, runId, authority);
+      }
       const run = await client.query("SELECT id FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE", [runId]);
       if (!run.rows[0]) throw new HttpError(404, "Research run not found", "run_not_found");
       if (options.mode === "replace") {
@@ -16743,9 +24717,23 @@ export class Repository {
     publicationState: "not_applicable" | "partial_confirmation_required" | "queued" | "waiting_for_apple_authorization";
   }> {
     const { runId, queryPlan, plan, result, fence } = input;
+    const releaseManifestCanaryMarker = await this.getResearchCheckpoint(
+      runId,
+      RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+    );
+    if (releaseManifestCanaryMarker !== null) {
+      throw new HttpError(
+        409,
+        "Manifest-only release canaries cannot persist a publishable manifest",
+        parseReleaseManifestCanaryMarker(releaseManifestCanaryMarker)
+          ? "release_manifest_canary_write_forbidden"
+          : "release_manifest_canary_integrity",
+      );
+    }
     const originalSelectionPlanProvided = selectionPlanV3Hash(plan) === queryPlan.selectionPlanHash;
     const expectedQueryPlan = queryPlan.schemaVersion === 1
-      ? queryPlan
+      || queryPlan.schemaVersion === 4
+      ? queryPlanV3ExecutionProjection(plan, queryPlan)
       : originalSelectionPlanProvided
       ? createQueryPlanV3(plan, queryPlan.graphSnapshotId, {
         schemaVersion: queryPlan.schemaVersion,
@@ -16773,9 +24761,15 @@ export class Repository {
       throw new HttpError(409, "Pipeline V3 retrieval contract does not match the immutable run", "pipeline_policy_mismatch");
     }
     const target = plan.requestedTrackCount;
+    const manifestEligibleOutcome = result.outcome.status === "exact_ready"
+      || result.outcome.status === "partial_ready";
     const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
     const supportsGroundedRecoveryAudit = schemaVersion >= 15;
     const supportsSeparatedRecoveryPersistence = schemaVersion >= 18;
+    const supportsSourceDiversity = supportsSeparatedRecoveryPersistence
+      && await this.getSetting(
+        CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+      ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
     const finalSemanticPlan = result.semanticPlanRevisions?.at(-1)?.plan ?? plan;
     if (finalSemanticPlan.prompt !== plan.prompt
       || finalSemanticPlan.requestedTrackCount !== plan.requestedTrackCount
@@ -16810,12 +24804,48 @@ export class Repository {
     const attestedBindingsByTrack = new Map<QualifiedTrackV3, Array<EvidenceBindingReferenceV3 & {
       eligibilityAttestation: EvidenceEligibilityAttestationV3;
     }>>();
+    const canonicalRetrieval = isCanonicalQueryPlanV3SchemaVersion(
+      queryPlan.schemaVersion,
+    );
     for (const track of allTracks) {
       const bindings = attestedEvidenceBindingsForSelectionV3(
         track.evidenceBindingIds,
         track.evidenceBindings,
+        canonicalRetrieval ? {
+          requireHostedEvidenceSnapshot: true,
+          storefront: plan.storefront,
+        } : {},
       );
-      if (bindings.length === 0) {
+      if (canonicalRetrieval) {
+        const policy = plan.canonicalContractPolicy;
+        if (!policy) {
+          throw new HttpError(
+            409,
+            "Canonical retrieval is missing its persisted contract policy",
+            "pipeline_v3_evidence_attestation_missing",
+          );
+        }
+        const assessments = track.canonicalClauseAssessments ?? {};
+        const evaluation = evaluateCanonicalContractTrackV1({
+          policy,
+          assessments,
+        });
+        const evidenceIntegrity = canonicalRequiredEvidenceIntegrityV3({
+          policy,
+          assessments,
+          bindingIds: track.evidenceBindingIds,
+          bindings: track.evidenceBindings,
+          storefront: plan.storefront,
+        });
+        if (!evaluation.eligible
+          || !evidenceIntegrity.passed) {
+          throw new HttpError(
+            409,
+            "Canonical track evidence does not satisfy its exact clause obligations",
+            "pipeline_v3_evidence_attestation_missing",
+          );
+        }
+      } else if (bindings.length === 0) {
         throw new HttpError(
           409,
           "A qualified V3 track has no attested exact track-scope evidence",
@@ -16830,7 +24860,8 @@ export class Repository {
       || result.reserve.some((track) => selectedFamilyKeys.has(track.recordingFamilyKey))) {
       throw new HttpError(409, "Pipeline V3 manifest tracks must be recording-family unique", "pipeline_v3_result_invalid");
     }
-    if (queryPlan.schemaVersion === 4) {
+    if (manifestEligibleOutcome
+      && isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)) {
       const publicationValidation = validateCanonicalPublicationSetV3({
         plan,
         tracks: result.selected,
@@ -16856,7 +24887,9 @@ export class Repository {
     // algorithm at persistence and publication time. The wider immutable
     // research contract remains frozen in run_specs, selection_plans,
     // query_plan_revisions, graph snapshots, and the revision snapshots.
-    const manifestHash = result.selected.length === 0 ? null : manifestContentHash(
+    const manifestHash = !manifestEligibleOutcome || result.selected.length === 0
+      ? null
+      : manifestContentHash(
       result.selected.map((track) => ({
         // V3 persists a run-owned UUID for every discovered candidate. The
         // publisher loads and hashes that persisted UUID, not the adapter's
@@ -16944,6 +24977,7 @@ export class Repository {
       // trust anchor and catches a forged query payload whose attacker also
       // recomputed the query hash.
       const canonicalStoredQueryPlan = immutable.query_plan_json.schemaVersion === 1
+        || immutable.query_plan_json.schemaVersion === 4
         ? queryPlanV3ExecutionProjection(
           immutable.selection_plan_json,
           immutable.query_plan_json,
@@ -16960,7 +24994,9 @@ export class Repository {
             playlistContractCompilerVersion: immutable.query_plan_json.playlistContractCompilerVersion,
           },
         );
-      const canonicalContractMatches = immutable.query_plan_json.schemaVersion !== 4
+      const canonicalContractMatches = !isCanonicalQueryPlanV3SchemaVersion(
+        immutable.query_plan_json.schemaVersion,
+      )
         || (
           immutable.active_playlist_contract_revision_id !== null
           && immutable.playlist_contract_json !== null
@@ -17079,13 +25115,83 @@ export class Repository {
           const provider = strategy?.discoveryDependencyIds[0] ?? "orchestration_local";
           const dependencyKey = strategy?.discoveryDependencyIds.join("+")
             || "orchestration_local";
+          const dependencyIds = [...new Set(
+            lead.discoveryDependencyIds ?? strategy?.discoveryDependencyIds ?? [],
+          )].filter((value) => [
+            "orchestration_local",
+            "apple_catalog",
+            "hosted_web",
+            "governed_evidence_graph",
+          ].includes(value));
+          const provenanceRoots = [...new Set(
+            lead.provenanceRoots ?? [],
+          )].filter((value) => (
+            typeof value === "string"
+            && value.trim().length > 0
+            && value.length <= 240
+          ));
+          const cacheOrigin = lead.cacheOrigin ?? (
+            dependencyIds.includes("governed_evidence_graph")
+              ? "governed_snapshot"
+              : dependencyIds.length === 1
+                && dependencyIds[0] === "orchestration_local"
+                ? "orchestration_local"
+                : "unknown"
+          );
+          const sourceFreshUntil = lead.sourceFreshUntil
+            && Number.isFinite(Date.parse(lead.sourceFreshUntil))
+            ? new Date(lead.sourceFreshUntil)
+            : null;
+          if ((dependencyIds.includes("governed_evidence_graph")
+              && cacheOrigin !== "governed_snapshot")
+            || (cacheOrigin === "fresh_cache"
+              && (!sourceFreshUntil || sourceFreshUntil <= new Date()))) {
+            throw new HttpError(
+              409,
+              "Pipeline V3 lead provenance is stale or inconsistent",
+              "pipeline_v3_result_invalid",
+            );
+          }
           await client.query(
-            `INSERT INTO pipeline_candidate_leads(
+            supportsSourceDiversity
+              ? `INSERT INTO pipeline_candidate_leads(
+               id,run_id,query_plan_revision_id,semantic_revision,strategy_id,candidate_key,
+               artist,title,album,source_record_ids,citation_hashes,predicate_coverage,
+               rejection_code,dependency_ids,provenance_roots,cache_origin,
+               source_fresh_until)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,
+                    $12::jsonb,$13,$14::text[],$15::text[],$16,$17)
+             ON CONFLICT(run_id,semantic_revision,strategy_id,candidate_key) DO NOTHING`
+              : `INSERT INTO pipeline_candidate_leads(
                id,run_id,query_plan_revision_id,semantic_revision,strategy_id,candidate_key,
                artist,title,album,source_record_ids,citation_hashes,predicate_coverage,rejection_code)
              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13)
              ON CONFLICT(run_id,semantic_revision,strategy_id,candidate_key) DO NOTHING`,
-            [
+            supportsSourceDiversity ? [
+              deterministicUuid({
+                runId,
+                kind: "pipeline_candidate_lead",
+                semanticRevision,
+                strategyId: lead.strategyId,
+                candidateKey: lead.candidateKey,
+              }),
+              runId,
+              immutable.query_plan_id,
+              semanticRevision,
+              lead.strategyId.slice(0, 160),
+              lead.candidateKey,
+              lead.artist.slice(0, 240),
+              lead.title.slice(0, 240),
+              lead.album?.slice(0, 240) ?? null,
+              JSON.stringify(lead.sourceRecordIds),
+              JSON.stringify(lead.citationHashes),
+              JSON.stringify(lead.predicateCoverage),
+              lead.rejectionCode?.slice(0, 120) ?? null,
+              dependencyIds,
+              provenanceRoots,
+              cacheOrigin,
+              sourceFreshUntil,
+            ] : [
               deterministicUuid({
                 runId,
                 kind: "pipeline_candidate_lead",
@@ -17117,7 +25223,31 @@ export class Repository {
               identityHintHash: lead.candidateKey,
             });
             await client.query(
-              `INSERT INTO playlist_discovery_leads(
+              supportsSourceDiversity
+                ? `INSERT INTO playlist_discovery_leads(
+                 id,run_id,contract_revision_id,execution_attempt_id,provider,
+                 dependency_key,dependency_ids,provenance_roots,cache_origin,
+                 source_fresh_until,strategy_id,identity_hint_hash,lead_json,status,
+                 evidence_eligible)
+               VALUES($1,$2,$3,$4,$5,$6,$7::text[],$8::text[],$9,$10,$11,$12,
+                      $13::jsonb,$14,false)
+               ON CONFLICT(
+                 run_id,contract_revision_id,provider,strategy_id,identity_hint_hash
+               ) DO UPDATE SET
+                 execution_attempt_id=EXCLUDED.execution_attempt_id,
+                 dependency_ids=EXCLUDED.dependency_ids,
+                 provenance_roots=EXCLUDED.provenance_roots,
+                 cache_origin=EXCLUDED.cache_origin,
+                 source_fresh_until=EXCLUDED.source_fresh_until,
+                 lead_json=EXCLUDED.lead_json,
+                 status=CASE
+                   WHEN playlist_discovery_leads.status IN ('qualified','rejected','revoked')
+                   THEN playlist_discovery_leads.status
+                   ELSE EXCLUDED.status
+                 END,
+                 updated_at=now()
+               WHERE playlist_discovery_leads.evidence_eligible=false`
+                : `INSERT INTO playlist_discovery_leads(
                  id,run_id,contract_revision_id,execution_attempt_id,provider,
                  dependency_key,strategy_id,identity_hint_hash,lead_json,status,
                  evidence_eligible)
@@ -17134,7 +25264,32 @@ export class Repository {
                  END,
                  updated_at=now()
                WHERE playlist_discovery_leads.evidence_eligible=false`,
-              [
+              supportsSourceDiversity ? [
+                discoveryLeadId,
+                runId,
+                recoveryAuthority.contractRevisionId,
+                recoveryAuthority.executionAttemptId,
+                provider.slice(0, 80),
+                dependencyKey.slice(0, 120),
+                dependencyIds,
+                provenanceRoots,
+                cacheOrigin,
+                sourceFreshUntil,
+                lead.strategyId.slice(0, 120),
+                lead.candidateKey,
+                JSON.stringify({
+                  schemaVersion: "genio-playlist-discovery-lead/v1",
+                  untrusted: true,
+                  artist: lead.artist.slice(0, 240),
+                  title: lead.title.slice(0, 240),
+                  album: lead.album?.slice(0, 240) ?? null,
+                  sourceRecordIds: lead.sourceRecordIds.slice(0, 64),
+                  citationHashes: lead.citationHashes.slice(0, 32),
+                  predicateCoverage: lead.predicateCoverage.slice(0, 64),
+                  semanticRevision,
+                }),
+                lead.rejectionCode === null ? "qualifying" : "rejected",
+              ] : [
                 discoveryLeadId,
                 runId,
                 recoveryAuthority.contractRevisionId,
@@ -17263,11 +25418,24 @@ export class Repository {
             );
             const evidenceRecordIds = [...new Set(track.evidenceBindingIds)]
               .slice(0, 128);
+            const finalEvidenceIntegrity =
+              queryPlan.canonicalContractPolicy
+                ? canonicalRequiredEvidenceIntegrityV3({
+                  policy: queryPlan.canonicalContractPolicy,
+                  assessments: track.canonicalClauseAssessments,
+                  bindingIds: track.evidenceBindingIds,
+                  bindings: track.evidenceBindings,
+                  storefront: plan.storefront,
+                })
+                : null;
             const canonical = queryPlan.canonicalContractPolicy
               ? pipelineV3CanonicalPredicateProjection(
                   queryPlan.canonicalContractPolicy,
                   track.canonicalClauseAssessments,
                   evidenceRecordIds,
+                  finalEvidenceIntegrity?.obligationMismatchClauseIds ?? [],
+                  finalEvidenceIntegrity
+                    ?.evidenceGradeMismatchClauseIds ?? [],
                 )
               : null;
             if (canonical
@@ -17305,6 +25473,26 @@ export class Repository {
               independentProvenanceRoots: track.independentProvenanceRoots,
               rankingSignals: track.rankingSignals,
               sourceRank: track.sourceRank,
+              ...(queryPlan.playlistQualityPolicy ? {
+                centralQualityCriterionObservations:
+                  centralQualityCriterionObservationsForPolicyV3({
+                    observations:
+                      track.centralQualityCriterionObservations,
+                    policy: queryPlan.playlistQualityPolicy,
+                    artist: track.artist,
+                    title: track.title,
+                    album: track.album,
+                    appleSongId: track.appleSongId,
+                    recordingFamilyKey: track.recordingFamilyKey,
+                  }),
+              } : {}),
+              hostedEvidenceSnapshots: (
+                attestedBindingsByTrack.get(track) ?? []
+              ).flatMap((binding) => (
+                binding.hostedEvidenceSnapshot
+                  ? [structuredClone(binding.hostedEvidenceSnapshot)]
+                  : []
+              )),
               ...(track.playlistOptimizationSignals ? {
                 playlistOptimizationSignals:
                   normalizePlaylistOptimizationSignalsV3(
@@ -17333,6 +25521,22 @@ export class Repository {
               qualityResult,
               catalogResult,
             }));
+            // Callback persistence is an audit trail, not a second active
+            // publication authority. Supersede every earlier active
+            // projection for this immutable recording identity before
+            // installing the one final result row.
+            await client.query(
+              `UPDATE playlist_qualification_records
+               SET decision='revoked',revoked_at=COALESCE(revoked_at,now())
+               WHERE run_id=$1 AND contract_revision_id=$2
+                 AND stable_identity_hash=$3
+                 AND decision='qualified' AND revoked_at IS NULL`,
+              [
+                runId,
+                recoveryAuthority.contractRevisionId,
+                stableIdentityHash,
+              ],
+            );
             await client.query(
               `INSERT INTO playlist_qualification_records(
                  id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
@@ -17343,7 +25547,15 @@ export class Repository {
                  $10::jsonb,'qualified',$11)
                ON CONFLICT(
                  run_id,contract_revision_id,stable_identity_hash,qualification_hash
-               ) DO NOTHING`,
+               ) DO UPDATE SET
+                 discovery_lead_id=EXCLUDED.discovery_lead_id,
+                 candidate_id=EXCLUDED.candidate_id,
+                 storefront=EXCLUDED.storefront,
+                 predicate_results_json=EXCLUDED.predicate_results_json,
+                 evidence_record_ids_json=EXCLUDED.evidence_record_ids_json,
+                 quality_result_json=EXCLUDED.quality_result_json,
+                 catalog_result_json=EXCLUDED.catalog_result_json,
+                 decision='qualified',revoked_at=NULL,qualified_at=now()`,
               [
                 deterministicUuid({
                   kind: "playlist_qualification_record",
@@ -17434,7 +25646,11 @@ export class Repository {
       for (const [index, track] of allTracks.entries()) {
         if (!track.title.trim() || !track.artist.trim() || !track.appleSongId.trim()
           || !track.recordingFamilyKey.trim() || !Array.isArray(track.evidenceBindingIds)
-          || track.evidenceBindingIds.length < 1) {
+          // Canonical evaluation above has already proved that every passing
+          // non-catalog obligation references an attested external binding.
+          // A track whose complete proof is authoritative structured catalog
+          // metadata therefore needs no manufactured web/source binding.
+          || (!canonicalRetrieval && track.evidenceBindingIds.length < 1)) {
           throw new HttpError(409, "A qualified V3 track is missing identity or evidence", "pipeline_v3_result_invalid");
         }
         const familyId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", familyKey: track.recordingFamilyKey });
@@ -17506,6 +25722,17 @@ export class Repository {
 
         const bindings = attestedBindingsByTrack.get(track)!;
         for (const binding of bindings) {
+          const canonicalPredicates = canonicalRetrieval
+            ? (finalSemanticPlan.canonicalContractPolicy?.clauses ?? []).filter(
+                (clause) => track.canonicalClauseAssessments?.[clause.id]
+                  ?.evidenceIds?.includes(binding.id),
+              )
+            : [];
+          // Canonical contracts retain their exact Boolean clause assessments
+          // in the qualification record. Extra attested sources that do not
+          // satisfy a clause are not promoted into a misleading legacy scope
+          // binding.
+          if (canonicalRetrieval && canonicalPredicates.length === 0) continue;
           const normalizedUrl = assertPublicHttpsUrl(binding.url!).toString();
           let sourceRecordId = deterministicUuid({ runId, url: normalizedUrl });
           const source = await client.query<{ id: string }>(
@@ -17518,16 +25745,21 @@ export class Repository {
           sourceRecordId = source.rows[0]!.id;
           const positivePredicates = evidenceMembershipPredicatesV3(finalSemanticPlan);
           const explicitPredicateIds = binding.predicateIds ?? binding.supportedPredicateIds;
+          const sourcePredicateIds = binding.hostedEvidenceSnapshot
+            ? [...binding.hostedEvidenceSnapshot.predicateIds]
+            : [...new Set(explicitPredicateIds ?? [])].sort();
           const supportedPredicates = positivePredicates.filter((predicate) => (
             explicitPredicateIds?.includes(predicate.id)
           ));
           // Compatibility is intentionally limited to a single-axis run. A
           // composite binding without typed axis attribution must fail closed.
-          const persistedPredicates = supportedPredicates.length > 0
-            ? supportedPredicates
-            : positivePredicates.length === 1 && explicitPredicateIds === undefined
-              ? positivePredicates
-              : [];
+          const persistedPredicates = canonicalRetrieval
+            ? canonicalPredicates
+            : supportedPredicates.length > 0
+              ? supportedPredicates
+              : positivePredicates.length === 1 && explicitPredicateIds === undefined
+                ? positivePredicates
+                : [];
           if (persistedPredicates.length === 0) {
             throw new HttpError(
               409,
@@ -17557,12 +25789,16 @@ export class Repository {
               [bindingId, runId, candidateId, sourceRecordId, normalizedUrl, binding.kind.slice(0, 64), scopeAxis, scopeValue, relationship, Math.max(0, Math.min(1, binding.strength)), JSON.stringify([
                 { kind: "evidence_eligibility_attestation", attestation: binding.eligibilityAttestation },
                 { kind: "evidence_source_governance", governance: binding.governance },
+                ...(binding.hostedEvidenceSnapshot ? [{
+                  kind: "hosted_web_evidence_snapshot",
+                  snapshot: binding.hostedEvidenceSnapshot,
+                }] : []),
                 {
                   kind: "pipeline_v3_binding",
                   id: binding.id,
                   label: binding.provenanceRoot,
                   predicateIds: [predicate.id],
-                  sourcePredicateIds: explicitPredicateIds ?? [predicate.id],
+                  sourcePredicateIds,
                 },
                 ...track.sourceObservationIds.map((id) => ({ kind: "source_observation", id })),
               ]), compactEvidenceNote(`Qualified ${predicate.id} by ${binding.kind}; source rank ${binding.sourceRank}.`)],
@@ -17586,7 +25822,7 @@ export class Repository {
             { toStage: "playable", reasonCode: "pipeline_v3_storefront_playable" },
             { toStage: "canonicalized", reasonCode: "pipeline_v3_recording_family_canonicalized" },
             { toStage: "quota_eligible", reasonCode: item.reserve ? "pipeline_v3_qualified_reserve" : "pipeline_v3_selected" },
-            ...(item.reserve ? [] : [
+            ...(!manifestEligibleOutcome || item.reserve ? [] : [
               { toStage: "sequenced" as const, reasonCode: "pipeline_v3_sequence_assigned" },
               { toStage: "manifested" as const, reasonCode: "pipeline_v3_manifest_locked" },
             ]),
@@ -17616,8 +25852,8 @@ export class Repository {
         playable: result.stages.storefrontPlayable,
         canonicalized: result.stages.canonicalUnique,
         quota_eligible: result.selected.length + result.reserve.length,
-        sequenced: result.selected.length,
-        manifested: result.selected.length,
+        sequenced: manifestEligibleOutcome ? result.selected.length : 0,
+        manifested: manifestEligibleOutcome ? result.selected.length : 0,
         published: 0,
       };
       const outcome = buildPipelineOutcome({
@@ -17648,10 +25884,16 @@ export class Repository {
       }
 
       if (!manifestId || !manifestRevisionId || !manifestHash) {
+        const terminalStatus = result.outcome.status === "failed_integrity"
+          ? "failed_integrity"
+          : "no_compatible_tracks";
+        const terminalPhase = result.outcome.status === "failed_integrity"
+          ? "pipeline_v3_failed_integrity"
+          : "pipeline_v3_no_compatible_tracks";
         await client.query(
-          `UPDATE research_runs SET status='no_compatible_tracks',phase='pipeline_v3_no_compatible_tracks',
+          `UPDATE research_runs SET status=$2,phase=$3,
              error=NULL,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1`,
-          [runId],
+          [runId, terminalStatus, terminalPhase],
         );
         return { manifestId: null, manifestRevisionId: null, manifestHash: null, clientBucket: immutable.client_bucket, exact: false, existing: false };
       }
@@ -17662,7 +25904,8 @@ export class Repository {
       const description = manifestDescriptionForBrief(brief);
       const manifestContractDatabaseId = immutable.active_playlist_contract_revision_id;
       const manifestContractHash = immutable.playlist_contract_json?.semanticHash ?? null;
-      if (queryPlan.schemaVersion === 4 && (!manifestContractDatabaseId || !manifestContractHash)) {
+      if (isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)
+        && (!manifestContractDatabaseId || !manifestContractHash)) {
         throw new HttpError(
           409,
           "Pipeline V3 manifest is missing its canonical contract binding",
@@ -17852,11 +26095,37 @@ export class Repository {
     };
   }
 
-  async createManifestRevision(runId: string, revision: ManifestRevision): Promise<string> {
+  async createManifestRevision(
+    runId: string,
+    revision: ManifestRevision,
+    options: {
+      publicationAuthority?: BeginPublicationReconciliationInput;
+      supersedeRevisionId?: string;
+    } = {},
+  ): Promise<string> {
     boundedPipelineBatch(revision.tracks, 10_000, "Manifest revision tracks");
     const reserveTracks = revision.reserveTracks ?? [];
     boundedPipelineBatch(reserveTracks, 10_000, "Manifest revision reserve tracks");
+    const publicationAuthority = options.publicationAuthority;
+    if (publicationAuthority && (
+      publicationAuthority.runId !== runId
+      || publicationAuthority.manifestId !== revision.manifestId
+      || publicationAuthority.manifestRevisionId !== revision.parentRevisionId
+      || publicationAuthority.manifestRevisionId !== options.supersedeRevisionId
+    )) {
+      throw new HttpError(
+        400,
+        "Canonical publication repair authority is invalid",
+        "invalid_publication_reconciliation",
+      );
+    }
     return this.transaction(async (client) => {
+      if (publicationAuthority) {
+        await this.assertPublicationReconciliationAuthority(
+          client,
+          publicationAuthority,
+        );
+      }
       const manifest = await client.query<{
         id: string;
         pipeline_version: PipelineVersion;
@@ -18051,7 +26320,7 @@ export class Repository {
         }
       }
       if (revision.pipelineVersion === "corpus_first_v3"
-        && v3QueryPlanSnapshot?.schemaVersion === 4) {
+        && isCanonicalQueryPlanV3SchemaVersion(v3QueryPlanSnapshot?.schemaVersion)) {
         const activeContract = run.active_contract_json;
         const activeContractBound = Boolean(
           run.active_contract_revision_id
@@ -18074,21 +26343,29 @@ export class Repository {
             "manifest_contract_stale",
           );
         }
-        const qualificationRows = await client.query<{
-          candidate_id: string;
+        const canonicalPolicy =
+          v3SelectionPlanSnapshot?.canonicalContractPolicy;
+        if (!canonicalPolicy) {
+          throw new CanonicalPublicationRevalidationRequiredErrorV1([
+            "canonical_publication_contract_stale",
+          ]);
+        }
+        const selectedCandidateIds = revision.tracks.map(
+          ({ candidateId }) => candidateId,
+        );
+        const qualificationRows = await client.query<
+          PersistedPipelineV3QualificationEvidenceRow & {
           artist: string;
           title: string;
           album: string | null;
-          family_key: string;
-          decision: string;
           revoked_at: Date | null;
-          predicate_results_json: unknown;
-          evidence_record_ids_json: unknown;
-          quality_result_json: unknown;
-          catalog_result_json: unknown;
         }>(
           `SELECT qualification.candidate_id,candidate.artist,candidate.title,
-                  candidate.album,family.family_key,qualification.decision,
+                  candidate.album,
+                  qualification.stable_identity_hash,
+                  qualification.qualification_hash,
+                  family.family_key recording_family_key,
+                  qualification.decision,
                   qualification.revoked_at,
                   qualification.predicate_results_json,
                   qualification.evidence_record_ids_json,
@@ -18107,28 +26384,65 @@ export class Repository {
              AND lower(qualification.storefront)=lower($4)
              AND qualification.decision='qualified'
              AND qualification.revoked_at IS NULL
-             AND qualification.quality_result_json->>'verdict'='pass'
-             AND qualification.catalog_result_json->>'verdict'='pass'
            ORDER BY qualification.candidate_id,
                     qualification.qualified_at DESC,qualification.id DESC`,
           [
             runId,
             run.active_contract_revision_id,
-            revision.tracks.map(({ candidateId }) => candidateId),
+            selectedCandidateIds,
             v3SelectionPlanSnapshot.storefront,
           ],
         );
+        const persistedEvidence = await client.query<
+          PersistedPipelineV3EvidenceBindingRow
+        >(
+          `SELECT binding.candidate_id,binding.source_url,
+                  source.provenance_root,binding.binding_kind,
+                  binding.confidence,binding.provenance_path_json
+           FROM track_scope_bindings binding
+           JOIN source_records source
+             ON source.id=binding.source_record_id
+            AND source.run_id=binding.run_id
+            AND source.url=binding.source_url
+           WHERE binding.run_id=$1
+             AND binding.candidate_id=ANY($2::uuid[])
+             AND binding.eligibility='qualifying'
+             AND binding.pipeline_version='corpus_first_v3'
+           ORDER BY binding.candidate_id,binding.id
+           FOR SHARE OF binding,source`,
+          [runId, selectedCandidateIds],
+        );
+        const evidenceIntegrityReason =
+          persistedCanonicalEvidenceIntegrityReason({
+            storefront: v3SelectionPlanSnapshot.storefront,
+            canonicalPolicy,
+            candidateIds: selectedCandidateIds,
+            qualifications: qualificationRows.rows,
+            bindings: persistedEvidence.rows,
+          });
+        if (evidenceIntegrityReason) {
+          throw new CanonicalPublicationRevalidationRequiredErrorV1([
+            evidenceIntegrityReason,
+          ]);
+        }
+        const persistedBindingsByCandidate =
+          persistedPipelineV3EvidenceBindingIndex(
+            persistedEvidence.rows,
+          ).bindingsByCandidate;
         const qualifications: PersistedCanonicalQualificationV1[] =
           qualificationRows.rows.map((row) => ({
             candidateId: row.candidate_id,
             artist: row.artist,
             title: row.title,
             album: row.album,
-            recordingFamilyKey: row.family_key,
+            recordingFamilyKey: row.recording_family_key,
             decision: row.decision,
             revokedAt: row.revoked_at,
             predicateResults: row.predicate_results_json,
             evidenceRecordIds: row.evidence_record_ids_json,
+            evidenceBindings: persistedBindingsByCandidate.get(
+              row.candidate_id,
+            ) ?? [],
             qualityResult: row.quality_result_json,
             catalogResult: row.catalog_result_json,
           }));
@@ -18259,6 +26573,20 @@ export class Repository {
           })),
           { pipelineVersion: revision.pipelineVersion, policyVersion: revision.policyVersion },
         );
+      }
+      if (publicationAuthority && options.supersedeRevisionId) {
+        const superseded = await client.query(
+          `UPDATE manifest_revisions SET status='superseded'
+           WHERE id=$1 AND manifest_id=$2 AND status='locked'`,
+          [options.supersedeRevisionId, revision.manifestId],
+        );
+        if ((superseded.rowCount ?? 0) !== 1) {
+          throw new HttpError(
+            409,
+            "Canonical publication repair source revision is stale",
+            "manifest_revision_stale",
+          );
+        }
       }
       return id;
     });
@@ -18448,21 +26776,42 @@ export class Repository {
     });
   }
 
-  async exchangeCapabilityToken(tokenHash: string, session: {
+  async exchangeCapabilityToken(tokenHashes: readonly string[], session: {
     id: string;
     tokenHash?: string;
     expiresAt?: Date;
     reuseExisting?: boolean;
   }): Promise<any | null> {
+    const hashes = capabilityHashCandidates(tokenHashes);
     return this.transaction(async (client) => {
-      const token = await client.query<{ id: string; run_id: string; access_id: string }>(
-        `SELECT id,run_id,access_id FROM capability_tokens WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`,
-        [tokenHash],
+      const tokens = await client.query<{ id: string; run_id: string; access_id: string }>(
+        `SELECT id,run_id,access_id
+         FROM capability_tokens
+         WHERE token_hash=ANY($1::text[])
+           AND consumed_at IS NULL AND expires_at>now()
+         ORDER BY array_position($1::text[],token_hash),id
+         FOR UPDATE`,
+        [hashes],
       );
-      if (!token.rows[0]) return null;
+      const token = tokens.rows[0];
+      if (!token) return null;
+      const tokenIds = tokens.rows.map((row) => row.id);
+      if (tokens.rows.some((row) => (
+        row.run_id !== token.run_id || row.access_id !== token.access_id
+      ))) {
+        // A raw token should never have been stored under two generations for
+        // different grants. Burn every candidate in the same transaction and
+        // return the ordinary invalid-capability result rather than creating a
+        // generation or grant oracle.
+        await client.query(
+          "UPDATE capability_tokens SET consumed_at=now() WHERE id=ANY($1::uuid[])",
+          [tokenIds],
+        );
+        return null;
+      }
       const access = await client.query(
         "SELECT 1 FROM run_accesses WHERE id=$1 AND deleted_at IS NULL AND expires_at>now() FOR KEY SHARE",
-        [token.rows[0].access_id],
+        [token.access_id],
       );
       if (!access.rows[0]) return null;
       let expiresAt: Date;
@@ -18492,20 +26841,26 @@ export class Repository {
         expiresAt = session.expiresAt;
         await client.query(
           "INSERT INTO capability_sessions(id,run_id,access_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
-          [session.id, token.rows[0].run_id, token.rows[0].access_id, session.tokenHash, expiresAt],
+          [session.id, token.run_id, token.access_id, session.tokenHash, expiresAt],
         );
       }
-      await client.query("UPDATE capability_tokens SET consumed_at=now() WHERE id=$1", [token.rows[0].id]);
-      await this.attachCapabilitySessionAccess(client, session.id, token.rows[0].run_id, token.rows[0].access_id);
-      return { id: session.id, runId: token.rows[0].run_id, accessId: token.rows[0].access_id, expiresAt };
+      await client.query(
+        "UPDATE capability_tokens SET consumed_at=now() WHERE id=ANY($1::uuid[])",
+        [tokenIds],
+      );
+      await this.attachCapabilitySessionAccess(client, session.id, token.run_id, token.access_id);
+      return { id: session.id, runId: token.run_id, accessId: token.access_id, expiresAt };
     });
   }
 
-  async getCapabilitySession(tokenHash: string): Promise<any | null> {
+  async getCapabilitySession(tokenHashes: readonly string[]): Promise<any | null> {
+    const hashes = capabilityHashCandidates(tokenHashes);
     const result = await this.pool.query(
-      `WITH live_session AS (
-         UPDATE capability_sessions s SET last_seen_at=now(),updated_at=now()
-         WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+      `WITH candidate AS (
+         SELECT s.id
+         FROM capability_sessions s
+         WHERE s.token_hash=ANY($1::text[])
+           AND s.revoked_at IS NULL AND s.expires_at>now()
            AND (
              EXISTS (
                SELECT 1 FROM capability_session_accesses csa
@@ -18520,6 +26875,14 @@ export class Repository {
                WHERE csb.session_id=s.id AND b.expires_at>now()
              )
            )
+         ORDER BY array_position($1::text[],s.token_hash),s.id
+         LIMIT 1
+         FOR UPDATE
+       ),
+       live_session AS (
+         UPDATE capability_sessions s SET last_seen_at=now(),updated_at=now()
+         FROM candidate c
+         WHERE s.id=c.id
          RETURNING s.id,s.expires_at
        )
        SELECT ls.id,aa.run_id,aa.access_id,ls.expires_at
@@ -18533,7 +26896,7 @@ export class Repository {
            AND a.deleted_at IS NULL AND a.expires_at>now() AND r.deleted_at IS NULL
          ORDER BY csa.created_at DESC,csa.access_id DESC LIMIT 1
        ) aa ON true`,
-      [tokenHash],
+      [hashes],
     );
     const row = result.rows[0];
     return row ? {
@@ -19106,7 +27469,21 @@ export class Repository {
   }
 
   async getSystemHealth(): Promise<any> {
-    const [worker, queue, costs, apple, notifications, publications, orphans, retention, researchPaused, publishingPaused, feedbackPaused] = await Promise.all([
+    const [
+      worker,
+      queue,
+      costs,
+      apple,
+      notifications,
+      publications,
+      orphans,
+      retention,
+      researchPaused,
+      publishingPaused,
+      feedbackPaused,
+      releaseManifestCanaryGuardsVersion,
+      canonicalExecutionHardeningVersion,
+    ] = await Promise.all([
       this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC"),
       this.pool.query(
         `SELECT
@@ -19145,6 +27522,8 @@ export class Repository {
       this.getSetting("research_paused"),
       this.getSetting("publishing_paused"),
       this.getSetting("feedback_paused"),
+      this.getSetting("release_manifest_canary_guards_version"),
+      this.getSetting("canonical_execution_hardening_version"),
     ]);
     const queueRow = queue.rows[0] ?? {};
     const notificationRow = notifications.rows[0] ?? {};
@@ -19195,10 +27574,14 @@ export class Repository {
         .map((row) => row.configurationHash)
         .filter((value): value is string => Boolean(value)))]
         .sort();
+      const eligibleIdentityCount = eligibleWorkers.filter((row) => (
+        Boolean(row.executorRevision) && Boolean(row.configurationHash)
+      )).length;
       return representative ? {
         ...representative,
         compatibleCapacity: laneCompatibleCapacity,
         eligibleWorkerCount: eligibleWorkers.length,
+        eligibleIdentityCount,
         eligibleRevisions,
         eligibleConfigurationHashes,
         ready: laneCompatibleCapacity > 0,
@@ -19210,6 +27593,7 @@ export class Repository {
         queueClass: lane,
         compatibleCapacity: 0,
         eligibleWorkerCount: 0,
+        eligibleIdentityCount: 0,
         eligibleRevisions: [],
         eligibleConfigurationHashes: [],
         ready: false,
@@ -19224,6 +27608,8 @@ export class Repository {
         ok: true,
         schemaVersion: databaseSchemaVersion,
         schemaCompatible: isDatabaseSchemaVersionCompatible(databaseSchemaVersion),
+        releaseManifestCanaryGuardsVersion,
+        canonicalExecutionHardeningVersion,
       },
       worker: heartbeat ? {
         ...heartbeat,
@@ -19279,12 +27665,23 @@ export class Repository {
   ): Promise<{
     contractRevision: number;
     contractHash: string;
+    answerLineageHash: string;
+    queryPlanRevisionId: string;
+    guidanceLineage: Array<{
+      questionSetHash: string;
+      baseContractHash: string;
+      resultingContractHash: string;
+      executionDeltaHash: string;
+      affectedClauseIds: string[];
+      acceptedAt: string;
+    }>;
     attempts: Array<{
       stage: string;
       status: string;
       executorRevision: string;
       executorIdentityHash: string;
       configurationHash: string;
+      queryPlanRevisionId: string;
       startedAt: string;
       completedAt: string | null;
     }>;
@@ -19304,28 +27701,33 @@ export class Repository {
       id: string;
       revision: number;
       contract_hash: string;
+      answer_lineage_hash: string;
+      query_plan_revision_id: string;
     }>(
-      `SELECT contract.id,contract.revision,contract.contract_hash
+      `SELECT contract.id,contract.revision,contract.contract_hash,
+              contract.answer_lineage_hash,active_plan.query_plan_revision_id
        FROM research_runs run
        JOIN playlist_contract_revisions contract
          ON contract.id=run.active_playlist_contract_revision_id
+       JOIN run_active_query_plans active_plan ON active_plan.run_id=run.id
        WHERE run.id=$1 AND run.deleted_at IS NULL`,
       [runId],
     );
     const active = contract.rows[0];
     if (!active) return null;
-    const [attempts, reconciliation] = await Promise.all([
+    const [attempts, reconciliation, guidance] = await Promise.all([
       this.pool.query<{
         stage: string;
         status: string;
         executor_revision: string;
         executor_identity_hash: string;
         configuration_hash: string;
+        query_plan_revision_id: string | null;
         started_at: Date;
         completed_at: Date | null;
       }>(
         `SELECT stage,status,executor_revision,executor_identity_hash,
-                configuration_hash,started_at,completed_at
+                configuration_hash,query_plan_revision_id,started_at,completed_at
          FROM playlist_execution_attempts
          WHERE run_id=$1 AND contract_revision_id=$2
          ORDER BY started_at,id`,
@@ -19349,6 +27751,42 @@ export class Repository {
             [runId, active.id, manifestId],
           )
         : Promise.resolve({ rows: [] }),
+      this.pool.query<{
+        question_set_hash: string;
+        base_contract_hash: string | null;
+        resulting_contract_hash: string | null;
+        execution_delta_hash: string;
+        questions_json: unknown;
+        accepted_at: Date;
+      }>(
+        `WITH RECURSIVE lineage(id,parent_revision_id,path) AS (
+           SELECT id,parent_revision_id,ARRAY[id]::uuid[]
+           FROM playlist_contract_revisions WHERE id=$1
+           UNION ALL
+           SELECT parent.id,parent.parent_revision_id,lineage.path || parent.id
+           FROM playlist_contract_revisions parent
+           JOIN lineage ON lineage.parent_revision_id=parent.id
+           WHERE array_length(lineage.path,1)<100
+             AND NOT parent.id=ANY(lineage.path)
+         )
+         SELECT answers.question_set_hash,
+                base.contract_hash base_contract_hash,
+                resulting.contract_hash resulting_contract_hash,
+                answers.execution_delta_hash,
+                questions.questions_json,
+                answers.accepted_at
+         FROM guidance_answer_sets answers
+         JOIN guidance_question_sets questions
+           ON questions.id=answers.question_set_id
+         LEFT JOIN playlist_contract_revisions base
+           ON base.id=answers.base_contract_revision_id
+         LEFT JOIN playlist_contract_revisions resulting
+           ON resulting.id=answers.resulting_contract_revision_id
+         WHERE answers.invalidated_at IS NULL
+           AND answers.resulting_contract_revision_id IN (SELECT id FROM lineage)
+         ORDER BY answers.accepted_at,answers.id`,
+        [active.id],
+      ),
     ]);
     const publication = reconciliation.rows[0] ?? null;
     const expectedCount = Number(publication?.expected_count ?? 0);
@@ -19368,9 +27806,31 @@ export class Repository {
       ?? "unverified";
     const observedHash = safeHash(publication?.observed_ordered_ids_hash);
     const contractHash = safeHash(active.contract_hash) ?? "unverified";
+    const safeClauseIds = (value: unknown): string[] => {
+      if (!Array.isArray(value)) return [];
+      const ids = value.flatMap((question) => {
+        if (!question || typeof question !== "object" || Array.isArray(question)) return [];
+        const affected = (question as Record<string, unknown>).affectedClauseIds;
+        return Array.isArray(affected) ? affected : [];
+      }).filter((item): item is string => (
+        typeof item === "string"
+        && /^[0-9A-Za-z][0-9A-Za-z._:-]{0,159}$/u.test(item)
+      ));
+      return [...new Set(ids)].sort();
+    };
     return {
       contractRevision: Number(active.revision),
       contractHash,
+      answerLineageHash: safeHash(active.answer_lineage_hash) ?? "unverified",
+      queryPlanRevisionId: active.query_plan_revision_id,
+      guidanceLineage: guidance.rows.map((row) => ({
+        questionSetHash: safeHash(row.question_set_hash) ?? "unverified",
+        baseContractHash: safeHash(row.base_contract_hash) ?? "unverified",
+        resultingContractHash: safeHash(row.resulting_contract_hash) ?? "unverified",
+        executionDeltaHash: safeHash(row.execution_delta_hash) ?? "unverified",
+        affectedClauseIds: safeClauseIds(row.questions_json),
+        acceptedAt: row.accepted_at.toISOString(),
+      })),
       attempts: attempts.rows.map((attempt) => ({
         stage: /^[0-9A-Za-z._:-]{1,80}$/u.test(attempt.stage)
           ? attempt.stage
@@ -19388,6 +27848,7 @@ export class Repository {
         executorIdentityHash: safeHash(attempt.executor_identity_hash)
           ?? "unverified",
         configurationHash: safeHash(attempt.configuration_hash) ?? "unverified",
+        queryPlanRevisionId: attempt.query_plan_revision_id ?? "unverified",
         startedAt: attempt.started_at.toISOString(),
         completedAt: attempt.completed_at?.toISOString() ?? null,
       })),
@@ -19487,6 +27948,7 @@ export class Repository {
       user_authorized_scope_or_count_changes: number;
       original_request_exact_success: number;
       guided_exact_resolution: number;
+      nuance_assisted_exact_success: number;
       approved_partial_publication: number;
       actionable_decision: number;
       dependency_paused: number;
@@ -19535,6 +27997,42 @@ export class Repository {
                ON marker.brief_request_id=candidate.brief_request_id
              WHERE candidate.run_id=run.id
            )
+       ), contract_projections AS (
+         SELECT contract.id,
+                jsonb_build_object(
+                  'requestedTrackCount',contract.contract_json->'requestedTrackCount',
+                  'hardClauses',COALESCE((
+                    SELECT jsonb_agg(
+                      clause - 'source' - 'changePolicy'
+                      ORDER BY clause->>'id'
+                    )
+                    FROM jsonb_array_elements(
+                      CASE
+                        WHEN jsonb_typeof(contract.contract_json->'clauses')='array'
+                          THEN contract.contract_json->'clauses'
+                        ELSE '[]'::jsonb
+                      END
+                    ) clause
+                    WHERE clause->>'hardness'='hard'
+                  ),'[]'::jsonb),
+                  'trackPredicate',COALESCE(
+                    contract.contract_json->'trackPredicate',
+                    'null'::jsonb
+                  ),
+                  'playlistConstraints',COALESCE((
+                    SELECT jsonb_agg(constraint_row ORDER BY constraint_row->>'id')
+                    FROM jsonb_array_elements(
+                      CASE
+                        WHEN jsonb_typeof(
+                          contract.contract_json->'playlistConstraints'
+                        )='array'
+                          THEN contract.contract_json->'playlistConstraints'
+                        ELSE '[]'::jsonb
+                      END
+                    ) constraint_row
+                  ),'[]'::jsonb)
+                ) eligibility_projection
+         FROM playlist_contract_revisions contract
        ), offered_raw AS (
          SELECT 'brief:' || questions.brief_request_id owner_key,
                 brief.expires_at abandoned_at
@@ -19562,47 +28060,71 @@ export class Repository {
              ELSE 'run:' || answers.run_id
            END owner_key,
            answers.normalized_answers_json,
-           answers.execution_delta_json
+           answers.execution_delta_json,
+           answers.base_contract_revision_id,
+           answers.resulting_contract_revision_id,
+           (
+             answers.base_contract_revision_id IS NOT NULL
+             AND answers.resulting_contract_revision_id IS NOT NULL
+             AND answers.resulting_contract_revision_id
+               <> answers.base_contract_revision_id
+           ) revision_changed,
+           (
+             answers.base_contract_revision_id IS NOT NULL
+             AND answers.resulting_contract_revision_id IS NOT NULL
+             AND answers.resulting_contract_revision_id
+               <> answers.base_contract_revision_id
+             AND base.eligibility_projection
+               IS DISTINCT FROM resulting.eligibility_projection
+           ) eligibility_changed
          FROM guidance_answer_sets answers
          JOIN offered ON offered.owner_key=CASE
            WHEN answers.brief_request_id IS NOT NULL
              THEN 'brief:' || answers.brief_request_id
            ELSE 'run:' || answers.run_id
          END
+         LEFT JOIN contract_projections base
+           ON base.id=answers.base_contract_revision_id
+         LEFT JOIN contract_projections resulting
+           ON resulting.id=answers.resulting_contract_revision_id
          WHERE answers.invalidated_at IS NULL
        ), run_guidance AS (
          SELECT run.id,
                 EXISTS (
-                  SELECT 1 FROM guidance_answer_sets answers
+                  SELECT 1 FROM answered answers
                   WHERE (
-                      answers.brief_request_id=run.contract_brief_request_id
-                      OR answers.run_id=run.id
+                      answers.owner_key='run:' || run.id
+                      OR (
+                        run.contract_brief_request_id IS NOT NULL
+                        AND answers.owner_key=
+                          'brief:' || run.contract_brief_request_id
+                      )
                     )
-                    AND answers.invalidated_at IS NULL
-                    AND answers.base_contract_revision_id IS NOT NULL
-                    AND answers.resulting_contract_revision_id IS NOT NULL
-                    AND answers.resulting_contract_revision_id
-                      <> answers.base_contract_revision_id
-                ) guided,
+                    AND answers.eligibility_changed
+                ) guided_intent_revision,
                 EXISTS (
-                  SELECT 1 FROM guidance_answer_sets answers
+                  SELECT 1 FROM answered answers
                   WHERE (
-                      answers.brief_request_id=run.contract_brief_request_id
-                      OR answers.run_id=run.id
+                      answers.owner_key='run:' || run.id
+                      OR (
+                        run.contract_brief_request_id IS NOT NULL
+                        AND answers.owner_key=
+                          'brief:' || run.contract_brief_request_id
+                      )
                     )
-                    AND answers.invalidated_at IS NULL
-                    AND jsonb_path_exists(
-                      answers.execution_delta_json,
-                      '$[*] ? (
-                        @.op == "add_clause"
-                        || @.op == "replace_clause"
-                        || @.op == "remove_clause"
-                        || @.op == "replace_track_predicate"
-                        || @.op == "set_requested_track_count"
-                        || @.op == "set_playlist_constraints"
-                      )'
+                    AND answers.revision_changed
+                ) AND NOT EXISTS (
+                  SELECT 1 FROM answered answers
+                  WHERE (
+                      answers.owner_key='run:' || run.id
+                      OR (
+                        run.contract_brief_request_id IS NOT NULL
+                        AND answers.owner_key=
+                          'brief:' || run.contract_brief_request_id
+                      )
                     )
-                ) scope_or_count_changed
+                    AND answers.eligibility_changed
+                ) nuance_assisted
          FROM eligible_runs run
        )
        SELECT
@@ -19623,15 +28145,19 @@ export class Repository {
             )) guidance_abandoned,
          (SELECT count(*)::int FROM eligible_runs) research_started_exact_confirmed,
          (SELECT count(*)::int FROM run_guidance
-          WHERE scope_or_count_changed) user_authorized_scope_or_count_changes,
+          WHERE guided_intent_revision) user_authorized_scope_or_count_changes,
          (SELECT count(*)::int
           FROM eligible_runs run JOIN run_guidance guidance ON guidance.id=run.id
           WHERE run.status='complete' AND run.exact_count_satisfied
-            AND NOT guidance.guided) original_request_exact_success,
+            AND NOT guidance.guided_intent_revision) original_request_exact_success,
          (SELECT count(*)::int
           FROM eligible_runs run JOIN run_guidance guidance ON guidance.id=run.id
           WHERE run.status='complete' AND run.exact_count_satisfied
-            AND guidance.guided) guided_exact_resolution,
+            AND guidance.guided_intent_revision) guided_exact_resolution,
+         (SELECT count(*)::int
+          FROM eligible_runs run JOIN run_guidance guidance ON guidance.id=run.id
+          WHERE run.status='complete' AND run.exact_count_satisfied
+            AND guidance.nuance_assisted) nuance_assisted_exact_success,
          (SELECT count(*)::int FROM eligible_runs run
           WHERE run.status='partial'
             AND EXISTS (
@@ -19679,6 +28205,7 @@ export class Repository {
       outcomes: {
         originalRequestExactSuccess: Number(row.original_request_exact_success),
         guidedExactResolution: Number(row.guided_exact_resolution),
+        nuanceAssistedExactSuccess: Number(row.nuance_assisted_exact_success),
         approvedPartialPublication: Number(row.approved_partial_publication),
         actionableDecision: Number(row.actionable_decision),
         dependencyPaused: Number(row.dependency_paused),

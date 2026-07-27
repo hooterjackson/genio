@@ -78,10 +78,13 @@ describe("adaptive run decision v1", () => {
     expect(decision.decisionHash).toMatch(/^[a-f0-9]{64}$/u);
     const { schemaVersion, ...publicShape } = decision;
     expect(schemaVersion).toBe(ADAPTIVE_RUN_DECISION_SCHEMA_V1);
-    expect(publicAdaptiveRunDecisionV1(decision)).toEqual({
+    const publicDecision = publicAdaptiveRunDecisionV1(decision);
+    expect(publicDecision).toEqual({
       ...publicShape,
       kind: "research_boundary",
     });
+    expect(publicAdaptiveRunDecisionV1(publicDecision))
+      .toEqual(publicDecision);
   });
 
   test("does not advertise a second extension or a zero-track partial", () => {

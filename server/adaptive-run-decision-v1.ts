@@ -16,7 +16,8 @@ export type AdaptiveRunDecisionReasonV1 =
   | "central_quality_floor"
   | "playlist_optimization_constraints"
   | "dependency_retry_window_expired"
-  | "frontier_exhausted_under_policy";
+  | "frontier_exhausted_under_policy"
+  | "runtime_feasibility_unknown";
 
 export interface AdaptiveRunDecisionPredicateV1 {
   readonly clauseId: string;
@@ -188,7 +189,13 @@ function stringList(value: unknown, maximumItems = 20): string[] {
 export function publicAdaptiveRunDecisionV1(value: unknown): RunDecisionActionView | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  if (row.schemaVersion !== ADAPTIVE_RUN_DECISION_SCHEMA_V1
+  const recognizedShape =
+    row.schemaVersion === ADAPTIVE_RUN_DECISION_SCHEMA_V1
+    || (
+      row.schemaVersion === undefined
+      && row.kind === "research_boundary"
+    );
+  if (!recognizedShape
     || typeof row.decisionHash !== "string"
     || !/^[a-f0-9]{64}$/u.test(row.decisionHash)
     || typeof row.contractRevisionId !== "string"
@@ -201,7 +208,8 @@ export function publicAdaptiveRunDecisionV1(value: unknown): RunDecisionActionVi
     && reason !== "central_quality_floor"
     && reason !== "playlist_optimization_constraints"
     && reason !== "dependency_retry_window_expired"
-    && reason !== "frontier_exhausted_under_policy") {
+    && reason !== "frontier_exhausted_under_policy"
+    && reason !== "runtime_feasibility_unknown") {
     return null;
   }
   const targetTrackCount = finiteInteger(

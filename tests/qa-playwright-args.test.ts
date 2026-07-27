@@ -1,8 +1,10 @@
 import { describe, expect, test } from "vitest";
 import {
   hasExplicitPlaywrightProject,
+  LOCAL_QA_OWNER_ALLOWLIST_VERSION,
   normalizePlaywrightArguments,
   playwrightProjectRuns,
+  qaWebServerEnvironment,
   RESPONSIVE_QA_PROJECTS,
 } from "../scripts/qa-playwright-args.mjs";
 
@@ -41,5 +43,26 @@ describe("browser QA argument routing", () => {
       ]));
       expect(run.arguments_[0]).not.toBe("--");
     }
+  });
+
+  test("gives the local owner binding a deterministic non-secret release identity", () => {
+    expect(qaWebServerEnvironment({})).toEqual({
+      OWNER_EMAIL: "owner@example.com",
+      OWNER_ALLOWLIST_VERSION: LOCAL_QA_OWNER_ALLOWLIST_VERSION,
+    });
+    expect(qaWebServerEnvironment({
+      OWNER_EMAIL: " qa-owner@example.com ",
+      OWNER_ALLOWLIST_VERSION: " local-release-42 ",
+    })).toEqual({
+      OWNER_EMAIL: "qa-owner@example.com",
+      OWNER_ALLOWLIST_VERSION: "local-release-42",
+    });
+    expect(qaWebServerEnvironment({
+      OWNER_EMAIL: "",
+      OWNER_ALLOWLIST_VERSION: "",
+    })).toEqual({
+      OWNER_EMAIL: "owner@example.com",
+      OWNER_ALLOWLIST_VERSION: LOCAL_QA_OWNER_ALLOWLIST_VERSION,
+    });
   });
 });

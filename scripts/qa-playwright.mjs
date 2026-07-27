@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { systemE2eEnvironment } from "./system-e2e-environment.mjs";
 import { playwrightProjectRuns } from "./qa-playwright-args.mjs";
+import { terminateOwnedQaWebServer } from "./qa-process-lifecycle.mjs";
 
 const host = "127.0.0.1";
 const suiteLockDirectory = join(tmpdir(), "genio-playwright-suite.lock");
@@ -160,26 +163,75 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-function runPlaywright(arguments_, projectName) {
+function runPlaywright(arguments_, projectName, runIndex) {
   return new Promise((resolve, reject) => {
-    child = spawn(process.execPath, [playwrightCli, "test", ...arguments_], {
+    const ownershipToken = randomUUID();
+    const webServerLeasePath = startsLocalServer
+      ? join(suiteLockDirectory, `webserver-${runIndex}-${ownershipToken}.json`)
+      : null;
+    const playwrightChild = spawn(process.execPath, [playwrightCli, "test", ...arguments_], {
       stdio: "inherit",
       env: {
         ...process.env,
+        ...systemE2eEnvironment(process.env),
         PLAYWRIGHT_BASE_URL: baseURL,
+        ...(webServerLeasePath
+          ? {
+              GENIO_QA_RUNNER_PID: String(process.pid),
+              GENIO_QA_WEBSERVER_LEASE_PATH: webServerLeasePath,
+              GENIO_QA_WEBSERVER_OWNERSHIP_TOKEN: ownershipToken,
+            }
+          : {}),
         ...(projectName ? { PLAYWRIGHT_HTML_OUTPUT_DIR: `playwright-report/${projectName}` } : {}),
       },
       detached: process.platform !== "win32",
     });
+    child = playwrightChild;
+    let settled = false;
 
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
+    async function cleanupWebServer() {
+      if (!webServerLeasePath) return;
+      await terminateOwnedQaWebServer({
+        leasePath: webServerLeasePath,
+        ownershipToken,
+      });
+    }
+
+    playwrightChild.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      void cleanupWebServer().then(
+        () => reject(error),
+        (cleanupError) => reject(new AggregateError(
+          [error, cleanupError],
+          "Browser QA process and webserver cleanup both failed",
+        )),
+      );
+    });
+    playwrightChild.once("exit", (code, signal) => {
+      if (settled) return;
+      settled = true;
       // Each responsive project receives a fresh Vinext preview. Kill any
       // process-group residue before the next project starts so closed RSC
       // streams cannot accumulate and poison later tests.
-      signalChild("SIGKILL");
-      child = undefined;
-      resolve({ code: code ?? 1, signal });
+      try {
+        if (playwrightChild.pid) {
+          if (process.platform !== "win32") process.kill(-playwrightChild.pid, "SIGKILL");
+          else playwrightChild.kill("SIGKILL");
+        }
+      } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ESRCH")) {
+          reject(error);
+          return;
+        }
+      }
+      void cleanupWebServer().then(
+        () => {
+          if (child === playwrightChild) child = undefined;
+          resolve({ code: code ?? 1, signal });
+        },
+        reject,
+      );
     });
   });
 }
@@ -192,7 +244,7 @@ let failed = false;
 for (const [index, run] of runs.entries()) {
   if (receivedSignal) break;
   process.stdout.write(`\nBrowser QA project: ${run.projectName ?? "explicit selection"}\n`);
-  const result = await runPlaywright(run.arguments_, run.projectName);
+  const result = await runPlaywright(run.arguments_, run.projectName, index);
   if (result.signal) {
     receivedSignal = receivedSignal || result.signal;
     break;
