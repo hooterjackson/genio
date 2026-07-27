@@ -111,6 +111,7 @@ jobs:
           POSTGRES_DB: needle
           POSTGRES_USER: needle
           POSTGRES_PASSWORD: needle
+          PGDATA: /var/lib/postgresql/data/pgdata
         ports:
           - 5432:5432
         options: >-

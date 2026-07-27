@@ -69,6 +69,9 @@ describe("CI unit and PostgreSQL test partition", () => {
       nextJob,
     );
     expect(section).toContain(`image: ${productionPostgresImage}`);
+    expect(section).toContain(
+      "PGDATA: /var/lib/postgresql/data/pgdata",
+    );
     expect(section).toContain("pnpm test:database:preflight");
     expect(section).toContain("pnpm db:migrate");
     expect(section).toContain("pnpm test:database");
