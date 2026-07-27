@@ -30,6 +30,13 @@ function bootstrapEnvironment(
   overrides: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   return {
+    // The unit-and-database CI job deliberately defines these runtime values
+    // globally. A fresh-bootstrap fixture must explicitly clear them before
+    // importing the Railway definition; omitting them would inherit the job
+    // credentials and correctly trip the production fail-closed parser.
+    DATABASE_URL: undefined,
+    GATEWAY_HMAC_SECRET: undefined,
+    CAPABILITY_PEPPER: undefined,
     GENIO_RELEASE_IMAGE: releaseImage,
     GENIO_RELEASE_REVISION: releaseRevision,
     GENIO_RELEASE_VERSION: "2.4.0",
@@ -70,7 +77,7 @@ async function railwayProject(
 ) {
   vi.unstubAllEnvs();
   for (const [name, value] of Object.entries(environment)) {
-    if (value !== undefined) vi.stubEnv(name, value);
+    vi.stubEnv(name, value ?? "");
   }
   vi.resetModules();
   const definition = (await import("../.railway/railway.ts")).default as unknown as (
@@ -108,6 +115,26 @@ afterEach(() => {
 });
 
 describe("fresh staging bootstrap", () => {
+  test("does not inherit unit-and-database job credentials", async () => {
+    vi.stubEnv(
+      "DATABASE_URL",
+      "postgresql://needle:needle@127.0.0.1:5432/needle",
+    );
+    vi.stubEnv(
+      "GATEWAY_HMAC_SECRET",
+      "0123456789abcdef0123456789abcdef",
+    );
+    vi.stubEnv(
+      "CAPABILITY_PEPPER",
+      "fedcba9876543210fedcba9876543210",
+    );
+
+    await expect(railwayProject(bootstrapEnvironment())).resolves.toBeDefined();
+    expect(process.env.DATABASE_URL).toBe("");
+    expect(process.env.GATEWAY_HMAC_SECRET).toBe("");
+    expect(process.env.CAPABILITY_PEPPER).toBe("");
+  });
+
   test("is staging-only and requires an explicit fresh/empty assertion", () => {
     const integrated = railwayReleasePhaseConfiguration(
       bootstrapEnvironment(),

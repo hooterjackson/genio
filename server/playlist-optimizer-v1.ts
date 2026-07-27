@@ -438,6 +438,42 @@ function coverageGain(
   return axisGain + artistGain + Number(albumGain) + quotaGain;
 }
 
+/**
+ * Exact constant-time check for the static minima when `value` would occupy
+ * the final immutable slot. The general optimistic feasibility guard treats
+ * each coverage axis independently, which is correct while several slots
+ * remain but can make the exact rescue evaluate thousands of terminal sets
+ * that one last track cannot jointly complete.
+ */
+function completesStaticMinimums(
+  value: PlaylistOptimizationCandidateV1,
+  context: SelectionContext,
+  constraints: PlaylistOptimizationConstraintsV1,
+): boolean {
+  if (context.artists.size + Number(!context.artists.has(value.artistKey))
+    < constraints.minimumDistinctArtists) {
+    return false;
+  }
+  if (context.albums.size + Number(
+    value.albumKey !== null && !context.albums.has(value.albumKey),
+  ) < constraints.minimumDistinctAlbums) {
+    return false;
+  }
+  const required = requirements(constraints);
+  for (const axis of Object.keys(required) as CoverageAxis[]) {
+    let possible = context.covered[axis].size;
+    for (const key of value[axis]) {
+      if (!context.covered[axis].has(key)) possible += 1;
+    }
+    if (possible < required[axis]) return false;
+  }
+  return (constraints.canonicalQuotaRules ?? []).every((rule) => (
+    (context.canonicalQuotaCounts.get(rule.id) ?? 0)
+      + Number((value.canonicalQuotaRuleIds ?? []).includes(rule.id))
+      >= rule.minimumCount
+  ));
+}
+
 function selectionUtility(
   value: PlaylistOptimizationCandidateV1,
   selected: readonly PlaylistOptimizationCandidateV1[],
@@ -1237,10 +1273,23 @@ function exactPlaylistRescue(
           selected,
           constraints,
           context,
-        ))) {
+        ))
+        || (selected.length + 1 === constraints.targetTrackCount
+          && !completesStaticMinimums(value, context, constraints))) {
         continue;
       }
       selected.push(value);
+      // Once this pick fills the immutable count, there is no residual
+      // frontier to prove feasible. Re-enter the terminal branch directly so
+      // it performs the exact sequence and constraint summary without
+      // repeatedly scanning every lower-ranked row that can no longer be
+      // selected. The terminal recursive call still consumes the same exact
+      // node and summary budgets.
+      if (selected.length === constraints.targetTrackCount) {
+        if (search(index + 1)) return true;
+        selected.pop();
+        continue;
+      }
       const remaining = candidates.slice(index + 1);
       consumeOptimizationWork(budget, "exact", remaining.length + 1);
       const viable = canStillSatisfy(selected, remaining, constraints);
@@ -1292,6 +1341,17 @@ export function optimizePlaylistV1(input: {
       for (const rankedCandidate of ranked) {
         const { value } = rankedCandidate;
         const selected = [...state.selected, value];
+        // A final-slot candidate either completes every static minimum now or
+        // it never can; no lower-ranked row is eligible to join this set.
+        // Avoid rebuilding and rescanning the entire residual pool for a
+        // zero-slot optimistic-feasibility query.
+        if (selected.length === input.constraints.targetTrackCount) {
+          if (completesStaticMinimums(value, context, input.constraints)) {
+            viable.push(rankedCandidate);
+            if (viable.length >= branchWidth) break;
+          }
+          continue;
+        }
         const remaining = candidates.filter((candidateValue) => (
           !state.selectedIds.has(candidateValue.id) && candidateValue.id !== value.id
         ));
