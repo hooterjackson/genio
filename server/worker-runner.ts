@@ -66,10 +66,15 @@ import {
   type JobQueueClass,
   type WorkerQueueClass,
 } from "./job-queue-class.ts";
-import { runtimeReleaseContract } from "./runtime-release.ts";
+import {
+  runtimeReleaseContract,
+  semanticExecutionConfigurationHash,
+} from "./runtime-release.ts";
 import {
   CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION,
   releaseDatabaseReadinessReady,
   releaseExecutionConfigured,
   runtimeReleaseDeploymentPhase,
@@ -96,7 +101,7 @@ const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_CONTROL_INTERVAL_MS = 5_000;
 const PIPELINE_OBSERVABILITY_MAX_CATCHUP_HOURS = 24;
-const WORKER_CONFIGURATION_ENV_KEYS = [
+export const WORKER_CONFIGURATION_ENV_KEYS = Object.freeze([
   "NODE_ENV",
   "RELEASE_ENVIRONMENT",
   "RELEASE_DEPLOYMENT_PHASE",
@@ -113,7 +118,9 @@ const WORKER_CONFIGURATION_ENV_KEYS = [
   "RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH",
   "RELEASE_PUBLIC_ROLLOUT_STAGE",
   "RELEASE_PUBLIC_ROLLOUT_OPERATION",
+  "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH",
   "RELEASE_PUBLIC_ROLLOUT_INTENT_GROUP",
+  "RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH",
   "RELEASE_PUBLIC_ROLLOUT_FROM_PERCENT",
   "RELEASE_PUBLIC_ROLLOUT_TO_PERCENT",
   "RELEASE_PREVIOUS_PUBLIC_ROLLOUT_EVIDENCE_HASH",
@@ -189,9 +196,10 @@ const WORKER_CONFIGURATION_ENV_KEYS = [
   "FAST_RESEARCH_MAX_EXTRACTION_TOKENS",
   "FAST_RESEARCH_SEARCH_CONTEXT",
   "APPLE_MATCHING_CONCURRENCY",
+  "APPLE_MATCH_MAX_QUERIES",
   "FAST_MATCH_LOOKUP_TIMEOUT_MS",
   "APPLE_CATALOG_RECOVERY_TIMEOUT_MS",
-] as const;
+] as const);
 
 function positiveEnv(name: string, fallback: number, maximum: number): number {
   const value = Number(process.env[name] ?? fallback);
@@ -246,6 +254,8 @@ export interface DurableJob {
   queryPlanRevisionId?: string | null;
   requiredExecutorCapabilityHash?: string | null;
   requiredExecutorCapabilityVector?: Record<string, unknown> | null;
+  requiredExecutorRevision?: string | null;
+  requiredExecutorSemanticConfigurationHash?: string | null;
   stageKey?: string;
   leaseEpoch?: number;
   leaseExpiresAt?: Date | null;
@@ -259,6 +269,10 @@ export interface WorkerQueueRepository {
     leaseMs: number,
     capability: WorkerPipelineCapability,
     queueClass: WorkerQueueClass,
+    executorReleaseIdentity: {
+      executorRevision: string;
+      semanticExecutionConfigurationHash: string;
+    },
   ): Promise<DurableJob | null>;
   renewJobLease(jobId: string, workerId: string, leaseMs: number, leaseEpoch?: number): Promise<boolean>;
   deferJob(jobId: string, workerId: string, availableAt: Date, reason: string, leaseEpoch?: number): Promise<void>;
@@ -276,6 +290,7 @@ export interface WorkerQueueRepository {
     [key: string]: unknown;
   }): Promise<void>;
   getSetting(key: string): Promise<string | null>;
+  executorReleaseIdentityFenceAvailable?(): Promise<boolean>;
   getRunControlState(runId: string): Promise<{ status: string; phase: string } | null>;
   quarantineCanonicalExecution?(input: {
     runId: string;
@@ -313,6 +328,7 @@ export interface WorkerQueueRepository {
     executorCapabilityHash?: string | null;
     executorCapabilityVector?: Record<string, unknown> | null;
     configurationHash: string;
+    semanticExecutionConfigurationHash?: string | null;
     idempotencyKey: string;
     checkpointCursor?: string | null;
     leaseExpiresAt?: Date | null;
@@ -581,6 +597,7 @@ export class WorkerRunner {
   private readonly schemaSupport: DatabaseSchemaSupport;
   private readonly queueClass: WorkerQueueClass;
   private readonly configurationHash: string;
+  private readonly semanticExecutionConfigurationHash: string;
   private readonly handlers: Record<string, JobHandler>;
   private readonly active = new Map<string, {
     promise: Promise<void>;
@@ -618,6 +635,8 @@ export class WorkerRunner {
       pipelineCapability: this.pipelineCapability,
       schemaSupport: this.schemaSupport,
     });
+    this.semanticExecutionConfigurationHash =
+      semanticExecutionConfigurationHash(this.environment);
     this.handlers = {
       ...defaultJobHandlers(repository, {
         v3RetrievalPort: options.v3RetrievalPort ?? null,
@@ -665,6 +684,11 @@ export class WorkerRunner {
             this.leaseMs,
             this.pipelineCapability,
             this.queueClass,
+            {
+              executorRevision: this.version,
+              semanticExecutionConfigurationHash:
+                this.semanticExecutionConfigurationHash,
+            },
           );
           if (!job) break;
           claimed = true;
@@ -710,6 +734,8 @@ export class WorkerRunner {
       observedDatabaseSchemaVersion,
       observedDatabaseCapabilityVersion,
       observedCanonicalExecutionHardeningVersion,
+      observedExecutorReleaseIdentityFencingVersion,
+      executorReleaseIdentityFenceSupported,
     ] =
       await Promise.all([
         this.repository.getSchemaVersion(),
@@ -717,13 +743,24 @@ export class WorkerRunner {
         this.repository.getSetting(
           CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
         ),
+        this.repository.getSetting(
+          CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+        ),
+        this.repository.executorReleaseIdentityFenceAvailable?.()
+          ?? Promise.resolve(false),
       ]);
     if (!releaseDatabaseReadinessReady({
       environment: this.environment,
       observedDatabaseSchemaVersion,
       observedDatabaseCapabilityVersion,
       observedCanonicalExecutionHardeningVersion,
-    })) {
+      observedCanonicalExecutorReleaseIdentityFencingVersion:
+        observedExecutorReleaseIdentityFencingVersion,
+      executorReleaseIdentityFenceSupported,
+    })
+      || observedExecutorReleaseIdentityFencingVersion
+        !== CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+      || executorReleaseIdentityFenceSupported !== true) {
       throw new Error(
         "Worker release database readiness check failed; refusing durable mutations",
       );
@@ -753,6 +790,8 @@ export class WorkerRunner {
       ).map(({ hash, vector }) => ({ hash, vector })),
       queueClass: this.queueClass,
       configurationHash: this.configurationHash,
+      semanticExecutionConfigurationHash:
+        this.semanticExecutionConfigurationHash,
       capacity: this.concurrency,
       activeJobs: this.active.size,
     });
@@ -922,6 +961,20 @@ export class WorkerRunner {
 
     try {
       if (!handler) throw new NonRetriableJobError(`Unknown durable job kind ${job.kind}`);
+      const releaseIdentityPairComplete =
+        (job.requiredExecutorRevision == null)
+        === (job.requiredExecutorSemanticConfigurationHash == null);
+      if (!releaseIdentityPairComplete
+        || (job.requiredExecutorRevision != null
+          && (
+            job.requiredExecutorRevision !== this.version
+            || job.requiredExecutorSemanticConfigurationHash
+              !== this.semanticExecutionConfigurationHash
+          ))) {
+        throw new CanonicalExecutionIntegrityError(
+          "executor_release_identity_mismatch",
+        );
+      }
       const cancellationBeforeStart = await this.runCancellationReason(job);
       if (cancellationBeforeStart) {
         await this.repository.cancelLeasedJob(job.id, this.workerId, cancellationBeforeStart, job.leaseEpoch);
@@ -988,6 +1041,8 @@ export class WorkerRunner {
               ? executorCapability.vector as unknown as Record<string, unknown>
               : null,
             configurationHash: this.configurationHash,
+            semanticExecutionConfigurationHash:
+              this.semanticExecutionConfigurationHash,
             idempotencyKey: `${job.id}:${leaseGeneration}:${activeContract.id}`,
             checkpointCursor: job.stageKey || null,
             leaseExpiresAt: job.leaseExpiresAt ?? null,

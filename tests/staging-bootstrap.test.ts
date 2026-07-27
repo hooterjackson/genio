@@ -335,6 +335,8 @@ describe("fresh staging bootstrap", () => {
       observedDatabaseSchemaVersion: "18",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,

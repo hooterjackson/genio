@@ -86,6 +86,8 @@ describe("runtime release deployment phase", () => {
       observedDatabaseSchemaVersion: "18",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
     expect(canonicalContractCohortConfigured(environment)).toBe(true);
     expect(canonicalContractCohortConfigured({
@@ -138,7 +140,25 @@ describe("runtime release deployment phase", () => {
       observedDatabaseSchemaVersion: "18",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
+    expect(canonicalContractActivationReady({
+      environment: schema5,
+      observedDatabaseSchemaVersion: "18",
+      observedDatabaseCapabilityVersion: "1",
+      observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: null,
+      executorReleaseIdentityFenceSupported: true,
+    })).toBe(false);
+    expect(canonicalContractActivationReady({
+      environment: schema5,
+      observedDatabaseSchemaVersion: "18",
+      observedDatabaseCapabilityVersion: "1",
+      observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorReleaseIdentityFenceSupported: false,
+    })).toBe(false);
   });
 
   test("requires every independently signed activation control without fallback", () => {
@@ -204,6 +224,9 @@ describe("runtime release deployment phase", () => {
       environment: expand,
       observedDatabaseSchemaVersion: "18",
       observedDatabaseCapabilityVersion: "1",
+      observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
   });
 });

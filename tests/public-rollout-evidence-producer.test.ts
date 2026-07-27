@@ -20,6 +20,7 @@ function observation(): ReleaseConvergenceObservation {
     eligibleIdentityCount: 1,
     eligibleRevisions: [revision],
     eligibleConfigurationHashes: [digest],
+    eligibleSemanticExecutionConfigurationHashes: [digest],
     lastSeenAt: "2026-07-24T12:00:00.000Z",
   };
   return {
@@ -27,23 +28,49 @@ function observation(): ReleaseConvergenceObservation {
     sitesVersion: "2.4.0",
     sitesRevision: revision,
     api: {
+      replicaIdentityHash: "f".repeat(64),
       identifier: "genio-api",
       version: "2.4.0",
       revision,
       configurationHash: digest,
+      semanticExecutionConfigurationHash: digest,
     },
     runtime: {
+      semanticExecutionConfigurationHash: digest,
       publicRolloutEvidenceHash: "c".repeat(64),
       publicRolloutStage: "genre_scene:0->1",
     },
     runtimeContractHash: "d".repeat(64),
     systemHttpStatus: 200,
     system: {
+      api: {
+        replicaIdentityHash: "0".repeat(64),
+        identifier: "genio-api",
+        version: "2.4.0",
+        revision,
+        configurationHash: digest,
+        semanticExecutionConfigurationHash: digest,
+      },
       ok: true,
       activationReady: true,
       database: "ready",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
+      canonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorFencing: {
+        ready: true,
+        incompleteJobs: 0,
+        mismatchedActiveAttempts: 0,
+        uncoveredJobs: 0,
+        requirementsHash: "f".repeat(64),
+      },
+      publicRollout: {
+        active: true,
+        databaseAuthorized: true,
+        evidenceHash: "c".repeat(64),
+        stage: "genre_scene:0->1",
+        targetConfigurationHash: "e".repeat(64),
+      },
       paused: false,
       workerProtocol: {
         expected: "playlist-pipeline-v10",
@@ -166,6 +193,12 @@ describe("public rollout live observation producer", () => {
     }],
     ["capability failure", (value: ReleaseConvergenceObservation) => {
       value.system.releaseManifestCanaryGuardsVersion = "0";
+    }],
+    ["unauthorized rollout database state", (value: ReleaseConvergenceObservation) => {
+      value.system.publicRollout.databaseAuthorized = false;
+    }],
+    ["mismatched rollout database state", (value: ReleaseConvergenceObservation) => {
+      value.system.publicRollout.evidenceHash = "9".repeat(64);
     }],
     ["paused system", (value: ReleaseConvergenceObservation) => {
       value.system.paused = true;

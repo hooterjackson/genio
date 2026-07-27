@@ -47,6 +47,7 @@ import {
   createStrictSignedEnvelope,
   signedArtifactSha256,
 } from "../shared/signed-artifact.ts";
+import { semanticBehaviorHashV1 } from "../shared/semantic-release-evidence.ts";
 import {
   PUBLIC_ROLLOUT_EVIDENCE_SCHEMA_VERSION,
   SIGNED_PUBLIC_ROLLOUT_EVIDENCE_SCHEMA_VERSION,
@@ -70,6 +71,8 @@ import { publicGuidanceQuestionV3 } from "../server/adaptive-guidance-contract-b
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import {
   RELEASE_EVIDENCE_TTL_MS,
+  assertFinalizationBrowserPublicRolloutBindingV1,
+  assertFinalizationRuntimePublicRolloutBindingV1,
   loadReleaseEvidenceSigningBundle,
   releaseEvidenceConfigurationHash,
   releaseGateProducerKeyFingerprint,
@@ -90,6 +93,7 @@ import {
 } from "../scripts/github-offline-attestation.ts";
 import {
   SIGNED_STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
+  STABLE_RELEASE_FINALIZATION_SOURCE_BUNDLE_SCHEMA_V2,
   STABLE_RELEASE_AUTHORIZATION_ISSUER_V1,
   STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
   authorizeStableRelease,
@@ -104,6 +108,11 @@ import {
   GITHUB_CLIENT_PAYLOAD_MAX_BYTES,
 } from "../scripts/prepare-stable-release-dispatch.ts";
 import {
+  buildReleaseConvergenceEvidence,
+  type ReleaseConvergenceObservation,
+} from "../scripts/verify-release-convergence.ts";
+import {
+  FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1,
   RELEASE_GATE_ARTIFACT_SCHEMA_V1,
   attestReleaseGateArtifact,
   createOfflineReleaseGateArtifact,
@@ -146,6 +155,11 @@ const semanticBaselineStableAuthorizerKeys =
   generateKeyPairSync("ed25519");
 const stagingControlPlaneKeys = generateKeyPairSync("ed25519");
 const sitesControlPlaneKeys = generateKeyPairSync("ed25519");
+const controlPlaneReceiptKeys = {
+  apple: generateKeyPairSync("ed25519"),
+  provider: generateKeyPairSync("ed25519"),
+  qaBudget: generateKeyPairSync("ed25519"),
+};
 const semanticBaselineFixtureIds = [
   "fixed-three-track-control-v1",
   "smooth-reggaeton-heat-50-v1",
@@ -168,6 +182,33 @@ const approvedStagingControlPlaneTrustPolicy =
     approvedKeySha256:
       stagingControlPlaneKeyFingerprint(stagingControlPlaneKeys.publicKey),
   });
+const approvedControlPlaneReceiptTrustPolicies = {
+  apple: controlPlaneReceiptTrustPolicyV1({
+    receiptKind: "apple",
+    approvedIssuer: "apple-control-plane-test-v1",
+    approvedKeyId: "apple-control-plane-key-test-v1",
+    approvedKeySha256:
+      controlPlaneReceiptKeyFingerprint(controlPlaneReceiptKeys.apple.publicKey),
+  }),
+  provider: controlPlaneReceiptTrustPolicyV1({
+    receiptKind: "provider",
+    approvedIssuer: "provider-control-plane-test-v1",
+    approvedKeyId: "provider-control-plane-key-test-v1",
+    approvedKeySha256:
+      controlPlaneReceiptKeyFingerprint(
+        controlPlaneReceiptKeys.provider.publicKey,
+      ),
+  }),
+  qaBudget: controlPlaneReceiptTrustPolicyV1({
+    receiptKind: "qa_budget",
+    approvedIssuer: "qa-budget-ledger-test-v1",
+    approvedKeyId: "qa-budget-ledger-key-test-v1",
+    approvedKeySha256:
+      controlPlaneReceiptKeyFingerprint(
+        controlPlaneReceiptKeys.qaBudget.publicKey,
+      ),
+  }),
+};
 const approvedSitesControlPlaneTrustPolicy = sitesControlPlaneTrustPolicyV1({
   approvedKeyId: "sites-control-plane-test-v1",
   approvedKeySha256:
@@ -295,6 +336,7 @@ function payload(
     ? stagingConfiguration
     : productionConfiguration;
   const runtime = {
+    semanticExecutionConfigurationHash: "f".repeat(64),
     releaseEnvironment: kind === "candidate" ? "staging" : "production",
     deploymentPhase: "activate",
     databaseSchemaVersion: "18",
@@ -375,6 +417,9 @@ function payload(
           publicRolloutEvidencePayloadHash: null,
           publicRolloutCompletedAt: null,
           publicRolloutIntentGroup: null,
+          publicRolloutFromPercent: null,
+          publicRolloutToPercent: null,
+          publicRolloutTargetConfigurationHash: null,
         }
       : kind === "promotion"
         ? {
@@ -385,6 +430,9 @@ function payload(
             publicRolloutEvidencePayloadHash: null,
             publicRolloutCompletedAt: null,
             publicRolloutIntentGroup: null,
+            publicRolloutFromPercent: null,
+            publicRolloutToPercent: null,
+            publicRolloutTargetConfigurationHash: null,
           }
         : {
             candidateEvidencePayloadHash: "f".repeat(64),
@@ -394,6 +442,9 @@ function payload(
             publicRolloutEvidencePayloadHash: "d".repeat(64),
             publicRolloutCompletedAt: "2026-07-23T12:26:00.000Z",
             publicRolloutIntentGroup: "genre_scene",
+            publicRolloutFromPercent: "50",
+            publicRolloutToPercent: "100",
+            publicRolloutTargetConfigurationHash: "4".repeat(64),
           },
     configuration,
     stagingControls: {
@@ -439,6 +490,17 @@ function payload(
         approvedStagingControlPlaneTrustPolicy.approvedKeySha256,
     },
     runtime,
+    semanticReview: {
+      schemaVersion: "genio-release-semantic-review/v1",
+      gateEvidenceHash: hash,
+      reviewedAt: phaseGeneratedAt.candidate,
+      semanticBehaviorHash: semanticBehaviorHashV1(runtime),
+      fixtures: semanticBaselineFixtureIds.map((fixtureId, index) => ({
+        fixtureId,
+        orderedManifestHash: ["7", "8", "9"][index]!.repeat(64),
+        outputHash: ["a", "b", "c"][index]!.repeat(64),
+      })),
+    },
     environmentSnapshots: {
       staging: {
         scope: "full",
@@ -454,6 +516,13 @@ function payload(
         providerCredentialVersionHash: "1".repeat(64),
         appleCredentialVersionHash: "3".repeat(64),
         appleQaVerifierCredentialVersionHash: "d".repeat(64),
+        publicRollout: {
+          active: false,
+          databaseAuthorized: true,
+          evidenceHash: null,
+          stage: null,
+          targetConfigurationHash: null,
+        },
       },
       production: kind !== "candidate" ? {
         scope: kind === "finalization" ? "full" : "backend",
@@ -469,6 +538,21 @@ function payload(
         providerCredentialVersionHash: "2".repeat(64),
         appleCredentialVersionHash: "4".repeat(64),
         appleQaVerifierCredentialVersionHash: "e".repeat(64),
+        publicRollout: kind === "finalization"
+          ? {
+              active: true,
+              databaseAuthorized: true,
+              evidenceHash: "d".repeat(64),
+              stage: "genre_scene:50->100",
+              targetConfigurationHash: "4".repeat(64),
+            }
+          : {
+              active: false,
+              databaseAuthorized: true,
+              evidenceHash: null,
+              stage: null,
+              targetConfigurationHash: null,
+            },
       } : null,
     },
     gates,
@@ -497,11 +581,13 @@ function protectedBaselineMetadataForFinalization(
       finalization.payload.stagingControls.candidateImageReference,
     finalizationEvidencePayloadHash: finalization.payloadHash,
     finalBrowserGateEvidenceHash: finalBrowser.evidenceHash,
-    fixtures: semanticBaselineFixtureIds.map((fixtureId, index) => ({
-      fixtureId,
-      orderedManifestHash: String(index + 1).repeat(64),
-      outputHash: String(index + 4).repeat(64),
-    })),
+    fixtures: finalization.payload.semanticReview.fixtures.map(
+      (fixture: {
+        fixtureId: string;
+        orderedManifestHash: string;
+        outputHash: string;
+      }) => ({ ...fixture }),
+    ),
   };
 }
 
@@ -531,7 +617,12 @@ function createSemanticBaselineLineageFixture() {
     publicRolloutEvidencePayloadHash: "3".repeat(64),
     publicRolloutCompletedAt: "2026-07-22T09:30:00.000Z",
     publicRolloutIntentGroup: "genre_scene",
+    publicRolloutFromPercent: "50",
+    publicRolloutToPercent: "100",
+    publicRolloutTargetConfigurationHash: "4".repeat(64),
   };
+  finalizationPayload.semanticReview.reviewedAt =
+    finalizationPayload.lineage.candidateEvidenceGeneratedAt;
   finalizationPayload.stagingControls.candidateEvidencePayloadHash =
     finalizationPayload.lineage.candidateEvidencePayloadHash;
   finalizationPayload.stagingControls.candidateSourceRevision =
@@ -550,6 +641,14 @@ function createSemanticBaselineLineageFixture() {
     "2.3.9";
   finalizationPayload.environmentSnapshots.production.sitesSourceRevision =
     sourceRevision;
+  finalizationPayload.environmentSnapshots.production.publicRollout = {
+    active: true,
+    databaseAuthorized: true,
+    evidenceHash:
+      finalizationPayload.lineage.publicRolloutEvidencePayloadHash!,
+    stage: "genre_scene:50->100",
+    targetConfigurationHash: "4".repeat(64),
+  };
   for (const gateValue of finalizationPayload.gates) {
     gateValue.completedAt = finalizationGeneratedAt;
   }
@@ -650,9 +749,39 @@ function sha256(value: unknown): string {
   return createHash("sha256").update(stableReleaseEvidenceJson(value)).digest("hex");
 }
 
+function resignReleaseEvidence(
+  value: {
+    payload: unknown;
+    signature: { keyId: string };
+  },
+  signingKey: KeyObject,
+) {
+  const signedPayload = validateReleaseEvidencePayload(value.payload);
+  const keyId = value.signature.keyId;
+  return {
+    schemaVersion: "genio-signed-release-evidence/v3" as const,
+    payload: signedPayload,
+    payloadHash: sha256(signedPayload),
+    signature: {
+      algorithm: "Ed25519" as const,
+      keyId,
+      value: sign(
+        null,
+        Buffer.from(stableReleaseEvidenceJson({
+          algorithm: "Ed25519",
+          keyId,
+          payload: signedPayload,
+        })),
+        signingKey,
+      ).toString("base64url"),
+    },
+  };
+}
+
 function runtimeSnapshot(
   value: ReturnType<typeof payload>,
   environment: "staging" | "production",
+  publicRolloutEvidence?: unknown,
 ) {
   const observation = sitesObservation(value.kind, environment);
   const configuration = {
@@ -670,8 +799,39 @@ function runtimeSnapshot(
     configuration,
   });
   const runtimeHash = releaseEvidenceRuntimeHash({ runtime } as any);
+  const rolloutEnvelope = publicRolloutEvidence as
+    | {
+        payloadHash: string;
+        payload: {
+          transition: {
+            intentGroup: string;
+            fromPercent: string;
+            toPercent: string;
+          };
+          targetConfigurationHash: string;
+        };
+      }
+    | undefined;
+  const publicRollout = environment === "production"
+    && value.kind === "finalization"
+    ? {
+        active: true,
+        databaseAuthorized: true,
+        evidenceHash: rolloutEnvelope!.payloadHash,
+        stage:
+          `${rolloutEnvelope!.payload.transition.intentGroup}:${rolloutEnvelope!.payload.transition.fromPercent}->${rolloutEnvelope!.payload.transition.toPercent}`,
+        targetConfigurationHash:
+          rolloutEnvelope!.payload.targetConfigurationHash,
+      }
+    : {
+        active: false,
+        databaseAuthorized: true,
+        evidenceHash: null,
+        stage: null,
+        targetConfigurationHash: null,
+      };
   const unsigned = {
-    schemaVersion: "genio-release-runtime-snapshot/v2",
+    schemaVersion: "genio-release-runtime-snapshot/v3",
     generatedAt: environment === "staging"
       ? phaseGeneratedAt.candidate
       : value.generatedAt,
@@ -687,8 +847,21 @@ function runtimeSnapshot(
       sourceRevision: value.candidate.sourceRevision,
     },
     sitesObservation: observation,
+    apiObservations: {
+      liveReplicaIdentityHash: "8".repeat(64),
+      systemReplicaIdentityHash: "9".repeat(64),
+    },
+    executorFencing: {
+      version: "1",
+      ready: true,
+      incompleteJobs: 0,
+      mismatchedActiveAttempts: 0,
+      uncoveredJobs: 0,
+      requirementsHash: "a".repeat(64),
+    },
     configuration,
     runtime,
+    publicRollout,
     credentialVersionHashes: {
       provider: environment === "staging" ? "1".repeat(64) : "2".repeat(64),
       apple: environment === "staging" ? "3".repeat(64) : "4".repeat(64),
@@ -1093,6 +1266,20 @@ function sourceEvidence(
         semanticBaselineLineageFixture.stableAuthorization,
       protectedBaselineStableAuthorizerVerificationKey:
         semanticBaselineLineageFixture.stableAuthorizerVerificationKey,
+      protectedBaselineVerification: {
+        schemaVersion:
+          "genio-historical-stable-predecessor-verification-context/v1",
+        mode: "normal",
+        repository: "hooterjackson/genio",
+        defaultBranch: "main",
+        controllerSourceRevision: null,
+        successorRcTag: candidate.tag,
+        successorSourceRevision: candidate.sourceRevision,
+      },
+      protectedBaselineImageAttestation: null,
+      protectedBaselineStoredConsumer:
+        semanticBaselineLineageFixture.consumer,
+      protectedBaselineGithubAttestationVerification: null,
       protectedBaselineLineage:
         semanticBaselineLineageFixture.consumer,
       blindedPackage,
@@ -1119,39 +1306,154 @@ function sourceEvidence(
     const nextObservedAt = new Date(
       Date.parse(sourceGeneratedAt) + 30_000,
     ).toISOString();
-    const unsigned = {
-      schemaVersion: "genio-release-convergence/v2",
-      generatedAt: sourceGeneratedAt,
-      expiresAt: sourceExpiresAt,
+    const semanticExecution =
+      releaseRuntimeSnapshot.runtime.semanticExecutionConfigurationHash;
+    const convergenceObservation = (
+      observedAt: string,
+    ): ReleaseConvergenceObservation => {
+      const runtime = {
+        pipelineVersion: "pipeline-v3",
+        semanticExecutionConfigurationHash: semanticExecution,
+        releaseEnvironment: "production",
+        deploymentPhase: "activate",
+        expectedDatabaseSchemaVersion: "18",
+        canonicalActivationConfigured: "true",
+        assignmentEnabled: "true",
+        ownerCanaryEnabled: "true",
+        productionEvidenceApproved: "true",
+        curatedHostedEvidenceApproved: "true",
+        genreSceneEvidenceApproved: "true",
+        geographicScopeEvidenceApproved: "true",
+        factualFeasibilityApproved: "true",
+        publicRolloutEvidenceHash:
+          releaseRuntimeSnapshot.publicRollout.evidenceHash,
+        publicRolloutStage:
+          releaseRuntimeSnapshot.publicRollout.stage,
+        schemaVersion: "18",
+        schemaMinimum: "17",
+        schemaMaximum: "18",
+        schemaPreferred: "18",
+        workerProtocol: "playlist-pipeline-v10",
+        minimumWorkerProtocol: "playlist-pipeline-v10",
+        selectionPlanVersion: "selection-plan-v3",
+        queryPlanSchemaVersion: "5",
+        briefContractVersion: "3",
+        guidanceContractOwnerCanaryEnabled: "true",
+        guidanceContractReggaetonCanaryEnabled: "true",
+        guidancePolicyVersion: "adaptive_guidance_v3",
+        evidencePolicyVersion: "governed_evidence_v2",
+        queryPlanPolicyVersion: "query_plan_v3_4",
+        semanticScopePolicyVersion: "scope_gate_v2_1_2",
+        musicConceptPolicyVersion: "music_concepts_v3_2_0",
+        pipelinePolicyVersion: "corpus_first_v3",
+        promptVersion: "grounded_recovery_v3_1_prompt_v1",
+        briefProviderModelId: "gpt-5.4-mini",
+        baselineProviderModelId: "gpt-5.6-luna",
+        escalationProviderModelId: "gpt-5.6-terra",
+        modelResolutionMode: "catalog",
+        modelCatalogValidatedAt: sourceGeneratedAt,
+      };
+      const lane = (configurationHash: string) => ({
+        status: "healthy",
+        protocolVersion: "playlist-pipeline-v10",
+        compatibleCapacity: 1,
+        eligibleWorkerCount: 1,
+        eligibleIdentityCount: 1,
+        eligibleRevisions: [candidate.sourceRevision],
+        eligibleConfigurationHashes: [configurationHash],
+        eligibleSemanticExecutionConfigurationHashes: [
+          semanticExecution,
+        ],
+        lastSeenAt: observedAt,
+      });
+      return {
+        observedAt,
+        sitesVersion:
+          releaseRuntimeSnapshot.sitesObservation.version,
+        sitesRevision:
+          releaseRuntimeSnapshot.sitesObservation.sourceRevision,
+        api: {
+          replicaIdentityHash:
+            releaseRuntimeSnapshot.apiObservations.liveReplicaIdentityHash,
+          identifier: "genio-api",
+          version: candidate.version,
+          revision: candidate.sourceRevision,
+          configurationHash: hash,
+          semanticExecutionConfigurationHash: semanticExecution,
+        },
+        runtime,
+        runtimeContractHash: sha256(runtime),
+        systemHttpStatus: 200,
+        system: {
+          api: {
+            replicaIdentityHash:
+              releaseRuntimeSnapshot.apiObservations
+                .systemReplicaIdentityHash,
+            identifier: "genio-api",
+            version: candidate.version,
+            revision: candidate.sourceRevision,
+            configurationHash: hash,
+            semanticExecutionConfigurationHash: semanticExecution,
+          },
+          ok: true,
+          activationReady: true,
+          database: "ready",
+          releaseManifestCanaryGuardsVersion: "1",
+          canonicalExecutionHardeningVersion: "1",
+          canonicalExecutorReleaseIdentityFencingVersion: "1",
+          executorFencing: {
+            ready: true,
+            incompleteJobs: 0,
+            mismatchedActiveAttempts: 0,
+            uncoveredJobs: 0,
+            requirementsHash: "f".repeat(64),
+          },
+          publicRollout: releaseRuntimeSnapshot.publicRollout,
+          paused: false,
+          workerProtocol: {
+            expected: "playlist-pipeline-v10",
+            minimumAccepted: "playlist-pipeline-v10",
+            actual: "playlist-pipeline-v10",
+          },
+          workerLanes: {
+            interactive: lane(hash),
+            deep: lane(hash),
+          },
+          queue: {
+            queued: 0,
+            leased: 0,
+            expiredLeases: 0,
+            failed: 0,
+            oldestQueuedSeconds: 0,
+          },
+        },
+      };
+    };
+    const convergence = buildReleaseConvergenceEvidence({
       origin: "https://9enio.com",
       scope,
-      expected: {
-        backend: {
-          revision: candidate.sourceRevision,
-          version: candidate.version,
-        },
-        sites: {
-          revision: releaseRuntimeSnapshot.sitesObservation.sourceRevision,
-          version: releaseRuntimeSnapshot.sitesObservation.version,
-          candidateMatched: sitesCandidateMatched,
-        },
-        samples: 2,
-        minimumObservationSpanMs: 30_000,
-        configurationHashes: {
-          api: hash,
-          interactiveWorker: hash,
-          deepWorker: hash,
-        },
+      expectedRevision: candidate.sourceRevision,
+      expectedVersion: candidate.version,
+      expectedSitesRevision:
+        releaseRuntimeSnapshot.sitesObservation.sourceRevision,
+      expectedSitesVersion:
+        releaseRuntimeSnapshot.sitesObservation.version,
+      expectedSamples: 2,
+      expectedConfigurationHashes: {
+        api: hash,
+        interactiveWorker: hash,
+        deepWorker: hash,
+        semanticExecution,
       },
-      observationSpanMs: 30_000,
-      passed: true,
-      violations: [],
       observations: [
-        { observedAt: sourceGeneratedAt },
-        { observedAt: nextObservedAt },
+        convergenceObservation(sourceGeneratedAt),
+        convergenceObservation(nextObservedAt),
       ],
-    };
-    return { convergence: { ...unsigned, evidenceHash: sha256(unsigned) } };
+      generatedAt: sourceGeneratedAt,
+    });
+    expect(convergence.expected.sites.candidateMatched)
+      .toBe(sitesCandidateMatched);
+    return { convergence };
   }
   if (gateName === "final_custom_domain_browser") {
     const rollbackTarget = createSitesProductionRollbackTargetV1({
@@ -1191,7 +1493,7 @@ function sourceEvidence(
       rollbackTarget,
     };
     const browserUnsigned = {
-      schemaVersion: "genio-final-custom-domain-browser/v1",
+      schemaVersion: "genio-final-custom-domain-browser/v2",
       origin: "https://9enio.com",
       candidateRevision: candidate.sourceRevision,
       observedAt: sourceGeneratedAt,
@@ -1201,6 +1503,19 @@ function sourceEvidence(
       publicPlaylistContentsVisible: true,
       privacyProjectionPassed: true,
       screenshotHashes: ["c".repeat(64)],
+      publicAssignmentProbes:
+        FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture, index) => ({
+          fixtureId: fixture.fixtureId,
+          intentGroup: fixture.intentGroup,
+          targetTrackCount: fixture.targetTrackCount,
+          rolloutEvidenceHash:
+            releaseRuntimeSnapshot.publicRollout.evidenceHash!,
+          rolloutStage:
+            releaseRuntimeSnapshot.publicRollout.stage!,
+          assignmentHash: String((index % 9) + 1).repeat(64),
+          contractVersion: 3,
+          cleanupStatus: 204,
+        })),
     };
     const sitesControlPlane = {
       ...sitesUnsigned,
@@ -1209,7 +1524,9 @@ function sourceEvidence(
     const sitesAttestationPayload = {
       schemaVersion: "genio-sites-control-plane-attestation/v1",
       generatedAt: sourceGeneratedAt,
-      expiresAt: sourceExpiresAt,
+      expiresAt: new Date(
+        Date.parse(sourceGeneratedAt) + 6 * 60_000,
+      ).toISOString(),
       issuer: "openai-sites-control-plane",
       operation: "production_deployment_ready",
       receiptHash: sitesControlPlane.evidenceHash,
@@ -1313,6 +1630,9 @@ function sourceEvidence(
   };
 }
 
+const STABLE_CONTROL_PLANE_SOURCE_FIXTURE_FILE =
+  "stable-finalization-control-plane-sources.json";
+
 function writeStagingControlPlaneEvidence(
   directory: string,
   kind: "candidate" | "promotion" | "finalization",
@@ -1326,17 +1646,97 @@ function writeStagingControlPlaneEvidence(
 } {
   const evidenceFile = "staging-control-plane-evidence.json";
   const verificationKeyFile = "staging-control-plane-public.pem";
+  const candidate = {
+    version: "2.4.0",
+    sourceRevision: revision,
+    imageDigest: digest,
+    imageReference: `ghcr.io/hooterjackson/genio@${digest}`,
+  };
+  const generatedAt = phaseGeneratedAt[kind];
+  const appleReceipt = createStrictSignedEnvelope({
+    envelopeSchemaVersion: SIGNED_APPLE_CONTROL_PLANE_RECEIPT_SCHEMA_V1,
+    payload: {
+      schemaVersion: APPLE_CONTROL_PLANE_RECEIPT_SCHEMA_V1,
+      phase: kind,
+      issuer: approvedControlPlaneReceiptTrustPolicies.apple.approvedIssuer,
+      generatedAt,
+      expiresAt: phaseExpiresAt(kind),
+      candidate,
+      staging: {
+        runtimeSnapshotHash: stagingSnapshot.snapshotHash,
+        appleCredentialVersionHash: "3".repeat(64),
+        appleQaVerifierCredentialVersionHash: "d".repeat(64),
+        appleQaVerifierCredentialIdentityHash: "1".repeat(64),
+        appleAccountIdHash: "c".repeat(64),
+        musicKitOrigin: "https://staging-9enio.example",
+        musicKitOriginRegistered: true,
+        musicKitOriginRegistrationEvidenceHash: "6".repeat(64),
+      },
+      production: {
+        runtimeSnapshotHash: productionSnapshot?.snapshotHash ?? null,
+        appleCredentialVersionHash: "4".repeat(64),
+        appleQaVerifierCredentialVersionHash: "e".repeat(64),
+        appleQaVerifierCredentialIdentityHash: "2".repeat(64),
+        appleAccountIdHash: "0".repeat(64),
+      },
+    },
+    signingKey: controlPlaneReceiptKeys.apple.privateKey,
+    keyId: approvedControlPlaneReceiptTrustPolicies.apple.approvedKeyId,
+  });
+  const providerReceipt = createStrictSignedEnvelope({
+    envelopeSchemaVersion: SIGNED_PROVIDER_CONTROL_PLANE_RECEIPT_SCHEMA_V1,
+    payload: {
+      schemaVersion: PROVIDER_CONTROL_PLANE_RECEIPT_SCHEMA_V1,
+      phase: kind,
+      issuer: approvedControlPlaneReceiptTrustPolicies.provider.approvedIssuer,
+      generatedAt,
+      expiresAt: phaseExpiresAt(kind),
+      candidate,
+      staging: {
+        runtimeSnapshotHash: stagingSnapshot.snapshotHash,
+        providerCredentialVersionHash: "1".repeat(64),
+        providerProjectIdentityHash: "8".repeat(64),
+      },
+      production: {
+        runtimeSnapshotHash: productionSnapshot?.snapshotHash ?? null,
+        providerCredentialVersionHash: "2".repeat(64),
+        providerProjectIdentityHash: "9".repeat(64),
+      },
+    },
+    signingKey: controlPlaneReceiptKeys.provider.privateKey,
+    keyId: approvedControlPlaneReceiptTrustPolicies.provider.approvedKeyId,
+  });
+  const budgetReceipt = createStrictSignedEnvelope({
+    envelopeSchemaVersion: SIGNED_QA_BUDGET_LEDGER_RECEIPT_SCHEMA_V1,
+    payload: {
+      schemaVersion: QA_BUDGET_LEDGER_RECEIPT_SCHEMA_V1,
+      phase: kind,
+      issuer: approvedControlPlaneReceiptTrustPolicies.qaBudget.approvedIssuer,
+      generatedAt,
+      expiresAt: new Date(
+        Date.parse(generatedAt) + 60 * 60_000,
+      ).toISOString(),
+      candidate,
+      runtimeSnapshots: {
+        staging: stagingSnapshot.snapshotHash,
+        production: productionSnapshot?.snapshotHash ?? null,
+      },
+      ledgerScope: "staging_release_qa",
+      currency: "USD",
+      monthlyCostLimitUsd: 10,
+      spentUsd: 4,
+      reservedForRequiredGatesUsd: 4,
+      asOf: generatedAt,
+    },
+    signingKey: controlPlaneReceiptKeys.qaBudget.privateKey,
+    keyId: approvedControlPlaneReceiptTrustPolicies.qaBudget.approvedKeyId,
+  });
   const envelope = createStrictSignedEnvelope({
     envelopeSchemaVersion: SIGNED_STAGING_CONTROL_PLANE_EVIDENCE_SCHEMA_V1,
     payload: {
       schemaVersion: STAGING_CONTROL_PLANE_EVIDENCE_SCHEMA_V1,
       phase: kind,
-      candidate: {
-        version: "2.4.0",
-        sourceRevision: revision,
-        imageDigest: digest,
-        imageReference: `ghcr.io/hooterjackson/genio@${digest}`,
-      },
+      candidate,
       candidateEvidencePayloadHash,
       generatedAt: phaseGeneratedAt[kind],
       expiresAt: phaseExpiresAt(kind),
@@ -1382,22 +1782,33 @@ function writeStagingControlPlaneEvidence(
       },
       receipts: {
         apple: {
-          payloadHash: "a".repeat(64),
-          issuer: "apple-control-plane-test-v1",
-          keyId: "apple-control-plane-key-test-v1",
-          keySha256: "1".repeat(64),
+          payloadHash: appleReceipt.payloadHash,
+          issuer:
+            approvedControlPlaneReceiptTrustPolicies.apple.approvedIssuer,
+          keyId:
+            approvedControlPlaneReceiptTrustPolicies.apple.approvedKeyId,
+          keySha256:
+            approvedControlPlaneReceiptTrustPolicies.apple.approvedKeySha256,
         },
         provider: {
-          payloadHash: "b".repeat(64),
-          issuer: "provider-control-plane-test-v1",
-          keyId: "provider-control-plane-key-test-v1",
-          keySha256: "2".repeat(64),
+          payloadHash: providerReceipt.payloadHash,
+          issuer:
+            approvedControlPlaneReceiptTrustPolicies.provider.approvedIssuer,
+          keyId:
+            approvedControlPlaneReceiptTrustPolicies.provider.approvedKeyId,
+          keySha256:
+            approvedControlPlaneReceiptTrustPolicies.provider
+              .approvedKeySha256,
         },
         qaBudget: {
-          payloadHash: "c".repeat(64),
-          issuer: "qa-budget-ledger-test-v1",
-          keyId: "qa-budget-ledger-key-test-v1",
-          keySha256: "3".repeat(64),
+          payloadHash: budgetReceipt.payloadHash,
+          issuer:
+            approvedControlPlaneReceiptTrustPolicies.qaBudget.approvedIssuer,
+          keyId:
+            approvedControlPlaneReceiptTrustPolicies.qaBudget.approvedKeyId,
+          keySha256:
+            approvedControlPlaneReceiptTrustPolicies.qaBudget
+              .approvedKeySha256,
         },
       },
     },
@@ -1408,6 +1819,37 @@ function writeStagingControlPlaneEvidence(
   writeFileSync(
     join(directory, verificationKeyFile),
     stagingControlPlaneKeys.publicKey.export({ format: "pem", type: "spki" }),
+  );
+  writeFileSync(
+    join(directory, STABLE_CONTROL_PLANE_SOURCE_FIXTURE_FILE),
+    JSON.stringify({
+      stagingControlPlaneEvidence: envelope,
+      stagingControlPlaneVerificationKey:
+        stableReleaseVerificationKeyV1(stagingControlPlaneKeys.publicKey),
+      stagingControlPlaneTrustPolicy:
+        approvedStagingControlPlaneTrustPolicy,
+      controlPlaneReceipts: {
+        apple: appleReceipt,
+        provider: providerReceipt,
+        qaBudget: budgetReceipt,
+      },
+      controlPlaneReceiptVerificationKeys: {
+        apple:
+          stableReleaseVerificationKeyV1(
+            controlPlaneReceiptKeys.apple.publicKey,
+          ),
+        provider:
+          stableReleaseVerificationKeyV1(
+            controlPlaneReceiptKeys.provider.publicKey,
+          ),
+        qaBudget:
+          stableReleaseVerificationKeyV1(
+            controlPlaneReceiptKeys.qaBudget.publicKey,
+          ),
+      },
+      controlPlaneReceiptTrustPolicies:
+        approvedControlPlaneReceiptTrustPolicies,
+    }),
   );
   return {
     evidenceFile,
@@ -1422,9 +1864,11 @@ function writeSigningBundle(
   lineage: {
     priorReleaseEvidence?: unknown;
     publicRolloutEvidence?: unknown;
+    mutatePayload?: (value: ReturnType<typeof payload>) => void;
   } = {},
 ): string {
   const value = payload(kind);
+  lineage.mutatePayload?.(value);
   const priorEnvelope = lineage.priorReleaseEvidence as
     | {
         payloadHash: string;
@@ -1441,7 +1885,11 @@ function writeSigningBundle(
   const stagingSnapshot = runtimeSnapshot(value, "staging");
   writeFileSync(join(directory, "runtime-staging.json"), JSON.stringify(stagingSnapshot));
   const productionSnapshot = kind !== "candidate"
-    ? runtimeSnapshot(value, "production")
+    ? runtimeSnapshot(
+        value,
+        "production",
+        kind === "finalization" ? lineage.publicRolloutEvidence : undefined,
+      )
     : null;
   if (productionSnapshot) {
     writeFileSync(join(directory, "runtime-production.json"), JSON.stringify(productionSnapshot));
@@ -1572,6 +2020,99 @@ function writeSigningBundle(
   return bundlePath;
 }
 
+function candidateSemanticAuthorizationEvidence(
+  directory: string,
+  candidateEvidence: unknown,
+) {
+  return {
+    candidateEvidence,
+    semanticReviewGateArtifact: JSON.parse(readFileSync(
+      join(directory, "gate-semantic_ranking_blinded_review.json"),
+      "utf8",
+    )),
+    semanticReviewGateProducerAttestation: JSON.parse(readFileSync(
+      join(
+        directory,
+        "gate-semantic_ranking_blinded_review.attestation.json",
+      ),
+      "utf8",
+    )),
+    releaseGateProducerVerificationKey: producerKeys.publicKey,
+    approvedReleaseGateProducer: approvedProducerTrustPolicy,
+    approvedSemanticReviewer: approvedReviewerTrustPolicy,
+  };
+}
+
+function stableFinalizationSourceEvidence(
+  promotionDirectory: string,
+  finalizationDirectory: string,
+  promotionEvidence: unknown,
+  publicRolloutEvidence: unknown,
+) {
+  const controlPlaneSources = JSON.parse(readFileSync(
+    join(
+      finalizationDirectory,
+      STABLE_CONTROL_PLANE_SOURCE_FIXTURE_FILE,
+    ),
+    "utf8",
+  )) as {
+    stagingControlPlaneEvidence: unknown;
+    stagingControlPlaneVerificationKey: unknown;
+    stagingControlPlaneTrustPolicy: unknown;
+    controlPlaneReceipts: unknown;
+    controlPlaneReceiptVerificationKeys: unknown;
+    controlPlaneReceiptTrustPolicies: unknown;
+  };
+  const gateDirectory = (gateName: string): string =>
+    gateName.startsWith("production_")
+      || gateName === "backend_release_convergence"
+      ? promotionDirectory
+      : finalizationDirectory;
+  const gateNames = [
+    "production_fixed_three_track",
+    "production_affected_regression",
+    "backend_release_convergence",
+    "release_convergence",
+    "final_custom_domain_browser",
+  ] as const;
+  return {
+    finalizationSourceEvidence: {
+      schemaVersion:
+        STABLE_RELEASE_FINALIZATION_SOURCE_BUNDLE_SCHEMA_V2,
+      promotionEvidence,
+      publicRolloutEvidence,
+      ...controlPlaneSources,
+      gateArtifacts: Object.fromEntries(
+        gateNames.map((gateName) => [
+          gateName,
+          JSON.parse(readFileSync(
+            join(gateDirectory(gateName), `gate-${gateName}.json`),
+            "utf8",
+          )),
+        ]),
+      ),
+      gateProducerAttestations: Object.fromEntries(
+        gateNames.map((gateName) => [
+          gateName,
+          JSON.parse(readFileSync(
+            join(
+              gateDirectory(gateName),
+              `gate-${gateName}.attestation.json`,
+            ),
+            "utf8",
+          )),
+        ]),
+      ),
+    },
+    approvedSitesControlPlane:
+      approvedSitesControlPlaneTrustPolicy,
+    approvedStagingControlPlane:
+      approvedStagingControlPlaneTrustPolicy,
+    approvedControlPlaneReceipts:
+      controlPlaneSources.controlPlaneReceiptTrustPolicies,
+  };
+}
+
 function rolloutConfiguration(
   genreScenePercent: "50" | "100",
 ): PublicRolloutConfiguration {
@@ -1587,16 +2128,16 @@ function rolloutConfiguration(
     PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
     PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
     PIPELINE_V3_GENRE_SCENE_PERCENT: genreScenePercent,
-    PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
-    PIPELINE_V3_SIMILARITY_PERCENT: "0",
-    PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "0",
-    PIPELINE_V3_FIXED_CONTAINER_PERCENT: "0",
-    PIPELINE_V3_FACTUAL_PERCENT: "0",
-    PIPELINE_V3_EXHAUSTIVE_PERCENT: "0",
+    PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "100",
+    PIPELINE_V3_SIMILARITY_PERCENT: "100",
+    PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "100",
+    PIPELINE_V3_FIXED_CONTAINER_PERCENT: "100",
+    PIPELINE_V3_FACTUAL_PERCENT: "100",
+    PIPELINE_V3_EXHAUSTIVE_PERCENT: "100",
     PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "false",
-    PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "false",
+    PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "true",
     RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
     RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
     RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
@@ -1680,6 +2221,8 @@ function completedPublicRolloutEvidence(
     promotion: {
       configurationHash: releaseEvidenceConfigurationHash(promotion.payload),
       runtimeHash: releaseEvidenceRuntimeHash(promotion.payload),
+      semanticBehaviorHash:
+        promotion.payload.semanticReview.semanticBehaviorHash,
       productionCanaryEvidenceHash:
         publicRolloutProductionCanaryEvidenceHash(promotion.payload.gates),
       sitesVersion: productionSnapshot.sitesVersion,
@@ -2062,6 +2605,35 @@ async function writeRealFinalizationControlPlane(input: {
     railway,
     now: controlGeneratedAt,
   });
+  writeFileSync(
+    join(input.directory, STABLE_CONTROL_PLANE_SOURCE_FIXTURE_FILE),
+    JSON.stringify({
+      stagingControlPlaneEvidence: JSON.parse(
+        readFileSync(target("evidence"), "utf8"),
+      ),
+      stagingControlPlaneVerificationKey:
+        stableReleaseVerificationKeyV1(stagingControlPlaneKeys.publicKey),
+      stagingControlPlaneTrustPolicy:
+        approvedStagingControlPlaneTrustPolicy,
+      controlPlaneReceipts: {
+        apple: appleReceipt,
+        provider: providerReceipt,
+        qaBudget: budgetReceipt,
+      },
+      controlPlaneReceiptVerificationKeys: {
+        apple: stableReleaseVerificationKeyV1(receiptKeys.apple.publicKey),
+        provider:
+          stableReleaseVerificationKeyV1(receiptKeys.provider.publicKey),
+        qaBudget:
+          stableReleaseVerificationKeyV1(receiptKeys.budget.publicKey),
+      },
+      controlPlaneReceiptTrustPolicies: {
+        apple: trusts.apple,
+        provider: trusts.provider,
+        qaBudget: trusts.budget,
+      },
+    }),
+  );
   return {
     evidenceFile: files.evidence,
     verificationKeyFile: files.verificationKey,
@@ -2069,6 +2641,45 @@ async function writeRealFinalizationControlPlane(input: {
 }
 
 describe("signed release evidence", () => {
+  test("recomputes convergence instead of trusting a signed passed flag", () => {
+    const value = payload("promotion");
+    const snapshot = runtimeSnapshot(value, "production");
+    const fixtures = releaseFixtureBindingsForGate(
+      "backend_release_convergence",
+    );
+    const sources = sourceEvidence(
+      "backend_release_convergence",
+      value.candidate,
+      fixtures,
+      "production",
+      snapshot.credentialVersionHashes.appleQaVerifier,
+      snapshot,
+      "9".repeat(64),
+    );
+    const convergence = sources.convergence as {
+      evidenceHash: string;
+      observations: Array<{
+        runtime: { semanticExecutionConfigurationHash: string };
+      }>;
+      [key: string]: unknown;
+    };
+    convergence.observations[0]!.runtime
+      .semanticExecutionConfigurationHash = "0".repeat(64);
+    const unsigned: Record<string, unknown> = { ...convergence };
+    delete unsigned.evidenceHash;
+    convergence.evidenceHash = sha256(unsigned);
+
+    expect(() => createReleaseGateArtifactFromSources({
+      gate: "backend_release_convergence",
+      completedAt: value.generatedAt,
+      candidate: value.candidate,
+      configurationHash: snapshot.configurationHash,
+      runtimeHash: snapshot.runtimeHash,
+      fixtures,
+      sources,
+    })).toThrow(/canonical recomputation/u);
+  });
+
   test("recompiles both immutable guided fixtures from the actual server-owned questions", () => {
     const reggaeton = validateReleaseFixtureGuidancePayload(
       "smooth-reggaeton-heat-50-v1",
@@ -2271,7 +2882,17 @@ describe("signed release evidence", () => {
       const stableAuthorizer = generateKeyPairSync("ed25519");
       const protectedBaselineMetadata =
         protectedBaselineMetadataForFinalization(finalization);
-      const stableAuthorization = await authorizeStableRelease({
+      const stableAuthorizationInput = {
+        ...candidateSemanticAuthorizationEvidence(
+          candidateDirectory,
+          candidateEvidence,
+        ),
+        ...stableFinalizationSourceEvidence(
+          promotionDirectory,
+          finalizationDirectory,
+          promotionEvidence,
+          publicRolloutEvidence,
+        ),
         finalizationEvidence: finalization,
         protectedBaselineMetadata,
         releaseVerificationKey: releaseKeys.publicKey,
@@ -2286,7 +2907,255 @@ describe("signed release evidence", () => {
         expectedRevision: revision,
         expectedImageDigest: digest,
         generatedAt: "2026-07-23T12:45:00.000Z",
-      });
+      };
+      const forgedProtectedBaselineMetadata =
+        structuredClone(protectedBaselineMetadata);
+      forgedProtectedBaselineMetadata.fixtures[0]!.orderedManifestHash =
+        "0".repeat(64);
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        protectedBaselineMetadata: forgedProtectedBaselineMetadata,
+      })).rejects.toThrow(
+        /protected semantic baseline metadata does not bind the exact finalized stable release/u,
+      );
+      const forgedGateProducerAttestation = structuredClone(
+        stableAuthorizationInput.semanticReviewGateProducerAttestation,
+      );
+      forgedGateProducerAttestation.signature.value = "A".repeat(86);
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        semanticReviewGateProducerAttestation:
+          forgedGateProducerAttestation,
+      })).rejects.toThrow(
+        /release gate producer attestation signature is invalid/u,
+      );
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        approvedSemanticReviewer: {
+          ...approvedReviewerTrustPolicy,
+          approvedKeySha256: "0".repeat(64),
+        },
+      })).rejects.toThrow(
+        /semantic reviewer or baseline does not match the protected semantic review policy/u,
+      );
+      const finalizationSourceGateNames = [
+        "production_fixed_three_track",
+        "production_affected_regression",
+        "backend_release_convergence",
+        "release_convergence",
+        "final_custom_domain_browser",
+      ] as const;
+      const signerSummaryOnlyBundle = structuredClone(
+        stableAuthorizationInput.finalizationSourceEvidence,
+      ) as unknown as {
+        gateArtifacts: Record<string, unknown>;
+      };
+      signerSummaryOnlyBundle.gateArtifacts = Object.fromEntries(
+        finalizationSourceGateNames.map((gateName) => {
+          const phase = gateName === "production_fixed_three_track"
+              || gateName === "production_affected_regression"
+              || gateName === "backend_release_convergence"
+            ? promotionEvidence.payload
+            : finalization.payload;
+          return [
+            gateName,
+            phase.gates.find(({ name }) => name === gateName),
+          ];
+        }),
+      );
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        finalizationSourceEvidence: signerSummaryOnlyBundle,
+      })).rejects.toThrow(
+        /release gate artifact contains missing or unapproved fields/u,
+      );
+      for (const gateName of finalizationSourceGateNames) {
+        const mutatedArtifactBundle = structuredClone(
+          stableAuthorizationInput.finalizationSourceEvidence,
+        ) as unknown as {
+          gateArtifacts: Record<
+            string,
+            { evidenceHash: string }
+          >;
+        };
+        mutatedArtifactBundle.gateArtifacts[gateName]!.evidenceHash =
+          "0".repeat(64);
+        await expect(authorizeStableRelease({
+          ...stableAuthorizationInput,
+          finalizationSourceEvidence: mutatedArtifactBundle,
+        })).rejects.toThrow(
+          new RegExp(
+            `release gate ${gateName} evidence hash does not match`,
+            "u",
+          ),
+        );
+
+        const mutatedAttestationBundle = structuredClone(
+          stableAuthorizationInput.finalizationSourceEvidence,
+        ) as unknown as {
+          gateProducerAttestations: Record<
+            string,
+            { signature: { value: string } }
+          >;
+        };
+        mutatedAttestationBundle.gateProducerAttestations[
+          gateName
+        ]!.signature.value = "A".repeat(86);
+        await expect(authorizeStableRelease({
+          ...stableAuthorizationInput,
+          finalizationSourceEvidence: mutatedAttestationBundle,
+        })).rejects.toThrow(
+          /release gate producer attestation signature is invalid/u,
+        );
+      }
+      const mutatedReceiptBundle = structuredClone(
+        stableAuthorizationInput.finalizationSourceEvidence,
+      ) as unknown as {
+        controlPlaneReceipts: {
+          apple: { signature: { value: string } };
+        };
+      };
+      mutatedReceiptBundle.controlPlaneReceipts.apple.signature.value =
+        "A".repeat(86);
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        finalizationSourceEvidence: mutatedReceiptBundle,
+      })).rejects.toThrow(
+        /Apple control-plane receipt signature is invalid/u,
+      );
+
+      for (const mutation of [
+        {
+          lineage: { publicRolloutFromPercent: "10" },
+          runtime: { stage: "genre_scene:10->100" },
+        },
+        {
+          lineage: {
+            publicRolloutTargetConfigurationHash: "0".repeat(64),
+          },
+          runtime: {
+            targetConfigurationHash: "0".repeat(64),
+          },
+        },
+      ]) {
+        const mutatedFinalizationPayload =
+          structuredClone(finalization.payload);
+        Object.assign(
+          mutatedFinalizationPayload.lineage,
+          mutation.lineage,
+        );
+        Object.assign(
+          mutatedFinalizationPayload.environmentSnapshots.production!
+            .publicRollout,
+          mutation.runtime,
+        );
+        const resignedMutation = resignReleaseEvidence({
+          payload: mutatedFinalizationPayload,
+          signature: finalization.signature,
+        }, releaseKeys.privateKey);
+        await expect(authorizeStableRelease({
+          ...stableAuthorizationInput,
+          finalizationEvidence: resignedMutation,
+          protectedBaselineMetadata:
+            protectedBaselineMetadataForFinalization(resignedMutation),
+        })).rejects.toThrow(
+          /does not preserve the exact independently verified rollout transition/u,
+        );
+      }
+      const changedRolloutTargetPayload =
+        structuredClone(finalization.payload);
+      changedRolloutTargetPayload.lineage.publicRolloutToPercent = "50";
+      changedRolloutTargetPayload.environmentSnapshots.production!
+        .publicRollout.stage = "genre_scene:50->50";
+      expect(() => resignReleaseEvidence({
+        payload: changedRolloutTargetPayload,
+        signature: finalization.signature,
+      }, releaseKeys.privateKey)).toThrow(
+        /candidate → promotion → rollout → finalization/u,
+      );
+
+      const mutatedGateSummaryPayload =
+        structuredClone(finalization.payload);
+      mutatedGateSummaryPayload.gates.find(
+        ({ name }) => name === "final_custom_domain_browser",
+      )!.evidenceHash = "0".repeat(64);
+      const resignedGateSummary = resignReleaseEvidence({
+        payload: mutatedGateSummaryPayload,
+        signature: finalization.signature,
+      }, releaseKeys.privateKey);
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        finalizationEvidence: resignedGateSummary,
+        protectedBaselineMetadata:
+          protectedBaselineMetadataForFinalization(resignedGateSummary),
+      })).rejects.toThrow(
+        /source artifact final_custom_domain_browser does not match its signed release evidence/u,
+      );
+      const rewrittenControlPlanePayload =
+        structuredClone(finalization.payload);
+      rewrittenControlPlanePayload.stagingControls.controlPlaneEvidenceHash =
+        "0".repeat(64);
+      const resignedControlPlaneRewrite = resignReleaseEvidence({
+        payload: rewrittenControlPlanePayload,
+        signature: finalization.signature,
+      }, releaseKeys.privateKey);
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        finalizationEvidence: resignedControlPlaneRewrite,
+        protectedBaselineMetadata:
+          protectedBaselineMetadataForFinalization(
+            resignedControlPlaneRewrite,
+          ),
+      })).rejects.toThrow(
+        /does not preserve the exact signed staging control-plane evidence/u,
+      );
+      const forgedCandidatePayload =
+        structuredClone(candidateEvidence.payload);
+      const forgedCandidateFixtures =
+        forgedCandidatePayload.semanticReview.fixtures as Array<{
+          fixtureId: string;
+          orderedManifestHash: string;
+          outputHash: string;
+        }>;
+      forgedCandidateFixtures[0]!.orderedManifestHash = "0".repeat(64);
+      const forgedCandidateEvidence = resignReleaseEvidence({
+        payload: forgedCandidatePayload,
+        signature: candidateEvidence.signature,
+      }, releaseKeys.privateKey);
+      const forgedFinalizationPayload =
+        structuredClone(finalization.payload);
+      forgedFinalizationPayload.lineage.candidateEvidencePayloadHash =
+        forgedCandidateEvidence.payloadHash;
+      forgedFinalizationPayload.stagingControls
+        .candidateEvidencePayloadHash = forgedCandidateEvidence.payloadHash;
+      forgedFinalizationPayload.semanticReview =
+        structuredClone(forgedCandidateEvidence.payload.semanticReview);
+      const forgedFinalization = resignReleaseEvidence({
+        payload: forgedFinalizationPayload,
+        signature: finalization.signature,
+      }, releaseKeys.privateKey);
+      const releaseSignerOwnedMetadata =
+        protectedBaselineMetadataForFinalization(forgedFinalization);
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        ...candidateSemanticAuthorizationEvidence(
+          candidateDirectory,
+          forgedCandidateEvidence,
+        ),
+        finalizationEvidence: forgedFinalization,
+        protectedBaselineMetadata: releaseSignerOwnedMetadata,
+      })).rejects.toThrow(
+        /candidate semantic review fixtures were not mechanically derived from the independently verified candidate arms/u,
+      );
+      await expect(authorizeStableRelease({
+        ...stableAuthorizationInput,
+        generatedAt: "2026-07-23T12:47:00.000Z",
+      })).rejects.toThrow(
+        /Sites control-plane attestation is not currently valid/u,
+      );
+      const stableAuthorization = await authorizeStableRelease(
+        stableAuthorizationInput,
+      );
       const dispatch = buildStableReleaseDispatchRequest({
         candidateTag: "v2.4.0-rc.1",
         imageDigest: digest,
@@ -2342,6 +3211,131 @@ describe("signed release evidence", () => {
       })).toThrow(/runtime does not match/u);
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects model and semantic-policy drift after independent review", async () => {
+    const keys = generateKeyPairSync("ed25519");
+    const candidateDirectory = mkdtempSync(
+      join(tmpdir(), "genio-semantic-behavior-candidate-"),
+    );
+    const driftedPromotionDirectory = mkdtempSync(
+      join(tmpdir(), "genio-semantic-behavior-promotion-drift-"),
+    );
+    const promotionDirectory = mkdtempSync(
+      join(tmpdir(), "genio-semantic-behavior-promotion-"),
+    );
+    const driftedFinalizationDirectory = mkdtempSync(
+      join(tmpdir(), "genio-semantic-behavior-finalization-drift-"),
+    );
+    try {
+      const candidateBundle = JSON.parse(readFileSync(
+        writeSigningBundle(candidateDirectory),
+        "utf8",
+      ));
+      const candidate = await signReleaseEvidenceBundle(
+        candidateBundle,
+        candidateDirectory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        keys.privateKey,
+        "release-2026",
+      );
+      const driftedPromotionBundle = JSON.parse(readFileSync(
+        writeSigningBundle(
+          driftedPromotionDirectory,
+          "promotion",
+          {
+            priorReleaseEvidence: candidate,
+            mutatePayload: (value) => {
+              value.runtime.modelIds.baseline = "gpt-5.6-terra";
+            },
+          },
+        ),
+        "utf8",
+      ));
+      await expect(signReleaseEvidenceBundle(
+        driftedPromotionBundle,
+        driftedPromotionDirectory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        keys.privateKey,
+        "release-2026",
+      )).rejects.toThrow(
+        /semantic behavior changed after the reviewed candidate phase/u,
+      );
+
+      const promotionBundle = JSON.parse(readFileSync(
+        writeSigningBundle(promotionDirectory, "promotion", {
+          priorReleaseEvidence: candidate,
+        }),
+        "utf8",
+      ));
+      const promotion = await signReleaseEvidenceBundle(
+        promotionBundle,
+        promotionDirectory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        keys.privateKey,
+        "release-2026",
+      );
+      const publicRolloutEvidence = completedPublicRolloutEvidence(
+        promotion as any,
+        keys.privateKey,
+      );
+      const driftedFinalizationBundle = JSON.parse(readFileSync(
+        writeSigningBundle(
+          driftedFinalizationDirectory,
+          "finalization",
+          {
+            priorReleaseEvidence: promotion,
+            publicRolloutEvidence,
+            mutatePayload: (value) => {
+              value.runtime.policyVersions.selection =
+                "selection_plan_v3_drifted";
+            },
+          },
+        ),
+        "utf8",
+      ));
+      await expect(signReleaseEvidenceBundle(
+        driftedFinalizationBundle,
+        driftedFinalizationDirectory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        keys.privateKey,
+        "release-2026",
+      )).rejects.toThrow(
+        /semantic behavior changed after the reviewed candidate phase/u,
+      );
+    } finally {
+      rmSync(candidateDirectory, { recursive: true, force: true });
+      rmSync(driftedPromotionDirectory, { recursive: true, force: true });
+      rmSync(promotionDirectory, { recursive: true, force: true });
+      rmSync(driftedFinalizationDirectory, {
+        recursive: true,
+        force: true,
+      });
     }
   });
 
@@ -2409,6 +3403,11 @@ describe("signed release evidence", () => {
         keys.privateKey,
         "release-2026",
       );
+      const candidateSemanticEvidence =
+        candidateSemanticAuthorizationEvidence(
+          candidateDirectory,
+          candidate,
+        );
       expect(() => verifyReleaseEvidence(
         candidate,
         keys.publicKey,
@@ -2510,6 +3509,13 @@ describe("signed release evidence", () => {
           protectedBaselineMetadata,
         );
       await expect(authorizeStableRelease({
+        ...candidateSemanticEvidence,
+        ...stableFinalizationSourceEvidence(
+          promotionDirectory,
+          finalizationDirectory,
+          promotion,
+          publicRolloutEvidence,
+        ),
         finalizationEvidence: finalization,
         protectedBaselineMetadata,
         releaseVerificationKey: keys.publicKey,
@@ -2526,6 +3532,13 @@ describe("signed release evidence", () => {
         generatedAt: "2026-07-23T12:39:00.000Z",
       })).rejects.toThrow(/cannot predate finalization/u);
       const stableAuthorization = await authorizeStableRelease({
+        ...candidateSemanticEvidence,
+        ...stableFinalizationSourceEvidence(
+          promotionDirectory,
+          finalizationDirectory,
+          promotion,
+          publicRolloutEvidence,
+        ),
         finalizationEvidence: finalization,
         protectedBaselineMetadata,
         releaseVerificationKey: keys.publicKey,
@@ -2681,6 +3694,13 @@ describe("signed release evidence", () => {
         now: "2026-07-23T12:45:00.000Z",
       })).toThrow(/exact stable release target/u);
       await expect(authorizeStableRelease({
+        ...candidateSemanticEvidence,
+        ...stableFinalizationSourceEvidence(
+          promotionDirectory,
+          finalizationDirectory,
+          promotion,
+          publicRolloutEvidence,
+        ),
         finalizationEvidence: promotion,
         protectedBaselineMetadata,
         releaseVerificationKey: keys.publicKey,
@@ -3165,6 +4185,133 @@ describe("signed release evidence", () => {
       })).toThrow(/runtime contains missing or unapproved fields/u);
       expect(validRuntime[field]).toBe(expected);
     }
+  });
+
+  test("rejects stale or unauthorized finalization rollout snapshot bindings", () => {
+    for (const publicRollout of [
+      {
+        ...payload("finalization").environmentSnapshots.production!
+          .publicRollout,
+        evidenceHash: "0".repeat(64),
+      },
+      {
+        ...payload("finalization").environmentSnapshots.production!
+          .publicRollout,
+        stage: "genre_scene:10->50",
+      },
+      {
+        ...payload("finalization").environmentSnapshots.production!
+          .publicRollout,
+        databaseAuthorized: false,
+      },
+    ]) {
+      const value = payload("finalization");
+      value.environmentSnapshots.production!.publicRollout =
+        publicRollout;
+      expect(() => validateReleaseEvidencePayload(value))
+        .toThrow(/public rollout|database authority/u);
+    }
+  });
+
+  test("preserves the exact rollout transition in signed finalization lineage", () => {
+    expect(validateReleaseEvidencePayload(payload("finalization")).lineage)
+      .toMatchObject({
+        publicRolloutIntentGroup: "genre_scene",
+        publicRolloutFromPercent: "50",
+        publicRolloutToPercent: "100",
+        publicRolloutTargetConfigurationHash: "4".repeat(64),
+      });
+    const changedFrom = payload("finalization");
+    changedFrom.lineage.publicRolloutFromPercent = "10";
+    expect(() => validateReleaseEvidencePayload(changedFrom))
+      .toThrow(/does not bind its signed public rollout lineage/u);
+
+    const changedConfiguration = payload("finalization");
+    changedConfiguration.lineage.publicRolloutTargetConfigurationHash =
+      "0".repeat(64);
+    expect(() => validateReleaseEvidencePayload(changedConfiguration))
+      .toThrow(/does not bind its signed public rollout lineage/u);
+
+    const nonFinalTarget = payload("finalization");
+    nonFinalTarget.lineage.publicRolloutToPercent = "50";
+    nonFinalTarget.environmentSnapshots.production!.publicRollout.stage =
+      "genre_scene:50->50";
+    expect(() => validateReleaseEvidencePayload(nonFinalTarget))
+      .toThrow(/candidate → promotion → rollout → finalization/u);
+
+    const missingTransition = structuredClone(payload("finalization"));
+    delete (missingTransition.lineage as Partial<
+      typeof missingTransition.lineage
+    >).publicRolloutTargetConfigurationHash;
+    expect(() => validateReleaseEvidencePayload(missingTransition))
+      .toThrow(/lineage contains missing or unapproved fields/u);
+  });
+
+  test("exactly binds finalization runtime rollout hash, stage, and target configuration", () => {
+    const signedRollout = {
+      payloadHash: "1".repeat(64),
+      intentGroup: "genre_scene",
+      fromPercent: "50",
+      toPercent: "100",
+      targetConfigurationHash: "2".repeat(64),
+    };
+    const runtimePublicRollout = {
+      active: true,
+      databaseAuthorized: true,
+      evidenceHash: signedRollout.payloadHash,
+      stage: "genre_scene:50->100",
+      targetConfigurationHash:
+        signedRollout.targetConfigurationHash,
+    };
+    expect(() => assertFinalizationRuntimePublicRolloutBindingV1({
+      runtimePublicRollout,
+      signedRollout,
+    })).not.toThrow();
+    for (const invalid of [
+      { ...runtimePublicRollout, evidenceHash: "3".repeat(64) },
+      { ...runtimePublicRollout, stage: "genre_scene:10->50" },
+      {
+        ...runtimePublicRollout,
+        targetConfigurationHash: "4".repeat(64),
+      },
+      { ...runtimePublicRollout, databaseAuthorized: false },
+    ]) {
+      expect(() => assertFinalizationRuntimePublicRolloutBindingV1({
+        runtimePublicRollout: invalid,
+        signedRollout,
+      })).toThrow(/exact signed public rollout/u);
+    }
+  });
+
+  test("rejects browser probes for any rollout other than finalization lineage", () => {
+    const signedRollout = {
+      payloadHash: "1".repeat(64),
+      intentGroup: "genre_scene",
+      fromPercent: "50",
+      toPercent: "100",
+    };
+    const probe = {
+      rolloutEvidenceHash: signedRollout.payloadHash,
+      rolloutStage: "genre_scene:50->100",
+    };
+    expect(() => assertFinalizationBrowserPublicRolloutBindingV1({
+      probes: [probe],
+      signedRollout,
+    })).not.toThrow();
+    expect(() => assertFinalizationBrowserPublicRolloutBindingV1({
+      probes: [{
+        ...probe,
+        rolloutEvidenceHash: "2".repeat(64),
+      }],
+      signedRollout,
+    })).toThrow(/exact signed public rollout/u);
+    expect(() => assertFinalizationBrowserPublicRolloutBindingV1({
+      probes: [{
+        ...probe,
+        rolloutStage: "genre_scene:10->50",
+      }],
+      signedRollout,
+    })).toThrow(/exact signed public rollout/u);
   });
 
   test("cannot sign candidate evidence when staging budget or credential isolation is unproven", () => {

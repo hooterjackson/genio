@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import {
   CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
 } from "../server/release-deployment-phase.ts";
 import { WorkerRunner } from "../server/worker-runner.ts";
 
@@ -26,6 +27,8 @@ function repositoryHarness(input: {
   schemaVersion: string | null;
   capabilityVersion: string | null;
   hardeningVersion: string | null;
+  releaseIdentityVersion?: string | null;
+  releaseIdentitySupported?: boolean;
 }) {
   return {
     ensureSchemaVersion: vi.fn(async () => undefined),
@@ -35,7 +38,15 @@ function repositoryHarness(input: {
         ? input.capabilityVersion
         : key === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING
           ? input.hardeningVersion
+          : key
+            === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING
+            ? input.releaseIdentityVersion === undefined
+              ? "1"
+              : input.releaseIdentityVersion
           : null),
+    executorReleaseIdentityFenceAvailable: vi.fn(
+      async () => input.releaseIdentitySupported ?? true,
+    ),
     updateWorkerHeartbeat: vi.fn(async () => undefined),
     leaseNextJob: vi.fn(async () => null),
   } as any;
@@ -100,6 +111,12 @@ describe("worker release database fence", () => {
       if (key === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING) {
         return "1";
       }
+      if (
+        key
+          === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING
+      ) {
+        return "1";
+      }
       if (key !== CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING) return null;
       capabilityChecks += 1;
       return capabilityChecks === 1 ? "1" : null;
@@ -110,6 +127,25 @@ describe("worker release database fence", () => {
     );
     expect(repository.updateWorkerHeartbeat).toHaveBeenCalledTimes(1);
     expect(repository.leaseNextJob).not.toHaveBeenCalled();
+  });
+
+  test("production activation rejects a missing or partial 0020 fence", async () => {
+    for (const releaseIdentity of [
+      { releaseIdentityVersion: null, releaseIdentitySupported: true },
+      { releaseIdentityVersion: "1", releaseIdentitySupported: false },
+    ]) {
+      const repository = repositoryHarness({
+        schemaVersion: "18",
+        capabilityVersion: "1",
+        hardeningVersion: "1",
+        ...releaseIdentity,
+      });
+      await expect(runner(repository).run()).rejects.toThrow(
+        /release database readiness check failed/u,
+      );
+      expect(repository.updateWorkerHeartbeat).not.toHaveBeenCalled();
+      expect(repository.leaseNextJob).not.toHaveBeenCalled();
+    }
   });
 
   test("production activation with schema 18 and its capability may lease", async () => {

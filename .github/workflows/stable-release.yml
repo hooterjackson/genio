@@ -8,7 +8,7 @@ on:
     types: [genio-stable-release]
 
 concurrency:
-  group: stable-release
+  group: stable-release-mutation
   cancel-in-progress: false
 
 permissions:
@@ -285,9 +285,8 @@ jobs:
             --deny-self-hosted-runners \
             --no-public-good \
             --format json > stable-image-attestation.json
-      - name: Create the immutable stable tag and GitHub Release
+      - name: Write the exact stable tag and release notes
         env:
-          GH_TOKEN: ${{ github.token }}
           STABLE_TAG: ${{ steps.target.outputs.stable_tag }}
           SOURCE_REVISION: ${{ steps.target.outputs.source_revision }}
           FINALIZATION_HASH: ${{ steps.verify.outputs.finalization_hash }}
@@ -297,6 +296,131 @@ jobs:
           VERIFIED_STABLE_TAG_RULESET_ID: ${{ steps.protection.outputs.stable_tag_ruleset_id }}
         run: |
           node -e 'const fs=require("node:fs"); if(!/^[1-9]\d*$/.test(process.env.VERIFIED_GITHUB_ACTIONS_APP_ID??"")||!/^[1-9]\d*$/.test(process.env.VERIFIED_STABLE_TAG_RULESET_ID??"")) throw new Error("verified stable tag write principal is missing"); const lines=[`gênio stable release ${process.env.STABLE_TAG}`,"",`RC: ${process.env.CANDIDATE_TAG}`,`Source-Revision: ${process.env.SOURCE_REVISION}`,`Image-Digest: ${process.env.IMAGE_DIGEST}`,`Finalization-Evidence-SHA256: ${process.env.FINALIZATION_HASH}`,`Protected-Semantic-Baseline-SHA256: ${process.env.BASELINE_HASH}`,`Stable-Authorization-SHA256: ${process.env.AUTHORIZATION_HASH}`,`Tag-Ruleset-ID: ${process.env.VERIFIED_STABLE_TAG_RULESET_ID}`,`Tag-Bypass-Integration-ID: ${process.env.VERIFIED_GITHUB_ACTIONS_APP_ID}`,""]; fs.writeFileSync("stable-release-notes.txt",lines.join("\n"),{mode:0o600,flag:"wx"});'
+      - name: Fence stable-version monotonicity immediately before mutation
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          STABLE_TAG: ${{ steps.target.outputs.stable_tag }}
+          SOURCE_REVISION: ${{ steps.target.outputs.source_revision }}
+        with:
+          script: |
+            const { readFileSync } = require("node:fs");
+            const STABLE_TAG =
+              /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            const versionTuple = (tag) => {
+              const match = STABLE_TAG.exec(tag);
+              return match
+                ? [BigInt(match[1]), BigInt(match[2]), BigInt(match[3])]
+                : null;
+            };
+            const compareVersion = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            const targetVersion = versionTuple(process.env.STABLE_TAG ?? "");
+            if (!targetVersion || !/^[0-9a-f]{40}$/u.test(
+              process.env.SOURCE_REVISION ?? "",
+            )) {
+              throw new Error("stable mutation target identity is invalid");
+            }
+            const [tagRefs, releases] = await Promise.all([
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+            ]);
+            const stableRefs = tagRefs.flatMap((ref) => {
+              const tag = ref.ref?.replace(/^refs\/tags\//u, "") ?? "";
+              const tuple = versionTuple(tag);
+              return tuple ? [{ ref, tag, tuple }] : [];
+            });
+            const stableReleases = releases.flatMap((release) => {
+              const tuple = versionTuple(release.tag_name ?? "");
+              return tuple ? [{ release, tuple }] : [];
+            });
+            if (
+              stableRefs.some(({ tuple }) =>
+                compareVersion(tuple, targetVersion) > 0
+              )
+              || stableReleases.some(({ tuple }) =>
+                compareVersion(tuple, targetVersion) > 0
+              )
+            ) {
+              throw new Error(
+                "stable release would move semantic version backwards",
+              );
+            }
+            const equalRefs = stableRefs.filter(({ tuple }) =>
+              compareVersion(tuple, targetVersion) === 0
+            );
+            const equalReleases = stableReleases.filter(({ tuple }) =>
+              compareVersion(tuple, targetVersion) === 0
+            );
+            if (equalRefs.length > 1 || equalReleases.length > 1) {
+              throw new Error("stable release identity is duplicated");
+            }
+            const expectedBody = readFileSync(
+              "stable-release-notes.txt",
+              "utf8",
+            );
+            if (equalRefs.length === 1) {
+              const equalRef = equalRefs[0];
+              if (
+                equalRef.tag !== process.env.STABLE_TAG
+                || equalRef.ref.object?.type !== "tag"
+              ) {
+                throw new Error(
+                  "equal stable tag is not an exact idempotent annotated tag",
+                );
+              }
+              const annotated = await github.rest.git.getTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_sha: equalRef.ref.object.sha,
+              });
+              if (
+                annotated.data.tag !== process.env.STABLE_TAG
+                || annotated.data.object.type !== "commit"
+                || annotated.data.object.sha !== process.env.SOURCE_REVISION
+                || annotated.data.message !== expectedBody
+              ) {
+                throw new Error(
+                  "equal stable tag is not an exact idempotent release identity",
+                );
+              }
+            }
+            if (equalReleases.length === 1) {
+              const release = equalReleases[0].release;
+              if (
+                equalRefs.length !== 1
+                || release.tag_name !== process.env.STABLE_TAG
+                || release.target_commitish !== process.env.SOURCE_REVISION
+                || release.name !== process.env.STABLE_TAG
+                || release.body !== expectedBody
+                || release.prerelease !== false
+                || (release.draft !== true && release.immutable !== true)
+              ) {
+                throw new Error(
+                  "equal stable release is not an exact idempotent reconciliation",
+                );
+              }
+            }
+      - name: Create the immutable stable tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_TAG: ${{ steps.target.outputs.stable_tag }}
+          SOURCE_REVISION: ${{ steps.target.outputs.source_revision }}
+        run: |
           if git ls-remote --exit-code --tags origin "refs/tags/$STABLE_TAG" >/dev/null 2>&1; then
             git fetch --force origin "refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
             test "$(git cat-file -t "refs/tags/$STABLE_TAG")" = "tag"

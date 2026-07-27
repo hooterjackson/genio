@@ -41,8 +41,20 @@ import {
 } from "../lib/semantic-ranking-review.ts";
 import {
   validateStableReleaseVerificationKeyV1,
-  verifyHistoricalStableReleaseConsumerBundle,
 } from "./authorize-stable-release.ts";
+import {
+  HISTORICAL_STABLE_PREDECESSOR_DEFAULT_BRANCH,
+  HISTORICAL_STABLE_PREDECESSOR_REPOSITORY,
+  verifyHistoricalStablePredecessor,
+} from "./historical-stable-predecessor.ts";
+import {
+  PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
+  type PublicRolloutIntentGroup,
+} from "../shared/public-rollout-evidence.ts";
+import {
+  buildReleaseConvergenceEvidence,
+  type ReleaseConvergenceObservation,
+} from "./verify-release-convergence.ts";
 
 /**
  * Release fixtures are code-owned product contracts. A live canary may accept
@@ -128,6 +140,70 @@ export interface ReleaseGateCandidateBindingV1 {
   imageDigest: string;
   sitesSourceRevision: string;
 }
+
+export interface FinalPublicAssignmentProbeFixtureV1 {
+  fixtureId: string;
+  intentGroup: PublicRolloutIntentGroup;
+  prompt: string;
+  targetTrackCount: number;
+}
+
+/**
+ * These prompts are deliberately recognizable as release canaries while still
+ * exercising the ordinary anonymous public-assignment path. Raw prompts never
+ * enter release evidence; only the code-owned fixture ID, group, and count do.
+ */
+export const FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1 = Object.freeze([
+  Object.freeze({
+    fixtureId: "final-public-assignment-genre-scene-v1",
+    intentGroup: "genre_scene",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:genre_scene:v1] Create 3 polished reggaeton tracks.",
+    targetTrackCount: 3,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-mood-activity-theme-v1",
+    intentGroup: "mood_activity_theme",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:mood_activity_theme:v1] Create 3 dark ambient tracks for sleep.",
+    targetTrackCount: 3,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-similarity-v1",
+    intentGroup: "similarity",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:similarity:v1] Create 3 tracks similar to Radiohead while excluding Radiohead.",
+    targetTrackCount: 3,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-artist-catalogue-v1",
+    intentGroup: "artist_catalogue",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:artist_catalogue:v1] Create 3 songs by Bjork.",
+    targetTrackCount: 3,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-fixed-container-v1",
+    intentGroup: "fixed_container",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:fixed_container:v1] Create 3 tracks from the album \"Kind of Blue\".",
+    targetTrackCount: 3,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-factual-relationship-v1",
+    intentGroup: "factual_relationship",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:factual_relationship:v1] Create 3 tracks performed by Paulinho da Costa.",
+    targetTrackCount: 3,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-exhaustive-v1",
+    intentGroup: "exhaustive",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:exhaustive:v1] Create an exhaustive selection of 3 Nigerian boogie tracks.",
+    targetTrackCount: 3,
+  }),
+] as const satisfies readonly FinalPublicAssignmentProbeFixtureV1[]);
 
 export interface ReleaseGateProofV1 {
   schemaVersion: typeof RELEASE_GATE_PROOF_SCHEMA_V1;
@@ -391,6 +467,7 @@ export const RELEASE_GATE_ASSERTIONS: Readonly<Record<ReleaseGateName, readonly 
       "anonymous_playlist_directory",
       "public_playlist_contents_visible",
       "privacy_projection",
+      "public_assignment_all_intents_v3",
     ]),
   });
 
@@ -1180,6 +1257,10 @@ function validateSemanticReviewSources(
       "protectedBaselineReleaseVerificationKey",
       "protectedBaselineStableAuthorization",
       "protectedBaselineStableAuthorizerVerificationKey",
+      "protectedBaselineVerification",
+      "protectedBaselineImageAttestation",
+      "protectedBaselineStoredConsumer",
+      "protectedBaselineGithubAttestationVerification",
       "protectedBaselineLineage",
       "blindedPackage",
       "blindScorecard",
@@ -1222,15 +1303,68 @@ function validateSemanticReviewSources(
     validateSemanticRankingProtectedBaselineMetadataV1(
       sources.protectedBaselineMetadata,
     );
-  const protectedBaselineLineage =
-    verifyHistoricalStableReleaseConsumerBundle({
-      finalizationEvidence:
-        sources.protectedBaselineFinalizationEvidence,
+  const predecessorVerification = asRecord(
+    sources.protectedBaselineVerification,
+    "semantic review predecessor verification context",
+  );
+  exactKeys(predecessorVerification, [
+    "schemaVersion",
+    "mode",
+    "repository",
+    "defaultBranch",
+    "controllerSourceRevision",
+    "successorRcTag",
+    "successorSourceRevision",
+  ], "semantic review predecessor verification context");
+  if (
+    predecessorVerification.schemaVersion
+      !== "genio-historical-stable-predecessor-verification-context/v1"
+    || (
+      predecessorVerification.mode !== "normal"
+      && predecessorVerification.mode !== "bootstrap"
+    )
+    || predecessorVerification.repository
+      !== HISTORICAL_STABLE_PREDECESSOR_REPOSITORY
+    || predecessorVerification.defaultBranch
+      !== HISTORICAL_STABLE_PREDECESSOR_DEFAULT_BRANCH
+    || predecessorVerification.successorRcTag !== candidate.tag
+    || predecessorVerification.successorSourceRevision
+      !== candidate.sourceRevision
+    || (
+      predecessorVerification.mode === "normal"
+      && (
+        predecessorVerification.controllerSourceRevision !== null
+        || sources.protectedBaselineImageAttestation !== null
+        || sources.protectedBaselineGithubAttestationVerification !== null
+      )
+    )
+    || (
+      predecessorVerification.mode === "bootstrap"
+      && (
+        typeof predecessorVerification.controllerSourceRevision !== "string"
+        || !SOURCE_REVISION.test(
+          predecessorVerification.controllerSourceRevision,
+        )
+        || !sources.protectedBaselineImageAttestation
+        || typeof sources.protectedBaselineImageAttestation !== "object"
+        || !sources.protectedBaselineGithubAttestationVerification
+        || typeof sources.protectedBaselineGithubAttestationVerification
+          !== "object"
+      )
+    )
+  ) {
+    throw new Error(
+      "semantic review predecessor verification context is invalid",
+    );
+  }
+  const protectedBaselineVerification =
+    verifyHistoricalStablePredecessor({
+      evidence: sources.protectedBaselineFinalizationEvidence,
       protectedBaselineMetadata,
       releaseVerificationKey: releaseVerificationKey.key,
       approvedReleaseKeySha256:
         reviewerTrustPolicy.approvedBaselineReleaseKeySha256,
-      stableAuthorization:
+      authorization:
         sources.protectedBaselineStableAuthorization,
       stableAuthorizationVerificationKey:
         stableAuthorizerVerificationKey.key,
@@ -1239,13 +1373,34 @@ function validateSemanticReviewSources(
       approvedStableAuthorizerKeySha256:
         reviewerTrustPolicy
           .approvedBaselineStableAuthorizerKeySha256,
-      expectedRcTag: protectedBaselineMetadata.rcTag,
-      expectedVersion: protectedBaselineMetadata.version,
-      expectedRevision: protectedBaselineMetadata.sourceRevision,
-      expectedImageDigest: protectedBaselineMetadata.imageDigest,
-      expectedImageReference: protectedBaselineMetadata.imageReference,
+      imageAttestation: sources.protectedBaselineImageAttestation,
+      storedConsumer: sources.protectedBaselineStoredConsumer,
+      githubAttestationVerification:
+        sources.protectedBaselineGithubAttestationVerification,
+      expectedPredecessorRcTag: protectedBaselineMetadata.rcTag,
+      expectedPredecessorVersion: protectedBaselineMetadata.version,
+      expectedPredecessorRevision: protectedBaselineMetadata.sourceRevision,
+      expectedPredecessorImageDigest: protectedBaselineMetadata.imageDigest,
+      expectedPredecessorImageReference:
+        protectedBaselineMetadata.imageReference,
+      expectedSuccessorRcTag: candidate.tag,
+      expectedSuccessorSourceRevision: candidate.sourceRevision,
+      expectedRepository: String(predecessorVerification.repository),
+      expectedDefaultBranch:
+        String(predecessorVerification.defaultBranch),
+      expectedControllerSourceRevision:
+        predecessorVerification.mode === "bootstrap"
+          ? String(predecessorVerification.controllerSourceRevision)
+          : candidate.sourceRevision,
       now: artifact.reviewedAt,
     });
+  if (protectedBaselineVerification.mode !== predecessorVerification.mode) {
+    throw new Error(
+      "semantic review predecessor schema mode does not match its protected context",
+    );
+  }
+  const protectedBaselineLineage =
+    protectedBaselineVerification.lineage;
   if (
     stableReleaseFixtureJson(protectedBaselineLineage)
       !== stableReleaseFixtureJson(sources.protectedBaselineLineage)
@@ -1352,8 +1507,14 @@ function validateConvergenceSource(
     "api",
     "interactiveWorker",
     "deepWorker",
+    "semanticExecution",
   ], "release convergence expected configuration hashes");
-  for (const field of ["api", "interactiveWorker", "deepWorker"]) {
+  for (const field of [
+    "api",
+    "interactiveWorker",
+    "deepWorker",
+    "semanticExecution",
+  ]) {
     digest(
       configurationHashes[field],
       `release convergence expected configuration ${field}`,
@@ -1394,7 +1555,32 @@ function validateConvergenceSource(
   ) throw new Error("release convergence source did not pass");
   timestamp(evidence.generatedAt, "release convergence generatedAt");
   timestamp(evidence.expiresAt, "release convergence expiresAt");
-  recomputeHash(evidence, "evidenceHash", "release convergence evidence");
+  const recomputed = buildReleaseConvergenceEvidence({
+    origin: String(evidence.origin),
+    scope: requiredScope,
+    expectedRevision: candidate.sourceRevision,
+    expectedVersion: candidate.version,
+    expectedSitesRevision: String(sites.revision),
+    expectedSitesVersion: String(sites.version),
+    expectedSamples: Number(expected.samples),
+    expectedConfigurationHashes: {
+      api: String(configurationHashes.api),
+      interactiveWorker: String(configurationHashes.interactiveWorker),
+      deepWorker: String(configurationHashes.deepWorker),
+      semanticExecution: String(configurationHashes.semanticExecution),
+    },
+    observations:
+      evidence.observations as ReleaseConvergenceObservation[],
+    generatedAt: String(evidence.generatedAt),
+  });
+  if (
+    stableReleaseFixtureJson(recomputed)
+      !== stableReleaseFixtureJson(evidence)
+  ) {
+    throw new Error(
+      "release convergence source is not the canonical recomputation",
+    );
+  }
 }
 
 export function validateSitesControlPlaneSource(
@@ -1616,10 +1802,14 @@ function validateFinalBrowserSources(
     "publicPlaylistContentsVisible",
     "privacyProjectionPassed",
     "screenshotHashes",
+    "publicAssignmentProbes",
     "evidenceHash",
   ], "final custom-domain browser evidence");
+  const publicAssignmentProbes = Array.isArray(browser.publicAssignmentProbes)
+    ? browser.publicAssignmentProbes
+    : [];
   if (
-    browser.schemaVersion !== "genio-final-custom-domain-browser/v1"
+    browser.schemaVersion !== "genio-final-custom-domain-browser/v2"
     || browser.origin !== "https://9enio.com"
     || browser.candidateRevision !== candidate.sourceRevision
     || browser.tlsValid !== true
@@ -1628,7 +1818,84 @@ function validateFinalBrowserSources(
     || browser.publicPlaylistContentsVisible !== true
     || browser.privacyProjectionPassed !== true
     || safeStringArray(browser.screenshotHashes, "final browser screenshots").length < 1
+    || publicAssignmentProbes.length
+      !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
   ) throw new Error("final custom-domain browser evidence did not pass");
+  const fixturesById = new Map<
+    string,
+    (typeof FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1)[number]
+  >(
+    FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture) => [
+      fixture.fixtureId,
+      fixture,
+    ]),
+  );
+  const seenFixtureIds = new Set<string>();
+  const seenIntentGroups = new Set<string>();
+  const governedIntentGroups = Object.keys(
+    PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
+  );
+  const rolloutEvidenceHashes = new Set<string>();
+  const rolloutStages = new Set<string>();
+  const assignmentHashes = new Set<string>();
+  for (const [index, probeValue] of publicAssignmentProbes.entries()) {
+    const probe = asRecord(
+      probeValue,
+      `final public assignment probe ${index}`,
+    );
+    exactKeys(probe, [
+      "fixtureId",
+      "intentGroup",
+      "targetTrackCount",
+      "rolloutEvidenceHash",
+      "rolloutStage",
+      "assignmentHash",
+      "contractVersion",
+      "cleanupStatus",
+    ], `final public assignment probe ${index}`);
+    const fixture = typeof probe.fixtureId === "string"
+      ? fixturesById.get(probe.fixtureId)
+      : undefined;
+    const rolloutStage = typeof probe.rolloutStage === "string"
+      ? probe.rolloutStage
+      : "";
+    if (
+      !fixture
+      || seenFixtureIds.has(fixture.fixtureId)
+      || seenIntentGroups.has(fixture.intentGroup)
+      || probe.intentGroup !== fixture.intentGroup
+      || probe.targetTrackCount !== fixture.targetTrackCount
+      || probe.contractVersion !== 3
+      || probe.cleanupStatus !== 204
+      || !/^[0-9a-f]{64}$/u.test(String(probe.rolloutEvidenceHash))
+      || !/^[0-9a-f]{64}$/u.test(String(probe.assignmentHash))
+      || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->100$/u
+        .test(rolloutStage)
+    ) {
+      throw new Error(
+        `final public assignment probe ${index} did not prove its code-owned V3 assignment`,
+      );
+    }
+    seenFixtureIds.add(fixture.fixtureId);
+    seenIntentGroups.add(fixture.intentGroup);
+    rolloutEvidenceHashes.add(String(probe.rolloutEvidenceHash));
+    rolloutStages.add(rolloutStage);
+    assignmentHashes.add(String(probe.assignmentHash));
+  }
+  if (
+    seenFixtureIds.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || seenIntentGroups.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || governedIntentGroups.length
+      !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || governedIntentGroups.some((group) => !seenIntentGroups.has(group))
+    || rolloutEvidenceHashes.size !== 1
+    || rolloutStages.size !== 1
+    || assignmentHashes.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+  ) {
+    throw new Error(
+      "final public assignment probes do not bind one exact signed rollout state",
+    );
+  }
   timestamp(browser.observedAt, "final custom-domain browser observedAt");
   recomputeHash(browser, "evidenceHash", "final custom-domain browser evidence");
 }

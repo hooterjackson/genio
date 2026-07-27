@@ -284,6 +284,10 @@ export const playlistExecutionAttempts = pgTable("playlist_execution_attempts", 
   executorCapabilityHash: varchar("executor_capability_hash", { length: 64 }),
   executorCapabilityVector: jsonb("executor_capability_vector"),
   configurationHash: varchar("configuration_hash", { length: 64 }).notNull(),
+  semanticExecutionConfigurationHash: varchar(
+    "semantic_execution_configuration_hash",
+    { length: 64 },
+  ),
   idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
   checkpointCursor: varchar("checkpoint_cursor", { length: 240 }),
   status: varchar("status", { length: 40 }).notNull(),
@@ -318,6 +322,10 @@ export const playlistExecutionAttempts = pgTable("playlist_execution_attempts", 
   ),
   check("playlist_execution_attempt_numbers_valid", sql`${table.attemptNumber} > 0 AND ${table.leaseGeneration} >= 0`),
   check("playlist_execution_attempt_identity_valid", sql`${table.executorIdentityHash} ~ '^[0-9a-f]{64}$'`),
+  check(
+    "playlist_execution_attempt_semantic_identity_valid",
+    sql`${table.semanticExecutionConfigurationHash} IS NULL OR ${table.semanticExecutionConfigurationHash} ~ '^[0-9a-f]{64}$'`,
+  ),
   check("playlist_execution_attempt_status_valid", sql`${table.status} IN ('queued','running','blocked','complete','cancelled','discarded','failed')`),
 ]);
 
@@ -1419,6 +1427,11 @@ export const jobQueue = pgTable("job_queue", {
   queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "set null" }),
   requiredExecutorCapabilityHash: varchar("required_executor_capability_hash", { length: 64 }),
   requiredExecutorCapabilityVector: jsonb("required_executor_capability_vector"),
+  requiredExecutorRevision: varchar("required_executor_revision", { length: 160 }),
+  requiredExecutorSemanticConfigurationHash: varchar(
+    "required_executor_semantic_configuration_hash",
+    { length: 64 },
+  ),
   stageKey: varchar("stage_key", { length: 160 }).notNull().default("default"),
   status: varchar("status", { length: 32 }).notNull().default("queued"),
   payloadJson: jsonb("payload_json").notNull().default({}),
@@ -1453,10 +1466,27 @@ export const jobQueue = pgTable("job_queue", {
     table.availableAt,
     table.leaseExpiresAt,
   ),
+  index("job_executor_release_identity_lease_idx").on(
+    table.status,
+    table.requiredExecutorRevision,
+    table.requiredExecutorSemanticConfigurationHash,
+    table.availableAt,
+    table.leaseExpiresAt,
+  ),
   index("job_plan_stage_status_idx").on(table.runId, table.queryPlanRevisionId, table.stageKey, table.status),
   index("job_run_idx").on(table.runId),
   check("job_lease_epoch_valid", sql`${table.leaseEpoch} >= 0`),
   check("job_queue_class_valid", sql`${table.queueClass} IN ('interactive','deep','publication','system')`),
+  check(
+    "job_required_executor_release_identity_complete",
+    sql`(
+      (${table.requiredExecutorRevision} IS NULL AND ${table.requiredExecutorSemanticConfigurationHash} IS NULL)
+      OR (
+        ${table.requiredExecutorRevision} ~ '^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$'
+        AND ${table.requiredExecutorSemanticConfigurationHash} ~ '^[0-9a-f]{64}$'
+      )
+    )`,
+  ),
 ]);
 
 export const workerHeartbeats = pgTable("worker_heartbeats", {

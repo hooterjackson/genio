@@ -14,9 +14,18 @@ import {
   releaseProducerOption,
 } from "./release-gate-producer.ts";
 import {
+  FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1,
+  type FinalPublicAssignmentProbeFixtureV1,
   releaseFixtureSha256,
   validateSitesControlPlaneSource,
 } from "./release-fixtures.ts";
+import {
+  pipelineV3RolloutGroup,
+} from "../server/query-plan-v3.ts";
+import { createRunSpecV3 } from "../server/selection-plan-v3.ts";
+import {
+  PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
+} from "../shared/public-rollout-evidence.ts";
 import {
   sitesControlPlaneKeyFingerprint,
   sitesControlPlaneTrustPolicyV1,
@@ -29,6 +38,9 @@ const PRODUCTION_ORIGIN = "https://9enio.com";
 const DEADLINE_MS = 3 * 60_000;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const SHA256 = /^[0-9a-f]{64}$/u;
+const FINAL_ROLLOUT_STAGE =
+  /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->100$/u;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -169,10 +181,109 @@ function remaining(deadlineAt: number, maximum: number): number {
   return Math.max(1, Math.min(value, maximum));
 }
 
+export function assertFinalPublicAssignmentProbeFixtureClassifications(): void {
+  const fixtureIds = new Set<string>();
+  const intentGroups = new Set<string>();
+  const governedIntentGroups = Object.keys(
+    PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
+  );
+  for (const fixture of FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1) {
+    const plan = createRunSpecV3({
+      prompt: fixture.prompt,
+      requestedTrackCount: fixture.targetTrackCount,
+      storefront: "us",
+    });
+    const classifiedGroup = pipelineV3RolloutGroup(plan);
+    if (
+      fixtureIds.has(fixture.fixtureId)
+      || intentGroups.has(fixture.intentGroup)
+      || classifiedGroup !== fixture.intentGroup
+      || plan.criticalAmbiguities.length !== 0
+    ) {
+      throw new Error(
+        `final public assignment fixture ${fixture.fixtureId} does not uniquely classify as ${fixture.intentGroup}`,
+      );
+    }
+    fixtureIds.add(fixture.fixtureId);
+    intentGroups.add(fixture.intentGroup);
+  }
+  if (
+    fixtureIds.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || intentGroups.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || governedIntentGroups.length
+      !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || governedIntentGroups.some((group) => !intentGroups.has(group))
+  ) {
+    throw new Error(
+      "final public assignment fixtures do not cover every rollout intent",
+    );
+  }
+}
+
+assertFinalPublicAssignmentProbeFixtureClassifications();
+
+export interface BrowserPublicAssignmentProbeResultV1 {
+  postStatus: number;
+  requestIdValid: boolean;
+  rolloutEvidenceHash: string | null;
+  rolloutStage: string | null;
+  assignmentHash: string | null;
+  getStatus: number | null;
+  contractVersion: number | null;
+  cleanupStatus: number | null;
+}
+
+export interface FinalPublicAssignmentProbeEvidenceV1 {
+  fixtureId: string;
+  intentGroup: FinalPublicAssignmentProbeFixtureV1["intentGroup"];
+  targetTrackCount: number;
+  rolloutEvidenceHash: string;
+  rolloutStage: string;
+  assignmentHash: string;
+  contractVersion: 3;
+  cleanupStatus: 204;
+}
+
+export function validateBrowserPublicAssignmentProbeResultV1(input: {
+  fixture: FinalPublicAssignmentProbeFixtureV1;
+  result: BrowserPublicAssignmentProbeResultV1;
+  expectedRolloutEvidenceHash: string;
+  expectedRolloutStage: string;
+}): FinalPublicAssignmentProbeEvidenceV1 {
+  const { result } = input;
+  if (
+    (result.postStatus !== 200 && result.postStatus !== 202)
+    || result.requestIdValid !== true
+    || result.rolloutEvidenceHash !== input.expectedRolloutEvidenceHash
+    || result.rolloutStage !== input.expectedRolloutStage
+    || typeof result.assignmentHash !== "string"
+    || !SHA256.test(result.assignmentHash)
+    || result.getStatus !== 200
+    || result.contractVersion !== 3
+    || result.cleanupStatus !== 204
+  ) {
+    throw new Error(
+      `public assignment probe ${input.fixture.fixtureId} did not prove an exact contract-3 assignment and cleanup`,
+    );
+  }
+  return {
+    fixtureId: input.fixture.fixtureId,
+    intentGroup: input.fixture.intentGroup,
+    targetTrackCount: input.fixture.targetTrackCount,
+    rolloutEvidenceHash: result.rolloutEvidenceHash,
+    rolloutStage: result.rolloutStage,
+    assignmentHash: result.assignmentHash,
+    contractVersion: 3,
+    cleanupStatus: 204,
+  };
+}
+
 export interface FinalCustomDomainBrowserProducerArgs {
   origin: typeof PRODUCTION_ORIGIN;
   expectedRevision: string;
   expectedVersion: string;
+  expectedPublicRolloutEvidenceHash: string;
+  expectedPublicRolloutStage: string;
   candidateTag: string;
   imageDigest: string;
   runtimeSnapshotPath: string;
@@ -200,6 +311,8 @@ export function parseFinalCustomDomainBrowserProducerArgs(
     "--origin",
     "--expected-revision",
     "--expected-version",
+    "--expected-public-rollout-evidence-hash",
+    "--expected-public-rollout-stage",
     "--candidate-tag",
     "--image-digest",
     "--runtime-snapshot",
@@ -229,6 +342,24 @@ export function parseFinalCustomDomainBrowserProducerArgs(
   }
   const expectedRevision = releaseProducerOption(argv, "--expected-revision").toLowerCase();
   const expectedVersion = releaseProducerOption(argv, "--expected-version");
+  const expectedPublicRolloutEvidenceHash = releaseProducerOption(
+    argv,
+    "--expected-public-rollout-evidence-hash",
+  );
+  const expectedPublicRolloutStage = releaseProducerOption(
+    argv,
+    "--expected-public-rollout-stage",
+  );
+  if (!SHA256.test(expectedPublicRolloutEvidenceHash)) {
+    throw new Error(
+      "--expected-public-rollout-evidence-hash must be the exact signed rollout payload hash",
+    );
+  }
+  if (!FINAL_ROLLOUT_STAGE.test(expectedPublicRolloutStage)) {
+    throw new Error(
+      "--expected-public-rollout-stage must encode a governed intent transition to 100%",
+    );
+  }
   const candidateTag = releaseProducerOption(argv, "--candidate-tag");
   const imageDigest = releaseProducerOption(argv, "--image-digest");
   releaseProducerCandidate({
@@ -253,6 +384,8 @@ export function parseFinalCustomDomainBrowserProducerArgs(
     origin: PRODUCTION_ORIGIN,
     expectedRevision,
     expectedVersion,
+    expectedPublicRolloutEvidenceHash,
+    expectedPublicRolloutStage,
     candidateTag,
     imageDigest,
     runtimeSnapshotPath: releaseProducerOption(argv, "--runtime-snapshot"),
@@ -365,6 +498,8 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
   origin: typeof PRODUCTION_ORIGIN;
   candidateRevision: string;
   candidateVersion: string;
+  expectedPublicRolloutEvidenceHash: string;
+  expectedPublicRolloutStage: string;
   artifactDirectory: string;
   deadlineAt: number;
 }): Promise<JsonRecord> {
@@ -435,10 +570,130 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
       path: resolve(directory, "production-playlists.png"),
       timeout: remaining(input.deadlineAt, 30_000),
     });
+    const publicAssignmentProbes: FinalPublicAssignmentProbeEvidenceV1[] = [];
+    for (const fixture of FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1) {
+      remaining(input.deadlineAt, 1);
+      const probeResult = await page.evaluate(
+        async ({ prompt, targetTrackCount, timeoutMs }) => {
+          const lifecycleController = new AbortController();
+          const lifecycleTimer = setTimeout(
+            () => lifecycleController.abort(),
+            Math.max(1, timeoutMs - 5_000),
+          );
+          try {
+            const postResponse = await fetch("/api/v1/brief", {
+              method: "POST",
+              cache: "no-store",
+              credentials: "same-origin",
+              headers: {
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ prompt, targetTrackCount }),
+              signal: lifecycleController.signal,
+            });
+            const rolloutEvidenceHash = postResponse.headers.get(
+              "x-genio-public-rollout-evidence-hash",
+            );
+            const rolloutStage = postResponse.headers.get(
+              "x-genio-public-rollout-stage",
+            );
+            const assignmentHash = postResponse.headers.get(
+              "x-genio-public-rollout-assignment-hash",
+            );
+            let requestId: string | null = null;
+            try {
+              const payload: unknown = await postResponse.json();
+              if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+                const candidate = (payload as Record<string, unknown>).requestId;
+                requestId = typeof candidate === "string" ? candidate : null;
+              }
+            } catch {
+              requestId = null;
+            }
+            const requestIdValid = requestId !== null
+              && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+                .test(requestId);
+            let getStatus: number | null = null;
+            let contractVersion: number | null = null;
+            let cleanupStatus: number | null = null;
+            if (requestIdValid) {
+              try {
+                const getResponse = await fetch(`/api/v1/brief/${requestId}`, {
+                  cache: "no-store",
+                  credentials: "same-origin",
+                  signal: lifecycleController.signal,
+                });
+                getStatus = getResponse.status;
+                try {
+                  const payload: unknown = await getResponse.json();
+                  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+                    const candidate = (payload as Record<string, unknown>)
+                      .briefContractVersion;
+                    contractVersion = typeof candidate === "number"
+                      ? candidate
+                      : null;
+                  }
+                } catch {
+                  contractVersion = null;
+                }
+              } finally {
+                const cleanupController = new AbortController();
+                const cleanupTimer = setTimeout(
+                  () => cleanupController.abort(),
+                  Math.min(5_000, timeoutMs),
+                );
+                try {
+                  const cleanupResponse = await fetch(
+                    `/api/v1/brief/${requestId}`,
+                    {
+                      method: "DELETE",
+                      cache: "no-store",
+                      credentials: "same-origin",
+                      signal: cleanupController.signal,
+                    },
+                  );
+                  cleanupStatus = cleanupResponse.status;
+                } catch {
+                  cleanupStatus = null;
+                } finally {
+                  clearTimeout(cleanupTimer);
+                }
+              }
+            }
+            return {
+              postStatus: postResponse.status,
+              requestIdValid,
+              rolloutEvidenceHash,
+              rolloutStage,
+              assignmentHash,
+              getStatus,
+              contractVersion,
+              cleanupStatus,
+            };
+          } finally {
+            clearTimeout(lifecycleTimer);
+          }
+        },
+        {
+          prompt: fixture.prompt,
+          targetTrackCount: fixture.targetTrackCount,
+          timeoutMs: remaining(input.deadlineAt, 20_000),
+        },
+      );
+      publicAssignmentProbes.push(
+        validateBrowserPublicAssignmentProbeResultV1({
+          fixture,
+          result: probeResult,
+          expectedRolloutEvidenceHash:
+            input.expectedPublicRolloutEvidenceHash,
+          expectedRolloutStage: input.expectedPublicRolloutStage,
+        }),
+      );
+    }
     remaining(input.deadlineAt, 1);
     const observedAt = new Date().toISOString();
     const unsigned = {
-      schemaVersion: "genio-final-custom-domain-browser/v1",
+      schemaVersion: "genio-final-custom-domain-browser/v2",
       origin: input.origin,
       candidateRevision: input.candidateRevision,
       observedAt,
@@ -449,6 +704,7 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
       privacyProjectionPassed: true,
       screenshotHashes: [aboutScreenshot, directoryScreenshot]
         .map((bytes) => createHash("sha256").update(bytes).digest("hex")),
+      publicAssignmentProbes,
     };
     return {
       ...unsigned,
@@ -488,6 +744,9 @@ async function main(): Promise<void> {
     origin: args.origin,
     candidateRevision: args.expectedRevision,
     candidateVersion: args.expectedVersion,
+    expectedPublicRolloutEvidenceHash:
+      args.expectedPublicRolloutEvidenceHash,
+    expectedPublicRolloutStage: args.expectedPublicRolloutStage,
     artifactDirectory: args.browserArtifactDirectory,
     deadlineAt,
   });

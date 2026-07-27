@@ -166,6 +166,8 @@ async function main(): Promise<void> {
       interactiveWorker:
         runtimeSnapshot.configuration.interactiveWorkerHash,
       deepWorker: runtimeSnapshot.configuration.deepWorkerHash,
+      semanticExecution:
+        runtimeSnapshot.runtime.semanticExecutionConfigurationHash,
     },
   }, deadlineAt);
   if (!convergence.passed) {

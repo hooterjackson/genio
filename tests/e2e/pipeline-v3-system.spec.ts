@@ -1,11 +1,12 @@
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { Pool } from "pg";
 import { createDatabase } from "../../db/index.ts";
 import { deterministicBriefFallback } from "../../server/brief-policy.ts";
 import {
+  attestedEvidenceBindingsForSelectionV3,
   publicTrackScopeAttestationV3,
   type QualifiedTrackV3,
   type RetrievalResultV3,
@@ -47,6 +48,9 @@ async function applySql(pool: Pool, sql: string): Promise<void> {
 function fixtureTrack(prefix: string, index: number, predicateIds: readonly string[]): QualifiedTrackV3 {
   const ordinal = String(index + 1).padStart(3, "0");
   const url = `https://example.test/system-e2e/${prefix}/${ordinal}`;
+  const sourceHash = createHash("sha256")
+    .update(["hosted_web_search", url].join("\u0000"))
+    .digest("hex");
   return {
     candidateId: `${prefix}:candidate:${ordinal}`,
     title: `${prefix} Track ${ordinal}`,
@@ -76,8 +80,8 @@ function fixtureTrack(prefix: string, index: number, predicateIds: readonly stri
         cachePolicy: "excerpt_only",
         retentionPolicy: "ninety_days",
         freshnessPolicy: "revalidate_30d",
-        sourceHash: "a".repeat(64),
-        sourceRevision: "b".repeat(64),
+        sourceHash,
+        sourceRevision: sourceHash,
       },
       eligibilityAttestation: publicTrackScopeAttestationV3(url),
     }],
@@ -176,6 +180,14 @@ function fixtureResult(input: {
     },
   };
 }
+
+test("stitched V3 fixtures retain attested exact track-scope evidence", () => {
+  const track = fixtureTrack("exact", 0, ["genre:disco"]);
+  expect(attestedEvidenceBindingsForSelectionV3(
+    track.evidenceBindingIds,
+    track.evidenceBindings,
+  )).toHaveLength(1);
+});
 
 async function waitForApi(child: ChildProcess, output: () => string): Promise<void> {
   const deadline = Date.now() + 20_000;

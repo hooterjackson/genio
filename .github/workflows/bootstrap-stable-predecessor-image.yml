@@ -1,0 +1,537 @@
+name: bootstrap stable predecessor wrapper image
+
+on:
+  # This one-time workflow is loaded only from the default branch and accepts
+  # no operator-controlled source, tag, version, recipe, or image identity.
+  repository_dispatch:
+    types: [genio-stable-predecessor-wrapper-image-v2-3-4]
+
+concurrency:
+  group: stable-release-mutation
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  BOOTSTRAP_REPOSITORY: hooterjackson/genio
+  BOOTSTRAP_WORKFLOW: .github/workflows/bootstrap-stable-predecessor-image.yml
+  STABLE_TAG: v2.3.4
+  ORIGINAL_TAG_OBJECT: 0fb63ccc88b6f5ea675b3b43506fc112fa3fae58
+  ORIGINAL_SOURCE_REVISION: 7dc877cfc1537a9936974f9699a4b8ba9740b5f5
+  ORIGINAL_SOURCE_TREE: 91076c2f06de9d562532981c3a602f1c6366f057
+  HISTORICAL_SOURCE_ARCHIVE_SHA256: bc599443f33e37ec100f2daa21d7e6da100315912cdf97bad8a2c65450c4d922
+  CONTROLLER_DOCKERFILE_SHA256: 67bef0595e27b3bfff80a6208b25c6da04de6535018f6c83a4e6dee4aeeabb08
+  HISTORICAL_BUILD_INTENT_SHA256: ae81d5d22a4ebbdb56f284e9c5cd673dfd690c87bb9f9d5b8195b11d8e74bb99
+  HISTORICAL_PACKAGE_SHA256: 176f15dac5c6b9c43c3833396f4aae880750b2cfcb26ea4404576a282061a54d
+  HISTORICAL_LOCKFILE_SHA256: a153c35bd8eec4fa2134f1bdd16224a9f2464b67aaa4f71454f89635e44ec444
+  HISTORICAL_WORKSPACE_SHA256: 204107ece0b6c76b579d0bf514e0cd4b675d751ff792fa1ffdfae6d1c360eb6d
+
+jobs:
+  publish_wrapper_by_digest:
+    environment: stable-predecessor-bootstrap-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Reject payloads and fence the real default-branch controller
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CLIENT_PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          test "$GITHUB_REPOSITORY" = "$BOOTSTRAP_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$BOOTSTRAP_WORKFLOW@refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          node -e 'const value=JSON.parse(process.env.CLIENT_PAYLOAD_JSON??"null"); if(!value||typeof value!=="object"||Array.isArray(value)||Object.keys(value).length!==0) throw new Error("dispatch payload must be an empty object");'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: controller
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: historical
+          fetch-depth: 0
+          persist-credentials: false
+          ref: 7dc877cfc1537a9936974f9699a4b8ba9740b5f5
+      - name: Verify the exact controller recipe and historical source context
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$(git -C controller rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C controller rev-parse "origin/$DEFAULT_BRANCH")" = "$GITHUB_SHA"
+          test "$(git -C historical rev-parse HEAD)" = "$ORIGINAL_SOURCE_REVISION"
+          test "$(git -C historical rev-parse HEAD^{tree})" = "$ORIGINAL_SOURCE_TREE"
+          test "$(git -C historical cat-file -t "$ORIGINAL_TAG_OBJECT")" = "tag"
+          test "$(git -C historical rev-parse "$ORIGINAL_TAG_OBJECT^{}")" = "$ORIGINAL_SOURCE_REVISION"
+          test "$(sha256sum controller/Dockerfile | cut -d' ' -f1)" = "$CONTROLLER_DOCKERFILE_SHA256"
+          test "$(git -C historical show HEAD:.railway/railway.ts | sha256sum | cut -d' ' -f1)" = "$HISTORICAL_BUILD_INTENT_SHA256"
+          test "$(sha256sum historical/package.json | cut -d' ' -f1)" = "$HISTORICAL_PACKAGE_SHA256"
+          test "$(sha256sum historical/pnpm-lock.yaml | cut -d' ' -f1)" = "$HISTORICAL_LOCKFILE_SHA256"
+          test "$(sha256sum historical/pnpm-workspace.yaml | cut -d' ' -f1)" = "$HISTORICAL_WORKSPACE_SHA256"
+          test ! -e historical/Dockerfile
+          test ! -e historical/Containerfile
+          test ! -e historical/nixpacks.toml
+          git -C controller merge-base --is-ancestor "$ORIGINAL_SOURCE_REVISION" "$GITHUB_SHA"
+          git -C historical archive \
+            --format=tar \
+            --output="$RUNNER_TEMP/v2.3.4-source.tar" \
+            "$ORIGINAL_SOURCE_REVISION"
+          test "$(sha256sum "$RUNNER_TEMP/v2.3.4-source.tar" | cut -d' ' -f1)" = "$HISTORICAL_SOURCE_ARCHIVE_SHA256"
+          mkdir historical-context
+          tar -xf "$RUNNER_TEMP/v2.3.4-source.tar" -C historical-context
+          test ! -e historical-context/.git
+          test ! -e historical-context/.gitmodules
+          test "$(sha256sum historical-context/package.json | cut -d' ' -f1)" = "$HISTORICAL_PACKAGE_SHA256"
+          test "$(sha256sum historical-context/pnpm-lock.yaml | cut -d' ' -f1)" = "$HISTORICAL_LOCKFILE_SHA256"
+          test "$(sha256sum historical-context/pnpm-workspace.yaml | cut -d' ' -f1)" = "$HISTORICAL_WORKSPACE_SHA256"
+      - name: Verify one-time reachability and protected controller
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fail = (message) => {
+              throw new Error(`stable predecessor wrapper: ${message}`);
+            };
+            if (
+              context.repo.owner.toLowerCase() !== "hooterjackson"
+              || context.repo.repo !== "genio"
+              || context.payload.repository?.fork !== false
+              || context.ref
+                !== `refs/heads/${context.payload.repository?.default_branch}`
+              || context.sha !== process.env.GITHUB_SHA
+              || Object.keys(context.payload.client_payload ?? {}).length !== 0
+            ) {
+              fail("forked, non-default, replayed, or parameterized controller");
+            }
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: context.payload.repository.default_branch,
+            });
+            if (!branch.data.protected || branch.data.commit.sha !== context.sha) {
+              fail("controller is not the current protected default-branch head");
+            }
+            const immutable = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            if (immutable.data.enabled !== true) {
+              fail("immutable Releases are not enabled");
+            }
+            const refs = await github.paginate(
+              github.rest.git.listMatchingRefs,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              },
+            );
+            const stable = refs.flatMap((ref) => {
+              const match =
+                /^refs\/tags\/v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(ref.ref ?? "");
+              return match
+                ? [{ ref: ref.ref, version: match.slice(1).map(BigInt) }]
+                : [];
+            }).sort((left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left.version[index] > right.version[index]) return -1;
+                if (left.version[index] < right.version[index]) return 1;
+              }
+              return 0;
+            });
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            const target = [2n, 3n, 4n];
+            const compare = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            if (
+              stable[0]?.ref !== "refs/tags/v2.3.4"
+              || releases.some(({ tag_name }) => {
+                const match =
+                  /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                    .exec(tag_name ?? "");
+                if (!match) return false;
+                const version = match.slice(1).map(BigInt);
+                return compare(version, target) > 0;
+              })
+            ) {
+              fail("one-time v2.3.4 bootstrap reachability is closed");
+            }
+      - id: identity
+        name: Resolve the fixed wrapper repository
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/genio" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+        with:
+          url: https://github.com/oras-project/oras/releases/download/v1.3.0/oras_1.3.0_linux_amd64.tar.gz
+          checksum: 6cdc692f929100feb08aa8de584d02f7bcc30ec7d88bc2adc2054d782db57c64
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        name: Build the explicit non-historical wrapper without registry mutation
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: historical-context
+          file: controller/Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          build-args: |
+            GENIO_BUILD_VERSION=2.3.4
+            GENIO_BUILD_REVISION=7dc877cfc1537a9936974f9699a4b8ba9740b5f5
+          outputs: type=oci,dest=${{ runner.temp }}/stable-predecessor-wrapper.oci.tar
+      - id: seal
+        name: Seal the registry-free OCI archive and image digest
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          OCI_ARCHIVE: ${{ runner.temp }}/stable-predecessor-wrapper.oci.tar
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          SEAL_EVIDENCE: stable-predecessor-wrapper-seal.json
+        with:
+          script: |
+            const { createHash } = require("node:crypto");
+            const { execFileSync } = require("node:child_process");
+            const {
+              lstatSync,
+              mkdirSync,
+              readFileSync,
+              readdirSync,
+              rmSync,
+              writeFileSync,
+            } = require("node:fs");
+            const { join } = require("node:path");
+            const fail = (message) => {
+              throw new Error(`stable predecessor wrapper seal: ${message}`);
+            };
+            const sha256 = (bytes) =>
+              `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+            const archive = process.env.OCI_ARCHIVE;
+            const buildDigest = process.env.BUILD_DIGEST;
+            const sealEvidence = process.env.SEAL_EVIDENCE;
+            const digestPattern = /^sha256:([0-9a-f]{64})$/u;
+            if (
+              !archive
+              || !sealEvidence
+              || !digestPattern.test(buildDigest ?? "")
+            ) {
+              fail("missing OCI archive, seal evidence path, or BuildKit digest");
+            }
+            const archiveBytes = readFileSync(archive);
+            const archiveSha256 = sha256(archiveBytes).slice("sha256:".length);
+            const entries = execFileSync("tar", ["-tf", archive], {
+              encoding: "utf8",
+              maxBuffer: 16 * 1024 * 1024,
+            }).split("\n").filter(Boolean).map((entry) =>
+              entry.replace(/^\.\//u, "")
+            ).filter(Boolean);
+            if (
+              new Set(entries).size !== entries.length
+              || entries.some((entry) =>
+                entry.startsWith("/")
+                || entry.includes("\\")
+                || entry.split("/").includes("..")
+              )
+            ) {
+              fail("OCI archive contains duplicate or unsafe paths");
+            }
+            const extractRoot =
+              `${process.env.RUNNER_TEMP}/stable-predecessor-wrapper-layout`;
+            rmSync(extractRoot, { recursive: true, force: true });
+            mkdirSync(extractRoot, { recursive: true });
+            execFileSync(
+              "tar",
+              [
+                "-xf",
+                archive,
+                "-C",
+                extractRoot,
+                "--no-same-owner",
+                "--no-same-permissions",
+              ],
+              { maxBuffer: 16 * 1024 * 1024 },
+            );
+            const readJson = (path, label) => {
+              try {
+                return JSON.parse(readFileSync(path, "utf8"));
+              } catch {
+                fail(`${label} is not valid JSON`);
+              }
+            };
+            const layout = readJson(
+              join(extractRoot, "oci-layout"),
+              "oci-layout",
+            );
+            if (layout?.imageLayoutVersion !== "1.0.0") {
+              fail("unsupported OCI layout version");
+            }
+            const index = readJson(
+              join(extractRoot, "index.json"),
+              "index.json",
+            );
+            if (
+              index?.schemaVersion !== 2
+              || !Array.isArray(index.manifests)
+              || index.manifests.length !== 1
+            ) {
+              fail("OCI index must contain exactly one root descriptor");
+            }
+            const indexMediaTypes = new Set([
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+            ]);
+            const manifestMediaTypes = new Set([
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+            ]);
+            const graph = new Map();
+            const visit = (descriptor, traverse) => {
+              const match = digestPattern.exec(descriptor?.digest ?? "");
+              if (
+                !match
+                || typeof descriptor.mediaType !== "string"
+                || !Number.isSafeInteger(descriptor.size)
+                || descriptor.size < 0
+              ) {
+                fail("invalid OCI descriptor");
+              }
+              const bytes = readFileSync(
+                join(extractRoot, "blobs", "sha256", match[1]),
+              );
+              if (
+                bytes.length !== descriptor.size
+                || sha256(bytes) !== descriptor.digest
+              ) {
+                fail(`descriptor bytes do not match ${descriptor.digest}`);
+              }
+              const prior = graph.get(descriptor.digest);
+              const value = {
+                digest: descriptor.digest,
+                mediaType: descriptor.mediaType,
+                size: descriptor.size,
+              };
+              if (prior && JSON.stringify(prior) !== JSON.stringify(value)) {
+                fail(`conflicting descriptor ${descriptor.digest}`);
+              }
+              graph.set(descriptor.digest, value);
+              if (!traverse || prior) return;
+              if (indexMediaTypes.has(descriptor.mediaType)) {
+                const childIndex = readJson(
+                  join(extractRoot, "blobs", "sha256", match[1]),
+                  descriptor.digest,
+                );
+                if (
+                  childIndex?.schemaVersion !== 2
+                  || !Array.isArray(childIndex.manifests)
+                  || childIndex.manifests.length === 0
+                ) {
+                  fail(`invalid image index ${descriptor.digest}`);
+                }
+                for (const child of childIndex.manifests) visit(child, true);
+                return;
+              }
+              if (!manifestMediaTypes.has(descriptor.mediaType)) {
+                fail(`unsupported root media type ${descriptor.mediaType}`);
+              }
+              const manifest = readJson(
+                join(extractRoot, "blobs", "sha256", match[1]),
+                descriptor.digest,
+              );
+              if (
+                manifest?.schemaVersion !== 2
+                || !manifest.config
+                || !Array.isArray(manifest.layers)
+              ) {
+                fail(`invalid image manifest ${descriptor.digest}`);
+              }
+              visit(manifest.config, false);
+              for (const layer of manifest.layers) visit(layer, false);
+            };
+            const root = index.manifests[0];
+            visit(root, true);
+            if (root.digest !== buildDigest) {
+              fail("BuildKit digest differs from the OCI root digest");
+            }
+            const algorithms = readdirSync(join(extractRoot, "blobs"));
+            const blobNames = readdirSync(
+              join(extractRoot, "blobs", "sha256"),
+            );
+            const graphNames = [...graph.keys()]
+              .map((digest) => digest.slice("sha256:".length))
+              .sort();
+            if (
+              algorithms.length !== 1
+              || algorithms[0] !== "sha256"
+              || blobNames.some((name) =>
+                !/^[0-9a-f]{64}$/u.test(name)
+                || !lstatSync(
+                  join(extractRoot, "blobs", "sha256", name),
+                ).isFile()
+              )
+              || JSON.stringify(blobNames.sort()) !== JSON.stringify(graphNames)
+            ) {
+              fail("OCI archive contains unsealed or missing blobs");
+            }
+            const graphSha256 = sha256(
+              Buffer.from(JSON.stringify([...graph.values()].sort(
+                (left, right) => left.digest.localeCompare(right.digest),
+              ))),
+            ).slice("sha256:".length);
+            const evidence = {
+              schemaVersion: "genio-sealed-oci-wrapper/v1",
+              archiveSha256,
+              imageDigest: root.digest,
+              graphSha256,
+            };
+            writeFileSync(
+              sealEvidence,
+              `${JSON.stringify(evidence, null, 2)}\n`,
+              { mode: 0o600, flag: "wx" },
+            );
+            core.setOutput("archive_sha256", archiveSha256);
+            core.setOutput("digest", root.digest);
+            core.setOutput("graph_sha256", graphSha256);
+      - name: Recheck full stable semver immediately before wrapper push
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fail = (message) => {
+              throw new Error(`stable predecessor wrapper final fence: ${message}`);
+            };
+            const tuple = (tag) => {
+              const match =
+                /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(tag ?? "");
+              return match ? match.slice(1).map(BigInt) : null;
+            };
+            const compare = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            const target = [2n, 3n, 4n];
+            const [refs, releases] = await Promise.all([
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+            ]);
+            const stable = refs.flatMap((ref) => {
+              const version = tuple(ref.ref?.replace(/^refs\/tags\//u, ""));
+              return version ? [{ ref: ref.ref, version }] : [];
+            }).sort((left, right) => compare(right.version, left.version));
+            const laterTag = stable.some(
+              ({ version }) => compare(version, target) > 0,
+            );
+            const laterRelease = releases.some((release) => {
+              const version = tuple(release.tag_name);
+              return version && compare(version, target) > 0;
+            });
+            if (
+              stable[0]?.ref !== "refs/tags/v2.3.4"
+              || laterTag
+              || laterRelease
+            ) {
+              fail(
+                "one-time v2.3.4 wrapper publication is closed by a later stable tag or Release",
+              );
+            }
+      - id: push
+        name: Push exactly the sealed OCI archive without rebuilding or tagging
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          OCI_ARCHIVE: ${{ runner.temp }}/stable-predecessor-wrapper.oci.tar
+          SEALED_ARCHIVE_SHA256: ${{ steps.seal.outputs.archive_sha256 }}
+          SEALED_DIGEST: ${{ steps.seal.outputs.digest }}
+        run: |
+          test "$(sha256sum "$OCI_ARCHIVE" | cut -d' ' -f1)" = "$SEALED_ARCHIVE_SHA256"
+          oras manifest fetch \
+            --oci-layout \
+            "$OCI_ARCHIVE@$SEALED_DIGEST" \
+            --output "$RUNNER_TEMP/wrapper-local-manifest.json"
+          test "$(sha256sum "$RUNNER_TEMP/wrapper-local-manifest.json" | cut -d' ' -f1)" = "${SEALED_DIGEST#sha256:}"
+          oras cp \
+            --from-oci-layout \
+            "$OCI_ARCHIVE@$SEALED_DIGEST" \
+            "$IMAGE"
+          oras manifest fetch \
+            "$IMAGE@$SEALED_DIGEST" \
+            --output "$RUNNER_TEMP/wrapper-remote-manifest.json"
+          test "$(sha256sum "$RUNNER_TEMP/wrapper-remote-manifest.json" | cut -d' ' -f1)" = "${SEALED_DIGEST#sha256:}"
+          cmp "$RUNNER_TEMP/wrapper-local-manifest.json" "$RUNNER_TEMP/wrapper-remote-manifest.json"
+          echo "digest=$SEALED_DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Attest only the separately reconstructed wrapper
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ steps.identity.outputs.image }}
+          subject-digest: ${{ steps.seal.outputs.digest }}
+          push-to-registry: true
+      - id: digest_id
+        name: Derive a colon-free artifact identity
+        env:
+          IMAGE_DIGEST: ${{ steps.seal.outputs.digest }}
+        run: |
+          node -e 'const fs=require("node:fs"); const match=/^sha256:([0-9a-f]{64})$/.exec(process.env.IMAGE_DIGEST??""); if(!match) throw new Error("wrapper digest is invalid"); fs.appendFileSync(process.env.GITHUB_OUTPUT,`value=${match[1]}\n`);'
+      - name: Reverify and record the immutable wrapper identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.seal.outputs.digest }}
+          OCI_ARCHIVE_SHA256: ${{ steps.seal.outputs.archive_sha256 }}
+          OCI_GRAPH_SHA256: ${{ steps.seal.outputs.graph_sha256 }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          gh attestation verify "oci://$IMAGE@$IMAGE_DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/$BOOTSTRAP_WORKFLOW" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --source-digest "$GITHUB_SHA" \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --deny-self-hosted-runners \
+            --no-public-good \
+            --format json > wrapper-attestation-verification.json
+          node -e 'const crypto=require("node:crypto"); const fs=require("node:fs"); const sort=(value)=>Array.isArray(value)?value.map(sort):value&&typeof value==="object"?Object.fromEntries(Object.entries(value).sort(([left],[right])=>left.localeCompare(right)).map(([key,item])=>[key,sort(item)])):value; const verification=JSON.parse(fs.readFileSync("wrapper-attestation-verification.json","utf8")); const githubVerificationSha256=crypto.createHash("sha256").update(JSON.stringify(sort(verification))).digest("hex"); const value={schemaVersion:"genio-stable-predecessor-wrapper-image/v1",kind:"separate_reconstruction_wrapper_not_historical_railway_artifact",sourceRevision:process.env.ORIGINAL_SOURCE_REVISION,sourceTree:process.env.ORIGINAL_SOURCE_TREE,sourceArchiveSha256:process.env.HISTORICAL_SOURCE_ARCHIVE_SHA256,controllerRevision:process.env.GITHUB_SHA,controllerRecipeSha256:process.env.CONTROLLER_DOCKERFILE_SHA256,historicalBuildIntentSha256:process.env.HISTORICAL_BUILD_INTENT_SHA256,ociArchiveSha256:process.env.OCI_ARCHIVE_SHA256,ociGraphSha256:process.env.OCI_GRAPH_SHA256,imageReference:`${process.env.IMAGE}@${process.env.IMAGE_DIGEST}`,imageDigest:process.env.IMAGE_DIGEST,githubVerificationSha256,limitations:["wrapper_bytes_are_not_claimed_to_equal_any_historical_railway_artifact","railway_observations_cannot_satisfy_this_image_attestation"]}; fs.writeFileSync("stable-predecessor-wrapper-image.json",JSON.stringify(value,null,2)+"\n",{mode:0o600,flag:"wx"});'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stable-predecessor-wrapper-${{ steps.digest_id.outputs.value }}
+          path: |
+            stable-predecessor-wrapper-seal.json
+            stable-predecessor-wrapper-image.json
+            wrapper-attestation-verification.json
+          if-no-files-found: error
+          retention-days: 7

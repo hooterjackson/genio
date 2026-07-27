@@ -37,6 +37,7 @@ import {
 const revision = "a".repeat(40);
 const identityHash = "c".repeat(64);
 const configurationHash = "d".repeat(64);
+const semanticExecutionConfigurationHash = "6".repeat(64);
 const HOSTED_TEST_ACQUIRED_AT = new Date(Date.now() - 60_000).toISOString();
 const HOSTED_TEST_FRESH_UNTIL = new Date(
   Date.parse(HOSTED_TEST_ACQUIRED_AT) + 29 * 24 * 60 * 60_000,
@@ -307,9 +308,27 @@ function runtimeSnapshot() {
     sitesOwnerAllowlistVersions: Array(3).fill("owner-allowlist-v1"),
     livePayload: {
       ok: true,
-      build: { version: "2.4.0", revision },
+      build: {
+        identifier: `2.4.0+${revision.slice(0, 12)}`,
+        version: "2.4.0",
+        revision,
+      },
+      api: {
+        schemaVersion: "genio-api-runtime-identity/v1",
+        replicaIdentityHash: "4".repeat(64),
+        build: {
+          identifier: `2.4.0+${revision.slice(0, 12)}`,
+          version: "2.4.0",
+          revision,
+        },
+        configurationHash: "8".repeat(64),
+        semanticExecutionConfigurationHash,
+      },
       configurationHash: "8".repeat(64),
       runtime: {
+        semanticExecutionConfigurationHash,
+        publicRolloutEvidenceHash: null,
+        publicRolloutStage: null,
         releaseEnvironment: "staging",
         deploymentPhase: "activate",
         workerProtocol: "playlist-pipeline-v10",
@@ -336,6 +355,32 @@ function runtimeSnapshot() {
       schemaVersion: "18",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
+      canonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorFencing: {
+        ready: true,
+        incompleteJobs: 0,
+        mismatchedActiveAttempts: 0,
+        uncoveredJobs: 0,
+        requirements: [],
+      },
+      api: {
+        schemaVersion: "genio-api-runtime-identity/v1",
+        replicaIdentityHash: "5".repeat(64),
+        build: {
+          identifier: `2.4.0+${revision.slice(0, 12)}`,
+          version: "2.4.0",
+          revision,
+        },
+        configurationHash: "8".repeat(64),
+        semanticExecutionConfigurationHash,
+      },
+      publicRollout: {
+        active: false,
+        databaseAuthorized: true,
+        evidenceHash: null,
+        stage: null,
+        targetConfigurationHash: null,
+      },
       paused: false,
       workerLanes: {
         interactive: {
@@ -344,8 +389,12 @@ function runtimeSnapshot() {
           compatibleCapacity: 1,
           eligibleWorkerCount: 1,
           eligibleIdentityCount: 1,
+          candidateExecutorIdentityReady: true,
           eligibleRevisions: [revision],
           eligibleConfigurationHashes: [configurationHash],
+          eligibleSemanticExecutionConfigurationHashes: [
+            semanticExecutionConfigurationHash,
+          ],
         },
         deep: {
           status: "healthy",
@@ -353,8 +402,12 @@ function runtimeSnapshot() {
           compatibleCapacity: 1,
           eligibleWorkerCount: 1,
           eligibleIdentityCount: 1,
+          candidateExecutorIdentityReady: true,
           eligibleRevisions: [revision],
           eligibleConfigurationHashes: ["9".repeat(64)],
+          eligibleSemanticExecutionConfigurationHashes: [
+            semanticExecutionConfigurationHash,
+          ],
         },
       },
     },

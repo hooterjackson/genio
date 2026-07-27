@@ -13,6 +13,7 @@ import {
   signedArtifactSha256,
   verifyStrictSignedEnvelope,
 } from "./signed-artifact.ts";
+import { semanticBehaviorHashV1 } from "./semantic-release-evidence.ts";
 
 export const PUBLIC_ROLLOUT_EVIDENCE_SCHEMA_VERSION =
   "genio-public-rollout-evidence/v4";
@@ -375,6 +376,7 @@ function releaseConfiguration(value: unknown): JsonRecord {
 
 function releaseRuntime(value: unknown): JsonRecord {
   const result = exactObject(value, [
+    "semanticExecutionConfigurationHash",
     "releaseEnvironment",
     "deploymentPhase",
     "databaseSchemaVersion",
@@ -387,6 +389,10 @@ function releaseRuntime(value: unknown): JsonRecord {
     "modelIds",
     "policyVersions",
   ], "public rollout soak runtimeSnapshot.runtime");
+  sha256Digest(
+    result.semanticExecutionConfigurationHash,
+    "public rollout soak runtimeSnapshot.runtime.semanticExecutionConfigurationHash",
+  );
   if (
     result.releaseEnvironment !== "production"
     || result.deploymentPhase !== "activate"
@@ -673,6 +679,7 @@ function payloadValidator(
   const promotion = exactObject(payload.promotion, [
     "configurationHash",
     "runtimeHash",
+    "semanticBehaviorHash",
     "productionCanaryEvidenceHash",
     "sitesVersion",
     "sitesRevision",
@@ -686,6 +693,7 @@ function payloadValidator(
   for (const field of [
     "configurationHash",
     "runtimeHash",
+    "semanticBehaviorHash",
     "productionCanaryEvidenceHash",
   ] as const) {
     sha256Digest(promotion[field], `public rollout promotion.${field}`);
@@ -749,9 +757,10 @@ function payloadValidator(
     snapshotConfigurationHash !== signedArtifactSha256(snapshotConfiguration)
     || snapshotRuntimeHash !== signedArtifactSha256(snapshotRuntime)
     || snapshotRuntimeHash !== promotion.runtimeHash
+    || promotion.semanticBehaviorHash !== semanticBehaviorHashV1(snapshotRuntime)
   ) {
     throw new Error(
-      "public rollout soak runtime snapshot does not match the fresh signed promotion",
+      "public rollout soak runtime and semantic behavior do not match the fresh signed promotion",
     );
   }
   const soakStartedAt = isoTimestamp(
@@ -1783,11 +1792,12 @@ export function verifyPreviousPublicRolloutLineage(
 }
 
 /**
- * Finalization consumes one fully rolled-out intent as proof that a signed
- * backend cohort transition completed while Sites still exposed the exact
+ * Finalization consumes the last fully rolled-out intent as proof that every
+ * governed backend cohort reached 100% while Sites still exposed the exact
  * pre-candidate identity. This verifier intentionally accepts no caller-owned
- * scope relaxation: the transition must be an advance to 100%, fresh, and
- * chained to the exact promotion artifact and runtime.
+ * scope relaxation: the transition must be an advance to 100%, every target
+ * percentage must be 100%, and the evidence must be fresh and chained to the
+ * exact promotion artifact and runtime.
  */
 export function verifyPublicRolloutFinalizationLineage(
   value: unknown,
@@ -1800,6 +1810,7 @@ export function verifyPublicRolloutFinalizationLineage(
     expectedPromotionEvidenceHash: string;
     expectedPromotionConfigurationHash: string;
     expectedPromotionRuntimeHash: string;
+    expectedSemanticBehaviorHash: string;
     expectedProductionCanaryEvidenceHash: string;
     expectedSitesVersion: string;
     expectedSitesRevision: string;
@@ -1832,6 +1843,8 @@ export function verifyPublicRolloutFinalizationLineage(
     || promotion.configurationHash
       !== options.expectedPromotionConfigurationHash
     || promotion.runtimeHash !== options.expectedPromotionRuntimeHash
+    || promotion.semanticBehaviorHash
+      !== options.expectedSemanticBehaviorHash
     || promotion.productionCanaryEvidenceHash
       !== options.expectedProductionCanaryEvidenceHash
     || promotion.sitesVersion !== options.expectedSitesVersion
@@ -1845,6 +1858,14 @@ export function verifyPublicRolloutFinalizationLineage(
   if (result.operation !== "advance" || result.toPercent !== "100") {
     throw new Error(
       "finalization requires a completed signed backend cohort rollout to 100%",
+    );
+  }
+  if (
+    Object.values(publicRolloutPercentages(result.targetConfiguration))
+      .some((percentage) => percentage !== "100")
+  ) {
+    throw new Error(
+      "finalization requires every governed intent cohort at 100%",
     );
   }
   const minimumSoakStartedAt = isoTimestamp(

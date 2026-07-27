@@ -7,6 +7,7 @@ const DEFAULT_INTERVAL_SECONDS = 30;
 const EVIDENCE_TTL_MS = 24 * 60 * 60 * 1_000;
 const RUNTIME_EVIDENCE_KEYS = [
   "pipelineVersion",
+  "semanticExecutionConfigurationHash",
   "releaseEnvironment",
   "deploymentPhase",
   "expectedDatabaseSchemaVersion",
@@ -73,6 +74,7 @@ export interface ReleaseConvergenceArgs {
     api: string;
     interactiveWorker: string;
     deepWorker: string;
+    semanticExecution: string;
   };
 }
 
@@ -84,28 +86,49 @@ export interface ReleaseConvergenceWorkerLane {
   eligibleIdentityCount: number;
   eligibleRevisions: string[];
   eligibleConfigurationHashes: string[];
+  eligibleSemanticExecutionConfigurationHashes: string[];
   lastSeenAt: string | null;
+}
+
+export interface ReleaseConvergenceApiIdentity {
+  replicaIdentityHash: string | null;
+  identifier: string | null;
+  version: string | null;
+  revision: string | null;
+  configurationHash: string | null;
+  semanticExecutionConfigurationHash: string | null;
 }
 
 export interface ReleaseConvergenceObservation {
   observedAt: string;
   sitesVersion: string | null;
   sitesRevision: string | null;
-  api: {
-    identifier: string | null;
-    version: string | null;
-    revision: string | null;
-    configurationHash: string | null;
-  };
+  api: ReleaseConvergenceApiIdentity;
   runtime: JsonRecord;
   runtimeContractHash: string;
   systemHttpStatus: number;
   system: {
+    api: ReleaseConvergenceApiIdentity;
     ok: boolean;
     activationReady: boolean;
     database: string | null;
     releaseManifestCanaryGuardsVersion: string | null;
     canonicalExecutionHardeningVersion: string | null;
+    canonicalExecutorReleaseIdentityFencingVersion: string | null;
+    executorFencing: {
+      ready: boolean;
+      incompleteJobs: number;
+      mismatchedActiveAttempts: number;
+      uncoveredJobs: number;
+      requirementsHash: string | null;
+    };
+    publicRollout: {
+      active: boolean;
+      databaseAuthorized: boolean;
+      evidenceHash: string | null;
+      stage: string | null;
+      targetConfigurationHash: string | null;
+    };
     paused: boolean;
     workerProtocol: {
       expected: string | null;
@@ -148,6 +171,7 @@ export interface ReleaseConvergenceEvidence {
       api: string;
       interactiveWorker: string;
       deepWorker: string;
+      semanticExecution: string;
     };
   };
   observationSpanMs: number;
@@ -269,6 +293,8 @@ export function parseReleaseConvergenceArgs(argv: readonly string[]): ReleaseCon
       configurationHashes.interactiveWorker = value;
     } else if (argument === "--expected-deep-configuration-hash") {
       configurationHashes.deepWorker = value;
+    } else if (argument === "--expected-semantic-execution-configuration-hash") {
+      configurationHashes.semanticExecution = value;
     } else {
       throw new Error(`Unknown argument: ${argument}`);
     }
@@ -313,12 +339,14 @@ export function parseReleaseConvergenceArgs(argv: readonly string[]): ReleaseCon
   }
   const configuredHashes = Object.values(configurationHashes);
   if (configuredHashes.length !== 0 && (
-    configuredHashes.length !== 3
+    configuredHashes.length !== 4
     || configuredHashes.some((value) => (
       typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)
     ))
   )) {
-    throw new Error("all three expected service configuration hashes are required");
+    throw new Error(
+      "all three service configuration hashes and the semantic execution configuration hash are required",
+    );
   }
   return {
     origin: parsedOrigin.origin,
@@ -329,7 +357,7 @@ export function parseReleaseConvergenceArgs(argv: readonly string[]): ReleaseCon
     expectedSitesVersion,
     samples,
     intervalMs,
-    ...(configuredHashes.length === 3
+    ...(configuredHashes.length === 4
       ? {
         expectedConfigurationHashes: configurationHashes as
           NonNullable<ReleaseConvergenceArgs["expectedConfigurationHashes"]>,
@@ -358,6 +386,33 @@ function runtimeEvidence(value: unknown): JsonRecord {
   }));
 }
 
+function apiIdentity(value: unknown): ReleaseConvergenceApiIdentity {
+  const source = asRecord(value);
+  const build = asRecord(source.build);
+  return {
+    replicaIdentityHash:
+      typeof source.replicaIdentityHash === "string"
+        && /^[0-9a-f]{64}$/u.test(source.replicaIdentityHash)
+        ? source.replicaIdentityHash
+        : null,
+    identifier: safeText(build.identifier, 140),
+    version: safeText(build.version, 64),
+    revision: safeFullRevision(build.revision),
+    configurationHash:
+      typeof source.configurationHash === "string"
+        && /^[0-9a-f]{64}$/u.test(source.configurationHash)
+        ? source.configurationHash
+        : null,
+    semanticExecutionConfigurationHash:
+      typeof source.semanticExecutionConfigurationHash === "string"
+        && /^[0-9a-f]{64}$/u.test(
+          source.semanticExecutionConfigurationHash,
+        )
+        ? source.semanticExecutionConfigurationHash
+        : null,
+  };
+}
+
 function workerLane(value: unknown): ReleaseConvergenceWorkerLane {
   const source = asRecord(value);
   const eligibleRevisions = Array.isArray(source.eligibleRevisions)
@@ -371,6 +426,15 @@ function workerLane(value: unknown): ReleaseConvergenceWorkerLane {
       .filter((item): item is string => typeof item === "string" && /^[0-9a-f]{64}$/u.test(item)))]
       .sort()
     : [];
+  const eligibleSemanticExecutionConfigurationHashes = Array.isArray(
+    source.eligibleSemanticExecutionConfigurationHashes,
+  )
+    ? [...new Set(source.eligibleSemanticExecutionConfigurationHashes
+      .filter((item): item is string => (
+        typeof item === "string" && /^[0-9a-f]{64}$/u.test(item)
+      )))]
+      .sort()
+    : [];
   return {
     status: safeText(source.status, 40),
     protocolVersion: safeText(source.protocolVersion, 80),
@@ -379,6 +443,7 @@ function workerLane(value: unknown): ReleaseConvergenceWorkerLane {
     eligibleIdentityCount: count(source.eligibleIdentityCount),
     eligibleRevisions,
     eligibleConfigurationHashes,
+    eligibleSemanticExecutionConfigurationHashes,
     lastSeenAt: safeTimestamp(source.lastSeenAt),
   };
 }
@@ -391,30 +456,24 @@ export function releaseConvergenceObservation(input: {
   systemHttpStatus: number;
 }): ReleaseConvergenceObservation {
   const live = asRecord(input.livePayload);
-  const build = asRecord(live.build);
+  const liveApi = apiIdentity(live.api);
   const runtime = runtimeEvidence(live.runtime);
   const system = asRecord(input.systemPayload);
   const protocol = asRecord(system.workerProtocol);
   const lanes = asRecord(system.workerLanes);
   const queue = asRecord(system.queue);
+  const publicRollout = asRecord(system.publicRollout);
+  const executorFencing = asRecord(system.executorFencing);
   return {
     observedAt: safeTimestamp(input.observedAt) ?? new Date(0).toISOString(),
     sitesVersion: sitesVersionFromHtml(input.sitesHtml),
     sitesRevision: sitesRevisionFromHtml(input.sitesHtml),
-    api: {
-      identifier: safeText(build.identifier, 140),
-      version: safeText(build.version, 64),
-      revision: safeFullRevision(build.revision),
-      configurationHash:
-        typeof live.configurationHash === "string"
-          && /^[0-9a-f]{64}$/u.test(live.configurationHash)
-          ? live.configurationHash
-          : null,
-    },
+    api: liveApi,
     runtime,
     runtimeContractHash: sha256(runtime),
     systemHttpStatus: Number.isInteger(input.systemHttpStatus) ? input.systemHttpStatus : 0,
     system: {
+      api: apiIdentity(system.api),
       ok: system.ok === true,
       activationReady: system.activationReady === true,
       database: safeText(system.database, 40),
@@ -426,6 +485,46 @@ export function releaseConvergenceObservation(input: {
         system.canonicalExecutionHardeningVersion,
         40,
       ),
+      canonicalExecutorReleaseIdentityFencingVersion: safeText(
+        system.canonicalExecutorReleaseIdentityFencingVersion,
+        40,
+      ),
+      executorFencing: {
+        ready: executorFencing.ready === true,
+        incompleteJobs: count(
+          executorFencing.incompleteJobs,
+        ),
+        mismatchedActiveAttempts: count(
+          executorFencing.mismatchedActiveAttempts,
+        ),
+        uncoveredJobs: count(executorFencing.uncoveredJobs),
+        requirementsHash: Array.isArray(executorFencing.requirements)
+          ? sha256(executorFencing.requirements)
+          : null,
+      },
+      publicRollout: {
+        active: publicRollout.active === true,
+        databaseAuthorized: publicRollout.databaseAuthorized === true,
+        evidenceHash:
+          typeof publicRollout.evidenceHash === "string"
+            && /^[0-9a-f]{64}$/u.test(publicRollout.evidenceHash)
+            ? publicRollout.evidenceHash
+            : null,
+        stage:
+          typeof publicRollout.stage === "string"
+            && /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u.test(
+              publicRollout.stage,
+            )
+            ? publicRollout.stage
+            : null,
+        targetConfigurationHash:
+          typeof publicRollout.targetConfigurationHash === "string"
+            && /^[0-9a-f]{64}$/u.test(
+              publicRollout.targetConfigurationHash,
+            )
+            ? publicRollout.targetConfigurationHash
+            : null,
+      },
       paused: system.paused === true,
       workerProtocol: {
         expected: safeText(protocol.expected, 80),
@@ -463,6 +562,7 @@ export function buildReleaseConvergenceEvidence(input: {
     api: string;
     interactiveWorker: string;
     deepWorker: string;
+    semanticExecution: string;
   };
   observations: readonly ReleaseConvergenceObservation[];
   generatedAt?: string;
@@ -503,6 +603,10 @@ export function buildReleaseConvergenceEvidence(input: {
     interactive: new Set<string>(),
     deep: new Set<string>(),
   };
+  const laneSemanticExecutionConfigurationHashes = {
+    interactive: new Set<string>(),
+    deep: new Set<string>(),
+  };
   let previousObservedAt = Number.NEGATIVE_INFINITY;
   const previousLaneHeartbeat = {
     interactive: Number.NEGATIVE_INFINITY,
@@ -532,6 +636,61 @@ export function buildReleaseConvergenceEvidence(input: {
       !== input.expectedConfigurationHashes.api) {
       violations.push(`${label}:api_configuration_mismatch`);
     }
+    if (observation.api.replicaIdentityHash === null) {
+      violations.push(`${label}:api_replica_identity_missing`);
+    }
+    const runtimeSemanticExecutionConfigurationHash =
+      observation.runtime.semanticExecutionConfigurationHash;
+    if (
+      typeof runtimeSemanticExecutionConfigurationHash !== "string"
+      || runtimeSemanticExecutionConfigurationHash
+        !== input.expectedConfigurationHashes.semanticExecution
+    ) {
+      violations.push(
+        `${label}:runtime_semantic_execution_configuration_mismatch`,
+      );
+    }
+    const systemApi = observation.system.api ?? {
+      replicaIdentityHash: null,
+      identifier: null,
+      version: null,
+      revision: null,
+      configurationHash: null,
+      semanticExecutionConfigurationHash: null,
+    };
+    if (systemApi.replicaIdentityHash === null) {
+      violations.push(`${label}:system_api_replica_identity_missing`);
+    }
+    if (systemApi.version !== input.expectedVersion) {
+      violations.push(
+        `${label}:system_api_version:${systemApi.version ?? "missing"}`,
+      );
+    }
+    if (
+      !systemApi.revision
+      || !revisionMatches(systemApi.revision, input.expectedRevision)
+    ) {
+      violations.push(
+        `${label}:system_api_revision:${systemApi.revision ?? "missing"}`,
+      );
+    }
+    if (
+      systemApi.configurationHash
+        !== input.expectedConfigurationHashes.api
+      || systemApi.configurationHash !== observation.api.configurationHash
+    ) {
+      violations.push(`${label}:system_api_configuration_mismatch`);
+    }
+    if (
+      systemApi.semanticExecutionConfigurationHash
+        !== input.expectedConfigurationHashes.semanticExecution
+      || systemApi.semanticExecutionConfigurationHash
+        !== runtimeSemanticExecutionConfigurationHash
+    ) {
+      violations.push(
+        `${label}:system_api_semantic_execution_configuration_mismatch`,
+      );
+    }
     if (observation.systemHttpStatus !== 200 || !observation.system.ok) {
       violations.push(`${label}:system_unhealthy:${observation.systemHttpStatus}`);
     }
@@ -549,6 +708,49 @@ export function buildReleaseConvergenceEvidence(input: {
           observation.system.canonicalExecutionHardeningVersion ?? "missing"
         }`,
       );
+    }
+    if (
+      observation.system
+        .canonicalExecutorReleaseIdentityFencingVersion !== "1"
+    ) {
+      violations.push(
+        `${label}:canonical_executor_release_identity_fencing:${
+          observation.system
+            .canonicalExecutorReleaseIdentityFencingVersion ?? "missing"
+        }`,
+      );
+    }
+    if (
+      !observation.system.executorFencing.ready
+      || observation.system.executorFencing.incompleteJobs !== 0
+      || observation.system.executorFencing.mismatchedActiveAttempts !== 0
+      || observation.system.executorFencing.uncoveredJobs !== 0
+      || observation.system.executorFencing.requirementsHash === null
+    ) {
+      violations.push(`${label}:executor_release_identity_not_converged`);
+    }
+    const rollout = observation.system.publicRollout;
+    const runtimeRolloutEvidenceHash =
+      observation.runtime.publicRolloutEvidenceHash;
+    const runtimeRolloutStage = observation.runtime.publicRolloutStage;
+    const activeRolloutInvalid = rollout.active && (
+      !rollout.databaseAuthorized
+      || rollout.evidenceHash === null
+      || rollout.stage === null
+      || rollout.targetConfigurationHash === null
+      || runtimeRolloutEvidenceHash !== rollout.evidenceHash
+      || runtimeRolloutStage !== rollout.stage
+    );
+    const inactiveRolloutInvalid = !rollout.active && (
+      !rollout.databaseAuthorized
+      || rollout.evidenceHash !== null
+      || rollout.stage !== null
+      || rollout.targetConfigurationHash !== null
+      || runtimeRolloutEvidenceHash !== null
+      || runtimeRolloutStage !== null
+    );
+    if (activeRolloutInvalid || inactiveRolloutInvalid) {
+      violations.push(`${label}:public_rollout_database_authority_invalid`);
     }
     if (!observation.system.activationReady) violations.push(`${label}:activation_not_ready`);
     if (observation.system.paused) violations.push(`${label}:system_paused`);
@@ -595,6 +797,27 @@ export function buildReleaseConvergenceEvidence(input: {
           violations.push(`${label}:${laneName}_configuration_mismatch`);
         }
       }
+      if (lane.eligibleSemanticExecutionConfigurationHashes.length !== 1) {
+        violations.push(
+          `${label}:${laneName}_semantic_execution_configuration_hashes:${
+            lane.eligibleSemanticExecutionConfigurationHashes.join(",")
+              || "missing"
+          }`,
+        );
+      } else {
+        const laneSemanticExecutionConfigurationHash =
+          lane.eligibleSemanticExecutionConfigurationHashes[0]!;
+        laneSemanticExecutionConfigurationHashes[laneName]
+          .add(laneSemanticExecutionConfigurationHash);
+        if (
+          laneSemanticExecutionConfigurationHash
+            !== input.expectedConfigurationHashes.semanticExecution
+        ) {
+          violations.push(
+            `${label}:${laneName}_semantic_execution_configuration_mismatch`,
+          );
+        }
+      }
       const lastSeenAt = lane.lastSeenAt ? Date.parse(lane.lastSeenAt) : Number.NaN;
       if (!Number.isFinite(lastSeenAt) || !Number.isFinite(observedAt)
         || lastSeenAt > observedAt + 5_000 || observedAt - lastSeenAt > 120_000) {
@@ -611,6 +834,11 @@ export function buildReleaseConvergenceEvidence(input: {
   for (const laneName of ["interactive", "deep"] as const) {
     if (laneConfigurationHashes[laneName].size > 1) {
       violations.push(`${laneName}_configuration_changed_between_samples`);
+    }
+    if (laneSemanticExecutionConfigurationHashes[laneName].size > 1) {
+      violations.push(
+        `${laneName}_semantic_execution_configuration_changed_between_samples`,
+      );
     }
   }
   const observationTimes = input.observations

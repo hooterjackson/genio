@@ -19,7 +19,9 @@ import {
   parseHistoricalReplayReleaseProducerArgs,
 } from "../scripts/historical-browser-replay-release-producer.ts";
 import {
+  assertFinalPublicAssignmentProbeFixtureClassifications,
   parseFinalCustomDomainBrowserProducerArgs,
+  validateBrowserPublicAssignmentProbeResultV1,
   validatePublicPlaylistDirectoryDto,
 } from "../scripts/final-custom-domain-browser-producer.ts";
 import {
@@ -28,6 +30,8 @@ import {
   releaseProducerCandidate,
 } from "../scripts/release-gate-producer.ts";
 import {
+  createReleaseGateArtifactFromSources,
+  FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1,
   releaseFixtureSha256,
   validateReleaseGateArtifact,
   verifyReleaseGateProducerAttestation,
@@ -35,6 +39,8 @@ import {
 
 const revision = "a".repeat(40);
 const imageDigest = `sha256:${"b".repeat(64)}`;
+const publicRolloutEvidenceHash = "e".repeat(64);
+const publicRolloutStage = "exhaustive:50->100";
 
 function producerFiles(): string[] {
   return [
@@ -173,6 +179,8 @@ describe("live release gate producers", () => {
       "--origin", "https://9enio.com",
       "--expected-revision", revision,
       "--expected-version", "2.4.0",
+      "--expected-public-rollout-evidence-hash", publicRolloutEvidenceHash,
+      "--expected-public-rollout-stage", publicRolloutStage,
       "--candidate-tag", "v2.4.0-rc.2",
       "--image-digest", imageDigest,
       "--browser-artifact-dir", "/tmp/browser-evidence",
@@ -189,12 +197,31 @@ describe("live release gate producers", () => {
       "--sites-control-plane-verification-key", "/tmp/sites-public.pem",
     ], trustedSitesEnvironment)).toMatchObject({
       origin: "https://9enio.com",
+      expectedPublicRolloutEvidenceHash: publicRolloutEvidenceHash,
+      expectedPublicRolloutStage: publicRolloutStage,
       sitesControlPlaneEvidencePath: "/tmp/sites-control-plane.json",
       sitesControlPlaneAttestationPath: "/tmp/sites-attestation.json",
       sitesControlPlaneVerificationKeyPath: "/tmp/sites-public.pem",
       trustedSitesControlPlaneKeyFingerprint: "d".repeat(64),
       trustedSitesControlPlaneKeyId: "sites-connector-v1",
     });
+    const missingRolloutHash = [...base];
+    missingRolloutHash.splice(
+      missingRolloutHash.indexOf("--expected-public-rollout-evidence-hash"),
+      2,
+    );
+    expect(() => parseFinalCustomDomainBrowserProducerArgs(
+      missingRolloutHash,
+      trustedSitesEnvironment,
+    )).toThrow(/expected-public-rollout-evidence-hash/u);
+    const invalidRolloutStage = [...base];
+    invalidRolloutStage[
+      invalidRolloutStage.indexOf("--expected-public-rollout-stage") + 1
+    ] = "100";
+    expect(() => parseFinalCustomDomainBrowserProducerArgs(
+      invalidRolloutStage,
+      trustedSitesEnvironment,
+    )).toThrow(/encode a governed intent transition/u);
     expect(() => parseFinalCustomDomainBrowserProducerArgs([
       ...base,
       "--sites-control-plane-evidence", "/tmp/sites-control-plane.json",
@@ -244,6 +271,69 @@ describe("live release gate producers", () => {
     }
   });
 
+  test("uses code-owned prompts that classify into every public rollout intent", () => {
+    expect(assertFinalPublicAssignmentProbeFixtureClassifications())
+      .toBeUndefined();
+    expect(FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture) => (
+      fixture.intentGroup
+    ))).toEqual([
+      "genre_scene",
+      "mood_activity_theme",
+      "similarity",
+      "artist_catalogue",
+      "fixed_container",
+      "factual_relationship",
+      "exhaustive",
+    ]);
+  });
+
+  test("sanitizes a live public assignment lifecycle and fails closed", () => {
+    const fixture = FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1[0];
+    const result = {
+      postStatus: 202,
+      requestIdValid: true,
+      rolloutEvidenceHash: publicRolloutEvidenceHash,
+      rolloutStage: publicRolloutStage,
+      assignmentHash: "f".repeat(64),
+      getStatus: 200,
+      contractVersion: 3,
+      cleanupStatus: 204,
+    };
+    const evidence = validateBrowserPublicAssignmentProbeResultV1({
+      fixture,
+      result,
+      expectedRolloutEvidenceHash: publicRolloutEvidenceHash,
+      expectedRolloutStage: publicRolloutStage,
+    });
+    expect(evidence).toEqual({
+      fixtureId: fixture.fixtureId,
+      intentGroup: fixture.intentGroup,
+      targetTrackCount: fixture.targetTrackCount,
+      rolloutEvidenceHash: publicRolloutEvidenceHash,
+      rolloutStage: publicRolloutStage,
+      assignmentHash: "f".repeat(64),
+      contractVersion: 3,
+      cleanupStatus: 204,
+    });
+    expect(JSON.stringify(evidence)).not.toMatch(
+      /prompt|requestId|cookie|capability/iu,
+    );
+    for (const mutation of [
+      { rolloutEvidenceHash: "0".repeat(64) },
+      { rolloutStage: "genre_scene:50->100" },
+      { assignmentHash: null },
+      { contractVersion: 2 },
+      { cleanupStatus: 200 },
+    ]) {
+      expect(() => validateBrowserPublicAssignmentProbeResultV1({
+        fixture,
+        result: { ...result, ...mutation },
+        expectedRolloutEvidenceHash: publicRolloutEvidenceHash,
+        expectedRolloutStage: publicRolloutStage,
+      })).toThrow(/exact contract-3 assignment and cleanup/u);
+    }
+  });
+
   test("emits separate typed source, gate, and producer attestation files", async () => {
     const directory = await mkdtemp(join(tmpdir(), "genio-producer-test-"));
     const privateKeyPath = join(directory, "producer-private.pem");
@@ -260,8 +350,19 @@ describe("live release gate producers", () => {
       imageDigest,
     });
     const observedAt = new Date().toISOString();
+    const publicAssignmentProbes =
+      FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture, index) => ({
+        fixtureId: fixture.fixtureId,
+        intentGroup: fixture.intentGroup,
+        targetTrackCount: fixture.targetTrackCount,
+        rolloutEvidenceHash: publicRolloutEvidenceHash,
+        rolloutStage: publicRolloutStage,
+        assignmentHash: (index + 1).toString(16).padStart(64, "0"),
+        contractVersion: 3,
+        cleanupStatus: 204,
+      }));
     const browserUnsigned = {
-      schemaVersion: "genio-final-custom-domain-browser/v1",
+      schemaVersion: "genio-final-custom-domain-browser/v2",
       origin: "https://9enio.com",
       candidateRevision: revision,
       observedAt,
@@ -271,6 +372,7 @@ describe("live release gate producers", () => {
       publicPlaylistContentsVisible: true,
       privacyProjectionPassed: true,
       screenshotHashes: ["c".repeat(64)],
+      publicAssignmentProbes,
     };
     const priorRevision = "f".repeat(40);
     const rollbackTarget = createSitesProductionRollbackTargetV1({
@@ -349,7 +451,7 @@ describe("live release gate producers", () => {
       completedAt: observedAt,
       candidate,
       runtimeSnapshot: {
-        schemaVersion: "genio-release-runtime-snapshot/v2",
+        schemaVersion: "genio-release-runtime-snapshot/v3",
         generatedAt: observedAt,
         origin: "https://9enio.com",
         environment: "production",
@@ -362,8 +464,27 @@ describe("live release gate producers", () => {
           ownerAllowlistVersion: "owner-allowlist-v1",
           candidateMatched: true,
         },
+        apiObservations: {
+          liveReplicaIdentityHash: "8".repeat(64),
+          systemReplicaIdentityHash: "9".repeat(64),
+        },
+        executorFencing: {
+          version: "1",
+          ready: true,
+          incompleteJobs: 0,
+          mismatchedActiveAttempts: 0,
+          uncoveredJobs: 0,
+          requirementsHash: "a".repeat(64),
+        },
         configuration: {} as never,
         runtime: {} as never,
+        publicRollout: {
+          active: true,
+          databaseAuthorized: true,
+          evidenceHash: publicRolloutEvidenceHash,
+          stage: publicRolloutStage,
+          targetConfigurationHash: "7".repeat(64),
+        },
         credentialVersionHashes: {
           provider: "1".repeat(64),
           apple: "2".repeat(64),
@@ -422,6 +543,56 @@ describe("live release gate producers", () => {
       },
       sourceHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
     });
+    const browserWithPrivatePromptUnsigned = {
+      ...browserUnsigned,
+      publicAssignmentProbes: browserUnsigned.publicAssignmentProbes.map(
+        (probe, index) => index === 0
+          ? { ...probe, prompt: "must never enter release evidence" }
+          : probe,
+      ),
+    };
+    expect(() => createReleaseGateArtifactFromSources({
+      gate: "final_custom_domain_browser",
+      completedAt: observedAt,
+      candidate,
+      configurationHash: "4".repeat(64),
+      runtimeHash: "5".repeat(64),
+      fixtures: [],
+      sources: {
+        ...produced.artifact.sources,
+        browser: {
+          ...browserWithPrivatePromptUnsigned,
+          evidenceHash: releaseFixtureSha256(
+            browserWithPrivatePromptUnsigned,
+          ),
+        },
+      },
+    })).toThrow(/missing or unapproved fields/u);
+    const duplicateAssignmentUnsigned = {
+      ...browserUnsigned,
+      publicAssignmentProbes: browserUnsigned.publicAssignmentProbes.map(
+        (probe) => ({
+          ...probe,
+          assignmentHash:
+            browserUnsigned.publicAssignmentProbes[0]!.assignmentHash,
+        }),
+      ),
+    };
+    expect(() => createReleaseGateArtifactFromSources({
+      gate: "final_custom_domain_browser",
+      completedAt: observedAt,
+      candidate,
+      configurationHash: "4".repeat(64),
+      runtimeHash: "5".repeat(64),
+      fixtures: [],
+      sources: {
+        ...produced.artifact.sources,
+        browser: {
+          ...duplicateAssignmentUnsigned,
+          evidenceHash: releaseFixtureSha256(duplicateAssignmentUnsigned),
+        },
+      },
+    })).toThrow(/one exact signed rollout state/u);
   });
 
   test("preflights the producer key and immutable output paths before live work", async () => {

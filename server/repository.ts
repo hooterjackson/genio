@@ -101,6 +101,8 @@ import {
   CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION,
 } from "./release-deployment-phase.ts";
 import { CanonicalExecutionIntegrityError } from "./canonical-execution-integrity.ts";
 import type { ColdCorpusBuildResultV3 } from "./pipeline-v3-corpus-builder.ts";
@@ -669,6 +671,8 @@ export interface JobView {
   queryPlanRevisionId: string | null;
   requiredExecutorCapabilityHash: string | null;
   requiredExecutorCapabilityVector: Record<string, unknown> | null;
+  requiredExecutorRevision: string | null;
+  requiredExecutorSemanticConfigurationHash: string | null;
   stageKey: string;
   leaseEpoch: number;
   leaseOwner: string | null;
@@ -904,14 +908,51 @@ function heartbeatExecutorRevision(metadata: unknown): string | null {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
   const value = (metadata as Record<string, unknown>).version;
   if (typeof value !== "string") return null;
-  const normalized = value.trim().toLowerCase();
-  return /^[0-9a-z][0-9a-z._+-]{0,127}$/u.test(normalized) ? normalized : null;
+  const normalized = value.trim();
+  return /^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$/u.test(normalized)
+    ? normalized
+    : null;
 }
 
 function heartbeatConfigurationHash(metadata: unknown): string | null {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
   const value = (metadata as Record<string, unknown>).configurationHash;
   return typeof value === "string" && /^[0-9a-f]{64}$/u.test(value) ? value : null;
+}
+
+function heartbeatSemanticExecutionConfigurationHash(
+  metadata: unknown,
+): string | null {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  const value = (metadata as Record<string, unknown>)
+    .semanticExecutionConfigurationHash;
+  return typeof value === "string" && /^[0-9a-f]{64}$/u.test(value)
+    ? value
+    : null;
+}
+
+export interface CanonicalExecutorReleaseIdentityV1 {
+  executorRevision: string;
+  semanticExecutionConfigurationHash: string;
+}
+
+export function canonicalExecutorReleaseIdentityV1(
+  environment: NodeJS.ProcessEnv = process.env,
+): CanonicalExecutorReleaseIdentityV1 {
+  const build = buildInformation(environment);
+  const executorRevision = (build.revision ?? build.version).trim();
+  if (
+    !/^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$/u.test(executorRevision)
+  ) {
+    throw new Error(
+      "Canonical executor release revision is not a safe immutable label",
+    );
+  }
+  return {
+    executorRevision,
+    semanticExecutionConfigurationHash:
+      runtimeReleaseContract(environment).semanticExecutionConfigurationHash,
+  };
 }
 
 function deterministicUuid(value: unknown): string {
@@ -2802,6 +2843,7 @@ export interface BeginPlaylistExecutionAttemptInput {
   executorCapabilityHash?: string | null;
   executorCapabilityVector?: Record<string, unknown> | null;
   configurationHash: string;
+  semanticExecutionConfigurationHash?: string | null;
   idempotencyKey: string;
   checkpointCursor?: string | null;
   leaseExpiresAt?: Date | null;
@@ -3696,6 +3738,141 @@ export class Repository {
   }
 
   /**
+   * The additive 0020 fence is authoritative only after its exact capability
+   * marker and all columns are visible in the same database transaction.
+   * Column-only/manual partial schemas must never authorize canonical work.
+   */
+  async executorReleaseIdentityFenceAvailable(
+    client: PoolClient | Pool = this.pool,
+  ): Promise<boolean> {
+    const result = await client.query<{ supported: boolean }>(
+      `SELECT
+         EXISTS(
+           SELECT 1 FROM settings WHERE key=$1 AND value=$2
+         )
+         AND EXISTS(
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema=current_schema()
+             AND table_name='job_queue'
+             AND column_name='required_executor_revision'
+         )
+         AND EXISTS(
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema=current_schema()
+             AND table_name='job_queue'
+             AND column_name=
+               'required_executor_semantic_configuration_hash'
+         )
+         AND EXISTS(
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema=current_schema()
+             AND table_name='playlist_execution_attempts'
+             AND column_name='semantic_execution_configuration_hash'
+         )
+         AND (
+           SELECT count(*)=3
+           FROM pg_trigger executor_trigger
+           JOIN pg_class relation
+             ON relation.oid=executor_trigger.tgrelid
+           JOIN pg_namespace relation_namespace
+             ON relation_namespace.oid=relation.relnamespace
+           JOIN pg_proc executor_function
+             ON executor_function.oid=executor_trigger.tgfoid
+           JOIN pg_namespace function_namespace
+             ON function_namespace.oid=executor_function.pronamespace
+           WHERE NOT executor_trigger.tgisinternal
+             AND executor_trigger.tgenabled<>'D'
+             AND relation_namespace.nspname=current_schema()
+             AND function_namespace.nspname=current_schema()
+             AND (
+               (
+                 relation.relname='job_queue'
+                 AND executor_trigger.tgname=
+                   'job_executor_release_identity_require'
+                 AND executor_function.proname=
+                   'require_schema5_job_executor_release_identity'
+               )
+               OR (
+                 relation.relname='job_queue'
+                 AND executor_trigger.tgname=
+                   'job_executor_release_identity_lease'
+                 AND executor_function.proname=
+                   'enforce_job_executor_release_identity_lease'
+               )
+               OR (
+                 relation.relname='playlist_execution_attempts'
+                 AND executor_trigger.tgname=
+                   'playlist_attempt_executor_release_identity'
+                 AND executor_function.proname=
+                   'enforce_attempt_executor_release_identity'
+               )
+             )
+         )
+         AND NOT EXISTS(
+           SELECT 1
+           FROM pg_trigger inventory_trigger
+           JOIN pg_class inventory_relation
+             ON inventory_relation.oid=inventory_trigger.tgrelid
+           JOIN pg_namespace inventory_relation_namespace
+             ON inventory_relation_namespace.oid=
+               inventory_relation.relnamespace
+           JOIN pg_proc inventory_function
+             ON inventory_function.oid=inventory_trigger.tgfoid
+           JOIN pg_namespace inventory_function_namespace
+             ON inventory_function_namespace.oid=
+               inventory_function.pronamespace
+           WHERE NOT inventory_trigger.tgisinternal
+             AND inventory_relation_namespace.nspname=current_schema()
+             AND inventory_function_namespace.nspname=current_schema()
+             AND (
+               inventory_trigger.tgname IN (
+                 'job_executor_release_identity_require',
+                 'job_executor_release_identity_lease',
+                 'playlist_attempt_executor_release_identity'
+               )
+               OR inventory_function.proname IN (
+                 'require_schema5_job_executor_release_identity',
+                 'enforce_job_executor_release_identity_lease',
+                 'enforce_attempt_executor_release_identity'
+               )
+             )
+             AND NOT (
+               (
+                 inventory_relation.relname='job_queue'
+                 AND inventory_trigger.tgname=
+                   'job_executor_release_identity_require'
+                 AND inventory_function.proname=
+                   'require_schema5_job_executor_release_identity'
+               )
+               OR (
+                 inventory_relation.relname='job_queue'
+                 AND inventory_trigger.tgname=
+                   'job_executor_release_identity_lease'
+                 AND inventory_function.proname=
+                   'enforce_job_executor_release_identity_lease'
+               )
+               OR (
+                 inventory_relation.relname=
+                   'playlist_execution_attempts'
+                 AND inventory_trigger.tgname=
+                   'playlist_attempt_executor_release_identity'
+                 AND inventory_function.proname=
+                   'enforce_attempt_executor_release_identity'
+               )
+             )
+         ) supported`,
+      [
+        CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+        CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION,
+      ],
+    );
+    return result.rows[0]?.supported === true;
+  }
+
+  /**
    * Estimate the lower-decile evidence-qualified → storefront-playable
    * conversion from recent runs in the same immutable routing segment.
    * Missing telemetry is not a request failure: the policy compiler freezes
@@ -4287,6 +4464,8 @@ export class Repository {
     const supportsQueryPlanFence =
       queryPlanFenceCapability.rows[0]?.value
         === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable();
     if (supportsQueryPlanFence && (
       typeof input.jobId !== "string"
       || !UUID_PATTERN.test(input.jobId)
@@ -4304,6 +4483,23 @@ export class Repository {
         409,
         "Canonical execution capability fence is invalid",
         "executor_capability_mismatch",
+      );
+    }
+    if (supportsReleaseIdentityFence && (
+      !/^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$/u.test(
+        input.executorRevision,
+      )
+      || (
+        input.semanticExecutionConfigurationHash != null
+        && !/^[a-f0-9]{64}$/u.test(
+          input.semanticExecutionConfigurationHash,
+        )
+      )
+    )) {
+      throw new HttpError(
+        409,
+        "Canonical executor release identity fence is invalid",
+        "executor_release_identity_mismatch",
       );
     }
     const id = randomUUID();
@@ -4330,6 +4526,27 @@ export class Repository {
              AND ($6::uuid IS NULL OR active.query_plan_revision_id=$6)
              AND job.required_executor_capability_hash=$8::varchar(64)
              AND job.required_executor_capability_vector=$9::jsonb
+             ${supportsReleaseIdentityFence ? `
+             AND (
+               (
+                 job.required_executor_revision IS NULL
+                 AND job.required_executor_semantic_configuration_hash IS NULL
+               )
+               OR (
+                 job.required_executor_revision=$10::varchar(160)
+                 AND job.required_executor_semantic_configuration_hash=$11::varchar(64)
+                 AND EXISTS(
+                   SELECT 1 FROM worker_heartbeats heartbeat
+                   WHERE heartbeat.worker_id=job.lease_owner
+                     AND heartbeat.last_seen_at>now()-interval '5 minutes'
+                     AND heartbeat.metadata_json->>'version'
+                       =job.required_executor_revision
+                     AND heartbeat.metadata_json
+                       ->>'semanticExecutionConfigurationHash'
+                       =job.required_executor_semantic_configuration_hash
+                 )
+               )
+             )` : ""}
            FOR UPDATE OF job`,
           [
             input.runId,
@@ -4341,6 +4558,10 @@ export class Repository {
             input.stage,
             input.executorCapabilityHash,
             JSON.stringify(input.executorCapabilityVector),
+            ...(supportsReleaseIdentityFence ? [
+              input.executorRevision,
+              input.semanticExecutionConfigurationHash,
+            ] : []),
           ],
         );
         if (!authority.rows[0]) {
@@ -4369,10 +4590,16 @@ export class Repository {
              id,run_id,contract_revision_id,job_id,query_plan_revision_id,stage,
              dependency_key,attempt_number,lease_generation,executor_revision,
              executor_identity_hash,executor_capability_hash,
-             executor_capability_vector,configuration_hash,idempotency_key,
+             executor_capability_vector,configuration_hash,
+             ${supportsReleaseIdentityFence
+               ? "semantic_execution_configuration_hash,"
+               : ""}
+             idempotency_key,
              checkpoint_cursor,status,lease_expires_at,last_active_at)
            SELECT $1,run.id,contract.id,job.id,$5,$6::text,$7,$8,$9::int,$10,$11,$12::varchar(64),
-                  $13::jsonb,$14,$15,$16,'running',job.lease_expires_at,now()
+                  $13::jsonb,$14,
+                  ${supportsReleaseIdentityFence ? "$18::varchar(64)," : ""}
+                  $15,$16,'running',job.lease_expires_at,now()
            FROM research_runs run
            JOIN playlist_contract_revisions contract
              ON contract.id=run.active_playlist_contract_revision_id
@@ -4386,6 +4613,27 @@ export class Repository {
              AND ($5::uuid IS NULL OR active.query_plan_revision_id=$5)
              AND job.required_executor_capability_hash=$12::varchar(64)
              AND job.required_executor_capability_vector=$13::jsonb
+             ${supportsReleaseIdentityFence ? `
+             AND (
+               (
+                 job.required_executor_revision IS NULL
+                 AND job.required_executor_semantic_configuration_hash IS NULL
+               )
+               OR (
+                 job.required_executor_revision=$10::varchar(160)
+                 AND job.required_executor_semantic_configuration_hash=$18::varchar(64)
+                 AND EXISTS(
+                   SELECT 1 FROM worker_heartbeats heartbeat
+                   WHERE heartbeat.worker_id=job.lease_owner
+                     AND heartbeat.last_seen_at>now()-interval '5 minutes'
+                     AND heartbeat.metadata_json->>'version'
+                       =job.required_executor_revision
+                     AND heartbeat.metadata_json
+                       ->>'semanticExecutionConfigurationHash'
+                       =job.required_executor_semantic_configuration_hash
+                 )
+               )
+             )` : ""}
            ON CONFLICT(idempotency_key) DO NOTHING
            RETURNING id`,
           [
@@ -4406,6 +4654,9 @@ export class Repository {
             input.idempotencyKey,
             input.checkpointCursor ?? null,
             input.workerId,
+            ...(supportsReleaseIdentityFence
+              ? [input.semanticExecutionConfigurationHash]
+              : []),
           ],
         );
       })
@@ -4471,17 +4722,26 @@ export class Repository {
       executor_identity_hash: string;
       executor_capability_hash: string | null;
       executor_capability_vector: Record<string, unknown> | null;
+      executor_revision: string;
+      semantic_execution_configuration_hash: string | null;
       configuration_hash: string;
     }>(
       supportsQueryPlanFence
         ? `SELECT id,run_id,contract_revision_id,query_plan_revision_id,stage,lease_generation,
-                  executor_identity_hash,executor_capability_hash,
-                  executor_capability_vector,configuration_hash
+                  executor_revision,executor_identity_hash,
+                  executor_capability_hash,executor_capability_vector,
+                  ${supportsReleaseIdentityFence
+                    ? "semantic_execution_configuration_hash"
+                    : "NULL::varchar semantic_execution_configuration_hash"},
+                  configuration_hash
            FROM playlist_execution_attempts WHERE idempotency_key=$1`
         : `SELECT id,run_id,contract_revision_id,NULL::uuid query_plan_revision_id,
                   stage,lease_generation,executor_identity_hash,
                   NULL::varchar executor_capability_hash,
-                  NULL::jsonb executor_capability_vector,configuration_hash
+                  NULL::jsonb executor_capability_vector,
+                  executor_revision,
+                  NULL::varchar semantic_execution_configuration_hash,
+                  configuration_hash
            FROM playlist_execution_attempts WHERE idempotency_key=$1`,
       [input.idempotencyKey],
     );
@@ -4493,7 +4753,11 @@ export class Repository {
         && row.query_plan_revision_id !== (input.queryPlanRevisionId ?? null))
       || row.stage !== input.stage
       || Number(row.lease_generation) !== input.leaseGeneration
+      || row.executor_revision !== input.executorRevision
       || row.executor_identity_hash !== input.executorIdentityHash
+      || (supportsReleaseIdentityFence
+        && row.semantic_execution_configuration_hash
+          !== (input.semanticExecutionConfigurationHash ?? null))
       || (supportsQueryPlanFence
         && (
           row.executor_capability_hash !== input.executorCapabilityHash
@@ -4525,6 +4789,15 @@ export class Repository {
     const tracksActiveIntervals = await this.getSetting(
       CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
     ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable();
+    if (supportsReleaseIdentityFence && !tracksActiveIntervals) {
+      throw new HttpError(
+        503,
+        "Canonical execution fencing is partially configured",
+        "executor_release_identity_unavailable",
+      );
+    }
     const result = await this.pool.query(
       `UPDATE playlist_execution_attempts attempt
        SET status=$5,blocker_kind=$6,checkpoint_cursor=COALESCE($7,checkpoint_cursor),
@@ -4540,7 +4813,8 @@ export class Repository {
          AND job.lease_owner=$9
          AND job.lease_epoch=$4
          AND job.status='leased'
-         AND job.lease_expires_at>now()` : ""}
+         AND job.lease_expires_at>now()
+         ` : ""}
        WHERE attempt.id=$1 AND attempt.run_id=$2 AND attempt.contract_revision_id=$3
          AND attempt.lease_generation=$4 AND attempt.status='running'
          AND run.id=attempt.run_id
@@ -4550,7 +4824,29 @@ export class Repository {
            AND attempt.executor_capability_hash
              =job.required_executor_capability_hash
            AND attempt.executor_capability_vector
-             =job.required_executor_capability_vector` : ""}`,
+             =job.required_executor_capability_vector
+           ${supportsReleaseIdentityFence ? `
+           AND (
+             (
+               job.required_executor_revision IS NULL
+               AND job.required_executor_semantic_configuration_hash IS NULL
+             )
+             OR (
+               attempt.executor_revision=job.required_executor_revision
+               AND attempt.semantic_execution_configuration_hash
+                 =job.required_executor_semantic_configuration_hash
+               AND EXISTS(
+                 SELECT 1 FROM worker_heartbeats heartbeat
+                 WHERE heartbeat.worker_id=job.lease_owner
+                   AND heartbeat.last_seen_at>now()-interval '5 minutes'
+                   AND heartbeat.metadata_json->>'version'
+                     =job.required_executor_revision
+                   AND heartbeat.metadata_json
+                     ->>'semanticExecutionConfigurationHash'
+                     =job.required_executor_semantic_configuration_hash
+               )
+             )
+           )` : ""}` : ""}`,
       [
         input.attemptId,
         input.runId,
@@ -4784,6 +5080,8 @@ export class Repository {
       );
     }
     return this.transaction(async (client) => {
+      const supportsReleaseIdentityFence =
+        await this.executorReleaseIdentityFenceAvailable(client);
       const authority = await client.query<{
         contract_hash: string;
         contract_json: PlaylistContractRevisionV1;
@@ -4807,6 +5105,22 @@ export class Repository {
           AND job.lease_owner=$4
           AND job.lease_epoch=$5
           AND job.lease_expires_at>now()
+          ${supportsReleaseIdentityFence ? `AND (
+            (
+              job.required_executor_revision IS NULL
+              AND job.required_executor_semantic_configuration_hash IS NULL
+            )
+            OR EXISTS(
+              SELECT 1 FROM worker_heartbeats heartbeat
+              WHERE heartbeat.worker_id=job.lease_owner
+                AND heartbeat.last_seen_at>now()-interval '5 minutes'
+                AND heartbeat.metadata_json->>'version'
+                  =job.required_executor_revision
+                AND heartbeat.metadata_json
+                  ->>'semanticExecutionConfigurationHash'
+                  =job.required_executor_semantic_configuration_hash
+            )
+          )` : ""}
          JOIN playlist_execution_attempts attempt
            ON attempt.id=$6 AND attempt.run_id=run.id
           AND attempt.contract_revision_id=contract.id
@@ -4819,6 +5133,17 @@ export class Repository {
             =job.required_executor_capability_hash
           AND attempt.executor_capability_vector
             =job.required_executor_capability_vector
+          ${supportsReleaseIdentityFence ? `AND (
+            (
+              job.required_executor_revision IS NULL
+              AND job.required_executor_semantic_configuration_hash IS NULL
+            )
+            OR (
+              attempt.executor_revision=job.required_executor_revision
+              AND attempt.semantic_execution_configuration_hash
+                =job.required_executor_semantic_configuration_hash
+            )
+          )` : ""}
          WHERE run.id=$1 AND run.deleted_at IS NULL
            AND run.status IN ('researching','continuing_research','queued')
          FOR UPDATE OF run,contract,active_plan,query_plan,job,attempt`,
@@ -5343,20 +5668,27 @@ export class Repository {
       const queueClass: JobQueueClass = isDeepQueryPlan(plan.plan_json)
         ? "deep"
         : "interactive";
+      const executorReleaseIdentity = canonicalExecutorReleaseIdentityV1();
       const inserted = await client.query<{
         id: string;
         required_executor_capability_hash: string | null;
         required_executor_capability_vector: Record<string, unknown> | null;
+        required_executor_revision: string | null;
+        required_executor_semantic_configuration_hash: string | null;
       }>(
         `INSERT INTO job_queue(
            id,run_id,kind,dedupe_key,payload_json,available_at,max_attempts,
            pipeline_version,minimum_worker_protocol,query_plan_revision_id,
-           stage_key,queue_class)
+           stage_key,queue_class,required_executor_revision,
+           required_executor_semantic_configuration_hash)
          VALUES(
-           $1,$2,'research',$3,$4::jsonb,$5,10,'corpus_first_v3',$6,$7,$8,$9
+           $1,$2,'research',$3,$4::jsonb,$5,10,'corpus_first_v3',$6,$7,$8,$9,
+           $10,$11
          )
          RETURNING id,required_executor_capability_hash,
-                   required_executor_capability_vector`,
+                   required_executor_capability_vector,
+                   required_executor_revision,
+                   required_executor_semantic_configuration_hash`,
         [
           jobId,
           input.runId,
@@ -5375,6 +5707,8 @@ export class Repository {
           plan.id,
           stageKey,
           queueClass,
+          executorReleaseIdentity.executorRevision,
+          executorReleaseIdentity.semanticExecutionConfigurationHash,
         ],
       );
       const queuedJob = inserted.rows[0];
@@ -5382,7 +5716,11 @@ export class Repository {
         || queuedJob.required_executor_capability_hash
           !== expectedExecutor.hash
         || stableStringify(queuedJob.required_executor_capability_vector)
-          !== stableStringify(expectedExecutor.vector)) {
+          !== stableStringify(expectedExecutor.vector)
+        || queuedJob.required_executor_revision
+          !== executorReleaseIdentity.executorRevision
+        || queuedJob.required_executor_semantic_configuration_hash
+          !== executorReleaseIdentity.semanticExecutionConfigurationHash) {
         throw new HttpError(
           409,
           "The resume job could not be bound to the exact executor",
@@ -5565,11 +5903,30 @@ export class Repository {
     runId: string,
     fence: PipelineV3WriteFence,
   ): Promise<void> {
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable(client);
     const current = await client.query<{ id: string }>(
-      `SELECT id FROM job_queue
-       WHERE id=$1 AND run_id=$2 AND lease_owner=$3 AND lease_epoch=$4
-         AND query_plan_revision_id=$5 AND stage_key=$6
-         AND status='leased' AND lease_expires_at>now()
+      `SELECT job.id FROM job_queue job
+       WHERE job.id=$1 AND job.run_id=$2 AND job.lease_owner=$3
+         AND job.lease_epoch=$4
+         AND job.query_plan_revision_id=$5 AND job.stage_key=$6
+         AND job.status='leased' AND job.lease_expires_at>now()
+         ${supportsReleaseIdentityFence ? `AND (
+           (
+             job.required_executor_revision IS NULL
+             AND job.required_executor_semantic_configuration_hash IS NULL
+           )
+           OR EXISTS(
+             SELECT 1 FROM worker_heartbeats heartbeat
+             WHERE heartbeat.worker_id=job.lease_owner
+               AND heartbeat.last_seen_at>now()-interval '5 minutes'
+               AND heartbeat.metadata_json->>'version'
+                 =job.required_executor_revision
+               AND heartbeat.metadata_json
+                 ->>'semanticExecutionConfigurationHash'
+                 =job.required_executor_semantic_configuration_hash
+           )
+         )` : ""}
        FOR UPDATE`,
       [
         fence.jobId,
@@ -5612,6 +5969,17 @@ export class Repository {
              =job.required_executor_capability_hash
            AND attempt.executor_capability_vector
              =job.required_executor_capability_vector
+           ${supportsReleaseIdentityFence ? `AND (
+             (
+               job.required_executor_revision IS NULL
+               AND job.required_executor_semantic_configuration_hash IS NULL
+             )
+             OR (
+               attempt.executor_revision=job.required_executor_revision
+               AND attempt.semantic_execution_configuration_hash
+                 =job.required_executor_semantic_configuration_hash
+             )
+           )` : ""}
          FOR UPDATE OF attempt`,
         [
           fence.contractAttemptId,
@@ -6408,6 +6776,8 @@ export class Repository {
     client: PoolClient,
     input: BeginPublicationReconciliationInput,
   ): Promise<void> {
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable(client);
     const authority = await client.query<{
       run_status: string;
       run_phase: string;
@@ -6431,6 +6801,7 @@ export class Repository {
       job_lease_owner: string | null;
       job_lease_epoch: number;
       job_stage_key: string;
+      executor_release_identity_current: boolean;
     }>(
       `SELECT run.status run_status,run.phase run_phase,
               run.active_playlist_contract_revision_id active_contract_revision_id,
@@ -6454,7 +6825,30 @@ export class Repository {
               attempt.idempotency_key attempt_idempotency_key,
               job.id job_id,job.status job_status,
               job.lease_owner job_lease_owner,
-              job.lease_epoch job_lease_epoch,job.stage_key job_stage_key
+              job.lease_epoch job_lease_epoch,job.stage_key job_stage_key,
+              ${supportsReleaseIdentityFence ? `(
+                (
+                  job.required_executor_revision IS NULL
+                  AND job.required_executor_semantic_configuration_hash
+                    IS NULL
+                )
+                OR (
+                  attempt.executor_revision=job.required_executor_revision
+                  AND attempt.semantic_execution_configuration_hash
+                    =job.required_executor_semantic_configuration_hash
+                  AND EXISTS(
+                    SELECT 1 FROM worker_heartbeats heartbeat
+                    WHERE heartbeat.worker_id=job.lease_owner
+                      AND heartbeat.last_seen_at>
+                        now()-interval '5 minutes'
+                      AND heartbeat.metadata_json->>'version'
+                        =job.required_executor_revision
+                      AND heartbeat.metadata_json
+                        ->>'semanticExecutionConfigurationHash'
+                        =job.required_executor_semantic_configuration_hash
+                  )
+                )
+              )` : "true"} executor_release_identity_current
        FROM research_runs run
        JOIN playlist_contract_revisions contract
          ON contract.id=run.active_playlist_contract_revision_id
@@ -6507,7 +6901,8 @@ export class Repository {
       || row.job_status !== "leased"
       || row.job_lease_owner !== input.workerId
       || Number(row.job_lease_epoch) !== input.leaseGeneration
-      || row.job_stage_key !== input.stageKey) {
+      || row.job_stage_key !== input.stageKey
+      || row.executor_release_identity_current !== true) {
       throw new HttpError(
         409,
         "Publication reconciliation is fenced to stale immutable authority",
@@ -7121,6 +7516,8 @@ export class Repository {
     input: AppleWritePermitRequest,
     signal?: AbortSignal,
   ): Promise<AppleWritePermit> {
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable();
     const executionFence = input.executionFence;
     const executionFenceValid = executionFence !== null
       && UUID_PATTERN.test(executionFence.executionAttemptId)
@@ -7274,6 +7671,27 @@ export class Repository {
                FROM playlist_execution_attempts attempt
                JOIN job_queue job ON job.id=$2 AND job.run_id=attempt.run_id
                WHERE attempt.id=$1 AND attempt.run_id=$3
+                 ${supportsReleaseIdentityFence ? `AND (
+                   (
+                     job.required_executor_revision IS NULL
+                     AND job.required_executor_semantic_configuration_hash IS NULL
+                   )
+                   OR (
+                     attempt.executor_revision=job.required_executor_revision
+                     AND attempt.semantic_execution_configuration_hash
+                       =job.required_executor_semantic_configuration_hash
+                     AND EXISTS(
+                       SELECT 1 FROM worker_heartbeats heartbeat
+                       WHERE heartbeat.worker_id=job.lease_owner
+                         AND heartbeat.last_seen_at>now()-interval '5 minutes'
+                         AND heartbeat.metadata_json->>'version'
+                           =job.required_executor_revision
+                         AND heartbeat.metadata_json
+                           ->>'semanticExecutionConfigurationHash'
+                           =job.required_executor_semantic_configuration_hash
+                     )
+                   )
+                 )` : ""}
                FOR SHARE OF attempt,job`,
               [
                 executionFence.executionAttemptId,
@@ -12952,13 +13370,15 @@ export class Repository {
         const queueClass: JobQueueClass = isDeepQueryPlan(queryPlan)
           ? "deep"
           : "interactive";
+        const executorReleaseIdentity = canonicalExecutorReleaseIdentityV1();
         const inserted = await client.query<{ id: string }>(
           `INSERT INTO job_queue(
              id,run_id,kind,dedupe_key,payload_json,max_attempts,
              pipeline_version,minimum_worker_protocol,query_plan_revision_id,
-             stage_key,queue_class)
+             stage_key,queue_class,required_executor_revision,
+             required_executor_semantic_configuration_hash)
            VALUES($1,$2,'research',$3,$4::jsonb,10,'corpus_first_v3',
-             $5,$6,$7,$8)
+             $5,$6,$7,$8,$9,$10)
            ON CONFLICT(kind,dedupe_key) DO NOTHING RETURNING id`,
           [
             randomUUID(),
@@ -12975,6 +13395,8 @@ export class Repository {
             queryPlanRevisionId,
             stageKey,
             queueClass,
+            executorReleaseIdentity.executorRevision,
+            executorReleaseIdentity.semanticExecutionConfigurationHash,
           ],
         );
         if (!inserted.rows[0]) {
@@ -15851,11 +16273,15 @@ export class Repository {
       );
       const jobId = randomUUID();
       const dedupeKey = `v3-corpus-resume:${input.runId}:${source.id}:${successorHash}`;
+      const executorReleaseIdentity = canonicalExecutorReleaseIdentityV1();
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO job_queue(
            id,run_id,kind,dedupe_key,payload_json,max_attempts,pipeline_version,
-           minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class)
-         VALUES($1,$2,'research',$3,$4::jsonb,10,'corpus_first_v3',$5,$6,$7,'deep')
+           minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class,
+           required_executor_revision,
+           required_executor_semantic_configuration_hash)
+         VALUES($1,$2,'research',$3,$4::jsonb,10,'corpus_first_v3',$5,$6,$7,'deep',
+           $8,$9)
          ON CONFLICT(kind,dedupe_key) DO NOTHING RETURNING id`,
         [
           jobId,
@@ -15871,6 +16297,8 @@ export class Repository {
           minimumWorkerProtocolForQueryPlan(successorPlan),
           successorId,
           successorStageKey,
+          executorReleaseIdentity.executorRevision,
+          executorReleaseIdentity.semanticExecutionConfigurationHash,
         ],
       );
       if (!inserted.rows[0]) {
@@ -18738,6 +19166,8 @@ export class Repository {
   async commitPublicationCompletion(input: PublicationCompletionFence): Promise<void> {
     const supportsPublicationReconciliation =
       Number(await this.getSchemaVersion() ?? 0) >= 18;
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable();
     const contractPairComplete = (input.contractRevisionId === null) === (input.contractHash === null);
     const executionFence = input.executionFence;
     const executionFenceValid = executionFence !== null
@@ -18983,6 +19413,27 @@ export class Repository {
            FROM playlist_execution_attempts attempt
            JOIN job_queue job ON job.id=$2 AND job.run_id=attempt.run_id
            WHERE attempt.id=$1 AND attempt.run_id=$3
+             ${supportsReleaseIdentityFence ? `AND (
+               (
+                 job.required_executor_revision IS NULL
+                 AND job.required_executor_semantic_configuration_hash IS NULL
+               )
+               OR (
+                 attempt.executor_revision=job.required_executor_revision
+                 AND attempt.semantic_execution_configuration_hash
+                   =job.required_executor_semantic_configuration_hash
+                 AND EXISTS(
+                   SELECT 1 FROM worker_heartbeats heartbeat
+                   WHERE heartbeat.worker_id=job.lease_owner
+                     AND heartbeat.last_seen_at>now()-interval '5 minutes'
+                     AND heartbeat.metadata_json->>'version'
+                       =job.required_executor_revision
+                     AND heartbeat.metadata_json
+                       ->>'semanticExecutionConfigurationHash'
+                       =job.required_executor_semantic_configuration_hash
+                 )
+               )
+             )` : ""}
            FOR UPDATE OF attempt,job`,
           [
             executionFence.executionAttemptId,
@@ -19594,20 +20045,36 @@ export class Repository {
     runId: string;
     dedupeKey: string;
   }): Promise<boolean> {
+    const executorReleaseIdentity = canonicalExecutorReleaseIdentityV1();
     const result = await this.pool.query<{ id: string }>(
       `INSERT INTO job_queue(
          id,run_id,kind,queue_class,dedupe_key,pipeline_version,
          minimum_worker_protocol,query_plan_revision_id,stage_key,payload_json,
-         max_attempts)
+         max_attempts,required_executor_revision,
+         required_executor_semantic_configuration_hash)
        SELECT $1,m.run_id,'publication','publication',$4,
               COALESCE(r.pipeline_version,'legacy_v1'),
               CASE WHEN r.brief_contract_version=3 THEN 10 ELSE 4 END,
-              active.query_plan_revision_id,'publication',$5,6
+              active.query_plan_revision_id,'publication',$5,6,
+              CASE WHEN COALESCE((plan.plan_json->>'schemaVersion')::int,0)>=5
+                THEN $6 ELSE NULL END,
+              CASE WHEN COALESCE((plan.plan_json->>'schemaVersion')::int,0)>=5
+                THEN $7 ELSE NULL END
        FROM manifests m JOIN research_runs r ON r.id=m.run_id
        LEFT JOIN run_active_query_plans active ON active.run_id=m.run_id
+       LEFT JOIN query_plan_revisions plan
+         ON plan.id=active.query_plan_revision_id
        WHERE m.id=$2 AND m.run_id=$3 AND r.status='waiting_for_apple_authorization' AND r.deleted_at IS NULL
        ON CONFLICT(kind,dedupe_key) DO NOTHING RETURNING id`,
-      [randomUUID(), input.manifestId, input.runId, input.dedupeKey.slice(0, 160), { manifestId: input.manifestId }],
+      [
+        randomUUID(),
+        input.manifestId,
+        input.runId,
+        input.dedupeKey.slice(0, 160),
+        { manifestId: input.manifestId },
+        executorReleaseIdentity.executorRevision,
+        executorReleaseIdentity.semanticExecutionConfigurationHash,
+      ],
     );
     return Boolean(result.rowCount);
   }
@@ -19682,8 +20149,26 @@ export class Repository {
           input.matchingAuthority,
         );
       }
-      const runResult = await client.query<{ status: string; phase: string }>(
-        "SELECT status,phase FROM research_runs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+      const runResult = await client.query<{
+        status: string;
+        phase: string;
+        pipeline_version: PipelineVersion;
+        brief_contract_version: number;
+        query_plan_revision_id: string | null;
+        query_plan_schema_version: number;
+      }>(
+        `SELECT run.status,run.phase,run.pipeline_version,
+                run.brief_contract_version,active.query_plan_revision_id,
+                COALESCE(
+                  (plan.plan_json->>'schemaVersion')::int,
+                  0
+                ) query_plan_schema_version
+         FROM research_runs run
+         LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+         LEFT JOIN query_plan_revisions plan
+           ON plan.id=active.query_plan_revision_id
+         WHERE run.id=$1 AND run.deleted_at IS NULL
+         FOR UPDATE OF run`,
         [input.runId],
       );
       const run = runResult.rows[0];
@@ -19764,18 +20249,61 @@ export class Repository {
       }
 
       const jobId = job?.id ?? randomUUID();
+      const executorReleaseIdentity = run.query_plan_schema_version >= 5
+        ? canonicalExecutorReleaseIdentityV1()
+        : null;
+      const minimumWorkerProtocol = Math.max(
+        minimumWorkerProtocolForPipeline(run.pipeline_version),
+        run.brief_contract_version >= 3
+          ? BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL
+          : 0,
+      );
       if (job) {
         await client.query(
-          `UPDATE job_queue SET run_id=$2,payload_json=$3,status='queued',attempts=0,max_attempts=6,
-             available_at=now(),lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,completed_at=NULL,updated_at=now()
+          `UPDATE job_queue SET
+             run_id=$2,payload_json=$3,status='queued',attempts=0,
+             max_attempts=6,available_at=now(),lease_owner=NULL,
+             lease_expires_at=NULL,last_error=NULL,completed_at=NULL,
+             pipeline_version=$4,minimum_worker_protocol=$5,
+             query_plan_revision_id=$6,stage_key='publication',
+             queue_class='publication',required_executor_revision=$7,
+             required_executor_semantic_configuration_hash=$8,
+             updated_at=now()
            WHERE id=$1 AND status IN ('failed','cancelled')`,
-          [jobId, input.runId, { runId: input.runId, manifestId: input.manifestId }],
+          [
+            jobId,
+            input.runId,
+            { runId: input.runId, manifestId: input.manifestId },
+            run.pipeline_version,
+            minimumWorkerProtocol,
+            run.query_plan_revision_id,
+            executorReleaseIdentity?.executorRevision ?? null,
+            executorReleaseIdentity?.semanticExecutionConfigurationHash
+              ?? null,
+          ],
         );
       } else {
         await client.query(
-          `INSERT INTO job_queue(id,run_id,kind,dedupe_key,payload_json,max_attempts)
-           VALUES($1,$2,'publication',$3,$4,6)`,
-          [jobId, input.runId, dedupeKey, { runId: input.runId, manifestId: input.manifestId }],
+          `INSERT INTO job_queue(
+             id,run_id,kind,queue_class,dedupe_key,payload_json,max_attempts,
+             pipeline_version,minimum_worker_protocol,
+             query_plan_revision_id,stage_key,required_executor_revision,
+             required_executor_semantic_configuration_hash)
+           VALUES(
+             $1,$2,'publication','publication',$3,$4,6,$5,$6,$7,
+             'publication',$8,$9)`,
+          [
+            jobId,
+            input.runId,
+            dedupeKey,
+            { runId: input.runId, manifestId: input.manifestId },
+            run.pipeline_version,
+            minimumWorkerProtocol,
+            run.query_plan_revision_id,
+            executorReleaseIdentity?.executorRevision ?? null,
+            executorReleaseIdentity?.semanticExecutionConfigurationHash
+              ?? null,
+          ],
         );
       }
       await client.query("INSERT INTO rate_limit_events(client_bucket,action) VALUES($1,'publish')", [input.clientBucket]);
@@ -20496,11 +21024,16 @@ export class Repository {
         const jobId = randomUUID();
         const dedupeKey = `v3-partial-continue:${input.runId}:${checkpoint.outcomeVersion}:${successorHash}`;
         const queueClass: JobQueueClass = isDeepQueryPlan(successorPlan) ? "deep" : "interactive";
+        const executorReleaseIdentity =
+          canonicalExecutorReleaseIdentityV1();
         const inserted = await client.query<{ id: string }>(
           `INSERT INTO job_queue(
              id,run_id,kind,dedupe_key,payload_json,max_attempts,pipeline_version,
-             minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class)
-           VALUES($1,$2,'research',$3,$4::jsonb,10,'corpus_first_v3',$5,$6,$7,$8)
+             minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class,
+             required_executor_revision,
+             required_executor_semantic_configuration_hash)
+           VALUES($1,$2,'research',$3,$4::jsonb,10,'corpus_first_v3',$5,$6,$7,$8,
+             $9,$10)
            ON CONFLICT(kind,dedupe_key) DO NOTHING RETURNING id`,
           [
             jobId,
@@ -20517,6 +21050,8 @@ export class Repository {
             successorId,
             successorStageKey,
             queueClass,
+            executorReleaseIdentity.executorRevision,
+            executorReleaseIdentity.semanticExecutionConfigurationHash,
           ],
         );
         if (!inserted.rows[0]) {
@@ -20878,6 +21413,11 @@ export class Repository {
         input.minimumWorkerProtocol ?? pipelineMinimum,
         planMinimum,
       );
+      const executorReleaseIdentity =
+        pipelineVersion === "corpus_first_v3"
+        && Number(activeQueryPlan?.schemaVersion ?? 0) >= 5
+          ? canonicalExecutorReleaseIdentityV1()
+          : null;
       const persist = async (client: PoolClient | Pool) => {
         const result = await client.query<{
           id: string;
@@ -20885,9 +21425,14 @@ export class Repository {
         }>(
           `INSERT INTO job_queue(
              id,run_id,brief_request_id,kind,dedupe_key,payload_json,available_at,max_attempts,
-             pipeline_version,minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class
+             pipeline_version,minimum_worker_protocol,query_plan_revision_id,stage_key,queue_class,
+             required_executor_revision,
+             required_executor_semantic_configuration_hash
            )
-           VALUES($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now()),$8,$9,$10,$11,$12,$13)
+           VALUES(
+             $1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now()),$8,$9,$10,
+             $11,$12,$13,$14,$15
+           )
            ON CONFLICT(kind,dedupe_key) DO UPDATE SET
              run_id=EXCLUDED.run_id,
              brief_request_id=EXCLUDED.brief_request_id,
@@ -20897,6 +21442,10 @@ export class Repository {
              query_plan_revision_id=EXCLUDED.query_plan_revision_id,
              stage_key=EXCLUDED.stage_key,
              queue_class=EXCLUDED.queue_class,
+             required_executor_revision=
+               EXCLUDED.required_executor_revision,
+             required_executor_semantic_configuration_hash=
+               EXCLUDED.required_executor_semantic_configuration_hash,
              status='queued',
              attempts=0,
              max_attempts=EXCLUDED.max_attempts,
@@ -20923,6 +21472,9 @@ export class Repository {
             queryPlanRevisionId,
             (input.stageKey ?? "default").slice(0, 160),
             queueClass,
+            executorReleaseIdentity?.executorRevision ?? null,
+            executorReleaseIdentity?.semanticExecutionConfigurationHash
+              ?? null,
           ],
         );
         if (result.rows[0]) {
@@ -20982,15 +21534,34 @@ export class Repository {
     leaseMs: number,
     capability: WorkerPipelineCapability = WORKER_PIPELINE_CAPABILITY,
     workerQueueClass: WorkerQueueClass = "all",
+    executorReleaseIdentity: CanonicalExecutorReleaseIdentityV1 =
+      canonicalExecutorReleaseIdentityV1(),
   ): Promise<JobView | null> {
     if (!isWorkerCapabilityValid(capability)) {
       throw new HttpError(400, "Worker lease capability is invalid", "invalid_worker_capability");
+    }
+    if (
+      !/^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$/u.test(
+        executorReleaseIdentity.executorRevision,
+      )
+      || !/^[0-9a-f]{64}$/u.test(
+        executorReleaseIdentity.semanticExecutionConfigurationHash,
+      )
+    ) {
+      throw new HttpError(
+        400,
+        "Worker executor release identity is invalid",
+        "invalid_executor_release_identity",
+      );
     }
     const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
     const supportsExecutorCapabilityFence = schemaVersion >= 18
       && await this.getSetting(
         CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
       ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    const supportsExecutorReleaseIdentityFence =
+      schemaVersion >= 18
+      && await this.executorReleaseIdentityFenceAvailable();
     const executorCapabilities = JSON.stringify(
       (capability.canonicalExecutorCapabilities ?? []).map(({ hash, vector }) => ({
         hash,
@@ -21042,6 +21613,56 @@ export class Repository {
            )
          )`
       : "";
+    const candidateExecutorReleaseIdentityPredicate =
+      supportsExecutorReleaseIdentityFence
+        ? ` AND (
+             NOT EXISTS (
+               SELECT 1 FROM query_plan_revisions release_plan
+               WHERE release_plan.id=COALESCE(
+                   candidate.query_plan_revision_id,
+                   CASE WHEN candidate.kind='publication' THEN (
+                     SELECT active.query_plan_revision_id
+                     FROM run_active_query_plans active
+                     WHERE active.run_id=candidate.run_id
+                   ) ELSE NULL END
+                 )
+                 AND COALESCE(
+                   (release_plan.plan_json->>'schemaVersion')::int,
+                   1
+                 )>=5
+             )
+             OR (
+               candidate.required_executor_revision=$5::varchar(160)
+               AND candidate.required_executor_semantic_configuration_hash=
+                 $6::varchar(64)
+             )
+           )`
+        : "";
+    const exhaustedExecutorReleaseIdentityPredicate =
+      supportsExecutorReleaseIdentityFence
+        ? ` AND (
+             NOT EXISTS (
+               SELECT 1 FROM query_plan_revisions release_plan
+               WHERE release_plan.id=COALESCE(
+                   job_queue.query_plan_revision_id,
+                   CASE WHEN job_queue.kind='publication' THEN (
+                     SELECT active.query_plan_revision_id
+                     FROM run_active_query_plans active
+                     WHERE active.run_id=job_queue.run_id
+                   ) ELSE NULL END
+                 )
+                 AND COALESCE(
+                   (release_plan.plan_json->>'schemaVersion')::int,
+                   1
+                 )>=5
+             )
+             OR (
+               job_queue.required_executor_revision=$12::varchar(160)
+               AND job_queue.required_executor_semantic_configuration_hash=
+                 $13::varchar(64)
+             )
+           )`
+        : "";
     // Derive the effective fence from both immutable contracts at lease time.
     // This protects work queued during a rolling migration even if an older
     // trigger physically stamped a lower number on the row.
@@ -21130,6 +21751,11 @@ export class Repository {
              AND pipeline_version=ANY($9::varchar[])
              ${queuePredicate}
              ${exhaustedExecutorCapabilityPredicate}
+             ${exhaustedExecutorReleaseIdentityPredicate}
+             AND cardinality($10::varchar[])>=0
+             AND jsonb_typeof($11::jsonb)='array'
+             AND $12::varchar IS NOT NULL
+             AND $13::varchar IS NOT NULL
            ORDER BY lease_expires_at,id
            FOR UPDATE SKIP LOCKED
            LIMIT 20
@@ -21157,8 +21783,10 @@ export class Repository {
           sanitizeFailure(null, "background"),
           capability.protocolNumber,
           [...capability.pipelineVersions],
-          ...(schemaVersion >= 14 ? [queueClasses] : []),
-          ...(supportsExecutorCapabilityFence ? [executorCapabilities] : []),
+          queueClasses,
+          executorCapabilities,
+          executorReleaseIdentity.executorRevision,
+          executorReleaseIdentity.semanticExecutionConfigurationHash,
         ],
       );
       for (const job of exhausted.rows) {
@@ -21241,6 +21869,11 @@ export class Repository {
            AND candidate.pipeline_version=ANY($2::varchar[])
            ${candidateQueuePredicate}
            ${candidateExecutorCapabilityPredicate}
+           ${candidateExecutorReleaseIdentityPredicate}
+           AND cardinality($3::varchar[])>=0
+           AND jsonb_typeof($4::jsonb)='array'
+           AND $5::varchar IS NOT NULL
+           AND $6::varchar IS NOT NULL
            AND NOT (candidate.kind IN ('brief','research','matching') AND COALESCE((SELECT value='true' FROM settings WHERE key='research_paused'),false))
            AND NOT (candidate.kind='publication' AND COALESCE((SELECT value='true' FROM settings WHERE key='publishing_paused'),false))
            AND NOT (
@@ -21282,8 +21915,10 @@ export class Repository {
         [
           capability.protocolNumber,
           [...capability.pipelineVersions],
-          ...(schemaVersion >= 14 ? [queueClasses] : []),
-          ...(supportsExecutorCapabilityFence ? [executorCapabilities] : []),
+          queueClasses,
+          executorCapabilities,
+          executorReleaseIdentity.executorRevision,
+          executorReleaseIdentity.semanticExecutionConfigurationHash,
         ],
       );
       const job = selected.rows[0];
@@ -21311,6 +21946,10 @@ export class Repository {
           row.required_executor_capability_hash ?? null,
         requiredExecutorCapabilityVector:
           row.required_executor_capability_vector ?? null,
+        requiredExecutorRevision:
+          row.required_executor_revision ?? null,
+        requiredExecutorSemanticConfigurationHash:
+          row.required_executor_semantic_configuration_hash ?? null,
         stageKey: typeof row.stage_key === "string" ? row.stage_key : "default",
         leaseEpoch: Number(row.lease_epoch ?? 0),
         leaseOwner: row.lease_owner,
@@ -21336,6 +21975,9 @@ export class Repository {
       && await this.getSetting(
         CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
       ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+    const supportsReleaseIdentityFence =
+      await this.executorReleaseIdentityFenceAvailable();
+    if (supportsReleaseIdentityFence && !tracksActiveIntervals) return false;
     if (tracksActiveIntervals) {
       const result = await this.pool.query<{ id: string }>(
         `WITH lease_clock AS (
@@ -21354,6 +21996,9 @@ export class Repository {
            RETURNING job.id,job.lease_epoch,job.query_plan_revision_id,
                      job.stage_key,job.required_executor_capability_hash,
                      job.required_executor_capability_vector
+                     ${supportsReleaseIdentityFence ? `,
+                     job.required_executor_revision,
+                     job.required_executor_semantic_configuration_hash` : ""}
          ),
          accrued AS (
            UPDATE playlist_execution_attempts attempt
@@ -21379,6 +22024,17 @@ export class Repository {
                IS NOT DISTINCT FROM job.required_executor_capability_hash
              AND attempt.executor_capability_vector
                IS NOT DISTINCT FROM job.required_executor_capability_vector
+             ${supportsReleaseIdentityFence ? `AND (
+               (
+                 job.required_executor_revision IS NULL
+                 AND job.required_executor_semantic_configuration_hash IS NULL
+               )
+               OR (
+                 attempt.executor_revision=job.required_executor_revision
+                 AND attempt.semantic_execution_configuration_hash
+                   =job.required_executor_semantic_configuration_hash
+               )
+             )` : ""}
            RETURNING attempt.id
          )
          SELECT id FROM renewed`,
@@ -27483,6 +28139,7 @@ export class Repository {
       feedbackPaused,
       releaseManifestCanaryGuardsVersion,
       canonicalExecutionHardeningVersion,
+      canonicalExecutorReleaseIdentityFencingVersion,
     ] = await Promise.all([
       this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC"),
       this.pool.query(
@@ -27524,6 +28181,9 @@ export class Repository {
       this.getSetting("feedback_paused"),
       this.getSetting("release_manifest_canary_guards_version"),
       this.getSetting("canonical_execution_hardening_version"),
+      this.getSetting(
+        CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+      ),
     ]);
     const queueRow = queue.rows[0] ?? {};
     const notificationRow = notifications.rows[0] ?? {};
@@ -27532,6 +28192,146 @@ export class Repository {
     const configuredStaleSeconds = Number(process.env.WORKER_STALE_SECONDS ?? 90);
     const staleAfterMs = (Number.isFinite(configuredStaleSeconds) ? Math.max(30, configuredStaleSeconds) : 90) * 1_000;
     const databaseSchemaVersion = await this.getSchemaVersion();
+    const executorReleaseIdentityFenceSupported =
+      canonicalExecutorReleaseIdentityFencingVersion
+        === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+      && await this.executorReleaseIdentityFenceAvailable();
+    const executorFencingBase = executorReleaseIdentityFenceSupported
+      ? await (async () => {
+        const [summary, requirements] = await Promise.all([
+          this.pool.query<{
+            incomplete_jobs: number;
+            mismatched_active_attempts: number;
+          }>(
+            `SELECT
+               (
+                 SELECT count(*)::int
+                 FROM job_queue job
+                 LEFT JOIN run_active_query_plans active
+                   ON active.run_id=job.run_id
+                     AND job.kind='publication'
+                 JOIN query_plan_revisions plan
+                   ON plan.id=COALESCE(
+                     job.query_plan_revision_id,
+                     active.query_plan_revision_id
+                   )
+                 WHERE COALESCE(
+                   (plan.plan_json->>'schemaVersion')::int,
+                   1
+                 )>=5
+                   AND job.status IN ('queued','retry','leased')
+                   AND (
+                     job.required_executor_revision IS NULL
+                     OR job.required_executor_semantic_configuration_hash
+                       IS NULL
+                   )
+               ) incomplete_jobs,
+               (
+                 SELECT count(*)::int
+                 FROM playlist_execution_attempts attempt
+                 JOIN job_queue job ON job.id=attempt.job_id
+                 LEFT JOIN run_active_query_plans active
+                   ON active.run_id=job.run_id
+                     AND job.kind='publication'
+                 JOIN query_plan_revisions plan
+                   ON plan.id=COALESCE(
+                     job.query_plan_revision_id,
+                     active.query_plan_revision_id
+                   )
+                 WHERE COALESCE(
+                   (plan.plan_json->>'schemaVersion')::int,
+                   1
+                 )>=5
+                   AND attempt.status='running'
+                   AND job.status='leased'
+                   AND (
+                     job.required_executor_revision IS NULL
+                     OR job.required_executor_semantic_configuration_hash
+                       IS NULL
+                     OR attempt.executor_revision
+                       IS DISTINCT FROM job.required_executor_revision
+                     OR attempt.semantic_execution_configuration_hash
+                       IS DISTINCT FROM
+                         job.required_executor_semantic_configuration_hash
+                     OR NOT EXISTS(
+                       SELECT 1 FROM worker_heartbeats heartbeat
+                       WHERE heartbeat.worker_id=job.lease_owner
+                         AND heartbeat.last_seen_at>
+                           now()-interval '5 minutes'
+                         AND heartbeat.metadata_json->>'version'
+                           =job.required_executor_revision
+                         AND heartbeat.metadata_json
+                           ->>'semanticExecutionConfigurationHash'
+                           =job.required_executor_semantic_configuration_hash
+                     )
+                   )
+               ) mismatched_active_attempts`,
+          ),
+          this.pool.query<{
+            queue_class: string;
+            status: string;
+            executor_revision: string;
+            semantic_execution_configuration_hash: string;
+            count: number;
+          }>(
+            `SELECT job.queue_class,job.status,
+                    job.required_executor_revision executor_revision,
+                    job.required_executor_semantic_configuration_hash
+                      semantic_execution_configuration_hash,
+                    count(*)::int count
+             FROM job_queue job
+             LEFT JOIN run_active_query_plans active
+               ON active.run_id=job.run_id
+                 AND job.kind='publication'
+             JOIN query_plan_revisions plan
+               ON plan.id=COALESCE(
+                 job.query_plan_revision_id,
+                 active.query_plan_revision_id
+               )
+             WHERE COALESCE(
+               (plan.plan_json->>'schemaVersion')::int,
+               1
+             )>=5
+               AND job.status IN ('queued','retry','leased')
+               AND job.required_executor_revision IS NOT NULL
+               AND job.required_executor_semantic_configuration_hash
+                 IS NOT NULL
+             GROUP BY job.queue_class,job.status,
+                      job.required_executor_revision,
+                      job.required_executor_semantic_configuration_hash
+             ORDER BY job.queue_class,job.status,
+                      job.required_executor_revision,
+                      job.required_executor_semantic_configuration_hash
+             LIMIT 32`,
+          ),
+        ]);
+        const row = summary.rows[0] ?? {
+          incomplete_jobs: 0,
+          mismatched_active_attempts: 0,
+        };
+        const incompleteJobs = Number(row.incomplete_jobs ?? 0);
+        const mismatchedActiveAttempts =
+          Number(row.mismatched_active_attempts ?? 0);
+        return {
+          ready: incompleteJobs === 0 && mismatchedActiveAttempts === 0,
+          incompleteJobs,
+          mismatchedActiveAttempts,
+          requirements: requirements.rows.map((requirement) => ({
+            queueClass: requirement.queue_class,
+            status: requirement.status,
+            executorRevision: requirement.executor_revision,
+            semanticExecutionConfigurationHash:
+              requirement.semantic_execution_configuration_hash,
+            count: Number(requirement.count),
+          })),
+        };
+      })()
+      : {
+        ready: false,
+        incompleteJobs: 0,
+        mismatchedActiveAttempts: 0,
+        requirements: [],
+      };
     const evaluatedWorkers = worker.rows.map((row) => {
       const lastSeenAt = date(row.last_seen_at);
       const stale = !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs;
@@ -27545,8 +28345,37 @@ export class Repository {
         queueClass: heartbeatQueueClass(row.metadata_json),
         executorRevision: heartbeatExecutorRevision(row.metadata_json),
         configurationHash: heartbeatConfigurationHash(row.metadata_json),
+        semanticExecutionConfigurationHash:
+          heartbeatSemanticExecutionConfigurationHash(row.metadata_json),
       };
     });
+    const candidateExecutorReleaseIdentity =
+      canonicalExecutorReleaseIdentityV1();
+    const eligibleExecutorWorkers = evaluatedWorkers.filter((row) => (
+      !row.stale
+      && row.schemaCompatible
+      && row.protocolCompatible
+      && Number(row.capacity ?? 0) > 0
+      && row.executorRevision
+        === candidateExecutorReleaseIdentity.executorRevision
+      && row.semanticExecutionConfigurationHash
+        === candidateExecutorReleaseIdentity
+          .semanticExecutionConfigurationHash
+    ));
+    const uncoveredJobs = executorFencingBase.requirements
+      .filter((requirement) => !eligibleExecutorWorkers.some((workerRow) => (
+        workerRow.executorRevision === requirement.executorRevision
+        && workerRow.semanticExecutionConfigurationHash
+          === requirement.semanticExecutionConfigurationHash
+        && queueClassesForWorker(workerRow.queueClass)
+          .includes(requirement.queueClass as JobQueueClass)
+      )))
+      .reduce((count, requirement) => count + Number(requirement.count), 0);
+    const executorFencing = {
+      ...executorFencingBase,
+      ready: executorFencingBase.ready && uncoveredJobs === 0,
+      uncoveredJobs,
+    };
     // A newer bridge heartbeat must not hide healthy v5 capacity during a
     // mixed rollout. Prefer a fully compatible fresh worker, then any fresh
     // worker for actionable diagnostics, then the newest stale heartbeat.
@@ -27574,9 +28403,23 @@ export class Repository {
         .map((row) => row.configurationHash)
         .filter((value): value is string => Boolean(value)))]
         .sort();
+      const eligibleSemanticExecutionConfigurationHashes = [...new Set(
+        eligibleWorkers
+          .map((row) => row.semanticExecutionConfigurationHash)
+          .filter((value): value is string => Boolean(value)),
+      )].sort();
       const eligibleIdentityCount = eligibleWorkers.filter((row) => (
-        Boolean(row.executorRevision) && Boolean(row.configurationHash)
+        Boolean(row.executorRevision)
+        && Boolean(row.configurationHash)
+        && Boolean(row.semanticExecutionConfigurationHash)
       )).length;
+      const candidateExecutorIdentityReady = eligibleWorkers.some((row) => (
+        row.executorRevision
+          === candidateExecutorReleaseIdentity.executorRevision
+        && row.semanticExecutionConfigurationHash
+          === candidateExecutorReleaseIdentity
+            .semanticExecutionConfigurationHash
+      ));
       return representative ? {
         ...representative,
         compatibleCapacity: laneCompatibleCapacity,
@@ -27584,6 +28427,8 @@ export class Repository {
         eligibleIdentityCount,
         eligibleRevisions,
         eligibleConfigurationHashes,
+        eligibleSemanticExecutionConfigurationHashes,
+        candidateExecutorIdentityReady,
         ready: laneCompatibleCapacity > 0,
       } : {
         stale: true,
@@ -27596,6 +28441,8 @@ export class Repository {
         eligibleIdentityCount: 0,
         eligibleRevisions: [],
         eligibleConfigurationHashes: [],
+        eligibleSemanticExecutionConfigurationHashes: [],
+        candidateExecutorIdentityReady: false,
         ready: false,
       };
     };
@@ -27610,6 +28457,8 @@ export class Repository {
         schemaCompatible: isDatabaseSchemaVersionCompatible(databaseSchemaVersion),
         releaseManifestCanaryGuardsVersion,
         canonicalExecutionHardeningVersion,
+        canonicalExecutorReleaseIdentityFencingVersion,
+        executorReleaseIdentityFenceSupported,
       },
       worker: heartbeat ? {
         ...heartbeat,
@@ -27622,6 +28471,7 @@ export class Repository {
         compatibleCapacity: 0,
       },
       workerLanes,
+      executorFencing,
       queue: {
         queued: Number(queueRow.queued ?? 0),
         leased: Number(queueRow.leased ?? 0),

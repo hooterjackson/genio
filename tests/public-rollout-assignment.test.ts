@@ -3,6 +3,7 @@ import {
   assertPublicRolloutExecutionGroupV1,
   createPublicRolloutAssignmentV1,
   parsePublicRolloutAssignmentV1,
+  publicRolloutRuntimeDatabaseAuthorityV1,
 } from "../server/public-rollout-assignment.ts";
 import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";
 import { signedArtifactSha256 } from "../shared/signed-artifact.ts";
@@ -35,11 +36,8 @@ function environment(
   };
 }
 
-function assignment(
-  stickyKey: string,
-  env = environment(),
-  prompt = "Smooth reggaeton for a warm late-night dance floor",
-  authorityEnvironment = env,
+function databaseAuthority(
+  authorityEnvironment = environment(),
 ) {
   const configuration = {
     PIPELINE_V2_OWNER_CANARY: "false",
@@ -96,17 +94,26 @@ function assignment(
     targetConfigurationHash: signedArtifactSha256(configuration),
     targetConfiguration: configuration,
   };
+  return {
+    global: state,
+    intents: configuration.PIPELINE_V3_GENRE_SCENE_PERCENT === "0"
+      ? {}
+      : { genre_scene: state },
+  };
+}
+
+function assignment(
+  stickyKey: string,
+  env = environment(),
+  prompt = "Smooth reggaeton for a warm late-night dance floor",
+  authorityEnvironment = env,
+) {
   return createPublicRolloutAssignmentV1({
     prompt,
     requestedTrackCount: 50,
     stickyKey,
     environment: env,
-    databaseAuthority: {
-      global: state,
-      intents: configuration.PIPELINE_V3_GENRE_SCENE_PERCENT === "0"
-        ? {}
-        : { genre_scene: state },
-    },
+    databaseAuthority: databaseAuthority(authorityEnvironment),
   })!;
 }
 
@@ -234,6 +241,56 @@ describe("persisted public canonical rollout assignment", () => {
         RELEASE_ENVIRONMENT: "production",
         RELEASE_DEPLOYMENT_PHASE: "activate",
       },
+    })).toBeNull();
+  });
+
+  test("proves that all protected runtime markers match database authority", () => {
+    const env = environment("100");
+    expect(publicRolloutRuntimeDatabaseAuthorityV1({
+      environment: env,
+      databaseAuthority: databaseAuthority(env),
+    })).toEqual({
+      evidenceHash: "a".repeat(64),
+      stage: "genre_scene:0->100",
+      targetConfigurationHash:
+        signedArtifactSha256(
+          (databaseAuthority(env).global as {
+            targetConfiguration: PublicRolloutConfiguration;
+          }).targetConfiguration,
+        ),
+    });
+  });
+
+  test("fails health proof on partial, stale, or database-only rollout state", () => {
+    const env = environment("100");
+    expect(() => publicRolloutRuntimeDatabaseAuthorityV1({
+      environment: {
+        ...env,
+        RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH: "b".repeat(64),
+      },
+      databaseAuthority: databaseAuthority(env),
+    })).toThrow(/runtime identity does not match its database authority/u);
+    expect(() => publicRolloutRuntimeDatabaseAuthorityV1({
+      environment: {
+        RELEASE_ENVIRONMENT: "production",
+        RELEASE_DEPLOYMENT_PHASE: "activate",
+        RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH: "a".repeat(64),
+      },
+      databaseAuthority: databaseAuthority(env),
+    })).toThrow(/runtime identity does not match its database authority/u);
+    expect(() => publicRolloutRuntimeDatabaseAuthorityV1({
+      environment: {
+        RELEASE_ENVIRONMENT: "production",
+        RELEASE_DEPLOYMENT_PHASE: "activate",
+      },
+      databaseAuthority: databaseAuthority(env),
+    })).toThrow(/runtime identity does not match its database authority/u);
+    expect(publicRolloutRuntimeDatabaseAuthorityV1({
+      environment: {
+        RELEASE_ENVIRONMENT: "production",
+        RELEASE_DEPLOYMENT_PHASE: "activate",
+      },
+      databaseAuthority: null,
     })).toBeNull();
   });
 });

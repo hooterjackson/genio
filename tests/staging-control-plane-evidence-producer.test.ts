@@ -68,6 +68,7 @@ const productionServices = [
 
 function runtime(environment: "staging" | "production") {
   return {
+    semanticExecutionConfigurationHash: "f".repeat(64),
     releaseEnvironment: environment,
     deploymentPhase: "activate" as const,
     databaseSchemaVersion: "18",
@@ -134,7 +135,7 @@ function runtimeSnapshot(
   };
   const runtimeValue = runtime(environment);
   const unsigned = {
-    schemaVersion: "genio-release-runtime-snapshot/v2" as const,
+    schemaVersion: "genio-release-runtime-snapshot/v3" as const,
     generatedAt,
     origin: environment === "staging" ? stagingOrigin : productionOrigin,
     environment,
@@ -146,8 +147,27 @@ function runtimeSnapshot(
       sourceRevision: revision,
     },
     sitesObservation,
+    apiObservations: {
+      liveReplicaIdentityHash: "8".repeat(64),
+      systemReplicaIdentityHash: "9".repeat(64),
+    },
+    executorFencing: {
+      version: "1",
+      ready: true,
+      incompleteJobs: 0,
+      mismatchedActiveAttempts: 0,
+      uncoveredJobs: 0,
+      requirementsHash: "a".repeat(64),
+    },
     configuration,
     runtime: runtimeValue,
+    publicRollout: {
+      active: false,
+      databaseAuthorized: true,
+      evidenceHash: null,
+      stage: null,
+      targetConfigurationHash: null,
+    },
     credentialVersionHashes: {
       provider: environment === "staging"
         ? "b".repeat(64)

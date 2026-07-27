@@ -47,6 +47,7 @@ import {
   signedArtifactSha256,
   stableSignedArtifactJson,
 } from "../shared/signed-artifact.ts";
+import { semanticBehaviorHashV1 } from "../shared/semantic-release-evidence.ts";
 import {
   publicRolloutIntentCanaryKeyFingerprint,
 } from "../shared/public-rollout-intent-canary.ts";
@@ -121,6 +122,7 @@ beforeAll(() => {
     secretVersionsHash: hash("5"),
   };
   const runtime = {
+    semanticExecutionConfigurationHash: hash("0"),
     releaseEnvironment: "staging",
     deploymentPhase: "activate",
     databaseSchemaVersion: "18",
@@ -184,6 +186,9 @@ beforeAll(() => {
       publicRolloutEvidencePayloadHash: null,
       publicRolloutCompletedAt: null,
       publicRolloutIntentGroup: null,
+      publicRolloutFromPercent: null,
+      publicRolloutToPercent: null,
+      publicRolloutTargetConfigurationHash: null,
     },
     configuration,
     stagingControls: {
@@ -225,6 +230,21 @@ beforeAll(() => {
       controlPlaneKeyFingerprint: hash("8"),
     },
     runtime,
+    semanticReview: {
+      schemaVersion: "genio-release-semantic-review/v1",
+      gateEvidenceHash: hash("6"),
+      reviewedAt: generatedAt,
+      semanticBehaviorHash: semanticBehaviorHashV1(runtime),
+      fixtures: [
+        "fixed-three-track-control-v1",
+        "smooth-reggaeton-heat-50-v1",
+        "french-jazz-guided-constraint-25-v1",
+      ].map((fixtureId, index) => ({
+        fixtureId,
+        orderedManifestHash: ["6", "7", "8"][index]!.repeat(64),
+        outputHash: ["9", "a", "b"][index]!.repeat(64),
+      })),
+    },
     environmentSnapshots: {
       staging: {
         scope: "full",
@@ -240,6 +260,13 @@ beforeAll(() => {
         providerCredentialVersionHash: hash("1"),
         appleCredentialVersionHash: hash("3"),
         appleQaVerifierCredentialVersionHash: hash("a"),
+        publicRollout: {
+          active: false,
+          databaseAuthorized: true,
+          evidenceHash: null,
+          stage: null,
+          targetConfigurationHash: null,
+        },
       },
       production: null,
     },

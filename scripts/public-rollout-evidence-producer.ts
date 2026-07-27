@@ -452,8 +452,17 @@ export function summarizePublicRolloutObservation(
 ): PublicRolloutSoakObservation {
   const runtime = value.runtime;
   const system = value.system;
+  const publicRollout = system.publicRollout;
   const interactive = system.workerLanes.interactive;
   const deep = system.workerLanes.deep;
+  const runtimeRolloutEvidenceHash =
+    typeof runtime.publicRolloutEvidenceHash === "string"
+      ? runtime.publicRolloutEvidenceHash
+      : null;
+  const runtimeRolloutStage =
+    typeof runtime.publicRolloutStage === "string"
+      ? runtime.publicRolloutStage
+      : null;
   if (
     value.sitesVersion === null
     || value.sitesRevision === null
@@ -475,6 +484,14 @@ export function summarizePublicRolloutObservation(
     || deep.status !== "healthy"
     || deep.protocolVersion !== "playlist-pipeline-v10"
     || deep.lastSeenAt === null
+    || publicRollout.databaseAuthorized !== true
+    || publicRollout.active !== (runtimeRolloutEvidenceHash !== null)
+    || publicRollout.evidenceHash !== runtimeRolloutEvidenceHash
+    || publicRollout.stage !== runtimeRolloutStage
+    || (
+      publicRollout.active
+      && publicRollout.targetConfigurationHash === null
+    )
   ) {
     throw new Error(
       "public rollout producer cannot summarize an unhealthy convergence observation",
@@ -487,14 +504,8 @@ export function summarizePublicRolloutObservation(
     apiVersion: String(value.api.version),
     apiRevision: String(value.api.revision),
     apiConfigurationHash: String(value.api.configurationHash),
-    publicRolloutEvidenceHash:
-      typeof runtime.publicRolloutEvidenceHash === "string"
-        ? runtime.publicRolloutEvidenceHash
-        : null,
-    publicRolloutStage:
-      typeof runtime.publicRolloutStage === "string"
-        ? runtime.publicRolloutStage
-        : null,
+    publicRolloutEvidenceHash: runtimeRolloutEvidenceHash,
+    publicRolloutStage: runtimeRolloutStage,
     systemHttpStatus: 200,
     systemOk: true,
     activationReady: true,
@@ -594,6 +605,8 @@ export function buildPublicRolloutPayload(input: {
         input.promotionPayload,
       ),
       runtimeHash: releaseEvidenceRuntimeHash(input.promotionPayload),
+      semanticBehaviorHash:
+        input.promotionPayload.semanticReview.semanticBehaviorHash,
       productionCanaryEvidenceHash:
         publicRolloutProductionCanaryEvidenceHash(input.promotionPayload.gates),
       sitesVersion:
@@ -832,6 +845,8 @@ async function main(): Promise<void> {
       interactiveWorker:
         runtimeSnapshot.configuration.interactiveWorkerHash,
       deepWorker: runtimeSnapshot.configuration.deepWorkerHash,
+      semanticExecution:
+        runtimeSnapshot.runtime.semanticExecutionConfigurationHash,
     },
   }, deadlineAt);
   const payload = buildPublicRolloutPayload({

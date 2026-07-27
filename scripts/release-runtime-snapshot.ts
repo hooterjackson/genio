@@ -41,7 +41,7 @@ export interface ReleaseSecretVersionsV2 {
 }
 
 export interface ReleaseRuntimeSnapshotV1 {
-  schemaVersion: "genio-release-runtime-snapshot/v2";
+  schemaVersion: "genio-release-runtime-snapshot/v3";
   generatedAt: string;
   origin: string;
   environment: "staging" | "production";
@@ -57,8 +57,27 @@ export interface ReleaseRuntimeSnapshotV1 {
     ownerAllowlistVersion: string;
     candidateMatched: boolean;
   };
+  apiObservations: {
+    liveReplicaIdentityHash: string;
+    systemReplicaIdentityHash: string;
+  };
+  executorFencing: {
+    version: "1";
+    ready: true;
+    incompleteJobs: 0;
+    mismatchedActiveAttempts: 0;
+    uncoveredJobs: 0;
+    requirementsHash: string;
+  };
   configuration: ReleaseConfiguration;
   runtime: ReleaseRuntime;
+  publicRollout: {
+    active: boolean;
+    databaseAuthorized: boolean;
+    evidenceHash: string | null;
+    stage: string | null;
+    targetConfigurationHash: string | null;
+  };
   credentialVersionHashes: {
     provider: string;
     apple: string;
@@ -130,6 +149,66 @@ function stringArray(value: unknown): string[] {
     : [];
 }
 
+function apiRuntimeIdentity(input: {
+  value: unknown;
+  label: string;
+  expectedRevision: string;
+  expectedVersion: string;
+  expectedConfigurationHash: string;
+  expectedSemanticExecutionConfigurationHash: string;
+}): {
+  replicaIdentityHash: string;
+  build: {
+    identifier: string;
+    version: string;
+    revision: string;
+  };
+} {
+  const identity = asRecord(input.value, input.label);
+  exactKeys(identity, [
+    "schemaVersion",
+    "replicaIdentityHash",
+    "build",
+    "configurationHash",
+    "semanticExecutionConfigurationHash",
+  ], input.label);
+  if (identity.schemaVersion !== "genio-api-runtime-identity/v1") {
+    throw new Error(`${input.label} uses an unsupported schema`);
+  }
+  const build = asRecord(identity.build, `${input.label} build`);
+  exactKeys(build, ["identifier", "version", "revision"], `${input.label} build`);
+  const observedRevision = revision(
+    build.revision,
+    `${input.label} source revision`,
+  );
+  const observedIdentifier = releaseLabel(
+    build.identifier,
+    `${input.label} build identifier`,
+  );
+  if (
+    build.version !== input.expectedVersion
+    || observedRevision !== input.expectedRevision
+    || identity.configurationHash !== input.expectedConfigurationHash
+    || identity.semanticExecutionConfigurationHash
+      !== input.expectedSemanticExecutionConfigurationHash
+  ) {
+    throw new Error(
+      `${input.label} does not match the candidate API build and configuration`,
+    );
+  }
+  return {
+    replicaIdentityHash: digest(
+      identity.replicaIdentityHash,
+      `${input.label} replica identity hash`,
+    ),
+    build: {
+      identifier: observedIdentifier,
+      version: input.expectedVersion,
+      revision: observedRevision,
+    },
+  };
+}
+
 function htmlAttribute(html: string, name: string): string | null {
   const match = new RegExp(
     `\\b${name}=(?:"([^"]+)"|'([^']+)'|([^\\s>]+))`,
@@ -198,9 +277,11 @@ function workerConfigurationHash(input: {
   value: unknown;
   expectedRevision: string;
   expectedProtocol: string;
+  expectedSemanticExecutionConfigurationHash: string;
 }): string {
   const lane = asRecord(input.value, `${input.lane} worker lane`);
   if (lane.status !== "healthy"
+    || lane.candidateExecutorIdentityReady !== true
     || Number(lane.compatibleCapacity ?? 0) < 1
     || Number(lane.eligibleWorkerCount ?? 0) < 1
     || Number(lane.eligibleIdentityCount ?? -1)
@@ -219,6 +300,18 @@ function workerConfigurationHash(input: {
     .filter((item) => SHA256.test(item)))];
   if (hashes.length !== 1) {
     throw new Error(`${input.lane} worker lane does not expose one authoritative configuration hash`);
+  }
+  const semanticHashes = [...new Set(
+    stringArray(lane.eligibleSemanticExecutionConfigurationHashes)
+      .filter((item) => SHA256.test(item)),
+  )];
+  if (
+    semanticHashes.length !== 1
+    || semanticHashes[0] !== input.expectedSemanticExecutionConfigurationHash
+  ) {
+    throw new Error(
+      `${input.lane} worker lane semantic execution configuration does not match the API`,
+    );
   }
   return hashes[0]!;
 }
@@ -240,6 +333,10 @@ function runtimeSnapshot(input: {
     prompt: releaseLabel(runtime.promptVersion, "prompt policy"),
   };
   const result: ReleaseRuntime = {
+    semanticExecutionConfigurationHash: digest(
+      runtime.semanticExecutionConfigurationHash,
+      "semantic execution configuration hash",
+    ),
     releaseEnvironment: releaseLabel(
       runtime.releaseEnvironment,
       "release environment",
@@ -296,6 +393,121 @@ function runtimeSnapshot(input: {
     throw new Error("runtime does not satisfy the schema-18/protocol-10 release contract");
   }
   return result;
+}
+
+function publicRolloutSnapshot(input: {
+  live: JsonRecord;
+  system: JsonRecord;
+}): ReleaseRuntimeSnapshotV1["publicRollout"] {
+  const runtime = asRecord(input.live.runtime, "API runtime");
+  const authority = asRecord(
+    input.system.publicRollout,
+    "system public rollout authority",
+  );
+  exactKeys(authority, [
+    "active",
+    "databaseAuthorized",
+    "evidenceHash",
+    "stage",
+    "targetConfigurationHash",
+  ], "system public rollout authority");
+  if (
+    typeof authority.active !== "boolean"
+    || authority.databaseAuthorized !== true
+  ) {
+    throw new Error(
+      "system public rollout authority was not read from the database",
+    );
+  }
+  const runtimeEvidenceHash = runtime.publicRolloutEvidenceHash;
+  const runtimeStage = runtime.publicRolloutStage;
+  const authorityEvidenceHash = authority.evidenceHash;
+  const authorityStage = authority.stage;
+  const authorityTargetConfigurationHash =
+    authority.targetConfigurationHash;
+  if (!authority.active) {
+    if (
+      runtimeEvidenceHash !== null
+      || runtimeStage !== null
+      || authorityEvidenceHash !== null
+      || authorityStage !== null
+      || authorityTargetConfigurationHash !== null
+    ) {
+      throw new Error(
+        "inactive public rollout contains stale runtime or database markers",
+      );
+    }
+    return {
+      active: false,
+      databaseAuthorized: true,
+      evidenceHash: null,
+      stage: null,
+      targetConfigurationHash: null,
+    };
+  }
+  const stagePattern =
+    /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u;
+  if (
+    typeof authorityEvidenceHash !== "string"
+    || !SHA256.test(authorityEvidenceHash)
+    || typeof authorityStage !== "string"
+    || !stagePattern.test(authorityStage)
+    || typeof authorityTargetConfigurationHash !== "string"
+    || !SHA256.test(authorityTargetConfigurationHash)
+    || runtimeEvidenceHash !== authorityEvidenceHash
+    || runtimeStage !== authorityStage
+  ) {
+    throw new Error(
+      "active public rollout runtime identity does not match its database authority",
+    );
+  }
+  return {
+    active: true,
+    databaseAuthorized: true,
+    evidenceHash: authorityEvidenceHash,
+    stage: authorityStage,
+    targetConfigurationHash: authorityTargetConfigurationHash,
+  };
+}
+
+function executorFencingSnapshot(
+  system: JsonRecord,
+): ReleaseRuntimeSnapshotV1["executorFencing"] {
+  if (system.canonicalExecutorReleaseIdentityFencingVersion !== "1") {
+    throw new Error(
+      "canonical executor release identity fence marker is not active",
+    );
+  }
+  const fencing = asRecord(
+    system.executorFencing,
+    "system executor release identity fencing",
+  );
+  exactKeys(fencing, [
+    "ready",
+    "incompleteJobs",
+    "mismatchedActiveAttempts",
+    "uncoveredJobs",
+    "requirements",
+  ], "system executor release identity fencing");
+  if (
+    fencing.ready !== true
+    || fencing.incompleteJobs !== 0
+    || fencing.mismatchedActiveAttempts !== 0
+    || fencing.uncoveredJobs !== 0
+    || !Array.isArray(fencing.requirements)
+  ) {
+    throw new Error(
+      "system executor release identity fencing is not converged",
+    );
+  }
+  return {
+    version: "1",
+    ready: true,
+    incompleteJobs: 0,
+    mismatchedActiveAttempts: 0,
+    uncoveredJobs: 0,
+    requirementsHash: sha256(fencing.requirements),
+  };
 }
 
 export function buildReleaseRuntimeSnapshot(input: {
@@ -373,6 +585,39 @@ export function buildReleaseRuntimeSnapshot(input: {
     system,
     expectedEnvironment: input.environment,
   });
+  const liveApiIdentity = apiRuntimeIdentity({
+    value: live.api,
+    label: "API liveness runtime identity",
+    expectedRevision,
+    expectedVersion: input.expectedVersion,
+    expectedConfigurationHash: apiHash,
+    expectedSemanticExecutionConfigurationHash:
+      runtime.semanticExecutionConfigurationHash,
+  });
+  if (
+    liveApiIdentity.build.identifier !== build.identifier
+    || liveApiIdentity.build.version !== build.version
+    || liveApiIdentity.build.revision !== build.revision
+  ) {
+    throw new Error(
+      "API liveness identity disagrees with its legacy build fields",
+    );
+  }
+  const systemApiIdentity = apiRuntimeIdentity({
+    value: system.api,
+    label: "system health API runtime identity",
+    expectedRevision,
+    expectedVersion: input.expectedVersion,
+    expectedConfigurationHash: apiHash,
+    expectedSemanticExecutionConfigurationHash:
+      runtime.semanticExecutionConfigurationHash,
+  });
+  const apiObservations = {
+    liveReplicaIdentityHash: liveApiIdentity.replicaIdentityHash,
+    systemReplicaIdentityHash: systemApiIdentity.replicaIdentityHash,
+  };
+  const executorFencing = executorFencingSnapshot(system);
+  const publicRollout = publicRolloutSnapshot({ live, system });
   if (input.sitesOwnerAllowlistVersions.length !== 3) {
     throw new Error("release probes must expose three owner allowlist versions");
   }
@@ -405,12 +650,16 @@ export function buildReleaseRuntimeSnapshot(input: {
       value: lanes.interactive,
       expectedRevision,
       expectedProtocol: runtime.workerProtocol,
+      expectedSemanticExecutionConfigurationHash:
+        runtime.semanticExecutionConfigurationHash,
     }),
     deepWorkerHash: workerConfigurationHash({
       lane: "deep",
       value: lanes.deep,
       expectedRevision,
       expectedProtocol: runtime.workerProtocol,
+      expectedSemanticExecutionConfigurationHash:
+        runtime.semanticExecutionConfigurationHash,
     }),
     sitesHash: sha256({
       buildIdentity: sites,
@@ -434,7 +683,7 @@ export function buildReleaseRuntimeSnapshot(input: {
     candidateMatched: sitesCandidateMatched,
   };
   const unsigned = {
-    schemaVersion: "genio-release-runtime-snapshot/v2" as const,
+    schemaVersion: "genio-release-runtime-snapshot/v3" as const,
     generatedAt,
     origin: input.origin,
     environment: input.environment,
@@ -444,8 +693,11 @@ export function buildReleaseRuntimeSnapshot(input: {
       sourceRevision: expectedRevision,
     },
     sitesObservation,
+    apiObservations,
+    executorFencing,
     configuration,
     runtime,
+    publicRollout,
     credentialVersionHashes,
     configurationHash: releaseEvidenceConfigurationHash({ configuration }),
     runtimeHash: releaseEvidenceRuntimeHash({ runtime }),
@@ -505,8 +757,13 @@ export function parseReleaseRuntimeSnapshotArgs(
   }
   const productionHost = parsedOrigin.hostname === "9enio.com"
     || parsedOrigin.hostname === "www.9enio.com";
-  if ((environment === "staging" && productionHost)
-    || (environment === "production" && !productionHost)) {
+  if (
+    (environment === "staging" && productionHost)
+    || (
+      environment === "production"
+      && parsedOrigin.origin !== "https://9enio.com"
+    )
+  ) {
     throw new Error(
       `--origin does not identify the requested ${environment} environment`,
     );

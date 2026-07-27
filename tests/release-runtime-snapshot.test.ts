@@ -11,17 +11,28 @@ import { validateRuntimeSnapshot } from "../scripts/release-evidence.ts";
 const revision = "a".repeat(40);
 const hash = "b".repeat(64);
 const sitesConfigurationHash = "2".repeat(64);
+const semanticExecutionConfigurationHash = "f".repeat(64);
 
 function live(configurationHash = hash) {
+  const build = {
+    identifier: `2.4.0+${revision.slice(0, 12)}`,
+    version: "2.4.0",
+    revision,
+  };
   return {
     ok: true,
-    build: {
-      version: "2.4.0",
-      revision,
+    build,
+    api: {
+      schemaVersion: "genio-api-runtime-identity/v1",
+      replicaIdentityHash: "6".repeat(64),
+      build,
+      configurationHash,
+      semanticExecutionConfigurationHash,
     },
     configurationHash,
-      runtime: {
+    runtime: {
       ownerAllowlistVersion: "owner-allowlist-v1",
+      semanticExecutionConfigurationHash,
       releaseEnvironment: "staging",
       deploymentPhase: "activate",
       workerProtocol: "playlist-pipeline-v10",
@@ -30,6 +41,8 @@ function live(configurationHash = hash) {
       briefProviderModelId: "gpt-5.4-mini",
       baselineProviderModelId: "gpt-5.6-luna",
       escalationProviderModelId: "gpt-5.6-terra",
+      publicRolloutEvidenceHash: null,
+      publicRolloutStage: null,
       guidancePolicyVersion: "adaptive_guidance_v3",
       evidencePolicyVersion: "governed_evidence_v2",
       queryPlanPolicyVersion: "query_plan_v3_4",
@@ -49,8 +62,12 @@ function lane(configurationHash: string) {
     compatibleCapacity: 1,
     eligibleWorkerCount: 1,
     eligibleIdentityCount: 1,
+    candidateExecutorIdentityReady: true,
     eligibleRevisions: [revision],
     eligibleConfigurationHashes: [configurationHash],
+    eligibleSemanticExecutionConfigurationHashes: [
+      semanticExecutionConfigurationHash,
+    ],
   };
 }
 
@@ -62,6 +79,32 @@ function system() {
     schemaVersion: "18",
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
+    canonicalExecutorReleaseIdentityFencingVersion: "1",
+    executorFencing: {
+      ready: true,
+      incompleteJobs: 0,
+      mismatchedActiveAttempts: 0,
+      uncoveredJobs: 0,
+      requirements: [],
+    },
+    api: {
+      schemaVersion: "genio-api-runtime-identity/v1",
+      replicaIdentityHash: "7".repeat(64),
+      build: {
+        identifier: `2.4.0+${revision.slice(0, 12)}`,
+        version: "2.4.0",
+        revision,
+      },
+      configurationHash: hash,
+      semanticExecutionConfigurationHash,
+    },
+    publicRollout: {
+      active: false,
+      databaseAuthorized: true,
+      evidenceHash: null,
+      stage: null,
+      targetConfigurationHash: null,
+    },
     paused: false,
     workerLanes: {
       interactive: lane("c".repeat(64)),
@@ -103,7 +146,7 @@ function snapshot(overrides: Partial<Parameters<typeof buildReleaseRuntimeSnapsh
 describe("authoritative release runtime snapshot", () => {
   test("binds Sites, API, both worker lanes, runtime, and secret versions", () => {
     expect(snapshot()).toMatchObject({
-      schemaVersion: "genio-release-runtime-snapshot/v2",
+      schemaVersion: "genio-release-runtime-snapshot/v3",
       environment: "staging",
       scope: "full",
       candidate: { version: "2.4.0", sourceRevision: revision },
@@ -114,6 +157,18 @@ describe("authoritative release runtime snapshot", () => {
         ownerAllowlistVersion: "owner-allowlist-v1",
         candidateMatched: true,
       },
+      apiObservations: {
+        liveReplicaIdentityHash: "6".repeat(64),
+        systemReplicaIdentityHash: "7".repeat(64),
+      },
+      executorFencing: {
+        version: "1",
+        ready: true,
+        incompleteJobs: 0,
+        mismatchedActiveAttempts: 0,
+        uncoveredJobs: 0,
+        requirementsHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
       configuration: {
         apiHash: hash,
         interactiveWorkerHash: "c".repeat(64),
@@ -121,6 +176,7 @@ describe("authoritative release runtime snapshot", () => {
         sitesHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
       },
       runtime: {
+        semanticExecutionConfigurationHash,
         releaseEnvironment: "staging",
         databaseSchemaVersion: "18",
         databaseCapabilityVersion: "2",
@@ -132,6 +188,13 @@ describe("authoritative release runtime snapshot", () => {
           baseline: "gpt-5.6-luna",
           escalation: "gpt-5.6-terra",
         },
+      },
+      publicRollout: {
+        active: false,
+        databaseAuthorized: true,
+        evidenceHash: null,
+        stage: null,
+        targetConfigurationHash: null,
       },
     });
     expect(snapshot().configurationHash).toMatch(/^[0-9a-f]{64}$/u);
@@ -175,6 +238,12 @@ describe("authoritative release runtime snapshot", () => {
       "production",
       "backend",
     )).toEqual(productionBackend);
+    expect(() => validateRuntimeSnapshot({
+      ...productionBackend,
+      origin: "https://candidate-production.example",
+    }, "production", "backend")).toThrow(
+      /canonical https:\/\/9enio\.com origin/u,
+    );
     expect(() => validateRuntimeSnapshot(
       productionBackend,
       "production",
@@ -235,6 +304,24 @@ describe("authoritative release runtime snapshot", () => {
     overlapping.workerLanes.deep.eligibleRevisions.push("9".repeat(40));
     expect(() => snapshot({ systemPayload: overlapping }))
       .toThrow(/exclusively on the candidate revision/u);
+    const semanticDrift = system();
+    semanticDrift.workerLanes.deep
+      .eligibleSemanticExecutionConfigurationHashes = ["9".repeat(64)];
+    expect(() => snapshot({ systemPayload: semanticDrift }))
+      .toThrow(/semantic execution configuration does not match the API/u);
+    const mixedApi = system();
+    mixedApi.api.build.revision = "9".repeat(40);
+    expect(() => snapshot({ systemPayload: mixedApi }))
+      .toThrow(/system health API runtime identity does not match the candidate/u);
+    const mixedConfiguration = system();
+    mixedConfiguration.api.configurationHash = "9".repeat(64);
+    expect(() => snapshot({ systemPayload: mixedConfiguration }))
+      .toThrow(/system health API runtime identity does not match the candidate/u);
+    const mixedSemanticIdentity = system();
+    mixedSemanticIdentity.api.semanticExecutionConfigurationHash =
+      "9".repeat(64);
+    expect(() => snapshot({ systemPayload: mixedSemanticIdentity }))
+      .toThrow(/system health API runtime identity does not match the candidate/u);
     expect(() => parseReleaseSecretVersions({
       ...secretVersions(),
       versions: {
@@ -253,13 +340,75 @@ describe("authoritative release runtime snapshot", () => {
   });
 
   test("changes the aggregate when API config or secret versions change", () => {
+    const changedLive = live("9".repeat(64));
+    const changedSystem = system();
+    changedSystem.api.configurationHash = "9".repeat(64);
     expect(snapshot({
-      livePayload: live("9".repeat(64)),
+      livePayload: changedLive,
+      systemPayload: changedSystem,
     }).configurationHash).not.toBe(snapshot().configurationHash);
     expect(snapshot({
       secretVersions: secretVersions("8".repeat(64)),
     }).configuration.secretVersionsHash)
       .not.toBe(snapshot().configuration.secretVersionsHash);
+  });
+
+  test("binds active rollout runtime markers to exact database authority", () => {
+    const evidenceHash = "7".repeat(64);
+    const targetConfigurationHash = "8".repeat(64);
+    const stage = "genre_scene:50->100";
+    const activeLive = {
+      ...live(),
+      runtime: {
+        ...live().runtime,
+        publicRolloutEvidenceHash: evidenceHash,
+        publicRolloutStage: stage,
+      },
+    };
+    const activeSystem = {
+      ...system(),
+      publicRollout: {
+        active: true,
+        databaseAuthorized: true,
+        evidenceHash,
+        stage,
+        targetConfigurationHash,
+      },
+    };
+    expect(snapshot({
+      livePayload: activeLive,
+      systemPayload: activeSystem,
+    }).publicRollout).toEqual(activeSystem.publicRollout);
+
+    expect(() => snapshot({
+      livePayload: {
+        ...activeLive,
+        runtime: {
+          ...activeLive.runtime,
+          publicRolloutEvidenceHash: "9".repeat(64),
+        },
+      },
+      systemPayload: activeSystem,
+    })).toThrow(/does not match its database authority/u);
+    expect(() => snapshot({
+      livePayload: activeLive,
+      systemPayload: {
+        ...activeSystem,
+        publicRollout: {
+          ...activeSystem.publicRollout,
+          databaseAuthorized: false,
+        },
+      },
+    })).toThrow(/was not read from the database/u);
+    expect(() => snapshot({
+      systemPayload: {
+        ...system(),
+        publicRollout: {
+          ...system().publicRollout,
+          evidenceHash,
+        },
+      },
+    })).toThrow(/stale runtime or database markers/u);
   });
 
   test("extracts only full Sites build identities", () => {

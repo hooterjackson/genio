@@ -6,6 +6,7 @@ import {
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import {
   attestSemanticRankingReviewV1,
   semanticRankingReviewerKeyFingerprint,
@@ -26,8 +27,12 @@ import {
 } from "../lib/semantic-ranking-review.ts";
 import {
   stableReleaseVerificationKeyV1,
-  verifyHistoricalStableReleaseConsumerBundle,
 } from "./authorize-stable-release.ts";
+import {
+  HISTORICAL_STABLE_PREDECESSOR_DEFAULT_BRANCH,
+  HISTORICAL_STABLE_PREDECESSOR_REPOSITORY,
+  verifyHistoricalStablePredecessor,
+} from "./historical-stable-predecessor.ts";
 import {
   emitReleaseGateProducerArtifacts,
   loadReleaseProducerRuntimeSnapshot,
@@ -38,13 +43,16 @@ import {
 } from "./release-gate-producer.ts";
 import {
   releaseFixtureBindingsForGate,
-  stableReleaseFixtureJson,
   type ReleaseGateArtifactV1,
   type ReleaseGateProducerAttestationV1,
 } from "./release-fixtures.ts";
-import { loadSemanticBaselineHandoff } from "./semantic-baseline-handoff.ts";
+import {
+  loadSemanticBaselineHandoff,
+  SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
+} from "./semantic-baseline-handoff.ts";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
+const SOURCE_REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const KEY_ID = /^[0-9A-Za-z][0-9A-Za-z._:-]{2,79}$/u;
 const ATTEST_MODE = "attest";
 const PRODUCE_MODE = "produce";
@@ -55,6 +63,7 @@ interface SemanticReviewInputFiles {
   reviewerAttestationPath: string;
   reviewerVerificationKeyPath: string;
   protectedBaselineHandoffDirectory: string;
+  protectedBaselineGithubAttestationVerificationPath: string;
   blindedPackagePath: string;
   blindScorecardPath: string;
   blindMappingPath: string;
@@ -73,6 +82,12 @@ export interface SemanticRankingReviewProducerArgs {
   };
   reviewerTrustPolicy: SemanticRankingReviewerTrustPolicyV1;
   approvedBaselineHandoffSha256: string;
+  predecessorVerification: {
+    repository: string;
+    defaultBranch: string;
+    mode: "normal" | "bootstrap";
+    controllerSourceRevision: string;
+  };
   review: SemanticReviewInputFiles;
   files: ReleaseProducerFiles;
 }
@@ -215,6 +230,11 @@ export function parseSemanticRankingReviewProducerArgs(
     "--reviewer-attestation",
     "--reviewer-verification-key",
     "--protected-baseline-handoff-directory",
+    "--protected-baseline-github-attestation-verification",
+    "--expected-predecessor-repository",
+    "--expected-predecessor-default-branch",
+    "--expected-predecessor-mode",
+    "--expected-predecessor-controller-revision",
     "--blinded-package",
     "--blind-scorecard",
     "--blind-mapping",
@@ -238,6 +258,33 @@ export function parseSemanticRankingReviewProducerArgs(
     sourceRevision: expectedRevision,
     imageDigest,
   });
+  const predecessorRepository = releaseProducerOption(
+    argv,
+    "--expected-predecessor-repository",
+  );
+  const predecessorDefaultBranch = releaseProducerOption(
+    argv,
+    "--expected-predecessor-default-branch",
+  );
+  const predecessorControllerSourceRevision = releaseProducerOption(
+    argv,
+    "--expected-predecessor-controller-revision",
+  ).toLowerCase();
+  const predecessorMode = releaseProducerOption(
+    argv,
+    "--expected-predecessor-mode",
+  );
+  if (
+    predecessorRepository !== HISTORICAL_STABLE_PREDECESSOR_REPOSITORY
+    || predecessorDefaultBranch
+      !== HISTORICAL_STABLE_PREDECESSOR_DEFAULT_BRANCH
+    || (predecessorMode !== "normal" && predecessorMode !== "bootstrap")
+    || !SOURCE_REVISION.test(predecessorControllerSourceRevision)
+  ) {
+    throw new Error(
+      "semantic review predecessor verification requires the exact protected repository, default branch, mode, and controller revision",
+    );
+  }
   return {
     origin: exactConfiguredStagingOrigin(
       releaseProducerOption(argv, "--origin"),
@@ -262,6 +309,13 @@ export function parseSemanticRankingReviewProducerArgs(
       semanticReviewerTrustPolicyFromEnvironment(environment),
     approvedBaselineHandoffSha256:
       semanticBaselineHandoffHashFromEnvironment(environment),
+    predecessorVerification: {
+      repository: predecessorRepository,
+      defaultBranch: predecessorDefaultBranch,
+      mode: predecessorMode,
+      controllerSourceRevision:
+        predecessorControllerSourceRevision,
+    },
     review: {
       reviewArtifactPath: releaseProducerOption(argv, "--review-artifact"),
       reviewReportPath: releaseProducerOption(argv, "--review-report"),
@@ -272,6 +326,11 @@ export function parseSemanticRankingReviewProducerArgs(
         releaseProducerOption(
           argv,
           "--protected-baseline-handoff-directory",
+        ),
+      protectedBaselineGithubAttestationVerificationPath:
+        releaseProducerOption(
+          argv,
+          "--protected-baseline-github-attestation-verification",
         ),
       blindedPackagePath:
         releaseProducerOption(argv, "--blinded-package"),
@@ -415,6 +474,7 @@ export async function produceSemanticRankingReviewGate(
     args.review.reviewerAttestationPath,
     args.review.reviewerVerificationKeyPath,
     args.review.protectedBaselineHandoffDirectory,
+    args.review.protectedBaselineGithubAttestationVerificationPath,
     args.review.blindedPackagePath,
     args.review.blindScorecardPath,
     args.review.blindMappingPath,
@@ -448,6 +508,18 @@ export async function produceSemanticRankingReviewGate(
       artifactPath: args.review.reviewArtifactPath,
       reportPath: args.review.reviewReportPath,
     });
+  if (
+    resolve(
+      args.review.protectedBaselineGithubAttestationVerificationPath,
+    ) !== resolve(
+      args.review.protectedBaselineHandoffDirectory,
+      SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
+    )
+  ) {
+    throw new Error(
+      "fresh predecessor GitHub verification must be the sealed handoff file",
+    );
+  }
   const protectedBaselineHandoff = await loadSemanticBaselineHandoff({
     directory: args.review.protectedBaselineHandoffDirectory,
     expectedManifestSha256: args.approvedBaselineHandoffSha256,
@@ -457,6 +529,10 @@ export async function produceSemanticRankingReviewGate(
       args.reviewerTrustPolicy.approvedBaselineMetadataSha256,
     expectedStableTag:
       args.reviewerTrustPolicy.approvedBaselineStableTag,
+    expectedPredecessorMode:
+      args.predecessorVerification.mode,
+    expectedPredecessorControllerSourceRevision:
+      args.predecessorVerification.controllerSourceRevision,
     expectedReleaseVerificationKeySha256:
       args.reviewerTrustPolicy.approvedBaselineReleaseKeySha256,
     expectedStableAuthorizerKeyId:
@@ -469,6 +545,7 @@ export async function produceSemanticRankingReviewGate(
     blindedPackage,
     blindScorecard,
     blindMapping,
+    protectedBaselineGithubAttestationVerification,
   ] = await Promise.all([
     jsonInput(args.review.blindedPackagePath, "--blinded-package")
       .then(validateSemanticRankingBlindedPackageV1),
@@ -476,7 +553,21 @@ export async function produceSemanticRankingReviewGate(
       .then(validateSemanticRankingBlindScorecardV1),
     jsonInput(args.review.blindMappingPath, "--blind-mapping")
       .then(validateSemanticRankingBlindMappingV1),
+    jsonInput(
+      args.review.protectedBaselineGithubAttestationVerificationPath,
+      "--protected-baseline-github-attestation-verification",
+    ),
   ]);
+  if (
+    !isDeepStrictEqual(
+      protectedBaselineGithubAttestationVerification,
+      protectedBaselineHandoff.githubAttestationVerification,
+    )
+  ) {
+    throw new Error(
+      "fresh predecessor GitHub verification differs from the sealed handoff",
+    );
+  }
   const protectedBaselineMetadata =
     protectedBaselineHandoff.protectedBaselineMetadata;
   const protectedBaselineFinalizationEvidence =
@@ -487,14 +578,14 @@ export async function produceSemanticRankingReviewGate(
     protectedBaselineHandoff.releaseVerificationKey;
   const protectedBaselineStableAuthorizerKey =
     protectedBaselineHandoff.stableAuthorizerVerificationKey;
-  const protectedBaselineLineage =
-    verifyHistoricalStableReleaseConsumerBundle({
-      finalizationEvidence: protectedBaselineFinalizationEvidence,
+  const protectedBaselineVerification =
+    verifyHistoricalStablePredecessor({
+      evidence: protectedBaselineFinalizationEvidence,
       protectedBaselineMetadata,
       releaseVerificationKey: protectedBaselineReleaseKey.key,
       approvedReleaseKeySha256:
         args.reviewerTrustPolicy.approvedBaselineReleaseKeySha256,
-      stableAuthorization: protectedBaselineStableAuthorization,
+      authorization: protectedBaselineStableAuthorization,
       stableAuthorizationVerificationKey:
         protectedBaselineStableAuthorizerKey.key,
       approvedStableAuthorizerKeyId:
@@ -503,14 +594,34 @@ export async function produceSemanticRankingReviewGate(
       approvedStableAuthorizerKeySha256:
         args.reviewerTrustPolicy
           .approvedBaselineStableAuthorizerKeySha256,
-      expectedRcTag: protectedBaselineMetadata.rcTag,
-      expectedVersion: protectedBaselineMetadata.version,
-      expectedRevision: protectedBaselineMetadata.sourceRevision,
-      expectedImageDigest: protectedBaselineMetadata.imageDigest,
-      expectedImageReference: protectedBaselineMetadata.imageReference,
+      imageAttestation:
+        protectedBaselineHandoff.stableImageAttestation,
+      storedConsumer:
+        protectedBaselineHandoff.stableReleaseConsumer,
+      githubAttestationVerification:
+        protectedBaselineGithubAttestationVerification,
+      expectedPredecessorRcTag: protectedBaselineMetadata.rcTag,
+      expectedPredecessorVersion: protectedBaselineMetadata.version,
+      expectedPredecessorRevision: protectedBaselineMetadata.sourceRevision,
+      expectedPredecessorImageDigest: protectedBaselineMetadata.imageDigest,
+      expectedPredecessorImageReference:
+        protectedBaselineMetadata.imageReference,
+      expectedSuccessorRcTag: candidate.tag,
+      expectedSuccessorSourceRevision: candidate.sourceRevision,
+      expectedRepository:
+        args.predecessorVerification.repository,
+      expectedDefaultBranch:
+        args.predecessorVerification.defaultBranch,
+      expectedControllerSourceRevision:
+        args.predecessorVerification.controllerSourceRevision,
       now: reviewArtifact.reviewedAt,
     });
+  const protectedBaselineLineage =
+    protectedBaselineVerification.lineage;
   if (
+    protectedBaselineVerification.mode
+      !== protectedBaselineHandoff.manifest.predecessor.mode
+    ||
     protectedBaselineLineage.protectedBaselineMetadataHash
       !== args.reviewerTrustPolicy.approvedBaselineMetadataSha256
     || protectedBaselineLineage.candidate.stableTag
@@ -518,16 +629,6 @@ export async function produceSemanticRankingReviewGate(
   ) {
     throw new Error(
       "protected semantic baseline lineage is not the approved predecessor release",
-    );
-  }
-  if (
-    stableReleaseFixtureJson(protectedBaselineLineage)
-      !== stableReleaseFixtureJson(
-        protectedBaselineHandoff.stableReleaseConsumer,
-      )
-  ) {
-    throw new Error(
-      "protected semantic baseline stored consumer is not the rederived signed lineage",
     );
   }
   validateSemanticRankingReviewBindingsV2({
@@ -600,6 +701,25 @@ export async function produceSemanticRankingReviewGate(
         stableReleaseVerificationKeyV1(
           protectedBaselineStableAuthorizerKey.key,
         ),
+      protectedBaselineVerification: {
+        schemaVersion:
+          "genio-historical-stable-predecessor-verification-context/v1",
+        mode: protectedBaselineVerification.mode,
+        repository: args.predecessorVerification.repository,
+        defaultBranch: args.predecessorVerification.defaultBranch,
+        controllerSourceRevision:
+          protectedBaselineVerification.mode === "bootstrap"
+            ? args.predecessorVerification.controllerSourceRevision
+            : null,
+        successorRcTag: candidate.tag,
+        successorSourceRevision: candidate.sourceRevision,
+      },
+      protectedBaselineImageAttestation:
+        protectedBaselineVerification.imageAttestation,
+      protectedBaselineStoredConsumer:
+        protectedBaselineVerification.storedConsumer,
+      protectedBaselineGithubAttestationVerification:
+        protectedBaselineVerification.githubAttestationVerification,
       protectedBaselineLineage,
       blindedPackage,
       blindScorecard,

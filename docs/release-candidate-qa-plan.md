@@ -676,9 +676,12 @@ materializes the two historical Ed25519 public keys only from
 `RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL` GitHub
 secrets, then rejects them unless their SPKI fingerprints equal the pins
 derived from the immutable consumer manifest. The sealed
-`genio-semantic-baseline-handoff/v1` manifest binds the RC tag/revision,
+`genio-semantic-baseline-handoff/v2` manifest binds the RC tag/revision,
 release ID/identity, all five exact asset-byte hashes, both exact key-byte
-hashes, and both key fingerprints. The workflow uploads that fixed eight-file
+hashes, both key fingerprints, the exact predecessor mode/controller revision,
+and the fresh GitHub attestation-verification byte hash. The fresh verification
+JSON is itself part of the exact directory. The workflow uploads that fixed
+nine-file
 inventory, re-downloads and revalidates it before image publication, and
 preserves it inside the exact candidate artifact. Neither public-key bytes nor
 handoff authority may come from repository variables.
@@ -735,6 +738,11 @@ pnpm release:semantic-review:produce -- \
   --reviewer-attestation <DETACHED_REVIEWER_ATTESTATION_JSON> \
   --reviewer-verification-key <INDEPENDENT_REVIEWER_ED25519_PUBLIC_KEY> \
   --protected-baseline-handoff-directory <EXACT_RC_HANDOFF_DIRECTORY> \
+  --protected-baseline-github-attestation-verification <EXACT_RC_HANDOFF_DIRECTORY>/predecessor-image-attestation-verification.json \
+  --expected-predecessor-repository hooterjackson/genio \
+  --expected-predecessor-default-branch main \
+  --expected-predecessor-mode <normal|bootstrap> \
+  --expected-predecessor-controller-revision <SEALED_PREDECESSOR_CONTROLLER_GIT_SHA> \
   --blinded-package <RANDOMIZED_BLINDED_PACKAGE_JSON> \
   --blind-scorecard <EXACT_BLIND_SCORECARD_JSON> \
   --blind-mapping <SEPARATE_BLIND_MAPPING_JSON> \
@@ -758,8 +766,13 @@ cryptographically rederived lineage, and binds the exact stable tag,
 source/image, final-browser evidence, metadata, and fixture hashes to the
 immutable predecessor pins. Expiration today does not invalidate lineage that
 was valid then; non-overlapping, future-dated, repinned, or hash-mismatched
-lineage fails. The producer invocation additionally requires the handoff hash;
-the same seven reviewer/baseline pins remain mandatory when
+lineage fails. For the one-time `v2.3.4` bootstrap predecessor, those baseline fixture hashes
+are explicitly reconstruction-wrapper-only evidence. The bootstrap
+`wrapperFixtureEvidenceHash` is derived from three typed staging gate
+artifacts and their detached producer attestations and never claims equality
+with unrecovered historical Railway production outputs.
+The producer invocation additionally requires the handoff hash; the same seven
+reviewer/baseline pins remain mandatory when
 `release:evidence sign` revalidates the signed producer result. A
 caller-generated second key is
 not an independent reviewer. The producer also rejects reuse of the release

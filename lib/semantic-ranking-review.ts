@@ -903,6 +903,23 @@ export function validateSemanticRankingReviewArtifactV1(
   };
 }
 
+/**
+ * The candidate arms in a validated blinded review are the only authoritative
+ * source for the fixture hashes that may become the next protected stable
+ * baseline. Scores are deliberately excluded: the stable baseline stores the
+ * exact ordered output identity, not a mutable review presentation.
+ */
+export function semanticRankingCandidateBaselineFixturesV1(
+  value: unknown,
+): readonly SemanticRankingProtectedBaselineFixtureV1[] {
+  const artifact = validateSemanticRankingReviewArtifactV1(value);
+  return artifact.pairs.map(({ fixtureId, candidate }) => ({
+    fixtureId,
+    orderedManifestHash: candidate.orderedManifestHash,
+    outputHash: candidate.outputHash,
+  }));
+}
+
 export function validateSemanticRankingReviewBindingsV2(input: {
   artifact: unknown;
   protectedBaselineMetadata: unknown;

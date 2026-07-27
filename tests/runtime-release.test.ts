@@ -3,6 +3,7 @@ import {
   apiReleaseConfigurationHash,
   releaseOwnerAllowlistVersion,
   runtimeReleaseContract,
+  semanticExecutionConfigurationHash,
 } from "../server/runtime-release.ts";
 
 describe("public V3 runtime release contract", () => {
@@ -201,5 +202,92 @@ describe("public V3 runtime release contract", () => {
         guidanceContractReggaetonCanaryEnabled: false,
       });
     }
+  });
+
+  test("fences normalized semantic execution controls without cohort percentages or secrets", () => {
+    const environment = {
+      APPLE_STOREFRONT: "US",
+      GUIDANCE_CONTRACT_V3_ENABLED: "true",
+      GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
+      OPENAI_TIMEOUT_MS: "60000",
+      FAST_MATCH_LOOKUP_TIMEOUT_MS: "7000",
+      APPLE_CATALOG_RECOVERY_TIMEOUT_MS: "90000",
+      RESULT_REUSE_DAYS: "30",
+      OPENAI_MAX_RESPONSE_RESERVATION_USD: "0.75",
+      OPENAI_API_KEY: "sk-secret-one",
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "10",
+    };
+    const first = semanticExecutionConfigurationHash(environment);
+    expect(first).toMatch(/^[0-9a-f]{64}$/u);
+    expect(runtimeReleaseContract(environment)
+      .semanticExecutionConfigurationHash).toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
+    })).not.toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      OPENAI_TIMEOUT_MS: "60001",
+    })).not.toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      FAST_MATCH_LOOKUP_TIMEOUT_MS: "7001",
+    })).not.toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      APPLE_MATCH_MAX_QUERIES: "7",
+    })).not.toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      OPENAI_API_KEY: "sk-secret-two",
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "50",
+    })).toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      APPLE_STOREFRONT: "us",
+      OPENAI_TIMEOUT_MS: "060000",
+    })).toBe(first);
+    expect(() => semanticExecutionConfigurationHash({
+      ...environment,
+      GUIDANCE_CONTRACT_V3_ENABLED: "yes",
+    })).toThrow(/must be true or false/u);
+  });
+
+  test("keeps operational monthly ceilings outside semantic execution identity", () => {
+    const environment = {
+      APP_MONTHLY_COST_LIMIT_USD: "100",
+      MONTHLY_RESEARCH_CEILING_USD: "40",
+      AUTO_RUN_COST_LIMIT_USD: "0.75",
+      INITIAL_COST_GATE_USD: "0.20",
+    };
+    const first = semanticExecutionConfigurationHash(environment);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      APP_MONTHLY_COST_LIMIT_USD: "250",
+      MONTHLY_RESEARCH_CEILING_USD: "80",
+    })).toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      AUTO_RUN_COST_LIMIT_USD: "1.00",
+    })).not.toBe(first);
+    expect(semanticExecutionConfigurationHash({
+      ...environment,
+      INITIAL_COST_GATE_USD: "0.25",
+    })).not.toBe(first);
+  });
+
+  test("records only the privacy-safe MusicBrainz readiness mode", () => {
+    const configuredEmail = semanticExecutionConfigurationHash({
+      MUSICBRAINZ_CONTACT: "owner@example.com",
+    });
+    expect(semanticExecutionConfigurationHash({
+      MUSICBRAINZ_CONTACT: "another-operator@example.net",
+    })).toBe(configuredEmail);
+    expect(semanticExecutionConfigurationHash({
+      MUSICBRAINZ_CONTACT: "https://9enio.com/contact",
+    })).not.toBe(configuredEmail);
+    expect(() => semanticExecutionConfigurationHash({
+      MUSICBRAINZ_CONTACT: "operator-contact-not-configured.invalid",
+    })).toThrow(/valid email address or HTTPS URL/u);
   });
 });

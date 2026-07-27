@@ -36,6 +36,8 @@ import {
   stableReleaseEvidenceJson,
   validateReleaseEvidencePayload,
 } from "../scripts/release-evidence.ts";
+import { createStrictSignedEnvelope } from "../shared/signed-artifact.ts";
+import { semanticBehaviorHashV1 } from "../shared/semantic-release-evidence.ts";
 import {
   RELEASE_GATE_ARTIFACT_SCHEMA_V1,
   releaseFixtureSha256,
@@ -45,20 +47,38 @@ import {
   type ReleaseGateName,
 } from "../scripts/release-fixtures.ts";
 import {
-  authorizeStableRelease,
+  SIGNED_STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
+  STABLE_RELEASE_AUTHORIZATION_ISSUER_V1,
+  STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
   stableReleaseKeyFingerprint,
   verifyHistoricalStableReleaseConsumerBundle,
 } from "../scripts/authorize-stable-release.ts";
 import {
   createSemanticBaselineHandoff,
+  loadSemanticBaselineHandoff,
   SEMANTIC_BASELINE_RELEASE_ASSET_NAMES,
   semanticBaselineReleaseIdentitySha256,
 } from "../scripts/semantic-baseline-handoff.ts";
+import {
+  authorizeStablePredecessorBootstrap,
+  createStablePredecessorBootstrapEvidence,
+  createStablePredecessorBootstrapImageAttestationV1,
+  createStablePredecessorOriginalRailwayProvenanceV1,
+  stablePredecessorRecoveredRailwayObservationV1,
+  STABLE_PREDECESSOR_BOOTSTRAP_COMPATIBILITY_RC_TAG,
+  STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION,
+  STABLE_PREDECESSOR_BOOTSTRAP_TAG,
+  verifyHistoricalStablePredecessorBootstrapLineage,
+} from "../scripts/stable-predecessor-bootstrap.ts";
 import {
   assertIndependentSemanticReviewerKey,
   parseSemanticRankingReviewProducerArgs,
   produceSemanticRankingReviewGate,
 } from "../scripts/semantic-ranking-review-producer.ts";
+import {
+  createStableBootstrapIndependentEvidenceFixture,
+  stableBootstrapSourceBytesFixture,
+} from "./helpers/stable-bootstrap-independent-evidence.ts";
 
 const revision = "a".repeat(40);
 const baselineRevision = "b".repeat(40);
@@ -66,6 +86,10 @@ const imageDigest = `sha256:${"c".repeat(64)}`;
 const baselineImageDigest = `sha256:${"d".repeat(64)}`;
 const reviewedAt = "2026-07-23T20:00:00.000Z";
 const stagingOrigin = "https://staging-9enio.example";
+const releaseCandidateQaPlanUrl = new URL(
+  "../docs/release-candidate-qa-plan.md",
+  import.meta.url,
+);
 const fixtureIds = [
   "fixed-three-track-control-v1",
   "smooth-reggaeton-heat-50-v1",
@@ -83,6 +107,28 @@ function semanticReviewInputs(
     finalizationEvidencePayloadHash: digest("e"),
     finalBrowserGateEvidenceHash: digest("f"),
   },
+  baselineIdentity: {
+    rcTag: string;
+    stableTag: string;
+    version: string;
+    sourceRevision: string;
+    imageDigest: string;
+    imageReference: string;
+  } = {
+    rcTag: "v2.3.9-rc.2",
+    stableTag: "v2.3.9",
+    version: "2.3.9",
+    sourceRevision: baselineRevision,
+    imageDigest: baselineImageDigest,
+    imageReference:
+      `ghcr.io/hooterjackson/genio@${baselineImageDigest}`,
+  },
+  baselineFixtures: SemanticRankingProtectedBaselineMetadataV1["fixtures"] =
+    fixtureIds.map((fixtureId, index) => ({
+      fixtureId,
+      orderedManifestHash: digest(String(index + 1)),
+      outputHash: digest(String(index + 4)),
+    })),
 ): {
   artifact: SemanticRankingReviewArtifactV1;
   protectedBaselineMetadata: SemanticRankingProtectedBaselineMetadataV1;
@@ -93,22 +139,12 @@ function semanticReviewInputs(
 } {
   const protectedBaselineMetadata: SemanticRankingProtectedBaselineMetadataV1 = {
     schemaVersion: "genio-semantic-ranking-protected-baseline/v2",
-    rcTag: "v2.3.9-rc.2",
-    stableTag: "v2.3.9",
-    version: "2.3.9",
-    sourceRevision: baselineRevision,
-    imageDigest: baselineImageDigest,
-    imageReference:
-      `ghcr.io/hooterjackson/genio@${baselineImageDigest}`,
+    ...baselineIdentity,
     finalizationEvidencePayloadHash:
       lineage.finalizationEvidencePayloadHash,
     finalBrowserGateEvidenceHash:
       lineage.finalBrowserGateEvidenceHash,
-    fixtures: fixtureIds.map((fixtureId, index) => ({
-      fixtureId,
-      orderedManifestHash: digest(String(index + 1)),
-      outputHash: digest(String(index + 4)),
-    })),
+    fixtures: baselineFixtures,
   };
   const candidateOutputs = fixtureIds.map((fixtureId, index) => ({
     fixtureId,
@@ -248,6 +284,7 @@ function runtimeSnapshot() {
     secretVersionsHash: "5".repeat(64),
   };
   const runtime = {
+    semanticExecutionConfigurationHash: "f".repeat(64),
     releaseEnvironment: "staging" as const,
     deploymentPhase: "activate" as const,
     databaseSchemaVersion: "18" as const,
@@ -274,7 +311,7 @@ function runtimeSnapshot() {
     },
   };
   const unsigned = {
-    schemaVersion: "genio-release-runtime-snapshot/v2" as const,
+    schemaVersion: "genio-release-runtime-snapshot/v3" as const,
     generatedAt: reviewedAt,
     origin: stagingOrigin,
     environment: "staging" as const,
@@ -284,8 +321,27 @@ function runtimeSnapshot() {
       sourceRevision: revision,
     },
     sitesObservation,
+    apiObservations: {
+      liveReplicaIdentityHash: "8".repeat(64),
+      systemReplicaIdentityHash: "9".repeat(64),
+    },
+    executorFencing: {
+      version: "1",
+      ready: true,
+      incompleteJobs: 0,
+      mismatchedActiveAttempts: 0,
+      uncoveredJobs: 0,
+      requirementsHash: "a".repeat(64),
+    },
     configuration,
     runtime,
+    publicRollout: {
+      active: false,
+      databaseAuthorized: true,
+      evidenceHash: null,
+      stage: null,
+      targetConfigurationHash: null,
+    },
     credentialVersionHashes: {
       provider: "6".repeat(64),
       apple: "7".repeat(64),
@@ -379,6 +435,9 @@ function signedBaselineFinalization(signingKey: KeyObject) {
       publicRolloutEvidencePayloadHash: "3".repeat(64),
       publicRolloutCompletedAt: rolloutCompletedAt,
       publicRolloutIntentGroup: "genre_scene",
+      publicRolloutFromPercent: "50",
+      publicRolloutToPercent: "100",
+      publicRolloutTargetConfigurationHash: "4".repeat(64),
     },
     configuration,
     stagingControls: {
@@ -421,6 +480,17 @@ function signedBaselineFinalization(signingKey: KeyObject) {
       controlPlaneKeyFingerprint: "8".repeat(64),
     },
     runtime,
+    semanticReview: {
+      schemaVersion: "genio-release-semantic-review/v1",
+      gateEvidenceHash: digest("0"),
+      reviewedAt: "2026-07-22T17:00:00.000Z",
+      semanticBehaviorHash: semanticBehaviorHashV1(runtime),
+      fixtures: fixtureIds.map((fixtureId, index) => ({
+        fixtureId,
+        orderedManifestHash: digest(String(index + 1)),
+        outputHash: digest(String(index + 4)),
+      })),
+    },
     environmentSnapshots: {
       staging: {
         scope: "full",
@@ -436,6 +506,13 @@ function signedBaselineFinalization(signingKey: KeyObject) {
         providerCredentialVersionHash: "1".repeat(64),
         appleCredentialVersionHash: "3".repeat(64),
         appleQaVerifierCredentialVersionHash: "d".repeat(64),
+        publicRollout: {
+          active: false,
+          databaseAuthorized: true,
+          evidenceHash: null,
+          stage: null,
+          targetConfigurationHash: null,
+        },
       },
       production: {
         scope: "full",
@@ -451,6 +528,13 @@ function signedBaselineFinalization(signingKey: KeyObject) {
         providerCredentialVersionHash: "2".repeat(64),
         appleCredentialVersionHash: "4".repeat(64),
         appleQaVerifierCredentialVersionHash: "e".repeat(64),
+        publicRollout: {
+          active: true,
+          databaseAuthorized: true,
+          evidenceHash: "3".repeat(64),
+          stage: "genre_scene:50->100",
+          targetConfigurationHash: "4".repeat(64),
+        },
       },
     },
     gates: [
@@ -480,7 +564,10 @@ function signedBaselineFinalization(signingKey: KeyObject) {
   };
 }
 
-async function setup(score = 4) {
+async function setup(
+  score = 4,
+  predecessorMode: "normal" | "bootstrap" = "normal",
+) {
   const directory = await mkdtemp(join(tmpdir(), "genio-semantic-review-"));
   const handoffDirectory = join(directory, "semantic-baseline-handoff");
   await mkdir(handoffDirectory, { mode: 0o700 });
@@ -488,60 +575,260 @@ async function setup(score = 4) {
   const producer = generateKeyPairSync("ed25519");
   const baselineRelease = generateKeyPairSync("ed25519");
   const baselineStableAuthorizer = generateKeyPairSync("ed25519");
-  const baselineFinalization =
-    signedBaselineFinalization(baselineRelease.privateKey);
-  const finalBrowserGate = baselineFinalization.payload.gates.find(
-    ({ name }) => name === "final_custom_domain_browser",
-  );
-  if (!finalBrowserGate) {
-    throw new Error("baseline finalization test fixture has no browser gate");
-  }
-  const semanticInputs = semanticReviewInputs(score, {
-    finalizationEvidencePayloadHash: baselineFinalization.payloadHash,
-    finalBrowserGateEvidenceHash: finalBrowserGate.evidenceHash,
-  });
+  const originalRailwayProvenance = generateKeyPairSync("ed25519");
   const baselineStableAuthorizerKeyId =
     "semantic-baseline-stable-authorizer-test-v1";
-  const baselineStableAuthorization = await authorizeStableRelease({
-    finalizationEvidence: baselineFinalization,
-    protectedBaselineMetadata: semanticInputs.protectedBaselineMetadata,
-    releaseVerificationKey: baselineRelease.publicKey,
-    approvedReleaseKeySha256:
-      stableReleaseKeyFingerprint(baselineRelease.publicKey),
-    authorizerSigningKey: baselineStableAuthorizer.privateKey,
-    approvedAuthorizerKeyId: baselineStableAuthorizerKeyId,
-    approvedAuthorizerKeySha256:
-      stableReleaseKeyFingerprint(baselineStableAuthorizer.publicKey),
-    expectedRcTag: semanticInputs.protectedBaselineMetadata.rcTag,
-    expectedVersion: semanticInputs.protectedBaselineMetadata.version,
-    expectedRevision:
-      semanticInputs.protectedBaselineMetadata.sourceRevision,
-    expectedImageDigest:
-      semanticInputs.protectedBaselineMetadata.imageDigest,
-    generatedAt: "2026-07-22T19:00:00.000Z",
-  });
-  const baselineStoredConsumer = verifyHistoricalStableReleaseConsumerBundle({
-    finalizationEvidence: baselineFinalization,
-    protectedBaselineMetadata: semanticInputs.protectedBaselineMetadata,
-    releaseVerificationKey: baselineRelease.publicKey,
-    approvedReleaseKeySha256:
-      stableReleaseKeyFingerprint(baselineRelease.publicKey),
-    stableAuthorization: baselineStableAuthorization,
-    stableAuthorizationVerificationKey:
-      baselineStableAuthorizer.publicKey,
-    approvedStableAuthorizerKeyId: baselineStableAuthorizerKeyId,
-    approvedStableAuthorizerKeySha256:
-      stableReleaseKeyFingerprint(baselineStableAuthorizer.publicKey),
-    expectedRcTag: semanticInputs.protectedBaselineMetadata.rcTag,
-    expectedVersion: semanticInputs.protectedBaselineMetadata.version,
-    expectedRevision:
-      semanticInputs.protectedBaselineMetadata.sourceRevision,
-    expectedImageDigest:
-      semanticInputs.protectedBaselineMetadata.imageDigest,
-    expectedImageReference:
-      semanticInputs.protectedBaselineMetadata.imageReference,
-    now: reviewedAt,
-  });
+  const predecessor = (() => {
+    if (predecessorMode === "normal") {
+      const baselineFinalization =
+        signedBaselineFinalization(baselineRelease.privateKey);
+      const finalBrowserGate = baselineFinalization.payload.gates.find(
+        ({ name }) => name === "final_custom_domain_browser",
+      );
+      if (!finalBrowserGate) {
+        throw new Error(
+          "baseline finalization test fixture has no browser gate",
+        );
+      }
+      const semanticInputs = semanticReviewInputs(score, {
+        finalizationEvidencePayloadHash: baselineFinalization.payloadHash,
+        finalBrowserGateEvidenceHash: finalBrowserGate.evidenceHash,
+      });
+      const baselineStableAuthorization = createStrictSignedEnvelope({
+        envelopeSchemaVersion:
+          SIGNED_STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
+        payload: {
+          schemaVersion: STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
+          issuer: STABLE_RELEASE_AUTHORIZATION_ISSUER_V1,
+          generatedAt: "2026-07-22T19:00:00.000Z",
+          expiresAt: baselineFinalization.payload.expiresAt,
+          action: "create_stable_tag_and_github_release",
+          candidate: {
+            rcTag: semanticInputs.protectedBaselineMetadata.rcTag,
+            stableTag: semanticInputs.protectedBaselineMetadata.stableTag,
+            version: semanticInputs.protectedBaselineMetadata.version,
+            sourceRevision:
+              semanticInputs.protectedBaselineMetadata.sourceRevision,
+            imageDigest:
+              semanticInputs.protectedBaselineMetadata.imageDigest,
+          },
+          finalizationEvidencePayloadHash: baselineFinalization.payloadHash,
+          finalBrowserGateEvidenceHash: finalBrowserGate.evidenceHash,
+          protectedBaselineMetadataHash: semanticInputs.baselineMetadataHash,
+        },
+        signingKey: baselineStableAuthorizer.privateKey,
+        keyId: baselineStableAuthorizerKeyId,
+      });
+      const baselineStoredConsumer =
+        verifyHistoricalStableReleaseConsumerBundle({
+          finalizationEvidence: baselineFinalization,
+          protectedBaselineMetadata:
+            semanticInputs.protectedBaselineMetadata,
+          releaseVerificationKey: baselineRelease.publicKey,
+          approvedReleaseKeySha256:
+            stableReleaseKeyFingerprint(baselineRelease.publicKey),
+          stableAuthorization: baselineStableAuthorization,
+          stableAuthorizationVerificationKey:
+            baselineStableAuthorizer.publicKey,
+          approvedStableAuthorizerKeyId:
+            baselineStableAuthorizerKeyId,
+          approvedStableAuthorizerKeySha256:
+            stableReleaseKeyFingerprint(
+              baselineStableAuthorizer.publicKey,
+            ),
+          expectedRcTag:
+            semanticInputs.protectedBaselineMetadata.rcTag,
+          expectedVersion:
+            semanticInputs.protectedBaselineMetadata.version,
+          expectedRevision:
+            semanticInputs.protectedBaselineMetadata.sourceRevision,
+          expectedImageDigest:
+            semanticInputs.protectedBaselineMetadata.imageDigest,
+          expectedImageReference:
+            semanticInputs.protectedBaselineMetadata.imageReference,
+          now: reviewedAt,
+        });
+      return {
+        baselineFinalization,
+        baselineStableAuthorization,
+        baselineStoredConsumer,
+        baselineImageAttestation: {
+          verified: true,
+          evidenceHash: "f".repeat(64),
+        },
+        baselineGithubAttestationVerification: {
+          verificationResult: "verified",
+          sourceRevision: baselineRevision,
+        },
+        semanticInputs,
+      };
+    }
+
+    const baselineGithubAttestationVerification = {
+      verificationResult: "verified",
+      subjectDigest: baselineImageDigest,
+      repository: "hooterjackson/genio",
+    };
+    const recoveredRailwayObservation =
+      stablePredecessorRecoveredRailwayObservationV1();
+    const baselineImageAttestation =
+      createStablePredecessorBootstrapImageAttestationV1({
+        repository: "hooterjackson/genio",
+        defaultBranch: "main",
+        controllerSourceRevision: revision,
+        imageReference:
+          `ghcr.io/hooterjackson/genio@${baselineImageDigest}`,
+        recoveredRailwayObservation,
+        githubAttestationVerification:
+          baselineGithubAttestationVerification,
+      });
+    const sourceBytes = stableBootstrapSourceBytesFixture();
+    const independent =
+      createStableBootstrapIndependentEvidenceFixture({
+        candidate: {
+          tag: STABLE_PREDECESSOR_BOOTSTRAP_COMPATIBILITY_RC_TAG,
+          version: "2.3.4",
+          sourceRevision:
+            STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION,
+          imageDigest: baselineImageDigest,
+          sitesSourceRevision:
+            STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION,
+        },
+        completedAt: "2026-07-22T18:00:00.000Z",
+      });
+    const finalBrowserSources = independent.bundle.sources.at(-1)!.artifact
+      .sources;
+    const originalRailwayProvenanceKeyId =
+      "semantic-original-railway-provenance-v1";
+    const originalRailwayProvenanceArtifact =
+      createStablePredecessorOriginalRailwayProvenanceV1({
+        repository: "hooterjackson/genio",
+        originalImageReference:
+          `registry.railway.app/genio-production@sha256:${"e".repeat(64)}`,
+        recoveredRailwayObservation,
+        signingKey: originalRailwayProvenance.privateKey,
+        keyId: originalRailwayProvenanceKeyId,
+        generatedAt: "2026-07-22T18:00:00.000Z",
+      });
+    const baselineFinalization = createStablePredecessorBootstrapEvidence({
+      repository: "hooterjackson/genio",
+      defaultBranch: "main",
+      controllerSourceRevision: revision,
+      ...sourceBytes,
+      imageReference:
+        `ghcr.io/hooterjackson/genio@${baselineImageDigest}`,
+      imageAttestation: baselineImageAttestation,
+      recoveredRailwayObservation,
+      independentEvidence: independent.bundle,
+      generatedAt: "2026-07-22T18:00:00.000Z",
+      signingKey: baselineRelease.privateKey,
+      keyId: "bootstrap-evidence-test-v1",
+    });
+    const finalBrowserGate = (
+      baselineFinalization.payload.gates as Array<{
+        name: string;
+        evidenceHash: string;
+      }>
+    ).find(({ name }) => name === "final_custom_domain_browser")!;
+    const semanticInputs = semanticReviewInputs(
+      score,
+      {
+        finalizationEvidencePayloadHash:
+          baselineFinalization.payloadHash,
+        finalBrowserGateEvidenceHash: finalBrowserGate.evidenceHash,
+      },
+      {
+        rcTag: STABLE_PREDECESSOR_BOOTSTRAP_COMPATIBILITY_RC_TAG,
+        stableTag: STABLE_PREDECESSOR_BOOTSTRAP_TAG,
+        version: "2.3.4",
+        sourceRevision: STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION,
+        imageDigest: baselineImageDigest,
+        imageReference:
+          `ghcr.io/hooterjackson/genio@${baselineImageDigest}`,
+      },
+      baselineFinalization.payload.fixtures as
+        SemanticRankingProtectedBaselineMetadataV1["fixtures"],
+    );
+    const baselineStableAuthorization =
+      authorizeStablePredecessorBootstrap({
+        bootstrapEvidence: baselineFinalization,
+        protectedBaselineMetadata:
+          semanticInputs.protectedBaselineMetadata,
+        imageAttestation: baselineImageAttestation,
+        sourceBytes,
+        releaseVerificationKey: baselineRelease.publicKey,
+        approvedReleaseKeyId: "bootstrap-evidence-test-v1",
+        approvedReleaseKeySha256:
+          stableReleaseKeyFingerprint(baselineRelease.publicKey),
+        approvedProducerKeyId: independent.producerKeyId,
+        approvedProducerKeySha256: independent.producerKeySha256,
+        approvedSitesControlPlaneVerificationKey:
+          finalBrowserSources.sitesControlPlaneVerificationKey,
+        approvedSitesControlPlaneTrustPolicy:
+          finalBrowserSources.sitesControlPlaneTrustPolicy,
+        originalRailwayProvenance: originalRailwayProvenanceArtifact,
+        originalRailwayProvenanceVerificationKey:
+          originalRailwayProvenance.publicKey,
+        approvedOriginalRailwayProvenanceKeyId:
+          originalRailwayProvenanceKeyId,
+        approvedOriginalRailwayProvenanceKeySha256:
+          stableReleaseKeyFingerprint(originalRailwayProvenance.publicKey),
+        authorizerSigningKey: baselineStableAuthorizer.privateKey,
+        approvedAuthorizerKeyId: baselineStableAuthorizerKeyId,
+        approvedAuthorizerKeySha256:
+          stableReleaseKeyFingerprint(
+            baselineStableAuthorizer.publicKey,
+          ),
+        expectedRepository: "hooterjackson/genio",
+        expectedDefaultBranch: "main",
+        generatedAt: "2026-07-22T18:30:00.000Z",
+      });
+    const lineage = verifyHistoricalStablePredecessorBootstrapLineage({
+      bootstrapEvidence: baselineFinalization,
+      protectedBaselineMetadata:
+        semanticInputs.protectedBaselineMetadata,
+      releaseVerificationKey: baselineRelease.publicKey,
+      approvedReleaseKeySha256:
+        stableReleaseKeyFingerprint(baselineRelease.publicKey),
+      stableAuthorization: baselineStableAuthorization,
+      stableAuthorizationVerificationKey:
+        baselineStableAuthorizer.publicKey,
+      approvedStableAuthorizerKeyId: baselineStableAuthorizerKeyId,
+      approvedStableAuthorizerKeySha256:
+        stableReleaseKeyFingerprint(baselineStableAuthorizer.publicKey),
+      expectedRcTag:
+        semanticInputs.protectedBaselineMetadata.rcTag,
+      expectedVersion:
+        semanticInputs.protectedBaselineMetadata.version,
+      expectedRevision:
+        semanticInputs.protectedBaselineMetadata.sourceRevision,
+      expectedImageDigest:
+        semanticInputs.protectedBaselineMetadata.imageDigest,
+      expectedImageReference:
+        semanticInputs.protectedBaselineMetadata.imageReference,
+      expectedRepository: "hooterjackson/genio",
+      expectedDefaultBranch: "main",
+      now: reviewedAt,
+    });
+    const baselineStoredConsumer = { ...lineage } as Record<string, unknown>;
+    delete baselineStoredConsumer.bootstrap;
+    return {
+      baselineFinalization,
+      baselineStableAuthorization,
+      baselineStoredConsumer,
+      baselineImageAttestation,
+      baselineGithubAttestationVerification,
+      semanticInputs,
+    };
+  })();
+  const {
+    baselineFinalization,
+    baselineStableAuthorization,
+    baselineStoredConsumer,
+    baselineImageAttestation,
+    baselineGithubAttestationVerification,
+    semanticInputs,
+  } = predecessor;
   const artifact = semanticInputs.artifact;
   const report = evaluateSemanticRankingReviewV1(artifact);
   const reviewerAttestation = attestSemanticRankingReviewV1({
@@ -570,6 +857,11 @@ async function setup(score = 4) {
       join(handoffDirectory, "stable-release-consumer.json"),
     protectedBaselineImageAttestation:
       join(handoffDirectory, "stable-image-attestation.json"),
+    protectedBaselineGithubAttestationVerification:
+      join(
+        handoffDirectory,
+        "predecessor-image-attestation-verification.json",
+      ),
     protectedBaselineHandoffManifest:
       join(handoffDirectory, "semantic-baseline-handoff.json"),
     blindedPackage: join(directory, "blinded-package.json"),
@@ -579,6 +871,9 @@ async function setup(score = 4) {
     source: join(directory, "gate-source.json"),
     gate: join(directory, "gate.json"),
     producerAttestation: join(directory, "gate-attestation.json"),
+    predecessorMode,
+    predecessorControllerSourceRevision:
+      predecessorMode === "normal" ? baselineRevision : revision,
   };
   await Promise.all([
     writeFile(paths.runtime, JSON.stringify(runtimeSnapshot())),
@@ -617,10 +912,11 @@ async function setup(score = 4) {
     ),
     writeFile(
       paths.protectedBaselineImageAttestation,
-      JSON.stringify({
-        verified: true,
-        evidenceHash: "f".repeat(64),
-      }),
+      JSON.stringify(baselineImageAttestation),
+    ),
+    writeFile(
+      paths.protectedBaselineGithubAttestationVerification,
+      JSON.stringify(baselineGithubAttestationVerification),
     ),
     writeFile(paths.blindedPackage, JSON.stringify(semanticInputs.blindedPackage)),
     writeFile(paths.blindScorecard, JSON.stringify(semanticInputs.blindScorecard)),
@@ -667,6 +963,9 @@ async function setup(score = 4) {
       semanticInputs.protectedBaselineMetadata.stableTag,
     predecessorSourceRevision:
       semanticInputs.protectedBaselineMetadata.sourceRevision,
+    predecessorMode,
+    predecessorControllerSourceRevision:
+      paths.predecessorControllerSourceRevision,
     predecessorReleaseIdentitySha256,
     metadataSha256: semanticInputs.baselineMetadataHash,
     assetSha256,
@@ -686,6 +985,8 @@ async function setup(score = 4) {
     baselineFinalization,
     baselineStableAuthorization,
     baselineStoredConsumer,
+    baselineImageAttestation,
+    baselineGithubAttestationVerification,
     handoff,
     artifact,
     report,
@@ -708,6 +1009,13 @@ function producerArgs(paths: Awaited<ReturnType<typeof setup>>["paths"]) {
     "--reviewer-attestation", paths.reviewerAttestation,
     "--reviewer-verification-key", paths.reviewerPublicKey,
     "--protected-baseline-handoff-directory", paths.handoffDirectory,
+    "--protected-baseline-github-attestation-verification",
+    paths.protectedBaselineGithubAttestationVerification,
+    "--expected-predecessor-repository", "hooterjackson/genio",
+    "--expected-predecessor-default-branch", "main",
+    "--expected-predecessor-mode", paths.predecessorMode,
+    "--expected-predecessor-controller-revision",
+    paths.predecessorControllerSourceRevision,
     "--blinded-package", paths.blindedPackage,
     "--blind-scorecard", paths.blindScorecard,
     "--blind-mapping", paths.blindMapping,
@@ -745,6 +1053,61 @@ function approvedReviewerEnvironment(
 }
 
 describe("semantic ranking blinded-review live gate producer", () => {
+  test("documents every fail-closed predecessor handoff argument", async () => {
+    const plan = await readFile(releaseCandidateQaPlanUrl, "utf8");
+    for (const option of [
+      "--protected-baseline-github-attestation-verification",
+      "--expected-predecessor-repository",
+      "--expected-predecessor-default-branch",
+      "--expected-predecessor-mode",
+      "--expected-predecessor-controller-revision",
+    ]) {
+      expect(plan).toContain(option);
+    }
+    expect(plan).toContain(
+      "<EXACT_RC_HANDOFF_DIRECTORY>/predecessor-image-attestation-verification.json",
+    );
+  });
+
+  test("seals predecessor mode, controller, and fresh GitHub verification", async () => {
+    const value = await setup();
+    const load = () => loadSemanticBaselineHandoff({
+      directory: value.paths.handoffDirectory,
+      expectedManifestSha256: value.handoff.manifestSha256,
+      expectedCandidateTag: "v2.4.0-rc.2",
+      expectedCandidateSourceRevision: revision,
+      expectedMetadataSha256: value.semanticInputs.baselineMetadataHash,
+      expectedStableTag:
+        value.semanticInputs.protectedBaselineMetadata.stableTag,
+      expectedPredecessorMode: "normal",
+      expectedPredecessorControllerSourceRevision: baselineRevision,
+      expectedReleaseVerificationKeySha256:
+        stableReleaseKeyFingerprint(value.baselineRelease.publicKey),
+      expectedStableAuthorizerKeyId:
+        value.baselineStableAuthorizerKeyId,
+      expectedStableAuthorizerKeySha256:
+        stableReleaseKeyFingerprint(value.baselineStableAuthorizer.publicKey),
+    });
+    const loaded = await load();
+    expect(loaded.manifest).toMatchObject({
+      schemaVersion: "genio-semantic-baseline-handoff/v2",
+      predecessor: {
+        mode: "normal",
+        controllerSourceRevision: baselineRevision,
+      },
+    });
+    expect(loaded.githubAttestationVerification).toEqual(
+      value.baselineGithubAttestationVerification,
+    );
+    await writeFile(
+      value.paths.protectedBaselineGithubAttestationVerification,
+      JSON.stringify({ verificationResult: "substituted" }),
+    );
+    await expect(load()).rejects.toThrow(
+      /fresh GitHub attestation verification hash mismatch/u,
+    );
+  });
+
   test("accepts only the configured staging origin and has no caller pass option", async () => {
     const value = await setup();
     const { paths } = value;
@@ -753,6 +1116,10 @@ describe("semantic ranking blinded-review live gate producer", () => {
     })).toMatchObject({
       origin: stagingOrigin,
       expectedRevision: revision,
+      predecessorVerification: {
+        mode: "normal",
+        controllerSourceRevision: baselineRevision,
+      },
       guidanceLineageHashes: {
         reggaeton: "9".repeat(64),
         frenchJazz: "d".repeat(64),
@@ -799,6 +1166,28 @@ describe("semantic ranking blinded-review live gate producer", () => {
         RELEASE_SEMANTIC_REVIEWER_KEY_SHA256: "f".repeat(64),
       }),
     )).rejects.toThrow(/protected approved reviewer key/u);
+    const mismatchedModeArgs = producerArgs(paths);
+    mismatchedModeArgs[
+      mismatchedModeArgs.indexOf("--expected-predecessor-mode") + 1
+    ] = "bootstrap";
+    await expect(produceSemanticRankingReviewGate(
+      parseSemanticRankingReviewProducerArgs(
+        mismatchedModeArgs,
+        approvedReviewerEnvironment(value),
+      ),
+    )).rejects.toThrow(/protected candidate and predecessor pins/u);
+    const mismatchedControllerArgs = producerArgs(paths);
+    mismatchedControllerArgs[
+      mismatchedControllerArgs.indexOf(
+        "--expected-predecessor-controller-revision",
+      ) + 1
+    ] = revision;
+    await expect(produceSemanticRankingReviewGate(
+      parseSemanticRankingReviewProducerArgs(
+        mismatchedControllerArgs,
+        approvedReviewerEnvironment(value),
+      ),
+    )).rejects.toThrow(/protected candidate and predecessor pins/u);
     await expect(produceSemanticRankingReviewGate(
       parseSemanticRankingReviewProducerArgs(producerArgs(paths), {
         ...approvedReviewerEnvironment(value),
@@ -874,6 +1263,56 @@ describe("semantic ranking blinded-review live gate producer", () => {
       credentialVersionHashes: source.credentialVersionHashes,
       evidence: source.evidence,
     }));
+  });
+
+  test("preserves and revalidates the exact bootstrap predecessor proof downstream", async () => {
+    const value = await setup(4, "bootstrap");
+    const args = parseSemanticRankingReviewProducerArgs(
+      producerArgs(value.paths),
+      approvedReviewerEnvironment(value),
+    );
+    await produceSemanticRankingReviewGate(args);
+    const rawGate = JSON.parse(await readFile(value.paths.gate, "utf8"));
+    const gate = validateReleaseGateArtifact(rawGate);
+    expect(gate.sources).toMatchObject({
+      protectedBaselineVerification: {
+        schemaVersion:
+          "genio-historical-stable-predecessor-verification-context/v1",
+        mode: "bootstrap",
+        repository: "hooterjackson/genio",
+        defaultBranch: "main",
+        controllerSourceRevision: revision,
+        successorRcTag: "v2.4.0-rc.2",
+        successorSourceRevision: revision,
+      },
+      protectedBaselineImageAttestation:
+        value.baselineImageAttestation,
+      protectedBaselineStoredConsumer:
+        value.baselineStoredConsumer,
+      protectedBaselineGithubAttestationVerification:
+        value.baselineGithubAttestationVerification,
+      protectedBaselineLineage: {
+        bootstrap: {
+          controllerSourceRevision: revision,
+          controllerRepository: "hooterjackson/genio",
+          controllerDefaultBranch: "main",
+        },
+      },
+    });
+
+    const substitutedFreshVerification = structuredClone(rawGate);
+    substitutedFreshVerification.sources
+      .protectedBaselineGithubAttestationVerification.subjectDigest =
+        `sha256:${"0".repeat(64)}`;
+    expect(() =>
+      validateReleaseGateArtifact(substitutedFreshVerification)
+    ).toThrow(/fresh external GitHub verification/u);
+
+    const droppedStoredConsumer = structuredClone(rawGate);
+    delete droppedStoredConsumer.sources.protectedBaselineStoredConsumer;
+    expect(() =>
+      validateReleaseGateArtifact(droppedStoredConsumer)
+    ).toThrow(/missing or unapproved fields/u);
   });
 
   test("rejects self-repinned metadata, unapproved predecessor tags, key reuse, and lineage hash tampering", async () => {
@@ -957,6 +1396,37 @@ describe("semantic ranking blinded-review live gate producer", () => {
         approvedReviewerEnvironment(missingKey),
       ),
     )).rejects.toThrow(/missing or unexpected file/u);
+
+    const missingFreshGithubProof = await setup(4, "bootstrap");
+    await rm(
+      missingFreshGithubProof.paths
+        .protectedBaselineGithubAttestationVerification,
+    );
+    await expect(produceSemanticRankingReviewGate(
+      parseSemanticRankingReviewProducerArgs(
+        producerArgs(missingFreshGithubProof.paths),
+        approvedReviewerEnvironment(missingFreshGithubProof),
+      ),
+    )).rejects.toThrow(/missing or unexpected file/u);
+
+    const substitutedFreshGithubProof = await setup(4, "bootstrap");
+    await writeFile(
+      substitutedFreshGithubProof.paths
+        .protectedBaselineGithubAttestationVerification,
+      JSON.stringify({
+        verificationResult: "verified",
+        subjectDigest: `sha256:${"0".repeat(64)}`,
+        repository: "hooterjackson/genio",
+      }),
+    );
+    await expect(produceSemanticRankingReviewGate(
+      parseSemanticRankingReviewProducerArgs(
+        producerArgs(substitutedFreshGithubProof.paths),
+        approvedReviewerEnvironment(substitutedFreshGithubProof),
+      ),
+    )).rejects.toThrow(
+      /fresh GitHub attestation verification hash mismatch/u,
+    );
 
     const substitutedKey = await setup();
     const attackerKey = generateKeyPairSync("ed25519");

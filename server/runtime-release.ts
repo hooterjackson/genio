@@ -44,9 +44,13 @@ import {
   type RuntimeReleaseDeploymentPhase,
 } from "./release-deployment-phase.ts";
 import { resolveBriefInterpretationModel } from "./brief-model.ts";
+import {
+  musicBrainzContactConfigurationLabel,
+} from "./musicbrainz-contact.ts";
 
 export interface RuntimeReleaseContract {
   pipelineVersion: "corpus_first_v3";
+  semanticExecutionConfigurationHash: string;
   releaseEnvironment: "development" | "staging" | "production";
   ownerAllowlistVersion: string | null;
   capabilityPepperVersionHash: string | null;
@@ -90,7 +94,453 @@ export interface RuntimeReleaseContract {
   modelCatalogValidatedAt: string;
 }
 
-const API_RELEASE_CONFIGURATION_ENV_KEYS = [
+export const SEMANTIC_EXECUTION_CONFIGURATION_SCHEMA_V1 =
+  "genio-semantic-execution-configuration/v1" as const;
+
+/**
+ * Closed, secret-free inventory of mutable environment inputs that can alter
+ * interpretation, retrieval yield, qualification, matching, or exact output.
+ * Pure percentage cohorts and signed rollout-lineage markers are deliberately
+ * excluded: they decide who receives a behavior, not what that behavior does.
+ */
+export const SEMANTIC_EXECUTION_CONFIGURATION_ENV_KEYS_V1 = Object.freeze([
+  "APPLE_CATALOG_RECOVERY_TIMEOUT_MS",
+  "APPLE_MATCHING_CONCURRENCY",
+  "APPLE_MATCH_MAX_QUERIES",
+  "APPLE_SHARE_URL_TIMEOUT_SECONDS",
+  "APPLE_STOREFRONT",
+  "APPLE_WRITE_LOCK_WAIT_MS",
+  "APPLE_WRITE_TOKEN_CAPACITY",
+  "APPLE_WRITE_TOKEN_REFILL_PER_SECOND",
+  "AUTO_RUN_COST_LIMIT_USD",
+  "COST_TIMEZONE",
+  "ENABLE_DISCOGS_ADAPTER",
+  "FAST_MATCH_LOOKUP_TIMEOUT_MS",
+  "FAST_RESEARCH_MAX_EXTRACTION_TOKENS",
+  "FAST_RESEARCH_MAX_SYNTHESIS_TOKENS",
+  "FAST_RESEARCH_MAX_WEB_CALLS",
+  "FAST_RESEARCH_SEARCH_CONTEXT",
+  "GUIDANCE_CONTRACT_V2_ENABLED",
+  "GUIDANCE_CONTRACT_V2_OWNER_CANARY",
+  "GUIDANCE_CONTRACT_V3_ENABLED",
+  "GUIDANCE_CONTRACT_V3_OWNER_CANARY",
+  "GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED",
+  "GUIDANCE_SCOUT_TIMEOUT_MS",
+  "INITIAL_COST_GATE_USD",
+  "MUSICBRAINZ_CONTACT",
+  "OPENAI_BRIEF_MODEL",
+  "OPENAI_CURATED_LUNA_SNAPSHOT",
+  "OPENAI_CURATED_TERRA_SNAPSHOT",
+  "OPENAI_DEEP_MODEL",
+  "OPENAI_FAST_MODEL",
+  "OPENAI_GPT_5_4_MINI_CACHED_INPUT_USD_PER_MILLION",
+  "OPENAI_GPT_5_4_MINI_INPUT_USD_PER_MILLION",
+  "OPENAI_GPT_5_4_MINI_OUTPUT_USD_PER_MILLION",
+  "OPENAI_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_CACHED_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_OUTPUT_USD_PER_MILLION",
+  "OPENAI_MAX_BRIEF_RESERVATION_USD",
+  "OPENAI_MAX_RESPONSE_RESERVATION_USD",
+  "OPENAI_MIN_BRIEF_RESERVATION_USD",
+  "OPENAI_MIN_RESPONSE_RESERVATION_USD",
+  "OPENAI_OUTPUT_USD_PER_MILLION",
+  "OPENAI_RESUME_CONTEXT_FALLBACK_TOKENS",
+  "OPENAI_TERRA_CACHED_INPUT_USD_PER_MILLION",
+  "OPENAI_TERRA_INPUT_USD_PER_MILLION",
+  "OPENAI_TERRA_OUTPUT_USD_PER_MILLION",
+  "OPENAI_TIMEOUT_MS",
+  "OPENAI_WEB_SEARCH_USD",
+  "PIPELINE_V2_FACTUAL_OWNER_CANARY",
+  "PIPELINE_V2_OWNER_CANARY",
+  "PIPELINE_V3_ASSIGNMENT_ENABLED",
+  "PIPELINE_V3_BASELINE_MODEL_ID",
+  "PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED",
+  "PIPELINE_V3_ESCALATION_MODEL_ID",
+  "PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED",
+  "PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED",
+  "PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED",
+  "PIPELINE_V3_MAX_EXTRACTION_TOKENS",
+  "PIPELINE_V3_MAX_RAW_CANDIDATES",
+  "PIPELINE_V3_MAX_ROUNDS",
+  "PIPELINE_V3_MAX_SEARCH_CALLS",
+  "PIPELINE_V3_MAX_SYNTHESIS_TOKENS",
+  "PIPELINE_V3_MAX_TOOL_CALLS",
+  "PIPELINE_V3_MODEL_CATALOG_VALIDATED_AT",
+  "PIPELINE_V3_OWNER_CANARY",
+  "PIPELINE_V3_OWNER_CANARY_GROUPS",
+  "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
+  "PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED",
+  "PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION",
+  "RESEARCH_MAX_GAP_PASSES",
+  "RESEARCH_MAX_SEGMENTS_PER_PASS",
+  "RESEARCH_TURNS_PER_SEGMENT",
+  "RESULT_REUSE_DAYS",
+] as const);
+
+export const SEMANTIC_EXECUTION_CONFIGURATION_REVIEWED_EXCLUSIONS_V1 =
+  Object.freeze({
+    cohortPercentages: Object.freeze([
+      "PIPELINE_V2_CURATED_PERCENT",
+      "PIPELINE_V2_FACTUAL_PERCENT",
+      "PIPELINE_V2_SIMILARITY_PERCENT",
+      "PIPELINE_V3_ARTIST_CATALOGUE_PERCENT",
+      "PIPELINE_V3_EXHAUSTIVE_PERCENT",
+      "PIPELINE_V3_FACTUAL_PERCENT",
+      "PIPELINE_V3_FIXED_CONTAINER_PERCENT",
+      "PIPELINE_V3_GENRE_SCENE_PERCENT",
+      "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
+      "PIPELINE_V3_SIMILARITY_PERCENT",
+    ] as const),
+    rolloutLineage: Object.freeze([
+      "RELEASE_BRIDGE_CONVERGENCE_EVIDENCE_HASH",
+      "RELEASE_EXPAND_CONVERGENCE_EVIDENCE_HASH",
+      "RELEASE_PREVIOUS_PUBLIC_ROLLOUT_EVIDENCE_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_FROM_PERCENT",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_GROUP",
+      "RELEASE_PUBLIC_ROLLOUT_OPERATION",
+      "RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_STAGE",
+      "RELEASE_PUBLIC_ROLLOUT_TO_PERCENT",
+      "RELEASE_VERIFIED_CANDIDATE_EVIDENCE_HASH",
+    ] as const),
+    credentials: Object.freeze([
+      "APPLE_KEY_ID",
+      "APPLE_MEDIA_ID",
+      "APPLE_TEAM_ID",
+      "APPLE_TOKEN_ENCRYPTION_KEY_ID",
+      "GATEWAY_KEY_ID",
+      "GATEWAY_PREVIOUS_KEY_ID",
+      "RELEASE_SECRET_VERSIONS_HASH",
+    ] as const),
+    operationalBudgets: Object.freeze([
+      "APP_MONTHLY_COST_LIMIT_USD",
+      "MONTHLY_RESEARCH_CEILING_USD",
+    ] as const),
+    deploymentInfrastructure: Object.freeze([
+      "APP_ORIGIN",
+      "BRIEF_LIMIT_PER_24H",
+      "CAPABILITY_PREVIOUS_PEPPER_EXPIRES_AT",
+      "CAPABILITY_SESSION_TTL_DAYS",
+      "MAX_GLOBAL_NONTERMINAL_RUNS",
+      "NODE_ENV",
+      "OWNER_ALLOWLIST_VERSION",
+      "QA_STAGING_CONTROL_HASH",
+      "RELEASE_DEPLOYMENT_PHASE",
+      "RELEASE_ENVIRONMENT",
+      "RELEASE_EXECUTION_ENABLED",
+      "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+      "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
+      "RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION",
+      "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
+      "RELEASE_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED",
+      "REQUIRE_WORKER_HEARTBEAT",
+      "RETENTION_DAYS",
+      "RUN_LIMIT_PER_24H",
+      "WORKER_STALE_SECONDS",
+    ] as const),
+  });
+
+/**
+ * Closed classification for static server environment reads that are not
+ * semantic-execution inputs. This inventory is enforced against source by a
+ * census test, so a new direct read cannot silently bypass release review.
+ * Values in these categories must never be copied into release evidence.
+ */
+export const SERVER_ENVIRONMENT_READ_REVIEWED_EXCLUSIONS_V1 =
+  Object.freeze({
+    secretMaterialAndPrivateIdentifiers: Object.freeze([
+      "ALERT_EMAIL",
+      "APPLE_MUSICKIT_PRIVATE_KEY",
+      "APPLE_MUSICKIT_PRIVATE_KEY_BASE64",
+      "APPLE_TOKEN_ENCRYPTION_KEY",
+      "CAPABILITY_PEPPER",
+      "CAPABILITY_PEPPER_VERSION",
+      "CAPABILITY_PREVIOUS_PEPPER",
+      "CAPABILITY_PREVIOUS_PEPPER_VERSION",
+      "GATEWAY_HMAC_SECRET",
+      "GATEWAY_KEYS_JSON",
+      "GATEWAY_PREVIOUS_HMAC_SECRET",
+      "GATEWAY_PREVIOUS_SECRET",
+      "GATEWAY_SECRET",
+      "DISCOGS_TOKEN",
+      "OPENAI_API_KEY",
+      "OWNER_ALERT_EMAIL",
+      "OWNER_EMAIL",
+      "RELEASE_CANARY_HMAC_SECRET",
+      "RESEND_API_KEY",
+      "RESEND_FROM",
+    ] as const),
+    buildIdentity: Object.freeze([
+      "APP_VERSION",
+      "COMMIT_SHA",
+      "GITHUB_SHA",
+      "RAILWAY_GIT_COMMIT_SHA",
+      "SOURCE_COMMIT_SHA",
+    ] as const),
+    processTopology: Object.freeze([
+      "MAX_WORKER_JOBS",
+      "PORT",
+      "RAILWAY_REPLICA_ID",
+      "WORKER_CONCURRENCY",
+      "WORKER_HEARTBEAT_SECONDS",
+      "WORKER_LEASE_SECONDS",
+      "WORKER_POLL_MS",
+      "WORKER_QUEUE_CLASS",
+      "WORKER_RENEW_SECONDS",
+    ] as const),
+    nonPlaylistProductPolicy: Object.freeze([
+      "FEEDBACK_GLOBAL_DAILY_LIMIT",
+      "FEEDBACK_STORAGE_LIMIT_BYTES",
+    ] as const),
+    observability: Object.freeze([
+      "LOG_LEVEL",
+    ] as const),
+    testOnly: Object.freeze([
+      "GENIO_SYSTEM_E2E",
+    ] as const),
+  });
+
+/**
+ * Dynamic indexed environment reads are permitted only at these reviewed
+ * source sites and only for these closed key inventories. The source census
+ * checks the exact site multiset, so switching syntax cannot bypass review.
+ */
+export const SERVER_DYNAMIC_ENVIRONMENT_READ_SOURCES_V1 = Object.freeze([
+  Object.freeze({
+    site: "cost-config.ts:environment[primary]",
+    occurrences: 2,
+    keys: Object.freeze([
+      "APP_MONTHLY_COST_LIMIT_USD",
+      "AUTO_RUN_COST_LIMIT_USD",
+      "OPENAI_GPT_5_4_MINI_CACHED_INPUT_USD_PER_MILLION",
+      "OPENAI_GPT_5_4_MINI_INPUT_USD_PER_MILLION",
+      "OPENAI_GPT_5_4_MINI_OUTPUT_USD_PER_MILLION",
+      "OPENAI_INPUT_USD_PER_MILLION",
+      "OPENAI_LUNA_CACHED_INPUT_USD_PER_MILLION",
+      "OPENAI_LUNA_INPUT_USD_PER_MILLION",
+      "OPENAI_LUNA_OUTPUT_USD_PER_MILLION",
+      "OPENAI_OUTPUT_USD_PER_MILLION",
+      "OPENAI_TERRA_CACHED_INPUT_USD_PER_MILLION",
+      "OPENAI_TERRA_INPUT_USD_PER_MILLION",
+      "OPENAI_TERRA_OUTPUT_USD_PER_MILLION",
+      "OPENAI_WEB_SEARCH_USD",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "cost-config.ts:environment[legacy]",
+    occurrences: 2,
+    keys: Object.freeze([
+      "INITIAL_COST_GATE_USD",
+      "MONTHLY_RESEARCH_CEILING_USD",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "runtime-release.ts:environment[key]",
+    occurrences: 2,
+    keys: Object.freeze([
+      ...SEMANTIC_EXECUTION_CONFIGURATION_ENV_KEYS_V1,
+      "NODE_ENV",
+      "APP_ORIGIN",
+      "RELEASE_ENVIRONMENT",
+      "RELEASE_DEPLOYMENT_PHASE",
+      "RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION",
+      "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
+      "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
+      "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "worker-runner.ts:process.env[name]",
+    occurrences: 1,
+    keys: Object.freeze([
+      "WORKER_CONCURRENCY",
+      "WORKER_HEARTBEAT_SECONDS",
+      "WORKER_LEASE_SECONDS",
+      "WORKER_POLL_MS",
+      "WORKER_RENEW_SECONDS",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "worker-runner.ts:environment[key]",
+    occurrences: 1,
+    keys: Object.freeze([
+      ...SEMANTIC_EXECUTION_CONFIGURATION_ENV_KEYS_V1,
+    ] as const),
+  }),
+  Object.freeze({
+    site: "worker-runner.ts:environment[name]",
+    occurrences: 1,
+    keys: Object.freeze([
+      "APPLE_KEY_ID",
+      "APPLE_MEDIA_ID",
+      "APPLE_TEAM_ID",
+      "APPLE_TOKEN_ENCRYPTION_KEY",
+      "OPENAI_API_KEY",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "secrets.ts:process.env[name]",
+    occurrences: 1,
+    keys: Object.freeze([
+      "APPLE_KEY_ID",
+      "APPLE_MEDIA_ID",
+      "APPLE_MUSICKIT_PRIVATE_KEY",
+      "APPLE_MUSICKIT_PRIVATE_KEY_BASE64",
+      "APPLE_TEAM_ID",
+      "APPLE_TOKEN_ENCRYPTION_KEY",
+      "APPLE_TOKEN_ENCRYPTION_KEY_ID",
+      "DISCOGS_TOKEN",
+      "OPENAI_API_KEY",
+      "RESEND_API_KEY",
+      "RESEND_FROM",
+      "OWNER_ALERT_EMAIL",
+      "ALERT_EMAIL",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "matching-service.ts:process.env[name]",
+    occurrences: 1,
+    keys: Object.freeze([
+      "APPLE_CATALOG_RECOVERY_TIMEOUT_MS",
+      "APPLE_MATCHING_CONCURRENCY",
+      "APPLE_MATCH_MAX_QUERIES",
+      "FAST_MATCH_LOOKUP_TIMEOUT_MS",
+    ] as const),
+  }),
+  Object.freeze({
+    site: "query-plan-v3.ts:env[pipelineV3RolloutVariable(group)]",
+    occurrences: 1,
+    keys: Object.freeze([
+      "PIPELINE_V3_ARTIST_CATALOGUE_PERCENT",
+      "PIPELINE_V3_EXHAUSTIVE_PERCENT",
+      "PIPELINE_V3_FACTUAL_PERCENT",
+      "PIPELINE_V3_FIXED_CONTAINER_PERCENT",
+      "PIPELINE_V3_GENRE_SCENE_PERCENT",
+      "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
+      "PIPELINE_V3_SIMILARITY_PERCENT",
+    ] as const),
+  }),
+] as const);
+
+type SemanticExecutionConfigurationKey =
+  typeof SEMANTIC_EXECUTION_CONFIGURATION_ENV_KEYS_V1[number];
+
+const SEMANTIC_EXECUTION_BOOLEAN_KEYS = new Set<SemanticExecutionConfigurationKey>([
+  "ENABLE_DISCOGS_ADAPTER",
+  "GUIDANCE_CONTRACT_V2_ENABLED",
+  "GUIDANCE_CONTRACT_V2_OWNER_CANARY",
+  "GUIDANCE_CONTRACT_V3_ENABLED",
+  "GUIDANCE_CONTRACT_V3_OWNER_CANARY",
+  "GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED",
+  "PIPELINE_V2_FACTUAL_OWNER_CANARY",
+  "PIPELINE_V2_OWNER_CANARY",
+  "PIPELINE_V3_ASSIGNMENT_ENABLED",
+  "PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED",
+  "PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED",
+  "PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED",
+  "PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED",
+  "PIPELINE_V3_OWNER_CANARY",
+  "PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED",
+]);
+
+const SEMANTIC_EXECUTION_NUMERIC_KEYS = new Set<SemanticExecutionConfigurationKey>([
+  "APPLE_CATALOG_RECOVERY_TIMEOUT_MS",
+  "APPLE_MATCHING_CONCURRENCY",
+  "APPLE_MATCH_MAX_QUERIES",
+  "APPLE_SHARE_URL_TIMEOUT_SECONDS",
+  "APPLE_WRITE_LOCK_WAIT_MS",
+  "APPLE_WRITE_TOKEN_CAPACITY",
+  "APPLE_WRITE_TOKEN_REFILL_PER_SECOND",
+  "AUTO_RUN_COST_LIMIT_USD",
+  "FAST_MATCH_LOOKUP_TIMEOUT_MS",
+  "FAST_RESEARCH_MAX_EXTRACTION_TOKENS",
+  "FAST_RESEARCH_MAX_SYNTHESIS_TOKENS",
+  "FAST_RESEARCH_MAX_WEB_CALLS",
+  "GUIDANCE_SCOUT_TIMEOUT_MS",
+  "INITIAL_COST_GATE_USD",
+  "OPENAI_GPT_5_4_MINI_CACHED_INPUT_USD_PER_MILLION",
+  "OPENAI_GPT_5_4_MINI_INPUT_USD_PER_MILLION",
+  "OPENAI_GPT_5_4_MINI_OUTPUT_USD_PER_MILLION",
+  "OPENAI_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_CACHED_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_INPUT_USD_PER_MILLION",
+  "OPENAI_LUNA_OUTPUT_USD_PER_MILLION",
+  "OPENAI_MAX_BRIEF_RESERVATION_USD",
+  "OPENAI_MAX_RESPONSE_RESERVATION_USD",
+  "OPENAI_MIN_BRIEF_RESERVATION_USD",
+  "OPENAI_MIN_RESPONSE_RESERVATION_USD",
+  "OPENAI_OUTPUT_USD_PER_MILLION",
+  "OPENAI_RESUME_CONTEXT_FALLBACK_TOKENS",
+  "OPENAI_TERRA_CACHED_INPUT_USD_PER_MILLION",
+  "OPENAI_TERRA_INPUT_USD_PER_MILLION",
+  "OPENAI_TERRA_OUTPUT_USD_PER_MILLION",
+  "OPENAI_TIMEOUT_MS",
+  "OPENAI_WEB_SEARCH_USD",
+  "PIPELINE_V3_MAX_EXTRACTION_TOKENS",
+  "PIPELINE_V3_MAX_RAW_CANDIDATES",
+  "PIPELINE_V3_MAX_ROUNDS",
+  "PIPELINE_V3_MAX_SEARCH_CALLS",
+  "PIPELINE_V3_MAX_SYNTHESIS_TOKENS",
+  "PIPELINE_V3_MAX_TOOL_CALLS",
+  "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
+  "RESEARCH_MAX_GAP_PASSES",
+  "RESEARCH_MAX_SEGMENTS_PER_PASS",
+  "RESEARCH_TURNS_PER_SEGMENT",
+  "RESULT_REUSE_DAYS",
+]);
+
+function normalizedSemanticExecutionValue(
+  key: SemanticExecutionConfigurationKey,
+  value: string | undefined,
+): string | number | boolean | null {
+  const normalized = value?.trim() ?? "";
+  if (key === "MUSICBRAINZ_CONTACT") {
+    return musicBrainzContactConfigurationLabel(value);
+  }
+  if (!normalized) return null;
+  if (SEMANTIC_EXECUTION_BOOLEAN_KEYS.has(key)) {
+    if (normalized !== "true" && normalized !== "false") {
+      throw new Error(`${key} must be true or false for semantic execution fencing`);
+    }
+    return normalized === "true";
+  }
+  if (SEMANTIC_EXECUTION_NUMERIC_KEYS.has(key)) {
+    const numeric = Number(normalized);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      throw new Error(`${key} must be a finite non-negative number for semantic execution fencing`);
+    }
+    return Object.is(numeric, -0) ? 0 : numeric;
+  }
+  if (
+    normalized.length > 256
+    || /[\u0000-\u001f\u007f]/u.test(normalized)
+  ) {
+    throw new Error(`${key} is not a safe semantic execution label`);
+  }
+  return key === "APPLE_STOREFRONT" || key === "FAST_RESEARCH_SEARCH_CONTEXT"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+export function semanticExecutionConfigurationHash(
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  const values = Object.fromEntries(
+    SEMANTIC_EXECUTION_CONFIGURATION_ENV_KEYS_V1.map((key) => [
+      key,
+      normalizedSemanticExecutionValue(key, environment[key]),
+    ]),
+  );
+  return sha256Hex(stableStringify({
+    schemaVersion: SEMANTIC_EXECUTION_CONFIGURATION_SCHEMA_V1,
+    values,
+  }));
+}
+
+export const API_RELEASE_CONFIGURATION_ENV_KEYS = Object.freeze([
   "NODE_ENV",
   "APP_ORIGIN",
   "RELEASE_ENVIRONMENT",
@@ -108,7 +558,9 @@ const API_RELEASE_CONFIGURATION_ENV_KEYS = [
   "RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH",
   "RELEASE_PUBLIC_ROLLOUT_STAGE",
   "RELEASE_PUBLIC_ROLLOUT_OPERATION",
+  "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH",
   "RELEASE_PUBLIC_ROLLOUT_INTENT_GROUP",
+  "RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH",
   "RELEASE_PUBLIC_ROLLOUT_FROM_PERCENT",
   "RELEASE_PUBLIC_ROLLOUT_TO_PERCENT",
   "RELEASE_PREVIOUS_PUBLIC_ROLLOUT_EVIDENCE_HASH",
@@ -186,7 +638,7 @@ const API_RELEASE_CONFIGURATION_ENV_KEYS = [
   "GUIDANCE_CONTRACT_V3_ENABLED",
   "GUIDANCE_CONTRACT_V3_OWNER_CANARY",
   "GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED",
-] as const;
+] as const);
 
 function safeProviderModelId(value: string | undefined, fallback: string): string {
   const normalized = value?.trim() ?? "";
@@ -247,6 +699,8 @@ export function runtimeReleaseContract(
   const capabilityPepper = capabilityPepperRotationStatus(environment);
   return Object.freeze({
     pipelineVersion: "corpus_first_v3",
+    semanticExecutionConfigurationHash:
+      semanticExecutionConfigurationHash(environment),
     releaseEnvironment: releaseEnvironment(environment.RELEASE_ENVIRONMENT),
     ownerAllowlistVersion,
     capabilityPepperVersionHash: capabilityPepper.currentVersionHash,

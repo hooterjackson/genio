@@ -11,6 +11,7 @@ import {
 } from "./apple-catalog-cache.ts";
 import { catalogRecordingVersionClass } from "./pipeline-v2-policy.ts";
 import { PIPELINE_V2_MUSICBRAINZ_MAX_UNCACHED_REQUESTS } from "./research-policy.ts";
+import { musicBrainzUserAgent } from "./musicbrainz-contact.ts";
 
 const MUSICBRAINZ_HOST = "musicbrainz.org";
 const MUSICBRAINZ_CACHE_STOREFRONT = "zz";
@@ -172,10 +173,9 @@ export function musicBrainzEnrichmentFingerprint(
 }
 
 function musicBrainzHeaders(): Record<string, string> {
-  const contact = process.env.MUSICBRAINZ_CONTACT?.trim() || "https://9enio.com/about";
   return {
     Accept: "application/json",
-    "User-Agent": `9enio/1.1 (${contact.slice(0, 200)})`,
+    "User-Agent": musicBrainzUserAgent(),
   };
 }
 

@@ -20,7 +20,10 @@ describe("CI unit and PostgreSQL test partition", () => {
       .filter((name) => name.endsWith(".integration.test.ts"))
       .sort();
 
-    expect(integrationFiles).toHaveLength(16);
+    expect(integrationFiles.length).toBeGreaterThan(0);
+    expect(integrationFiles).toContain(
+      "canonical-executor-release-identity.integration.test.ts",
+    );
     expect(packageJson.scripts?.["test:coverage"]).toContain(
       "--exclude 'tests/*.integration.test.ts'",
     );

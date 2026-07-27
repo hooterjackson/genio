@@ -263,13 +263,22 @@ test("deep workers advertise and lease only the deep lane without authorization 
     await waitFor(() => harness.repository.leaseNextJob.mock.calls.length > 0);
     expect(harness.repository.updateWorkerHeartbeat).toHaveBeenCalledWith(
       expect.any(String),
-      expect.objectContaining({ queueClass: "deep" }),
+      expect.objectContaining({
+        queueClass: "deep",
+        semanticExecutionConfigurationHash:
+          expect.stringMatching(/^[0-9a-f]{64}$/u),
+      }),
     );
     expect(harness.repository.leaseNextJob).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(Number),
       expect.any(Object),
       "deep",
+      expect.objectContaining({
+        executorRevision: expect.any(String),
+        semanticExecutionConfigurationHash:
+          expect.stringMatching(/^[0-9a-f]{64}$/u),
+      }),
     );
     expect(harness.repository.getAppleAuthorization).not.toHaveBeenCalled();
     expect(harness.repository.listWaitingPublicationManifests).not.toHaveBeenCalled();

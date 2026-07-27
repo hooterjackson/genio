@@ -25,6 +25,7 @@ import {
   createStrictSignedEnvelope,
   signedArtifactSha256,
 } from "../shared/signed-artifact.ts";
+import { semanticBehaviorHashV1 } from "../shared/semantic-release-evidence.ts";
 
 const keys = generateKeyPairSync("ed25519");
 const intentCanaryKeys = generateKeyPairSync("ed25519");
@@ -61,6 +62,7 @@ const releaseConfiguration = {
   secretVersionsHash: "5".repeat(64),
 };
 const releaseRuntime = {
+  semanticExecutionConfigurationHash: "f".repeat(64),
   releaseEnvironment: "production",
   deploymentPhase: "activate",
   databaseSchemaVersion: "18",
@@ -88,6 +90,7 @@ const releaseRuntime = {
 };
 const promotionConfigurationHash = signedArtifactSha256(releaseConfiguration);
 const promotionRuntimeHash = signedArtifactSha256(releaseRuntime);
+const semanticBehaviorHash = semanticBehaviorHashV1(releaseRuntime);
 
 function configuration(
   percentages: Partial<Record<string, string>> = {},
@@ -223,6 +226,7 @@ function payload(input: {
     promotion: {
       configurationHash: promotionConfigurationHash,
       runtimeHash: promotionRuntimeHash,
+      semanticBehaviorHash,
       productionCanaryEvidenceHash,
       sitesVersion: priorSitesVersion,
       sitesRevision: priorSitesRevision,
@@ -921,6 +925,59 @@ describe("signed public cohort rollout evidence", () => {
     )).toThrow(/configuration, runtime, and canaries/u);
   });
 
+  test("rejects rollout evidence when reviewed semantic behavior drifts", () => {
+    const drifted = payload();
+    drifted.promotion.semanticBehaviorHash = "0".repeat(64);
+    const envelope = createStrictSignedEnvelope({
+      envelopeSchemaVersion: SIGNED_PUBLIC_ROLLOUT_EVIDENCE_SCHEMA_VERSION,
+      payload: drifted,
+      signingKey: keys.privateKey,
+      keyId: "public-rollout-test-v1",
+    });
+    expect(() => verifyPublicRolloutEvidence(
+      envelope,
+      keys.publicKey,
+      options(),
+    )).toThrow(/semantic behavior/u);
+
+    const executionDrifted = structuredClone(payload());
+    executionDrifted.soak.runtimeSnapshot.runtime
+      .semanticExecutionConfigurationHash = "0".repeat(64);
+    const driftedRuntimeHash = signedArtifactSha256(
+      executionDrifted.soak.runtimeSnapshot.runtime,
+    );
+    executionDrifted.soak.runtimeSnapshot.runtimeHash = driftedRuntimeHash;
+    executionDrifted.promotion.runtimeHash = driftedRuntimeHash;
+    const executionEnvelope = createStrictSignedEnvelope({
+      envelopeSchemaVersion: SIGNED_PUBLIC_ROLLOUT_EVIDENCE_SCHEMA_VERSION,
+      payload: executionDrifted,
+      signingKey: keys.privateKey,
+      keyId: "public-rollout-test-v1",
+    });
+    expect(() => verifyPublicRolloutEvidence(
+      executionEnvelope,
+      keys.publicKey,
+      options({ expectedPromotionRuntimeHash: driftedRuntimeHash }),
+    )).toThrow(/semantic behavior/u);
+
+    const missingExecutionFence = structuredClone(payload());
+    delete (
+      missingExecutionFence.soak.runtimeSnapshot.runtime as
+        Record<string, unknown>
+    ).semanticExecutionConfigurationHash;
+    const missingFenceEnvelope = createStrictSignedEnvelope({
+      envelopeSchemaVersion: SIGNED_PUBLIC_ROLLOUT_EVIDENCE_SCHEMA_VERSION,
+      payload: missingExecutionFence,
+      signingKey: keys.privateKey,
+      keyId: "public-rollout-test-v1",
+    });
+    expect(() => verifyPublicRolloutEvidence(
+      missingFenceEnvelope,
+      keys.publicKey,
+      options(),
+    )).toThrow(/runtime.*missing or unapproved fields/u);
+  });
+
   test("requires explicit composite capability 2 and both promotion markers", () => {
     const validPromotion = payload().promotion;
     for (const [field, expected] of [
@@ -1008,8 +1065,23 @@ describe("signed public cohort rollout evidence", () => {
   });
 
   test("finalization requires a fresh completed 100% rollout while prior Sites stayed live", () => {
-    const current = configuration({ PIPELINE_V3_GENRE_SCENE_PERCENT: "50" });
-    const target = configuration({ PIPELINE_V3_GENRE_SCENE_PERCENT: "100" });
+    const fullyRolledOut = {
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
+      PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "100",
+      PIPELINE_V3_SIMILARITY_PERCENT: "100",
+      PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "100",
+      PIPELINE_V3_FIXED_CONTAINER_PERCENT: "100",
+      PIPELINE_V3_FACTUAL_PERCENT: "100",
+      PIPELINE_V3_EXHAUSTIVE_PERCENT: "100",
+    };
+    const finalApprovals = {
+      PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "true",
+    };
+    const current = configuration({
+      ...fullyRolledOut,
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "50",
+    }, finalApprovals);
+    const target = configuration(fullyRolledOut, finalApprovals);
     const complete = signed({
       fromPercent: "50",
       toPercent: "100",
@@ -1028,6 +1100,7 @@ describe("signed public cohort rollout evidence", () => {
         expectedPromotionEvidenceHash: promotionEvidenceHash,
         expectedPromotionConfigurationHash: promotionConfigurationHash,
         expectedPromotionRuntimeHash: promotionRuntimeHash,
+        expectedSemanticBehaviorHash: semanticBehaviorHash,
         expectedProductionCanaryEvidenceHash: productionCanaryEvidenceHash,
         expectedSitesVersion: priorSitesVersion,
         expectedSitesRevision: priorSitesRevision,
@@ -1040,6 +1113,25 @@ describe("signed public cohort rollout evidence", () => {
       toPercent: "100",
     });
     expect(() => verifyPublicRolloutFinalizationLineage(
+      complete,
+      keys.publicKey,
+      {
+        expectedTag: "v2.4.0-rc.2",
+        expectedVersion: "2.4.0",
+        expectedRevision: revision,
+        expectedImageDigest: imageDigest,
+        expectedPromotionEvidenceHash: promotionEvidenceHash,
+        expectedPromotionConfigurationHash: promotionConfigurationHash,
+        expectedPromotionRuntimeHash: promotionRuntimeHash,
+        expectedSemanticBehaviorHash: "0".repeat(64),
+        expectedProductionCanaryEvidenceHash: productionCanaryEvidenceHash,
+        expectedSitesVersion: priorSitesVersion,
+        expectedSitesRevision: priorSitesRevision,
+        minimumSoakStartedAt:
+          new Date(Date.now() - 5 * 60_000).toISOString(),
+      },
+    )).toThrow(/exact pre-Sites promotion/u);
+    expect(() => verifyPublicRolloutFinalizationLineage(
       signed(),
       keys.publicKey,
       {
@@ -1050,11 +1142,42 @@ describe("signed public cohort rollout evidence", () => {
         expectedPromotionEvidenceHash: promotionEvidenceHash,
         expectedPromotionConfigurationHash: promotionConfigurationHash,
         expectedPromotionRuntimeHash: promotionRuntimeHash,
+        expectedSemanticBehaviorHash: semanticBehaviorHash,
         expectedProductionCanaryEvidenceHash: productionCanaryEvidenceHash,
         expectedSitesVersion: priorSitesVersion,
         expectedSitesRevision: priorSitesRevision,
         minimumSoakStartedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
       },
     )).toThrow(/completed signed backend cohort rollout to 100%/u);
+    expect(() => verifyPublicRolloutFinalizationLineage(
+      signed({
+        fromPercent: "50",
+        toPercent: "100",
+        current: configuration({
+          PIPELINE_V3_GENRE_SCENE_PERCENT: "50",
+        }),
+        target: configuration({
+          PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
+        }),
+        previousRolloutEvidenceHash: "7".repeat(64),
+      }),
+      keys.publicKey,
+      {
+        expectedTag: "v2.4.0-rc.2",
+        expectedVersion: "2.4.0",
+        expectedRevision: revision,
+        expectedImageDigest: imageDigest,
+        expectedPromotionEvidenceHash: promotionEvidenceHash,
+        expectedPromotionConfigurationHash: promotionConfigurationHash,
+        expectedPromotionRuntimeHash: promotionRuntimeHash,
+        expectedSemanticBehaviorHash: semanticBehaviorHash,
+        expectedProductionCanaryEvidenceHash:
+          productionCanaryEvidenceHash,
+        expectedSitesVersion: priorSitesVersion,
+        expectedSitesRevision: priorSitesRevision,
+        minimumSoakStartedAt:
+          new Date(Date.now() - 5 * 60_000).toISOString(),
+      },
+    )).toThrow(/every governed intent cohort at 100%/u);
   });
 });

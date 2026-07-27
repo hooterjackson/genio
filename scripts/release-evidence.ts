@@ -25,16 +25,26 @@ import {
   verifySitesControlPlaneAttestation,
 } from "../shared/sites-control-plane-attestation.ts";
 import {
+  PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
+  PUBLIC_ROLLOUT_PERCENT_LADDER,
   publicRolloutProductionCanaryEvidenceHash,
   verifyPublicRolloutFinalizationLineage,
+  type PublicRolloutIntentGroup,
+  type PublicRolloutPercent,
 } from "../shared/public-rollout-evidence.ts";
 import {
+  semanticRankingCandidateBaselineFixturesV1,
   semanticRankingReviewerKeyFingerprint,
   semanticRankingReviewerTrustPolicyV1,
+  validateSemanticRankingReviewArtifactV1,
   validateSemanticRankingReviewerTrustPolicyV1,
   validateSemanticRankingReviewerVerificationKeyV1,
+  type SemanticRankingProtectedBaselineFixtureV1,
   type SemanticRankingReviewerTrustPolicyV1,
 } from "../lib/semantic-ranking-review.ts";
+import {
+  semanticBehaviorHashV1,
+} from "../shared/semantic-release-evidence.ts";
 import {
   RELEASE_GATE_ARTIFACT_SCHEMA_V1,
   validateReleaseFixtureBindingsForGate,
@@ -74,6 +84,18 @@ export interface ReleaseGateProducerTrustPolicyV1 {
   approvedKeySha256: string;
 }
 
+export interface VerifiedCandidateSemanticReviewAuthorizationV1 {
+  candidateEvidence: ReleaseEvidencePayloadV1;
+  candidateEvidencePayloadHash: string;
+  candidateEvidenceGeneratedAt: string;
+  gateEvidenceHash: string;
+  reviewedAt: string;
+  semanticBehaviorHash: string;
+  fixtures: readonly SemanticRankingProtectedBaselineFixtureV1[];
+  producerKeySha256: string;
+  reviewerKeySha256: string;
+}
+
 export interface ReleaseEvidenceGateV1 {
   name: ReleaseEvidenceGateName;
   environment: "offline" | "staging" | "production";
@@ -102,6 +124,21 @@ export interface ReleaseEvidenceEnvironmentSnapshotV1 {
   providerCredentialVersionHash: string;
   appleCredentialVersionHash: string;
   appleQaVerifierCredentialVersionHash: string;
+  publicRollout: {
+    active: boolean;
+    databaseAuthorized: boolean;
+    evidenceHash: string | null;
+    stage: string | null;
+    targetConfigurationHash: string | null;
+  };
+}
+
+export interface ReleaseEvidenceSemanticReviewV1 {
+  schemaVersion: "genio-release-semantic-review/v1";
+  gateEvidenceHash: string;
+  reviewedAt: string;
+  semanticBehaviorHash: string;
+  fixtures: readonly SemanticRankingProtectedBaselineFixtureV1[];
 }
 
 export interface ReleaseEvidencePayloadV1 {
@@ -123,7 +160,10 @@ export interface ReleaseEvidencePayloadV1 {
     promotionEvidenceGeneratedAt: string | null;
     publicRolloutEvidencePayloadHash: string | null;
     publicRolloutCompletedAt: string | null;
-    publicRolloutIntentGroup: string | null;
+    publicRolloutIntentGroup: PublicRolloutIntentGroup | null;
+    publicRolloutFromPercent: PublicRolloutPercent | null;
+    publicRolloutToPercent: PublicRolloutPercent | null;
+    publicRolloutTargetConfigurationHash: string | null;
   };
   configuration: {
     apiHash: string;
@@ -171,6 +211,7 @@ export interface ReleaseEvidencePayloadV1 {
     controlPlaneKeyFingerprint: string;
   };
   runtime: {
+    semanticExecutionConfigurationHash: string;
     releaseEnvironment: "staging" | "production";
     deploymentPhase: "activate";
     databaseSchemaVersion: string;
@@ -196,6 +237,7 @@ export interface ReleaseEvidencePayloadV1 {
       prompt: string;
     };
   };
+  semanticReview: ReleaseEvidenceSemanticReviewV1;
   environmentSnapshots: {
     staging: ReleaseEvidenceEnvironmentSnapshotV1;
     production: ReleaseEvidenceEnvironmentSnapshotV1 | null;
@@ -353,7 +395,7 @@ export function releaseEvidenceRuntimeHash(
 }
 
 export interface LoadedRuntimeSnapshotV1 {
-  schemaVersion: "genio-release-runtime-snapshot/v2";
+  schemaVersion: "genio-release-runtime-snapshot/v3";
   generatedAt: string;
   origin: string;
   environment: "staging" | "production";
@@ -369,8 +411,21 @@ export interface LoadedRuntimeSnapshotV1 {
     ownerAllowlistVersion: string;
     candidateMatched: boolean;
   };
+  apiObservations: {
+    liveReplicaIdentityHash: string;
+    systemReplicaIdentityHash: string;
+  };
+  executorFencing: {
+    version: "1";
+    ready: true;
+    incompleteJobs: 0;
+    mismatchedActiveAttempts: 0;
+    uncoveredJobs: 0;
+    requirementsHash: string;
+  };
   configuration: ReleaseEvidencePayloadV1["configuration"];
   runtime: ReleaseEvidencePayloadV1["runtime"];
+  publicRollout: ReleaseEvidenceEnvironmentSnapshotV1["publicRollout"];
   credentialVersionHashes: {
     provider: string;
     apple: string;
@@ -412,6 +467,7 @@ function validateRuntimeShape(
 ): ReleaseEvidencePayloadV1["runtime"] {
   const runtime = asRecord(value, labelPrefix);
   exactKeys(runtime, [
+    "semanticExecutionConfigurationHash",
     "releaseEnvironment",
     "deploymentPhase",
     "databaseSchemaVersion",
@@ -424,6 +480,10 @@ function validateRuntimeShape(
     "modelIds",
     "policyVersions",
   ], labelPrefix);
+  digest(
+    runtime.semanticExecutionConfigurationHash,
+    `${labelPrefix}.semanticExecutionConfigurationHash`,
+  );
   if (runtime.releaseEnvironment !== expectedEnvironment) {
     throw new Error(`${labelPrefix}.releaseEnvironment must be ${expectedEnvironment}`);
   }
@@ -496,14 +556,17 @@ export function validateRuntimeSnapshot(
     "scope",
     "candidate",
     "sitesObservation",
+    "apiObservations",
+    "executorFencing",
     "configuration",
     "runtime",
+    "publicRollout",
     "credentialVersionHashes",
     "configurationHash",
     "runtimeHash",
     "snapshotHash",
   ], `${expectedEnvironment} runtime snapshot`);
-  if (root.schemaVersion !== "genio-release-runtime-snapshot/v2"
+  if (root.schemaVersion !== "genio-release-runtime-snapshot/v3"
     || root.environment !== expectedEnvironment
     || root.scope !== expectedScope) {
     throw new Error(
@@ -530,6 +593,14 @@ export function validateRuntimeSnapshot(
   if (expectedEnvironment === "staging"
     && (origin.hostname === "9enio.com" || origin.hostname === "www.9enio.com")) {
     throw new Error("staging runtime snapshot cannot use the production origin");
+  }
+  if (
+    expectedEnvironment === "production"
+    && origin.origin !== "https://9enio.com"
+  ) {
+    throw new Error(
+      "production runtime snapshot must use the canonical https://9enio.com origin",
+    );
   }
   const candidate = asRecord(root.candidate, `${expectedEnvironment} runtime snapshot candidate`);
   exactKeys(candidate, ["version", "sourceRevision"], `${expectedEnvironment} runtime snapshot candidate`);
@@ -581,6 +652,49 @@ export function validateRuntimeSnapshot(
       `${expectedEnvironment} runtime snapshot Sites candidate binding is invalid`,
     );
   }
+  const apiObservations = asRecord(
+    root.apiObservations,
+    `${expectedEnvironment} runtime snapshot apiObservations`,
+  );
+  exactKeys(apiObservations, [
+    "liveReplicaIdentityHash",
+    "systemReplicaIdentityHash",
+  ], `${expectedEnvironment} runtime snapshot apiObservations`);
+  digest(
+    apiObservations.liveReplicaIdentityHash,
+    `${expectedEnvironment} runtime snapshot apiObservations.liveReplicaIdentityHash`,
+  );
+  digest(
+    apiObservations.systemReplicaIdentityHash,
+    `${expectedEnvironment} runtime snapshot apiObservations.systemReplicaIdentityHash`,
+  );
+  const executorFencing = asRecord(
+    root.executorFencing,
+    `${expectedEnvironment} runtime snapshot executorFencing`,
+  );
+  exactKeys(executorFencing, [
+    "version",
+    "ready",
+    "incompleteJobs",
+    "mismatchedActiveAttempts",
+    "uncoveredJobs",
+    "requirementsHash",
+  ], `${expectedEnvironment} runtime snapshot executorFencing`);
+  if (
+    executorFencing.version !== "1"
+    || executorFencing.ready !== true
+    || executorFencing.incompleteJobs !== 0
+    || executorFencing.mismatchedActiveAttempts !== 0
+    || executorFencing.uncoveredJobs !== 0
+  ) {
+    throw new Error(
+      `${expectedEnvironment} runtime snapshot executor fencing is not converged`,
+    );
+  }
+  digest(
+    executorFencing.requirementsHash,
+    `${expectedEnvironment} runtime snapshot executorFencing.requirementsHash`,
+  );
   const configuration = validateConfigurationShape(
     root.configuration,
     `${expectedEnvironment} runtime snapshot configuration`,
@@ -603,6 +717,52 @@ export function validateRuntimeSnapshot(
     expectedEnvironment,
     `${expectedEnvironment} runtime snapshot runtime`,
   );
+  const publicRollout = asRecord(
+    root.publicRollout,
+    `${expectedEnvironment} runtime snapshot publicRollout`,
+  );
+  exactKeys(publicRollout, [
+    "active",
+    "databaseAuthorized",
+    "evidenceHash",
+    "stage",
+    "targetConfigurationHash",
+  ], `${expectedEnvironment} runtime snapshot publicRollout`);
+  if (
+    typeof publicRollout.active !== "boolean"
+    || publicRollout.databaseAuthorized !== true
+  ) {
+    throw new Error(
+      `${expectedEnvironment} runtime snapshot public rollout lacks database authority`,
+    );
+  }
+  if (publicRollout.active) {
+    digest(
+      publicRollout.evidenceHash,
+      `${expectedEnvironment} runtime snapshot publicRollout.evidenceHash`,
+    );
+    if (
+      typeof publicRollout.stage !== "string"
+      || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u
+        .test(publicRollout.stage)
+    ) {
+      throw new Error(
+        `${expectedEnvironment} runtime snapshot publicRollout.stage is invalid`,
+      );
+    }
+    digest(
+      publicRollout.targetConfigurationHash,
+      `${expectedEnvironment} runtime snapshot publicRollout.targetConfigurationHash`,
+    );
+  } else if (
+    publicRollout.evidenceHash !== null
+    || publicRollout.stage !== null
+    || publicRollout.targetConfigurationHash !== null
+  ) {
+    throw new Error(
+      `${expectedEnvironment} runtime snapshot inactive public rollout has stale markers`,
+    );
+  }
   const credentialVersionHashes = asRecord(
     root.credentialVersionHashes,
     `${expectedEnvironment} runtime snapshot credentialVersionHashes`,
@@ -638,8 +798,11 @@ export function validateRuntimeSnapshot(
     scope: root.scope,
     candidate: root.candidate,
     sitesObservation: root.sitesObservation,
+    apiObservations: root.apiObservations,
+    executorFencing: root.executorFencing,
     configuration: root.configuration,
     runtime: root.runtime,
+    publicRollout: root.publicRollout,
     credentialVersionHashes: root.credentialVersionHashes,
     configurationHash: root.configurationHash,
     runtimeHash: root.runtimeHash,
@@ -649,6 +812,62 @@ export function validateRuntimeSnapshot(
     throw new Error(`${expectedEnvironment} runtime snapshot hash does not match its contents`);
   }
   return root as unknown as LoadedRuntimeSnapshotV1;
+}
+
+export function assertFinalizationRuntimePublicRolloutBindingV1(input: {
+  runtimePublicRollout: ReleaseEvidenceEnvironmentSnapshotV1["publicRollout"];
+  signedRollout: {
+    payloadHash: string;
+    intentGroup: string;
+    fromPercent: string;
+    toPercent: string;
+    targetConfigurationHash: string;
+  };
+}): void {
+  const expectedStage =
+    `${input.signedRollout.intentGroup}:${input.signedRollout.fromPercent}->${input.signedRollout.toPercent}`;
+  if (
+    !input.runtimePublicRollout.active
+    || !input.runtimePublicRollout.databaseAuthorized
+    || input.runtimePublicRollout.evidenceHash
+      !== input.signedRollout.payloadHash
+    || input.runtimePublicRollout.stage !== expectedStage
+    || input.runtimePublicRollout.targetConfigurationHash
+      !== input.signedRollout.targetConfigurationHash
+  ) {
+    throw new Error(
+      "finalization runtime snapshot does not prove the exact signed public rollout was database-authorized and active",
+    );
+  }
+}
+
+export function assertFinalizationBrowserPublicRolloutBindingV1(input: {
+  probes: readonly unknown[];
+  signedRollout: {
+    payloadHash: string;
+    intentGroup: string;
+    fromPercent: string;
+    toPercent: string;
+  };
+}): void {
+  const expectedStage =
+    `${input.signedRollout.intentGroup}:${input.signedRollout.fromPercent}->${input.signedRollout.toPercent}`;
+  if (
+    input.probes.length < 1
+    || input.probes.some((probeValue, probeIndex) => {
+      const probe = asRecord(
+        probeValue,
+        `final browser public assignment probe ${probeIndex}`,
+      );
+      return probe.rolloutEvidenceHash
+          !== input.signedRollout.payloadHash
+        || probe.rolloutStage !== expectedStage;
+    })
+  ) {
+    throw new Error(
+      "final browser probes do not bind the exact signed public rollout",
+    );
+  }
 }
 
 function requiredGates(kind: ReleaseEvidenceKind): readonly ReleaseEvidenceGateName[] {
@@ -721,6 +940,7 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
     "configuration",
     "stagingControls",
     "runtime",
+    "semanticReview",
     "environmentSnapshots",
     "gates",
   ], "release evidence");
@@ -780,6 +1000,9 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
     "publicRolloutEvidencePayloadHash",
     "publicRolloutCompletedAt",
     "publicRolloutIntentGroup",
+    "publicRolloutFromPercent",
+    "publicRolloutToPercent",
+    "publicRolloutTargetConfigurationHash",
   ], "lineage");
   const candidateEvidencePayloadHash =
     lineage.candidateEvidencePayloadHash === null
@@ -830,22 +1053,66 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
           lineage.publicRolloutIntentGroup,
           "lineage.publicRolloutIntentGroup",
         );
+  if (
+    publicRolloutIntentGroup !== null
+    && !(publicRolloutIntentGroup in PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS)
+  ) {
+    throw new Error("lineage.publicRolloutIntentGroup is not governed");
+  }
+  const rolloutPercent = (
+    value: unknown,
+    field: string,
+  ): PublicRolloutPercent | null => {
+    if (value === null) return null;
+    if (
+      typeof value !== "string"
+      || !PUBLIC_ROLLOUT_PERCENT_LADDER.includes(
+        value as PublicRolloutPercent,
+      )
+    ) {
+      throw new Error(`${field} is not an approved rollout percentage`);
+    }
+    return value as PublicRolloutPercent;
+  };
+  const publicRolloutFromPercent = rolloutPercent(
+    lineage.publicRolloutFromPercent,
+    "lineage.publicRolloutFromPercent",
+  );
+  const publicRolloutToPercent = rolloutPercent(
+    lineage.publicRolloutToPercent,
+    "lineage.publicRolloutToPercent",
+  );
+  const publicRolloutTargetConfigurationHash =
+    lineage.publicRolloutTargetConfigurationHash === null
+      ? null
+      : digest(
+          lineage.publicRolloutTargetConfigurationHash,
+          "lineage.publicRolloutTargetConfigurationHash",
+        );
   const candidateLineagePresent = candidateEvidencePayloadHash !== null
     && candidateEvidenceGeneratedAt !== null;
   const promotionLineagePresent = promotionEvidencePayloadHash !== null
     && promotionEvidenceGeneratedAt !== null;
   const rolloutLineagePresent = publicRolloutEvidencePayloadHash !== null
     && publicRolloutCompletedAt !== null
-    && publicRolloutIntentGroup !== null;
+    && publicRolloutIntentGroup !== null
+    && publicRolloutFromPercent !== null
+    && publicRolloutToPercent !== null
+    && publicRolloutTargetConfigurationHash !== null;
+  const rolloutLineageNulls = [
+    publicRolloutEvidencePayloadHash,
+    publicRolloutCompletedAt,
+    publicRolloutIntentGroup,
+    publicRolloutFromPercent,
+    publicRolloutToPercent,
+    publicRolloutTargetConfigurationHash,
+  ].filter((value) => value === null).length;
   if (
     (candidateEvidencePayloadHash === null)
       !== (candidateEvidenceGeneratedAt === null)
     || (promotionEvidencePayloadHash === null)
       !== (promotionEvidenceGeneratedAt === null)
-    || (publicRolloutEvidencePayloadHash === null)
-      !== (publicRolloutCompletedAt === null)
-    || (publicRolloutEvidencePayloadHash === null)
-      !== (publicRolloutIntentGroup === null)
+    || (rolloutLineageNulls !== 0 && rolloutLineageNulls !== 6)
     || (root.kind === "candidate"
       && (
         candidateLineagePresent
@@ -863,6 +1130,7 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
         !candidateLineagePresent
         || !promotionLineagePresent
         || !rolloutLineagePresent
+        || publicRolloutToPercent !== "100"
       ))
   ) {
     throw new Error(
@@ -1103,6 +1371,82 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
     ? "staging"
     : "production";
   const runtime = validateRuntimeShape(root.runtime, requiredReleaseEnvironment);
+  const semanticReviewValue = asRecord(
+    root.semanticReview,
+    "semanticReview",
+  );
+  exactKeys(semanticReviewValue, [
+    "schemaVersion",
+    "gateEvidenceHash",
+    "reviewedAt",
+    "semanticBehaviorHash",
+    "fixtures",
+  ], "semanticReview");
+  if (
+    semanticReviewValue.schemaVersion
+      !== "genio-release-semantic-review/v1"
+  ) {
+    throw new Error("semanticReview uses an unsupported schema");
+  }
+  const semanticReviewGateEvidenceHash = digest(
+    semanticReviewValue.gateEvidenceHash,
+    "semanticReview.gateEvidenceHash",
+  );
+  const semanticReviewReviewedAt = timestamp(
+    semanticReviewValue.reviewedAt,
+    "semanticReview.reviewedAt",
+  );
+  const semanticBehaviorHash = digest(
+    semanticReviewValue.semanticBehaviorHash,
+    "semanticReview.semanticBehaviorHash",
+  );
+  if (semanticBehaviorHash !== semanticBehaviorHashV1(runtime)) {
+    throw new Error(
+      "semantic behavior hash does not match the signed release runtime",
+    );
+  }
+  if (
+    Date.parse(semanticReviewReviewedAt) > Date.parse(generatedAt) + 5 * 60_000
+    || Date.parse(generatedAt) - Date.parse(semanticReviewReviewedAt)
+      > RELEASE_EVIDENCE_TTL_MS
+  ) {
+    throw new Error("semantic review is outside the release evidence window");
+  }
+  if (
+    !Array.isArray(semanticReviewValue.fixtures)
+    || semanticReviewValue.fixtures.length < 3
+  ) {
+    throw new Error("semanticReview.fixtures must contain the reviewed fixtures");
+  }
+  const semanticReviewFixtures =
+    semanticReviewValue.fixtures.map((value, index) => {
+      const fixture = asRecord(value, `semanticReview.fixtures[${index}]`);
+      exactKeys(
+        fixture,
+        ["fixtureId", "orderedManifestHash", "outputHash"],
+        `semanticReview.fixtures[${index}]`,
+      );
+      return {
+        fixtureId: label(
+          fixture.fixtureId,
+          `semanticReview.fixtures[${index}].fixtureId`,
+        ),
+        orderedManifestHash: digest(
+          fixture.orderedManifestHash,
+          `semanticReview.fixtures[${index}].orderedManifestHash`,
+        ),
+        outputHash: digest(
+          fixture.outputHash,
+          `semanticReview.fixtures[${index}].outputHash`,
+        ),
+      };
+    });
+  if (
+    new Set(semanticReviewFixtures.map(({ fixtureId }) => fixtureId)).size
+      !== semanticReviewFixtures.length
+  ) {
+    throw new Error("semanticReview.fixtures contains duplicate fixture IDs");
+  }
 
   const environmentSnapshots = asRecord(root.environmentSnapshots, "environmentSnapshots");
   exactKeys(environmentSnapshots, ["staging", "production"], "environmentSnapshots");
@@ -1127,6 +1471,7 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
         "providerCredentialVersionHash",
         "appleCredentialVersionHash",
         "appleQaVerifierCredentialVersionHash",
+        "publicRollout",
       ],
       `environmentSnapshots.${environment}`,
     );
@@ -1177,6 +1522,52 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
       binding.appleQaVerifierCredentialVersionHash,
       `environmentSnapshots.${environment}.appleQaVerifierCredentialVersionHash`,
     );
+    const publicRollout = asRecord(
+      binding.publicRollout,
+      `environmentSnapshots.${environment}.publicRollout`,
+    );
+    exactKeys(publicRollout, [
+      "active",
+      "databaseAuthorized",
+      "evidenceHash",
+      "stage",
+      "targetConfigurationHash",
+    ], `environmentSnapshots.${environment}.publicRollout`);
+    if (
+      typeof publicRollout.active !== "boolean"
+      || publicRollout.databaseAuthorized !== true
+    ) {
+      throw new Error(
+        `environmentSnapshots.${environment}.publicRollout lacks database authority`,
+      );
+    }
+    if (publicRollout.active) {
+      digest(
+        publicRollout.evidenceHash,
+        `environmentSnapshots.${environment}.publicRollout.evidenceHash`,
+      );
+      if (
+        typeof publicRollout.stage !== "string"
+        || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u
+          .test(publicRollout.stage)
+      ) {
+        throw new Error(
+          `environmentSnapshots.${environment}.publicRollout.stage is invalid`,
+        );
+      }
+      digest(
+        publicRollout.targetConfigurationHash,
+        `environmentSnapshots.${environment}.publicRollout.targetConfigurationHash`,
+      );
+    } else if (
+      publicRollout.evidenceHash !== null
+      || publicRollout.stage !== null
+      || publicRollout.targetConfigurationHash !== null
+    ) {
+      throw new Error(
+        `environmentSnapshots.${environment}.publicRollout has stale inactive markers`,
+      );
+    }
     return binding as unknown as ReleaseEvidenceEnvironmentSnapshotV1;
   };
   const stagingSnapshot = snapshotBinding(environmentSnapshots.staging, "staging");
@@ -1235,6 +1626,27 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
     throw new Error(
       "finalization release evidence requires a full candidate-matched production snapshot",
     );
+  }
+  if (stagingSnapshot.publicRollout.active) {
+    throw new Error(
+      "staging release evidence cannot carry a production public rollout",
+    );
+  }
+  if (root.kind === "finalization") {
+    const appliedRollout = productionSnapshot!.publicRollout;
+    const expectedRolloutStage =
+      `${publicRolloutIntentGroup}:${publicRolloutFromPercent}->${publicRolloutToPercent}`;
+    if (
+      !appliedRollout.active
+      || appliedRollout.evidenceHash !== publicRolloutEvidencePayloadHash
+      || appliedRollout.stage !== expectedRolloutStage
+      || appliedRollout.targetConfigurationHash
+        !== publicRolloutTargetConfigurationHash
+    ) {
+      throw new Error(
+        "finalization environment snapshot does not bind its signed public rollout lineage",
+      );
+    }
   }
   const activeSnapshot = root.kind === "candidate" ? stagingSnapshot : productionSnapshot!;
   if (activeSnapshot.configurationHash !== releaseEvidenceConfigurationHash({ configuration })
@@ -1377,6 +1789,21 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
   const extras = [...gateNames].filter((gate) => !expectedGates.includes(gate));
   if (missing.length > 0 || extras.length > 0) {
     throw new Error(`release evidence gates do not match ${root.kind}: missing=${missing.join(",") || "none"} extras=${extras.join(",") || "none"}`);
+  }
+  if (root.kind === "candidate") {
+    const semanticGate = (root.gates as ReleaseEvidenceGateV1[]).find(
+      ({ name }) => name === "semantic_ranking_blinded_review",
+    );
+    if (
+      !semanticGate
+      || semanticGate.evidenceHash !== semanticReviewGateEvidenceHash
+      || Date.parse(semanticReviewReviewedAt)
+        > Date.parse(semanticGate.completedAt)
+    ) {
+      throw new Error(
+        "candidate semantic review summary does not bind its verified release gate",
+      );
+    }
   }
   return value as ReleaseEvidencePayloadV1;
 }
@@ -1685,6 +2112,8 @@ export async function loadReleaseEvidenceSigningBundle(
             releaseEvidenceConfigurationHash(priorReleasePayload!),
           expectedPromotionRuntimeHash:
             releaseEvidenceRuntimeHash(priorReleasePayload!),
+          expectedSemanticBehaviorHash:
+            priorReleasePayload!.semanticReview.semanticBehaviorHash,
           expectedProductionCanaryEvidenceHash:
             publicRolloutProductionCanaryEvidenceHash(
               priorReleasePayload!.gates,
@@ -1727,6 +2156,12 @@ export async function loadReleaseEvidenceSigningBundle(
     throw new Error(
       "finalization runtime snapshot predates the signed public rollout",
     );
+  }
+  if (kind === "finalization") {
+    assertFinalizationRuntimePublicRolloutBindingV1({
+      runtimePublicRollout: productionSnapshot!.publicRollout,
+      signedRollout: publicRollout!,
+    });
   }
 
   const artifactFiles = asRecord(
@@ -1917,6 +2352,7 @@ export async function loadReleaseEvidenceSigningBundle(
       appleCredentialVersionHash: stagingSnapshot.credentialVersionHashes.apple,
       appleQaVerifierCredentialVersionHash:
         stagingSnapshot.credentialVersionHashes.appleQaVerifier,
+      publicRollout: stagingSnapshot.publicRollout,
     },
     production: productionSnapshot
       ? {
@@ -1937,6 +2373,7 @@ export async function loadReleaseEvidenceSigningBundle(
         appleCredentialVersionHash: productionSnapshot.credentialVersionHashes.apple,
         appleQaVerifierCredentialVersionHash:
           productionSnapshot.credentialVersionHashes.appleQaVerifier,
+        publicRollout: productionSnapshot.publicRollout,
       }
       : null,
   };
@@ -1990,6 +2427,51 @@ export async function loadReleaseEvidenceSigningBundle(
         throw new Error(
           `${expectedGate} does not bind the exact runtime snapshot Sites identity`,
         );
+      }
+      if (kind === "finalization" && expectedGate === "release_convergence") {
+        const expectedRolloutStage =
+          `${publicRollout!.intentGroup}:${publicRollout!.fromPercent}->${publicRollout!.toPercent}`;
+        const observations = Array.isArray(convergence.observations)
+          ? convergence.observations
+          : [];
+        if (observations.length < 2) {
+          throw new Error(
+            "release_convergence has no independently repeated rollout observations",
+          );
+        }
+        for (const [observationIndex, observationValue] of observations.entries()) {
+          const observation = asRecord(
+            observationValue,
+            `release_convergence observation ${observationIndex}`,
+          );
+          const observedRuntime = asRecord(
+            observation.runtime,
+            `release_convergence observation ${observationIndex} runtime`,
+          );
+          const observedSystem = asRecord(
+            observation.system,
+            `release_convergence observation ${observationIndex} system`,
+          );
+          const observedRollout = asRecord(
+            observedSystem.publicRollout,
+            `release_convergence observation ${observationIndex} public rollout`,
+          );
+          if (
+            observedRuntime.publicRolloutEvidenceHash
+              !== publicRollout!.payloadHash
+            || observedRuntime.publicRolloutStage !== expectedRolloutStage
+            || observedRollout.active !== true
+            || observedRollout.databaseAuthorized !== true
+            || observedRollout.evidenceHash !== publicRollout!.payloadHash
+            || observedRollout.stage !== expectedRolloutStage
+            || observedRollout.targetConfigurationHash
+              !== publicRollout!.targetConfigurationHash
+          ) {
+            throw new Error(
+              "release_convergence did not observe the exact database-authorized signed public rollout",
+            );
+          }
+        }
       }
     }
     if (expectedGate === "staging_provider_manifest") {
@@ -2142,6 +2624,15 @@ export async function loadReleaseEvidenceSigningBundle(
       const priorSites =
         priorReleasePayload!.environmentSnapshots.production!;
       const rolloutCompletedAt = publicRollout!.soak.completedAt;
+      const publicAssignmentProbes = Array.isArray(
+        browser.publicAssignmentProbes,
+      )
+        ? browser.publicAssignmentProbes
+        : [];
+      assertFinalizationBrowserPublicRolloutBindingV1({
+        probes: publicAssignmentProbes,
+        signedRollout: publicRollout!,
+      });
       if (
         previousSites.liveBuildVersion !== priorSites.sitesVersion
         || previousSites.liveBuildRevision !== priorSites.sitesSourceRevision
@@ -2177,6 +2668,40 @@ export async function loadReleaseEvidenceSigningBundle(
     };
   });
   const activeSnapshot = kind === "candidate" ? stagingSnapshot : productionSnapshot!;
+  const semanticBehaviorHash = semanticBehaviorHashV1(activeSnapshot.runtime);
+  if (
+    priorReleasePayload
+    && priorReleasePayload.semanticReview.semanticBehaviorHash
+      !== semanticBehaviorHash
+  ) {
+    throw new Error(
+      "semantic behavior changed after the reviewed candidate phase",
+    );
+  }
+  const semanticReview: ReleaseEvidenceSemanticReviewV1 =
+    kind === "candidate"
+      ? (() => {
+          const semanticGate = artifacts.find(
+            ({ gate }) => gate === "semantic_ranking_blinded_review",
+          );
+          if (!semanticGate) {
+            throw new Error(
+              "candidate release evidence has no verified semantic review gate",
+            );
+          }
+          const reviewArtifact = validateSemanticRankingReviewArtifactV1(
+            semanticGate.sources.reviewArtifact,
+          );
+          return {
+            schemaVersion: "genio-release-semantic-review/v1",
+            gateEvidenceHash: semanticGate.evidenceHash,
+            reviewedAt: reviewArtifact.reviewedAt,
+            semanticBehaviorHash,
+            fixtures:
+              semanticRankingCandidateBaselineFixturesV1(reviewArtifact),
+          };
+        })()
+      : priorReleasePayload!.semanticReview;
   const lineage: ReleaseEvidencePayloadV1["lineage"] = kind === "candidate"
     ? {
         candidateEvidencePayloadHash: null,
@@ -2186,6 +2711,9 @@ export async function loadReleaseEvidenceSigningBundle(
         publicRolloutEvidencePayloadHash: null,
         publicRolloutCompletedAt: null,
         publicRolloutIntentGroup: null,
+        publicRolloutFromPercent: null,
+        publicRolloutToPercent: null,
+        publicRolloutTargetConfigurationHash: null,
       }
     : kind === "promotion"
       ? {
@@ -2196,6 +2724,9 @@ export async function loadReleaseEvidenceSigningBundle(
           publicRolloutEvidencePayloadHash: null,
           publicRolloutCompletedAt: null,
           publicRolloutIntentGroup: null,
+          publicRolloutFromPercent: null,
+          publicRolloutToPercent: null,
+          publicRolloutTargetConfigurationHash: null,
         }
       : {
           candidateEvidencePayloadHash:
@@ -2207,6 +2738,10 @@ export async function loadReleaseEvidenceSigningBundle(
           publicRolloutEvidencePayloadHash: publicRollout!.payloadHash,
           publicRolloutCompletedAt: publicRollout!.soak.completedAt,
           publicRolloutIntentGroup: publicRollout!.intentGroup,
+          publicRolloutFromPercent: publicRollout!.fromPercent,
+          publicRolloutToPercent: publicRollout!.toPercent,
+          publicRolloutTargetConfigurationHash:
+            publicRollout!.targetConfigurationHash,
         };
   return validateReleaseEvidencePayload({
     schemaVersion: "genio-release-evidence/v3",
@@ -2218,6 +2753,7 @@ export async function loadReleaseEvidenceSigningBundle(
     configuration: activeSnapshot.configuration,
     stagingControls: stagingControlPlane.derivedControls,
     runtime: activeSnapshot.runtime,
+    semanticReview,
     environmentSnapshots,
     gates,
   });
@@ -2367,6 +2903,172 @@ export function verifyReleaseEvidence(
     throw new Error("release evidence runtime does not match the promotion target");
   }
   return payload;
+}
+
+/**
+ * Rebuilds the candidate semantic baseline from the independently attested
+ * blinded-review gate. Stable authorization must not trust fixture hashes that
+ * exist only in release-signer-owned candidate/finalization summaries.
+ */
+export function verifyCandidateSemanticReviewAuthorizationEvidence(input: {
+  candidateEvidence: unknown;
+  semanticReviewGateArtifact: unknown;
+  semanticReviewGateProducerAttestation: unknown;
+  releaseVerificationKey: string | Buffer | KeyObject;
+  releaseGateProducerVerificationKey: string | Buffer | KeyObject;
+  approvedReleaseGateProducer: unknown;
+  approvedSemanticReviewer: unknown;
+  expectedTag: string;
+  expectedRevision: string;
+  expectedImageDigest: string;
+  now?: string;
+}): VerifiedCandidateSemanticReviewAuthorizationV1 {
+  const candidateEvidence = verifyReleaseEvidence(
+    input.candidateEvidence,
+    input.releaseVerificationKey,
+    {
+      expectedKind: "candidate",
+      expectedTag: input.expectedTag,
+      expectedRevision: input.expectedRevision,
+      expectedImageDigest: input.expectedImageDigest,
+      now: input.now,
+    },
+  );
+  const candidateEnvelope = asRecord(
+    input.candidateEvidence,
+    "signed candidate release evidence",
+  );
+  const candidateEvidencePayloadHash = digest(
+    candidateEnvelope.payloadHash,
+    "candidate release evidence payload hash",
+  );
+  const artifact = validateReleaseGateArtifact(
+    input.semanticReviewGateArtifact,
+  );
+  if (
+    artifact.gate !== "semantic_ranking_blinded_review"
+    || artifact.environment !== "staging"
+    || !sameCandidate(candidateEvidence.candidate, artifact.candidate)
+  ) {
+    throw new Error(
+      "semantic review gate does not bind the exact candidate release",
+    );
+  }
+  const candidateGate = candidateEvidence.gates.find(
+    ({ name }) => name === "semantic_ranking_blinded_review",
+  );
+  const canonicalGate = {
+    name: artifact.gate,
+    environment: artifact.environment,
+    passed: true as const,
+    completedAt: artifact.completedAt,
+    evidenceHash: artifact.evidenceHash,
+    artifactSchemaVersion: artifact.schemaVersion,
+    configurationHash: artifact.configurationHash,
+    runtimeHash: artifact.runtimeHash,
+    fixtures: artifact.fixtures,
+    cacheMode: artifact.cacheMode,
+    budgetStatus: artifact.budgetStatus,
+  };
+  if (
+    !candidateGate
+    || stableReleaseEvidenceJson(candidateGate)
+      !== stableReleaseEvidenceJson(canonicalGate)
+    || artifact.configurationHash
+      !== releaseEvidenceConfigurationHash(candidateEvidence)
+    || artifact.runtimeHash !== releaseEvidenceRuntimeHash(candidateEvidence)
+    || candidateEvidence.semanticReview.gateEvidenceHash
+      !== artifact.evidenceHash
+  ) {
+    throw new Error(
+      "candidate release evidence does not bind the exact semantic review gate",
+    );
+  }
+
+  const producerTrust = validateReleaseGateProducerTrustPolicyV1(
+    input.approvedReleaseGateProducer,
+  );
+  const producerKeySha256 = releaseGateProducerKeyFingerprint(
+    input.releaseGateProducerVerificationKey,
+  );
+  if (producerKeySha256 !== producerTrust.approvedKeySha256) {
+    throw new Error(
+      "semantic review gate producer does not use the protected approved key",
+    );
+  }
+  const producerAttestation = verifyReleaseGateProducerAttestation(
+    input.semanticReviewGateProducerAttestation,
+    artifact,
+    input.releaseGateProducerVerificationKey,
+  );
+  if (
+    producerAttestation.signature.keyId !== producerTrust.approvedKeyId
+  ) {
+    throw new Error(
+      "semantic review gate producer key ID is not protected and approved",
+    );
+  }
+
+  const approvedSemanticReviewer =
+    validateSemanticRankingReviewerTrustPolicyV1(
+      input.approvedSemanticReviewer,
+    );
+  const artifactReviewerTrust =
+    validateSemanticRankingReviewerTrustPolicyV1(
+      artifact.sources.reviewerTrustPolicy,
+    );
+  const reviewerKey = validateSemanticRankingReviewerVerificationKeyV1(
+    artifact.sources.reviewerVerificationKey,
+  );
+  if (
+    stableReleaseEvidenceJson(artifactReviewerTrust)
+      !== stableReleaseEvidenceJson(approvedSemanticReviewer)
+    || reviewerKey.source.sha256
+      !== approvedSemanticReviewer.approvedKeySha256
+  ) {
+    throw new Error(
+      "semantic reviewer or baseline does not match the protected semantic review policy",
+    );
+  }
+  const reviewerKeySha256 = reviewerKey.source.sha256;
+  if (reviewerKeySha256 === producerKeySha256) {
+    throw new Error(
+      "semantic reviewer key must be separate from the release gate producer key",
+    );
+  }
+
+  const reviewArtifact = validateSemanticRankingReviewArtifactV1(
+    artifact.sources.reviewArtifact,
+  );
+  const fixtures = Object.freeze(
+    semanticRankingCandidateBaselineFixturesV1(reviewArtifact).map(
+      (fixture) => Object.freeze({ ...fixture }),
+    ),
+  );
+  if (
+    reviewArtifact.reviewedAt
+      !== candidateEvidence.semanticReview.reviewedAt
+    || stableReleaseEvidenceJson(fixtures)
+      !== stableReleaseEvidenceJson(
+        candidateEvidence.semanticReview.fixtures,
+      )
+  ) {
+    throw new Error(
+      "candidate semantic review fixtures were not mechanically derived from the independently verified candidate arms",
+    );
+  }
+  return Object.freeze({
+    candidateEvidence,
+    candidateEvidencePayloadHash,
+    candidateEvidenceGeneratedAt: candidateEvidence.generatedAt,
+    gateEvidenceHash: artifact.evidenceHash,
+    reviewedAt: reviewArtifact.reviewedAt,
+    semanticBehaviorHash:
+      candidateEvidence.semanticReview.semanticBehaviorHash,
+    fixtures,
+    producerKeySha256,
+    reviewerKeySha256,
+  });
 }
 
 function option(args: readonly string[], name: string): string {

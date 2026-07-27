@@ -9,7 +9,10 @@ import {
   selectAppleAuthorizationStage,
 } from "./owner.ts";
 import { parseOwnerCatalogImport, unverifiedImportedCandidates } from "./catalog-import.ts";
-import { Repository } from "./repository.ts";
+import {
+  canonicalExecutorReleaseIdentityV1,
+  Repository,
+} from "./repository.ts";
 import {
   capabilityPepperRotationStatus,
   HttpError,
@@ -109,6 +112,8 @@ import { authenticateReleaseCanary } from "./release-canary-request.ts";
 import {
   CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+  CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION,
   canonicalContractActivationConfigured,
   canonicalContractActivationReady,
   releaseDatabaseReadinessReady,
@@ -119,7 +124,10 @@ import {
   RELEASE_MANIFEST_CANARY_MAX_TRACKS,
   RELEASE_MANIFEST_CANARY_MARKER_PHASE,
 } from "./release-manifest-canary.ts";
-import { createPublicRolloutAssignmentV1 } from "./public-rollout-assignment.ts";
+import {
+  createPublicRolloutAssignmentV1,
+  publicRolloutRuntimeDatabaseAuthorityV1,
+} from "./public-rollout-assignment.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -130,6 +138,33 @@ const evidenceGraphServiceV3 = new EvidenceGraphServiceV3(evidenceGraphRepositor
 const capabilities = new CapabilityService(repository);
 const verifyGateway = createGatewayVerifier(repository);
 const gatewayIdentities = new WeakMap<FastifyRequest, GatewayIdentity>();
+
+function apiRuntimeIdentityV1(
+  environment: NodeJS.ProcessEnv = process.env,
+): {
+  schemaVersion: "genio-api-runtime-identity/v1";
+  replicaIdentityHash: string;
+  build: ReturnType<typeof buildInformation>;
+  configurationHash: string;
+  semanticExecutionConfigurationHash: string;
+} {
+  const build = buildInformation(environment);
+  const runtime = runtimeReleaseContract(environment);
+  const replicaIdentity = environment.RAILWAY_REPLICA_ID?.trim()
+    || `process:${process.pid}`;
+  return {
+    schemaVersion: "genio-api-runtime-identity/v1",
+    replicaIdentityHash: sha256Hex(stableStringify({
+      schemaVersion: "genio-api-replica-identity/v1",
+      buildIdentifier: build.identifier,
+      replicaIdentity,
+    })),
+    build,
+    configurationHash: apiReleaseConfigurationHash(environment),
+    semanticExecutionConfigurationHash:
+      runtime.semanticExecutionConfigurationHash,
+  };
+}
 
 async function resolveCustomArtistIdentities(input: {
   customTexts: readonly string[];
@@ -271,18 +306,26 @@ async function customGuidanceTrackCountAuthorityForRequest(
     observedDatabaseSchemaVersion,
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
+    observedCanonicalExecutorReleaseIdentityFencingVersion,
+    executorReleaseIdentityFenceSupported,
   ] = await Promise.all([
     repository.getSchemaVersion(),
     repository.getSetting(CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING),
     repository.getSetting(
       CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
     ),
+    repository.getSetting(
+      CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+    ),
+    repository.executorReleaseIdentityFenceAvailable(),
   ]);
   return canonicalContractActivationReady({
     environment: process.env,
     observedDatabaseSchemaVersion,
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
+    observedCanonicalExecutorReleaseIdentityFencingVersion,
+    executorReleaseIdentityFenceSupported,
   })
     ? AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1
     : PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1;
@@ -292,7 +335,17 @@ async function requireWorkerForNewWork(): Promise<void> {
   const required = process.env.REQUIRE_WORKER_HEARTBEAT === "true" || process.env.NODE_ENV === "production";
   if (!required) return;
   const health = await repository.getSystemHealth();
-  if (!workerLaneReady(health, "interactive")) {
+  const candidateIdentity = canonicalExecutorReleaseIdentityV1();
+  const lane = health.workerLanes?.interactive;
+  if (!workerLaneReady(health, "interactive")
+    || lane?.candidateExecutorIdentityReady !== true
+    || lane.executorRevision !== candidateIdentity.executorRevision
+      && !lane.eligibleRevisions?.includes(
+        candidateIdentity.executorRevision,
+      )
+    || !lane.eligibleSemanticExecutionConfigurationHashes?.includes(
+      candidateIdentity.semanticExecutionConfigurationHash,
+    )) {
     throw new HttpError(503, "Research worker is temporarily unavailable", "worker_unavailable");
   }
 }
@@ -309,6 +362,8 @@ interface WorkerLaneHealthView {
   eligibleWorkerCount?: number;
   eligibleRevisions?: string[];
   eligibleConfigurationHashes?: string[];
+  eligibleSemanticExecutionConfigurationHashes?: string[];
+  candidateExecutorIdentityReady?: boolean;
   lastSeenAt?: string | null;
 }
 
@@ -322,6 +377,7 @@ function workerLaneReady(health: WorkerLaneSystemHealthView, lane: "interactive"
     && !worker.stale
     && worker.schemaCompatible
     && worker.protocolCompatible
+    && worker.candidateExecutorIdentityReady === true
     && Number(worker.compatibleCapacity ?? 0) > 0);
 }
 
@@ -331,6 +387,9 @@ function workerLaneStatus(health: WorkerLaneSystemHealthView, lane: "interactive
   if (worker.stale) return "stale";
   if (!worker.schemaCompatible) return "schema_mismatch";
   if (!worker.protocolCompatible) return "protocol_mismatch";
+  if (worker.candidateExecutorIdentityReady !== true) {
+    return "executor_identity_mismatch";
+  }
   return Number(worker.compatibleCapacity ?? 0) > 0 ? "healthy" : "missing";
 }
 
@@ -388,7 +447,8 @@ async function enqueueResearchResume(runId: string): Promise<void> {
 }
 
 app.get("/health/live", async () => {
-  const build = buildInformation();
+  const api = apiRuntimeIdentityV1();
+  const build = api.build;
   const runtime = runtimeReleaseContract();
   let graphSnapshot: {
     id: string;
@@ -422,7 +482,8 @@ app.get("/health/live", async () => {
     version: build.version,
     revision: build.revision,
     build,
-    configurationHash: apiReleaseConfigurationHash(),
+    configurationHash: api.configurationHash,
+    api,
     runtime: { ...runtime, graphSnapshot },
   };
 });
@@ -439,22 +500,37 @@ app.get("/health/ready", async (_request, reply) => {
       CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
     )
     : null;
+  const canonicalExecutorReleaseIdentityFencingVersion = ok
+    ? await repository.getSetting(
+      CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+    )
+    : null;
+  const executorReleaseIdentityFenceSupported = ok
+    ? await repository.executorReleaseIdentityFenceAvailable()
+    : false;
   const deploymentDatabaseReady = releaseDatabaseReadinessReady({
     environment: process.env,
     observedDatabaseSchemaVersion: schemaVersion,
     observedDatabaseCapabilityVersion: releaseManifestCanaryGuardsVersion,
     observedCanonicalExecutionHardeningVersion:
       canonicalExecutionHardeningVersion,
+    observedCanonicalExecutorReleaseIdentityFencingVersion:
+      canonicalExecutorReleaseIdentityFencingVersion,
+    executorReleaseIdentityFenceSupported,
   });
   const schemaCompatible = ok
     && isDatabaseSchemaVersionCompatible(schemaVersion)
-    && deploymentDatabaseReady;
+    && deploymentDatabaseReady
+    && canonicalExecutorReleaseIdentityFencingVersion
+      === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+    && executorReleaseIdentityFenceSupported;
   if (!schemaCompatible || !capabilityPepper.ready) return reply.code(503).send({
     ok: false,
     database: ok,
     schemaVersion,
     releaseManifestCanaryGuardsVersion,
     canonicalExecutionHardeningVersion,
+    canonicalExecutorReleaseIdentityFencingVersion,
     schemaSupport: DATABASE_SCHEMA_SUPPORT,
     capabilityPepper,
   });
@@ -464,6 +540,7 @@ app.get("/health/ready", async (_request, reply) => {
     schemaVersion,
     releaseManifestCanaryGuardsVersion,
     canonicalExecutionHardeningVersion,
+    canonicalExecutorReleaseIdentityFencingVersion,
     schemaSupport: DATABASE_SCHEMA_SUPPORT,
     capabilityPepper,
   };
@@ -471,22 +548,38 @@ app.get("/health/ready", async (_request, reply) => {
 
 app.get("/health/system", async (_request, reply) => {
   try {
+    const api = apiRuntimeIdentityV1();
     const capabilityPepper = capabilityPepperRotationStatus();
-    const health = await repository.getSystemHealth();
+    const [health, publicRolloutDatabaseAuthority] = await Promise.all([
+      repository.getSystemHealth(),
+      repository.getPublicRolloutDatabaseAuthority(),
+    ]);
+    const publicRollout = publicRolloutRuntimeDatabaseAuthorityV1({
+      databaseAuthority: publicRolloutDatabaseAuthority,
+    });
     const schemaVersion = health.database.schemaVersion;
     const releaseManifestCanaryGuardsVersion =
       health.database.releaseManifestCanaryGuardsVersion ?? null;
     const canonicalExecutionHardeningVersion =
       health.database.canonicalExecutionHardeningVersion ?? null;
+    const canonicalExecutorReleaseIdentityFencingVersion =
+      health.database.canonicalExecutorReleaseIdentityFencingVersion ?? null;
     const deploymentDatabaseReady = releaseDatabaseReadinessReady({
       environment: process.env,
       observedDatabaseSchemaVersion: schemaVersion,
       observedDatabaseCapabilityVersion: releaseManifestCanaryGuardsVersion,
       observedCanonicalExecutionHardeningVersion:
         canonicalExecutionHardeningVersion,
+      observedCanonicalExecutorReleaseIdentityFencingVersion:
+        canonicalExecutorReleaseIdentityFencingVersion,
+      executorReleaseIdentityFenceSupported:
+        health.database.executorReleaseIdentityFenceSupported === true,
     });
     const schemaCompatible = isDatabaseSchemaVersionCompatible(schemaVersion)
-      && deploymentDatabaseReady;
+      && deploymentDatabaseReady
+      && canonicalExecutorReleaseIdentityFencingVersion
+        === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+      && health.executorFencing.ready === true;
     // Public/API readiness depends on the interactive lane. The deep lane is
     // a separate activation prerequisite so a missing deep worker cannot take
     // otherwise healthy interactive traffic offline during staged rollout.
@@ -501,6 +594,25 @@ app.get("/health/system", async (_request, reply) => {
       schemaVersion,
       releaseManifestCanaryGuardsVersion,
       canonicalExecutionHardeningVersion,
+      canonicalExecutorReleaseIdentityFencingVersion,
+      executorFencing: health.executorFencing,
+      api,
+      publicRollout: publicRollout
+        ? {
+            active: true,
+            databaseAuthorized: true,
+            evidenceHash: publicRollout.evidenceHash,
+            stage: publicRollout.stage,
+            targetConfigurationHash:
+              publicRollout.targetConfigurationHash,
+          }
+        : {
+            active: false,
+            databaseAuthorized: true,
+            evidenceHash: null,
+            stage: null,
+            targetConfigurationHash: null,
+          },
       capabilityPepper,
       worker: health.worker.worker_id
         ? health.worker.stale
@@ -525,6 +637,12 @@ app.get("/health/system", async (_request, reply) => {
           eligibleIdentityCount: health.workerLanes.interactive.eligibleIdentityCount ?? 0,
           eligibleRevisions: health.workerLanes.interactive.eligibleRevisions ?? [],
           eligibleConfigurationHashes: health.workerLanes.interactive.eligibleConfigurationHashes ?? [],
+          eligibleSemanticExecutionConfigurationHashes:
+            health.workerLanes.interactive
+              .eligibleSemanticExecutionConfigurationHashes ?? [],
+          candidateExecutorIdentityReady:
+            health.workerLanes.interactive
+              .candidateExecutorIdentityReady === true,
           lastSeenAt: health.workerLanes.interactive.lastSeenAt ?? null,
         },
         deep: {
@@ -535,6 +653,11 @@ app.get("/health/system", async (_request, reply) => {
           eligibleIdentityCount: health.workerLanes.deep.eligibleIdentityCount ?? 0,
           eligibleRevisions: health.workerLanes.deep.eligibleRevisions ?? [],
           eligibleConfigurationHashes: health.workerLanes.deep.eligibleConfigurationHashes ?? [],
+          eligibleSemanticExecutionConfigurationHashes:
+            health.workerLanes.deep
+              .eligibleSemanticExecutionConfigurationHashes ?? [],
+          candidateExecutorIdentityReady:
+            health.workerLanes.deep.candidateExecutorIdentityReady === true,
           lastSeenAt: health.workerLanes.deep.lastSeenAt ?? null,
         },
       },
@@ -557,7 +680,13 @@ app.get("/api/health", async () => ({ ok: await repository.ping(), service: "nee
 
 app.get("/api/v1/system/health", async () => {
   const capabilityPepper = capabilityPepperRotationStatus();
-  const health = await repository.getSystemHealth();
+  const [health, publicRolloutDatabaseAuthority] = await Promise.all([
+    repository.getSystemHealth(),
+    repository.getPublicRolloutDatabaseAuthority(),
+  ]);
+  const publicRollout = publicRolloutRuntimeDatabaseAuthorityV1({
+    databaseAuthority: publicRolloutDatabaseAuthority,
+  });
   const deploymentDatabaseReady = releaseDatabaseReadinessReady({
     environment: process.env,
     observedDatabaseSchemaVersion: health.database.schemaVersion,
@@ -565,8 +694,17 @@ app.get("/api/v1/system/health", async () => {
       health.database.releaseManifestCanaryGuardsVersion ?? null,
     observedCanonicalExecutionHardeningVersion:
       health.database.canonicalExecutionHardeningVersion ?? null,
+    observedCanonicalExecutorReleaseIdentityFencingVersion:
+      health.database.canonicalExecutorReleaseIdentityFencingVersion ?? null,
+    executorReleaseIdentityFenceSupported:
+      health.database.executorReleaseIdentityFenceSupported === true,
   });
+  const canonicalExecutorReleaseIdentityFencingVersion =
+    health.database.canonicalExecutorReleaseIdentityFencingVersion ?? null;
   const ok = deploymentDatabaseReady
+    && canonicalExecutorReleaseIdentityFencingVersion
+      === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+    && health.executorFencing.ready === true
     && capabilityPepper.ready
     && workerLaneReady(health, "interactive");
   return {
@@ -577,6 +715,24 @@ app.get("/api/v1/system/health", async () => {
       health.database.releaseManifestCanaryGuardsVersion ?? null,
     canonicalExecutionHardeningVersion:
       health.database.canonicalExecutionHardeningVersion ?? null,
+    canonicalExecutorReleaseIdentityFencingVersion,
+    executorFencing: health.executorFencing,
+    publicRollout: publicRollout
+      ? {
+          active: true,
+          databaseAuthorized: true,
+          evidenceHash: publicRollout.evidenceHash,
+          stage: publicRollout.stage,
+          targetConfigurationHash:
+            publicRollout.targetConfigurationHash,
+        }
+      : {
+          active: false,
+          databaseAuthorized: true,
+          evidenceHash: null,
+          stage: null,
+          targetConfigurationHash: null,
+        },
     capabilityPepper,
     worker: {
       stale: health.worker.stale,
@@ -595,6 +751,12 @@ app.get("/api/v1/system/health", async () => {
         eligibleIdentityCount: health.workerLanes.interactive.eligibleIdentityCount ?? 0,
         eligibleRevisions: health.workerLanes.interactive.eligibleRevisions ?? [],
         eligibleConfigurationHashes: health.workerLanes.interactive.eligibleConfigurationHashes ?? [],
+        eligibleSemanticExecutionConfigurationHashes:
+          health.workerLanes.interactive
+            .eligibleSemanticExecutionConfigurationHashes ?? [],
+        candidateExecutorIdentityReady:
+          health.workerLanes.interactive
+            .candidateExecutorIdentityReady === true,
         lastSeenAt: health.workerLanes.interactive.lastSeenAt ?? null,
       },
       deep: {
@@ -605,6 +767,11 @@ app.get("/api/v1/system/health", async () => {
         eligibleIdentityCount: health.workerLanes.deep.eligibleIdentityCount ?? 0,
         eligibleRevisions: health.workerLanes.deep.eligibleRevisions ?? [],
         eligibleConfigurationHashes: health.workerLanes.deep.eligibleConfigurationHashes ?? [],
+        eligibleSemanticExecutionConfigurationHashes:
+          health.workerLanes.deep
+            .eligibleSemanticExecutionConfigurationHashes ?? [],
+        candidateExecutorIdentityReady:
+          health.workerLanes.deep.candidateExecutorIdentityReady === true,
         lastSeenAt: health.workerLanes.deep.lastSeenAt ?? null,
       },
     },
@@ -699,6 +866,8 @@ app.post<{
     observedDatabaseSchemaVersion,
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
+    observedCanonicalExecutorReleaseIdentityFencingVersion,
+    executorReleaseIdentityFenceSupported,
   ] =
     canonicalActivationConfigured || expandedTrackCountRequested
       ? await Promise.all([
@@ -707,13 +876,19 @@ app.post<{
         repository.getSetting(
           CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
         ),
+        repository.getSetting(
+          CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+        ),
+        repository.executorReleaseIdentityFenceAvailable(),
       ])
-      : [null, null, null];
+      : [null, null, null, null, false];
   const canonicalActivationReady = canonicalContractActivationReady({
     environment: process.env,
     observedDatabaseSchemaVersion,
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
+    observedCanonicalExecutorReleaseIdentityFencingVersion,
+    executorReleaseIdentityFenceSupported,
   });
   if (
     canonicalContractCohortRequested
@@ -766,6 +941,21 @@ app.post<{
       dedupeKey: `brief:${created.id}`,
       maxAttempts: 6,
     });
+  }
+  if (publicRolloutAssignment?.assigned === true) {
+    reply
+      .header(
+        "x-genio-public-rollout-evidence-hash",
+        publicRolloutAssignment.rolloutEvidenceHash,
+      )
+      .header(
+        "x-genio-public-rollout-stage",
+        publicRolloutAssignment.rolloutStage,
+      )
+      .header(
+        "x-genio-public-rollout-assignment-hash",
+        publicRolloutAssignment.assignmentHash,
+      );
   }
   return reply.code(created.created ? 202 : 200).send({ requestId: created.id, status: created.status, pollAfterMs: 1_500 });
 });
@@ -1079,6 +1269,8 @@ app.post<{
       observedDatabaseSchemaVersion,
       observedDatabaseCapabilityVersion,
       observedCanonicalExecutionHardeningVersion,
+      observedCanonicalExecutorReleaseIdentityFencingVersion,
+      executorReleaseIdentityFenceSupported,
     ] =
       await Promise.all([
         repository.getSchemaVersion(),
@@ -1086,6 +1278,10 @@ app.post<{
         repository.getSetting(
           CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
         ),
+        repository.getSetting(
+          CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+        ),
+        repository.executorReleaseIdentityFenceAvailable(),
       ]);
     const trackCountAdmission = playlistTrackCountAdmission({
       requestedTrackCount,
@@ -1095,6 +1291,8 @@ app.post<{
         observedDatabaseSchemaVersion,
         observedDatabaseCapabilityVersion,
         observedCanonicalExecutionHardeningVersion,
+        observedCanonicalExecutorReleaseIdentityFencingVersion,
+        executorReleaseIdentityFenceSupported,
       }),
     });
     if (trackCountAdmission.status !== "accepted"
@@ -1858,6 +2056,10 @@ app.get("/api/v1/owner/status", async (request) => {
       health.database.releaseManifestCanaryGuardsVersion ?? null,
     observedCanonicalExecutionHardeningVersion:
       health.database.canonicalExecutionHardeningVersion ?? null,
+    observedCanonicalExecutorReleaseIdentityFencingVersion:
+      health.database.canonicalExecutorReleaseIdentityFencingVersion ?? null,
+    executorReleaseIdentityFenceSupported:
+      health.database.executorReleaseIdentityFenceSupported === true,
   });
   const ok = deploymentDatabaseReady
     && capabilityPepper.ready

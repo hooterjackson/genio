@@ -105,20 +105,25 @@ databaseDescribe("database-backed Apple write gateway", () => {
   const createCompletionFenceFixture = async (label: string) => {
     const runId = randomUUID();
     const contractRevisionId = randomUUID();
+    const selectionPlanId = randomUUID();
+    const graphSnapshotId = randomUUID();
+    const graphSnapshotContentHash =
+      randomUUID().replaceAll("-", "").repeat(2);
+    const selectionPlanRevisionHash = "4".repeat(64);
+    const queryPlanRevisionId = randomUUID();
     const manifestId = randomUUID();
     const manifestRevisionId = randomUUID();
     const candidateId = randomUUID();
     const publicationVolumeId = randomUUID();
-    const jobId = randomUUID();
     const workerId = `publication-completion-worker-${label}`;
     const manifestRevisionHash = "c".repeat(64);
     const contractHash = "d".repeat(64);
     await repository.pool.query(
       `INSERT INTO research_runs(
-         id,prompt,brief_json,brief_hash,brief_contract_version,status,phase,
+       id,prompt,brief_json,brief_hash,brief_contract_version,status,phase,
          pipeline_version,policy_version,selection_plan_json,client_bucket,
          idempotency_key,retention_expires_at)
-       VALUES($1,$2,'{}'::jsonb,$3,3,'publishing','apple_publication',
+       VALUES($1,$2,'{}'::jsonb,$3,3,'manifest_ready','manifest_ready',
          'catalog_first_v2','relevance_first_2026_07',
          '{"requestedTrackCount":1}'::jsonb,$4,$5,now()+interval '1 day')`,
       [
@@ -144,6 +149,46 @@ databaseDescribe("database-backed Apple write gateway", () => {
       `UPDATE research_runs SET active_playlist_contract_revision_id=$2
        WHERE id=$1`,
       [runId, contractRevisionId],
+    );
+    await repository.pool.query(
+      `INSERT INTO selection_plans(
+         id,run_id,revision,status,plan_hash,plan_json,pipeline_version,
+         policy_version,confirmed_at)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'corpus_first_v3',
+         'corpus_first_v3_policy_v1',now())`,
+      [selectionPlanId, runId, selectionPlanRevisionHash],
+    );
+    await repository.pool.query(
+      `INSERT INTO graph_snapshots(
+         id,status,content_hash,assertion_count,catalog_identity_count,locked_at)
+       VALUES($1,'locked',$2,0,0,now())`,
+      [graphSnapshotId, graphSnapshotContentHash],
+    );
+    await repository.pool.query(
+      `INSERT INTO query_plan_revisions(
+         id,run_id,selection_plan_id,revision,graph_snapshot_id,engine,status,
+         plan_hash,plan_json,pipeline_version,policy_version,activated_at)
+       VALUES($1,$2,$3,1,$4,'portfolio','active',$5,$6::jsonb,
+         'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+      [
+        queryPlanRevisionId,
+        runId,
+        selectionPlanId,
+        graphSnapshotId,
+        "6".repeat(64),
+        JSON.stringify({
+          schemaVersion: 5,
+          selectionPlanHash: selectionPlanRevisionHash,
+          executorCapabilityHash: schema5ExecutorCapability.hash,
+          executorCapabilityVector: schema5ExecutorCapability.vector,
+        }),
+      ],
+    );
+    await repository.pool.query(
+      `INSERT INTO run_active_query_plans(
+         run_id,query_plan_revision_id)
+       VALUES($1,$2)`,
+      [runId, queryPlanRevisionId],
     );
     await repository.pool.query(
       `INSERT INTO manifests(
@@ -180,34 +225,56 @@ databaseDescribe("database-backed Apple write gateway", () => {
          'https://music.apple.com/us/playlist/completion/pl.completion',1,2,now())`,
       [publicationVolumeId, manifestId, manifestRevisionId],
     );
-    await repository.pool.query(
-      `INSERT INTO job_queue(
-         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
-         minimum_worker_protocol,stage_key,status,payload_json,max_attempts,
-         lease_owner,lease_expires_at)
-       VALUES($1,$2,'publication','publication',$3,'catalog_first_v2',
-         10,'publication','leased','{}'::jsonb,3,$4,
-         now()+interval '5 minutes')`,
-      [
-        jobId,
-        runId,
+    const queued = await repository.queueManifestPublication({
+      runId,
+      manifestId,
+      appleAuthorized: true,
+      clientBucket: `publication-completion:${label}:${runId}`,
+      clientBucketAliases: [
         `publication-completion:${label}:${runId}`,
-        workerId,
       ],
-    );
-    // The completion fence is canonical even though this isolated Apple
-    // gateway fixture does not execute retrieval. Bind the job and attempt to
-    // the exact schema-5 executor envelope instead of bypassing the fence.
+      rateLimit: Number.POSITIVE_INFINITY,
+    });
+    expect(queued).toMatchObject({
+      queued: true,
+      state: "queued",
+      jobId: expect.any(String),
+    });
+    const jobId = queued.jobId!;
+    const queuedAuthority = (await repository.pool.query<{
+      query_plan_revision_id: string | null;
+      required_executor_capability_hash: string | null;
+      required_executor_revision: string | null;
+      required_executor_semantic_configuration_hash: string | null;
+    }>(
+      `SELECT query_plan_revision_id,required_executor_capability_hash,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue WHERE id=$1`,
+      [jobId],
+    )).rows[0]!;
+    expect(queuedAuthority).toMatchObject({
+      query_plan_revision_id: queryPlanRevisionId,
+      required_executor_capability_hash: schema5ExecutorCapability.hash,
+      required_executor_revision: expect.any(String),
+      required_executor_semantic_configuration_hash:
+        expect.stringMatching(/^[0-9a-f]{64}$/u),
+    });
+    const executorRevision = queuedAuthority.required_executor_revision!;
+    const semanticExecutionConfigurationHash =
+      queuedAuthority.required_executor_semantic_configuration_hash!;
+    await repository.updateWorkerHeartbeat(workerId, {
+      version: executorRevision,
+      semanticExecutionConfigurationHash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await repository.pool.query(
-      `UPDATE job_queue
-       SET required_executor_capability_hash=$2,
-           required_executor_capability_vector=$3::jsonb
+      `UPDATE job_queue SET status='leased',lease_owner=$2,
+         lease_expires_at=now()+interval '5 minutes'
        WHERE id=$1`,
-      [
-        jobId,
-        schema5ExecutorCapability.hash,
-        JSON.stringify(schema5ExecutorCapability.vector),
-      ],
+      [jobId, workerId],
     );
     const leaseGeneration = Number((await repository.pool.query<{
       lease_epoch: string;
@@ -220,18 +287,19 @@ databaseDescribe("database-backed Apple write gateway", () => {
       contractRevisionId,
       jobId,
       workerId,
-      queryPlanRevisionId: null,
+      queryPlanRevisionId,
       stage: "publication",
       dependencyKey: "publication",
       attemptNumber: 1,
       leaseGeneration,
-      executorRevision: "apple-write-gateway-integration",
+      executorRevision,
       executorIdentityHash: "1".repeat(64),
       executorCapabilityHash: schema5ExecutorCapability.hash,
       executorCapabilityVector: structuredClone(
         schema5ExecutorCapability.vector,
       ) as unknown as Record<string, unknown>,
       configurationHash: "2".repeat(64),
+      semanticExecutionConfigurationHash,
       idempotencyKey: `${jobId}:${leaseGeneration}:${contractRevisionId}`,
     });
     const executionFence = {
@@ -264,6 +332,11 @@ databaseDescribe("database-backed Apple write gateway", () => {
       appendedCount: 1,
       batchCursor: 1,
     });
+    await repository.updateRun(runId, {
+      status: "publishing",
+      phase: "apple_publication",
+      error: null,
+    });
     return {
       runId,
       manifestId,
@@ -272,6 +345,11 @@ databaseDescribe("database-backed Apple write gateway", () => {
       contractRevisionId,
       contractHash,
       executionFence,
+      reconciliationAuthority: reconciliationBase,
+      executorReleaseIdentity: {
+        executorRevision,
+        semanticExecutionConfigurationHash,
+      },
       selectedCount: 1,
       terminalStatus: "complete" as const,
       publicationVolumes: [{
@@ -372,6 +450,15 @@ databaseDescribe("database-backed Apple write gateway", () => {
       );
       expect(expired.rows[0]?.expired).toBe(true);
 
+      await repository.updateWorkerHeartbeat("replacement-worker", {
+        version: fixture.executorReleaseIdentity.executorRevision,
+        semanticExecutionConfigurationHash:
+          fixture.executorReleaseIdentity
+            .semanticExecutionConfigurationHash,
+        protocolVersion: "playlist-pipeline-v10",
+        capacity: 1,
+        activeJobs: 0,
+      });
       takeoverPromise = repository.pool.query(
         `UPDATE job_queue
          SET lease_owner='replacement-worker',
@@ -465,15 +552,19 @@ databaseDescribe("database-backed Apple write gateway", () => {
       `INSERT INTO job_queue(
          id,run_id,kind,queue_class,dedupe_key,pipeline_version,
          minimum_worker_protocol,stage_key,status,payload_json,max_attempts,
-         lease_owner,lease_expires_at)
+         lease_owner,lease_expires_at,required_executor_revision,
+         required_executor_semantic_configuration_hash)
        VALUES($1,$2,'publication','publication',$3,'catalog_first_v2',
          10,'publication','leased','{}'::jsonb,3,$4,
-         now()+interval '5 minutes')`,
+         now()+interval '5 minutes',$5,$6)`,
       [
         unrelatedJobId,
         fixture.runId,
         `spliced-authority:${fixture.runId}`,
         fixture.executionFence.workerId,
+        fixture.executorReleaseIdentity.executorRevision,
+        fixture.executorReleaseIdentity
+          .semanticExecutionConfigurationHash,
       ],
     );
     const unrelatedLease = Number((await repository.pool.query<{
@@ -508,6 +599,14 @@ databaseDescribe("database-backed Apple write gateway", () => {
 
   test("rejects Apple mutation and terminal completion after the lease is superseded", async () => {
     const fixture = await createCompletionFenceFixture("stale-lease");
+    await repository.updateWorkerHeartbeat("replacement-worker", {
+      version: fixture.executorReleaseIdentity.executorRevision,
+      semanticExecutionConfigurationHash:
+        fixture.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await repository.pool.query(
       `UPDATE job_queue
        SET lease_owner='replacement-worker',
@@ -530,6 +629,36 @@ databaseDescribe("database-backed Apple write gateway", () => {
     })).rejects.toMatchObject({ code: "publication_execution_stale" });
     await expect(repository.commitPublicationCompletion(fixture))
       .rejects.toMatchObject({ code: "publication_execution_stale" });
+  });
+
+  test("rejects reconciliation and Apple mutation after the executor heartbeat becomes stale", async () => {
+    const fixture = await createCompletionFenceFixture(
+      "stale-executor-heartbeat",
+    );
+    await repository.pool.query(
+      `UPDATE worker_heartbeats
+       SET last_seen_at=now()-interval '6 minutes'
+       WHERE worker_id=$1`,
+      [fixture.executionFence.workerId],
+    );
+
+    await expect(repository.beginPublicationReconciliation(
+      fixture.reconciliationAuthority,
+    )).rejects.toMatchObject({
+      code: "publication_reconciliation_stale",
+    });
+    await expect(repository.acquireAppleWritePermit({
+      runId: fixture.runId,
+      manifestId: fixture.manifestId,
+      manifestRevisionId: fixture.manifestRevisionId,
+      manifestRevisionHash: fixture.manifestRevisionHash,
+      contractRevisionId: fixture.contractRevisionId,
+      contractHash: fixture.contractHash,
+      executionFence: fixture.executionFence,
+      publicationVolumeId:
+        fixture.publicationVolumes[0]!.publicationVolumeId,
+      operation: "append_tracks",
+    })).rejects.toMatchObject({ code: "publication_execution_stale" });
   });
 
   test("atomically completes only the active reconciled publication attempt", async () => {

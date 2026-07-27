@@ -167,6 +167,7 @@ databaseDescribe("staging manifest-only release canary integration", () => {
 
   beforeAll(async () => {
     vi.stubEnv("RELEASE_ENVIRONMENT", "staging");
+    vi.stubEnv("RAILWAY_GIT_COMMIT_SHA", sourceRevision);
     vi.stubEnv("APPLE_STOREFRONT", "us");
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
@@ -210,7 +211,8 @@ databaseDescribe("staging manifest-only release canary integration", () => {
     await pool.query(
       `INSERT INTO settings(key,value) VALUES
          ('schema_version','18'),
-         ('release_manifest_canary_guards_version','1')`,
+         ('release_manifest_canary_guards_version','1'),
+         ('canonical_executor_release_identity_fencing_version','1')`,
     );
     const snapshotId = randomUUID();
     await pool.query(
@@ -476,9 +478,13 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       stage_key: string;
       query_plan_revision_id: string;
       minimum_worker_protocol: number;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
     }>(
       `SELECT id,kind,status,payload_json,stage_key,
-              query_plan_revision_id,minimum_worker_protocol
+              query_plan_revision_id,minimum_worker_protocol,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
        FROM job_queue WHERE run_id=$1`,
       [fixture.runId],
     )).rows;
@@ -509,6 +515,17 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       },
     )).resolves.toBeNull();
 
+    await repository.updateWorkerHeartbeat(
+      "manifest-canary-worker-one",
+      {
+        version: queued[0]!.required_executor_revision,
+        semanticExecutionConfigurationHash:
+          queued[0]!.required_executor_semantic_configuration_hash,
+        protocolVersion: "playlist-pipeline-v10",
+        capacity: 1,
+        activeJobs: 0,
+      },
+    );
     const first = await repository.leaseNextJob(
       "manifest-canary-worker-one",
       60_000,
@@ -538,6 +555,17 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       [fixture.runId],
     )).rows[0]?.count).toBe(1);
 
+    await repository.updateWorkerHeartbeat(
+      "manifest-canary-worker-two",
+      {
+        version: queued[0]!.required_executor_revision,
+        semanticExecutionConfigurationHash:
+          queued[0]!.required_executor_semantic_configuration_hash,
+        protocolVersion: "playlist-pipeline-v10",
+        capacity: 1,
+        activeJobs: 0,
+      },
+    );
     const second = await repository.leaseNextJob(
       "manifest-canary-worker-two",
       60_000,
@@ -631,9 +659,17 @@ databaseDescribe("staging manifest-only release canary integration", () => {
     });
     await expect(pool.query(
       `INSERT INTO job_queue(
-         id,run_id,kind,dedupe_key,status,payload_json,max_attempts)
-       VALUES($1,$2,'publication',$3,'queued','{}'::jsonb,1)`,
-      [randomUUID(), fixture.runId, `direct-publication:${fixture.runId}`],
+         id,run_id,kind,dedupe_key,status,payload_json,max_attempts,
+         required_executor_revision,
+         required_executor_semantic_configuration_hash)
+       VALUES($1,$2,'publication',$3,'queued','{}'::jsonb,1,$4,$5)`,
+      [
+        randomUUID(),
+        fixture.runId,
+        `direct-publication:${fixture.runId}`,
+        sourceRevision,
+        sha256Hex("manifest-canary-direct-publication"),
+      ],
     )).rejects.toThrow(/release_manifest_canary_write_forbidden/u);
     await expect(pool.query(
       `INSERT INTO manifests(id,run_id,name,description,content_hash)
@@ -798,15 +834,27 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       stage_key: string;
       required_executor_capability_hash: string;
       required_executor_capability_vector: Record<string, unknown>;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
     }>(
       `SELECT id,stage_key,required_executor_capability_hash,
-              required_executor_capability_vector
+              required_executor_capability_vector,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
        FROM job_queue
        WHERE run_id=$1 AND kind='research'
        ORDER BY created_at DESC LIMIT 1`,
       [fixture.runId],
     )).rows[0]!;
     expect(job.stage_key).toBe(fixture.marker.stageKey);
+    await repository.updateWorkerHeartbeat(workerId, {
+      version: job.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        job.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await pool.query(
       `UPDATE job_queue
        SET status='leased',lease_owner=$2,
@@ -827,13 +875,15 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       stage: job.stage_key,
       attemptNumber: 1,
       leaseGeneration,
-      executorRevision: sourceRevision,
+      executorRevision: job.required_executor_revision,
       executorIdentityHash,
       executorCapabilityHash: job.required_executor_capability_hash,
       executorCapabilityVector: structuredClone(
         job.required_executor_capability_vector,
       ),
       configurationHash,
+      semanticExecutionConfigurationHash:
+        job.required_executor_semantic_configuration_hash,
       idempotencyKey: `manifest-canary-attempt:${fixture.runId}`,
       checkpointCursor: fixture.marker.stageKey,
     });

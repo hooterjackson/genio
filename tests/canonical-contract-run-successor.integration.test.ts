@@ -1081,6 +1081,23 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     const queued = await repository.enqueueJob(
       pipelineV3ResearchJob(fixture.created.runId, sourceQueryPlan!),
     );
+    const queuedAuthority = (await pool.query<{
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue WHERE id=$1`,
+      [queued.id],
+    )).rows[0]!;
+    await repository.updateWorkerHeartbeat("late-old-worker", {
+      version: queuedAuthority.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        queuedAuthority.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     const leased = await repository.leaseNextJob(
       "late-old-worker",
       120_000,
@@ -1325,6 +1342,25 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       trigger: "rescue_guidance",
     });
     const workerId = `lineage-worker-${randomUUID()}`;
+    const queuedAuthority = (await pool.query<{
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue
+       WHERE run_id=$1 AND kind='research' AND status='queued'
+       ORDER BY created_at,id LIMIT 1`,
+      [successor.runId],
+    )).rows[0]!;
+    await repository.updateWorkerHeartbeat(workerId, {
+      version: queuedAuthority.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        queuedAuthority.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     const leased = (await pool.query<{
       id: string;
       lease_epoch: number;

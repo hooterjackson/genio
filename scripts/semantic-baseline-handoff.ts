@@ -18,10 +18,12 @@ import {
 } from "../lib/semantic-ranking-review.ts";
 import { stableReleaseKeyFingerprint } from "./authorize-stable-release.ts";
 
-export const SEMANTIC_BASELINE_HANDOFF_SCHEMA_V1 =
-  "genio-semantic-baseline-handoff/v1" as const;
+export const SEMANTIC_BASELINE_HANDOFF_SCHEMA_V2 =
+  "genio-semantic-baseline-handoff/v2" as const;
 export const SEMANTIC_BASELINE_HANDOFF_MANIFEST =
   "semantic-baseline-handoff.json" as const;
+export const SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE =
+  "predecessor-image-attestation-verification.json" as const;
 export const SEMANTIC_BASELINE_RELEASE_KEY_FILE =
   "release-verification-public-key.pem" as const;
 export const SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_FILE =
@@ -47,8 +49,8 @@ const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
 type SemanticBaselineReleaseAssetName =
   typeof SEMANTIC_BASELINE_RELEASE_ASSET_NAMES[number];
 
-export interface SemanticBaselineHandoffManifestV1 {
-  schemaVersion: typeof SEMANTIC_BASELINE_HANDOFF_SCHEMA_V1;
+export interface SemanticBaselineHandoffManifestV2 {
+  schemaVersion: typeof SEMANTIC_BASELINE_HANDOFF_SCHEMA_V2;
   candidate: {
     tag: string;
     sourceRevision: string;
@@ -57,6 +59,9 @@ export interface SemanticBaselineHandoffManifestV1 {
     releaseId: number;
     stableTag: string;
     sourceRevision: string;
+    mode: "normal" | "bootstrap";
+    controllerSourceRevision: string;
+    githubAttestationVerificationBytesSha256: string;
     releaseIdentitySha256: string;
     metadataSha256: string;
     releaseVerificationKeySha256: string;
@@ -81,8 +86,8 @@ export interface SemanticBaselineHandoffManifestV1 {
   ];
 }
 
-export interface LoadedSemanticBaselineHandoffV1 {
-  manifest: SemanticBaselineHandoffManifestV1;
+export interface LoadedSemanticBaselineHandoffV2 {
+  manifest: SemanticBaselineHandoffManifestV2;
   manifestSha256: string;
   releaseAssets: Readonly<Record<SemanticBaselineReleaseAssetName, Buffer>>;
   releaseVerificationKey: {
@@ -100,6 +105,7 @@ export interface LoadedSemanticBaselineHandoffV1 {
   stableAuthorization: unknown;
   stableReleaseConsumer: unknown;
   stableImageAttestation: Record<string, unknown>;
+  githubAttestationVerification: Record<string, unknown>;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -299,14 +305,14 @@ export function semanticBaselineReleaseIdentitySha256(input: {
 }
 
 export function semanticBaselineHandoffManifestSha256(
-  value: SemanticBaselineHandoffManifestV1,
+  value: SemanticBaselineHandoffManifestV2,
 ): string {
   return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
-export function validateSemanticBaselineHandoffManifestV1(
+export function validateSemanticBaselineHandoffManifestV2(
   value: unknown,
-): SemanticBaselineHandoffManifestV1 {
+): SemanticBaselineHandoffManifestV2 {
   const manifest = exactRecord(value, [
     "schemaVersion",
     "candidate",
@@ -322,6 +328,9 @@ export function validateSemanticBaselineHandoffManifestV1(
     "releaseId",
     "stableTag",
     "sourceRevision",
+    "mode",
+    "controllerSourceRevision",
+    "githubAttestationVerificationBytesSha256",
     "releaseIdentitySha256",
     "metadataSha256",
     "releaseVerificationKeySha256",
@@ -329,11 +338,15 @@ export function validateSemanticBaselineHandoffManifestV1(
     "stableAuthorizerKeySha256",
   ], "semantic baseline handoff predecessor");
   if (
-    manifest.schemaVersion !== SEMANTIC_BASELINE_HANDOFF_SCHEMA_V1
+    manifest.schemaVersion !== SEMANTIC_BASELINE_HANDOFF_SCHEMA_V2
     || typeof candidate.tag !== "string"
     || !RC_TAG.test(candidate.tag)
     || typeof predecessor.stableTag !== "string"
     || !STABLE_TAG.test(predecessor.stableTag)
+    || (
+      predecessor.mode !== "normal"
+      && predecessor.mode !== "bootstrap"
+    )
     || !Number.isSafeInteger(predecessor.releaseId)
     || Number(predecessor.releaseId) <= 0
     || typeof predecessor.stableAuthorizerKeyId !== "string"
@@ -366,7 +379,7 @@ export function validateSemanticBaselineHandoffManifestV1(
         asset.sha256,
         `semantic baseline handoff asset ${index}.sha256`,
       ),
-    } as SemanticBaselineHandoffManifestV1["releaseAssets"][number];
+    } as SemanticBaselineHandoffManifestV2["releaseAssets"][number];
   });
   const publicKeys = Array.isArray(manifest.historicalPublicKeys)
     ? manifest.historicalPublicKeys
@@ -398,9 +411,9 @@ export function validateSemanticBaselineHandoffManifestV1(
         `semantic baseline handoff key ${index}.keySha256`,
       ),
     };
-  }) as SemanticBaselineHandoffManifestV1["historicalPublicKeys"];
-  const parsed: SemanticBaselineHandoffManifestV1 = {
-    schemaVersion: SEMANTIC_BASELINE_HANDOFF_SCHEMA_V1,
+  }) as SemanticBaselineHandoffManifestV2["historicalPublicKeys"];
+  const parsed: SemanticBaselineHandoffManifestV2 = {
+    schemaVersion: SEMANTIC_BASELINE_HANDOFF_SCHEMA_V2,
     candidate: {
       tag: candidate.tag,
       sourceRevision: revision(
@@ -414,6 +427,15 @@ export function validateSemanticBaselineHandoffManifestV1(
       sourceRevision: revision(
         predecessor.sourceRevision,
         "semantic baseline handoff predecessor.sourceRevision",
+      ),
+      mode: predecessor.mode,
+      controllerSourceRevision: revision(
+        predecessor.controllerSourceRevision,
+        "semantic baseline handoff predecessor.controllerSourceRevision",
+      ),
+      githubAttestationVerificationBytesSha256: digest(
+        predecessor.githubAttestationVerificationBytesSha256,
+        "semantic baseline handoff predecessor.githubAttestationVerificationBytesSha256",
       ),
       releaseIdentitySha256: digest(
         predecessor.releaseIdentitySha256,
@@ -437,6 +459,12 @@ export function validateSemanticBaselineHandoffManifestV1(
     historicalPublicKeys: parsedKeys,
   };
   if (
+    (
+      parsed.predecessor.mode === "normal"
+      && parsed.predecessor.controllerSourceRevision
+        !== parsed.predecessor.sourceRevision
+    )
+    ||
     parsed.predecessor.releaseVerificationKeySha256
       === parsed.predecessor.stableAuthorizerKeySha256
     || parsed.historicalPublicKeys[0].keySha256
@@ -457,6 +485,7 @@ async function loadBundleFiles(
   assets: Record<SemanticBaselineReleaseAssetName, Buffer>;
   releaseKeyBytes: Buffer;
   stableAuthorizerKeyBytes: Buffer;
+  githubAttestationVerificationBytes: Buffer;
 }> {
   const resolved = await exactDirectory(
     directory,
@@ -473,7 +502,11 @@ async function loadBundleFiles(
       ),
     ] as const),
   );
-  const [releaseKeyBytes, stableAuthorizerKeyBytes] = await Promise.all([
+  const [
+    releaseKeyBytes,
+    stableAuthorizerKeyBytes,
+    githubAttestationVerificationBytes,
+  ] = await Promise.all([
     regularFileBytes(
       join(resolved, SEMANTIC_BASELINE_RELEASE_KEY_FILE),
       "semantic baseline historical release verification key",
@@ -484,6 +517,11 @@ async function loadBundleFiles(
       "semantic baseline historical stable-authorizer key",
       MAX_PUBLIC_KEY_BYTES,
     ),
+    regularFileBytes(
+      join(resolved, SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE),
+      "semantic baseline fresh GitHub attestation verification",
+      MAX_ASSET_BYTES,
+    ),
   ]);
   return {
     directory: resolved,
@@ -493,14 +531,15 @@ async function loadBundleFiles(
     >,
     releaseKeyBytes,
     stableAuthorizerKeyBytes,
+    githubAttestationVerificationBytes,
   };
 }
 
 async function validateBundleAgainstManifest(input: {
-  manifest: SemanticBaselineHandoffManifestV1;
+  manifest: SemanticBaselineHandoffManifestV2;
   directory: string;
   expectedNames: readonly string[];
-}): Promise<LoadedSemanticBaselineHandoffV1> {
+}): Promise<LoadedSemanticBaselineHandoffV2> {
   const files = await loadBundleFiles(input.directory, input.expectedNames);
   const assetHashes = Object.fromEntries(
     input.manifest.releaseAssets.map(({ name, sha256 }) => [name, sha256]),
@@ -536,6 +575,22 @@ async function validateBundleAgainstManifest(input: {
   ) {
     throw new Error("semantic baseline historical public-key bytes mismatch");
   }
+  if (
+    bytesSha256(files.githubAttestationVerificationBytes)
+      !== input.manifest.predecessor
+        .githubAttestationVerificationBytesSha256
+  ) {
+    throw new Error(
+      "semantic baseline fresh GitHub attestation verification hash mismatch",
+    );
+  }
+  const githubAttestationVerification = record(
+    parseJson(
+      files.githubAttestationVerificationBytes,
+      "semantic baseline fresh GitHub attestation verification",
+    ),
+    "semantic baseline fresh GitHub attestation verification",
+  );
   const protectedBaselineMetadata =
     validateSemanticRankingProtectedBaselineMetadataV1(
       parseJson(
@@ -613,6 +668,7 @@ async function validateBundleAgainstManifest(input: {
     ),
     stableReleaseConsumer,
     stableImageAttestation,
+    githubAttestationVerification,
   };
 }
 
@@ -624,6 +680,8 @@ export async function createSemanticBaselineHandoff(input: {
   predecessorReleaseId: number;
   predecessorStableTag: string;
   predecessorSourceRevision: string;
+  predecessorMode: "normal" | "bootstrap";
+  predecessorControllerSourceRevision: string;
   predecessorReleaseIdentitySha256: string;
   metadataSha256: string;
   assetSha256: Record<SemanticBaselineReleaseAssetName, string>;
@@ -631,7 +689,7 @@ export async function createSemanticBaselineHandoff(input: {
   stableAuthorizerKeyId: string;
   stableAuthorizerKeySha256: string;
 }): Promise<{
-  manifest: SemanticBaselineHandoffManifestV1;
+  manifest: SemanticBaselineHandoffManifestV2;
   manifestSha256: string;
 }> {
   const directory = await exactDirectory(
@@ -640,6 +698,7 @@ export async function createSemanticBaselineHandoff(input: {
       ...SEMANTIC_BASELINE_RELEASE_ASSET_NAMES,
       SEMANTIC_BASELINE_RELEASE_KEY_FILE,
       SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_FILE,
+      SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
     ],
     "semantic baseline handoff input",
   );
@@ -658,8 +717,20 @@ export async function createSemanticBaselineHandoff(input: {
       `semantic baseline selected asset ${name}`,
     ),
   }));
-  const provisional: SemanticBaselineHandoffManifestV1 = {
-    schemaVersion: SEMANTIC_BASELINE_HANDOFF_SCHEMA_V1,
+  const githubAttestationVerificationBytes = await regularFileBytes(
+    join(directory, SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE),
+    "semantic baseline fresh GitHub attestation verification",
+    MAX_ASSET_BYTES,
+  );
+  record(
+    parseJson(
+      githubAttestationVerificationBytes,
+      "semantic baseline fresh GitHub attestation verification",
+    ),
+    "semantic baseline fresh GitHub attestation verification",
+  );
+  const provisional: SemanticBaselineHandoffManifestV2 = {
+    schemaVersion: SEMANTIC_BASELINE_HANDOFF_SCHEMA_V2,
     candidate: {
       tag: input.candidateTag,
       sourceRevision: input.candidateSourceRevision,
@@ -668,6 +739,11 @@ export async function createSemanticBaselineHandoff(input: {
       releaseId: input.predecessorReleaseId,
       stableTag: input.predecessorStableTag,
       sourceRevision: input.predecessorSourceRevision,
+      mode: input.predecessorMode,
+      controllerSourceRevision:
+        input.predecessorControllerSourceRevision,
+      githubAttestationVerificationBytesSha256:
+        bytesSha256(githubAttestationVerificationBytes),
       releaseIdentitySha256: input.predecessorReleaseIdentitySha256,
       metadataSha256: input.metadataSha256,
       releaseVerificationKeySha256:
@@ -696,9 +772,10 @@ export async function createSemanticBaselineHandoff(input: {
       ...SEMANTIC_BASELINE_RELEASE_ASSET_NAMES,
       SEMANTIC_BASELINE_RELEASE_KEY_FILE,
       SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_FILE,
+      SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
     ],
   );
-  const manifest = validateSemanticBaselineHandoffManifestV1({
+  const manifest = validateSemanticBaselineHandoffManifestV2({
     ...provisional,
     historicalPublicKeys: [
       {
@@ -718,6 +795,7 @@ export async function createSemanticBaselineHandoff(input: {
       ...SEMANTIC_BASELINE_RELEASE_ASSET_NAMES,
       SEMANTIC_BASELINE_RELEASE_KEY_FILE,
       SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_FILE,
+      SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
     ],
   });
   await writeFile(
@@ -738,21 +816,24 @@ export async function loadSemanticBaselineHandoff(input: {
   expectedCandidateSourceRevision: string;
   expectedMetadataSha256: string;
   expectedStableTag: string;
+  expectedPredecessorMode: "normal" | "bootstrap";
+  expectedPredecessorControllerSourceRevision: string;
   expectedReleaseVerificationKeySha256: string;
   expectedStableAuthorizerKeyId: string;
   expectedStableAuthorizerKeySha256: string;
-}): Promise<LoadedSemanticBaselineHandoffV1> {
+}): Promise<LoadedSemanticBaselineHandoffV2> {
   const directory = await exactDirectory(
     input.directory,
     [
       ...SEMANTIC_BASELINE_RELEASE_ASSET_NAMES,
       SEMANTIC_BASELINE_RELEASE_KEY_FILE,
       SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_FILE,
+      SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
       SEMANTIC_BASELINE_HANDOFF_MANIFEST,
     ],
     "semantic baseline handoff",
   );
-  const manifest = validateSemanticBaselineHandoffManifestV1(
+  const manifest = validateSemanticBaselineHandoffManifestV2(
     parseJson(
       await regularFileBytes(
         join(directory, SEMANTIC_BASELINE_HANDOFF_MANIFEST),
@@ -775,6 +856,9 @@ export async function loadSemanticBaselineHandoff(input: {
     || manifest.predecessor.metadataSha256
       !== input.expectedMetadataSha256
     || manifest.predecessor.stableTag !== input.expectedStableTag
+    || manifest.predecessor.mode !== input.expectedPredecessorMode
+    || manifest.predecessor.controllerSourceRevision
+      !== input.expectedPredecessorControllerSourceRevision
     || manifest.predecessor.releaseVerificationKeySha256
       !== input.expectedReleaseVerificationKeySha256
     || manifest.predecessor.stableAuthorizerKeyId
@@ -793,6 +877,7 @@ export async function loadSemanticBaselineHandoff(input: {
       ...SEMANTIC_BASELINE_RELEASE_ASSET_NAMES,
       SEMANTIC_BASELINE_RELEASE_KEY_FILE,
       SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_FILE,
+      SEMANTIC_BASELINE_GITHUB_VERIFICATION_FILE,
       SEMANTIC_BASELINE_HANDOFF_MANIFEST,
     ],
   });
@@ -852,6 +937,8 @@ async function main(): Promise<void> {
       "--predecessor-release-id",
       "--predecessor-stable-tag",
       "--predecessor-source-revision",
+      "--predecessor-mode",
+      "--predecessor-controller-source-revision",
       "--predecessor-release-identity-sha256",
       "--metadata-sha256",
       "--asset-sha256-json-b64url",
@@ -864,6 +951,10 @@ async function main(): Promise<void> {
     if (!Number.isSafeInteger(releaseId) || releaseId <= 0) {
       throw new Error("--predecessor-release-id must be a positive integer");
     }
+    const predecessorMode = required(values, "--predecessor-mode");
+    if (predecessorMode !== "normal" && predecessorMode !== "bootstrap") {
+      throw new Error("--predecessor-mode must be normal or bootstrap");
+    }
     const created = await createSemanticBaselineHandoff({
       directory: required(values, "--directory"),
       manifestOutputPath: required(values, "--manifest-output"),
@@ -875,6 +966,9 @@ async function main(): Promise<void> {
         required(values, "--predecessor-stable-tag"),
       predecessorSourceRevision:
         required(values, "--predecessor-source-revision"),
+      predecessorMode,
+      predecessorControllerSourceRevision:
+        required(values, "--predecessor-controller-source-revision"),
       predecessorReleaseIdentitySha256:
         required(values, "--predecessor-release-identity-sha256"),
       metadataSha256: required(values, "--metadata-sha256"),
@@ -890,7 +984,10 @@ async function main(): Promise<void> {
     });
     await appendFile(
       required(values, "--github-output"),
-      `sha256=${created.manifestSha256}\n`,
+      `sha256=${created.manifestSha256}\n`
+        + "github_attestation_verification_bytes_sha256="
+        + `${created.manifest.predecessor
+          .githubAttestationVerificationBytesSha256}\n`,
       { encoding: "utf8" },
     );
     process.stdout.write(`${JSON.stringify({
@@ -907,10 +1004,16 @@ async function main(): Promise<void> {
       "--candidate-source-revision",
       "--metadata-sha256",
       "--stable-tag",
+      "--predecessor-mode",
+      "--predecessor-controller-source-revision",
       "--release-verification-key-sha256",
       "--stable-authorizer-key-id",
       "--stable-authorizer-key-sha256",
     ]));
+    const predecessorMode = required(values, "--predecessor-mode");
+    if (predecessorMode !== "normal" && predecessorMode !== "bootstrap") {
+      throw new Error("--predecessor-mode must be normal or bootstrap");
+    }
     const loaded = await loadSemanticBaselineHandoff({
       directory: required(values, "--directory"),
       expectedManifestSha256:
@@ -920,6 +1023,9 @@ async function main(): Promise<void> {
         required(values, "--candidate-source-revision"),
       expectedMetadataSha256: required(values, "--metadata-sha256"),
       expectedStableTag: required(values, "--stable-tag"),
+      expectedPredecessorMode: predecessorMode,
+      expectedPredecessorControllerSourceRevision:
+        required(values, "--predecessor-controller-source-revision"),
       expectedReleaseVerificationKeySha256:
         required(values, "--release-verification-key-sha256"),
       expectedStableAuthorizerKeyId:

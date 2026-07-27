@@ -409,6 +409,10 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     accessId: string;
     selectionPlan: SelectionPlanV3;
     queryPlan: QueryPlanV3;
+    executorReleaseIdentity: {
+      executorRevision: string;
+      semanticExecutionConfigurationHash: string | null;
+    };
     fence: PipelineV3WriteFence;
   }> {
     const clientBucket = `v3-manifest-${label}-${randomUUID()}`;
@@ -693,9 +697,13 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       job_id: string;
       stage_key: string;
       access_id: string;
+      required_executor_revision: string | null;
+      required_executor_semantic_configuration_hash: string | null;
     }>(
       `SELECT sp.plan_json selection_plan,qp.plan_json query_plan,qp.id query_plan_id,
-              jq.id job_id,jq.stage_key,ra.id access_id
+              jq.id job_id,jq.stage_key,ra.id access_id,
+              jq.required_executor_revision,
+              jq.required_executor_semantic_configuration_hash
        FROM selection_plans sp
        JOIN run_active_query_plans aqp ON aqp.run_id=sp.run_id
        JOIN query_plan_revisions qp ON qp.id=aqp.query_plan_revision_id
@@ -706,6 +714,26 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       [created.runId],
     )).rows[0]!;
     const workerId = `v3-manifest-worker-${randomUUID()}`;
+    if (Number(active.query_plan.schemaVersion ?? 1) >= 5) {
+      expect(active.required_executor_revision).toMatch(
+        /^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$/u,
+      );
+      expect(active.required_executor_semantic_configuration_hash).toMatch(
+        /^[0-9a-f]{64}$/u,
+      );
+    }
+    const executorRevision =
+      active.required_executor_revision ?? "integration-v3-worker";
+    await repository.updateWorkerHeartbeat(workerId, {
+      version: executorRevision,
+      ...(active.required_executor_semantic_configuration_hash ? {
+        semanticExecutionConfigurationHash:
+          active.required_executor_semantic_configuration_hash,
+      } : {}),
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await pool.query(
       `UPDATE job_queue
        SET status='leased',lease_owner=$2,lease_expires_at=now()+interval '5 minutes'
@@ -736,7 +764,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
           dependencyKey: "research",
           attemptNumber: 1,
           leaseGeneration: leaseEpoch,
-          executorRevision: "integration-v3-recovery",
+          executorRevision,
           executorIdentityHash: "e".repeat(64),
           executorCapabilityHash:
             active.query_plan.executorCapabilityHash ?? null,
@@ -747,6 +775,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
                 ) as unknown as Record<string, unknown>
               : null,
           configurationHash: "d".repeat(64),
+          semanticExecutionConfigurationHash:
+            active.required_executor_semantic_configuration_hash,
           idempotencyKey:
             `${active.job_id}:${leaseEpoch}:${contractRevision.id}`,
         })
@@ -756,6 +786,11 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       accessId: active.access_id,
       selectionPlan: active.selection_plan,
       queryPlan: active.query_plan,
+      executorReleaseIdentity: {
+        executorRevision,
+        semanticExecutionConfigurationHash:
+          active.required_executor_semantic_configuration_hash,
+      },
       fence: {
         jobId: active.job_id,
         workerId,
@@ -781,6 +816,14 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       "or_membership",
     );
     const successorWorkerId = `v3-successor-worker-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(successorWorkerId, {
+      version: context.executorReleaseIdentity.executorRevision,
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await pool.query(
       `UPDATE job_queue
        SET lease_owner=$2,lease_expires_at=now()+interval '5 minutes'
@@ -803,13 +846,15 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       dependencyKey: "research",
       attemptNumber: 2,
       leaseGeneration: successorGeneration,
-      executorRevision: "integration-v3-successor",
+      executorRevision: context.executorReleaseIdentity.executorRevision,
       executorIdentityHash: "f".repeat(64),
       executorCapabilityHash: context.queryPlan.executorCapabilityHash!,
       executorCapabilityVector: structuredClone(
         context.queryPlan.executorCapabilityVector!,
       ) as unknown as Record<string, unknown>,
       configurationHash: "d".repeat(64),
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
       idempotencyKey:
         `${context.fence.jobId}:${successorGeneration}:${context.fence.contractRevisionDatabaseId}`,
     });
@@ -824,13 +869,15 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       dependencyKey: "research",
       attemptNumber: 3,
       leaseGeneration: context.fence.leaseEpoch,
-      executorRevision: "integration-v3-stale",
+      executorRevision: context.executorReleaseIdentity.executorRevision,
       executorIdentityHash: "e".repeat(64),
       executorCapabilityHash: context.queryPlan.executorCapabilityHash!,
       executorCapabilityVector: structuredClone(
         context.queryPlan.executorCapabilityVector!,
       ) as unknown as Record<string, unknown>,
       configurationHash: "d".repeat(64),
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
       idempotencyKey:
         `${context.fence.jobId}:${context.fence.leaseEpoch}:stale-retry`,
     })).rejects.toMatchObject({ code: "job_lease_lost" });
@@ -958,9 +1005,19 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       },
     });
 
+    const staleSuccessorWorkerId =
+      `v3-feasibility-successor-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(staleSuccessorWorkerId, {
+      version: context.executorReleaseIdentity.executorRevision,
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await pool.query(
-      "UPDATE job_queue SET lease_owner=lease_owner || '-successor' WHERE id=$1",
-      [context.fence.jobId],
+      "UPDATE job_queue SET lease_owner=$2 WHERE id=$1",
+      [context.fence.jobId, staleSuccessorWorkerId],
     );
     const staleReport = assessPlaylistRuntimeFeasibilityV1({
       contractRevisionId: context.queryPlan.playlistContractRevisionId!,
@@ -1577,16 +1634,19 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       `INSERT INTO job_queue(
          id,run_id,kind,queue_class,dedupe_key,pipeline_version,
          minimum_worker_protocol,stage_key,status,payload_json,max_attempts,
-         lease_owner,lease_expires_at)
+         lease_owner,lease_expires_at,required_executor_revision,
+         required_executor_semantic_configuration_hash)
        VALUES($1,$2,'publication','publication',$3,'corpus_first_v3',
          10,$4,'leased','{}'::jsonb,3,$5,
-         now()+interval '5 minutes')`,
+         now()+interval '5 minutes',$6,$7)`,
       [
         unrelatedJobId,
         context.runId,
         `spliced-reconciliation:${context.runId}`,
         original.stageKey,
         original.workerId,
+        context.executorReleaseIdentity.executorRevision,
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
       ],
     );
     const unrelatedLease = Number((await pool.query<{
@@ -1635,15 +1695,27 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       query_plan_revision_id: string | null;
       required_executor_capability_hash: string;
       required_executor_capability_vector: Record<string, unknown>;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
     }>(
       `SELECT id,stage_key,query_plan_revision_id,
               required_executor_capability_hash,
-              required_executor_capability_vector
+              required_executor_capability_vector,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
        FROM job_queue
        WHERE kind='publication' AND dedupe_key=$1`,
       [recoveryDedupeKey],
     )).rows[0]!;
     const recoveryWorker = `reauth-worker-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(recoveryWorker, {
+      version: recoveryJob.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        recoveryJob.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await pool.query(
       `UPDATE job_queue
        SET status='leased',lease_owner=$2,
@@ -1667,13 +1739,15 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       dependencyKey: "publication",
       attemptNumber: 1,
       leaseGeneration: recoveryLeaseGeneration,
-      executorRevision: "integration-reauthorization-recovery",
+      executorRevision: recoveryJob.required_executor_revision,
       executorIdentityHash: "3".repeat(64),
       executorCapabilityHash:
         recoveryJob.required_executor_capability_hash,
       executorCapabilityVector:
         recoveryJob.required_executor_capability_vector,
       configurationHash: "4".repeat(64),
+      semanticExecutionConfigurationHash:
+        recoveryJob.required_executor_semantic_configuration_hash,
       idempotencyKey:
         `${recoveryJob.id}:${recoveryLeaseGeneration}:${locked!.contractRevisionId}`,
     });

@@ -155,8 +155,13 @@ logs, or signs the raw secret values.
    `needs` edges to both authorization and validation. Browser downloads and
    candidate test processes therefore never share a runner, workspace, or
    token with registry or attestation authority. The publishing job builds
-   only `linux/amd64`, attests, and publishes the immutable candidate image; it
-   contains no Railway or Sites deploy step.
+   only `linux/amd64` without pushing, immediately rechecks stable-version
+   monotonicity and the exact immutable predecessor, then pushes that already
+   built image and attests its resulting digest. Release-candidate, stable,
+   and one-time predecessor-bootstrap workflows share the
+   `stable-release-mutation` concurrency lock, so their final mutation windows
+   cannot overlap. The candidate workflow contains no Railway or Sites deploy
+   step.
 
    Both container roots are immutable: the application Dockerfile pins the
    reviewed Node 22.19 Alpine OCI index digest and CI/RC/Compose pin the
@@ -417,10 +422,12 @@ logs, or signs the raw secret values.
    future-dated lineage, or any stable tag/source/image/final-browser/fixture
    hash mismatch.
    These inputs must come from the exact
-   `genio-semantic-baseline-handoff/v1` directory preserved in the successful
+   `genio-semantic-baseline-handoff/v2` directory preserved in the successful
    RC candidate artifact. The directory has exactly the five immutable
-   GitHub-Release asset bytes, the two historical public-key byte strings, and
-   its candidate-bound manifest. Set
+   GitHub-Release asset bytes, the two historical public-key byte strings, the
+   fresh predecessor GitHub attestation-verification JSON, and its
+   candidate-bound manifest. The manifest also binds the exact predecessor
+   mode/controller revision and verification byte hash. Set
    `RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256` from the RC workflow output and
    pass that directory with `--protected-baseline-handoff-directory`; the
    semantic producer no longer accepts independently selected baseline files.
@@ -545,12 +552,40 @@ logs, or signs the raw secret values.
 
     ```sh
     RELEASE_VERIFICATION_KEY_SHA256="$RELEASE_VERIFICATION_KEY_SHA256" \
+    RELEASE_GATE_PRODUCER_KEY_ID="$RELEASE_GATE_PRODUCER_KEY_ID" \
+    RELEASE_GATE_PRODUCER_KEY_SHA256="$RELEASE_GATE_PRODUCER_KEY_SHA256" \
+    RELEASE_SEMANTIC_REVIEWER_KEY_ID="$RELEASE_SEMANTIC_REVIEWER_KEY_ID" \
+    RELEASE_SEMANTIC_REVIEWER_KEY_SHA256="$RELEASE_SEMANTIC_REVIEWER_KEY_SHA256" \
+    RELEASE_SEMANTIC_BASELINE_METADATA_SHA256="$RELEASE_SEMANTIC_BASELINE_METADATA_SHA256" \
+    RELEASE_SEMANTIC_BASELINE_STABLE_TAG="$RELEASE_SEMANTIC_BASELINE_STABLE_TAG" \
+    RELEASE_SEMANTIC_BASELINE_RELEASE_KEY_SHA256="$RELEASE_SEMANTIC_BASELINE_RELEASE_KEY_SHA256" \
+    RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_ID="$RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_ID" \
+    RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_SHA256="$RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_SHA256" \
+    RELEASE_SITES_CONTROL_PLANE_KEY_ID="$RELEASE_SITES_CONTROL_PLANE_KEY_ID" \
+    RELEASE_SITES_CONTROL_PLANE_KEY_SHA256="$RELEASE_SITES_CONTROL_PLANE_KEY_SHA256" \
+    RELEASE_STAGING_CONTROL_PLANE_KEY_ID="$RELEASE_STAGING_CONTROL_PLANE_KEY_ID" \
+    RELEASE_STAGING_CONTROL_PLANE_KEY_SHA256="$RELEASE_STAGING_CONTROL_PLANE_KEY_SHA256" \
+    RELEASE_APPLE_CONTROL_PLANE_ISSUER="$RELEASE_APPLE_CONTROL_PLANE_ISSUER" \
+    RELEASE_APPLE_CONTROL_PLANE_KEY_ID="$RELEASE_APPLE_CONTROL_PLANE_KEY_ID" \
+    RELEASE_APPLE_CONTROL_PLANE_KEY_SHA256="$RELEASE_APPLE_CONTROL_PLANE_KEY_SHA256" \
+    RELEASE_PROVIDER_CONTROL_PLANE_ISSUER="$RELEASE_PROVIDER_CONTROL_PLANE_ISSUER" \
+    RELEASE_PROVIDER_CONTROL_PLANE_KEY_ID="$RELEASE_PROVIDER_CONTROL_PLANE_KEY_ID" \
+    RELEASE_PROVIDER_CONTROL_PLANE_KEY_SHA256="$RELEASE_PROVIDER_CONTROL_PLANE_KEY_SHA256" \
+    RELEASE_QA_BUDGET_LEDGER_ISSUER="$RELEASE_QA_BUDGET_LEDGER_ISSUER" \
+    RELEASE_QA_BUDGET_LEDGER_KEY_ID="$RELEASE_QA_BUDGET_LEDGER_KEY_ID" \
+    RELEASE_QA_BUDGET_LEDGER_KEY_SHA256="$RELEASE_QA_BUDGET_LEDGER_KEY_SHA256" \
     RELEASE_STABLE_AUTHORIZER_KEY_ID="$RELEASE_STABLE_AUTHORIZER_KEY_ID" \
     RELEASE_STABLE_AUTHORIZER_KEY_SHA256="$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" \
     pnpm release:stable:authorize -- \
       --confirm-stable-release-authorization \
+      --candidate-evidence candidate-evidence.signed.json \
       --finalization-evidence finalization-evidence.signed.json \
+      --finalization-source-evidence finalization-source-evidence.json \
+      --semantic-review-gate-artifact gate-semantic-ranking-blinded-review.json \
+      --semantic-review-gate-producer-attestation gate-semantic-ranking-blinded-review.attestation.json \
+      --protected-baseline-metadata protected-semantic-baseline.json \
       --release-verification-key "$RELEASE_VERIFICATION_KEY_FILE" \
+      --release-gate-producer-verification-key "$RELEASE_GATE_PRODUCER_VERIFICATION_KEY_FILE" \
       --authorizer-signing-key "$RELEASE_STABLE_AUTHORIZER_PRIVATE_KEY_FILE" \
       --output stable-release-authorization.signed.json \
       --expected-rc-tag "$RELEASE_RC_TAG" \
@@ -559,10 +594,44 @@ logs, or signs the raw secret values.
       --expected-image-digest "$RELEASE_IMAGE_DIGEST"
     ```
 
-    The stable-authorizer key is independently pinned and must differ from the
-    release-evidence key. Only this fresh signed authorization permits creation
-    of the stable annotated `v<version>` tag and matching GitHub Release.
-    Prepare the bounded four-key dispatch payload locally before calling
+    `finalization-source-evidence.json` must use
+    `genio-stable-release-finalization-source-bundle/v2`. It preserves the
+    actual signed promotion evidence and public-rollout evidence plus the raw
+    artifact and detached producer attestation for
+    `production_fixed_three_track`, `production_affected_regression`,
+    `backend_release_convergence`, `release_convergence`, and
+    `final_custom_domain_browser`. The stable authorizer independently
+    re-verifies those sources, including the Apple verifier binding, exact
+    rollout transition and target configuration, repeated convergence,
+    protected Sites receipt, and final browser probes. It does not accept the
+    release signer's gate summaries as source evidence. Preserve this input
+    with the isolated authorizer's audit record; the bounded GitHub dispatch
+    remains the five-key signed-consumer bundle below.
+
+    The same source bundle must also contain the signed finalization staging
+    control-plane aggregate, its canonical
+    `genio-stable-release-verification-key/v1` public key, and its protected
+    trust policy; plus the detached Apple, provider, and QA-budget receipts,
+    each receipt's canonical public key, and each protected receipt trust
+    policy. The protected values supplied through the environment above must
+    match the embedded audit copies exactly. The stable authorizer re-verifies
+    every signature and candidate/runtime/hash binding at authorization time,
+    checks the finalization `stagingControls` against the aggregate-derived
+    controls, and caps authorization expiry to the earliest nested source
+    expiry. An expired Sites attestation, control-plane aggregate, or detached
+    receipt requires fresh evidence rather than historical replay.
+
+    The authorizer also independently re-verifies the candidate evidence,
+    semantic-review gate, detached gate-producer signature, blinded external
+    review, and protected predecessor. The release, gate-producer,
+    semantic-reviewer, Sites-control-plane, staging-control-plane, Apple
+    receipt, provider receipt, QA-budget receipt, and stable-authorizer keys
+    must be nine distinct protected keys. The authorizer recomputes the candidate-arm
+    fixture hashes; a rewritten candidate/finalization/baseline bundle cannot
+    self-assert a new reviewed result. Only this fresh signed authorization
+    permits creation of the stable annotated `v<version>` tag and matching
+    GitHub Release.
+    Prepare the bounded five-key dispatch payload locally before calling
     GitHub; the command fails before dispatch when the encoded evidence reaches
     GitHub's 64 KiB `client_payload` ceiling:
 
@@ -572,6 +641,7 @@ logs, or signs the raw secret values.
       --candidate-tag "$RELEASE_RC_TAG" \
       --image-digest "$RELEASE_IMAGE_DIGEST" \
       --finalization-evidence finalization-evidence.signed.json \
+      --protected-baseline-metadata protected-semantic-baseline.json \
       --stable-authorization stable-release-authorization.signed.json \
       --output stable-release-dispatch.json
 
@@ -580,12 +650,79 @@ logs, or signs the raw secret values.
       --input stable-release-dispatch.json
     ```
 
-    `.github/workflows/stable-release.yml` is the only workflow with
-    `contents: write`. Before any ref or Release write it verifies the exact
+    `.github/workflows/stable-release.yml` and the one-time, hard-coded
+    `.github/workflows/bootstrap-stable-predecessor.yml` are the only workflows
+    with `contents: write`. The bootstrap publisher can publish evidence for
+    only the existing annotated `v2.3.4` predecessor while it remains the
+    greatest stable tag and no `v2.4.0` stable Release exists; it cannot create,
+    move, or delete any tag or ref. It accepts no successor identity, and its
+    signed authorization permits only a later `v2.4.0-rc.N` descendant of the
+    exact protected default-branch bootstrap controller. The historical
+    `v2.3.4` tree contains no Dockerfile. Read-only recovery preserved the exact
+    API, worker, and deep-worker deployment records and complete retained build
+    logs, but Railway exposed no registry reference, OCI manifest/config bytes,
+    generated plan bytes, SBOM, signature, or supply-chain attestation. The
+    canonical capture is therefore typed
+    `authenticated_platform_observation_not_supply_chain_attestation`; its
+    three lane-specific Railway metadata digests and distinct BuildKit
+    manifest/config digests can never satisfy an image-attestation predicate.
+    Bootstrap semantic fixtures are likewise scoped only to the reconstructed
+    wrapper. The evidence embeds the exact three staging fixture gate
+    artifacts, the final custom-domain browser artifact, and all four detached
+    producer attestations in a bounded canonical compressed source bundle.
+    Verification replays the typed gate validators, requires a protected
+    producer key distinct from the release, stable-authorizer, and Sites
+    control-plane keys, and derives the fixture registry from those artifacts.
+    Bootstrap authorization additionally requires the Sites verification key
+    and trust policy from protected environment configuration, verifies the
+    embedded Sites signature with that external key, and rejects an
+    internally consistent substituted Sites key/policy pair. The resulting
+    `wrapperFixtureEvidenceHash` is not a claim that wrapper outputs equal any
+    historical production execution.
+
+    `.github/workflows/bootstrap-stable-predecessor-image.yml` is a separate
+    one-time digest-only wrapper producer. It accepts no payload, checks out the
+    exact historical revision, verifies a pinned deterministic `git archive`,
+    expands that archive into a VCS-metadata-free build context, verifies the
+    protected controller Dockerfile independently, pushes no tag, and keylessly
+    attests only the resulting GHCR wrapper. The wrapper bytes and controller
+    recipe are explicitly not claimed to equal any historical Railway artifact.
+    `bootstrap-stable-predecessor.yml` never builds or writes a registry. Its
+    dormant publisher independently reruns GitHub's keyless verification for
+    the exact digest, signer workflow, protected source revision, source ref,
+    predicate type, and hosted runner, then hash-binds the canonical parsed
+    verification result into the image-attestation asset and rederives the
+    consumer through the five-asset verifier. Before doing so, it materializes
+    the original tag, commit, and tree object bytes plus the protected
+    controller workflow bytes from Git, reconstructs the exact Git object IDs,
+    and compares byte-derived SHA-256 commitments with the signed bootstrap
+    evidence; operator-entered digest summaries are not accepted. The
+    publisher remains fail-closed unless the dispatch includes a bounded
+    `genio-signed-stable-predecessor-original-railway-provenance/v1`
+    envelope. That envelope must be signed by the independently operated key
+    pinned in
+    `RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID`,
+    `RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256`, and
+    `RELEASE_ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL`; it must bind the
+    exact historical source/tree, all three fixed Railway deployment IDs, the
+    canonical recovered observation hash, and an immutable registry
+    manifest digest. A caller-entered digest without that signature cannot
+    pass. The authorization and publication verifier also require
+    `RELEASE_SITES_CONTROL_PLANE_KEY_ID`,
+    `RELEASE_SITES_CONTROL_PLANE_KEY_SHA256`, and the protected
+    `RELEASE_SITES_CONTROL_PLANE_VERIFICATION_KEY_B64URL`. Missing, expired,
+    mismatched, or substituted evidence blocks before publication. The signed
+    bootstrap authorization retains the original-Railway proof hash and
+    verifier identity. Immediately before the Release API mutation, the
+    workflow rereads stable tags and Releases under the shared mutation lock
+    and requires `v2.3.4` to remain the greatest exact stable identity. Every
+    ordinary stable release uses `stable-release.yml`.
+
+    Before any ref or Release write, `stable-release.yml` verifies the exact
     annotated RC/default-branch SHA/package version/image digest, full
     post-Sites finalization evidence, the independently signed stable
-    authorization, and the GHCR provenance attestation. It also reads GitHub's
-    control plane and fails closed unless:
+    authorization, and the GHCR provenance attestation. Both publishers read
+    GitHub's control plane and fail closed unless:
 
     - `main` is protected with strict GitHub-Actions-app-bound required checks,
       at least one approving PR review, and admin enforcement;
@@ -601,20 +738,27 @@ logs, or signs the raw secret values.
       verified Integration/ruleset IDs are recorded in the tag annotation;
     - repository immutable releases are enabled.
 
-    It creates a draft Release, uploads and byte-compares the four evidence
+    It creates a draft Release, uploads and byte-compares the five evidence
     assets, verifies exact title/body/target/assets, publishes, then rereads the
     Release and requires GitHub to report it immutable. A pre-existing
     incomplete or inconsistent tag, draft, Release, or asset fails closed.
 
-    **Current external P0 (verified 2026-07-24):** this private repository's
-    present GitHub plan/control plane does not expose the required ruleset,
-    `stable-release` environment is absent, `main` is not protected with the
-    required checks, and immutable releases are not enabled. Do not dispatch
-    `genio-stable-release` and do not create a manual stable tag or Release
-    until those controls are available and configured. Adding GitHub Actions
-    spend changes only the compute budget; it does not satisfy any of these
-    controls and is usable by release QA only after the independent budget
-    ledger signs a source and the receipt producer converts it.
+    **Current external P0 (verified 2026-07-26):** the four workflow
+    environments now exist and are restricted to protected branches, but this
+    private repository is on a GitHub plan where GitHub explicitly reports
+    that branch protections and repository rulesets are not enforced.
+    Required environment reviewers are also unavailable. `main` therefore
+    cannot yet provide the enforced app-bound checks, independent approval,
+    and admin enforcement required by the release verifier. The repository
+    also currently has no Actions secrets or variables, so its pinned release
+    keys, control-plane tokens, and tag-ruleset identity are absent. Immutable
+    Releases have not been independently proven enabled. Railway staging
+    exists but contains no services; its first declarative plan cannot be
+    generated until an immutable RC image digest is supplied. Do not dispatch
+    a bootstrap/stable publisher and do not create a manual RC/stable tag or
+    Release until these controls are available and configured. Adding GitHub
+    Actions spend changes only compute budget; it does not satisfy any of
+    these controls.
 
 The public-rollout producer consumes the exact backend-scoped production
 runtime snapshot and signed promotion evidence, reads the protected current

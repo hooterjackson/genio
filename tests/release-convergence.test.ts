@@ -13,7 +13,10 @@ const expectedConfigurationHashes = {
   api: configurationHash,
   interactiveWorker: configurationHash,
   deepWorker: configurationHash,
+  semanticExecution: "2".repeat(64),
 };
+const semanticExecutionConfigurationHash =
+  expectedConfigurationHashes.semanticExecution;
 const observedAt = "2026-07-23T12:00:00.000Z";
 const nextObservedAt = "2026-07-23T12:00:30.000Z";
 
@@ -22,25 +25,61 @@ function observation(overrides: {
   sitesRevision?: string;
   apiRevision?: string;
   apiConfigurationHash?: string;
+  systemApiRevision?: string;
+  systemApiConfigurationHash?: string;
+  systemApiSemanticExecutionConfigurationHash?: string;
   interactiveConfigurationHash?: string;
   deepConfigurationHash?: string;
+  runtimeSemanticExecutionConfigurationHash?: string;
+  interactiveSemanticExecutionConfigurationHashes?: string[];
+  deepSemanticExecutionConfigurationHashes?: string[];
   interactiveRevisions?: string[];
   deepRevisions?: string[];
   observedAt?: string;
   interactiveLastSeenAt?: string;
   deepLastSeenAt?: string;
+  publicRollout?: {
+    active: boolean;
+    databaseAuthorized: boolean;
+    evidenceHash: string | null;
+    stage: string | null;
+    targetConfigurationHash: string | null;
+  };
 } = {}) {
+  const publicRollout = overrides.publicRollout ?? {
+    active: false,
+    databaseAuthorized: true,
+    evidenceHash: null,
+    stage: null,
+    targetConfigurationHash: null,
+  };
+  const apiBuild = {
+    identifier: `2.3.5+${revision.slice(0, 12)}`,
+    version: "2.3.5",
+    revision: overrides.apiRevision ?? revision,
+  };
+  const apiConfigurationHash =
+    overrides.apiConfigurationHash ?? configurationHash;
+  const runtimeSemanticExecutionConfigurationHash =
+    overrides.runtimeSemanticExecutionConfigurationHash
+      ?? semanticExecutionConfigurationHash;
   return releaseConvergenceObservation({
     observedAt: overrides.observedAt ?? observedAt,
     sitesHtml: `<html lang="en" data-build-version="${overrides.sitesVersion ?? "2.3.5"}" data-build-revision="${overrides.sitesRevision ?? revision}">`,
     livePayload: {
-      configurationHash: overrides.apiConfigurationHash ?? configurationHash,
-      build: {
-        identifier: `2.3.5+${revision.slice(0, 12)}`,
-        version: "2.3.5",
-        revision: overrides.apiRevision ?? revision,
+      configurationHash: apiConfigurationHash,
+      build: apiBuild,
+      api: {
+        schemaVersion: "genio-api-runtime-identity/v1",
+        replicaIdentityHash: "6".repeat(64),
+        build: apiBuild,
+        configurationHash: apiConfigurationHash,
+        semanticExecutionConfigurationHash:
+          runtimeSemanticExecutionConfigurationHash,
       },
       runtime: {
+        semanticExecutionConfigurationHash:
+          runtimeSemanticExecutionConfigurationHash,
         releaseEnvironment: "production",
         deploymentPhase: "activate",
         expectedDatabaseSchemaVersion: "18",
@@ -56,15 +95,44 @@ function observation(overrides: {
         briefContractVersion: "3",
         guidancePolicyVersion: "adaptive_guidance_v3",
         baselineProviderModelId: "gpt-5.6-luna",
+        publicRolloutEvidenceHash: publicRollout.active
+          ? publicRollout.evidenceHash
+          : null,
+        publicRolloutStage: publicRollout.active
+          ? publicRollout.stage
+          : null,
       },
     },
     systemHttpStatus: 200,
     systemPayload: {
+      api: {
+        schemaVersion: "genio-api-runtime-identity/v1",
+        replicaIdentityHash: "7".repeat(64),
+        build: {
+          identifier: `2.3.5+${revision.slice(0, 12)}`,
+          version: "2.3.5",
+          revision: overrides.systemApiRevision ?? revision,
+        },
+        configurationHash:
+          overrides.systemApiConfigurationHash ?? configurationHash,
+        semanticExecutionConfigurationHash:
+          overrides.systemApiSemanticExecutionConfigurationHash
+            ?? semanticExecutionConfigurationHash,
+      },
       ok: true,
       activationReady: true,
       database: "ready",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
+      canonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorFencing: {
+        ready: true,
+        incompleteJobs: 0,
+        mismatchedActiveAttempts: 0,
+        uncoveredJobs: 0,
+        requirements: [],
+      },
+      publicRollout,
       paused: false,
       workerProtocol: {
         expected: "playlist-pipeline-v10",
@@ -82,6 +150,9 @@ function observation(overrides: {
           eligibleConfigurationHashes: [
             overrides.interactiveConfigurationHash ?? configurationHash,
           ],
+          eligibleSemanticExecutionConfigurationHashes:
+            overrides.interactiveSemanticExecutionConfigurationHashes
+              ?? [semanticExecutionConfigurationHash],
           lastSeenAt: overrides.interactiveLastSeenAt ?? "2026-07-23T11:59:50.000Z",
         },
         deep: {
@@ -94,6 +165,9 @@ function observation(overrides: {
           eligibleConfigurationHashes: [
             overrides.deepConfigurationHash ?? configurationHash,
           ],
+          eligibleSemanticExecutionConfigurationHashes:
+            overrides.deepSemanticExecutionConfigurationHashes
+              ?? [semanticExecutionConfigurationHash],
           lastSeenAt: overrides.deepLastSeenAt ?? "2026-07-23T11:59:45.000Z",
         },
       },
@@ -140,6 +214,22 @@ describe("release convergence evidence", () => {
       "--expected-version", "2.3.5",
       "--interval-seconds", "0",
     ])).toThrow(/30 to 120/u);
+    expect(parseReleaseConvergenceArgs([
+      "--expected-revision", revision,
+      "--expected-version", "2.3.5",
+      "--expected-api-configuration-hash", configurationHash,
+      "--expected-interactive-configuration-hash", configurationHash,
+      "--expected-deep-configuration-hash", configurationHash,
+      "--expected-semantic-execution-configuration-hash",
+      semanticExecutionConfigurationHash,
+    ])).toMatchObject({ expectedConfigurationHashes });
+    expect(() => parseReleaseConvergenceArgs([
+      "--expected-revision", revision,
+      "--expected-version", "2.3.5",
+      "--expected-api-configuration-hash", configurationHash,
+      "--expected-interactive-configuration-hash", configurationHash,
+      "--expected-deep-configuration-hash", configurationHash,
+    ])).toThrow(/semantic execution configuration hash/u);
   });
 
   test("reads the immutable Sites version marker without executing page scripts", () => {
@@ -182,6 +272,13 @@ describe("release convergence evidence", () => {
       evidenceHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
     });
     expect(result.observations[0]).toMatchObject({
+      api: {
+        replicaIdentityHash: "6".repeat(64),
+        version: "2.3.5",
+        revision,
+        configurationHash,
+        semanticExecutionConfigurationHash,
+      },
       runtime: {
         deploymentPhase: "activate",
         expectedDatabaseSchemaVersion: "18",
@@ -191,9 +288,29 @@ describe("release convergence evidence", () => {
         queryPlanSchemaVersion: "5",
         briefContractVersion: "3",
         baselineProviderModelId: "gpt-5.6-luna",
+        semanticExecutionConfigurationHash,
       },
       system: {
+        api: {
+          replicaIdentityHash: "7".repeat(64),
+          version: "2.3.5",
+          revision,
+          configurationHash,
+          semanticExecutionConfigurationHash,
+        },
         queue: { failed: 2 },
+        workerLanes: {
+          interactive: {
+            eligibleSemanticExecutionConfigurationHashes: [
+              semanticExecutionConfigurationHash,
+            ],
+          },
+          deep: {
+            eligibleSemanticExecutionConfigurationHashes: [
+              semanticExecutionConfigurationHash,
+            ],
+          },
+        },
       },
     });
   });
@@ -350,6 +467,82 @@ describe("release convergence evidence", () => {
     ]));
   });
 
+  test("retains database-authorized rollout identity and rejects partial authority", () => {
+    const rollout = {
+      active: true,
+      databaseAuthorized: true,
+      evidenceHash: "a".repeat(64),
+      stage: "genre_scene:50->100",
+      targetConfigurationHash: "b".repeat(64),
+    };
+    const healthy = observation({ publicRollout: rollout });
+    expect(healthy.system.publicRollout).toEqual(rollout);
+
+    const result = buildReleaseConvergenceEvidence({
+      origin: "https://9enio.com",
+      expectedRevision: revision,
+      expectedVersion: "2.3.5",
+      expectedSamples: 2,
+      expectedConfigurationHashes,
+      observations: [
+        observation({
+          publicRollout: {
+            ...rollout,
+            databaseAuthorized: false,
+          },
+        }),
+        observation({
+          observedAt: nextObservedAt,
+          interactiveLastSeenAt: "2026-07-23T12:00:20.000Z",
+          deepLastSeenAt: "2026-07-23T12:00:15.000Z",
+          publicRollout: {
+            ...rollout,
+            targetConfigurationHash: null,
+          },
+        }),
+      ],
+      generatedAt: nextObservedAt,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.violations).toEqual(expect.arrayContaining([
+      "sample_1:public_rollout_database_authority_invalid",
+      "sample_2:public_rollout_database_authority_invalid",
+    ]));
+  });
+
+  test("rejects rollout identity that differs between runtime and database", () => {
+    const rollout = {
+      active: true,
+      databaseAuthorized: true,
+      evidenceHash: "a".repeat(64),
+      stage: "genre_scene:50->100",
+      targetConfigurationHash: "b".repeat(64),
+    };
+    const first = observation({ publicRollout: rollout });
+    const second = observation({
+      observedAt: nextObservedAt,
+      interactiveLastSeenAt: "2026-07-23T12:00:20.000Z",
+      deepLastSeenAt: "2026-07-23T12:00:15.000Z",
+      publicRollout: rollout,
+    });
+    first.runtime.publicRolloutEvidenceHash = "c".repeat(64);
+    second.runtime.publicRolloutStage = "genre_scene:10->50";
+    const result = buildReleaseConvergenceEvidence({
+      origin: "https://9enio.com",
+      expectedRevision: revision,
+      expectedVersion: "2.3.5",
+      expectedSamples: 2,
+      expectedConfigurationHashes,
+      observations: [first, second],
+      generatedAt: nextObservedAt,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.violations).toEqual(expect.arrayContaining([
+      "sample_1:public_rollout_database_authority_invalid",
+      "sample_2:public_rollout_database_authority_invalid",
+    ]));
+  });
+
   test("rejects a stale configuration even when source revision is unchanged", () => {
     const result = buildReleaseConvergenceEvidence({
       origin: "https://9enio.com",
@@ -378,6 +571,66 @@ describe("release convergence evidence", () => {
       "sample_1:interactive_configuration_mismatch",
       "sample_2:api_configuration_mismatch",
       "sample_2:interactive_configuration_mismatch",
+    ]));
+  });
+
+  test("rejects API and worker-lane semantic execution drift", () => {
+    const result = buildReleaseConvergenceEvidence({
+      origin: "https://9enio.com",
+      expectedRevision: revision,
+      expectedVersion: "2.3.5",
+      expectedSamples: 2,
+      expectedConfigurationHashes,
+      observations: [
+        observation({
+          runtimeSemanticExecutionConfigurationHash: "3".repeat(64),
+          interactiveSemanticExecutionConfigurationHashes: [
+            "4".repeat(64),
+          ],
+        }),
+        observation({
+          observedAt: nextObservedAt,
+          deepSemanticExecutionConfigurationHashes: ["5".repeat(64)],
+          interactiveLastSeenAt: "2026-07-23T12:00:20.000Z",
+          deepLastSeenAt: "2026-07-23T12:00:15.000Z",
+        }),
+      ],
+      generatedAt: nextObservedAt,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.violations).toEqual(expect.arrayContaining([
+      "sample_1:runtime_semantic_execution_configuration_mismatch",
+      "sample_1:interactive_semantic_execution_configuration_mismatch",
+      "sample_2:deep_semantic_execution_configuration_mismatch",
+    ]));
+  });
+
+  test("rejects a mixed /health/system API identity", () => {
+    const result = buildReleaseConvergenceEvidence({
+      origin: "https://9enio.com",
+      expectedRevision: revision,
+      expectedVersion: "2.3.5",
+      expectedSamples: 2,
+      expectedConfigurationHashes,
+      observations: [
+        observation({
+          systemApiRevision: "9".repeat(40),
+          systemApiConfigurationHash: "8".repeat(64),
+        }),
+        observation({
+          observedAt: nextObservedAt,
+          interactiveLastSeenAt: "2026-07-23T12:00:20.000Z",
+          deepLastSeenAt: "2026-07-23T12:00:15.000Z",
+          systemApiSemanticExecutionConfigurationHash: "7".repeat(64),
+        }),
+      ],
+      generatedAt: nextObservedAt,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.violations).toEqual(expect.arrayContaining([
+      `sample_1:system_api_revision:${"9".repeat(40)}`,
+      "sample_1:system_api_configuration_mismatch",
+      "sample_2:system_api_semantic_execution_configuration_mismatch",
     ]));
   });
 });

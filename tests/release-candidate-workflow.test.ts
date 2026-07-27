@@ -250,6 +250,10 @@ describe("release-candidate workflow trust boundary", () => {
       '"GET /repos/{owner}/{repo}/immutable-releases"',
     );
     expect(authorization).toContain("github.rest.repos.listReleases");
+    expect(authorization).toContain("github.rest.git.listMatchingRefs");
+    expect(authorization).toContain(
+      "candidate version must be greater than every existing stable tag and release",
+    );
     expect(authorization).toContain(
       "lowerStableVersions.sort(",
     );
@@ -320,7 +324,34 @@ describe("release-candidate workflow trust boundary", () => {
       "Reverify the predecessor image's keyless provenance",
     );
     expect(authorization).toContain(
-      '--source-digest "$BASELINE_SOURCE_REVISION"',
+      '--source-digest "$BASELINE_SIGNER_SOURCE_DIGEST"',
+    );
+    expect(authorization).toContain(
+      '--signer-workflow "$GITHUB_REPOSITORY/$BASELINE_SIGNER_WORKFLOW"',
+    );
+    expect(authorization).toContain(
+      "fresh GitHub verification does not match the bootstrap image attestation canonical hash",
+    );
+    expect(authorization).toContain(
+      "Reverify the predecessor through the shared strict dispatcher",
+    );
+    expect(authorization).toContain(
+      'import { verifyHistoricalStablePredecessor } from "./scripts/historical-stable-predecessor.ts"',
+    );
+    expect(authorization).toContain(
+      "name: semantic-baseline-github-verification-${{ steps.identity.outputs.candidate_tag }}",
+    );
+    expect(authorization).toContain(
+      "semantic-baseline-handoff/predecessor-image-attestation-verification.json",
+    );
+    expect(authorization).toContain(
+      "--predecessor-mode \"$PREDECESSOR_MODE\"",
+    );
+    expect(authorization).toContain(
+      "--predecessor-controller-source-revision \"$PREDECESSOR_CONTROLLER_SOURCE_REVISION\"",
+    );
+    expect(authorization).toContain(
+      "controllerSourceRevision ?? imageSignerSourceDigest",
     );
     expect(offline).toContain(
       "Recheck the exact immutable predecessor before publication",
@@ -330,6 +361,10 @@ describe("release-candidate workflow trust boundary", () => {
     );
     expect(offline).toContain("github.rest.repos.getReleaseByTag");
     expect(offline).toContain("github.rest.repos.listReleases");
+    expect(offline).toContain("github.rest.git.listMatchingRefs");
+    expect(offline).toContain(
+      "candidate version is no longer greater than every stable tag and release",
+    );
     expect(offline).toContain(
       "observed !== expectedAssetSha256[name]",
     );
@@ -342,6 +377,10 @@ describe("release-candidate workflow trust boundary", () => {
       "Reconfirm the predecessor is still greatest before image publication",
     );
     expect(publishing).toContain("github.rest.repos.listReleases");
+    expect(publishing).toContain("github.rest.git.listMatchingRefs");
+    expect(publishing).toContain(
+      "candidate version is no longer greater than every stable tag and release",
+    );
     expect(publishing).toContain(
       "predecessor?.id !== expectedReleaseId",
     );
@@ -357,6 +396,15 @@ describe("release-candidate workflow trust boundary", () => {
       "RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256: ${{ needs.authorize.outputs.semantic_baseline_handoff_sha256 }}",
     );
     expect(publishing).toContain(
+      "RELEASE_SEMANTIC_BASELINE_PREDECESSOR_MODE: ${{ needs.authorize.outputs.semantic_baseline_predecessor_mode }}",
+    );
+    expect(publishing).toContain(
+      "RELEASE_SEMANTIC_BASELINE_CONTROLLER_SOURCE_REVISION: ${{ needs.authorize.outputs.semantic_baseline_controller_source_revision }}",
+    );
+    expect(publishing).toContain(
+      "RELEASE_SEMANTIC_BASELINE_GITHUB_ATTESTATION_VERIFICATION_BYTES_SHA256: ${{ needs.authorize.outputs.semantic_baseline_github_attestation_verification_bytes_sha256 }}",
+    );
+    expect(publishing).toContain(
       "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
     );
     expect(publishing).toContain(
@@ -366,11 +414,29 @@ describe("release-candidate workflow trust boundary", () => {
       "--expected-manifest-sha256 \"$RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256\"",
     );
     expect(publishing).toContain(
+      "--predecessor-mode \"$RELEASE_SEMANTIC_BASELINE_PREDECESSOR_MODE\"",
+    );
+    expect(publishing).toContain(
+      "--predecessor-controller-source-revision \"$RELEASE_SEMANTIC_BASELINE_CONTROLLER_SOURCE_REVISION\"",
+    );
+    expect(publishing).toContain(
       "semanticBaselineHandoffSha256:process.env.RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256",
     );
     expect(publishing).toContain("semantic-baseline-handoff/");
     expect(publishing).toContain(
       "semanticBaselineMetadataSha256:process.env.RELEASE_SEMANTIC_BASELINE_METADATA_SHA256",
+    );
+    expect(publishing).toContain(
+      'schemaVersion:"genio-release-image/v2"',
+    );
+    expect(publishing).toContain(
+      "semanticBaselinePredecessorMode:process.env.RELEASE_SEMANTIC_BASELINE_PREDECESSOR_MODE",
+    );
+    expect(publishing).toContain(
+      "semanticBaselineControllerSourceRevision:process.env.RELEASE_SEMANTIC_BASELINE_CONTROLLER_SOURCE_REVISION",
+    );
+    expect(publishing).toContain(
+      "semanticBaselineGithubAttestationVerificationBytesSha256:process.env.RELEASE_SEMANTIC_BASELINE_GITHUB_ATTESTATION_VERIFICATION_BYTES_SHA256",
     );
     expect(publishing).toContain(
       "GENIO_RELEASE_VERIFICATION_KEY_SHA256=${{ needs.authorize.outputs.release_verification_key_sha256 }}",
@@ -383,6 +449,97 @@ describe("release-candidate workflow trust boundary", () => {
     );
     expect(publishing).not.toContain(
       "GENIO_RELEASE_VERIFICATION_KEY_SHA256=${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}",
+    );
+  });
+
+  test("admits the one-time predecessor only through an exact bootstrap schema pair", async () => {
+    const authorization = job(
+      await readFile(workflowUrl, "utf8"),
+      "authorize",
+    );
+    for (const schema of [
+      "genio-signed-release-evidence/v3",
+      "genio-release-evidence/v3",
+      "genio-signed-stable-release-authorization/v2",
+      "genio-stable-release-authorization/v2",
+      "genio-signed-stable-predecessor-bootstrap-evidence/v1",
+      "genio-stable-predecessor-bootstrap-evidence/v1",
+      "genio-signed-stable-predecessor-bootstrap-authorization/v1",
+      "genio-stable-predecessor-bootstrap-authorization/v1",
+    ]) {
+      expect(authorization).toContain(schema);
+    }
+    expect(authorization).toContain(
+      "if (normalSchemaPair === bootstrapSchemaPair)",
+    );
+    expect(authorization).toContain(
+      "evidence and authorization must use one exact supported schema pair",
+    );
+    expect(authorization).toContain(
+      'const BOOTSTRAP_SUCCESSOR_RC = /^v2\\.4\\.0-rc\\.[1-9]\\d*$/u',
+    );
+    expect(authorization).toContain(
+      'const BOOTSTRAP_STABLE_TAG = "v2.3.4"',
+    );
+    expect(authorization).toContain(
+      '"7dc877cfc1537a9936974f9699a4b8ba9740b5f5"',
+    );
+    expect(authorization).toContain(
+      '"0fb63ccc88b6f5ea675b3b43506fc112fa3fae58"',
+    );
+    expect(authorization).toContain(
+      '"91076c2f06de9d562532981c3a602f1c6366f057"',
+    );
+    expect(authorization).toContain(
+      'const BOOTSTRAP_CONTROLLER_WORKFLOW =\n              ".github/workflows/bootstrap-stable-predecessor.yml"',
+    );
+    expect(authorization).toContain(
+      'const BOOTSTRAP_IMAGE_WORKFLOW =\n              ".github/workflows/bootstrap-stable-predecessor-image.yml"',
+    );
+    expect(authorization).toContain(
+      'successorPolicy.version !== "2.4.0"',
+    );
+    expect(authorization).toContain(
+      "sourceTreeObjectSha256",
+    );
+    expect(authorization).toContain(
+      "wrapperFixtureEvidenceHash",
+    );
+    expect(authorization).toContain(
+      "reconstruction_wrapper_only_not_historical_production_equivalence",
+    );
+    expect(authorization).toContain(
+      "wrapper_fixture_evidence_does_not_prove_historical_production_output_equivalence",
+    );
+    expect(authorization).toContain(
+      "authorization.payload.producerKeySha256",
+    );
+    expect(authorization).toContain(
+      "authorization.payload.sitesKeySha256",
+    );
+    expect(authorization).toContain(
+      "successorReleaseExists || successorTagExists",
+    );
+    expect(authorization).toContain(
+      'ref: "tags/v2.4.0"',
+    );
+    expect(authorization).toContain(
+      'annotatedTag.data.message !== "Release v2.3.4\\n"',
+    );
+    expect(authorization).toContain(
+      "sourceCommit.data.tree.sha !== BOOTSTRAP_SOURCE_TREE",
+    );
+    expect(authorization).toContain(
+      "controllerAncestry.data.merge_base_commit?.sha",
+    );
+    expect(authorization).toContain(
+      "imageAttestation.workflowSourceRevision",
+    );
+    expect(authorization).toContain(
+      "imageAttestation.githubVerificationHash",
+    );
+    expect(authorization).toContain(
+      "predecessor schema mode and GitHub verification binding differ",
     );
   });
 
@@ -405,6 +562,43 @@ describe("release-candidate workflow trust boundary", () => {
     expect(workflow).not.toMatch(/\brailway\s+config\s+(?:apply|stage)\b/iu);
     expect(workflow).not.toMatch(/\b(?:deploy|publish)[^\n]*(?:Railway|Sites)\b/iu);
     expect(workflow).not.toContain("openai/sites");
+  });
+
+  test("serializes stable mutations and fences the predecessor after build but before push and attestation", async () => {
+    const workflow = await readFile(workflowUrl, "utf8");
+    const publishing = job(workflow, "publish");
+    expect(workflow).toContain(
+      "concurrency:\n  group: stable-release-mutation\n  cancel-in-progress: false",
+    );
+    const build = publishing.indexOf(
+      "Build the candidate image without registry mutation",
+    );
+    const fence = publishing.indexOf(
+      "Recheck stable monotonicity after build and immediately before image push",
+    );
+    const push = publishing.indexOf(
+      "Push the already-built candidate only after the final fence",
+    );
+    const attestation = publishing.indexOf("Attest image provenance");
+    expect(build).toBeGreaterThan(0);
+    expect(fence).toBeGreaterThan(build);
+    expect(push).toBeGreaterThan(fence);
+    expect(attestation).toBeGreaterThan(push);
+    expect(publishing.slice(build, fence)).toContain("load: true");
+    expect(publishing.slice(build, fence)).toContain("provenance: false");
+    expect(publishing.slice(build, fence)).not.toContain("push: true");
+    expect(publishing).toContain(
+      "subject-digest: ${{ steps.push.outputs.digest }}",
+    );
+    expect(publishing).toContain(
+      "candidate version is no longer greater than every stable tag and release",
+    );
+    expect(workflow).toContain(
+      '"originalRailwayProvenanceArtifactHash"',
+    );
+    expect(workflow).toContain(
+      "authorization.payload.originalRailwayProvenanceKeySha256",
+    );
   });
 
   test("embeds the immutable source identity inside the promoted image", async () => {

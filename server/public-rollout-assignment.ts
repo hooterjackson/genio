@@ -42,6 +42,12 @@ interface ParsedPublicRolloutDatabaseAuthorityV1 {
   targetConfiguration: PublicRolloutConfiguration;
 }
 
+export interface PublicRolloutRuntimeDatabaseAuthorityV1 {
+  evidenceHash: string;
+  stage: string;
+  targetConfigurationHash: string;
+}
+
 const SHA256 = /^[0-9a-f]{64}$/u;
 const STAGE =
   /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(0|1|10|50|100)->(0|1|10|50|100)$/u;
@@ -199,6 +205,55 @@ export function parsePublicRolloutDatabaseAuthorityV1(
     stage: global.stage,
     targetConfigurationHash: global.targetConfigurationHash,
     targetConfiguration,
+  });
+}
+
+/**
+ * Bind the public runtime markers to the atomically persisted rollout
+ * authority. This is intentionally stricter than cohort selection: a stale
+ * database row, a partially applied Railway variable set, or an authority
+ * present in only one plane makes release health fail closed.
+ */
+export function publicRolloutRuntimeDatabaseAuthorityV1(input: {
+  environment?: NodeJS.ProcessEnv;
+  databaseAuthority?: PublicRolloutDatabaseAuthorityV1 | null;
+}): PublicRolloutRuntimeDatabaseAuthorityV1 | null {
+  const environment = input.environment ?? process.env;
+  const runtime = {
+    evidenceHash:
+      environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH?.trim() ?? "",
+    rollbackWarrantHash:
+      environment.RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH?.trim() ?? "",
+    intentCanaryHash:
+      environment.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH?.trim() ?? "",
+    stage: environment.RELEASE_PUBLIC_ROLLOUT_STAGE?.trim() ?? "",
+  };
+  const runtimePresent = Object.values(runtime).some((value) => value !== "");
+  const authority = parsePublicRolloutDatabaseAuthorityV1(
+    input.databaseAuthority,
+  );
+  if (!runtimePresent && authority === null) return null;
+  if (
+    environment.RELEASE_ENVIRONMENT !== "production"
+    || environment.RELEASE_DEPLOYMENT_PHASE !== "activate"
+    || !SHA256.test(runtime.evidenceHash)
+    || !SHA256.test(runtime.rollbackWarrantHash)
+    || !SHA256.test(runtime.intentCanaryHash)
+    || !STAGE.test(runtime.stage)
+    || authority === null
+    || runtime.evidenceHash !== authority.evidenceHash
+    || runtime.rollbackWarrantHash !== authority.rollbackWarrantHash
+    || runtime.intentCanaryHash !== authority.intentCanaryHash
+    || runtime.stage !== authority.stage
+  ) {
+    throw new Error(
+      "public rollout runtime identity does not match its database authority",
+    );
+  }
+  return Object.freeze({
+    evidenceHash: authority.evidenceHash,
+    stage: authority.stage,
+    targetConfigurationHash: authority.targetConfigurationHash,
   });
 }
 

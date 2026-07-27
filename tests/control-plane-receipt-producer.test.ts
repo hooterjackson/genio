@@ -36,17 +36,35 @@ const revision = "a".repeat(40);
 const imageDigest = `sha256:${"b".repeat(64)}`;
 const imageReference = `ghcr.io/hooterjackson/genio@${imageDigest}`;
 const stagingOrigin = "https://staging-9enio.example";
+const semanticExecutionConfigurationHash =
+  createHash("sha256").update("semantic-execution").digest("hex");
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
 function live(environment: "staging" | "production") {
+  const build = {
+    identifier: `2.4.0+${revision.slice(0, 12)}`,
+    version: "2.4.0",
+    revision,
+  };
+  const configurationHash = digest(`${environment}:api`);
   return {
     ok: true,
-    build: { version: "2.4.0", revision },
-    configurationHash: digest(`${environment}:api`),
+    build,
+    api: {
+      schemaVersion: "genio-api-runtime-identity/v1",
+      replicaIdentityHash: digest(`${environment}:live-api-replica`),
+      build,
+      configurationHash,
+      semanticExecutionConfigurationHash,
+    },
+    configurationHash,
     runtime: {
+      semanticExecutionConfigurationHash,
+      publicRolloutEvidenceHash: null,
+      publicRolloutStage: null,
       ownerAllowlistVersion: "owner-allowlist-v1",
       releaseEnvironment: environment,
       deploymentPhase: "activate",
@@ -75,16 +93,46 @@ function system(environment: "staging" | "production") {
     compatibleCapacity: 1,
     eligibleWorkerCount: 1,
     eligibleIdentityCount: 1,
+    candidateExecutorIdentityReady: true,
     eligibleRevisions: [revision],
     eligibleConfigurationHashes: [digest(`${environment}:${name}`)],
+    eligibleSemanticExecutionConfigurationHashes: [
+      semanticExecutionConfigurationHash,
+    ],
   });
   return {
     ok: true,
     activationReady: true,
     database: "ready",
-    schemaVersion: "18",
-    releaseManifestCanaryGuardsVersion: "1",
-    canonicalExecutionHardeningVersion: "1",
+      schemaVersion: "18",
+      releaseManifestCanaryGuardsVersion: "1",
+      canonicalExecutionHardeningVersion: "1",
+      canonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorFencing: {
+        ready: true,
+        incompleteJobs: 0,
+        mismatchedActiveAttempts: 0,
+        uncoveredJobs: 0,
+        requirements: [],
+      },
+      api: {
+        schemaVersion: "genio-api-runtime-identity/v1",
+        replicaIdentityHash: digest(`${environment}:system-api-replica`),
+        build: {
+          identifier: `2.4.0+${revision.slice(0, 12)}`,
+          version: "2.4.0",
+          revision,
+        },
+        configurationHash: digest(`${environment}:api`),
+        semanticExecutionConfigurationHash,
+      },
+      publicRollout: {
+      active: false,
+      databaseAuthorized: true,
+      evidenceHash: null,
+      stage: null,
+      targetConfigurationHash: null,
+    },
     paused: false,
     workerLanes: {
       interactive: lane("interactive"),

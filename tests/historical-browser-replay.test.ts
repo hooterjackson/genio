@@ -86,7 +86,7 @@ function corpusValue() {
 
 function runtimeSnapshot(): LoadedRuntimeSnapshotV1 {
   return {
-    schemaVersion: "genio-release-runtime-snapshot/v2",
+    schemaVersion: "genio-release-runtime-snapshot/v3",
     generatedAt: "2026-07-24T12:00:00.000Z",
     origin,
     environment: "staging",
@@ -102,6 +102,18 @@ function runtimeSnapshot(): LoadedRuntimeSnapshotV1 {
       ownerAllowlistVersion: "owners-v1",
       candidateMatched: true,
     },
+    apiObservations: {
+      liveReplicaIdentityHash: hash("7"),
+      systemReplicaIdentityHash: hash("8"),
+    },
+    executorFencing: {
+      version: "1",
+      ready: true,
+      incompleteJobs: 0,
+      mismatchedActiveAttempts: 0,
+      uncoveredJobs: 0,
+      requirementsHash: hash("9"),
+    },
     configuration: {
       apiHash: hash("2"),
       interactiveWorkerHash: hash("3"),
@@ -110,6 +122,7 @@ function runtimeSnapshot(): LoadedRuntimeSnapshotV1 {
       secretVersionsHash: hash("5"),
     },
     runtime: {
+      semanticExecutionConfigurationHash: hash("6"),
       releaseEnvironment: "staging",
       deploymentPhase: "activate",
       databaseSchemaVersion: "18",
@@ -134,6 +147,13 @@ function runtimeSnapshot(): LoadedRuntimeSnapshotV1 {
         pipeline: "pipeline-v3",
         prompt: "prompt-v1",
       },
+    },
+    publicRollout: {
+      active: false,
+      databaseAuthorized: true,
+      evidenceHash: null,
+      stage: null,
+      targetConfigurationHash: null,
     },
     credentialVersionHashes: {
       provider: hash("6"),

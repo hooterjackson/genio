@@ -26,6 +26,11 @@ export const CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING =
 export const CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION =
   REQUIRED_ACTIVATION_EXECUTION_CONTROLS
     .RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION;
+/** Additive 0020 immutable source/semantic executor fence. */
+export const CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING =
+  "canonical_executor_release_identity_fencing_version";
+export const CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION =
+  "1";
 export const CANONICAL_RELEASE_DATABASE_CAPABILITY_VERSION =
   REQUIRED_ACTIVATION_EXECUTION_CONTROLS
     .RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION;
@@ -93,14 +98,16 @@ export function releaseExecutionConfigured(
 
 /**
  * Readiness for bootstrap is intentionally stronger than ordinary bridge
- * readiness: migrations 0018 and 0019 and both capability markers must be
- * visible.
+ * readiness: migrations 0018 through 0020, their capability markers, and the
+ * exact 0020 trigger/column inventory must be visible.
  */
 export function releaseDatabaseReadinessReady(input: {
   environment?: NodeJS.ProcessEnv;
   observedDatabaseSchemaVersion: string | null;
   observedDatabaseCapabilityVersion?: string | null;
   observedCanonicalExecutionHardeningVersion?: string | null;
+  observedCanonicalExecutorReleaseIdentityFencingVersion?: string | null;
+  executorReleaseIdentityFenceSupported?: boolean;
 }): boolean {
   const phase = runtimeReleaseDeploymentPhase(input.environment);
   if (phase === "bootstrap") {
@@ -110,7 +117,10 @@ export function releaseDatabaseReadinessReady(input: {
       && input.observedDatabaseCapabilityVersion
         === CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
       && input.observedCanonicalExecutionHardeningVersion
-        === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+        === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION
+      && input.observedCanonicalExecutorReleaseIdentityFencingVersion
+        === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+      && input.executorReleaseIdentityFenceSupported === true;
   }
   if (phase === "activate") {
     return releaseExecutionConfigured(input.environment)
@@ -123,8 +133,15 @@ export function releaseDatabaseReadinessReady(input: {
       && input.observedDatabaseSchemaVersion === expectedSchema
       && (
         expectedSchema !== CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION
-        || input.observedDatabaseCapabilityVersion
-          === CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
+        || (
+          input.observedDatabaseCapabilityVersion
+            === CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
+          && input.observedCanonicalExecutionHardeningVersion
+            === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION
+          && input.observedCanonicalExecutorReleaseIdentityFencingVersion
+            === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+          && input.executorReleaseIdentityFenceSupported === true
+        )
       );
   }
   return phase === "unconfigured"
@@ -170,13 +187,18 @@ export function canonicalContractActivationReady(input: {
   observedDatabaseSchemaVersion: string | null;
   observedDatabaseCapabilityVersion?: string | null;
   observedCanonicalExecutionHardeningVersion?: string | null;
+  observedCanonicalExecutorReleaseIdentityFencingVersion?: string | null;
+  executorReleaseIdentityFenceSupported?: boolean;
 }): boolean {
   return canonicalContractActivationConfigured(input.environment)
     && input.observedDatabaseSchemaVersion === CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION
     && input.observedDatabaseCapabilityVersion
       === CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
     && input.observedCanonicalExecutionHardeningVersion
-      === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
+      === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION
+    && input.observedCanonicalExecutorReleaseIdentityFencingVersion
+      === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+    && input.executorReleaseIdentityFenceSupported === true;
 }
 
 export function canonicalContractCohortConfigured(
