@@ -22,6 +22,7 @@ import {
   searchAppleCatalogResources,
   type AppleCatalogAlbum,
   type AppleCatalogArtist,
+  type AppleCatalogPage,
   type AppleCatalogPlaylist,
   type AppleArtistAlbumView,
 } from "./apple.ts";
