@@ -25593,7 +25593,13 @@ export class Repository {
               "canonical_playlist_optimization_failed:",
             ))
             ?.slice("canonical_playlist_optimization_failed:".length)
-            .split(":")[0]
+            .replace(/[:/]/gu, ".")
+            .slice(0, 48)
+          : null;
+        const retrievalAlbumCount = operatorReasonClass?.startsWith(
+          "minimum_distinct_albums.",
+        )
+          ? result.playlistOptimization?.distinct.albums
           : null;
         throw Object.assign(
           new HttpError(
@@ -25607,6 +25613,10 @@ export class Repository {
             operatorCode:
               `pipeline_v3_result_invalid.canonical_preflight.${operatorStage}${
                 operatorReasonClass ? `.${operatorReasonClass}` : ""
+              }${
+                Number.isSafeInteger(retrievalAlbumCount)
+                  ? `.retrieval.${retrievalAlbumCount}`
+                  : ""
               }`,
           },
         );
