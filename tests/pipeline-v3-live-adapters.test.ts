@@ -3934,8 +3934,23 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(providerRequest.instructions).toContain(
       "identity-bound central-suitability enrichment pass",
     );
-    expect(JSON.parse(providerRequest.input).excludedArtistTitlePairs)
-      .toEqual([]);
+    const providerPayload = JSON.parse(providerRequest.input);
+    expect(providerPayload).toEqual({
+      operation: "catalog_bound_central_quality",
+      centralQualityPolicy: selection.playlistQualityPolicy,
+      requestedCandidateCount: 1,
+      catalogCandidates: [{
+        artist: exactSeed.artistName,
+        title: exactSeed.name,
+        album: exactSeed.albumName,
+      }],
+    });
+    expect(providerPayload).not.toHaveProperty("prompt");
+    expect(providerPayload).not.toHaveProperty("membershipPredicates");
+    expect(providerPayload).not.toHaveProperty("canonicalTrackPredicate");
+    expect(providerPayload).not.toHaveProperty("rankingObjectives");
+    expect(providerPayload).not.toHaveProperty("conceptDiscoveryHints");
+    expect(providerPayload).not.toHaveProperty("scoutSourceHints");
     expect(providerRequest.text.format.schema.properties.candidates.items
       .properties.sources.items.properties.predicateIds.minItems).toBe(0);
     const metadata = batch.candidates[0]!.metadata as any;
