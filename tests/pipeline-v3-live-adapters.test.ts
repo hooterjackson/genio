@@ -4065,6 +4065,123 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(firstChunkFailures).toBe(2);
   });
 
+  test("retries only identities omitted from an otherwise valid quality-evidence chunk", async () => {
+    const base = plan("five smooth disco songs", 5);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeeds = Array.from({ length: 5 }, (_, index): CatalogSong => ({
+      ...song(750 + index, `Artist ${index + 1}`, `Track ${index + 1}`),
+      genreNames: ["Disco"],
+    }));
+    const requestedTitles: string[][] = [];
+    const createResponse = vi.fn(async (input: any) => {
+      const catalogCandidates = JSON.parse(input.input).catalogCandidates as Array<{
+        artist: string;
+        title: string;
+        album: string;
+      }>;
+      requestedTitles.push(catalogCandidates.map(({ title }) => title));
+      const returned = requestedTitles.length === 1
+        ? catalogCandidates.slice(0, 4)
+        : catalogCandidates;
+      const rows = returned.map((candidate, index) => {
+        const sourceUrl = `https://example.com/partial-quality/${encodeURIComponent(candidate.title)}`;
+        return {
+          candidate,
+          sourceUrl,
+          text: `${candidate.artist} — ${candidate.title} is smooth. [source]`,
+          index,
+        };
+      });
+      return {
+        id: `partial_quality_${requestedTitles.length}`,
+        output_text: JSON.stringify({
+          candidates: rows.map(({ candidate, sourceUrl }) => ({
+            ...candidate,
+            centralQualityScore: 0.9,
+            centralQualityCriteria: [{ criterion: "smooth", verdict: "pass" }],
+            sources: [{ url: sourceUrl, predicateIds: [] }],
+          })),
+        }),
+        output: [
+          {
+            type: "web_search_call",
+            action: { sources: rows.map(({ sourceUrl }) => ({ url: sourceUrl })) },
+          },
+          ...rows.map(({ sourceUrl, text, index }) => ({
+            id: `partial_quality_message_${requestedTitles.length}_${index}`,
+            type: "message",
+            content: [{
+              type: "output_text",
+              text,
+              annotations: [{
+                type: "url_citation",
+                url: sourceUrl,
+                start_index: text.indexOf("[source]"),
+                end_index: text.indexOf("[source]") + "[source]".length,
+              }],
+            }],
+          })),
+        ],
+      };
+    });
+    const adapters = createPipelineV3LiveAdapters({
+      model: "quality-test-model",
+      escalationModel: "quality-test-model",
+      createResponse: createResponse as any,
+      searchAppleResources: vi.fn(async (
+        _storefront: string,
+        query: string,
+      ) => emptySearch({
+        artists: [{
+          id: `artist-${query}`,
+          name: query,
+          genreNames: ["Disco"],
+        }],
+      })) as any,
+      lookupAppleByIds: vi.fn(async () => exactSeeds) as any,
+      getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
+      getArtistAlbums: vi.fn(async () => ({ items: [], next: null })) as any,
+      getAlbumTracks: vi.fn(async () => ({ items: [], next: null })) as any,
+    });
+
+    const batch = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 5,
+      qualifiedRecordingFamilyKeys: exactSeeds.map((seed) => `isrc:${seed.isrc}`),
+      qualifiedTrackSeeds: exactSeeds.map((seed) => ({
+        artist: seed.artistName,
+        title: seed.name,
+        appleSongId: seed.id,
+        recordingFamilyKey: `isrc:${seed.isrc}`,
+      })),
+    });
+
+    expect(batch.candidates).toHaveLength(5);
+    expect(requestedTitles).toEqual([
+      exactSeeds.map(({ name }) => name),
+      [exactSeeds[4]!.name],
+    ]);
+    expect(createResponse).toHaveBeenCalledTimes(2);
+  });
+
   test("chunks exact quality-seed Apple lookups at the 25-ID provider limit", async () => {
     const base = plan("twenty-six smooth disco songs", 26);
     const selection: SelectionPlanV3 = {

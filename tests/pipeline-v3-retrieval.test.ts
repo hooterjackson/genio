@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   canonicalRequiredEvidenceIntegrityV3,
+  centralQualityVerdictV3,
   createCentralQualityCriterionObservationV3,
   createHostedWebEvidenceSnapshotV3,
   executeRetrievalV3,
@@ -1780,6 +1781,97 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(result.deficit.discardedByReason).toMatchObject({
       central_quality_failed: 1,
     });
+  });
+
+  test.each([
+    {
+      label: "five verified criteria and one bounded unknown",
+      verdicts: ["pass", "pass", "pass", "pass", "pass", "unknown"] as const,
+      expected: "pass" as const,
+    },
+    {
+      label: "four verified criteria and two unknowns above the ceiling",
+      verdicts: ["pass", "pass", "pass", "pass", "unknown", "unknown"] as const,
+      expected: "unknown" as const,
+    },
+    {
+      label: "a known failure despite five verified criteria",
+      verdicts: ["pass", "pass", "pass", "pass", "pass", "fail"] as const,
+      expected: "fail" as const,
+    },
+  ])("aggregates central suitability without converting every criterion into a hard gate: $label", ({
+    verdicts,
+    expected,
+  }) => {
+    const criteria = [
+      "crowd-pleasing",
+      "danceable",
+      "flirtatious",
+      "polished",
+      "sensual",
+      "smooth",
+    ];
+    const qualityPlan = canonicalDiscoPlan(1, {
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: criteria.map((criterion) => `quality:${criterion}`),
+        criteria,
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    });
+    const value = candidate(888);
+    const qualificationResult = canonicalDiscoQualification(value, {
+      centralQualityCriterionObservations: criteria.map((criterion, index) => (
+        createCentralQualityCriterionObservationV3({
+          policy: qualityPlan.playlistQualityPolicy!,
+          criterion,
+          verdict: verdicts[index]!,
+          sourceKind: "hosted_web_response",
+          sourceId: `quality:${criterion}`,
+          artist: value.artist,
+          title: value.title,
+          album: value.album,
+          catalogIdentity: {
+            appleSongId: `apple-${value.id}`,
+            recordingFamilyKey: `family-${value.id}`,
+          },
+        })
+      )),
+    });
+    const track: QualifiedTrackV3 = {
+      candidateId: qualificationResult.candidateId,
+      artist: value.artist,
+      title: value.title,
+      album: value.album,
+      sourceObservationIds: value.sourceObservationIds,
+      appleSongId: qualificationResult.catalog.appleSongId!,
+      recordingFamilyKey: qualificationResult.catalog.recordingFamilyKey!,
+      evidenceBindingIds: qualificationResult.evidence.bindingIds,
+      evidenceBindings: qualificationResult.evidence.bindings,
+      centralQualityCriterionObservations:
+        qualificationResult.centralQualityCriterionObservations,
+      canonicalClauseAssessments:
+        qualificationResult.canonicalClauseAssessments,
+      evidenceStrength: qualificationResult.evidence.strength,
+      scopeFit: qualificationResult.scope.fit,
+      independentProvenanceRoots:
+        qualificationResult.evidence.independentProvenanceRoots,
+      versionConfidence: qualificationResult.version.confidence,
+      catalogConfidence: qualificationResult.catalog.confidence,
+      rankingSignals: qualificationResult.rankingSignals,
+      sourceRank: qualificationResult.sourceRank,
+    };
+
+    expect(centralQualityVerdictV3(
+      track,
+      qualityPlan.playlistQualityPolicy!,
+    )).toBe(expected);
   });
 
   test("preserves catalog-bound quality proof when discovery omitted the album", async () => {

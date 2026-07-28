@@ -3406,15 +3406,26 @@ export function centralQualityVerdictV3(
       observation.verdict,
     ]);
   }
-  let hasUnknownCriterion = false;
+  let passedCriteria = 0;
+  let unknownCriteria = 0;
   for (const criterion of policy.criteria) {
     const verdicts = byCriterion.get(criterion) ?? [];
     // Known failure dominates every later pass or aggregate score. This is
     // the zeroKnownFailures invariant at its lowest executable boundary.
     if (verdicts.includes("fail")) return "fail";
-    if (!verdicts.includes("pass")) hasUnknownCriterion = true;
+    if (verdicts.includes("pass")) passedCriteria += 1;
+    else unknownCriteria += 1;
   }
-  return hasUnknownCriterion ? "unknown" : "pass";
+  if (policy.criteria.length === 0) return "unknown";
+  // Central suitability is a playlist-level objective, not six independent
+  // hard evidence gates. Classify a recording as a quality pass when its
+  // criterion coverage itself meets the immutable coverage/unknown policy;
+  // one bounded unknown must not turn five independently verified positives
+  // into an all-or-nothing failure. Known failures still fail closed above.
+  return passedCriteria / policy.criteria.length >= policy.minimumPassRatio
+    && unknownCriteria / policy.criteria.length <= policy.maximumUnknownRatio
+    ? "pass"
+    : "unknown";
 }
 
 export function evaluateCentralQualityV3(input: {

@@ -2956,7 +2956,7 @@ export function createPipelineV3LiveAdapters(
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
         chunks.push(songs.slice(offset, offset + chunkSize));
       }
-      const completed = new Map<number, HostedWebDiscoveryPageV3>();
+      const completed = new Map<number, HostedWebCandidateV3[]>();
       let pending = chunks.map((chunk, index) => ({ chunk, index }));
       let lastError: unknown = null;
       // One malformed or transient five-track response must not discard every
@@ -2973,7 +2973,7 @@ export function createPipelineV3LiveAdapters(
               options.onProviderUsage,
               chunk,
             );
-            return { ok: true as const, index, page };
+            return { ok: true as const, index, chunk, page };
           } catch (error) {
             if (request.signal?.aborted) throw request.signal.reason ?? error;
             return { ok: false as const, index, chunk, error };
@@ -2982,14 +2982,42 @@ export function createPipelineV3LiveAdapters(
         pending = [];
         for (const result of results) {
           if (result.ok) {
-            completed.set(result.index, result.page);
+            const prior = completed.get(result.index) ?? [];
+            const merged = [...prior, ...result.page.candidates];
+            completed.set(result.index, merged);
+            const requestedFamiliesByPair = new Map<string, Set<string>>();
+            for (const song of chunks[result.index] ?? result.chunk) {
+              const pair = exactTrackKey(song.artistName, song.name);
+              requestedFamiliesByPair.set(pair, new Set([
+                ...(requestedFamiliesByPair.get(pair) ?? []),
+                recordingFamily(song),
+              ]));
+            }
+            const missingSongs = result.chunk.filter((song) => {
+              const pair = exactTrackKey(song.artistName, song.name);
+              const pairFamilies = requestedFamiliesByPair.get(pair)
+                ?? new Set<string>();
+              return !merged.some((candidate) => (
+                exactTrackKey(candidate.artist, candidate.title) === pair
+                && (
+                  candidate.album
+                    ? normalized(candidate.album) === normalized(song.albumName)
+                    : pairFamilies.size === 1
+                )
+              ));
+            });
+            if (missingSongs.length > 0) {
+              pending.push({ index: result.index, chunk: missingSongs });
+            }
           } else {
             lastError = result.error;
             pending.push({ index: result.index, chunk: result.chunk });
           }
         }
       }
-      if (completed.size === 0 && chunks.length > 0) {
+      const verifiedCandidateCount = [...completed.values()]
+        .reduce((count, candidates) => count + candidates.length, 0);
+      if (verifiedCandidateCount === 0 && chunks.length > 0) {
         const dependencyError = asRetrievalDependencyError(
           lastError,
           "hosted_web",
@@ -3004,7 +3032,7 @@ export function createPipelineV3LiveAdapters(
       }
       return [...completed.entries()]
         .sort(([left], [right]) => left - right)
-        .flatMap(([, page]) => page.candidates);
+        .flatMap(([, candidates]) => candidates);
     });
 
   return Object.freeze({
