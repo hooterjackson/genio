@@ -2971,26 +2971,37 @@ export function createPipelineV3LiveAdapters(
       // successful evidence, and fail the strategy only when no chunk can be
       // verified after the bounded three-attempt provider window.
       for (let attempt = 0; attempt < 3 && pending.length > 0; attempt += 1) {
-        const results = await mapConcurrent(pending, 6, async ({ chunk, index }) => {
-          try {
-            const page = await defaultHostedWebDiscovery(
-              { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
-              request.modelRoute ?? modelRoute,
-              createResponse,
-              options.onProviderUsage,
-              chunk,
-            );
-            return { ok: true as const, index, chunk, page };
-          } catch (error) {
-            if (request.signal?.aborted) throw request.signal.reason ?? error;
-            // A cost boundary is an execution state, not a transient provider
-            // failure. Preserve it for the retrieval controller so the run
-            // receives an honest budget decision instead of a misleading
-            // partial quality result.
-            if (isProviderBudgetBoundary(error)) throw error;
-            return { ok: false as const, index, chunk, error };
-          }
-        });
+        // Cost reservations are atomic but concurrent. Launching four verbose
+        // quality chunks together can temporarily reserve the full run budget
+        // even though each call reconciles far below its conservative ceiling.
+        // Two lanes keep useful parallelism without manufacturing a budget
+        // boundary from overlapping reservations.
+        const results = await mapConcurrent(
+          pending,
+          request.plan.playlistQualityPolicy ? 2 : 6,
+          async ({ chunk, index }) => {
+            try {
+              const page = await defaultHostedWebDiscovery(
+                { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
+                request.modelRoute ?? modelRoute,
+                createResponse,
+                options.onProviderUsage,
+                chunk,
+              );
+              return { ok: true as const, index, chunk, page };
+            } catch (error) {
+              if (request.signal?.aborted) {
+                throw request.signal.reason ?? error;
+              }
+              // A cost boundary is an execution state, not a transient
+              // provider failure. Preserve it for the retrieval controller so
+              // the run receives an honest budget decision instead of a
+              // misleading partial quality result.
+              if (isProviderBudgetBoundary(error)) throw error;
+              return { ok: false as const, index, chunk, error };
+            }
+          },
+        );
         pending = [];
         for (const result of results) {
           if (result.ok) {
