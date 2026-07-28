@@ -3487,7 +3487,7 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
   });
 
   test.each(["discovery", "qualification"] as const)(
-    "propagates a non-retryable %s provider class instead of aggregating a transient outage",
+    "isolates a non-retryable %s provider class as an operational outage instead of aborting the portfolio",
     async (stage) => {
       const failure = new RetrievalDependencyErrorV3(
         "provider quota unavailable",
@@ -3511,11 +3511,29 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
         },
       };
 
-      await expect(executeRetrievalV3({
+      const result = await executeRetrievalV3({
         runId: `non-retryable-${stage}-provider`,
         plan: plan("25 disco songs", 25),
         adapters,
-      })).rejects.toBe(failure);
+      });
+
+      expect(result.outcome).toMatchObject({
+        status: "failed_system",
+        stopReason: "provider_failure",
+      });
+      expect(result.publicationBoundary.manifestDisposition)
+        .toBe("blocked_operational_failure");
+      if (stage === "discovery") {
+        expect(result.dependencyOutages).toContainEqual(expect.objectContaining({
+          dependencyId: "hosted_web",
+          failureClass: "quota",
+          active: true,
+        }));
+      }
+      expect(result.strategies.some((strategy) => (
+        strategy.providerFailures > 0
+        && strategy.status === "provider_error"
+      ))).toBe(true);
     },
   );
 

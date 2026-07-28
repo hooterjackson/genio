@@ -4032,17 +4032,10 @@ function finalStopReason(input: {
     && state.rawCandidates === 0
     && state.providerFailures === 0
   ));
-  const rawCandidateCount = input.strategies.reduce(
-    (total, state) => total + state.rawCandidates,
-    0,
-  );
   // A successful zero-result frontier may establish that no compatible
-  // tracks exist. Provider/contract failures that produced no raw candidates
-  // cannot establish that claim, even when dependent zero-work strategies
-  // exhausted because they had no seed material.
-  if (input.qualifiedCount === 0
-    && input.providerFailureCount > 0
-    && rawCandidateCount === 0) {
+  // tracks exist. A provider failure cannot establish that claim, even when
+  // other dependent zero-work strategies exhausted without seed material.
+  if (input.qualifiedCount === 0 && input.providerFailureCount > 0) {
     return "provider_failure";
   }
   if (input.qualifiedCount === 0 && input.providerFailureCount > 0
@@ -4651,7 +4644,6 @@ export async function executeRetrievalV3(input: {
         continue;
       }
       if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-      if (!error.retriable) throw error;
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`discover:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -4662,7 +4654,8 @@ export async function executeRetrievalV3(input: {
         retryAfterUntil: retryAfterUntilFromError(error),
         failureClass: error.failureClass,
       });
-      state.status = state.providerFailures >= policy.maximumProviderFailuresPerStrategy
+      state.status = !error.retriable
+        || state.providerFailures >= policy.maximumProviderFailuresPerStrategy
         ? "provider_error"
         : "available";
       continue;
@@ -4832,7 +4825,6 @@ export async function executeRetrievalV3(input: {
         continue;
       }
       if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-      if (!error.retriable) throw error;
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -4846,7 +4838,8 @@ export async function executeRetrievalV3(input: {
       for (let index = 0; index < candidates.length; index += 1) {
         incrementReason(discardedByReason, "qualification_missing");
       }
-      state.status = state.providerFailures >= policy.maximumProviderFailuresPerStrategy
+      state.status = !error.retriable
+        || state.providerFailures >= policy.maximumProviderFailuresPerStrategy
         ? "provider_error"
         : "available";
       continue;
@@ -4938,7 +4931,6 @@ export async function executeRetrievalV3(input: {
           pendingDiscoveries = [];
         } else {
           if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-          if (!error.retriable) throw error;
           providerFailureCount += 1;
           state.providerFailures += 1;
           integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -4949,6 +4941,7 @@ export async function executeRetrievalV3(input: {
             retryAfterUntil: retryAfterUntilFromError(error),
             failureClass: error.failureClass,
           });
+          if (!error.retriable) state.status = "provider_error";
           const idempotencyKey = recoveryAuditIdempotencyKeyV3({
             runId: input.runId,
             planHash: recoveryProposal.revision.planHash,

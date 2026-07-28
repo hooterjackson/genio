@@ -3762,7 +3762,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     const citationText =
       "Chic — Good Times is described as smooth and polished dance music. [source]";
     const markerStart = citationText.indexOf("[source]");
-    const createResponse = vi.fn(async (_input: unknown) => ({
+    const createResponse = vi.fn(async () => ({
       id: "resp_quality_seed_expansion",
       output_text: JSON.stringify({
         candidates: [{
@@ -3847,7 +3847,9 @@ describe("Pipeline V3 live read-only adapters", () => {
       undefined,
     );
     expect(batch.candidates).toHaveLength(1);
-    const providerRequest = createResponse.mock.calls[0]![0] as any;
+    const providerRequest = (
+      createResponse.mock.calls as unknown as Array<[any]>
+    )[0]![0];
     expect(providerRequest.instructions).toContain(
       "identity-bound central-suitability enrichment pass",
     );
