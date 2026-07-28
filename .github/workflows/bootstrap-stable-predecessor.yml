@@ -59,17 +59,18 @@ jobs:
         name: Authorize read-only provenance recovery from exact GitHub controls
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          BOOTSTRAP_CONTROL_PLANE_TOKEN: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN }}
+          BOOTSTRAP_CONTROL_PLANE_TOKEN: >-
+            ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
           BOOTSTRAP_AUTHORIZED_ACTOR: ${{ vars.STABLE_PREDECESSOR_BOOTSTRAP_ACTOR }}
           STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
         with:
-          github-token: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN }}
+          github-token: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
           script: |
             const fail = (message) => {
               throw new Error(`stable predecessor bootstrap: ${message}`);
             };
             if (!process.env.BOOTSTRAP_CONTROL_PLANE_TOKEN) {
-              fail("protected control-plane token is missing");
+              fail("protected bootstrap control-plane credential is missing");
             }
             if (
               context.repo.owner.toLowerCase() !== "hooterjackson"
@@ -532,17 +533,18 @@ jobs:
         name: Reauthorize the exact GitHub controls before Release writes
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          BOOTSTRAP_CONTROL_PLANE_TOKEN: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN }}
+          BOOTSTRAP_CONTROL_PLANE_TOKEN: >-
+            ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
           BOOTSTRAP_AUTHORIZED_ACTOR: ${{ vars.STABLE_PREDECESSOR_BOOTSTRAP_ACTOR }}
           STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
         with:
-          github-token: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN }}
+          github-token: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
           script: |
             const fail = (message) => {
               throw new Error(`stable predecessor bootstrap recheck: ${message}`);
             };
             if (!process.env.BOOTSTRAP_CONTROL_PLANE_TOKEN) {
-              fail("protected control-plane token is missing");
+              fail("protected bootstrap control-plane credential is missing");
             }
             const payload = context.payload.client_payload ?? {};
             const expectedPayloadKeys = [

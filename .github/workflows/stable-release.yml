@@ -55,13 +55,16 @@ jobs:
         name: Require protected branch, environment, tag ruleset, and dispatcher
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          STABLE_RELEASE_CONTROL_PLANE_TOKEN: ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN }}
+          STABLE_RELEASE_CONTROL_PLANE_TOKEN: >-
+            ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN || github.token }}
           STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
         with:
-          github-token: ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN }}
+          github-token: ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN || github.token }}
           script: |
             if (!process.env.STABLE_RELEASE_CONTROL_PLANE_TOKEN) {
-              core.setFailed("protected stable-release control-plane token is missing");
+              core.setFailed(
+                "protected stable-release control-plane credential is missing",
+              );
               return;
             }
             const clientPayload = context.payload.client_payload ?? {};
