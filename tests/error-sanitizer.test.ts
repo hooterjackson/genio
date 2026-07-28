@@ -4,6 +4,7 @@ import {
   failureContextForRun,
   publicToolFailure,
   safeAppleAuthorizationFailure,
+  safeTechnicalFailureDiagnostic,
   sanitizeFailure,
   sanitizeOptionalFailure,
   type FailureContext,
@@ -14,6 +15,29 @@ const privateFailure = new Error(
 );
 
 describe("durable and public error sanitization", () => {
+  test("operator diagnostics retain only bounded machine identifiers", () => {
+    expect(safeTechnicalFailureDiagnostic(Object.assign(privateFailure, {
+      name: "HttpError",
+      code: "pipeline_v3_result_invalid",
+      statusCode: 409,
+    }))).toEqual({
+      name: "HttpError",
+      code: "pipeline_v3_result_invalid",
+      status: 409,
+    });
+    expect(safeTechnicalFailureDiagnostic({
+      name: "Error\npostgres://private",
+      code: "secret=sk-proj-PRIVATE",
+      status: 9_999,
+      message: "password=private",
+      stack: "private stack",
+    })).toEqual({
+      name: "Error",
+      code: null,
+      status: null,
+    });
+  });
+
   test("preserves only a bounded count-specific matching shortfall", () => {
     const shortfall = "Apple Music matching found 42 strict unique catalog matches for the required 50. No playlist was published because the exact count could not be met safely.";
     expect(sanitizeFailure(shortfall, "matching")).toBe(shortfall);

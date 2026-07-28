@@ -758,6 +758,10 @@ export interface CandidateQualificationV3 {
     readonly storefrontPlayable: boolean;
     readonly appleSongId: string | null;
     readonly recordingFamilyKey: string | null;
+    /** Authoritative resolved catalog identity for downstream evidence binding. */
+    readonly artistName?: string;
+    readonly trackName?: string;
+    readonly albumName?: string | null;
     readonly confidence: number;
     /** Normalized Apple/catalog issue year used for immutable era checks. */
     readonly releaseYear?: number | null;
@@ -5046,11 +5050,20 @@ export async function executeRetrievalV3(input: {
         continue;
       }
 
+      const resolvedArtist = qualification.catalog.artistName?.trim()
+        || candidate.artist.trim();
+      const resolvedTitle = qualification.catalog.trackName?.trim()
+        || candidate.title.trim();
+      const resolvedAlbum = qualification.catalog.albumName === null
+        ? null
+        : qualification.catalog.albumName?.trim()
+          || candidate.album?.trim()
+          || null;
       const qualified: QualifiedTrackV3 = {
         candidateId: candidate.id,
-        title: candidate.title.trim(),
-        artist: candidate.artist.trim(),
-        album: candidate.album?.trim() || null,
+        title: resolvedTitle,
+        artist: resolvedArtist,
+        album: resolvedAlbum,
         appleSongId: qualification.catalog.appleSongId,
         recordingFamilyKey: qualification.catalog.recordingFamilyKey,
         catalogReleaseYear: qualification.catalog.releaseYear ?? null,
@@ -5096,9 +5109,9 @@ export async function executeRetrievalV3(input: {
               observations:
                 qualification.centralQualityCriterionObservations,
               policy: activePlan.playlistQualityPolicy,
-              artist: candidate.artist.trim(),
-              title: candidate.title.trim(),
-              album: candidate.album?.trim() || null,
+              artist: resolvedArtist,
+              title: resolvedTitle,
+              album: resolvedAlbum,
               appleSongId: qualification.catalog.appleSongId,
               recordingFamilyKey:
                 qualification.catalog.recordingFamilyKey,

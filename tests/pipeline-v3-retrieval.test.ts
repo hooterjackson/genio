@@ -1782,6 +1782,87 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
   });
 
+  test("preserves catalog-bound quality proof when discovery omitted the album", async () => {
+    const qualityPlan: SelectionPlanV3 = {
+      ...plan("one smooth disco track", 1),
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const value = candidate(101, {
+      artist: "Resolved Artist",
+      title: "Resolved Track",
+      album: null,
+    });
+    const appleSongId = `apple-${value.id}`;
+    const recordingFamilyKey = `family-${value.id}`;
+    const observations = qualityPlan.playlistQualityPolicy!.criteria.map(
+      (criterion) => createCentralQualityCriterionObservationV3({
+        policy: qualityPlan.playlistQualityPolicy!,
+        criterion,
+        verdict: "pass",
+        sourceKind: "hosted_web_response",
+        sourceId: "resolved-quality-source",
+        artist: value.artist,
+        title: value.title,
+        album: "Resolved Album",
+        catalogIdentity: { appleSongId, recordingFamilyKey },
+      }),
+    );
+    let delivered = false;
+    const result = await executeRetrievalV3({
+      runId: "quality-resolved-catalog-identity",
+      plan: qualityPlan,
+      adapters: {
+        discover: async () => {
+          if (delivered) {
+            return { candidates: [], nextCursor: null, exhausted: true };
+          }
+          delivered = true;
+          return { candidates: [value], nextCursor: null, exhausted: true };
+        },
+        qualify: async () => [qualification(value, {
+          catalog: {
+            storefrontPlayable: true,
+            appleSongId,
+            recordingFamilyKey,
+            artistName: value.artist,
+            trackName: value.title,
+            albumName: "Resolved Album",
+            confidence: 0.99,
+          },
+          centralQualityCriterionObservations: observations,
+          rankingSignals: { relevance: 1, central_quality: 1 },
+        })],
+      },
+    });
+
+    expect(result.outcome.status).toBe("exact_ready");
+    expect(result.selected).toHaveLength(1);
+    expect(result.selected[0]).toMatchObject({
+      artist: value.artist,
+      title: value.title,
+      album: "Resolved Album",
+      appleSongId,
+      recordingFamilyKey,
+    });
+    expect(result.centralQuality).toMatchObject({
+      passed: true,
+      passCount: 1,
+      failCount: 0,
+      unknownCount: 0,
+    });
+  });
+
   test("retains conflicting criterion observations and lets a known failure dominate a later pass", async () => {
     const qualityPlan: SelectionPlanV3 = {
       ...plan("one smooth disco track", 1),

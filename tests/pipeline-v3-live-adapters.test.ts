@@ -3842,6 +3842,11 @@ describe("Pipeline V3 live read-only adapters", () => {
         candidates: batch.candidates,
       });
       expect(qualification!.catalog.appleSongId).toBe(first.id);
+      expect(qualification!.catalog).toMatchObject({
+        artistName: first.artistName,
+        trackName: first.name,
+        albumName: first.albumName,
+      });
       expect(qualification!.centralQualityCriterionObservations).toHaveLength(
         expectedBound ? observations.length : 0,
       );

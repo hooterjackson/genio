@@ -1245,6 +1245,15 @@ function pipelineV3QualificationProjection(
   const evidenceRecordIds = [...new Set(qualification.evidence.bindingIds)]
     .filter((value) => typeof value === "string" && value.trim().length > 0)
     .slice(0, 128);
+  const resolvedArtist = qualification.catalog.artistName?.trim()
+    || candidate.artist.trim();
+  const resolvedTitle = qualification.catalog.trackName?.trim()
+    || candidate.title.trim();
+  const resolvedAlbum = qualification.catalog.albumName === null
+    ? null
+    : qualification.catalog.albumName?.trim()
+      || candidate.album?.trim()
+      || null;
   const qualityResult = {
     evidence: {
       passed: qualification.evidence.passed,
@@ -1264,9 +1273,9 @@ function pipelineV3QualificationProjection(
           observations:
             qualification.centralQualityCriterionObservations,
           policy: queryPlan.playlistQualityPolicy,
-          artist: candidate.artist,
-          title: candidate.title,
-          album: candidate.album,
+          artist: resolvedArtist,
+          title: resolvedTitle,
+          album: resolvedAlbum,
           appleSongId: qualification.catalog.appleSongId ?? "",
           recordingFamilyKey:
             qualification.catalog.recordingFamilyKey ?? "",

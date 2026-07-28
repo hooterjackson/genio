@@ -3089,6 +3089,11 @@ export function createPipelineV3LiveAdapters(
             storefrontPlayable: Boolean(resolved.song),
             appleSongId: resolved.song?.id ?? null,
             recordingFamilyKey: resolvedRecordingFamily,
+            ...(resolved.song ? {
+              artistName: resolved.song.artistName,
+              trackName: resolved.song.name,
+              albumName: resolved.song.albumName,
+            } : {}),
             confidence: resolved.confidence,
             releaseYear,
             compatibleReleaseYears: resolved.compatibleReleaseYears,

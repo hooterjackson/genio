@@ -32,6 +32,7 @@ import {
 import {
   failureContextForJob,
   safeAppleAuthorizationFailure,
+  safeTechnicalFailureDiagnostic,
   sanitizeFailure,
 } from "./error-sanitizer.ts";
 import { readCostConfiguration } from "./cost-config.ts";
@@ -1618,6 +1619,12 @@ export class WorkerRunner {
       const message = job.kind === "apple_authorization"
         ? safeAppleAuthorizationFailure(error)
         : sanitizeFailure(error, failureContextForJob(job.kind));
+      if (job.kind === "research") {
+        console.error(
+          "[needle-worker] Unexpected research failure",
+          safeTechnicalFailureDiagnostic(error),
+        );
+      }
       const providerRejectedAuthorization = job.kind === "apple_authorization"
         && error instanceof AppleApiError
         && !error.retriable;

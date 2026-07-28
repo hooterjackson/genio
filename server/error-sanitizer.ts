@@ -18,6 +18,48 @@ export type FailureContext =
   | "apple_authorization"
   | "background";
 
+export interface SafeTechnicalFailureDiagnostic {
+  name: string;
+  code: string | null;
+  status: number | null;
+}
+
+const SAFE_DIAGNOSTIC_NAME = /^[A-Za-z][A-Za-z0-9]{0,79}$/u;
+const SAFE_DIAGNOSTIC_CODE = /^[a-z0-9][a-z0-9_.:-]{0,119}$/u;
+
+/**
+ * Retain only bounded machine identifiers for operator logs. Error messages,
+ * stacks, prompts, URLs, credentials, and provider payloads never cross this
+ * boundary.
+ */
+export function safeTechnicalFailureDiagnostic(
+  error: unknown,
+): SafeTechnicalFailureDiagnostic {
+  const value = error && typeof error === "object"
+    ? error as { name?: unknown; code?: unknown; status?: unknown; statusCode?: unknown }
+    : {};
+  const name = typeof value.name === "string"
+    && SAFE_DIAGNOSTIC_NAME.test(value.name)
+    ? value.name
+    : "Error";
+  const code = typeof value.code === "string"
+    && SAFE_DIAGNOSTIC_CODE.test(value.code)
+    ? value.code
+    : null;
+  const suppliedStatus = typeof value.status === "number"
+    ? value.status
+    : typeof value.statusCode === "number"
+      ? value.statusCode
+      : null;
+  const status = suppliedStatus !== null
+    && Number.isSafeInteger(suppliedStatus)
+    && suppliedStatus >= 100
+    && suppliedStatus <= 599
+    ? suppliedStatus
+    : null;
+  return { name, code, status };
+}
+
 const FAILURE_MESSAGES: Record<FailureContext, string> = {
   brief: "gênio could not interpret this request after the final attempt.",
   research: "Research could not be completed after the final attempt.",
