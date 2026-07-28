@@ -3451,6 +3451,43 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
   });
 
+  test("treats the immutable dollar reservation boundary as budget exhaustion, not a technical failure", async () => {
+    let discoveryCall = 0;
+    const budgetError = Object.assign(
+      new Error("Run needs additional budget approval"),
+      { code: "run_budget_reached" },
+    );
+    const result = await executeRetrievalV3({
+      runId: "dollar-budget-run",
+      plan: plan("two disco tracks", 2),
+      adapters: {
+        discover: async () => {
+          discoveryCall += 1;
+          if (discoveryCall > 1) throw budgetError;
+          return {
+            candidates: [candidate(1)],
+            nextCursor: null,
+            exhausted: false,
+            costUnits: 1,
+          };
+        },
+        qualify: async ({ candidates }) => candidates.map((value) => qualification(value)),
+      },
+      policy: {
+        maximumConcurrentDiscovery: 1,
+        maximumGlobalRounds: 2,
+      },
+    });
+
+    expect(discoveryCall).toBe(2);
+    expect(result.selected).toHaveLength(1);
+    expect(result.outcome).toMatchObject({
+      status: "partial_ready",
+      stopReason: "budget_reached",
+      shortfall: 1,
+    });
+  });
+
   test("aborts provider work that is still in flight at the active-compute deadline", async () => {
     const startedAt = Date.now();
     let observedSignal: AbortSignal | undefined;

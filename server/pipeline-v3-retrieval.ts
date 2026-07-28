@@ -3814,6 +3814,12 @@ function retryAfterUntilFromError(error: RetrievalDependencyErrorV3): Date | nul
   return error.retryAfterUntil ? new Date(error.retryAfterUntil) : null;
 }
 
+function isRetrievalBudgetBoundary(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) return false;
+  const code = String((error as { code?: unknown }).code ?? "");
+  return code === "run_budget_reached" || code === "monthly_budget_reached";
+}
+
 function latestDependencyRetryAfterUntil(
   state: MutableDependencyStateV3,
 ): Date | null {
@@ -4391,6 +4397,12 @@ export async function executeRetrievalV3(input: {
   };
 
   while (true) {
+    // A reservation can reach the immutable dollar ceiling while other
+    // requests in the same bounded wave are already in flight. Drain those
+    // successful responses deterministically, but do not start another wave.
+    if (stopReason === "budget_reached" && pendingDiscoveries.length === 0) {
+      break;
+    }
     if (policy.deadlineAtEpochMs !== null && now() >= policy.deadlineAtEpochMs) {
       stopReason = "deadline_reached";
       break;
@@ -4563,6 +4575,11 @@ export async function executeRetrievalV3(input: {
         pendingDiscoveries = [];
         break;
       }
+      if (isRetrievalBudgetBoundary(error)) {
+        stopReason = "budget_reached";
+        state.status = "available";
+        continue;
+      }
       if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
       if (!error.retriable) throw error;
       providerFailureCount += 1;
@@ -4730,6 +4747,11 @@ export async function executeRetrievalV3(input: {
         pendingDiscoveries = [];
         break;
       }
+      if (isRetrievalBudgetBoundary(error)) {
+        stopReason = "budget_reached";
+        state.status = "available";
+        continue;
+      }
       if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
       if (!error.retriable) throw error;
       providerFailureCount += 1;
@@ -4832,39 +4854,44 @@ export async function executeRetrievalV3(input: {
           pendingDiscoveries = [];
           break;
         }
-        if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-        if (!error.retriable) throw error;
-        providerFailureCount += 1;
-        state.providerFailures += 1;
-        integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
-        observeDependencyFailure({
-          dependencies: dependencyStates,
-          dependencyIds: failedDependencyIds(error, state.definition.qualificationDependencyIds),
-          strategyId: state.definition.id,
-          retryAfterUntil: retryAfterUntilFromError(error),
-          failureClass: error.failureClass,
-        });
-        const idempotencyKey = recoveryAuditIdempotencyKeyV3({
-          runId: input.runId,
-          planHash: recoveryProposal.revision.planHash,
-          transformations: recoveryProposal.revision.transformations,
-        });
-        recoveryAudits.push(Object.freeze({
-          generation: 1,
-          rootCause: "provider_degraded",
-          action: "semantic_equivalent_requalification",
-          status: "failed",
-          before,
-          after: recoveryStageSnapshotV3(
-            { ...counters, selected: 0, reserve: 0 },
-            appleLookupCount,
-            appleProviderRequestCount,
-          ),
-          beforeFailedMembershipPredicateIds: beforeFailures,
-          afterFailedMembershipPredicateIds: beforeFailures,
-          transformationKinds: recoveryProposal.revision.transformations.map(({ kind }) => kind),
-          idempotencyKey,
-        }));
+        if (isRetrievalBudgetBoundary(error)) {
+          stopReason = "budget_reached";
+          pendingDiscoveries = [];
+        } else {
+          if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
+          if (!error.retriable) throw error;
+          providerFailureCount += 1;
+          state.providerFailures += 1;
+          integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
+          observeDependencyFailure({
+            dependencies: dependencyStates,
+            dependencyIds: failedDependencyIds(error, state.definition.qualificationDependencyIds),
+            strategyId: state.definition.id,
+            retryAfterUntil: retryAfterUntilFromError(error),
+            failureClass: error.failureClass,
+          });
+          const idempotencyKey = recoveryAuditIdempotencyKeyV3({
+            runId: input.runId,
+            planHash: recoveryProposal.revision.planHash,
+            transformations: recoveryProposal.revision.transformations,
+          });
+          recoveryAudits.push(Object.freeze({
+            generation: 1,
+            rootCause: "provider_degraded",
+            action: "semantic_equivalent_requalification",
+            status: "failed",
+            before,
+            after: recoveryStageSnapshotV3(
+              { ...counters, selected: 0, reserve: 0 },
+              appleLookupCount,
+              appleProviderRequestCount,
+            ),
+            beforeFailedMembershipPredicateIds: beforeFailures,
+            afterFailedMembershipPredicateIds: beforeFailures,
+            transformationKinds: recoveryProposal.revision.transformations.map(({ kind }) => kind),
+            idempotencyKey,
+          }));
+        }
       }
     }
 
