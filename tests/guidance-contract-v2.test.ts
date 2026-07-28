@@ -7,7 +7,10 @@ import {
   guidanceRequestClassificationV2,
   planDeltaHasEffect,
 } from "../server/guidance-contract-v2.ts";
-import { createRunSpecV3 } from "../server/selection-plan-v3.ts";
+import {
+  createRunSpecV3,
+  criticalGuidanceQuestionsV3,
+} from "../server/selection-plan-v3.ts";
 import type { PlaylistGuidanceQuestion } from "../shared/types.ts";
 
 const optionalQuestion: PlaylistGuidanceQuestion = {
@@ -63,6 +66,29 @@ describe("intelligent guidance contract 2", () => {
     });
     expect(question.options).toHaveLength(3);
     expect(question.options.every((option) => option.planDelta && planDeltaHasEffect(option.planDelta))).toBe(true);
+  });
+
+  test("compiles geographic critical options with the real place value", () => {
+    const spec = createRunSpecV3({ prompt: "French jazz", requestedTrackCount: 25 });
+    const question = contractTwoGuidanceQuestion(
+      criticalGuidanceQuestionsV3(spec)[0]!,
+      "critical_ambiguity",
+    );
+    expect(question.options[0]?.planDelta?.membershipConstraints).toContainEqual(expect.objectContaining({
+      axis: "geography",
+      values: ["France"],
+      geographyRelationship: "artist_origin",
+    }));
+    expect(question.options[1]?.planDelta?.membershipConstraints).toContainEqual(expect.objectContaining({
+      axis: "scene",
+      values: ["French jazz scene"],
+      geographyRelationship: "label_or_venue_scene",
+    }));
+    expect(question.options[2]?.planDelta?.membershipConstraints).toContainEqual(expect.objectContaining({
+      axis: "language",
+      values: ["French"],
+      geographyRelationship: "language",
+    }));
   });
 
   test("answer compilation is order-independent and explicit skips are inert", () => {

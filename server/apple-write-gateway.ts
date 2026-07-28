@@ -1,3 +1,5 @@
+import type { PublicationExecutionFence } from "./publication-reconciliation-persistence.ts";
+
 export const APPLE_WRITE_GATEWAY_LOCK = "genio:apple-write-gateway:v1";
 export const APPLE_WRITE_GATEWAY_STATE_KEY = "apple_write_token_bucket_v1";
 export const APPLE_WRITE_GATEWAY_EVENT_BUCKET = "apple:global";
@@ -8,6 +10,15 @@ export type AppleWriteOperation = "create_playlist" | "append_tracks";
 export interface AppleWritePermitRequest {
   runId: string;
   manifestId: string;
+  manifestRevisionId: string | null;
+  manifestRevisionHash: string;
+  contractRevisionId: string | null;
+  contractHash: string | null;
+  /**
+   * Canonical publications must bind the external mutation to the currently
+   * leased execution attempt. Legacy V1/V2 bridge publications use null.
+   */
+  executionFence: PublicationExecutionFence | null;
   publicationVolumeId: string;
   operation: AppleWriteOperation;
 }

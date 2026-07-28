@@ -2,6 +2,7 @@ import type {
   AutomaticQaScenario,
 } from "./feedback.ts";
 import { redactSensitiveDiagnosticText } from "./feedback.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 
 export type AutomaticFailureExportStatus = "quarantined" | "promoted" | "dismissed";
 
@@ -70,7 +71,9 @@ function finiteCount(value: unknown, fallback = 1): number {
 }
 
 function requestedTrackCount(value: unknown): number | null {
-  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 300
+  return Number.isInteger(value)
+    && Number(value) >= 1
+    && Number(value) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
     ? Number(value)
     : null;
 }

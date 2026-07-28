@@ -154,10 +154,17 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   expect(matchGatewayRoute("GET", "/api/v1/owner/status")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/health/live")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/health/live")?.owner).toBeUndefined();
+  expect(matchGatewayRoute("GET", "/health/system")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute("GET", "/health/system")?.owner).toBeUndefined();
+  expect(matchGatewayRoute("POST", "/health/system")).toBeNull();
   expect(matchGatewayRoute("GET", "/api/v1/runs")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/api/v1/playlists")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/api/v1/runs/run-id/tracks")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/api/v1/runs/run-id/progress")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute(
+    "GET",
+    "/api/v1/runs/run-id/manifest-canary-evidence",
+  )).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/research/continue")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/partial/confirm")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/cancel")).toMatchObject({ method: "POST" });

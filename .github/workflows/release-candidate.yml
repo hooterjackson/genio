@@ -1,0 +1,2533 @@
+name: release candidate
+
+on:
+  # repository_dispatch workflows are always loaded from the protected default
+  # branch. This prevents an RC tag from supplying the workflow that evaluates
+  # and publishes itself.
+  repository_dispatch:
+    types: [genio-release-candidate]
+  # Fallback path for environments where dispatch transport fails before run creation.
+  # This preserves all existing authorization/verification logic while preserving
+  # the same release-candidate contract via explicit input.
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: "Release candidate tag to run (for example: v2.4.0-rc.2)"
+        required: true
+        type: string
+
+concurrency:
+  group: stable-release-mutation
+  cancel-in-progress: false
+
+# Every job declares its own least-privilege token. In particular, the runner
+# that installs Playwright and executes candidate code has no package, OIDC, or
+# attestation write authority.
+permissions: {}
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: read
+      checks: read
+      contents: read
+      packages: read
+      pull-requests: read
+    env:
+      CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag || github.event.inputs.candidate_tag }}
+    outputs:
+      candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
+      source_revision: ${{ steps.identity.outputs.source_revision }}
+      version: ${{ steps.identity.outputs.version }}
+      image: ${{ steps.identity.outputs.image }}
+      release_verification_key_sha256: ${{ steps.release_authority.outputs.sha256 }}
+      public_rollout_intent_canary_authority_policy_sha256: ${{ steps.release_authority.outputs.public_rollout_intent_canary_authority_policy_sha256 }}
+      semantic_baseline_metadata_sha256: ${{ steps.stable_predecessor.outputs.metadata_sha256 }}
+      semantic_baseline_stable_tag: ${{ steps.stable_predecessor.outputs.stable_tag }}
+      semantic_baseline_release_key_sha256: ${{ steps.stable_predecessor.outputs.release_key_sha256 }}
+      semantic_baseline_stable_authorizer_key_id: ${{ steps.stable_predecessor.outputs.stable_authorizer_key_id }}
+      semantic_baseline_stable_authorizer_key_sha256: ${{ steps.stable_predecessor.outputs.stable_authorizer_key_sha256 }}
+      semantic_baseline_release_id: ${{ steps.stable_predecessor.outputs.release_id }}
+      semantic_baseline_release_identity_sha256: ${{ steps.stable_predecessor.outputs.release_identity_sha256 }}
+      semantic_baseline_asset_sha256_json_b64url: ${{ steps.stable_predecessor.outputs.asset_sha256_json_b64url }}
+      semantic_baseline_predecessor_mode: ${{ steps.stable_predecessor.outputs.predecessor_mode }}
+      semantic_baseline_controller_source_revision: ${{ steps.stable_predecessor.outputs.controller_source_revision }}
+      semantic_baseline_github_attestation_verification_bytes_sha256: ${{ steps.semantic_baseline_handoff.outputs.github_attestation_verification_bytes_sha256 }}
+      semantic_baseline_handoff_sha256: ${{ steps.semantic_baseline_handoff.outputs.sha256 }}
+      stable_authorizer_key_id: ${{ steps.release_authority.outputs.stable_authorizer_key_id }}
+      stable_authorizer_key_sha256: ${{ steps.release_authority.outputs.stable_authorizer_key_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: release_authority
+        name: Pin the release verification authority
+        env:
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
+          RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}
+          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
+        run: |
+          if [[ ! "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "RELEASE_VERIFICATION_KEY_SHA256 must be a configured lowercase SHA-256 digest." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 must pin the protected source/producer authority set and fixture registry." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_STABLE_AUTHORIZER_KEY_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:+/-]{2,159}$ ]]; then
+            echo "RELEASE_STABLE_AUTHORIZER_KEY_ID must pin the protected stable authorizer." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" =~ ^[0-9a-f]{64}$ || "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" = "$RELEASE_VERIFICATION_KEY_SHA256" ]]; then
+            echo "RELEASE_STABLE_AUTHORIZER_KEY_SHA256 must pin a distinct protected stable-authorizer key." >&2
+            exit 1
+          fi
+          echo "sha256=$RELEASE_VERIFICATION_KEY_SHA256" >> "$GITHUB_OUTPUT"
+          echo "public_rollout_intent_canary_authority_policy_sha256=$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" >> "$GITHUB_OUTPUT"
+          echo "stable_authorizer_key_id=$RELEASE_STABLE_AUTHORIZER_KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "stable_authorizer_key_sha256=$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" >> "$GITHUB_OUTPUT"
+      - id: candidate
+        name: Resolve merged candidate from the trusted default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          case "$CANDIDATE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-rc.[1-9]*) ;;
+            *) echo "candidate tag is invalid" >&2; exit 1 ;;
+          esac
+          git fetch --force --tags origin
+          test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
+          CANDIDATE_SHA="$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")"
+          test "$CANDIDATE_SHA" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test "$CANDIDATE_SHA" = "$GITHUB_SHA"
+          echo "sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Require an authorized dispatcher, merged PR, and green checks
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        with:
+          script: |
+            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            if (!["admin", "maintain"].includes(permission.data.permission)) {
+              core.setFailed("release dispatch requires maintain or admin permission");
+              return;
+            }
+            const pulls = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: process.env.CANDIDATE_SHA,
+                per_page: 100,
+              },
+            );
+            const merged = pulls.find((pull) =>
+              pull.merged_at
+              && pull.base.ref === context.payload.repository.default_branch
+              && pull.merge_commit_sha === process.env.CANDIDATE_SHA
+            );
+            if (!merged) {
+              core.setFailed("candidate must be the merge commit of a PR into the default branch");
+              return;
+            }
+            const trustedWorkflowPath = ".github/workflows/ci.yml";
+            const trustedWorkflow = await github.rest.actions.getWorkflow({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: trustedWorkflowPath,
+            });
+            if (
+              trustedWorkflow.data.path !== trustedWorkflowPath
+              || trustedWorkflow.data.state !== "active"
+            ) {
+              core.setFailed("trusted CI workflow identity is not active on the default branch");
+              return;
+            }
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: trustedWorkflow.data.id,
+                branch: context.payload.repository.default_branch,
+                event: "push",
+                status: "completed",
+                head_sha: process.env.CANDIDATE_SHA,
+                per_page: 100,
+              },
+            );
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const trustedRuns = workflowRuns.filter((run) =>
+              run.workflow_id === trustedWorkflow.data.id
+              && run.path === trustedWorkflowPath
+              && run.event === "push"
+              && run.head_branch === context.payload.repository.default_branch
+              && run.head_sha === process.env.CANDIDATE_SHA
+              && run.repository?.full_name === repository
+              && run.head_repository?.full_name === repository
+              && run.conclusion === "success"
+            );
+            trustedRuns.sort((left, right) =>
+              Number(right.run_attempt ?? 0) - Number(left.run_attempt ?? 0)
+            );
+            const trustedRun = trustedRuns[0];
+            if (!trustedRun || !trustedRun.check_suite_id) {
+              core.setFailed(
+                "candidate has no successful default-branch run of the trusted CI workflow",
+              );
+              return;
+            }
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForSuite,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                check_suite_id: trustedRun.check_suite_id,
+                filter: "latest",
+                per_page: 100,
+              },
+            );
+            const untrustedChecks = checkRuns.filter((run) =>
+              run.head_sha !== process.env.CANDIDATE_SHA
+              || run.app?.slug !== "github-actions"
+              || run.check_suite?.id !== trustedRun.check_suite_id
+            );
+            if (untrustedChecks.length) {
+              core.setFailed(
+                "candidate checks do not share the trusted GitHub Actions workflow provenance",
+              );
+              return;
+            }
+            const required = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
+            const latest = new Map();
+            for (const run of checkRuns) {
+              const prior = latest.get(run.name);
+              if (!prior || Date.parse(run.completed_at ?? run.started_at ?? "0")
+                > Date.parse(prior.completed_at ?? prior.started_at ?? "0")) {
+                latest.set(run.name, run);
+              }
+            }
+            const failed = required.filter((name) =>
+              latest.get(name)?.conclusion !== "success"
+            );
+            if (failed.length) {
+              core.setFailed(`candidate required checks are not green: ${failed.join(", ")}`);
+            }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.candidate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+      - name: Verify annotated RC identity
+        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - id: identity
+        name: Resolve candidate identity
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source_revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${REPOSITORY_OWNER,,}/genio" >> "$GITHUB_OUTPUT"
+      - id: stable_predecessor
+        name: Resolve the exact immutable stable predecessor and signed lineage
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          CANDIDATE_TAG: ${{ steps.identity.outputs.candidate_tag }}
+        with:
+          script: |
+            const { createHash } = require("node:crypto");
+            const { mkdir, writeFile } = require("node:fs/promises");
+            const { join } = require("node:path");
+
+            const SHA256 = /^[0-9a-f]{64}$/u;
+            const SOURCE_REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+            const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+            const SIGNING_KEY_ID =
+              /^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$/u;
+            const STABLE_AUTHORIZER_KEY_ID =
+              /^[0-9A-Za-z][0-9A-Za-z._:+/-]{2,159}$/u;
+            const SIGNATURE = /^[0-9A-Za-z_-]{64,256}$/u;
+            const STABLE_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            const RC_TAG =
+              /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/u;
+            const BOOTSTRAP_SUCCESSOR_RC = /^v2\.4\.0-rc\.[1-9]\d*$/u;
+            const BOOTSTRAP_STABLE_TAG = "v2.3.4";
+            const BOOTSTRAP_COMPATIBILITY_RC_TAG = "v2.3.4-rc.1";
+            const BOOTSTRAP_SOURCE_REVISION =
+              "7dc877cfc1537a9936974f9699a4b8ba9740b5f5";
+            const BOOTSTRAP_TAG_OBJECT =
+              "0fb63ccc88b6f5ea675b3b43506fc112fa3fae58";
+            const BOOTSTRAP_SOURCE_TREE =
+              "91076c2f06de9d562532981c3a602f1c6366f057";
+            const BOOTSTRAP_CONTROLLER_WORKFLOW =
+              ".github/workflows/bootstrap-stable-predecessor.yml";
+            const BOOTSTRAP_IMAGE_WORKFLOW =
+              ".github/workflows/bootstrap-stable-predecessor-image.yml";
+            const expectedAssetNames = [
+              "finalization-evidence.json",
+              "protected-semantic-baseline.json",
+              "stable-authorization.json",
+              "stable-image-attestation.json",
+              "stable-release-consumer.json",
+            ];
+
+            function fail(message) {
+              throw new Error(`immutable stable predecessor: ${message}`);
+            }
+            function record(value, label) {
+              if (!value || typeof value !== "object" || Array.isArray(value)) {
+                fail(`${label} must be an object`);
+              }
+              return value;
+            }
+            function exact(value, keys, label) {
+              const source = record(value, label);
+              const actual = Object.keys(source).sort();
+              const expected = [...keys].sort();
+              if (
+                actual.length !== expected.length
+                || actual.some((key, index) => key !== expected[index])
+              ) {
+                fail(`${label} contains missing or unapproved fields`);
+              }
+              return source;
+            }
+            function sortedJsonValue(value) {
+              if (Array.isArray(value)) return value.map(sortedJsonValue);
+              if (!value || typeof value !== "object") return value;
+              return Object.fromEntries(
+                Object.entries(value)
+                  .sort(([left], [right]) => left.localeCompare(right))
+                  .map(([key, item]) => [key, sortedJsonValue(item)]),
+              );
+            }
+            function stableJson(value) {
+              return JSON.stringify(sortedJsonValue(value));
+            }
+            function sha256(value) {
+              return createHash("sha256").update(value).digest("hex");
+            }
+            function stableSha256(value) {
+              return sha256(Buffer.from(stableJson(value), "utf8"));
+            }
+            function digest(value, label) {
+              if (typeof value !== "string" || !SHA256.test(value)) {
+                fail(`${label} must be a lowercase SHA-256 digest`);
+              }
+              return value;
+            }
+            function timestamp(value, label) {
+              const parsed = typeof value === "string" ? Date.parse(value) : NaN;
+              if (
+                !Number.isFinite(parsed)
+                || new Date(parsed).toISOString() !== value
+              ) {
+                fail(`${label} must be a canonical ISO timestamp`);
+              }
+              return parsed;
+            }
+            function versionTuple(tag) {
+              const match = STABLE_TAG.exec(tag);
+              return match
+                ? [BigInt(match[1]), BigInt(match[2]), BigInt(match[3])]
+                : null;
+            }
+            function compareVersion(left, right) {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            }
+            function responseBytes(data, label) {
+              if (data instanceof ArrayBuffer) return Buffer.from(data);
+              if (ArrayBuffer.isView(data)) {
+                return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+              }
+              if (typeof data === "string") return Buffer.from(data, "utf8");
+              fail(`${label} did not return raw asset bytes`);
+            }
+            function parseJson(bytes, label) {
+              let value;
+              try {
+                value = JSON.parse(bytes.toString("utf8"));
+              } catch {
+                fail(`${label} is not valid JSON`);
+              }
+              return value;
+            }
+            function validateEnvelope(value, schemaVersion, label) {
+              const envelope = exact(
+                value,
+                ["schemaVersion", "payload", "payloadHash", "signature"],
+                label,
+              );
+              if (envelope.schemaVersion !== schemaVersion) {
+                fail(`${label} uses an unsupported schema`);
+              }
+              const payload = record(envelope.payload, `${label}.payload`);
+              const payloadHash = digest(
+                envelope.payloadHash,
+                `${label}.payloadHash`,
+              );
+              if (payloadHash !== stableSha256(payload)) {
+                fail(`${label} payload hash does not match its canonical payload`);
+              }
+              const signature = exact(
+                envelope.signature,
+                ["algorithm", "keyId", "value"],
+                `${label}.signature`,
+              );
+              if (
+                signature.algorithm !== "Ed25519"
+                || typeof signature.keyId !== "string"
+                || !SIGNING_KEY_ID.test(signature.keyId)
+                || typeof signature.value !== "string"
+                || !SIGNATURE.test(signature.value)
+              ) {
+                fail(`${label} signature envelope is invalid`);
+              }
+              return { envelope, payload, payloadHash, signature };
+            }
+
+            const candidateMatch = RC_TAG.exec(process.env.CANDIDATE_TAG ?? "");
+            if (!candidateMatch) fail("candidate tag is not a strict RC tag");
+            const candidateVersion = versionTuple(`v${candidateMatch[1]}`);
+            if (!candidateVersion) fail("candidate version is invalid");
+            if (!SOURCE_REVISION.test(process.env.CANDIDATE_SHA ?? "")) {
+              fail("candidate source revision is invalid");
+            }
+
+            const immutableReleases = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            if (immutableReleases.data.enabled !== true) {
+              fail("repository immutable releases are not enabled");
+            }
+
+            const [releases, stableTagRefs] = await Promise.all([
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+            ]);
+            const stableTagAtOrAboveCandidate = stableTagRefs.some((ref) => {
+              const tuple = versionTuple(ref.ref?.replace(/^refs\/tags\//u, "") ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) >= 0;
+            });
+            const stableReleaseAtOrAboveCandidate = releases.some((release) => {
+              const tuple = versionTuple(release.tag_name ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) >= 0;
+            });
+            if (
+              stableTagAtOrAboveCandidate
+              || stableReleaseAtOrAboveCandidate
+            ) {
+              fail(
+                "candidate version must be greater than every existing stable tag and release",
+              );
+            }
+            const lowerStableVersions = releases.flatMap((release) => {
+              const tuple = versionTuple(release.tag_name ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) < 0
+                ? [{ release, tuple }]
+                : [];
+            });
+            lowerStableVersions.sort(
+              (left, right) => compareVersion(right.tuple, left.tuple),
+            );
+            const selected = lowerStableVersions[0]?.release;
+            if (!selected) {
+              fail("candidate has no lower stable semantic-version release");
+            }
+            if (
+              selected.draft !== false
+              || selected.prerelease !== false
+              || selected.immutable !== true
+              || typeof selected.published_at !== "string"
+              || !Number.isSafeInteger(selected.id)
+              || selected.id <= 0
+              || selected.tag_name !== selected.name
+            ) {
+              fail(
+                "greatest lower stable semantic-version release is not published and immutable",
+              );
+            }
+
+            const assetNames = (selected.assets ?? [])
+              .map((asset) => asset?.name)
+              .sort();
+            if (
+              JSON.stringify(assetNames)
+                !== JSON.stringify(expectedAssetNames)
+            ) {
+              fail("published release does not have the exact signed-lineage asset inventory");
+            }
+            const assetsByName = new Map();
+            for (const asset of selected.assets ?? []) {
+              if (
+                !Number.isSafeInteger(asset.id)
+                || asset.id <= 0
+                || asset.state !== "uploaded"
+                || !Number.isSafeInteger(asset.size)
+                || asset.size <= 0
+                || assetsByName.has(asset.name)
+              ) {
+                fail(`release asset ${asset?.name ?? "<unknown>"} is invalid`);
+              }
+              assetsByName.set(asset.name, asset);
+            }
+
+            const assetBytes = new Map();
+            const assetSha256 = {};
+            const handoffDirectory = "semantic-baseline-handoff";
+            await mkdir(handoffDirectory, { mode: 0o700 });
+            for (const name of expectedAssetNames) {
+              const asset = assetsByName.get(name);
+              const response = await github.request(
+                "GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  asset_id: asset.id,
+                  headers: {
+                    accept: "application/octet-stream",
+                    "X-GitHub-Api-Version": "2026-03-10",
+                  },
+                },
+              );
+              const bytes = responseBytes(response.data, name);
+              const observed = sha256(bytes);
+              if (
+                bytes.length !== asset.size
+                || (
+                  typeof asset.digest === "string"
+                  && asset.digest !== `sha256:${observed}`
+                )
+              ) {
+                fail(`release asset ${name} bytes do not match its API identity`);
+              }
+              assetBytes.set(name, bytes);
+              assetSha256[name] = observed;
+              await writeFile(join(handoffDirectory, name), bytes, {
+                flag: "wx",
+                mode: 0o600,
+              });
+            }
+
+            const metadata = exact(
+              parseJson(
+                assetBytes.get("protected-semantic-baseline.json"),
+                "protected semantic baseline metadata",
+              ),
+              [
+                "schemaVersion",
+                "rcTag",
+                "stableTag",
+                "version",
+                "sourceRevision",
+                "imageDigest",
+                "imageReference",
+                "finalizationEvidencePayloadHash",
+                "finalBrowserGateEvidenceHash",
+                "fixtures",
+              ],
+              "protected semantic baseline metadata",
+            );
+            if (
+              metadata.schemaVersion
+                !== "genio-semantic-ranking-protected-baseline/v2"
+              || metadata.stableTag !== selected.tag_name
+              || metadata.version !== selected.tag_name.slice(1)
+              || metadata.stableTag !== `v${metadata.version}`
+              || !RC_TAG.test(metadata.rcTag)
+              || !String(metadata.rcTag).startsWith(`${metadata.stableTag}-rc.`)
+              || !SOURCE_REVISION.test(metadata.sourceRevision ?? "")
+              || !IMAGE_DIGEST.test(metadata.imageDigest ?? "")
+              || metadata.imageReference
+                !== `ghcr.io/${context.repo.owner.toLowerCase()}/genio@${metadata.imageDigest}`
+              || !Array.isArray(metadata.fixtures)
+              || metadata.fixtures.length < 3
+            ) {
+              fail("protected semantic baseline metadata has an invalid release identity");
+            }
+            digest(
+              metadata.finalizationEvidencePayloadHash,
+              "metadata finalization evidence hash",
+            );
+            digest(
+              metadata.finalBrowserGateEvidenceHash,
+              "metadata final browser evidence hash",
+            );
+            const fixtureIds = new Set();
+            for (const [index, fixtureValue] of metadata.fixtures.entries()) {
+              const fixture = exact(
+                fixtureValue,
+                ["fixtureId", "orderedManifestHash", "outputHash"],
+                `protected semantic baseline fixture ${index}`,
+              );
+              if (
+                typeof fixture.fixtureId !== "string"
+                || fixture.fixtureId.length < 3
+                || fixtureIds.has(fixture.fixtureId)
+              ) {
+                fail(`protected semantic baseline fixture ${index} is invalid`);
+              }
+              fixtureIds.add(fixture.fixtureId);
+              digest(fixture.orderedManifestHash, `fixture ${index} manifest hash`);
+              digest(fixture.outputHash, `fixture ${index} output hash`);
+            }
+            const metadataSha256 = stableSha256(metadata);
+
+            const signedEvidenceValue = parseJson(
+              assetBytes.get("finalization-evidence.json"),
+              "signed predecessor evidence",
+            );
+            const signedAuthorizationValue = parseJson(
+              assetBytes.get("stable-authorization.json"),
+              "signed predecessor authorization",
+            );
+            const evidenceSchema = String(
+              record(signedEvidenceValue, "signed predecessor evidence")
+                .schemaVersion ?? "",
+            );
+            const evidencePayloadSchema = String(
+              record(
+                record(
+                  signedEvidenceValue,
+                  "signed predecessor evidence",
+                ).payload,
+                "signed predecessor evidence payload",
+              ).schemaVersion ?? "",
+            );
+            const authorizationSchema = String(
+              record(
+                signedAuthorizationValue,
+                "signed predecessor authorization",
+              ).schemaVersion ?? "",
+            );
+            const authorizationPayloadSchema = String(
+              record(
+                record(
+                  signedAuthorizationValue,
+                  "signed predecessor authorization",
+                ).payload,
+                "signed predecessor authorization payload",
+              ).schemaVersion ?? "",
+            );
+            const normalSchemaPair =
+              evidenceSchema === "genio-signed-release-evidence/v3"
+              && evidencePayloadSchema === "genio-release-evidence/v3"
+              && authorizationSchema
+                === "genio-signed-stable-release-authorization/v2"
+              && authorizationPayloadSchema
+                === "genio-stable-release-authorization/v2";
+            const bootstrapSchemaPair =
+              evidenceSchema
+                === "genio-signed-stable-predecessor-bootstrap-evidence/v1"
+              && evidencePayloadSchema
+                === "genio-stable-predecessor-bootstrap-evidence/v1"
+              && authorizationSchema
+                === "genio-signed-stable-predecessor-bootstrap-authorization/v1"
+              && authorizationPayloadSchema
+                === "genio-stable-predecessor-bootstrap-authorization/v1";
+            if (normalSchemaPair === bootstrapSchemaPair) {
+              fail(
+                "evidence and authorization must use one exact supported schema pair",
+              );
+            }
+            const predecessorMode = bootstrapSchemaPair
+              ? "bootstrap"
+              : "normal";
+            const finalization = validateEnvelope(
+              signedEvidenceValue,
+              evidenceSchema,
+              "signed predecessor evidence",
+            );
+            const authorization = validateEnvelope(
+              signedAuthorizationValue,
+              authorizationSchema,
+              "signed predecessor authorization",
+            );
+            let finalizationGeneratedAt;
+            let finalizationExpiresAt;
+            let authorizationGeneratedAt;
+            let authorizationExpiresAt;
+            let controllerSourceRevision = null;
+            let imageSignerWorkflow = ".github/workflows/release-candidate.yml";
+            let imageSignerSourceDigest = metadata.sourceRevision;
+            let imageGithubVerificationHash = null;
+
+            if (predecessorMode === "normal") {
+              const finalizationPayload = exact(
+                finalization.payload,
+                [
+                  "schemaVersion",
+                  "kind",
+                  "generatedAt",
+                  "expiresAt",
+                  "candidate",
+                  "lineage",
+                  "configuration",
+                  "stagingControls",
+                  "runtime",
+                  "semanticReview",
+                  "environmentSnapshots",
+                  "gates",
+                ],
+                "finalization evidence payload",
+              );
+              const finalizationCandidate = exact(
+                finalizationPayload.candidate,
+                [
+                  "tag",
+                  "version",
+                  "sourceRevision",
+                  "imageDigest",
+                  "sitesSourceRevision",
+                ],
+                "finalization evidence candidate",
+              );
+              finalizationGeneratedAt = timestamp(
+                finalizationPayload.generatedAt,
+                "finalization evidence generatedAt",
+              );
+              finalizationExpiresAt = timestamp(
+                finalizationPayload.expiresAt,
+                "finalization evidence expiresAt",
+              );
+              if (
+                finalizationPayload.schemaVersion
+                  !== "genio-release-evidence/v3"
+                || finalizationPayload.kind !== "finalization"
+                || finalizationExpiresAt <= finalizationGeneratedAt
+                || finalizationExpiresAt - finalizationGeneratedAt
+                  > 24 * 60 * 60 * 1000
+                || finalizationCandidate.tag !== metadata.rcTag
+                || finalizationCandidate.version !== metadata.version
+                || finalizationCandidate.sourceRevision
+                  !== metadata.sourceRevision
+                || finalizationCandidate.sitesSourceRevision
+                  !== metadata.sourceRevision
+                || finalizationCandidate.imageDigest !== metadata.imageDigest
+                || finalization.payloadHash
+                  !== metadata.finalizationEvidencePayloadHash
+              ) {
+                fail(
+                  "signed finalization evidence does not bind the exact stable target",
+                );
+              }
+              const stagingControls = record(
+                finalizationPayload.stagingControls,
+                "finalization staging controls",
+              );
+              const productionSnapshot = record(
+                record(
+                  finalizationPayload.environmentSnapshots,
+                  "finalization environment snapshots",
+                ).production,
+                "finalization production snapshot",
+              );
+              if (
+                stagingControls.controlPlanePhase !== "finalization"
+                || stagingControls.candidateImageReference
+                  !== metadata.imageReference
+                || productionSnapshot.scope !== "full"
+                || productionSnapshot.sitesCandidateMatched !== true
+              ) {
+                fail("finalization does not bind the full post-Sites image");
+              }
+              if (!Array.isArray(finalizationPayload.gates)) {
+                fail("finalization gates are invalid");
+              }
+              const finalBrowserGates = finalizationPayload.gates.filter(
+                (gate) => gate?.name === "final_custom_domain_browser",
+              );
+              if (
+                finalBrowserGates.length !== 1
+                || finalBrowserGates[0].passed !== true
+                || finalBrowserGates[0].environment !== "production"
+                || finalBrowserGates[0].evidenceHash
+                  !== metadata.finalBrowserGateEvidenceHash
+              ) {
+                fail(
+                  "finalization does not bind the exact successful final browser gate",
+                );
+              }
+
+              const authorizationPayload = exact(
+                authorization.payload,
+                [
+                  "schemaVersion",
+                  "issuer",
+                  "generatedAt",
+                  "expiresAt",
+                  "action",
+                  "candidate",
+                  "finalizationEvidencePayloadHash",
+                  "finalBrowserGateEvidenceHash",
+                  "protectedBaselineMetadataHash",
+                ],
+                "stable authorization payload",
+              );
+              const authorizationCandidate = exact(
+                authorizationPayload.candidate,
+                [
+                  "rcTag",
+                  "stableTag",
+                  "version",
+                  "sourceRevision",
+                  "imageDigest",
+                ],
+                "stable authorization candidate",
+              );
+              authorizationGeneratedAt = timestamp(
+                authorizationPayload.generatedAt,
+                "stable authorization generatedAt",
+              );
+              authorizationExpiresAt = timestamp(
+                authorizationPayload.expiresAt,
+                "stable authorization expiresAt",
+              );
+              if (
+                authorizationPayload.schemaVersion
+                  !== "genio-stable-release-authorization/v2"
+                || authorizationPayload.issuer
+                  !== "genio-protected-stable-release-authorizer"
+                || authorizationPayload.action
+                  !== "create_stable_tag_and_github_release"
+                || authorizationExpiresAt <= authorizationGeneratedAt
+                || authorizationExpiresAt - authorizationGeneratedAt
+                  > 24 * 60 * 60 * 1000
+                || authorizationGeneratedAt < finalizationGeneratedAt
+                || authorizationGeneratedAt >= finalizationExpiresAt
+                || authorizationExpiresAt > finalizationExpiresAt
+                || authorizationCandidate.rcTag !== metadata.rcTag
+                || authorizationCandidate.stableTag !== metadata.stableTag
+                || authorizationCandidate.version !== metadata.version
+                || authorizationCandidate.sourceRevision
+                  !== metadata.sourceRevision
+                || authorizationCandidate.imageDigest
+                  !== metadata.imageDigest
+                || authorizationPayload.finalizationEvidencePayloadHash
+                  !== finalization.payloadHash
+                || authorizationPayload.finalBrowserGateEvidenceHash
+                  !== metadata.finalBrowserGateEvidenceHash
+                || authorizationPayload.protectedBaselineMetadataHash
+                  !== metadataSha256
+              ) {
+                fail(
+                  "stable authorization does not bind the exact finalized baseline",
+                );
+              }
+            } else {
+              const bootstrapPayload = exact(
+                finalization.payload,
+                [
+                  "schemaVersion",
+                  "issuer",
+                  "generatedAt",
+                  "expiresAt",
+                  "kind",
+                  "mode",
+                  "candidate",
+                  "anchor",
+                  "successorPolicy",
+                  "controller",
+                  "provenance",
+                  "independentEvidence",
+                  "productionObservation",
+                  "fixtures",
+                  "fixtureRegistryHash",
+                  "gates",
+                  "limitations",
+                ],
+                "bootstrap predecessor evidence payload",
+              );
+              const bootstrapCandidate = exact(
+                bootstrapPayload.candidate,
+                [
+                  "compatibilityRcTag",
+                  "compatibilityRcTagIsSynthetic",
+                  "stableTag",
+                  "version",
+                  "sourceRevision",
+                  "sourceTree",
+                  "imageDigest",
+                  "imageReference",
+                ],
+                "bootstrap predecessor candidate",
+              );
+              const bootstrapAnchor = exact(
+                bootstrapPayload.anchor,
+                [
+                  "tagObject",
+                  "tagObjectSha256",
+                  "tagMessageSha256",
+                  "sourceCommitSha256",
+                  "sourceTreeObjectSha256",
+                ],
+                "bootstrap predecessor anchor",
+              );
+              const successorPolicy = exact(
+                bootstrapPayload.successorPolicy,
+                [
+                  "version",
+                  "rcTagPattern",
+                  "requiresGreatestLowerStable",
+                  "requiresControllerAncestry",
+                  "forbidsPublishedStableVersion",
+                ],
+                "bootstrap successor policy",
+              );
+              const controller = exact(
+                bootstrapPayload.controller,
+                [
+                  "repository",
+                  "defaultBranch",
+                  "sourceRevision",
+                  "workflow",
+                  "workflowSha256",
+                ],
+                "bootstrap predecessor controller",
+              );
+              const provenance = exact(
+                bootstrapPayload.provenance,
+                [
+                  "imageAttestationHash",
+                  "recoveredRailwayObservationHash",
+                  "independentEvidenceHash",
+                  "fixtureRegistryHash",
+                ],
+                "bootstrap predecessor provenance",
+              );
+              const productionObservation = exact(
+                bootstrapPayload.productionObservation,
+                [
+                  "sourceRevision",
+                  "kind",
+                  "recoveredRailwayObservationHash",
+                  "semanticBaselineScope",
+                  "wrapperFixtureEvidenceHash",
+                ],
+                "bootstrap production observation",
+              );
+              finalizationGeneratedAt = timestamp(
+                bootstrapPayload.generatedAt,
+                "bootstrap evidence generatedAt",
+              );
+              finalizationExpiresAt = timestamp(
+                bootstrapPayload.expiresAt,
+                "bootstrap evidence expiresAt",
+              );
+              controllerSourceRevision = String(
+                controller.sourceRevision ?? "",
+              );
+              for (const [label, value] of [
+                ["bootstrap anchor tag-object hash", bootstrapAnchor.tagObjectSha256],
+                ["bootstrap anchor tag-message hash", bootstrapAnchor.tagMessageSha256],
+                ["bootstrap anchor source-commit hash", bootstrapAnchor.sourceCommitSha256],
+                ["bootstrap anchor tree-object hash", bootstrapAnchor.sourceTreeObjectSha256],
+                ["bootstrap controller workflow hash", controller.workflowSha256],
+                ["bootstrap image attestation hash", provenance.imageAttestationHash],
+                ["bootstrap Railway observation hash", provenance.recoveredRailwayObservationHash],
+                ["bootstrap independent source evidence hash", provenance.independentEvidenceHash],
+                ["bootstrap fixture registry hash", provenance.fixtureRegistryHash],
+                ["bootstrap wrapper fixture evidence hash", productionObservation.wrapperFixtureEvidenceHash],
+              ]) digest(value, label);
+              if (
+                !BOOTSTRAP_SUCCESSOR_RC.test(process.env.CANDIDATE_TAG ?? "")
+                || selected.tag_name !== BOOTSTRAP_STABLE_TAG
+                || metadata.rcTag !== BOOTSTRAP_COMPATIBILITY_RC_TAG
+                || metadata.stableTag !== BOOTSTRAP_STABLE_TAG
+                || metadata.version !== "2.3.4"
+                || metadata.sourceRevision !== BOOTSTRAP_SOURCE_REVISION
+                || bootstrapPayload.schemaVersion
+                  !== "genio-stable-predecessor-bootstrap-evidence/v1"
+                || bootstrapPayload.issuer
+                  !== "genio-protected-stable-predecessor-bootstrap-producer"
+                || bootstrapPayload.kind !== "stable_predecessor_bootstrap"
+                || bootstrapPayload.mode
+                  !== "recovered_observation_with_separate_reconstruction_wrapper"
+                || finalizationExpiresAt <= finalizationGeneratedAt
+                || finalizationExpiresAt - finalizationGeneratedAt
+                  > 24 * 60 * 60 * 1000
+                || bootstrapCandidate.compatibilityRcTag
+                  !== BOOTSTRAP_COMPATIBILITY_RC_TAG
+                || bootstrapCandidate.compatibilityRcTagIsSynthetic !== true
+                || bootstrapCandidate.stableTag !== BOOTSTRAP_STABLE_TAG
+                || bootstrapCandidate.version !== "2.3.4"
+                || bootstrapCandidate.sourceRevision
+                  !== BOOTSTRAP_SOURCE_REVISION
+                || bootstrapCandidate.sourceTree !== BOOTSTRAP_SOURCE_TREE
+                || bootstrapCandidate.imageDigest !== metadata.imageDigest
+                || bootstrapCandidate.imageReference !== metadata.imageReference
+                || bootstrapAnchor.tagObject !== BOOTSTRAP_TAG_OBJECT
+                || successorPolicy.version !== "2.4.0"
+                || successorPolicy.rcTagPattern
+                  !== "^v2\\.4\\.0-rc\\.[1-9]\\d*$"
+                || successorPolicy.requiresGreatestLowerStable !== true
+                || successorPolicy.requiresControllerAncestry !== true
+                || successorPolicy.forbidsPublishedStableVersion !== true
+                || controller.repository !== `${context.repo.owner}/${context.repo.repo}`
+                || controller.defaultBranch
+                  !== context.payload.repository.default_branch
+                || !SOURCE_REVISION.test(controllerSourceRevision)
+                || controller.workflow
+                  !== `${context.repo.owner}/${context.repo.repo}/${BOOTSTRAP_CONTROLLER_WORKFLOW}`
+                || productionObservation.sourceRevision
+                  !== BOOTSTRAP_SOURCE_REVISION
+                || productionObservation.kind
+                  !== "authenticated_platform_observation_not_supply_chain_attestation"
+                || productionObservation.semanticBaselineScope
+                  !== "reconstruction_wrapper_only_not_historical_production_equivalence"
+                || productionObservation.recoveredRailwayObservationHash
+                  !== provenance.recoveredRailwayObservationHash
+                || provenance.fixtureRegistryHash
+                  !== bootstrapPayload.fixtureRegistryHash
+                || finalization.payloadHash
+                  !== metadata.finalizationEvidencePayloadHash
+              ) {
+                fail(
+                  "bootstrap evidence is not the exact one-time v2.3.4 predecessor for a v2.4.0 RC",
+                );
+              }
+              if (!Array.isArray(bootstrapPayload.gates)) {
+                fail("bootstrap evidence gates are invalid");
+              }
+              const expectedBootstrapGates = [
+                "staging_fixed_three_track",
+                "staging_affected_regression",
+                "staging_guided_constraint",
+                "final_custom_domain_browser",
+              ];
+              if (
+                bootstrapPayload.gates.length !== expectedBootstrapGates.length
+                || bootstrapPayload.gates.some((gate, index) =>
+                  gate?.name !== expectedBootstrapGates[index]
+                  || gate?.passed !== true
+                  || gate?.environment !== (
+                    gate.name === "final_custom_domain_browser"
+                      ? "production"
+                      : "staging"
+                  )
+                  || !SHA256.test(gate?.evidenceHash ?? "")
+                )
+                || new Set(
+                  bootstrapPayload.gates.map(({ evidenceHash }) => evidenceHash),
+                ).size !== expectedBootstrapGates.length
+                || !Array.isArray(bootstrapPayload.limitations)
+                || !bootstrapPayload.limitations.includes(
+                  "wrapper_fixture_evidence_does_not_prove_historical_production_output_equivalence",
+                )
+              ) {
+                fail(
+                  "bootstrap evidence does not bind the exact wrapper-only fixture/browser source set",
+                );
+              }
+              const finalBrowserGates = bootstrapPayload.gates.filter(
+                (gate) => gate?.name === "final_custom_domain_browser",
+              );
+              if (
+                finalBrowserGates.length !== 1
+                || finalBrowserGates[0].passed !== true
+                || finalBrowserGates[0].environment !== "production"
+                || finalBrowserGates[0].evidenceHash
+                  !== metadata.finalBrowserGateEvidenceHash
+              ) {
+                fail(
+                  "bootstrap evidence does not bind the exact production browser gate",
+                );
+              }
+
+              const authorizationPayload = exact(
+                authorization.payload,
+                [
+                  "schemaVersion",
+                  "issuer",
+                  "generatedAt",
+                  "expiresAt",
+                  "action",
+                  "candidate",
+                  "anchor",
+                  "successorPolicy",
+                  "controller",
+                  "bootstrapEvidencePayloadHash",
+                  "protectedBaselineMetadataHash",
+                  "imageAttestationHash",
+                  "recoveredRailwayObservationHash",
+                  "independentEvidenceHash",
+                  "fixtureRegistryHash",
+                  "finalBrowserGateEvidenceHash",
+                  "producerKeyId",
+                  "producerKeySha256",
+                  "sitesKeyId",
+                  "sitesKeySha256",
+                  "originalRailwayProvenancePayloadHash",
+                  "originalRailwayProvenanceArtifactHash",
+                  "originalRailwayProvenanceKeyId",
+                  "originalRailwayProvenanceKeySha256",
+                  "originalRailwayImageDigest",
+                ],
+                "bootstrap predecessor authorization payload",
+              );
+              authorizationGeneratedAt = timestamp(
+                authorizationPayload.generatedAt,
+                "bootstrap authorization generatedAt",
+              );
+              authorizationExpiresAt = timestamp(
+                authorizationPayload.expiresAt,
+                "bootstrap authorization expiresAt",
+              );
+              if (
+                authorizationPayload.schemaVersion
+                  !== "genio-stable-predecessor-bootstrap-authorization/v1"
+                || authorizationPayload.issuer
+                  !== "genio-protected-stable-predecessor-bootstrap-authorizer"
+                || authorizationPayload.action
+                  !== "publish_immutable_v2_3_4_predecessor_bootstrap"
+                || authorizationExpiresAt <= authorizationGeneratedAt
+                || authorizationExpiresAt - authorizationGeneratedAt
+                  > 24 * 60 * 60 * 1000
+                || authorizationGeneratedAt < finalizationGeneratedAt
+                || authorizationGeneratedAt >= finalizationExpiresAt
+                || authorizationExpiresAt > finalizationExpiresAt
+                || stableJson(authorizationPayload.candidate)
+                  !== stableJson(bootstrapPayload.candidate)
+                || stableJson(authorizationPayload.anchor)
+                  !== stableJson(bootstrapPayload.anchor)
+                || stableJson(authorizationPayload.successorPolicy)
+                  !== stableJson(bootstrapPayload.successorPolicy)
+                || stableJson(authorizationPayload.controller)
+                  !== stableJson(bootstrapPayload.controller)
+                || authorizationPayload.bootstrapEvidencePayloadHash
+                  !== finalization.payloadHash
+                || authorizationPayload.protectedBaselineMetadataHash
+                  !== metadataSha256
+                || authorizationPayload.imageAttestationHash
+                  !== provenance.imageAttestationHash
+                || authorizationPayload.recoveredRailwayObservationHash
+                  !== provenance.recoveredRailwayObservationHash
+                || authorizationPayload.independentEvidenceHash
+                  !== provenance.independentEvidenceHash
+                || authorizationPayload.fixtureRegistryHash
+                  !== bootstrapPayload.fixtureRegistryHash
+                || authorizationPayload.finalBrowserGateEvidenceHash
+                  !== metadata.finalBrowserGateEvidenceHash
+                || !SIGNING_KEY_ID.test(
+                  authorizationPayload.producerKeyId ?? "",
+                )
+                || !SHA256.test(
+                  authorizationPayload.producerKeySha256 ?? "",
+                )
+                || !SIGNING_KEY_ID.test(
+                  authorizationPayload.sitesKeyId ?? "",
+                )
+                || !SHA256.test(
+                  authorizationPayload.sitesKeySha256 ?? "",
+                )
+                || !SHA256.test(
+                  authorizationPayload.originalRailwayProvenancePayloadHash
+                    ?? "",
+                )
+                || !SHA256.test(
+                  authorizationPayload.originalRailwayProvenanceArtifactHash
+                    ?? "",
+                )
+                || !SIGNING_KEY_ID.test(
+                  authorizationPayload.originalRailwayProvenanceKeyId ?? "",
+                )
+                || !SHA256.test(
+                  authorizationPayload.originalRailwayProvenanceKeySha256
+                    ?? "",
+                )
+                || !IMAGE_DIGEST.test(
+                  authorizationPayload.originalRailwayImageDigest ?? "",
+                )
+                || new Set([
+                  authorizationPayload.producerKeySha256,
+                  authorizationPayload.sitesKeySha256,
+                  authorizationPayload.originalRailwayProvenanceKeySha256,
+                ]).size !== 3
+              ) {
+                fail(
+                  "bootstrap authorization does not bind the exact predecessor evidence",
+                );
+              }
+              const successorReleaseExists = releases.some(
+                (release) => release.tag_name === "v2.4.0",
+              );
+              let successorTagExists = false;
+              try {
+                await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: "tags/v2.4.0",
+                });
+                successorTagExists = true;
+              } catch (error) {
+                if (Number(error?.status) !== 404) throw error;
+              }
+              if (successorReleaseExists || successorTagExists) {
+                fail(
+                  "v2.3.4 bootstrap consumption closes once v2.4.0 is published or tagged",
+                );
+              }
+              imageSignerWorkflow = BOOTSTRAP_IMAGE_WORKFLOW;
+              imageSignerSourceDigest = controllerSourceRevision;
+            }
+
+            const consumer = exact(
+              parseJson(
+                assetBytes.get("stable-release-consumer.json"),
+                "stable release consumer manifest",
+              ),
+              [
+                "schemaVersion",
+                "verifiedAt",
+                "candidate",
+                "finalizationEvidencePayloadHash",
+                "finalBrowserGateEvidenceHash",
+                "protectedBaselineMetadataHash",
+                "stableAuthorizationPayloadHash",
+                "releaseVerificationKeySha256",
+                "stableAuthorizerKeyId",
+                "stableAuthorizerKeySha256",
+              ],
+              "stable release consumer manifest",
+            );
+            const consumerCandidate = exact(
+              consumer.candidate,
+              [
+                "rcTag",
+                "stableTag",
+                "version",
+                "sourceRevision",
+                "imageDigest",
+                "imageReference",
+              ],
+              "stable release consumer candidate",
+            );
+            const verifiedAt = timestamp(
+              consumer.verifiedAt,
+              "stable release consumer verifiedAt",
+            );
+            const releaseKeySha256 = digest(
+              consumer.releaseVerificationKeySha256,
+              "historical release verification key fingerprint",
+            );
+            const stableAuthorizerKeySha256 = digest(
+              consumer.stableAuthorizerKeySha256,
+              "historical stable-authorizer key fingerprint",
+            );
+            if (
+              consumer.schemaVersion
+                !== "genio-stable-release-consumer-manifest/v2"
+              || consumerCandidate.rcTag !== metadata.rcTag
+              || consumerCandidate.stableTag !== metadata.stableTag
+              || consumerCandidate.version !== metadata.version
+              || consumerCandidate.sourceRevision !== metadata.sourceRevision
+              || consumerCandidate.imageDigest !== metadata.imageDigest
+              || consumerCandidate.imageReference !== metadata.imageReference
+              || consumer.finalizationEvidencePayloadHash
+                !== finalization.payloadHash
+              || consumer.finalBrowserGateEvidenceHash
+                !== metadata.finalBrowserGateEvidenceHash
+              || consumer.protectedBaselineMetadataHash !== metadataSha256
+              || consumer.stableAuthorizationPayloadHash
+                !== authorization.payloadHash
+              || consumer.stableAuthorizerKeyId
+                !== authorization.signature.keyId
+              || !STABLE_AUTHORIZER_KEY_ID.test(
+                consumer.stableAuthorizerKeyId ?? "",
+              )
+              || releaseKeySha256 === stableAuthorizerKeySha256
+              || (
+                predecessorMode === "bootstrap"
+                && new Set([
+                  releaseKeySha256,
+                  stableAuthorizerKeySha256,
+                  authorization.payload.producerKeySha256,
+                  authorization.payload.sitesKeySha256,
+                  authorization.payload.originalRailwayProvenanceKeySha256,
+                ]).size !== 5
+              )
+              || verifiedAt < authorizationGeneratedAt - 5 * 60 * 1000
+              || verifiedAt >= authorizationExpiresAt
+              || verifiedAt >= finalizationExpiresAt
+            ) {
+              fail("stable consumer manifest does not match the signed release lineage");
+            }
+
+            let imageAttestation;
+            try {
+              imageAttestation = JSON.parse(
+                assetBytes.get("stable-image-attestation.json").toString("utf8"),
+              );
+            } catch {
+              fail("stable image attestation verification result is not JSON");
+            }
+            if (
+              !imageAttestation
+              || typeof imageAttestation !== "object"
+            ) {
+              fail("stable image attestation verification result is empty");
+            }
+            if (predecessorMode === "bootstrap") {
+              imageAttestation = exact(
+                imageAttestation,
+                [
+                  "schemaVersion",
+                  "repository",
+                  "workflow",
+                  "workflowRef",
+                  "workflowSourceRevision",
+                  "controllerRecipeSourceRevision",
+                  "controllerRecipeSha256",
+                  "historicalBuildIntentSha256",
+                  "builderIdentity",
+                  "reconstructionMode",
+                  "subjectImageReference",
+                  "subjectImageDigest",
+                  "historicalSourceRevision",
+                  "historicalSourceTree",
+                  "recoveredRailwayObservation",
+                  "recoveredRailwayObservationHash",
+                  "githubVerificationHash",
+                  "predicateType",
+                  "runnerEnvironment",
+                ],
+                "bootstrap image attestation",
+              );
+              imageGithubVerificationHash = digest(
+                imageAttestation.githubVerificationHash,
+                "bootstrap image GitHub verification hash",
+              );
+              if (
+                imageAttestation.schemaVersion
+                  !== "genio-stable-predecessor-bootstrap-image-attestation/v1"
+                || imageAttestation.repository
+                  !== `${context.repo.owner}/${context.repo.repo}`
+                || imageAttestation.workflow
+                  !== `${context.repo.owner}/${context.repo.repo}/${BOOTSTRAP_IMAGE_WORKFLOW}`
+                || imageAttestation.workflowRef
+                  !== `refs/heads/${context.payload.repository.default_branch}`
+                || imageAttestation.workflowSourceRevision
+                  !== controllerSourceRevision
+                || imageAttestation.controllerRecipeSourceRevision
+                  !== controllerSourceRevision
+                || imageAttestation.subjectImageReference
+                  !== metadata.imageReference
+                || imageAttestation.subjectImageDigest
+                  !== metadata.imageDigest
+                || imageAttestation.historicalSourceRevision
+                  !== BOOTSTRAP_SOURCE_REVISION
+                || imageAttestation.historicalSourceTree
+                  !== BOOTSTRAP_SOURCE_TREE
+                || imageAttestation.predicateType
+                  !== "https://slsa.dev/provenance/v1"
+                || imageAttestation.runnerEnvironment !== "github-hosted"
+                || stableSha256(imageAttestation)
+                  !== authorization.payload.imageAttestationHash
+              ) {
+                fail(
+                  "bootstrap image attestation does not bind the exact controller and signed authorization",
+                );
+              }
+            }
+
+            if (
+              selected.target_commitish !== metadata.sourceRevision
+              || selected.tag_name !== metadata.stableTag
+            ) {
+              fail("GitHub Release target does not match protected baseline metadata");
+            }
+            const requiredReleaseNoteLines = predecessorMode === "bootstrap"
+              ? [
+                  "gênio wrapper-backed stable predecessor v2.3.4",
+                  "Compatibility-RC: v2.3.4-rc.1",
+                  `Original-Tag-Object: ${BOOTSTRAP_TAG_OBJECT}`,
+                  `Original-Source-Revision: ${BOOTSTRAP_SOURCE_REVISION}`,
+                  `Original-Source-Tree: ${BOOTSTRAP_SOURCE_TREE}`,
+                  `Wrapper-Image-Digest: ${metadata.imageDigest}`,
+                  "Railway-Observation-Kind: authenticated_platform_observation_not_supply_chain_attestation",
+                  "Wrapper-Limitation: not historical Railway artifact",
+                  `Bootstrap-Evidence-SHA256: ${finalization.payloadHash}`,
+                  `Protected-Semantic-Baseline-SHA256: ${metadataSha256}`,
+                  `Bootstrap-Authorization-SHA256: ${authorization.payloadHash}`,
+                  `Bootstrap-Controller-Revision: ${controllerSourceRevision}`,
+                  `Bootstrap-Workflow: ${context.repo.owner}/${context.repo.repo}/${BOOTSTRAP_CONTROLLER_WORKFLOW}`,
+                ]
+              : [
+                  `gênio stable release ${metadata.stableTag}`,
+                  `RC: ${metadata.rcTag}`,
+                  `Source-Revision: ${metadata.sourceRevision}`,
+                  `Image-Digest: ${metadata.imageDigest}`,
+                  `Finalization-Evidence-SHA256: ${finalization.payloadHash}`,
+                  `Protected-Semantic-Baseline-SHA256: ${metadataSha256}`,
+                  `Stable-Authorization-SHA256: ${authorization.payloadHash}`,
+                ];
+            const releaseNoteLines = new Set(
+              String(selected.body ?? "").split("\n"),
+            );
+            if (
+              requiredReleaseNoteLines.some((line) => !releaseNoteLines.has(line))
+            ) {
+              fail("GitHub Release notes do not bind the exact signed lineage");
+            }
+
+            const tagRef = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `tags/${selected.tag_name}`,
+            });
+            if (tagRef.data.object.type !== "tag") {
+              fail("stable predecessor tag is not annotated");
+            }
+            const annotatedTag = await github.rest.git.getTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_sha: tagRef.data.object.sha,
+            });
+            if (
+              annotatedTag.data.tag !== selected.tag_name
+              || annotatedTag.data.object.type !== "commit"
+              || annotatedTag.data.object.sha !== metadata.sourceRevision
+              || (
+                predecessorMode === "bootstrap"
+                  ? (
+                      tagRef.data.object.sha !== BOOTSTRAP_TAG_OBJECT
+                      || annotatedTag.data.message !== "Release v2.3.4\n"
+                    )
+                  : annotatedTag.data.message !== selected.body
+              )
+            ) {
+              fail(
+                "annotated stable tag does not bind the protected source and release notes",
+              );
+            }
+            const ancestry = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead: `${metadata.sourceRevision}...${process.env.CANDIDATE_SHA}`,
+            });
+            if (
+              ancestry.data.status !== "ahead"
+              || ancestry.data.merge_base_commit?.sha !== metadata.sourceRevision
+            ) {
+              fail("stable predecessor source is not an ancestor of the RC candidate");
+            }
+            if (predecessorMode === "bootstrap") {
+              const sourceCommit = await github.rest.git.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: BOOTSTRAP_SOURCE_REVISION,
+              });
+              const controllerAncestry =
+                await github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead:
+                    `${controllerSourceRevision}...${process.env.CANDIDATE_SHA}`,
+                });
+              if (
+                sourceCommit.data.tree.sha !== BOOTSTRAP_SOURCE_TREE
+                || (
+                  controllerSourceRevision
+                    !== process.env.CANDIDATE_SHA
+                  && (
+                    controllerAncestry.data.status !== "ahead"
+                    || controllerAncestry.data.merge_base_commit?.sha
+                      !== controllerSourceRevision
+                  )
+                )
+              ) {
+                fail(
+                  "bootstrap source tree or protected controller ancestry does not bind the RC",
+                );
+              }
+            }
+
+            const releaseIdentitySha256 = stableSha256({
+              releaseId: selected.id,
+              stableTag: metadata.stableTag,
+              sourceRevision: metadata.sourceRevision,
+              metadataSha256,
+              assetSha256,
+            });
+            core.setOutput("release_id", String(selected.id));
+            core.setOutput("stable_tag", metadata.stableTag);
+            core.setOutput("rc_tag", metadata.rcTag);
+            core.setOutput("version", metadata.version);
+            core.setOutput("source_revision", metadata.sourceRevision);
+            core.setOutput("image_digest", metadata.imageDigest);
+            core.setOutput("image_reference", metadata.imageReference);
+            core.setOutput("predecessor_mode", predecessorMode);
+            core.setOutput(
+              "controller_source_revision",
+              controllerSourceRevision ?? imageSignerSourceDigest,
+            );
+            core.setOutput("image_signer_workflow", imageSignerWorkflow);
+            core.setOutput(
+              "image_signer_source_digest",
+              imageSignerSourceDigest,
+            );
+            core.setOutput(
+              "image_github_verification_hash",
+              imageGithubVerificationHash ?? "",
+            );
+            core.setOutput("metadata_sha256", metadataSha256);
+            core.setOutput("release_key_sha256", releaseKeySha256);
+            core.setOutput(
+              "stable_authorizer_key_id",
+              consumer.stableAuthorizerKeyId,
+            );
+            core.setOutput(
+              "stable_authorizer_key_sha256",
+              stableAuthorizerKeySha256,
+            );
+            core.setOutput(
+              "asset_sha256_json_b64url",
+              Buffer.from(JSON.stringify(assetSha256), "utf8").toString("base64url"),
+            );
+            core.setOutput(
+              "release_identity_sha256",
+              releaseIdentitySha256,
+            );
+      - name: Reverify the predecessor image's keyless provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_IMAGE_REFERENCE: ${{ steps.stable_predecessor.outputs.image_reference }}
+          BASELINE_SIGNER_WORKFLOW: ${{ steps.stable_predecessor.outputs.image_signer_workflow }}
+          BASELINE_SIGNER_SOURCE_DIGEST: ${{ steps.stable_predecessor.outputs.image_signer_source_digest }}
+          PREDECESSOR_MODE: ${{ steps.stable_predecessor.outputs.predecessor_mode }}
+          EXPECTED_GITHUB_VERIFICATION_HASH: ${{ steps.stable_predecessor.outputs.image_github_verification_hash }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          gh attestation verify "oci://$BASELINE_IMAGE_REFERENCE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/$BASELINE_SIGNER_WORKFLOW" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --source-digest "$BASELINE_SIGNER_SOURCE_DIGEST" \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --deny-self-hosted-runners \
+            --no-public-good \
+            --format json > semantic-baseline-handoff/predecessor-image-attestation-verification.json
+          node -e 'const crypto=require("node:crypto"); const fs=require("node:fs"); const bytes=fs.readFileSync("semantic-baseline-handoff/predecessor-image-attestation-verification.json"); if(bytes.length===0||bytes.length>2*1024*1024) throw new Error("fresh predecessor GitHub verification is empty or oversized"); const value=JSON.parse(bytes.toString("utf8")); if(!value||typeof value!=="object") throw new Error("fresh predecessor GitHub verification must be structured JSON"); if(process.env.PREDECESSOR_MODE==="bootstrap"){const stable=(item)=>JSON.stringify(item&&typeof item==="object"?(Array.isArray(item)?item.map((entry)=>JSON.parse(stable(entry))):Object.fromEntries(Object.entries(item).sort(([left],[right])=>left.localeCompare(right)).map(([key,entry])=>[key,JSON.parse(stable(entry))]))):item); const observed=crypto.createHash("sha256").update(stable(value)).digest("hex"); if(!/^[0-9a-f]{64}$/.test(process.env.EXPECTED_GITHUB_VERIFICATION_HASH??"")||observed!==process.env.EXPECTED_GITHUB_VERIFICATION_HASH) throw new Error("fresh GitHub verification does not match the bootstrap image attestation canonical hash");}else if(process.env.PREDECESSOR_MODE!=="normal"||process.env.EXPECTED_GITHUB_VERIFICATION_HASH!==""){throw new Error("predecessor schema mode and GitHub verification binding differ");}'
+      - name: Materialize the selected predecessor's historical public keys
+        env:
+          HISTORICAL_RELEASE_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_SEMANTIC_BASELINE_RELEASE_PUBLIC_KEY_B64URL }}
+          HISTORICAL_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL }}
+        run: |
+          node -e 'const fs=require("node:fs"); const inputs=[["HISTORICAL_RELEASE_PUBLIC_KEY_B64URL","semantic-baseline-handoff/release-verification-public-key.pem"],["HISTORICAL_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL","semantic-baseline-handoff/stable-authorizer-public-key.pem"]]; for(const [name,path] of inputs){const value=process.env[name]??""; if(!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} must be canonical unpadded base64url`); const bytes=Buffer.from(value,"base64url"); if(bytes.length===0||bytes.toString("base64url")!==value) throw new Error(`${name} must be canonical unpadded base64url`); fs.writeFileSync(path,bytes,{flag:"wx",mode:0o600});}'
+      - name: Reverify the predecessor through the shared strict dispatcher
+        env:
+          EXPECTED_PREDECESSOR_MODE: ${{ steps.stable_predecessor.outputs.predecessor_mode }}
+          EXPECTED_PREDECESSOR_RC_TAG: ${{ steps.stable_predecessor.outputs.rc_tag }}
+          EXPECTED_PREDECESSOR_VERSION: ${{ steps.stable_predecessor.outputs.version }}
+          EXPECTED_PREDECESSOR_REVISION: ${{ steps.stable_predecessor.outputs.source_revision }}
+          EXPECTED_PREDECESSOR_IMAGE_DIGEST: ${{ steps.stable_predecessor.outputs.image_digest }}
+          EXPECTED_PREDECESSOR_IMAGE_REFERENCE: ${{ steps.stable_predecessor.outputs.image_reference }}
+          EXPECTED_CONTROLLER_SOURCE_REVISION: ${{ steps.stable_predecessor.outputs.controller_source_revision }}
+          EXPECTED_RELEASE_KEY_SHA256: ${{ steps.stable_predecessor.outputs.release_key_sha256 }}
+          EXPECTED_STABLE_AUTHORIZER_KEY_ID: ${{ steps.stable_predecessor.outputs.stable_authorizer_key_id }}
+          EXPECTED_STABLE_AUTHORIZER_KEY_SHA256: ${{ steps.stable_predecessor.outputs.stable_authorizer_key_sha256 }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          node --experimental-transform-types --input-type=module -e 'import fs from "node:fs"; import { verifyHistoricalStablePredecessor } from "./scripts/historical-stable-predecessor.ts"; const directory="semantic-baseline-handoff"; const json=(name)=>JSON.parse(fs.readFileSync(`${directory}/${name}`,"utf8")); const result=verifyHistoricalStablePredecessor({evidence:json("finalization-evidence.json"),protectedBaselineMetadata:json("protected-semantic-baseline.json"),releaseVerificationKey:fs.readFileSync(`${directory}/release-verification-public-key.pem`),approvedReleaseKeySha256:process.env.EXPECTED_RELEASE_KEY_SHA256,authorization:json("stable-authorization.json"),stableAuthorizationVerificationKey:fs.readFileSync(`${directory}/stable-authorizer-public-key.pem`),approvedStableAuthorizerKeyId:process.env.EXPECTED_STABLE_AUTHORIZER_KEY_ID,approvedStableAuthorizerKeySha256:process.env.EXPECTED_STABLE_AUTHORIZER_KEY_SHA256,imageAttestation:json("stable-image-attestation.json"),storedConsumer:json("stable-release-consumer.json"),githubAttestationVerification:json("predecessor-image-attestation-verification.json"),expectedPredecessorRcTag:process.env.EXPECTED_PREDECESSOR_RC_TAG,expectedPredecessorVersion:process.env.EXPECTED_PREDECESSOR_VERSION,expectedPredecessorRevision:process.env.EXPECTED_PREDECESSOR_REVISION,expectedPredecessorImageDigest:process.env.EXPECTED_PREDECESSOR_IMAGE_DIGEST,expectedPredecessorImageReference:process.env.EXPECTED_PREDECESSOR_IMAGE_REFERENCE,expectedSuccessorRcTag:process.env.CANDIDATE_TAG,expectedSuccessorSourceRevision:process.env.CANDIDATE_SHA,expectedRepository:process.env.GITHUB_REPOSITORY,expectedDefaultBranch:process.env.DEFAULT_BRANCH,expectedControllerSourceRevision:process.env.EXPECTED_CONTROLLER_SOURCE_REVISION}); if(result.mode!==process.env.EXPECTED_PREDECESSOR_MODE) throw new Error("shared predecessor dispatcher mode differs from the exact schema pair");'
+      - id: semantic_baseline_handoff
+        name: Seal the exact semantic baseline handoff
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          PREDECESSOR_RELEASE_ID: ${{ steps.stable_predecessor.outputs.release_id }}
+          PREDECESSOR_STABLE_TAG: ${{ steps.stable_predecessor.outputs.stable_tag }}
+          PREDECESSOR_SOURCE_REVISION: ${{ steps.stable_predecessor.outputs.source_revision }}
+          PREDECESSOR_MODE: ${{ steps.stable_predecessor.outputs.predecessor_mode }}
+          PREDECESSOR_CONTROLLER_SOURCE_REVISION: ${{ steps.stable_predecessor.outputs.controller_source_revision }}
+          PREDECESSOR_RELEASE_IDENTITY_SHA256: ${{ steps.stable_predecessor.outputs.release_identity_sha256 }}
+          PREDECESSOR_METADATA_SHA256: ${{ steps.stable_predecessor.outputs.metadata_sha256 }}
+          PREDECESSOR_ASSET_SHA256_JSON_B64URL: ${{ steps.stable_predecessor.outputs.asset_sha256_json_b64url }}
+          PREDECESSOR_RELEASE_KEY_SHA256: ${{ steps.stable_predecessor.outputs.release_key_sha256 }}
+          PREDECESSOR_STABLE_AUTHORIZER_KEY_ID: ${{ steps.stable_predecessor.outputs.stable_authorizer_key_id }}
+          PREDECESSOR_STABLE_AUTHORIZER_KEY_SHA256: ${{ steps.stable_predecessor.outputs.stable_authorizer_key_sha256 }}
+        run: |
+          node --experimental-transform-types scripts/semantic-baseline-handoff.ts create \
+            --directory semantic-baseline-handoff \
+            --manifest-output semantic-baseline-handoff/semantic-baseline-handoff.json \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --candidate-source-revision "$CANDIDATE_SHA" \
+            --predecessor-release-id "$PREDECESSOR_RELEASE_ID" \
+            --predecessor-stable-tag "$PREDECESSOR_STABLE_TAG" \
+            --predecessor-source-revision "$PREDECESSOR_SOURCE_REVISION" \
+            --predecessor-mode "$PREDECESSOR_MODE" \
+            --predecessor-controller-source-revision "$PREDECESSOR_CONTROLLER_SOURCE_REVISION" \
+            --predecessor-release-identity-sha256 "$PREDECESSOR_RELEASE_IDENTITY_SHA256" \
+            --metadata-sha256 "$PREDECESSOR_METADATA_SHA256" \
+            --asset-sha256-json-b64url "$PREDECESSOR_ASSET_SHA256_JSON_B64URL" \
+            --release-verification-key-sha256 "$PREDECESSOR_RELEASE_KEY_SHA256" \
+            --stable-authorizer-key-id "$PREDECESSOR_STABLE_AUTHORIZER_KEY_ID" \
+            --stable-authorizer-key-sha256 "$PREDECESSOR_STABLE_AUTHORIZER_KEY_SHA256" \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: semantic-baseline-handoff-${{ steps.identity.outputs.candidate_tag }}
+          path: semantic-baseline-handoff/
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: semantic-baseline-github-verification-${{ steps.identity.outputs.candidate_tag }}
+          path: semantic-baseline-handoff/predecessor-image-attestation-verification.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+  validate_offline:
+    needs: [authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: rc-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      CAPABILITY_PEPPER_VERSION: rc-capability-v1
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: rc-owner-allowlist-v1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck the exact immutable predecessor before publication
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CANDIDATE_SHA: ${{ needs.authorize.outputs.source_revision }}
+          CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+          EXPECTED_RELEASE_ID: ${{ needs.authorize.outputs.semantic_baseline_release_id }}
+          EXPECTED_STABLE_TAG: ${{ needs.authorize.outputs.semantic_baseline_stable_tag }}
+          EXPECTED_METADATA_SHA256: ${{ needs.authorize.outputs.semantic_baseline_metadata_sha256 }}
+          EXPECTED_RELEASE_IDENTITY_SHA256: ${{ needs.authorize.outputs.semantic_baseline_release_identity_sha256 }}
+          EXPECTED_ASSET_SHA256_JSON_B64URL: ${{ needs.authorize.outputs.semantic_baseline_asset_sha256_json_b64url }}
+        with:
+          script: |
+            const { createHash } = require("node:crypto");
+            const SHA256 = /^[0-9a-f]{64}$/u;
+            const STABLE_TAG =
+              /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            const RC_TAG =
+              /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/u;
+            const expectedAssetNames = [
+              "finalization-evidence.json",
+              "protected-semantic-baseline.json",
+              "stable-authorization.json",
+              "stable-image-attestation.json",
+              "stable-release-consumer.json",
+            ];
+            const fail = (message) => {
+              throw new Error(`immutable stable predecessor recheck: ${message}`);
+            };
+            const sortedJsonValue = (value) => {
+              if (Array.isArray(value)) return value.map(sortedJsonValue);
+              if (!value || typeof value !== "object") return value;
+              return Object.fromEntries(
+                Object.entries(value)
+                  .sort(([left], [right]) => left.localeCompare(right))
+                  .map(([key, item]) => [key, sortedJsonValue(item)]),
+              );
+            };
+            const stableSha256 = (value) => createHash("sha256")
+              .update(JSON.stringify(sortedJsonValue(value)))
+              .digest("hex");
+            const responseBytes = (data, label) => {
+              if (data instanceof ArrayBuffer) return Buffer.from(data);
+              if (ArrayBuffer.isView(data)) {
+                return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+              }
+              if (typeof data === "string") return Buffer.from(data, "utf8");
+              fail(`${label} did not return raw asset bytes`);
+            };
+            const versionTuple = (tag) => {
+              const match = STABLE_TAG.exec(tag);
+              return match
+                ? [BigInt(match[1]), BigInt(match[2]), BigInt(match[3])]
+                : null;
+            };
+            const compareVersion = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+
+            const releaseId = Number(process.env.EXPECTED_RELEASE_ID);
+            if (!Number.isSafeInteger(releaseId) || releaseId <= 0) {
+              fail("authorized release ID is invalid");
+            }
+            const candidateMatch = RC_TAG.exec(process.env.CANDIDATE_TAG ?? "");
+            const candidateVersion = candidateMatch
+              ? versionTuple(`v${candidateMatch[1]}`)
+              : null;
+            if (!candidateVersion) fail("authorized RC version is invalid");
+            const encodedAssetHashes =
+              process.env.EXPECTED_ASSET_SHA256_JSON_B64URL ?? "";
+            let expectedAssetSha256;
+            try {
+              const decoded = Buffer.from(encodedAssetHashes, "base64url");
+              if (decoded.toString("base64url") !== encodedAssetHashes) {
+                fail("authorized asset hash map is not canonical base64url");
+              }
+              expectedAssetSha256 = JSON.parse(decoded.toString("utf8"));
+            } catch (error) {
+              if (error instanceof Error && error.message.startsWith("immutable")) {
+                throw error;
+              }
+              fail("authorized asset hash map is invalid");
+            }
+            if (
+              !expectedAssetSha256
+              || typeof expectedAssetSha256 !== "object"
+              || Array.isArray(expectedAssetSha256)
+              || JSON.stringify(Object.keys(expectedAssetSha256).sort())
+                !== JSON.stringify(expectedAssetNames)
+              || expectedAssetNames.some(
+                (name) => !SHA256.test(expectedAssetSha256[name] ?? ""),
+              )
+            ) {
+              fail("authorized asset hash map has the wrong inventory");
+            }
+
+            const [byId, byTag, releases, stableTagRefs] = await Promise.all([
+              github.rest.repos.getRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: releaseId,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+              github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: process.env.EXPECTED_STABLE_TAG,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+            ]);
+            const release = byId.data;
+            const stableTagAtOrAboveCandidate = stableTagRefs.some((ref) => {
+              const tuple = versionTuple(ref.ref?.replace(/^refs\/tags\//u, "") ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) >= 0;
+            });
+            const stableReleaseAtOrAboveCandidate = releases.some((item) => {
+              const tuple = versionTuple(item.tag_name ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) >= 0;
+            });
+            if (
+              stableTagAtOrAboveCandidate
+              || stableReleaseAtOrAboveCandidate
+            ) {
+              fail(
+                "candidate version is no longer greater than every stable tag and release",
+              );
+            }
+            const lowerStableVersions = releases.flatMap((item) => {
+              const tuple = versionTuple(item.tag_name ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) < 0
+                ? [{ item, tuple }]
+                : [];
+            });
+            lowerStableVersions.sort(
+              (left, right) => compareVersion(right.tuple, left.tuple),
+            );
+            if (
+              lowerStableVersions[0]?.item.id !== releaseId
+              || byTag.data.id !== releaseId
+              || release.id !== releaseId
+              || release.tag_name !== process.env.EXPECTED_STABLE_TAG
+              || release.name !== process.env.EXPECTED_STABLE_TAG
+              || release.draft !== false
+              || release.prerelease !== false
+              || release.immutable !== true
+            ) {
+              fail("authorized release identity or immutable state changed");
+            }
+            const assets = release.assets ?? [];
+            if (
+              JSON.stringify(assets.map(({ name }) => name).sort())
+                !== JSON.stringify(expectedAssetNames)
+            ) {
+              fail("authorized release asset inventory changed");
+            }
+            const observedAssetSha256 = {};
+            let metadata;
+            for (const name of expectedAssetNames) {
+              const matches = assets.filter((asset) => asset.name === name);
+              if (
+                matches.length !== 1
+                || matches[0].state !== "uploaded"
+                || !Number.isSafeInteger(matches[0].size)
+                || matches[0].size <= 0
+              ) {
+                fail(`authorized release asset ${name} is invalid`);
+              }
+              const response = await github.request(
+                "GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  asset_id: matches[0].id,
+                  headers: {
+                    accept: "application/octet-stream",
+                    "X-GitHub-Api-Version": "2026-03-10",
+                  },
+                },
+              );
+              const bytes = responseBytes(response.data, name);
+              const observed = createHash("sha256").update(bytes).digest("hex");
+              if (
+                bytes.length !== matches[0].size
+                || observed !== expectedAssetSha256[name]
+                || (
+                  typeof matches[0].digest === "string"
+                  && matches[0].digest !== `sha256:${observed}`
+                )
+              ) {
+                fail(`authorized release asset ${name} bytes changed`);
+              }
+              observedAssetSha256[name] = observed;
+              if (name === "protected-semantic-baseline.json") {
+                try {
+                  metadata = JSON.parse(bytes.toString("utf8"));
+                } catch {
+                  fail("protected semantic baseline metadata is no longer JSON");
+                }
+              }
+            }
+            if (
+              !metadata
+              || stableSha256(metadata)
+                !== process.env.EXPECTED_METADATA_SHA256
+              || metadata.stableTag !== process.env.EXPECTED_STABLE_TAG
+              || metadata.sourceRevision !== release.target_commitish
+            ) {
+              fail("protected semantic baseline metadata identity changed");
+            }
+            const releaseIdentitySha256 = stableSha256({
+              releaseId,
+              stableTag: metadata.stableTag,
+              sourceRevision: metadata.sourceRevision,
+              metadataSha256: process.env.EXPECTED_METADATA_SHA256,
+              assetSha256: observedAssetSha256,
+            });
+            if (
+              releaseIdentitySha256
+                !== process.env.EXPECTED_RELEASE_IDENTITY_SHA256
+            ) {
+              fail("authorized release identity hash changed");
+            }
+
+            const tagRef = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `tags/${metadata.stableTag}`,
+            });
+            if (tagRef.data.object.type !== "tag") {
+              fail("authorized stable tag is no longer annotated");
+            }
+            const annotatedTag = await github.rest.git.getTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_sha: tagRef.data.object.sha,
+            });
+            if (
+              annotatedTag.data.object.type !== "commit"
+              || annotatedTag.data.object.sha !== metadata.sourceRevision
+            ) {
+              fail("authorized annotated stable tag target changed");
+            }
+            const ancestry = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead:
+                `${metadata.sourceRevision}...${process.env.CANDIDATE_SHA}`,
+            });
+            if (
+              ancestry.data.status !== "ahead"
+              || ancestry.data.merge_base_commit?.sha !== metadata.sourceRevision
+            ) {
+              fail("authorized stable predecessor is no longer an RC ancestor");
+            }
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - name: Verify annotated RC identity
+        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - run: pnpm install --frozen-lockfile
+      - name: Reclaim known package-manager caches before build
+        run: |
+          pnpm store prune
+          sudo apt-get clean
+      - name: Require build disk headroom
+        run: |
+          FREE_KIB="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+          MIN_FREE_KIB="$((8 * 1024 * 1024))"
+          echo "Release validation free space: $((FREE_KIB / 1024)) MiB"
+          if [ "$FREE_KIB" -lt "$MIN_FREE_KIB" ]; then
+            echo "At least 8 GiB of free disk is required before release validation." >&2
+            exit 1
+          fi
+      - name: Run immutable-artifact and database checks
+        run: |
+          pnpm security:secrets
+          pnpm security:dependencies
+          pnpm lint
+          pnpm build
+          pnpm release:fixtures:check
+          pnpm qa:policy:check
+          pnpm test:database:preflight
+          pnpm db:migrate
+      - name: Reclaim known package-manager caches before coverage
+        run: |
+          pnpm store prune
+          sudo apt-get clean
+      - name: Require coverage disk headroom
+        run: |
+          FREE_KIB="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+          MIN_FREE_KIB="$((8 * 1024 * 1024))"
+          echo "Release validation free space: $((FREE_KIB / 1024)) MiB"
+          if [ "$FREE_KIB" -lt "$MIN_FREE_KIB" ]; then
+            echo "At least 8 GiB of free disk is required before release validation." >&2
+            exit 1
+          fi
+      - name: Run coverage and database suites
+        run: |
+          pnpm test:coverage
+          pnpm test:database
+
+  validate_browser:
+    needs: [authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [mobile-320, mobile-390, mobile-430, desktop]
+    env:
+      CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: rc-owner-allowlist-v1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - name: Verify annotated RC identity
+        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - run: pnpm install --frozen-lockfile
+      - name: Install only headless browser engines
+        run: pnpm exec playwright install --with-deps chromium-headless-shell webkit
+      - name: Reclaim known package-manager caches before browser QA
+        run: |
+          pnpm store prune
+          sudo apt-get clean
+      - name: Require browser disk headroom
+        run: |
+          FREE_KIB="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+          MIN_FREE_KIB="$((8 * 1024 * 1024))"
+          echo "Release validation free space: $((FREE_KIB / 1024)) MiB"
+          if [ "$FREE_KIB" -lt "$MIN_FREE_KIB" ]; then
+            echo "At least 8 GiB of free disk is required before release validation." >&2
+            exit 1
+          fi
+      - name: Run browser suite
+        run: pnpm test:e2e --project=${{ matrix.project }}
+      - name: Upload browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rc-playwright-${{ matrix.project }}-${{ env.CANDIDATE_TAG }}
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  validate_production_database:
+    needs: [authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # Match the immutable Postgres 18 image currently serving production.
+        image: ghcr.io/railwayapp-templates/postgres-ssl:18@sha256:764fabc5fceb7166414c425a57bed8722a08cfb7fff508efb21a86eb31e172a6
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+          PGDATA: /var/lib/postgresql/data/pgdata
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: rc-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      CAPABILITY_PEPPER_VERSION: rc-capability-v1
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: rc-owner-allowlist-v1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - name: Verify annotated RC identity
+        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - run: pnpm install --frozen-lockfile
+      - name: Reclaim known package-manager caches before production-database QA
+        run: |
+          pnpm store prune
+          sudo apt-get clean
+      - name: Require production-database disk headroom
+        run: |
+          FREE_KIB="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+          MIN_FREE_KIB="$((8 * 1024 * 1024))"
+          echo "Production-database validation free space: $((FREE_KIB / 1024)) MiB"
+          if [ "$FREE_KIB" -lt "$MIN_FREE_KIB" ]; then
+            echo "At least 8 GiB of free disk is required before production-database validation." >&2
+            exit 1
+          fi
+      - run: pnpm test:database:preflight
+      - run: pnpm db:migrate
+      - run: pnpm test:database
+
+  validate_system:
+    needs: [authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: rc-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      CAPABILITY_PEPPER_VERSION: rc-capability-v1
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: rc-owner-allowlist-v1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - name: Verify annotated RC identity
+        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:database:preflight
+      - run: pnpm db:migrate
+      - name: Install only the headless Chromium engine
+        run: pnpm exec playwright install --with-deps chromium-headless-shell
+      - name: Reclaim known package-manager caches before stitched system QA
+        run: |
+          pnpm store prune
+          sudo apt-get clean
+      - name: Require stitched-system disk headroom
+        run: |
+          FREE_KIB="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+          MIN_FREE_KIB="$((8 * 1024 * 1024))"
+          echo "Release validation free space: $((FREE_KIB / 1024)) MiB"
+          if [ "$FREE_KIB" -lt "$MIN_FREE_KIB" ]; then
+            echo "At least 8 GiB of free disk is required before release validation." >&2
+            exit 1
+          fi
+      - name: Run stitched API-worker-database browser suite
+        run: pnpm test:e2e:system
+      - name: Upload stitched-system failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rc-system-failure-${{ env.CANDIDATE_TAG }}
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: [authorize, validate_offline, validate_browser, validate_production_database, validate_system]
+    if: ${{ needs.authorize.result == 'success' && needs.validate_offline.result == 'success' && needs.validate_browser.result == 'success' && needs.validate_production_database.result == 'success' && needs.validate_system.result == 'success' }}
+    environment: release-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      SOURCE_REVISION: ${{ needs.authorize.outputs.source_revision }}
+      RELEASE_VERSION: ${{ needs.authorize.outputs.version }}
+      IMAGE: ${{ needs.authorize.outputs.image }}
+      RELEASE_VERIFICATION_KEY_SHA256: ${{ needs.authorize.outputs.release_verification_key_sha256 }}
+      RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ needs.authorize.outputs.public_rollout_intent_canary_authority_policy_sha256 }}
+      RELEASE_SEMANTIC_BASELINE_METADATA_SHA256: ${{ needs.authorize.outputs.semantic_baseline_metadata_sha256 }}
+      RELEASE_SEMANTIC_BASELINE_STABLE_TAG: ${{ needs.authorize.outputs.semantic_baseline_stable_tag }}
+      RELEASE_SEMANTIC_BASELINE_RELEASE_KEY_SHA256: ${{ needs.authorize.outputs.semantic_baseline_release_key_sha256 }}
+      RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_ID: ${{ needs.authorize.outputs.semantic_baseline_stable_authorizer_key_id }}
+      RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_SHA256: ${{ needs.authorize.outputs.semantic_baseline_stable_authorizer_key_sha256 }}
+      RELEASE_SEMANTIC_BASELINE_PREDECESSOR_MODE: ${{ needs.authorize.outputs.semantic_baseline_predecessor_mode }}
+      RELEASE_SEMANTIC_BASELINE_CONTROLLER_SOURCE_REVISION: ${{ needs.authorize.outputs.semantic_baseline_controller_source_revision }}
+      RELEASE_SEMANTIC_BASELINE_GITHUB_ATTESTATION_VERIFICATION_BYTES_SHA256: ${{ needs.authorize.outputs.semantic_baseline_github_attestation_verification_bytes_sha256 }}
+      RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256: ${{ needs.authorize.outputs.semantic_baseline_handoff_sha256 }}
+      RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ needs.authorize.outputs.stable_authorizer_key_id }}
+      RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ needs.authorize.outputs.stable_authorizer_key_sha256 }}
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      source_revision: ${{ needs.authorize.outputs.source_revision }}
+      version: ${{ needs.authorize.outputs.version }}
+      image: ${{ needs.authorize.outputs.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: semantic-baseline-handoff-${{ needs.authorize.outputs.candidate_tag }}
+          path: semantic-baseline-handoff
+      - name: Reconfirm the predecessor is still greatest before image publication
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+          EXPECTED_RELEASE_ID: ${{ needs.authorize.outputs.semantic_baseline_release_id }}
+          EXPECTED_STABLE_TAG: ${{ needs.authorize.outputs.semantic_baseline_stable_tag }}
+        with:
+          script: |
+            const STABLE_TAG =
+              /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            const RC_TAG =
+              /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/u;
+            const versionTuple = (tag) => {
+              const match = STABLE_TAG.exec(tag);
+              return match
+                ? [BigInt(match[1]), BigInt(match[2]), BigInt(match[3])]
+                : null;
+            };
+            const compareVersion = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            const candidateMatch = RC_TAG.exec(process.env.CANDIDATE_TAG ?? "");
+            const candidateVersion = candidateMatch
+              ? versionTuple(`v${candidateMatch[1]}`)
+              : null;
+            const expectedReleaseId = Number(process.env.EXPECTED_RELEASE_ID);
+            if (
+              !candidateVersion
+              || !Number.isSafeInteger(expectedReleaseId)
+              || expectedReleaseId <= 0
+            ) {
+              throw new Error("authorized immutable predecessor identity is invalid");
+            }
+            const [releases, stableTagRefs] = await Promise.all([
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+            ]);
+            const stableTagAtOrAboveCandidate = stableTagRefs.some((ref) => {
+              const tuple = versionTuple(ref.ref?.replace(/^refs\/tags\//u, "") ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) >= 0;
+            });
+            const stableReleaseAtOrAboveCandidate = releases.some((release) => {
+              const tuple = versionTuple(release.tag_name ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) >= 0;
+            });
+            if (
+              stableTagAtOrAboveCandidate
+              || stableReleaseAtOrAboveCandidate
+            ) {
+              throw new Error(
+                "candidate version is no longer greater than every stable tag and release",
+              );
+            }
+            const lowerStableVersions = releases.flatMap((release) => {
+              const tuple = versionTuple(release.tag_name ?? "");
+              return tuple && compareVersion(tuple, candidateVersion) < 0
+                ? [{ release, tuple }]
+                : [];
+            });
+            lowerStableVersions.sort(
+              (left, right) => compareVersion(right.tuple, left.tuple),
+            );
+            const predecessor = lowerStableVersions[0]?.release;
+            if (
+              predecessor?.id !== expectedReleaseId
+              || predecessor.tag_name !== process.env.EXPECTED_STABLE_TAG
+              || predecessor.draft !== false
+              || predecessor.prerelease !== false
+              || predecessor.immutable !== true
+            ) {
+              throw new Error(
+                "authorized release is no longer the greatest published immutable stable predecessor",
+              );
+            }
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - name: Reverify the sealed semantic baseline handoff
+        run: |
+          node --experimental-transform-types scripts/semantic-baseline-handoff.ts verify \
+            --directory semantic-baseline-handoff \
+            --expected-manifest-sha256 "$RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --candidate-source-revision "$SOURCE_REVISION" \
+            --metadata-sha256 "$RELEASE_SEMANTIC_BASELINE_METADATA_SHA256" \
+            --stable-tag "$RELEASE_SEMANTIC_BASELINE_STABLE_TAG" \
+            --predecessor-mode "$RELEASE_SEMANTIC_BASELINE_PREDECESSOR_MODE" \
+            --predecessor-controller-source-revision "$RELEASE_SEMANTIC_BASELINE_CONTROLLER_SOURCE_REVISION" \
+            --release-verification-key-sha256 "$RELEASE_SEMANTIC_BASELINE_RELEASE_KEY_SHA256" \
+            --stable-authorizer-key-id "$RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_ID" \
+            --stable-authorizer-key-sha256 "$RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_SHA256"
+      - name: Reverify exact validated source identity
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require(\"./package.json\").version')" = "$RELEASE_VERSION"
+          node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Reclaim known package-manager caches before image build
+        run: |
+          pnpm store prune
+          sudo apt-get clean
+      - name: Require image-build disk headroom
+        run: |
+          FREE_KIB="$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+          MIN_FREE_KIB="$((8 * 1024 * 1024))"
+          echo "Release publication free space: $((FREE_KIB / 1024)) MiB"
+          if [ "$FREE_KIB" -lt "$MIN_FREE_KIB" ]; then
+            echo "At least 8 GiB of free disk is required before image publication." >&2
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        name: Build the candidate image without registry mutation
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          build-args: |
+            GENIO_BUILD_VERSION=${{ needs.authorize.outputs.version }}
+            GENIO_BUILD_REVISION=${{ needs.authorize.outputs.source_revision }}
+            GENIO_RELEASE_VERIFICATION_KEY_SHA256=${{ needs.authorize.outputs.release_verification_key_sha256 }}
+            GENIO_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256=${{ needs.authorize.outputs.public_rollout_intent_canary_authority_policy_sha256 }}
+          tags: |
+            ${{ needs.authorize.outputs.image }}:${{ needs.authorize.outputs.candidate_tag }}
+            ${{ needs.authorize.outputs.image }}:sha-${{ needs.authorize.outputs.source_revision }}
+      - name: Recheck stable monotonicity after build and immediately before image push
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          EXPECTED_RELEASE_ID: ${{ needs.authorize.outputs.semantic_baseline_release_id }}
+        with:
+          script: |
+            const stablePattern =
+              /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            const candidatePattern =
+              /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/u;
+            const tuple = (tag) => {
+              const match = stablePattern.exec(tag ?? "");
+              return match
+                ? [BigInt(match[1]), BigInt(match[2]), BigInt(match[3])]
+                : null;
+            };
+            const compare = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            const candidateMatch = candidatePattern.exec(
+              process.env.CANDIDATE_TAG ?? "",
+            );
+            const candidateVersion = candidateMatch
+              ? tuple(`v${candidateMatch[1]}`)
+              : null;
+            const expectedReleaseId = Number(process.env.EXPECTED_RELEASE_ID);
+            if (
+              !candidateVersion
+              || !Number.isSafeInteger(expectedReleaseId)
+              || expectedReleaseId <= 0
+            ) {
+              throw new Error("candidate or predecessor identity is invalid");
+            }
+            const [refs, releases] = await Promise.all([
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+            ]);
+            if (
+              refs.some((ref) => {
+                const version = tuple(
+                  ref.ref?.replace(/^refs\/tags\//u, ""),
+                );
+                return version && compare(version, candidateVersion) >= 0;
+              })
+              || releases.some((release) => {
+                const version = tuple(release.tag_name);
+                return version && compare(version, candidateVersion) >= 0;
+              })
+            ) {
+              throw new Error(
+                "candidate version is no longer greater than every stable tag and release",
+              );
+            }
+            const predecessors = releases.flatMap((release) => {
+              const version = tuple(release.tag_name);
+              return version && compare(version, candidateVersion) < 0
+                ? [{ release, version }]
+                : [];
+            }).sort((left, right) => compare(right.version, left.version));
+            const predecessor = predecessors[0]?.release;
+            if (
+              predecessor?.id !== expectedReleaseId
+              || predecessor.tag_name
+                !== process.env.RELEASE_SEMANTIC_BASELINE_STABLE_TAG
+              || predecessor.draft !== false
+              || predecessor.prerelease !== false
+              || predecessor.immutable !== true
+            ) {
+              throw new Error(
+                "authorized predecessor changed after the candidate build",
+              );
+            }
+      - id: push
+        name: Push the already-built candidate only after the final fence
+        run: |
+          CANDIDATE_PUSH_OUTPUT="$(docker push "$IMAGE:$CANDIDATE_TAG")"
+          printf '%s\n' "$CANDIDATE_PUSH_OUTPUT"
+          REVISION_PUSH_OUTPUT="$(docker push "$IMAGE:sha-$SOURCE_REVISION")"
+          printf '%s\n' "$REVISION_PUSH_OUTPUT"
+          CANDIDATE_DIGEST="$(printf '%s\n' "$CANDIDATE_PUSH_OUTPUT" | awk '/digest: sha256:/{print $2}' | tail -n 1)"
+          REVISION_DIGEST="$(printf '%s\n' "$REVISION_PUSH_OUTPUT" | awk '/digest: sha256:/{print $2}' | tail -n 1)"
+          if [[ ! "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ || "$CANDIDATE_DIGEST" != "$REVISION_DIGEST" ]]; then
+            echo "candidate tags did not publish the same immutable digest" >&2
+            exit 1
+          fi
+          echo "digest=$CANDIDATE_DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ needs.authorize.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Write immutable artifact identity
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          RELEASE_WORKFLOW_CANDIDATE_SHA: ${{ needs.authorize.outputs.source_revision }}
+          RELEASE_WORKFLOW_CANDIDATE_REF_NAME: ${{ needs.authorize.outputs.candidate_tag }}
+        run: |
+          node -e 'const fs=require("node:fs"); const value={schemaVersion:"genio-release-image/v2",candidateTag:process.env.CANDIDATE_TAG,sourceRevision:process.env.SOURCE_REVISION,image:`${process.env.IMAGE}@${process.env.IMAGE_DIGEST}`,semanticBaselineMetadataSha256:process.env.RELEASE_SEMANTIC_BASELINE_METADATA_SHA256,semanticBaselineStableTag:process.env.RELEASE_SEMANTIC_BASELINE_STABLE_TAG,semanticBaselineReleaseKeySha256:process.env.RELEASE_SEMANTIC_BASELINE_RELEASE_KEY_SHA256,semanticBaselineStableAuthorizerKeyId:process.env.RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_ID,semanticBaselineStableAuthorizerKeySha256:process.env.RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_SHA256,semanticBaselinePredecessorMode:process.env.RELEASE_SEMANTIC_BASELINE_PREDECESSOR_MODE,semanticBaselineControllerSourceRevision:process.env.RELEASE_SEMANTIC_BASELINE_CONTROLLER_SOURCE_REVISION,semanticBaselineGithubAttestationVerificationBytesSha256:process.env.RELEASE_SEMANTIC_BASELINE_GITHUB_ATTESTATION_VERIFICATION_BYTES_SHA256,semanticBaselineHandoffSha256:process.env.RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256,releaseVerificationKeySha256:process.env.RELEASE_VERIFICATION_KEY_SHA256,publicRolloutIntentCanaryAuthorityPolicySha256:process.env.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256,stableAuthorizerKeyId:process.env.RELEASE_STABLE_AUTHORIZER_KEY_ID,stableAuthorizerKeySha256:process.env.RELEASE_STABLE_AUTHORIZER_KEY_SHA256}; fs.writeFileSync("release-image.json",JSON.stringify(value,null,2)+"\n",{mode:0o600});'
+          node --experimental-transform-types scripts/release-fixtures.ts offline --candidate-tag "$CANDIDATE_TAG" --source-revision "$SOURCE_REVISION" --image-digest "$IMAGE_DIGEST" --output release-offline-suite.json
+          sha256sum release-offline-suite.json > release-offline-suite.sha256
+      - id: offline_attestation
+        name: Keylessly attest the offline suite
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: ${{ github.workspace }}/release-offline-suite.json
+      - name: Verify and preserve the keyless offline-suite attestation
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.offline_attestation.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_WORKFLOW_REF: ${{ github.ref }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          test -s "$ATTESTATION_BUNDLE"
+          gh attestation verify release-offline-suite.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --bundle "$ATTESTATION_BUNDLE" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
+            --source-ref "$TRUSTED_WORKFLOW_REF" \
+            --source-digest "$TRUSTED_WORKFLOW_SHA" \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --deny-self-hosted-runners \
+            --format json > release-offline-suite.github-verification.json
+          cp "$ATTESTATION_BUNDLE" release-offline-suite.github-attestation.json
+          node -e 'const crypto=require("node:crypto"); const fs=require("node:fs"); const artifactSha256=crypto.createHash("sha256").update(fs.readFileSync("release-offline-suite.json")).digest("hex"); const value={schemaVersion:"genio-release-offline-attestation-binding/v1",repository:process.env.GITHUB_REPOSITORY,workflow:process.env.GITHUB_REPOSITORY+"/.github/workflows/release-candidate.yml",workflowRef:process.env.TRUSTED_WORKFLOW_REF,workflowSha:process.env.TRUSTED_WORKFLOW_SHA,candidateSourceRevision:process.env.SOURCE_REVISION,artifactSha256,predicateType:"https://slsa.dev/provenance/v1"}; fs.writeFileSync("release-offline-suite.github-binding.json",JSON.stringify(value,null,2)+"\n",{mode:0o600});'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-image-${{ needs.authorize.outputs.candidate_tag }}
+          path: |
+            release-image.json
+            release-offline-suite.json
+            release-offline-suite.sha256
+            release-offline-suite.github-attestation.json
+            release-offline-suite.github-binding.json
+            release-offline-suite.github-verification.json
+            semantic-baseline-handoff/
+          if-no-files-found: error
+          retention-days: 7

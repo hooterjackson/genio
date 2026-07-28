@@ -1,3 +1,5 @@
+import { PUBLIC_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
+
 /**
  * Durable queue classes are a security boundary, not merely a scheduling
  * hint. Deep workers can perform evidence research and read-only catalog
@@ -64,5 +66,10 @@ export function isDeepQueryPlan(plan: unknown): boolean {
   const engines = Array.isArray(record.engines)
     ? record.engines.filter((value): value is string => typeof value === "string")
     : typeof record.engine === "string" ? [record.engine] : [];
-  return engines.includes("factual_relationship") || engines.includes("exhaustive");
+  const targetTrackCount = record.targetTrackCount;
+  const expandedCount = Number.isSafeInteger(targetTrackCount)
+    && Number(targetTrackCount) > PUBLIC_PLAYLIST_MAXIMUM_TRACKS;
+  return expandedCount
+    || engines.includes("factual_relationship")
+    || engines.includes("exhaustive");
 }

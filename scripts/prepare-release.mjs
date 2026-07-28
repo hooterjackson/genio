@@ -52,4 +52,7 @@ await Promise.all([
 ]);
 await rename(packageTemporary, packagePath);
 await rename(manifestTemporary, manifestPath);
-console.log(`Prepared gênio v${version}. Commit, tag v${version}, validate, and deploy this exact revision.`);
+console.log(
+  `Prepared gênio v${version}. Commit it, create an annotated v${version}-rc.N tag, `
+  + "build one digest-pinned candidate, and promote only signed evidence for that exact artifact.",
+);

@@ -30,6 +30,7 @@ import {
   WorkerRunner,
   type DurableJob,
 } from "../server/worker-runner.ts";
+import { ResearchProviderBlockedError } from "../server/research.ts";
 import { WORKER_PIPELINE_PROTOCOL_VERSION } from "../server/worker-protocol.ts";
 
 const validAuthorization: AppleAuthorizationRecord = {
@@ -76,6 +77,27 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
 
   await research.enqueueJob({ kind: "research" });
   expect(source.enqueueJob).toHaveBeenCalledTimes(1);
+  expect("claimResearchProviderRetry" in research).toBe(true);
+  expect("validateResearchProviderAttempt" in research).toBe(true);
+  expect("persistResearchProviderBlocker" in research).toBe(true);
+  expect("resolveResearchProviderBlocker" in research).toBe(true);
+  const researchAuthority = { expectedGeneration: "generation" } as any;
+  await research.resolveResearchProviderBlocker?.(
+    "run-1",
+    researchAuthority,
+  );
+  expect(source.resolveResearchProviderBlocker).toHaveBeenCalledWith(
+    "run-1",
+    researchAuthority,
+  );
+  await research.validateResearchProviderAttempt?.(
+    "run-1",
+    researchAuthority,
+  );
+  expect(source.validateResearchProviderAttempt).toHaveBeenCalledWith(
+    "run-1",
+    researchAuthority,
+  );
 
   // Catalog discovery happens behind the matching worker facade in
   // production. If this capability is omitted, direct repository tests pass
@@ -86,6 +108,21 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
     policyVersion: "relevance_first_2026_07",
   });
   expect(source.persistCatalogDiscoveredCandidates).toHaveBeenCalledTimes(1);
+  expect("persistCatalogProviderBlocker" in matching).toBe(true);
+  expect("claimCatalogProviderRetry" in matching).toBe(true);
+  expect("resolveCatalogProviderBlocker" in matching).toBe(true);
+  const recoveredOutcome = { status: "no_compatible_tracks" } as any;
+  const retryAuthority = { expectedGeneration: "generation" } as any;
+  await matching.resolveCatalogProviderBlocker?.(
+    "run-1",
+    recoveredOutcome,
+    retryAuthority,
+  );
+  expect(source.resolveCatalogProviderBlocker).toHaveBeenCalledWith(
+    "run-1",
+    recoveredOutcome,
+    retryAuthority,
+  );
 
   expect("getManifestPreflightReserveTracks" in publication).toBe(true);
   await publication.getManifestPreflightReserveTracks?.("manifest-1", "revision-1", "us");
@@ -108,15 +145,48 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   await publication.acquireAppleWritePermit?.({
     runId: "run-1",
     manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    contractRevisionId: null,
+    contractHash: null,
+    executionFence: null,
     publicationVolumeId: "volume-1",
     operation: "append_tracks",
   });
   expect(source.acquireAppleWritePermit).toHaveBeenCalledWith({
     runId: "run-1",
     manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    contractRevisionId: null,
+    contractHash: null,
+    executionFence: null,
     publicationVolumeId: "volume-1",
     operation: "append_tracks",
   });
+  const completionFence = {
+    runId: "run-1",
+    manifestId: "manifest-1",
+    manifestRevisionId: "revision-1",
+    manifestRevisionHash: "a".repeat(64),
+    contractRevisionId: null,
+    contractHash: null,
+    executionFence: null,
+    selectedCount: 1,
+    terminalStatus: "complete" as const,
+    publicationVolumes: [{
+      publicationVolumeId: "volume-1",
+      attempt: 0,
+      applePlaylistId: "p.test",
+      appendedCount: 1,
+      startPosition: 0,
+      endPosition: 0,
+    }],
+    pipelineOutcome: null,
+  };
+  expect("commitPublicationCompletion" in publication).toBe(true);
+  await publication.commitPublicationCompletion?.(completionFence);
+  expect(source.commitPublicationCompletion).toHaveBeenCalledWith(completionFence);
 });
 
 test("production worker refuses startup when provider or encryption secrets are absent", () => {
@@ -193,13 +263,22 @@ test("deep workers advertise and lease only the deep lane without authorization 
     await waitFor(() => harness.repository.leaseNextJob.mock.calls.length > 0);
     expect(harness.repository.updateWorkerHeartbeat).toHaveBeenCalledWith(
       expect.any(String),
-      expect.objectContaining({ queueClass: "deep" }),
+      expect.objectContaining({
+        queueClass: "deep",
+        semanticExecutionConfigurationHash:
+          expect.stringMatching(/^[0-9a-f]{64}$/u),
+      }),
     );
     expect(harness.repository.leaseNextJob).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(Number),
       expect.any(Object),
       "deep",
+      expect.objectContaining({
+        executorRevision: expect.any(String),
+        semanticExecutionConfigurationHash:
+          expect.stringMatching(/^[0-9a-f]{64}$/u),
+      }),
     );
     expect(harness.repository.getAppleAuthorization).not.toHaveBeenCalled();
     expect(harness.repository.listWaitingPublicationManifests).not.toHaveBeenCalled();
@@ -527,6 +606,40 @@ test("visitor deletion aborts an active lease without requeueing it", async () =
     await waitFor(() => harness.repository.cancelLeasedJob.mock.calls.length === 1);
     expect(harness.repository.deferJob).not.toHaveBeenCalled();
     expect(harness.repository.completeJob).not.toHaveBeenCalled();
+  } finally {
+    await runner.stop();
+    await running;
+  }
+});
+
+test("a durably committed factual research provider pause completes only its current lease", async () => {
+  const harness = runnerHarness();
+  const runner = new WorkerRunner(harness.repository, {
+    concurrency: 1,
+    pollMs: 5,
+    controlIntervalMs: 60_000,
+    heartbeatMs: 60_000,
+    renewMs: 60_000,
+    handlers: {
+      research: async () => {
+        throw new ResearchProviderBlockedError(
+          "00000000-0000-4000-8000-000000000100",
+        );
+      },
+    },
+  });
+  const running = runner.run();
+  try {
+    await waitFor(
+      () => harness.repository.completeJob.mock.calls.length === 1,
+    );
+    expect(harness.repository.completeJob).toHaveBeenCalledWith(
+      harness.job.id,
+      expect.any(String),
+      harness.job.leaseEpoch,
+    );
+    expect(harness.repository.failJob).not.toHaveBeenCalled();
+    expect(harness.repository.deferJob).not.toHaveBeenCalled();
   } finally {
     await runner.stop();
     await running;

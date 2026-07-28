@@ -47,8 +47,20 @@ export function pipelineV3ActivationPreconditionFailure(input: {
 export function createPipelineV3ActivationContract(
   selectionPlan: SelectionPlanV3,
   graphSnapshotId: string,
+  contract: {
+    readonly briefContractVersion?: 1 | 2 | 3;
+    readonly executionDeltaHash?: string;
+    readonly playlistContractRevisionId?: string;
+    readonly playlistContractSemanticHash?: string;
+    readonly playlistContractCompilerVersion?: string;
+  } = {},
 ): PipelineV3ActivationContract {
-  const queryPlan = createRuntimeQueryPlanV3(selectionPlan, graphSnapshotId);
+  const queryPlan = createRuntimeQueryPlanV3(
+    selectionPlan,
+    graphSnapshotId,
+    process.env,
+    contract,
+  );
   return Object.freeze({
     queryPlan,
     planHash: queryPlanV3Hash(queryPlan),

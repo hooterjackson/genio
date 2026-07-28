@@ -1,6 +1,11 @@
 # Schema 16 extension audit
 
-Status: design input for release 2.3.0. Release 2.2.2 only makes schema 16 readable; it does not create this migration or activate contract 2, query-plan schema 3, guidance, diagnostics, or new traffic.
+Status: historical design input for release 2.3.0. Do not use this document as
+the current deployment contract. The implementation has advanced through the
+expand-only schema-18 recovery foundation, worker protocol 10, brief contract
+3, and query-plan schema 4 in migrations `0016_playlist_contract_foundation.sql`
+and `0017_playlist_recovery_foundation.sql`. The remainder below preserves the
+schema-16 review rationale for audit history.
 
 ## Existing systems to extend
 

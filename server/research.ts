@@ -17,6 +17,7 @@ import type {
   SourceRecordInput,
   TrackCandidateInput,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   createOpenAIResponse,
   GUIDANCE_SCOUT_MAX_COST_USD,
@@ -33,6 +34,7 @@ import {
 } from "./security.ts";
 import { bestAdapters, createAdapterRegistry } from "./adapters.ts";
 import {
+  applyExecutableRequestedTrackCount,
   canonicalBriefForRequest,
   deterministicBriefFallback,
   estimateResearchCost,
@@ -93,6 +95,7 @@ import {
 import { createSelectionPlanV2, selectionPlanResearchContext } from "./selection-plan-v2.ts";
 import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
 import {
+  PipelineV3DependencyUnavailableError,
   PipelineV3WorkerExecution,
   type PipelineV3RetrievalExecutionPort,
   type PipelineV3WorkerRepository,
@@ -102,9 +105,14 @@ import type { ColdCorpusBuilderPortV3 } from "./pipeline-v3-corpus-builder.ts";
 import { pipelineV3ResearchJob } from "./research-resume.ts";
 import type { JobQueueClass } from "./job-queue-class.ts";
 import {
+  parseReleaseManifestCanaryMarker,
+  RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+} from "./release-manifest-canary.ts";
+import {
   criticalAmbiguityAnswersFromGuidanceV3,
   criticalGuidanceQuestionsV3,
   createRunSpecV3,
+  deterministicGuidanceQuestionsV3,
   resolveRunSpecV3,
 } from "./selection-plan-v3.ts";
 import { validateProductionGuidedScoutV3 } from "./pipeline-v3-policy.ts";
@@ -114,6 +122,20 @@ import {
   guidanceQuestionSetHashV2,
   guidanceRequestClassificationV2,
 } from "./guidance-contract-v2.ts";
+import {
+  deterministicGuidanceCandidatesV3,
+  selectGuidanceRoundV3,
+} from "./adaptive-guidance-v3.ts";
+import { publicGuidanceQuestionV3 } from "./adaptive-guidance-contract-bridge.ts";
+import {
+  compilePlaylistContractShadowV1,
+  PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
+} from "./playlist-contract-shadow-bridge-v1.ts";
+import {
+  assertPlaylistContractIntegrityV1,
+  type PlaylistContractRevisionV1,
+} from "./playlist-contract-v1.ts";
+import { assessPlaylistFeasibilityV1 } from "./playlist-feasibility-v1.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -125,6 +147,44 @@ export type ResearchPhase =
   | "track_verification"
   | "catalog_enrichment"
   | "gap_analysis";
+
+export interface ResearchProviderJobAuthorityV2 {
+  jobId: string;
+  workerId: string;
+  leaseEpoch: number;
+  providerDependencyRetry: boolean;
+  expectedGeneration: string | null;
+  priorFailureCount: number;
+  claimToken: string | null;
+}
+
+export interface ResearchProviderBlockerV2 {
+  schemaVersion: 1;
+  kind: "provider";
+  dependencyKey: "openai_research";
+  reasonCode: "research_provider_unavailable";
+  phase: ResearchPhase;
+  gapAttempt: number;
+  researchGeneration: number;
+  segment: number;
+  eligibleCandidateCount: number;
+  failureCount: number;
+  retryAfterUntil: string | null;
+  openedAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Signals that a factual V2 pass committed a durable provider pause. The
+ * worker must complete the current queue item without applying its generic
+ * success/failure transitions; the exact successor generation owns recovery.
+ */
+export class ResearchProviderBlockedError extends Error {
+  readonly name = "ResearchProviderBlockedError";
+  constructor(readonly generation: string | null = null) {
+    super("Research provider is durably blocked");
+  }
+}
 
 export interface ResearchPassReport {
   phase: ResearchPhase;
@@ -219,7 +279,10 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
   getBriefRequest(briefRequestId: string): Promise<{
     id: string;
     prompt: string;
+    /** Immutable count from the original submitted brief request. */
     requestedTrackCount?: number | null;
+    /** Active successor-contract count used for finalization and execution. */
+    executionRequestedTrackCount?: number | null;
     model: string;
     status: "queued" | "processing" | "awaiting_answers" | "finalizing" | "complete" | "failed";
     brief?: PlaylistBrief | null;
@@ -227,7 +290,7 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     answers?: PlaylistGuidanceAnswer[];
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
-    briefContractVersion?: 1 | 2;
+    briefContractVersion?: 1 | 2 | 3;
     questionSetHash?: string | null;
     guidancePreferences?: PlaylistGuidancePreference[];
   } | null>;
@@ -239,10 +302,58 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     guidanceSourceHints?: PlaylistGuidanceSourceHint[];
     guidanceTelemetry?: PlaylistGuidanceTelemetry | null;
     guidanceContract?: PlaylistGuidanceQuestionSetContract;
+    selectionPlan?: SelectionPlan;
     estimateUsd?: number;
     error?: string | null;
   }): Promise<void>;
   saveBriefSelectionPlan?(briefRequestId: string, plan: SelectionPlan): Promise<void>;
+  getActivePlaylistContractRevision?(input: {
+    briefRequestId?: string | null;
+    runId?: string | null;
+  }): Promise<{
+    id: string;
+    contractHash: string;
+    contract: Record<string, unknown>;
+  } | null>;
+  preparePlaylistRunRescueGuidance?(input: {
+    runId: string;
+    contractRevisionId: string;
+    contractSemanticHash: string;
+    limitingClauseIds: readonly string[];
+    fence: PipelineV3WriteFence;
+  }): Promise<unknown | null>;
+  savePlaylistContractRevision?(input: {
+    briefRequestId: string;
+    expectedParentRevisionId: string | null;
+    contractHash: string;
+    contract: Record<string, unknown>;
+    compilerVersion: string;
+    ontologyVersion: string;
+    evidencePolicyVersion: string;
+    questionTemplateVersion: string;
+    catalogPolicyVersion: string;
+    locale: string;
+    storefront: string;
+    answerLineageHash: string;
+  }): Promise<{ id: string; contractHash: string; contract: Record<string, unknown> }>;
+  savePlaylistFeasibilitySnapshot?(input: {
+    contractRevisionId: string;
+    phase: "initial";
+    assessment:
+      | "contradictory"
+      | "known_ceiling"
+      | "likely"
+      | "at_risk"
+      | "unknown"
+      | "frontier_exhausted_under_policy";
+    targetCount: number;
+    observedQualifiedCount: number;
+    projectedLowerCount: number | null;
+    projectedUpperCount: number | null;
+    confidence: number | null;
+    reportHash: string;
+    report: Record<string, unknown>;
+  }): Promise<{ id: string; created: boolean }>;
   getRun(runId: string): Promise<ResearchRunRecord>;
   updateRun(runId: string, patch: {
     status?: string;
@@ -251,17 +362,61 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     approvedBudget?: number;
     noNewGapPasses?: number;
     error?: string | null;
-  }, fence?: PipelineV3WriteFence): Promise<void>;
+  }, fence?: PipelineV3WriteFence | ResearchProviderJobAuthorityV2): Promise<void>;
   getCoverage(runId: string): Promise<Record<string, unknown>>;
-  addSources(runId: string, sources: SourceRecordInput[]): Promise<Map<string, string>>;
-  addCitationAttestations(runId: string, attestations: readonly HostedCitationAttestation[]): Promise<void>;
-  addCandidates(runId: string, candidates: TrackCandidateInput[], sourceIds: Map<string, string>, verificationPhase: ResearchPhase): Promise<number>;
+  addSources(
+    runId: string,
+    sources: SourceRecordInput[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<Map<string, string>>;
+  addCitationAttestations(
+    runId: string,
+    attestations: readonly HostedCitationAttestation[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<void>;
+  addCandidates(
+    runId: string,
+    candidates: TrackCandidateInput[],
+    sourceIds: Map<string, string>,
+    verificationPhase: ResearchPhase,
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<number>;
   listCandidates?(runId: string): Promise<Array<TrackCandidateInput & { id: string }>>;
-  upsertFrontier(runId: string, items: SourceFrontierItem[]): Promise<void>;
-  upsertResearchContainers(runId: string, items: ResearchContainerInput[]): Promise<void>;
+  upsertFrontier(
+    runId: string,
+    items: SourceFrontierItem[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<void>;
+  upsertResearchContainers(
+    runId: string,
+    items: ResearchContainerInput[],
+    authority?: ResearchProviderJobAuthorityV2 | null,
+  ): Promise<void>;
   listResearchContainers(runId: string): Promise<ResearchContainerView[]>;
   getResearchCheckpoint(runId: string, checkpointKey: string): Promise<unknown | null>;
-  saveResearchCheckpoint(runId: string, checkpointKey: string, checkpoint: unknown, fence?: PipelineV3WriteFence): Promise<void>;
+  saveResearchCheckpoint(
+    runId: string,
+    checkpointKey: string,
+    checkpoint: unknown,
+    fence?: PipelineV3WriteFence | ResearchProviderJobAuthorityV2,
+  ): Promise<void>;
+  claimResearchProviderRetry?(
+    runId: string,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<{ claimToken: string } | null>;
+  validateResearchProviderAttempt?(
+    runId: string,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<boolean>;
+  persistResearchProviderBlocker?(
+    runId: string,
+    blocker: ResearchProviderBlockerV2,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<{ generation: string }>;
+  resolveResearchProviderBlocker?(
+    runId: string,
+    authority: ResearchProviderJobAuthorityV2,
+  ): Promise<boolean>;
   enqueueJob(input: {
     kind: string;
     runId?: string | null;
@@ -275,6 +430,7 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     queryPlanRevisionId?: string | null;
     stageKey?: string;
     queueClass?: JobQueueClass;
+    workerWriteFence?: ResearchProviderJobAuthorityV2;
   }): Promise<unknown>;
   reserveProviderCost(subject: { runId?: string | null; briefRequestId?: string | null } | string, operation: string, maximumCostUsd: number): Promise<ProviderCostReservation>;
   reconcileProviderCost(reservationId: string, actualCostUsd: number, usage?: unknown): Promise<void>;
@@ -302,11 +458,18 @@ async function addCandidateRowsPreservingValid(
   candidates: TrackCandidateInput[],
   sourceIds: Map<string, string>,
   verificationPhase: ResearchPhase,
+  authority?: ResearchProviderJobAuthorityV2 | null,
 ): Promise<{ added: number; rejected: number }> {
   if (candidates.length === 0) return { added: 0, rejected: 0 };
   try {
     return {
-      added: await repository.addCandidates(runId, candidates, sourceIds, verificationPhase),
+      added: await repository.addCandidates(
+        runId,
+        candidates,
+        sourceIds,
+        verificationPhase,
+        authority,
+      ),
       rejected: 0,
     };
   } catch (error) {
@@ -321,6 +484,7 @@ async function addCandidateRowsPreservingValid(
       candidates.slice(0, midpoint),
       sourceIds,
       verificationPhase,
+      authority,
     );
     const right = await addCandidateRowsPreservingValid(
       repository,
@@ -328,6 +492,7 @@ async function addCandidateRowsPreservingValid(
       candidates.slice(midpoint),
       sourceIds,
       verificationPhase,
+      authority,
     );
     return {
       added: left.added + right.added,
@@ -1326,6 +1491,7 @@ export class ResearchOrchestrator {
       matchingPayload?: Record<string, unknown>;
       matchingDedupeKey?: string;
     },
+    authority?: ResearchProviderJobAuthorityV2,
   ): Promise<"matching" | "partial"> {
     const eligibleCount = Math.max(0, Math.floor(eligibleCandidateCount));
     const run = await this.repository.getRun(runId);
@@ -1342,7 +1508,7 @@ export class ResearchOrchestrator {
         status: "no_compatible_tracks",
         phase: options.emptyPhase,
         error: null,
-      });
+      }, authority);
       return "partial";
     }
 
@@ -1350,12 +1516,13 @@ export class ResearchOrchestrator {
       status: "ready_for_matching",
       phase: catalogFirstRecovery ? "research_empty_catalog_handoff" : options.readyPhase,
       error: null,
-    });
+    }, authority);
     await this.repository.enqueueJob({
       kind: "matching",
       runId,
       payload: { runId, storefront: storefrontForRun(run), ...(options.matchingPayload ?? {}) },
       dedupeKey: options.matchingDedupeKey ?? `matching:${runId}`,
+      workerWriteFence: authority,
     });
     return "matching";
   }
@@ -1363,9 +1530,34 @@ export class ResearchOrchestrator {
   async enqueue(runId: string): Promise<void> {
     const run = await this.repository.getRun(runId);
     const pipeline = persistedWorkerPipeline(run);
+    const markerValue = await this.repository.getResearchCheckpoint(
+      runId,
+      RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+    );
     if (pipeline.route === "corpus_first_v3") {
-      await this.repository.enqueueJob(pipelineV3ResearchJob(runId, pipeline.queryPlan!));
+      const marker = markerValue === null
+        ? null
+        : parseReleaseManifestCanaryMarker(markerValue);
+      if (markerValue !== null && !marker) {
+        throw new HttpError(
+          409,
+          "Manifest-only release canary authority is malformed",
+          "release_manifest_canary_integrity",
+        );
+      }
+      await this.repository.enqueueJob(pipelineV3ResearchJob(
+        runId,
+        pipeline.queryPlan!,
+        marker ? "shadow" : "active",
+      ));
       return;
+    }
+    if (markerValue !== null) {
+      throw new HttpError(
+        409,
+        "Manifest-only release canaries require Pipeline V3",
+        "release_manifest_canary_contract_invalid",
+      );
     }
     const resume = await this.repository.getResearchCheckpoint(runId, "resume") as { phase?: ResearchPhase; gapAttempt?: number; generation?: number; segment?: number } | null;
     const policy = researchExecutionPolicyForRun({ ...run, selectionPlan: pipeline.selectionPlan });
@@ -1413,6 +1605,7 @@ export class ResearchOrchestrator {
       segment?: number;
       status?: string;
     },
+    authority?: ResearchProviderJobAuthorityV2,
   ): Promise<void> {
     if (resume.status === "queued" && resume.phase
       && ([...PHASES, "gap_analysis"] as string[]).includes(resume.phase)) {
@@ -1424,6 +1617,7 @@ export class ResearchOrchestrator {
         runId,
         payload: { runId, phase: resume.phase, gapAttempt, generation, segment },
         dedupeKey: `research:${runId}:${checkpointKey(resume.phase, gapAttempt)}:g${generation}`,
+        workerWriteFence: authority,
       });
       return;
     }
@@ -1436,6 +1630,7 @@ export class ResearchOrchestrator {
           runId,
           payload: { runId, storefront: storefrontForRun(run) },
           dedupeKey: `matching:${runId}`,
+          workerWriteFence: authority,
         });
       }
     }
@@ -1446,6 +1641,7 @@ export class ResearchOrchestrator {
     run: ResearchRunRecord,
     payload: Record<string, unknown>,
     signal?: AbortSignal,
+    authority?: ResearchProviderJobAuthorityV2,
   ): Promise<void> {
     if (["publishing", "waiting_for_apple_authorization", "complete", "partial", "failed", "expired", "deleted"]
       .includes(run.status)) return;
@@ -1493,12 +1689,13 @@ export class ResearchOrchestrator {
         status: "ready_for_matching",
         phase: "catalog_refill_research_complete",
         error: null,
-      });
+      }, authority);
       await this.repository.enqueueJob({
         kind: "matching",
         runId,
         payload: matchingPayload,
         dedupeKey: `matching-refill:${runId}:${generation}`,
+        workerWriteFence: authority,
       });
     };
     const completed = await this.repository.getResearchCheckpoint(runId, completionKey) as { status?: string } | null;
@@ -1529,13 +1726,17 @@ export class ResearchOrchestrator {
         deadlineAt: route.deadlineAt,
         completedAt: new Date().toISOString(),
         ...values,
-      });
+      }, authority);
       await handoff();
     };
 
     try {
       assertActive(signal);
-      await this.repository.updateRun(runId, { status: "researching", phase: "catalog_refill_research", error: null });
+      await this.repository.updateRun(
+        runId,
+        { status: "researching", phase: "catalog_refill_research", error: null },
+        authority,
+      );
       if (!this.repository.listCandidates) throw new Error("Catalog refill candidate inventory is unavailable");
       const existingCandidates = await this.repository.listCandidates(runId);
       const existingPairKeys = new Set(existingCandidates.map((candidate) => (
@@ -1613,7 +1814,11 @@ export class ResearchOrchestrator {
           0.05,
         );
         const attestations = collectHostedCitationAttestations(response);
-        await this.repository.addCitationAttestations(runId, attestations);
+        await this.repository.addCitationAttestations(
+          runId,
+          attestations,
+          authority,
+        );
         durableSynthesis = fastSynthesisCheckpoint(response, attestations);
         if (durableSynthesis.webSearchCalls > openAIRequestPolicy.maxHostedSearchCalls) {
           throw new FastResearchContractError(
@@ -1621,9 +1826,18 @@ export class ResearchOrchestrator {
             "hosted_search_limit",
           );
         }
-        await this.repository.saveResearchCheckpoint(runId, synthesisKey, durableSynthesis);
+        await this.repository.saveResearchCheckpoint(
+          runId,
+          synthesisKey,
+          durableSynthesis,
+          authority,
+        );
       } else {
-        await this.repository.addCitationAttestations(runId, durableSynthesis.citationAttestations);
+        await this.repository.addCitationAttestations(
+          runId,
+          durableSynthesis.citationAttestations,
+          authority,
+        );
       }
 
       const extracted = extractFastCandidatesFromSynthesis(
@@ -1650,7 +1864,11 @@ export class ResearchOrchestrator {
         ...candidate,
         selectionRank: route.baselineSelectionRank + synthesisIndex + 1,
       }));
-      const sourceIds = await this.repository.addSources(runId, validated.sources);
+      const sourceIds = await this.repository.addSources(
+        runId,
+        validated.sources,
+        authority,
+      );
       let newlyAdded = 0;
       let persistenceRejectedCandidateCount = 0;
       for (let index = 0; index < ranked.length; index += 50) {
@@ -1660,6 +1878,7 @@ export class ResearchOrchestrator {
           ranked.slice(index, index + 50),
           sourceIds,
           "track_verification",
+          authority,
         );
         newlyAdded += persisted.added;
         persistenceRejectedCandidateCount += persisted.rejected;
@@ -1672,7 +1891,7 @@ export class ResearchOrchestrator {
         discoveredCount: route.additionalCandidateGoal,
         recoveredCount: newlyAdded,
         note: `${newlyAdded} new citation-eligible catalog-ready candidates recovered in bounded refill generation ${generation}`,
-      }]);
+      }], authority);
       await finishAtBoundary("complete", {
         extractedCandidateCount: extracted.length,
         rejectedCandidateCount: validated.rejectedCandidateCount + persistenceRejectedCandidateCount,
@@ -1733,6 +1952,7 @@ export class ResearchOrchestrator {
     run: ResearchRunRecord,
     payload: Record<string, unknown>,
     signal?: AbortSignal,
+    authority?: ResearchProviderJobAuthorityV2,
   ): Promise<void> {
     const brief = run.brief;
     const pipeline = persistedWorkerPipeline(run);
@@ -1760,7 +1980,12 @@ export class ResearchOrchestrator {
         throw new Error("Fast research is missing its immutable confirmation deadline");
       }
       route = createFastRouteCheckpoint(policy, confirmedAt);
-      await this.repository.saveResearchCheckpoint(runId, `fast:route:${policy.version}`, route);
+      await this.repository.saveResearchCheckpoint(
+        runId,
+        `fast:route:${policy.version}`,
+        route,
+        authority,
+      );
     }
     for (const [key, expected] of [
       ["fastConfirmedAt", route.confirmedAt],
@@ -1790,6 +2015,7 @@ export class ResearchOrchestrator {
             fastDeadlineAt: route.deadlineAt,
           },
         },
+        authority,
       );
       return;
     }
@@ -1811,7 +2037,7 @@ export class ResearchOrchestrator {
         researchDeadlineAt,
         deadlineAt,
         updatedAt: new Date().toISOString(),
-      });
+      }, authority);
     }
 
     const remainingMs = () => Math.max(0, Date.parse(researchDeadlineAt) - Date.now());
@@ -1824,7 +2050,11 @@ export class ResearchOrchestrator {
 
     try {
       assertActive(signal);
-      await this.repository.updateRun(runId, { status: "researching", phase: "fast_research", error: null });
+      await this.repository.updateRun(
+        runId,
+        { status: "researching", phase: "fast_research", error: null },
+        authority,
+      );
 
       const requestedMinimum = Math.max(1, brief.targetSize?.min ?? 50);
       const diversityInstruction = artistDiversityResearchInstruction(brief, requestedMinimum);
@@ -1915,7 +2145,11 @@ export class ResearchOrchestrator {
           );
           modelCallCount += 1;
           const attestations = collectHostedCitationAttestations(response);
-          await this.repository.addCitationAttestations(runId, attestations);
+          await this.repository.addCitationAttestations(
+            runId,
+            attestations,
+            authority,
+          );
           synthesis = fastSynthesisCheckpoint(response, attestations);
           if (synthesis.webSearchCalls > openAIRequestPolicy.maxHostedSearchCalls) {
             throw new FastResearchContractError(
@@ -1923,9 +2157,18 @@ export class ResearchOrchestrator {
               "hosted_search_limit",
             );
           }
-          await this.repository.saveResearchCheckpoint(runId, synthesisKey, synthesis);
+          await this.repository.saveResearchCheckpoint(
+            runId,
+            synthesisKey,
+            synthesis,
+            authority,
+          );
         } else {
-          await this.repository.addCitationAttestations(runId, synthesis.citationAttestations);
+          await this.repository.addCitationAttestations(
+            runId,
+            synthesis.citationAttestations,
+            authority,
+          );
         }
 
         let extraction = await this.repository.getResearchCheckpoint(runId, extractionKey) as {
@@ -1943,7 +2186,7 @@ export class ResearchOrchestrator {
               ...extraction,
               extractor: "deterministic-evidence-group-v1",
               updatedAt: new Date().toISOString(),
-            });
+            }, authority);
           } else {
             // Compatibility path for a persisted synthesis created before the
             // strict EVIDENCE GROUP protocol. New production responses should
@@ -1991,7 +2234,7 @@ export class ResearchOrchestrator {
               responseId: response.id,
               extractor: "model-compatibility-fallback",
               updatedAt: new Date().toISOString(),
-            });
+            }, authority);
           }
         }
 
@@ -2013,7 +2256,11 @@ export class ResearchOrchestrator {
           ...candidate,
           selectionRank: eligibleBefore + index + 1,
         }));
-        const sourceIds = await this.repository.addSources(runId, validated.sources);
+        const sourceIds = await this.repository.addSources(
+          runId,
+          validated.sources,
+          authority,
+        );
         for (let index = 0; index < rankedCandidates.length; index += 50) {
           assertActive(signal);
           const persisted = await addCandidateRowsPreservingValid(
@@ -2022,6 +2269,7 @@ export class ResearchOrchestrator {
             rankedCandidates.slice(index, index + 50),
             sourceIds,
             "track_verification",
+            authority,
           );
           newlyAdded += persisted.added;
           totalRejected += persisted.rejected;
@@ -2064,7 +2312,7 @@ export class ResearchOrchestrator {
             ? `${candidateGoal - requestedMinimum} additional citation-eligible candidates are available to backfill catalog misses`
             : `${reserveShortfall} reserve candidates were not recovered before the bounded fast cutoff`,
         },
-      ]);
+      ], authority);
       if (shortfall > 0) {
         const outcome = eligibleCount > 0 || pipeline.route === "catalog_first_v2_curated"
           ? "matching"
@@ -2089,7 +2337,7 @@ export class ResearchOrchestrator {
           shortfall,
           candidateGoal,
           reserveShortfall,
-        });
+        }, authority);
         await this.repository.saveResearchCheckpoint(runId, policyKey, {
           status: "shortfall",
           profile: policy.version,
@@ -2102,7 +2350,7 @@ export class ResearchOrchestrator {
           shortfall,
           citationEligibleCandidateCount: eligibleCount,
           next: outcome,
-        });
+        }, authority);
         await this.handoffBestEffortResearch(runId, eligibleCount, {
           readyPhase: "research_shortfall_handoff",
           emptyPhase: "research_empty",
@@ -2112,7 +2360,7 @@ export class ResearchOrchestrator {
             fastResearchDeadlineAt: route.researchDeadlineAt,
             fastDeadlineAt: route.deadlineAt,
           },
-        });
+        }, authority);
         return;
       }
       await this.repository.saveResearchCheckpoint(runId, completionKey, {
@@ -2134,7 +2382,7 @@ export class ResearchOrchestrator {
         shortfall,
         candidateGoal,
         reserveShortfall,
-      });
+      }, authority);
       await this.repository.saveResearchCheckpoint(runId, policyKey, {
         status: "complete",
         profile: policy.version,
@@ -2144,7 +2392,7 @@ export class ResearchOrchestrator {
         researchDeadlineAt,
         deadlineAt,
         completedAt: new Date().toISOString(),
-      });
+      }, authority);
       await this.handoffBestEffortResearch(runId, eligibleCount, {
         readyPhase: "research_complete",
         emptyPhase: "research_empty",
@@ -2154,7 +2402,7 @@ export class ResearchOrchestrator {
           fastResearchDeadlineAt: route.researchDeadlineAt,
           fastDeadlineAt: route.deadlineAt,
         },
-      });
+      }, authority);
     } catch (error) {
       if (signal?.aborted) throw error;
       if (remainingMs() <= 0) {
@@ -2176,7 +2424,7 @@ export class ResearchOrchestrator {
           discoveredCount: requestedMinimum,
           recoveredCount: eligibleCount,
           note: `${Math.max(0, requestedMinimum - eligibleCount)} tracks remain below the confirmed minimum at the fixed research cutoff`,
-        }]);
+        }], authority);
         await this.repository.saveResearchCheckpoint(runId, policyKey, {
           status: "deadline",
           profile: policy.version,
@@ -2187,7 +2435,7 @@ export class ResearchOrchestrator {
           deadlineAt,
           error: message,
           updatedAt: new Date().toISOString(),
-        });
+        }, authority);
         await this.repository.saveResearchCheckpoint(runId, completionKey, {
           status: shortfall > 0 ? "shortfall" : "complete",
           next: outcome,
@@ -2204,7 +2452,7 @@ export class ResearchOrchestrator {
           shortfall,
           candidateGoal,
           reserveShortfall,
-        });
+        }, authority);
         await this.handoffBestEffortResearch(runId, eligibleCount, {
           readyPhase: shortfall > 0 ? "research_shortfall_handoff" : "research_deadline_handoff",
           emptyPhase: "research_empty",
@@ -2214,7 +2462,7 @@ export class ResearchOrchestrator {
             fastResearchDeadlineAt: route.researchDeadlineAt,
             fastDeadlineAt: route.deadlineAt,
           },
-        });
+        }, authority);
         return;
       }
       if (error instanceof ProviderRequestError) {
@@ -2242,7 +2490,7 @@ export class ResearchOrchestrator {
           discoveredCount: requestedMinimum,
           recoveredCount: eligibleCount,
           note: `${shortfall} tracks remain below the confirmed minimum because the research provider was unavailable`,
-        }]);
+        }], authority);
         await this.repository.saveResearchCheckpoint(runId, policyKey, {
           status: "provider_error",
           profile: policy.version,
@@ -2252,7 +2500,7 @@ export class ResearchOrchestrator {
           researchDeadlineAt,
           deadlineAt,
           updatedAt: new Date().toISOString(),
-        });
+        }, authority);
         await this.repository.saveResearchCheckpoint(runId, completionKey, {
           status: shortfall > 0 ? "shortfall" : "complete",
           next: outcome,
@@ -2269,7 +2517,7 @@ export class ResearchOrchestrator {
           shortfall,
           candidateGoal,
           reserveShortfall,
-        });
+        }, authority);
         await this.handoffBestEffortResearch(runId, eligibleCount, {
           readyPhase: shortfall > 0 ? "research_shortfall_handoff" : "research_complete",
           emptyPhase: "research_empty",
@@ -2279,7 +2527,7 @@ export class ResearchOrchestrator {
             fastResearchDeadlineAt: route.researchDeadlineAt,
             fastDeadlineAt: route.deadlineAt,
           },
-        });
+        }, authority);
         return;
       }
       throw error;
@@ -2292,12 +2540,67 @@ export class ResearchOrchestrator {
     const gapAttempt = Number.isInteger(payload.gapAttempt) ? Number(payload.gapAttempt) : 0;
     const generation = Number.isInteger(payload.generation) && Number(payload.generation) >= 0 ? Number(payload.generation) : 0;
     const segment = Number.isInteger(payload.segment) && Number(payload.segment) >= 0 ? Number(payload.segment) : 0;
+    const providerDependencyRetry = payload.researchProviderDependencyRetry === true;
+    const providerBlockerGeneration = typeof payload.researchProviderBlockerGeneration === "string"
+      ? payload.researchProviderBlockerGeneration
+      : null;
+    const providerBlockerFailureCount = Number(
+      payload.researchProviderBlockerFailureCount ?? 0,
+    );
+    const jobId = safeString(payload.__jobId, 100);
+    const workerId = safeString(payload.__jobWorkerId, 200);
+    const leaseEpoch = Number(payload.__jobLeaseEpoch);
+    const providerAuthority: ResearchProviderJobAuthorityV2 | null =
+      jobId && workerId && Number.isSafeInteger(leaseEpoch) && leaseEpoch >= 1
+        ? {
+            jobId,
+            workerId,
+            leaseEpoch,
+            providerDependencyRetry,
+            expectedGeneration: providerDependencyRetry
+              ? providerBlockerGeneration
+              : null,
+            priorFailureCount: providerDependencyRetry
+              && Number.isSafeInteger(providerBlockerFailureCount)
+              && providerBlockerFailureCount >= 1
+              ? providerBlockerFailureCount
+              : 0,
+            claimToken: null,
+          }
+        : null;
+    let factualV2 = false;
+    let v2WriteFence: ResearchProviderJobAuthorityV2 | undefined;
     if (!runId) throw new Error("Research job payload is invalid");
+    if (providerDependencyRetry
+      && (!providerAuthority
+        || !providerAuthority.expectedGeneration
+        || providerAuthority.priorFailureCount < 1)) {
+      throw new Error("Research provider retry authority is invalid");
+    }
 
     try {
       assertActive(signal);
       const initialRun = await this.repository.getRun(runId);
       const pipeline = persistedWorkerPipeline(initialRun);
+      factualV2 = pipeline.route === "catalog_first_v2_factual";
+      const pipelineV2 = pipeline.route === "catalog_first_v2_factual"
+        || pipeline.route === "catalog_first_v2_curated";
+      if (pipelineV2 && this.repository.claimResearchProviderRetry) {
+        if (!providerAuthority) {
+          throw new Error("Research worker lease authority is unavailable");
+        }
+        const claimed = await this.repository.claimResearchProviderRetry(
+          runId,
+          providerAuthority,
+        );
+        if (!claimed) {
+          throw new ResearchProviderBlockedError(
+            providerAuthority.expectedGeneration,
+          );
+        }
+        providerAuthority.claimToken = claimed.claimToken;
+        v2WriteFence = providerAuthority;
+      }
       if (pipeline.route === "corpus_first_v3") {
         await this.pipelineV3.process({
           runId,
@@ -2310,7 +2613,13 @@ export class ResearchOrchestrator {
       }
       const executionPolicy = researchExecutionPolicyForRun({ ...initialRun, selectionPlan: pipeline.selectionPlan });
       if (payload.postMatchRefill === true) {
-        await this.processFastPostMatchRefillJob(runId, initialRun, payload, signal);
+        await this.processFastPostMatchRefillJob(
+          runId,
+          initialRun,
+          payload,
+          signal,
+          v2WriteFence,
+        );
         return;
       }
       if (executionPolicy.kind === "fast_curated") {
@@ -2319,7 +2628,13 @@ export class ResearchOrchestrator {
           this.repository.getResearchCheckpoint(runId, `fast:policy:${executionPolicy.version}`),
         ]);
         if (pipeline.route === "catalog_first_v2_curated" || payload.fast === true || routeCheckpoint || fastCheckpoint) {
-          await this.processFastCuratedJob(runId, initialRun, payload, signal);
+          await this.processFastCuratedJob(
+            runId,
+            initialRun,
+            payload,
+            signal,
+            v2WriteFence,
+          );
           return;
         }
       }
@@ -2345,6 +2660,7 @@ export class ResearchOrchestrator {
             runId,
             payload: { runId, phase, gapAttempt, generation: resumeGeneration, segment: resumeSegment },
             dedupeKey: `research:${runId}:${checkpointKey(phase, gapAttempt)}:g${resumeGeneration}`,
+            workerWriteFence: v2WriteFence,
           });
         }
         return;
@@ -2357,7 +2673,11 @@ export class ResearchOrchestrator {
         // Each advancement checkpoint is written before its successor job. If
         // the worker dies in that narrow window, the stale job repairs the
         // idempotent handoff instead of leaving the run permanently stranded.
-        await this.repairCheckpointedHandoff(runId, resume);
+        await this.repairCheckpointedHandoff(
+          runId,
+          resume,
+          v2WriteFence,
+        );
         return;
       }
       const durableLimits = initialRun.pipelinePolicySnapshot?.durableResearchLimits;
@@ -2376,11 +2696,11 @@ export class ResearchOrchestrator {
           completionBlockers: [message],
           next: eligibleCount > 0 ? "matching" : "partial",
           updatedAt: new Date().toISOString(),
-        });
+        }, v2WriteFence);
         await this.handoffBestEffortResearch(runId, eligibleCount, {
           readyPhase: "research_limit_handoff",
           emptyPhase: "research_empty",
-        });
+        }, v2WriteFence);
         return;
       }
       if (segment >= researchSegmentLimit(durableLimits?.segmentsPerPass)) {
@@ -2396,11 +2716,11 @@ export class ResearchOrchestrator {
           completionBlockers: [message],
           next: eligibleCount > 0 ? "matching" : "partial",
           updatedAt: new Date().toISOString(),
-        });
+        }, v2WriteFence);
         await this.handoffBestEffortResearch(runId, eligibleCount, {
           readyPhase: "research_limit_handoff",
           emptyPhase: "research_empty",
-        });
+        }, v2WriteFence);
         return;
       }
       await this.repository.saveResearchCheckpoint(runId, "resume", {
@@ -2410,9 +2730,48 @@ export class ResearchOrchestrator {
         segment,
         status: "active",
         updatedAt: new Date().toISOString(),
-      });
-      await this.repository.updateRun(runId, { status: "researching", phase, error: null });
-      const outcome = await this.runPass(runId, (await this.repository.getRun(runId)).brief, phase, gapAttempt, segment, signal);
+      }, v2WriteFence);
+      if (!providerAuthority?.providerDependencyRetry) {
+        await this.repository.updateRun(
+          runId,
+          { status: "researching", phase, error: null },
+          v2WriteFence,
+        );
+      }
+      const outcome = await this.runPass(
+        runId,
+        (await this.repository.getRun(runId)).brief,
+        phase,
+        gapAttempt,
+        segment,
+        signal,
+        factualV2 ? providerAuthority : null,
+      );
+      if (factualV2
+        && providerAuthority
+        && this.repository.validateResearchProviderAttempt
+        && !await this.repository.validateResearchProviderAttempt(
+          runId,
+          providerAuthority,
+        )) {
+        throw new ResearchProviderBlockedError(
+          providerAuthority.expectedGeneration,
+        );
+      }
+      if (providerAuthority?.providerDependencyRetry) {
+        if (!this.repository.resolveResearchProviderBlocker) {
+          throw new Error("Research provider recovery storage is unavailable");
+        }
+        const resolved = await this.repository.resolveResearchProviderBlocker(
+          runId,
+          providerAuthority,
+        );
+        if (!resolved) {
+          throw new ResearchProviderBlockedError(
+            providerAuthority.expectedGeneration,
+          );
+        }
+      }
       if (outcome.kind === "continue") {
         const nextGeneration = generation + 1;
         if (outcome.nextSegment >= researchSegmentLimit(durableLimits?.segmentsPerPass)) {
@@ -2433,7 +2792,7 @@ export class ResearchOrchestrator {
             completionBlockers: [message],
             next: eligibleCount > 0 ? "matching" : "partial",
             updatedAt: new Date().toISOString(),
-          });
+          }, v2WriteFence);
           await this.repository.saveResearchCheckpoint(runId, `${checkpointKey(phase, gapAttempt)}:segment-limit`, {
             status: "complete",
             phase,
@@ -2441,11 +2800,11 @@ export class ResearchOrchestrator {
             completionBlockers: [message],
             next: eligibleCount > 0 ? "matching" : "partial",
             updatedAt: new Date().toISOString(),
-          });
+          }, v2WriteFence);
           await this.handoffBestEffortResearch(runId, eligibleCount, {
             readyPhase: "research_limit_handoff",
             emptyPhase: "research_empty",
-          });
+          }, v2WriteFence);
           return;
         }
         await this.repository.saveResearchCheckpoint(runId, "resume", {
@@ -2455,18 +2814,30 @@ export class ResearchOrchestrator {
           segment: outcome.nextSegment,
           status: "queued",
           updatedAt: new Date().toISOString(),
-        });
+        }, v2WriteFence);
         await this.repository.enqueueJob({
           kind: "research",
           runId,
           payload: { runId, phase, gapAttempt, generation: nextGeneration, segment: outcome.nextSegment },
           dedupeKey: `research:${runId}:${checkpointKey(phase, gapAttempt)}:g${nextGeneration}`,
+          workerWriteFence: v2WriteFence,
         });
         return;
       }
       assertActive(signal);
-      await this.repository.upsertFrontier(runId, outcome.report.frontierItems);
-      await this.advance(runId, phase, gapAttempt, outcome.report, signal);
+      await this.repository.upsertFrontier(
+        runId,
+        outcome.report.frontierItems,
+        v2WriteFence,
+      );
+      await this.advance(
+        runId,
+        phase,
+        gapAttempt,
+        outcome.report,
+        signal,
+        v2WriteFence,
+      );
     } catch (error) {
       if (error instanceof BudgetPause) {
         const resume = await this.repository.getResearchCheckpoint(runId, "resume") as { generation?: number; segment?: number } | null;
@@ -2477,15 +2848,79 @@ export class ResearchOrchestrator {
           segment: Number(resume?.segment ?? segment),
           status: "paused",
           updatedAt: new Date().toISOString(),
-        });
+        }, v2WriteFence);
         await this.repository.updateRun(runId, {
           status: "awaiting_budget",
           phase,
           error: error.isProviderOverrun ? error.message : null,
-        });
+        }, v2WriteFence);
         return;
       }
       if (error instanceof ProviderRequestError) {
+        if (factualV2) {
+          if (!error.retriable) {
+            await this.repository.updateRun(runId, {
+              status: "failed_system",
+              phase: "research_provider_configuration_quarantine",
+              error: null,
+            }, v2WriteFence);
+            throw new PipelineV3DependencyUnavailableError(
+              "openai_research",
+              `openai_research_${error.failureClass}`,
+              error.retryAfterUntil,
+              error.failureClass,
+            );
+          }
+          // Provider failure is not evidence that the musical frontier is
+          // empty. Preserve both zero and non-zero candidate inventories and
+          // durably pause the exact factual pass instead of handing it to
+          // matching or emitting a scarcity terminal.
+          if (!providerAuthority
+            || !this.repository.persistResearchProviderBlocker) {
+            throw error;
+          }
+          const coverage = await this.repository.getCoverage(runId);
+          const eligibleCount = Math.max(
+            0,
+            Number(
+              coverage.eligibleCandidateCount
+                ?? coverage.candidateCount
+                ?? 0,
+            ),
+          );
+          await this.repository.upsertFrontier(runId, [{
+            sourceClass: "provider",
+            strategy: `provider availability during ${phase}`,
+            cursor: null,
+            status: "unresolved",
+            discoveredCount: 0,
+            recoveredCount: eligibleCount,
+            note: "Research provider was unavailable; preserved all evidence-backed candidates already saved",
+          }], v2WriteFence);
+          const now = new Date().toISOString();
+          const persisted = await this.repository.persistResearchProviderBlocker(
+            runId,
+            {
+              schemaVersion: 1,
+              kind: "provider",
+              dependencyKey: "openai_research",
+              reasonCode: "research_provider_unavailable",
+              phase,
+              gapAttempt,
+              researchGeneration: generation,
+              segment,
+              eligibleCandidateCount: eligibleCount,
+              failureCount: providerAuthority.providerDependencyRetry
+                ? providerAuthority.priorFailureCount + 1
+                : 1,
+              retryAfterUntil: error.retryAfterUntil?.toISOString() ?? null,
+              openedAt: now,
+              updatedAt: now,
+            },
+            providerAuthority,
+          );
+          throw new ResearchProviderBlockedError(persisted.generation);
+        }
         // The deep path has no fixed wall-clock boundary to turn a provider
         // outage into a natural best-effort handoff. Do that explicitly rather
         // than retrying the entire pass until the generic worker failure path
@@ -2523,17 +2958,25 @@ export class ResearchOrchestrator {
     }
   }
 
-  private async advance(runId: string, phase: ResearchPhase, gapAttempt: number, report: ResearchPassReport, signal?: AbortSignal): Promise<void> {
+  private async advance(
+    runId: string,
+    phase: ResearchPhase,
+    gapAttempt: number,
+    report: ResearchPassReport,
+    signal?: AbortSignal,
+    authority?: ResearchProviderJobAuthorityV2,
+  ): Promise<void> {
     assertActive(signal);
     if (phase !== "gap_analysis") {
       const index = PHASES.indexOf(phase);
       const next = index === PHASES.length - 1 ? "gap_analysis" : PHASES[index + 1];
-      await this.repository.saveResearchCheckpoint(runId, "resume", { phase: next, gapAttempt: 0, generation: 0, segment: 0, status: "queued", updatedAt: new Date().toISOString() });
+      await this.repository.saveResearchCheckpoint(runId, "resume", { phase: next, gapAttempt: 0, generation: 0, segment: 0, status: "queued", updatedAt: new Date().toISOString() }, authority);
       await this.repository.enqueueJob({
         kind: "research",
         runId,
         payload: { runId, phase: next, gapAttempt: 0, generation: 0, segment: 0 },
         dedupeKey: `research:${runId}:${checkpointKey(next, 0)}:g0`,
+        workerWriteFence: authority,
       });
       return;
     }
@@ -2559,9 +3002,9 @@ export class ResearchOrchestrator {
         state: "prepared",
         noNewGapPasses: noNew,
         updatedAt: new Date().toISOString(),
-      });
+      }, authority);
     }
-    await this.repository.updateRun(runId, { noNewGapPasses: noNew });
+    await this.repository.updateRun(runId, { noNewGapPasses: noNew }, authority);
     const coverage = await this.repository.getCoverage(runId);
     assertActive(signal);
     const frontier = Array.isArray(coverage.frontier) ? coverage.frontier as SourceFrontierItem[] : [];
@@ -2573,20 +3016,21 @@ export class ResearchOrchestrator {
     const openContainers = unresolvedContainers(containers);
 
     if (noNew >= 2 && completion.ready && unresolvedCompletion.length === 0 && openContainers.length === 0) {
-      await this.repository.updateRun(runId, { status: "ready_for_matching", phase: "research_complete" });
-      await this.repository.saveResearchCheckpoint(runId, "resume", { phase, gapAttempt, generation: 0, segment: 0, status: "complete", updatedAt: new Date().toISOString() });
+      await this.repository.updateRun(runId, { status: "ready_for_matching", phase: "research_complete" }, authority);
+      await this.repository.saveResearchCheckpoint(runId, "resume", { phase, gapAttempt, generation: 0, segment: 0, status: "complete", updatedAt: new Date().toISOString() }, authority);
       await this.repository.enqueueJob({
         kind: "matching",
         runId,
         payload: { runId, storefront: storefrontForRun(run) },
         dedupeKey: `matching:${runId}`,
+        workerWriteFence: authority,
       });
       await this.repository.saveResearchCheckpoint(runId, advanceKey, {
         state: "complete",
         noNewGapPasses: noNew,
         next: "matching",
         updatedAt: new Date().toISOString(),
-      });
+      }, authority);
       return;
     }
 
@@ -2607,28 +3051,29 @@ export class ResearchOrchestrator {
         completionBlockers,
         next: eligibleCount > 0 ? "matching" : "partial",
         updatedAt: new Date().toISOString(),
-      });
+      }, authority);
       await this.repository.saveResearchCheckpoint(runId, advanceKey, {
         state: "complete",
         noNewGapPasses: noNew,
         next: eligibleCount > 0 ? "matching" : "partial",
         completionBlockers,
         updatedAt: new Date().toISOString(),
-      });
+      }, authority);
       await this.handoffBestEffortResearch(runId, eligibleCount, {
         readyPhase: "research_limit_handoff",
         emptyPhase: "research_empty",
-      });
+      }, authority);
       return;
     }
 
     const nextAttempt = gapAttempt + 1;
-    await this.repository.saveResearchCheckpoint(runId, "resume", { phase: "gap_analysis", gapAttempt: nextAttempt, generation: 0, segment: 0, status: "queued", updatedAt: new Date().toISOString() });
+    await this.repository.saveResearchCheckpoint(runId, "resume", { phase: "gap_analysis", gapAttempt: nextAttempt, generation: 0, segment: 0, status: "queued", updatedAt: new Date().toISOString() }, authority);
     await this.repository.enqueueJob({
       kind: "research",
       runId,
       payload: { runId, phase: "gap_analysis", gapAttempt: nextAttempt, generation: 0, segment: 0 },
       dedupeKey: `research:${runId}:gap_analysis:${nextAttempt}:g0`,
+      workerWriteFence: authority,
     });
     await this.repository.saveResearchCheckpoint(runId, advanceKey, {
       state: "complete",
@@ -2636,7 +3081,7 @@ export class ResearchOrchestrator {
       next: `gap_analysis:${nextAttempt}`,
       completionBlockers,
       updatedAt: new Date().toISOString(),
-    });
+    }, authority);
   }
 
   protected async callModel(
@@ -2694,6 +3139,7 @@ export class ResearchOrchestrator {
     gapAttempt: number,
     segment: number,
     signal?: AbortSignal,
+    providerAuthority?: ResearchProviderJobAuthorityV2 | null,
   ): Promise<ResearchPassOutcome> {
     assertActive(signal);
     const persistedRun = await this.repository.getRun(runId);
@@ -2775,7 +3221,7 @@ export class ResearchOrchestrator {
         pendingOutputs: [],
         contextTokens: 0,
         updatedAt: new Date().toISOString(),
-      });
+      }, providerAuthority ?? undefined);
       return { kind: "continue", nextSegment };
     }
     const segmentRequestKey = `${key}:segment:${segment}`;
@@ -2849,7 +3295,11 @@ export class ResearchOrchestrator {
       assertActive(signal);
       const responseAttestations = collectHostedCitationAttestations(response);
       if (responseAttestations.length > 0) {
-        await this.repository.addCitationAttestations(runId, responseAttestations);
+        await this.repository.addCitationAttestations(
+          runId,
+          responseAttestations,
+          providerAuthority,
+        );
         for (const item of responseAttestations) {
           const citationKey = `${item.responseId}\u0000${item.outputItemId}\u0000${item.contentIndex}\u0000${item.startIndex}\u0000${item.endIndex}\u0000${item.sourceUrl}`;
           if (citationKeys.has(citationKey)) continue;
@@ -2975,9 +3425,19 @@ export class ResearchOrchestrator {
               };
               assertActive(signal);
               result.records.forEach((record) => knownUrls.add(normalizeUrl(record.url)));
-              const sourceIds = await this.repository.addSources(runId, result.records);
+              const sourceIds = await this.repository.addSources(
+                runId,
+                result.records,
+                providerAuthority,
+              );
               const automaticContainers = adapterContainerInputs(args.adapter, action, result, sourceIds, target, adapterLedger[ledgerKey]);
-              if (automaticContainers.length > 0) await this.repository.upsertResearchContainers(runId, automaticContainers);
+              if (automaticContainers.length > 0) {
+                await this.repository.upsertResearchContainers(
+                  runId,
+                  automaticContainers,
+                  providerAuthority,
+                );
+              }
               await this.repository.upsertFrontier(runId, [{
                 sourceClass: args.adapter,
                 strategy: adapterLedger[ledgerKey].strategy,
@@ -2986,8 +3446,13 @@ export class ResearchOrchestrator {
                 discoveredCount: advertised,
                 recoveredCount: recovered,
                 note: compactEvidenceNote(result.note),
-              }]);
-              await this.repository.saveResearchCheckpoint(runId, `${key}:adapter-ledger`, adapterLedger);
+              }], providerAuthority);
+              await this.repository.saveResearchCheckpoint(
+                runId,
+                `${key}:adapter-ledger`,
+                adapterLedger,
+                providerAuthority ?? undefined,
+              );
             }
             assertActive(signal);
             result.records.forEach((record) => knownUrls.add(normalizeUrl(record.url)));
@@ -3013,18 +3478,36 @@ export class ResearchOrchestrator {
           } else if (call.name === "upsert_candidates") {
             const batch = validateCandidateBatch(args, knownUrls, phase, brief, blockedSourceClasses, citationAttestations);
             assertActive(signal);
-            const sourceIds = await this.repository.addSources(runId, batch.sources);
+            const sourceIds = await this.repository.addSources(
+              runId,
+              batch.sources,
+              providerAuthority,
+            );
             assertActive(signal);
-            const added = await this.repository.addCandidates(runId, batch.candidates, sourceIds, phase);
+            const added = await this.repository.addCandidates(
+              runId,
+              batch.candidates,
+              sourceIds,
+              phase,
+              providerAuthority,
+            );
             outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ acceptedSources: batch.sources.length, acceptedCandidates: batch.candidates.length, newlyAdded: added }) });
           } else if (call.name === "upsert_containers") {
             const sources = validateSources(args, knownUrls, blockedSourceClasses);
             assertActive(signal);
-            const sourceIds = await this.repository.addSources(runId, sources);
+            const sourceIds = await this.repository.addSources(
+              runId,
+              sources,
+              providerAuthority,
+            );
             const existing = await this.repository.listResearchContainers(runId);
             const containers = validateContainerBatch(args, knownUrls, sourceIds, existing, adapterLedger);
             assertActive(signal);
-            await this.repository.upsertResearchContainers(runId, containers);
+            await this.repository.upsertResearchContainers(
+              runId,
+              containers,
+              providerAuthority,
+            );
             outputs.push({
               type: "function_call_output",
               call_id: call.call_id,
@@ -3099,7 +3582,7 @@ export class ResearchOrchestrator {
           adapterLedger,
           report,
           updatedAt: new Date().toISOString(),
-        });
+        }, providerAuthority ?? undefined);
         return { kind: "complete", report };
       }
 
@@ -3126,7 +3609,7 @@ export class ResearchOrchestrator {
           ...processedCheckpoint,
           status: "complete",
           updatedAt: new Date().toISOString(),
-        });
+        }, providerAuthority ?? undefined);
         const nextSegment = segment + 1;
         await this.repository.saveResearchCheckpoint(runId, key, {
           ...processedCheckpoint,
@@ -3136,10 +3619,15 @@ export class ResearchOrchestrator {
           pendingOutputs: [],
           contextTokens: 0,
           updatedAt: new Date().toISOString(),
-        });
+        }, providerAuthority ?? undefined);
         return { kind: "continue", nextSegment };
       }
-      await this.repository.saveResearchCheckpoint(runId, key, processedCheckpoint);
+      await this.repository.saveResearchCheckpoint(
+        runId,
+        key,
+        processedCheckpoint,
+        providerAuthority ?? undefined,
+      );
       response = await this.callModel(runId, `research.${segmentRequestKey}.${turn + 1}`, stableRequestKey(runId, segmentRequestKey, turn + 1), {
         model: deepResearchModel(),
         max_output_tokens: 4_000,
@@ -3165,7 +3653,11 @@ function requestedTrackCountForV3(
   brief: PlaylistBrief,
 ): number {
   const candidates = [requestedTrackCount, brief.targetSize?.max, brief.targetSize?.min];
-  const count = candidates.find((value) => Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 300);
+  const count = candidates.find((value) => (
+    Number.isInteger(value)
+    && Number(value) >= 1
+    && Number(value) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+  ));
   return count == null ? 50 : Number(count);
 }
 
@@ -3204,10 +3696,24 @@ export async function processBriefInterpretationJob(
       // Chosen effects are persisted separately and consumed by research and
       // sequencing. Re-canonicalize the original brief without folding answer
       // prose into its factual subject, relationship, evidence, or exclusions.
-      const canonicalBrief = canonicalBriefForRequest(request, request.brief!);
+      const executionRequestedTrackCount = request.executionRequestedTrackCount
+        ?? request.requestedTrackCount;
+      const canonicalBrief = canonicalBriefForRequest(
+        { ...request, requestedTrackCount: executionRequestedTrackCount },
+        request.brief!,
+      );
+      const executionBrief = executionRequestedTrackCount == null
+        ? canonicalBrief
+        : applyExecutableRequestedTrackCount(
+            canonicalBrief,
+            executionRequestedTrackCount,
+          );
       const v3Spec = createRunSpecV3({
         prompt: request.prompt,
-        requestedTrackCount: requestedTrackCountForV3(request.requestedTrackCount, canonicalBrief),
+        requestedTrackCount: requestedTrackCountForV3(
+          executionRequestedTrackCount,
+          executionBrief,
+        ),
         storefront: process.env.APPLE_STOREFRONT ?? "us",
       });
       const v3Plan = resolveRunSpecV3(
@@ -3217,16 +3723,16 @@ export async function processBriefInterpretationJob(
       if (!v3Plan.confirmed) throw new Error("Critical playlist scope is unresolved");
       const selectionPlan = createSelectionPlanV2({
         prompt: request.prompt,
-        brief: canonicalBrief,
+        brief: executionBrief,
         guidancePreferences: request.guidancePreferences ?? [],
         storefront: process.env.APPLE_STOREFRONT ?? "us",
       });
-      await repository.saveBriefSelectionPlan?.(briefRequestId, selectionPlan);
       await repository.saveBriefResult(briefRequestId, {
         status: "complete",
         expectedStatus: "finalizing",
-        brief: canonicalBrief,
-        estimateUsd: estimateResearchCost(canonicalBrief),
+        brief: executionBrief,
+        selectionPlan,
+        estimateUsd: estimateResearchCost(executionBrief),
         error: null,
       });
     } catch (error) {
@@ -3331,7 +3837,161 @@ export async function processBriefInterpretationJob(
       storefront: process.env.APPLE_STOREFRONT ?? "us",
     });
     const contractTwo = request.briefContractVersion === 2;
+    const contractThree = request.briefContractVersion === 3;
     const requestClassification = guidanceRequestClassificationV2(v3Spec);
+    const preliminarySelectionPlan = createSelectionPlanV2({
+      prompt: request.prompt,
+      brief: canonicalBrief,
+      guidancePreferences: request.guidancePreferences ?? [],
+      storefront: process.env.APPLE_STOREFRONT ?? "us",
+    });
+
+    if (contractThree) {
+      if (!repository.getActivePlaylistContractRevision
+        || !repository.savePlaylistContractRevision
+        || !repository.savePlaylistFeasibilitySnapshot) {
+        throw new Error("Contract-3 repository capabilities are unavailable");
+      }
+      const shadow = compilePlaylistContractShadowV1({
+        contractId: `brief:${briefRequestId}`,
+        prompt: request.prompt,
+        brief: canonicalBrief,
+        selectionPlan: preliminarySelectionPlan,
+        locale: "en",
+      });
+      let active = await repository.getActivePlaylistContractRevision({
+        briefRequestId,
+      });
+      if (!active) {
+        active = await repository.savePlaylistContractRevision({
+          briefRequestId,
+          expectedParentRevisionId: null,
+          contractHash: shadow.contract.semanticHash,
+          contract: structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+          compilerVersion: shadow.contract.versions.compiler,
+          ontologyVersion: shadow.contract.versions.ontology,
+          evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+          questionTemplateVersion: shadow.contract.versions.questionTemplates,
+          catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+          locale: shadow.contract.locale,
+          storefront: shadow.contract.storefront,
+          answerLineageHash: createHash("sha256")
+            .update(JSON.stringify(shadow.contract.answerLineage))
+            .digest("hex"),
+        });
+      }
+      const activeContract = active.contract as unknown as PlaylistContractRevisionV1;
+      assertPlaylistContractIntegrityV1(activeContract);
+      if (active.contractHash !== activeContract.semanticHash
+        || activeContract.semanticHash !== shadow.contract.semanticHash) {
+        throw new Error("Canonical contract shadow drifted before guidance");
+      }
+      const feasibility = assessPlaylistFeasibilityV1({
+        contractRevisionId: activeContract.revisionId,
+        contractSemanticHash: activeContract.semanticHash,
+        targetTrackCount: activeContract.requestedTrackCount,
+        scope: preliminarySelectionPlan.scopeKind === "fixed_release_container"
+          ? "closed_set"
+          : "open_world",
+        phase: "preview",
+        dependencyHealth: "healthy",
+        eligibleEstimateLower: null,
+        eligibleEstimateUpper: null,
+        closedSetCapacity: null,
+        discoveredCount: 0,
+        qualifiedCount: 0,
+        storefrontSafeCount: 0,
+        contradictions: [],
+        limitingPredicateIds: [],
+        frontiers: [],
+        activeResearchBudgetExhausted: false,
+        policyVersions: {
+          compiler: activeContract.versions.compiler,
+          ontology: activeContract.versions.ontology,
+          evidence: activeContract.versions.evidencePolicy,
+          bridge: PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
+        },
+      });
+      const feasibilitySnapshot = await repository.savePlaylistFeasibilitySnapshot({
+        contractRevisionId: active.id,
+        phase: "initial",
+        assessment: feasibility.state,
+        targetCount: feasibility.targetTrackCount,
+        observedQualifiedCount: 0,
+        projectedLowerCount: feasibility.eligibleEstimateLower,
+        projectedUpperCount: feasibility.eligibleEstimateUpper,
+        confidence: null,
+        reportHash: feasibility.reportHash,
+        report: structuredClone(feasibility) as unknown as Record<string, unknown>,
+      });
+      const candidates = deterministicGuidanceCandidatesV3({
+        prompt: request.prompt,
+        baseContractRevisionId: activeContract.revisionId,
+        baseContractSemanticHash: activeContract.semanticHash,
+        preservedTrackPredicate: shadow.preservedTrackPredicate,
+        ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+        baseContract: activeContract,
+        criticalAmbiguities: v3Spec.criticalAmbiguities,
+      });
+      const round = selectGuidanceRoundV3({
+        stage: "initial",
+        requestShape: requestClassification === "precise"
+          ? "fully_explicit"
+          : preliminarySelectionPlan.scopeKind === "fixed_release_container"
+            ? "fixed_list"
+            : preliminarySelectionPlan.scopeKind === "factual_frontier"
+              ? "factual"
+              : "curated",
+        candidates,
+      });
+      const questions = round.decisions.map(publicGuidanceQuestionV3);
+      const generationMode = questions.length > 0
+        ? "deterministic_critical"
+        : "no_material_questions";
+      const guidanceTelemetry: PlaylistGuidanceTelemetry = {
+        generationMode,
+        requestClassification,
+        guidancePolicyVersion: "adaptive_guidance_v3",
+        questionSetHash: round.roundHash,
+        proposedQuestionCount: candidates.length,
+        acceptedQuestionCount: questions.length,
+        webSearchCalls: 0,
+        validationIssues: Object.entries(round.rejectedDecisionReasons)
+          .map(([id, reason]) => `${id}:${reason}`)
+          .slice(0, 12),
+      };
+      const guidanceContract: PlaylistGuidanceQuestionSetContract = {
+        questionSetHash: round.roundHash,
+        requestClassification,
+        generationMode,
+        guidancePolicyVersion: "adaptive_guidance_v3",
+        locale: activeContract.locale,
+        storefront: activeContract.storefront,
+        targetTrackCount: activeContract.requestedTrackCount,
+        explicitConstraintHash: v3Spec.explicitUserConstraintHash,
+        rejectedQuestionReasons: guidanceTelemetry.validationIssues,
+        baseContractRevisionId: activeContract.revisionId,
+        baseContractSemanticHash: activeContract.semanticHash,
+        guidanceRound: "initial",
+        trigger: round.decisions[0]?.trigger ?? "nuance",
+        axis: round.decisions[0]?.axis ?? null,
+        feasibilitySnapshotId: feasibilitySnapshot.id,
+      };
+      const status = questions.length > 0 ? "awaiting_answers" : "complete";
+      await repository.saveBriefSelectionPlan?.(briefRequestId, preliminarySelectionPlan);
+      await repository.saveBriefResult(briefRequestId, {
+        status,
+        expectedStatus: "queued",
+        brief: canonicalBrief,
+        questions,
+        guidanceSourceHints: [],
+        guidanceTelemetry,
+        guidanceContract,
+        ...(status === "complete" ? { estimateUsd: estimateResearchCost(canonicalBrief) } : {}),
+        error: null,
+      });
+      return;
+    }
 
     let scout: {
       questions: PlaylistGuidanceQuestion[];
@@ -3468,7 +4128,15 @@ export async function processBriefInterpretationJob(
       ].slice(0, 12),
     };
     const criticalQuestions = criticalGuidanceQuestionsV3(v3Spec);
-    const combinedQuestions = combineGuidanceQuestionsV3(criticalQuestions, scout.questions);
+    const deterministicQuestions = contractTwo
+      && criticalQuestions.length === 0
+      && scout.questions.length === 0
+      ? deterministicGuidanceQuestionsV3(v3Spec)
+      : [];
+    const combinedQuestions = combineGuidanceQuestionsV3(
+      criticalQuestions,
+      scout.questions.length > 0 ? scout.questions : deterministicQuestions,
+    );
     const questions = contractTwo
       ? combinedQuestions.map((question) => contractTwoGuidanceQuestion(question, requestClassification))
       : combinedQuestions;
@@ -3479,11 +4147,20 @@ export async function processBriefInterpretationJob(
         proposedQuestionCount: Math.min(3, scout.telemetry.proposedQuestionCount + criticalQuestions.length),
         acceptedQuestionCount: questions.length,
       };
+    } else if (deterministicQuestions.length > 0) {
+      scout.telemetry = {
+        ...scout.telemetry,
+        generationMode: "balanced_default",
+        proposedQuestionCount: Math.min(3, scout.telemetry.proposedQuestionCount + deterministicQuestions.length),
+        acceptedQuestionCount: questions.length,
+      };
     }
     let guidanceContract: PlaylistGuidanceQuestionSetContract | undefined;
     if (contractTwo) {
       const generationMode = criticalQuestions.length > 0
         ? "deterministic_critical"
+        : deterministicQuestions.length > 0
+          ? "balanced_default"
         : scout.telemetry.generationMode;
       const questionSetHash = guidanceQuestionSetHashV2({
         classification: requestClassification,
@@ -3515,12 +4192,7 @@ export async function processBriefInterpretationJob(
       };
     }
     const status = questions.length > 0 ? "awaiting_answers" : "complete";
-    const selectionPlan = createSelectionPlanV2({
-      prompt: request.prompt,
-      brief: canonicalBrief,
-      guidancePreferences: request.guidancePreferences ?? [],
-      storefront: process.env.APPLE_STOREFRONT ?? "us",
-    });
+    const selectionPlan = preliminarySelectionPlan;
     await repository.saveBriefSelectionPlan?.(briefRequestId, selectionPlan);
     await repository.saveBriefResult(briefRequestId, {
       status,

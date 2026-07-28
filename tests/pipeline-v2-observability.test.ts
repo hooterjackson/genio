@@ -78,6 +78,12 @@ describe("Pipeline V2 operational alert policy", () => {
     terminalRuns: 20,
     zeroResultRuns: 0,
     partialRuns: 0,
+    shortfallRuns: 0,
+    systemFailureRuns: 0,
+    integrityFailureRuns: 0,
+    briefFailures: 0,
+    guidanceFailures: 0,
+    stuckWorkItems: 0,
     localContractRejections: 0,
     providerCircuitOpenings: 0,
     paginationLoops: 0,
@@ -94,6 +100,12 @@ describe("Pipeline V2 operational alert policy", () => {
       ...baseline,
       zeroResultRuns: 3,
       partialRuns: 6,
+      shortfallRuns: 7,
+      systemFailureRuns: 1,
+      integrityFailureRuns: 1,
+      briefFailures: 2,
+      guidanceFailures: 1,
+      stuckWorkItems: 1,
       localContractRejections: 2,
       providerCircuitOpenings: 3,
       paginationLoops: 1,
@@ -102,11 +114,25 @@ describe("Pipeline V2 operational alert policy", () => {
     }).map((alert) => alert.kind)).toEqual([
       "pipeline_zero_result_spike",
       "pipeline_partial_rate_elevated",
+      "pipeline_shortfall_rate_elevated",
+      "pipeline_system_failure",
+      "pipeline_integrity_failure",
+      "pipeline_brief_failure",
+      "pipeline_guidance_failure",
+      "pipeline_stuck_work",
       "pipeline_local_contract_rejections",
       "pipeline_provider_circuit_repeated",
       "pipeline_pagination_loop",
       "pipeline_endpoint_drift",
       "pipeline_publication_divergence",
     ]);
+  });
+
+  test("routes guidance failures to one alert class instead of double-notifying as generic brief failures", () => {
+    expect(evaluatePipelineOperationalWindow({
+      ...baseline,
+      briefFailures: 1,
+      guidanceFailures: 1,
+    }).map((alert) => alert.kind)).toEqual(["pipeline_guidance_failure"]);
   });
 });

@@ -32,10 +32,27 @@ function emptyDelta(): PlaylistGuidancePlanDelta {
 function criticalConstraint(
   question: PlaylistGuidanceQuestion,
   optionId: string,
+  effect: PlaylistGuidanceEffect | undefined,
   value: string,
 ): SelectionConstraint | null {
   const id = `guided:${question.decisionKey ?? question.id}:${optionId}`.slice(0, 160);
   const option = optionId.toLocaleLowerCase("en-US");
+  const geography = effect?.geographyConstraint ?? null;
+  if (geography) {
+    return {
+      id,
+      axis: geography.relationship === "language"
+        ? "language"
+        : geography.relationship === "label_or_venue_scene"
+          ? "scene"
+          : "geography",
+      operator: "require",
+      values: [geography.value],
+      kind: "hard",
+      geographyRelationship: geography.relationship,
+      relaxationRank: null,
+    };
+  }
   if (option.includes("house_genre")) {
     return { id, axis: "genre", operator: "require", values: ["house"], kind: "hard", relaxationRank: null };
   }
@@ -96,7 +113,7 @@ function deltaFromLegacyEffect(
   const delta = emptyDelta();
   const value = normalized(effect?.value || displayValue).slice(0, 500);
   if (question.criticality === "required" || question.id.startsWith("v3-critical:")) {
-    const constraint = criticalConstraint(question, optionId, value);
+    const constraint = criticalConstraint(question, optionId, effect, value);
     if (constraint) delta.membershipConstraints.push(constraint);
     else delta.discoveryFocus.push(value);
     return delta;

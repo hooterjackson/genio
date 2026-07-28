@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import * as databaseSchema from "../db/schema.ts";
 import { Repository } from "../server/repository.ts";
 import { ResearchOrchestrator } from "../server/research.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
@@ -66,7 +68,10 @@ databaseDescribe("schema-14 durable worker queue isolation", () => {
        WHERE id=$1`,
       [snapshotId, "a".repeat(64)],
     );
-    repository = new Repository({ pool, db: {} } as never);
+    repository = new Repository({
+      pool,
+      db: drizzle(pool, { schema: databaseSchema }),
+    });
   }, 30_000);
 
   afterAll(async () => {

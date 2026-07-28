@@ -1,0 +1,1061 @@
+name: bootstrap stable predecessor v2.3.4
+
+on:
+  # Repository dispatch is deliberately used instead of workflow_dispatch.
+  # GitHub loads this workflow from the default branch, so an operator cannot
+  # select a branch containing a replacement verifier.
+  repository_dispatch:
+    types: [genio-stable-predecessor-bootstrap-v2-3-4]
+
+concurrency:
+  group: stable-release-mutation
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  BOOTSTRAP_REPOSITORY: hooterjackson/genio
+  BOOTSTRAP_WORKFLOW: .github/workflows/bootstrap-stable-predecessor.yml
+  BOOTSTRAP_IMAGE_WORKFLOW: .github/workflows/bootstrap-stable-predecessor-image.yml
+  STABLE_TAG: v2.3.4
+  COMPATIBILITY_RC_TAG: v2.3.4-rc.1
+  ORIGINAL_TAG_OBJECT: 0fb63ccc88b6f5ea675b3b43506fc112fa3fae58
+  ORIGINAL_SOURCE_REVISION: 7dc877cfc1537a9936974f9699a4b8ba9740b5f5
+  ORIGINAL_SOURCE_TREE: 91076c2f06de9d562532981c3a602f1c6366f057
+
+jobs:
+  verify_recovered_provenance:
+    environment: stable-predecessor-bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      image_reference: ${{ steps.identity.outputs.image_reference }}
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      EXPECTED_IMAGE_DIGEST: ${{ github.event.client_payload.image_digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - id: controller
+        name: Fence the protected default-branch bootstrap controller
+        run: |
+          test "$GITHUB_REPOSITORY" = "$BOOTSTRAP_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test "$GITHUB_SHA" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$BOOTSTRAP_WORKFLOW@refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$(git cat-file -t "$ORIGINAL_TAG_OBJECT")" = "tag"
+          test "$(git rev-parse "$ORIGINAL_TAG_OBJECT^{}")" = "$ORIGINAL_SOURCE_REVISION"
+          test "$(git rev-parse "$ORIGINAL_SOURCE_REVISION^{tree}")" = "$ORIGINAL_SOURCE_TREE"
+          git merge-base --is-ancestor "$ORIGINAL_SOURCE_REVISION" "$GITHUB_SHA"
+          node -e 'const cp=require("node:child_process"); const raw=cp.execFileSync("git",["cat-file","tag",process.env.ORIGINAL_TAG_OBJECT],{encoding:"utf8"}); const expected=`object ${process.env.ORIGINAL_SOURCE_REVISION}\ntype commit\ntag ${process.env.STABLE_TAG}\n`; if(!raw.startsWith(expected)||!raw.endsWith("\n\nRelease v2.3.4\n")) throw new Error("the fixed historical annotated tag object is not exact");'
+      - id: protection
+        name: Authorize read-only provenance recovery from exact GitHub controls
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          BOOTSTRAP_CONTROL_PLANE_TOKEN: >-
+            ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
+          BOOTSTRAP_AUTHORIZED_ACTOR: ${{ vars.STABLE_PREDECESSOR_BOOTSTRAP_ACTOR }}
+          STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
+        with:
+          github-token: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
+          script: |
+            const fail = (message) => {
+              throw new Error(`stable predecessor bootstrap: ${message}`);
+            };
+            if (!process.env.BOOTSTRAP_CONTROL_PLANE_TOKEN) {
+              fail("protected bootstrap control-plane credential is missing");
+            }
+            if (
+              context.repo.owner.toLowerCase() !== "hooterjackson"
+              || context.repo.repo !== "genio"
+              || context.payload.repository?.fork !== false
+              || context.ref
+                !== `refs/heads/${context.payload.repository?.default_branch}`
+              || context.sha !== process.env.GITHUB_SHA
+              || process.env.GITHUB_WORKFLOW_SHA !== context.sha
+            ) {
+              fail("forked, non-default, or replayed controller");
+            }
+            const payload = context.payload.client_payload ?? {};
+            const payloadKeys = Object.keys(payload).sort();
+            const expectedPayloadKeys = [
+              "finalization_evidence_b64url",
+              "image_digest",
+              "original_railway_provenance_attestation_b64url",
+              "protected_baseline_metadata_b64url",
+              "recovered_production_provenance_b64url",
+              "stable_authorization_b64url",
+            ];
+            if (
+              JSON.stringify(payloadKeys) !== JSON.stringify(expectedPayloadKeys)
+              || payloadKeys.length > 10
+              || Buffer.byteLength(JSON.stringify(payload), "utf8") >= 64 * 1024
+              || !/^sha256:[0-9a-f]{64}$/u.test(payload.image_digest ?? "")
+            ) {
+              fail("dispatch has unexpected, oversized, or invalid inputs");
+            }
+            for (const key of expectedPayloadKeys.filter((key) =>
+              key.endsWith("_b64url")
+            )) {
+              const value = payload[key];
+              if (
+                typeof value !== "string"
+                || value.length > 24_000
+                || !/^[0-9A-Za-z_-]+$/u.test(value)
+              ) {
+                fail(`${key} is not bounded canonical base64url`);
+              }
+              const bytes = Buffer.from(value, "base64url");
+              if (
+                bytes.length === 0
+                || bytes.length > 18_000
+                || bytes.toString("base64url") !== value
+              ) {
+                fail(`${key} is not bounded canonical base64url`);
+              }
+            }
+            const authorizedActor =
+              process.env.BOOTSTRAP_AUTHORIZED_ACTOR ?? "";
+            if (
+              !/^[0-9A-Za-z](?:[0-9A-Za-z-]{0,37}[0-9A-Za-z])?$/u
+                .test(authorizedActor)
+              || context.actor !== authorizedActor
+            ) {
+              fail("dispatcher is not the protected bootstrap authority");
+            }
+            const permission =
+              await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: context.actor,
+              });
+            if (permission.data.permission !== "admin") {
+              fail("bootstrap requires an exact repository administrator");
+            }
+            const defaultBranch = context.payload.repository.default_branch;
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+            if (!branch.data.protected || branch.data.commit.sha !== context.sha) {
+              fail("controller is not the current protected default-branch head");
+            }
+            const protection = await github.rest.repos.getBranchProtection({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+            const requiredChecks = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
+            const githubActionsApp = await github.rest.apps.getBySlug({
+              app_slug: "github-actions",
+            });
+            const githubActionsAppId = Number(githubActionsApp.data.id);
+            if (
+              githubActionsApp.data.slug !== "github-actions"
+              || !Number.isSafeInteger(githubActionsAppId)
+              || githubActionsAppId <= 0
+            ) {
+              fail("GitHub Actions Integration identity is invalid");
+            }
+            const configuredChecks =
+              protection.data.required_status_checks?.checks ?? [];
+            if (
+              protection.data.required_status_checks?.strict !== true
+              || configuredChecks.length !== requiredChecks.length
+              || requiredChecks.some((name) =>
+                !configuredChecks.some((check) =>
+                  check.context === name
+                  && Number(check.app_id) === githubActionsAppId
+                )
+              )
+              || (
+                protection.data.required_pull_request_reviews
+                  ?.required_approving_review_count ?? 0
+              ) < 1
+              || protection.data.enforce_admins?.enabled !== true
+            ) {
+              fail(
+                "branch protection lacks exact app-bound checks, approval, or admin enforcement",
+              );
+            }
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForRef,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.sha,
+                filter: "latest",
+                per_page: 100,
+              },
+            );
+            if (requiredChecks.some((name) => {
+              const matches = checkRuns.filter((run) => run.name === name);
+              return matches.length !== 1
+                || Number(matches[0]?.app?.id) !== githubActionsAppId
+                || matches[0]?.status !== "completed"
+                || matches[0]?.conclusion !== "success";
+            })) {
+              fail("controller does not have exact successful app-bound checks");
+            }
+            const associatedPulls = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                per_page: 100,
+              },
+            );
+            const mergedPulls = associatedPulls.filter((pull) =>
+              pull.merged_at
+              && pull.base?.ref === defaultBranch
+              && pull.merge_commit_sha === context.sha
+            );
+            if (mergedPulls.length !== 1) {
+              fail("controller is not one exact reviewed default-branch merge");
+            }
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: mergedPulls[0].number,
+                per_page: 100,
+              },
+            );
+            const latestReviewByActor = new Map();
+            for (const review of reviews) {
+              const actor = review.user?.login;
+              if (actor && review.state !== "COMMENTED") {
+                latestReviewByActor.set(actor, review.state);
+              }
+            }
+            if (
+              ![...latestReviewByActor.entries()].some(([actor, state]) =>
+                actor !== context.actor && state === "APPROVED"
+              )
+            ) {
+              fail("controller merge lacks an independent current approval");
+            }
+            const environment = await github.request(
+              "GET /repos/{owner}/{repo}/environments/{environment_name}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment_name: "stable-predecessor-bootstrap",
+              },
+            );
+            const reviewerRule = (environment.data.protection_rules ?? [])
+              .find((rule) => rule.type === "required_reviewers");
+            if (
+              environment.data.name !== "stable-predecessor-bootstrap"
+              || environment.data.deployment_branch_policy?.protected_branches
+                !== true
+              || environment.data.deployment_branch_policy
+                ?.custom_branch_policies !== false
+              || !reviewerRule
+              || !Array.isArray(reviewerRule.reviewers)
+              || reviewerRule.reviewers.length < 1
+              || (
+                environment.data.prevent_self_review !== true
+                && reviewerRule.prevent_self_review !== true
+              )
+            ) {
+              fail("bootstrap environment lacks protected branches and independent review");
+            }
+            const immutableReleases = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            if (immutableReleases.data.enabled !== true) {
+              fail("repository immutable releases are not enabled");
+            }
+            const rulesetId = Number(process.env.STABLE_TAG_RULESET_ID);
+            if (!Number.isSafeInteger(rulesetId) || rulesetId <= 0) {
+              fail("protected stable tag ruleset identity is missing");
+            }
+            const ruleset = await github.request(
+              "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ruleset_id: rulesetId,
+              },
+            );
+            const ruleTypes = (ruleset.data.rules ?? [])
+              .map(({ type }) => type)
+              .sort();
+            const bypassActors = ruleset.data.bypass_actors ?? [];
+            if (
+              ruleset.data.target !== "tag"
+              || ruleset.data.enforcement !== "active"
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.include ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*"])
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.exclude ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*-rc.*"])
+              || JSON.stringify(ruleTypes)
+                !== JSON.stringify(["creation", "deletion", "update"])
+              || bypassActors.length !== 1
+              || bypassActors[0]?.actor_type !== "Integration"
+              || Number(bypassActors[0]?.actor_id) !== githubActionsAppId
+              || bypassActors[0]?.bypass_mode !== "always"
+            ) {
+              fail("stable tag ruleset is not exact");
+            }
+            const tagRef = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "tags/v2.3.4",
+            });
+            if (
+              tagRef.data.object.type !== "tag"
+              || tagRef.data.object.sha
+                !== "0fb63ccc88b6f5ea675b3b43506fc112fa3fae58"
+            ) {
+              fail("v2.3.4 ref does not resolve to the fixed annotated tag object");
+            }
+            const tag = await github.rest.git.getTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_sha: "0fb63ccc88b6f5ea675b3b43506fc112fa3fae58",
+            });
+            if (
+              tag.data.tag !== "v2.3.4"
+              || tag.data.object.type !== "commit"
+              || tag.data.object.sha
+                !== "7dc877cfc1537a9936974f9699a4b8ba9740b5f5"
+              || tag.data.message !== "Release v2.3.4\n"
+            ) {
+              fail("v2.3.4 annotated tag is not the exact historical object");
+            }
+            const commit = await github.rest.git.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: "7dc877cfc1537a9936974f9699a4b8ba9740b5f5",
+            });
+            if (
+              commit.data.tree.sha
+                !== "91076c2f06de9d562532981c3a602f1c6366f057"
+            ) {
+              fail("v2.3.4 source tree is not exact");
+            }
+            const ancestry = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead:
+                "7dc877cfc1537a9936974f9699a4b8ba9740b5f5..."
+                + context.sha,
+            });
+            if (
+              ancestry.data.status !== "ahead"
+              || ancestry.data.merge_base_commit?.sha
+                !== "7dc877cfc1537a9936974f9699a4b8ba9740b5f5"
+            ) {
+              fail("bootstrap controller is not a descendant of v2.3.4");
+            }
+            const tagRefs = await github.paginate(
+              github.rest.git.listMatchingRefs,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              },
+            );
+            const stableRefs = tagRefs.flatMap((ref) => {
+              const match =
+                /^refs\/tags\/v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(ref.ref ?? "");
+              return match
+                ? [{
+                    ref,
+                    version: [
+                      BigInt(match[1]),
+                      BigInt(match[2]),
+                      BigInt(match[3]),
+                    ],
+                  }]
+                : [];
+            });
+            stableRefs.sort((left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left.version[index] > right.version[index]) return -1;
+                if (left.version[index] < right.version[index]) return 1;
+              }
+              return 0;
+            });
+            if (stableRefs[0]?.ref?.ref !== "refs/tags/v2.3.4") {
+              fail("v2.3.4 is no longer the greatest stable tag");
+            }
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            const hasSuccessorOrLaterStable = releases.some((release) => {
+              const match =
+                /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(release.tag_name ?? "");
+              if (!match) return false;
+              const version = [
+                BigInt(match[1]),
+                BigInt(match[2]),
+                BigInt(match[3]),
+              ];
+              const predecessor = [2n, 3n, 4n];
+              for (let index = 0; index < 3; index += 1) {
+                if (version[index] > predecessor[index]) return true;
+                if (version[index] < predecessor[index]) return false;
+              }
+              return false;
+            });
+            if (hasSuccessorOrLaterStable) {
+              fail("a normal v2.4.0 or later stable release already exists");
+            }
+            const existing = releases.filter((release) =>
+              release.tag_name === "v2.3.4"
+            );
+            if (
+              existing.length > 1
+              || (
+                existing.length === 1
+                && (
+                  existing[0].name !== "v2.3.4"
+                  || existing[0].target_commitish
+                    !== "7dc877cfc1537a9936974f9699a4b8ba9740b5f5"
+                  || existing[0].prerelease !== false
+                  || (!existing[0].draft && existing[0].immutable !== true)
+                )
+              )
+            ) {
+              fail("existing v2.3.4 release has an incompatible identity");
+            }
+            core.setOutput("github_actions_app_id", String(githubActionsAppId));
+            core.setOutput("stable_tag_ruleset_id", String(rulesetId));
+      - id: identity
+        name: Resolve the recovered immutable image identity
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          node -e 'const fs=require("node:fs"); const digest=process.env.EXPECTED_IMAGE_DIGEST??""; if(!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error("expected image digest is invalid"); const name=`ghcr.io/${process.env.REPOSITORY_OWNER.toLowerCase()}/genio`; fs.appendFileSync(process.env.GITHUB_OUTPUT,`image_name=${name}\nimage_reference=${name}@${digest}\n`);'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+      - name: Verify independently signed original Railway provenance
+        env:
+          RECOVERED_PRODUCTION_PROVENANCE_B64URL: ${{ github.event.client_payload.recovered_production_provenance_b64url }}
+          ORIGINAL_RAILWAY_PROVENANCE_ATTESTATION_B64URL: ${{ github.event.client_payload.original_railway_provenance_attestation_b64url }}
+          ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL }}
+          ORIGINAL_RAILWAY_PROVENANCE_KEY_ID: ${{ vars.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID }}
+          ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256: ${{ vars.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256 }}
+        run: |
+          node -e 'const fs=require("node:fs"); const inputs=[["RECOVERED_PRODUCTION_PROVENANCE_B64URL","recovered-production-provenance.json",18000,true],["ORIGINAL_RAILWAY_PROVENANCE_ATTESTATION_B64URL","original-railway-provenance.json",18000,true],["ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL","original-railway-provenance-public-key.pem",4096,false]]; for(const [name,path,limit,json] of inputs){const value=process.env[name]??""; if(!/^[0-9A-Za-z_-]+$/.test(value)||value.length>24000) throw new Error(`${name} is not bounded canonical base64url`); const bytes=Buffer.from(value,"base64url"); if(bytes.length===0||bytes.length>limit||bytes.toString("base64url")!==value) throw new Error(`${name} is empty, oversized, or noncanonical`); if(json) JSON.parse(bytes.toString("utf8")); fs.writeFileSync(path,bytes,{mode:0o600,flag:"wx"});}'
+          node --experimental-transform-types --input-type=module -e 'import fs from "node:fs"; import { verifyStablePredecessorOriginalRailwayProvenanceV1 } from "./scripts/stable-predecessor-bootstrap.ts"; const value=JSON.parse(fs.readFileSync("original-railway-provenance.json","utf8")); const recovered=JSON.parse(fs.readFileSync("recovered-production-provenance.json","utf8")); const verified=verifyStablePredecessorOriginalRailwayProvenanceV1({value,verificationKey:fs.readFileSync("original-railway-provenance-public-key.pem"),approvedKeyId:process.env.ORIGINAL_RAILWAY_PROVENANCE_KEY_ID??"",approvedKeySha256:process.env.ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256??"",recoveredRailwayObservation:recovered,expectedRepository:process.env.GITHUB_REPOSITORY}); if(verified.payload.repository!==process.env.GITHUB_REPOSITORY) throw new Error("original Railway provenance repository differs");'
+
+  publish:
+    needs: [verify_recovered_provenance]
+    environment: stable-predecessor-bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      attestations: read
+      contents: write
+      packages: read
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      EXPECTED_IMAGE_DIGEST: ${{ github.event.client_payload.image_digest }}
+      IMAGE_REFERENCE: ${{ needs.verify_recovered_provenance.outputs.image_reference }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+      - name: Re-fence the exact protected bootstrap controller
+        run: |
+          test "$GITHUB_REPOSITORY" = "$BOOTSTRAP_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test "$GITHUB_SHA" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$BOOTSTRAP_WORKFLOW@refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$IMAGE_REFERENCE" = "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/genio@$EXPECTED_IMAGE_DIGEST"
+          test "$(git cat-file -t "$ORIGINAL_TAG_OBJECT")" = "tag"
+          test "$(git rev-parse "$ORIGINAL_TAG_OBJECT^{}")" = "$ORIGINAL_SOURCE_REVISION"
+          test "$(git rev-parse "$ORIGINAL_SOURCE_REVISION^{tree}")" = "$ORIGINAL_SOURCE_TREE"
+          git merge-base --is-ancestor "$ORIGINAL_SOURCE_REVISION" "$GITHUB_SHA"
+      - name: Materialize exact Git object and controller workflow bytes
+        run: |
+          mkdir bootstrap-source-bytes
+          git cat-file tag "$ORIGINAL_TAG_OBJECT" \
+            > bootstrap-source-bytes/tag-object
+          git cat-file commit "$ORIGINAL_SOURCE_REVISION" \
+            > bootstrap-source-bytes/source-commit
+          git cat-file tree "$ORIGINAL_SOURCE_TREE" \
+            > bootstrap-source-bytes/source-tree
+          git show "$GITHUB_SHA:$BOOTSTRAP_WORKFLOW" \
+            > bootstrap-source-bytes/controller-workflow.yml
+          test -s bootstrap-source-bytes/tag-object
+          test -s bootstrap-source-bytes/source-commit
+          test -s bootstrap-source-bytes/source-tree
+          test -s bootstrap-source-bytes/controller-workflow.yml
+      - id: protection
+        name: Reauthorize the exact GitHub controls before Release writes
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          BOOTSTRAP_CONTROL_PLANE_TOKEN: >-
+            ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
+          BOOTSTRAP_AUTHORIZED_ACTOR: ${{ vars.STABLE_PREDECESSOR_BOOTSTRAP_ACTOR }}
+          STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
+        with:
+          github-token: ${{ secrets.STABLE_PREDECESSOR_BOOTSTRAP_CONTROL_PLANE_TOKEN || github.token }}
+          script: |
+            const fail = (message) => {
+              throw new Error(`stable predecessor bootstrap recheck: ${message}`);
+            };
+            if (!process.env.BOOTSTRAP_CONTROL_PLANE_TOKEN) {
+              fail("protected bootstrap control-plane credential is missing");
+            }
+            const payload = context.payload.client_payload ?? {};
+            const expectedPayloadKeys = [
+              "finalization_evidence_b64url",
+              "image_digest",
+              "original_railway_provenance_attestation_b64url",
+              "protected_baseline_metadata_b64url",
+              "recovered_production_provenance_b64url",
+              "stable_authorization_b64url",
+            ];
+            if (
+              context.repo.owner.toLowerCase() !== "hooterjackson"
+              || context.repo.repo !== "genio"
+              || context.payload.repository?.fork !== false
+              || context.ref
+                !== `refs/heads/${context.payload.repository?.default_branch}`
+              || context.sha !== process.env.GITHUB_SHA
+              || process.env.GITHUB_WORKFLOW_SHA !== context.sha
+              || JSON.stringify(Object.keys(payload).sort())
+                !== JSON.stringify(expectedPayloadKeys)
+              || Object.keys(payload).length > 10
+              || Buffer.byteLength(JSON.stringify(payload), "utf8") >= 64 * 1024
+              || payload.image_digest !== process.env.EXPECTED_IMAGE_DIGEST
+              || !/^sha256:[0-9a-f]{64}$/u.test(payload.image_digest ?? "")
+            ) {
+              fail("repository, controller, or dispatch identity changed");
+            }
+            const authorizedActor =
+              process.env.BOOTSTRAP_AUTHORIZED_ACTOR ?? "";
+            const permission =
+              await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: context.actor,
+              });
+            if (
+              !/^[0-9A-Za-z](?:[0-9A-Za-z-]{0,37}[0-9A-Za-z])?$/u
+                .test(authorizedActor)
+              || context.actor !== authorizedActor
+              || permission.data.permission !== "admin"
+            ) {
+              fail("actor is no longer the exact protected administrator");
+            }
+            const defaultBranch = context.payload.repository.default_branch;
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+            const protection = await github.rest.repos.getBranchProtection({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+            const requiredChecks = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
+            const githubActionsApp = await github.rest.apps.getBySlug({
+              app_slug: "github-actions",
+            });
+            const githubActionsAppId = Number(githubActionsApp.data.id);
+            const configuredChecks =
+              protection.data.required_status_checks?.checks ?? [];
+            if (
+              !branch.data.protected
+              || branch.data.commit.sha !== context.sha
+              || githubActionsApp.data.slug !== "github-actions"
+              || !Number.isSafeInteger(githubActionsAppId)
+              || githubActionsAppId <= 0
+              || protection.data.required_status_checks?.strict !== true
+              || configuredChecks.length !== requiredChecks.length
+              || requiredChecks.some((name) =>
+                !configuredChecks.some((check) =>
+                  check.context === name
+                  && Number(check.app_id) === githubActionsAppId
+                )
+              )
+              || (
+                protection.data.required_pull_request_reviews
+                  ?.required_approving_review_count ?? 0
+              ) < 1
+              || protection.data.enforce_admins?.enabled !== true
+            ) {
+              fail("protected branch or app-bound checks changed");
+            }
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForRef,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.sha,
+                filter: "latest",
+                per_page: 100,
+              },
+            );
+            if (requiredChecks.some((name) => {
+              const matches = checkRuns.filter((run) => run.name === name);
+              return matches.length !== 1
+                || Number(matches[0]?.app?.id) !== githubActionsAppId
+                || matches[0]?.status !== "completed"
+                || matches[0]?.conclusion !== "success";
+            })) {
+              fail("controller check results changed");
+            }
+            const environment = await github.request(
+              "GET /repos/{owner}/{repo}/environments/{environment_name}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment_name: "stable-predecessor-bootstrap",
+              },
+            );
+            const reviewerRule = (environment.data.protection_rules ?? [])
+              .find((rule) => rule.type === "required_reviewers");
+            if (
+              environment.data.name !== "stable-predecessor-bootstrap"
+              || environment.data.deployment_branch_policy?.protected_branches
+                !== true
+              || environment.data.deployment_branch_policy
+                ?.custom_branch_policies !== false
+              || !reviewerRule
+              || !Array.isArray(reviewerRule.reviewers)
+              || reviewerRule.reviewers.length < 1
+              || (
+                environment.data.prevent_self_review !== true
+                && reviewerRule.prevent_self_review !== true
+              )
+            ) {
+              fail("bootstrap environment controls changed");
+            }
+            const immutableReleases = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            if (immutableReleases.data.enabled !== true) {
+              fail("repository immutable releases were disabled");
+            }
+            const rulesetId = Number(process.env.STABLE_TAG_RULESET_ID);
+            if (!Number.isSafeInteger(rulesetId) || rulesetId <= 0) {
+              fail("stable tag ruleset identity is missing");
+            }
+            const ruleset = await github.request(
+              "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ruleset_id: rulesetId,
+              },
+            );
+            const ruleTypes = (ruleset.data.rules ?? [])
+              .map(({ type }) => type)
+              .sort();
+            const bypassActors = ruleset.data.bypass_actors ?? [];
+            if (
+              ruleset.data.target !== "tag"
+              || ruleset.data.enforcement !== "active"
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.include ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*"])
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.exclude ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*-rc.*"])
+              || JSON.stringify(ruleTypes)
+                !== JSON.stringify(["creation", "deletion", "update"])
+              || bypassActors.length !== 1
+              || bypassActors[0]?.actor_type !== "Integration"
+              || Number(bypassActors[0]?.actor_id) !== githubActionsAppId
+              || bypassActors[0]?.bypass_mode !== "always"
+            ) {
+              fail("stable tag ruleset changed");
+            }
+            const tagRef = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "tags/v2.3.4",
+            });
+            const tag = await github.rest.git.getTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_sha: "0fb63ccc88b6f5ea675b3b43506fc112fa3fae58",
+            });
+            const commit = await github.rest.git.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: "7dc877cfc1537a9936974f9699a4b8ba9740b5f5",
+            });
+            if (
+              tagRef.data.object.type !== "tag"
+              || tagRef.data.object.sha
+                !== "0fb63ccc88b6f5ea675b3b43506fc112fa3fae58"
+              || tag.data.tag !== "v2.3.4"
+              || tag.data.object.type !== "commit"
+              || tag.data.object.sha
+                !== "7dc877cfc1537a9936974f9699a4b8ba9740b5f5"
+              || tag.data.message !== "Release v2.3.4\n"
+              || commit.data.tree.sha
+                !== "91076c2f06de9d562532981c3a602f1c6366f057"
+            ) {
+              fail("historical tag, commit, or tree changed");
+            }
+            const tagRefs = await github.paginate(
+              github.rest.git.listMatchingRefs,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              },
+            );
+            const stableVersions = tagRefs.flatMap((ref) => {
+              const match =
+                /^refs\/tags\/v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(ref.ref ?? "");
+              return match
+                ? [{
+                    ref: ref.ref,
+                    version: [
+                      BigInt(match[1]),
+                      BigInt(match[2]),
+                      BigInt(match[3]),
+                    ],
+                  }]
+                : [];
+            });
+            stableVersions.sort((left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left.version[index] > right.version[index]) return -1;
+                if (left.version[index] < right.version[index]) return 1;
+              }
+              return 0;
+            });
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            const hasSuccessorOrLaterStable = releases.some((release) => {
+              const match =
+                /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(release.tag_name ?? "");
+              if (!match) return false;
+              const version = [
+                BigInt(match[1]),
+                BigInt(match[2]),
+                BigInt(match[3]),
+              ];
+              const predecessor = [2n, 3n, 4n];
+              for (let index = 0; index < 3; index += 1) {
+                if (version[index] > predecessor[index]) return true;
+                if (version[index] < predecessor[index]) return false;
+              }
+              return false;
+            });
+            if (
+              stableVersions[0]?.ref !== "refs/tags/v2.3.4"
+              || hasSuccessorOrLaterStable
+            ) {
+              fail("one-time v2.3.4 bootstrap reachability closed");
+            }
+            core.setOutput("github_actions_app_id", String(githubActionsAppId));
+            core.setOutput("stable_tag_ruleset_id", String(rulesetId));
+      - name: Materialize bounded signed bootstrap inputs and pinned public keys
+        env:
+          FINALIZATION_EVIDENCE_B64URL: ${{ github.event.client_payload.finalization_evidence_b64url }}
+          ORIGINAL_RAILWAY_PROVENANCE_ATTESTATION_B64URL: ${{ github.event.client_payload.original_railway_provenance_attestation_b64url }}
+          PROTECTED_BASELINE_METADATA_B64URL: ${{ github.event.client_payload.protected_baseline_metadata_b64url }}
+          RECOVERED_PRODUCTION_PROVENANCE_B64URL: ${{ github.event.client_payload.recovered_production_provenance_b64url }}
+          STABLE_AUTHORIZATION_B64URL: ${{ github.event.client_payload.stable_authorization_b64url }}
+          ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL }}
+          RELEASE_VERIFICATION_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_VERIFICATION_PUBLIC_KEY_B64URL }}
+          SITES_CONTROL_PLANE_VERIFICATION_KEY_B64URL: ${{ secrets.RELEASE_SITES_CONTROL_PLANE_VERIFICATION_KEY_B64URL }}
+          STABLE_AUTHORIZER_PUBLIC_KEY_B64URL: ${{ secrets.RELEASE_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL }}
+          RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID: ${{ vars.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID }}
+          RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256: ${{ vars.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256 }}
+          RELEASE_SITES_CONTROL_PLANE_KEY_ID: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_ID }}
+          RELEASE_SITES_CONTROL_PLANE_KEY_SHA256: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256 }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
+        run: |
+          node -e 'const crypto=require("node:crypto"); const fs=require("node:fs"); const inputs=[["FINALIZATION_EVIDENCE_B64URL","finalization-evidence.json",18000,true],["ORIGINAL_RAILWAY_PROVENANCE_ATTESTATION_B64URL","original-railway-provenance.json",18000,true],["PROTECTED_BASELINE_METADATA_B64URL","protected-semantic-baseline.json",18000,true],["RECOVERED_PRODUCTION_PROVENANCE_B64URL","recovered-production-provenance.json",18000,true],["STABLE_AUTHORIZATION_B64URL","stable-authorization.json",18000,true],["ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL","original-railway-provenance-public-key.pem",4096,false],["RELEASE_VERIFICATION_PUBLIC_KEY_B64URL","release-verification-public-key.pem",4096,false],["SITES_CONTROL_PLANE_VERIFICATION_KEY_B64URL","sites-control-plane-verification-key.json",4096,true],["STABLE_AUTHORIZER_PUBLIC_KEY_B64URL","stable-authorizer-public-key.pem",4096,false]]; for(const [name,path,limit,json] of inputs){const value=process.env[name]??""; if(!/^[0-9A-Za-z_-]+$/.test(value)) throw new Error(`${name} must be canonical unpadded base64url`); const bytes=Buffer.from(value,"base64url"); if(bytes.length===0||bytes.length>limit||bytes.toString("base64url")!==value) throw new Error(`${name} is empty, oversized, or noncanonical`); if(json) JSON.parse(bytes.toString("utf8")); fs.writeFileSync(path,bytes,{mode:0o600,flag:"wx"});} const fingerprint=(path)=>crypto.createHash("sha256").update(crypto.createPublicKey(fs.readFileSync(path)).export({format:"der",type:"spki"})).digest("hex"); const hashes=[fingerprint("release-verification-public-key.pem"),fingerprint("stable-authorizer-public-key.pem"),fingerprint("original-railway-provenance-public-key.pem")]; const expected=[process.env.RELEASE_VERIFICATION_KEY_SHA256,process.env.RELEASE_STABLE_AUTHORIZER_KEY_SHA256,process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256]; if(expected.some((value)=>!/^[0-9a-f]{64}$/.test(value??""))||hashes.some((value,index)=>value!==expected[index])||new Set([...hashes,process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256]).size!==4) throw new Error("bootstrap verification keys are unpinned, mismatched, or not distinct"); if(!/^[0-9A-Za-z][0-9A-Za-z._:+/-]{2,159}$/.test(process.env.RELEASE_SITES_CONTROL_PLANE_KEY_ID??"")||!/^[0-9a-f]{64}$/.test(process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256??"")) throw new Error("protected Sites trust policy is missing"); fs.writeFileSync("sites-control-plane-trust-policy.json",JSON.stringify({schemaVersion:"genio-sites-control-plane-trust-policy/v1",approvedKeyId:process.env.RELEASE_SITES_CONTROL_PLANE_KEY_ID,approvedKeySha256:process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256})+"\\n",{mode:0o600,flag:"wx"});'
+      - name: Reverify the exact wrapper image attestation immediately before asset production
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://$IMAGE_REFERENCE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/$BOOTSTRAP_IMAGE_WORKFLOW" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --source-digest "$GITHUB_SHA" \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --deny-self-hosted-runners \
+            --no-public-good \
+            --format json > wrapper-attestation-verification.json
+          node -e 'const fs=require("node:fs"); const path="wrapper-attestation-verification.json"; const bytes=fs.readFileSync(path); if(bytes.length===0||bytes.length>2*1024*1024) throw new Error("wrapper attestation verification is empty or oversized"); const value=JSON.parse(bytes.toString("utf8")); if(!value||typeof value!=="object") throw new Error("wrapper attestation verification is not structured JSON");'
+      - id: verify
+        name: Produce and verify the exact five bootstrap assets
+        env:
+          RELEASE_VERIFICATION_KEY_ID: ${{ vars.RELEASE_VERIFICATION_KEY_ID }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}
+          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
+          RELEASE_GATE_PRODUCER_KEY_ID: ${{ vars.RELEASE_GATE_PRODUCER_KEY_ID }}
+          RELEASE_GATE_PRODUCER_KEY_SHA256: ${{ vars.RELEASE_GATE_PRODUCER_KEY_SHA256 }}
+          RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID: ${{ vars.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID }}
+          RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256: ${{ vars.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256 }}
+          RELEASE_SITES_CONTROL_PLANE_KEY_ID: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_ID }}
+          RELEASE_SITES_CONTROL_PLANE_KEY_SHA256: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256 }}
+        run: |
+          node --experimental-transform-types scripts/stable-predecessor-bootstrap.ts produce \
+            --confirm-v2-3-4-stable-predecessor-bootstrap \
+            --bootstrap-evidence finalization-evidence.json \
+            --protected-baseline-metadata protected-semantic-baseline.json \
+            --bootstrap-authorization stable-authorization.json \
+            --release-verification-key release-verification-public-key.pem \
+            --stable-authorization-verification-key stable-authorizer-public-key.pem \
+            --recovered-production-provenance recovered-production-provenance.json \
+            --original-railway-provenance original-railway-provenance.json \
+            --original-railway-provenance-verification-key original-railway-provenance-public-key.pem \
+            --sites-control-plane-verification-key sites-control-plane-verification-key.json \
+            --sites-control-plane-trust-policy sites-control-plane-trust-policy.json \
+            --github-attestation-verification wrapper-attestation-verification.json \
+            --controller-workflow-bytes bootstrap-source-bytes/controller-workflow.yml \
+            --tag-object-bytes bootstrap-source-bytes/tag-object \
+            --source-commit-bytes bootstrap-source-bytes/source-commit \
+            --source-tree-object-bytes bootstrap-source-bytes/source-tree \
+            --expected-image-digest "$EXPECTED_IMAGE_DIGEST" \
+            --bootstrap-controller-revision "$GITHUB_SHA" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-default-branch "$DEFAULT_BRANCH" \
+            --output-image-attestation stable-image-attestation.json \
+            --output-consumer stable-release-consumer.json
+          node --experimental-transform-types scripts/stable-predecessor-bootstrap.ts verify \
+            --confirm-v2-3-4-stable-predecessor-bootstrap \
+            --assets-directory . \
+            --release-verification-key release-verification-public-key.pem \
+            --stable-authorization-verification-key stable-authorizer-public-key.pem \
+            --original-railway-provenance original-railway-provenance.json \
+            --original-railway-provenance-verification-key original-railway-provenance-public-key.pem \
+            --sites-control-plane-verification-key sites-control-plane-verification-key.json \
+            --sites-control-plane-trust-policy sites-control-plane-trust-policy.json \
+            --github-attestation-verification wrapper-attestation-verification.json \
+            --controller-workflow-bytes bootstrap-source-bytes/controller-workflow.yml \
+            --tag-object-bytes bootstrap-source-bytes/tag-object \
+            --source-commit-bytes bootstrap-source-bytes/source-commit \
+            --source-tree-object-bytes bootstrap-source-bytes/source-tree \
+            --expected-image-digest "$EXPECTED_IMAGE_DIGEST" \
+            --bootstrap-controller-revision "$GITHUB_SHA" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-default-branch "$DEFAULT_BRANCH" \
+            --output stable-predecessor-bootstrap-verification.json
+          node -e 'const crypto=require("node:crypto"); const fs=require("node:fs"); const stable=(value)=>JSON.stringify(value&&typeof value==="object"?(Array.isArray(value)?value.map((item)=>JSON.parse(stable(item))):Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).map(([key,item])=>[key,JSON.parse(stable(item))]))):value); const evidence=JSON.parse(fs.readFileSync("finalization-evidence.json","utf8")); const metadata=JSON.parse(fs.readFileSync("protected-semantic-baseline.json","utf8")); const authorization=JSON.parse(fs.readFileSync("stable-authorization.json","utf8")); const sha=(bytes)=>crypto.createHash("sha256").update(bytes).digest("hex"); const metadataHash=sha(Buffer.from(stable(metadata),"utf8")); for(const [label,value] of [["evidence",evidence.payloadHash],["authorization",authorization.payloadHash],["metadata",metadataHash]]) if(!/^[0-9a-f]{64}$/.test(value??"")) throw new Error(`${label} hash is invalid`); fs.appendFileSync(process.env.GITHUB_OUTPUT,`evidence_hash=${evidence.payloadHash}\nmetadata_hash=${metadataHash}\nauthorization_hash=${authorization.payloadHash}\n`);'
+      - name: Fence bootstrap monotonicity immediately before Release mutation
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fail = (message) => {
+              throw new Error(`stable predecessor bootstrap final fence: ${message}`);
+            };
+            const tuple = (tag) => {
+              const match =
+                /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+                  .exec(tag ?? "");
+              return match ? match.slice(1).map(BigInt) : null;
+            };
+            const compare = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            const target = [2n, 3n, 4n];
+            const [refs, releases] = await Promise.all([
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+            ]);
+            const stableRefs = refs.flatMap((ref) => {
+              const version = tuple(ref.ref?.replace(/^refs\/tags\//u, ""));
+              return version ? [{ ref, version }] : [];
+            }).sort((left, right) => compare(right.version, left.version));
+            if (
+              stableRefs[0]?.ref?.ref !== "refs/tags/v2.3.4"
+              || stableRefs.some(({ version }) => compare(version, target) > 0)
+              || releases.some((release) => {
+                const version = tuple(release.tag_name);
+                return version && compare(version, target) > 0;
+              })
+            ) {
+              fail("v2.3.4 is no longer the greatest stable identity");
+            }
+            const existing = releases.filter(
+              ({ tag_name }) => tag_name === "v2.3.4",
+            );
+            if (
+              existing.length > 1
+              || (
+                existing.length === 1
+                && (
+                  existing[0].name !== "v2.3.4"
+                  || existing[0].target_commitish
+                    !== "7dc877cfc1537a9936974f9699a4b8ba9740b5f5"
+                  || existing[0].prerelease !== false
+                  || (!existing[0].draft && existing[0].immutable !== true)
+                )
+              )
+            ) {
+              fail("existing v2.3.4 Release is not an exact idempotent target");
+            }
+      - name: Create or reconcile only the immutable v2.3.4 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP_EVIDENCE_HASH: ${{ steps.verify.outputs.evidence_hash }}
+          BASELINE_HASH: ${{ steps.verify.outputs.metadata_hash }}
+          BOOTSTRAP_AUTHORIZATION_HASH: ${{ steps.verify.outputs.authorization_hash }}
+          VERIFIED_GITHUB_ACTIONS_APP_ID: ${{ steps.protection.outputs.github_actions_app_id }}
+          VERIFIED_STABLE_TAG_RULESET_ID: ${{ steps.protection.outputs.stable_tag_ruleset_id }}
+        run: |
+          node -e 'const fs=require("node:fs"); const numeric=(value)=>/^[1-9]\d*$/.test(value??""); if(!numeric(process.env.VERIFIED_GITHUB_ACTIONS_APP_ID)||!numeric(process.env.VERIFIED_STABLE_TAG_RULESET_ID)) throw new Error("verified GitHub control identities are missing"); const lines=["gênio wrapper-backed stable predecessor v2.3.4","","Compatibility-RC: v2.3.4-rc.1",`Original-Tag-Object: ${process.env.ORIGINAL_TAG_OBJECT}`,`Original-Source-Revision: ${process.env.ORIGINAL_SOURCE_REVISION}`,`Original-Source-Tree: ${process.env.ORIGINAL_SOURCE_TREE}`,`Wrapper-Image-Digest: ${process.env.EXPECTED_IMAGE_DIGEST}`,"Railway-Observation-Kind: authenticated_platform_observation_not_supply_chain_attestation","Wrapper-Limitation: not historical Railway artifact",`Bootstrap-Evidence-SHA256: ${process.env.BOOTSTRAP_EVIDENCE_HASH}`,`Protected-Semantic-Baseline-SHA256: ${process.env.BASELINE_HASH}`,`Bootstrap-Authorization-SHA256: ${process.env.BOOTSTRAP_AUTHORIZATION_HASH}`,`Bootstrap-Controller-Revision: ${process.env.GITHUB_SHA}`,`Bootstrap-Workflow: ${process.env.GITHUB_REPOSITORY}/${process.env.BOOTSTRAP_WORKFLOW}`,`Tag-Ruleset-ID: ${process.env.VERIFIED_STABLE_TAG_RULESET_ID}`,`Tag-Bypass-Integration-ID: ${process.env.VERIFIED_GITHUB_ACTIONS_APP_ID}`,""]; fs.writeFileSync("stable-predecessor-release-notes.txt",lines.join("\n"),{mode:0o600,flag:"wx"});'
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > stable-release-api.json 2>/dev/null; then
+            gh release create "$STABLE_TAG" \
+              --draft \
+              --verify-tag \
+              --target "$ORIGINAL_SOURCE_REVISION" \
+              --title "$STABLE_TAG" \
+              --notes-file stable-predecessor-release-notes.txt
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > stable-release-api.json
+          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-predecessor-release-notes.txt","utf8"); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.ORIGINAL_SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.prerelease||(!release.draft&&release.immutable!==true)) throw new Error("v2.3.4 Release identity or body is not exact");'
+          mkdir existing-release-assets
+          for ASSET in \
+            finalization-evidence.json \
+            protected-semantic-baseline.json \
+            stable-authorization.json \
+            stable-image-attestation.json \
+            stable-release-consumer.json; do
+            if ASSET_NAME="$ASSET" node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); process.exit((release.assets??[]).some(({name})=>name===process.env.ASSET_NAME)?0:1)'; then
+              gh release download "$STABLE_TAG" \
+                --dir existing-release-assets \
+                --pattern "$ASSET" \
+                --clobber
+            fi
+          done
+          node --experimental-transform-types scripts/stable-release-assets.ts \
+            --release stable-release-api.json \
+            --expected-directory . \
+            --downloaded-directory existing-release-assets \
+            --output stable-release-asset-plan.json
+          if node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.exit(plan.missing.length+plan.replace.length>0?0:1)'; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+              > stable-release-before-reconcile.json
+            node -e 'const fs=require("node:fs"); const before=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const current=JSON.parse(fs.readFileSync("stable-release-before-reconcile.json","utf8")); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); if(current.id!==before.id||current.id!==plan.releaseId||current.tag_name!==before.tag_name||current.target_commitish!==before.target_commitish||current.name!==before.name||current.body!==before.body||current.prerelease||!current.draft) throw new Error("v2.3.4 left the exact draft state before asset reconciliation");'
+            for ASSET in $(node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.stdout.write(plan.replace.join("\n"))'); do
+              gh release delete-asset "$STABLE_TAG" "$ASSET" --yes
+              gh release upload "$STABLE_TAG" "$ASSET"
+            done
+            for ASSET in $(node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.stdout.write(plan.missing.join("\n"))'); do
+              gh release upload "$STABLE_TAG" "$ASSET"
+            done
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > stable-release-api.json
+          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-predecessor-release-notes.txt","utf8"); const expectedAssets=["finalization-evidence.json","protected-semantic-baseline.json","stable-authorization.json","stable-image-attestation.json","stable-release-consumer.json"]; const actualAssets=(release.assets??[]).map(({name})=>name).sort(); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.ORIGINAL_SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.prerelease||JSON.stringify(actualAssets)!==JSON.stringify(expectedAssets)) throw new Error("v2.3.4 Release identity, body, or exact five assets differ");'
+          mkdir exact-release-assets
+          gh release download "$STABLE_TAG" \
+            --dir exact-release-assets \
+            --pattern finalization-evidence.json \
+            --pattern protected-semantic-baseline.json \
+            --pattern stable-authorization.json \
+            --pattern stable-image-attestation.json \
+            --pattern stable-release-consumer.json
+          cmp finalization-evidence.json exact-release-assets/finalization-evidence.json
+          cmp protected-semantic-baseline.json exact-release-assets/protected-semantic-baseline.json
+          cmp stable-authorization.json exact-release-assets/stable-authorization.json
+          cmp stable-image-attestation.json exact-release-assets/stable-image-attestation.json
+          cmp stable-release-consumer.json exact-release-assets/stable-release-consumer.json
+          node --experimental-transform-types scripts/stable-release-assets.ts \
+            --release stable-release-api.json \
+            --expected-directory . \
+            --downloaded-directory exact-release-assets \
+            --output stable-release-final-asset-plan.json
+          node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-final-asset-plan.json","utf8")); if(plan.missing.length||plan.replace.length||plan.verified.length!==5) throw new Error("v2.3.4 five-asset reconciliation did not converge exactly");'
+          if node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); process.exit(release.draft?0:1)'; then
+            gh release edit "$STABLE_TAG" --draft=false
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > published-stable-release-api.json
+          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("published-stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-predecessor-release-notes.txt","utf8"); const expectedAssets=["finalization-evidence.json","protected-semantic-baseline.json","stable-authorization.json","stable-image-attestation.json","stable-release-consumer.json"]; const actualAssets=(release.assets??[]).map(({name})=>name).sort(); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.ORIGINAL_SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.draft||release.prerelease||release.immutable!==true||JSON.stringify(actualAssets)!==JSON.stringify(expectedAssets)) throw new Error("v2.3.4 GitHub Release is not exact, published, and immutable");'

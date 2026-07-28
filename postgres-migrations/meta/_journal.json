@@ -113,6 +113,41 @@
       "when": 1785124800000,
       "tag": "0015_intelligent_guidance_diagnostics",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1785211200000,
+      "tag": "0016_playlist_contract_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1785297600000,
+      "tag": "0017_playlist_recovery_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1785384000000,
+      "tag": "0018_release_manifest_canary_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785470400000,
+      "tag": "0019_canonical_execution_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785556800000,
+      "tag": "0020_executor_release_identity_fencing",
+      "breakpoints": true
     }
   ]
 }

@@ -98,6 +98,15 @@ export interface PipelineCandidateLeadArtifactV3 {
   readonly citationHashes: readonly string[];
   readonly predicateCoverage: readonly string[];
   readonly rejectionCode: string | null;
+  readonly discoveryDependencyIds?: readonly string[];
+  readonly provenanceRoots?: readonly string[];
+  readonly cacheOrigin?:
+    | "live"
+    | "fresh_cache"
+    | "governed_snapshot"
+    | "orchestration_local"
+    | "unknown";
+  readonly sourceFreshUntil?: string | null;
 }
 
 export interface RetrievalPredicateDiagnosticsV3 {
@@ -433,13 +442,17 @@ export function proposeSemanticRecoveryV3(input: {
   });
 }
 
-/** Restore original equivalent predicate ids so immutable-plan persistence can
- * retain explicit track bindings for every original predicate. */
+/** Restore original equivalent predicate ids on legacy references so
+ * immutable-plan persistence can retain explicit bindings for every original
+ * predicate. A hash-bound hosted snapshot is immutable evidence, however:
+ * its predicate/obligation set may not be widened after acquisition. The
+ * semantic revision's typed projection retains that alias lineage instead. */
 export function projectQualificationToOriginalPredicatesV3(
   qualification: CandidateQualificationV3,
   projection: Readonly<Record<string, string>>,
 ): CandidateQualificationV3 {
   const bindings = qualification.evidence.bindings?.map((binding) => {
+    if (binding.hostedEvidenceSnapshot) return binding;
     const predicateIds = new Set(binding.predicateIds ?? binding.supportedPredicateIds ?? []);
     for (const [removed, retained] of Object.entries(projection)) {
       if (predicateIds.has(retained)) predicateIds.add(removed);

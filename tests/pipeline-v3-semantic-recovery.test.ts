@@ -1,7 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+  createHostedWebEvidenceSnapshotV3,
   executeRetrievalV3,
   publicTrackScopeAttestationV3,
+  RetrievalDependencyErrorV3,
   type CandidateQualificationV3,
   type QualificationRequestV3,
   type RawTrackCandidateV3,
@@ -18,6 +20,11 @@ import {
   type MembershipPredicateV3,
   type SelectionPlanV3,
 } from "../server/selection-plan-v3.ts";
+
+const HOSTED_TEST_ACQUIRED_AT = new Date(Date.now() - 60_000).toISOString();
+const HOSTED_TEST_FRESH_UNTIL = new Date(
+  Date.parse(HOSTED_TEST_ACQUIRED_AT) + 29 * 24 * 60 * 60_000,
+).toISOString();
 
 function basePlan(prompt = "25 baile funk tracks", target = 5): SelectionPlanV3 {
   return resolveRunSpecV3(createRunSpecV3({
@@ -59,7 +66,27 @@ function qualification(input: {
     .filter(({ operator, axis }) => operator !== "exclude" && !["era", "content", "recording_version"].includes(axis))
     .map(({ id }) => id);
   const sourceUrl = `https://evidence.example.test/${input.candidate.id}`;
-  return {
+  const excerpt =
+    `${input.candidate.artist} — ${input.candidate.title}: exact scoped track evidence.`;
+  const hostedEvidenceSnapshot = input.passed
+    ? createHostedWebEvidenceSnapshotV3({
+      sourceUrl,
+      excerpt,
+      responseId: `semantic-response-${input.candidate.id}`,
+      outputItemId: `semantic-output-${input.candidate.id}`,
+      contentIndex: 0,
+      citationStartIndex: 0,
+      citationEndIndex: excerpt.length,
+      excerptStartIndex: 0,
+      excerptEndIndex: excerpt.length,
+      acquiredAt: HOSTED_TEST_ACQUIRED_AT,
+      storefront: input.plan.storefront,
+      freshnessExpiresAt: HOSTED_TEST_FRESH_UNTIL,
+      predicateIds,
+      obligationIds: predicateIds,
+    })
+    : null;
+  const result: CandidateQualificationV3 = {
     candidateId: input.candidate.id,
     scope: {
       passed: input.passed,
@@ -78,7 +105,7 @@ function qualification(input: {
         provenanceRoot: "evidence.example.test",
         strength: 0.95,
         sourceRank: 1,
-        kind: "track_specific_source",
+        kind: "hosted_web_track",
         predicateIds,
         governance: {
           policyVersion: "evidence-source-governance-v3",
@@ -92,10 +119,17 @@ function qualification(input: {
           cachePolicy: "excerpt_only",
           retentionPolicy: "ninety_days",
           freshnessPolicy: "revalidate_30d",
-          sourceHash: "a".repeat(64),
-          sourceRevision: "b".repeat(64),
+          acquiredAt: hostedEvidenceSnapshot!.acquiredAt,
+          freshnessExpiresAt: hostedEvidenceSnapshot!.freshnessExpiresAt,
+          revokedAt: null,
+          sourceHash: hostedEvidenceSnapshot!.snapshotHash,
+          sourceRevision: hostedEvidenceSnapshot!.snapshotHash,
         },
-        eligibilityAttestation: publicTrackScopeAttestationV3(sourceUrl),
+        hostedEvidenceSnapshot: hostedEvidenceSnapshot!,
+        eligibilityAttestation: publicTrackScopeAttestationV3(
+          sourceUrl,
+          hostedEvidenceSnapshot!,
+        ),
       }] : [],
     },
     version: { compatible: input.passed, confidence: input.passed ? 0.95 : 0 },
@@ -110,6 +144,7 @@ function qualification(input: {
     rankingSignals: { relevance: 1 },
     sourceRank: 1,
   };
+  return result;
 }
 
 describe("Pipeline V3 bounded semantic recovery", () => {
@@ -144,7 +179,6 @@ describe("Pipeline V3 bounded semantic recovery", () => {
         claimedRevisions.push(revision.revision);
       },
     });
-
     expect(adapters.discover).toHaveBeenCalled();
     expect(adapters.qualify).toHaveBeenCalledTimes(2);
     expect(claimedRevisions).toEqual([2]);
@@ -281,7 +315,12 @@ describe("Pipeline V3 bounded semantic recovery", () => {
         discovered = true;
         return { candidates: candidates(), nextCursor: null, exhausted: true };
       },
-      qualify: vi.fn(async () => { throw new Error("Apple unavailable"); }),
+      qualify: vi.fn(async () => {
+        throw new RetrievalDependencyErrorV3(
+          "Apple unavailable",
+          ["apple_catalog"],
+        );
+      }),
     };
     const result = await executeRetrievalV3({ runId: "provider-outage", plan, adapters });
     expect(adapters.qualify).toHaveBeenCalledTimes(1);

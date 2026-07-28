@@ -66,6 +66,39 @@ describe("playlist waiting state", () => {
   });
 
   it.each([
+    ["accepted", false, "active"],
+    ["needs_input", false, "action-required"],
+    ["probing", false, "active"],
+    ["executing", false, "active"],
+    ["blocked_dependency", false, "paused"],
+    ["needs_decision", false, "action-required"],
+    ["ready", false, "active"],
+    ["publishing", false, "active"],
+    ["completed", true, "idle"],
+    ["cancelled", true, "idle"],
+    ["quarantined", false, "paused"],
+  ])(
+    "renders the schema-18 resolution state %s conservatively",
+    (state, terminal, motion) => {
+      expect(playlistWorkMotion({
+        status: "researching",
+        resolution: { state, terminal },
+      })).toBe(motion);
+    },
+  );
+
+  it("keeps an unknown future resolution active unless the server marks it terminal", () => {
+    expect(playlistWorkMotion({
+      status: "future_status",
+      resolution: { state: "future_resolution", terminal: false },
+    })).toBe("active");
+    expect(playlistWorkMotion({
+      status: "future_status",
+      resolution: { state: "future_resolution", terminal: true },
+    })).toBe("idle");
+  });
+
+  it.each([
     ["visitor_review", "exception_review"],
     ["manifest_ready", "manifest"],
   ])("keeps an automatic %s handoff active in the assembly stage", (status, phase) => {

@@ -27,6 +27,24 @@ export type PartialReadyRun = {
     selectedTrackCount?: number;
     reasonCodes?: string[];
   } | null;
+  decisionAction?: {
+    reason?: string;
+    decisionHash?: string;
+    actions?: {
+      resumeLater?: boolean;
+    };
+  } | null;
+  resolution?: {
+    state?: string;
+    nextAction?: string;
+    terminal?: boolean;
+    blocker?: {
+      kind?: string;
+      nextRetryAt?: string | null;
+      automaticRetryUntil?: string | null;
+      versionHash?: string | null;
+    } | null;
+  } | null;
 };
 
 export type PartialReadyView = {
@@ -41,6 +59,66 @@ export type PartialReadyView = {
   manifestHash: string | null;
   reasonCode: string | null;
 };
+
+export type RunResolutionControl =
+  | "wait_for_retry"
+  | "resume_dependency"
+  | "refine_request"
+  | "contact_support"
+  | "cancel_job";
+
+/**
+ * Controls rendered for a public run resolution. This is deliberately based
+ * on supported visitor behavior, not on aspirational orchestration actions.
+ * A typed partial decision has its own screen and is handled separately.
+ */
+export function runResolutionControls(
+  run: PartialReadyRun | null | undefined,
+): RunResolutionControl[] {
+  const resolution = run?.resolution;
+  if (!resolution || resolution.terminal || partialReadyView(run)) return [];
+
+  switch (resolution.nextAction) {
+    case "wait_for_dependency":
+    case "authorize_apple":
+      return ["wait_for_retry", "refine_request", "cancel_job"];
+    case "contact_support":
+      return ["contact_support", "refine_request", "cancel_job"];
+    case "review_contract":
+    case "answer_initial_guidance":
+    case "answer_rescue_guidance":
+      return ["refine_request", "cancel_job"];
+    case "resume_research":
+      return resolution.state === "needs_decision"
+        && resolution.blocker?.kind === "provider"
+        && typeof resolution.blocker.versionHash === "string"
+        && /^[a-f0-9]{64}$/u.test(resolution.blocker.versionHash)
+        && run?.decisionAction?.reason === "dependency_retry_window_expired"
+        && run.decisionAction.actions?.resumeLater === true
+        && typeof run.decisionAction.decisionHash === "string"
+        && /^[a-f0-9]{64}$/u.test(run.decisionAction.decisionHash)
+        ? ["resume_dependency", "refine_request", "cancel_job"]
+        : ["refine_request", "cancel_job"];
+    case "decide_verified_partial":
+      // A malformed or stale partial action cannot power the explicit
+      // decision API, so fall back to a fresh contract revision.
+      return ["refine_request", "cancel_job"];
+    default:
+      if (resolution.state === "quarantined") {
+        return ["contact_support", "refine_request", "cancel_job"];
+      }
+      if (resolution.state === "needs_input" || resolution.state === "needs_decision") {
+        return ["refine_request", "cancel_job"];
+      }
+      return [];
+  }
+}
+
+export function shouldKeepPollingBlockedRun(
+  run: PartialReadyRun | null | undefined,
+): boolean {
+  return run?.resolution?.state === "blocked_dependency";
+}
 
 function asObject(value: unknown): UnknownObject {
   return value && typeof value === "object" && !Array.isArray(value)

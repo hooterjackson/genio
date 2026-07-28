@@ -44,13 +44,29 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
+function sitesSourceRevision(): string | undefined {
+  return [
+    process.env.SOURCE_COMMIT_SHA,
+    process.env.NEXT_PUBLIC_SOURCE_COMMIT_SHA,
+    process.env.GITHUB_SHA,
+    process.env.COMMIT_SHA,
+  ]
+    .map((value) => value?.trim().toLowerCase() ?? "")
+    .find((value) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value));
+}
+
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" data-build-version={currentRelease.version} suppressHydrationWarning>
+    <html
+      lang="en"
+      data-build-version={currentRelease.version}
+      data-build-revision={sitesSourceRevision()}
+      suppressHydrationWarning
+    >
       <body>
         {children}
       </body>

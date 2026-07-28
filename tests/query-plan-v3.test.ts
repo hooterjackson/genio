@@ -8,8 +8,14 @@ import {
   queryPlanV3Engines,
   queryPlanV3Hash,
 } from "../server/query-plan-v3.ts";
-import { createRunSpecV3, resolveRunSpecV3 } from "../server/selection-plan-v3.ts";
+import {
+  createRunSpecV3,
+  resolveRunSpecV3,
+  type SelectionPlanV3,
+} from "../server/selection-plan-v3.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "../server/music-concepts-v3.ts";
+import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 
 function confirmed(prompt: string, target = 50) {
   const spec = createRunSpecV3({ prompt, requestedTrackCount: target, storefront: "us" });
@@ -24,7 +30,7 @@ function confirmed(prompt: string, target = 50) {
 }
 
 describe("query plan V3", () => {
-  test("preserves the exact 1-300 target and separates ranking from hard membership", () => {
+  test("preserves the exact target and separates ranking from hard membership", () => {
     const plan = confirmed("Paulinho da Costa's 176 most influential songs", 176);
     const query = createQueryPlanV3(plan, "00000000-0000-4000-8000-000000000001");
     expect(query.schemaVersion).toBe(2);
@@ -48,6 +54,24 @@ describe("query plan V3", () => {
     expect(isQueryPlanV3(query)).toBe(true);
     expect(queryPlanV3Hash(query)).toMatch(/^[a-f0-9]{64}$/u);
   });
+
+  test.each([301, 1_000])(
+    "rejects expanded target %i outside a canonical contract fence",
+    (target) => {
+      expect(() => createQueryPlanV3(
+        confirmed(`${target} exact disco tracks`, target),
+        "00000000-0000-4000-8000-000000000001",
+      )).toThrow(/canonical schema.*fenced contract revision/iu);
+      const publicQuery = createQueryPlanV3(
+        confirmed("300 exact disco tracks", 300),
+        "00000000-0000-4000-8000-000000000001",
+      );
+      expect(isQueryPlanV3({
+        ...publicQuery,
+        targetTrackCount: target,
+      })).toBe(false);
+    },
+  );
 
   test("keeps runtime emission on schema 1 until the explicit activation flag is set", () => {
     const base = confirmed("25 disco songs", 25);
@@ -129,6 +153,109 @@ describe("query plan V3", () => {
     expect(() => createQueryPlanV3(plan, snapshot, { schemaVersion: 3 })).toThrow(/contract-2/iu);
     expect(isQueryPlanV3({ ...query, executionDeltaHash: "tampered" })).toBe(false);
     expect(isQueryPlanV3({ ...query, briefContractVersion: 1 })).toBe(false);
+  });
+
+  test("schema 5 fences a 1,000-track execution to one immutable canonical contract revision", () => {
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:query-plan-disco",
+      rawPrompt: "1,000 disco songs",
+      requestedTrackCount: 1_000,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [{
+        id: "genre:disco",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["disco"],
+        source: { provenance: "prompt", text: "disco" },
+      }],
+      trackPredicate: { op: "clause", clauseId: "genre:disco" },
+      qualityPolicy: {
+        centralSuitabilityClauseIds: [],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+      },
+    });
+    const canonicalContractPolicy = canonicalContractExecutionPolicyV1(contract);
+    const plan: SelectionPlanV3 = {
+      ...confirmed("1,000 disco songs", 1_000),
+      canonicalContractPolicy,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:disco-energy"],
+        criteria: ["disco energy"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const snapshot = "00000000-0000-4000-8000-000000000001";
+    const contractRevisionId = contract.revisionId;
+    const contractSemanticHash = contract.semanticHash;
+    const query = createQueryPlanV3(plan, snapshot, {
+      schemaVersion: 5,
+      briefContractVersion: 3,
+      playlistContractRevisionId: contractRevisionId,
+      playlistContractSemanticHash: contractSemanticHash,
+      playlistContractCompilerVersion: contract.versions.compiler,
+    });
+    expect(query).toMatchObject({
+      schemaVersion: 5,
+      briefContractVersion: 3,
+      guidancePolicyVersion: "adaptive_guidance_v3",
+      evidencePolicyVersion: "governed_evidence_v2",
+      playlistContractRevisionId: contractRevisionId,
+      playlistContractSemanticHash: contractSemanticHash,
+      playlistContractCompilerVersion: contract.versions.compiler,
+      targetTrackCount: 1_000,
+      playlistQualityPolicy: {
+        criteria: ["disco energy"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+      },
+    });
+    expect(isQueryPlanV3(query)).toBe(true);
+    expect(queryPlanV3EmissionSchemaVersion({
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+    })).toBe(1);
+    expect(queryPlanV3EmissionSchemaVersion({
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      NODE_ENV: "production",
+      RELEASE_ENVIRONMENT: "production",
+      RELEASE_DEPLOYMENT_PHASE: "activate",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+      RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+      RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXECUTION_ENABLED: "true",
+    })).toBe(5);
+    expect(() => createQueryPlanV3(plan, snapshot, {
+      schemaVersion: 5,
+      briefContractVersion: 3,
+    })).toThrow(/canonical.*fenced contract revision/iu);
+    expect(isQueryPlanV3({
+      ...query,
+      playlistContractSemanticHash: "tampered",
+    })).toBe(false);
+    expect(isQueryPlanV3({
+      ...query,
+      briefContractVersion: 2,
+    })).toBe(false);
+    expect(isQueryPlanV3({
+      ...query,
+      playlistQualityPolicy: {
+        ...query.playlistQualityPolicy!,
+        failThreshold: 0.9,
+      },
+    })).toBe(false);
   });
 
   test("rejects schema-2 plans whose governed music-concept policy drifts", () => {
@@ -447,12 +574,17 @@ describe("query plan V3", () => {
       env: { NODE_ENV: "test", PIPELINE_V3_ASSIGNMENT_ENABLED: "true", PIPELINE_V3_OWNER_CANARY: "true" },
     })).toMatchObject({ assigned: false, reason: "guidance_required" });
 
-    const resolved = confirmed("French jazz", 25);
+    const resolved = confirmed("25 disco songs", 25);
     expect(assignPipelineV3({
       plan: resolved,
       owner: true,
       stickyKey: "owner",
-      env: { NODE_ENV: "test", PIPELINE_V3_ASSIGNMENT_ENABLED: "true", PIPELINE_V3_OWNER_CANARY: "true" },
+      env: {
+        NODE_ENV: "test",
+        PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+        PIPELINE_V3_OWNER_CANARY: "true",
+        PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+      },
     })).toMatchObject({ assigned: true, reason: "owner_canary" });
   });
 
@@ -462,15 +594,16 @@ describe("query plan V3", () => {
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+      PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
     };
     expect(assignPipelineV3({
-      plan: confirmed("Brazilian disco songs", 50),
+      plan: confirmed("50 disco songs", 50),
       owner: true,
       stickyKey: "owner",
       env,
     })).toMatchObject({ assigned: true, reason: "owner_canary", group: "genre_scene" });
     expect(assignPipelineV3({
-      plan: confirmed("Brazilian disco songs", 100),
+      plan: confirmed("100 disco songs", 100),
       owner: true,
       stickyKey: "owner",
       env,
@@ -481,6 +614,36 @@ describe("query plan V3", () => {
       stickyKey: "owner",
       env,
     })).toMatchObject({ assigned: false, reason: "production_evidence_required", group: "factual_relationship" });
+  });
+
+  test("geographic evidence safety applies to owner canaries", () => {
+    const plan = confirmed("Brazilian disco songs", 25);
+    const env = {
+      PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+      PIPELINE_V3_OWNER_CANARY: "true",
+      PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
+      PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+      PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+    };
+    expect(assignPipelineV3({
+      plan,
+      owner: true,
+      stickyKey: "owner",
+      env,
+    })).toMatchObject({
+      assigned: false,
+      reason: "governed_geographic_evidence_required",
+      group: "genre_scene",
+    });
+    expect(assignPipelineV3({
+      plan,
+      owner: true,
+      stickyKey: "owner",
+      env: {
+        ...env,
+        PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
+      },
+    })).toMatchObject({ assigned: true, reason: "owner_canary", group: "genre_scene" });
   });
 
   test("public rollout requires adjudicated production evidence and a separate factual feasibility gate", () => {
@@ -499,7 +662,22 @@ describe("query plan V3", () => {
       plan: confirmed("Brazilian disco songs", 50),
       owner: false,
       stickyKey: "visitor",
-      env: { ...base, PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true" },
+      env: {
+        ...base,
+        PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+      },
+    })).toMatchObject({ assigned: false, reason: "governed_geographic_evidence_required" });
+    expect(assignPipelineV3({
+      plan: confirmed("Brazilian disco songs", 50),
+      owner: false,
+      stickyKey: "visitor",
+      env: {
+        ...base,
+        PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+        PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
+      },
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
     expect(assignPipelineV3({
       plan: confirmed("Paulinho da Costa's released performance credits", 25),
@@ -517,5 +695,53 @@ describe("query plan V3", () => {
         PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "true",
       },
     })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
+  });
+
+  test("holds both production reggaeton classifications on V2 until hosted evidence is approved", () => {
+    const genrePlan = confirmed(
+      "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.",
+      50,
+    );
+    const plans = [
+      { plan: genrePlan, group: "genre_scene" as const },
+      {
+        plan: { ...genrePlan, intents: ["mood_activity" as const] },
+        group: "mood_activity_theme" as const,
+      },
+    ];
+    const env = {
+      PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+      PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
+      PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "100",
+      PIPELINE_V3_OWNER_CANARY: "true",
+      PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene,mood_activity_theme",
+      PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "300",
+    };
+    for (const { plan, group } of plans) {
+      for (const owner of [false, true]) {
+        expect(assignPipelineV3({
+          plan,
+          owner,
+          stickyKey: owner ? "owner" : "visitor",
+          env,
+        })).toMatchObject({
+          assigned: false,
+          reason: "governed_curated_hosted_evidence_required",
+          group,
+        });
+      }
+    }
+    for (const { plan } of plans) {
+      expect(assignPipelineV3({
+        plan,
+        owner: false,
+        stickyKey: "visitor",
+        env: {
+          ...env,
+          PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+        },
+      })).toMatchObject({ assigned: true, reason: "sticky_rollout" });
+    }
   });
 });

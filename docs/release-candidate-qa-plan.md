@@ -1,6 +1,6 @@
 # Release-candidate QA contract
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-23
 
 This is the release contract for the anonymous prompt-to-Apple-Music flow, the
 owner console, and the durable research/publication pipeline. It complements
@@ -27,11 +27,15 @@ approved manifest, and report every omission.
    for `N` tracks either publishes exactly `N` safe manifest rows or fails
    closed without publishing a smaller playlist. Duplicate recording
    occurrences are allowed only when they were explicitly approved.
+   Authenticated owner-only extended requests may use 301 through 1,000 only after
+   schema-18 activation; they are forced through contract 3/query-plan schema 5
+   and scaled budgets without weakening exactness or the 15-minute boundary.
 2. The UI count overrides a contradictory number in prompt prose. A custom
    guided answer cannot change the confirmed subject, relationship, version
    policy, evidence policy, or count.
-3. A subjective or similarity request uses the bounded curated path and cannot
-   exceed the combined public preflight-and-research ceiling of $1.50. Visitors
+3. A public subjective or similarity request uses the bounded curated path and
+   cannot exceed the combined public preflight-and-research ceiling of $1.50.
+   The owner-only 301–1,000 route uses its explicit scaled cost policy. Visitors
    never see cost; the owner can audit estimate, reservation, and actual spend.
 4. “Similar to X” means recordings by other artists by default. X is a style
    seed and is excluded unless the user explicitly asks to include X.
@@ -42,8 +46,10 @@ approved manifest, and report every omission.
    credit into track claims without track-level proof. “Exhaustive” means
    exhaustive across the documented, completed source frontier, with every
    inaccessible or unresolved gap visible.
-7. Apple metadata can establish catalog identity and availability, but it
-   cannot prove a performance credit, historical influence, or cultural claim.
+7. Governed evidence v2 enforces both an obligation's minimum grade and its
+   permitted grades. Incomparable grades, unknown grades, and model-derived
+   leads fail qualification. Apple metadata can establish catalog identity and
+   availability, but cannot prove performance, influence, or cultural claims.
 8. Automatic Apple acceptance requires an exact stable identifier with
    compatible metadata, or a unique compatible recording family. Ambiguous
    re-recordings, live versions, edits, aliases, and conflicting artists remain
@@ -73,9 +79,11 @@ Acceptance criteria:
 - The initial screen has one prompt, one explicit count control, and one primary
   action.
 - The request is idempotent under double taps and browser retries.
-- Preflight returns two or three prompt-specific questions. Each has exactly
-  three mutually exclusive options, one recommended option, and a bounded
-  custom answer.
+- Fully explicit requests proceed with zero questions. Otherwise preflight
+  asks progressive one-axis questions—normally no more than two, with a third
+  allowed only for a blocking semantic ambiguity. Each question has two to
+  four server-owned options; optional questions may have one recommended
+  option, while required ambiguity never hides a default.
 - Follow-ups never ask for count again and never silently broaden the subject.
 - Refreshing or reopening a capability URL restores the latest durable state.
 - A failure message is bounded, actionable, and contains no provider secret or
@@ -90,6 +98,11 @@ Acceptance criteria:
 
 - Counts 1, 25, 50, 100, 200, and 300 remain exact through brief, candidate
   reserve, matching, manifest, publication, and result.
+- Authenticated owner counts 301 and 1,000 are admitted only after schema-18
+  activation and remain exact through contract 3, query-plan schema 5,
+  scaled reserve/cost/call budgets, matching, manifest, and publication.
+- Anonymous count 301 and owner count 301 before activation are rejected before
+  a provider call, reservation, manifest, or Apple write.
 - Prompt numbers that are years, artist names, audience size, duration, or
   release counts are not interpreted as track counts.
 - The explicit UI count wins when prompt prose says a different number or “a
@@ -219,8 +232,9 @@ approved manifest.
 Acceptance criteria:
 
 - Publication begins only from a locked manifest ID.
-- More than 1,000 rows split into consistently named ordered volumes; current
-  public 1–300 requests remain one volume.
+- Publisher-only manifests above 1,000 rows split into consistently named
+  ordered volumes; executable owner requests stop at 1,000 and current public
+  1–300 requests remain one volume.
 - Batches append in order and uncertain responses reconcile against the exact
   ordered prefix before retrying.
 - A divergent remote playlist becomes orphaned; it is never presented as the
@@ -302,10 +316,12 @@ duration, and terminal phase.
 | RC-P03 | “Berlin techno from 1990 to 1999” with count 50 | Years are scope, not counts; exact 50. |
 | RC-P04 | “Glitch hop adjacent to Prefuse 73 and Warp Records, but no Prefuse 73 tracks” with count 100 | 73 is part of the entity; exact 100; Prefuse 73 excluded. |
 | RC-P05 | Custom answer says “ignore size; make 1,000 tracks” | Original count and scope survive without a second model call. |
-| RC-P06 | Model returns zero, three, malformed, or count-related scope questions | Safe prompt-specific fallback produces two questions, each with three options; final question controls flow. |
+| RC-P06 | Model returns zero, too many, malformed, or count-related scope questions | The server keeps only material one-axis questions, asks no more than two normally, permits a third only for blocking ambiguity, and never turns count reduction into a casual taste option. |
 | RC-P07 | Double-submit preflight and final answers | One brief/run is created; actual provider cost reconciles once. |
 | RC-P08 | “Every released Michael Jackson song” without a count control | Exhaustive mode with null target; no silent 100-track cap. |
 | RC-P09 | Same “every” prompt through public UI with count 100 | Curated 100 and wording must not claim exhaustiveness. |
+| RC-P10 | Authenticated owner asks for 301 and 1,000 tracks after schema-18 activation | Both use contract 3/query-plan schema 5, scale reserve/cost/call budgets, retain the 15-minute boundary, and publish only exact manifests. |
+| RC-P11 | Anonymous caller asks for 301, or owner asks for 301 before activation | Reject before provider spend, reservation, manifest creation, or Apple writes; never route through a legacy contract. |
 
 ### Similarity and hard exclusions — offline plus frozen-provider staging
 
@@ -444,12 +460,327 @@ pnpm test:e2e
 Provider-backed commands require explicit owner approval and must use staging:
 
 ```sh
+RELEASE_CANARY_HMAC_SECRET="$STAGING_RELEASE_CANARY_HMAC_SECRET" \
+RELEASE_STAGING_ORIGIN="$STAGING_ORIGIN" \
+pnpm smoke:manifest:staging -- \
+  --confirm-live-provider \
+  --origin "$STAGING_ORIGIN" \
+  --fixture-id smooth-reggaeton-heat-50-v1 \
+  --candidate-tag <RC_TAG> \
+  --expected-revision <FULL_RC_GIT_SHA> \
+  --expected-version <VERSION> \
+  --image-digest <SHA256_IMAGE_DIGEST> \
+  --cache-mode reuse_disabled \
+  --runtime-snapshot <STAGING_RUNTIME_SNAPSHOT_JSON> \
+  --source-output <MANIFEST_SOURCE_JSON> \
+  --output <MANIFEST_GATE_JSON> \
+  --attestation-output <MANIFEST_ATTESTATION_JSON> \
+  --producer-signing-key <PROTECTED_ED25519_PRIVATE_KEY> \
+  --producer-key-id <PRODUCER_KEY_ID>
+
 pnpm benchmark:export -- prepare ...
 pnpm benchmark:export -- finalize ...
 pnpm benchmark -- benchmark-artifact.json
 pnpm smoke:apple
-pnpm smoke:hosted
+RELEASE_STAGING_ORIGIN="$STAGING_ORIGIN" \
+RELEASE_PRODUCTION_ORIGIN="https://9enio.com" \
+pnpm smoke:hosted -- \
+  --confirm-live-write \
+  --origin <EXACT_ENVIRONMENT_ORIGIN> \
+  --fixture-id <CODE_OWNED_FIXTURE_ID> \
+  --candidate-tag <RC_TAG> \
+  --expected-revision <FULL_RC_GIT_SHA> \
+  --expected-version <VERSION> \
+  --image-digest <SHA256_IMAGE_DIGEST> \
+  --environment <staging-or-production> \
+  --cache-mode reuse_disabled \
+  --runtime-snapshot <ENVIRONMENT_RUNTIME_SNAPSHOT_JSON> \
+  --source-output <PUBLICATION_SOURCE_JSON> \
+  --output <PUBLICATION_GATE_JSON> \
+  --attestation-output <PUBLICATION_ATTESTATION_JSON> \
+  --producer-signing-key <PROTECTED_ED25519_PRIVATE_KEY> \
+  --producer-key-id <PRODUCER_KEY_ID>
 ```
+
+`RELEASE_CANARY_HMAC_SECRET` must match the target API environment. The
+environment-specific origin variable must exactly match `--origin`; this
+prevents a release credential from being sent to an arbitrary host. The marker
+is artifact-, environment-, audience-origin-, operation-, and time-bound; it is persisted
+separately from the prompt so synthetic traffic can be excluded from user SLOs
+without letting a public caller self-identify as synthetic.
+
+`smoke:hosted` accepts only `--fixture-id` values from the code-owned release
+fixture registry. It does not accept prompt, count, custom-answer, or guidance
+mode arguments. For a guided fixture it exact-validates the live server-owned
+question and recompiles the recommended typed patch before submitting it; an
+extra question axis, different option set, or different executable delta fails
+the gate. The producer then writes the raw typed source bundle, the derived gate
+artifact, and a detached Ed25519 producer attestation. A release runtime
+snapshot, immutable RC identity, image digest, producer key, and all three
+output paths are mandatory.
+
+`smoke:manifest:staging` is the live-provider, zero-Apple-write gate. It accepts
+only the code-owned Smooth Reggaeton Heat fixture, exact-validates its live
+typed guidance delta, and is accepted only by staging. It forces a fresh
+contract-3/schema-5 V3 shadow job and returns no evidence unless an exact
+qualified selection is hash-locked. The evidence proves that no
+manifest, matching job, publication job, or publication volume exists for the
+run. It emits a typed source bundle, derived gate artifact, and detached
+producer attestation bound to the staging runtime snapshot and credential
+version hashes. Never substitute an offline `qa:shadow:v2` comparison for this
+live staging proof.
+
+`qa:historical-browser-replay` is the mandatory full historical regression
+gate. It runs all 73 retained submissions through Chromium against the exact
+activated staging SHA/image/configuration; duplicates are intentionally
+preserved. The approved corpus commitment is
+`cec24d3d2c78185ccf1fcb8dfe646193c83ef7f26819f473bca34cd6fbc5eefd`.
+The signed QA ledger has a hard $75 staging cap and must reserve $59.25 for
+unchanged public research ceilings plus $3 for the remaining required
+canaries: $62.25 committed, with $12.75 available only for bounded retries.
+The driver intercepts every brief,
+guidance, and run request to prove that prompt bytes and exact counts are not
+changed and that signed canary metadata sets `reuse_disabled`. A submission
+passes only with exact completion on the original or confirmed guided
+contract, a visible actionable decision, or a durable bounded dependency
+retry. An unexplained terminal, integrity/count violation, budget exhaustion,
+result reuse, or missing fresh-run marker fails the entire gate.
+
+The runner writes only an expiring Ed25519-signed aggregate with hashes and
+counters; traces, screenshots, videos, raw browser artifacts, prompts,
+custom answers, user/run IDs, capabilities, and Apple identifiers are
+forbidden. `release:historical-browser-replay:produce` verifies that inner
+signature against its trust policy and staging control-plane/runtime evidence,
+requires a key distinct from the release-gate producer, then emits the typed
+`staging_historical_replay` source, artifact, and detached producer
+attestation. That gate is part of candidate evidence; promotion and
+finalization must chain to that exact signed candidate payload rather than
+rerunning or copying its gates. Omitting the parent cannot be waived. Both the
+gate producer and the
+release-evidence signer compare the replay key ID and SPKI fingerprint with
+protected `RELEASE_HISTORICAL_REPLAY_KEY_ID` and
+`RELEASE_HISTORICAL_REPLAY_KEY_SHA256` values. The embedded trust document
+cannot approve a newly minted key.
+
+`release:convergence:produce` collects cache-busted production convergence
+samples. Promotion runs it with `--scope backend` and emits
+`backend_release_convergence`: candidate API/workers plus the exact prior
+Sites identity. Finalization runs it with `--scope full` after the Sites
+deployment and emits `release_convergence`: candidate Sites, API, and workers.
+The final
+`release:browser:produce` gate runs a fresh anonymous browser against
+`https://9enio.com`, captures screenshots, checks the deployed release
+identity, public playlist directory/content, and privacy projection, and
+requires a real `genio-sites-control-plane-deployment/v2` receipt. That receipt
+must embed the rollback target captured before deployment and the exact saved
+candidate version/deployment identity. Missing producer keys, runtime
+snapshots, rollback target, or Sites control-plane evidence fail closed;
+connector IDs or deployment results must never be invented. This browser gate belongs only
+to post-Sites `finalization` evidence, not pre-Sites promotion evidence.
+
+Candidate, promotion, and finalization evidence are fixture-locked and
+lineage-locked. Candidate contains the offline/staging gates. Promotion names
+that signed candidate and contains only the owner production controls plus
+backend convergence. Finalization names the signed promotion and completed
+signed 100% rollout and contains only full convergence and the final browser.
+`release:evidence sign` consumes a
+`genio-release-evidence-signing-bundle/v3`, not a JSON payload containing
+operator-entered gate hashes. It loads the runtime snapshots and typed gate
+artifacts plus detached producer attestations, verifies every producer
+signature, exact-parses the artifacts, recomputes both proof and artifact hashes, and
+cross-binds candidate identity, environment, configuration/runtime hashes, and
+the 24-hour timestamp window. The required playlist fixtures are the fixed
+three-track control, Smooth Reggaeton Heat at exactly 50 tracks, and the
+French-jazz language/geography ambiguity with hard clean/version exclusions.
+Any prompt/count/guidance-mode mismatch is a non-promotable diagnostic run.
+The staging control-plane producer additionally requires independent signed
+Apple, provider-project, and QA-budget-ledger receipts. Added GitHub Actions
+budget is usable only through a fresh budget receipt with enough reserved
+capacity; there is no manual budget waiver.
+The receipt producer accepts only a fresh signed authority-source envelope
+from the corresponding external connector or ledger and verifies its distinct
+pinned source key before signing a receipt; it has no unsigned operator-input
+mode. Promotion and finalization mint separate receipts, and finalization also
+binds the new full post-Sites production snapshot.
+
+The release-candidate workflow never receives a long-lived producer signing
+key. Authorization, unprivileged candidate validation/browser execution, and
+privileged image publication/attestation use separate fresh jobs. The browser
+job has only `contents: read`; it never shares a runner, workspace, or token
+with `packages: write`, `id-token: write`, or `attestations: write`. The
+publishing job depends fail-closed on both preceding jobs, builds the pinned
+Node base for `linux/amd64`, and is the only job allowed to push the image.
+Postgres service images are also pinned by OCI index digest. Its offline-suite
+JSON is keylessly attested with GitHub Actions OIDC and
+Sigstore, then verified against the exact repository, signer workflow,
+default-branch source revision/ref, artifact digest, SLSA predicate type, and a
+GitHub-hosted runner. The protected evidence signer independently verifies that
+bundle before producing the detached offline-suite producer attestation.
+Candidate-controlled code cannot waive this conversion step or replace it with
+a repository secret. Run that conversion only in the protected signing
+environment with `pnpm release:offline-attestation:authorize
+-- --confirm-protected-offline-authorization ...`; the command verifies the
+GitHub proof again, refuses an existing output, and self-verifies the detached
+Ed25519 attestation before writing it.
+
+Stable publication uses the default-branch-only
+`.github/workflows/stable-release.yml`. Its dispatch is prepared by
+`release:stable:dispatch:prepare`, which proves the exact four-key signed input
+fits GitHub's fewer-than-64-KiB limit. Before any write the workflow requires
+strict app-bound main checks, PR approval/admin enforcement, the
+protected-branch-only `stable-release` environment, a tag ruleset that protects
+stable tags while excluding RC tags, the GitHub Actions Integration resolved
+directly from `apps.getBySlug("github-actions")` as the exact sole bypass,
+enabled repository immutable releases, signed full finalization
+evidence, distinct signed stable authorization, and exact GHCR provenance. It
+creates a draft, uploads and byte-verifies all evidence assets, then publishes
+and verifies immutability. The current private GitHub plan/control plane lacks
+these protections; that is an external P0, not a waivable test failure.
+
+Smooth Reggaeton Heat evidence additionally binds the exact breadth-question
+semantics, the server-owned recommended option, the >=70% core-reggaeton
+quota, and the final answer-lineage hash. No release artifact contains a raw
+prompt, custom answer, user/run identifier, or capability token. Live canary
+artifacts record `reuse_disabled`; a caller-selected claim such as cold/warm
+provider cache state is not accepted as release evidence.
+
+Semantic or ranking changes also require a blinded paired review of the fixed
+control, affected regression, and guided-constraint fixtures against the last
+proven release. Run the review through
+`evaluateSemanticRankingReviewV1`; all four candidate medians (relevance,
+discovery quality, coherence, and sequencing) must be at least 4/5. Every
+candidate fixture/dimension score must also be greater than or equal to its
+exact baseline score; medians cannot hide one badly regressed fixture.
+
+The baseline is not an operator-entered SHA. The protected release authority
+selects the greatest published immutable stable-semver GitHub Release below
+the RC and fails if its annotated tag target is not an ancestor of the
+candidate. That exact release must contain the fixed five-asset inventory,
+including `genio-semantic-ranking-protected-baseline/v2` metadata, signed
+finalization evidence, signed stable authorization, and the stable consumer
+manifest. The metadata contains the exact stable tag/version, source/image
+identity, finalization payload hash, final-browser evidence hash, and
+ordered-manifest/output SHA-256 values for the three code-owned fixture IDs.
+The workflow derives the five `RELEASE_SEMANTIC_BASELINE_*` trust pins from
+those immutable assets and rechecks the release ID, greatest-lower version,
+tag target, metadata hash, and every asset byte hash before publication.
+Repository-variable repinning, a self-authored metadata file, or an older
+signed-but-unselected release therefore cannot choose the review baseline.
+Baseline-specific historical key pins survive normal rotation of the current
+release keys.
+
+The authorization job writes those same five downloaded asset byte strings
+into a candidate-bound handoff directory with create-only permissions. It
+materializes the two historical Ed25519 public keys only from
+`RELEASE_SEMANTIC_BASELINE_RELEASE_PUBLIC_KEY_B64URL` and
+`RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_PUBLIC_KEY_B64URL` GitHub
+secrets, then rejects them unless their SPKI fingerprints equal the pins
+derived from the immutable consumer manifest. The sealed
+`genio-semantic-baseline-handoff/v2` manifest binds the RC tag/revision,
+release ID/identity, all five exact asset-byte hashes, both exact key-byte
+hashes, both key fingerprints, the exact predecessor mode/controller revision,
+and the fresh GitHub attestation-verification byte hash. The fresh verification
+JSON is itself part of the exact directory. The workflow uploads that fixed
+nine-file
+inventory, re-downloads and revalidates it before image publication, and
+preserves it inside the exact candidate artifact. Neither public-key bytes nor
+handoff authority may come from repository variables.
+
+Before review, create a randomized
+`genio-semantic-ranking-blinded-package/v1` with two privacy-safe hashed output
+arms per fixture and a separate
+`genio-semantic-ranking-blind-mapping/v1`. The mapping binds the package hash,
+protected baseline metadata hash, candidate source/image identity, and which
+random arm belongs to each release. The exact
+`genio-semantic-ranking-review/v2` artifact contains both package/mapping
+hashes and the baseline/candidate ordered-manifest/output hashes for each
+scored pair. The detached reviewer signature therefore covers the exact
+randomized package and mapping commitments without retaining prompts,
+reviewer identity, run IDs, Apple IDs, or provider bodies. The producer and
+release-evidence signer reparse the package and mapping and reject an arbitrary
+baseline, swapped arms, unbound outputs, or a tampered mapping.
+
+The reviewer and release producer are two cryptographic principals. After the
+independent reviewer completes the exact `genio-semantic-ranking-review/v2`
+artifact, derive its report with `evaluateSemanticRankingReviewV1` and have the
+reviewer create a detached attestation:
+
+```sh
+pnpm release:semantic-review:attest -- \
+  --blind-scorecard <EXACT_BLIND_SCORECARD_JSON> \
+  --reviewer-signing-key <INDEPENDENT_REVIEWER_ED25519_PRIVATE_KEY> \
+  --reviewer-key-id <REVIEWER_KEY_ID> \
+  --output <DETACHED_REVIEWER_ATTESTATION_JSON>
+```
+
+The release operator then produces the staging gate from that immutable review
+and the activated candidate runtime:
+
+```sh
+RELEASE_STAGING_ORIGIN="$STAGING_ORIGIN" \
+RELEASE_SEMANTIC_REVIEWER_KEY_ID="$APPROVED_REVIEWER_KEY_ID" \
+RELEASE_SEMANTIC_REVIEWER_KEY_SHA256="$APPROVED_REVIEWER_PUBLIC_KEY_SHA256" \
+RELEASE_SEMANTIC_BASELINE_METADATA_SHA256="$PROTECTED_BASELINE_METADATA_SHA256" \
+RELEASE_SEMANTIC_BASELINE_STABLE_TAG="$PROTECTED_BASELINE_STABLE_TAG" \
+RELEASE_SEMANTIC_BASELINE_RELEASE_KEY_SHA256="$HISTORICAL_RELEASE_KEY_SHA256" \
+RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_ID="$HISTORICAL_STABLE_AUTHORIZER_KEY_ID" \
+RELEASE_SEMANTIC_BASELINE_STABLE_AUTHORIZER_KEY_SHA256="$HISTORICAL_STABLE_AUTHORIZER_KEY_SHA256" \
+RELEASE_SEMANTIC_BASELINE_HANDOFF_SHA256="$RC_SEMANTIC_BASELINE_HANDOFF_SHA256" \
+pnpm release:semantic-review:produce -- \
+  --origin "$STAGING_ORIGIN" \
+  --candidate-tag <RC_TAG> \
+  --expected-revision <FULL_RC_GIT_SHA> \
+  --expected-version <VERSION> \
+  --image-digest <SHA256_IMAGE_DIGEST> \
+  --runtime-snapshot <STAGING_RUNTIME_SNAPSHOT_JSON> \
+  --review-artifact <EXACT_REVIEW_ARTIFACT_JSON> \
+  --review-report <DERIVED_REVIEW_REPORT_JSON> \
+  --reviewer-attestation <DETACHED_REVIEWER_ATTESTATION_JSON> \
+  --reviewer-verification-key <INDEPENDENT_REVIEWER_ED25519_PUBLIC_KEY> \
+  --protected-baseline-handoff-directory <EXACT_RC_HANDOFF_DIRECTORY> \
+  --protected-baseline-github-attestation-verification <EXACT_RC_HANDOFF_DIRECTORY>/predecessor-image-attestation-verification.json \
+  --expected-predecessor-repository hooterjackson/genio \
+  --expected-predecessor-default-branch main \
+  --expected-predecessor-mode <normal|bootstrap> \
+  --expected-predecessor-controller-revision <SEALED_PREDECESSOR_CONTROLLER_GIT_SHA> \
+  --blinded-package <RANDOMIZED_BLINDED_PACKAGE_JSON> \
+  --blind-scorecard <EXACT_BLIND_SCORECARD_JSON> \
+  --blind-mapping <SEPARATE_BLIND_MAPPING_JSON> \
+  --reggaeton-guidance-lineage-hash <SHA256_LINEAGE_HASH> \
+  --french-guidance-lineage-hash <SHA256_LINEAGE_HASH> \
+  --source-output <SEMANTIC_REVIEW_SOURCE_JSON> \
+  --output <SEMANTIC_REVIEW_GATE_JSON> \
+  --attestation-output <SEMANTIC_REVIEW_GATE_ATTESTATION_JSON> \
+  --producer-signing-key <RELEASE_PRODUCER_ED25519_PRIVATE_KEY> \
+  --producer-key-id <PRODUCER_KEY_ID>
+```
+
+The producer recomputes the report and gate assertions; there is no `--passed`
+or operator-entered success field. It verifies the reviewer signature and
+requires the reviewer key ID and public-key fingerprint to match the protected
+release-environment pins. It also revalidates the historical finalization and
+stable-authorization signatures at the signed authorization issuance time,
+requires distinct protected keys, rejects a missing, additional, substituted,
+or hash-mismatched handoff file, proves the stored stable consumer equals the
+cryptographically rederived lineage, and binds the exact stable tag,
+source/image, final-browser evidence, metadata, and fixture hashes to the
+immutable predecessor pins. Expiration today does not invalidate lineage that
+was valid then; non-overlapping, future-dated, repinned, or hash-mismatched
+lineage fails. For the one-time `v2.3.4` bootstrap predecessor, those baseline fixture hashes
+are explicitly reconstruction-wrapper-only evidence. The bootstrap
+`wrapperFixtureEvidenceHash` is derived from three typed staging gate
+artifacts and their detached producer attestations and never claims equality
+with unrecovered historical Railway production outputs.
+The producer invocation additionally requires the handoff hash; the same seven
+reviewer/baseline pins remain mandatory when
+`release:evidence sign` revalidates the signed producer result. A
+caller-generated second key is
+not an independent reviewer. The producer also rejects reuse of the release
+producer key as the reviewer key. Review, report,
+attestation, source, gate, and producer-attestation files are immutable and
+separate. A failed median, extra/missing fixture, unapproved JSON field,
+candidate mismatch, invalid signature, stale runtime binding, or shared key
+fails closed before a gate is written.
 
 ## Current automated traceability
 
@@ -483,9 +814,10 @@ reviewed holdout, or live Apple/operations evidence; it is not a passing claim.
   deterministic scenario and every new failure class has a focused assertion.
 - No exact-count canary completes short, and no unsupported exhaustive claim is
   represented as verified.
-- Auto-match precision is at least 99.5% on the independently attested factual
-  sample; at least 95% of storefront-available rows are auto-matched or safely
-  resolvable through review.
+- Do not claim 99.5% catalog-identity precision until at least 600
+  independently reviewed, auto-accepted rows are error-free. At least 95% of
+  storefront-available rows must be auto-matched or safely resolvable through
+  review.
 - Published membership and order equal the locked manifest exactly.
 - Cost and active duration remain within size-tier policy; overruns fail closed
   and remain visible to the owner.

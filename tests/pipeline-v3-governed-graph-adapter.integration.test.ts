@@ -92,6 +92,7 @@ function factualPlan(count: number): SelectionPlanV3 {
     hardConstraints: [],
     softPreferences: [],
     sourceDiscoveryHints: [],
+    conceptDiscoveryHints: [],
     diversityGoals: {
       minimumDistinctArtists: null,
       minimumDistinctAlbums: null,

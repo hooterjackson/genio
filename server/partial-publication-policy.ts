@@ -1,4 +1,5 @@
 import { HttpError } from "./security.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 
 export const PARTIAL_DECISION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 export const PARTIAL_EXPLORE_MINIMUM_FILL_RATIO = 0.9;
@@ -29,8 +30,16 @@ export function parsePartialReadyCheckpoint(value: unknown): PartialReadyCheckpo
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
   const outcomeHash = safeText(row.outcomeHash, 64).toLowerCase();
-  const targetTrackCount = boundedInteger(row.targetTrackCount, 1, 300);
-  const verifiedTrackCount = boundedInteger(row.verifiedTrackCount, 0, 300);
+  const targetTrackCount = boundedInteger(
+    row.targetTrackCount,
+    1,
+    EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  );
+  const verifiedTrackCount = boundedInteger(
+    row.verifiedTrackCount,
+    0,
+    EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  );
   const outcomeVersion = boundedInteger(row.outcomeVersion ?? 1, 1, Number.MAX_SAFE_INTEGER);
   const remainingStrategyCount = boundedInteger(row.remainingStrategyCount ?? 0, 0, 1_000);
   const preparedAt = safeText(row.preparedAt, 64);

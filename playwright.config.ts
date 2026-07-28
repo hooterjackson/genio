@@ -1,4 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
+import { qaWebServerEnvironment } from "./scripts/qa-playwright-args.mjs";
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:4173";
 const parsedBaseURL = new URL(baseURL);
@@ -42,7 +43,10 @@ export default defineConfig({
   ],
   webServer: startsLocalServer
     ? {
-        command: `${nodeBinary} scripts/qa-webserver.mjs ${devPort} ${devHostname}`,
+        // Playwright launches this through a detached shell. `exec` replaces
+        // that shell so the wrapper PID written to the ownership lease is also
+        // the webserver process-group ID used by the outer cleanup.
+        command: `exec ${nodeBinary} scripts/qa-webserver.mjs ${devPort} ${devHostname}`,
         url: baseURL,
         // Browser QA needs its own production bundle and Worker bindings.
         // Reusing an unrelated preview can silently omit OWNER_EMAIL, skip
@@ -51,9 +55,7 @@ export default defineConfig({
         // A cold Vinext production build can take several minutes on a fresh
         // CI runner before the preview server becomes ready.
         timeout: 300_000,
-        env: {
-          OWNER_EMAIL: process.env.OWNER_EMAIL ?? "owner@example.com",
-        },
+        env: qaWebServerEnvironment(process.env),
       }
     : undefined,
 });

@@ -4,11 +4,18 @@
  * meaning or shape of queued playlist-pipeline work.
  */
 import type { PipelineVersion, QueryPlanV3 } from "../shared/types.ts";
+import {
+  canonicalExecutorCapabilityEnvelopeIsValidV1,
+  canonicalExecutorCapabilityForSchemaV1,
+  type CanonicalExecutorCapabilityEnvelopeV1,
+} from "./playlist-contract-backend-capability-v1.ts";
 
 export interface WorkerPipelineCapability {
   protocolVersion: string;
   protocolNumber: number;
   pipelineVersions: readonly PipelineVersion[];
+  /** Absent on workers released before exact canonical-executor fencing. */
+  canonicalExecutorCapabilities?: readonly CanonicalExecutorCapabilityEnvelopeV1[];
 }
 
 /**
@@ -20,6 +27,7 @@ export const WORKER_PIPELINE_V4_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: "playlist-pipeline-v4",
   protocolNumber: 4,
   pipelineVersions: ["legacy_v1"],
+  canonicalExecutorCapabilities: [],
 };
 
 // v5 adds immutable pipeline/minimum-protocol queue stamping and makes every
@@ -29,21 +37,26 @@ export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: "playlist-pipeline-v5",
   protocolNumber: 5,
   pipelineVersions: ["legacy_v1", "catalog_first_v2"],
+  canonicalExecutorCapabilities: [],
 };
 
-// v9 is the compatibility bridge for the next brief/query-plan contracts.
-// Advertising the newer capability does not activate those contracts: the API
-// continues to emit the legacy brief contract and query-plan schema 2 until
-// their separately gated rollout.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v9";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 9;
-/** Old-contract bridge capacity remains healthy while v9 workers roll out. */
+// v10 is the compatibility bridge for immutable playlist-contract revisions,
+// brief contract 3, historical query-plan schema 4, and directive-aware
+// schema 5. Advertising it does not activate those contracts; feature gates
+// and job stamping keep old work drainable.
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v10";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 10;
+/** Old-contract bridge capacity remains healthy while v10 workers roll out. */
 export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION = "playlist-pipeline-v8";
 export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER = 8;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
   protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION,
   protocolNumber: WORKER_PIPELINE_PROTOCOL_NUMBER,
   pipelineVersions: ["legacy_v1", "catalog_first_v2", "corpus_first_v3"],
+  canonicalExecutorCapabilities: [
+    canonicalExecutorCapabilityForSchemaV1({ queryPlanSchemaVersion: 4 }),
+    canonicalExecutorCapabilityForSchemaV1({ queryPlanSchemaVersion: 5 }),
+  ],
 };
 
 export const LEGACY_V1_MINIMUM_WORKER_PROTOCOL = 4;
@@ -55,6 +68,10 @@ export const CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL = 8;
 export const BRIEF_CONTRACT_2_MINIMUM_WORKER_PROTOCOL = 9;
 /** Reserved fence for the inactive query-plan schema-3 execution contract. */
 export const CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL = 9;
+/** Immutable playlist-contract revisions require fencing-aware v10 workers. */
+export const BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL = 10;
+/** Query-plan schemas 4+ carry the active playlist-contract revision hash. */
+export const CORPUS_FIRST_V3_SCHEMA_4_MINIMUM_WORKER_PROTOCOL = 10;
 
 export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
   if (pipelineVersion === "corpus_first_v3") return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
@@ -69,7 +86,10 @@ export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersio
 export function minimumWorkerProtocolForQueryPlan(
   queryPlan: Pick<QueryPlanV3, "schemaVersion"> | { readonly schemaVersion: number } | null | undefined,
 ): number {
-  if (typeof queryPlan?.schemaVersion === "number" && queryPlan.schemaVersion >= 3) {
+  if (typeof queryPlan?.schemaVersion === "number" && queryPlan.schemaVersion >= 4) {
+    return CORPUS_FIRST_V3_SCHEMA_4_MINIMUM_WORKER_PROTOCOL;
+  }
+  if (queryPlan?.schemaVersion === 3) {
     return CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL;
   }
   if (queryPlan?.schemaVersion === 2) return CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL;
@@ -95,7 +115,14 @@ export function isWorkerCapabilityValid(capability: WorkerPipelineCapability): b
       value === "legacy_v1"
       || value === "catalog_first_v2"
       || value === "corpus_first_v3"
-    ));
+    ))
+    && (capability.canonicalExecutorCapabilities === undefined
+      || Array.isArray(capability.canonicalExecutorCapabilities))
+    && (capability.canonicalExecutorCapabilities ?? []).every(
+      canonicalExecutorCapabilityEnvelopeIsValidV1,
+    )
+    && new Set((capability.canonicalExecutorCapabilities ?? []).map(({ hash }) => hash)).size
+      === (capability.canonicalExecutorCapabilities ?? []).length;
 }
 
 export function workerPipelineProtocolVersion(metadata: unknown): string | null {

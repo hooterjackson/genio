@@ -1,5 +1,11 @@
 import { expect, test, vi } from "vitest";
+import { automaticFailureQaExportScenario } from "../server/automatic-failure-qa-export.ts";
 import { parseFeedbackSubmission } from "../server/feedback.ts";
+import {
+  applyPlaylistContractPatchV1,
+  compilePlaylistContractRevisionV1,
+  type PlaylistContractRevisionV1,
+} from "../server/playlist-contract-v1.ts";
 import { Repository } from "../server/repository.ts";
 
 interface QueryCall {
@@ -132,7 +138,13 @@ function automaticFailureHarness() {
     if (normalized.startsWith("SELECT phase,state_json FROM research_checkpoints")) {
       return { rows: [{ phase: "semantic_outcome", state_json: { rootCause: checkpointRootCause } }], rowCount: 1 };
     }
-    if (normalized.startsWith("SELECT id,prompt,requested_track_count,model,status,error")) {
+    if (
+      normalized.startsWith("SELECT id,prompt,requested_track_count,model,status,error")
+      || (
+        normalized.startsWith("SELECT brief.id,brief.prompt,brief.requested_track_count")
+        && normalized.includes("FROM brief_requests brief")
+      )
+    ) {
       const matches = brief && String(values[0]) === String(brief.id);
       return { rows: matches ? [{ ...brief }] : [], rowCount: matches ? 1 : 0 };
     }
@@ -409,6 +421,17 @@ function automaticFailureHarness() {
     advanceBriefFailureGeneration: (updatedAt: string) => {
       if (brief) brief.updated_at = updatedAt;
     },
+    setBriefActiveContract: (
+      originalRequestedTrackCount: number,
+      activeContract: PlaylistContractRevisionV1,
+    ) => {
+      settings.set("schema_version", "18");
+      if (!brief) return;
+      brief.requested_track_count = originalRequestedTrackCount;
+      brief.brief_contract_version = 3;
+      brief.active_playlist_contract_revision_id = "88888888-8888-4888-8888-888888888888";
+      brief.active_playlist_contract_json = activeContract;
+    },
     seedAutomaticRunReport: (input: {
       id: string;
       runAccessId: string;
@@ -528,6 +551,121 @@ test("a failed brief retry creates a distinct report for a new terminal generati
     String(new Date("2026-07-22T12:01:00.000Z").getTime()),
     String(new Date("2026-07-22T12:02:00.000Z").getTime()),
   ]));
+});
+
+test("a guided count successor is the failure diagnostic and replay authority", async () => {
+  const harness = automaticFailureHarness();
+  const base = compilePlaylistContractRevisionV1({
+    contractId: "contract:automatic-failure-guided-count",
+    rawPrompt: "Influential Berlin techno",
+    requestedTrackCount: 20,
+    locale: "en-US",
+    storefront: "us",
+    clauses: [{
+      id: "membership:techno",
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "genre",
+      operator: "require",
+      values: ["techno"],
+      source: { provenance: "prompt", text: "techno" },
+    }],
+    trackPredicate: { op: "clause", clauseId: "membership:techno" },
+  });
+  const successor = applyPlaylistContractPatchV1(base, {
+    baseRevisionId: base.revisionId,
+    baseSemanticHash: base.semanticHash,
+    answerLineage: {
+      questionSetHash: "a".repeat(64),
+      questionId: "custom:track-count",
+      answerHash: "b".repeat(64),
+    },
+    operations: [{ op: "set_requested_track_count", count: 25 }],
+  });
+  harness.setBriefActiveContract(20, successor);
+
+  await expect(
+    harness.repository.captureAutomaticBriefFailure(String(harness.getBrief()?.id)),
+  ).resolves.toMatchObject({ created: true });
+
+  const report = harness.reports()[0];
+  expect(report).toMatchObject({
+    automaticFailure: {
+      requestedTrackCount: 25,
+      storefront: "us",
+      details: {
+        trackCountAuthority: {
+          originalRequestedTrackCount: 20,
+          executionRequestedTrackCount: 25,
+          source: "active_contract",
+          activeContractIntegrityValid: true,
+          briefContractVersion: 3,
+        },
+      },
+    },
+    qaScenario: {
+      request: { requestedTrackCount: 25, storefront: "us" },
+      expected: { requestedTrackCount: 25 },
+    },
+  });
+  expect(automaticFailureQaExportScenario(report)).toMatchObject({
+    request: { requestedTrackCount: 25, storefront: "us" },
+    expected: { requestedTrackCount: 25 },
+  });
+});
+
+test("a corrupt active contract cannot silently replay the original count", async () => {
+  const harness = automaticFailureHarness();
+  const contract = compilePlaylistContractRevisionV1({
+    contractId: "contract:automatic-failure-corrupt-count",
+    rawPrompt: "Influential Berlin techno",
+    requestedTrackCount: 25,
+    locale: "en-US",
+    storefront: "us",
+    clauses: [{
+      id: "membership:techno",
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "genre",
+      operator: "require",
+      values: ["techno"],
+      source: { provenance: "prompt", text: "techno" },
+    }],
+    trackPredicate: { op: "clause", clauseId: "membership:techno" },
+  });
+  harness.setBriefActiveContract(20, {
+    ...contract,
+    semanticHash: "0".repeat(64),
+  });
+
+  await expect(
+    harness.repository.captureAutomaticBriefFailure(String(harness.getBrief()?.id)),
+  ).resolves.toMatchObject({ created: true });
+
+  expect(harness.reports()[0]).toMatchObject({
+    automaticFailure: {
+      requestedTrackCount: null,
+      storefront: null,
+      details: {
+        trackCountAuthority: {
+          originalRequestedTrackCount: 20,
+          executionRequestedTrackCount: null,
+          source: "invalid_active_contract",
+          activeContractIntegrityValid: false,
+        },
+      },
+    },
+    qaScenario: {
+      request: { requestedTrackCount: null, storefront: null },
+      expected: { requestedTrackCount: null },
+    },
+  });
+  expect(automaticFailureQaExportScenario(harness.reports()[0])).toMatchObject({
+    request: { requestedTrackCount: null, storefront: null },
+    expected: { requestedTrackCount: null },
+  });
 });
 
 test("owner deletion suppresses the same automatic event until its source is removed", async () => {

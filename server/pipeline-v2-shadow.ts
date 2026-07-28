@@ -1,4 +1,5 @@
 import { sha256Hex, stableStringify } from "./security.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 
 export const PIPELINE_V2_SHADOW_INPUT_SCHEMA = "genio-pipeline-v2-shadow-input/v1" as const;
 export const PIPELINE_V2_SHADOW_REPORT_SCHEMA = "genio-pipeline-v2-shadow-report/v1" as const;
@@ -228,7 +229,11 @@ export function parsePipelineV2ShadowInput(value: unknown): PipelineV2ShadowInpu
     generatedAt: timestamp(input.generatedAt, "shadow input.generatedAt"),
     promptHash: sha256(input.promptHash, "shadow input.promptHash"),
     storefront,
-    targetTrackCount: positiveInteger(input.targetTrackCount, "shadow input.targetTrackCount", 300),
+    targetTrackCount: positiveInteger(
+      input.targetTrackCount,
+      "shadow input.targetTrackCount",
+      EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+    ),
     primary: parsePool(input.primary, "shadow input.primary", "legacy_v1"),
     shadow: parsePool(input.shadow, "shadow input.shadow", "catalog_first_v2"),
   };

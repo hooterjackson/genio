@@ -7,21 +7,41 @@ import type {
   SelectionConstraint,
 } from "../shared/types.ts";
 import {
+  EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+} from "../shared/product-policy.ts";
+import {
   PIPELINE_V3_MAX_SOURCE_DISCOVERY_HINTS,
   selectionPlanV3Hash,
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
+import { assertCanonicalContractExecutionPolicyV1 } from "./canonical-contract-runtime-v1.ts";
+import {
+  PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
+} from "./playlist-contract-v1.ts";
 import {
   EVIDENCE_POLICY_VERSION,
   GUIDANCE_POLICY_VERSION,
 } from "./guidance-contract-v2.ts";
+import { canonicalContractActivationConfigured } from "./release-deployment-phase.ts";
+import { canonicalExecutorCapabilityForSchemaV1 } from "./playlist-contract-backend-capability-v1.ts";
+import {
+  assertPipelineV3ConceptDiscoveryHints,
+  clonePipelineV3ConceptDiscoveryHints,
+  executableQueryPlanClauseIdsV3,
+  isPipelineV3ConceptDiscoveryHints,
+} from "./pipeline-v3-concept-discovery-hint.ts";
 
 export const LEGACY_QUERY_PLAN_V3_VERSION = 1 as const;
 export const LEGACY_QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
 export const QUERY_PLAN_V3_VERSION = 2 as const;
 export const CONTRACT_QUERY_PLAN_V3_VERSION = 3 as const;
+/** Historical contract-3 plan. It may predate typed execution directives. */
+export const LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 4 as const;
+/** Directive-aware canonical plan emitted by the current compiler. */
+export const CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 5 as const;
 // Schema 2 refines the query contract; it does not create a new persisted run
 // policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -29,11 +49,43 @@ export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const
 export type QueryPlanV3SchemaVersion =
   | typeof LEGACY_QUERY_PLAN_V3_VERSION
   | typeof QUERY_PLAN_V3_VERSION
-  | typeof CONTRACT_QUERY_PLAN_V3_VERSION;
+  | typeof CONTRACT_QUERY_PLAN_V3_VERSION
+  | typeof LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+
+export function isCanonicalQueryPlanV3SchemaVersion(
+  value: unknown,
+): value is
+  | typeof LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION {
+  return value === LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    || value === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+}
+
+export function queryPlanV3RequiresLegacyCanonicalExecutor(
+  value: Pick<QueryPlanV3, "schemaVersion" | "engines" | "executionDirectives">,
+): boolean {
+  return value.schemaVersion === LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    && !value.executionDirectives
+    && (value.engines.includes("fixed_container")
+      || value.engines.includes("similarity"));
+}
 
 export function queryPlanV3EmissionSchemaVersion(
   env: NodeJS.ProcessEnv = process.env,
 ): QueryPlanV3SchemaVersion {
+  if (
+    env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "5"
+    && canonicalContractActivationConfigured(env)
+  ) {
+    return CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+  }
+  if (
+    env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "4"
+    && canonicalContractActivationConfigured(env)
+  ) {
+    return LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+  }
   if (env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "3") return CONTRACT_QUERY_PLAN_V3_VERSION;
   if (env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "2") return QUERY_PLAN_V3_VERSION;
   return LEGACY_QUERY_PLAN_V3_VERSION;
@@ -58,6 +110,8 @@ export interface PipelineV3Assignment {
     | "guidance_required"
     | "owner_canary"
     | "production_evidence_required"
+    | "governed_curated_hosted_evidence_required"
+    | "governed_geographic_evidence_required"
     | "factual_feasibility_required"
     | "sticky_rollout"
     | "control";
@@ -68,7 +122,7 @@ function boundedPercentage(value: string | undefined): number {
   return Number.isFinite(parsed) ? Math.max(0, Math.min(100, parsed)) : 0;
 }
 
-function rolloutCohort(stickyKey: string): number {
+export function pipelineV3RolloutCohort(stickyKey: string): number {
   return createHash("sha256").update(stickyKey).digest().readUInt32BE(0) % 10_000;
 }
 
@@ -78,7 +132,11 @@ function isFixedContainerPrompt(prompt: string): boolean {
     || /\b(?:album|soundtrack|compilation)\s+["“][^"”]{2,120}["”]/u.test(normalized);
 }
 
-export function queryPlanV3Engines(plan: SelectionPlanV3): QueryPlanV3Engine[] {
+type PipelineV3IntentProjection = Pick<SelectionPlanV3, "prompt" | "intents">;
+
+export function queryPlanV3Engines(
+  plan: PipelineV3IntentProjection,
+): QueryPlanV3Engine[] {
   const engines: QueryPlanV3Engine[] = [];
   if (plan.intents.includes("exhaustive")) engines.push("exhaustive");
   else if (plan.intents.includes("factual_relationship")) engines.push("factual_relationship");
@@ -94,16 +152,22 @@ export function queryPlanV3Engines(plan: SelectionPlanV3): QueryPlanV3Engine[] {
   return [...new Set(engines)];
 }
 
-export function primaryQueryPlanV3Engine(plan: SelectionPlanV3): QueryPlanV3Engine {
+export function primaryQueryPlanV3Engine(
+  plan: PipelineV3IntentProjection,
+): QueryPlanV3Engine {
   return queryPlanV3Engines(plan)[0]!;
 }
 
-export function pipelineV3RolloutGroup(plan: SelectionPlanV3): PipelineV3RolloutGroup {
+export function pipelineV3RolloutGroup(
+  plan: PipelineV3IntentProjection,
+): PipelineV3RolloutGroup {
   const engine = primaryQueryPlanV3Engine(plan);
   return engine === "curated_genre_scene" ? "genre_scene" : engine;
 }
 
-function rolloutVariable(group: PipelineV3RolloutGroup): string {
+export function pipelineV3RolloutVariable(
+  group: PipelineV3RolloutGroup,
+): string {
   switch (group) {
     case "genre_scene": return "PIPELINE_V3_GENRE_SCENE_PERCENT";
     case "mood_activity_theme": return "PIPELINE_V3_MOOD_ACTIVITY_PERCENT";
@@ -137,7 +201,7 @@ function ownerCanaryAllows(
   );
   const configuredMaximum = Number(env.PIPELINE_V3_OWNER_CANARY_MAX_TRACKS ?? 50);
   const maximumTracks = Number.isSafeInteger(configuredMaximum)
-    ? Math.max(1, Math.min(300, configuredMaximum))
+    ? Math.max(1, Math.min(EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS, configuredMaximum))
     : 50;
   return groups.has(group) && plan.requestedTrackCount <= maximumTracks;
 }
@@ -151,12 +215,45 @@ export function assignPipelineV3(input: {
 }): PipelineV3Assignment {
   const env = input.env ?? process.env;
   const group = pipelineV3RolloutGroup(input.plan);
-  const cohort = rolloutCohort(`${input.stickyKey}:${group}:${QUERY_PLAN_V3_POLICY_VERSION}`);
+  const cohort = pipelineV3RolloutCohort(
+    `${input.stickyKey}:${group}:${QUERY_PLAN_V3_POLICY_VERSION}`,
+  );
   if (env.PIPELINE_V3_ASSIGNMENT_ENABLED !== "true") {
     return { assigned: false, cohort, percentage: 0, group, reason: "master_disabled" };
   }
   if (!input.plan.confirmed || input.plan.criticalAmbiguities.some(({ key }) => !input.plan.resolvedAmbiguityKeys.includes(key))) {
     return { assigned: false, cohort, percentage: 0, group, reason: "guidance_required" };
+  }
+  const requiresGeographicEvidence = input.plan.membershipPredicates.some((predicate) => (
+    predicate.operator !== "exclude"
+    && predicate.geographyRelationship !== null
+    && predicate.geographyRelationship !== undefined
+    && predicate.geographyRelationship !== "sound_association"
+  ));
+  const requiresCuratedHostedEvidence = (
+    group === "genre_scene"
+    || group === "mood_activity_theme"
+    || group === "similarity"
+  ) && env.PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED !== "true";
+  if (input.owner && requiresCuratedHostedEvidence) {
+    return {
+      assigned: false,
+      cohort,
+      percentage: 0,
+      group,
+      reason: "governed_curated_hosted_evidence_required",
+    };
+  }
+  if (input.owner
+    && requiresGeographicEvidence
+    && env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED !== "true") {
+    return {
+      assigned: false,
+      cohort,
+      percentage: 0,
+      group,
+      reason: "governed_geographic_evidence_required",
+    };
   }
   if (input.owner && ownerCanaryAllows(input.plan, group, env)) {
     return { assigned: true, cohort, percentage: 100, group, reason: "owner_canary" };
@@ -164,11 +261,30 @@ export function assignPipelineV3(input: {
   if (env.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED !== "true") {
     return { assigned: false, cohort, percentage: 0, group, reason: "production_evidence_required" };
   }
+  if (requiresCuratedHostedEvidence) {
+    return {
+      assigned: false,
+      cohort,
+      percentage: 0,
+      group,
+      reason: "governed_curated_hosted_evidence_required",
+    };
+  }
+  if (requiresGeographicEvidence
+    && env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED !== "true") {
+    return {
+      assigned: false,
+      cohort,
+      percentage: 0,
+      group,
+      reason: "governed_geographic_evidence_required",
+    };
+  }
   if ((group === "factual_relationship" || group === "exhaustive")
     && env.PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED !== "true") {
     return { assigned: false, cohort, percentage: 0, group, reason: "factual_feasibility_required" };
   }
-  const percentage = boundedPercentage(env[rolloutVariable(group)]);
+  const percentage = boundedPercentage(env[pipelineV3RolloutVariable(group)]);
   const assigned = cohort < Math.round(percentage * 100);
   return { assigned, cohort, percentage, group, reason: assigned ? "sticky_rollout" : "control" };
 }
@@ -260,11 +376,32 @@ export function createQueryPlanV3(
   graphSnapshotId: string,
   options: {
     readonly schemaVersion?: QueryPlanV3SchemaVersion;
-    readonly briefContractVersion?: 1 | 2;
+    readonly briefContractVersion?: 1 | 2 | 3;
     readonly executionDeltaHash?: string;
+    readonly playlistContractRevisionId?: string;
+    readonly playlistContractSemanticHash?: string;
+    readonly playlistContractCompilerVersion?: string;
   } = {},
 ): QueryPlanV3 {
   const requestedSchemaVersion = options.schemaVersion ?? QUERY_PLAN_V3_VERSION;
+  const canonicalSchema = isCanonicalQueryPlanV3SchemaVersion(
+    requestedSchemaVersion,
+  );
+  const directiveAwareCanonicalSchema =
+    requestedSchemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+  const executorCapability = directiveAwareCanonicalSchema
+    ? canonicalExecutorCapabilityForSchemaV1({
+        queryPlanSchemaVersion: requestedSchemaVersion,
+      })
+    : null;
+  if (
+    plan.requestedTrackCount > PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+    && !canonicalSchema
+  ) {
+    throw new Error(
+      "Expanded query plans require a canonical schema and fenced contract revision",
+    );
+  }
   if (requestedSchemaVersion >= QUERY_PLAN_V3_VERSION
     && plan.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION) {
     throw new Error("Typed query plans require the current governed music-concept policy");
@@ -275,13 +412,53 @@ export function createQueryPlanV3(
       || !/^[0-9a-f]{64}$/u.test(options.executionDeltaHash))) {
     throw new Error("Schema-3 query plans require a contract-2 execution-delta hash");
   }
+  if (canonicalSchema
+    && (options.briefContractVersion !== 3
+      || typeof options.playlistContractRevisionId !== "string"
+      || !options.playlistContractRevisionId.startsWith("pcr1:")
+      || typeof options.playlistContractSemanticHash !== "string"
+      || !/^[0-9a-f]{64}$/u.test(options.playlistContractSemanticHash)
+      || typeof options.playlistContractCompilerVersion !== "string"
+      || options.playlistContractCompilerVersion.length < 1)) {
+    throw new Error("Canonical query plans require a fenced contract revision");
+  }
+  if (canonicalSchema) {
+    if (!plan.canonicalContractPolicy) {
+      throw new Error("Canonical query plans require the canonical runtime selection policy");
+    }
+    assertCanonicalContractExecutionPolicyV1(plan.canonicalContractPolicy);
+    if (plan.canonicalContractPolicy.contractRevisionId !== options.playlistContractRevisionId
+      || plan.canonicalContractPolicy.contractSemanticHash !== options.playlistContractSemanticHash
+      || plan.canonicalContractPolicy.contractCompilerVersion
+        !== options.playlistContractCompilerVersion
+      || plan.canonicalContractPolicy.requestedTrackCount !== plan.requestedTrackCount
+      || plan.canonicalContractPolicy.storefront !== plan.storefront) {
+      throw new Error("Canonical runtime policy does not match its contract fence");
+    }
+  }
+  if (directiveAwareCanonicalSchema) {
+    if (stableStringify(plan.executionDirectives ?? null)
+      !== stableStringify(plan.canonicalContractPolicy!.executionDirectives ?? null)) {
+      throw new Error("Schema-5 execution directives do not match the canonical runtime policy");
+    }
+    if (plan.engines.includes("fixed_container")
+        !== Boolean(plan.executionDirectives?.fixedContainer)
+      || plan.engines.includes("similarity")
+        !== Boolean(plan.executionDirectives?.similarity)) {
+      throw new Error("Schema-5 routing engines do not match typed execution directives");
+    }
+  }
   if (!plan.confirmed || plan.criticalAmbiguities.some(({ key }) => !plan.resolvedAmbiguityKeys.includes(key))) {
     throw new Error("Critical playlist ambiguity must be resolved before a V3 query plan is created");
   }
   if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/iu.test(graphSnapshotId)) {
     throw new Error("A locked graph snapshot id is required");
   }
-  const engines = queryPlanV3Engines(plan);
+  // Contract-3 routing is already compiled and hash-bound. Re-running prompt
+  // heuristics here would create a second, mutable interpretation path.
+  const engines = canonicalSchema
+    ? [...plan.engines]
+    : queryPlanV3Engines(plan);
   const semanticClauses = plan.semanticClauses.map(semanticClause);
   const contextSignals = plan.contextSignals.map(semanticClause);
   const catalogPolicies = plan.catalogPolicies.map(semanticClause);
@@ -290,10 +467,36 @@ export function createQueryPlanV3(
       .filter((clause) => clause.role === "membership")
       .map(({ axis, operator, values }) => ({ axis, operator, values: normalizedValues(values) }))
     )).digest("hex");
+  const executableClauseIds = executableQueryPlanClauseIdsV3({
+    membershipPredicates: plan.membershipPredicates.map((predicate) => ({
+      id: predicate.id,
+      kind: predicate.axis,
+      subject: predicate.values.join(" | "),
+      relationship: predicate.operator,
+      hard: true,
+    })),
+    rankingObjectives: plan.rankingObjectives.map((objective) => ({
+      id: objective.id,
+      kind: objective.dimension,
+      description: objective.reason,
+      weight: objective.weight,
+      values: [...objective.values],
+    })),
+    semanticClauses,
+    hardConstraints: plan.hardConstraints,
+    softPreferences: plan.softPreferences,
+    canonicalContractPolicy: plan.canonicalContractPolicy,
+    playlistQuotaRules: plan.playlistQuotaRules,
+    playlistQualityPolicy: plan.playlistQualityPolicy,
+  });
+  const conceptDiscoveryHints = plan.conceptDiscoveryHints ?? [];
+  assertPipelineV3ConceptDiscoveryHints(conceptDiscoveryHints, executableClauseIds);
   const schemaTwo: QueryPlanV3 = {
-    schemaVersion: requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION
-      ? CONTRACT_QUERY_PLAN_V3_VERSION
-      : QUERY_PLAN_V3_VERSION,
+    schemaVersion: canonicalSchema
+      ? requestedSchemaVersion
+      : requestedSchemaVersion === CONTRACT_QUERY_PLAN_V3_VERSION
+        ? CONTRACT_QUERY_PLAN_V3_VERSION
+        : QUERY_PLAN_V3_VERSION,
     pipelineVersion: "corpus_first_v3",
     policyVersion: QUERY_PLAN_V3_POLICY_VERSION,
     engine: engines[0]!,
@@ -324,6 +527,11 @@ export function createQueryPlanV3(
       .filter(schemaTwoExecutableHardConstraint),
     softPreferences: distinctConstraints(plan.softPreferences),
     sourceDiscoveryHints: plan.sourceDiscoveryHints.map((hint) => ({ ...hint })),
+    ...(conceptDiscoveryHints.length > 0 ? {
+      conceptDiscoveryHints: clonePipelineV3ConceptDiscoveryHints(
+        conceptDiscoveryHints,
+      ),
+    } : {}),
     scopeKind: plan.scopeKind,
     diversityGoals: { ...plan.diversityGoals },
     orderingPolicy: { ...plan.orderingPolicy, goals: [...plan.orderingPolicy.goals] },
@@ -358,6 +566,36 @@ export function createQueryPlanV3(
       guidancePolicyVersion: GUIDANCE_POLICY_VERSION,
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
       executionDeltaHash: options.executionDeltaHash,
+    } : {}),
+    ...(canonicalSchema ? {
+      briefContractVersion: 3 as const,
+      guidancePolicyVersion: "adaptive_guidance_v3",
+      evidencePolicyVersion: PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
+      playlistContractRevisionId: options.playlistContractRevisionId,
+      playlistContractSemanticHash: options.playlistContractSemanticHash,
+      playlistContractCompilerVersion: options.playlistContractCompilerVersion,
+      ...(executorCapability ? {
+        executorCapabilityHash: executorCapability.hash,
+        executorCapabilityVector: structuredClone(executorCapability.vector),
+      } : {}),
+      playlistQuotaRules: (plan.playlistQuotaRules ?? []).map((rule) => ({
+        ...rule,
+        values: [...rule.values],
+        ...(rule.predicate ? { predicate: structuredClone(rule.predicate) } : {}),
+      })),
+      ...(plan.playlistQualityPolicy ? {
+        playlistQualityPolicy: {
+          ...plan.playlistQualityPolicy,
+          clauseIds: [...plan.playlistQualityPolicy.clauseIds],
+          criteria: [...plan.playlistQualityPolicy.criteria],
+        },
+      } : {}),
+      ...(plan.canonicalContractPolicy ? {
+        canonicalContractPolicy: structuredClone(plan.canonicalContractPolicy),
+      } : {}),
+      ...(directiveAwareCanonicalSchema && plan.executionDirectives ? {
+        executionDirectives: structuredClone(plan.executionDirectives),
+      } : {}),
     } : {}),
   };
   if ((options.schemaVersion ?? QUERY_PLAN_V3_VERSION) !== LEGACY_QUERY_PLAN_V3_VERSION) {
@@ -394,7 +632,13 @@ export function createRuntimeQueryPlanV3(
   plan: SelectionPlanV3,
   graphSnapshotId: string,
   env: NodeJS.ProcessEnv = process.env,
-  contract: { readonly briefContractVersion?: 1 | 2; readonly executionDeltaHash?: string } = {},
+  contract: {
+    readonly briefContractVersion?: 1 | 2 | 3;
+    readonly executionDeltaHash?: string;
+    readonly playlistContractRevisionId?: string;
+    readonly playlistContractSemanticHash?: string;
+    readonly playlistContractCompilerVersion?: string;
+  } = {},
 ): QueryPlanV3 {
   return createQueryPlanV3(plan, graphSnapshotId, {
     schemaVersion: queryPlanV3EmissionSchemaVersion(env),
@@ -465,6 +709,161 @@ function sameClause(left: QueryPlanV3SemanticClause, right: QueryPlanV3SemanticC
   return stableStringify(left) === stableStringify(right);
 }
 
+function isCanonicalPlaylistQuotaRule(
+  value: unknown,
+): value is NonNullable<QueryPlanV3["playlistQuotaRules"]>[number] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const rule = value as Partial<NonNullable<QueryPlanV3["playlistQuotaRules"]>[number]>;
+  const count = (candidate: unknown) => candidate === null
+    || (Number.isSafeInteger(candidate) && Number(candidate) >= 0 && Number(candidate) <= 10_000);
+  const ratio = (candidate: unknown) => candidate === null
+    || (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 && candidate <= 1);
+  return typeof rule.id === "string" && /^[A-Za-z0-9._:-]{1,160}$/u.test(rule.id)
+    && typeof rule.clauseId === "string" && /^[A-Za-z0-9._:-]{1,160}$/u.test(rule.clauseId)
+    && rule.axis === "genre"
+    && Array.isArray(rule.values)
+    && rule.values.length > 0
+    && rule.values.length <= 20
+    && rule.values.every((item) => typeof item === "string" && item.trim().length > 0 && item.length <= 240)
+    && count(rule.minimumCount)
+    && count(rule.maximumCount)
+    && ratio(rule.minimumRatio)
+    && ratio(rule.maximumRatio)
+    && (rule.minimumCount !== null
+      || rule.maximumCount !== null
+      || rule.minimumRatio !== null
+      || rule.maximumRatio !== null)
+    && [
+      "authoritative_structured_metadata",
+      "trusted_scoped_container",
+      "track_specific_editorial_assertion",
+      "primary_source",
+      "independent_secondary_source",
+    ].includes(String(rule.evidenceGrade))
+    && (rule.predicate === undefined
+      || (rule.predicate !== null && typeof rule.predicate === "object"));
+}
+
+function isCanonicalPlaylistQualityPolicy(
+  value: unknown,
+): value is NonNullable<QueryPlanV3["playlistQualityPolicy"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Partial<NonNullable<QueryPlanV3["playlistQualityPolicy"]>>;
+  const ratio = (candidate: unknown) => (
+    typeof candidate === "number"
+    && Number.isFinite(candidate)
+    && candidate >= 0
+    && candidate <= 1
+  );
+  return policy.policyVersion === "canonical_central_quality_v1"
+    && Array.isArray(policy.clauseIds)
+    && policy.clauseIds.length > 0
+    && policy.clauseIds.length <= 40
+    && policy.clauseIds.every((id) => (
+      typeof id === "string" && /^[A-Za-z0-9._:-]{1,160}$/u.test(id)
+    ))
+    && Array.isArray(policy.criteria)
+    && policy.criteria.length > 0
+    && policy.criteria.length <= 40
+    && policy.criteria.every((criterion) => (
+      typeof criterion === "string" && criterion.trim().length > 0 && criterion.length <= 240
+    ))
+    && ratio(policy.minimumPassRatio)
+    && ratio(policy.maximumUnknownRatio)
+    && policy.zeroKnownFailures === true
+    && policy.signalDimension === "central_quality"
+    && ratio(policy.passThreshold)
+    && ratio(policy.failThreshold)
+    && Number(policy.failThreshold) < Number(policy.passThreshold)
+    && policy.signalSemantics === "ranking_only_not_factual_evidence";
+}
+
+function isCanonicalContractRuntimePolicy(
+  value: unknown,
+  row: Partial<Pick<QueryPlanV3, "playlistContractRevisionId" | "playlistContractSemanticHash" | "targetTrackCount" | "storefront">>,
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  try {
+    assertCanonicalContractExecutionPolicyV1(
+      value as NonNullable<QueryPlanV3["canonicalContractPolicy"]>,
+    );
+  } catch {
+    return false;
+  }
+  const policy = value as NonNullable<QueryPlanV3["canonicalContractPolicy"]>;
+  return typeof row.playlistContractRevisionId === "string"
+    && typeof row.playlistContractSemanticHash === "string"
+    && typeof row.targetTrackCount === "number"
+    && typeof row.storefront === "string"
+    && policy.contractRevisionId === row.playlistContractRevisionId
+    && policy.contractSemanticHash === row.playlistContractSemanticHash
+    && policy.requestedTrackCount === row.targetTrackCount
+    && policy.storefront === row.storefront;
+}
+
+function canonicalExecutionDirectivesValid(row: Partial<QueryPlanV3>): boolean {
+  const policyDirectives = row.canonicalContractPolicy?.executionDirectives;
+  if (stableStringify(row.executionDirectives ?? null)
+    !== stableStringify(policyDirectives ?? null)) return false;
+  const directives = row.executionDirectives;
+  const engines = row.engines ?? [];
+  if (!directives) {
+    return !engines.includes("fixed_container") && !engines.includes("similarity");
+  }
+  if (engines.includes("fixed_container") !== Boolean(directives.fixedContainer)
+    || engines.includes("similarity") !== Boolean(directives.similarity)) return false;
+  if (directives.fixedContainer) {
+    const fixed = directives.fixedContainer;
+    const predicate = row.membershipPredicates?.find(({ id }) => id === fixed.membershipClauseId);
+    if (!predicate
+      || predicate.kind !== fixed.kind
+      || membershipOperatorPolarity(predicate.relationship) !== "positive"
+      || predicate.subject !== fixed.name) return false;
+  }
+  if (directives.similarity) {
+    const similarity = directives.similarity;
+    const ranking = row.rankingObjectives?.find(({ id }) => id === similarity.rankingClauseId);
+    if (!ranking
+      || ranking.kind !== "similarity"
+      || stableStringify(ranking.values ?? []) !== stableStringify(similarity.seedArtists)) {
+      return false;
+    }
+    const excluded = similarity.exactArtistExclusionClauseIds.flatMap((id) => {
+      const predicate = row.membershipPredicates?.find((candidate) => candidate.id === id);
+      if (!predicate
+        || predicate.kind !== "artist"
+        || membershipOperatorPolarity(predicate.relationship) !== "exclude") return ["__invalid__"];
+      return predicate.subject.split(" | ");
+    }).map((value) => value.toLocaleLowerCase("en-US")).sort();
+    const expected = similarity.excludedArtists
+      .map((value) => value.toLocaleLowerCase("en-US")).sort();
+    if (stableStringify(excluded) !== stableStringify(expected)) return false;
+  }
+  if (directives.exactArtistIdentityExclusions) {
+    const exact = directives.exactArtistIdentityExclusions;
+    if (exact.bindings.length === 0
+      || exact.bindings.some(({ storefront }) => storefront !== row.storefront)) {
+      return false;
+    }
+    const excluded = exact.bindings.flatMap((binding) => {
+      const predicate = row.membershipPredicates?.find(
+        (candidate) => candidate.id === binding.clauseId,
+      );
+      if (!predicate
+        || predicate.kind !== "artist"
+        || membershipOperatorPolarity(predicate.relationship) !== "exclude") {
+        return ["__invalid__"];
+      }
+      return predicate.subject.split(" | ");
+    }).map((value) => value.toLocaleLowerCase("en-US")).sort();
+    const expected = exact.bindings
+      .map(({ displayName }) => displayName.toLocaleLowerCase("en-US"))
+      .sort();
+    if (stableStringify(excluded) !== stableStringify(expected)) return false;
+  }
+  return true;
+}
+
 function membershipOperatorPolarity(operator: string): "positive" | "exclude" | null {
   if (operator === "include" || operator === "require") return "positive";
   if (operator === "exclude") return "exclude";
@@ -528,7 +927,10 @@ function semanticRoleProjectionMatches(
 }
 
 function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
-  if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION)
+  if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION
+      && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION
+      && row.schemaVersion !== LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      && row.schemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION)
     || row.policyVersion !== QUERY_PLAN_V3_POLICY_VERSION
     || row.semanticPolicyVersion !== "scope_gate_v2_1_2"
     || row.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
@@ -589,6 +991,49 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
     || typeof row.executionDeltaHash !== "string"
     || !/^[a-f0-9]{64}$/u.test(row.executionDeltaHash)
   )) return false;
+  if (isCanonicalQueryPlanV3SchemaVersion(row.schemaVersion)) {
+    if (row.briefContractVersion !== 3
+      || row.guidancePolicyVersion !== "adaptive_guidance_v3"
+      || row.evidencePolicyVersion !== PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION
+      || typeof row.playlistContractRevisionId !== "string"
+      || !row.playlistContractRevisionId.startsWith("pcr1:")
+      || typeof row.playlistContractSemanticHash !== "string"
+      || !/^[a-f0-9]{64}$/u.test(row.playlistContractSemanticHash)
+      || typeof row.playlistContractCompilerVersion !== "string"
+      || row.playlistContractCompilerVersion.length < 1
+      || !Array.isArray(row.playlistQuotaRules)
+      || row.playlistQuotaRules.length > 20
+      || !row.playlistQuotaRules.every(isCanonicalPlaylistQuotaRule)
+      || (row.playlistQualityPolicy !== undefined
+        && !isCanonicalPlaylistQualityPolicy(row.playlistQualityPolicy))
+      || !isCanonicalContractRuntimePolicy(row.canonicalContractPolicy, row)) {
+      return false;
+    }
+    if (row.schemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      && !canonicalExecutionDirectivesValid(row)) return false;
+    if (row.schemaVersion === LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      && (row.executionDirectives !== undefined
+        || row.canonicalContractPolicy?.executionDirectives !== undefined)
+      && !canonicalExecutionDirectivesValid(row)) return false;
+    if (row.schemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION) {
+      const expectedCapability = canonicalExecutorCapabilityForSchemaV1({
+        queryPlanSchemaVersion: row.schemaVersion,
+      });
+      if (row.executorCapabilityHash !== expectedCapability.hash
+        || stableStringify(row.executorCapabilityVector)
+          !== stableStringify(expectedCapability.vector)) return false;
+    } else if (
+      row.executorCapabilityHash !== undefined
+      || row.executorCapabilityVector !== undefined
+    ) {
+      const expectedCapability = canonicalExecutorCapabilityForSchemaV1({
+        queryPlanSchemaVersion: row.schemaVersion,
+      });
+      if (row.executorCapabilityHash !== expectedCapability.hash
+        || stableStringify(row.executorCapabilityVector)
+          !== stableStringify(expectedCapability.vector)) return false;
+    }
+  }
   return true;
 }
 
@@ -641,6 +1086,16 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
         || hint.excerpt.length > 500) return false;
       try { return assertPublicHttpsUrl(hint.url).toString() === hint.url; } catch { return false; }
     });
+  const queryPlanArraysValid = Array.isArray(row.membershipPredicates)
+    && Array.isArray(row.rankingObjectives)
+    && Array.isArray(row.hardConstraints)
+    && Array.isArray(row.softPreferences);
+  const conceptDiscoveryHintsValid = row.conceptDiscoveryHints === undefined
+    || (queryPlanArraysValid
+      && isPipelineV3ConceptDiscoveryHints(
+        row.conceptDiscoveryHints,
+        executableQueryPlanClauseIdsV3(row as QueryPlanV3),
+      ));
   const schemaValid = (row.schemaVersion === LEGACY_QUERY_PLAN_V3_VERSION
       && row.policyVersion === LEGACY_QUERY_PLAN_V3_POLICY_VERSION)
     || typedQueryPlanContractValid(row);
@@ -653,7 +1108,11 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
     && /^[a-z]{2}$/u.test(row.storefront)
     && Number.isInteger(row.targetTrackCount)
     && Number(row.targetTrackCount) >= 1
-    && Number(row.targetTrackCount) <= 300
+    && Number(row.targetTrackCount) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+    && (
+      Number(row.targetTrackCount) <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS
+      || isCanonicalQueryPlanV3SchemaVersion(row.schemaVersion)
+    )
     && Array.isArray(row.engines)
     && row.engines.length > 0
     && row.engine === row.engines[0]
@@ -672,6 +1131,7 @@ export function isQueryPlanV3(value: unknown): value is QueryPlanV3 {
     && Array.isArray(row.hardConstraints)
     && Array.isArray(row.softPreferences)
     && sourceDiscoveryHintsValid
+    && conceptDiscoveryHintsValid
     && continuationValid
     && corpusReviewValid;
 }

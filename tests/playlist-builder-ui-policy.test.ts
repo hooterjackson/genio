@@ -8,6 +8,8 @@ import {
   partialReadyView,
   publishedTrackCountSummary,
   publishedResultHeading,
+  runResolutionControls,
+  shouldKeepPollingBlockedRun,
   shouldPresentShortfallWithoutError,
   shouldQuietlyClearInitialRunRestore,
 } from "../app/playlist-builder-ui-policy.ts";
@@ -152,5 +154,124 @@ describe("Pipeline V3 partial publication decisions", () => {
     })).toBe(false);
     expect(partialDecisionHeading(1)).toBe("1 verified track is ready");
     expect(partialDecisionHeading(8)).toBe("8 verified tracks are ready");
+  });
+});
+
+describe("never-dead-end run controls", () => {
+  it("keeps dependency recovery automatic while exposing revision and cancellation exits", () => {
+    const run = {
+      status: "failed_system",
+      resolution: {
+        state: "blocked_dependency",
+        nextAction: "wait_for_dependency",
+        terminal: false,
+        blocker: {
+          kind: "provider",
+          nextRetryAt: "2026-07-23T12:00:00.000Z",
+        },
+      },
+    };
+    expect(runResolutionControls(run)).toEqual([
+      "wait_for_retry",
+      "refine_request",
+      "cancel_job",
+    ]);
+    expect(shouldKeepPollingBlockedRun(run)).toBe(true);
+  });
+
+  it("routes quarantine to a real support link and retains safe exits", () => {
+    const run = {
+      status: "failed_integrity",
+      resolution: {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+      },
+    };
+    expect(runResolutionControls(run)).toEqual([
+      "contact_support",
+      "refine_request",
+      "cancel_job",
+    ]);
+    expect(shouldKeepPollingBlockedRun(run)).toBe(false);
+  });
+
+  it("offers Resume later only for a hash-bound retained dependency decision", () => {
+    const eligible = {
+      status: "needs_decision",
+      phase: "dependency_retry_window_expired",
+      decisionAction: {
+        reason: "dependency_retry_window_expired",
+        decisionHash: "a".repeat(64),
+        actions: { resumeLater: true },
+      },
+      resolution: {
+        state: "needs_decision",
+        nextAction: "resume_research",
+        terminal: false,
+        blocker: {
+          kind: "provider",
+          nextRetryAt: null,
+          automaticRetryUntil: "2026-07-24T12:00:00.000Z",
+          versionHash: "b".repeat(64),
+        },
+      },
+    };
+    expect(runResolutionControls(eligible)).toEqual([
+      "resume_dependency",
+      "refine_request",
+      "cancel_job",
+    ]);
+    expect(runResolutionControls({
+      ...eligible,
+      resolution: {
+        ...eligible.resolution,
+        blocker: {
+          ...eligible.resolution.blocker,
+          versionHash: null,
+        },
+      },
+    })).toEqual(["refine_request", "cancel_job"]);
+    expect(runResolutionControls({
+      ...eligible,
+      resolution: {
+        ...eligible.resolution,
+        blocker: {
+          ...eligible.resolution.blocker,
+          kind: "scope_decision",
+        },
+      },
+    })).toEqual(["refine_request", "cancel_job"]);
+  });
+
+  it("does not expose a fake partial action when the signed decision is absent", () => {
+    expect(runResolutionControls({
+      status: "partial_ready",
+      resolution: {
+        state: "needs_decision",
+        nextAction: "decide_verified_partial",
+        terminal: false,
+      },
+    })).toEqual(["refine_request", "cancel_job"]);
+  });
+
+  it("leaves a valid explicit partial decision to the dedicated decision screen", () => {
+    expect(runResolutionControls({
+      status: "partial_ready",
+      partialAction: {
+        kind: "partial_publication",
+        targetTrackCount: 50,
+        qualifiedTrackCount: 42,
+        remainingStrategyCount: 1,
+        canContinueResearch: true,
+        outcomeVersion: 2,
+        outcomeHash: "a".repeat(64),
+      },
+      resolution: {
+        state: "needs_decision",
+        nextAction: "decide_verified_partial",
+        terminal: false,
+      },
+    })).toEqual([]);
   });
 });

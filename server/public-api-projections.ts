@@ -7,8 +7,142 @@ import type {
   PartialPublicationActionView,
   PublicResearchRunView,
   ResearchRunView,
+  RunGuidanceActionView,
   RunProgressView,
+  RunResolutionView,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
+import { publicAdaptiveRunDecisionV1 } from "./adaptive-run-decision-v1.ts";
+import {
+  guidanceDecisionV3FromPublicQuestion,
+  publicGuidanceQuestionV3,
+} from "./adaptive-guidance-contract-bridge.ts";
+
+function publicRunGuidanceAction(value: unknown): RunGuidanceActionView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const questionSetHash = publicProgressText(row.questionSetHash, 64).toLowerCase();
+  const baseContractRevisionId = publicProgressText(row.baseContractRevisionId, 160);
+  const baseContractSemanticHash = publicProgressText(
+    row.baseContractSemanticHash,
+    64,
+  ).toLowerCase();
+  const attemptsUsed = publicProgressOptionalCount(row.attemptsUsed);
+  if (!/^[a-f0-9]{64}$/u.test(questionSetHash)
+    || !baseContractRevisionId
+    || !/^[a-f0-9]{64}$/u.test(baseContractSemanticHash)
+    || attemptsUsed === null
+    || attemptsUsed < 1
+    || attemptsUsed > 2
+    || row.maximumAttempts !== 2
+    || !Array.isArray(row.questions)) {
+    return null;
+  }
+  if (row.kind === "interpretation_summary") {
+    const summary = row.interpretationSummary;
+    const actions = row.actions;
+    const reason = row.reason;
+    const axis = row.axis === null
+      ? null
+      : publicProgressText(row.axis, 80);
+    if (row.questions.length !== 0
+      || row.showEditableInterpretationSummary !== true
+      || !["clarification_attempt_limit", "rescue_question_limit"].includes(
+        String(reason),
+      )
+      || (row.axis !== null && !axis)
+      || !summary
+      || typeof summary !== "object"
+      || Array.isArray(summary)
+      || !actions
+      || typeof actions !== "object"
+      || Array.isArray(actions)) {
+      return null;
+    }
+    const summaryRow = summary as Record<string, unknown>;
+    const actionRow = actions as Record<string, unknown>;
+    const count = publicProgressOptionalCount(summaryRow.count);
+    const textList = (value: unknown): string[] | null => {
+      if (!Array.isArray(value) || value.length > 100) return null;
+      const output = value.map((item) => publicProgressText(item, 500));
+      return output.some((item) => !item) ? null : output;
+    };
+    const mustHave = textList(summaryRow.mustHave);
+    const prefer = textList(summaryRow.prefer);
+    const avoid = textList(summaryRow.avoid);
+    const flow = textList(summaryRow.flow);
+    if (count === null
+      || count < 1
+      || count > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
+      || !mustHave || !prefer || !avoid || !flow
+      || actionRow.changeEarlierAnswer !== true
+      || actionRow.reviewContract !== true
+      || actionRow.resumeLater !== true
+      || actionRow.cancel !== true) {
+      return null;
+    }
+    return {
+      kind: "interpretation_summary",
+      questionSetHash,
+      baseContractRevisionId,
+      baseContractSemanticHash,
+      questions: [],
+      attemptsUsed,
+      maximumAttempts: 2,
+      showEditableInterpretationSummary: true,
+      reason: reason as "clarification_attempt_limit" | "rescue_question_limit",
+      axis,
+      interpretationSummary: {
+        mustHave,
+        prefer,
+        avoid,
+        flow,
+        count,
+      },
+      actions: {
+        changeEarlierAnswer: true,
+        reviewContract: true,
+        resumeLater: true,
+        cancel: true,
+      },
+    };
+  }
+  if (row.kind !== "rescue_guidance"
+    || row.showEditableInterpretationSummary !== false
+    || row.questions.length < 1
+    || row.questions.length > 1) {
+    return null;
+  }
+  const questions: PlaylistGuidanceQuestion[] = [];
+  try {
+    for (const question of row.questions) {
+      questions.push(publicGuidanceQuestionV3(
+        guidanceDecisionV3FromPublicQuestion(
+          question as PlaylistGuidanceQuestion,
+        ),
+      ));
+    }
+  } catch {
+    return null;
+  }
+  if (questions.some((question) => (
+    question.baseContractRevisionId !== baseContractRevisionId
+    || question.baseContractSemanticHash !== baseContractSemanticHash
+    || question.trigger !== "yield_risk"
+  ))) {
+    return null;
+  }
+  return {
+    kind: "rescue_guidance",
+    questionSetHash,
+    baseContractRevisionId,
+    baseContractSemanticHash,
+    questions,
+    attemptsUsed,
+    maximumAttempts: 2,
+    showEditableInterpretationSummary: false,
+  };
+}
 
 function publicPartialAction(value: unknown): PartialPublicationActionView | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -19,7 +153,9 @@ function publicPartialAction(value: unknown): PartialPublicationActionView | nul
   const outcomeVersion = publicProgressOptionalCount(row.outcomeVersion);
   const outcomeHash = publicProgressText(row.outcomeHash, 64).toLowerCase();
   if (
-    targetTrackCount === null || targetTrackCount < 1 || targetTrackCount > 300
+    targetTrackCount === null
+    || targetTrackCount < 1
+    || targetTrackCount > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
     || qualifiedTrackCount === null || qualifiedTrackCount >= targetTrackCount
     || remainingStrategyCount === null
     || outcomeVersion === null || outcomeVersion < 1
@@ -51,6 +187,62 @@ function publicExplore(value: unknown): ExplorePreferenceView | null {
     listed: row.listed,
     canChange: row.canChange,
     reason: publicProgressText(row.reason, 200) || null,
+  };
+}
+
+/**
+ * The capability-authenticated visitor API must advertise only actions that
+ * the visitor can actually complete. Rescue guidance is preserved only when
+ * its complete hash-bound action is present. A dependency resume is preserved
+ * only when the retained provider blocker carries its optimistic-lock hash;
+ * generic manual resume and Apple authorization remain owner/orchestrator
+ * operations.
+ */
+export function publicRunResolutionView(
+  resolution: RunResolutionView,
+  partialAction: PartialPublicationActionView | null,
+  guidanceAction: RunGuidanceActionView | null = null,
+): RunResolutionView {
+  let state = resolution.state;
+  let nextAction = resolution.nextAction;
+
+  if (nextAction === "answer_initial_guidance"
+    || (nextAction === "answer_rescue_guidance" && !guidanceAction)) {
+    state = "needs_decision";
+    nextAction = "review_contract";
+  } else if (nextAction === "authorize_apple") {
+    state = "blocked_dependency";
+    nextAction = "wait_for_dependency";
+  } else if (nextAction === "resume_research") {
+    const dependencyResume = resolution.state === "needs_decision"
+      && resolution.blocker?.kind === "provider"
+      && typeof resolution.blocker.versionHash === "string"
+      && /^[a-f0-9]{64}$/u.test(resolution.blocker.versionHash);
+    if (!dependencyResume) {
+      state = "needs_decision";
+      nextAction = partialAction?.canContinueResearch
+        ? "decide_verified_partial"
+        : "review_contract";
+    }
+  } else if (nextAction === "decide_verified_partial" && !partialAction) {
+    state = "needs_decision";
+    nextAction = "review_contract";
+  }
+
+  return {
+    state,
+    nextAction,
+    terminal: resolution.terminal,
+    contractRevisionId: resolution.contractRevisionId,
+    contractRevision: resolution.contractRevision,
+    contractHash: resolution.contractHash,
+    blocker: resolution.blocker ? {
+      kind: resolution.blocker.kind,
+      nextRetryAt: resolution.blocker.nextRetryAt,
+      automaticRetryUntil: resolution.blocker.automaticRetryUntil,
+      retryCount: resolution.blocker.retryCount,
+      versionHash: resolution.blocker.versionHash,
+    } : null,
   };
 }
 
@@ -175,6 +367,8 @@ export function publicResearchRunView(
   run: InternalResearchRunView,
   identity?: { id?: string; prompt?: string },
 ): PublicResearchRunView {
+  const partialAction = publicPartialAction(run.partialAction);
+  const guidanceAction = publicRunGuidanceAction(run.guidanceAction);
   return {
     id: identity?.id ?? run.id,
     prompt: identity?.prompt ?? run.prompt,
@@ -193,8 +387,13 @@ export function publicResearchRunView(
     pipelineOutcome: run.pipelineOutcome,
     candidateStageCounts: run.candidateStageCounts,
     progress: run.progress ? publicRunProgressView(run.progress) : undefined,
-    partialAction: publicPartialAction(run.partialAction),
+    partialAction,
+    decisionAction: publicAdaptiveRunDecisionV1(run.decisionAction),
+    guidanceAction,
     explore: publicExplore(run.explore),
+    resolution: run.resolution
+      ? publicRunResolutionView(run.resolution, partialAction, guidanceAction)
+      : undefined,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     completedAt: run.completedAt,
@@ -205,8 +404,9 @@ export function publicBriefStatusView(input: {
   requestId: string;
   prompt: string;
   requestedTrackCount: number | null;
+  originalRequestedTrackCount?: number | null;
   status: string;
-  briefContractVersion?: 1 | 2;
+  briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
   brief?: PlaylistBrief;
   questions?: PlaylistGuidanceQuestion[];
@@ -218,6 +418,7 @@ export function publicBriefStatusView(input: {
     requestId: input.requestId,
     prompt: input.prompt,
     requestedTrackCount: input.requestedTrackCount,
+    originalRequestedTrackCount: input.originalRequestedTrackCount,
     status: input.status,
     briefContractVersion: input.briefContractVersion,
     questionSetHash: input.questionSetHash,

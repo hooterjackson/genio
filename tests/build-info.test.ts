@@ -16,6 +16,17 @@ describe("public build information", () => {
     });
   });
 
+  test("prefers the explicitly promoted image revision over ambient platform Git metadata", () => {
+    expect(buildInformation({
+      APP_VERSION: "2.4.0",
+      SOURCE_COMMIT_SHA: "a".repeat(40),
+      RAILWAY_GIT_COMMIT_SHA: "b".repeat(40),
+    })).toMatchObject({
+      version: "2.4.0",
+      revision: "a".repeat(40),
+    });
+  });
+
   test("falls back to package metadata and rejects unsafe revision strings", () => {
     const result = buildInformation({
       RAILWAY_GIT_COMMIT_SHA: "secret=value",

@@ -26,6 +26,7 @@ const env = {
   GATEWAY_HMAC_SECRET: "owner-test-gateway-secret-at-least-32-bytes",
   IP_HASH_SECRET: "owner-test-ip-secret-at-least-32-bytes",
   OWNER_EMAIL: "owner@example.com",
+  OWNER_ALLOWLIST_VERSION: "owner-allowlist-v1",
 };
 
 const ctx = {
@@ -89,6 +90,8 @@ describe("Sites owner gateway boundary", () => {
     expect(forwardedHeaders().get("x-needle-owner-email")).toBe("owner@example.com");
     expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
     expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("x-genio-owner-allowlist-version"))
+      .toBe("owner-allowlist-v1");
   });
 
   test("a Node preview without the explicit local-QA opt-in cannot consume process gateway secrets", async () => {
@@ -99,6 +102,7 @@ describe("Sites owner gateway boundary", () => {
       "GATEWAY_HMAC_SECRET",
       "IP_HASH_SECRET",
       "OWNER_EMAIL",
+      "OWNER_ALLOWLIST_VERSION",
     ] as const;
     const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
     try {
@@ -108,6 +112,7 @@ describe("Sites owner gateway boundary", () => {
       process.env.GATEWAY_HMAC_SECRET = env.GATEWAY_HMAC_SECRET;
       process.env.IP_HASH_SECRET = env.IP_HASH_SECRET;
       process.env.OWNER_EMAIL = env.OWNER_EMAIL;
+      process.env.OWNER_ALLOWLIST_VERSION = env.OWNER_ALLOWLIST_VERSION;
 
       const response = await worker.fetch(apiRequest("/api/v1/owner/apple/authorization/validate", {
         "OAI-Authenticated-User-Email": "owner@example.com",
@@ -123,6 +128,23 @@ describe("Sites owner gateway boundary", () => {
         else process.env[name] = value;
       }
     }
+  });
+
+  test("fails closed when an owner allowlist has no explicit release version", async () => {
+    const missingVersion = { ...env, OWNER_ALLOWLIST_VERSION: undefined };
+    const response = await worker.fetch(
+      apiRequest("/api/v1/owner/apple/authorization/validate", {
+        "OAI-Authenticated-User-Email": "owner@example.com",
+      }),
+      missingVersion as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Owner allowlist release identity is not configured.",
+    });
+    expect(upstreamFetch).not.toHaveBeenCalled();
   });
 
   test("the owner can retry the saved Apple authorization through the signed gateway", async () => {
@@ -170,6 +192,23 @@ describe("Sites owner gateway boundary", () => {
     expect(upstreamFetch.mock.calls[0]?.[1]?.method).toBe("GET");
     expect(forwardedHeaders().has("x-needle-owner-email")).toBe(false);
     expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  });
+
+  test("the release system-health probe crosses the signed gateway with its cache-busting query", async () => {
+    const response = await worker.fetch(new Request(
+      "https://needle.example/health/system?release-evidence=probe-123",
+      { headers: { "CF-Connecting-IP": "203.0.113.10" } },
+    ), env as never, ctx);
+
+    expect(response.status).toBe(200);
+    expect(upstreamFetch).toHaveBeenCalledOnce();
+    expect(String(upstreamFetch.mock.calls[0]?.[0])).toBe(
+      "https://railway.example/health/system?release-evidence=probe-123",
+    );
+    expect(upstreamFetch.mock.calls[0]?.[1]?.method).toBe("GET");
+    expect(forwardedHeaders().has("x-needle-owner-email")).toBe(false);
+    expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(response.headers.get("cache-control")).toBe("no-store");
   });
 
   test("a different Sites identity remains anonymous on public API requests", async () => {

@@ -2,6 +2,67 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.0",
+      "releasedAt": "2026-07-24",
+      "title": "Never-dead-end canonical playlists",
+      "notes": [
+        "Executes new canonical work only from immutable contract-3 revisions with typed Boolean predicates, versioned evidence policy, capability negotiation, and stale-worker fencing.",
+        "Enforces governed evidence v2 with a fail-closed partial order: minimum and permitted grades must both hold, incomparable or model-derived leads cannot qualify, and Apple metadata cannot prove factual relationships.",
+        "Asks progressive one-axis guidance questions with server-owned patches, optimistic locking, custom-answer confirmation, editable summaries, and bounded rescue decisions.",
+        "Reports truthful feasibility, dependency pauses, retry paths, explicit scope decisions, and technical quarantine without presenting provider failure as musical scarcity.",
+        "Adds concurrent independent discovery, dynamic Apple-safe reserves, deficit-specific recovery, and constrained playlist optimization for quality, diversity, quotas, and sequencing.",
+        "Persists schema-18 qualification records and revalidates exact membership, evidence, count, quality, quotas, diversity, order, and storefront availability immediately before Apple writes.",
+        "Separates original exact success, guided revision success, approved partial publication, actionable decisions, dependency pauses, quarantine, and cancellation in synthetic-safe metrics.",
+        "Adds authenticated non-reusable canaries, signed 24-hour release evidence, blinded semantic review gates, adversarial failure injection, and ordered Apple reconciliation checks.",
+        "Pins one immutable artifact through fail-closed bridge, expand, and activate phases before cohort rollout, with explicit staging controls and Sites deployment last.",
+        "Adds an authenticated owner-only extended route for 301–1,000 tracks after schema-18 activation, with scaled cost and discovery budgets; public requests remain capped at 300 with the same exactness and time boundary.",
+        "Recognizes reggaeton, Latin urban, and dembow as genre/scene concepts while keeping generic vibe language soft when a request already names its genre, so optional mood cannot become a hard evidence gate.",
+        "Covers the exact Smooth Reggaeton Heat request with one material adjacency question and an executable recommended contract requiring at least 70% core reggaeton."
+      ]
+    },
+    {
+      "version": "2.3.4",
+      "releasedAt": "2026-07-23",
+      "title": "Curated hosted retrieval safety",
+      "notes": [
+        "Extends the production reliability guard across genre, mood/activity, and similarity cohorts because all three use the same strict hosted-source retrieval contract.",
+        "Covers both immutable classifications observed for the exact Smooth Reggaeton Heat request during production replay.",
+        "Keeps these curated requests on Pipeline V2 until the shared Pipeline V3 hosted-retrieval evidence gate is explicitly approved."
+      ]
+    },
+    {
+      "version": "2.3.3",
+      "releasedAt": "2026-07-23",
+      "title": "Genre retrieval reliability guard",
+      "notes": [
+        "Routes new genre and scene requests, including reggaeton, through the proven Pipeline V2 path until Pipeline V3 genre evidence is explicitly approved.",
+        "Applies the genre safety gate to both public rollout and authenticated owner canaries.",
+        "Classifies zero-candidate Pipeline V3 runs with provider or structured-contract failures as retryable system failures instead of incorrectly claiming that no compatible tracks exist.",
+        "Adds a production-derived Smooth Reggaeton Heat regression covering the exact 50-track request that exposed the reliability gap."
+      ]
+    },
+    {
+      "version": "2.3.2",
+      "releasedAt": "2026-07-22",
+      "title": "Owner-canary geographic safety",
+      "notes": [
+        "Applies the governed geographic-evidence gate before owner-canary assignment so authenticated QA runs cannot bypass the same production safety rule as public requests.",
+        "Keeps Brazilian geographic-scene playlists on the proven Pipeline V2 path until Pipeline V3 geographic evidence is explicitly approved."
+      ]
+    },
+    {
+      "version": "2.3.1",
+      "releasedAt": "2026-07-22",
+      "title": "Production guidance and geographic evidence safety",
+      "notes": [
+        "Enables contract-2 guidance for public rollout so broad requests can receive subject-specific follow-up questions before research begins.",
+        "Guarantees a deterministic Brazilian-disco focus question when the bounded guidance scout returns no usable subject question.",
+        "Routes public geographic-scene requests through the proven Pipeline V2 evidence path until governed Pipeline V3 geographic evidence is explicitly approved.",
+        "Preserves exact requested counts and membership scope while preventing an unready Pipeline V3 scene predicate from discarding an otherwise valid candidate pool.",
+        "Compiles geographic guidance choices with their actual place, scene, or language value instead of an internal option identifier."
+      ]
+    },
+    {
       "version": "2.3.0",
       "releasedAt": "2026-07-22",
       "title": "Intelligent guidance and quality diagnostics",

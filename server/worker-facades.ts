@@ -35,9 +35,71 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
     listResearchContainers: (...args: Parameters<ResearchRepository["listResearchContainers"]>) => source.listResearchContainers(...args),
     getResearchCheckpoint: (...args: Parameters<ResearchRepository["getResearchCheckpoint"]>) => source.getResearchCheckpoint(...args),
     saveResearchCheckpoint: (...args: Parameters<ResearchRepository["saveResearchCheckpoint"]>) => source.saveResearchCheckpoint(...args),
+    ...(source.claimResearchProviderRetry ? {
+      claimResearchProviderRetry: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["claimResearchProviderRetry"]>
+        >
+      ) => source.claimResearchProviderRetry!(...args),
+    } : {}),
+    ...(source.persistResearchProviderBlocker ? {
+      persistResearchProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["persistResearchProviderBlocker"]>
+        >
+      ) => source.persistResearchProviderBlocker!(...args),
+    } : {}),
+    ...(source.validateResearchProviderAttempt ? {
+      validateResearchProviderAttempt: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["validateResearchProviderAttempt"]>
+        >
+      ) => source.validateResearchProviderAttempt!(...args),
+    } : {}),
+    ...(source.resolveResearchProviderBlocker ? {
+      resolveResearchProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<ResearchRepository["resolveResearchProviderBlocker"]>
+        >
+      ) => source.resolveResearchProviderBlocker!(...args),
+    } : {}),
+    ...(source.getActivePlaylistContractRevision ? {
+      getActivePlaylistContractRevision: (
+        ...args: Parameters<NonNullable<ResearchRepository["getActivePlaylistContractRevision"]>>
+      ) => source.getActivePlaylistContractRevision!(...args),
+    } : {}),
+    ...(source.openPlaylistRunBlocker ? {
+      openPlaylistRunBlocker: (
+        ...args: Parameters<NonNullable<ResearchRepository["openPlaylistRunBlocker"]>>
+      ) => source.openPlaylistRunBlocker!(...args),
+    } : {}),
+    ...(source.preparePlaylistRunRescueGuidance ? {
+      preparePlaylistRunRescueGuidance: (
+        ...args: Parameters<NonNullable<ResearchRepository["preparePlaylistRunRescueGuidance"]>>
+      ) => source.preparePlaylistRunRescueGuidance!(...args),
+    } : {}),
     claimPipelineV3SemanticRecovery: (
       ...args: Parameters<ResearchRepository["claimPipelineV3SemanticRecovery"]>
     ) => source.claimPipelineV3SemanticRecovery(...args),
+    ...(source.persistPipelineV3DiscoveryBatch ? {
+      persistPipelineV3DiscoveryBatch: (
+        ...args: Parameters<NonNullable<ResearchRepository["persistPipelineV3DiscoveryBatch"]>>
+      ) => source.persistPipelineV3DiscoveryBatch!(...args),
+    } : {}),
+    ...(source.persistPipelineV3QualificationBatch ? {
+      persistPipelineV3QualificationBatch: (
+        ...args: Parameters<NonNullable<ResearchRepository["persistPipelineV3QualificationBatch"]>>
+      ) => source.persistPipelineV3QualificationBatch!(...args),
+    } : {}),
+    ...(source.validatePipelineV3ContinuationQualifications ? {
+      validatePipelineV3ContinuationQualifications: (
+        ...args: Parameters<
+          NonNullable<
+            ResearchRepository["validatePipelineV3ContinuationQualifications"]
+          >
+        >
+      ) => source.validatePipelineV3ContinuationQualifications!(...args),
+    } : {}),
     persistPipelineV3RetrievalResult: (
       ...args: Parameters<ResearchRepository["persistPipelineV3RetrievalResult"]>
     ) => source.persistPipelineV3RetrievalResult(...args),
@@ -86,6 +148,27 @@ export function createMatchingRepositoryFacade(source: MatchingRepository): Matc
     } : {}),
     ...(source.savePipelineOutcome ? {
       savePipelineOutcome: (...args: Parameters<NonNullable<MatchingRepository["savePipelineOutcome"]>>) => source.savePipelineOutcome!(...args),
+    } : {}),
+    ...(source.persistCatalogProviderBlocker ? {
+      persistCatalogProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<MatchingRepository["persistCatalogProviderBlocker"]>
+        >
+      ) => source.persistCatalogProviderBlocker!(...args),
+    } : {}),
+    ...(source.claimCatalogProviderRetry ? {
+      claimCatalogProviderRetry: (
+        ...args: Parameters<
+          NonNullable<MatchingRepository["claimCatalogProviderRetry"]>
+        >
+      ) => source.claimCatalogProviderRetry!(...args),
+    } : {}),
+    ...(source.resolveCatalogProviderBlocker ? {
+      resolveCatalogProviderBlocker: (
+        ...args: Parameters<
+          NonNullable<MatchingRepository["resolveCatalogProviderBlocker"]>
+        >
+      ) => source.resolveCatalogProviderBlocker!(...args),
     } : {}),
     ...(source.getPipelineStageCounts ? {
       getPipelineStageCounts: (...args: Parameters<NonNullable<MatchingRepository["getPipelineStageCounts"]>>) => source.getPipelineStageCounts!(...args),
@@ -154,11 +237,34 @@ export function createPublicationRepositoryFacade(source: PublicationRepository)
     ...(source.acquireAppleWritePermit ? {
       acquireAppleWritePermit: (...args: Parameters<NonNullable<PublicationRepository["acquireAppleWritePermit"]>>) => source.acquireAppleWritePermit!(...args),
     } : {}),
+    ...(source.commitPublicationCompletion ? {
+      commitPublicationCompletion: (...args: Parameters<NonNullable<PublicationRepository["commitPublicationCompletion"]>>) => source.commitPublicationCompletion!(...args),
+    } : {}),
+    ...(source.beginPublicationReconciliation ? {
+      beginPublicationReconciliation: (
+        ...args: Parameters<NonNullable<PublicationRepository["beginPublicationReconciliation"]>>
+      ) => source.beginPublicationReconciliation!(...args),
+    } : {}),
+    ...(source.advancePublicationReconciliation ? {
+      advancePublicationReconciliation: (
+        ...args: Parameters<NonNullable<PublicationRepository["advancePublicationReconciliation"]>>
+      ) => source.advancePublicationReconciliation!(...args),
+    } : {}),
+    ...(source.openPlaylistRunBlocker ? {
+      openPlaylistRunBlocker: (
+        ...args: Parameters<NonNullable<PublicationRepository["openPlaylistRunBlocker"]>>
+      ) => source.openPlaylistRunBlocker!(...args),
+    } : {}),
     ...(source.getManifestPreflightTracks ? {
       getManifestPreflightTracks: (...args: Parameters<NonNullable<PublicationRepository["getManifestPreflightTracks"]>>) => source.getManifestPreflightTracks!(...args),
     } : {}),
     ...(source.getManifestPreflightReserveTracks ? {
       getManifestPreflightReserveTracks: (...args: Parameters<NonNullable<PublicationRepository["getManifestPreflightReserveTracks"]>>) => source.getManifestPreflightReserveTracks!(...args),
+    } : {}),
+    ...(source.revalidateCanonicalPublicationManifest ? {
+      revalidateCanonicalPublicationManifest: (
+        ...args: Parameters<NonNullable<PublicationRepository["revalidateCanonicalPublicationManifest"]>>
+      ) => source.revalidateCanonicalPublicationManifest!(...args),
     } : {}),
     ...(source.createManifestRevision ? {
       createManifestRevision: (...args: Parameters<NonNullable<PublicationRepository["createManifestRevision"]>>) => source.createManifestRevision!(...args),

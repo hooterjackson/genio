@@ -18,7 +18,10 @@ const localBindingConfig = {
   // bindings. Forward only the local owner identity needed by authenticated
   // browser QA; production Sites variables remain managed by Sites.
   vars: process.env.OWNER_EMAIL
-    ? { OWNER_EMAIL: process.env.OWNER_EMAIL }
+    ? {
+        OWNER_EMAIL: process.env.OWNER_EMAIL,
+        OWNER_ALLOWLIST_VERSION: process.env.OWNER_ALLOWLIST_VERSION ?? "",
+      }
     : {},
   d1_databases: d1
     ? [

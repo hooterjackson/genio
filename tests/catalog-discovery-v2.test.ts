@@ -67,6 +67,8 @@ describe("Pipeline V2 curated Apple catalog discovery", () => {
     [100, 100, 90_000, 6, 140],
     [200, 200, 180_000, 8, 260],
     [300, 300, 300_000, 10, 400],
+    [301, 500, 450_000, 17, 667],
+    [1_000, 1_000, 900_000, 34, 1_334],
   ] as const)("target %i selects the immutable %i-track discovery tier", (target, tier, deadlineMs, pages, calls) => {
     expect(catalogDiscoverySizePolicy(target)).toEqual({
       policyVersion: "relevance_first_2026_07_r2",

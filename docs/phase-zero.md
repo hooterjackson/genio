@@ -104,4 +104,4 @@ pnpm phase-zero:apple -- inventory \
 
 - [ ] Expand the checked-in Paulinho da Costa and Michael Jackson seed fixtures through independent review; do not use runtime research output to author the expected catalogue.
 - [ ] Prepare and finalize the Postgres-derived, hash-bound staging benchmark artifact with independently reviewed Apple judgments and Berlin-techno scores plus rationales.
-- [ ] Run `pnpm benchmark -- <artifact.json>` and retain the passing report with the release record (100% factual holdout recovery, at least 99.5% auto-match precision, and at least 95% storefront-available resolvability).
+- [ ] Run `pnpm benchmark -- <artifact.json>` and retain the passing report with the release record (100% factual holdout recovery, at least 600 independently reviewed error-free auto-matches before making the 99.5% catalog-identity claim, and at least 95% storefront-available resolvability).

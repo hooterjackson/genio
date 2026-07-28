@@ -1,11 +1,12 @@
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { Pool } from "pg";
 import { createDatabase } from "../../db/index.ts";
 import { deterministicBriefFallback } from "../../server/brief-policy.ts";
 import {
+  attestedEvidenceBindingsForSelectionV3,
   publicTrackScopeAttestationV3,
   type QualifiedTrackV3,
   type RetrievalResultV3,
@@ -47,6 +48,9 @@ async function applySql(pool: Pool, sql: string): Promise<void> {
 function fixtureTrack(prefix: string, index: number, predicateIds: readonly string[]): QualifiedTrackV3 {
   const ordinal = String(index + 1).padStart(3, "0");
   const url = `https://example.test/system-e2e/${prefix}/${ordinal}`;
+  const sourceHash = createHash("sha256")
+    .update(["hosted_web_search", url].join("\u0000"))
+    .digest("hex");
   return {
     candidateId: `${prefix}:candidate:${ordinal}`,
     title: `${prefix} Track ${ordinal}`,
@@ -76,8 +80,8 @@ function fixtureTrack(prefix: string, index: number, predicateIds: readonly stri
         cachePolicy: "excerpt_only",
         retentionPolicy: "ninety_days",
         freshnessPolicy: "revalidate_30d",
-        sourceHash: "a".repeat(64),
-        sourceRevision: "b".repeat(64),
+        sourceHash,
+        sourceRevision: sourceHash,
       },
       eligibilityAttestation: publicTrackScopeAttestationV3(url),
     }],
@@ -155,6 +159,8 @@ function fixtureResult(input: {
       id: "curated_genre_scene:system_e2e",
       engine: "curated_genre_scene",
       kind: "trusted_containers",
+      discoveryDependencyIds: ["apple_catalog"],
+      qualificationDependencyIds: ["apple_catalog"],
       status: input.continuationAvailable ? "available" : "exhausted",
       rounds: 1,
       rawCandidates: qualifiedPool.length,
@@ -174,6 +180,14 @@ function fixtureResult(input: {
     },
   };
 }
+
+test("stitched V3 fixtures retain attested exact track-scope evidence", () => {
+  const track = fixtureTrack("exact", 0, ["genre:disco"]);
+  expect(attestedEvidenceBindingsForSelectionV3(
+    track.evidenceBindingIds,
+    track.evidenceBindings,
+  )).toHaveLength(1);
+});
 
 async function waitForApi(child: ChildProcess, output: () => string): Promise<void> {
   const deadline = Date.now() + 20_000;
@@ -230,6 +244,9 @@ test.describe("Pipeline V3 stitched system E2E", () => {
     process.env.NODE_ENV = "test";
     process.env.PIPELINE_V3_ASSIGNMENT_ENABLED = "true";
     process.env.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED = "true";
+    process.env.PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED = "true";
+    process.env.PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED = "true";
+    process.env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED = "true";
     process.env.PIPELINE_V3_GENRE_SCENE_PERCENT = "100";
     // The stitched suite injects deterministic brief/retrieval ports, but the
     // immutable run policy still validates the exact production model route.
@@ -400,7 +417,7 @@ test.describe("Pipeline V3 stitched system E2E", () => {
     prompt: string,
   ): Promise<void> {
     try {
-      await expect(page.getByRole("heading", { name: /creating your playlist/i }))
+      await expect(page.getByTestId("working-indicator"))
         .toBeVisible({ timeout: 90_000 });
     } catch (error) {
       const alert = await page.getByRole("alert").allTextContents().catch(() => [] as string[]);
@@ -458,7 +475,9 @@ test.describe("Pipeline V3 stitched system E2E", () => {
       manifest_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
       track_ids: Array.from({ length: 25 }, (_, index) => `exact-apple-${String(index + 1).padStart(3, "0")}`),
     });
-    await expect(page.getByText("Paused until the owner reconnects Apple Music.")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("heading", { name: "Your playlist is safely paused" }))
+      .toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/owner reconnects Apple Music/i).first()).toBeVisible();
     await expect(page.getByText("JOBS", { exact: true })).toBeVisible();
   });
 
@@ -542,15 +561,17 @@ test.describe("Pipeline V3 stitched system E2E", () => {
       // owner reauthorization will resume publication from this manifest.
       publication_job_count: 0,
     });
-    await expect(page.getByText("Publication will resume after the owner reconnects Apple Music."))
+    await expect(page.getByRole("heading", { name: "17 tracks ready" }))
       .toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Publication will resume after the owner reconnects Apple Music."))
+      .toBeVisible();
   });
 
   test("continue research resumes the same immutable request and can reach exact fill", async ({ page }) => {
     const prompt = "System continuation Detroit techno music";
     await submit(page, prompt, 25);
     await expect(page.getByTestId("partial-decision-screen")).toBeVisible({ timeout: 90_000 });
-    await page.getByRole("button", { name: "CONTINUE RESEARCH →" }).click();
+    await page.getByRole("button", { name: "RUN ONE MORE BOUNDED PASS →" }).click();
     await expectWorkingScreen(page, prompt);
 
     await expect.poll(async () => (
@@ -581,8 +602,9 @@ test.describe("Pipeline V3 stitched system E2E", () => {
       decision_count: 0,
     });
     expect(retrievalCalls.size).toBeGreaterThan(0);
-    await expect(page.getByText("Paused until the owner reconnects Apple Music."))
+    await expect(page.getByRole("heading", { name: "Your playlist is safely paused" }))
       .toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/owner reconnects Apple Music/i).first()).toBeVisible();
   });
 
   test("zero-compatible flow completes neutrally without a manifest or Apple write", async ({ page }) => {

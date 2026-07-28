@@ -43,6 +43,8 @@ export const briefRequests = pgTable("brief_requests", {
   guidancePreferencesJson: jsonb("guidance_preferences_json").notNull().default([]),
   briefContractVersion: integer("brief_contract_version").notNull().default(1),
   activeGuidanceQuestionSetId: uuid("active_guidance_question_set_id"),
+  activePlaylistContractRevisionId: uuid("active_playlist_contract_revision_id"),
+  publicRolloutAssignmentJson: jsonb("public_rollout_assignment_json"),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
   selectionPlanJson: jsonb("selection_plan_json"),
@@ -78,6 +80,7 @@ export const researchRuns = pgTable("research_runs", {
   guidanceTelemetryJson: jsonb("guidance_telemetry_json"),
   guidancePreferencesJson: jsonb("guidance_preferences_json").notNull().default([]),
   briefContractVersion: integer("brief_contract_version").notNull().default(1),
+  activePlaylistContractRevisionId: uuid("active_playlist_contract_revision_id"),
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
   selectionPlanJson: jsonb("selection_plan_json"),
@@ -122,7 +125,7 @@ export const runSpecs = pgTable("run_specs", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   index("run_spec_hash_idx").on(table.specHash),
-  check("run_spec_requested_track_count_valid", sql`${table.requestedTrackCount} IS NULL OR ${table.requestedTrackCount} BETWEEN 1 AND 300`),
+  check("run_spec_requested_track_count_valid", sql`${table.requestedTrackCount} IS NULL OR ${table.requestedTrackCount} BETWEEN 1 AND 1000`),
 ]);
 
 /** Confirmed V3 membership/ranking contracts; only lifecycle status may change. */
@@ -196,9 +199,160 @@ export const runActiveQueryPlans = pgTable("run_active_query_plans", {
   activatedAt: timestamp("activated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("run_active_query_plan_revision_idx").on(table.queryPlanRevisionId)]);
 
+/**
+ * Immutable, replayable interpretation of a playlist request. A revision is
+ * owned by either a pre-run brief or a direct run, while a run created from a
+ * brief may point at the brief-owned revision without mutating it.
+ */
+export const playlistContractRevisions = pgTable("playlist_contract_revisions", {
+  id: uuid("id").primaryKey(),
+  briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  parentRevisionId: uuid("parent_revision_id"),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  contractHash: varchar("contract_hash", { length: 64 }).notNull(),
+  contractJson: jsonb("contract_json").notNull(),
+  compilerVersion: varchar("compiler_version", { length: 80 }).notNull(),
+  ontologyVersion: varchar("ontology_version", { length: 80 }).notNull(),
+  evidencePolicyVersion: varchar("evidence_policy_version", { length: 80 }).notNull(),
+  questionTemplateVersion: varchar("question_template_version", { length: 80 }).notNull(),
+  catalogPolicyVersion: varchar("catalog_policy_version", { length: 80 }).notNull(),
+  locale: varchar("locale", { length: 32 }).notNull(),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  answerLineageHash: varchar("answer_lineage_hash", { length: 64 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("playlist_contract_brief_revision_idx").on(table.briefRequestId, table.revision),
+  uniqueIndex("playlist_contract_run_revision_idx").on(table.runId, table.revision),
+  uniqueIndex("playlist_contract_brief_hash_idx").on(table.briefRequestId, table.contractHash),
+  uniqueIndex("playlist_contract_run_hash_idx").on(table.runId, table.contractHash),
+  index("playlist_contract_parent_idx").on(table.parentRevisionId),
+  index("playlist_contract_status_idx").on(table.status, table.createdAt),
+  check("playlist_contract_owner_valid", sql`num_nonnulls(${table.briefRequestId}, ${table.runId}) = 1`),
+  check("playlist_contract_revision_positive", sql`${table.revision} > 0`),
+  check("playlist_contract_status_valid", sql`${table.status} IN ('active','superseded','legacy_import')`),
+]);
+
+/** Immutable preflight or recovery estimate bound to one contract revision. */
+export const playlistFeasibilitySnapshots = pgTable("playlist_feasibility_snapshots", {
+  id: uuid("id").primaryKey(),
+  contractRevisionId: uuid("contract_revision_id").notNull().references(() => playlistContractRevisions.id, { onDelete: "cascade" }),
+  phase: varchar("phase", { length: 40 }).notNull(),
+  assessment: varchar("assessment", { length: 40 }).notNull(),
+  targetCount: integer("target_count").notNull(),
+  observedQualifiedCount: integer("observed_qualified_count").notNull().default(0),
+  projectedLowerCount: integer("projected_lower_count"),
+  projectedUpperCount: integer("projected_upper_count"),
+  confidence: numeric("confidence", { precision: 5, scale: 4, mode: "number" }),
+  reportHash: varchar("report_hash", { length: 64 }).notNull(),
+  reportJson: jsonb("report_json").notNull(),
+  invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("playlist_feasibility_contract_hash_idx").on(table.contractRevisionId, table.reportHash),
+  index("playlist_feasibility_contract_idx").on(table.contractRevisionId, table.createdAt),
+  check("playlist_feasibility_phase_valid", sql`${table.phase} IN ('initial','post_guidance','recovery')`),
+  check("playlist_feasibility_assessment_valid", sql`${table.assessment} IN ('contradictory','known_ceiling','likely','at_risk','unknown','frontier_exhausted_under_policy')`),
+  check("playlist_feasibility_counts_valid", sql`
+    ${table.targetCount} BETWEEN 1 AND 1000
+    AND ${table.observedQualifiedCount} >= 0
+    AND (${table.projectedLowerCount} IS NULL OR ${table.projectedLowerCount} >= 0)
+    AND (${table.projectedUpperCount} IS NULL OR ${table.projectedUpperCount} >= 0)
+    AND (${table.projectedLowerCount} IS NULL OR ${table.projectedUpperCount} IS NULL OR ${table.projectedLowerCount} <= ${table.projectedUpperCount})
+  `),
+  check("playlist_feasibility_confidence_valid", sql`${table.confidence} IS NULL OR (${table.confidence} >= 0 AND ${table.confidence} <= 1)`),
+]);
+
+/**
+ * Orthogonal worker-attempt ledger. Fencing data lives here rather than being
+ * inferred from the user-facing run state.
+ */
+export const playlistExecutionAttempts = pgTable("playlist_execution_attempts", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  contractRevisionId: uuid("contract_revision_id").notNull().references(() => playlistContractRevisions.id, { onDelete: "cascade" }),
+  jobId: uuid("job_id"),
+  queryPlanRevisionId: uuid("query_plan_revision_id")
+    .references(() => queryPlanRevisions.id, { onDelete: "cascade" }),
+  stage: varchar("stage", { length: 80 }).notNull(),
+  dependencyKey: varchar("dependency_key", { length: 120 }),
+  attemptNumber: integer("attempt_number").notNull(),
+  leaseGeneration: integer("lease_generation").notNull(),
+  executorRevision: varchar("executor_revision", { length: 160 }).notNull(),
+  executorIdentityHash: varchar("executor_identity_hash", { length: 64 }).notNull(),
+  executorCapabilityHash: varchar("executor_capability_hash", { length: 64 }),
+  executorCapabilityVector: jsonb("executor_capability_vector"),
+  configurationHash: varchar("configuration_hash", { length: 64 }).notNull(),
+  semanticExecutionConfigurationHash: varchar(
+    "semantic_execution_configuration_hash",
+    { length: 64 },
+  ),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
+  checkpointCursor: varchar("checkpoint_cursor", { length: 240 }),
+  status: varchar("status", { length: 40 }).notNull(),
+  blockerKind: varchar("blocker_kind", { length: 64 }),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  lastActiveAt: timestamp("last_active_at", { withTimezone: true }).notNull(),
+  activeComputeMs: bigint("active_compute_ms", { mode: "number" }).notNull().default(0),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("playlist_execution_attempt_idempotency_idx").on(table.idempotencyKey),
+  uniqueIndex("playlist_execution_attempt_generation_idx").on(
+    table.runId,
+    table.contractRevisionId,
+    table.stage,
+    table.attemptNumber,
+    table.leaseGeneration,
+  ),
+  index("playlist_execution_attempt_run_idx").on(table.runId, table.startedAt),
+  index("playlist_execution_attempt_job_generation_idx").on(
+    table.jobId,
+    table.leaseGeneration,
+    table.status,
+  ),
+  index("playlist_execution_attempt_query_plan_idx").on(
+    table.runId,
+    table.contractRevisionId,
+    table.queryPlanRevisionId,
+    table.stage,
+    table.status,
+  ),
+  check("playlist_execution_attempt_numbers_valid", sql`${table.attemptNumber} > 0 AND ${table.leaseGeneration} >= 0`),
+  check("playlist_execution_attempt_identity_valid", sql`${table.executorIdentityHash} ~ '^[0-9a-f]{64}$'`),
+  check(
+    "playlist_execution_attempt_semantic_identity_valid",
+    sql`${table.semanticExecutionConfigurationHash} IS NULL OR ${table.semanticExecutionConfigurationHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check("playlist_execution_attempt_status_valid", sql`${table.status} IN ('queued','running','blocked','complete','cancelled','discarded','failed')`),
+]);
+
+/** Durable dependency or user-input blocker with a bounded retry horizon. */
+export const playlistRunBlockers = pgTable("playlist_run_blockers", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  contractRevisionId: uuid("contract_revision_id").notNull().references(() => playlistContractRevisions.id, { onDelete: "cascade" }),
+  blockerKind: varchar("blocker_kind", { length: 64 }).notNull(),
+  dependencyKey: varchar("dependency_key", { length: 120 }),
+  retryCount: integer("retry_count").notNull().default(0),
+  nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
+  automaticRetryUntil: timestamp("automatic_retry_until", { withTimezone: true }),
+  stateJson: jsonb("state_json").notNull().default({}),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("playlist_run_blocker_active_idx").on(table.runId, table.resolvedAt, table.nextRetryAt),
+  check("playlist_run_blocker_retry_valid", sql`${table.retryCount} >= 0`),
+  check("playlist_run_blocker_kind_valid", sql`${table.blockerKind} IN ('guidance','scope_decision','provider','apple_authorization','budget','integrity','publication_reconciliation')`),
+]);
+
 export const guidanceQuestionSets = pgTable("guidance_question_sets", {
   id: uuid("id").primaryKey(),
-  briefRequestId: uuid("brief_request_id").notNull().references(() => briefRequests.id, { onDelete: "cascade" }),
+  briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "cascade" }),
   revision: integer("revision").notNull(),
   questionSetHash: varchar("question_set_hash", { length: 64 }).notNull(),
   requestClassification: varchar("request_classification", { length: 40 }).notNull(),
@@ -208,20 +362,33 @@ export const guidanceQuestionSets = pgTable("guidance_question_sets", {
   storefront: varchar("storefront", { length: 16 }).notNull(),
   targetTrackCount: integer("target_track_count").notNull(),
   explicitConstraintHash: varchar("explicit_constraint_hash", { length: 64 }).notNull(),
+  baseContractRevisionId: uuid("base_contract_revision_id").references(() => playlistContractRevisions.id, { onDelete: "set null" }),
+  parentQuestionSetId: uuid("parent_question_set_id"),
+  feasibilitySnapshotId: uuid("feasibility_snapshot_id").references(() => playlistFeasibilitySnapshots.id, { onDelete: "set null" }),
+  guidanceRound: varchar("guidance_round", { length: 24 }).notNull().default("initial"),
+  trigger: varchar("trigger", { length: 24 }).notNull().default("nuance"),
+  axis: varchar("axis", { length: 80 }),
   rejectedQuestionReasonsJson: jsonb("rejected_question_reasons_json").notNull().default([]),
   questionsJson: jsonb("questions_json").notNull(),
   active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("guidance_question_sets_revision_idx").on(table.briefRequestId, table.revision),
+  uniqueIndex("guidance_question_sets_run_revision_idx").on(table.runId, table.revision),
   uniqueIndex("guidance_question_sets_hash_idx").on(table.briefRequestId, table.questionSetHash),
+  uniqueIndex("guidance_question_sets_run_hash_idx").on(table.runId, table.questionSetHash),
   uniqueIndex("guidance_question_sets_active_idx").on(table.briefRequestId).where(sql`${table.active}`),
+  uniqueIndex("guidance_question_sets_run_active_idx").on(table.runId).where(sql`${table.active}`),
   index("guidance_question_sets_policy_idx").on(table.guidancePolicyVersion, table.createdAt),
+  check("guidance_question_sets_owner_valid", sql`num_nonnulls(${table.briefRequestId}, ${table.runId}) = 1`),
+  check("guidance_question_sets_round_valid", sql`${table.guidanceRound} IN ('initial','rescue')`),
+  check("guidance_question_sets_trigger_valid", sql`${table.trigger} IN ('correctness','yield_risk','nuance')`),
 ]);
 
 export const guidanceAnswerSets = pgTable("guidance_answer_sets", {
   id: uuid("id").primaryKey(),
-  briefRequestId: uuid("brief_request_id").notNull().references(() => briefRequests.id, { onDelete: "cascade" }),
+  briefRequestId: uuid("brief_request_id").references(() => briefRequests.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => researchRuns.id, { onDelete: "cascade" }),
   questionSetId: uuid("question_set_id").notNull().references(() => guidanceQuestionSets.id, { onDelete: "cascade" }),
   questionSetHash: varchar("question_set_hash", { length: 64 }).notNull(),
   normalizedAnswersJson: jsonb("normalized_answers_json").notNull(),
@@ -229,15 +396,21 @@ export const guidanceAnswerSets = pgTable("guidance_answer_sets", {
   answerHash: varchar("answer_hash", { length: 64 }).notNull(),
   executionDeltaJson: jsonb("execution_delta_json").notNull(),
   executionDeltaHash: varchar("execution_delta_hash", { length: 64 }).notNull(),
+  baseContractRevisionId: uuid("base_contract_revision_id").references(() => playlistContractRevisions.id, { onDelete: "set null" }),
+  resultingContractRevisionId: uuid("resulting_contract_revision_id").references(() => playlistContractRevisions.id, { onDelete: "set null" }),
   resultingSelectionPlanId: uuid("resulting_selection_plan_id").references(() => selectionPlans.id, { onDelete: "set null" }),
   resultingQueryPlanRevisionId: uuid("resulting_query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "set null" }),
   idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
   acceptedAt: timestamp("accepted_at", { withTimezone: true }).notNull().defaultNow(),
+  invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("guidance_answer_sets_idempotency_idx").on(table.briefRequestId, table.idempotencyKey),
+  uniqueIndex("guidance_answer_sets_run_idempotency_idx").on(table.runId, table.idempotencyKey),
   uniqueIndex("guidance_answer_sets_hash_idx").on(table.briefRequestId, table.answerHash),
+  uniqueIndex("guidance_answer_sets_run_hash_idx").on(table.runId, table.answerHash),
   index("guidance_answer_sets_question_set_idx").on(table.questionSetId, table.acceptedAt),
+  check("guidance_answer_sets_owner_valid", sql`num_nonnulls(${table.briefRequestId}, ${table.runId}) = 1`),
 ]);
 
 export const runStageMetricSummaries = pgTable("run_stage_metric_summaries", {
@@ -993,6 +1166,10 @@ export const manifests = pgTable("manifests", {
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   policyVersion: varchar("policy_version", { length: 80 }).notNull().default("legacy_v1"),
   selectionPlanJson: jsonb("selection_plan_json"),
+  contractRevisionId: uuid("contract_revision_id")
+    .references(() => playlistContractRevisions.id, { onDelete: "restrict" }),
+  contractHash: varchar("contract_hash", { length: 64 }),
+  partialConsentAnswerHash: varchar("partial_consent_answer_hash", { length: 64 }),
   lockedAt: timestamp("locked_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
@@ -1118,7 +1295,7 @@ export const partialPublicationDecisions = pgTable("partial_publication_decision
     table.decision,
   ),
   index("partial_publication_decision_run_expiry_idx").on(table.runId, table.expiresAt),
-  check("partial_publication_decision_counts_valid", sql`${table.targetCount} BETWEEN 1 AND 300 AND ${table.selectedCount} BETWEEN 0 AND ${table.targetCount}`),
+  check("partial_publication_decision_counts_valid", sql`${table.targetCount} BETWEEN 1 AND 1000 AND ${table.selectedCount} BETWEEN 0 AND ${table.targetCount}`),
 ]);
 
 /** A durable logical playlist whose active Apple revision changes atomically. */
@@ -1248,6 +1425,13 @@ export const jobQueue = pgTable("job_queue", {
   pipelineVersion: varchar("pipeline_version", { length: 48 }).notNull().default("legacy_v1"),
   minimumWorkerProtocol: integer("minimum_worker_protocol").notNull().default(4),
   queryPlanRevisionId: uuid("query_plan_revision_id").references(() => queryPlanRevisions.id, { onDelete: "set null" }),
+  requiredExecutorCapabilityHash: varchar("required_executor_capability_hash", { length: 64 }),
+  requiredExecutorCapabilityVector: jsonb("required_executor_capability_vector"),
+  requiredExecutorRevision: varchar("required_executor_revision", { length: 160 }),
+  requiredExecutorSemanticConfigurationHash: varchar(
+    "required_executor_semantic_configuration_hash",
+    { length: 64 },
+  ),
   stageKey: varchar("stage_key", { length: 160 }).notNull().default("default"),
   status: varchar("status", { length: 32 }).notNull().default("queued"),
   payloadJson: jsonb("payload_json").notNull().default({}),
@@ -1276,10 +1460,33 @@ export const jobQueue = pgTable("job_queue", {
     table.availableAt,
     table.leaseExpiresAt,
   ),
+  index("job_executor_capability_lease_idx").on(
+    table.status,
+    table.requiredExecutorCapabilityHash,
+    table.availableAt,
+    table.leaseExpiresAt,
+  ),
+  index("job_executor_release_identity_lease_idx").on(
+    table.status,
+    table.requiredExecutorRevision,
+    table.requiredExecutorSemanticConfigurationHash,
+    table.availableAt,
+    table.leaseExpiresAt,
+  ),
   index("job_plan_stage_status_idx").on(table.runId, table.queryPlanRevisionId, table.stageKey, table.status),
   index("job_run_idx").on(table.runId),
   check("job_lease_epoch_valid", sql`${table.leaseEpoch} >= 0`),
   check("job_queue_class_valid", sql`${table.queueClass} IN ('interactive','deep','publication','system')`),
+  check(
+    "job_required_executor_release_identity_complete",
+    sql`(
+      (${table.requiredExecutorRevision} IS NULL AND ${table.requiredExecutorSemanticConfigurationHash} IS NULL)
+      OR (
+        ${table.requiredExecutorRevision} ~ '^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$'
+        AND ${table.requiredExecutorSemanticConfigurationHash} ~ '^[0-9a-f]{64}$'
+      )
+    )`,
+  ),
 ]);
 
 export const workerHeartbeats = pgTable("worker_heartbeats", {
@@ -1380,3 +1587,158 @@ export const retentionTombstones = pgTable("retention_tombstones", {
   aggregateCostUsd: numeric("aggregate_cost_usd", { precision: 12, scale: 6, mode: "number" }).notNull().default(0),
   retainedAt: timestamp("retained_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/**
+ * Provider results are untrusted discovery leads until a separate,
+ * contract-fenced qualification record binds identity and evidence.
+ */
+export const playlistDiscoveryLeads = pgTable("playlist_discovery_leads", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  contractRevisionId: uuid("contract_revision_id").notNull()
+    .references(() => playlistContractRevisions.id, { onDelete: "cascade" }),
+  executionAttemptId: uuid("execution_attempt_id")
+    .references(() => playlistExecutionAttempts.id, { onDelete: "set null" }),
+  provider: varchar("provider", { length: 80 }).notNull(),
+  dependencyKey: varchar("dependency_key", { length: 120 }).notNull(),
+  dependencyIds: text("dependency_ids").array().notNull().default(sql`'{}'::text[]`),
+  provenanceRoots: text("provenance_roots").array().notNull().default(sql`'{}'::text[]`),
+  cacheOrigin: varchar("cache_origin", { length: 32 }).notNull().default("unknown"),
+  sourceFreshUntil: timestamp("source_fresh_until", { withTimezone: true }),
+  strategyId: varchar("strategy_id", { length: 120 }).notNull(),
+  identityHintHash: varchar("identity_hint_hash", { length: 64 }).notNull(),
+  leadJson: jsonb("lead_json").notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("discovered"),
+  evidenceEligible: boolean("evidence_eligible").notNull().default(false),
+  discoveredAt: timestamp("discovered_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("playlist_discovery_lead_identity_idx").on(
+    table.runId,
+    table.contractRevisionId,
+    table.provider,
+    table.strategyId,
+    table.identityHintHash,
+  ),
+  index("playlist_discovery_lead_attempt_idx").on(table.executionAttemptId, table.status),
+  index("playlist_discovery_lead_dependency_idx").on(table.runId, table.dependencyKey, table.status),
+  check("playlist_discovery_lead_not_evidence", sql`${table.evidenceEligible}=false`),
+]);
+
+export const playlistQualificationRecords = pgTable("playlist_qualification_records", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  contractRevisionId: uuid("contract_revision_id").notNull()
+    .references(() => playlistContractRevisions.id, { onDelete: "cascade" }),
+  discoveryLeadId: uuid("discovery_lead_id")
+    .references(() => playlistDiscoveryLeads.id, { onDelete: "set null" }),
+  candidateId: uuid("candidate_id").references(() => trackCandidates.id, { onDelete: "cascade" }),
+  stableIdentityHash: varchar("stable_identity_hash", { length: 64 }).notNull(),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  predicateResultsJson: jsonb("predicate_results_json").notNull(),
+  evidenceRecordIdsJson: jsonb("evidence_record_ids_json").notNull().default([]),
+  qualityResultJson: jsonb("quality_result_json").notNull(),
+  catalogResultJson: jsonb("catalog_result_json").notNull(),
+  decision: varchar("decision", { length: 32 }).notNull(),
+  qualificationHash: varchar("qualification_hash", { length: 64 }).notNull(),
+  qualifiedAt: timestamp("qualified_at", { withTimezone: true }).notNull().defaultNow(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("playlist_qualification_identity_idx").on(
+    table.runId,
+    table.contractRevisionId,
+    table.stableIdentityHash,
+    table.qualificationHash,
+  ),
+  index("playlist_qualification_contract_idx").on(
+    table.runId,
+    table.contractRevisionId,
+    table.decision,
+    table.qualifiedAt,
+  ),
+  index("playlist_qualification_candidate_idx").on(table.candidateId, table.decision),
+]);
+
+export const playlistPublicationReconciliations = pgTable("playlist_publication_reconciliations", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  contractRevisionId: uuid("contract_revision_id").notNull()
+    .references(() => playlistContractRevisions.id, { onDelete: "restrict" }),
+  executionAttemptId: uuid("execution_attempt_id").notNull()
+    .references(() => playlistExecutionAttempts.id, { onDelete: "restrict" }),
+  manifestId: uuid("manifest_id").notNull().references(() => manifests.id, { onDelete: "restrict" }),
+  manifestRevisionId: uuid("manifest_revision_id")
+    .references(() => manifestRevisions.id, { onDelete: "restrict" }),
+  applePlaylistId: varchar("apple_playlist_id", { length: 160 }),
+  state: varchar("state", { length: 40 }).notNull(),
+  expectedOrderedIdsHash: varchar("expected_ordered_ids_hash", { length: 64 }).notNull(),
+  observedOrderedIdsHash: varchar("observed_ordered_ids_hash", { length: 64 }),
+  appendedCount: integer("appended_count").notNull().default(0),
+  expectedCount: integer("expected_count").notNull(),
+  batchCursor: integer("batch_cursor").notNull().default(0),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
+  blockerId: uuid("blocker_id").references(() => playlistRunBlockers.id, { onDelete: "set null" }),
+  reconciliationJson: jsonb("reconciliation_json").notNull().default({}),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  ...timestamps,
+}, (table) => [
+  index("playlist_publication_reconcile_run_idx").on(table.runId, table.state, table.nextRetryAt),
+]);
+
+export const pipelineCohortKillSwitches = pgTable("pipeline_cohort_kill_switches", {
+  cohortKey: varchar("cohort_key", { length: 160 }).primaryKey(),
+  route: varchar("route", { length: 48 }).notNull(),
+  intentGroup: varchar("intent_group", { length: 80 }),
+  disabled: boolean("disabled").notNull().default(false),
+  reasonCode: varchar("reason_code", { length: 120 }),
+  changedBy: varchar("changed_by", { length: 80 }).notNull(),
+  changedAt: timestamp("changed_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("pipeline_cohort_kill_switch_route_idx").on(table.route, table.disabled, table.intentGroup),
+  unique("pipeline_cohort_kill_switch_authority_idx")
+    .on(table.route, table.intentGroup)
+    .nullsNotDistinct(),
+]);
+
+/**
+ * Authenticated release-canary inventory. It deliberately stores no prompt,
+ * answer, public access ID, or capability identifier, and therefore supports
+ * synthetic-traffic exclusion without making those values metric labels.
+ */
+export const releaseCanaryMarkers = pgTable("release_canary_markers", {
+  id: uuid("id").primaryKey(),
+  canaryId: varchar("canary_id", { length: 64 }).notNull(),
+  environment: varchar("environment", { length: 16 }).notNull(),
+  audience: varchar("audience", { length: 512 }).notNull(),
+  operation: varchar("operation", { length: 16 }).notNull(),
+  sourceRevision: varchar("source_revision", { length: 64 }).notNull(),
+  cacheMode: varchar("cache_mode", { length: 16 }).notNull(),
+  briefRequestId: uuid("brief_request_id")
+    .references(() => briefRequests.id, { onDelete: "cascade" }),
+  runId: uuid("run_id")
+    .references(() => researchRuns.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("release_canary_marker_scope_idx").on(
+    table.canaryId,
+    table.environment,
+    table.operation,
+    table.sourceRevision,
+  ),
+  uniqueIndex("release_canary_marker_brief_idx")
+    .on(table.briefRequestId)
+    .where(sql`${table.briefRequestId} IS NOT NULL`),
+  uniqueIndex("release_canary_marker_run_idx")
+    .on(table.runId)
+    .where(sql`${table.runId} IS NOT NULL`),
+  check("release_canary_marker_environment_valid", sql`${table.environment} IN ('staging','production')`),
+  check("release_canary_marker_operation_valid", sql`${table.operation} IN ('brief','run')`),
+  check("release_canary_marker_audience_valid", sql`${table.audience} ~ '^https://[^/@?#[:space:]]+$'`),
+  check("release_canary_marker_cache_mode_valid", sql`${table.cacheMode} IN ('reuse_disabled','legacy_unknown')`),
+  check("release_canary_marker_source_revision_valid", sql`${table.sourceRevision} ~ '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'`),
+  check("release_canary_marker_owner_valid", sql`(
+    (${table.operation}='brief' AND ${table.briefRequestId} IS NOT NULL AND ${table.runId} IS NULL)
+    OR (${table.operation}='run' AND ${table.runId} IS NOT NULL AND ${table.briefRequestId} IS NULL)
+  )`),
+]);

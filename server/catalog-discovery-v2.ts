@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CatalogSong, PipelinePolicyVersion } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   AppleApiError,
   AppleAuthorizationRequiredError,
@@ -138,7 +139,7 @@ export interface CatalogDiscoveryProgressSnapshot {
 
 export interface CatalogDiscoverySizePolicy {
   policyVersion: PipelinePolicyVersion;
-  tier: 25 | 50 | 100 | 200 | 300;
+  tier: 25 | 50 | 100 | 200 | 300 | 500 | 750 | 1_000;
   deadlineMs: number;
   maxPagesPerStrategy: number;
   maxTotalProviderCalls: number;
@@ -267,6 +268,7 @@ export interface CuratedCatalogDiscoveryResult {
   totalQualifiedCount: number;
   totalAttemptedCount: number;
   stoppedBecause: CatalogDiscoveryStopReason;
+  retryAfterUntil?: string | null;
   progress: CatalogDiscoveryProgressSnapshot;
 }
 
@@ -301,6 +303,7 @@ interface PageResult {
   searchNext: Partial<Record<AppleCatalogSearchType, string>>;
   failedReason: string | null;
   failureClass: "transient" | "permanent" | "invalid_cursor" | null;
+  retryAfterUntil?: string | null;
 }
 
 const ROUND_ORDER: readonly CatalogDiscoveryRound[] = ["A", "B", "C", "D"];
@@ -330,6 +333,9 @@ const CATALOG_SIZE_POLICIES: readonly CatalogDiscoverySizePolicy[] = Object.free
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 100, deadlineMs: 90_000, maxPagesPerStrategy: 6, maxTotalProviderCalls: 140 }),
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 200, deadlineMs: 180_000, maxPagesPerStrategy: 8, maxTotalProviderCalls: 260 }),
   Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 300, deadlineMs: 300_000, maxPagesPerStrategy: 10, maxTotalProviderCalls: 400 }),
+  Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 500, deadlineMs: 450_000, maxPagesPerStrategy: 17, maxTotalProviderCalls: 667 }),
+  Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 750, deadlineMs: 675_000, maxPagesPerStrategy: 25, maxTotalProviderCalls: 1_000 }),
+  Object.freeze({ policyVersion: "relevance_first_2026_07", tier: 1_000, deadlineMs: 900_000, maxPagesPerStrategy: 34, maxTotalProviderCalls: 1_334 }),
 ]);
 
 /** Immutable execution limits selected from the requested output tier. */
@@ -341,7 +347,13 @@ export function catalogDiscoverySizePolicy(
     && policyVersion !== "relevance_first_2026_07_r2") {
     throw new Error(`Unsupported catalog discovery policy: ${policyVersion}`);
   }
-  const bounded = Math.max(1, Math.min(300, Math.floor(Number.isFinite(target) ? target : 50)));
+  const bounded = Math.max(
+    1,
+    Math.min(
+      EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+      Math.floor(Number.isFinite(target) ? target : 50),
+    ),
+  );
   const policy = CATALOG_SIZE_POLICIES.find((candidate) => bounded <= candidate.tier) ?? CATALOG_SIZE_POLICIES.at(-1)!;
   return policy.policyVersion === policyVersion ? policy : Object.freeze({ ...policy, policyVersion });
 }
@@ -857,6 +869,11 @@ async function fetchPage(
     return { item, songs: [], artists: page.items, albums: [], playlists: [], next: page.next, searchNext: {}, failedReason: null, failureClass: null };
   } catch (error) {
     const classified = classifyCatalogProviderFailure(error, signal);
+    const retryAfterUntil = error instanceof AppleApiError
+      && error.retryAfterUntil
+      && Number.isFinite(error.retryAfterUntil.getTime())
+      ? error.retryAfterUntil.toISOString()
+      : null;
     return {
       item,
       songs: [],
@@ -867,6 +884,7 @@ async function fetchPage(
       searchNext: {},
       failedReason: classified.reasonCode,
       failureClass: classified.failureClass,
+      retryAfterUntil,
     };
   }
 }
@@ -957,6 +975,10 @@ export async function discoverCuratedAppleCatalog(
     candidates.set(restored.song.id, restored);
   }
   let providerCallCount = request.resumeProgress?.providerCallCount ?? 0;
+  // Keep the wire value as a string. TypeScript cannot observe assignments to
+  // an outer Date made inside the async page-scheduler callback, which would
+  // otherwise incorrectly narrow the final value to `never`.
+  let retryAfterUntil: string | null = null;
   let checkpointSequence = request.resumeProgress?.sequence ?? 0;
   const roundsCompleted: CatalogDiscoveryRound[] = [...(request.resumeProgress?.roundsCompleted ?? [])];
   const restoredEligibleCount = [...candidates.values()].filter((candidate) => candidate.eligible).length;
@@ -1124,6 +1146,16 @@ export async function discoverCuratedAppleCatalog(
         const item = page.item;
         item.pagesAttempted += 1;
         if (page.failedReason) {
+          const pageRetryAfterUntil = page.retryAfterUntil
+            ? new Date(page.retryAfterUntil)
+            : null;
+          if (pageRetryAfterUntil
+            && Number.isFinite(pageRetryAfterUntil.getTime())
+            && (!retryAfterUntil
+              || pageRetryAfterUntil.getTime()
+                > new Date(retryAfterUntil).getTime())) {
+            retryAfterUntil = pageRetryAfterUntil.toISOString();
+          }
           item.status = page.failureClass === "invalid_cursor" ? "invalid_cursor" : "failed";
           item.lastReasonCode = page.failedReason;
           item.retryable = page.failureClass === "transient";
@@ -1437,6 +1469,7 @@ export async function discoverCuratedAppleCatalog(
     totalQualifiedCount,
     totalAttemptedCount,
     stoppedBecause,
+    retryAfterUntil,
     progress,
   };
 }

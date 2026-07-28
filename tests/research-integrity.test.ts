@@ -6,6 +6,7 @@ import {
   maximumOpenAICallCostUsd,
   recordStructuredSourcePaginationLoop,
   ResearchOrchestrator,
+  ResearchProviderBlockedError,
   researchCompletionReadiness,
   researchGapPassLimit,
   researchSegmentLimit,
@@ -1043,6 +1044,20 @@ describe("fast curated orchestration", () => {
     state.run.brief = brief("curated", { min: 1, max: 50 });
     state.run.status = "queued";
     state.run.phase = "queued";
+    enableCatalogFirstV2(state, "documented Test scene recordings");
+    const providerAuthority = {
+      jobId: "00000000-0000-4000-8000-000000000201",
+      workerId: "curated-worker-test",
+      leaseEpoch: 2,
+      providerDependencyRetry: false,
+      expectedGeneration: null,
+      priorFailureCount: 0,
+      claimToken: "00000000-0000-4000-8000-000000000202",
+    };
+    const claimResearchProviderRetry = vi.fn(async () => ({
+      claimToken: providerAuthority.claimToken,
+    }));
+    Object.assign(state.repository, { claimResearchProviderRetry });
     state.run.guidanceSourceHints = [{
       url: "https://scout.example/documented-scene-fork",
       title: "Documented scene fork",
@@ -1061,12 +1076,14 @@ describe("fast curated orchestration", () => {
     state.repository.addSources = async (_runId?: string, sources?: any[]) => new Map(
       (sources ?? []).map((source: any, index: number) => [source.url, `source-${index}`]),
     );
-    state.repository.addCandidates = async (_runId?: string, candidates?: any[]) => {
+    const addCandidates = vi.fn(async (...args: any[]) => {
+      const candidates = args[1] as any[] | undefined;
       persistedCandidates.push(...(candidates ?? []));
       state.coverage.candidateCount = persistedCandidates.length;
       state.coverage.eligibleCandidateCount = persistedCandidates.length;
       return candidates?.length ?? 0;
-    };
+    });
+    state.repository.addCandidates = addCandidates;
     state.repository.upsertFrontier = async (_runId?: string, items?: any[]) => { frontier.push(...(items ?? [])); };
 
     const support = fastEvidenceGroup(
@@ -1103,9 +1120,26 @@ describe("fast curated orchestration", () => {
     };
     const orchestrator = new ScriptedResearchOrchestrator(state.repository as any, [synthesis]);
 
-    await orchestrator.processJob({ runId: state.run.id, phase: "scope_resolution", gapAttempt: 0, fast: true });
+    await orchestrator.processJob({
+      runId: state.run.id,
+      phase: "scope_resolution",
+      gapAttempt: 0,
+      fast: true,
+      __jobId: providerAuthority.jobId,
+      __jobWorkerId: providerAuthority.workerId,
+      __jobLeaseEpoch: providerAuthority.leaseEpoch,
+    });
 
     expect(orchestrator.calls).toHaveLength(1);
+    expect(claimResearchProviderRetry).toHaveBeenCalledOnce();
+    expect(addCandidates.mock.calls[0]?.[4]).toMatchObject({
+      ...providerAuthority,
+      claimToken: providerAuthority.claimToken,
+    });
+    expect(state.jobs.at(-1)).toMatchObject({
+      kind: "matching",
+      workerWriteFence: providerAuthority,
+    });
     expect(orchestrator.calls[0]!.body).toMatchObject({
       model: "gpt-5.6-luna",
       reasoning: { effort: "low" },
@@ -1798,6 +1832,92 @@ describe("fast curated orchestration", () => {
 });
 
 describe("durable research segmentation", () => {
+  test.each([0, 2])(
+    "a factual V2 provider outage durably pauses with %i preserved candidates and never hands off",
+    async (eligibleCandidateCount) => {
+      const state = segmentedRepository();
+      state.run.brief = brief("exhaustive", null);
+      state.run.phase = "source_discovery";
+      state.coverage.candidateCount = eligibleCandidateCount;
+      state.coverage.eligibleCandidateCount = eligibleCandidateCount;
+      enableCatalogFirstV2(
+        state,
+        "all documented session credits for the selected musician",
+      );
+      const claimResearchProviderRetry = vi.fn(async () => ({
+        claimToken: "00000000-0000-4000-8000-000000000099",
+      }));
+      const persistResearchProviderBlocker = vi.fn(async (
+        _runId: string,
+        blocker: Record<string, unknown>,
+      ) => {
+        Object.assign(state.run, {
+          status: "failed_system",
+          phase: "research_provider_blocked_retry_scheduled",
+        });
+        state.checkpoints.set("resume", {
+          phase: blocker.phase,
+          status: "paused",
+          boundary: "provider_error",
+          eligibleCandidateCount,
+        });
+        return { generation: "00000000-0000-4000-8000-000000000100" };
+      });
+      Object.assign(state.repository, {
+        claimResearchProviderRetry,
+        persistResearchProviderBlocker,
+      });
+      const orchestrator = new ScriptedResearchOrchestrator(
+        state.repository as any,
+        [new ProviderRequestError(
+          "Provider is temporarily unavailable",
+          "openai",
+          503,
+          true,
+        )],
+      );
+
+      await expect(orchestrator.processJob({
+        runId: state.run.id,
+        phase: "source_discovery",
+        gapAttempt: 0,
+        generation: 0,
+        segment: 0,
+        __jobId: "00000000-0000-4000-8000-000000000001",
+        __jobWorkerId: "deep-worker-test",
+        __jobLeaseEpoch: 1,
+      })).rejects.toBeInstanceOf(ResearchProviderBlockedError);
+
+      expect(claimResearchProviderRetry).toHaveBeenCalledOnce();
+      expect(persistResearchProviderBlocker).toHaveBeenCalledWith(
+        state.run.id,
+        expect.objectContaining({
+          dependencyKey: "openai_research",
+          reasonCode: "research_provider_unavailable",
+          phase: "source_discovery",
+          eligibleCandidateCount,
+          failureCount: 1,
+        }),
+        expect.objectContaining({
+          providerDependencyRetry: false,
+          claimToken: "00000000-0000-4000-8000-000000000099",
+        }),
+      );
+      expect(state.run).toMatchObject({
+        status: "failed_system",
+        phase: "research_provider_blocked_retry_scheduled",
+      });
+      expect(state.checkpoints.get("resume")).toMatchObject({
+        status: "paused",
+        boundary: "provider_error",
+        eligibleCandidateCount,
+      });
+      expect(state.jobs.some((job: any) => job.kind === "matching")).toBe(
+        false,
+      );
+    },
+  );
+
   test("a deep provider rejection preserves candidates and never becomes a failed job", async () => {
     const state = segmentedRepository();
     state.run.brief = brief("exhaustive", null);

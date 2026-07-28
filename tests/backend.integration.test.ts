@@ -16,6 +16,9 @@ import {
 import { canonicalGatewayRequest, createGatewayVerifier } from "../server/gateway-auth.ts";
 import { processNotificationJob } from "../server/notifications.ts";
 import { publicationTerminalStatus } from "../server/publisher.ts";
+import {
+  PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+} from "../server/playlist-count-policy.ts";
 import { Repository } from "../server/repository.ts";
 import {
   FAST_POST_MATCH_REFILL_LIMIT,
@@ -23,8 +26,17 @@ import {
   parseFastPostMatchRefillRouteCheckpoint,
 } from "../server/research-policy.ts";
 import { appleAuthorizationGeneration } from "../server/apple.ts";
-import type { HostedCitationAttestation } from "../server/research.ts";
-import { capabilityHash, hmacBase64Url, sha256Hex } from "../server/security.ts";
+import type {
+  HostedCitationAttestation,
+  ResearchProviderJobAuthorityV2,
+} from "../server/research.ts";
+import {
+  capabilityHash,
+  hmacBase64Url,
+  hmacHex,
+  randomToken,
+  sha256Hex,
+} from "../server/security.ts";
 import {
   WORKER_PIPELINE_CAPABILITY,
   WORKER_PIPELINE_PROTOCOL_VERSION,
@@ -33,6 +45,13 @@ import {
 import { parseFeedbackSubmission } from "../server/feedback.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 import { buildPipelineOutcome } from "../server/pipeline-outcome-v2.ts";
+import type { CatalogProviderJobAuthorityV2 } from "../server/matching-service.ts";
+import {
+  createPublicRolloutAssignmentV1,
+  type PublicRolloutDatabaseAuthorityV1,
+} from "../server/public-rollout-assignment.ts";
+import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";
+import { signedArtifactSha256 } from "../shared/signed-artifact.ts";
 import { GUIDED_BRIEF_BUDGET_USD, GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
 import type {
   CitationAttestationInput,
@@ -68,6 +87,59 @@ const evidenceBinding = {
   subjectEntity: brief.subjectEntities[0]!,
   subjectRelationship: brief.relationship,
 };
+
+function publicRolloutAuthority(
+  environment: NodeJS.ProcessEnv,
+): PublicRolloutDatabaseAuthorityV1 {
+  const percentage = environment.PIPELINE_V3_GENRE_SCENE_PERCENT ?? "0";
+  const configuration: PublicRolloutConfiguration = {
+    PIPELINE_V2_OWNER_CANARY: "false",
+    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_SIMILARITY_PERCENT: "0",
+    PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
+    PIPELINE_V2_FACTUAL_PERCENT: "0",
+    PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+    PIPELINE_V3_OWNER_CANARY: "true",
+    PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+    PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
+    PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+    PIPELINE_V3_GENRE_SCENE_PERCENT: percentage as "0" | "1" | "10" | "50" | "100",
+    PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
+    PIPELINE_V3_SIMILARITY_PERCENT: "0",
+    PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "0",
+    PIPELINE_V3_FIXED_CONTAINER_PERCENT: "0",
+    PIPELINE_V3_FACTUAL_PERCENT: "0",
+    PIPELINE_V3_EXHAUSTIVE_PERCENT: "0",
+    PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+    PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+    PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "false",
+    PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "false",
+    RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+    RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+    RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+    GUIDANCE_CONTRACT_V3_ENABLED: "false",
+    GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
+    GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
+  };
+  const state = {
+    schemaVersion: "genio-public-rollout-database-authority/v1",
+    evidenceHash: environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH!,
+    rollbackWarrantHash:
+      environment.RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH!,
+    intentCanaryHash:
+      environment.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH!,
+    intentGroup: "genre_scene",
+    toPercent: percentage,
+    stage: environment.RELEASE_PUBLIC_ROLLOUT_STAGE!,
+    targetConfigurationHash: signedArtifactSha256(configuration),
+    targetConfiguration: configuration,
+  };
+  return {
+    global: state,
+    intents: percentage === "0" ? {} : { genre_scene: state },
+  };
+}
 
 function guidanceQuestions(count: 1 | 2 | 3 = 2): PlaylistGuidanceQuestion[] {
   return Array.from({ length: count }, (_, questionIndex) => {
@@ -185,6 +257,10 @@ databaseDescribe("hosted backend integration", () => {
           EXECUTE format('TRUNCATE TABLE %I.%I CASCADE', current_schema(), table_name);
         END LOOP;
       END $$`);
+    // TRUNCATE clears application data, including the migration-owned runtime
+    // schema marker. Each test starts from the actual migrated schema unless it
+    // deliberately overrides the marker to exercise compatibility fencing.
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
   });
 
   afterEach(() => {
@@ -199,6 +275,218 @@ databaseDescribe("hosted backend integration", () => {
       await adminPool.end();
     }
   }, 30_000);
+
+  async function claimV2MatchingAttempt(
+    runId: string,
+    payload: Record<string, unknown> = { runId, storefront: "us" },
+  ): Promise<CatalogProviderJobAuthorityV2> {
+    const jobId = randomUUID();
+    const workerId = `v2-provider-test-${randomUUID()}`;
+    await repository.pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,stage_key,payload_json,max_attempts,
+         available_at)
+       VALUES($1,$2,'matching','interactive',$3,'catalog_first_v2',4,
+         'catalog_matching',$4::jsonb,3,now())`,
+      [jobId, runId, `v2-provider-attempt:${jobId}`, JSON.stringify(payload)],
+    );
+    const leased = await repository.pool.query<{ lease_epoch: number }>(
+      `UPDATE job_queue
+       SET status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1 RETURNING lease_epoch`,
+      [jobId, workerId],
+    );
+    const authority: CatalogProviderJobAuthorityV2 = {
+      jobId,
+      workerId,
+      leaseEpoch: Number(leased.rows[0]?.lease_epoch ?? 0),
+      providerDependencyRetry: payload.providerDependencyRetry === true,
+      expectedGeneration:
+        typeof payload.providerBlockerGeneration === "string"
+          ? payload.providerBlockerGeneration
+          : null,
+      priorFailureCount: Number(payload.providerBlockerFailureCount ?? 0),
+      claimToken: null,
+    };
+    const claim = await repository.claimCatalogProviderRetry(runId, authority);
+    if (!claim) throw new Error("V2 provider test attempt was not claimable");
+    authority.claimToken = claim.claimToken;
+    return authority;
+  }
+
+  async function claimQueuedV2ProviderRetry(
+    runId: string,
+  ): Promise<CatalogProviderJobAuthorityV2> {
+    const workerId = `v2-provider-retry-${randomUUID()}`;
+    const queued = await repository.pool.query<{
+      id: string;
+      payload_json: Record<string, unknown>;
+      lease_epoch: number;
+    }>(
+      `UPDATE job_queue
+       SET available_at=now(),status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=(
+         SELECT id FROM job_queue
+         WHERE run_id=$1 AND kind='matching' AND status='queued'
+           AND payload_json->>'providerDependencyRetry'='true'
+         ORDER BY available_at,id LIMIT 1
+       )
+       RETURNING id,payload_json,lease_epoch`,
+      [runId, workerId],
+    );
+    if (!queued.rows[0]) throw new Error("V2 provider retry was not queued");
+    const payload = queued.rows[0].payload_json;
+    await repository.pool.query(
+      `UPDATE research_checkpoints
+       SET state_json=state_json || $3::jsonb
+       WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+         AND state_json->>'generation'=$2`,
+      [
+        runId,
+        String(payload.providerBlockerGeneration),
+        JSON.stringify({
+          nextRetryAt: new Date(Date.now() - 1_000).toISOString(),
+        }),
+      ],
+    );
+    const authority: CatalogProviderJobAuthorityV2 = {
+      jobId: queued.rows[0].id,
+      workerId,
+      leaseEpoch: Number(queued.rows[0].lease_epoch),
+      providerDependencyRetry: true,
+      expectedGeneration: String(payload.providerBlockerGeneration),
+      priorFailureCount: Number(payload.providerBlockerFailureCount),
+      claimToken: null,
+    };
+    const claim = await repository.claimCatalogProviderRetry(runId, authority);
+    if (!claim) throw new Error("V2 provider retry was not claimable");
+    authority.claimToken = claim.claimToken;
+    return authority;
+  }
+
+  async function claimV2ResearchAttempt(
+    runId: string,
+    payload: Record<string, unknown> = {
+      runId,
+      phase: "source_discovery",
+      gapAttempt: 0,
+      generation: 0,
+      segment: 0,
+    },
+  ): Promise<ResearchProviderJobAuthorityV2> {
+    const jobId = randomUUID();
+    const workerId = `v2-research-provider-test-${randomUUID()}`;
+    await repository.pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,stage_key,payload_json,max_attempts,
+         available_at)
+       VALUES($1,$2,'research','interactive',$3,'catalog_first_v2',4,
+         'research',$4::jsonb,1,now())`,
+      [
+        jobId,
+        runId,
+        `v2-research-provider-attempt:${jobId}`,
+        JSON.stringify(payload),
+      ],
+    );
+    const leased = await repository.pool.query<{ lease_epoch: number }>(
+      `UPDATE job_queue
+       SET status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1 RETURNING lease_epoch`,
+      [jobId, workerId],
+    );
+    const authority: ResearchProviderJobAuthorityV2 = {
+      jobId,
+      workerId,
+      leaseEpoch: Number(leased.rows[0]?.lease_epoch ?? 0),
+      providerDependencyRetry:
+        payload.researchProviderDependencyRetry === true,
+      expectedGeneration:
+        typeof payload.researchProviderBlockerGeneration === "string"
+          ? payload.researchProviderBlockerGeneration
+          : null,
+      priorFailureCount: Number(
+        payload.researchProviderBlockerFailureCount ?? 0,
+      ),
+      claimToken: null,
+    };
+    const claim = await repository.claimResearchProviderRetry(
+      runId,
+      authority,
+    );
+    if (!claim) {
+      throw new Error("V2 research provider test attempt was not claimable");
+    }
+    authority.claimToken = claim.claimToken;
+    return authority;
+  }
+
+  async function claimQueuedV2ResearchProviderRetry(
+    runId: string,
+  ): Promise<ResearchProviderJobAuthorityV2> {
+    const workerId = `v2-research-provider-retry-${randomUUID()}`;
+    const queued = await repository.pool.query<{
+      id: string;
+      payload_json: Record<string, unknown>;
+      lease_epoch: number;
+    }>(
+      `UPDATE job_queue
+       SET available_at=now(),status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=(
+         SELECT id FROM job_queue
+         WHERE run_id=$1 AND kind='research' AND status='queued'
+           AND payload_json->>'researchProviderDependencyRetry'='true'
+         ORDER BY available_at,id LIMIT 1
+       )
+       RETURNING id,payload_json,lease_epoch`,
+      [runId, workerId],
+    );
+    if (!queued.rows[0]) {
+      throw new Error("V2 research provider retry was not queued");
+    }
+    const payload = queued.rows[0].payload_json;
+    await repository.pool.query(
+      `UPDATE research_checkpoints
+       SET state_json=state_json || $3::jsonb
+       WHERE run_id=$1 AND phase='research_provider_blocker_v2'
+         AND state_json->>'generation'=$2`,
+      [
+        runId,
+        String(payload.researchProviderBlockerGeneration),
+        JSON.stringify({
+          nextRetryAt: new Date(Date.now() - 1_000).toISOString(),
+        }),
+      ],
+    );
+    const authority: ResearchProviderJobAuthorityV2 = {
+      jobId: queued.rows[0].id,
+      workerId,
+      leaseEpoch: Number(queued.rows[0].lease_epoch),
+      providerDependencyRetry: true,
+      expectedGeneration: String(
+        payload.researchProviderBlockerGeneration,
+      ),
+      priorFailureCount: Number(
+        payload.researchProviderBlockerFailureCount,
+      ),
+      claimToken: null,
+    };
+    const claim = await repository.claimResearchProviderRetry(
+      runId,
+      authority,
+    );
+    if (!claim) {
+      throw new Error("V2 research provider retry was not claimable");
+    }
+    authority.claimToken = claim.claimToken;
+    return authority;
+  }
 
   async function createAutomaticRefillRun(
     label: string,
@@ -292,20 +580,22 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     // The 2.2.2 bridge remains healthy across the active schema and the future
-    // schema-16 expansion, while failing closed outside its declared window.
+    // schema-18 expansion, while failing closed outside its declared window.
     await repository.setSetting("schema_version", "13");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "12");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
-      /supported 13-16, found 12/u,
+      /supported 13-18, found 12/u,
     );
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-16, found 12/u);
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-18, found 12/u);
     await repository.setSetting("schema_version", "16");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "17");
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-16, found 17/u);
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
+    await repository.setSetting("schema_version", "19");
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-18, found 19/u);
     await repository.setSetting("schema_version", "15");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
@@ -363,6 +653,1088 @@ databaseDescribe("hosted backend integration", () => {
          AND column_name='selection_rank'`,
     );
     expect(candidateColumns.rows.map((row) => row.column_name)).toEqual(["selection_rank"]);
+  });
+
+  test("provider blocker retries preserve one anchored 24-hour horizon", async () => {
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    const runId = await repository.createRun("Anchored provider blocker", brief, 0, 1);
+    const contractRevisionId = randomUUID();
+    const contractHash = "a".repeat(64);
+    await repository.pool.query(
+      `INSERT INTO playlist_contract_revisions(
+         id,run_id,revision,status,contract_hash,contract_json,compiler_version,
+         ontology_version,evidence_policy_version,question_template_version,
+         catalog_policy_version,locale,storefront,answer_lineage_hash)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'compiler-test','ontology-test',
+         'evidence-test','questions-test','catalog-test','en-US','us',$4)`,
+      [contractRevisionId, runId, contractHash, "b".repeat(64)],
+    );
+    await repository.pool.query(
+      "UPDATE research_runs SET active_playlist_contract_revision_id=$2 WHERE id=$1",
+      [runId, contractRevisionId],
+    );
+    const firstRetryAt = new Date("2026-07-23T12:00:01.000Z");
+    const firstHorizon = new Date("2026-07-24T12:00:00.000Z");
+    const blockerId = await repository.openPlaylistRunBlocker({
+      runId,
+      contractRevisionId,
+      blockerKind: "provider",
+      dependencyKey: "v3_retrieval_provider",
+      retryCount: 1,
+      nextRetryAt: firstRetryAt,
+      automaticRetryUntil: firstHorizon,
+      state: {
+        firstFailureAt: "2026-07-23T12:00:00.000Z",
+        retryLane: "immediate",
+      },
+    });
+    const reopenedId = await repository.openPlaylistRunBlocker({
+      runId,
+      contractRevisionId,
+      blockerKind: "provider",
+      dependencyKey: "v3_retrieval_provider",
+      retryCount: 2,
+      nextRetryAt: new Date("2026-07-23T12:00:03.000Z"),
+      automaticRetryUntil: new Date("2026-07-24T12:05:00.000Z"),
+      state: {
+        retryLane: "immediate",
+        retryOrdinal: 2,
+      },
+    });
+
+    expect(reopenedId).toBe(blockerId);
+    await expect(repository.getActivePlaylistRunBlocker({
+      runId,
+      contractRevisionId,
+      blockerKind: "provider",
+      dependencyKey: "v3_retrieval_provider",
+    })).resolves.toMatchObject({
+      id: blockerId,
+      retryCount: 2,
+      nextRetryAt: new Date("2026-07-23T12:00:03.000Z"),
+      automaticRetryUntil: firstHorizon,
+      state: {
+        firstFailureAt: "2026-07-23T12:00:00.000Z",
+        retryLane: "immediate",
+        retryOrdinal: 2,
+      },
+    });
+    const rows = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count
+       FROM playlist_run_blockers
+       WHERE run_id=$1 AND contract_revision_id=$2
+         AND blocker_kind='provider' AND resolved_at IS NULL`,
+      [runId, contractRevisionId],
+    );
+    expect(rows.rows[0]?.count).toBe(1);
+  });
+
+  test("a superseded Apple provider lease cannot persist a match from a late response", async () => {
+    const matchingBrief: PlaylistBrief = {
+      ...brief,
+      mode: "curated",
+      targetSize: { min: 1, max: 1 },
+    };
+    const runId = await repository.createRun(
+      "Late Apple response fence",
+      matchingBrief,
+      0,
+      1,
+    );
+    await repository.savePipelineSelectionPlan(
+      runId,
+      createSelectionPlanV2({
+        prompt: matchingBrief.description,
+        brief: matchingBrief,
+        storefront: "us",
+      }),
+    );
+    await repository.addCandidates(
+      runId,
+      [{
+        artist: "Late Apple Artist",
+        title: "Late Apple Track",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      }],
+      new Map(),
+      "source_discovery",
+    );
+    const candidate = (await repository.listCandidates(runId))[0]!;
+    const authority = await claimV2MatchingAttempt(runId);
+    const duplicateClaim = await repository.claimCatalogProviderRetry(
+      runId,
+      authority,
+    );
+    expect(duplicateClaim?.claimToken).toBe(authority.claimToken);
+
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET lease_epoch=lease_epoch+1,lease_owner='replacement-matcher',
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [authority.jobId],
+    );
+    await expect(repository.saveMatch(
+      runId,
+      {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "late response from superseded Apple pass",
+        score: 1,
+        song: {
+          id: "late-apple-catalog-id",
+          name: candidate.title,
+          artistName: candidate.artist,
+          albumName: "",
+        },
+        alternatives: [],
+      },
+      authority,
+    )).rejects.toMatchObject({
+      code: "catalog_provider_retry_stale",
+    });
+    const matches = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM catalog_matches WHERE run_id=$1",
+      [runId],
+    );
+    expect(matches.rows[0]?.count).toBe(0);
+  });
+
+  test("V2 provider outages atomically persist failed_system, a blocker, and one bounded retry", async () => {
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    const runId = await repository.createRun(
+      "V2 provider outage transaction",
+      { ...brief, mode: "curated", targetSize: { min: 25, max: 25 } },
+      0,
+      1,
+    );
+    const contractRevisionId = randomUUID();
+    await repository.pool.query(
+      `INSERT INTO playlist_contract_revisions(
+         id,run_id,revision,status,contract_hash,contract_json,compiler_version,
+         ontology_version,evidence_policy_version,question_template_version,
+         catalog_policy_version,locale,storefront,answer_lineage_hash)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'compiler-test','ontology-test',
+         'evidence-test','questions-test','catalog-test','en-US','us',$4)`,
+      [
+        contractRevisionId,
+        runId,
+        "c".repeat(64),
+        "d".repeat(64),
+      ],
+    );
+    await repository.pool.query(
+      `UPDATE research_runs
+       SET active_playlist_contract_revision_id=$2,
+           pipeline_version='catalog_first_v2',
+           policy_version='relevance_first_2026_07'
+       WHERE id=$1`,
+      [runId, contractRevisionId],
+    );
+    const openedAt = new Date();
+    const nextRetryAt = new Date(openedAt.getTime() + 5 * 60_000);
+    const automaticRetryUntil = new Date(
+      openedAt.getTime() + 24 * 60 * 60_000,
+    );
+    const outcome = buildPipelineOutcome({
+      pipelineVersion: "catalog_first_v2",
+      policyVersion: "relevance_first_2026_07",
+      status: "failed_system",
+      targetTrackCount: 25,
+      discoveredTrackCount: 0,
+      qualifiedTrackCount: 0,
+      selectedTrackCount: 0,
+      publishedTrackCount: 0,
+      frontierExhausted: false,
+      providerUnavailable: true,
+      reasonCodes: ["apple_provider_degraded"],
+      completedAt: openedAt.toISOString(),
+    });
+    const initialAuthority = await claimV2MatchingAttempt(runId);
+    const supersedingClaim = await repository.claimCatalogProviderRetry(
+      runId,
+      initialAuthority,
+    );
+    if (!supersedingClaim) {
+      throw new Error("Same-lease V2 provider attempt was not claimable");
+    }
+    expect(supersedingClaim.claimToken).toBe(initialAuthority.claimToken);
+    const currentAuthority = {
+      ...initialAuthority,
+      claimToken: supersedingClaim.claimToken,
+    };
+
+    await repository.persistCatalogProviderBlocker(runId, {
+      schemaVersion: 1,
+      kind: "provider",
+      dependencyKey: "apple_catalog",
+      reasonCode: "apple_provider_degraded",
+      storefront: "us",
+      safeTrackCount: 0,
+      failureCount: 1,
+      nextRetryAt: nextRetryAt.toISOString(),
+      retryAfterUntil: null,
+      automaticRetryUntil: automaticRetryUntil.toISOString(),
+      needsDecision: false,
+      openedAt: openedAt.toISOString(),
+      updatedAt: openedAt.toISOString(),
+    }, outcome, currentAuthority);
+
+    const persisted = await repository.pool.query<{
+      run_status: string;
+      run_phase: string;
+      outcome_status: string;
+      provider_unavailable: boolean;
+      retry_count: number;
+      next_retry_at: Date;
+      automatic_retry_until: Date;
+      blocker_state: Record<string, unknown>;
+      checkpoint_state: Record<string, unknown>;
+      queued_retries: number;
+      retry_payload: Record<string, unknown>;
+    }>(
+      `SELECT run.status run_status,run.phase run_phase,
+              outcome.status outcome_status,outcome.provider_unavailable,
+              blocker.retry_count,blocker.next_retry_at,
+              blocker.automatic_retry_until,blocker.state_json blocker_state,
+              checkpoint.state_json checkpoint_state,
+              (SELECT count(*)::int FROM job_queue job
+               WHERE job.run_id=run.id AND job.kind='matching'
+                 AND job.status='queued'
+                 AND job.payload_json->>'providerDependencyRetry'='true')
+                queued_retries,
+              (SELECT job.payload_json FROM job_queue job
+               WHERE job.run_id=run.id AND job.kind='matching'
+                 AND job.status='queued'
+                 AND job.payload_json->>'providerDependencyRetry'='true'
+               LIMIT 1) retry_payload
+       FROM research_runs run
+       JOIN pipeline_outcomes outcome ON outcome.run_id=run.id
+       JOIN playlist_run_blockers blocker ON blocker.run_id=run.id
+         AND blocker.blocker_kind='provider'
+         AND blocker.dependency_key='apple_catalog'
+         AND blocker.resolved_at IS NULL
+       JOIN research_checkpoints checkpoint ON checkpoint.run_id=run.id
+         AND checkpoint.phase='catalog_provider_blocker_v2'
+       WHERE run.id=$1`,
+      [runId],
+    );
+    expect(persisted.rows[0]).toMatchObject({
+      run_status: "failed_system",
+      run_phase: "catalog_provider_blocked_retry_scheduled",
+      outcome_status: "failed_system",
+      provider_unavailable: true,
+      retry_count: 1,
+      queued_retries: 1,
+      blocker_state: {
+        dependencyKey: "apple_catalog",
+        reasonCode: "apple_provider_degraded",
+        failureCount: 1,
+        nextAction: "wait_for_dependency",
+        automaticResume: true,
+      },
+      checkpoint_state: {
+        dependencyKey: "apple_catalog",
+        failureCount: 1,
+      },
+      retry_payload: {
+        runId,
+        storefront: "us",
+        retryIncomplete: true,
+        recoveryGeneration: 1,
+        providerDependencyRetry: true,
+      },
+    });
+    expect(persisted.rows[0]!.next_retry_at.getTime())
+      .toBeGreaterThanOrEqual(nextRetryAt.getTime());
+    expect(persisted.rows[0]!.next_retry_at.getTime())
+      .toBeLessThanOrEqual(nextRetryAt.getTime() + 5_000);
+    expect(persisted.rows[0]?.automatic_retry_until.toISOString())
+      .toBe(automaticRetryUntil.toISOString());
+
+    const countsBefore = await repository.pool.query<{
+      blockers: number;
+      retries: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM playlist_run_blockers
+          WHERE run_id=$1 AND resolved_at IS NULL) blockers,
+         (SELECT count(*)::int FROM job_queue
+          WHERE run_id=$1 AND payload_json->>'providerDependencyRetry'='true')
+            retries`,
+      [runId],
+    );
+    await expect(repository.persistCatalogProviderBlocker(runId, {
+      schemaVersion: 1,
+      kind: "provider",
+      dependencyKey: "apple_catalog",
+      reasonCode: "apple_provider_degraded",
+      storefront: "us",
+      safeTrackCount: 0,
+      failureCount: 2,
+      nextRetryAt: new Date(openedAt.getTime() + 30 * 60_000).toISOString(),
+      retryAfterUntil: null,
+      automaticRetryUntil: automaticRetryUntil.toISOString(),
+      needsDecision: false,
+      openedAt: openedAt.toISOString(),
+      updatedAt: openedAt.toISOString(),
+    }, {
+      ...outcome,
+      policyVersion: "relevance_first_2026_07_r2",
+    }, currentAuthority)).rejects.toMatchObject({
+      code: "catalog_provider_blocker_stale",
+    });
+    const countsAfter = await repository.pool.query<{
+      blockers: number;
+      retries: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM playlist_run_blockers
+          WHERE run_id=$1 AND resolved_at IS NULL) blockers,
+         (SELECT count(*)::int FROM job_queue
+          WHERE run_id=$1 AND payload_json->>'providerDependencyRetry'='true')
+            retries`,
+      [runId],
+    );
+    expect(countsAfter.rows[0]).toEqual(countsBefore.rows[0]);
+
+    const recoveredNoCompatible = buildPipelineOutcome({
+      pipelineVersion: "catalog_first_v2",
+      policyVersion: "relevance_first_2026_07",
+      status: "no_compatible_tracks",
+      targetTrackCount: 25,
+      discoveredTrackCount: 0,
+      qualifiedTrackCount: 0,
+      selectedTrackCount: 0,
+      publishedTrackCount: 0,
+      frontierExhausted: true,
+      providerUnavailable: false,
+      reasonCodes: ["catalog_recovery_exhausted_without_compatible_tracks"],
+    });
+    await expect(repository.savePipelineOutcome(
+      runId,
+      recoveredNoCompatible,
+    )).rejects.toMatchObject({
+      code: "catalog_provider_transition_required",
+    });
+
+    const retryAuthority = await claimQueuedV2ProviderRetry(runId);
+    const replacementWorkerId = `v2-provider-retry-replacement-${randomUUID()}`;
+    const replacementLease = await repository.pool.query<{
+      lease_epoch: number;
+    }>(
+      `UPDATE job_queue
+       SET lease_epoch=lease_epoch+1,lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1
+       RETURNING lease_epoch`,
+      [retryAuthority.jobId, replacementWorkerId],
+    );
+    const replacementAuthority = {
+      ...retryAuthority,
+      workerId: replacementWorkerId,
+      leaseEpoch: Number(replacementLease.rows[0]?.lease_epoch),
+      claimToken: null,
+    };
+    const supersedingRetryClaim =
+      await repository.claimCatalogProviderRetry(runId, replacementAuthority);
+    if (!supersedingRetryClaim) {
+      throw new Error("Replacement V2 recovery lease was not claimable");
+    }
+    const currentRetryAuthority = {
+      ...replacementAuthority,
+      claimToken: supersedingRetryClaim.claimToken,
+    };
+    await expect(repository.resolveCatalogProviderBlocker(
+      runId,
+      recoveredNoCompatible,
+      retryAuthority,
+    )).rejects.toMatchObject({
+      code: "catalog_provider_retry_stale",
+    });
+    await repository.resolveCatalogProviderBlocker(
+      runId,
+      recoveredNoCompatible,
+      currentRetryAuthority,
+    );
+    const resolved = await repository.pool.query<{
+      open_blockers: number;
+      queued_retries: number;
+      checkpoint_state: Record<string, unknown>;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM playlist_run_blockers
+          WHERE run_id=$1 AND resolved_at IS NULL) open_blockers,
+         (SELECT count(*)::int FROM job_queue
+          WHERE run_id=$1 AND status='queued'
+            AND payload_json->>'providerDependencyRetry'='true')
+            queued_retries,
+         (SELECT state_json FROM research_checkpoints
+          WHERE run_id=$1 AND phase='catalog_provider_blocker_v2')
+            checkpoint_state`,
+      [runId],
+    );
+    expect(resolved.rows[0]).toMatchObject({
+      open_blockers: 0,
+      queued_retries: 0,
+      checkpoint_state: {
+        resolvedAt: expect.any(String),
+        nextRetryAt: null,
+        automaticResume: false,
+      },
+    });
+  });
+
+  test("V2 provider outages retain a public dependency pause without a canonical contract", async () => {
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    const runId = await repository.createRun(
+      "V2 provider outage without canonical contract",
+      { ...brief, mode: "curated", targetSize: { min: 25, max: 25 } },
+      0,
+      1,
+    );
+    await repository.pool.query(
+      `UPDATE research_runs
+       SET pipeline_version='catalog_first_v2',
+           policy_version='relevance_first_2026_07'
+       WHERE id=$1`,
+      [runId],
+    );
+    const openedAt = new Date();
+    const firstNextRetryAt = new Date(openedAt.getTime() + 5 * 60_000);
+    const firstAutomaticRetryUntil = new Date(
+      openedAt.getTime() + 24 * 60 * 60_000,
+    );
+    const outcome = buildPipelineOutcome({
+      pipelineVersion: "catalog_first_v2",
+      policyVersion: "relevance_first_2026_07",
+      status: "failed_system",
+      targetTrackCount: 25,
+      discoveredTrackCount: 0,
+      qualifiedTrackCount: 0,
+      selectedTrackCount: 0,
+      publishedTrackCount: 0,
+      frontierExhausted: false,
+      providerUnavailable: true,
+      reasonCodes: ["apple_provider_degraded"],
+      completedAt: openedAt.toISOString(),
+    });
+    const firstAuthority = await claimV2MatchingAttempt(runId);
+
+    await repository.persistCatalogProviderBlocker(runId, {
+      schemaVersion: 1,
+      kind: "provider",
+      dependencyKey: "apple_catalog",
+      reasonCode: "apple_provider_degraded",
+      storefront: "us",
+      safeTrackCount: 0,
+      failureCount: 1,
+      nextRetryAt: firstNextRetryAt.toISOString(),
+      retryAfterUntil: null,
+      automaticRetryUntil: firstAutomaticRetryUntil.toISOString(),
+      needsDecision: false,
+      openedAt: openedAt.toISOString(),
+      updatedAt: openedAt.toISOString(),
+    }, outcome, firstAuthority);
+
+    const laterAttempt = new Date(openedAt.getTime() + 1_000);
+    const secondAuthority = await claimQueuedV2ProviderRetry(runId);
+    await repository.persistCatalogProviderBlocker(runId, {
+      schemaVersion: 1,
+      kind: "provider",
+      dependencyKey: "apple_catalog",
+      reasonCode: "apple_provider_circuit_open",
+      storefront: "us",
+      safeTrackCount: 0,
+      failureCount: 2,
+      nextRetryAt: new Date(
+        laterAttempt.getTime() + 30 * 60_000,
+      ).toISOString(),
+      retryAfterUntil: null,
+      automaticRetryUntil: new Date(
+        laterAttempt.getTime() + 24 * 60 * 60_000,
+      ).toISOString(),
+      needsDecision: false,
+      openedAt: laterAttempt.toISOString(),
+      updatedAt: laterAttempt.toISOString(),
+    }, {
+      ...outcome,
+      reasonCodes: ["apple_provider_circuit_open"],
+      completedAt: laterAttempt.toISOString(),
+    }, secondAuthority);
+
+    const persisted = await repository.pool.query<{
+      open_contract_blockers: number;
+      queued_retries: number;
+      checkpoint_state: Record<string, unknown>;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM playlist_run_blockers
+          WHERE run_id=$1 AND resolved_at IS NULL) open_contract_blockers,
+         (SELECT count(*)::int FROM job_queue
+          WHERE run_id=$1 AND kind='matching' AND status='queued'
+            AND payload_json->>'providerDependencyRetry'='true')
+           queued_retries,
+         (SELECT state_json FROM research_checkpoints
+          WHERE run_id=$1 AND phase='catalog_provider_blocker_v2')
+           checkpoint_state`,
+      [runId],
+    );
+    expect(persisted.rows[0]).toMatchObject({
+      open_contract_blockers: 0,
+      queued_retries: 1,
+      checkpoint_state: {
+        kind: "provider",
+        dependencyKey: "apple_catalog",
+        reasonCode: "apple_provider_circuit_open",
+        failureCount: 2,
+        openedAt: openedAt.toISOString(),
+        automaticRetryUntil: firstAutomaticRetryUntil.toISOString(),
+        nextAction: "wait_for_dependency",
+      },
+    });
+    expect(persisted.rows[0]?.checkpoint_state.nextRetryAt).toBe(
+      new Date(openedAt.getTime() + 30 * 60_000).toISOString(),
+    );
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      status: "failed_system",
+      phase: "catalog_provider_blocked_retry_scheduled",
+      resolution: {
+        state: "blocked_dependency",
+        nextAction: "wait_for_dependency",
+        contractRevisionId: null,
+        contractRevision: null,
+        contractHash: null,
+        blocker: {
+          kind: "provider",
+          automaticRetryUntil: firstAutomaticRetryUntil.toISOString(),
+          retryCount: 2,
+          versionHash: null,
+        },
+      },
+    });
+
+    const decisionGeneration = String(
+      persisted.rows[0]?.checkpoint_state.generation,
+    );
+    await repository.pool.query(
+      `UPDATE research_checkpoints
+       SET state_json=state_json || $2::jsonb
+       WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'`,
+      [runId, JSON.stringify({
+        openedAt: new Date(openedAt.getTime() - 26 * 60 * 60_000)
+          .toISOString(),
+        automaticRetryUntil: new Date(
+          openedAt.getTime() - 2 * 60 * 60_000,
+        ).toISOString(),
+        nextRetryAt: null,
+        needsDecision: true,
+        nextAction: "resume_revise_or_cancel",
+      })],
+    );
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      resolution: {
+        state: "needs_decision",
+        nextAction: "review_contract",
+        blocker: {
+          kind: "provider",
+          versionHash: null,
+        },
+      },
+    });
+
+    await repository.pool.query(
+      `UPDATE research_checkpoints
+       SET state_json=state_json || $2::jsonb
+       WHERE run_id=$1 AND phase='catalog_provider_blocker_v2'
+         AND state_json->>'generation'=$3`,
+      [
+        runId,
+        JSON.stringify({
+          openedAt: openedAt.toISOString(),
+          automaticRetryUntil: firstAutomaticRetryUntil.toISOString(),
+          nextRetryAt: new Date(Date.now() - 1_000).toISOString(),
+          needsDecision: false,
+          nextAction: "wait_for_dependency",
+        }),
+        decisionGeneration,
+      ],
+    );
+    const recoveryAuthority = await claimQueuedV2ProviderRetry(runId);
+    await repository.resolveCatalogProviderBlocker(
+      runId,
+      buildPipelineOutcome({
+        pipelineVersion: "catalog_first_v2",
+        policyVersion: "relevance_first_2026_07",
+        status: "no_compatible_tracks",
+        targetTrackCount: 25,
+        discoveredTrackCount: 0,
+        qualifiedTrackCount: 0,
+        selectedTrackCount: 0,
+        publishedTrackCount: 0,
+        frontierExhausted: true,
+        providerUnavailable: false,
+        reasonCodes: ["catalog_recovery_exhausted_without_compatible_tracks"],
+      }),
+      recoveryAuthority,
+    );
+    await expect(repository.saveResearchCheckpoint(
+      runId,
+      "catalog_provider_recovery_post_resolution",
+      { status: "complete" },
+      recoveryAuthority,
+    )).resolves.toBeUndefined();
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      resolution: {
+        blocker: null,
+      },
+    });
+  });
+
+  test("factual V2 research outages preserve candidates behind one exact durable generation", async () => {
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    const factualBrief: PlaylistBrief = {
+      ...brief,
+      title: "Documented session credits",
+      description: "All documented tracks this musician performed on.",
+      mode: "exhaustive",
+      relationship: "performed on",
+      evidencePolicy: "track-specific session credit",
+      targetSize: null,
+    };
+    const runId = await repository.createRun(
+      factualBrief.title,
+      factualBrief,
+      0,
+      1,
+    );
+    const plan = createSelectionPlanV2({
+      prompt: factualBrief.description,
+      brief: factualBrief,
+      storefront: "us",
+    });
+    expect(plan.intents).toEqual(expect.arrayContaining([
+      "factual_relationship",
+      "exhaustive",
+    ]));
+    await repository.savePipelineSelectionPlan(runId, plan);
+    const contractRevisionId = randomUUID();
+    await repository.pool.query(
+      `INSERT INTO playlist_contract_revisions(
+         id,run_id,revision,status,contract_hash,contract_json,compiler_version,
+         ontology_version,evidence_policy_version,question_template_version,
+         catalog_policy_version,locale,storefront,answer_lineage_hash)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'compiler-test','ontology-test',
+         'evidence-test','questions-test','catalog-test','en-US','us',$4)`,
+      [
+        contractRevisionId,
+        runId,
+        "e".repeat(64),
+        "f".repeat(64),
+      ],
+    );
+    await repository.pool.query(
+      `UPDATE research_runs
+       SET active_playlist_contract_revision_id=$2,status='researching',
+           phase='source_discovery'
+       WHERE id=$1`,
+      [runId, contractRevisionId],
+    );
+    await repository.addCandidates(
+      runId,
+      [{
+        artist: "Race Artist",
+        title: "Race Track",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      }],
+      new Map(),
+      "source_discovery",
+    );
+    const raceCandidate = (await repository.listCandidates(runId))[0]!;
+    const racingMatcherAuthority = await claimV2MatchingAttempt(runId);
+    const openedAt = new Date().toISOString();
+    const staleAuthority = await claimV2ResearchAttempt(runId);
+    const supersedingClaim = await repository.claimResearchProviderRetry(
+      runId,
+      staleAuthority,
+    );
+    if (!supersedingClaim) {
+      throw new Error("Same-lease research provider claim was unavailable");
+    }
+    expect(supersedingClaim.claimToken).toBe(staleAuthority.claimToken);
+    const currentAuthority = {
+      ...staleAuthority,
+      claimToken: supersedingClaim.claimToken,
+    };
+    const blocker = {
+      schemaVersion: 1 as const,
+      kind: "provider" as const,
+      dependencyKey: "openai_research" as const,
+      reasonCode: "research_provider_unavailable" as const,
+      phase: "source_discovery" as const,
+      gapAttempt: 0,
+      researchGeneration: 0,
+      segment: 0,
+      eligibleCandidateCount: 2,
+      failureCount: 1,
+      retryAfterUntil: null,
+      openedAt,
+      updatedAt: openedAt,
+    };
+
+    const persistedGeneration = await repository.persistResearchProviderBlocker(
+      runId,
+      blocker,
+      currentAuthority,
+    );
+    expect(persistedGeneration.generation).toMatch(
+      /^[0-9a-f-]{36}$/u,
+    );
+    await expect(repository.saveMatch(
+      runId,
+      {
+        candidateId: raceCandidate.id,
+        status: "accepted",
+        basis: "stale matcher must not survive a research outage",
+        score: 1,
+        song: {
+          id: "stale-race-catalog-id",
+          name: raceCandidate.title,
+          artistName: raceCandidate.artist,
+          albumName: "",
+        },
+        alternatives: [],
+      },
+      racingMatcherAuthority,
+    )).rejects.toMatchObject({
+      code: "catalog_provider_retry_stale",
+    });
+    const staleMatches = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM catalog_matches WHERE run_id=$1",
+      [runId],
+    );
+    expect(staleMatches.rows[0]?.count).toBe(0);
+
+    const persisted = await repository.pool.query<{
+      run_status: string;
+      run_phase: string;
+      open_blockers: number;
+      queued_retries: number;
+      queued_matching: number;
+      next_retry_at: Date;
+      blocker_state: Record<string, unknown>;
+      resume_state: Record<string, unknown>;
+      retry_payload: Record<string, unknown>;
+    }>(
+      `SELECT run.status run_status,run.phase run_phase,
+              (SELECT count(*)::int FROM playlist_run_blockers blocker
+               WHERE blocker.run_id=run.id
+                 AND blocker.dependency_key='openai_research'
+                 AND blocker.resolved_at IS NULL) open_blockers,
+              (SELECT count(*)::int FROM job_queue job
+               WHERE job.run_id=run.id AND job.kind='research'
+                 AND job.status='queued'
+                 AND job.payload_json->>'researchProviderDependencyRetry'
+                   ='true') queued_retries,
+              (SELECT count(*)::int FROM job_queue job
+               WHERE job.run_id=run.id AND job.kind='matching'
+                 AND job.status='queued') queued_matching,
+              (SELECT next_retry_at FROM playlist_run_blockers blocker
+               WHERE blocker.run_id=run.id
+                 AND blocker.dependency_key='openai_research'
+                 AND blocker.resolved_at IS NULL) next_retry_at,
+              (SELECT state_json FROM research_checkpoints
+               WHERE run_id=run.id
+                 AND phase='research_provider_blocker_v2') blocker_state,
+              (SELECT state_json FROM research_checkpoints
+               WHERE run_id=run.id AND phase='resume') resume_state,
+              (SELECT payload_json FROM job_queue job
+               WHERE job.run_id=run.id AND job.kind='research'
+                 AND job.status='queued'
+                 AND job.payload_json->>'researchProviderDependencyRetry'
+                   ='true'
+               LIMIT 1) retry_payload
+       FROM research_runs run WHERE run.id=$1`,
+      [runId],
+    );
+    expect(persisted.rows[0]).toMatchObject({
+      run_status: "failed_system",
+      run_phase: "research_provider_blocked_retry_scheduled",
+      open_blockers: 1,
+      queued_retries: 1,
+      queued_matching: 0,
+      blocker_state: {
+        generation: persistedGeneration.generation,
+        dependencyKey: "openai_research",
+        eligibleCandidateCount: 2,
+        failureCount: 1,
+        nextAction: "wait_for_dependency",
+      },
+      resume_state: {
+        status: "paused",
+        boundary: "provider_error",
+        eligibleCandidateCount: 2,
+        providerBlockerGeneration: persistedGeneration.generation,
+      },
+      retry_payload: {
+        runId,
+        phase: "source_discovery",
+        gapAttempt: 0,
+        generation: 0,
+        segment: 0,
+        researchProviderDependencyRetry: true,
+        researchProviderBlockerGeneration: persistedGeneration.generation,
+        researchProviderBlockerFailureCount: 1,
+      },
+    });
+    expect(persisted.rows[0]?.next_retry_at.toISOString()).toBe(
+      new Date(Date.parse(openedAt) + 5 * 60_000).toISOString(),
+    );
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      status: "failed_system",
+      phase: "research_provider_blocked_retry_scheduled",
+      resolution: {
+        state: "blocked_dependency",
+        nextAction: "wait_for_dependency",
+        blocker: {
+          kind: "provider",
+          retryCount: 1,
+        },
+      },
+    });
+    await expect(repository.savePipelineOutcome(
+      runId,
+      buildPipelineOutcome({
+        pipelineVersion: "catalog_first_v2",
+        policyVersion: plan.policyVersion,
+        status: "no_compatible_tracks",
+        targetTrackCount: 1,
+        discoveredTrackCount: 2,
+        qualifiedTrackCount: 2,
+        selectedTrackCount: 0,
+        publishedTrackCount: 0,
+        frontierExhausted: true,
+        providerUnavailable: false,
+        reasonCodes: ["stale_research_frontier_exhausted"],
+      }),
+    )).rejects.toMatchObject({
+      code: "catalog_provider_transition_required",
+    });
+
+    const recoveryAuthority =
+      await claimQueuedV2ResearchProviderRetry(runId);
+    await expect(repository.resolveResearchProviderBlocker(
+      runId,
+      recoveryAuthority,
+    )).resolves.toBe(true);
+    await expect(repository.saveResearchCheckpoint(
+      runId,
+      "research_provider_recovery_post_resolution",
+      { status: "complete" },
+      recoveryAuthority,
+    )).resolves.toBeUndefined();
+    const recovered = await repository.pool.query<{
+      run_status: string;
+      run_phase: string;
+      open_blockers: number;
+      queued_retries: number;
+      queued_watchdogs: number;
+      blocker_state: Record<string, unknown>;
+    }>(
+      `SELECT run.status run_status,run.phase run_phase,
+              (SELECT count(*)::int FROM playlist_run_blockers blocker
+               WHERE blocker.run_id=run.id
+                 AND blocker.dependency_key='openai_research'
+                 AND blocker.resolved_at IS NULL) open_blockers,
+              (SELECT count(*)::int FROM job_queue job
+               WHERE job.run_id=run.id AND job.status='queued'
+                 AND job.payload_json->>'researchProviderDependencyRetry'
+                   ='true') queued_retries,
+              (SELECT count(*)::int FROM job_queue job
+               WHERE job.run_id=run.id AND job.status='queued'
+                 AND job.payload_json->>'researchProviderRecoveryWatchdog'
+                   ='true') queued_watchdogs,
+              (SELECT state_json FROM research_checkpoints
+               WHERE run_id=run.id
+                 AND phase='research_provider_blocker_v2') blocker_state
+       FROM research_runs run WHERE run.id=$1`,
+      [runId],
+    );
+    expect(recovered.rows[0]).toMatchObject({
+      run_status: "researching",
+      run_phase: "source_discovery",
+      open_blockers: 0,
+      queued_retries: 0,
+      queued_watchdogs: 1,
+      blocker_state: {
+        generation: persistedGeneration.generation,
+        resolvedAt: expect.any(String),
+        automaticResume: false,
+        nextRetryAt: null,
+      },
+    });
+  });
+
+  test("a superseded factual provider lease cannot persist candidates from a late response", async () => {
+    const factualBrief: PlaylistBrief = {
+      title: "Late factual response fence",
+      description: "All documented session credits for one musician.",
+      mode: "exhaustive",
+      relationship: "performed on",
+      subjectEntities: ["Fence Musician"],
+      include: ["officially released recordings"],
+      exclude: ["unreleased recordings"],
+      versionPolicy: "one canonical studio recording",
+      orderingPolicy: "chronological",
+      evidencePolicy: "track-specific session credit",
+      targetSize: null,
+      ambiguities: [],
+    };
+    const runId = await repository.createRun(
+      factualBrief.title,
+      factualBrief,
+      0,
+      1,
+    );
+    await repository.savePipelineSelectionPlan(
+      runId,
+      createSelectionPlanV2({
+        prompt: factualBrief.description,
+        brief: factualBrief,
+        storefront: "us",
+      }),
+    );
+    await repository.pool.query(
+      "UPDATE research_runs SET status='researching',phase='source_discovery' WHERE id=$1",
+      [runId],
+    );
+    const authority = await claimV2ResearchAttempt(runId);
+    const duplicateClaim = await repository.claimResearchProviderRetry(
+      runId,
+      authority,
+    );
+    expect(duplicateClaim?.claimToken).toBe(authority.claimToken);
+
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET lease_epoch=lease_epoch+1,lease_owner='replacement-worker',
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [authority.jobId],
+    );
+    await expect(repository.addCandidates(
+      runId,
+      [{
+        artist: "Late Artist",
+        title: "Late Track",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      }],
+      new Map(),
+      "source_discovery",
+      authority,
+    )).rejects.toMatchObject({
+      code: "research_provider_retry_stale",
+    });
+    const candidates = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM track_candidates WHERE run_id=$1",
+      [runId],
+    );
+    expect(candidates.rows[0]?.count).toBe(0);
+    const staleHandoffKey = `matching:${runId}:stale-provider-handoff`;
+    await expect(repository.enqueueJob({
+      kind: "matching",
+      runId,
+      payload: { runId, storefront: "us" },
+      dedupeKey: staleHandoffKey,
+      workerWriteFence: authority,
+    })).rejects.toMatchObject({
+      code: "research_provider_retry_stale",
+    });
+    const handoffs = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count FROM job_queue
+       WHERE kind='matching' AND dedupe_key=$1`,
+      [staleHandoffKey],
+    );
+    expect(handoffs.rows[0]?.count).toBe(0);
+  });
+
+  test("a superseded curated provider lease cannot persist candidates from a late response", async () => {
+    const curatedBrief: PlaylistBrief = {
+      ...brief,
+      title: "Late curated response fence",
+      description: "A nuanced curated playlist with an exact count.",
+      mode: "curated",
+      relationship: "genre and scene fit",
+      targetSize: { min: 25, max: 25 },
+    };
+    const runId = await repository.createRun(
+      curatedBrief.title,
+      curatedBrief,
+      0,
+      1,
+    );
+    await repository.savePipelineSelectionPlan(
+      runId,
+      createSelectionPlanV2({
+        prompt: curatedBrief.description,
+        brief: curatedBrief,
+        storefront: "us",
+      }),
+    );
+    await repository.pool.query(
+      "UPDATE research_runs SET status='researching',phase='fast_research' WHERE id=$1",
+      [runId],
+    );
+    const authority = await claimV2ResearchAttempt(runId);
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET lease_epoch=lease_epoch+1,lease_owner='replacement-worker',
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [authority.jobId],
+    );
+    await expect(repository.addCandidates(
+      runId,
+      [{
+        artist: "Late Curated Artist",
+        title: "Late Curated Track",
+        album: null,
+        releaseYear: null,
+        durationMs: null,
+        isrc: null,
+        musicbrainzId: null,
+        versionLabel: null,
+        evidence: [],
+      }],
+      new Map(),
+      "track_verification",
+      authority,
+    )).rejects.toMatchObject({
+      code: "research_provider_retry_stale",
+    });
+    const candidates = await repository.pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM track_candidates WHERE run_id=$1",
+      [runId],
+    );
+    expect(candidates.rows[0]?.count).toBe(0);
   });
 
   test("Apple catalog cache persists storefront-isolated payloads and provider telemetry", async () => {
@@ -1623,13 +2995,8 @@ databaseDescribe("hosted backend integration", () => {
 
   test("captures and deduplicates a terminal run failure with owner-visible QA metadata", async () => {
     vi.stubEnv("APPLE_STOREFRONT", "us");
-    // The suite truncates settings between tests. Restore the migrated schema
-    // marker so this fixture exercises the real immutable RunSpec metadata
-    // path used by production schema 15 rather than the legacy fallback.
-    await repository.pool.query(
-      "INSERT INTO settings(key,value) VALUES('schema_version',$1)",
-      [DATABASE_SCHEMA_VERSION],
-    );
+    // The shared fixture restores the migrated schema marker after every
+    // TRUNCATE so this path exercises immutable RunSpec metadata.
     const prompt = "37 obscure integration-test disco recordings";
     const requestedTrackCount = 37;
     const clientBucket = `automatic-failure-${randomUUID()}`;
@@ -1864,6 +3231,104 @@ databaseDescribe("hosted backend integration", () => {
     })).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
   });
 
+  test("returns the persisted brief when an idempotent retry crosses signed rollout revisions", async () => {
+    const prompt = "Create a 50-track core reggaeton playlist";
+    const clientBucket = `brief-rollout-overlap-${randomUUID()}`;
+    const key = `brief-rollout-overlap-${randomUUID()}`;
+    const rolloutEnvironment = (
+      evidenceHash: string,
+      stage: string,
+      percentage: string,
+    ): NodeJS.ProcessEnv => ({
+      RELEASE_ENVIRONMENT: "production",
+      RELEASE_DEPLOYMENT_PHASE: "activate",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
+      RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
+      RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXECUTION_ENABLED: "true",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH: evidenceHash,
+      RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH: "f".repeat(64),
+      RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH: "e".repeat(64),
+      RELEASE_PUBLIC_ROLLOUT_STAGE: stage,
+      PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
+      PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+      GUIDANCE_CONTRACT_V3_ENABLED: "false",
+      PIPELINE_V3_GENRE_SCENE_PERCENT: percentage,
+    });
+    const selectedEnvironment = rolloutEnvironment(
+      "a".repeat(64),
+      "genre_scene:50->100",
+      "100",
+    );
+    const selected = createPublicRolloutAssignmentV1({
+      prompt,
+      requestedTrackCount: 50,
+      stickyKey: clientBucket,
+      environment: selectedEnvironment,
+      databaseAuthority: publicRolloutAuthority(selectedEnvironment),
+    });
+    expect(selected).toMatchObject({ assigned: true, percentage: 100 });
+    const first = await repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: key,
+      briefContractVersion: 3,
+      publicRolloutAssignment: selected,
+    });
+    const rolledBackEnvironment = rolloutEnvironment(
+      "b".repeat(64),
+      "genre_scene:100->0",
+      "0",
+    );
+    const rolledBack = createPublicRolloutAssignmentV1({
+      prompt,
+      requestedTrackCount: 50,
+      stickyKey: clientBucket,
+      environment: rolledBackEnvironment,
+      databaseAuthority: publicRolloutAuthority(rolledBackEnvironment),
+    });
+    expect(rolledBack).toMatchObject({ assigned: false, percentage: 0 });
+    await expect(repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: key,
+      briefContractVersion: 1,
+      publicRolloutAssignment: rolledBack,
+    })).resolves.toEqual({
+      id: first.id,
+      status: "queued",
+      created: false,
+    });
+    const persisted = await repository.pool.query<{
+      brief_contract_version: number;
+      public_rollout_assignment_json: {
+        rolloutEvidenceHash: string;
+        assigned: boolean;
+      };
+    }>(
+      `SELECT brief_contract_version,public_rollout_assignment_json
+       FROM brief_requests WHERE id=$1`,
+      [first.id],
+    );
+    expect(persisted.rows[0]).toMatchObject({
+      brief_contract_version: 3,
+      public_rollout_assignment_json: {
+        rolloutEvidenceHash: "a".repeat(64),
+        assigned: true,
+      },
+    });
+  });
+
   test("preserves a custom 150-track target from the brief through the persisted V2 run", async () => {
     vi.stubEnv("PIPELINE_V2_CURATED_PERCENT", "100");
     const clientBucket = `brief-count-150-${randomUUID()}`;
@@ -2014,6 +3479,8 @@ databaseDescribe("hosted backend integration", () => {
       });
 
       await expect(repository.submitBriefAnswers({
+        customTrackCountAuthority:
+          PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
         briefRequestId: request.id,
         idempotencyKey: `answers-${randomUUID()}`,
         answers: guidanceAnswers(questions),
@@ -2103,6 +3570,8 @@ databaseDescribe("hosted backend integration", () => {
     });
 
     await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
       briefRequestId: request.id,
       idempotencyKey: `invalid-answers-${randomUUID()}`,
       answers: answers(questions),
@@ -2139,6 +3608,8 @@ databaseDescribe("hosted backend integration", () => {
     });
 
     await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
       briefRequestId: request.id,
       idempotencyKey: `invalid-count-${randomUUID()}`,
       answers: guidanceAnswers(questions),
@@ -2165,6 +3636,8 @@ databaseDescribe("hosted backend integration", () => {
     const idempotencyKey = `guided-replay-${randomUUID()}`;
     const submit = (submittedAnswers = answers, key = idempotencyKey) =>
       repository.submitBriefAnswers({
+        customTrackCountAuthority:
+          PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
         briefRequestId: request.id,
         idempotencyKey: key,
         answers: submittedAnswers,
@@ -2199,6 +3672,8 @@ databaseDescribe("hosted backend integration", () => {
     });
     const idempotencyKey = `guided-concurrent-${randomUUID()}`;
     const submit = () => repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
       briefRequestId: request.id,
       idempotencyKey,
       answers,
@@ -2250,6 +3725,8 @@ databaseDescribe("hosted backend integration", () => {
       questions,
     });
     await repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
       briefRequestId: request.id,
       idempotencyKey: `guided-stale-preflight-${randomUUID()}`,
       answers,
@@ -2281,6 +3758,84 @@ databaseDescribe("hosted backend integration", () => {
       clientBucket,
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
+    })).rejects.toMatchObject({ statusCode: 400, code: "invalid_track_count" });
+  });
+
+  test.each([301, 1_000])(
+    "persists activated owner contract-3 size %i through the expanded schema",
+    async (requestedTrackCount) => {
+      await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+      const clientBucket = `owner-expanded-count-${requestedTrackCount}-${randomUUID()}`;
+      const created = await repository.createBriefRequest({
+        prompt: `An authenticated owner playlist with ${requestedTrackCount} tracks`,
+        requestedTrackCount,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion: 3,
+        allowExecutableTrackCount: true,
+      });
+      await expect(repository.getBriefRequest(created.id)).resolves.toMatchObject({
+        requestedTrackCount,
+        briefContractVersion: 3,
+      });
+    },
+  );
+
+  test.each([1, 2] as const)(
+    "rejects expanded durable admission under legacy brief contract %i",
+    async (briefContractVersion) => {
+      const clientBucket = `owner-expanded-contract-${briefContractVersion}-${randomUUID()}`;
+      await expect(repository.createBriefRequest({
+        prompt: "An expanded request with a legacy execution contract",
+        requestedTrackCount: 301,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion,
+        allowExecutableTrackCount: true,
+      })).rejects.toMatchObject({
+        statusCode: 409,
+        code: "expanded_track_count_contract_required",
+      });
+    },
+  );
+
+  test("rejects expanded durable admission until schema 18 is observed", async () => {
+    const schema = vi.spyOn(repository, "getSchemaVersion").mockResolvedValue("17");
+    const clientBucket = `owner-expanded-schema-${randomUUID()}`;
+    try {
+      await expect(repository.createBriefRequest({
+        prompt: "An expanded canonical request before schema activation",
+        requestedTrackCount: 301,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion: 3,
+        allowExecutableTrackCount: true,
+      })).rejects.toMatchObject({
+        statusCode: 503,
+        code: "expanded_track_count_activation_not_ready",
+      });
+    } finally {
+      schema.mockRestore();
+    }
+  });
+
+  test("rejects owner work above the executable 1,000-track boundary", async () => {
+    const clientBucket = `owner-expanded-count-invalid-${randomUUID()}`;
+    await expect(repository.createBriefRequest({
+      prompt: "An authenticated owner playlist above the executable boundary",
+      requestedTrackCount: 1_001,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+      allowExecutableTrackCount: true,
     })).rejects.toMatchObject({ statusCode: 400, code: "invalid_track_count" });
   });
 
@@ -3589,6 +5144,7 @@ databaseDescribe("hosted backend integration", () => {
     const first = await repository.runPipelineV2OperationalAlertSweep({ windowEndedAt });
     expect(first.alerts.map((alert) => alert.kind)).toEqual([
       "pipeline_zero_result_spike",
+      "pipeline_shortfall_rate_elevated",
       "pipeline_local_contract_rejections",
       "pipeline_provider_circuit_repeated",
       "pipeline_pagination_loop",
@@ -3601,7 +5157,7 @@ databaseDescribe("hosted backend integration", () => {
       `SELECT kind,count(*)::int count FROM notification_outbox
        WHERE kind LIKE 'pipeline_%' GROUP BY kind ORDER BY kind`,
     );
-    expect(notifications.rows).toHaveLength(6);
+    expect(notifications.rows).toHaveLength(7);
     expect(notifications.rows.every((row) => row.count === 1)).toBe(true);
   });
 
@@ -5303,6 +6859,149 @@ databaseDescribe("hosted backend integration", () => {
     await expect(capabilities.authenticate(request)).rejects.toMatchObject({ statusCode: 401, code: "capability_required" });
   });
 
+  test("rotates capability peppers without breaking live tokens or sessions", async () => {
+    const oldPepper = "integration-old-capability-pepper";
+    const newPepper = "integration-new-capability-pepper";
+    vi.stubEnv("CAPABILITY_PEPPER", oldPepper);
+    vi.stubEnv("CAPABILITY_PEPPER_VERSION", "capability-v1");
+    vi.stubEnv("CAPABILITY_PREVIOUS_PEPPER", "");
+    vi.stubEnv("CAPABILITY_PREVIOUS_PEPPER_VERSION", "");
+    vi.stubEnv("CAPABILITY_PREVIOUS_PEPPER_EXPIRES_AT", "");
+    const clientBucket = `capability-rotation-${randomUUID()}`;
+    const created = await repository.createRunIdempotent({
+      prompt: "Capability pepper rotation integration test",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      globalLimit: 100,
+    });
+    const capabilities = new CapabilityService(repository);
+    const oldTransfer = await capabilities.issue(created.runId, created.accessId);
+    const oldSessionReply = new ReplyStub();
+    const oldSession = await capabilities.exchange(
+      await capabilities.issue(created.runId, created.accessId),
+      oldSessionReply as unknown as FastifyReply,
+    );
+    const oldCookie = cookieRequest(
+      oldSessionReply.headers.get("set-cookie")!.split(";")[0]!,
+    );
+
+    vi.stubEnv("CAPABILITY_PEPPER", newPepper);
+    vi.stubEnv("CAPABILITY_PEPPER_VERSION", "capability-v2");
+    vi.stubEnv("CAPABILITY_PREVIOUS_PEPPER", oldPepper);
+    vi.stubEnv("CAPABILITY_PREVIOUS_PEPPER_VERSION", "capability-v1");
+    vi.stubEnv(
+      "CAPABILITY_PREVIOUS_PEPPER_EXPIRES_AT",
+      new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    );
+
+    await expect(capabilities.authenticate(oldCookie)).resolves.toMatchObject({
+      id: oldSession.id,
+    });
+    await expect(capabilities.exchange(
+      oldTransfer,
+      new ReplyStub() as unknown as FastifyReply,
+      oldSession,
+    )).resolves.toMatchObject({
+      id: oldSession.id,
+      runId: created.runId,
+      accessId: created.accessId,
+    });
+
+    const currentOnlyToken = await capabilities.issue(created.runId, created.accessId);
+    const storedCurrent = await repository.pool.query<{ token_hash: string }>(
+      "SELECT token_hash FROM capability_tokens WHERE token_hash=$1",
+      [hmacHex(newPepper, currentOnlyToken)],
+    );
+    expect(storedCurrent.rows).toHaveLength(1);
+    expect(storedCurrent.rows[0]?.token_hash).not.toBe(hmacHex(oldPepper, currentOnlyToken));
+
+    // If an operational mistake stored the same raw grant under both
+    // generations, one exchange consumes both candidates atomically.
+    const duplicateRawToken = randomToken();
+    await repository.createCapabilityToken(
+      created.runId,
+      created.accessId,
+      hmacHex(newPepper, duplicateRawToken),
+      new Date(Date.now() + 60_000),
+    );
+    await repository.createCapabilityToken(
+      created.runId,
+      created.accessId,
+      hmacHex(oldPepper, duplicateRawToken),
+      new Date(Date.now() + 60_000),
+    );
+    await expect(capabilities.exchange(
+      duplicateRawToken,
+      new ReplyStub() as unknown as FastifyReply,
+      oldSession,
+    )).resolves.toMatchObject({ id: oldSession.id });
+    const consumed = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count
+       FROM capability_tokens
+       WHERE token_hash=ANY($1::text[]) AND consumed_at IS NOT NULL`,
+      [[
+        hmacHex(newPepper, duplicateRawToken),
+        hmacHex(oldPepper, duplicateRawToken),
+      ]],
+    );
+    expect(consumed.rows[0]?.count).toBe(2);
+    await expect(capabilities.exchange(
+      duplicateRawToken,
+      new ReplyStub() as unknown as FastifyReply,
+      oldSession,
+    )).rejects.toMatchObject({ statusCode: 401, code: "invalid_capability" });
+
+    const other = await repository.createRunIdempotent({
+      prompt: "Capability pepper conflicting grant integration test",
+      brief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      reuseDays: 0,
+      globalLimit: 100,
+      capabilitySessionId: oldSession.id,
+    });
+    const conflictingRawToken = randomToken();
+    await repository.createCapabilityToken(
+      created.runId,
+      created.accessId,
+      hmacHex(newPepper, conflictingRawToken),
+      new Date(Date.now() + 60_000),
+    );
+    await repository.createCapabilityToken(
+      other.runId,
+      other.accessId,
+      hmacHex(oldPepper, conflictingRawToken),
+      new Date(Date.now() + 60_000),
+    );
+    await expect(capabilities.exchange(
+      conflictingRawToken,
+      new ReplyStub() as unknown as FastifyReply,
+      oldSession,
+    )).rejects.toMatchObject({
+      statusCode: 401,
+      code: "invalid_capability",
+      message: "Capability token is invalid or expired",
+    });
+    const conflictingConsumed = await repository.pool.query<{ count: number }>(
+      `SELECT count(*)::int count
+       FROM capability_tokens
+       WHERE token_hash=ANY($1::text[]) AND consumed_at IS NOT NULL`,
+      [[
+        hmacHex(newPepper, conflictingRawToken),
+        hmacHex(oldPepper, conflictingRawToken),
+      ]],
+    );
+    expect(conflictingConsumed.rows[0]?.count).toBe(2);
+  });
+
   test("allows repeated active runs from one anonymous bucket while preserving capability isolation", async () => {
     vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
     const clientBucket = `capability-multi-run-${randomUUID()}`;
@@ -5801,6 +7500,7 @@ databaseDescribe("hosted backend integration", () => {
   test("sets host-only production capability cookies with strict security attributes", async () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("CAPABILITY_PEPPER", "integration-capability-pepper-32-bytes");
+    vi.stubEnv("CAPABILITY_PEPPER_VERSION", "integration-capability-v1");
     vi.resetModules();
     const productionModule = await import("../server/capabilities.ts");
     expect(productionModule.CAPABILITY_COOKIE).toBe("__Host-needle-session");
@@ -5990,6 +7690,8 @@ databaseDescribe("hosted backend integration", () => {
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     await repository.pool.query("DELETE FROM worker_heartbeats");
     await repository.updateWorkerHeartbeat("deep-v8", {
+      version: "abcdef0123456789",
+      configurationHash: "1".repeat(64),
       schemaVersion: DATABASE_SCHEMA_VERSION,
       schemaMinimum: DATABASE_SCHEMA_VERSION,
       schemaMaximum: DATABASE_SCHEMA_VERSION,
@@ -6006,6 +7708,9 @@ databaseDescribe("hosted backend integration", () => {
       worker_id: "deep-v8",
       ready: true,
       compatibleCapacity: 1,
+      eligibleWorkerCount: 1,
+      eligibleRevisions: ["abcdef0123456789"],
+      eligibleConfigurationHashes: ["1".repeat(64)],
     });
     expect(deepOnly.workerLanes.interactive).toMatchObject({
       ready: false,
@@ -6013,6 +7718,8 @@ databaseDescribe("hosted backend integration", () => {
     });
 
     await repository.updateWorkerHeartbeat("interactive-v8", {
+      version: "abcdef0123456789",
+      configurationHash: "2".repeat(64),
       schemaVersion: DATABASE_SCHEMA_VERSION,
       schemaMinimum: DATABASE_SCHEMA_VERSION,
       schemaMaximum: DATABASE_SCHEMA_VERSION,
@@ -6028,6 +7735,9 @@ databaseDescribe("hosted backend integration", () => {
       worker_id: "interactive-v8",
       ready: true,
       compatibleCapacity: 2,
+      eligibleWorkerCount: 1,
+      eligibleRevisions: ["abcdef0123456789"],
+      eligibleConfigurationHashes: ["2".repeat(64)],
     });
     expect(bothLanes.workerLanes.deep).toMatchObject({
       worker_id: "deep-v8",

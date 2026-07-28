@@ -12,6 +12,11 @@ import type {
   PlaylistGuidanceSourceHint,
   PlaylistGuidanceTelemetry,
 } from "../shared/types.ts";
+import {
+  executableCuratedResearchBudgetUsd,
+  PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+} from "../shared/product-policy.ts";
+import { playlistCandidateGoalV1 } from "./playlist-feasibility-v1.ts";
 
 export const GUIDED_SCOUT_V3_LIMITS = Object.freeze({
   maximumQuestions: 3,
@@ -217,9 +222,42 @@ function boundedInteger(value: string | undefined, fallback: number, minimum: nu
 }
 
 function curatedCostCeiling(target: number): number {
-  if (target <= 50) return 0.75;
-  if (target <= 100) return 1.5;
-  return 3;
+  return executableCuratedResearchBudgetUsd(target);
+}
+
+export type PipelineV3SizeTier = "1_50" | "51_100" | "101_300" | "301_1000";
+
+export interface PipelineV3ConversionObservation {
+  readonly p10QualifiedToAppleSafeConversionRate: number;
+  readonly sampleCount: number;
+}
+
+export function pipelineV3SizeTier(target: number): PipelineV3SizeTier {
+  if (target <= 50) return "1_50";
+  if (target <= 100) return "51_100";
+  if (target <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS) return "101_300";
+  return "301_1000";
+}
+
+function scaledLargeRequestLimit(
+  configured: string | undefined,
+  baselineAtPublicMaximum: number,
+  target: number,
+  maximum: number,
+): number {
+  const configuredBaseline = boundedInteger(
+    configured,
+    baselineAtPublicMaximum,
+    1,
+    maximum,
+  );
+  if (target <= PUBLIC_PLAYLIST_MAXIMUM_TRACKS) return configuredBaseline;
+  return Math.min(
+    maximum,
+    Math.ceil(
+      configuredBaseline * target / PUBLIC_PLAYLIST_MAXIMUM_TRACKS,
+    ),
+  );
 }
 
 /** Freeze every mutable V3 execution input at run creation. */
@@ -227,6 +265,7 @@ export function createPipelinePolicySnapshotV3(input: {
   plan: SelectionPlanV3;
   environment?: NodeJS.ProcessEnv;
   modelRoutingSignals?: PipelineV3ModelRoutingSignals;
+  conversionObservation?: PipelineV3ConversionObservation | null;
   capturedAt?: string;
 }): PipelinePolicySnapshot {
   const environment = input.environment ?? process.env;
@@ -238,6 +277,16 @@ export function createPipelinePolicySnapshotV3(input: {
     target,
     100_000,
   );
+  const observedConversionRate = Number(
+    input.conversionObservation?.p10QualifiedToAppleSafeConversionRate ?? 0.5,
+  );
+  const conversion = playlistCandidateGoalV1(
+    target,
+    Number.isFinite(observedConversionRate) ? observedConversionRate : 0.5,
+  );
+  const conversionRateSampleCount = Number.isSafeInteger(input.conversionObservation?.sampleCount)
+    ? Math.max(0, Number(input.conversionObservation?.sampleCount))
+    : 0;
   const factual = input.plan.intents.includes("factual_relationship")
     || input.plan.intents.includes("exhaustive");
   return {
@@ -252,14 +301,38 @@ export function createPipelinePolicySnapshotV3(input: {
       version: "corpus_first_v3_policy_v1",
       model: modelRoute.providerModelId,
       modelRoute,
-      maximumGlobalRounds: boundedInteger(environment.PIPELINE_V3_MAX_ROUNDS, 48, 1, 1_000),
+      maximumGlobalRounds: scaledLargeRequestLimit(
+        environment.PIPELINE_V3_MAX_ROUNDS,
+        48,
+        target,
+        1_000,
+      ),
       maximumRawCandidates,
+      candidateGoal: conversion.candidateGoal,
+      qualifiedPoolGoal: target + conversion.reserveTrackCount,
+      p10QualifiedToAppleSafeConversionRate: conversion.clampedConversionRate,
+      conversionRateSampleCount,
+      conversionRateSegment: {
+        storefront: input.plan.storefront.trim().toLowerCase(),
+        route: "corpus_first_v3",
+        sizeTier: pipelineV3SizeTier(target),
+      },
       reservePercent: 20,
       maximumCostUsd: factual ? 5 : curatedCostCeiling(target),
     },
     requestLimits: {
-      maxToolCalls: boundedInteger(environment.PIPELINE_V3_MAX_TOOL_CALLS, 48, 1, 200),
-      maxHostedSearchCalls: boundedInteger(environment.PIPELINE_V3_MAX_SEARCH_CALLS, 16, 1, 100),
+      maxToolCalls: scaledLargeRequestLimit(
+        environment.PIPELINE_V3_MAX_TOOL_CALLS,
+        48,
+        target,
+        200,
+      ),
+      maxHostedSearchCalls: scaledLargeRequestLimit(
+        environment.PIPELINE_V3_MAX_SEARCH_CALLS,
+        16,
+        target,
+        100,
+      ),
       maxSynthesisTokens: boundedInteger(environment.PIPELINE_V3_MAX_SYNTHESIS_TOKENS, 8_000, 1_000, 32_000),
       maxExtractionTokens: boundedInteger(environment.PIPELINE_V3_MAX_EXTRACTION_TOKENS, 12_000, 1_000, 64_000),
     },

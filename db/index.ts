@@ -2,7 +2,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool, type PoolConfig } from "pg";
 import * as schema from "./schema.ts";
 
-export const DATABASE_SCHEMA_VERSION = "16";
+export const DATABASE_SCHEMA_VERSION = "18";
 
 export interface DatabaseSchemaSupport {
   minimum: string;
@@ -11,18 +11,18 @@ export interface DatabaseSchemaSupport {
 }
 
 /**
- * Release 2.3.0 prefers the expand-only schema-16 guidance/diagnostics
- * foundation while keeping schema-13/14/15 databases readable during the
- * rolling binary and migration sequence.
+ * Recovery bridge binaries prefer the expand-only schema-18 foundation while
+ * keeping schema-13 through schema-17 databases readable
+ * during the rolling binary and migration sequence.
  */
 export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",
-  maximum: "16",
+  maximum: "18",
   preferred: DATABASE_SCHEMA_VERSION,
 };
 
 /**
- * Compatibility bridge for the schema-13 -> schema-16 expand
+ * Compatibility bridge for the schema-13 -> schema-18 expand
  * migration. Bridge binaries prefer the pre-migration schema while remaining
  * healthy after the expand migration, so API and workers can be promoted
  * independently. Schema 12 is deliberately outside this range: accepting it
@@ -30,7 +30,7 @@ export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
  */
 export const DATABASE_SCHEMA_V13_BRIDGE_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",
-  maximum: "16",
+  maximum: "18",
   preferred: "13",
 };
 

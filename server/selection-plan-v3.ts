@@ -8,6 +8,11 @@
 
 import { createHash } from "node:crypto";
 import type {
+  CanonicalPlaylistContractExecutionPolicyV1,
+  CanonicalPlaylistExecutionDirectivesV1,
+  CanonicalPlaylistQualityPolicy,
+  CanonicalPlaylistQuotaRule,
+  PipelineV3ConceptDiscoveryHint,
   PipelineV3SourceDiscoveryHint,
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
@@ -16,10 +21,12 @@ import type {
   ResearchIntent,
   SelectionConstraint,
   SelectionDiversityGoals,
+  SelectionGeographyConstraint,
   SelectionOrderingPolicy,
   SelectionPlan,
   SelectionScopeKind,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
 import {
   inferSelectionGeographyRelationship,
@@ -71,6 +78,8 @@ export type MembershipAxisV3 =
   | "mood"
   | "activity"
   | "artist"
+  | "album"
+  | "playlist"
   | "track"
   | "label"
   | "venue"
@@ -94,6 +103,7 @@ export interface MembershipPredicateV3 {
 export type RankingDimensionV3 =
   | "influence"
   | "relevance"
+  | "central_quality"
   | "similarity"
   | "source_rank"
   | "artist_diversity"
@@ -177,6 +187,8 @@ export interface CriticalAmbiguityV3 {
   readonly sceneValue?: string;
   readonly originValue?: string;
   readonly languageValue?: string;
+  /** Exact named subject for possessive factual-relationship questions. */
+  readonly subjectValue?: string;
 }
 
 export interface RunSpecV3 {
@@ -197,6 +209,16 @@ export interface RunSpecV3 {
   readonly orderingPolicy: Readonly<SelectionOrderingPolicy>;
   readonly softGoalRelaxationOrder: readonly string[];
   readonly sourceDiscoveryHints: readonly PipelineV3SourceDiscoveryHint[];
+  /** Immutable, untrusted concept leads; never selection or ranking policy. */
+  readonly conceptDiscoveryHints: readonly PipelineV3ConceptDiscoveryHint[];
+  /** Present only when an immutable canonical contract owns distribution. */
+  readonly playlistQuotaRules?: readonly CanonicalPlaylistQuotaRule[];
+  /** Present only when an immutable canonical contract owns central quality. */
+  readonly playlistQualityPolicy?: Readonly<CanonicalPlaylistQualityPolicy>;
+  /** Sole selection authority for immutable contract-3 work. */
+  readonly canonicalContractPolicy?: Readonly<CanonicalPlaylistContractExecutionPolicyV1>;
+  /** Typed discovery identity; canonical workers never reconstruct it from prompt prose. */
+  readonly executionDirectives?: Readonly<CanonicalPlaylistExecutionDirectivesV1>;
   readonly criticalAmbiguities: readonly CriticalAmbiguityV3[];
   readonly recordingPolicy: RecordingPolicyV3;
   readonly semanticPolicyVersion: typeof SEMANTIC_SCOPE_POLICY_VERSION;
@@ -1156,6 +1178,7 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       summary: "The possessive does not say whether the subject performed, wrote, produced, or merely influenced the recordings.",
       blocking: true,
       optionIds: ["subject_performed", "subject_created", "subject_influenced", "custom"],
+      subjectValue: possessive[1]!.trim(),
     });
   }
 
@@ -1176,8 +1199,12 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
 export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   const prompt = normalize(input.prompt);
   if (prompt.length < 2 || prompt.length > 4_000) throw new Error("Playlist prompt must contain 2–4,000 characters");
-  if (!Number.isSafeInteger(input.requestedTrackCount) || input.requestedTrackCount < 1 || input.requestedTrackCount > 300) {
-    throw new Error("Requested track count must be an integer between 1 and 300");
+  if (!Number.isSafeInteger(input.requestedTrackCount)
+    || input.requestedTrackCount < 1
+    || input.requestedTrackCount > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
+    throw new Error(
+      `Requested track count must be an integer between 1 and ${EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS}`,
+    );
   }
   const storefront = (input.storefront ?? "us").trim().toLowerCase();
   if (!/^[a-z]{2}$/u.test(storefront)) throw new Error("Storefront must be a two-letter code");
@@ -1489,6 +1516,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     orderingPolicy,
     softGoalRelaxationOrder,
     sourceDiscoveryHints: sanitizePipelineV3SourceDiscoveryHints(input.guidanceSourceHints),
+    conceptDiscoveryHints: [],
     criticalAmbiguities: ambiguities,
     recordingPolicy: recordingPolicyForInput(input),
     semanticPolicyVersion: SEMANTIC_SCOPE_POLICY_VERSION,
@@ -1705,6 +1733,29 @@ const CRITICAL_QUESTION_COPY: Readonly<Record<StaticCriticalAmbiguityKeyV3, {
   },
 };
 
+function criticalQuestionGeographyConstraint(
+  ambiguity: CriticalAmbiguityV3,
+  optionId: string,
+): SelectionGeographyConstraint | null {
+  if (ambiguity.key === "french_jazz_scope") {
+    if (optionId === "french_artist_origin") return { value: "France", relationship: "artist_origin" };
+    if (optionId === "french_scene") return { value: "French jazz scene", relationship: "label_or_venue_scene" };
+    if (optionId === "french_language") return { value: "French", relationship: "language" };
+  }
+  if (ambiguity.key === "geographic_genre_scope") {
+    if (optionId === "geographic_artist_origin" && ambiguity.originValue) {
+      return { value: ambiguity.originValue, relationship: "artist_origin" };
+    }
+    if (optionId === "geographic_scene" && ambiguity.sceneValue) {
+      return { value: ambiguity.sceneValue, relationship: "label_or_venue_scene" };
+    }
+    if (optionId === "geographic_language" && ambiguity.languageValue) {
+      return { value: ambiguity.languageValue, relationship: "language" };
+    }
+  }
+  return null;
+}
+
 /** Critical questions are server-owned and survive scout/provider failure. */
 export function criticalGuidanceQuestionsV3(spec: RunSpecV3): PlaylistGuidanceQuestion[] {
   return spec.criticalAmbiguities.slice(0, 3).map((ambiguity) => {
@@ -1738,17 +1789,75 @@ export function criticalGuidanceQuestionsV3(spec: RunSpecV3): PlaylistGuidanceQu
       question: copy.question,
       decisionKey: ambiguity.key,
       whyMaterial: copy.whyMaterial,
-      options: copy.options.map((option, index) => ({
-        ...option,
-        recommended: index === 0,
-        effect: {
-          kind: "research_preference" as const,
-          value: option.id,
-          orderingBehavior: null,
-        },
-      })),
+      options: copy.options.map((option, index) => {
+        const geographyConstraint = criticalQuestionGeographyConstraint(ambiguity, option.id);
+        return {
+          ...option,
+          recommended: index === 0,
+          effect: {
+            kind: "research_preference" as const,
+            value: option.id,
+            orderingBehavior: null,
+            ...(geographyConstraint ? { geographyConstraint } : {}),
+          },
+        };
+      }),
     };
   });
+}
+
+/**
+ * Server-owned subject fallbacks keep broad contract-2 requests from silently
+ * skipping guidance when the bounded scout returns no usable questions. These
+ * are optional preference forks: they change discovery/ranking, never the
+ * immutable membership scope or requested count.
+ */
+export function deterministicGuidanceQuestionsV3(spec: RunSpecV3): PlaylistGuidanceQuestion[] {
+  const prompt = normalize(spec.prompt);
+  if (!/\bbrazil(?:ian)?\s+disco\b/u.test(prompt)) return [];
+  return [{
+    id: "v3-fallback:brazilian_disco_focus",
+    header: "Brazilian disco",
+    question: "Which side of Brazilian disco should lead the playlist?",
+    decisionKey: "brazilian_disco_focus",
+    whyMaterial: "The choice changes which recordings are discovered and how familiar staples are balanced against boogie and disco-funk cuts.",
+    groundingMode: "inference",
+    options: [
+      {
+        id: "brazilian_disco_staples",
+        label: "Dance-floor staples",
+        description: "Lead with canonical, widely recognized Brazilian disco recordings.",
+        recommended: true,
+        effect: {
+          kind: "familiarity_bias",
+          value: "Brazilian disco dance-floor staples",
+          orderingBehavior: null,
+        },
+      },
+      {
+        id: "brazilian_disco_boogie",
+        label: "Boogie and funk",
+        description: "Emphasize Brazilian boogie and disco-funk crossover recordings.",
+        recommended: false,
+        effect: {
+          kind: "subscene_focus",
+          value: "Brazilian boogie and disco-funk crossovers",
+          orderingBehavior: null,
+        },
+      },
+      {
+        id: "brazilian_disco_balanced",
+        label: "Balanced survey",
+        description: "Balance staples, deeper cuts, and adjacent disco-funk across the scene.",
+        recommended: false,
+        effect: {
+          kind: "research_preference",
+          value: "balanced Brazilian disco survey with staples, deeper cuts, and disco-funk breadth",
+          orderingBehavior: null,
+        },
+      },
+    ],
+  }];
 }
 
 /** Convert only server-owned critical-question answers into typed V3 scope. */

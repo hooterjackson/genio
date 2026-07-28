@@ -5,6 +5,11 @@ type WaitingRun = {
   status: string;
   phase?: string | null;
   autoPublish?: boolean;
+  resolution?: {
+    state?: string;
+    nextAction?: string;
+    terminal?: boolean;
+  } | null;
 };
 
 const terminalStatuses = new Set([
@@ -76,6 +81,16 @@ export function isAutomaticPlaylistHandoff(run: WaitingRun): boolean {
 }
 
 export function playlistWorkMotion(run: WaitingRun): PlaylistWorkMotion {
+  if (run.resolution) {
+    if (run.resolution.terminal) return "idle";
+    if (run.resolution.state === "needs_input" || run.resolution.state === "needs_decision") {
+      return "action-required";
+    }
+    if (run.resolution.state === "blocked_dependency" || run.resolution.state === "quarantined") {
+      return "paused";
+    }
+    return "active";
+  }
   if (terminalStatuses.has(run.status)) return "idle";
   if (actionRequiredStatuses.has(run.status)) return "action-required";
   if (pausedStatuses.has(run.status)) return "paused";
@@ -88,6 +103,10 @@ export function playlistWorkMotion(run: WaitingRun): PlaylistWorkMotion {
  * even though it contains the word "catalog".
  */
 export function playlistWorkStage(run: WaitingRun): PlaylistWorkStage {
+  if (run.resolution?.nextAction === "answer_initial_guidance"
+    || run.resolution?.nextAction === "answer_rescue_guidance"
+    || run.resolution?.nextAction === "review_contract") return "plan";
+  if (run.resolution?.nextAction === "authorize_apple") return "publish";
   if (isAutomaticPlaylistHandoff(run)) return "sequence";
   if (run.status === "awaiting_guidance") return "plan";
   if (run.status === "partial_ready") return "sequence";

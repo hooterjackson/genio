@@ -135,7 +135,7 @@ test("a shortfall pauses durably and continues only after the visitor chooses it
   await expect(page.getByText("50", { exact: true })).toBeVisible();
   await expect(page.getByText("13", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "CONTINUE RESEARCH →" }).click();
+  await page.getByRole("button", { name: "RUN ONE MORE BOUNDED PASS →" }).click();
   await expect.poll(() => continueBody).toEqual({ outcomeVersion: 3 });
   await expect(page.getByRole("heading", { name: "Researching your playlist" })).toBeVisible();
   await expect(page.getByTestId("working-indicator")).toHaveAttribute("data-stage", "discover");

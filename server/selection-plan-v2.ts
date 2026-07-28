@@ -10,6 +10,7 @@ import type {
   SelectionScopeKind,
   SelectionVersionPolicy,
 } from "../shared/types.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 import {
   effectiveGuidanceGeographyConstraint,
   type PlaylistGuidancePreference,
@@ -28,7 +29,8 @@ export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
-const MOOD_ACTIVITY_INTENT = /\b(?:mood|vibe|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
+const MOOD_ACTIVITY_INTENT = /\b(?:mood|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
+const VIBE_INTENT = /\bvibes?\b/iu;
 // `editorial_ranking` is an evidence-bearing intent: every selected track must
 // independently prove the requested ranking or historical claim. Reserve it
 // for requests that actually make such a claim. Lightweight curation words
@@ -39,7 +41,7 @@ const EDITORIAL_RANKING_INTENT = /\b(?:best|greatest|top(?:\s+\d+)?|ranked|ranki
 const EXPLICIT_EDITORIAL_EVIDENCE_INTENT = /\b(?:require|required|must|only)\b[^.;!?\n]{0,100}\b(?:editorial|historical|documented|cited|ranking|ranked|influence)\b|\b(?:editorial|historical|documented|cited)\b[^.;!?\n]{0,100}\bevidence\b/iu;
 const SOFT_EDITORIAL_DESCRIPTOR = /\b(?:essential|iconic|classic|definitive|representative)\b/giu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
-const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggae|classical|country|electronic)\b/iu;
+const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggaet[oó]n|reggae|latin[ -]?urban|dembow|classical|country|electronic)\b/iu;
 const THEME_INTENT_MENTION = /\b(?:(?:songs?|tracks?|recordings?|music)\s+about|lyrics?\s+about|themes?|themed)\b/giu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
@@ -276,11 +278,24 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   // “Essentials” or its description says “recordings by Brazilian artists”.
   const directIntentScope = prompt;
   const intents: ResearchIntent[] = [];
+  const directThemeIntent = hasPositiveThemeIntent(directIntentScope);
+  const physicalHouseTheme = directThemeIntent
+    && /\b(?:a|the|physical)\s+houses?\b|\bhomes?\b/iu.test(directIntentScope)
+    && !/\bhouse\s+music\b/iu.test(directIntentScope);
+  const genreSceneIntent = !physicalHouseTheme
+    && (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship));
   if (brief.mode === "exhaustive" || brief.mode === "hybrid" || EXHAUSTIVE_INTENT.test(directIntentScope)) intents.push("exhaustive");
   if (assertsFactualTrackRelationship(`${brief.relationship} ${prompt}`)) intents.push("factual_relationship");
   if (SIMILARITY_INTENT.test(directIntentScope)) intents.push("similarity");
-  if (MOOD_ACTIVITY_INTENT.test(directIntentScope)) intents.push("mood_activity");
-  const directThemeIntent = hasPositiveThemeIntent(directIntentScope);
+  // A generic "vibe" modifier on an explicit genre request is a soft
+  // curation preference unless the visitor also names a concrete mood or
+  // activity. Treating the word itself as an evidence-bearing intent made
+  // every selected recording prove that mood independently, even when the
+  // immutable plan correctly stored all vibe rules as relaxable preferences.
+  if (MOOD_ACTIVITY_INTENT.test(directIntentScope)
+    || (VIBE_INTENT.test(directIntentScope) && !genreSceneIntent)) {
+    intents.push("mood_activity");
+  }
   if (directThemeIntent) intents.push("theme");
   // Generated descriptions often say “recordings by Brazilian artists” or
   // similar while describing a genre survey. That is not a direct-artist
@@ -290,13 +305,7 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
     || EXPLICIT_EDITORIAL_EVIDENCE_INTENT.test(directIntentScope)) {
     intents.push("editorial_ranking");
   }
-  const physicalHouseTheme = directThemeIntent
-    && /\b(?:a|the|physical)\s+houses?\b|\bhomes?\b/iu.test(directIntentScope)
-    && !/\bhouse\s+music\b/iu.test(directIntentScope);
-  if (!physicalHouseTheme
-    && (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship))) {
-    intents.push("genre_scene");
-  }
+  if (genreSceneIntent) intents.push("genre_scene");
   if (intents.length === 0) intents.push("genre_scene");
   return [...new Set(intents)];
 }
@@ -364,6 +373,9 @@ const GENRE_TERMS: Array<[string, RegExp]> = [
   ["baile funk", /\b(?:baile funk|funk carioca)\b/iu],
   ["hip-hop", /\bhip[ -]?hop\b/iu],
   ["bossa nova", /\bbossa nova\b/iu],
+  ["reggaeton", /\breggaet[oó]n\b/iu],
+  ["Latin urban", /\blatin[ -]?urban\b/iu],
+  ["dembow", /\bdembow\b/iu],
   ["house music", /\bhouse\s+music\b|\bhouse\b(?=\s+(?:anthems?|artists?|classics?|djs?|genre|mixes?|producers?|scene|tracks?))/iu],
   ["drill", /\bdrill\b/iu],
   ["jazz", /\bjazz\b/iu],
@@ -799,6 +811,15 @@ function versionPolicyFor(brief: PlaylistBrief): SelectionVersionPolicy {
 
 function contentPolicyFor(brief: PlaylistBrief): SelectionPlan["contentPolicy"] {
   const scope = [brief.versionPolicy, ...brief.include, ...brief.exclude].join(" ");
+  const languages = unique([
+    brief.relationship,
+    ...brief.include,
+    ...brief.subjectEntities,
+  ].flatMap((value) => (
+    parseSelectionGeographyConstraints(value)
+      .filter(({ relationship }) => relationship === "language")
+      .map(({ value: language }) => language)
+  )));
   return {
     explicitContent: /clean(?:\s+versions?)?\s+only|no explicit|exclude explicit/iu.test(scope)
       ? "clean_only"
@@ -810,10 +831,11 @@ function contentPolicyFor(brief: PlaylistBrief): SelectionPlan["contentPolicy"] 
       : /prefer instrumental|instrumental only/iu.test(scope)
         ? "prefer"
         : "allow",
-    languages: unique([
-      ...brief.include,
-      ...brief.subjectEntities,
-    ].filter((value) => /language|english|french|portuguese|spanish|german|japanese/iu.test(value))),
+    // Language is an exact typed relationship, never an adjective substring.
+    // In particular, “French jazz” is still unresolved geography/scene/
+    // language scope and must not become an unsatisfiable catalog-language
+    // policy before the listener answers that question.
+    languages,
   };
 }
 
@@ -840,6 +862,45 @@ function fixedReleaseContainerScope(prompt: string, brief: PlaylistBrief): boole
   return FIXED_RELEASE_CONTAINER.test(prompt)
     || FIXED_RELEASE_CONTAINER.test(interpretedScope)
     || (brief.subjectEntities.length >= 2 && POSSESSIVE_CONTAINER_REFERENCE.test(prompt));
+}
+
+function fixedContainerIdentity(
+  prompt: string,
+  brief: PlaylistBrief,
+): SelectionPlan["fixedContainerIdentity"] {
+  const compact = prompt.normalize("NFKC").replace(/\s+/gu, " ").trim();
+  const explicit = compact.match(
+    /\b(?:from|on|off)\s+(?:the\s+)?(album|ep|lp|mixtape|soundtrack|compilation|box\s+set|playlist)\s+(?:called\s+|named\s+|titled\s+)?["“]?(.+?)["”]?(?:\s+by\s+(.+?))?(?=\s*(?:,\s*(?:exactly\s+)?\d+\s+(?:songs?|tracks?)|\s+(?:with|containing)\s+\d+\s+(?:songs?|tracks?)|[.!?]|$))/iu,
+  ) ?? compact.match(
+    /\b(album|ep|lp|mixtape|soundtrack|compilation|box\s+set|playlist)\s+(?:called\s+|named\s+|titled\s+)?["“]?(.+?)["”]?(?:\s+by\s+(.+?))?(?=\s*(?:,\s*(?:exactly\s+)?\d+\s+(?:songs?|tracks?)|\s+(?:with|containing)\s+\d+\s+(?:songs?|tracks?)|[.!?]|$))/iu,
+  );
+  if (explicit) {
+    const rawKind = normalized(explicit[1] ?? "");
+    const name = (explicit[2] ?? "").replace(/^["“]|["”]$/gu, "").trim();
+    const artistName = (explicit[3] ?? "").replace(/[.!?]+$/gu, "").trim() || null;
+    if (name) {
+      return {
+        kind: rawKind === "playlist" ? "playlist" : "album",
+        name,
+        artistName,
+      };
+    }
+  }
+
+  const possessive = compact.match(
+    /\b(?:songs?|tracks?|recordings?)\s+(?:from|on|off)\s+(.+?)['’]s\s+(.+?)(?=\s*(?:,\s*(?:exactly\s+)?\d+\s+(?:songs?|tracks?)|[.!?]|$))/iu,
+  );
+  if (possessive) {
+    const artistName = possessive[1]!.trim();
+    const name = possessive[2]!.trim();
+    if (artistName && name) return { kind: "album", name, artistName };
+  }
+
+  // A fixed scope without a deterministically compiled identity must not enter
+  // canonical fixed-container execution. Subject entities remain discovery
+  // hints and cannot silently become an album identity.
+  void brief;
+  return undefined;
 }
 
 function selectionScopeKind(
@@ -910,7 +971,9 @@ function parsedPlaylistCount(value: string | undefined): number | null {
   const numeric = /^\d{1,3}$/u.test(normalizedValue)
     ? Number.parseInt(normalizedValue, 10)
     : PLAYLIST_COUNT_WORDS.get(normalizedValue);
-  return Number.isSafeInteger(numeric) && Number(numeric) >= 1 && Number(numeric) <= 300
+  return Number.isSafeInteger(numeric)
+    && Number(numeric) >= 1
+    && Number(numeric) <= EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS
     ? Number(numeric)
     : null;
 }
@@ -938,6 +1001,9 @@ export function createSelectionPlanV2(input: {
   const guidance = input.guidancePreferences ?? [];
   const intents = intentSet(input.prompt, input.brief);
   const scopeKind = selectionScopeKind(input.prompt, intents, input.brief);
+  const compiledFixedContainerIdentity = scopeKind === "fixed_release_container"
+    ? fixedContainerIdentity(input.prompt, input.brief)
+    : undefined;
   const requestedTrackCount = Math.max(1, Math.floor(input.brief.targetSize?.min ?? 50));
   const reserveTrackCount = Math.max(5, Math.ceil(requestedTrackCount * 0.1));
   const fixedScope = scopeKind !== "broad_curated";
@@ -970,6 +1036,9 @@ export function createSelectionPlanV2(input: {
     policyVersion: PIPELINE_V2_SELECTION_PLAN_VERSION,
     intents,
     scopeKind,
+    ...(compiledFixedContainerIdentity ? {
+      fixedContainerIdentity: compiledFixedContainerIdentity,
+    } : {}),
     storefront: (input.storefront ?? "us").toLocaleLowerCase("en-US"),
     requestedTrackCount,
     minimumQualifiedTrackCount: requestedTrackCount,

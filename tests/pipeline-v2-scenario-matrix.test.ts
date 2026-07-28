@@ -384,7 +384,7 @@ describe("Pipeline V2 provider-free scenario matrix", () => {
       { value: "Arabic", relationship: "language" },
       { value: "French", relationship: "language" },
     ]));
-    expect(plan.contentPolicy.languages.join(" ")).toMatch(/French-language.*Arabic-language/iu);
+    expect(plan.contentPolicy.languages).toEqual(["French", "Arabic"]);
   });
 
   test.each([25, 50, 100, 200, 300])(

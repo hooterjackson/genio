@@ -12,6 +12,7 @@ import { assertPublicHttpsUrl } from "./security.ts";
 import { optionalSecret } from "./secrets.ts";
 import { searchAppleCatalog } from "./apple.ts";
 import { boundedResponseText } from "./bounded-response.ts";
+import { musicBrainzUserAgent } from "./musicbrainz-contact.ts";
 
 const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("Adapter request aborted"));
@@ -172,8 +173,10 @@ async function throttleMusicBrainz(signal?: AbortSignal): Promise<void> {
 }
 
 function musicBrainzHeaders(): Record<string, string> {
-  const contact = process.env.MUSICBRAINZ_CONTACT ?? "operator-contact-not-configured.invalid";
-  return { "User-Agent": `9enio/1.0 (${contact})`, Accept: "application/json" };
+  return {
+    "User-Agent": musicBrainzUserAgent(process.env, "1.0"),
+    Accept: "application/json",
+  };
 }
 
 class MusicBrainzAdapter implements SourceAdapter {

@@ -1,4 +1,5 @@
 import { sha256Hex, stableStringify } from "../server/security.ts";
+import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
 
 export const PIPELINE_V2_BENCHMARK_SUITE_SCHEMA = "genio-pipeline-v2-release-suite/v1" as const;
 export const PIPELINE_V2_BENCHMARK_RESULTS_SCHEMA = "genio-pipeline-v2-release-results/v1" as const;
@@ -312,7 +313,12 @@ export function parsePipelineV2BenchmarkSuite(value: unknown): PipelineV2Benchma
     return {
       id: stringValue(scenario.id, `suite.scenarios[${index}].id`, 80),
       prompt: stringValue(scenario.prompt, `suite.scenarios[${index}].prompt`, 2_000),
-      targetCount: integer(scenario.targetCount, `suite.scenarios[${index}].targetCount`, 1, 300),
+      targetCount: integer(
+        scenario.targetCount,
+        `suite.scenarios[${index}].targetCount`,
+        1,
+        EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+      ),
       catalogRich: booleanValue(scenario.catalogRich, `suite.scenarios[${index}].catalogRich`),
       exactFillRequired: booleanValue(scenario.exactFillRequired, `suite.scenarios[${index}].exactFillRequired`),
       minimumPublishedRatio: ratio(scenario.minimumPublishedRatio, `suite.scenarios[${index}].minimumPublishedRatio`),
@@ -353,7 +359,12 @@ function parseRun(value: unknown, path: string): PipelineV2BenchmarkRun {
   if (run.pipelineVersion !== "catalog_first_v2") throw new Error(`${path}.pipelineVersion must be catalog_first_v2`);
   if (run.selectionPlanVersion !== "selection_plan_v2") throw new Error(`${path}.selectionPlanVersion must be selection_plan_v2`);
   if (run.storefront !== "us") throw new Error(`${path}.storefront must be us`);
-  if (!Array.isArray(run.tracks) || run.tracks.length > 300) throw new Error(`${path}.tracks must contain at most 300 rows`);
+  if (!Array.isArray(run.tracks)
+    || run.tracks.length > EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS) {
+    throw new Error(
+      `${path}.tracks must contain at most ${EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS} rows`,
+    );
+  }
   const tracks = run.tracks.map((value, index) => {
     const track = asObject(value, `${path}.tracks[${index}]`);
     exactKeys(track, ["position", "candidateId", "appleSongId", "recordingFamilyKey", "scopeBindingIds"], `${path}.tracks[${index}]`);

@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+  createHostedWebEvidenceSnapshotV3,
   executeRetrievalV3,
   publicTrackScopeAttestationV3,
   type CandidateQualificationV3,
@@ -27,6 +28,10 @@ import {
 } from "./fixtures/rio-disco-scope-gate-incident.ts";
 
 const GRAPH_SNAPSHOT_ID = "491e695c-a8a0-49c0-886f-72e6f2fa1870";
+const HOSTED_TEST_ACQUIRED_AT = new Date(Date.now() - 60_000).toISOString();
+const HOSTED_TEST_FRESH_UNTIL = new Date(
+  Date.parse(HOSTED_TEST_ACQUIRED_AT) + 29 * 24 * 60 * 60_000,
+).toISOString();
 
 function compileCorrectedRioPlan() {
   const spec = createRunSpecV3({
@@ -61,6 +66,23 @@ function qualifiedCandidate(
 ): CandidateQualificationV3 {
   const sourceUrl = String(candidate.metadata?.sourceUrl);
   const bindingId = `binding-${candidate.id}`;
+  const excerpt = `${candidate.artist} — ${candidate.title}: exact disco scope evidence.`;
+  const hostedEvidenceSnapshot = createHostedWebEvidenceSnapshotV3({
+    sourceUrl,
+    excerpt,
+    responseId: `rio-response-${candidate.id}`,
+    outputItemId: `rio-output-${candidate.id}`,
+    contentIndex: 0,
+    citationStartIndex: 0,
+    citationEndIndex: excerpt.length,
+    excerptStartIndex: 0,
+    excerptEndIndex: excerpt.length,
+    acquiredAt: HOSTED_TEST_ACQUIRED_AT,
+    storefront: "us",
+    freshnessExpiresAt: HOSTED_TEST_FRESH_UNTIL,
+    predicateIds,
+    obligationIds: predicateIds,
+  });
   return {
     candidateId: candidate.id,
     scope: {
@@ -97,10 +119,17 @@ function qualifiedCandidate(
           cachePolicy: "excerpt_only",
           retentionPolicy: "ninety_days",
           freshnessPolicy: "immutable_revision",
-          sourceHash: "a".repeat(64),
-          sourceRevision: "b".repeat(64),
+          acquiredAt: hostedEvidenceSnapshot.acquiredAt,
+          freshnessExpiresAt: hostedEvidenceSnapshot.freshnessExpiresAt,
+          revokedAt: null,
+          sourceHash: hostedEvidenceSnapshot.snapshotHash,
+          sourceRevision: hostedEvidenceSnapshot.snapshotHash,
         },
-        eligibilityAttestation: publicTrackScopeAttestationV3(sourceUrl),
+        hostedEvidenceSnapshot,
+        eligibilityAttestation: publicTrackScopeAttestationV3(
+          sourceUrl,
+          hostedEvidenceSnapshot,
+        ),
       }],
     },
     version: {

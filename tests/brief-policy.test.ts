@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { PlaylistBrief } from "../shared/types.ts";
 import {
+  applyExecutableRequestedTrackCount,
   applyRequestedTrackCount,
   canonicalBriefForRequest,
   canonicalBriefForPrompt,
@@ -18,6 +19,7 @@ import {
 import { researchExecutionPolicy } from "../server/research-policy.ts";
 import {
   curatedResearchBudgetUsd,
+  executableCuratedResearchBudgetUsd,
   GUIDED_BRIEF_BUDGET_USD,
   PUBLIC_FAST_RESEARCH_BUDGET_USD,
   PUBLIC_PLAYLIST_DEFAULT_TRACKS,
@@ -187,6 +189,12 @@ describe("playlist brief policy", () => {
     expect(applyRequestedTrackCount(brief("curated"), 200).targetSize).toEqual({ min: 200, max: 200 });
     expect(() => applyRequestedTrackCount(brief("curated"), 0)).toThrow(/1 to 300/u);
     expect(() => applyRequestedTrackCount(brief("curated"), 301)).toThrow(/1 to 300/u);
+    expect(applyExecutableRequestedTrackCount(brief("curated"), 301).targetSize)
+      .toEqual({ min: 301, max: 301 });
+    expect(applyExecutableRequestedTrackCount(brief("curated"), 1_000).targetSize)
+      .toEqual({ min: 1_000, max: 1_000 });
+    expect(() => applyExecutableRequestedTrackCount(brief("curated"), 1_001))
+      .toThrow(/1 to 1000/u);
   });
 
   test("keeps stored scope authoritative while accepting only ambiguity acknowledgement", () => {
@@ -369,6 +377,24 @@ describe("playlist brief policy", () => {
     expect(curatedResearchBudgetUsd(101)).toBe(3);
     expect(curatedResearchBudgetUsd(300)).toBe(3);
     expect(curatedResearchBudgetUsd(301)).toBe(0);
+    expect(executableCuratedResearchBudgetUsd(300)).toBe(3);
+    expect(executableCuratedResearchBudgetUsd(301)).toBe(3.25);
+    expect(executableCuratedResearchBudgetUsd(1_000)).toBe(10);
+    expect(executableCuratedResearchBudgetUsd(1_001)).toBe(0);
+  });
+
+  test.each([
+    [301, 3.25],
+    [1_000, 10],
+  ] as const)("scales the authenticated owner estimate for %i exact tracks", (count, cost) => {
+    const estimate = estimateResearchCostRange({
+      ...brief("curated"),
+      targetSize: { min: count, max: count },
+    });
+    expect(estimate).toMatchObject({
+      maximumUsd: cost,
+      approvalUsd: cost,
+    });
   });
 
   test("uses the pessimistic edge of the range for the approval gate", () => {

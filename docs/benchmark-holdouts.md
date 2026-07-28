@@ -83,6 +83,6 @@ pnpm benchmark:export -- finalize \
 pnpm benchmark -- benchmark-artifact.json
 ```
 
-`finalize` re-reads Postgres and fails on changed manifests or matches, missing or extra judgments, legacy matches without an immutable first decision, non-US storefronts, or unknown attestation fields. Tracks, citations, automatic-match status, correctness, and resolvability are derived by the exporter; reviewers cannot supply those result fields. The evaluator verifies the export schema, database provenance, attestation digest, and artifact digest before scoring. Matching acceptance also requires at least 100 factual candidates, so a tiny perfect sample cannot pass.
+`finalize` re-reads Postgres and fails on changed manifests or matches, missing or extra judgments, legacy matches without an immutable first decision, non-US storefronts, or unknown attestation fields. Tracks, citations, automatic-match status, correctness, and resolvability are derived by the exporter; reviewers cannot supply those result fields. The evaluator verifies the export schema, database provenance, attestation digest, and artifact digest before scoring. A 99.5% catalog-identity claim additionally requires at least 600 independently reviewed auto-accepted rows with zero observed identity errors, so a small perfect sample cannot pass or be presented as statistically sufficient.
 
 The detailed staging rows are removed by retention. Prepare, review, and finalize the artifact before the 90-day detail window closes.

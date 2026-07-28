@@ -1,14 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import * as databaseSchema from "../db/schema.ts";
 import { Repository } from "../server/repository.ts";
 import type {
   QualifiedTrackV3,
   RetrievalOutcomeStatusV3,
   RetrievalResultV3,
 } from "../server/pipeline-v3-retrieval.ts";
-import { publicTrackScopeAttestationV3 } from "../server/pipeline-v3-retrieval.ts";
+import {
+  createCentralQualityCriterionObservationV3,
+  createHostedWebEvidenceSnapshotV3,
+  publicTrackScopeAttestationV3,
+  retrievalStrategiesForEnginesV3,
+} from "../server/pipeline-v3-retrieval.ts";
 import {
   selectionPlanFromQueryPlanV3,
   type PipelineV3WriteFence,
@@ -19,7 +26,18 @@ import {
   manifestContentHash as publisherManifestContentHash,
   publishManifest,
 } from "../server/publisher.ts";
-import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
+import { orderedAppleStableIdsHash } from "../server/publication-reconciliation-persistence.ts";
+import {
+  CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+} from "../server/canonical-publication-revalidation-v1.ts";
+import {
+  createQueryPlanV3,
+  isQueryPlanV3,
+  queryPlanV3Hash,
+} from "../server/query-plan-v3.ts";
+import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 import {
   evidenceMembershipPredicateIdsV3,
   selectionPlanV3Hash,
@@ -30,10 +48,15 @@ import {
   buildSemanticEquivalentRecoveryPlanV3,
   type SemanticPlanRevisionArtifactV3,
 } from "../server/pipeline-v3-semantic-recovery.ts";
+import { assessPlaylistRuntimeFeasibilityV1 } from "../server/playlist-feasibility-v1.ts";
 import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
+const HOSTED_TEST_ACQUIRED_AT = new Date(Date.now() - 60_000).toISOString();
+const HOSTED_TEST_FRESH_UNTIL = new Date(
+  Date.parse(HOSTED_TEST_ACQUIRED_AT) + 29 * 24 * 60 * 60_000,
+).toISOString();
 const migrationDirectory = new URL("../postgres-migrations/", import.meta.url);
 const migrationSql = readdirSync(migrationDirectory)
   .filter((file) => /^\d+_.+\.sql$/u.test(file))
@@ -88,10 +111,32 @@ function qualifiedTrack(
 ): QualifiedTrackV3 {
   const ordinal = String(index + 1).padStart(4, "0");
   const sourceUrl = `https://example.test/${encodeURIComponent(prefix)}/tracks/${ordinal}`;
+  const title = `${prefix} Track ${ordinal}`;
+  const artist = `${prefix} Artist ${Math.floor(index / 3) + 1}`;
+  const excerpt = `${artist} — ${title} satisfies ${(
+    predicateIds ?? []
+  ).join(", ")}.`;
+  const hostedEvidenceSnapshot = predicateIds?.length
+    ? createHostedWebEvidenceSnapshotV3({
+        sourceUrl,
+        excerpt,
+        responseId: `resp_${ordinal}`,
+        outputItemId: `msg_${ordinal}`,
+        contentIndex: 0,
+        citationStartIndex: Math.max(0, excerpt.length - 1),
+        citationEndIndex: excerpt.length,
+        excerptStartIndex: 0,
+        excerptEndIndex: excerpt.length,
+        acquiredAt: HOSTED_TEST_ACQUIRED_AT,
+        storefront: "us",
+        freshnessExpiresAt: HOSTED_TEST_FRESH_UNTIL,
+        predicateIds,
+      })
+    : undefined;
   return {
     candidateId: `${prefix}:candidate:${ordinal}`,
-    title: `${prefix} Track ${ordinal}`,
-    artist: `${prefix} Artist ${Math.floor(index / 3) + 1}`,
+    title,
+    artist,
     album: `${prefix} Album ${Math.floor(index / 10) + 1}`,
     appleSongId: `${prefix}-apple-${ordinal}`,
     recordingFamilyKey: `${prefix}:family:${ordinal}`,
@@ -103,7 +148,11 @@ function qualifiedTrack(
       provenanceRoot: `example.test:${prefix}`,
       strength: 0.95,
       sourceRank: index + 1,
-      kind: "track_specific_source",
+      // This fixture models an exact, track-specific editorial assertion
+      // returned by hosted research. Keep the binding kind aligned with the
+      // server-derived evidence grade instead of relying on the legacy
+      // unclassified `track_specific_source` label.
+      kind: "hosted_web_track",
       predicateIds,
       governance: {
         policyVersion: "evidence-source-governance-v3",
@@ -117,10 +166,19 @@ function qualifiedTrack(
         cachePolicy: "excerpt_only",
         retentionPolicy: "ninety_days",
         freshnessPolicy: "revalidate_30d",
-        sourceHash: "a".repeat(64),
-        sourceRevision: "a".repeat(64),
+        ...(hostedEvidenceSnapshot ? {
+          freshnessExpiresAt: hostedEvidenceSnapshot.freshnessExpiresAt,
+          acquiredAt: hostedEvidenceSnapshot.acquiredAt,
+          revokedAt: hostedEvidenceSnapshot.revokedAt,
+        } : {}),
+        sourceHash: hostedEvidenceSnapshot?.snapshotHash ?? "a".repeat(64),
+        sourceRevision: hostedEvidenceSnapshot?.snapshotHash ?? "a".repeat(64),
       },
-      eligibilityAttestation: publicTrackScopeAttestationV3(sourceUrl),
+      ...(hostedEvidenceSnapshot ? { hostedEvidenceSnapshot } : {}),
+      eligibilityAttestation: publicTrackScopeAttestationV3(
+        sourceUrl,
+        hostedEvidenceSnapshot,
+      ),
     }],
     evidenceStrength: 0.95,
     scopeFit: 0.99,
@@ -137,7 +195,10 @@ function retrievalResult(input: {
   target: number;
   selectedCount: number;
   reserveCount?: number;
-  status: Extract<RetrievalOutcomeStatusV3, "exact_ready" | "partial_ready" | "no_compatible_tracks">;
+  status: Extract<
+    RetrievalOutcomeStatusV3,
+    "exact_ready" | "partial_ready" | "no_compatible_tracks" | "failed_integrity"
+  >;
   prefix: string;
   predicateIds?: readonly string[];
 }): RetrievalResultV3 {
@@ -151,6 +212,12 @@ function retrievalResult(input: {
   const qualifiedPool = [...selected, ...reserve];
   const exact = input.status === "exact_ready";
   const partial = input.status === "partial_ready";
+  const integrityFailure = input.status === "failed_integrity";
+  const stopReason = exact
+    ? "qualified_reserve_satisfied"
+    : integrityFailure
+      ? "integrity_failure"
+      : "frontier_exhausted";
   const stages = {
     discovered: qualifiedPool.length,
     validCandidates: qualifiedPool.length,
@@ -170,7 +237,7 @@ function retrievalResult(input: {
     engines: ["curated_genre_scene"],
     outcome: {
       status: input.status,
-      stopReason: exact ? "qualified_reserve_satisfied" : "frontier_exhausted",
+      stopReason,
       requestedTrackCount: input.target,
       qualifiedTrackCount: qualifiedPool.length,
       selectedTrackCount: selected.length,
@@ -190,12 +257,14 @@ function retrievalResult(input: {
       targetShortfall: Math.max(0, input.target - selected.length),
       reserveShortfall: exact ? 0 : Math.max(0, 10 - reserve.length),
       discardedByReason: {},
-      primaryShortfallReason: exact ? null : "frontier_exhausted",
+      primaryShortfallReason: exact ? null : stopReason,
     },
     strategies: [{
       id: "curated_genre_scene:trusted_scoped_containers",
       engine: "curated_genre_scene",
       kind: "trusted_containers",
+      discoveryDependencyIds: ["apple_catalog"],
+      qualificationDependencyIds: ["apple_catalog"],
       status: "exhausted",
       rounds: 1,
       rawCandidates: qualifiedPool.length,
@@ -211,8 +280,61 @@ function retrievalResult(input: {
         ? "exact_draft_ready"
         : partial
           ? "partial_confirmation_required"
-          : "no_manifest",
+          : integrityFailure
+            ? "blocked_operational_failure"
+            : "no_manifest",
     },
+  };
+}
+
+function withCanonicalCatalogProof(
+  result: RetrievalResultV3,
+): RetrievalResultV3 {
+  const prove = (track: QualifiedTrackV3): QualifiedTrackV3 => ({
+    ...track,
+    evidenceBindingIds: [],
+    evidenceBindings: [],
+    evidenceStrength: 1,
+    independentProvenanceRoots: 1,
+    canonicalClauseAssessments: {
+      "catalog:storefront-playable": {
+        status: "pass",
+        evidenceGrade: "authoritative_structured_metadata",
+        evidenceIds: [],
+      },
+    },
+  });
+  const selected = result.selected.map(prove);
+  const reserve = result.reserve.map(prove);
+  return {
+    ...result,
+    selected,
+    reserve,
+    qualifiedPool: [...selected, ...reserve],
+  };
+}
+
+function withCanonicalHostedProof(
+  result: RetrievalResultV3,
+  clauseId: string,
+): RetrievalResultV3 {
+  const prove = (track: QualifiedTrackV3): QualifiedTrackV3 => ({
+    ...track,
+    canonicalClauseAssessments: {
+      [clauseId]: {
+        status: "pass",
+        evidenceGrade: "track_specific_editorial_assertion",
+        evidenceIds: [...track.evidenceBindingIds],
+      },
+    },
+  });
+  const selected = result.selected.map(prove);
+  const reserve = result.reserve.map(prove);
+  return {
+    ...result,
+    selected,
+    reserve,
+    qualifiedPool: [...selected, ...reserve],
   };
 }
 
@@ -228,6 +350,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY_GROUPS", "genre_scene");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    vi.stubEnv("PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED", "true");
     vi.stubEnv("APPLE_STOREFRONT", "us");
     adminPool = new Pool({
       connectionString: databaseUrl,
@@ -255,7 +379,10 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
        VALUES('owner','test-ciphertext',$1,$2,'test-key','us','valid',now())`,
       ["b".repeat(24), "c".repeat(32)],
     );
-    repository = new Repository({ pool, db: {} } as never);
+    repository = new Repository({
+      pool,
+      db: drizzle(pool, { schema: databaseSchema }),
+    });
   }, 30_000);
 
   afterAll(async () => {
@@ -272,11 +399,20 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     label: string,
     transformSelectionPlan?: (plan: SelectionPlanV3) => SelectionPlanV3,
     rawPrompt = `Create ${target} released recordings in the ${label} music genre`,
+    canonicalRecovery:
+      | false
+      | "empty"
+      | "or_membership"
+      | "not_exclusion" = false,
   ): Promise<{
     runId: string;
     accessId: string;
     selectionPlan: SelectionPlanV3;
     queryPlan: QueryPlanV3;
+    executorReleaseIdentity: {
+      executorRevision: string;
+      semanticExecutionConfigurationHash: string | null;
+    };
     fence: PipelineV3WriteFence;
   }> {
     const clientBucket = `v3-manifest-${label}-${randomUUID()}`;
@@ -309,6 +445,249 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         graphSnapshotId,
       });
     }
+    if (canonicalRecovery) {
+      const active = (await pool.query<{
+        selection_plan: SelectionPlanV3;
+        selection_plan_id: string;
+        selection_revision: number;
+        query_plan_id: string;
+        query_revision: number;
+        graph_snapshot_id: string;
+        raw_prompt: string;
+      }>(
+        `SELECT selection.plan_json selection_plan,
+                selection.id selection_plan_id,
+                selection.revision selection_revision,
+                query.id query_plan_id,query.revision query_revision,
+                query.graph_snapshot_id,
+                spec.raw_prompt
+         FROM research_runs run
+         JOIN run_specs spec ON spec.run_id=run.id
+         JOIN run_active_query_plans active ON active.run_id=run.id
+         JOIN query_plan_revisions query
+           ON query.id=active.query_plan_revision_id
+         JOIN selection_plans selection
+           ON selection.id=query.selection_plan_id
+         WHERE run.id=$1`,
+        [created.runId],
+      )).rows[0]!;
+      expect(
+        active?.selection_plan,
+        `active selection plan missing for ${label} (${created.runId})`,
+      ).toBeTruthy();
+      const canonicalClauses = canonicalRecovery === "or_membership"
+        ? [{
+            id: "genre:reggaeton",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "genre",
+            operator: "require" as const,
+            values: ["reggaeton"],
+            source: {
+              provenance: "prompt" as const,
+              text: "reggaeton",
+            },
+          }, {
+            id: "genre:dembow",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "genre",
+            operator: "require" as const,
+            values: ["dembow"],
+            source: {
+              provenance: "prompt" as const,
+              text: "dembow",
+            },
+          }]
+        : canonicalRecovery === "not_exclusion"
+        ? [{
+            id: "genre:reggaeton",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "genre",
+            operator: "require" as const,
+            values: ["reggaeton"],
+            source: {
+              provenance: "prompt" as const,
+              text: "reggaeton",
+            },
+          }, {
+            id: "artist:bad-bunny",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "artist",
+            operator: "require" as const,
+            values: ["Bad Bunny"],
+            source: {
+              provenance: "prompt" as const,
+              text: "Bad Bunny",
+            },
+          }]
+        : [{
+            id: "catalog:storefront-playable",
+            kind: "catalog_version" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "catalog",
+            operator: "require" as const,
+            values: ["storefront playable"],
+            source: {
+              provenance: "system_default" as const,
+              text: "storefront playable",
+            },
+            evidence: {
+              required: true,
+              claim: "The recording is playable in the requested storefront",
+              minimumGrade: "authoritative_structured_metadata" as const,
+              permittedGrades: [
+                "authoritative_structured_metadata" as const,
+              ],
+            },
+            // This fixture isolates publication reconciliation. Production
+            // adapters supply the structured assessment; allowing a missing
+            // fixture assessment avoids manufacturing editorial evidence.
+            unknownPolicy: "allow" as const,
+          }];
+      const contract = compilePlaylistContractRevisionV1({
+        contractId: `run:${created.runId}`,
+        rawPrompt: active.raw_prompt,
+        requestedTrackCount: target,
+        locale: "en-US",
+        storefront: active.selection_plan.storefront,
+        clauses: canonicalClauses,
+        trackPredicate: canonicalRecovery === "or_membership"
+          ? {
+              op: "any",
+              children: canonicalClauses.map(({ id }) => ({
+                op: "clause" as const,
+                clauseId: id,
+              })),
+            }
+          : canonicalRecovery === "not_exclusion"
+          ? {
+              op: "all",
+              children: [
+                {
+                  op: "clause" as const,
+                  clauseId: "genre:reggaeton",
+                },
+                {
+                  op: "not" as const,
+                  child: {
+                    op: "clause" as const,
+                    clauseId: "artist:bad-bunny",
+                  },
+                },
+              ],
+            }
+          : {
+              op: "clause",
+              clauseId: "catalog:storefront-playable",
+            },
+      });
+      const contractRevision = await repository.savePlaylistContractRevision({
+        runId: created.runId,
+        expectedParentRevisionId: null,
+        contractHash: contract.semanticHash,
+        contract: structuredClone(contract) as unknown as Record<string, unknown>,
+        compilerVersion: contract.versions.compiler,
+        ontologyVersion: contract.versions.ontology,
+        evidencePolicyVersion: contract.versions.evidencePolicy,
+        questionTemplateVersion: contract.versions.questionTemplates,
+        catalogPolicyVersion: contract.versions.catalogPolicy,
+        locale: contract.locale,
+        storefront: contract.storefront,
+        answerLineageHash: sha256Hex(
+          stableStringify(contract.answerLineage),
+        ),
+      });
+      const canonicalSelectionPlan: SelectionPlanV3 = {
+        ...active.selection_plan,
+        canonicalContractPolicy:
+          canonicalContractExecutionPolicyV1(contract),
+      };
+      const canonicalQueryPlan = createQueryPlanV3(
+        canonicalSelectionPlan,
+        active.graph_snapshot_id,
+        {
+          schemaVersion: 5,
+          briefContractVersion: 3,
+          playlistContractRevisionId: contract.revisionId,
+          playlistContractSemanticHash: contract.semanticHash,
+          playlistContractCompilerVersion: contract.versions.compiler,
+        },
+      );
+      const canonicalSelectionHash =
+        selectionPlanV3Hash(canonicalSelectionPlan);
+      const canonicalQueryHash = queryPlanV3Hash(canonicalQueryPlan);
+      const canonicalSelectionPlanId = randomUUID();
+      const canonicalQueryPlanId = randomUUID();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `UPDATE selection_plans SET status='superseded'
+           WHERE run_id=$1 AND status='active'`,
+          [created.runId],
+        );
+        await client.query(
+          `INSERT INTO selection_plans(
+             id,run_id,revision,status,plan_hash,plan_json,
+             pipeline_version,policy_version,confirmed_at)
+           VALUES($1,$2,$3,'active',$4,$5::jsonb,
+             'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+          [
+            canonicalSelectionPlanId,
+            created.runId,
+            active.selection_revision + 1,
+            canonicalSelectionHash,
+            JSON.stringify(canonicalSelectionPlan),
+          ],
+        );
+        await client.query(
+          `INSERT INTO query_plan_revisions(
+             id,run_id,selection_plan_id,revision,parent_revision_id,
+             graph_snapshot_id,engine,status,plan_hash,plan_json,
+             pipeline_version,policy_version,activated_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,'active',$8,$9::jsonb,
+             'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+          [
+            canonicalQueryPlanId,
+            created.runId,
+            canonicalSelectionPlanId,
+            active.query_revision + 1,
+            active.query_plan_id,
+            active.graph_snapshot_id,
+            canonicalQueryPlan.engine,
+            canonicalQueryHash,
+            JSON.stringify(canonicalQueryPlan),
+          ],
+        );
+        await client.query(
+          `UPDATE run_active_query_plans
+           SET query_plan_revision_id=$2,activated_at=now()
+           WHERE run_id=$1`,
+          [created.runId, canonicalQueryPlanId],
+        );
+        await client.query(
+          `UPDATE query_plan_revisions SET status='superseded'
+           WHERE run_id=$1 AND id<>$2 AND status='active'`,
+          [created.runId, canonicalQueryPlanId],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+      expect(contractRevision.contractHash).toBe(canonicalQueryPlan
+        .playlistContractSemanticHash);
+    }
     await new ResearchOrchestrator(repository).enqueue(created.runId);
 
     const active = (await pool.query<{
@@ -318,9 +697,13 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       job_id: string;
       stage_key: string;
       access_id: string;
+      required_executor_revision: string | null;
+      required_executor_semantic_configuration_hash: string | null;
     }>(
       `SELECT sp.plan_json selection_plan,qp.plan_json query_plan,qp.id query_plan_id,
-              jq.id job_id,jq.stage_key,ra.id access_id
+              jq.id job_id,jq.stage_key,ra.id access_id,
+              jq.required_executor_revision,
+              jq.required_executor_semantic_configuration_hash
        FROM selection_plans sp
        JOIN run_active_query_plans aqp ON aqp.run_id=sp.run_id
        JOIN query_plan_revisions qp ON qp.id=aqp.query_plan_revision_id
@@ -331,6 +714,26 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       [created.runId],
     )).rows[0]!;
     const workerId = `v3-manifest-worker-${randomUUID()}`;
+    if (Number(active.query_plan.schemaVersion ?? 1) >= 5) {
+      expect(active.required_executor_revision).toMatch(
+        /^[0-9A-Za-z][0-9A-Za-z._:+-]{0,159}$/u,
+      );
+      expect(active.required_executor_semantic_configuration_hash).toMatch(
+        /^[0-9a-f]{64}$/u,
+      );
+    }
+    const executorRevision =
+      active.required_executor_revision ?? "integration-v3-worker";
+    await repository.updateWorkerHeartbeat(workerId, {
+      version: executorRevision,
+      ...(active.required_executor_semantic_configuration_hash ? {
+        semanticExecutionConfigurationHash:
+          active.required_executor_semantic_configuration_hash,
+      } : {}),
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
     await pool.query(
       `UPDATE job_queue
        SET status='leased',lease_owner=$2,lease_expires_at=now()+interval '5 minutes'
@@ -341,20 +744,1268 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
       [active.job_id],
     )).rows[0]!.lease_epoch);
+    const contractRevision = canonicalRecovery
+      ? await repository.getActivePlaylistContractRevision({
+          runId: created.runId,
+        })
+      : null;
+    const immutableContract = contractRevision?.contract as {
+      revisionId: string;
+      semanticHash: string;
+    } | undefined;
+    const executionAttempt = contractRevision
+      ? await repository.beginPlaylistExecutionAttempt({
+          runId: created.runId,
+          contractRevisionId: contractRevision.id,
+          jobId: active.job_id,
+          workerId,
+          queryPlanRevisionId: active.query_plan_id,
+          stage: active.stage_key,
+          dependencyKey: "research",
+          attemptNumber: 1,
+          leaseGeneration: leaseEpoch,
+          executorRevision,
+          executorIdentityHash: "e".repeat(64),
+          executorCapabilityHash:
+            active.query_plan.executorCapabilityHash ?? null,
+          executorCapabilityVector:
+            active.query_plan.executorCapabilityVector
+              ? structuredClone(
+                  active.query_plan.executorCapabilityVector,
+                ) as unknown as Record<string, unknown>
+              : null,
+          configurationHash: "d".repeat(64),
+          semanticExecutionConfigurationHash:
+            active.required_executor_semantic_configuration_hash,
+          idempotencyKey:
+            `${active.job_id}:${leaseEpoch}:${contractRevision.id}`,
+        })
+      : null;
     return {
       runId: created.runId,
       accessId: active.access_id,
       selectionPlan: active.selection_plan,
       queryPlan: active.query_plan,
+      executorReleaseIdentity: {
+        executorRevision,
+        semanticExecutionConfigurationHash:
+          active.required_executor_semantic_configuration_hash,
+      },
       fence: {
         jobId: active.job_id,
         workerId,
         leaseEpoch,
         queryPlanRevisionId: active.query_plan_id,
         stageKey: active.stage_key,
+        ...(contractRevision && immutableContract && executionAttempt ? {
+          contractAttemptId: executionAttempt.id,
+          contractRevisionDatabaseId: contractRevision.id,
+          contractRevisionId: immutableContract.revisionId,
+          contractSemanticHash: immutableContract.semanticHash,
+        } : {}),
       },
     };
   }
+
+  test("a stale begin cannot discard the successor lease generation's running attempt", async () => {
+    const context = await createLeasedRun(
+      3,
+      "schema-19-stale-begin-fence",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    const successorWorkerId = `v3-successor-worker-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(successorWorkerId, {
+      version: context.executorReleaseIdentity.executorRevision,
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
+    await pool.query(
+      `UPDATE job_queue
+       SET lease_owner=$2,lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [context.fence.jobId, successorWorkerId],
+    );
+    const successorGeneration = Number((await pool.query<{ lease_epoch: string }>(
+      "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
+      [context.fence.jobId],
+    )).rows[0]!.lease_epoch);
+    expect(successorGeneration).toBeGreaterThan(context.fence.leaseEpoch);
+
+    const successor = await repository.beginPlaylistExecutionAttempt({
+      runId: context.runId,
+      contractRevisionId: context.fence.contractRevisionDatabaseId!,
+      jobId: context.fence.jobId,
+      workerId: successorWorkerId,
+      queryPlanRevisionId: context.fence.queryPlanRevisionId,
+      stage: context.fence.stageKey,
+      dependencyKey: "research",
+      attemptNumber: 2,
+      leaseGeneration: successorGeneration,
+      executorRevision: context.executorReleaseIdentity.executorRevision,
+      executorIdentityHash: "f".repeat(64),
+      executorCapabilityHash: context.queryPlan.executorCapabilityHash!,
+      executorCapabilityVector: structuredClone(
+        context.queryPlan.executorCapabilityVector!,
+      ) as unknown as Record<string, unknown>,
+      configurationHash: "d".repeat(64),
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      idempotencyKey:
+        `${context.fence.jobId}:${successorGeneration}:${context.fence.contractRevisionDatabaseId}`,
+    });
+
+    await expect(repository.beginPlaylistExecutionAttempt({
+      runId: context.runId,
+      contractRevisionId: context.fence.contractRevisionDatabaseId!,
+      jobId: context.fence.jobId,
+      workerId: context.fence.workerId,
+      queryPlanRevisionId: context.fence.queryPlanRevisionId,
+      stage: context.fence.stageKey,
+      dependencyKey: "research",
+      attemptNumber: 3,
+      leaseGeneration: context.fence.leaseEpoch,
+      executorRevision: context.executorReleaseIdentity.executorRevision,
+      executorIdentityHash: "e".repeat(64),
+      executorCapabilityHash: context.queryPlan.executorCapabilityHash!,
+      executorCapabilityVector: structuredClone(
+        context.queryPlan.executorCapabilityVector!,
+      ) as unknown as Record<string, unknown>,
+      configurationHash: "d".repeat(64),
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      idempotencyKey:
+        `${context.fence.jobId}:${context.fence.leaseEpoch}:stale-retry`,
+    })).rejects.toMatchObject({ code: "job_lease_lost" });
+
+    await expect(pool.query<{ status: string }>(
+      "SELECT status FROM playlist_execution_attempts WHERE id=$1",
+      [successor.id],
+    )).resolves.toMatchObject({ rows: [{ status: "running" }] });
+  }, 30_000);
+
+  test("persists a runtime feasibility proof only under the active contract-attempt fence", async () => {
+    const context = await createLeasedRun(
+      25,
+      "schema-18-runtime-feasibility",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    const report = assessPlaylistRuntimeFeasibilityV1({
+      contractRevisionId: context.queryPlan.playlistContractRevisionId!,
+      contractSemanticHash: context.queryPlan.playlistContractSemanticHash!,
+      targetTrackCount: context.queryPlan.targetTrackCount!,
+      scope: "open_world",
+      stopReason: "frontier_exhausted",
+      discoveredCount: 19,
+      qualifiedCount: 7,
+      storefrontSafeCount: 4,
+      contradictions: [],
+      limitingPredicateIds: ["genre:reggaeton"],
+      strategies: [
+        {
+          id: "curated_genre_scene:trusted_scoped_containers",
+          status: "exhausted",
+          rounds: 2,
+          rawCandidates: 11,
+          newQualifiedFamilies: 4,
+          discoveryDependencyIds: ["apple_catalog"],
+        },
+        {
+          id: "curated_genre_scene:editorial_tracks",
+          status: "exhausted",
+          rounds: 3,
+          rawCandidates: 8,
+          newQualifiedFamilies: 3,
+          discoveryDependencyIds: ["hosted_web"],
+        },
+      ],
+      dependencyOutages: [],
+      budgets: {
+        activeComputeConsumedMs: 12_345,
+        activeComputeAllowanceMs: 900_000,
+        maximumGlobalRounds: 48,
+        maximumRawCandidates: 500,
+        maximumCostUnits: 48,
+        qualifiedPoolGoal: 55,
+      },
+      policyVersions: {
+        queryPlanPolicy: context.queryPlan.policyVersion,
+        semanticPolicy: context.queryPlan.semanticPolicyVersion!,
+        evidencePolicy: context.queryPlan.evidencePolicyVersion!,
+      },
+    });
+
+    await expect(repository.persistPipelineV3RuntimeFeasibilitySnapshot({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      phase: "initial",
+      report,
+      fence: context.fence,
+    })).resolves.toMatchObject({
+      id: expect.any(String),
+      created: true,
+    });
+    await expect(repository.persistPipelineV3RuntimeFeasibilitySnapshot({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      phase: "initial",
+      report,
+      fence: context.fence,
+    })).resolves.toMatchObject({
+      id: expect.any(String),
+      created: false,
+    });
+    const persisted = (await pool.query<{
+      contract_revision_id: string;
+      phase: string;
+      assessment: string;
+      target_count: number;
+      observed_qualified_count: number;
+      report_hash: string;
+      report_json: Record<string, unknown>;
+    }>(
+      `SELECT contract_revision_id,phase,assessment,target_count,
+              observed_qualified_count,report_hash,report_json
+       FROM playlist_feasibility_snapshots
+       WHERE contract_revision_id=$1`,
+      [context.fence.contractRevisionDatabaseId],
+    )).rows;
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]).toMatchObject({
+      contract_revision_id: context.fence.contractRevisionDatabaseId,
+      phase: "initial",
+      assessment: "frontier_exhausted_under_policy",
+      target_count: 25,
+      observed_qualified_count: 7,
+      report_hash: report.reportHash,
+      report_json: {
+        frontierProof: {
+          completedFrontierIds: [
+            "curated_genre_scene:editorial_tracks",
+            "curated_genre_scene:trusted_scoped_containers",
+          ],
+          independentDependencyKeys: ["apple_catalog", "hosted_web"],
+        },
+        runtimeEvidence: {
+          discoveredCount: 19,
+          qualifiedCount: 7,
+          storefrontSafeCount: 4,
+          budgets: {
+            activeComputeConsumedMs: 12_345,
+            activeComputeAllowanceMs: 900_000,
+            observedStrategyRounds: 5,
+          },
+        },
+      },
+    });
+
+    const staleSuccessorWorkerId =
+      `v3-feasibility-successor-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(staleSuccessorWorkerId, {
+      version: context.executorReleaseIdentity.executorRevision,
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
+    await pool.query(
+      "UPDATE job_queue SET lease_owner=$2 WHERE id=$1",
+      [context.fence.jobId, staleSuccessorWorkerId],
+    );
+    const staleReport = assessPlaylistRuntimeFeasibilityV1({
+      contractRevisionId: context.queryPlan.playlistContractRevisionId!,
+      contractSemanticHash: context.queryPlan.playlistContractSemanticHash!,
+      targetTrackCount: context.queryPlan.targetTrackCount!,
+      scope: "open_world",
+      stopReason: "frontier_exhausted",
+      discoveredCount: 20,
+      qualifiedCount: 7,
+      storefrontSafeCount: 4,
+      contradictions: [],
+      limitingPredicateIds: ["genre:dembow"],
+      strategies: report.runtimeEvidence!.frontiers.map((frontier) => ({
+        id: frontier.id,
+        status: "exhausted" as const,
+        rounds: 1,
+        rawCandidates: frontier.discoveredCount,
+        newQualifiedFamilies: frontier.qualifiedCount,
+        discoveryDependencyIds: frontier.dependencyKeys ?? [frontier.dependencyKey],
+      })),
+      dependencyOutages: [],
+      budgets: {
+        activeComputeConsumedMs: 12_346,
+        activeComputeAllowanceMs: 900_000,
+        maximumGlobalRounds: 48,
+        maximumRawCandidates: 500,
+        maximumCostUnits: 48,
+        qualifiedPoolGoal: 55,
+      },
+      policyVersions: {
+        queryPlanPolicy: context.queryPlan.policyVersion,
+      },
+    });
+    await expect(repository.persistPipelineV3RuntimeFeasibilitySnapshot({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      phase: "recovery",
+      report: staleReport,
+      fence: context.fence,
+    })).rejects.toMatchObject({ code: "job_lease_lost" });
+    await expect(pool.query(
+      "SELECT count(*)::int count FROM playlist_feasibility_snapshots WHERE contract_revision_id=$1",
+      [context.fence.contractRevisionDatabaseId],
+    )).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  }, 30_000);
+
+  test("separates untrusted leads from contract-fenced qualification records", async () => {
+    const context = await createLeasedRun(
+      1,
+      "schema-18-separated-recovery",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    expect(context.queryPlan.schemaVersion).toBe(5);
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const source = qualifiedTrack(
+      "schema-18-separated-recovery",
+      0,
+      ["genre:reggaeton", "genre:dembow"],
+    );
+    const candidate = {
+      id: source.candidateId,
+      artist: source.artist,
+      title: source.title,
+      album: source.album,
+      sourceObservationIds: [...source.sourceObservationIds],
+    };
+    const discoveryRequest = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+        costUnits: 1,
+        provenance: {
+          cacheOrigin: "fresh_cache",
+          sourceFreshUntil: "2099-01-01T00:00:00.000Z",
+        },
+      },
+      fence: context.fence,
+    });
+
+    const discovered = (await pool.query<{
+      id: string;
+      contract_revision_id: string;
+      execution_attempt_id: string;
+      status: string;
+      evidence_eligible: boolean;
+      dependency_ids: string[];
+      provenance_roots: string[];
+      cache_origin: string;
+      source_fresh_until: Date | null;
+      lead_json: Record<string, unknown>;
+    }>(
+      `SELECT id,contract_revision_id,execution_attempt_id,status,
+              evidence_eligible,dependency_ids,provenance_roots,cache_origin,
+              source_fresh_until,lead_json
+       FROM playlist_discovery_leads WHERE run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(discovered).toMatchObject({
+      contract_revision_id: context.fence.contractRevisionDatabaseId,
+      execution_attempt_id: context.fence.contractAttemptId,
+      status: "discovered",
+      evidence_eligible: false,
+      dependency_ids: [...strategy.discoveryDependencyIds],
+      provenance_roots: [],
+      cache_origin: "fresh_cache",
+      lead_json: {
+        schemaVersion: "genio-playlist-discovery-lead/v1",
+        untrusted: true,
+      },
+    });
+    expect(discovered.source_fresh_until?.toISOString())
+      .toBe("2099-01-01T00:00:00.000Z");
+    await expect(pool.query(
+      "UPDATE playlist_discovery_leads SET evidence_eligible=true WHERE id=$1",
+      [discovered.id],
+    )).rejects.toThrow();
+
+    await repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: {
+        runId: context.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: context.selectionPlan,
+        engine: strategy.engine,
+        strategy,
+        candidates: [candidate],
+      },
+      qualifications: [{
+        candidateId: candidate.id,
+        scope: {
+          // The canonical schema must execute the exact OR tree below. This
+          // deliberately contradictory flattened legacy result is retained
+          // only as an audit observation.
+          passed: false,
+          failedMembershipPredicateIds: ["legacy:flattened"],
+          fit: 0,
+        },
+        hardConstraints: {
+          passed: true,
+          failedConstraintIds: [],
+        },
+        evidence: {
+          passed: true,
+          bindingIds: source.evidenceBindingIds,
+          bindings: source.evidenceBindings,
+          strength: source.evidenceStrength,
+          independentProvenanceRoots: source.independentProvenanceRoots,
+        },
+        version: {
+          compatible: true,
+          confidence: source.versionConfidence,
+        },
+        catalog: {
+          lookupAttempted: true,
+          storefrontPlayable: true,
+          appleSongId: source.appleSongId,
+          recordingFamilyKey: source.recordingFamilyKey,
+          confidence: source.catalogConfidence,
+        },
+        canonicalClauseAssessments: {
+          "genre:reggaeton": {
+            status: "pass",
+            evidenceGrade: "track_specific_editorial_assertion",
+            evidenceIds: [...source.evidenceBindingIds],
+          },
+          "genre:dembow": { status: "unknown" },
+        },
+        rankingSignals: source.rankingSignals,
+        sourceRank: source.sourceRank,
+      }],
+      fence: context.fence,
+    });
+
+    const qualification = (await pool.query<{
+      decision: string;
+      predicate_results_json: Record<string, unknown>;
+      evidence_record_ids_json: string[];
+      quality_result_json: Record<string, unknown>;
+      catalog_result_json: Record<string, unknown>;
+      lead_status: string;
+      evidence_eligible: boolean;
+    }>(
+      `SELECT qualification.decision,qualification.predicate_results_json,
+              qualification.evidence_record_ids_json,
+              qualification.quality_result_json,
+              qualification.catalog_result_json,
+              lead.status lead_status,lead.evidence_eligible
+       FROM playlist_qualification_records qualification
+       JOIN playlist_discovery_leads lead
+         ON lead.id=qualification.discovery_lead_id
+       WHERE qualification.run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(qualification).toMatchObject({
+      decision: "qualified",
+      lead_status: "qualified",
+      evidence_eligible: false,
+      predicate_results_json: {
+        scope: { passed: false },
+        hardConstraints: { passed: true },
+        legacyFlattenedAuthoritative: false,
+        canonicalContract: {
+          evaluation: { status: "pass", eligible: true },
+          evidenceIntegrity: { passed: true },
+          assessments: {
+            "genre:reggaeton": { status: "pass" },
+            "genre:dembow": { status: "unknown" },
+          },
+        },
+      },
+      quality_result_json: {
+        evidence: { passed: true },
+        provenance: {
+          dependencyIds: [...strategy.discoveryDependencyIds],
+          provenanceRoots: source.evidenceBindings
+            ?.map(({ provenanceRoot }) => provenanceRoot)
+            .sort(),
+          cacheOrigin: "fresh_cache",
+          sourceFreshUntil: "2099-01-01T00:00:00.000Z",
+        },
+      },
+      catalog_result_json: {
+        version: { compatible: true },
+        catalog: {
+          storefrontPlayable: true,
+          appleSongId: source.appleSongId,
+        },
+      },
+    });
+    expect(qualification.evidence_record_ids_json)
+      .toEqual(source.evidenceBindingIds);
+
+    const finalBase = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-separated-recovery",
+      predicateIds: ["genre:reggaeton", "genre:dembow"],
+    });
+    const finalSelected = finalBase.selected.map((track) => ({
+      ...track,
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+        "genre:dembow": { status: "unknown" as const },
+      },
+    }));
+    const finalPersisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...finalBase,
+        selected: finalSelected,
+        qualifiedPool: finalSelected,
+      },
+      fence: context.fence,
+    });
+    expect((await pool.query<{
+      active: number;
+      revoked: number;
+    }>(
+      `SELECT
+         count(*) FILTER (
+           WHERE decision='qualified' AND revoked_at IS NULL
+         )::int active,
+         count(*) FILTER (
+           WHERE decision='revoked' AND revoked_at IS NOT NULL
+         )::int revoked
+       FROM playlist_qualification_records
+       WHERE run_id=$1`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      active: 1,
+      revoked: 1,
+    });
+    const durableBinding = (await pool.query<{
+      provenance_path_json: Array<Record<string, unknown>>;
+    }>(
+      `SELECT provenance_path_json
+       FROM track_scope_bindings
+       WHERE run_id=$1
+       ORDER BY id
+       LIMIT 1`,
+      [context.runId],
+    )).rows[0]!.provenance_path_json.find(
+      ({ kind }) => kind === "pipeline_v3_binding",
+    );
+    expect(durableBinding).toMatchObject({
+      predicateIds: ["genre:reggaeton"],
+      sourcePredicateIds: ["genre:dembow", "genre:reggaeton"],
+    });
+    await expect(repository.validatePipelineV3ContinuationQualifications({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      tracks: finalSelected,
+    })).resolves.toBeUndefined();
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: finalPersisted.manifestId!,
+      manifestRevisionId: finalPersisted.manifestRevisionId!,
+      manifestRevisionHash: finalPersisted.manifestHash!,
+      selectedCount: 1,
+    })).resolves.toMatchObject({
+      enforcement: "required",
+      decision: null,
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: finalPersisted.manifestId!,
+      manifestRevisionId: finalPersisted.manifestRevisionId!,
+      manifestRevisionHash: finalPersisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).resolves.toBeUndefined();
+
+    const duplicatedAuthority = await pool.query(
+      `UPDATE playlist_qualification_records
+       SET decision='qualified',revoked_at=NULL
+       WHERE run_id=$1 AND decision='revoked'
+       RETURNING id`,
+      [context.runId],
+    );
+    expect(duplicatedAuthority.rowCount).toBe(1);
+    await expect(repository.validatePipelineV3ContinuationQualifications({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      tracks: finalSelected,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_continuation_qualification_invalid",
+    });
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: finalPersisted.manifestId!,
+      manifestRevisionId: finalPersisted.manifestRevisionId!,
+      manifestRevisionHash: finalPersisted.manifestHash!,
+      selectedCount: 1,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_evidence_attestation_missing",
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: finalPersisted.manifestId!,
+      manifestRevisionId: finalPersisted.manifestRevisionId!,
+      manifestRevisionHash: finalPersisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: ["canonical_qualification_projection_ambiguous"],
+    });
+
+    await expect(repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: {
+        ...context.fence,
+        contractSemanticHash: "0".repeat(64),
+      },
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_recovery_fence_stale",
+    });
+
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: `test:${context.runId}`,
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+      disabled: true,
+      reasonCode: "integration_test",
+      changedBy: "integration",
+    });
+    await expect(repository.isPipelineCohortDisabled({
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+    })).resolves.toBe(true);
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: `test:reenable:${context.runId}`,
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+      disabled: false,
+      changedBy: "integration",
+    });
+    await expect(repository.isPipelineCohortDisabled({
+      route: "corpus_first_v3",
+      intentGroup: "genre_scene",
+    })).resolves.toBe(false);
+    await expect(pool.query<{
+      cohort_key: string;
+      disabled: boolean;
+    }>(
+      `SELECT cohort_key,disabled
+       FROM pipeline_cohort_kill_switches
+       WHERE route='corpus_first_v3' AND intent_group='genre_scene'`,
+    )).resolves.toMatchObject({
+      rows: [{
+        cohort_key: `test:reenable:${context.runId}`,
+        disabled: false,
+      }],
+    });
+  }, 120_000);
+
+  test("persists the contract-bound publication reconciliation lifecycle", async () => {
+    const context = await createLeasedRun(
+      1,
+      "disco",
+      undefined,
+      undefined,
+      "empty",
+    );
+    const result = withCanonicalCatalogProof(retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-publication-reconciliation",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    }));
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const locked = await repository.getManifestById(persisted.manifestId!);
+    expect(locked).toBeTruthy();
+    const expectedOrderedIdsHash = orderedAppleStableIdsHash(
+      locked!.tracks.map((track: { catalogId: string }) => track.catalogId),
+    );
+    const base = {
+      runId: context.runId,
+      contractRevisionId: locked!.contractRevisionId!,
+      contractHash: locked!.contractHash!,
+      executionAttemptId: context.fence.contractAttemptId!,
+      jobId: context.fence.jobId,
+      workerId: context.fence.workerId,
+      leaseGeneration: context.fence.leaseEpoch,
+      stageKey: context.fence.stageKey,
+      manifestId: locked!.id,
+      manifestRevisionId: locked!.revisionId!,
+      manifestRevisionHash: locked!.contentHash,
+      expectedOrderedIdsHash,
+      expectedCount: 1,
+      idempotencyKey:
+        `publish:${locked!.id}:${locked!.revisionId}:${locked!.contentHash}`,
+    };
+    await expect(repository.beginPublicationReconciliation(base)).resolves
+      .toMatchObject({
+        state: "preflight",
+        appendedCount: 0,
+        batchCursor: 0,
+      });
+    await expect(repository.beginPublicationReconciliation(base)).resolves
+      .toMatchObject({ state: "preflight" });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "create_pending",
+      appendedCount: 0,
+      batchCursor: 0,
+      detail: { volumeAttempt: 0 },
+    });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "append_pending",
+      applePlaylistId: "p.integration",
+      appendedCount: 1,
+      batchCursor: 1,
+      detail: { volumeAttempt: 0 },
+    });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "reconciling",
+      applePlaylistId: "p.integration",
+      observedOrderedIdsHash: expectedOrderedIdsHash,
+      appendedCount: 1,
+      batchCursor: 1,
+      detail: { exactMembershipVerified: true },
+    });
+    await repository.advancePublicationReconciliation({
+      ...base,
+      state: "complete",
+      applePlaylistId: "p.integration",
+      observedOrderedIdsHash: expectedOrderedIdsHash,
+      appendedCount: 1,
+      batchCursor: 1,
+      detail: { terminalFenceCommitted: true },
+    });
+    const stored = (await pool.query<{
+      state: string;
+      expected_ordered_ids_hash: string;
+      observed_ordered_ids_hash: string;
+      appended_count: number;
+      batch_cursor: number;
+      evidence_eligible_leads: number;
+    }>(
+      `SELECT reconciliation.state,reconciliation.expected_ordered_ids_hash,
+              reconciliation.observed_ordered_ids_hash,
+              reconciliation.appended_count,reconciliation.batch_cursor,
+              (SELECT count(*)::int FROM playlist_discovery_leads lead
+               WHERE lead.run_id=reconciliation.run_id
+                 AND lead.evidence_eligible) evidence_eligible_leads
+       FROM playlist_publication_reconciliations reconciliation
+       WHERE reconciliation.run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(stored).toEqual({
+      state: "complete",
+      expected_ordered_ids_hash: expectedOrderedIdsHash,
+      observed_ordered_ids_hash: expectedOrderedIdsHash,
+      appended_count: 1,
+      batch_cursor: 1,
+      evidence_eligible_leads: 0,
+    });
+    await expect(repository.advancePublicationReconciliation({
+      ...base,
+      state: "append_pending",
+      applePlaylistId: "p.integration",
+      appendedCount: 1,
+      batchCursor: 1,
+    })).rejects.toMatchObject({
+      code: "publication_reconciliation_conflict",
+    });
+    await expect(repository.beginPublicationReconciliation({
+      ...base,
+      manifestRevisionHash: "0".repeat(64),
+      idempotencyKey: `${base.idempotencyKey.slice(0, -1)}0`,
+    })).rejects.toMatchObject({
+      code: "publication_reconciliation_stale",
+    });
+  }, 120_000);
+
+  test("atomically adopts authorization-blocked reconciliation only after the former lease is inactive", async () => {
+    const context = await createLeasedRun(
+      1,
+      "disco",
+      undefined,
+      undefined,
+      "empty",
+    );
+    const result = withCanonicalCatalogProof(retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "publication-reauthorization-adoption",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    }));
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const locked = await repository.getManifestById(persisted.manifestId!);
+    expect(locked).toBeTruthy();
+    const expectedOrderedIdsHash = orderedAppleStableIdsHash(
+      locked!.tracks.map((track: { catalogId: string }) => track.catalogId),
+    );
+    const original = {
+      runId: context.runId,
+      contractRevisionId: locked!.contractRevisionId!,
+      contractHash: locked!.contractHash!,
+      executionAttemptId: context.fence.contractAttemptId!,
+      jobId: context.fence.jobId,
+      workerId: context.fence.workerId,
+      leaseGeneration: context.fence.leaseEpoch,
+      stageKey: context.fence.stageKey,
+      manifestId: locked!.id,
+      manifestRevisionId: locked!.revisionId!,
+      manifestRevisionHash: locked!.contentHash,
+      expectedOrderedIdsHash,
+      expectedCount: 1,
+      idempotencyKey:
+        `publish:${locked!.id}:${locked!.revisionId}:${locked!.contentHash}`,
+    };
+    const unrelatedJobId = randomUUID();
+    await pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,stage_key,status,payload_json,max_attempts,
+         lease_owner,lease_expires_at,required_executor_revision,
+         required_executor_semantic_configuration_hash)
+       VALUES($1,$2,'publication','publication',$3,'corpus_first_v3',
+         10,$4,'leased','{}'::jsonb,3,$5,
+         now()+interval '5 minutes',$6,$7)`,
+      [
+        unrelatedJobId,
+        context.runId,
+        `spliced-reconciliation:${context.runId}`,
+        original.stageKey,
+        original.workerId,
+        context.executorReleaseIdentity.executorRevision,
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      ],
+    );
+    const unrelatedLease = Number((await pool.query<{
+      lease_epoch: string;
+    }>(
+      "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
+      [unrelatedJobId],
+    )).rows[0]!.lease_epoch);
+    expect(unrelatedLease).toBe(original.leaseGeneration);
+    await expect(repository.beginPublicationReconciliation({
+      ...original,
+      jobId: unrelatedJobId,
+    })).rejects.toMatchObject({ code: "publication_reconciliation_stale" });
+    await repository.beginPublicationReconciliation(original);
+    await repository.advancePublicationReconciliation({
+      ...original,
+      state: "authorization_blocked",
+      appendedCount: 0,
+      batchCursor: 0,
+      detail: { nextAction: "authorize_apple" },
+    });
+    await repository.updateRun(context.runId, {
+      status: "waiting_for_apple_authorization",
+      phase: "apple_reauthorization",
+      error: null,
+    });
+    const recoveryDedupeKey =
+      `publication:${locked!.id}:reauth:integration`;
+    await expect(repository.enqueueWaitingPublicationRecovery({
+      manifestId: locked!.id,
+      runId: context.runId,
+      dedupeKey: recoveryDedupeKey,
+    })).resolves.toBe(true);
+    await expect(pool.query<{ status: string; phase: string }>(
+      "SELECT status,phase FROM research_runs WHERE id=$1",
+      [context.runId],
+    )).resolves.toMatchObject({
+      rows: [{
+        status: "waiting_for_apple_authorization",
+        phase: "apple_reauthorization",
+      }],
+    });
+    const recoveryJob = (await pool.query<{
+      id: string;
+      stage_key: string;
+      query_plan_revision_id: string | null;
+      required_executor_capability_hash: string;
+      required_executor_capability_vector: Record<string, unknown>;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT id,stage_key,query_plan_revision_id,
+              required_executor_capability_hash,
+              required_executor_capability_vector,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue
+       WHERE kind='publication' AND dedupe_key=$1`,
+      [recoveryDedupeKey],
+    )).rows[0]!;
+    const recoveryWorker = `reauth-worker-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(recoveryWorker, {
+      version: recoveryJob.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        recoveryJob.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
+    await pool.query(
+      `UPDATE job_queue
+       SET status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [recoveryJob.id, recoveryWorker],
+    );
+    const recoveryLeaseGeneration = Number((await pool.query<{
+      lease_epoch: string;
+    }>(
+      "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
+      [recoveryJob.id],
+    )).rows[0]!.lease_epoch);
+    const recoveryAttempt = await repository.beginPlaylistExecutionAttempt({
+      runId: context.runId,
+      contractRevisionId: locked!.contractRevisionId!,
+      jobId: recoveryJob.id,
+      workerId: recoveryWorker,
+      queryPlanRevisionId: recoveryJob.query_plan_revision_id,
+      stage: recoveryJob.stage_key,
+      dependencyKey: "publication",
+      attemptNumber: 1,
+      leaseGeneration: recoveryLeaseGeneration,
+      executorRevision: recoveryJob.required_executor_revision,
+      executorIdentityHash: "3".repeat(64),
+      executorCapabilityHash:
+        recoveryJob.required_executor_capability_hash,
+      executorCapabilityVector:
+        recoveryJob.required_executor_capability_vector,
+      configurationHash: "4".repeat(64),
+      semanticExecutionConfigurationHash:
+        recoveryJob.required_executor_semantic_configuration_hash,
+      idempotencyKey:
+        `${recoveryJob.id}:${recoveryLeaseGeneration}:${locked!.contractRevisionId}`,
+    });
+    const recovery = {
+      ...original,
+      executionAttemptId: recoveryAttempt.id,
+      jobId: recoveryJob.id,
+      workerId: recoveryWorker,
+      leaseGeneration: recoveryLeaseGeneration,
+      stageKey: recoveryJob.stage_key,
+    };
+    await expect(repository.beginPublicationReconciliation(recovery))
+      .rejects.toMatchObject({ code: "publication_reconciliation_active" });
+
+    await pool.query(
+      `UPDATE job_queue
+       SET status='completed',lease_owner=NULL,lease_expires_at=NULL,
+           completed_at=now()
+       WHERE id=$1`,
+      [original.jobId],
+    );
+    await expect(repository.beginPublicationReconciliation(recovery)).resolves
+      .toMatchObject({
+        state: "authorization_blocked",
+        appendedCount: 0,
+        batchCursor: 0,
+      });
+    await expect(pool.query<{ status: string; phase: string }>(
+      "SELECT status,phase FROM research_runs WHERE id=$1",
+      [context.runId],
+    )).resolves.toMatchObject({
+      rows: [{ status: "publishing", phase: "apple_publication" }],
+    });
+    await repository.advancePublicationReconciliation({
+      ...recovery,
+      state: "append_pending",
+      applePlaylistId: "p.reauthorized",
+      appendedCount: 0,
+      batchCursor: 0,
+    });
+    const adopted = (await pool.query<{
+      execution_attempt_id: string;
+      state: string;
+      reconciliation_json: Record<string, unknown>;
+      old_attempt_status: string;
+    }>(
+      `SELECT reconciliation.execution_attempt_id,reconciliation.state,
+              reconciliation.reconciliation_json,
+              attempt.status old_attempt_status
+       FROM playlist_publication_reconciliations reconciliation
+       JOIN playlist_execution_attempts attempt ON attempt.id=$2
+       WHERE reconciliation.run_id=$1`,
+      [context.runId, original.executionAttemptId],
+    )).rows[0]!;
+    expect(adopted).toMatchObject({
+      execution_attempt_id: recoveryAttempt.id,
+      state: "append_pending",
+      old_attempt_status: "discarded",
+      reconciliation_json: {
+        jobId: recoveryJob.id,
+        workerId: recoveryWorker,
+        leaseGeneration: recoveryLeaseGeneration,
+        stageKey: recoveryJob.stage_key,
+        adoptedFrom: {
+          executionAttemptId: original.executionAttemptId,
+          jobId: original.jobId,
+          leaseGeneration: original.leaseGeneration,
+        },
+      },
+    });
+  }, 120_000);
+
+  test("revalidates an unchanged locked canonical manifest from current qualifications immediately before publication", async () => {
+    const context = await createLeasedRun(
+      1,
+      "disco",
+      undefined,
+      undefined,
+      "empty",
+    );
+    const result = withCanonicalCatalogProof(retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-prepublication-revalidation",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    }));
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const locked = await repository.getManifestById(persisted.manifestId!);
+    expect(locked).toMatchObject({
+      revisionId: persisted.manifestRevisionId,
+      contentHash: persisted.manifestHash,
+      contractRevisionId: context.fence.contractRevisionDatabaseId,
+    });
+    const publicationRepository =
+      createPublicationRepositoryFacade(repository);
+    const prepublicationFence = {
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    };
+    await expect(
+      publicationRepository.revalidateCanonicalPublicationManifest!(
+        prepublicationFence,
+      ),
+    ).resolves.toBeUndefined();
+
+    const revoked = await pool.query(
+      `UPDATE playlist_qualification_records
+       SET decision='revoked',revoked_at=now()
+       WHERE run_id=$1 AND candidate_id=$2
+       RETURNING id`,
+      [context.runId, locked!.tracks[0]!.candidateId],
+    );
+    expect(revoked.rowCount).toBe(1);
+    await expect(
+      publicationRepository.revalidateCanonicalPublicationManifest!(
+        prepublicationFence,
+      ),
+    ).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: expect.arrayContaining([
+        "canonical_qualification_projection_missing",
+      ]),
+    });
+  }, 120_000);
+
+  test("refuses to lock an exact reserve repair that breaks a canonical playlist quota", async () => {
+    const context = await createLeasedRun(
+      2,
+      "schema-18-publication-quota-repair",
+      (plan) => ({
+        ...plan,
+        playlistQuotaRules: [{
+          id: "quota:disco",
+          clauseId: "quota:disco",
+          axis: "genre",
+          values: ["disco"],
+          minimumCount: 2,
+          maximumCount: null,
+          minimumRatio: null,
+          maximumRatio: null,
+          evidenceGrade: "authoritative_structured_metadata",
+        }],
+        diversityGoals: {
+          minimumDistinctArtists: null,
+          minimumDistinctAlbums: null,
+          minimumDistinctEras: null,
+          minimumDistinctScenes: null,
+          minimumDistinctGeographies: null,
+          maximumTracksPerArtist: null,
+          maximumTracksPerAlbum: null,
+        },
+        orderingPolicy: {
+          mode: "source_order",
+          goals: [],
+          avoidAdjacentSameArtist: false,
+          avoidAdjacentSameAlbum: false,
+        },
+        softGoalRelaxationOrder: [],
+      }),
+      "2 disco tracks",
+      "empty",
+    );
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 2,
+      selectedCount: 2,
+      reserveCount: 1,
+      status: "exact_ready",
+      prefix: "schema-18-publication-quota-repair",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    });
+    const selected = base.selected.map((track, index) => ({
+      ...track,
+      catalogGenreNames: ["Disco"],
+      discoveryDependencyIds: ["hosted_web"] as const,
+      provenanceRoots: [`quota-selected-${index}`],
+      cacheOrigin: "live" as const,
+    }));
+    const reserve = base.reserve.map((track, index) => ({
+      ...track,
+      catalogGenreNames: ["Latin Pop"],
+      discoveryDependencyIds: ["hosted_web"] as const,
+      provenanceRoots: [`quota-reserve-${index}`],
+      cacheOrigin: "live" as const,
+    }));
+    const result = withCanonicalCatalogProof({
+      ...base,
+      selected,
+      reserve,
+      qualifiedPool: [...selected, ...reserve],
+    });
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const original = await repository.getManifestRevision(
+      context.runId,
+      persisted.manifestRevisionId!,
+    );
+    expect(original).toBeTruthy();
+    const reserveTracks = await repository.getManifestPreflightReserveTracks(
+      persisted.manifestId!,
+      persisted.manifestRevisionId!,
+      context.selectionPlan.storefront,
+    );
+    expect(reserveTracks).toHaveLength(1);
+    const replacementTracks = [
+      {
+        position: 0,
+        candidateId: reserveTracks[0]!.candidateId,
+        recordingFamilyId: reserveTracks[0]!.recordingFamilyId,
+        catalogIdentityId: reserveTracks[0]!.catalogIdentityId,
+        catalogId: reserveTracks[0]!.catalogId,
+        artist: reserveTracks[0]!.artist,
+        title: reserveTracks[0]!.title,
+      },
+      {
+        ...original!.tracks[1]!,
+        position: 1,
+      },
+    ];
+    await expect(repository.createManifestRevision(context.runId, {
+      ...original!,
+      id: "",
+      revision: 2,
+      parentRevisionId: original!.id,
+      status: "locked",
+      reason: "publication_preflight_qualified_reserve_substituted",
+      contentHash: publisherManifestContentHash(replacementTracks),
+      createdAt: new Date().toISOString(),
+      lockedAt: new Date().toISOString(),
+      tracks: replacementTracks,
+      reserveTracks: [],
+    })).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: expect.arrayContaining([
+        "canonical_quota_failed:quota:disco",
+      ]),
+    });
+    await expect(pool.query<{ count: number }>(
+      "SELECT count(*)::int count FROM manifest_revisions WHERE manifest_id=$1",
+      [persisted.manifestId],
+    )).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  }, 120_000);
 
   test.each([150, 300])(
     "locks a provenance-bound %i-track manifest and queues exact publication idempotently",
@@ -1051,6 +2702,54 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     )).rows[0]).toEqual({ candidates: 0, manifests: 0 });
   }, 30_000);
 
+  test("rejects a valid extra concept lead that is absent from the immutable selection plan", async () => {
+    const context = await createLeasedRun(1, "forged-concept-discovery-hint");
+    const forgedQueryPlan: QueryPlanV3 = {
+      ...context.queryPlan,
+      conceptDiscoveryHints: [{
+        clauseId: "unexecuted:concept:velvet-pulse",
+        axis: "genre",
+        originalText: "velvet pulse",
+        normalizedText: "velvet pulse",
+        status: "unresolved",
+        ontologyVersion: "playlist_music_ontology_v2",
+        unresolvedTermId: `unresolved:${sha256Hex("velvet pulse").slice(0, 16)}`,
+        provenance: "immutable_playlist_contract_concept_v1",
+        untrusted: true,
+        usage: "discovery_lead_only_not_membership_evidence_or_ranking",
+      }],
+    };
+    expect(isQueryPlanV3(forgedQueryPlan)).toBe(true);
+    const forgedHash = queryPlanV3Hash(forgedQueryPlan);
+    await pool.query("ALTER TABLE query_plan_revisions DISABLE TRIGGER USER");
+    try {
+      await pool.query(
+        "UPDATE query_plan_revisions SET plan_json=$2::jsonb,plan_hash=$3 WHERE id=$1",
+        [context.fence.queryPlanRevisionId, JSON.stringify(forgedQueryPlan), forgedHash],
+      );
+    } finally {
+      await pool.query("ALTER TABLE query_plan_revisions ENABLE TRIGGER USER");
+    }
+    const forgedExecutionPlan = selectionPlanFromQueryPlanV3(forgedQueryPlan, {
+      prompt: "Opaque execution context.",
+    });
+
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: forgedQueryPlan,
+      plan: forgedExecutionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "forged-concept-discovery-hint",
+        predicateIds: positivePredicateIds(forgedExecutionPlan),
+      }),
+      fence: context.fence,
+    })).rejects.toMatchObject({ code: "pipeline_v3_plan_stale" });
+  }, 30_000);
+
   test("locks a partial manifest without any Apple write until capability-bound consent", async () => {
     const context = await createLeasedRun(50, "french-jazz-partial");
     const result = retrievalResult({
@@ -1169,6 +2868,137 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     )).rows[0]).toEqual({ manifests: 0, publication_jobs: 0 });
   }, 30_000);
 
+  test("persists a full-selection integrity failure as quarantine with no publishable manifest", async () => {
+    const context = await createLeasedRun(
+      25,
+      "returned-integrity-failure",
+      undefined,
+      "Create 25 disco tracks",
+    );
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: retrievalResult({
+        runId: context.runId,
+        target: 25,
+        selectedCount: 25,
+        status: "failed_integrity",
+        prefix: "integrity",
+      }),
+      fence: context.fence,
+    });
+
+    expect(persisted).toEqual({
+      manifestId: null,
+      manifestRevisionId: null,
+      manifestHash: null,
+      publicationState: "not_applicable",
+    });
+    expect((await pool.query<{
+      status: string;
+      phase: string;
+      pipeline_outcome: string;
+      manifests: number;
+      publication_jobs: number;
+    }>(
+      `SELECT run.status,run.phase,outcome.status pipeline_outcome,
+              (SELECT count(*)::int FROM manifests WHERE run_id=run.id) manifests,
+              (SELECT count(*)::int FROM job_queue
+               WHERE run_id=run.id AND kind='publication') publication_jobs
+       FROM research_runs run
+       JOIN pipeline_outcomes outcome ON outcome.run_id=run.id
+       WHERE run.id=$1`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      status: "failed_integrity",
+      phase: "pipeline_v3_failed_integrity",
+      pipeline_outcome: "failed_integrity",
+      manifests: 0,
+      publication_jobs: 0,
+    });
+  }, 30_000);
+
+  test("persists and republishes a canonical catalog-only proof without manufacturing an external binding", async () => {
+    const context = await createLeasedRun(
+      1,
+      "catalog-structured-metadata-only",
+      undefined,
+      "Create 1 released disco track",
+      "empty",
+    );
+    expect(context.queryPlan.schemaVersion).toBe(5);
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "catalog-structured-metadata-only",
+      predicateIds: positivePredicateIds(context.selectionPlan),
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      evidenceBindingIds: [],
+      evidenceBindings: [],
+      evidenceStrength: 1,
+      independentProvenanceRoots: 1,
+      canonicalClauseAssessments: {
+        "catalog:storefront-playable": {
+          status: "pass" as const,
+          evidenceGrade: "authoritative_structured_metadata" as const,
+          evidenceIds: [],
+        },
+      },
+    }));
+    const result: RetrievalResultV3 = {
+      ...base,
+      selected,
+      qualifiedPool: selected,
+    };
+
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    expect(persisted).toMatchObject({
+      manifestId: expect.any(String),
+      manifestRevisionId: expect.any(String),
+      publicationState: "queued",
+    });
+    expect((await pool.query<{ bindings: number; evidence_ids: string[] }>(
+      `SELECT
+         (SELECT count(*)::int FROM track_scope_bindings WHERE run_id=$1) bindings,
+         qualification.evidence_record_ids_json evidence_ids
+       FROM playlist_qualification_records qualification
+       WHERE qualification.run_id=$1`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      bindings: 0,
+      evidence_ids: [],
+    });
+
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).resolves.toMatchObject({
+      enforcement: "required",
+      decision: null,
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).resolves.toBeUndefined();
+  }, 30_000);
+
   test("rejects URL-less synthetic evidence before manifest persistence", async () => {
     const context = await createLeasedRun(1, "synthetic-evidence");
     const unsafe = retrievalResult({
@@ -1229,6 +3059,724 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       manifestRevisionHash: persisted.manifestHash!,
       selectedCount: 1,
     })).rejects.toMatchObject({ code: "pipeline_v3_evidence_attestation_missing" });
+  }, 30_000);
+
+  test("persists hosted evidence content and rejects excerpt tampering before publication", async () => {
+    const context = await createLeasedRun(
+      1,
+      "hosted-snapshot-prepublication-tamper",
+      undefined,
+      "Create 1 disco track",
+      "or_membership",
+    );
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: withCanonicalHostedProof(retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "hosted-snapshot-prepublication-tamper",
+        predicateIds: ["genre:reggaeton"],
+      }), "genre:reggaeton"),
+      fence: context.fence,
+    });
+    const durable = (await pool.query<{
+      provenance_path_json: Array<Record<string, unknown>>;
+      quality_result_json: Record<string, unknown>;
+    }>(
+      `SELECT binding.provenance_path_json,
+              qualification.quality_result_json
+       FROM track_scope_bindings binding
+       JOIN playlist_qualification_records qualification
+         ON qualification.run_id=binding.run_id
+        AND qualification.candidate_id=binding.candidate_id
+        AND qualification.decision='qualified'
+        AND qualification.revoked_at IS NULL
+       WHERE binding.run_id=$1
+       ORDER BY qualification.qualified_at DESC,binding.id
+       LIMIT 1`,
+      [context.runId],
+    )).rows[0]!;
+    const pathSnapshot = durable.provenance_path_json.find(
+      ({ kind }) => kind === "hosted_web_evidence_snapshot",
+    )?.snapshot as Record<string, unknown> | undefined;
+    const qualitySnapshots = durable.quality_result_json
+      .hostedEvidenceSnapshots as Array<Record<string, unknown>>;
+    expect(pathSnapshot).toMatchObject({
+      schemaVersion: "genio-hosted-web-evidence-snapshot/v1",
+      excerpt: expect.stringContaining("satisfies"),
+      excerptHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      snapshotHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      storefront: context.selectionPlan.storefront,
+      revokedAt: null,
+      predicateIds: ["genre:reggaeton"],
+      obligationIds: ["genre:reggaeton"],
+    });
+    expect(qualitySnapshots).toContainEqual(pathSnapshot);
+
+    await pool.query(
+      `UPDATE track_scope_bindings binding
+       SET provenance_path_json=(
+         SELECT jsonb_agg(
+           CASE
+             WHEN entry.item->>'kind'='hosted_web_evidence_snapshot'
+             THEN jsonb_set(
+               entry.item,
+               '{snapshot,excerpt}',
+               to_jsonb('tampered hosted evidence'::text)
+             )
+             ELSE entry.item
+           END
+           ORDER BY entry.ordinal
+         )
+         FROM jsonb_array_elements(binding.provenance_path_json)
+           WITH ORDINALITY entry(item,ordinal)
+       )
+       WHERE binding.run_id=$1`,
+      [context.runId],
+    );
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_evidence_attestation_missing",
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: ["canonical_evidence_binding_invalid"],
+    });
+  }, 30_000);
+
+  test("rejects an unbounded unhashed field injected into a persisted evidence wrapper", async () => {
+    const context = await createLeasedRun(
+      1,
+      "hosted-wrapper-prepublication-tamper",
+      undefined,
+      "Create 1 disco track",
+      "or_membership",
+    );
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: withCanonicalHostedProof(retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: "hosted-wrapper-prepublication-tamper",
+        predicateIds: ["genre:reggaeton"],
+      }), "genre:reggaeton"),
+      fence: context.fence,
+    });
+
+    await pool.query(
+      `UPDATE track_scope_bindings binding
+       SET provenance_path_json=(
+         SELECT jsonb_agg(
+           CASE
+             WHEN entry.item->>'kind'='evidence_source_governance'
+             THEN entry.item || jsonb_build_object(
+               'unhashedProviderPayload',
+               repeat('x', 1024 * 1024)
+             )
+             ELSE entry.item
+           END
+           ORDER BY entry.ordinal
+         )
+         FROM jsonb_array_elements(binding.provenance_path_json)
+           WITH ORDINALITY entry(item,ordinal)
+       )
+       WHERE binding.run_id=$1`,
+      [context.runId],
+    );
+
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_evidence_attestation_missing",
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).rejects.toMatchObject({
+      code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      reasonCodes: ["canonical_evidence_binding_invalid"],
+    });
+  }, 30_000);
+
+  test("rejects expired or revoked persisted hosted evidence before publication", async () => {
+    for (const mutation of [
+      {
+        label: "expired",
+        path: "{governance,freshnessExpiresAt}",
+        value: "2020-01-01T00:00:00.000Z",
+      },
+      {
+        label: "revoked",
+        path: "{governance,revokedAt}",
+        value: "2026-07-25T00:00:00.000Z",
+      },
+    ]) {
+      const context = await createLeasedRun(
+        1,
+        `hosted-snapshot-${mutation.label}`,
+        undefined,
+        "Create 1 disco track",
+        "or_membership",
+      );
+      const persisted = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result: withCanonicalHostedProof(retrievalResult({
+          runId: context.runId,
+          target: 1,
+          selectedCount: 1,
+          status: "exact_ready",
+          prefix: `hosted-snapshot-${mutation.label}`,
+          predicateIds: ["genre:reggaeton"],
+        }), "genre:reggaeton"),
+        fence: context.fence,
+      });
+      await pool.query(
+        `UPDATE track_scope_bindings binding
+         SET provenance_path_json=(
+           SELECT jsonb_agg(
+             CASE
+               WHEN entry.item->>'kind'='evidence_source_governance'
+               THEN jsonb_set(
+                 entry.item,
+                 $2::text[],
+                 to_jsonb($3::text)
+               )
+               ELSE entry.item
+             END
+             ORDER BY entry.ordinal
+           )
+           FROM jsonb_array_elements(binding.provenance_path_json)
+             WITH ORDINALITY entry(item,ordinal)
+         )
+         WHERE binding.run_id=$1`,
+        [
+          context.runId,
+          mutation.path.replace(/[{}]/gu, "").split(","),
+          mutation.value,
+        ],
+      );
+      await expect(repository.revalidateCanonicalPublicationManifest({
+        runId: context.runId,
+        manifestId: persisted.manifestId!,
+        manifestRevisionId: persisted.manifestRevisionId!,
+        manifestRevisionHash: persisted.manifestHash!,
+        partialPublicationAuthorized: false,
+      })).rejects.toMatchObject({
+        code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+        reasonCodes: ["canonical_evidence_binding_invalid"],
+      });
+    }
+  }, 60_000);
+
+  test("rejects qualification projection tampering at restart and publication", async () => {
+    const mutations = [{
+      label: "stable-identity-hash",
+      sql: `UPDATE playlist_qualification_records
+            SET stable_identity_hash=repeat('f',64)
+            WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+    }, {
+      label: "qualification-hash",
+      sql: `UPDATE playlist_qualification_records
+            SET qualification_hash=repeat('e',64)
+            WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+    }, {
+      label: "assessment-references",
+      sql: `UPDATE playlist_qualification_records
+            SET predicate_results_json=jsonb_set(
+              predicate_results_json,
+              '{canonicalContract,assessments,genre:reggaeton,evidenceIds}',
+              '[]'::jsonb
+            )
+            WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+    }, {
+      label: "hosted-snapshots",
+      sql: `UPDATE playlist_qualification_records
+            SET quality_result_json=jsonb_set(
+              quality_result_json,
+              '{hostedEvidenceSnapshots}',
+              '[]'::jsonb
+            )
+            WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+    }, {
+      label: "quality-projection",
+      sql: `UPDATE playlist_qualification_records
+            SET quality_result_json=jsonb_set(
+              quality_result_json,
+              '{sourceRank}',
+              '999'::jsonb
+            )
+            WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+    }, {
+      label: "catalog-projection",
+      sql: `UPDATE playlist_qualification_records
+            SET catalog_result_json=jsonb_set(
+              catalog_result_json,
+              '{appleSongId}',
+              to_jsonb('tampered-apple-id'::text)
+            )
+            WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+    }] as const;
+
+    for (const mutation of mutations) {
+      const context = await createLeasedRun(
+        1,
+        `canonical-projection-tamper-${mutation.label}`,
+        undefined,
+        "Create 1 reggaeton track",
+        "or_membership",
+      );
+      const base = retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        status: "exact_ready",
+        prefix: `canonical-projection-tamper-${mutation.label}`,
+        predicateIds: ["genre:reggaeton"],
+      });
+      const selected = base.selected.map((track) => ({
+        ...track,
+        canonicalClauseAssessments: {
+          "genre:reggaeton": {
+            status: "pass" as const,
+            evidenceGrade: "track_specific_editorial_assertion" as const,
+            evidenceIds: [...track.evidenceBindingIds],
+          },
+          "genre:dembow": { status: "unknown" as const },
+        },
+      }));
+      const persisted = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result: {
+          ...base,
+          selected,
+          qualifiedPool: selected,
+        },
+        fence: context.fence,
+      });
+      await expect(repository.validatePipelineV3ContinuationQualifications({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        tracks: selected,
+      })).resolves.toBeUndefined();
+
+      await pool.query(mutation.sql, [context.runId]);
+
+      await expect(repository.validatePipelineV3ContinuationQualifications({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        tracks: selected,
+      })).rejects.toMatchObject({
+        code: "pipeline_v3_continuation_qualification_invalid",
+      });
+      await expect(repository.getPublicationGuard({
+        runId: context.runId,
+        manifestId: persisted.manifestId!,
+        manifestRevisionId: persisted.manifestRevisionId!,
+        manifestRevisionHash: persisted.manifestHash!,
+        selectedCount: 1,
+      })).rejects.toMatchObject({
+        code: "pipeline_v3_evidence_attestation_missing",
+      });
+      await expect(repository.revalidateCanonicalPublicationManifest({
+        runId: context.runId,
+        manifestId: persisted.manifestId!,
+        manifestRevisionId: persisted.manifestRevisionId!,
+        manifestRevisionHash: persisted.manifestHash!,
+        partialPublicationAuthorized: false,
+      })).rejects.toMatchObject({
+        code: CANONICAL_PUBLICATION_REVALIDATION_ERROR,
+      });
+    }
+  }, 180_000);
+
+  test("persists policy-bound central-quality observations and fences continuation omission", async () => {
+    const qualityPolicy:
+      NonNullable<SelectionPlanV3["playlistQualityPolicy"]> = {
+      policyVersion: "canonical_central_quality_v1",
+      clauseIds: ["quality:smooth", "quality:polished"],
+      criteria: ["smooth", "polished"],
+      minimumPassRatio: 0.8,
+      maximumUnknownRatio: 0.2,
+      zeroKnownFailures: true,
+      signalDimension: "central_quality",
+      passThreshold: 0.75,
+      failThreshold: 0.4,
+      signalSemantics: "ranking_only_not_factual_evidence",
+    };
+    const context = await createLeasedRun(
+      1,
+      "central-quality-continuation",
+      (selection) => ({
+        ...selection,
+        playlistQualityPolicy: qualityPolicy,
+      }),
+      "Create one smooth and polished reggaeton track",
+      "or_membership",
+    );
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "central-quality-continuation",
+      predicateIds: ["genre:reggaeton"],
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      evidenceBindings: track.evidenceBindings?.map((binding) => ({
+        ...binding,
+        kind: "hosted_web_track",
+      })),
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+        "genre:dembow": { status: "unknown" as const },
+      },
+      centralQualityCriterionObservations: qualityPolicy.criteria.map(
+        (criterion) => createCentralQualityCriterionObservationV3({
+          policy: qualityPolicy,
+          criterion,
+          verdict: "pass",
+          sourceKind: "independent_curator_review",
+          sourceId: "central-quality-continuation-review",
+          artist: track.artist,
+          title: track.title,
+          album: track.album,
+          catalogIdentity: {
+            appleSongId: track.appleSongId,
+            recordingFamilyKey: track.recordingFamilyKey,
+          },
+        }),
+      ),
+      rankingSignals: {
+        ...track.rankingSignals,
+        central_quality: 1,
+      },
+    }));
+    const replayedSelected = selected.map((track) => ({
+      ...track,
+      centralQualityCriterionObservations: qualityPolicy.criteria.map(
+        (criterion) => createCentralQualityCriterionObservationV3({
+          policy: qualityPolicy,
+          criterion,
+          verdict: "pass",
+          sourceKind: "independent_curator_review",
+          sourceId: "review-for-another-catalog-family",
+          artist: track.artist,
+          title: track.title,
+          album: track.album,
+          catalogIdentity: {
+            appleSongId: "apple-replayed-recording",
+            recordingFamilyKey: "family-replayed-recording",
+          },
+        }),
+      ),
+    }));
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...base,
+        selected: replayedSelected,
+        qualifiedPool: replayedSelected,
+      },
+      fence: context.fence,
+    })).rejects.toMatchObject({ code: "pipeline_v3_result_invalid" });
+    await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...base,
+        selected,
+        qualifiedPool: selected,
+      },
+      fence: context.fence,
+    });
+
+    const persisted = (await pool.query<{
+      central_quality_criterion_observations: unknown;
+    }>(
+      `SELECT quality_result_json->'centralQualityCriterionObservations'
+                central_quality_criterion_observations
+       FROM playlist_qualification_records
+       WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL`,
+      [context.runId],
+    )).rows[0]!;
+    expect(persisted.central_quality_criterion_observations)
+      .toEqual(
+        [...selected[0]!.centralQualityCriterionObservations!]
+          .sort((left, right) => left.observationId.localeCompare(right.observationId)),
+      );
+    await expect(repository.validatePipelineV3ContinuationQualifications({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      tracks: selected,
+    })).resolves.toBeUndefined();
+    await expect(repository.validatePipelineV3ContinuationQualifications({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      tracks: [{
+        ...selected[0]!,
+        centralQualityCriterionObservations: [],
+      }],
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_continuation_qualification_invalid",
+    });
+    await expect(repository.validatePipelineV3ContinuationQualifications({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      tracks: replayedSelected,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_continuation_qualification_invalid",
+    });
+  }, 30_000);
+
+  test("publication guard preserves canonical OR semantics instead of requiring every positive leaf", async () => {
+    const context = await createLeasedRun(
+      1,
+      "canonical-or-publication",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    expect(context.queryPlan.schemaVersion).toBe(5);
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "canonical-or-publication",
+      predicateIds: ["genre:reggaeton"],
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+        "genre:dembow": {
+          status: "unknown" as const,
+        },
+      },
+    }));
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...base,
+        selected,
+        qualifiedPool: selected,
+      },
+      fence: context.fence,
+    });
+
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).resolves.toMatchObject({
+      enforcement: "required",
+      decision: null,
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).resolves.toBeUndefined();
+  }, 30_000);
+
+  test("reconstructs one multi-obligation hosted source for every persisted clause row", async () => {
+    const context = await createLeasedRun(
+      1,
+      "canonical-multi-obligation-source",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    const predicateIds = ["genre:dembow", "genre:reggaeton"];
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "canonical-multi-obligation-source",
+      predicateIds,
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+        "genre:dembow": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+      },
+    }));
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...base,
+        selected,
+        qualifiedPool: selected,
+      },
+      fence: context.fence,
+    });
+    const bindings = (await pool.query<{
+      provenance_path_json: Array<Record<string, unknown>>;
+    }>(
+      `SELECT provenance_path_json
+       FROM track_scope_bindings
+       WHERE run_id=$1
+       ORDER BY scope_axis,scope_value,id`,
+      [context.runId],
+    )).rows.map(({ provenance_path_json }) => (
+      provenance_path_json.find(
+        ({ kind }) => kind === "pipeline_v3_binding",
+      )
+    ));
+    expect(bindings).toHaveLength(2);
+    expect(bindings.map((binding) => binding?.predicateIds).sort())
+      .toEqual([["genre:dembow"], ["genre:reggaeton"]]);
+    expect(bindings.every((binding) => (
+      stableStringify(binding?.sourcePredicateIds) ===
+        stableStringify(predicateIds)
+    ))).toBe(true);
+
+    await expect(repository.validatePipelineV3ContinuationQualifications({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      tracks: selected,
+    })).resolves.toBeUndefined();
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).resolves.toMatchObject({
+      enforcement: "required",
+      decision: null,
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).resolves.toBeUndefined();
+  }, 30_000);
+
+  test("publication guard preserves canonical NOT semantics with proof of the decisive negative leaf", async () => {
+    const context = await createLeasedRun(
+      1,
+      "canonical-not-publication",
+      undefined,
+      undefined,
+      "not_exclusion",
+    );
+    expect(context.queryPlan.schemaVersion).toBe(5);
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "canonical-not-publication",
+      predicateIds: ["genre:reggaeton", "artist:bad-bunny"],
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      artist: "Ivy Queen",
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+        "artist:bad-bunny": {
+          status: "fail" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...track.evidenceBindingIds],
+        },
+      },
+    }));
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...base,
+        selected,
+        qualifiedPool: selected,
+      },
+      fence: context.fence,
+    });
+
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      selectedCount: 1,
+    })).resolves.toMatchObject({
+      enforcement: "required",
+      decision: null,
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: persisted.manifestId!,
+      manifestRevisionId: persisted.manifestRevisionId!,
+      manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).resolves.toBeUndefined();
   }, 30_000);
 
   test("publication guard requires every positive membership predicate for every manifest track", async () => {

@@ -12,6 +12,7 @@ export type RunStatus =
   | "review"
   | "visitor_review"
   | "partial_ready"
+  | "needs_decision"
   | "continuing_research"
   | "manifest_ready"
   | "publishing"
@@ -26,6 +27,137 @@ export type RunStatus =
   | "failed_integrity"
   | "expired"
   | "deleted";
+
+/** Additive public projection; legacy status remains available during rollout. */
+export type NeverDeadEndRunState =
+  | "accepted"
+  | "needs_input"
+  | "probing"
+  | "executing"
+  | "blocked_dependency"
+  | "needs_decision"
+  | "ready"
+  | "publishing"
+  | "completed"
+  | "cancelled"
+  | "quarantined";
+
+export type RunNextAction =
+  | "none"
+  | "answer_initial_guidance"
+  | "answer_rescue_guidance"
+  | "wait_for_dependency"
+  | "resume_research"
+  | "authorize_apple"
+  | "decide_verified_partial"
+  | "review_contract"
+  | "contact_support";
+
+export interface RunResolutionView {
+  state: NeverDeadEndRunState;
+  nextAction: RunNextAction;
+  terminal: boolean;
+  contractRevisionId: string | null;
+  contractRevision: number | null;
+  contractHash: string | null;
+  blocker: {
+    kind: string;
+    nextRetryAt: string | null;
+    automaticRetryUntil: string | null;
+    retryCount: number;
+    /** Public-safe optimistic lock for a retained dependency decision. */
+    versionHash: string | null;
+  } | null;
+}
+
+/** Public-safe, hash-bound decision offered at an automated research boundary. */
+export interface RunDecisionActionView {
+  kind: "research_boundary";
+  decisionHash: string;
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  reason:
+    | "active_compute_limit"
+    | "central_quality_floor"
+    | "playlist_optimization_constraints"
+    | "dependency_retry_window_expired"
+    | "frontier_exhausted_under_policy"
+    | "runtime_feasibility_unknown";
+  targetTrackCount: number;
+  verifiedTrackCount: number;
+  remainingStrategyCount: number;
+  consumedActiveComputeMs: number;
+  activeComputeLimitMs: number;
+  activeComputeExtensionsUsed: number;
+  namedPredicates: Array<{
+    clauseId: string;
+    label: string;
+  }>;
+  interpretationSummary: {
+    mustHave: string[];
+    prefer: string[];
+    avoid: string[];
+    flow: string[];
+    count: number;
+  };
+  actions: {
+    anotherBoundedPass: boolean;
+    reviseNamedPredicate: boolean;
+    reduceCount: boolean;
+    publishVerifiedPartial: boolean;
+    pause: boolean;
+    resumeLater: boolean;
+    cancel: boolean;
+  };
+  reachedAt: string;
+}
+
+/** Public-safe, optimistic-lock-bound clarification offered during research. */
+export interface RunGuidanceQuestionActionView {
+  kind: "rescue_guidance";
+  questionSetHash: string;
+  baseContractRevisionId: string;
+  baseContractSemanticHash: string;
+  questions: PlaylistGuidanceQuestion[];
+  attemptsUsed: number;
+  maximumAttempts: 2;
+  showEditableInterpretationSummary: false;
+}
+
+/**
+ * Durable no-more-questions boundary. After two attempts on one axis (or the
+ * two-question rescue budget), the product shows the immutable interpretation
+ * and explicit decisions instead of generating another clarification.
+ */
+export interface RunInterpretationSummaryActionView {
+  kind: "interpretation_summary";
+  questionSetHash: string;
+  baseContractRevisionId: string;
+  baseContractSemanticHash: string;
+  questions: [];
+  attemptsUsed: number;
+  maximumAttempts: 2;
+  showEditableInterpretationSummary: true;
+  reason: "clarification_attempt_limit" | "rescue_question_limit";
+  axis: string | null;
+  interpretationSummary: {
+    mustHave: string[];
+    prefer: string[];
+    avoid: string[];
+    flow: string[];
+    count: number;
+  };
+  actions: {
+    changeEarlierAnswer: true;
+    reviewContract: true;
+    resumeLater: true;
+    cancel: true;
+  };
+}
+
+export type RunGuidanceActionView =
+  | RunGuidanceQuestionActionView
+  | RunInterpretationSummaryActionView;
 
 export type JobKind =
   | "brief"
@@ -190,6 +322,159 @@ export interface SelectionContentPolicy {
 }
 
 /**
+ * A playlist-level distribution rule compiled from the canonical contract.
+ * The rule is immutable execution data; workers may not infer or relax it
+ * from prompt prose.
+ */
+export interface CanonicalPlaylistQuotaRule {
+  id: string;
+  clauseId: string;
+  axis: SelectionConstraintAxis;
+  values: string[];
+  minimumCount: number | null;
+  maximumCount: number | null;
+  minimumRatio: number | null;
+  maximumRatio: number | null;
+  evidenceGrade: CanonicalPlaylistContractEvidenceGradeV1;
+  /** Full tri-state predicate for evidence-backed quota axes. */
+  predicate?: CanonicalPlaylistContractPredicateV1;
+}
+
+/**
+ * Immutable playlist-level suitability floor. The criteria retain the
+ * contract's own wording, while the executable signal remains a ranking-only
+ * judgment and is never presented as factual membership evidence.
+ */
+export interface CanonicalPlaylistQualityPolicy {
+  policyVersion: "canonical_central_quality_v1";
+  clauseIds: string[];
+  criteria: string[];
+  minimumPassRatio: number;
+  maximumUnknownRatio: number;
+  zeroKnownFailures: true;
+  signalDimension: "central_quality";
+  passThreshold: number;
+  failThreshold: number;
+  signalSemantics: "ranking_only_not_factual_evidence";
+}
+
+export type CanonicalPlaylistContractTriStateV1 = "pass" | "fail" | "unknown";
+export type CanonicalPlaylistContractEvidenceGradeV1 =
+  | "authoritative_structured_metadata"
+  | "trusted_scoped_container"
+  | "track_specific_editorial_assertion"
+  | "primary_source"
+  | "independent_secondary_source"
+  | "model_derived_lead";
+
+export type CanonicalPlaylistContractPredicateV1 =
+  | { op: "clause"; clauseId: string }
+  | {
+    op: "all" | "any";
+    children: CanonicalPlaylistContractPredicateV1[];
+  }
+  | {
+    op: "not";
+    child: CanonicalPlaylistContractPredicateV1;
+  }
+  | {
+    op: "except";
+    base: CanonicalPlaylistContractPredicateV1;
+    exceptions: CanonicalPlaylistContractPredicateV1[];
+  }
+  | {
+    op: "alternative";
+    choices: Array<{
+      id: string;
+      priority: number;
+      predicate: CanonicalPlaylistContractPredicateV1;
+    }>;
+  };
+
+/**
+ * The complete selection-grade projection of one immutable contract clause.
+ * It intentionally contains no prompt prose: runtime workers execute this
+ * policy and may use human text only as a discovery hint.
+ */
+export interface CanonicalPlaylistContractClauseV1 {
+  id: string;
+  kind:
+    | "membership"
+    | "factual_relationship"
+    | "suitability"
+    | "exclusion"
+    | "catalog_version";
+  axis: string;
+  operator: "require" | "exclude";
+  values: string[];
+  unknownPolicy: "defer" | "reject" | "allow";
+  evidence: {
+    required: boolean;
+    minimumGrade: CanonicalPlaylistContractEvidenceGradeV1 | null;
+    permittedGrades: CanonicalPlaylistContractEvidenceGradeV1[];
+  };
+}
+
+export interface CanonicalPlaylistContractClauseAssessmentV1 {
+  status: CanonicalPlaylistContractTriStateV1;
+  evidenceGrade?: CanonicalPlaylistContractEvidenceGradeV1 | null;
+  evidenceIds?: string[];
+}
+
+/**
+ * Hash-bound execution identity for request shapes whose discovery semantics
+ * cannot be reconstructed from a generic predicate bag. Clause ids bind every
+ * directive back to the immutable canonical contract; workers fail closed when
+ * either side drifts.
+ */
+export interface CanonicalPlaylistExecutionDirectivesV1 {
+  readonly fixedContainer: {
+    readonly kind: "album" | "playlist";
+    readonly name: string;
+    readonly artistName: string | null;
+    readonly membershipClauseId: string;
+  } | null;
+  readonly similarity: {
+    readonly seedArtists: readonly string[];
+    readonly excludedArtists: readonly string[];
+    readonly rankingClauseId: string;
+    readonly exactArtistExclusionClauseIds: readonly string[];
+  } | null;
+  /** Exact named-artist exclusions which do not imply a similarity seed. */
+  readonly exactArtistIdentityExclusions?: {
+    readonly bindings: readonly {
+      readonly clauseId: string;
+      readonly catalogArtistId: string;
+      readonly displayName: string;
+      readonly storefront: string;
+    }[];
+  } | null;
+}
+
+/**
+ * Hash-bound runtime authority for contract-3 selection and publication.
+ * The compatibility SelectionPlan remains useful for discovery routing, but
+ * it can neither add nor remove an eligibility rule once this policy exists.
+ */
+export interface CanonicalPlaylistContractExecutionPolicyV1 {
+  policyVersion: "canonical_contract_runtime_v1";
+  /** Versioned partial-order semantics used to enforce every evidence floor. */
+  evidenceStrengthPolicyVersion: "evidence_strength_partial_order_v1";
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  contractCompilerVersion: string;
+  evidencePolicyVersion: string;
+  catalogPolicyVersion: string;
+  requestedTrackCount: number;
+  storefront: string;
+  clauses: CanonicalPlaylistContractClauseV1[];
+  trackPredicate: CanonicalPlaylistContractPredicateV1;
+  /** Present only for canonical request shapes that require typed routing. */
+  executionDirectives?: CanonicalPlaylistExecutionDirectivesV1;
+  projectionHash: string;
+}
+
+/**
  * Structural scope of a playlist request. This is intentionally distinct from
  * research intent: a curated request can still name one fixed release, whose
  * album identity must not be discarded during catalog matching.
@@ -200,6 +485,12 @@ export type SelectionScopeKind =
   | "fixed_release_container"
   | "factual_frontier";
 
+export interface SelectionFixedContainerIdentity {
+  kind: "album" | "playlist";
+  name: string;
+  artistName: string | null;
+}
+
 export interface SelectionPlan {
   schemaVersion: 1;
   pipelineVersion: PipelineVersion;
@@ -207,6 +498,8 @@ export interface SelectionPlan {
   intents: ResearchIntent[];
   /** Optional only so plans persisted before this discriminator remain readable. */
   scopeKind?: SelectionScopeKind;
+  /** Optional only for persisted plans compiled before fixed identity fencing. */
+  fixedContainerIdentity?: SelectionFixedContainerIdentity;
   /** Compatibility routing hints only; constraints and intents are authoritative. */
   archetypes?: ResearchArchetype[];
   storefront: string;
@@ -360,6 +653,24 @@ export interface QueryPlanV3CorpusReview {
 }
 
 /**
+ * A non-resolved concept preserved from an immutable contract revision solely
+ * to widen lead discovery. It is untrusted by construction and can never
+ * establish membership, evidence eligibility, quality, or ranking.
+ */
+export interface PipelineV3ConceptDiscoveryHint {
+  clauseId: string;
+  axis: string;
+  originalText: string;
+  normalizedText: string;
+  status: "discovery_only" | "unresolved";
+  ontologyVersion: "playlist_music_ontology_v2";
+  unresolvedTermId: string | null;
+  provenance: "immutable_playlist_contract_concept_v1";
+  untrusted: true;
+  usage: "discovery_lead_only_not_membership_evidence_or_ranking";
+}
+
+/**
  * A bounded discovery lead captured from the provider-returned guidance
  * scout response. This is intentionally not evidence: retrieval must fetch
  * the URL again, and the exact URL must be returned by that retrieval
@@ -372,8 +683,22 @@ export interface PipelineV3SourceDiscoveryHint {
   attestation: "guidance_scout_provider_response";
 }
 
+/**
+ * Complete, prompt-free declaration of the executor semantics accepted by a
+ * canonical query plan. The hash of this value is persisted on the plan, job,
+ * attempt, and worker heartbeat so rolling deploys cannot mix semantics.
+ */
+export interface CanonicalExecutorCapabilityVectorV1 {
+  version: "canonical_executor_capability_vector_v1";
+  queryPlanSchemaVersion: number;
+  backendCapabilityVersion: string;
+  playlistOptimizerPolicyVersion: string;
+  backend: string;
+  backendDeclaration: Record<string, unknown>;
+}
+
 export interface QueryPlanV3 {
-  schemaVersion: 1 | 2 | 3;
+  schemaVersion: 1 | 2 | 3 | 4 | 5;
   pipelineVersion: "corpus_first_v3";
   policyVersion: "corpus_first_v3_policy_v1" | "corpus_first_v3_policy_v2";
   engine: QueryPlanV3Engine;
@@ -389,6 +714,11 @@ export interface QueryPlanV3 {
   hardConstraints: SelectionConstraint[];
   softPreferences: SelectionConstraint[];
   sourceDiscoveryHints: PipelineV3SourceDiscoveryHint[];
+  /**
+   * Optional for rolling compatibility with query-plan rows written before
+   * immutable contract concept leads were persisted.
+   */
+  conceptDiscoveryHints?: PipelineV3ConceptDiscoveryHint[];
   /**
    * Optional only for query plans written before V3 selection-policy
    * persistence shipped. New plans always carry these fields; workers use
@@ -418,6 +748,25 @@ export interface QueryPlanV3 {
   guidancePolicyVersion?: string;
   evidencePolicyVersion?: string;
   executionDeltaHash?: string;
+  /** Contract-3 fencing metadata required by query-plan schemas 4 and 5. */
+  playlistContractRevisionId?: string;
+  playlistContractSemanticHash?: string;
+  playlistContractCompilerVersion?: string;
+  /** Required execution projection for canonical playlist-level quotas. */
+  playlistQuotaRules?: CanonicalPlaylistQuotaRule[];
+  /** Required when the canonical contract declares central suitability. */
+  playlistQualityPolicy?: CanonicalPlaylistQualityPolicy;
+  /**
+   * Sole eligibility authority for canonical contract work. Membership,
+   * evidence, exclusion, catalog, and unknown-policy decisions are evaluated
+   * from this hash-bound value instead of prompt text or legacy plan fields.
+   */
+  canonicalContractPolicy?: CanonicalPlaylistContractExecutionPolicyV1;
+  /** Required on schema-5 fixed-container/similarity plans and hash-bound above. */
+  executionDirectives?: CanonicalPlaylistExecutionDirectivesV1;
+  /** Exact, schema-aware executor declaration required for canonical work. */
+  executorCapabilityHash?: string;
+  executorCapabilityVector?: CanonicalExecutorCapabilityVectorV1;
   continuation?: QueryPlanV3Continuation;
   corpusReview?: QueryPlanV3CorpusReview;
 }
@@ -477,6 +826,25 @@ export type PipelineExecutionPolicySnapshot =
     };
     maximumGlobalRounds: number;
     maximumRawCandidates: number;
+    /**
+     * Frozen pre-catalog/evidence candidate target derived from the
+     * storefront/route/size segment's lower-decile Apple-safe conversion
+     * rate. This is discovery sizing, never the number of Apple-safe tracks
+     * retrieval must retain.
+     */
+    candidateGoal?: number;
+    /**
+     * Frozen Apple-safe target plus publication-repair reserve. Absent on
+     * historical snapshots, where candidateGoal retained its legacy meaning.
+     */
+    qualifiedPoolGoal?: number;
+    p10QualifiedToAppleSafeConversionRate?: number;
+    conversionRateSampleCount?: number;
+    conversionRateSegment?: {
+      storefront: string;
+      route: "corpus_first_v3";
+      sizeTier: "1_50" | "51_100" | "101_300" | "301_1000";
+    };
     reservePercent: number;
     maximumCostUsd: number;
   };
@@ -756,7 +1124,7 @@ export interface PlaylistBrief {
   ambiguityAcceptance?: string[];
 }
 
-export type PlaylistBriefContractVersion = 1 | 2;
+export type PlaylistBriefContractVersion = 1 | 2 | 3;
 
 export type PlaylistGuidanceRequestClassification =
   | "precise"
@@ -802,6 +1170,12 @@ export interface PlaylistGuidanceOption {
   feasibility?: PlaylistGuidanceFeasibility;
   /** Deterministic server-owned execution change. Required by contract 2. */
   planDelta?: PlaylistGuidancePlanDelta;
+  /** Contract-3 server-owned operations, fenced to the question's base revision. */
+  contractPatch?: {
+    operations: readonly Record<string, unknown>[];
+    affectedClauseIds: readonly string[];
+    expectedFeasibilityDirection: "narrower" | "neutral" | "broader";
+  };
   /**
    * Machine-readable effect of selecting this answer. Optional only so runs
    * created before the grounded question scout remain readable.
@@ -852,6 +1226,25 @@ export interface PlaylistGuidanceQuestion {
   decisionKey?: string;
   /** Why selecting an answer will materially change the resulting tracks. */
   whyMaterial?: string;
+  /** Contract-3 immutable guidance metadata. */
+  schemaVersion?: 3;
+  policyVersion?: string;
+  questionHash?: string;
+  trigger?: "correctness" | "yield_risk" | "nuance";
+  axis?: string;
+  baseContractRevisionId?: string;
+  baseContractSemanticHash?: string;
+  allowedPatchOperations?: readonly string[];
+  affectedClauseIds?: readonly string[];
+  materialityScore?: number;
+  /** Present for a custom-answer confirmation successor question. */
+  interpretationSummary?: {
+    mustHave: readonly string[];
+    prefer: readonly string[];
+    avoid: readonly string[];
+    flow: readonly string[];
+    count: number;
+  };
   /** Provider-attested web grounding. Optional only for legacy saved runs. */
   grounding?: PlaylistGuidanceGrounding;
   /** Server-owned questions may use an explicit inference instead of a URL. */
@@ -896,6 +1289,13 @@ export interface PlaylistGuidanceQuestionSetContract {
   targetTrackCount: number;
   explicitConstraintHash: string;
   rejectedQuestionReasons: string[];
+  /** Contract-3 question sets are bound to one immutable contract revision. */
+  baseContractRevisionId?: string;
+  baseContractSemanticHash?: string;
+  guidanceRound?: "initial" | "rescue";
+  trigger?: "correctness" | "yield_risk" | "nuance";
+  axis?: string | null;
+  feasibilitySnapshotId?: string | null;
 }
 
 export interface PlaylistGuidanceScoutResult {
@@ -912,10 +1312,14 @@ export interface PlaylistGuidanceAnswer {
   questionId: string;
   /** Select one returned option, or omit this and provide customText. */
   optionId?: string;
+  /** Contract-3 multi-select answer. Mutually exclusive with optionId/customText. */
+  optionIds?: string[];
   /** A bounded custom answer, mutually exclusive with optionId. */
   customText?: string;
   /** Contract-2 optional questions may be skipped explicitly. */
   skipped?: boolean;
+  /** Required after a custom answer recompiles into a hard contract change. */
+  confirmed?: boolean;
 }
 
 export interface SourceRecordInput {
@@ -1114,6 +1518,8 @@ export interface CatalogSong {
   id: string;
   name: string;
   artistName: string;
+  /** Stable Apple artist identities when supplied by song relationships. */
+  artistIds?: string[];
   albumName: string;
   genreNames?: string[];
   releaseDate?: string;
@@ -1238,7 +1644,10 @@ export interface ResearchRunView {
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
   progress?: RunProgressView;
   partialAction?: PartialPublicationActionView | null;
+  decisionAction?: RunDecisionActionView | null;
+  guidanceAction?: RunGuidanceActionView | null;
   explore?: ExplorePreferenceView | null;
+  resolution?: RunResolutionView;
 }
 
 /** Public-safe, hash-bound action required before publishing an underfilled manifest. */
@@ -1289,7 +1698,10 @@ export interface PublicResearchRunView {
   candidateStageCounts?: Partial<Record<CandidateStage, number>>;
   progress?: RunProgressView;
   partialAction?: PartialPublicationActionView | null;
+  decisionAction?: RunDecisionActionView | null;
+  guidanceAction?: RunGuidanceActionView | null;
   explore?: ExplorePreferenceView | null;
+  resolution?: RunResolutionView;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string | null;
@@ -1299,7 +1711,10 @@ export interface PublicResearchRunView {
 export interface PublicBriefStatusView {
   requestId: string;
   prompt: string;
+  /** Active confirmed count. This may differ after an explicit revision. */
   requestedTrackCount: number | null;
+  /** Immutable count from the original submission, retained for outcome metrics. */
+  originalRequestedTrackCount?: number | null;
   status: string;
   briefContractVersion?: PlaylistBriefContractVersion;
   questionSetHash?: string | null;

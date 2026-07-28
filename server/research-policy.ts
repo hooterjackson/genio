@@ -4,7 +4,11 @@ import type {
   PlaylistGuidanceTelemetry,
   SelectionPlan,
 } from "../shared/types.ts";
-import { GUIDED_SCOUT_BUDGET_USD } from "../shared/product-policy.ts";
+import {
+  EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS,
+  executableCuratedResearchBudgetUsd,
+  GUIDED_SCOUT_BUDGET_USD,
+} from "../shared/product-policy.ts";
 import {
   fastRunServiceLevel,
   isSupportedFastRouteTiming,
@@ -16,6 +20,7 @@ import {
 } from "./pipeline-v2-policy.ts";
 import { APPLE_CATALOG_CACHE_TTL_MS } from "./apple-catalog-cache.ts";
 import { requiresFactualFrontier } from "./factual-frontier-policy.ts";
+import { resolveBriefInterpretationModel } from "./brief-model.ts";
 
 type Environment = Record<string, string | undefined>;
 
@@ -104,7 +109,7 @@ export const FAST_RUN_DEADLINE_MS = 120_000;
 // of every medium playlist into timeout placeholders.
 export const FAST_MATCHING_RESERVE_MS = 40_000;
 export const FAST_MATCHING_FINALIZATION_RESERVE_MS = 5_000;
-export const FAST_CURATED_TARGET_MAXIMUM = 300;
+export const FAST_CURATED_TARGET_MAXIMUM = EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS;
 export const FAST_EXTRACTION_CANDIDATE_LIMIT = 120;
 export const FAST_POST_MATCH_REFILL_MAX_TOOL_CALLS = 3;
 export const FAST_POST_MATCH_REFILL_MAX_SYNTHESIS_TOKENS = 3_000;
@@ -667,7 +672,7 @@ export function briefInterpretationModel(environment: Environment = process.env)
   // Brief interpretation is a short, schema-constrained classification task.
   // GPT-5.4 mini is faster and 25% cheaper than Luna at the published rates;
   // cited web synthesis stays on Luna.
-  return environment.OPENAI_BRIEF_MODEL?.trim() || "gpt-5.4-mini";
+  return resolveBriefInterpretationModel(environment);
 }
 
 /**
@@ -724,9 +729,7 @@ export function researchExecutionPolicy(
 }
 
 function curatedRunCostCeiling(target: number): number {
-  if (target <= 50) return 0.75;
-  if (target <= 100) return 1.5;
-  return 3;
+  return executableCuratedResearchBudgetUsd(target);
 }
 
 /** Resolve and freeze every mutable policy input used by a Pipeline V2 run. */
@@ -767,7 +770,7 @@ export function createPipelinePolicySnapshot(input: {
     qualified: 0,
     attempted: 0,
     observedQualified: 0,
-    maximumRawGoal: 1_000,
+    maximumRawGoal: Math.min(100_000, Math.max(1_000, requested * 20)),
   }).rawDiscoveryGoal;
   return {
     schemaVersion: 1,

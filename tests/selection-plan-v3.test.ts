@@ -3,6 +3,7 @@ import {
   criticalAmbiguityAnswersFromGuidanceV3,
   criticalGuidanceQuestionsV3,
   createRunSpecV3,
+  deterministicGuidanceQuestionsV3,
   resolveRunSpecV3,
   type RunSpecV3Input,
 } from "../server/selection-plan-v3.ts";
@@ -38,6 +39,27 @@ function typedPlan(constraints: readonly SelectionConstraint[]): NonNullable<Run
 }
 
 describe("Pipeline V3 typed planning", () => {
+  test("provides a deterministic subject-specific fallback for broad Brazilian disco guidance", () => {
+    const questions = deterministicGuidanceQuestionsV3(createRunSpecV3({
+      prompt: "brazilian disco playlist",
+      requestedTrackCount: 25,
+    }));
+    expect(questions).toHaveLength(1);
+    expect(questions[0]).toMatchObject({
+      id: "v3-fallback:brazilian_disco_focus",
+      decisionKey: "brazilian_disco_focus",
+      options: [
+        { id: "brazilian_disco_staples", recommended: true },
+        { id: "brazilian_disco_boogie", recommended: false },
+        { id: "brazilian_disco_balanced", recommended: false },
+      ],
+    });
+    expect(deterministicGuidanceQuestionsV3(createRunSpecV3({
+      prompt: "Kind of Blue album",
+      requestedTrackCount: 5,
+    }))).toEqual([]);
+  });
+
   test("collapses baile funk aliases and ranks ordinary TikTok breakout context", () => {
     const spec = createRunSpecV3({
       prompt: "69 baile funk TikTok breakouts",
@@ -432,16 +454,22 @@ describe("Pipeline V3 typed planning", () => {
     }));
   });
 
-  test("freezes the complete run contract and bounds requested count", () => {
+  test("freezes the complete run contract at the executable owner boundary", () => {
     const spec = createRunSpecV3({ prompt: "Berlin techno", requestedTrackCount: 50 });
     expect(Object.isFrozen(spec)).toBe(true);
     expect(Object.isFrozen(spec.membershipPredicates)).toBe(true);
-    expect(() => createRunSpecV3({ prompt: "Berlin techno", requestedTrackCount: 301 })).toThrow(/between 1 and 300/i);
+    expect(() => createRunSpecV3({
+      prompt: "Berlin techno",
+      requestedTrackCount: 1_001,
+    })).toThrow(/between 1 and 1000/i);
   });
 
-  test.each([150, 176, 300])("preserves the authoritative requested count %i", (requestedTrackCount) => {
+  test.each([150, 176, 300, 301, 1_000])(
+    "preserves the authoritative requested count %i",
+    (requestedTrackCount) => {
     const spec = createRunSpecV3({ prompt: "Detroit techno", requestedTrackCount });
     expect(spec.requestedTrackCount).toBe(requestedTrackCount);
     expect(resolveRunSpecV3(spec, []).requestedTrackCount).toBe(requestedTrackCount);
-  });
+    },
+  );
 });

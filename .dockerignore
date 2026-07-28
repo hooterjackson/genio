@@ -1,0 +1,15 @@
+.git
+.github
+.next
+.pnpm-store
+.vinext
+.wrangler
+.artifacts
+coverage
+node_modules
+outputs
+playwright-report
+test-results
+work
+*.pem
+.env*

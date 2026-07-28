@@ -1,14 +1,28 @@
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import {
+  inspectReleaseWorktree,
+  readReleaseGitStatus,
+} from "./check-release-git-state.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const packageMetadata = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
 const manifest = JSON.parse(await readFile(resolve(root, "shared/releases.json"), "utf8"));
-const requireTag = process.argv.includes("--require-tag");
+const args = process.argv.slice(2).filter((argument) => argument !== "--");
+const requireTag = args.includes("--require-tag");
+const exactTagIndex = args.indexOf("--require-exact-tag");
+const exactTag = exactTagIndex >= 0 ? args[exactTagIndex + 1]?.trim() : null;
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 const isoDate = /^\d{4}-\d{2}-\d{2}$/u;
 const errors = [];
+
+if (exactTagIndex >= 0 && (!exactTag || exactTag.startsWith("--"))) {
+  errors.push("--require-exact-tag requires vX.Y.Z-rc.N");
+}
+if (requireTag && exactTagIndex >= 0) {
+  errors.push("--require-tag and --require-exact-tag are mutually exclusive");
+}
 
 function semverParts(value) {
   const match = semver.exec(value);
@@ -87,15 +101,46 @@ if (currentVersion !== packageMetadata.version) {
   errors.push(`package.json version ${packageMetadata.version} must match the current release ${currentVersion ?? "(missing)"}`);
 }
 
-if (requireTag && typeof packageMetadata.version === "string") {
+const requiredTag = requireTag
+  ? `v${packageMetadata.version}`
+  : exactTag;
+if (exactTag && !new RegExp(
+  `^v${String(packageMetadata.version).replaceAll(".", "\\.")}-rc\\.[1-9]\\d*$`,
+  "u",
+).test(exactTag)) {
+  errors.push(`Release-candidate tag must match v${packageMetadata.version}-rc.N`);
+}
+
+if (requiredTag && typeof packageMetadata.version === "string") {
+  try {
+    const worktree = inspectReleaseWorktree({
+      readStatus: () => readReleaseGitStatus(root),
+    });
+    if (!worktree.clean) {
+      errors.push(
+        `Release-tag validation requires a clean worktree; found ${worktree.changedPathCount} changed path(s)`,
+      );
+    }
+  } catch {
+    errors.push("Could not verify that the release worktree is clean");
+  }
   try {
     const tags = execFileSync("git", ["tag", "--points-at", "HEAD"], { cwd: root, encoding: "utf8" })
       .split("\n").map((tag) => tag.trim()).filter(Boolean);
-    if (!tags.includes(`v${packageMetadata.version}`)) {
-      errors.push(`Production release HEAD must be tagged v${packageMetadata.version}`);
+    if (!tags.includes(requiredTag)) {
+      errors.push(`Release HEAD must be tagged ${requiredTag}`);
+    } else {
+      const objectType = execFileSync(
+        "git",
+        ["cat-file", "-t", `refs/tags/${requiredTag}`],
+        { cwd: root, encoding: "utf8" },
+      ).trim();
+      if (objectType !== "tag") {
+        errors.push(`Release tag ${requiredTag} must be annotated`);
+      }
     }
   } catch {
-    errors.push("Could not verify the production release Git tag");
+    errors.push("Could not verify the release Git tag");
   }
 }
 
@@ -104,4 +149,4 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-console.log(`Release v${packageMetadata.version} is valid${requireTag ? " and tagged" : ""}.`);
+console.log(`Release v${packageMetadata.version} is valid${requiredTag ? ` and tagged ${requiredTag}` : ""}.`);

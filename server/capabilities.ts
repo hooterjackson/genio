@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { capabilityHash, HttpError, randomToken } from "./security.ts";
+import {
+  capabilityHash,
+  capabilityVerificationHashes,
+  HttpError,
+  randomToken,
+} from "./security.ts";
 
 export const CAPABILITY_COOKIE = process.env.NODE_ENV === "production" ? "__Host-needle-session" : "needle-session";
 
@@ -24,13 +29,13 @@ export interface CapabilityRepository {
     expiresAt?: Date;
     reuseExisting?: boolean;
   }): Promise<CapabilitySessionView | null>;
-  exchangeCapabilityToken(tokenHash: string, session: {
+  exchangeCapabilityToken(tokenHashes: readonly string[], session: {
     id: string;
     tokenHash?: string;
     expiresAt?: Date;
     reuseExisting?: boolean;
   }): Promise<CapabilitySessionView | null>;
-  getCapabilitySession(tokenHash: string): Promise<CapabilitySessionView | null>;
+  getCapabilitySession(tokenHashes: readonly string[]): Promise<CapabilitySessionView | null>;
   getCapabilitySessionAccess(sessionId: string, accessId: string): Promise<{ runId: string; accessId: string } | null>;
   getCapabilitySessionBrief(sessionId: string, briefRequestId: string): Promise<boolean>;
   revokeCapabilitySession(sessionId: string): Promise<void>;
@@ -107,7 +112,7 @@ export class CapabilityService {
       ? existingSession.expiresAt
       : new Date(Date.now() + Number(process.env.CAPABILITY_SESSION_TTL_DAYS ?? 90) * 86_400_000);
     const session = await this.repository.exchangeCapabilityToken(
-      capabilityHash(token),
+      capabilityVerificationHashes(token),
       existingSession
         ? { id: existingSession.id, reuseExisting: true }
         : { id: randomUUID(), tokenHash: capabilityHash(sessionToken!), expiresAt },
@@ -128,7 +133,7 @@ export class CapabilityService {
   async authenticateOptional(request: FastifyRequest): Promise<CapabilitySessionView | null> {
     const token = getCookie(request, CAPABILITY_COOKIE);
     if (!token) return null;
-    return this.repository.getCapabilitySession(capabilityHash(token));
+    return this.repository.getCapabilitySession(capabilityVerificationHashes(token));
   }
 
   async authenticate(request: FastifyRequest): Promise<CapabilitySessionView> {
@@ -158,7 +163,9 @@ export class CapabilityService {
   async revoke(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const token = getCookie(request, CAPABILITY_COOKIE);
     if (token) {
-      const session = await this.repository.getCapabilitySession(capabilityHash(token));
+      const session = await this.repository.getCapabilitySession(
+        capabilityVerificationHashes(token),
+      );
       if (session) await this.repository.revokeCapabilitySession(session.id);
     }
     reply.header("Set-Cookie", `${CAPABILITY_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${process.env.NODE_ENV === "production" ? "; Secure" : ""}`);

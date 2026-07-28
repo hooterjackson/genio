@@ -17,6 +17,7 @@ export function gatewayBodyLimit(method: string, pathname: string): number {
 
 const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "GET", path: /^\/health\/live$/ },
+  { method: "GET", path: /^\/health\/system$/ },
   { method: "POST", path: /^\/api\/v1\/feedback$/ },
   { method: "POST", path: /^\/api\/v1\/brief$/ },
   { method: "GET", path: /^\/api\/v1\/brief\/[A-Za-z0-9_-]+$/ },
@@ -43,6 +44,7 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/publish$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/result$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/evidence$/ },
+  { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/manifest-canary-evidence$/ },
   { method: "GET", path: /^\/api\/v1\/owner\/(?:status|budgets|runs|apple\/developer-token|apple\/authorization|publications\/orphans)$/, owner: true },
   { method: "GET", path: /^\/api\/v1\/owner\/feedback$/, owner: true },
   { method: "GET", path: /^\/api\/v1\/owner\/feedback\/[A-Za-z0-9_-]+\/image$/, owner: true },
