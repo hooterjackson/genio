@@ -17,7 +17,9 @@ import {
   FEEDBACK_GATEWAY_BODY_LIMIT,
   forwardedCapabilityCookie,
   gatewayBodyLimit,
+  hostedCapabilitySetCookieToLocalQa,
   isCrossSiteMutation,
+  localQaCapabilityCookieToHosted,
   matchGatewayRoute,
 } from "../worker/gateway-policy.ts";
 import { isStableApplePlaylistShareUrl, manifestOrderSql } from "../server/repository.ts";
@@ -249,6 +251,22 @@ test("Sites forwards only gênio's capability cookie across the Railway boundary
     "__Host-needle-session=one; __Host-needle-session=two",
     true,
   )).toThrow(/Duplicate gênio capability cookies/);
+});
+
+test("local hosted QA bridges only gênio's capability cookie across the HTTP boundary", () => {
+  expect(localQaCapabilityCookieToHosted("needle-session=local-token"))
+    .toBe("__Host-needle-session=local-token");
+  expect(localQaCapabilityCookieToHosted(null)).toBeNull();
+  expect(() => localQaCapabilityCookieToHosted("__Host-needle-session=wrong-side"))
+    .toThrow(/unexpected name/u);
+
+  expect(hostedCapabilitySetCookieToLocalQa(
+    "__Host-needle-session=hosted-token; Path=/; HttpOnly; SameSite=Strict; Max-Age=600; Secure",
+  )).toBe(
+    "needle-session=hosted-token; Path=/; HttpOnly; SameSite=Strict; Max-Age=600",
+  );
+  expect(hostedCapabilitySetCookieToLocalQa("unrelated=value; Secure"))
+    .toBe("unrelated=value; Secure");
 });
 
 test("Railway gateway rejects stale, body-tampered, signature-tampered, and replayed requests", async () => {

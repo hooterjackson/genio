@@ -68,6 +68,16 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
         ...args: Parameters<NonNullable<ResearchRepository["getActivePlaylistContractRevision"]>>
       ) => source.getActivePlaylistContractRevision!(...args),
     } : {}),
+    ...(source.savePlaylistContractRevision ? {
+      savePlaylistContractRevision: (
+        ...args: Parameters<NonNullable<ResearchRepository["savePlaylistContractRevision"]>>
+      ) => source.savePlaylistContractRevision!(...args),
+    } : {}),
+    ...(source.savePlaylistFeasibilitySnapshot ? {
+      savePlaylistFeasibilitySnapshot: (
+        ...args: Parameters<NonNullable<ResearchRepository["savePlaylistFeasibilitySnapshot"]>>
+      ) => source.savePlaylistFeasibilitySnapshot!(...args),
+    } : {}),
     ...(source.openPlaylistRunBlocker ? {
       openPlaylistRunBlocker: (
         ...args: Parameters<NonNullable<ResearchRepository["openPlaylistRunBlocker"]>>

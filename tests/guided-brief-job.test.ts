@@ -638,6 +638,43 @@ test("a question-scout provider failure releases only the scout reservation and 
   );
 });
 
+test("a retryable post-provider brief failure stays non-terminal for the durable retry", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-brief-durable-retry");
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    id: "response-brief-durable-retry",
+    model: "gpt-5.4-mini",
+    usage: { input_tokens: 500, output_tokens: 200 },
+    output_text: JSON.stringify(draftBrief),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-durable-retry",
+      prompt: "A resilient reggaeton playlist",
+      requestedTrackCount: 50,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 3,
+    })),
+    reserveProviderCost: vi.fn(async () => ({ reservationId: "reservation-brief-durable-retry" })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await expect(processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-durable-retry",
+  })).rejects.toThrow(/Contract-3 repository capabilities are unavailable/u);
+  expect(saveBriefResult).not.toHaveBeenCalledWith(
+    "brief-durable-retry",
+    expect.objectContaining({ status: "failed" }),
+  );
+});
+
 test("an exhausted scout-only budget skips follow-up questions without failing the brief", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-scout-budget");
   const fetchMock = vi.fn(async () => new Response(JSON.stringify({
