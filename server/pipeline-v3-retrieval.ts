@@ -3853,6 +3853,44 @@ function nextCentralQualityRecoveryWave(
   return expansion ? [expansion] : [];
 }
 
+/**
+ * A known-failure shortfall cannot be repaired by re-judging the surviving
+ * identities. Continue the most productive still-open identity frontier
+ * first, preferring deterministic trusted containers that have already
+ * yielded qualified recording families. Only fall back to artist expansion
+ * when no proven catalog frontier remains.
+ */
+function nextCentralQualityIdentityRecoveryWave(
+  states: readonly MutableStrategyStateV3[],
+): MutableStrategyStateV3[] {
+  const available = availableStrategies(states);
+  const byObservedYield = (
+    left: MutableStrategyStateV3,
+    right: MutableStrategyStateV3,
+  ) => (
+    right.newQualifiedFamilies / Math.max(1, right.rounds)
+      - left.newQualifiedFamilies / Math.max(1, left.rounds)
+    || left.definition.tier - right.definition.tier
+    || left.rounds - right.rounds
+    || left.ordinal - right.ordinal
+  );
+  const trusted = available
+    .filter(({ definition, newQualifiedFamilies }) => (
+      definition.kind === "trusted_containers"
+      && newQualifiedFamilies > 0
+    ))
+    .sort(byObservedYield)[0];
+  if (trusted) return [trusted];
+  const productive = available
+    .filter(({ definition, newQualifiedFamilies }) => (
+      definition.kind !== "qualified_expansion"
+      && newQualifiedFamilies > 0
+    ))
+    .sort(byObservedYield)[0];
+  if (productive) return [productive];
+  return nextCentralQualityRecoveryWave(states);
+}
+
 function mutableDependencyState(
   dependencies: Map<RetrievalUpstreamDependencyIdV3, MutableDependencyStateV3>,
   dependencyId: RetrievalUpstreamDependencyIdV3,
@@ -4590,14 +4628,31 @@ export async function executeRetrievalV3(input: {
             policy: activePlan.playlistQualityPolicy,
           }).eligible.length
         : requested;
-      const centralQualityRecoveryRequired =
+      const centralQualityNonFailureCapacity = activePlan.playlistQualityPolicy
+        ? currentRankedRepresentations.filter((track) => (
+            centralQualityVerdictV3(
+              track,
+              activePlan.playlistQualityPolicy!,
+            ) !== "fail"
+          )).length
+        : requested;
+      const centralQualityIdentityRecoveryRequired =
         activePlan.playlistQualityPolicy !== null
         && activePlan.playlistQualityPolicy !== undefined
         && currentRankedRepresentations.length >= requested
+        && centralQualityNonFailureCapacity < requested;
+      const centralQualityEvidenceRecoveryRequired =
+        activePlan.playlistQualityPolicy !== null
+        && activePlan.playlistQualityPolicy !== undefined
+        && currentRankedRepresentations.length >= requested
+        && centralQualityNonFailureCapacity >= requested
         && centralQualityCapacity < requested;
-      const centralQualityRecoveryWave = centralQualityRecoveryRequired
-        ? nextCentralQualityRecoveryWave(states)
-        : [];
+      const centralQualityRecoveryWave =
+        centralQualityIdentityRecoveryRequired
+          ? nextCentralQualityIdentityRecoveryWave(states)
+          : centralQualityEvidenceRecoveryRequired
+            ? nextCentralQualityRecoveryWave(states)
+            : [];
       const wave = centralQualityRecoveryWave.length > 0
         ? centralQualityRecoveryWave
         : nextStrategyWave(states, maximumWaveSize);

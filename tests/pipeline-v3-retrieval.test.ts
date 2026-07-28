@@ -2413,6 +2413,84 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     }));
   });
 
+  test("continues a productive trusted container when known quality failures create an identity deficit", async () => {
+    const base = canonicalDiscoPlan(5);
+    const qualityPlan: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const initial = Array.from({ length: 5 }, (_, index) => candidate(index));
+    const replacements = Array.from(
+      { length: 3 },
+      (_, index) => candidate(index + initial.length),
+    );
+    const strategyKinds: string[] = [];
+    let trustedRound = 0;
+
+    await executeRetrievalV3({
+      runId: "quality-known-failure-continues-trusted-container",
+      plan: qualityPlan,
+      policy: {
+        maximumRawCandidates: 20,
+        maximumGlobalRounds: 20,
+        maximumConcurrentDiscovery: 1,
+        qualifiedPoolGoal: 5,
+      },
+      adapters: {
+        discover: async (request) => {
+          strategyKinds.push(request.strategy.kind);
+          if (request.strategy.kind === "trusted_containers") {
+            trustedRound += 1;
+            return trustedRound === 1
+              ? {
+                  candidates: initial,
+                  nextCursor: "trusted-page-2",
+                  exhausted: false,
+                }
+              : {
+                  candidates: replacements,
+                  nextCursor: null,
+                  exhausted: true,
+                };
+          }
+          return { candidates: [], nextCursor: null, exhausted: true };
+        },
+        qualify: async ({ candidates: values }) => values.map((value) => (
+          canonicalDiscoQualification(value, {
+            centralQualityCriterionObservations: centralQualityObservations(
+              value,
+              qualityPlan.playlistQualityPolicy!,
+              initial.slice(2).some(({ id }) => id === value.id)
+                ? "fail"
+                : "pass",
+            ),
+          })
+        )),
+      },
+    });
+
+    const trustedRounds = strategyKinds
+      .map((kind, index) => ({ kind, index }))
+      .filter(({ kind }) => kind === "trusted_containers");
+    expect(trustedRounds).toHaveLength(2);
+    const firstQualifiedExpansion = strategyKinds.indexOf(
+      "qualified_expansion",
+    );
+    expect(firstQualifiedExpansion === -1
+      || trustedRounds[1]!.index < firstQualifiedExpansion).toBe(true);
+  });
+
   test("does not call a cache-sized qualified pool exact when artist diversity is infeasible", async () => {
     const diversityPlan = canonicalDiscoPlan(3, {
       diversityGoals: {
