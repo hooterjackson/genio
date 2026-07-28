@@ -15,13 +15,13 @@ import { describe, expect, test } from "vitest";
 import {
   authorizeStablePredecessorBootstrap,
   captureStablePredecessorRecoveredRailwayObservation,
-  createStablePredecessorBootstrapImageAttestationV1,
+  compressStablePredecessorBootstrapIndependentEvidenceV1,
+  createStablePredecessorBootstrapImageAttestationV2,
   createStablePredecessorBootstrapEvidence,
-  createStablePredecessorOriginalRailwayProvenanceV1,
   parseStablePredecessorBootstrapCliArgs,
   runStablePredecessorBootstrapCli,
-  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
-  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
+  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
+  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
   stablePredecessorBootstrapKeyFingerprint,
   stablePredecessorBootstrapFixtureRegistryHash,
   stablePredecessorRailwayObservationBytes,
@@ -65,7 +65,6 @@ function fixture(input?: { generatedAt?: string; authorizedAt?: string }) {
   const authorizationGeneratedAt = input?.authorizedAt ?? authorizedAt;
   const release = generateKeyPairSync("ed25519");
   const authorizer = generateKeyPairSync("ed25519");
-  const originalRailway = generateKeyPairSync("ed25519");
   const releaseKeySha256 =
     stablePredecessorBootstrapKeyFingerprint(release.publicKey);
   const authorizerKeySha256 =
@@ -78,7 +77,7 @@ function fixture(input?: { generatedAt?: string; authorizedAt?: string }) {
     subjectDigest: imageDigest,
   };
   const imageAttestation =
-    createStablePredecessorBootstrapImageAttestationV1({
+    createStablePredecessorBootstrapImageAttestationV2({
     repository,
     defaultBranch,
     controllerSourceRevision: controllerRevision,
@@ -98,19 +97,6 @@ function fixture(input?: { generatedAt?: string; authorizedAt?: string }) {
   });
   const finalBrowserSources = independent.bundle.sources.at(-1)!.artifact
     .sources;
-  const originalRailwayKeyId = "original-railway-provenance-v1";
-  const originalRailwayKeySha256 =
-    stablePredecessorBootstrapKeyFingerprint(originalRailway.publicKey);
-  const originalRailwayProvenance =
-    createStablePredecessorOriginalRailwayProvenanceV1({
-      repository,
-      originalImageReference:
-        `registry.railway.app/genio-production@sha256:${"c".repeat(64)}`,
-      recoveredRailwayObservation,
-      signingKey: originalRailway.privateKey,
-      keyId: originalRailwayKeyId,
-      generatedAt: evidenceGeneratedAt,
-    });
   const evidence = createStablePredecessorBootstrapEvidence({
     repository,
     defaultBranch,
@@ -161,11 +147,6 @@ function fixture(input?: { generatedAt?: string; authorizedAt?: string }) {
       finalBrowserSources.sitesControlPlaneVerificationKey,
     approvedSitesControlPlaneTrustPolicy:
       finalBrowserSources.sitesControlPlaneTrustPolicy,
-    originalRailwayProvenance,
-    originalRailwayProvenanceVerificationKey: originalRailway.publicKey,
-    approvedOriginalRailwayProvenanceKeyId: originalRailwayKeyId,
-    approvedOriginalRailwayProvenanceKeySha256:
-      originalRailwayKeySha256,
     authorizerSigningKey: authorizer.privateKey,
     approvedAuthorizerKeyId: "bootstrap-authorizer-v1",
     approvedAuthorizerKeySha256: authorizerKeySha256,
@@ -198,13 +179,9 @@ function fixture(input?: { generatedAt?: string; authorizedAt?: string }) {
   return {
     release,
     authorizer,
-    originalRailway,
     releaseKeySha256,
     authorizerKeySha256,
     independent,
-    originalRailwayKeyId,
-    originalRailwayKeySha256,
-    originalRailwayProvenance,
     sitesControlPlaneVerificationKey:
       finalBrowserSources.sitesControlPlaneVerificationKey,
     sitesControlPlaneTrustPolicy:
@@ -246,17 +223,22 @@ function protectedExternalAuthorities(value: ReturnType<typeof fixture>) {
       value.sitesControlPlaneVerificationKey,
     approvedSitesControlPlaneTrustPolicy:
       value.sitesControlPlaneTrustPolicy,
-    originalRailwayProvenance: value.originalRailwayProvenance,
-    originalRailwayProvenanceVerificationKey:
-      value.originalRailway.publicKey,
-    approvedOriginalRailwayProvenanceKeyId:
-      value.originalRailwayKeyId,
-    approvedOriginalRailwayProvenanceKeySha256:
-      value.originalRailwayKeySha256,
   };
 }
 
 describe("one-time stable predecessor bootstrap", () => {
+  test("compresses reordered evidence into one canonical commitment", () => {
+    const left = compressStablePredecessorBootstrapIndependentEvidenceV1({
+      z: { b: 2, a: 1 },
+      a: true,
+    });
+    const right = compressStablePredecessorBootstrapIndependentEvidenceV1({
+      a: true,
+      z: { a: 1, b: 2 },
+    });
+    expect(left).toEqual(right);
+  });
+
   test("pins all three recovered Railway lanes as observations, never attestations", () => {
     const observation = stablePredecessorRecoveredRailwayObservationV1();
     expect(validateStablePredecessorRecoveredRailwayObservationV1(
@@ -339,10 +321,10 @@ describe("one-time stable predecessor bootstrap", () => {
       now: "2026-07-26T11:00:00.000Z",
     });
     expect(value.evidence.schemaVersion).toBe(
-      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
+      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
     );
     expect(value.authorization.schemaVersion).toBe(
-      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
+      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
     );
     expect(verified.bootstrap).toMatchObject({
       tagObject: STABLE_PREDECESSOR_BOOTSTRAP_TAG_OBJECT,
@@ -409,6 +391,22 @@ describe("one-time stable predecessor bootstrap", () => {
     expect(() => verifyHistoricalStablePredecessor({
       ...input,
       authorization: mixedAuthorization,
+    })).toThrow(/schemas are mixed or unsupported/u);
+
+    const retiredEvidence = structuredClone(value.evidence);
+    retiredEvidence.schemaVersion =
+      "genio-signed-stable-predecessor-bootstrap-evidence/v1";
+    retiredEvidence.payload.schemaVersion =
+      "genio-stable-predecessor-bootstrap-evidence/v1";
+    const retiredAuthorization = structuredClone(value.authorization);
+    retiredAuthorization.schemaVersion =
+      "genio-signed-stable-predecessor-bootstrap-authorization/v1";
+    retiredAuthorization.payload.schemaVersion =
+      "genio-stable-predecessor-bootstrap-authorization/v1";
+    expect(() => verifyHistoricalStablePredecessor({
+      ...input,
+      evidence: retiredEvidence,
+      authorization: retiredAuthorization,
     })).toThrow(/schemas are mixed or unsupported/u);
   });
 
@@ -576,31 +574,23 @@ describe("one-time stable predecessor bootstrap", () => {
     })).toThrow(/outside the publication window/u);
   });
 
-  test("requires protected original Railway provenance and rejects substituted Sites trust", () => {
+  test("authorizes only the reduced provenance claim and rejects substituted Sites trust", () => {
     const value = fixture();
-    const tamperedRailway = structuredClone(
-      value.originalRailwayProvenance,
+    expect(value.authorization.payload).toMatchObject({
+      railwayObservationKind:
+        "authenticated_platform_observation_not_supply_chain_attestation",
+      wrapperReconstructionMode:
+        "controller_recipe_wrapper_not_historical_railway_artifact",
+      wrapperImageDigest: imageDigest,
+      historicalArtifactEquivalence: "not_claimed",
+      historicalArtifactIdentity: null,
+    });
+    expect(value.authorization.payload).not.toHaveProperty(
+      "originalRailwayImageDigest",
     );
-    tamperedRailway.payload.originalImageDigest = `sha256:${"0".repeat(64)}`;
-    expect(() => authorizeStablePredecessorBootstrap({
-      bootstrapEvidence: value.evidence,
-      protectedBaselineMetadata: value.metadata,
-      imageAttestation: value.imageAttestation,
-      sourceBytes: value.sourceBytes,
-      releaseVerificationKey: value.release.publicKey,
-      approvedReleaseKeyId: "bootstrap-evidence-v1",
-      approvedReleaseKeySha256: value.releaseKeySha256,
-      approvedProducerKeyId: value.independent.producerKeyId,
-      approvedProducerKeySha256: value.independent.producerKeySha256,
-      ...protectedExternalAuthorities(value),
-      originalRailwayProvenance: tamperedRailway,
-      authorizerSigningKey: value.authorizer.privateKey,
-      approvedAuthorizerKeyId: "bootstrap-authorizer-v1",
-      approvedAuthorizerKeySha256: value.authorizerKeySha256,
-      expectedRepository: repository,
-      expectedDefaultBranch: defaultBranch,
-      generatedAt: authorizedAt,
-    })).toThrow(/original Railway provenance|signature/u);
+    expect(value.authorization.payload).not.toHaveProperty(
+      "originalRailwayProvenanceArtifactHash",
+    );
 
     const substitutedSites = fixture();
     expect(() => authorizeStablePredecessorBootstrap({
@@ -781,10 +771,7 @@ describe("one-time stable predecessor bootstrap", () => {
       "--bootstrap-authorization", "authorization.json",
       "--release-verification-key", "release.pem",
       "--stable-authorization-verification-key", "authorizer.pem",
-      "--recovered-production-provenance", "railway.json",
-      "--original-railway-provenance", "original-railway.json",
-      "--original-railway-provenance-verification-key",
-      "original-railway.pem",
+      "--recovered-railway-observation", "railway.json",
       "--sites-control-plane-verification-key", "sites-key.json",
       "--sites-control-plane-trust-policy", "sites-policy.json",
       "--github-attestation-verification", "github.json",
@@ -807,9 +794,6 @@ describe("one-time stable predecessor bootstrap", () => {
       "--assets-directory", ".",
       "--release-verification-key", "release.pem",
       "--stable-authorization-verification-key", "authorizer.pem",
-      "--original-railway-provenance", "original-railway.json",
-      "--original-railway-provenance-verification-key",
-      "original-railway.pem",
       "--sites-control-plane-verification-key", "sites-key.json",
       "--sites-control-plane-trust-policy", "sites-policy.json",
       "--github-attestation-verification", "github.json",
@@ -848,12 +832,7 @@ describe("one-time stable predecessor bootstrap", () => {
       evidence: join(directory, "finalization-evidence.json"),
       metadata: join(directory, "protected-semantic-baseline.json"),
       authorization: join(directory, "stable-authorization.json"),
-      recovered: join(directory, "recovered-production-provenance.json"),
-      originalRailway: join(
-        directory,
-        "original-railway-provenance.json",
-      ),
-      originalRailwayKey: join(directory, "original-railway.pem"),
+      recovered: join(directory, "recovered-railway-observation.json"),
       sitesKey: join(directory, "sites-key.json"),
       sitesPolicy: join(directory, "sites-policy.json"),
       github: join(directory, "wrapper-attestation-verification.json"),
@@ -877,10 +856,6 @@ describe("one-time stable predecessor bootstrap", () => {
       producerKeyHash: process.env.RELEASE_GATE_PRODUCER_KEY_SHA256,
       sitesKeyId: process.env.RELEASE_SITES_CONTROL_PLANE_KEY_ID,
       sitesKeyHash: process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256,
-      originalRailwayKeyId:
-        process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID,
-      originalRailwayKeyHash:
-        process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256,
     };
     try {
       await Promise.all([
@@ -890,17 +865,6 @@ describe("one-time stable predecessor bootstrap", () => {
         writeFile(
           paths.recovered,
           JSON.stringify(stablePredecessorRecoveredRailwayObservationV1()),
-        ),
-        writeFile(
-          paths.originalRailway,
-          JSON.stringify(value.originalRailwayProvenance),
-        ),
-        writeFile(
-          paths.originalRailwayKey,
-          value.originalRailway.publicKey.export({
-            type: "spki",
-            format: "pem",
-          }),
         ),
         writeFile(
           paths.sitesKey,
@@ -947,10 +911,6 @@ describe("one-time stable predecessor bootstrap", () => {
       process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256 =
         String((value.sitesControlPlaneTrustPolicy as Record<string, unknown>)
           .approvedKeySha256);
-      process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID =
-        value.originalRailwayKeyId;
-      process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256 =
-        value.originalRailwayKeySha256;
       await runStablePredecessorBootstrapCli([
         "produce",
         "--confirm-v2-3-4-stable-predecessor-bootstrap",
@@ -959,10 +919,7 @@ describe("one-time stable predecessor bootstrap", () => {
         "--bootstrap-authorization", paths.authorization,
         "--release-verification-key", paths.releaseKey,
         "--stable-authorization-verification-key", paths.authorizerKey,
-        "--recovered-production-provenance", paths.recovered,
-        "--original-railway-provenance", paths.originalRailway,
-        "--original-railway-provenance-verification-key",
-        paths.originalRailwayKey,
+        "--recovered-railway-observation", paths.recovered,
         "--sites-control-plane-verification-key", paths.sitesKey,
         "--sites-control-plane-trust-policy", paths.sitesPolicy,
         "--github-attestation-verification", paths.github,
@@ -983,9 +940,6 @@ describe("one-time stable predecessor bootstrap", () => {
         "--assets-directory", directory,
         "--release-verification-key", paths.releaseKey,
         "--stable-authorization-verification-key", paths.authorizerKey,
-        "--original-railway-provenance", paths.originalRailway,
-        "--original-railway-provenance-verification-key",
-        paths.originalRailwayKey,
         "--sites-control-plane-verification-key", paths.sitesKey,
         "--sites-control-plane-trust-policy", paths.sitesPolicy,
         "--github-attestation-verification", paths.github,
@@ -1019,9 +973,6 @@ describe("one-time stable predecessor bootstrap", () => {
         "--assets-directory", directory,
         "--release-verification-key", paths.releaseKey,
         "--stable-authorization-verification-key", paths.authorizerKey,
-        "--original-railway-provenance", paths.originalRailway,
-        "--original-railway-provenance-verification-key",
-        paths.originalRailwayKey,
         "--sites-control-plane-verification-key", paths.sitesKey,
         "--sites-control-plane-trust-policy", paths.sitesPolicy,
         "--github-attestation-verification", paths.github,
@@ -1080,18 +1031,6 @@ describe("one-time stable predecessor bootstrap", () => {
       } else {
         process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256 =
           prior.sitesKeyHash;
-      }
-      if (prior.originalRailwayKeyId === undefined) {
-        delete process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID;
-      } else {
-        process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID =
-          prior.originalRailwayKeyId;
-      }
-      if (prior.originalRailwayKeyHash === undefined) {
-        delete process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256;
-      } else {
-        process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256 =
-          prior.originalRailwayKeyHash;
       }
       await rm(directory, { recursive: true, force: true });
     }

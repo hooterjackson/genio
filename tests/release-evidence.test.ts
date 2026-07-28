@@ -97,6 +97,7 @@ import {
   STABLE_RELEASE_AUTHORIZATION_ISSUER_V1,
   STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1,
   authorizeStableRelease,
+  parseStableReleaseAuthorizationArgs,
   stableReleaseKeyFingerprint,
   stableReleaseVerificationKeyV1,
   verifyHistoricalStableReleaseConsumerBundle,
@@ -106,6 +107,7 @@ import {
 import {
   buildStableReleaseDispatchRequest,
   GITHUB_CLIENT_PAYLOAD_MAX_BYTES,
+  verifyStableReleaseDispatchArtifacts,
 } from "../scripts/prepare-stable-release-dispatch.ts";
 import {
   buildReleaseConvergenceEvidence,
@@ -235,6 +237,17 @@ const approvedReviewerTrustPolicy = semanticRankingReviewerTrustPolicyV1({
       semanticBaselineStableAuthorizerKeys.publicKey,
     ),
 });
+
+function releaseAuthoringAuthority(
+  verificationKey: KeyObject,
+  bundle: { generatedAt?: unknown },
+) {
+  return {
+    approvedKeyId: "release-2026",
+    approvedKeySha256: stableReleaseKeyFingerprint(verificationKey),
+    now: String(bundle.generatedAt),
+  };
+}
 
 const strictGithubOfflineVerifier: GithubOfflineEvidenceVerifier = async ({
   artifactPath,
@@ -2641,6 +2654,34 @@ async function writeRealFinalizationControlPlane(input: {
 }
 
 describe("signed release evidence", () => {
+  test("rejects duplicate stable authorization CLI options", () => {
+    const args = [
+      "--confirm-stable-release-authorization",
+      "--candidate-evidence", "candidate.json",
+      "--finalization-evidence", "finalization.json",
+      "--finalization-source-evidence", "sources.json",
+      "--semantic-review-gate-artifact", "semantic.json",
+      "--semantic-review-gate-producer-attestation", "semantic.sig.json",
+      "--protected-baseline-metadata", "baseline.json",
+      "--release-verification-key", "release.pem",
+      "--release-gate-producer-verification-key", "producer.pem",
+      "--authorizer-signing-key", "authorizer.pem",
+      "--output", "authorization.json",
+      "--expected-rc-tag", "v2.4.0-rc.5",
+      "--expected-version", "2.4.0",
+      "--expected-revision", revision,
+      "--expected-image-digest", digest,
+    ];
+    expect(parseStableReleaseAuthorizationArgs(args)).toMatchObject({
+      "--expected-revision": revision,
+    });
+    expect(() => parseStableReleaseAuthorizationArgs([
+      ...args,
+      "--output",
+      "replacement.json",
+    ])).toThrow(/Duplicate argument: --output/u);
+  });
+
   test("recomputes convergence instead of trusting a signed passed flag", () => {
     const value = payload("promotion");
     const snapshot = runtimeSnapshot(value, "production");
@@ -2729,6 +2770,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, bundle),
       );
       expect(verifyReleaseEvidence(signed, keys.publicKey, {
         expectedKind: "candidate",
@@ -2743,6 +2785,70 @@ describe("signed release evidence", () => {
         candidate: { sourceRevision: revision, imageDigest: digest },
       });
       expect(signed.payloadHash).toMatch(/^[0-9a-f]{64}$/u);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("pins the release signer, uses the signer clock, and separates all nine authorities", async () => {
+    const keys = generateKeyPairSync("ed25519");
+    const directory = mkdtempSync(join(tmpdir(), "genio-release-authority-"));
+    try {
+      const bundle = JSON.parse(
+        readFileSync(writeSigningBundle(directory), "utf8"),
+      );
+      await expect(signReleaseEvidenceBundle(
+        bundle,
+        directory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        keys.privateKey,
+        "release-2026",
+        {
+          ...releaseAuthoringAuthority(keys.publicKey, bundle),
+          approvedKeySha256: "f".repeat(64),
+        },
+      )).rejects.toThrow(/protected release authority/u);
+
+      await expect(signReleaseEvidenceBundle(
+        bundle,
+        directory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        producerKeys.privateKey,
+        "release-2026",
+        releaseAuthoringAuthority(producerKeys.publicKey, bundle),
+      )).rejects.toThrow(/nine distinct protected authorities/u);
+
+      await expect(signReleaseEvidenceBundle(
+        bundle,
+        directory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+        keys.privateKey,
+        "release-2026",
+        {
+          ...releaseAuthoringAuthority(keys.publicKey, bundle),
+          now: new Date(
+            Date.parse(String(bundle.generatedAt)) - 6 * 60_000,
+          ).toISOString(),
+        },
+      )).rejects.toThrow(/generated in the future/u);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2778,6 +2884,10 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         releaseKeys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(
+          releaseKeys.publicKey,
+          candidateBundle,
+        ),
       );
       const promotionBundle = JSON.parse(readFileSync(
         writeSigningBundle(promotionDirectory, "promotion", {
@@ -2797,6 +2907,10 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         releaseKeys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(
+          releaseKeys.publicKey,
+          promotionBundle,
+        ),
       );
       const publicRolloutEvidence = completedPublicRolloutEvidence(
         promotionEvidence as any,
@@ -2855,6 +2969,10 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         releaseKeys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(
+          releaseKeys.publicKey,
+          finalizationBundle,
+        ),
       );
       expect(verifyReleaseEvidence(
         finalization,
@@ -3156,6 +3274,44 @@ describe("signed release evidence", () => {
       const stableAuthorization = await authorizeStableRelease(
         stableAuthorizationInput,
       );
+      expect(verifyStableReleaseDispatchArtifacts({
+        candidateTag: "v2.4.0-rc.1",
+        imageDigest: digest,
+        finalizationEvidence: finalization,
+        protectedBaselineMetadata,
+        stableAuthorization,
+        releaseVerificationKey: releaseKeys.publicKey,
+        approvedReleaseKeyId: "release-2026",
+        approvedReleaseKeySha256:
+          stableReleaseKeyFingerprint(releaseKeys.publicKey),
+        stableAuthorizationVerificationKey: stableAuthorizer.publicKey,
+        approvedStableAuthorizerKeyId:
+          stableAuthorization.signature.keyId,
+        approvedStableAuthorizerKeySha256:
+          stableReleaseKeyFingerprint(stableAuthorizer.publicKey),
+        now: String(stableAuthorization.payload.generatedAt),
+      })).toMatchObject({
+        candidate: {
+          rcTag: "v2.4.0-rc.1",
+          imageDigest: digest,
+        },
+      });
+      expect(() => verifyStableReleaseDispatchArtifacts({
+        candidateTag: "v2.4.0-rc.1",
+        imageDigest: digest,
+        finalizationEvidence: {},
+        protectedBaselineMetadata,
+        stableAuthorization,
+        releaseVerificationKey: releaseKeys.publicKey,
+        approvedReleaseKeyId: "release-2026",
+        approvedReleaseKeySha256:
+          stableReleaseKeyFingerprint(releaseKeys.publicKey),
+        stableAuthorizationVerificationKey: stableAuthorizer.publicKey,
+        approvedStableAuthorizerKeyId:
+          stableAuthorization.signature.keyId,
+        approvedStableAuthorizerKeySha256:
+          stableReleaseKeyFingerprint(stableAuthorizer.publicKey),
+      })).toThrow(/signed finalization evidence/u);
       const dispatch = buildStableReleaseDispatchRequest({
         candidateTag: "v2.4.0-rc.1",
         imageDigest: digest,
@@ -3198,6 +3354,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, bundle),
       );
       expect(() => verifyReleaseEvidence(signed, keys.publicKey, {
         expectedKind: "candidate",
@@ -3245,6 +3402,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, candidateBundle),
       );
       const driftedPromotionBundle = JSON.parse(readFileSync(
         writeSigningBundle(
@@ -3271,6 +3429,10 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(
+          keys.publicKey,
+          driftedPromotionBundle,
+        ),
       )).rejects.toThrow(
         /semantic behavior changed after the reviewed candidate phase/u,
       );
@@ -3293,6 +3455,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, promotionBundle),
       );
       const publicRolloutEvidence = completedPublicRolloutEvidence(
         promotion as any,
@@ -3325,6 +3488,10 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(
+          keys.publicKey,
+          driftedFinalizationBundle,
+        ),
       )).rejects.toThrow(
         /semantic behavior changed after the reviewed candidate phase/u,
       );
@@ -3357,6 +3524,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, bundle),
       );
       expect(() => verifyReleaseEvidence({
         ...signed,
@@ -3402,6 +3570,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, candidateBundle),
       );
       const candidateSemanticEvidence =
         candidateSemanticAuthorizationEvidence(
@@ -3437,6 +3606,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, promotionBundle),
       );
       const verifiedPromotion = verifyReleaseEvidence(
         promotion,
@@ -3478,6 +3648,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, finalizationBundle),
       )).rejects.toThrow(/protected approved key/u);
       const finalization = await signReleaseEvidenceBundle(
         finalizationBundle,
@@ -3491,6 +3662,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, finalizationBundle),
       );
       expect(verifyReleaseEvidence(finalization, keys.publicKey, {
         expectedKind: "finalization",
@@ -3777,6 +3949,23 @@ describe("signed release evidence", () => {
           approvedStagingControlPlaneTrustPolicy.approvedKeySha256,
       });
       await expect(loadReleaseEvidenceSigningBundle(
+        {
+          ...bundle,
+          runtimeSnapshotFiles: {
+            ...bundle.runtimeSnapshotFiles,
+            staging: "../runtime-staging.json",
+          },
+        },
+        directory,
+        producerKeys.publicKey,
+        approvedProducerTrustPolicy,
+        approvedReviewerTrustPolicy,
+        approvedHistoricalReplayTrustPolicy,
+        approvedStagingControlPlaneTrustPolicy,
+        approvedSitesControlPlaneTrustPolicy,
+        strictGithubOfflineVerifier,
+      )).rejects.toThrow(/normalized relative path without traversal/u);
+      await expect(loadReleaseEvidenceSigningBundle(
         bundle,
         directory,
         producerKeys.publicKey,
@@ -3959,13 +4148,16 @@ describe("signed release evidence", () => {
     }
   });
 
-  test("the signing CLI rejects a hand-authored payload and accepts a typed bundle", () => {
+  test("the signing CLI rejects hand-authored and stale typed bundles", () => {
     const keys = generateKeyPairSync("ed25519");
     const directory = mkdtempSync(join(tmpdir(), "genio-release-signing-cli-"));
     installStrictGithubCliFake(directory);
     const cliEnvironment = {
       ...process.env,
       PATH: `${directory}:${process.env.PATH ?? ""}`,
+      RELEASE_VERIFICATION_KEY_ID: "release-2026",
+      RELEASE_VERIFICATION_KEY_SHA256:
+        stableReleaseKeyFingerprint(keys.publicKey),
       RELEASE_GATE_PRODUCER_KEY_ID:
         approvedProducerTrustPolicy.approvedKeyId,
       RELEASE_GATE_PRODUCER_KEY_SHA256:
@@ -4006,7 +4198,7 @@ describe("signed release evidence", () => {
       writeFileSync(privateKeyPath, keys.privateKey.export({
         type: "pkcs8",
         format: "pem",
-      }));
+      }), { mode: 0o600 });
       writeFileSync(producerPublicKeyPath, producerKeys.publicKey.export({
         type: "spki",
         format: "pem",
@@ -4048,11 +4240,8 @@ describe("signed release evidence", () => {
         "--key-id",
         "release-2026",
       ], { encoding: "utf8", env: cliEnvironment });
-      expect(accepted.status).toBe(0);
-      expect(JSON.parse(accepted.stdout)).toMatchObject({
-        ok: true,
-        command: "sign",
-      });
+      expect(accepted.status).toBe(1);
+      expect(accepted.stderr).toMatch(/expired|evidence window/u);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -4075,6 +4264,7 @@ describe("signed release evidence", () => {
         strictGithubOfflineVerifier,
         keys.privateKey,
         "release-2026",
+        releaseAuthoringAuthority(keys.publicKey, bundle),
       );
       const evidencePath = join(directory, "evidence.json");
       const publicKeyPath = join(directory, "verification-key.pem");
@@ -4103,7 +4293,9 @@ describe("signed release evidence", () => {
         releaseEvidenceRuntimeHash(signed.payload),
       ], { encoding: "utf8" });
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("--expected-kind requires a value");
+      expect(result.stderr).toContain(
+        "--expected-kind must be supplied exactly once",
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

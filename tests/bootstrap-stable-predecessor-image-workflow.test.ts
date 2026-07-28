@@ -19,6 +19,11 @@ const workflowUrl = new URL(
   "../.github/workflows/bootstrap-stable-predecessor-image.yml",
   import.meta.url,
 );
+const wrapperRecipeUrl = new URL(
+  "../.github/release/stable-predecessor-v2.3.4.Dockerfile",
+  import.meta.url,
+);
+const applicationDockerfileUrl = new URL("../Dockerfile", import.meta.url);
 const historicalRevision = "7dc877cfc1537a9936974f9699a4b8ba9740b5f5";
 const setupOrasRevision = "22ce207df3b08e061f537244349aac6ae1d214f6";
 const orasVersion = "1.3.0";
@@ -78,6 +83,21 @@ function githubScriptAfter(workflow: string, stepName: string): string {
   return body.join("\n");
 }
 
+function workflowJob(
+  workflow: string,
+  name: "authorize_controls" | "publish_wrapper_by_digest",
+): string {
+  const order = ["authorize_controls", "publish_wrapper_by_digest"] as const;
+  const start = workflow.indexOf(`  ${name}:\n`);
+  const next = order[order.indexOf(name) + 1];
+  const end = next
+    ? workflow.indexOf(`  ${next}:\n`, start + 1)
+    : workflow.length;
+  expect(start, `${name} job must exist`).toBeGreaterThan(0);
+  expect(end, `${name} job must have a valid boundary`).toBeGreaterThan(start);
+  return workflow.slice(start, end);
+}
+
 describe("one-time v2.3.4 wrapper-image workflow", () => {
   test.skipIf(!hasHistoricalRevision)(
     "pins a deterministic historical export with no VCS metadata",
@@ -105,6 +125,8 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
 
   test("has no operator-selected identity and no ref or contents-write authority", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
+    const control = workflowJob(workflow, "authorize_controls");
+    const publishing = workflowJob(workflow, "publish_wrapper_by_digest");
     expect(workflow).toContain(
       "types: [genio-stable-predecessor-wrapper-image-v2-3-4]",
     );
@@ -128,6 +150,53 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
     expect(workflow).toContain(
       "concurrency:\n  group: stable-release-mutation\n  cancel-in-progress: false",
     );
+    expect(control).toContain("environment: release-control-audit");
+    expect(control).toMatch(/permissions:\s*\n\s+contents: read/u);
+    expect(control).toContain(
+      "private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}",
+    );
+    expect(control).toMatch(
+      /permission-actions: read[\s\S]*permission-administration: write[\s\S]*permission-checks: read[\s\S]*permission-contents: read[\s\S]*permission-pull-requests: read/u,
+    );
+    expect(control).not.toMatch(
+      /^\s+(?:packages|id-token|attestations):\s+write\s*$/mu,
+    );
+    expect(publishing).toContain("needs: [authorize_controls]");
+    expect(publishing).toContain(
+      "environment: stable-predecessor-bootstrap-image",
+    );
+    expect(publishing).not.toContain(
+      "RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY",
+    );
+    expect(publishing).not.toContain("STABLE_RELEASE_WRITER_APP_PRIVATE_KEY");
+  });
+
+  test("requires exact solo-owner approval and keeps control authority out of publication", async () => {
+    const workflow = await readFile(workflowUrl, "utf8");
+    const control = workflowJob(workflow, "authorize_controls");
+    const publishing = workflowJob(workflow, "publish_wrapper_by_digest");
+
+    expect(control).toContain(
+      '"GET /repos/{owner}/{repo}/immutable-releases"',
+    );
+    expect(publishing).not.toContain(
+      '"GET /repos/{owner}/{repo}/immutable-releases"',
+    );
+    expect(control).toContain("configuredChecks.length !== requiredChecks.length");
+    expect(control).toContain("Number(appId) !== githubActionsAppId");
+    expect(control).toContain("latestChecks.size !== requiredChecks.length");
+    expect(control).toContain("required_approving_review_count !== 0");
+    expect(control).toContain("dismiss_stale_reviews !== true");
+    expect(control).toContain("require_last_push_approval !== false");
+    expect(control).not.toContain("github.rest.pulls.listReviews");
+    expect(control).toContain('"release-control-audit"');
+    expect(control).toContain('"stable-predecessor-bootstrap-image"');
+    expect(control).toContain("reviewerRule.reviewers.length !== 1");
+    expect(control).toContain("!== context.repo.owner.toLowerCase()");
+    expect(control).toContain("environment.data.prevent_self_review === true");
+    expect(control).toContain("can_admins_bypass !== false");
+    expect(control).not.toContain("permission-packages: write");
+    expect(publishing).toContain("packages: write");
   });
 
   test("binds the pinned setup action to a checksum-verified ORAS release it can install", async () => {
@@ -151,7 +220,17 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
   });
 
   test("separates the protected controller recipe from the exact historical context", async () => {
-    const workflow = await readFile(workflowUrl, "utf8");
+    const [workflow, wrapperRecipe, applicationDockerfile] = await Promise.all([
+      readFile(workflowUrl, "utf8"),
+      readFile(wrapperRecipeUrl, "utf8"),
+      readFile(applicationDockerfileUrl, "utf8"),
+    ]);
+    expect(createHash("sha256").update(wrapperRecipe).digest("hex")).toBe(
+      "67bef0595e27b3bfff80a6208b25c6da04de6535018f6c83a4e6dee4aeeabb08",
+    );
+    expect(wrapperRecipe).not.toContain("COPY patches ./patches");
+    expect(applicationDockerfile).toContain("COPY patches ./patches");
+    expect(wrapperRecipe).not.toBe(applicationDockerfile);
     expect(workflow).toContain("path: controller");
     expect(workflow).toContain("path: historical");
     expect(workflow).toContain(
@@ -162,6 +241,9 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
     );
     expect(workflow).toContain(
       "CONTROLLER_DOCKERFILE_SHA256: 67bef0595e27b3bfff80a6208b25c6da04de6535018f6c83a4e6dee4aeeabb08",
+    );
+    expect(workflow).toContain(
+      "sha256sum controller/.github/release/stable-predecessor-v2.3.4.Dockerfile",
     );
     expect(workflow).toContain(
       "HISTORICAL_BUILD_INTENT_SHA256: ae81d5d22a4ebbdb56f284e9c5cd673dfd690c87bb9f9d5b8195b11d8e74bb99",
@@ -185,7 +267,9 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
     expect(workflow).toContain("test ! -e historical-context/.git");
     expect(workflow).toContain("context: historical-context");
     expect(workflow).not.toContain("context: historical\n");
-    expect(workflow).toContain("file: controller/Dockerfile");
+    expect(workflow).toContain(
+      "file: controller/.github/release/stable-predecessor-v2.3.4.Dockerfile",
+    );
     expect(workflow).toContain("GENIO_BUILD_VERSION=2.3.4");
     expect(workflow).toContain(
       "GENIO_BUILD_REVISION=7dc877cfc1537a9936974f9699a4b8ba9740b5f5",
@@ -250,6 +334,9 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
     const reachability = workflow.indexOf(
       "Recheck full stable semver immediately before wrapper push",
     );
+    const referenceFence = workflow.indexOf(
+      "Reread and fence the default head, controller, and historical tag",
+    );
     const publication = workflow.indexOf(
       "Push exactly the sealed OCI archive without rebuilding or tagging",
     );
@@ -259,7 +346,8 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
     expect(build).toBeGreaterThan(0);
     expect(seal).toBeGreaterThan(build);
     expect(reachability).toBeGreaterThan(seal);
-    expect(publication).toBeGreaterThan(reachability);
+    expect(referenceFence).toBeGreaterThan(reachability);
+    expect(publication).toBeGreaterThan(referenceFence);
     expect(attestation).toBeGreaterThan(publication);
     expect(workflow.match(/docker\/build-push-action@/gu)).toHaveLength(1);
     expect(workflow.match(/^\s+oras cp \\/gmu)).toHaveLength(1);
@@ -297,6 +385,15 @@ describe("one-time v2.3.4 wrapper-image workflow", () => {
     );
     expect(workflow).toContain(
       "one-time v2.3.4 wrapper publication is closed by a later stable tag or Release",
+    );
+    expect(workflow).toContain(
+      'test "$(git -C controller rev-parse "origin/$DEFAULT_BRANCH")" = "$EXPECTED_CONTROLLER_REVISION"',
+    );
+    expect(workflow).toContain(
+      'test "$(git -C historical rev-parse "refs/tags/$STABLE_TAG")" = "$EXPECTED_STABLE_TAG_OBJECT"',
+    );
+    expect(workflow).toContain(
+      'test "$(git -C historical rev-parse "$EXPECTED_STABLE_TAG_OBJECT^{}")" = "$EXPECTED_STABLE_TAG_TARGET"',
     );
     expect(workflow).not.toContain("v2.5.0-rc.");
   });

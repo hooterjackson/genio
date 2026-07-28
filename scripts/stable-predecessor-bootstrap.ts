@@ -45,16 +45,16 @@ import {
   validateReleaseGateProducerTrustPolicyV1,
 } from "./release-evidence.ts";
 
-export const STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1 =
-  "genio-stable-predecessor-bootstrap-evidence/v1" as const;
-export const SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1 =
-  "genio-signed-stable-predecessor-bootstrap-evidence/v1" as const;
-export const STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1 =
-  "genio-stable-predecessor-bootstrap-authorization/v1" as const;
-export const SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1 =
-  "genio-signed-stable-predecessor-bootstrap-authorization/v1" as const;
-export const STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_ATTESTATION_SCHEMA_V1 =
-  "genio-stable-predecessor-bootstrap-image-attestation/v1" as const;
+export const STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2 =
+  "genio-stable-predecessor-bootstrap-evidence/v2" as const;
+export const SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2 =
+  "genio-signed-stable-predecessor-bootstrap-evidence/v2" as const;
+export const STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2 =
+  "genio-stable-predecessor-bootstrap-authorization/v2" as const;
+export const SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2 =
+  "genio-signed-stable-predecessor-bootstrap-authorization/v2" as const;
+export const STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_ATTESTATION_SCHEMA_V2 =
+  "genio-stable-predecessor-bootstrap-image-attestation/v2" as const;
 export const STABLE_PREDECESSOR_BOOTSTRAP_FIXTURE_REGISTRY_SCHEMA_V1 =
   "genio-stable-predecessor-bootstrap-fixture-registry/v1" as const;
 export const STABLE_PREDECESSOR_BOOTSTRAP_INDEPENDENT_EVIDENCE_SCHEMA_V1 =
@@ -63,10 +63,6 @@ export const STABLE_PREDECESSOR_BOOTSTRAP_COMPRESSED_EVIDENCE_SCHEMA_V1 =
   "genio-stable-predecessor-bootstrap-compressed-evidence/v1" as const;
 export const STABLE_PREDECESSOR_RECOVERED_RAILWAY_OBSERVATION_SCHEMA_V1 =
   "genio-stable-predecessor-recovered-railway-observation/v1" as const;
-export const STABLE_PREDECESSOR_ORIGINAL_RAILWAY_PROVENANCE_SCHEMA_V1 =
-  "genio-stable-predecessor-original-railway-provenance/v1" as const;
-export const SIGNED_STABLE_PREDECESSOR_ORIGINAL_RAILWAY_PROVENANCE_SCHEMA_V1 =
-  "genio-signed-stable-predecessor-original-railway-provenance/v1" as const;
 
 export const STABLE_PREDECESSOR_BOOTSTRAP_TAG = "v2.3.4" as const;
 export const STABLE_PREDECESSOR_BOOTSTRAP_COMPATIBILITY_RC_TAG =
@@ -109,8 +105,6 @@ const REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const IMAGE_REFERENCE =
   /^ghcr\.io\/[0-9a-z](?:[0-9a-z._/-]*[0-9a-z])?@sha256:[0-9a-f]{64}$/u;
-const IMMUTABLE_OCI_REFERENCE =
-  /^[0-9a-z](?:[0-9a-z.-]*[0-9a-z])?(?::[1-9][0-9]{0,4})?\/[0-9a-z](?:[0-9a-z._/-]*[0-9a-z])?@sha256:[0-9a-f]{64}$/u;
 const KEY_ID = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{2,159}$/u;
 const SUCCESSOR_RC = /^v2\.4\.0-rc\.[1-9]\d*$/u;
 const BOOTSTRAP_INDEPENDENT_GATES = Object.freeze([
@@ -126,7 +120,8 @@ const MAXIMUM_BOOTSTRAP_COMPRESSED_EVIDENCE_BYTES = 64 * 1024;
 export const STABLE_PREDECESSOR_BOOTSTRAP_LIMITATIONS = Object.freeze([
   "wrapper_image_bytes_and_controller_recipe_are_not_claimed_to_equal_any_historical_railway_artifact",
   "railway_records_are_authenticated_platform_observations_not_supply_chain_attestations",
-  "recovered_railway_observations_lacked_registry_and_manifest_bytes_and_require_a_separate_protected_provenance_attestation",
+  "recovered_railway_observations_lacked_registry_reference_manifest_config_and_attestation_bytes",
+  "no_historical_railway_artifact_identity_or_equivalence_is_claimed",
   "railway_meta_image_digests_and_buildkit_oci_digests_are_distinct_unproven_identifiers",
   "baseline_authority_is_limited_to_the_hash_bound_semantic_fixtures",
   "wrapper_fixture_evidence_does_not_prove_historical_production_output_equivalence",
@@ -549,181 +544,6 @@ export function stablePredecessorRecoveredRailwayObservationV1(): JsonRecord {
       "railpack_plan_load_vertex_digest_does_not_recover_generated_plan_bytes",
     ],
   });
-}
-
-function validateOriginalRailwayProvenancePayloadV1(
-  value: unknown,
-  expectedRepository: string,
-): JsonRecord {
-  const payload = exactObject(value, [
-    "schemaVersion",
-    "issuer",
-    "generatedAt",
-    "expiresAt",
-    "operation",
-    "repository",
-    "sourceRevision",
-    "sourceTree",
-    "recoveredRailwayObservationHash",
-    "deploymentIds",
-    "originalImageReference",
-    "originalImageDigest",
-    "verificationMethod",
-    "verifiedClaims",
-  ], "original Railway provenance");
-  const generatedAt = timestamp(
-    payload.generatedAt,
-    "original Railway provenance.generatedAt",
-  );
-  const expiresAt = timestamp(
-    payload.expiresAt,
-    "original Railway provenance.expiresAt",
-  );
-  const claims = exactObject(payload.verifiedClaims, [
-    "sourceRevisionBound",
-    "deploymentSetBound",
-    "registryReferenceResolved",
-    "manifestBytesVerified",
-  ], "original Railway provenance verifiedClaims");
-  const originalImageReference = String(payload.originalImageReference ?? "");
-  const originalImageDigest = imageDigest(
-    payload.originalImageDigest,
-    "original Railway provenance image digest",
-  );
-  if (
-    payload.schemaVersion
-      !== STABLE_PREDECESSOR_ORIGINAL_RAILWAY_PROVENANCE_SCHEMA_V1
-    || payload.issuer !== "genio-independent-railway-provenance-verifier"
-    || payload.operation !== "verify_original_v2_3_4_production_image"
-    || payload.repository !== expectedRepository
-    || payload.sourceRevision !== STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION
-    || payload.sourceTree !== STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_TREE
-    || Date.parse(expiresAt) <= Date.parse(generatedAt)
-    || Date.parse(expiresAt) - Date.parse(generatedAt)
-      > STABLE_PREDECESSOR_BOOTSTRAP_TTL_MS
-    || !IMMUTABLE_OCI_REFERENCE.test(originalImageReference)
-    || !originalImageReference.endsWith(`@${originalImageDigest}`)
-    || payload.verificationMethod
-      !== "independent_railway_control_plane_and_registry_manifest"
-    || claims.sourceRevisionBound !== true
-    || claims.deploymentSetBound !== true
-    || claims.registryReferenceResolved !== true
-    || claims.manifestBytesVerified !== true
-    || JSON.stringify(payload.deploymentIds)
-      !== JSON.stringify(EXPECTED_RAILWAY_LANES.map(({ deploymentId }) =>
-        deploymentId
-      ))
-  ) {
-    throw new Error(
-      "original Railway provenance does not prove the exact v2.3.4 production artifact",
-    );
-  }
-  sha256Digest(
-    payload.recoveredRailwayObservationHash,
-    "original Railway provenance observation hash",
-  );
-  return payload;
-}
-
-export function createStablePredecessorOriginalRailwayProvenanceV1(input: {
-  repository: string;
-  originalImageReference: string;
-  recoveredRailwayObservation: unknown;
-  signingKey: string | Buffer | KeyObject;
-  keyId: string;
-  generatedAt?: string;
-}): ReturnType<typeof createStrictSignedEnvelope> {
-  const generatedAt = input.generatedAt ?? new Date().toISOString();
-  const recovered = validateStablePredecessorRecoveredRailwayObservationV1(
-    input.recoveredRailwayObservation,
-  );
-  const payload = validateOriginalRailwayProvenancePayloadV1({
-    schemaVersion:
-      STABLE_PREDECESSOR_ORIGINAL_RAILWAY_PROVENANCE_SCHEMA_V1,
-    issuer: "genio-independent-railway-provenance-verifier",
-    generatedAt,
-    expiresAt: new Date(
-      Date.parse(generatedAt) + STABLE_PREDECESSOR_BOOTSTRAP_TTL_MS,
-    ).toISOString(),
-    operation: "verify_original_v2_3_4_production_image",
-    repository: input.repository,
-    sourceRevision: STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION,
-    sourceTree: STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_TREE,
-    recoveredRailwayObservationHash: signedArtifactSha256(recovered),
-    deploymentIds: EXPECTED_RAILWAY_LANES.map(({ deploymentId }) =>
-      deploymentId
-    ),
-    originalImageReference: input.originalImageReference,
-    originalImageDigest: input.originalImageReference.split("@").at(-1),
-    verificationMethod:
-      "independent_railway_control_plane_and_registry_manifest",
-    verifiedClaims: {
-      sourceRevisionBound: true,
-      deploymentSetBound: true,
-      registryReferenceResolved: true,
-      manifestBytesVerified: true,
-    },
-  }, input.repository);
-  return createStrictSignedEnvelope({
-    envelopeSchemaVersion:
-      SIGNED_STABLE_PREDECESSOR_ORIGINAL_RAILWAY_PROVENANCE_SCHEMA_V1,
-    payload,
-    signingKey: privateKey(input.signingKey),
-    keyId: input.keyId,
-  });
-}
-
-export function verifyStablePredecessorOriginalRailwayProvenanceV1(input: {
-  value: unknown;
-  verificationKey: string | Buffer | KeyObject;
-  approvedKeyId: string;
-  approvedKeySha256: string;
-  recoveredRailwayObservation: unknown;
-  expectedRepository: string;
-  now?: string;
-}): ReturnType<typeof verifyStrictSignedEnvelope> {
-  const fingerprint =
-    stablePredecessorBootstrapKeyFingerprint(input.verificationKey);
-  if (
-    !KEY_ID.test(input.approvedKeyId)
-    || fingerprint !== sha256Digest(
-      input.approvedKeySha256,
-      "approved original Railway provenance key fingerprint",
-    )
-  ) {
-    throw new Error(
-      "original Railway provenance does not use the protected verifier key",
-    );
-  }
-  const verified = verifyStrictSignedEnvelope({
-    value: input.value,
-    verificationKey: publicKey(input.verificationKey),
-    envelopeSchemaVersion:
-      SIGNED_STABLE_PREDECESSOR_ORIGINAL_RAILWAY_PROVENANCE_SCHEMA_V1,
-    payloadLabel: "original Railway provenance",
-    validatePayload: (value) => validateOriginalRailwayProvenancePayloadV1(
-      value,
-      input.expectedRepository,
-    ),
-  });
-  const recovered = validateStablePredecessorRecoveredRailwayObservationV1(
-    input.recoveredRailwayObservation,
-  );
-  const now = input.now
-    ? timestamp(input.now, "original Railway provenance verification time")
-    : new Date().toISOString();
-  if (
-    verified.keyId !== input.approvedKeyId
-    || verified.payload.recoveredRailwayObservationHash
-      !== signedArtifactSha256(recovered)
-    || Date.parse(now) < Date.parse(String(verified.payload.generatedAt))
-    || Date.parse(now) >= Date.parse(String(verified.payload.expiresAt))
-  ) {
-    throw new Error(
-      "original Railway provenance signature, observation binding, or validity window is invalid",
-    );
-  }
-  return verified;
 }
 
 export async function captureStablePredecessorRecoveredRailwayObservation(
@@ -1400,7 +1220,7 @@ export function compressStablePredecessorBootstrapIndependentEvidenceV1(
   value: unknown,
 ): JsonRecord {
   const canonicalBytes = Buffer.from(
-    JSON.stringify(value),
+    stableSignedArtifactJson(value),
     "utf8",
   );
   if (
@@ -1505,7 +1325,7 @@ function validateCompressedStablePredecessorBootstrapIndependentEvidence(
     throw new Error("bootstrap independent evidence is not canonical JSON");
   }
   if (
-    canonicalBytes.toString("utf8") !== JSON.stringify(bundle)
+    canonicalBytes.toString("utf8") !== stableSignedArtifactJson(bundle)
     || deflateRawSync(canonicalBytes, { level: 9 }).toString("base64url")
       !== compressed.encoded
   ) {
@@ -1522,7 +1342,7 @@ function validateCompressedStablePredecessorBootstrapIndependentEvidence(
   };
 }
 
-function validateEvidencePayload(
+export function validateStablePredecessorBootstrapEvidencePayloadV2(
   value: unknown,
   expectedRepository?: string,
   expectedDefaultBranch?: string,
@@ -1555,7 +1375,7 @@ function validateEvidencePayload(
     "stable predecessor bootstrap evidence.expiresAt",
   );
   if (
-    payload.schemaVersion !== STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1
+    payload.schemaVersion !== STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2
     || payload.issuer !== "genio-protected-stable-predecessor-bootstrap-producer"
     || payload.kind !== "stable_predecessor_bootstrap"
     || payload.mode
@@ -1684,7 +1504,7 @@ function validateEvidencePayload(
   return payload;
 }
 
-export function validateStablePredecessorBootstrapImageAttestationV1(
+export function validateStablePredecessorBootstrapImageAttestationV2(
   value: unknown,
   expectedRepository?: string,
   expectedDefaultBranch?: string,
@@ -1700,6 +1520,8 @@ export function validateStablePredecessorBootstrapImageAttestationV1(
     "historicalBuildIntentSha256",
     "builderIdentity",
     "reconstructionMode",
+    "historicalArtifactEquivalence",
+    "historicalArtifactIdentity",
     "subjectImageReference",
     "subjectImageDigest",
     "historicalSourceRevision",
@@ -1716,7 +1538,7 @@ export function validateStablePredecessorBootstrapImageAttestationV1(
   );
   if (
     attestation.schemaVersion
-      !== STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_ATTESTATION_SCHEMA_V1
+      !== STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_ATTESTATION_SCHEMA_V2
     || typeof attestation.repository !== "string"
     || (expectedRepository && attestation.repository !== expectedRepository)
     || attestation.workflow
@@ -1733,6 +1555,8 @@ export function validateStablePredecessorBootstrapImageAttestationV1(
       !== STABLE_PREDECESSOR_BOOTSTRAP_BUILDER_IDENTITY
     || attestation.reconstructionMode
       !== STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE
+    || attestation.historicalArtifactEquivalence !== "not_claimed"
+    || attestation.historicalArtifactIdentity !== null
     || typeof attestation.subjectImageReference !== "string"
     || !IMAGE_REFERENCE.test(attestation.subjectImageReference)
     || !attestation.subjectImageReference.endsWith(`@${digest}`)
@@ -1806,11 +1630,11 @@ function validateAuthorizationPayload(
     "producerKeySha256",
     "sitesKeyId",
     "sitesKeySha256",
-    "originalRailwayProvenancePayloadHash",
-    "originalRailwayProvenanceArtifactHash",
-    "originalRailwayProvenanceKeyId",
-    "originalRailwayProvenanceKeySha256",
-    "originalRailwayImageDigest",
+    "railwayObservationKind",
+    "wrapperReconstructionMode",
+    "wrapperImageDigest",
+    "historicalArtifactEquivalence",
+    "historicalArtifactIdentity",
   ], "stable predecessor bootstrap authorization");
   const generatedAt = timestamp(
     payload.generatedAt,
@@ -1822,7 +1646,7 @@ function validateAuthorizationPayload(
   );
   if (
     payload.schemaVersion
-      !== STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1
+      !== STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2
     || payload.issuer !== "genio-protected-stable-predecessor-bootstrap-authorizer"
     || payload.action !== "publish_immutable_v2_3_4_predecessor_bootstrap"
     || Date.parse(expiresAt) <= Date.parse(generatedAt)
@@ -1853,31 +1677,31 @@ function validateAuthorizationPayload(
     "finalBrowserGateEvidenceHash",
     "producerKeySha256",
     "sitesKeySha256",
-    "originalRailwayProvenancePayloadHash",
-    "originalRailwayProvenanceArtifactHash",
-    "originalRailwayProvenanceKeySha256",
   ]) {
     sha256Digest(payload[name], `bootstrap authorization.${name}`);
   }
   imageDigest(
-    payload.originalRailwayImageDigest,
-    "bootstrap authorization.originalRailwayImageDigest",
+    payload.wrapperImageDigest,
+    "bootstrap authorization.wrapperImageDigest",
   );
   if (
     typeof payload.producerKeyId !== "string"
     || !KEY_ID.test(payload.producerKeyId)
     || typeof payload.sitesKeyId !== "string"
     || !KEY_ID.test(payload.sitesKeyId)
-    || typeof payload.originalRailwayProvenanceKeyId !== "string"
-    || !KEY_ID.test(payload.originalRailwayProvenanceKeyId)
+    || payload.railwayObservationKind
+      !== "authenticated_platform_observation_not_supply_chain_attestation"
+    || payload.wrapperReconstructionMode
+      !== STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE
+    || payload.historicalArtifactEquivalence !== "not_claimed"
+    || payload.historicalArtifactIdentity !== null
     || new Set([
       payload.producerKeySha256,
       payload.sitesKeySha256,
-      payload.originalRailwayProvenanceKeySha256,
-    ]).size !== 3
+    ]).size !== 2
   ) {
     throw new Error(
-      "bootstrap authorization independent producer authorities are invalid",
+      "bootstrap authorization authorities or reduced provenance claims are invalid",
     );
   }
   return payload;
@@ -1891,7 +1715,7 @@ export function isSignedStablePredecessorBootstrapEvidence(
     && typeof value === "object"
     && !Array.isArray(value)
     && (value as JsonRecord).schemaVersion
-      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1
+      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2
   );
 }
 
@@ -1903,7 +1727,7 @@ export function isSignedStablePredecessorBootstrapAuthorization(
     && typeof value === "object"
     && !Array.isArray(value)
     && (value as JsonRecord).schemaVersion
-      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1
+      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2
   );
 }
 
@@ -1921,7 +1745,7 @@ export function validateStablePredecessorBootstrapSuccessor(input: {
   }
 }
 
-export function createStablePredecessorBootstrapImageAttestationV1(input: {
+export function createStablePredecessorBootstrapImageAttestationV2(input: {
   repository: string;
   defaultBranch: string;
   controllerSourceRevision: string;
@@ -1941,9 +1765,9 @@ export function createStablePredecessorBootstrapImageAttestationV1(input: {
     input.recoveredRailwayObservation,
   );
   const digest = String(input.imageReference).split("@").at(-1) ?? "";
-  return validateStablePredecessorBootstrapImageAttestationV1({
+  return validateStablePredecessorBootstrapImageAttestationV2({
     schemaVersion:
-      STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_ATTESTATION_SCHEMA_V1,
+      STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_ATTESTATION_SCHEMA_V2,
     repository: input.repository,
     workflow:
       `${input.repository}/${STABLE_PREDECESSOR_BOOTSTRAP_IMAGE_WORKFLOW}`,
@@ -1956,6 +1780,8 @@ export function createStablePredecessorBootstrapImageAttestationV1(input: {
       STABLE_PREDECESSOR_HISTORICAL_BUILD_INTENT_SHA256,
     builderIdentity: STABLE_PREDECESSOR_BOOTSTRAP_BUILDER_IDENTITY,
     reconstructionMode: STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE,
+    historicalArtifactEquivalence: "not_claimed",
+    historicalArtifactIdentity: null,
     subjectImageReference: input.imageReference,
     subjectImageDigest: digest,
     historicalSourceRevision:
@@ -1988,7 +1814,7 @@ export function createStablePredecessorBootstrapEvidence(
   input: StablePredecessorBootstrapEvidenceInput,
 ): ReturnType<typeof createStrictSignedEnvelope> {
   const generatedAt = input.generatedAt ?? new Date().toISOString();
-  const image = validateStablePredecessorBootstrapImageAttestationV1(
+  const image = validateStablePredecessorBootstrapImageAttestationV2(
     input.imageAttestation,
     input.repository,
     input.defaultBranch,
@@ -2047,8 +1873,8 @@ export function createStablePredecessorBootstrapEvidence(
     );
   const fixtureRegistryHash =
     stablePredecessorBootstrapFixtureRegistryHash(independent.fixtures);
-  const payload = validateEvidencePayload({
-    schemaVersion: STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
+  const payload = validateStablePredecessorBootstrapEvidencePayloadV2({
+    schemaVersion: STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
     issuer: "genio-protected-stable-predecessor-bootstrap-producer",
     generatedAt,
     expiresAt: new Date(
@@ -2095,7 +1921,7 @@ export function createStablePredecessorBootstrapEvidence(
   }, input.repository, input.defaultBranch);
   return createStrictSignedEnvelope({
     envelopeSchemaVersion:
-      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
+      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
     payload,
     signingKey: privateKey(input.signingKey),
     keyId: input.keyId,
@@ -2124,13 +1950,14 @@ function verifiedEvidence(input: {
     value: input.value,
     verificationKey: publicKey(input.verificationKey),
     envelopeSchemaVersion:
-      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
+      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
     payloadLabel: "stable predecessor bootstrap evidence",
-    validatePayload: (value) => validateEvidencePayload(
+    validatePayload: (value) =>
+      validateStablePredecessorBootstrapEvidencePayloadV2(
       value,
       input.expectedRepository,
       input.expectedDefaultBranch,
-    ),
+      ),
   });
   if (result.keyId !== input.approvedKeyId) {
     throw new Error("bootstrap evidence key ID is not protected");
@@ -2150,11 +1977,6 @@ export function authorizeStablePredecessorBootstrap(input: {
   approvedProducerKeySha256: string;
   approvedSitesControlPlaneVerificationKey: unknown;
   approvedSitesControlPlaneTrustPolicy: unknown;
-  originalRailwayProvenance: unknown;
-  originalRailwayProvenanceVerificationKey:
-    string | Buffer | KeyObject;
-  approvedOriginalRailwayProvenanceKeyId: string;
-  approvedOriginalRailwayProvenanceKeySha256: string;
   authorizerSigningKey: string | Buffer | KeyObject;
   approvedAuthorizerKeyId: string;
   approvedAuthorizerKeySha256: string;
@@ -2210,20 +2032,11 @@ export function authorizeStablePredecessorBootstrap(input: {
     verificationKey: input.approvedSitesControlPlaneVerificationKey,
     trustPolicy: input.approvedSitesControlPlaneTrustPolicy,
   });
-  const image = validateStablePredecessorBootstrapImageAttestationV1(
+  const image = validateStablePredecessorBootstrapImageAttestationV2(
     input.imageAttestation,
     input.expectedRepository,
     input.expectedDefaultBranch,
   );
-  const originalRailway = verifyStablePredecessorOriginalRailwayProvenanceV1({
-    value: input.originalRailwayProvenance,
-    verificationKey: input.originalRailwayProvenanceVerificationKey,
-    approvedKeyId: input.approvedOriginalRailwayProvenanceKeyId,
-    approvedKeySha256: input.approvedOriginalRailwayProvenanceKeySha256,
-    recoveredRailwayObservation: image.recoveredRailwayObservation,
-    expectedRepository: input.expectedRepository,
-    now: generatedAt,
-  });
   if (
     !KEY_ID.test(input.approvedProducerKeyId)
     || independent.producerKeyId !== input.approvedProducerKeyId
@@ -2236,17 +2049,14 @@ export function authorizeStablePredecessorBootstrap(input: {
       authorizerFingerprint,
       independent.producerKeySha256,
       independent.sitesKeySha256,
-      input.approvedOriginalRailwayProvenanceKeySha256,
-    ]).size !== 5
+    ]).size !== 4
     || protectedSites.approvedKeyId
       !== validateSitesControlPlaneTrustPolicyV1(
         input.approvedSitesControlPlaneTrustPolicy,
       ).approvedKeyId
-    || originalRailway.keyId
-      !== input.approvedOriginalRailwayProvenanceKeyId
   ) {
     throw new Error(
-      "bootstrap release, producer, Sites, Railway provenance, and authorizer keys must be distinct protected authorities",
+      "bootstrap release, producer, Sites, and authorizer keys must be distinct protected authorities",
     );
   }
   const provenance = exactObject(
@@ -2282,6 +2092,11 @@ export function authorizeStablePredecessorBootstrap(input: {
     || metadata.finalizationEvidencePayloadHash !== evidence.payloadHash
     || metadata.finalBrowserGateEvidenceHash !== finalBrowser.evidenceHash
     || signedArtifactSha256(image) !== provenance.imageAttestationHash
+    || image.recoveredRailwayObservationHash
+      !== provenance.recoveredRailwayObservationHash
+    || image.reconstructionMode
+      !== STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE
+    || image.subjectImageDigest !== candidate.imageDigest
     || stableSignedArtifactJson(metadataFixtures)
       !== stableSignedArtifactJson(evidenceFixtures)
     || stablePredecessorBootstrapFixtureRegistryHash(evidenceFixtures)
@@ -2290,13 +2105,12 @@ export function authorizeStablePredecessorBootstrap(input: {
     throw new Error("bootstrap metadata does not bind the signed evidence");
   }
   const payload = validateAuthorizationPayload({
-    schemaVersion: STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
+    schemaVersion: STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
     issuer: "genio-protected-stable-predecessor-bootstrap-authorizer",
     generatedAt,
     expiresAt: new Date(Math.min(
       Date.parse(String(evidence.payload.expiresAt)),
       Date.parse(protectedSites.attestationExpiresAt),
-      Date.parse(String(originalRailway.payload.expiresAt)),
       Date.parse(generatedAt) + STABLE_PREDECESSOR_BOOTSTRAP_TTL_MS,
     )).toISOString(),
     action: "publish_immutable_v2_3_4_predecessor_bootstrap",
@@ -2317,18 +2131,17 @@ export function authorizeStablePredecessorBootstrap(input: {
     producerKeySha256: independent.producerKeySha256,
     sitesKeyId: protectedSites.approvedKeyId,
     sitesKeySha256: independent.sitesKeySha256,
-    originalRailwayProvenancePayloadHash: originalRailway.payloadHash,
-    originalRailwayProvenanceArtifactHash:
-      signedArtifactSha256(input.originalRailwayProvenance),
-    originalRailwayProvenanceKeyId: originalRailway.keyId,
-    originalRailwayProvenanceKeySha256:
-      input.approvedOriginalRailwayProvenanceKeySha256,
-    originalRailwayImageDigest:
-      originalRailway.payload.originalImageDigest,
+    railwayObservationKind:
+      "authenticated_platform_observation_not_supply_chain_attestation",
+    wrapperReconstructionMode:
+      STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE,
+    wrapperImageDigest: image.subjectImageDigest,
+    historicalArtifactEquivalence: "not_claimed",
+    historicalArtifactIdentity: null,
   }, input.expectedRepository, input.expectedDefaultBranch);
   return createStrictSignedEnvelope({
     envelopeSchemaVersion:
-      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
+      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
     payload,
     signingKey: privateKey(input.authorizerSigningKey),
     keyId: input.approvedAuthorizerKeyId,
@@ -2357,7 +2170,7 @@ function verifyAuthorization(input: {
     value: input.value,
     verificationKey: publicKey(input.verificationKey),
     envelopeSchemaVersion:
-      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
+      SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
     payloadLabel: "stable predecessor bootstrap authorization",
     validatePayload: (value) => validateAuthorizationPayload(
       value,
@@ -2529,13 +2342,19 @@ export function verifyHistoricalStablePredecessorBootstrapLineage(input: {
     || authorization.payload.sitesKeySha256 !== independent.sitesKeySha256
     || evidenceProvenance.independentEvidenceHash
       !== independent.independentEvidenceHash
+    || authorization.payload.railwayObservationKind
+      !== "authenticated_platform_observation_not_supply_chain_attestation"
+    || authorization.payload.wrapperReconstructionMode
+      !== STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE
+    || authorization.payload.wrapperImageDigest !== candidate.imageDigest
+    || authorization.payload.historicalArtifactEquivalence !== "not_claimed"
+    || authorization.payload.historicalArtifactIdentity !== null
     || new Set([
       input.approvedReleaseKeySha256,
       input.approvedStableAuthorizerKeySha256,
       independent.producerKeySha256,
       independent.sitesKeySha256,
-      authorization.payload.originalRailwayProvenanceKeySha256,
-    ]).size !== 5
+    ]).size !== 4
   ) {
     throw new Error("historical bootstrap lineage bindings differ");
   }
@@ -2612,7 +2431,7 @@ export function verifyStablePredecessorBootstrapAssetBundle(input: {
     expectedDefaultBranch: input.expectedDefaultBranch,
     now: input.now,
   });
-  const image = validateStablePredecessorBootstrapImageAttestationV1(
+  const image = validateStablePredecessorBootstrapImageAttestationV2(
     input.imageAttestation,
     input.expectedRepository,
     input.expectedDefaultBranch,
@@ -2725,7 +2544,9 @@ export function validateStablePredecessorBootstrapPublicationWindow(input: {
     "payloadHash",
     "signature",
   ], "signed stable predecessor bootstrap authorization");
-  const evidence = validateEvidencePayload(evidenceEnvelope.payload);
+  const evidence = validateStablePredecessorBootstrapEvidencePayloadV2(
+    evidenceEnvelope.payload,
+  );
   const authorization = validateAuthorizationPayload(
     authorizationEnvelope.payload,
   );
@@ -2812,9 +2633,7 @@ export function parseStablePredecessorBootstrapCliArgs(
         "--bootstrap-authorization",
         "--release-verification-key",
         "--stable-authorization-verification-key",
-        "--recovered-production-provenance",
-        "--original-railway-provenance",
-        "--original-railway-provenance-verification-key",
+        "--recovered-railway-observation",
         "--sites-control-plane-verification-key",
         "--sites-control-plane-trust-policy",
         "--github-attestation-verification",
@@ -2838,8 +2657,6 @@ export function parseStablePredecessorBootstrapCliArgs(
         "--assets-directory",
         "--release-verification-key",
         "--stable-authorization-verification-key",
-        "--original-railway-provenance",
-        "--original-railway-provenance-verification-key",
         "--sites-control-plane-verification-key",
         "--sites-control-plane-trust-policy",
         "--github-attestation-verification",
@@ -2881,8 +2698,6 @@ function bootstrapProtectedAuthority(): {
   producerKeySha256: string;
   sitesKeyId: string;
   sitesKeySha256: string;
-  originalRailwayKeyId: string;
-  originalRailwayKeySha256: string;
 } {
   const authority = {
     releaseKeyId:
@@ -2907,31 +2722,22 @@ function bootstrapProtectedAuthority(): {
       process.env.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256
         ?.trim()
         .toLowerCase() ?? "",
-    originalRailwayKeyId:
-      process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID?.trim() ?? "",
-    originalRailwayKeySha256:
-      process.env.RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256
-        ?.trim()
-        .toLowerCase() ?? "",
   };
   if (
     !KEY_ID.test(authority.releaseKeyId)
     || !KEY_ID.test(authority.authorizerKeyId)
     || !KEY_ID.test(authority.producerKeyId)
     || !KEY_ID.test(authority.sitesKeyId)
-    || !KEY_ID.test(authority.originalRailwayKeyId)
     || !/^[0-9a-f]{64}$/u.test(authority.releaseKeySha256)
     || !/^[0-9a-f]{64}$/u.test(authority.authorizerKeySha256)
     || !/^[0-9a-f]{64}$/u.test(authority.producerKeySha256)
     || !/^[0-9a-f]{64}$/u.test(authority.sitesKeySha256)
-    || !/^[0-9a-f]{64}$/u.test(authority.originalRailwayKeySha256)
     || new Set([
       authority.releaseKeySha256,
       authority.authorizerKeySha256,
       authority.producerKeySha256,
       authority.sitesKeySha256,
-      authority.originalRailwayKeySha256,
-    ]).size !== 5
+    ]).size !== 4
   ) {
     throw new Error(
       "bootstrap protected verification authority is missing or not distinct",
@@ -2996,20 +2802,16 @@ function bootstrapEvidencePayload(value: unknown): JsonRecord {
   );
 }
 
-function assertProtectedBootstrapExternalAuthorities(input: {
+function assertProtectedBootstrapReducedClaim(input: {
   bootstrapEvidence: unknown;
   stableAuthorization: unknown;
   recoveredRailwayObservation: unknown;
-  originalRailwayProvenance: unknown;
-  originalRailwayProvenanceVerificationKey:
-    string | Buffer | KeyObject;
   sitesControlPlaneVerificationKey: unknown;
   sitesControlPlaneTrustPolicy: unknown;
   authority: ReturnType<typeof bootstrapProtectedAuthority>;
   repository: string;
-  now?: string;
 }): void {
-  const evidencePayload = validateEvidencePayload(
+  const evidencePayload = validateStablePredecessorBootstrapEvidencePayloadV2(
     bootstrapEvidencePayload(input.bootstrapEvidence),
     input.repository,
   );
@@ -3023,15 +2825,13 @@ function assertProtectedBootstrapExternalAuthorities(input: {
     verificationKey: input.sitesControlPlaneVerificationKey,
     trustPolicy: input.sitesControlPlaneTrustPolicy,
   });
-  const originalRailway = verifyStablePredecessorOriginalRailwayProvenanceV1({
-    value: input.originalRailwayProvenance,
-    verificationKey: input.originalRailwayProvenanceVerificationKey,
-    approvedKeyId: input.authority.originalRailwayKeyId,
-    approvedKeySha256: input.authority.originalRailwayKeySha256,
-    recoveredRailwayObservation: input.recoveredRailwayObservation,
-    expectedRepository: input.repository,
-    now: input.now,
-  });
+  const observation = validateStablePredecessorRecoveredRailwayObservationV1(
+    input.recoveredRailwayObservation,
+  );
+  const candidate = fixedCandidate(
+    evidencePayload.candidate,
+    "bootstrap evidence candidate",
+  );
   const authorizationEnvelope = exactObject(input.stableAuthorization, [
     "schemaVersion",
     "payload",
@@ -3047,19 +2847,18 @@ function assertProtectedBootstrapExternalAuthorities(input: {
     || sites.approvedKeySha256 !== input.authority.sitesKeySha256
     || authorization.sitesKeyId !== sites.approvedKeyId
     || authorization.sitesKeySha256 !== sites.approvedKeySha256
-    || authorization.originalRailwayProvenancePayloadHash
-      !== originalRailway.payloadHash
-    || authorization.originalRailwayProvenanceArtifactHash
-      !== signedArtifactSha256(input.originalRailwayProvenance)
-    || authorization.originalRailwayProvenanceKeyId
-      !== originalRailway.keyId
-    || authorization.originalRailwayProvenanceKeySha256
-      !== input.authority.originalRailwayKeySha256
-    || authorization.originalRailwayImageDigest
-      !== originalRailway.payload.originalImageDigest
+    || authorization.recoveredRailwayObservationHash
+      !== signedArtifactSha256(observation)
+    || authorization.railwayObservationKind
+      !== "authenticated_platform_observation_not_supply_chain_attestation"
+    || authorization.wrapperReconstructionMode
+      !== STABLE_PREDECESSOR_BOOTSTRAP_RECONSTRUCTION_MODE
+    || authorization.wrapperImageDigest !== candidate.imageDigest
+    || authorization.historicalArtifactEquivalence !== "not_claimed"
+    || authorization.historicalArtifactIdentity !== null
   ) {
     throw new Error(
-      "bootstrap authorization does not bind the externally protected Sites and original Railway provenance",
+      "bootstrap authorization does not bind protected Sites authority and the reduced provenance claim",
     );
   }
 }
@@ -3071,7 +2870,7 @@ function assertProtectedBootstrapIndependentProducer(input: {
   repository: string;
   defaultBranch: string;
 }): void {
-  const payload = validateEvidencePayload(
+  const payload = validateStablePredecessorBootstrapEvidencePayloadV2(
     bootstrapEvidencePayload(input.bootstrapEvidence),
     input.repository,
     input.defaultBranch,
@@ -3151,8 +2950,6 @@ async function produceBootstrapAssets(
     releaseVerificationKey,
     stableAuthorizationVerificationKey,
     recoveredRailwayObservation,
-    originalRailwayProvenance,
-    originalRailwayProvenanceVerificationKey,
     sitesControlPlaneVerificationKey,
     sitesControlPlaneTrustPolicy,
     githubAttestationVerification,
@@ -3173,14 +2970,9 @@ async function produceBootstrapAssets(
     readFile(options["--release-verification-key"]!),
     readFile(options["--stable-authorization-verification-key"]!),
     boundedJson(
-      options["--recovered-production-provenance"]!,
+      options["--recovered-railway-observation"]!,
       "recovered production observation",
     ),
-    boundedJson(
-      options["--original-railway-provenance"]!,
-      "original Railway provenance",
-    ),
-    readFile(options["--original-railway-provenance-verification-key"]!),
     boundedJson(
       options["--sites-control-plane-verification-key"]!,
       "Sites control-plane verification key",
@@ -3210,7 +3002,7 @@ async function produceBootstrapAssets(
     sourceBytes,
   );
   const imageAttestation =
-    createStablePredecessorBootstrapImageAttestationV1({
+    createStablePredecessorBootstrapImageAttestationV2({
       repository,
       defaultBranch,
       controllerSourceRevision: controllerRevision,
@@ -3218,12 +3010,10 @@ async function produceBootstrapAssets(
       recoveredRailwayObservation,
       githubAttestationVerification,
     });
-  assertProtectedBootstrapExternalAuthorities({
+  assertProtectedBootstrapReducedClaim({
     bootstrapEvidence,
     stableAuthorization,
     recoveredRailwayObservation,
-    originalRailwayProvenance,
-    originalRailwayProvenanceVerificationKey,
     sitesControlPlaneVerificationKey,
     sitesControlPlaneTrustPolicy,
     authority,
@@ -3306,8 +3096,6 @@ async function verifyBootstrapAssets(
     storedConsumer,
     releaseVerificationKey,
     stableAuthorizationVerificationKey,
-    originalRailwayProvenance,
-    originalRailwayProvenanceVerificationKey,
     sitesControlPlaneVerificationKey,
     sitesControlPlaneTrustPolicy,
     githubAttestationVerification,
@@ -3336,11 +3124,6 @@ async function verifyBootstrapAssets(
     readFile(options["--release-verification-key"]!),
     readFile(options["--stable-authorization-verification-key"]!),
     boundedJson(
-      options["--original-railway-provenance"]!,
-      "original Railway provenance",
-    ),
-    readFile(options["--original-railway-provenance-verification-key"]!),
-    boundedJson(
       options["--sites-control-plane-verification-key"]!,
       "Sites control-plane verification key",
     ),
@@ -3368,17 +3151,15 @@ async function verifyBootstrapAssets(
     bootstrapEvidencePayload(bootstrapEvidence),
     sourceBytes,
   );
-  const parsedImage = validateStablePredecessorBootstrapImageAttestationV1(
+  const parsedImage = validateStablePredecessorBootstrapImageAttestationV2(
     imageAttestation,
     repository,
     defaultBranch,
   );
-  assertProtectedBootstrapExternalAuthorities({
+  assertProtectedBootstrapReducedClaim({
     bootstrapEvidence,
     stableAuthorization,
     recoveredRailwayObservation: parsedImage.recoveredRailwayObservation,
-    originalRailwayProvenance,
-    originalRailwayProvenanceVerificationKey,
     sitesControlPlaneVerificationKey,
     sitesControlPlaneTrustPolicy,
     authority,

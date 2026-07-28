@@ -62,8 +62,7 @@ import {
 import {
   authorizeStablePredecessorBootstrap,
   createStablePredecessorBootstrapEvidence,
-  createStablePredecessorBootstrapImageAttestationV1,
-  createStablePredecessorOriginalRailwayProvenanceV1,
+  createStablePredecessorBootstrapImageAttestationV2,
   stablePredecessorRecoveredRailwayObservationV1,
   STABLE_PREDECESSOR_BOOTSTRAP_COMPATIBILITY_RC_TAG,
   STABLE_PREDECESSOR_BOOTSTRAP_SOURCE_REVISION,
@@ -575,7 +574,6 @@ async function setup(
   const producer = generateKeyPairSync("ed25519");
   const baselineRelease = generateKeyPairSync("ed25519");
   const baselineStableAuthorizer = generateKeyPairSync("ed25519");
-  const originalRailwayProvenance = generateKeyPairSync("ed25519");
   const baselineStableAuthorizerKeyId =
     "semantic-baseline-stable-authorizer-test-v1";
   const predecessor = (() => {
@@ -672,7 +670,7 @@ async function setup(
     const recoveredRailwayObservation =
       stablePredecessorRecoveredRailwayObservationV1();
     const baselineImageAttestation =
-      createStablePredecessorBootstrapImageAttestationV1({
+      createStablePredecessorBootstrapImageAttestationV2({
         repository: "hooterjackson/genio",
         defaultBranch: "main",
         controllerSourceRevision: revision,
@@ -698,18 +696,6 @@ async function setup(
       });
     const finalBrowserSources = independent.bundle.sources.at(-1)!.artifact
       .sources;
-    const originalRailwayProvenanceKeyId =
-      "semantic-original-railway-provenance-v1";
-    const originalRailwayProvenanceArtifact =
-      createStablePredecessorOriginalRailwayProvenanceV1({
-        repository: "hooterjackson/genio",
-        originalImageReference:
-          `registry.railway.app/genio-production@sha256:${"e".repeat(64)}`,
-        recoveredRailwayObservation,
-        signingKey: originalRailwayProvenance.privateKey,
-        keyId: originalRailwayProvenanceKeyId,
-        generatedAt: "2026-07-22T18:00:00.000Z",
-      });
     const baselineFinalization = createStablePredecessorBootstrapEvidence({
       repository: "hooterjackson/genio",
       defaultBranch: "main",
@@ -766,13 +752,6 @@ async function setup(
           finalBrowserSources.sitesControlPlaneVerificationKey,
         approvedSitesControlPlaneTrustPolicy:
           finalBrowserSources.sitesControlPlaneTrustPolicy,
-        originalRailwayProvenance: originalRailwayProvenanceArtifact,
-        originalRailwayProvenanceVerificationKey:
-          originalRailwayProvenance.publicKey,
-        approvedOriginalRailwayProvenanceKeyId:
-          originalRailwayProvenanceKeyId,
-        approvedOriginalRailwayProvenanceKeySha256:
-          stableReleaseKeyFingerprint(originalRailwayProvenance.publicKey),
         authorizerSigningKey: baselineStableAuthorizer.privateKey,
         approvedAuthorizerKeyId: baselineStableAuthorizerKeyId,
         approvedAuthorizerKeySha256:

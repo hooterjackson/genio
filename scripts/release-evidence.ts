@@ -6,7 +6,6 @@ import {
   sign,
   verify,
 } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -57,6 +56,15 @@ import {
   verifyGithubOfflineAttestation,
   type GithubOfflineAttestationBindingV1,
 } from "./github-offline-attestation.ts";
+import {
+  parseCreateOnlyCliOptions,
+  readBoundedJsonFile,
+  readBoundedRegularFile,
+  readProtectedEd25519PrivateKey,
+  requiredProtectedEnvironment,
+  resolveContainedFilePath,
+  writeCanonicalJsonCreateOnly,
+} from "./release-authoring-io.ts";
 
 export { RELEASE_EVIDENCE_TTL_MS };
 
@@ -82,6 +90,12 @@ export interface ReleaseGateProducerTrustPolicyV1 {
   schemaVersion: "genio-release-gate-producer-trust-policy/v1";
   approvedKeyId: string;
   approvedKeySha256: string;
+}
+
+export interface ReleaseEvidenceAuthoringAuthorityV1 {
+  approvedKeyId: string;
+  approvedKeySha256: string;
+  now?: string;
 }
 
 export interface VerifiedCandidateSemanticReviewAuthorizationV1 {
@@ -369,7 +383,9 @@ function sortedJsonValue(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value as JsonRecord)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => (
+        left < right ? -1 : left > right ? 1 : 0
+      ))
       .map(([key, item]) => [key, sortedJsonValue(item)]),
   );
 }
@@ -1809,24 +1825,18 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
 }
 
 async function readJsonArtifact(path: string, label: string): Promise<unknown> {
-  let source: string;
-  try {
-    source = await readFile(path, "utf8");
-  } catch {
-    throw new Error(`${label} could not be read`);
-  }
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new Error(`${label} is not valid JSON`);
-  }
+  return readBoundedJsonFile(path, label);
 }
 
-function artifactFilePath(baseDirectory: string, value: unknown, label: string): string {
+async function artifactFilePath(
+  baseDirectory: string,
+  value: unknown,
+  label: string,
+): Promise<string> {
   if (typeof value !== "string" || !value.trim() || value.includes("\0")) {
     throw new Error(`${label} must name a JSON artifact file`);
   }
-  return resolve(baseDirectory, value);
+  return resolveContainedFilePath(baseDirectory, value, label);
 }
 
 function sameCandidate(
@@ -1903,10 +1913,12 @@ export async function loadReleaseEvidenceSigningBundle(
     );
   }
   const kind = root.kind;
-  const approvedSitesControlPlane = kind === "finalization"
-    ? validateSitesControlPlaneTrustPolicyV1(
+  const protectedSitesControlPlane =
+    validateSitesControlPlaneTrustPolicyV1(
       approvedSitesControlPlaneValue,
-    )
+    );
+  const approvedSitesControlPlane = kind === "finalization"
+    ? protectedSitesControlPlane
     : null;
   const generatedAt = timestamp(root.generatedAt, "release evidence signing bundle generatedAt");
   timestamp(root.expiresAt, "release evidence signing bundle expiresAt");
@@ -1927,24 +1939,24 @@ export async function loadReleaseEvidenceSigningBundle(
   }
   const priorReleaseEvidencePath = root.priorReleaseEvidenceFile === null
     ? null
-    : artifactFilePath(
+    : await artifactFilePath(
         baseDirectory,
         root.priorReleaseEvidenceFile,
         "priorReleaseEvidenceFile",
       );
   const publicRolloutEvidencePath = root.publicRolloutEvidenceFile === null
     ? null
-    : artifactFilePath(
+    : await artifactFilePath(
         baseDirectory,
         root.publicRolloutEvidenceFile,
         "publicRolloutEvidenceFile",
       );
-  const stagingControlPlaneEvidencePath = artifactFilePath(
+  const stagingControlPlaneEvidencePath = await artifactFilePath(
     baseDirectory,
     root.stagingControlPlaneEvidenceFile,
     "stagingControlPlaneEvidenceFile",
   );
-  const stagingControlPlaneVerificationKeyPath = artifactFilePath(
+  const stagingControlPlaneVerificationKeyPath = await artifactFilePath(
     baseDirectory,
     root.stagingControlPlaneVerificationKeyFile,
     "stagingControlPlaneVerificationKeyFile",
@@ -1955,7 +1967,11 @@ export async function loadReleaseEvidenceSigningBundle(
         stagingControlPlaneEvidencePath,
         "signed staging control-plane evidence",
       ),
-      readFile(stagingControlPlaneVerificationKeyPath),
+      readBoundedRegularFile(
+        stagingControlPlaneVerificationKeyPath,
+        "staging control-plane verification key",
+        16 * 1024,
+      ),
     ]);
   const stagingControlPlane = verifyStagingControlPlaneEvidence({
     value: stagingControlPlaneEvidenceValue,
@@ -1963,6 +1979,40 @@ export async function loadReleaseEvidenceSigningBundle(
     trustPolicy: stagingControlPlaneTrust,
     now: generatedAt,
   });
+  if (releaseVerificationKey) {
+    const receiptBindings = asRecord(
+      stagingControlPlane.payload.receipts,
+      "staging control-plane receipt bindings",
+    );
+    const receiptKeyFingerprints = [
+      "apple",
+      "provider",
+      "qaBudget",
+    ].map((name) => digest(
+      asRecord(
+        receiptBindings[name],
+        `${name} staging control-plane receipt binding`,
+      ).keySha256,
+      `${name} staging control-plane receipt key fingerprint`,
+    ));
+    const authorityFingerprints = [
+      releaseGateProducerKeyFingerprint(releaseVerificationKey),
+      producerTrust.approvedKeySha256,
+      approvedSemanticReviewer.approvedKeySha256,
+      approvedHistoricalReplay.approvedKeySha256,
+      stagingControlPlaneTrust.approvedKeySha256,
+      protectedSitesControlPlane.approvedKeySha256,
+      ...receiptKeyFingerprints,
+    ];
+    if (
+      authorityFingerprints.length !== 9
+      || new Set(authorityFingerprints).size !== authorityFingerprints.length
+    ) {
+      throw new Error(
+        "release evidence authoring requires nine distinct protected authorities",
+      );
+    }
+  }
   const offlineGithubAttestationFiles = asRecord(
     root.offlineGithubAttestationFiles,
     "release evidence signing bundle offlineGithubAttestationFiles",
@@ -1971,12 +2021,12 @@ export async function loadReleaseEvidenceSigningBundle(
     "bundle",
     "binding",
   ], "release evidence signing bundle offlineGithubAttestationFiles");
-  const offlineGithubBundlePath = artifactFilePath(
+  const offlineGithubBundlePath = await artifactFilePath(
     baseDirectory,
     offlineGithubAttestationFiles.bundle,
     "offlineGithubAttestationFiles.bundle",
   );
-  const offlineGithubBindingPath = artifactFilePath(
+  const offlineGithubBindingPath = await artifactFilePath(
     baseDirectory,
     offlineGithubAttestationFiles.binding,
     "offlineGithubAttestationFiles.binding",
@@ -1995,7 +2045,7 @@ export async function loadReleaseEvidenceSigningBundle(
     ["staging", "production"],
     "release evidence signing bundle runtimeSnapshotFiles",
   );
-  const stagingSnapshotPath = artifactFilePath(
+  const stagingSnapshotPath = await artifactFilePath(
     baseDirectory,
     runtimeSnapshotFiles.staging,
     "runtimeSnapshotFiles.staging",
@@ -2010,7 +2060,7 @@ export async function loadReleaseEvidenceSigningBundle(
   }
   const productionSnapshotPath = runtimeSnapshotFiles.production === null
     ? null
-    : artifactFilePath(
+    : await artifactFilePath(
       baseDirectory,
       runtimeSnapshotFiles.production,
       "runtimeSnapshotFiles.production",
@@ -2180,7 +2230,7 @@ export async function loadReleaseEvidenceSigningBundle(
     "release evidence signing bundle gateAttestationFiles",
   );
   const artifacts = await Promise.all(expectedGates.map(async (gateName) => {
-    const path = artifactFilePath(
+    const path = await artifactFilePath(
       baseDirectory,
       artifactFiles[gateName],
       `gateArtifactFiles.${gateName}`,
@@ -2204,7 +2254,7 @@ export async function loadReleaseEvidenceSigningBundle(
         );
       }
     }
-    const attestationPath = artifactFilePath(
+    const attestationPath = await artifactFilePath(
       baseDirectory,
       attestationFiles[gateName],
       `gateAttestationFiles.${gateName}`,
@@ -2811,7 +2861,31 @@ export async function signReleaseEvidenceBundle(
   githubOfflineVerifier: GithubOfflineEvidenceVerifier,
   signingKey: string | Buffer | KeyObject,
   keyIdValue: string,
+  authority: ReleaseEvidenceAuthoringAuthorityV1,
 ): Promise<SignedReleaseEvidenceV1> {
+  const keyId = label(keyIdValue, "signature.keyId");
+  const approvedKeyId = label(
+    authority.approvedKeyId,
+    "protected release verification key ID",
+  );
+  const approvedKeySha256 = digest(
+    authority.approvedKeySha256,
+    "protected release verification key fingerprint",
+  );
+  const signerPublicKey = createPublicKey(privateKey(signingKey));
+  if (
+    keyId !== approvedKeyId
+    || releaseGateProducerKeyFingerprint(signerPublicKey)
+      !== approvedKeySha256
+  ) {
+    throw new Error(
+      "release evidence signer does not match the protected release authority",
+    );
+  }
+  const signerNow = timestamp(
+    authority.now ?? new Date().toISOString(),
+    "release evidence signer time",
+  );
   const payload = await loadReleaseEvidenceSigningBundle(
     bundleValue,
     baseDirectory,
@@ -2822,9 +2896,20 @@ export async function signReleaseEvidenceBundle(
     stagingControlPlaneTrust,
     approvedSitesControlPlane,
     githubOfflineVerifier,
-    createPublicKey(privateKey(signingKey)),
+    signerPublicKey,
   );
-  return signValidatedReleaseEvidence(payload, signingKey, keyIdValue);
+  const evidence = signValidatedReleaseEvidence(payload, signingKey, keyId);
+  verifyReleaseEvidence(evidence, signerPublicKey, {
+    expectedKind: evidence.payload.kind,
+    expectedRevision: evidence.payload.candidate.sourceRevision,
+    expectedImageDigest: evidence.payload.candidate.imageDigest,
+    expectedTag: evidence.payload.candidate.tag,
+    expectedConfigurationHash:
+      releaseEvidenceConfigurationHash(evidence.payload),
+    expectedRuntimeHash: releaseEvidenceRuntimeHash(evidence.payload),
+    now: signerNow,
+  });
+  return evidence;
 }
 
 export function verifyReleaseEvidence(
@@ -3071,28 +3156,39 @@ export function verifyCandidateSemanticReviewAuthorizationEvidence(input: {
   });
 }
 
-function option(args: readonly string[], name: string): string {
-  const index = args.indexOf(name);
-  const value = index >= 0 ? args[index + 1] : "";
-  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-  return value;
-}
-
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (command === "sign") {
-    const inputPath = option(args, "--input");
-    const outputPath = option(args, "--output");
-    const privateKeyPath = option(args, "--private-key");
-    const producerPublicKeyPath = option(args, "--producer-public-key");
-    const keyId = option(args, "--key-id");
-    const [input, pem, producerPem] = await Promise.all([
-      readFile(inputPath, "utf8"),
-      readFile(privateKeyPath),
-      readFile(producerPublicKeyPath),
+    const options = parseCreateOnlyCliOptions(args, {
+      required: [
+        "--input",
+        "--output",
+        "--private-key",
+        "--producer-public-key",
+        "--key-id",
+      ],
+    });
+    const inputPath = options["--input"]!;
+    const outputPath = options["--output"]!;
+    const privateKeyPath = options["--private-key"]!;
+    const producerPublicKeyPath = options["--producer-public-key"]!;
+    const keyId = options["--key-id"]!;
+    const [input, signingKey, producerPem] = await Promise.all([
+      readBoundedJsonFile(inputPath, "release evidence signing bundle"),
+      readProtectedEd25519PrivateKey({
+        cliPath: privateKeyPath,
+        environmentName: "RELEASE_SIGNING_KEY_FILE",
+        label: "release evidence signing key",
+      }),
+      readBoundedRegularFile(
+        producerPublicKeyPath,
+        "release gate producer verification key",
+        16 * 1024,
+      ),
     ]);
+    const signerNow = new Date().toISOString();
     const evidence = await signReleaseEvidenceBundle(
-      JSON.parse(input),
+      input,
       dirname(resolve(inputPath)),
       producerPem,
       releaseGateProducerTrustPolicyV1({
@@ -3155,10 +3251,33 @@ async function main(): Promise<void> {
             .toLowerCase() ?? "",
       },
       verifyGithubOfflineAttestation,
-      pem,
+      signingKey,
       keyId,
+      {
+        approvedKeyId: requiredProtectedEnvironment(
+          "RELEASE_VERIFICATION_KEY_ID",
+          SAFE_LABEL,
+          "release verification key ID",
+        ),
+        approvedKeySha256: requiredProtectedEnvironment(
+          "RELEASE_VERIFICATION_KEY_SHA256",
+          SHA256,
+          "release verification key fingerprint",
+        ),
+        now: signerNow,
+      },
     );
-    await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    verifyReleaseEvidence(evidence, createPublicKey(signingKey), {
+      expectedKind: evidence.payload.kind,
+      expectedRevision: evidence.payload.candidate.sourceRevision,
+      expectedImageDigest: evidence.payload.candidate.imageDigest,
+      expectedTag: evidence.payload.candidate.tag,
+      expectedConfigurationHash:
+        releaseEvidenceConfigurationHash(evidence.payload),
+      expectedRuntimeHash: releaseEvidenceRuntimeHash(evidence.payload),
+      now: signerNow,
+    });
+    await writeCanonicalJsonCreateOnly(outputPath, evidence);
     process.stdout.write(`${JSON.stringify({
       ok: true,
       command,
@@ -3171,14 +3290,27 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "verify") {
-    const inputPath = option(args, "--input");
-    const publicKeyPath = option(args, "--public-key");
-    const expectedRevision = option(args, "--expected-revision");
-    const expectedImageDigest = option(args, "--expected-image-digest");
-    const expectedTag = option(args, "--expected-tag");
-    const expectedConfigurationHash = option(args, "--expected-configuration-hash");
-    const expectedRuntimeHash = option(args, "--expected-runtime-hash");
-    const expectedKindValue = option(args, "--expected-kind");
+    const options = parseCreateOnlyCliOptions(args, {
+      required: [
+        "--input",
+        "--public-key",
+        "--expected-revision",
+        "--expected-image-digest",
+        "--expected-tag",
+        "--expected-configuration-hash",
+        "--expected-runtime-hash",
+        "--expected-kind",
+      ],
+    });
+    const inputPath = options["--input"]!;
+    const publicKeyPath = options["--public-key"]!;
+    const expectedRevision = options["--expected-revision"]!;
+    const expectedImageDigest = options["--expected-image-digest"]!;
+    const expectedTag = options["--expected-tag"]!;
+    const expectedConfigurationHash =
+      options["--expected-configuration-hash"]!;
+    const expectedRuntimeHash = options["--expected-runtime-hash"]!;
+    const expectedKindValue = options["--expected-kind"]!;
     if (
       expectedKindValue !== "candidate"
       && expectedKindValue !== "promotion"
@@ -3188,25 +3320,32 @@ async function main(): Promise<void> {
         "--expected-kind must be candidate, promotion, or finalization",
       );
     }
-    const [input, pem] = await Promise.all([
-      readFile(inputPath, "utf8"),
-      readFile(publicKeyPath),
+    const [envelope, pem] = await Promise.all([
+      readBoundedJsonFile(inputPath, "signed release evidence"),
+      readBoundedRegularFile(
+        publicKeyPath,
+        "release verification key",
+        16 * 1024,
+      ),
     ]);
-    const envelope = JSON.parse(input) as SignedReleaseEvidenceV1;
-    const payload = verifyReleaseEvidence(envelope, pem, {
+    const payload = verifyReleaseEvidence(
+      envelope as SignedReleaseEvidenceV1,
+      pem,
+      {
       expectedKind: expectedKindValue,
       expectedRevision,
       expectedImageDigest,
       expectedTag,
       expectedConfigurationHash: digest(expectedConfigurationHash, "--expected-configuration-hash"),
       expectedRuntimeHash: digest(expectedRuntimeHash, "--expected-runtime-hash"),
-    });
+      },
+    );
     process.stdout.write(`${JSON.stringify({
       ok: true,
       command,
       kind: payload.kind,
-      payloadHash: envelope.payloadHash,
-      keyId: envelope.signature.keyId,
+      payloadHash: (envelope as SignedReleaseEvidenceV1).payloadHash,
+      keyId: (envelope as SignedReleaseEvidenceV1).signature.keyId,
       tag: payload.candidate.tag,
       configurationHash: releaseEvidenceConfigurationHash(payload),
       runtimeHash: releaseEvidenceRuntimeHash(payload),
@@ -3219,7 +3358,8 @@ async function main(): Promise<void> {
     + "--producer-public-key producer.pub.pem --key-id <id> | "
     + "verify --input evidence.json --public-key key.pub.pem --expected-revision <sha> "
     + "--expected-image-digest sha256:<digest> --expected-tag vX.Y.Z-rc.N "
-    + "--expected-kind candidate|promotion --expected-configuration-hash <sha256> "
+    + "--expected-kind candidate|promotion|finalization "
+    + "--expected-configuration-hash <sha256> "
     + "--expected-runtime-hash <sha256>",
   );
 }

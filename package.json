@@ -66,6 +66,8 @@
     "release:stable:authorize": "node --experimental-transform-types scripts/authorize-stable-release.ts",
     "release:stable:verify": "node --experimental-transform-types scripts/verify-stable-release.ts",
     "release:stable:dispatch:prepare": "node --experimental-transform-types scripts/prepare-stable-release-dispatch.ts",
+    "release:artifact:author": "node --experimental-transform-types scripts/release-artifact-author.ts",
+    "release:bootstrap:author": "node --experimental-transform-types scripts/stable-predecessor-author.ts",
     "release:snapshot": "node --experimental-transform-types scripts/release-runtime-snapshot.ts",
     "release:fixtures:check": "vitest run tests/release-fixtures.test.ts tests/release-evidence.test.ts",
     "release:evidence": "node --experimental-transform-types scripts/release-evidence.ts",

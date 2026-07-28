@@ -6,6 +6,7 @@ const dockerfileUrl = new URL("../Dockerfile", import.meta.url);
 const buildInfoUrl = new URL("../server/build-info.ts", import.meta.url);
 
 type ReleaseCandidateJob =
+  | "control"
   | "authorize"
   | "validate_offline"
   | "validate_browser"
@@ -15,6 +16,7 @@ type ReleaseCandidateJob =
 
 function job(workflow: string, name: ReleaseCandidateJob): string {
   const order = [
+    "control",
     "authorize",
     "validate_offline",
     "validate_browser",
@@ -33,24 +35,41 @@ function job(workflow: string, name: ReleaseCandidateJob): string {
 describe("release-candidate workflow trust boundary", () => {
   test("loads only from the default branch and accepts merged, green RC commits", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
+    const triggers = workflow.slice(0, workflow.indexOf("\nconcurrency:"));
     expect(workflow).toContain("repository_dispatch:");
     expect(workflow).toContain("types: [genio-release-candidate]");
-    expect(workflow).not.toContain("workflow_dispatch:");
+    expect(triggers).not.toContain("workflow_dispatch:");
+    for (const authorityInput of [
+      "release_verification_key_sha256",
+      "public_rollout_intent_canary_authority_policy_sha256",
+      "stable_authorizer_key_id",
+      "stable_authorizer_key_sha256",
+    ]) {
+      expect(triggers).not.toContain(authorityInput);
+    }
     expect(workflow).not.toMatch(/push:\s*\n\s+tags:/u);
     expect(workflow).toContain(
       "CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}",
     );
     expect(workflow).toContain(
-      'test "$CANDIDATE_SHA" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"',
+      'Object.keys(value).sort().join(",")!=="candidate_tag"',
     );
-    expect(workflow).toContain('test "$CANDIDATE_SHA" = "$GITHUB_SHA"');
+    expect(workflow).toContain(
+      "release dispatch accepts exactly one client_payload key: candidate_tag",
+    );
+    expect(workflow).toContain(
+      'test "$TAG_TARGET" = "$CONTROLLER_REVISION"',
+    );
+    expect(workflow).toContain(
+      'test "$CONTROLLER_REVISION" = "$GITHUB_SHA"',
+    );
     expect(workflow).toContain("listPullRequestsAssociatedWithCommit");
     expect(workflow).toContain('trustedWorkflowPath = ".github/workflows/ci.yml"');
     expect(workflow).toContain("github.rest.actions.getWorkflow");
     expect(workflow).toContain("github.rest.actions.listWorkflowRuns");
     expect(workflow).toContain('event: "push"');
     expect(workflow).toContain(
-      "run.head_branch === context.payload.repository.default_branch",
+      "run.head_branch === defaultBranch",
     );
     expect(workflow).toContain(
       "run.head_sha === process.env.CANDIDATE_SHA",
@@ -59,11 +78,13 @@ describe("release-candidate workflow trust boundary", () => {
       "run.head_repository?.full_name === repository",
     );
     expect(workflow).toContain("github.rest.checks.listForSuite");
-    expect(workflow).toContain('run.app?.slug !== "github-actions"');
+    expect(workflow).toContain('check.app?.slug !== "github-actions"');
     expect(workflow).toContain(
-      "run.check_suite?.id !== trustedRun.check_suite_id",
+      "check.check_suite?.id !== trustedRun.check_suite_id",
     );
-    expect(workflow).toContain("candidate required checks are not green");
+    expect(workflow).toContain(
+      "candidate does not have the exact successful App-bound checks",
+    );
     expect(workflow).toContain('"production-database-compatibility"');
     expect(workflow).toContain("ref: ${{ steps.candidate.outputs.sha }}");
     expect(workflow).toContain(
@@ -88,6 +109,7 @@ describe("release-candidate workflow trust boundary", () => {
 
   test("isolates exact-SHA offline, browser, production-database, and system validation from publishing authority", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
+    const control = job(workflow, "control");
     const authorization = job(workflow, "authorize");
     const offline = job(workflow, "validate_offline");
     const browser = job(workflow, "validate_browser");
@@ -96,8 +118,25 @@ describe("release-candidate workflow trust boundary", () => {
     const publishing = job(workflow, "publish");
 
     expect(workflow).toContain("permissions: {}");
+    expect(control).toContain("environment: release-control-audit");
+    expect(control).toMatch(/permissions:\s*\n\s+contents: read/u);
+    expect(control).toContain(
+      "private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}",
+    );
+    expect(control).toMatch(
+      /permission-actions: read[\s\S]*permission-administration: write[\s\S]*permission-checks: read[\s\S]*permission-contents: read[\s\S]*permission-pull-requests: read/u,
+    );
+    expect(control).not.toMatch(
+      /^\s+permission-(?:attestations|contents|packages):\s+write\s*$/mu,
+    );
+    expect(control).not.toContain("STABLE_RELEASE_WRITER_APP_PRIVATE_KEY");
+    expect(authorization).toContain("needs: [control]");
+    expect(authorization).toContain("environment: release-candidate");
     expect(authorization).toMatch(
-      /permissions:\s*\n\s+actions: read\s*\n\s+attestations: read\s*\n\s+checks: read\s*\n\s+contents: read\s*\n\s+packages: read\s*\n\s+pull-requests: read/u,
+      /permissions:\s*\n\s+attestations: read\s*\n\s+contents: read\s*\n\s+packages: read/u,
+    );
+    expect(authorization).not.toContain(
+      "RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY",
     );
     for (const validation of [offline, browser, productionDatabase, system]) {
       expect(validation).toContain("needs: [authorize]");
@@ -152,6 +191,7 @@ describe("release-candidate workflow trust boundary", () => {
       publishing.indexOf("docker/setup-buildx-action@"),
     );
     for (const section of [
+      control,
       authorization,
       offline,
       browser,
@@ -162,6 +202,121 @@ describe("release-candidate workflow trust boundary", () => {
       expect(section).toContain("runs-on: ubuntu-latest");
       expect(section).toContain("actions/checkout@");
     }
+  });
+
+  test("uses an auditor-only protected control job and exact live release controls", async () => {
+    const workflow = await readFile(workflowUrl, "utf8");
+    const control = job(workflow, "control");
+    const authorization = job(workflow, "authorize");
+    const publishing = job(workflow, "publish");
+
+    expect(control).toContain("RC_TAG_RULESET_ID: \"19863848\"");
+    expect(control).toContain("rulesetId !== 19863848");
+    expect(control).toContain(
+      'JSON.stringify(["refs/tags/v*-rc.*"])',
+    );
+    expect(control).toContain(
+      'JSON.stringify(["deletion", "update"])',
+    );
+    expect(control).toContain(
+      "(ruleset.data.bypass_actors ?? []).length !== 0",
+    );
+    expect(control).toContain(
+      '"GET /repos/{owner}/{repo}/immutable-releases"',
+    );
+    expect(authorization).not.toContain(
+      '"GET /repos/{owner}/{repo}/immutable-releases"',
+    );
+    expect(control).toContain(
+      "configuredChecks.length !== requiredChecks.length",
+    );
+    expect(control).toContain(
+      "Number(appId) !== githubActionsAppId",
+    );
+    expect(control).toContain(
+      "latestChecks.size !== requiredChecks.length",
+    );
+    expect(control).toContain(
+      "required_approving_review_count !== 0",
+    );
+    expect(control).toContain("dismiss_stale_reviews !== true");
+    expect(control).toContain("require_last_push_approval !== false");
+    expect(control).toContain("required_conversation_resolution?.enabled");
+    expect(control).toContain("allow_force_pushes?.enabled !== false");
+    expect(control).toContain("allow_deletions?.enabled !== false");
+    expect(control).not.toContain("github.rest.pulls.listReviews");
+    expect(control).toContain('"release-control-audit"');
+    expect(control).toContain('"release-candidate"');
+    expect(control).toContain("reviewerRule.reviewers.length !== 1");
+    expect(control).toContain("!== context.repo.owner.toLowerCase()");
+    expect(control).toContain("environment.data.prevent_self_review === true");
+    expect(control).toContain("can_admins_bypass !== false");
+    expect(control).not.toMatch(
+      /^\s+(?:packages|id-token|attestations):\s+write\s*$/mu,
+    );
+    expect(publishing).not.toContain(
+      "RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY",
+    );
+  });
+
+  test("carries and refences the annotated tag object through final publication without alias overwrite", async () => {
+    const workflow = await readFile(workflowUrl, "utf8");
+    const authorization = job(workflow, "authorize");
+    const publishing = job(workflow, "publish");
+
+    for (const output of [
+      "candidate_tag_object",
+      "candidate_tag_target",
+      "controller_revision",
+    ]) {
+      expect(authorization).toContain(`${output}: \${{ steps.identity.outputs.${output} }}`);
+    }
+    for (const name of [
+      "validate_offline",
+      "validate_browser",
+      "validate_production_database",
+      "validate_system",
+      "publish",
+    ] as const) {
+      const section = job(workflow, name);
+      expect(section).toContain(
+        "CANDIDATE_TAG_OBJECT: ${{ needs.authorize.outputs.candidate_tag_object }}",
+      );
+      expect(section).toContain(
+        "CANDIDATE_TAG_TARGET: ${{ needs.authorize.outputs.candidate_tag_target }}",
+      );
+    }
+    const referenceFence = publishing.indexOf(
+      "Reread and fence the controller and annotated candidate tag",
+    );
+    const aliasFence = publishing.indexOf(
+      "Refuse to overwrite differently bound GHCR aliases",
+    );
+    const push = publishing.indexOf(
+      "Push the already-built candidate only after the final fence",
+    );
+    expect(referenceFence).toBeGreaterThan(0);
+    expect(aliasFence).toBeGreaterThan(referenceFence);
+    expect(push).toBeGreaterThan(aliasFence);
+    expect(publishing).toContain(
+      'test "$(git rev-parse "origin/$DEFAULT_BRANCH")" = "$CONTROLLER_REVISION"',
+    );
+    expect(publishing).toContain(
+      'test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$CANDIDATE_TAG_OBJECT"',
+    );
+    expect(publishing).toContain(
+      'EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}',
+    );
+    expect(publishing).toContain(
+      "docker buildx imagetools inspect",
+    );
+    expect(publishing).toContain(
+      'if [[ "$observed" != "$EXPECTED_DIGEST" ]]',
+    );
+    expect(publishing).toContain('inspect_alias "$CANDIDATE_TAG"');
+    expect(publishing).toContain(
+      'inspect_alias "sha-$SOURCE_REVISION"',
+    );
   });
 
   test("guards disk headroom after pruning only known package-manager caches", async () => {
@@ -198,6 +353,7 @@ describe("release-candidate workflow trust boundary", () => {
 
   test("pins current authorities but derives the semantic baseline only from the exact immutable stable predecessor", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
+    const control = job(workflow, "control");
     const authorization = job(workflow, "authorize");
     const offline = job(workflow, "validate_offline");
     const publishing = job(workflow, "publish");
@@ -230,7 +386,28 @@ describe("release-candidate workflow trust boundary", () => {
       "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}",
     );
     expect(authorization).toContain(
+      "RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}",
+    );
+    expect(authorization).toContain(
+      "RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}",
+    );
+    expect(authorization).not.toMatch(
+      /github\.event\.(?:inputs|client_payload)\.(?:release_verification_key_sha256|RELEASE_VERIFICATION_KEY_SHA256|public_rollout_intent_canary_authority_policy_sha256|RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256|stable_authorizer_key_id|RELEASE_STABLE_AUTHORIZER_KEY_ID|stable_authorizer_key_sha256|RELEASE_STABLE_AUTHORIZER_KEY_SHA256)/u,
+    );
+    expect(authorization).toContain(
       '[[ ! "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]',
+    );
+    expect(authorization).toContain(
+      'RELEASE_VERIFICATION_KEY_SHA256" == "<64-hex>"',
+    );
+    expect(authorization).toContain(
+      'RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" == "<64-hex>"',
+    );
+    expect(authorization).toContain(
+      'RELEASE_STABLE_AUTHORIZER_KEY_ID" == "<key-id>"',
+    );
+    expect(authorization).toContain(
+      'RELEASE_STABLE_AUTHORIZER_KEY_SHA256" == "<64-hex>"',
     );
     for (const variable of [
       "RELEASE_SEMANTIC_BASELINE_METADATA_SHA256",
@@ -242,11 +419,18 @@ describe("release-candidate workflow trust boundary", () => {
       expect(authorization).not.toContain(`\${{ vars.${variable} }}`);
     }
     expect(authorization.indexOf("Pin the release verification authority"))
-      .toBeLessThan(authorization.indexOf("Resolve merged candidate"));
+      .toBeLessThan(
+        authorization.indexOf(
+          "Reverify the authorized controller and annotated candidate tag",
+        ),
+      );
     expect(authorization).toContain(
       "Resolve the exact immutable stable predecessor and signed lineage",
     );
-    expect(authorization).toContain(
+    expect(control).toContain(
+      '"GET /repos/{owner}/{repo}/immutable-releases"',
+    );
+    expect(authorization).not.toContain(
       '"GET /repos/{owner}/{repo}/immutable-releases"',
     );
     expect(authorization).toContain("github.rest.repos.listReleases");
@@ -462,10 +646,10 @@ describe("release-candidate workflow trust boundary", () => {
       "genio-release-evidence/v3",
       "genio-signed-stable-release-authorization/v2",
       "genio-stable-release-authorization/v2",
-      "genio-signed-stable-predecessor-bootstrap-evidence/v1",
-      "genio-stable-predecessor-bootstrap-evidence/v1",
-      "genio-signed-stable-predecessor-bootstrap-authorization/v1",
-      "genio-stable-predecessor-bootstrap-authorization/v1",
+      "genio-signed-stable-predecessor-bootstrap-evidence/v2",
+      "genio-stable-predecessor-bootstrap-evidence/v2",
+      "genio-signed-stable-predecessor-bootstrap-authorization/v2",
+      "genio-stable-predecessor-bootstrap-authorization/v2",
     ]) {
       expect(authorization).toContain(schema);
     }
@@ -510,6 +694,12 @@ describe("release-candidate workflow trust boundary", () => {
     );
     expect(authorization).toContain(
       "wrapper_fixture_evidence_does_not_prove_historical_production_output_equivalence",
+    );
+    expect(authorization).toContain(
+      "Historical-Artifact-Equivalence: not claimed",
+    );
+    expect(authorization).toContain(
+      "Historical-Artifact-Identity: unavailable",
     );
     expect(authorization).toContain(
       "authorization.payload.producerKeySha256",
@@ -594,11 +784,15 @@ describe("release-candidate workflow trust boundary", () => {
       "candidate version is no longer greater than every stable tag and release",
     );
     expect(workflow).toContain(
-      '"originalRailwayProvenanceArtifactHash"',
+      '"historicalArtifactEquivalence"',
     );
     expect(workflow).toContain(
-      "authorization.payload.originalRailwayProvenanceKeySha256",
+      'authorizationPayload.historicalArtifactEquivalence\n                  !== "not_claimed"',
     );
+    expect(workflow).toContain(
+      "authorizationPayload.wrapperImageDigest",
+    );
+    expect(workflow).not.toContain("originalRailwayProvenance");
   });
 
   test("embeds the immutable source identity inside the promoted image", async () => {
@@ -614,6 +808,10 @@ describe("release-candidate workflow trust boundary", () => {
       "GENIO_BUILD_VERSION=${{ needs.authorize.outputs.version }}",
     );
     expect(workflow).toContain("platforms: linux/amd64");
+    expect(dockerfile).toContain("COPY patches ./patches");
+    expect(dockerfile.indexOf("COPY patches ./patches")).toBeLessThan(
+      dockerfile.indexOf("RUN pnpm install --frozen-lockfile"),
+    );
     expect(dockerfile).toContain('schemaVersion:"genio-embedded-build/v1"');
     expect(dockerfile).toContain(
       "publicRolloutIntentCanaryAuthorityPolicySha256",

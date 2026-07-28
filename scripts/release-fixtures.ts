@@ -476,7 +476,9 @@ function sortedJsonValue(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value as JsonRecord)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => (
+        left < right ? -1 : left > right ? 1 : 0
+      ))
       .map(([key, item]) => [key, sortedJsonValue(item)]),
   );
 }
@@ -930,13 +932,25 @@ function recomputeHash(
   hashField: string,
   label: string,
   mode: "stable" | "insertion" = "stable",
+  insertionOrder?: readonly string[],
+  normalizeInsertionValue?: (value: JsonRecord) => JsonRecord,
 ): void {
   const expected = digest(record[hashField], `${label}.${hashField}`);
   const unsigned = { ...record };
   delete unsigned[hashField];
+  const orderedInsertionValue = Object.fromEntries(
+    (insertionOrder ?? Object.keys(unsigned)).map((key) => [
+        key,
+        unsigned[key],
+      ]),
+  );
   const actual = mode === "stable"
     ? releaseFixtureSha256(unsigned)
-    : createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
+    : createHash("sha256").update(JSON.stringify(
+      normalizeInsertionValue
+        ? normalizeInsertionValue(orderedInsertionValue)
+        : orderedInsertionValue,
+    )).digest("hex");
   if (expected !== actual) throw new Error(`${label} hash does not match its contents`);
 }
 
@@ -1031,7 +1045,7 @@ function validateHostedPublicationSource(
   },
 ): JsonRecord {
   const hosted = asRecord(value, "hosted publication evidence");
-  exactKeys(hosted, [
+  const hostedFields = [
     "schemaVersion",
     "canaryId",
     "cacheMode",
@@ -1052,7 +1066,8 @@ function validateHostedPublicationSource(
     "independentAppleEvidenceHash",
     "volumes",
     "evidenceHash",
-  ], "hosted publication evidence");
+  ] as const;
+  exactKeys(hosted, hostedFields, "hosted publication evidence");
   if (
     hosted.schemaVersion !== "genio-hosted-publication-smoke/v1"
     || hosted.cacheMode !== "reuse_disabled"
@@ -1101,7 +1116,22 @@ function validateHostedPublicationSource(
   if (total !== expected.targetTrackCount) {
     throw new Error("hosted publication volume count does not bind the fixture");
   }
-  recomputeHash(hosted, "evidenceHash", "hosted publication evidence", "insertion");
+  recomputeHash(
+    hosted,
+    "evidenceHash",
+    "hosted publication evidence",
+    "insertion",
+    hostedFields.filter((field) => field !== "evidenceHash"),
+    (ordered) => ({
+      ...ordered,
+      volumes: (ordered.volumes as JsonRecord[]).map((volume) => ({
+        index: volume.index,
+        trackCount: volume.trackCount,
+        appendedCount: volume.appendedCount,
+        shareUrl: volume.shareUrl,
+      })),
+    }),
+  );
   return hosted;
 }
 
