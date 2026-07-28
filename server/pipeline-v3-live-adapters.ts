@@ -1797,8 +1797,9 @@ async function discoverQualifiedAppleExpansion(input: {
     .map(({ artist, title }) => exactTrackKey(artist, title)));
   const eligibleCatalogSongs = [...catalogSongs.values()]
     .filter((song) => (
-      !excluded.has(exactTrackKey(song.artistName, song.name))
-      || enrichableSeedIds.has(song.id)
+      qualitySeedWindow.length > 0 && enrichableSeedIds.size > 0
+        ? enrichableSeedIds.has(song.id)
+        : !excluded.has(exactTrackKey(song.artistName, song.name))
     ))
     // The defining purpose of this pass is to close quality-evidence gaps on
     // identities that already passed membership. Do not let a large artist
@@ -1807,7 +1808,15 @@ async function discoverQualifiedAppleExpansion(input: {
       Number(enrichableSeedIds.has(right.id))
       - Number(enrichableSeedIds.has(left.id))
     ))
-    .slice(0, Math.min(300, Math.max(request.requestedRawCandidateCount, request.requestedRawCandidateCount * 2)));
+    .slice(0, qualitySeedWindow.length > 0 && enrichableSeedIds.size > 0
+      ? enrichableSeedIds.size
+      : Math.min(
+          300,
+          Math.max(
+            request.requestedRawCandidateCount,
+            request.requestedRawCandidateCount * 2,
+          ),
+        ));
   if (eligibleCatalogSongs.length === 0) {
     const finalRound = request.strategyRound >= request.strategy.maximumRounds;
     return {
@@ -1867,7 +1876,13 @@ async function discoverQualifiedAppleExpansion(input: {
             + (qualitySeedWindow.length > 0 ? 1 : 0),
         }),
     exhausted: finalRound,
-    costUnits: Math.max(1, Math.ceil(eligibleCatalogSongs.length / 100)),
+    costUnits: Math.max(
+      1,
+      Math.ceil(
+        eligibleCatalogSongs.length
+          / (request.plan.playlistQualityPolicy ? 5 : 100),
+      ),
+    ),
   };
 }
 
@@ -2926,8 +2941,13 @@ export function createPipelineV3LiveAdapters(
   const verifyAppleExpansion = options.verifyAppleExpansion
     ?? (async (request: DiscoveryRequestV3, songs: readonly CatalogSong[]) => {
       const verified: HostedWebCandidateV3[] = [];
-      for (let offset = 0; offset < songs.length; offset += 100) {
-        const chunk = songs.slice(offset, offset + 100);
+      // Central-quality rows are intentionally verbose: each exact recording
+      // carries one tri-state verdict per server-owned criterion. Small
+      // batches keep the strict response within its output budget and give
+      // hosted search enough room to bind every result to the exact track.
+      const chunkSize = request.plan.playlistQualityPolicy ? 5 : 100;
+      for (let offset = 0; offset < songs.length; offset += chunkSize) {
+        const chunk = songs.slice(offset, offset + chunkSize);
         const page = await defaultHostedWebDiscovery(
           { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
           request.modelRoute ?? modelRoute,

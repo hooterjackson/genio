@@ -4572,6 +4572,12 @@ export async function executeRetrievalV3(input: {
         const fairShare = localOnly
           ? Math.max(1, totalWaveRawGoal)
           : Math.max(1, Math.ceil(unallocatedRawGoal / unallocatedMaterialSlots));
+        const qualityEvidenceGoal = !localOnly
+          && state.definition.kind === "qualified_expansion"
+          && activePlan.playlistQualityPolicy
+          && frozenQualifiedTrackSeeds.length > 0
+          ? Math.min(25, frozenQualifiedTrackSeeds.length)
+          : 1;
         const requestedRawCandidateCount = localOnly
           ? Math.max(1, Math.min(
               fairShare,
@@ -4579,12 +4585,16 @@ export async function executeRetrievalV3(input: {
               remainingCapacity,
             ))
           : Math.max(1, Math.min(
-              fairShare,
+              Math.max(fairShare, qualityEvidenceGoal),
               state.definition.maximumBatchSize,
-              unallocatedRawGoal,
+              Math.max(unallocatedRawGoal, qualityEvidenceGoal),
+              remainingCapacity,
             ));
         if (!localOnly) {
-          unallocatedRawGoal -= requestedRawCandidateCount;
+          unallocatedRawGoal = Math.max(
+            0,
+            unallocatedRawGoal - requestedRawCandidateCount,
+          );
           unallocatedMaterialSlots -= 1;
         }
         return {
