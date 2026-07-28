@@ -3715,23 +3715,32 @@ describe("Pipeline V3 live read-only adapters", () => {
 
   test.each([
     {
+      label: "album-null evidence with one exact recording family",
+      evidenceAlbum: null,
+      catalogAlbums: ["Only Album"],
+      expectedBound: true,
+    },
+    {
       label: "album-null evidence",
       evidenceAlbum: null,
       catalogAlbums: ["First Album", "Second Album"],
+      expectedBound: false,
     },
     {
       label: "album-mismatched evidence",
       evidenceAlbum: "Missing Album",
       catalogAlbums: ["First Album", "Second Album"],
+      expectedBound: false,
     },
     {
       label: "one album spanning multiple recording families",
       evidenceAlbum: "Shared Album",
       catalogAlbums: ["Shared Album", "Shared Album"],
+      expectedBound: false,
     },
   ])(
-    "keeps $label central-quality proof unknown instead of copying it to possibilities[0]",
-    async ({ evidenceAlbum, catalogAlbums }) => {
+    "binds central-quality proof only when $label resolves to one exact Apple family",
+    async ({ evidenceAlbum, catalogAlbums, expectedBound }) => {
       const base = plan("one smooth disco song", 1);
       const selection: SelectionPlanV3 = {
         ...base,
@@ -3755,10 +3764,12 @@ describe("Pipeline V3 live read-only adapters", () => {
         ...song(401, "Shared Artist", "Shared Title"),
         albumName: catalogAlbums[0]!,
       };
-      const second: CatalogSong = {
-        ...song(402, "Shared Artist", "Shared Title"),
-        albumName: catalogAlbums[1]!,
-      };
+      const second: CatalogSong | null = catalogAlbums[1]
+        ? {
+          ...song(402, "Shared Artist", "Shared Title"),
+          albumName: catalogAlbums[1],
+        }
+        : null;
       const observations = selection.playlistQualityPolicy!.criteria.map(
         (criterion) => createCentralQualityCriterionObservationV3({
           policy: selection.playlistQualityPolicy!,
@@ -3780,7 +3791,7 @@ describe("Pipeline V3 live read-only adapters", () => {
           }],
         })) as any,
         getArtistTopSongs: vi.fn(async () => ({
-          items: [first, second],
+          items: second ? [first, second] : [first],
           next: null,
         })) as any,
         getArtistAlbums: vi.fn(async () => ({
@@ -3817,7 +3828,9 @@ describe("Pipeline V3 live read-only adapters", () => {
       const batch = await adapters.discover(discovery);
       expect(batch.candidates).toHaveLength(1);
       expect((batch.candidates[0]!.metadata as any)
-        .centralQualityCriterionObservations).toEqual([]);
+        .centralQualityCriterionObservations).toHaveLength(
+          expectedBound ? observations.length : 0,
+        );
 
       const [qualification] = await adapters.qualify({
         runId: "ambiguous-central-quality-expansion",
@@ -3829,7 +3842,9 @@ describe("Pipeline V3 live read-only adapters", () => {
         candidates: batch.candidates,
       });
       expect(qualification!.catalog.appleSongId).toBe(first.id);
-      expect(qualification!.centralQualityCriterionObservations).toEqual([]);
+      expect(qualification!.centralQualityCriterionObservations).toHaveLength(
+        expectedBound ? observations.length : 0,
+      );
     },
   );
 });

@@ -720,7 +720,11 @@ function candidateFromVerifiedAppleExpansion(
     id: `v3:apple:${hash(song.id).slice(0, 32)}`,
     title: song.name,
     artist: song.artistName,
-    album: song.albumName || null,
+    // Preserve the identity actually asserted by the hosted source. The
+    // immutable Apple row remains in metadata.song and is bound below after
+    // qualification; silently filling an omitted album here changes the
+    // candidate-stage quality observation hash and discards valid proof.
+    album: evidence.album?.trim() || null,
     sourceObservationIds: bindings.map((binding) => binding.id),
     metadata: {
       schema: "genio-v3-live-candidate/v1",
@@ -1706,20 +1710,20 @@ async function discoverQualifiedAppleExpansion(input: {
   const candidates: RawTrackCandidateV3[] = [];
   for (const evidence of verified) {
     const possibilities = songsByPair.get(exactTrackKey(evidence.artist, evidence.title)) ?? [];
-    const albumMatches = evidence.album
+    const identityMatches = evidence.album
       ? possibilities.filter((candidate) => (
           normalized(candidate.albumName) === normalized(evidence.album)
         ))
-      : [];
-    const recordingFamilies = new Set(albumMatches.map(recordingFamily));
+      : possibilities;
+    const recordingFamilies = new Set(identityMatches.map(recordingFamily));
     const song = evidence.album
-      ? albumMatches[0] ?? possibilities[0]
+      ? identityMatches[0] ?? possibilities[0]
       : possibilities[0];
     if (!song) continue;
     // Preserve the existing catalog expansion candidate, but never copy its
-    // central-quality proof across `possibilities[0]`. The proof is usable only
-    // when the claimed album resolves to one distinct recording family and the
-    // selected Apple row belongs to that family.
+    // central-quality proof across `possibilities[0]`. An omitted album is
+    // acceptable only when the exact artist/title result set collapses to one
+    // distinct recording family; a supplied album remains an exact match.
     const centralQualityBindingUnambiguous = recordingFamilies.size === 1
       && recordingFamilies.has(recordingFamily(song));
     candidates.push(candidateFromVerifiedAppleExpansion(
@@ -2559,12 +2563,16 @@ function centralQualityCandidateMatchesCatalogSong(
   candidate: Pick<RawTrackCandidateV3, "artist" | "title" | "album">,
   song: CatalogSong,
 ): boolean {
-  return Boolean(
-    candidate.album
-    && normalized(candidate.artist) === normalized(song.artistName)
-    && normalized(candidate.title) === normalized(song.name)
-    && normalized(candidate.album) === normalized(song.albumName),
-  );
+  if (normalized(candidate.artist) !== normalized(song.artistName)
+    || normalized(candidate.title) !== normalized(song.name)) {
+    return false;
+  }
+  // A provider may omit album while still naming an exact artist/title pair.
+  // That signal is safe only when the complete observed Apple result set
+  // collapses to one recording family (checked by the caller). When an album
+  // is supplied it remains an exact binding requirement.
+  return candidate.album === null
+    || normalized(candidate.album) === normalized(song.albumName);
 }
 
 function centralQualityCatalogResolutionIsUnambiguous(input: {
@@ -3038,9 +3046,12 @@ export function createPipelineV3LiveAdapters(
                   }),
                 ],
                 policy: request.plan.playlistQualityPolicy,
-                artist: candidate.artist,
-                title: candidate.title,
-                album: candidate.album,
+                // Every row entering this final normalizer is catalog-bound.
+                // Normalize against the resolved Apple identity, not the
+                // potentially album-omitted discovery lead.
+                artist: resolved.song.artistName,
+                title: resolved.song.name,
+                album: resolved.song.albumName,
                 appleSongId: resolved.song.id,
                 recordingFamilyKey: resolvedRecordingFamily,
               })

@@ -814,6 +814,87 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
   });
 
+  test("treats the evidence-policy clause as a meta-policy without requiring a duplicate obligation id", () => {
+    const membershipClauseId = "genre:reggaeton";
+    const evidenceClauseId = "bridge:evidence:qualification-policy";
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:evidence-meta-policy",
+      rawPrompt: "One verified reggaeton track",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: membershipClauseId,
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["reggaeton"],
+          source: { provenance: "prompt", text: "reggaeton" },
+        },
+        {
+          id: evidenceClauseId,
+          kind: "factual_relationship",
+          scope: "track",
+          hardness: "hard",
+          axis: "evidence",
+          operator: "require",
+          values: ["selection-grade evidence"],
+          source: {
+            provenance: "system_default",
+            text: "Require selection-grade evidence.",
+          },
+          evidence: {
+            required: true,
+            minimumGrade: null,
+            permittedGrades: ["track_specific_editorial_assertion"],
+          },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: membershipClauseId },
+          { op: "clause", clauseId: evidenceClauseId },
+        ],
+      },
+    });
+    const value = candidate(111);
+    const proven = withHostedCanonicalEvidence(
+      value,
+      qualification(value),
+      [membershipClauseId],
+    );
+    const bindingId = proven.evidence.bindingIds[0]!;
+
+    expect(canonicalRequiredEvidenceIntegrityV3({
+      policy: canonicalContractExecutionPolicyV1(contract),
+      assessments: {
+        [membershipClauseId]: {
+          status: "pass",
+          evidenceGrade: "track_specific_editorial_assertion",
+          evidenceIds: [bindingId],
+        },
+        [evidenceClauseId]: {
+          status: "pass",
+          evidenceGrade: "track_specific_editorial_assertion",
+          evidenceIds: [bindingId],
+        },
+      },
+      bindingIds: proven.evidence.bindingIds,
+      bindings: proven.evidence.bindings,
+      storefront: "us",
+    })).toMatchObject({
+      passed: true,
+      missingRequiredClauseIds: [],
+      unattestedEvidenceIds: [],
+      obligationMismatchClauseIds: [],
+      evidenceGradeMismatchClauseIds: [],
+    });
+  });
+
   test("does not upgrade an unknown binding kind merely because it arrived through a structured adapter", () => {
     const clauseId = "membership:structured-transport-is-not-entailment";
     const contract = compilePlaylistContractRevisionV1({

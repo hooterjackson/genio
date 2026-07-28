@@ -566,10 +566,12 @@ function centralQualityCandidateCriterionObservationsForPolicyV3(input: {
 }
 
 /**
- * Reissue candidate-stage quality judgments only after the exact source
- * artist/title/album triple has been resolved without ambiguity to one Apple
- * recording family. Album-null, album-mismatched, and multi-family candidates
- * deliberately yield no proof and therefore remain unknown.
+ * Reissue candidate-stage quality judgments only after the source identity
+ * has been resolved without ambiguity to one Apple recording family. A
+ * supplied album remains an exact requirement. An omitted album is accepted
+ * only when the caller proved the complete exact artist/title result set has
+ * one recording family; album mismatches and multi-family candidates remain
+ * unknown.
  */
 export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
   observations: unknown;
@@ -598,7 +600,6 @@ export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
   const recordingFamilyKey = input.catalog.recordingFamilyKey.trim();
   if (
     !input.unambiguous
-    || !candidateAlbum
     || !catalogAlbum
     || !appleSongId
     || appleSongId.length > 240
@@ -608,7 +609,7 @@ export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
       !== normalizeCentralQualityIdentityTextV3(input.catalog.artist)
     || normalizeCentralQualityIdentityTextV3(input.candidate.title)
       !== normalizeCentralQualityIdentityTextV3(input.catalog.title)
-    || candidateAlbum !== catalogAlbum
+    || (candidateAlbum && candidateAlbum !== catalogAlbum)
   ) return [];
   const sourceObservations =
     centralQualityCandidateCriterionObservationsForPolicyV3({
@@ -1711,6 +1712,12 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
         .filter((id) => typeof id === "string" && id.trim().length > 0),
     )];
     evidenceIdsByClause.set(clause.id, evidenceIds);
+    // The evidence-axis bridge clause is a meta-policy ("this selected track
+    // has selection-grade evidence"), not a second factual claim about the
+    // recording. Its cited binding must still be attested and grade-eligible,
+    // while the factual leaf that makes the Boolean predicate pass remains
+    // obligation-bound independently below.
+    const evidencePolicyClause = clause.axis === "evidence";
     const gradeEligible = playlistEvidenceGradeSatisfiesObligationV1({
       grade: assessment?.evidenceGrade,
       obligation: clause.evidence,
@@ -1718,7 +1725,12 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
       strengthPolicyVersion: input.policy.evidenceStrengthPolicyVersion,
     });
     if (gradeEligible) gradeEligibleClauseIds.add(clause.id);
-    const boundBindings = obligationBoundBindings(clause.id, evidenceIds);
+    const boundBindings = evidencePolicyClause
+      ? evidenceIds.flatMap((evidenceId) => {
+        const binding = attestedBindings.find(({ id }) => id === evidenceId);
+        return binding ? [binding] : [];
+      })
+      : obligationBoundBindings(clause.id, evidenceIds);
     const derivedEvidenceGrade = boundBindings.length === evidenceIds.length
       && evidenceIds.length > 0
       ? selectQualifyingPlaylistEvidenceGradeV1({
@@ -1794,7 +1806,8 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
       missingRequiredClauseIds.push(clause.id);
       continue;
     }
-    if (!obligationBoundEvidence(clause.id, evidenceIds)) {
+    if (clause.axis !== "evidence"
+      && !obligationBoundEvidence(clause.id, evidenceIds)) {
       obligationMismatchClauseIds.push(clause.id);
       continue;
     }

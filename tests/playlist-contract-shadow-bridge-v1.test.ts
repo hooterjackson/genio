@@ -222,6 +222,7 @@ describe("playlist contract shadow bridge v1", () => {
       constraint("exclude_bad_bunny", "artist", "exclude", ["Bad Bunny"], "hard"),
       constraint("ranking_influence", "relationship", "prefer", ["influential"], "soft"),
       constraint("suitability_smooth", "mood", "prefer", ["smooth"], "soft"),
+      constraint("avoid_aggressive", "mood", "avoid", ["aggressive"], "soft"),
     ];
     const selectionPlan: SelectionPlan = {
       ...baseline,
@@ -326,6 +327,17 @@ describe("playlist contract shadow bridge v1", () => {
       kind: "ranking_preference",
       hardness: "soft",
     });
+    expect(clauseForValue("avoid:aggressive")).toMatchObject({
+      kind: "ranking_preference",
+      hardness: "soft",
+      operator: "prefer",
+    });
+    expect(
+      bridged.contract.qualityPolicy.centralSuitabilityClauseIds.some((id) => (
+        bridged.contract.clauses.find((clause) => clause.id === id)
+          ?.values.includes("aggressive")
+      )),
+    ).toBe(false);
     expect(bridged.contract.clauses).toContainEqual(expect.objectContaining({
       id: "bridge:catalog:recording-version-policy",
       kind: "catalog_version",

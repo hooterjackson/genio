@@ -573,7 +573,8 @@ export function buildPlaylistContractShadowDraftV1(
       continue;
     }
 
-    if (CENTRAL_SUITABILITY_AXES.has(constraint.axis)) {
+    if (CENTRAL_SUITABILITY_AXES.has(constraint.axis)
+      && !isNegativeConstraint(constraint)) {
       for (const [valueIndex, value] of values.entries()) {
         addSuitabilityClause({
           clauses,
