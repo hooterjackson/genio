@@ -3713,6 +3713,163 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(getSimilarArtists).not.toHaveBeenCalled();
   });
 
+  test("revisits exact qualified Apple seeds for catalog-bound quality enrichment without minting membership evidence", async () => {
+    const base = plan("one smooth polished disco song", 1);
+    const genrePredicate = base.membershipPredicates
+      .find((value) => value.axis === "genre")!;
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:quality-seed-expansion",
+      rawPrompt: "one smooth polished disco song",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [{
+        id: genrePredicate.id,
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["disco"],
+        source: { provenance: "prompt", text: "disco" },
+      }],
+      trackPredicate: { op: "clause", clauseId: genrePredicate.id },
+    });
+    const selection: SelectionPlanV3 = {
+      ...base,
+      canonicalContractPolicy: canonicalContractExecutionPolicyV1(contract),
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth", "quality:polished"],
+        criteria: ["smooth", "polished"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeed: CatalogSong = {
+      ...song(451, "Chic", "Good Times"),
+      genreNames: ["Disco"],
+    };
+    const sourceUrl = "https://www.loc.gov/item/good-times-quality";
+    const citationText =
+      "Chic — Good Times is described as smooth and polished dance music. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async (_input: unknown) => ({
+      id: "resp_quality_seed_expansion",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: exactSeed.artistName,
+          title: exactSeed.name,
+          album: exactSeed.albumName,
+          centralQualityScore: 0.95,
+          centralQualityCriteria: [
+            { criterion: "smooth", verdict: "pass" },
+            { criterion: "polished", verdict: "pass" },
+          ],
+          sources: [{ url: sourceUrl, predicateIds: [] }],
+        }],
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: { sources: [{ url: sourceUrl }] },
+        },
+        {
+          id: "msg_quality_seed_expansion",
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: citationText,
+            annotations: [{
+              type: "url_citation",
+              url: sourceUrl,
+              start_index: markerStart,
+              end_index: markerStart + "[source]".length,
+            }],
+          }],
+        },
+      ],
+    }));
+    const lookupAppleByIds = vi.fn(async () => [exactSeed]);
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleResources: vi.fn(async () => emptySearch({
+        artists: [{
+          id: "chic",
+          name: exactSeed.artistName,
+          genreNames: ["Disco"],
+        }],
+      })) as any,
+      lookupAppleByIds: lookupAppleByIds as any,
+      getArtistTopSongs: vi.fn(async () => ({
+        items: [],
+        next: null,
+      })) as any,
+      getArtistAlbums: vi.fn(async () => ({
+        items: [],
+        next: null,
+      })) as any,
+      getAlbumTracks: vi.fn(async () => ({
+        items: [],
+        next: null,
+      })) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredTracks: [{
+        artist: exactSeed.artistName,
+        title: exactSeed.name,
+      }],
+      qualifiedRecordingFamilyKeys: [`isrc:${exactSeed.isrc}`],
+      qualifiedTrackSeeds: [{
+        artist: exactSeed.artistName,
+        title: exactSeed.name,
+        appleSongId: exactSeed.id,
+        recordingFamilyKey: `isrc:${exactSeed.isrc}`,
+      }],
+    };
+
+    const batch = await adapters.discover(discovery);
+
+    expect(lookupAppleByIds).toHaveBeenCalledWith(
+      "us",
+      [exactSeed.id],
+      undefined,
+    );
+    expect(batch.candidates).toHaveLength(1);
+    const providerRequest = createResponse.mock.calls[0]![0] as any;
+    expect(providerRequest.instructions).toContain(
+      "identity-bound central-suitability enrichment pass",
+    );
+    expect(JSON.parse(providerRequest.input).excludedArtistTitlePairs)
+      .toEqual([]);
+    expect(providerRequest.text.format.schema.properties.candidates.items
+      .properties.sources.items.properties.predicateIds.minItems).toBe(0);
+    const metadata = batch.candidates[0]!.metadata as any;
+    expect(metadata.bindings[0]).toMatchObject({
+      predicateIds: [],
+      hostedEvidenceSnapshot: {
+        predicateIds: [],
+        obligationIds: [],
+      },
+    });
+    expect(metadata.centralQualityCatalogBinding).toMatchObject({
+      appleSongId: exactSeed.id,
+      recordingFamilyKey: `isrc:${exactSeed.isrc}`,
+    });
+    expect(metadata.centralQualityCriterionObservations).toHaveLength(2);
+  });
+
   test.each([
     {
       label: "album-null evidence with one exact recording family",
@@ -3802,6 +3959,7 @@ describe("Pipeline V3 live read-only adapters", () => {
           items: [],
           next: null,
         })) as any,
+        lookupAppleByIds: vi.fn(async () => []) as any,
         verifyAppleExpansion: vi.fn(async () => [{
           artist: first.artistName,
           title: first.name,
