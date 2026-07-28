@@ -298,6 +298,22 @@ async function fromRetrievalDependency<T>(
   }
 }
 
+async function optionalAppleArtistAlbumView(
+  operation: () => Promise<AppleCatalogPage<AppleCatalogAlbum>>,
+): Promise<AppleCatalogPage<AppleCatalogAlbum>> {
+  try {
+    return await operation();
+  } catch (error) {
+    // Apple returns 404 when a valid artist simply has no collection for a
+    // particular optional view (for example featured- or compilation-albums).
+    // That is an empty discovery branch, not a permanent catalog outage.
+    if (error instanceof AppleApiError && error.status === 404) {
+      return { items: [], next: null };
+    }
+    throw error;
+  }
+}
+
 function normalized(value: string | null | undefined): string {
   return normalizeMusicText(value);
 }
@@ -3015,7 +3031,7 @@ export function createPipelineV3LiveAdapters(
           ),
           getAlbums: (...args) => fromRetrievalDependency(
             "apple_catalog",
-            () => getAlbums(...args),
+            () => optionalAppleArtistAlbumView(() => getAlbums(...args)),
           ),
           getAlbumTracks: (...args) => fromRetrievalDependency(
             "apple_catalog",

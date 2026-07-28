@@ -3713,6 +3713,66 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(getSimilarArtists).not.toHaveBeenCalled();
   });
 
+  test("treats a missing optional Apple artist album view as an empty branch", async () => {
+    const selection = plan("25 disco songs", 25);
+    const strategy = retrievalStrategiesForEnginesV3(["curated_genre_scene"])
+      .find((value) => value.kind === "qualified_expansion")!;
+    const expanded = song(302, "Chic", "My Forbidden Lover");
+    const album = {
+      id: "album-302",
+      name: expanded.albumName,
+      artistName: expanded.artistName,
+      releaseDate: "1979-01-01",
+      genreNames: ["Disco"],
+    };
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch({
+        artists: [{ id: "123", name: "Chic", genreNames: ["Disco"] }],
+      })) as any,
+      getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
+      getArtistAlbums: vi.fn(async (
+        _storefront: string,
+        _artistId: string,
+        view: string,
+      ) => {
+        if (view === "featured-albums") {
+          throw new AppleApiError("optional view missing", 404, false);
+        }
+        return { items: [album], next: null };
+      }) as any,
+      getAlbumTracks: vi.fn(async () => ({
+        items: [expanded],
+        next: null,
+      })) as any,
+      verifyAppleExpansion: vi.fn(async () => [{
+        artist: expanded.artistName,
+        title: expanded.name,
+        album: expanded.albumName,
+        sourceUrl: "https://www.loc.gov/item/disco-expansion-view",
+        provenanceRoot: "loc.gov",
+        evidenceStrength: 0.9,
+        sourceRank: 1,
+      }]),
+    });
+
+    const batch = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      strategyRound: 3,
+      requestedRawCandidateCount: 25,
+      qualifiedRecordingFamilyKeys: ["isrc:USAAA0000001"],
+      qualifiedTrackSeeds: [{
+        artist: "Chic",
+        title: "Good Times",
+        appleSongId: "10001",
+        recordingFamilyKey: "isrc:USAAA0000001",
+      }],
+    });
+
+    expect(batch.candidates).toHaveLength(1);
+    expect(batch.providerCircuitOpen).not.toBe(true);
+  });
+
   test("keeps qualified expansion available until earlier portfolio strategies produce seeds", async () => {
     const selection = plan("25 disco songs", 25);
     const strategy = retrievalStrategiesForEnginesV3([
