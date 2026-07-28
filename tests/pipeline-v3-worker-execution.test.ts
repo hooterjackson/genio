@@ -635,6 +635,34 @@ describe("Pipeline V3 durable worker execution", () => {
     );
   });
 
+  test("rehydrates central-quality ranking without changing its policy dimension", () => {
+    const canonical = canonicalQueryPlan(1);
+    const query: QueryPlanV3 = {
+      ...canonical.plan,
+      rankingObjectives: [
+        ...canonical.plan.rankingObjectives,
+        {
+          id: "canonical:ranking:central-quality",
+          kind: "central_quality",
+          description: "Prefer the strongest policy-bound central fit.",
+          weight: 1,
+          values: ["smooth"],
+        },
+      ],
+    };
+
+    const rehydrated = selectionPlanFromQueryPlanV3(query, {});
+
+    expect(rehydrated.rankingObjectives).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "canonical:ranking:central-quality",
+          dimension: "central_quality",
+        }),
+      ]),
+    );
+  });
+
   test("classifies unsupported exhaustive and cold factual graph work explicitly", () => {
     expect(governedCorpusActionReasonV3(factualQueryPlan({ exhaustive: true }))).toBe(
       "v3_exhaustive_frontier_builder_unavailable",

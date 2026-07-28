@@ -509,6 +509,7 @@ const MEMBERSHIP_OPERATORS = new Set<MembershipOperatorV3>([
 const RANKING_DIMENSIONS = new Set<RankingDimensionV3>([
   "influence",
   "relevance",
+  "central_quality",
   "similarity",
   "source_rank",
   "artist_diversity",
