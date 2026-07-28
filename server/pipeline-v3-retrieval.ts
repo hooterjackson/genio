@@ -1915,6 +1915,21 @@ export interface DiscoveryRequestV3 {
     readonly recordingFamilyKey: string;
   }[];
   /**
+   * The subset of qualified identities whose central-quality verdict remains
+   * unknown. Keeping this separate from `qualifiedTrackSeeds` lets an
+   * expansion retain its artist/catalog anchors after the quality evidence
+   * gap has closed, without paying to judge the same recording twice.
+   *
+   * Optional only for protocol-compatible direct/test callers. The canonical
+   * orchestrator always supplies it when a quality policy is active.
+   */
+  readonly qualityEvidenceTrackSeeds?: readonly {
+    readonly artist: string;
+    readonly title: string;
+    readonly appleSongId: string;
+    readonly recordingFamilyKey: string;
+  }[];
+  /**
    * Combines worker cancellation with the remaining active-compute window.
    * Live adapters must pass it to every provider request so one slow call
    * cannot run beyond the immutable contract's compute allowance.
@@ -4488,8 +4503,17 @@ export async function executeRetrievalV3(input: {
           optimizerActive ? [primary, ...alternates] : [primary]
         ))
         .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
+      const currentQualityEligibleRepresentations =
+        activePlan.playlistQualityPolicy
+          ? currentRankedRepresentations.filter((track) => (
+              centralQualityVerdictV3(
+                track,
+                activePlan.playlistQualityPolicy!,
+              ) !== "fail"
+            ))
+          : currentRankedRepresentations;
       const currentHardEligible = new Set(applyHardAggregateConstraints(
-        currentRankedRepresentations,
+        currentQualityEligibleRepresentations,
         activePlan.hardConstraints,
       ).eligible.map(({ recordingFamilyKey }) => recordingFamilyKey)).size;
       const fill = adaptiveFillPlanV3({
@@ -4547,7 +4571,7 @@ export async function executeRetrievalV3(input: {
       ));
       const remainingCandidateInputGoal = policy.candidateGoal === undefined
         ? fill.rawDiscoveryGoal
-        : Math.max(0, policy.candidateGoal - counters.evidenceEligible);
+        : Math.max(0, policy.candidateGoal - rawCandidateLedger.size);
       // The P10 conversion target sizes evidence-eligible discovery input. It
       // is neither an Apple-safe pool requirement nor a reason to issue one
       // oversized wave. Observe yield incrementally and stop as soon as the
@@ -4570,6 +4594,22 @@ export async function executeRetrievalV3(input: {
         appleSongId: primary.appleSongId,
         recordingFamilyKey: primary.recordingFamilyKey,
       }));
+      const frozenQualityEvidenceTrackSeeds = activePlan.playlistQualityPolicy
+        ? [...families.values()]
+            .map(({ primary }) => primary)
+            .filter((track) => (
+              centralQualityVerdictV3(
+                track,
+                activePlan.playlistQualityPolicy!,
+              ) === "unknown"
+            ))
+            .map((track) => ({
+              artist: track.artist,
+              title: track.title,
+              appleSongId: track.appleSongId,
+              recordingFamilyKey: track.recordingFamilyKey,
+            }))
+        : [];
       const discoverySignal = operationSignal();
       const requests = wave.map((state): {
         state: MutableStrategyStateV3;
@@ -4586,8 +4626,8 @@ export async function executeRetrievalV3(input: {
         const qualityEvidenceGoal = !localOnly
           && state.definition.kind === "qualified_expansion"
           && activePlan.playlistQualityPolicy
-          && frozenQualifiedTrackSeeds.length > 0
-          ? Math.min(75, frozenQualifiedTrackSeeds.length)
+          && frozenQualityEvidenceTrackSeeds.length > 0
+          ? Math.min(75, frozenQualityEvidenceTrackSeeds.length)
           : 1;
         const requestedRawCandidateCount = localOnly
           ? Math.max(1, Math.min(
@@ -4631,6 +4671,9 @@ export async function executeRetrievalV3(input: {
             alreadyDiscoveredTracks: frozenAlreadyDiscoveredTracks,
             qualifiedRecordingFamilyKeys: frozenQualifiedRecordingFamilyKeys,
             qualifiedTrackSeeds: frozenQualifiedTrackSeeds,
+            ...(activePlan.playlistQualityPolicy ? {
+              qualityEvidenceTrackSeeds: frozenQualityEvidenceTrackSeeds,
+            } : {}),
             ...(discoverySignal ? { signal: discoverySignal } : {}),
           },
         };

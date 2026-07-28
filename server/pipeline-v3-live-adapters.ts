@@ -1769,8 +1769,10 @@ async function discoverQualifiedAppleExpansion(input: {
     cursorState?.qualifiedSeedRoundsCompleted ?? 0;
   const qualitySeedOffset =
     qualifiedSeedRoundsCompleted * qualitySeedWindowSize;
+  const unresolvedQualitySeeds =
+    request.qualityEvidenceTrackSeeds ?? request.qualifiedTrackSeeds;
   const qualitySeedWindow = request.plan.playlistQualityPolicy
-    ? request.qualifiedTrackSeeds.slice(
+    ? unresolvedQualitySeeds.slice(
         qualitySeedOffset,
         qualitySeedOffset + qualitySeedWindowSize,
       )

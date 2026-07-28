@@ -2298,6 +2298,112 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(qualityRequestCount).toBe(5);
   });
 
+  test("stops re-judging resolved quality seeds and spends the next pass on the deficit", async () => {
+    const base = canonicalDiscoPlan(6);
+    const qualityPlan: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const initial = Array.from({ length: 6 }, (_, index) => candidate(index));
+    const replacements = [candidate(6), candidate(7)];
+    let replacementIndex = 0;
+    let seeded = false;
+    const unresolvedSeedCounts: number[] = [];
+
+    const result = await executeRetrievalV3({
+      runId: "quality-deficit-switches-to-fresh-catalog",
+      plan: qualityPlan,
+      policy: {
+        maximumRawCandidates: 20,
+        maximumGlobalRounds: 20,
+        maximumConcurrentDiscovery: 1,
+        candidateGoal: 12,
+        qualifiedPoolGoal: 7,
+      },
+      adapters: {
+        discover: async (request) => {
+          if (request.strategy.kind === "qualified_expansion"
+            && request.qualifiedTrackSeeds.length > 0) {
+            const unresolved = request.qualityEvidenceTrackSeeds ?? [];
+            unresolvedSeedCounts.push(unresolved.length);
+            if (unresolved.length > 0) {
+              return {
+                candidates: initial.map((value) => ({
+                  ...value,
+                  sourceObservationIds: [
+                    ...value.sourceObservationIds,
+                    `quality-${value.id}`,
+                  ],
+                })),
+                nextCursor: "quality-complete",
+                exhausted: false,
+                provenance: { cacheOrigin: "live", sourceFreshUntil: null },
+              };
+            }
+            return {
+              candidates: replacementIndex < replacements.length
+                ? [replacements[replacementIndex++]!]
+                : [],
+              nextCursor: null,
+              exhausted: replacementIndex >= replacements.length,
+              provenance: { cacheOrigin: "live", sourceFreshUntil: null },
+            };
+          }
+          if (!seeded
+            && request.strategy.discoveryDependencyIds.some(
+              (dependency) => dependency !== "orchestration_local",
+            )) {
+            seeded = true;
+            return {
+              candidates: initial,
+              nextCursor: null,
+              exhausted: true,
+              provenance: { cacheOrigin: "live", sourceFreshUntil: null },
+            };
+          }
+          return { candidates: [], nextCursor: null, exhausted: true };
+        },
+        qualify: async ({ candidates: values }) => values.map((value) => {
+          const qualityEnriched = value.sourceObservationIds.some(
+            (id) => id.startsWith("quality-"),
+          ) || replacements.some(({ id }) => id === value.id);
+          return canonicalDiscoQualification(value, qualityEnriched ? {
+            centralQualityCriterionObservations: centralQualityObservations(
+              value,
+              qualityPlan.playlistQualityPolicy!,
+              value.id === initial[0]!.id ? "fail" : "pass",
+            ),
+          } : {});
+        }),
+      },
+    });
+
+    expect(unresolvedSeedCounts).toEqual([6, 0, 0]);
+    expect(result.outcome).toMatchObject({
+      status: "exact_ready",
+      selectedTrackCount: 6,
+      reserveTrackCount: 1,
+      shortfall: 0,
+    });
+    expect(result.selected).not.toContainEqual(expect.objectContaining({
+      candidateId: initial[0]!.id,
+    }));
+    expect(result.selected).toContainEqual(expect.objectContaining({
+      candidateId: replacements[0]!.id,
+    }));
+  });
+
   test("does not call a cache-sized qualified pool exact when artist diversity is infeasible", async () => {
     const diversityPlan = canonicalDiscoPlan(3, {
       diversityGoals: {
