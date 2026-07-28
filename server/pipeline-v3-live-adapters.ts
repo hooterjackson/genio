@@ -1758,8 +1758,21 @@ async function discoverQualifiedAppleExpansion(input: {
   const qualitySeedWindowSize = 25;
   const qualifiedSeedRoundsCompleted =
     cursorState?.qualifiedSeedRoundsCompleted ?? 0;
+  const qualityExpansionEngines = request.plan.engines.filter((engine) => (
+    engine === "curated_genre_scene"
+    || engine === "mood_activity_theme"
+    || engine === "similarity"
+  ));
+  const qualityExpansionLane = Math.max(
+    0,
+    qualityExpansionEngines.findIndex((engine) => engine === request.engine),
+  );
   const qualitySeedOffset =
-    qualifiedSeedRoundsCompleted * qualitySeedWindowSize;
+    (
+      qualifiedSeedRoundsCompleted
+        * Math.max(1, qualityExpansionEngines.length)
+      + qualityExpansionLane
+    ) * qualitySeedWindowSize;
   const qualitySeedWindow = request.plan.playlistQualityPolicy
     ? request.qualifiedTrackSeeds.slice(
         qualitySeedOffset,
@@ -2940,24 +2953,25 @@ export function createPipelineV3LiveAdapters(
     ));
   const verifyAppleExpansion = options.verifyAppleExpansion
     ?? (async (request: DiscoveryRequestV3, songs: readonly CatalogSong[]) => {
-      const verified: HostedWebCandidateV3[] = [];
       // Central-quality rows are intentionally verbose: each exact recording
       // carries one tri-state verdict per server-owned criterion. Small
       // batches keep the strict response within its output budget and give
       // hosted search enough room to bind every result to the exact track.
       const chunkSize = request.plan.playlistQualityPolicy ? 5 : 100;
+      const chunks: CatalogSong[][] = [];
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
-        const chunk = songs.slice(offset, offset + chunkSize);
-        const page = await defaultHostedWebDiscovery(
+        chunks.push(songs.slice(offset, offset + chunkSize));
+      }
+      const pages = await mapConcurrent(chunks, 3, async (chunk) => (
+        defaultHostedWebDiscovery(
           { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
           request.modelRoute ?? modelRoute,
           createResponse,
           options.onProviderUsage,
           chunk,
-        );
-        verified.push(...page.candidates);
-      }
-      return verified;
+        )
+      ));
+      return pages.flatMap((page) => page.candidates);
     });
 
   return Object.freeze({
