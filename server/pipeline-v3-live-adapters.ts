@@ -1805,8 +1805,15 @@ async function discoverQualifiedAppleExpansion(input: {
   const qualitySeedWindowSize = 75;
   const qualifiedSeedRoundsCompleted =
     cursorState?.qualifiedSeedRoundsCompleted ?? 0;
-  const qualitySeedOffset =
-    qualifiedSeedRoundsCompleted * qualitySeedWindowSize;
+  // The controller supplies `qualityEvidenceTrackSeeds` as the current
+  // unresolved deficit, not as the original immutable seed list. Resolved
+  // rows disappear between rounds, so applying the historical cursor offset
+  // to that compacted list skips every remaining identity on round two.
+  // Retain offset pagination only for legacy callers that provide the full
+  // qualified seed list without the explicit unresolved window.
+  const qualitySeedOffset = request.qualityEvidenceTrackSeeds === undefined
+    ? qualifiedSeedRoundsCompleted * qualitySeedWindowSize
+    : 0;
   const unresolvedQualitySeeds =
     request.qualityEvidenceTrackSeeds ?? request.qualifiedTrackSeeds;
   const qualitySeedWindow = request.plan.playlistQualityPolicy

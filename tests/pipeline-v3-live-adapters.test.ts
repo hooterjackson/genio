@@ -4470,6 +4470,119 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(batch.candidates).toHaveLength(26);
   });
 
+  test("starts each explicit unresolved quality window at its first remaining identity", async () => {
+    const base = plan("two smooth disco songs", 2);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeeds = Array.from({ length: 2 }, (_, index): CatalogSong => ({
+      ...song(860 + index, `Artist ${index + 1}`, `Track ${index + 1}`),
+      genreNames: ["Disco"],
+    }));
+    const byId = new Map(exactSeeds.map((seed) => [seed.id, seed]));
+    const requestedTitles: string[][] = [];
+    const createResponse = vi.fn(async (input: any) => {
+      const catalogCandidates = JSON.parse(input.input).catalogCandidates as Array<{
+        artist: string;
+        title: string;
+        album: string;
+      }>;
+      requestedTitles.push(catalogCandidates.map(({ title }) => title));
+      return {
+        id: `quality_unresolved_round_${requestedTitles.length}`,
+        output_text: JSON.stringify({
+          candidates: catalogCandidates.map((candidate) => ({
+            ...candidate,
+            centralQualityScore: 0.9,
+            centralQualityCriteria: [{
+              criterion: "smooth",
+              verdict: "pass",
+            }],
+            sources: [],
+          })),
+        }),
+        output: [{
+          type: "web_search_call",
+          status: "completed",
+          action: { type: "search", query: "smooth disco" },
+        }],
+      };
+    });
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleResources: vi.fn(async (
+        _storefront: string,
+        query: string,
+      ) => emptySearch({
+        artists: [{
+          id: `artist-${query}`,
+          name: query,
+          genreNames: ["Disco"],
+        }],
+      })) as any,
+      lookupAppleByIds: vi.fn(async (
+        _storefront: string,
+        ids: readonly string[],
+      ) => ids.map((id) => byId.get(id)!)) as any,
+      getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
+      getArtistAlbums: vi.fn(async () => ({ items: [], next: null })) as any,
+      getAlbumTracks: vi.fn(async () => ({ items: [], next: null })) as any,
+    });
+    const qualifiedTrackSeeds = exactSeeds.map((seed) => ({
+      artist: seed.artistName,
+      title: seed.name,
+      appleSongId: seed.id,
+      recordingFamilyKey: `isrc:${seed.isrc}`,
+    }));
+
+    const first = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 1,
+      qualifiedRecordingFamilyKeys: qualifiedTrackSeeds.map(
+        ({ recordingFamilyKey }) => recordingFamilyKey,
+      ),
+      qualifiedTrackSeeds,
+      qualityEvidenceTrackSeeds: [qualifiedTrackSeeds[0]!],
+    });
+    expect(first.nextCursor).not.toBeNull();
+
+    const second = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      strategyRound: 2,
+      cursor: first.nextCursor,
+      requestedRawCandidateCount: 1,
+      qualifiedRecordingFamilyKeys: qualifiedTrackSeeds.map(
+        ({ recordingFamilyKey }) => recordingFamilyKey,
+      ),
+      qualifiedTrackSeeds,
+      qualityEvidenceTrackSeeds: [qualifiedTrackSeeds[1]!],
+    });
+
+    expect(first.candidates).toHaveLength(1);
+    expect(second.candidates).toHaveLength(1);
+    expect(requestedTitles).toEqual([
+      [exactSeeds[0]!.name],
+      [exactSeeds[1]!.name],
+    ]);
+  });
+
   test.each([
     {
       label: "album-null evidence with one exact recording family",
