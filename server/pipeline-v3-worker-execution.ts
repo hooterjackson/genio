@@ -860,9 +860,13 @@ export function selectionPlanFromQueryPlanV3(
     } : {}),
     diversityGoals,
     orderingPolicy,
-    softGoalRelaxationOrder: queryPlan.softGoalRelaxationOrder
-      ? [...queryPlan.softGoalRelaxationOrder]
-      : [
+    softGoalRelaxationOrder: isCanonicalQueryPlanV3SchemaVersion(
+      queryPlan.schemaVersion,
+    )
+      ? []
+      : queryPlan.softGoalRelaxationOrder
+        ? [...queryPlan.softGoalRelaxationOrder]
+        : [
           "sequencing_preferences",
           "album_concentration",
           "artist_concentration",

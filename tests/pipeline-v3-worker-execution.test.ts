@@ -663,6 +663,22 @@ describe("Pipeline V3 durable worker execution", () => {
     );
   });
 
+  test("removes legacy relaxation metadata from canonical query-plan rehydration", () => {
+    const canonical = canonicalQueryPlan(1);
+    const query: QueryPlanV3 = {
+      ...canonical.plan,
+      softGoalRelaxationOrder: [
+        "album_concentration",
+        "artist_concentration",
+      ],
+    };
+
+    const rehydrated = selectionPlanFromQueryPlanV3(query, {});
+
+    expect(rehydrated.softGoalRelaxationOrder).toEqual([]);
+    expect(rehydrated.diversityGoals).toEqual(query.diversityGoals);
+  });
+
   test("classifies unsupported exhaustive and cold factual graph work explicitly", () => {
     expect(governedCorpusActionReasonV3(factualQueryPlan({ exhaustive: true }))).toBe(
       "v3_exhaustive_frontier_builder_unavailable",
