@@ -3140,6 +3140,55 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     }));
   });
 
+  test("qualifies a same-batch cumulative recording only once", async () => {
+    const targetStrategy = "curated_genre_scene:trusted_scoped_containers";
+    let emitted = false;
+    const qualificationObservations: string[][] = [];
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        if (strategy.id !== targetStrategy || emitted) {
+          return { candidates: [], nextCursor: null, exhausted: true };
+        }
+        emitted = true;
+        return {
+          candidates: [
+            candidate(1, {
+              id: "same-batch-recording",
+              title: "Shared Recording",
+              artist: "One Artist",
+              album: "One Album",
+              sourceObservationIds: ["observation-1"],
+            }),
+            candidate(2, {
+              id: "same-batch-recording",
+              title: "Shared Recording",
+              artist: "One Artist",
+              album: "One Album",
+              sourceObservationIds: ["observation-2"],
+            }),
+          ],
+          nextCursor: null,
+          exhausted: true,
+        };
+      },
+      qualify: async ({ candidates }) => candidates.map((value) => {
+        qualificationObservations.push([...value.sourceObservationIds]);
+        return qualification(value);
+      }),
+    };
+
+    const result = await executeRetrievalV3({
+      runId: "same-batch-cumulative-recording",
+      plan: plan("one disco track", 1),
+      adapters,
+    });
+
+    expect(qualificationObservations).toEqual([
+      ["observation-1", "observation-2"],
+    ]);
+    expect(result.qualifiedPool).toHaveLength(1);
+  });
+
   test("resets zero-yield only when an exact-family issue proves an earlier canonical year", async () => {
     const targetStrategy = "curated_genre_scene:qualified_artist_release_expansion";
     const run = async (releaseYearsByRound: readonly (readonly number[])[]) => {

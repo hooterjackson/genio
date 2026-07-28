@@ -4747,6 +4747,15 @@ export async function executeRetrievalV3(input: {
       counters.validCandidates += 1;
       candidates.push(candidate);
     }
+    // One provider batch can repeat the same recording several times while
+    // adding stronger observations. The ledger intentionally merges each
+    // occurrence, but pushing every intermediate representation would send
+    // duplicate candidate IDs to qualification and make the separated
+    // recovery ledger reject an otherwise valid batch. Preserve the final
+    // cumulative representation for each ID in first-seen order.
+    candidates = [...new Map(
+      candidates.map((candidate) => [candidate.id, candidate]),
+    ).values()];
 
     let qualifications: readonly CandidateQualificationV3[];
     const qualificationSignal = operationSignal();
