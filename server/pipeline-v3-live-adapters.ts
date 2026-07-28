@@ -1755,24 +1755,14 @@ async function discoverQualifiedAppleExpansion(input: {
     for (const song of page.items) catalogSongs.set(song.id, song);
   }
 
-  const qualitySeedWindowSize = 25;
+  // One bounded pass must be able to evaluate the entire evidence-qualified
+  // pool for public playlist sizes. Splitting this across intent strategies
+  // repeatedly hit the active interaction boundary after only one window.
+  const qualitySeedWindowSize = 75;
   const qualifiedSeedRoundsCompleted =
     cursorState?.qualifiedSeedRoundsCompleted ?? 0;
-  const qualityExpansionEngines = request.plan.engines.filter((engine) => (
-    engine === "curated_genre_scene"
-    || engine === "mood_activity_theme"
-    || engine === "similarity"
-  ));
-  const qualityExpansionLane = Math.max(
-    0,
-    qualityExpansionEngines.findIndex((engine) => engine === request.engine),
-  );
   const qualitySeedOffset =
-    (
-      qualifiedSeedRoundsCompleted
-        * Math.max(1, qualityExpansionEngines.length)
-      + qualityExpansionLane
-    ) * qualitySeedWindowSize;
+    qualifiedSeedRoundsCompleted * qualitySeedWindowSize;
   const qualitySeedWindow = request.plan.playlistQualityPolicy
     ? request.qualifiedTrackSeeds.slice(
         qualitySeedOffset,
@@ -2962,7 +2952,7 @@ export function createPipelineV3LiveAdapters(
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
         chunks.push(songs.slice(offset, offset + chunkSize));
       }
-      const pages = await mapConcurrent(chunks, 3, async (chunk) => (
+      const pages = await mapConcurrent(chunks, 6, async (chunk) => (
         defaultHostedWebDiscovery(
           { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
           request.modelRoute ?? modelRoute,

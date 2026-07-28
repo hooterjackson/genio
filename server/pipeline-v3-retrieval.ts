@@ -4576,7 +4576,7 @@ export async function executeRetrievalV3(input: {
           && state.definition.kind === "qualified_expansion"
           && activePlan.playlistQualityPolicy
           && frozenQualifiedTrackSeeds.length > 0
-          ? Math.min(25, frozenQualifiedTrackSeeds.length)
+          ? Math.min(75, frozenQualifiedTrackSeeds.length)
           : 1;
         const requestedRawCandidateCount = localOnly
           ? Math.max(1, Math.min(
