@@ -25441,10 +25441,13 @@ export class Repository {
       || finalSemanticPlan.storefront !== plan.storefront
       || stableStringify(finalSemanticPlan.hardConstraints) !== stableStringify(plan.hardConstraints)
       || stableStringify(finalSemanticPlan.recordingPolicy) !== stableStringify(plan.recordingPolicy)) {
-      throw new HttpError(
-        409,
-        "Pipeline V3 semantic recovery changed an immutable request constraint",
-        "pipeline_v3_result_invalid",
+      throw Object.assign(
+        new HttpError(
+          409,
+          "Pipeline V3 semantic recovery changed an immutable request constraint",
+          "pipeline_v3_result_invalid",
+        ),
+        { operatorCode: "pipeline_v3_result_invalid.semantic_constraint_drift" },
       );
     }
     if (result.selected.length !== result.outcome.selectedTrackCount
@@ -25453,7 +25456,14 @@ export class Repository {
       || (result.outcome.status === "exact_ready" && result.selected.length !== target)
       || (result.outcome.status === "partial_ready" && (result.selected.length < 1 || result.selected.length >= target))
       || (result.outcome.status === "no_compatible_tracks" && result.selected.length !== 0)) {
-      throw new HttpError(409, "Pipeline V3 retrieval counts are internally inconsistent", "pipeline_v3_result_invalid");
+      throw Object.assign(
+        new HttpError(
+          409,
+          "Pipeline V3 retrieval counts are internally inconsistent",
+          "pipeline_v3_result_invalid",
+        ),
+        { operatorCode: "pipeline_v3_result_invalid.counts" },
+      );
     }
     boundedPipelineBatch(
       result.selected,
@@ -25523,7 +25533,14 @@ export class Repository {
     if (selectedFamilyKeys.size !== result.selected.length
       || new Set(result.reserve.map((track) => track.recordingFamilyKey)).size !== result.reserve.length
       || result.reserve.some((track) => selectedFamilyKeys.has(track.recordingFamilyKey))) {
-      throw new HttpError(409, "Pipeline V3 manifest tracks must be recording-family unique", "pipeline_v3_result_invalid");
+      throw Object.assign(
+        new HttpError(
+          409,
+          "Pipeline V3 manifest tracks must be recording-family unique",
+          "pipeline_v3_result_invalid",
+        ),
+        { operatorCode: "pipeline_v3_result_invalid.family_uniqueness" },
+      );
     }
     if (manifestEligibleOutcome
       && isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)) {
@@ -25537,12 +25554,15 @@ export class Repository {
           result.outcome.status === "partial_ready",
       });
       if (!publicationValidation.valid) {
-        throw new HttpError(
-          409,
-          `Pipeline V3 canonical publication preflight failed: ${
-            publicationValidation.reasonCodes.join(",")
-          }`,
-          "pipeline_v3_result_invalid",
+        throw Object.assign(
+          new HttpError(
+            409,
+            `Pipeline V3 canonical publication preflight failed: ${
+              publicationValidation.reasonCodes.join(",")
+            }`,
+            "pipeline_v3_result_invalid",
+          ),
+          { operatorCode: "pipeline_v3_result_invalid.canonical_preflight" },
         );
       }
     }
@@ -25742,7 +25762,14 @@ export class Repository {
       if (supportsGroundedRecoveryAudit) {
         const revisions = result.semanticPlanRevisions ?? [];
         if (revisions.length > 1) {
-          throw new HttpError(409, "Pipeline V3 recovery exceeded its single-repair boundary", "pipeline_v3_result_invalid");
+          throw Object.assign(
+            new HttpError(
+              409,
+              "Pipeline V3 recovery exceeded its single-repair boundary",
+              "pipeline_v3_result_invalid",
+            ),
+            { operatorCode: "pipeline_v3_result_invalid.repair_boundary" },
+          );
         }
         for (const revision of revisions) {
           const existing = await client.query<{
@@ -25811,10 +25838,13 @@ export class Repository {
               && cacheOrigin !== "governed_snapshot")
             || (cacheOrigin === "fresh_cache"
               && (!sourceFreshUntil || sourceFreshUntil <= new Date()))) {
-            throw new HttpError(
-              409,
-              "Pipeline V3 lead provenance is stale or inconsistent",
-              "pipeline_v3_result_invalid",
+            throw Object.assign(
+              new HttpError(
+                409,
+                "Pipeline V3 lead provenance is stale or inconsistent",
+                "pipeline_v3_result_invalid",
+              ),
+              { operatorCode: "pipeline_v3_result_invalid.lead_provenance" },
             );
           }
           await client.query(
@@ -26106,10 +26136,13 @@ export class Repository {
             if (canonical
               && (!canonical.evaluation.eligible
                 || !canonical.evidenceIntegrity.passed)) {
-              throw new HttpError(
-                409,
-                "A schema-4 qualified track does not satisfy its canonical contract",
-                "pipeline_v3_result_invalid",
+              throw Object.assign(
+                new HttpError(
+                  409,
+                  "A schema-4 qualified track does not satisfy its canonical contract",
+                  "pipeline_v3_result_invalid",
+                ),
+                { operatorCode: "pipeline_v3_result_invalid.canonical_qualification" },
               );
             }
             const predicateResults = canonical
@@ -26316,7 +26349,14 @@ export class Repository {
           // A track whose complete proof is authoritative structured catalog
           // metadata therefore needs no manufactured web/source binding.
           || (!canonicalRetrieval && track.evidenceBindingIds.length < 1)) {
-          throw new HttpError(409, "A qualified V3 track is missing identity or evidence", "pipeline_v3_result_invalid");
+          throw Object.assign(
+            new HttpError(
+              409,
+              "A qualified V3 track is missing identity or evidence",
+              "pipeline_v3_result_invalid",
+            ),
+            { operatorCode: "pipeline_v3_result_invalid.identity_evidence" },
+          );
         }
         const familyId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", familyKey: track.recordingFamilyKey });
         const candidateId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", candidateId: track.candidateId, familyKey: track.recordingFamilyKey });

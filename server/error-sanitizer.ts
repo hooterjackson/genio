@@ -36,15 +36,25 @@ export function safeTechnicalFailureDiagnostic(
   error: unknown,
 ): SafeTechnicalFailureDiagnostic {
   const value = error && typeof error === "object"
-    ? error as { name?: unknown; code?: unknown; status?: unknown; statusCode?: unknown }
+    ? error as {
+      name?: unknown;
+      code?: unknown;
+      operatorCode?: unknown;
+      status?: unknown;
+      statusCode?: unknown;
+    }
     : {};
   const name = typeof value.name === "string"
     && SAFE_DIAGNOSTIC_NAME.test(value.name)
     ? value.name
     : "Error";
-  const code = typeof value.code === "string"
-    && SAFE_DIAGNOSTIC_CODE.test(value.code)
-    ? value.code
+  const codeCandidate = typeof value.operatorCode === "string"
+    && SAFE_DIAGNOSTIC_CODE.test(value.operatorCode)
+    ? value.operatorCode
+    : value.code;
+  const code = typeof codeCandidate === "string"
+    && SAFE_DIAGNOSTIC_CODE.test(codeCandidate)
+    ? codeCandidate
     : null;
   const suppliedStatus = typeof value.status === "number"
     ? value.status

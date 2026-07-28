@@ -19,10 +19,11 @@ describe("durable and public error sanitization", () => {
     expect(safeTechnicalFailureDiagnostic(Object.assign(privateFailure, {
       name: "HttpError",
       code: "pipeline_v3_result_invalid",
+      operatorCode: "pipeline_v3_result_invalid.canonical_preflight",
       statusCode: 409,
     }))).toEqual({
       name: "HttpError",
-      code: "pipeline_v3_result_invalid",
+      code: "pipeline_v3_result_invalid.canonical_preflight",
       status: 409,
     });
     expect(safeTechnicalFailureDiagnostic({
