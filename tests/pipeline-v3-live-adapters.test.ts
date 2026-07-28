@@ -1896,6 +1896,99 @@ describe("Pipeline V3 live read-only adapters", () => {
     });
   });
 
+  test("preserves canonical OR when accepting a trusted Apple editorial container", async () => {
+    const clauses: PlaylistContractDraftV1["clauses"] = [
+      {
+        id: "genre:reggaeton",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["reggaeton"],
+        source: { provenance: "guidance", text: "reggaeton" },
+      },
+      {
+        id: "genre:dembow",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["dembow"],
+        source: { provenance: "guidance", text: "dembow" },
+      },
+      {
+        id: "genre:latin-urban",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["Latin urban"],
+        source: { provenance: "guidance", text: "Latin urban" },
+      },
+    ];
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:live:reggaeton-or",
+      rawPrompt: "Reggaeton plus adjacent Latin urban.",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses,
+      trackPredicate: {
+        op: "any",
+        children: clauses.map(({ id }) => ({ op: "clause", clauseId: id })),
+      },
+      qualityPolicy: {
+        centralSuitabilityClauseIds: [],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+      },
+    });
+    const selection = projectPlaylistContractExecutionV1({
+      contract,
+      basePlan: {
+        requestedTrackCount: 1,
+        minimumQualifiedTrackCount: 1,
+        storefront: "us",
+      },
+    }).selectionPlanV3;
+    const request = discoveryRequest(selection, "trusted_containers");
+    const appleSong = song(83, "Reggaeton Artist", "Reggaeton Track");
+    const getPlaylistTracks = vi.fn(async () => ({
+      items: [appleSong],
+      next: null,
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch({
+        playlists: [{
+          id: "pl.reggaeton",
+          name: "Reggaeton Essentials",
+          curatorName: "Apple Music",
+          description: "Defining reggaeton records.",
+          url: "https://music.apple.com/us/playlist/reggaeton-essentials/pl.reggaeton",
+        }],
+      })) as any,
+      getPlaylistTracks: getPlaylistTracks as any,
+    });
+
+    const batch = await adapters.discover(request);
+    const [qualification] = await adapters.qualify({
+      ...request,
+      candidates: batch.candidates,
+    });
+    const evaluation = evaluateCanonicalContractTrackV1({
+      policy: selection.canonicalContractPolicy!,
+      assessments: qualification.canonicalClauseAssessments ?? {},
+    });
+
+    expect(getPlaylistTracks).toHaveBeenCalled();
+    expect(batch.candidates).toHaveLength(1);
+    expect(evaluation).toMatchObject({ status: "pass", eligible: true });
+  });
+
   test("searches the semantic music scope before structural era terms", async () => {
     const base = plan("Essential disco tracks from 1973 through 1983 with broad artist diversity", 25);
     const selection: SelectionPlanV3 = {
