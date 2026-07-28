@@ -1,6 +1,13 @@
 import {
   generateKeyPairSync,
 } from "node:crypto";
+import {
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   semanticRankingProtectedBaselineMetadataSha256,
@@ -29,6 +36,7 @@ import {
   buildStablePredecessorBootstrapDispatchRequest,
   createStablePredecessorProtectedBaselineMetadata,
   parseStablePredecessorAuthorArgs,
+  readGithubAttestationVerificationFile,
 } from "../scripts/stable-predecessor-author.ts";
 import {
   createStableBootstrapIndependentEvidenceFixture,
@@ -285,6 +293,27 @@ describe("stable predecessor author", () => {
       historicalArtifactIdentity: null,
       subjectImageDigest: imageDigest,
     });
+  });
+
+  test("accepts GitHub's structured array verification output", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "genio-github-attestation-"),
+    );
+    const path = join(directory, "verification.json");
+    const verification = [{
+      attestation: { bundle: "sigstore" },
+      verificationResult: { verified: true },
+    }];
+    try {
+      await writeFile(path, `${JSON.stringify(verification)}\n`, {
+        mode: 0o600,
+      });
+      await expect(
+        readGithubAttestationVerificationFile(path),
+      ).resolves.toEqual(verification);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   test("parses exact authoring commands and rejects dispatch aliases", () => {

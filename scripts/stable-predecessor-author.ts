@@ -54,6 +54,26 @@ const KEY_ID = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{2,159}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
+export async function readGithubAttestationVerificationFile(
+  path: string,
+): Promise<unknown> {
+  const bytes = await readBoundedRegularFile(
+    path,
+    "GitHub attestation verification",
+  );
+  try {
+    const value: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!value || typeof value !== "object") {
+      throw new Error("not structured JSON");
+    }
+    return value;
+  } catch {
+    throw new Error(
+      "GitHub attestation verification must contain structured JSON",
+    );
+  }
+}
+
 function protectedAuthority(
   environment: NodeJS.ProcessEnv = process.env,
 ): {
@@ -471,9 +491,8 @@ async function imageAttestationCommand(
         options["--recovered-railway-observation"]!,
         "recovered Railway observation",
       ),
-      readBoundedJsonFile(
+      readGithubAttestationVerificationFile(
         options["--github-attestation-verification"]!,
-        "GitHub attestation verification",
       ),
     ]);
   const value = createStablePredecessorBootstrapImageAttestationV2({
