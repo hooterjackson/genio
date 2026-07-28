@@ -15,6 +15,22 @@ on:
         description: "Release candidate tag to run (for example: v2.4.0-rc.2)"
         required: true
         type: string
+      release_verification_key_sha256:
+        description: "Optional override: SHA-256 of the release verification key"
+        required: false
+        type: string
+      public_rollout_intent_canary_authority_policy_sha256:
+        description: "Optional override: SHA-256 of the public rollout intent-canary authority policy"
+        required: false
+        type: string
+      stable_authorizer_key_id:
+        description: "Optional override: stable authorizer key identifier"
+        required: false
+        type: string
+      stable_authorizer_key_sha256:
+        description: "Optional override: SHA-256 of the stable authorizer key"
+        required: false
+        type: string
 
 concurrency:
   group: stable-release-mutation
@@ -67,10 +83,38 @@ jobs:
       - id: release_authority
         name: Pin the release verification authority
         env:
-          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
-          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
-          RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}
-          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
+          RELEASE_VERIFICATION_KEY_SHA256: >-
+            ${{
+              github.event.inputs.release_verification_key_sha256 ||
+              github.event.inputs.RELEASE_VERIFICATION_KEY_SHA256 ||
+              github.event.client_payload.release_verification_key_sha256 ||
+              github.event.client_payload.RELEASE_VERIFICATION_KEY_SHA256 ||
+              vars.RELEASE_VERIFICATION_KEY_SHA256
+            }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: >-
+            ${{
+              github.event.inputs.public_rollout_intent_canary_authority_policy_sha256 ||
+              github.event.inputs.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 ||
+              github.event.client_payload.public_rollout_intent_canary_authority_policy_sha256 ||
+              github.event.client_payload.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 ||
+              vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256
+            }}
+          RELEASE_STABLE_AUTHORIZER_KEY_ID: >-
+            ${{
+              github.event.inputs.stable_authorizer_key_id ||
+              github.event.inputs.RELEASE_STABLE_AUTHORIZER_KEY_ID ||
+              github.event.client_payload.stable_authorizer_key_id ||
+              github.event.client_payload.RELEASE_STABLE_AUTHORIZER_KEY_ID ||
+              vars.RELEASE_STABLE_AUTHORIZER_KEY_ID
+            }}
+          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: >-
+            ${{
+              github.event.inputs.stable_authorizer_key_sha256 ||
+              github.event.inputs.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 ||
+              github.event.client_payload.stable_authorizer_key_sha256 ||
+              github.event.client_payload.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 ||
+              vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256
+            }}
         run: |
           if [[ ! "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "RELEASE_VERIFICATION_KEY_SHA256 must be a configured lowercase SHA-256 digest." >&2
