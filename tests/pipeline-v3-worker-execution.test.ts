@@ -2451,4 +2451,90 @@ describe("Pipeline V3 durable worker execution", () => {
       recordQualificationBatch: vi.fn(async () => undefined),
     })).rejects.toBe(persistenceFailure);
   });
+
+  test("flushes paid discovery and qualification observations before rethrowing a later retrieval failure", async () => {
+    const query = queryPlan(2);
+    const plan = selectionPlanFromQueryPlanV3(query, {
+      prompt: "Two influential disco recordings",
+    });
+    const rawCandidate = {
+      id: "paid-lead-1",
+      artist: "Test Artist",
+      title: "Test Track",
+      album: "Test Album",
+      sourceObservationIds: ["observation-paid-1"],
+    };
+    const laterFailure = new Error("later retrieval operation failed");
+    let discoveryCall = 0;
+    const port = createPipelineV3RetrievalExecutionPort({
+      adapters: {
+        discover: vi.fn(async () => {
+          discoveryCall += 1;
+          if (discoveryCall > 1) throw laterFailure;
+          return {
+            candidates: [rawCandidate],
+            nextCursor: null,
+            exhausted: false,
+            costUnits: 1,
+          };
+        }),
+        qualify: vi.fn(async () => [{
+          candidateId: rawCandidate.id,
+          scope: {
+            passed: false,
+            failedMembershipPredicateIds: ["membership:genre"],
+            fit: 0,
+          },
+          hardConstraints: {
+            passed: true,
+            failedConstraintIds: [],
+          },
+          evidence: {
+            passed: false,
+            bindingIds: [],
+            strength: 0,
+            independentProvenanceRoots: 0,
+          },
+          version: { compatible: true, confidence: 1 },
+          catalog: {
+            lookupAttempted: false,
+            storefrontPlayable: false,
+            appleSongId: null,
+            recordingFamilyKey: null,
+            confidence: 0,
+          },
+          rankingSignals: {},
+          sourceRank: 1,
+        }]),
+      },
+    });
+    const recordDiscoveryBatch = vi.fn(async () => undefined);
+    const recordQualificationBatch = vi.fn(async () => undefined);
+    const snapshot = workerRun("Two influential disco recordings", 2)
+      .pipelinePolicySnapshot;
+
+    await expect(port.execute({
+      runId: "run-v3-paid-resume",
+      plan,
+      executionMode: "active",
+      routingHints: { fixedContainer: false },
+      modelRoute: pipelineV3ModelRouteFromPolicySnapshot(snapshot),
+      policy: {
+        maximumGlobalRounds: 2,
+        maximumConcurrentDiscovery: 1,
+        maximumRawCandidates: 10,
+        qualifiedPoolGoal: 2,
+        maximumCostUnits: 10,
+        deadlineAtEpochMs: null,
+        maximumProviderFailuresPerStrategy: 1,
+      },
+      semanticRecoveryEnabled: false,
+      claimSemanticRecovery: vi.fn(async () => undefined),
+      recordDiscoveryBatch,
+      recordQualificationBatch,
+    })).rejects.toBe(laterFailure);
+
+    expect(recordDiscoveryBatch).toHaveBeenCalledOnce();
+    expect(recordQualificationBatch).toHaveBeenCalledOnce();
+  });
 });

@@ -949,35 +949,45 @@ export function createPipelineV3RetrievalExecutionPort(input: {
           return qualifications;
         },
       };
-      const result = await executeRetrievalV3({
-        runId: request.runId,
-        plan: request.plan,
-        adapters,
-        executionMode: request.executionMode,
-        routingHints: request.routingHints,
-        modelRoute: request.modelRoute,
-        semanticRecoveryEnabled: request.semanticRecoveryEnabled,
-        claimSemanticRecovery: request.claimSemanticRecovery,
-        policy: request.policy,
-        continuation: request.continuation,
-        signal: request.signal,
-      });
-      abortIfNeeded(request.signal);
       // Flush outside the retrieval scheduler's provider try/catch. A durable
       // persistence/fence failure is an integrity failure, never a provider
-      // outage or evidence scarcity signal.
-      for (const observed of discoveryBatches) {
-        await request.recordDiscoveryBatch?.(observed.request, observed.batch);
+      // outage or evidence scarcity signal. Flush successful observations even
+      // when a later provider/budget operation fails so a durable retry can
+      // resume from paid work instead of purchasing the same evidence again.
+      const flushObservedBatches = async (): Promise<void> => {
+        for (const observed of discoveryBatches) {
+          await request.recordDiscoveryBatch?.(observed.request, observed.batch);
+          abortIfNeeded(request.signal);
+        }
+        for (const observed of qualificationBatches) {
+          await request.recordQualificationBatch?.(
+            observed.request,
+            observed.qualifications,
+          );
+          abortIfNeeded(request.signal);
+        }
+      };
+      try {
+        const result = await executeRetrievalV3({
+          runId: request.runId,
+          plan: request.plan,
+          adapters,
+          executionMode: request.executionMode,
+          routingHints: request.routingHints,
+          modelRoute: request.modelRoute,
+          semanticRecoveryEnabled: request.semanticRecoveryEnabled,
+          claimSemanticRecovery: request.claimSemanticRecovery,
+          policy: request.policy,
+          continuation: request.continuation,
+          signal: request.signal,
+        });
         abortIfNeeded(request.signal);
+        await flushObservedBatches();
+        return result;
+      } catch (error) {
+        await flushObservedBatches();
+        throw error;
       }
-      for (const observed of qualificationBatches) {
-        await request.recordQualificationBatch?.(
-          observed.request,
-          observed.qualifications,
-        );
-        abortIfNeeded(request.signal);
-      }
-      return result;
     },
   });
 }
