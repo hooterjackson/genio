@@ -106,7 +106,18 @@ jobs:
             --arg publicRolloutIntentCanaryAuthorityPolicySha256 "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" \
             --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{schemaVersion,sourceRevision,version,imageReference,imageDigest,controllerRevision,releaseVerificationKeySha256,publicRolloutIntentCanaryAuthorityPolicySha256,runUrl,createdAt}' \
+            '{
+              schemaVersion: $schemaVersion,
+              sourceRevision: $sourceRevision,
+              version: $version,
+              imageReference: $imageReference,
+              imageDigest: $imageDigest,
+              controllerRevision: $controllerRevision,
+              releaseVerificationKeySha256: $releaseVerificationKeySha256,
+              publicRolloutIntentCanaryAuthorityPolicySha256: $publicRolloutIntentCanaryAuthorityPolicySha256,
+              runUrl: $runUrl,
+              createdAt: $createdAt
+            }' \
             > exact-sha-image-receipt.json
           echo "image_reference=$IMAGE_REFERENCE" >> "$GITHUB_OUTPUT"
           echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
