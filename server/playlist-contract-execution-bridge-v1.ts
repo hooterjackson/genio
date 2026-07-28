@@ -376,6 +376,12 @@ function canonicalDiversityGoals(
   ];
   for (const [axis, key] of axes) {
     const clause = contract.clauses.find((value) => value.axis === axis);
+    // Soft diversity clauses are optimization preferences. Treating the
+    // migration defaults as immutable minimums manufactured infeasibility
+    // whenever the evidence graph did not expose that taxonomy (notably
+    // minimum-distinct-scenes:0/2). Only an explicitly hard contract clause
+    // may block exact publication.
+    if (clause?.hardness !== "hard") continue;
     const count = Number(clause?.values[0]);
     if (Number.isSafeInteger(count) && count >= 0) values[key] = count;
   }

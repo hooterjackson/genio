@@ -269,7 +269,11 @@ function strategy(
 const ENGINE_STRATEGIES: Readonly<Record<RetrievalEngineV3, readonly RetrievalStrategyDefinitionV3[]>> = Object.freeze({
   curated_genre_scene: Object.freeze([
     strategy("curated_genre_scene", "resolve_scope", "scope_resolution", 1, 1, 80),
-    strategy("curated_genre_scene", "trusted_scoped_containers", "trusted_containers", 1, 3),
+    // Apple container pagination is deterministic and carries no hosted-model
+    // cost. Keep a bounded public-count frontier large enough for quality
+    // failures and 100+ track requests; exhaustion, flat-yield, candidate,
+    // round, and active-compute guards still stop it early.
+    strategy("curated_genre_scene", "trusted_scoped_containers", "trusted_containers", 1, 12),
     strategy("curated_genre_scene", "editorial_tracks", "editorial_tracks", 1, 3),
     strategy("curated_genre_scene", "qualified_artist_release_expansion", "qualified_expansion", 2, 4),
     strategy("curated_genre_scene", "multilingual_aliases", "multilingual_aliases", 2, 2),
@@ -277,7 +281,7 @@ const ENGINE_STRATEGIES: Readonly<Record<RetrievalEngineV3, readonly RetrievalSt
   ]),
   mood_activity_theme: Object.freeze([
     strategy("mood_activity_theme", "scoped_editorial_descriptions", "descriptive_tracks", 1, 3),
-    strategy("mood_activity_theme", "trusted_activity_containers", "trusted_containers", 1, 3),
+    strategy("mood_activity_theme", "trusted_activity_containers", "trusted_containers", 1, 12),
     strategy("mood_activity_theme", "qualified_artist_expansion", "qualified_expansion", 2, 3),
     strategy("mood_activity_theme", "deficit_queries", "deficit_query", 3, 3),
   ]),
@@ -566,10 +570,12 @@ function centralQualityCandidateCriterionObservationsForPolicyV3(input: {
 }
 
 /**
- * Reissue candidate-stage quality judgments only after the exact source
- * artist/title/album triple has been resolved without ambiguity to one Apple
- * recording family. Album-null, album-mismatched, and multi-family candidates
- * deliberately yield no proof and therefore remain unknown.
+ * Reissue candidate-stage quality judgments only after the source identity
+ * has been resolved without ambiguity to one Apple recording family. A
+ * supplied album remains an exact requirement. An omitted album is accepted
+ * only when the caller proved the complete exact artist/title result set has
+ * one recording family; album mismatches and multi-family candidates remain
+ * unknown.
  */
 export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
   observations: unknown;
@@ -598,7 +604,6 @@ export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
   const recordingFamilyKey = input.catalog.recordingFamilyKey.trim();
   if (
     !input.unambiguous
-    || !candidateAlbum
     || !catalogAlbum
     || !appleSongId
     || appleSongId.length > 240
@@ -608,7 +613,7 @@ export function bindCentralQualityCriterionObservationsToCatalogV3(input: {
       !== normalizeCentralQualityIdentityTextV3(input.catalog.artist)
     || normalizeCentralQualityIdentityTextV3(input.candidate.title)
       !== normalizeCentralQualityIdentityTextV3(input.catalog.title)
-    || candidateAlbum !== catalogAlbum
+    || (candidateAlbum && candidateAlbum !== catalogAlbum)
   ) return [];
   const sourceObservations =
     centralQualityCandidateCriterionObservationsForPolicyV3({
@@ -757,6 +762,10 @@ export interface CandidateQualificationV3 {
     readonly storefrontPlayable: boolean;
     readonly appleSongId: string | null;
     readonly recordingFamilyKey: string | null;
+    /** Authoritative resolved catalog identity for downstream evidence binding. */
+    readonly artistName?: string;
+    readonly trackName?: string;
+    readonly albumName?: string | null;
     readonly confidence: number;
     /** Normalized Apple/catalog issue year used for immutable era checks. */
     readonly releaseYear?: number | null;
@@ -1711,6 +1720,12 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
         .filter((id) => typeof id === "string" && id.trim().length > 0),
     )];
     evidenceIdsByClause.set(clause.id, evidenceIds);
+    // The evidence-axis bridge clause is a meta-policy ("this selected track
+    // has selection-grade evidence"), not a second factual claim about the
+    // recording. Its cited binding must still be attested and grade-eligible,
+    // while the factual leaf that makes the Boolean predicate pass remains
+    // obligation-bound independently below.
+    const evidencePolicyClause = clause.axis === "evidence";
     const gradeEligible = playlistEvidenceGradeSatisfiesObligationV1({
       grade: assessment?.evidenceGrade,
       obligation: clause.evidence,
@@ -1718,7 +1733,12 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
       strengthPolicyVersion: input.policy.evidenceStrengthPolicyVersion,
     });
     if (gradeEligible) gradeEligibleClauseIds.add(clause.id);
-    const boundBindings = obligationBoundBindings(clause.id, evidenceIds);
+    const boundBindings = evidencePolicyClause
+      ? evidenceIds.flatMap((evidenceId) => {
+        const binding = attestedBindings.find(({ id }) => id === evidenceId);
+        return binding ? [binding] : [];
+      })
+      : obligationBoundBindings(clause.id, evidenceIds);
     const derivedEvidenceGrade = boundBindings.length === evidenceIds.length
       && evidenceIds.length > 0
       ? selectQualifyingPlaylistEvidenceGradeV1({
@@ -1794,7 +1814,8 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
       missingRequiredClauseIds.push(clause.id);
       continue;
     }
-    if (!obligationBoundEvidence(clause.id, evidenceIds)) {
+    if (clause.axis !== "evidence"
+      && !obligationBoundEvidence(clause.id, evidenceIds)) {
       obligationMismatchClauseIds.push(clause.id);
       continue;
     }
@@ -1892,6 +1913,21 @@ export interface DiscoveryRequestV3 {
    * key and keeps later rounds from re-querying the same opaque IDs.
    */
   readonly qualifiedTrackSeeds: readonly {
+    readonly artist: string;
+    readonly title: string;
+    readonly appleSongId: string;
+    readonly recordingFamilyKey: string;
+  }[];
+  /**
+   * The subset of qualified identities whose central-quality verdict remains
+   * unknown. Keeping this separate from `qualifiedTrackSeeds` lets an
+   * expansion retain its artist/catalog anchors after the quality evidence
+   * gap has closed, without paying to judge the same recording twice.
+   *
+   * Optional only for protocol-compatible direct/test callers. The canonical
+   * orchestrator always supplies it when a quality policy is active.
+   */
+  readonly qualityEvidenceTrackSeeds?: readonly {
     readonly artist: string;
     readonly title: string;
     readonly appleSongId: string;
@@ -2668,6 +2704,49 @@ function addQualifiedToFamily(
   return { newFamily: false, meaningfulProgress };
 }
 
+function catalogQualityIdentityKey(
+  appleSongId: string,
+  recordingFamilyKey: string,
+): string {
+  return `${recordingFamilyKey}\u0000${appleSongId}`;
+}
+
+function mergeCatalogBoundQualityIntoFamily(
+  families: Map<string, RecordingFamilyEntryV3>,
+  input: {
+    appleSongId: string;
+    recordingFamilyKey: string;
+    observations: readonly CentralQualityCriterionObservationV3[];
+  },
+): boolean {
+  if (input.observations.length === 0) return false;
+  const family = families.get(input.recordingFamilyKey);
+  if (!family) return false;
+  const variants = [family.primary, ...family.alternates];
+  const index = variants.findIndex(({ appleSongId, recordingFamilyKey }) => (
+    appleSongId === input.appleSongId
+    && recordingFamilyKey === input.recordingFamilyKey
+  ));
+  if (index < 0) return false;
+  const existing = variants[index]!;
+  const observations = [...new Map([
+    ...(existing.centralQualityCriterionObservations ?? []),
+    ...input.observations,
+  ].map((observation) => [observation.observationId, observation])).values()]
+    .sort((left, right) => left.observationId.localeCompare(right.observationId));
+  if (observations.length
+    === (existing.centralQualityCriterionObservations?.length ?? 0)) {
+    return false;
+  }
+  variants[index] = {
+    ...existing,
+    centralQualityCriterionObservations: observations,
+  };
+  family.primary = variants[0]!;
+  family.alternates = variants.slice(1);
+  return true;
+}
+
 function incrementReason(
   reasons: Partial<Record<CandidateDeficitReasonV3, number>>,
   reason: CandidateDeficitReasonV3,
@@ -2782,16 +2861,16 @@ function playlistOptimizationConstraintsV3(
       hardAlbumMaximum,
       immutableDiversity ? plan.diversityGoals.maximumTracksPerAlbum : null,
     ),
-    // These portfolio concentration guards protect open-world curation. A
-    // fixed container, artist catalogue, or factual enumeration can
-    // legitimately come from one authoritative source/dependency and must not
-    // be converted into a false policy shortfall for doing so.
-    maximumTracksPerSource: openWorldCurated
-      ? Math.max(2, Math.ceil(target * 0.6))
-      : null,
-    maximumTracksPerDependency: openWorldCurated
-      ? Math.max(3, Math.ceil(target * 0.85))
-      : null,
+    // Provenance roots and dependency IDs describe operational lineage, not
+    // user-authorized playlist constraints. In particular, every independently
+    // curated Apple editorial container shares the `music.apple.com` root and
+    // every Apple-safe recording shares the `apple_catalog` dependency.
+    // Turning either into a hard per-playlist cap manufactures a 60%/85%
+    // shortfall even when the complete live, evidence-qualified pool satisfies
+    // the immutable contract. Cache concentration remains fail-closed below;
+    // explicit source/dependency quotas must be compiled as canonical rules.
+    maximumTracksPerSource: null,
+    maximumTracksPerDependency: null,
     maximumFreshCacheTracks: openWorldCurated
       ? Math.max(1, Math.floor(target * 0.5))
       : null,
@@ -3346,15 +3425,26 @@ export function centralQualityVerdictV3(
       observation.verdict,
     ]);
   }
-  let hasUnknownCriterion = false;
+  let passedCriteria = 0;
+  let unknownCriteria = 0;
   for (const criterion of policy.criteria) {
     const verdicts = byCriterion.get(criterion) ?? [];
     // Known failure dominates every later pass or aggregate score. This is
     // the zeroKnownFailures invariant at its lowest executable boundary.
     if (verdicts.includes("fail")) return "fail";
-    if (!verdicts.includes("pass")) hasUnknownCriterion = true;
+    if (verdicts.includes("pass")) passedCriteria += 1;
+    else unknownCriteria += 1;
   }
-  return hasUnknownCriterion ? "unknown" : "pass";
+  if (policy.criteria.length === 0) return "unknown";
+  // Central suitability is a playlist-level objective, not six independent
+  // hard evidence gates. Classify a recording as a quality pass when its
+  // criterion coverage itself meets the immutable coverage/unknown policy;
+  // one bounded unknown must not turn five independently verified positives
+  // into an all-or-nothing failure. Known failures still fail closed above.
+  return passedCriteria / policy.criteria.length >= policy.minimumPassRatio
+    && unknownCriteria / policy.criteria.length <= policy.maximumUnknownRatio
+    ? "pass"
+    : "unknown";
 }
 
 export function evaluateCentralQualityV3(input: {
@@ -3531,6 +3621,7 @@ export function validateCanonicalPublicationSetV3(input: {
         ranked: input.tracks,
         target: optimizationTarget,
         plan: input.plan,
+        validateFixedSelection: true,
       });
       if (!optimized.report.exact) {
         reasons.push(...optimized.report.unmetConstraints.map(
@@ -3637,6 +3728,7 @@ function optimizeQualifiedPlaylistV3(input: {
   ranked: readonly QualifiedTrackV3[];
   target: number;
   plan: SelectionPlanV3;
+  validateFixedSelection?: boolean;
 }): {
   selected: QualifiedTrackV3[];
   report: PlaylistOptimizationReportV3;
@@ -3650,7 +3742,11 @@ function optimizeQualifiedPlaylistV3(input: {
   // concentration, quality, and sequencing. Solving a preferred diversity set
   // first and then replacing it with the first quota-compliant set can discard
   // the only jointly feasible composition and manufacture a false shortfall.
-  const final = optimizePlaylistV1({ candidates, constraints });
+  const final = optimizePlaylistV1({
+    candidates,
+    constraints,
+    validateFixedSelection: input.validateFixedSelection,
+  });
 
   return {
     selected: final.selected.flatMap(({ id }) => {
@@ -3737,6 +3833,66 @@ function nextStrategyWave(
     if (selected.length >= maximumConcurrentDiscovery) break;
   }
   return selected;
+}
+
+/**
+ * Once the deterministic/catalog portfolio has produced enough distinct
+ * recording families for the requested count, central-quality evidence is a
+ * deficit on those exact identities rather than a reason to keep issuing
+ * broad discovery calls. Prefer one qualified expansion lane so it can bind
+ * suitability evidence to the existing Apple records (and then expand from
+ * those qualified artists if the evidence pass rejects some of them).
+ *
+ * The ordinary independent portfolio remains unchanged before a count-sized
+ * pool exists, and resumes automatically when every qualified-expansion lane
+ * is terminal. Shared Apple+hosted dependencies keep this rescue lane
+ * intentionally singular.
+ */
+function nextCentralQualityRecoveryWave(
+  states: readonly MutableStrategyStateV3[],
+): MutableStrategyStateV3[] {
+  const expansion = availableStrategies(states).find(
+    ({ definition }) => definition.kind === "qualified_expansion",
+  );
+  return expansion ? [expansion] : [];
+}
+
+/**
+ * A known-failure shortfall cannot be repaired by re-judging the surviving
+ * identities. Continue the most productive still-open identity frontier
+ * first, preferring deterministic trusted containers that have already
+ * yielded qualified recording families. Only fall back to artist expansion
+ * when no proven catalog frontier remains.
+ */
+function nextCentralQualityIdentityRecoveryWave(
+  states: readonly MutableStrategyStateV3[],
+): MutableStrategyStateV3[] {
+  const available = availableStrategies(states);
+  const byObservedYield = (
+    left: MutableStrategyStateV3,
+    right: MutableStrategyStateV3,
+  ) => (
+    right.newQualifiedFamilies / Math.max(1, right.rounds)
+      - left.newQualifiedFamilies / Math.max(1, left.rounds)
+    || left.definition.tier - right.definition.tier
+    || left.rounds - right.rounds
+    || left.ordinal - right.ordinal
+  );
+  const trusted = available
+    .filter(({ definition, newQualifiedFamilies }) => (
+      definition.kind === "trusted_containers"
+      && newQualifiedFamilies > 0
+    ))
+    .sort(byObservedYield)[0];
+  if (trusted) return [trusted];
+  const productive = available
+    .filter(({ definition, newQualifiedFamilies }) => (
+      definition.kind !== "qualified_expansion"
+      && newQualifiedFamilies > 0
+    ))
+    .sort(byObservedYield)[0];
+  if (productive) return [productive];
+  return nextCentralQualityRecoveryWave(states);
 }
 
 function mutableDependencyState(
@@ -3966,17 +4122,10 @@ function finalStopReason(input: {
     && state.rawCandidates === 0
     && state.providerFailures === 0
   ));
-  const rawCandidateCount = input.strategies.reduce(
-    (total, state) => total + state.rawCandidates,
-    0,
-  );
   // A successful zero-result frontier may establish that no compatible
-  // tracks exist. Provider/contract failures that produced no raw candidates
-  // cannot establish that claim, even when dependent zero-work strategies
-  // exhausted because they had no seed material.
-  if (input.qualifiedCount === 0
-    && input.providerFailureCount > 0
-    && rawCandidateCount === 0) {
+  // tracks exist. A provider failure cannot establish that claim, even when
+  // other dependent zero-work strategies exhausted without seed material.
+  if (input.qualifiedCount === 0 && input.providerFailureCount > 0) {
     return "provider_failure";
   }
   if (input.qualifiedCount === 0 && input.providerFailureCount > 0
@@ -4270,6 +4419,10 @@ export async function executeRetrievalV3(input: {
   const seenCandidateTracks = new Map<string, { artist: string; title: string }>();
   const rawCandidateLedger = new Map<string, RawCandidateLedgerEntryV3>();
   const families = new Map<string, RecordingFamilyEntryV3>();
+  const qualityObservationsByCatalogIdentity = new Map<
+    string,
+    CentralQualityCriterionObservationV3[]
+  >();
   for (const track of seedTracks) {
     seenCandidateTracks.set(track.candidateId, { artist: track.artist, title: track.title });
     appleIdToFamily.set(track.appleSongId, track.recordingFamilyKey);
@@ -4414,8 +4567,17 @@ export async function executeRetrievalV3(input: {
           optimizerActive ? [primary, ...alternates] : [primary]
         ))
         .sort((left, right) => compareQualified(left, right, activePlan.rankingObjectives));
+      const currentQualityEligibleRepresentations =
+        activePlan.playlistQualityPolicy
+          ? currentRankedRepresentations.filter((track) => (
+              centralQualityVerdictV3(
+                track,
+                activePlan.playlistQualityPolicy!,
+              ) !== "fail"
+            ))
+          : currentRankedRepresentations;
       const currentHardEligible = new Set(applyHardAggregateConstraints(
-        currentRankedRepresentations,
+        currentQualityEligibleRepresentations,
         activePlan.hardConstraints,
       ).eligible.map(({ recordingFamilyKey }) => recordingFamilyKey)).size;
       const fill = adaptiveFillPlanV3({
@@ -4463,7 +4625,41 @@ export async function executeRetrievalV3(input: {
         remainingGlobalRounds,
         concurrencyByKnownBudget,
       );
-      const wave = nextStrategyWave(states, maximumWaveSize);
+      const centralQualityCapacity = activePlan.playlistQualityPolicy
+        ? selectWithCentralQualityV3({
+            ranked: currentRankedRepresentations,
+            target: requested,
+            policy: activePlan.playlistQualityPolicy,
+          }).eligible.length
+        : requested;
+      const centralQualityNonFailureCapacity = activePlan.playlistQualityPolicy
+        ? currentRankedRepresentations.filter((track) => (
+            centralQualityVerdictV3(
+              track,
+              activePlan.playlistQualityPolicy!,
+            ) !== "fail"
+          )).length
+        : requested;
+      const centralQualityIdentityRecoveryRequired =
+        activePlan.playlistQualityPolicy !== null
+        && activePlan.playlistQualityPolicy !== undefined
+        && currentRankedRepresentations.length >= requested
+        && centralQualityNonFailureCapacity < requested;
+      const centralQualityEvidenceRecoveryRequired =
+        activePlan.playlistQualityPolicy !== null
+        && activePlan.playlistQualityPolicy !== undefined
+        && currentRankedRepresentations.length >= requested
+        && centralQualityNonFailureCapacity >= requested
+        && centralQualityCapacity < requested;
+      const centralQualityRecoveryWave =
+        centralQualityIdentityRecoveryRequired
+          ? nextCentralQualityIdentityRecoveryWave(states)
+          : centralQualityEvidenceRecoveryRequired
+            ? nextCentralQualityRecoveryWave(states)
+            : [];
+      const wave = centralQualityRecoveryWave.length > 0
+        ? centralQualityRecoveryWave
+        : nextStrategyWave(states, maximumWaveSize);
       if (wave.length === 0) break;
 
       const remainingCapacity = policy.maximumRawCandidates - seenCandidateIds.size;
@@ -4473,7 +4669,7 @@ export async function executeRetrievalV3(input: {
       ));
       const remainingCandidateInputGoal = policy.candidateGoal === undefined
         ? fill.rawDiscoveryGoal
-        : Math.max(0, policy.candidateGoal - counters.evidenceEligible);
+        : Math.max(0, policy.candidateGoal - rawCandidateLedger.size);
       // The P10 conversion target sizes evidence-eligible discovery input. It
       // is neither an Apple-safe pool requirement nor a reason to issue one
       // oversized wave. Observe yield incrementally and stop as soon as the
@@ -4496,6 +4692,22 @@ export async function executeRetrievalV3(input: {
         appleSongId: primary.appleSongId,
         recordingFamilyKey: primary.recordingFamilyKey,
       }));
+      const frozenQualityEvidenceTrackSeeds = activePlan.playlistQualityPolicy
+        ? [...families.values()]
+            .map(({ primary }) => primary)
+            .filter((track) => (
+              centralQualityVerdictV3(
+                track,
+                activePlan.playlistQualityPolicy!,
+              ) === "unknown"
+            ))
+            .map((track) => ({
+              artist: track.artist,
+              title: track.title,
+              appleSongId: track.appleSongId,
+              recordingFamilyKey: track.recordingFamilyKey,
+            }))
+        : [];
       const discoverySignal = operationSignal();
       const requests = wave.map((state): {
         state: MutableStrategyStateV3;
@@ -4509,6 +4721,12 @@ export async function executeRetrievalV3(input: {
         const fairShare = localOnly
           ? Math.max(1, totalWaveRawGoal)
           : Math.max(1, Math.ceil(unallocatedRawGoal / unallocatedMaterialSlots));
+        const qualityEvidenceGoal = !localOnly
+          && state.definition.kind === "qualified_expansion"
+          && activePlan.playlistQualityPolicy
+          && frozenQualityEvidenceTrackSeeds.length > 0
+          ? Math.min(75, frozenQualityEvidenceTrackSeeds.length)
+          : 1;
         const requestedRawCandidateCount = localOnly
           ? Math.max(1, Math.min(
               fairShare,
@@ -4516,12 +4734,22 @@ export async function executeRetrievalV3(input: {
               remainingCapacity,
             ))
           : Math.max(1, Math.min(
-              fairShare,
+              Math.max(fairShare, qualityEvidenceGoal),
               state.definition.maximumBatchSize,
-              unallocatedRawGoal,
+              Math.max(unallocatedRawGoal, qualityEvidenceGoal),
+              // Qualified expansion can be a pure evidence-enrichment pass
+              // over already-qualified Apple identities. Its rows are not new
+              // discovery leads, so the remaining raw-lead capacity must not
+              // truncate the exact quality window (for example 37/57).
+              qualityEvidenceGoal > 1
+                ? Math.max(remainingCapacity, qualityEvidenceGoal)
+                : remainingCapacity,
             ));
         if (!localOnly) {
-          unallocatedRawGoal -= requestedRawCandidateCount;
+          unallocatedRawGoal = Math.max(
+            0,
+            unallocatedRawGoal - requestedRawCandidateCount,
+          );
           unallocatedMaterialSlots -= 1;
         }
         return {
@@ -4541,6 +4769,9 @@ export async function executeRetrievalV3(input: {
             alreadyDiscoveredTracks: frozenAlreadyDiscoveredTracks,
             qualifiedRecordingFamilyKeys: frozenQualifiedRecordingFamilyKeys,
             qualifiedTrackSeeds: frozenQualifiedTrackSeeds,
+            ...(activePlan.playlistQualityPolicy ? {
+              qualityEvidenceTrackSeeds: frozenQualityEvidenceTrackSeeds,
+            } : {}),
             ...(discoverySignal ? { signal: discoverySignal } : {}),
           },
         };
@@ -4581,7 +4812,6 @@ export async function executeRetrievalV3(input: {
         continue;
       }
       if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-      if (!error.retriable) throw error;
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`discover:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -4592,7 +4822,8 @@ export async function executeRetrievalV3(input: {
         retryAfterUntil: retryAfterUntilFromError(error),
         failureClass: error.failureClass,
       });
-      state.status = state.providerFailures >= policy.maximumProviderFailuresPerStrategy
+      state.status = !error.retriable
+        || state.providerFailures >= policy.maximumProviderFailuresPerStrategy
         ? "provider_error"
         : "available";
       continue;
@@ -4724,6 +4955,15 @@ export async function executeRetrievalV3(input: {
       counters.validCandidates += 1;
       candidates.push(candidate);
     }
+    // One provider batch can repeat the same recording several times while
+    // adding stronger observations. The ledger intentionally merges each
+    // occurrence, but pushing every intermediate representation would send
+    // duplicate candidate IDs to qualification and make the separated
+    // recovery ledger reject an otherwise valid batch. Preserve the final
+    // cumulative representation for each ID in first-seen order.
+    candidates = [...new Map(
+      candidates.map((candidate) => [candidate.id, candidate]),
+    ).values()];
 
     let qualifications: readonly CandidateQualificationV3[];
     const qualificationSignal = operationSignal();
@@ -4753,7 +4993,6 @@ export async function executeRetrievalV3(input: {
         continue;
       }
       if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-      if (!error.retriable) throw error;
       providerFailureCount += 1;
       state.providerFailures += 1;
       integrityEvents.push(`qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -4767,7 +5006,8 @@ export async function executeRetrievalV3(input: {
       for (let index = 0; index < candidates.length; index += 1) {
         incrementReason(discardedByReason, "qualification_missing");
       }
-      state.status = state.providerFailures >= policy.maximumProviderFailuresPerStrategy
+      state.status = !error.retriable
+        || state.providerFailures >= policy.maximumProviderFailuresPerStrategy
         ? "provider_error"
         : "available";
       continue;
@@ -4859,7 +5099,6 @@ export async function executeRetrievalV3(input: {
           pendingDiscoveries = [];
         } else {
           if (!(error instanceof RetrievalDependencyErrorV3)) throw error;
-          if (!error.retriable) throw error;
           providerFailureCount += 1;
           state.providerFailures += 1;
           integrityEvents.push(`semantic_recovery_qualify:${state.definition.id}:${error instanceof Error ? error.message : "unknown_error"}`);
@@ -4870,6 +5109,7 @@ export async function executeRetrievalV3(input: {
             retryAfterUntil: retryAfterUntilFromError(error),
             failureClass: error.failureClass,
           });
+          if (!error.retriable) state.status = "provider_error";
           const idempotencyKey = recoveryAuditIdempotencyKeyV3({
             runId: input.runId,
             planHash: recoveryProposal.revision.planHash,
@@ -4924,6 +5164,51 @@ export async function executeRetrievalV3(input: {
         incrementReason(discardedByReason, "qualification_missing");
         rejectLead("qualification_missing");
         continue;
+      }
+      const catalogQualityObservations = activePlan.playlistQualityPolicy
+        && qualification.catalog.storefrontPlayable
+        && qualification.catalog.appleSongId
+        && qualification.catalog.recordingFamilyKey
+        && qualification.catalog.artistName?.trim()
+        && qualification.catalog.trackName?.trim()
+        && qualification.catalog.albumName?.trim()
+        ? centralQualityCriterionObservationsForPolicyV3({
+            observations:
+              qualification.centralQualityCriterionObservations,
+            policy: activePlan.playlistQualityPolicy,
+            artist: qualification.catalog.artistName,
+            title: qualification.catalog.trackName,
+            album: qualification.catalog.albumName,
+            appleSongId: qualification.catalog.appleSongId,
+            recordingFamilyKey:
+              qualification.catalog.recordingFamilyKey,
+          })
+        : [];
+      if (catalogQualityObservations.length > 0) {
+        const qualityKey = catalogQualityIdentityKey(
+          qualification.catalog.appleSongId!,
+          qualification.catalog.recordingFamilyKey!,
+        );
+        const cumulativeQualityObservations = [...new Map([
+          ...(qualityObservationsByCatalogIdentity.get(qualityKey) ?? []),
+          ...catalogQualityObservations,
+        ].map((observation) => [
+          observation.observationId,
+          observation,
+        ])).values()].sort((left, right) => (
+          left.observationId.localeCompare(right.observationId)
+        ));
+        qualityObservationsByCatalogIdentity.set(
+          qualityKey,
+          cumulativeQualityObservations,
+        );
+        if (mergeCatalogBoundQualityIntoFamily(families, {
+          appleSongId: qualification.catalog.appleSongId!,
+          recordingFamilyKey: qualification.catalog.recordingFamilyKey!,
+          observations: cumulativeQualityObservations,
+        })) {
+          meaningfulProgress += 1;
+        }
       }
       const failedPredicates = new Set(qualification.scope.failedMembershipPredicateIds);
       for (const predicate of activePlan.membershipPredicates) {
@@ -5033,11 +5318,20 @@ export async function executeRetrievalV3(input: {
         continue;
       }
 
+      const resolvedArtist = qualification.catalog.artistName?.trim()
+        || candidate.artist.trim();
+      const resolvedTitle = qualification.catalog.trackName?.trim()
+        || candidate.title.trim();
+      const resolvedAlbum = qualification.catalog.albumName === null
+        ? null
+        : qualification.catalog.albumName?.trim()
+          || candidate.album?.trim()
+          || null;
       const qualified: QualifiedTrackV3 = {
         candidateId: candidate.id,
-        title: candidate.title.trim(),
-        artist: candidate.artist.trim(),
-        album: candidate.album?.trim() || null,
+        title: resolvedTitle,
+        artist: resolvedArtist,
+        album: resolvedAlbum,
         appleSongId: qualification.catalog.appleSongId,
         recordingFamilyKey: qualification.catalog.recordingFamilyKey,
         catalogReleaseYear: qualification.catalog.releaseYear ?? null,
@@ -5080,12 +5374,19 @@ export async function executeRetrievalV3(input: {
         ...(activePlan.playlistQualityPolicy ? {
           centralQualityCriterionObservations:
             centralQualityCriterionObservationsForPolicyV3({
-              observations:
-                qualification.centralQualityCriterionObservations,
+              observations: [
+                ...(qualification.centralQualityCriterionObservations ?? []),
+                ...(qualityObservationsByCatalogIdentity.get(
+                  catalogQualityIdentityKey(
+                    qualification.catalog.appleSongId,
+                    qualification.catalog.recordingFamilyKey,
+                  ),
+                ) ?? []),
+              ],
               policy: activePlan.playlistQualityPolicy,
-              artist: candidate.artist.trim(),
-              title: candidate.title.trim(),
-              album: candidate.album?.trim() || null,
+              artist: resolvedArtist,
+              title: resolvedTitle,
+              album: resolvedAlbum,
               appleSongId: qualification.catalog.appleSongId,
               recordingFamilyKey:
                 qualification.catalog.recordingFamilyKey,

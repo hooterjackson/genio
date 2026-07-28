@@ -106,6 +106,17 @@ function normalized(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+/**
+ * Treat a bare suitability descriptor and the same descriptor followed by a
+ * non-semantic carrier noun as one criterion. The carrier can improve display
+ * prose, but judging both "flirtatious" and "flirtatious vibe" independently
+ * double-weights one user idea and makes the 80% coverage floor stricter than
+ * the immutable request.
+ */
+function suitabilitySemanticKey(value: string): string {
+  return normalized(value).replace(/\s+(?:atmosphere|feel|feeling|mood|vibe)$/u, "");
+}
+
 function unique(values: readonly string[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -257,9 +268,42 @@ function addSuitabilityClause(input: {
   idSeed: string;
   value: string;
   sourceText?: string;
+  requirePromptSource?: boolean;
 }): void {
-  const key = normalized(input.value);
-  if (!key || input.seenSuitability.has(key)) return;
+  const key = suitabilitySemanticKey(input.value);
+  if (!key) return;
+  const source = promptSource(
+    input.prompt,
+    input.sourceText ?? input.value,
+  );
+  // Provider-authored brief prose is allowed to suggest ranking language, but
+  // it cannot add an executable central-suitability obligation that the user
+  // never supplied. The exact user span (or a server-owned prompt extractor
+  // below) is the authority for immutable quality criteria.
+  if (input.requirePromptSource && source.provenance !== "prompt") return;
+  if (input.seenSuitability.has(key)) {
+    // Prefer the bare descriptor as the canonical server-owned wording when
+    // it arrives after a prose-shaped carrier form. Preserve the original
+    // clause identity so the immutable lineage and all references remain
+    // stable.
+    if (normalized(input.value) === key) {
+      const existingIndex = input.clauses.findIndex((clause) => (
+        clause.kind === "suitability"
+        && clause.values?.some((value) => suitabilitySemanticKey(value) === key)
+      ));
+      const existing = input.clauses[existingIndex];
+      if (existingIndex >= 0
+        && existing
+        && existing.values?.every((value) => normalized(value) !== key)) {
+        input.clauses[existingIndex] = {
+          ...existing,
+          values: [input.value],
+          source,
+        };
+      }
+    }
+    return;
+  }
   input.seenSuitability.add(key);
   const id = `bridge:suitability:${safeId(input.idSeed)}`;
   input.clauses.push({
@@ -270,7 +314,7 @@ function addSuitabilityClause(input: {
     axis: "central_suitability",
     operator: "prefer",
     values: [input.value],
-    source: promptSource(input.prompt, input.sourceText ?? input.value),
+    source,
   });
   input.centralSuitabilityClauseIds.push(id);
 }
@@ -573,7 +617,8 @@ export function buildPlaylistContractShadowDraftV1(
       continue;
     }
 
-    if (CENTRAL_SUITABILITY_AXES.has(constraint.axis)) {
+    if (CENTRAL_SUITABILITY_AXES.has(constraint.axis)
+      && !isNegativeConstraint(constraint)) {
       for (const [valueIndex, value] of values.entries()) {
         addSuitabilityClause({
           clauses,
@@ -582,6 +627,7 @@ export function buildPlaylistContractShadowDraftV1(
           prompt: input.prompt,
           idSeed: `${constraint.id}-${valueIndex + 1}`,
           value,
+          requirePromptSource: true,
         });
       }
       if (constraint.kind === "hard") softenedHardConstraintIds.push(constraint.id);

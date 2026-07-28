@@ -1313,8 +1313,39 @@ export function optimizePlaylistV1(input: {
   candidates: readonly PlaylistOptimizationCandidateV1[];
   constraints: PlaylistOptimizationConstraintsV1;
   budget?: PlaylistOptimizationBudgetV1;
+  /**
+   * Publication preflight may validate a frozen optimizer output directly.
+   * Retrieval selection must leave this false so its bounded search and
+   * retry semantics remain unchanged.
+   */
+  validateFixedSelection?: boolean;
 }): PlaylistOptimizationResultV1 {
   validateConstraints(input.constraints);
+  // Publication preflight commonly receives the optimizer's already ordered
+  // exact selection: there are no alternate rows to choose, so rerunning a
+  // bounded beam can only manufacture false infeasibility. Validate that
+  // fixed set directly in its frozen order before spending any search budget.
+  // This is linear/bounded by the public playlist maximum and does not weaken
+  // a constraint. A frozen set has no replacement frontier, so return its
+  // actual violations instead of manufacturing a different short selection.
+  const fixedSet = input.candidates.map(candidate);
+  if (input.validateFixedSelection === true
+    && input.constraints.sequencingMode !== "source_order") {
+    const fixedSummary = constraintSummary(fixedSet, input.constraints);
+    const duplicateCandidateId =
+      new Set(fixedSet.map(({ id }) => id)).size !== fixedSet.length;
+    const unmetConstraints = [
+      ...(duplicateCandidateId ? ["duplicate_candidate_id"] : []),
+      ...fixedSummary.unmetConstraints,
+    ];
+    return {
+      policyVersion: PLAYLIST_OPTIMIZER_POLICY_VERSION,
+      exact: unmetConstraints.length === 0,
+      selected: fixedSet,
+      ...fixedSummary,
+      unmetConstraints,
+    };
+  }
   const candidates = normalizedCandidateRepresentations(input.candidates);
   const budget = optimizationBudget(input.budget);
   const large = input.constraints.targetTrackCount > 100 || candidates.length > 1_000;

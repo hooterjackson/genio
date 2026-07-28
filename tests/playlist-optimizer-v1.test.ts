@@ -61,6 +61,90 @@ function constraints(
 }
 
 describe("playlist optimizer v1", () => {
+  test("validates an already ordered exact publication set without search", () => {
+    const candidates = Array.from({ length: 50 }, (_, index) => track(
+      `fixed-${index}`,
+      {
+        artistKey: `artist-${index}`,
+        albumKey: `album-${index}`,
+        familiarityScore: index < 25 ? 0.9 : 0.2,
+      },
+    ));
+    const result = optimizePlaylistV1({
+      candidates,
+      constraints: constraints({
+        targetTrackCount: 50,
+        maximumTracksPerArtist: 1,
+        maximumTracksPerAlbum: 1,
+        minimumDistinctArtists: 10,
+        minimumDistinctAlbums: 10,
+        minimumDistinctEras: 1,
+        minimumDistinctScenes: 1,
+        minimumDistinctGeographies: 1,
+        minimumFamiliarTracks: 20,
+        maximumFamiliarTracks: 30,
+        minimumCentralQualityPassTracks: 40,
+        maximumCentralQualityUnknownTracks: 10,
+        zeroCentralQualityFailures: true,
+        avoidAdjacentSameArtist: true,
+        avoidAdjacentSameAlbum: true,
+      }),
+      // A direct fixed-set validation must not consume combinatorial-search
+      // allowance because there is no selection frontier.
+      budget: {
+        maximumHeuristicWorkUnits: 1,
+        maximumExactNodes: 1,
+        maximumExactWorkUnits: 1,
+      },
+      validateFixedSelection: true,
+    });
+
+    expect(result).toMatchObject({
+      exact: true,
+      unmetConstraints: [],
+    });
+    expect(result.selected.map(({ id }) => id))
+      .toEqual(candidates.map(({ id }) => id));
+  });
+
+  test("reports a frozen set's actual violation without replacement search", () => {
+    const candidates = [
+      track("track-1", { artistKey: "same-artist" }),
+      track("track-2", { artistKey: "same-artist" }),
+    ];
+    const result = optimizePlaylistV1({
+      candidates,
+      constraints: constraints({
+        targetTrackCount: 2,
+        maximumTracksPerArtist: 1,
+        minimumDistinctArtists: 1,
+        minimumDistinctAlbums: 1,
+        minimumDistinctEras: 1,
+        minimumDistinctScenes: 1,
+        minimumDistinctGeographies: 1,
+        minimumFamiliarTracks: 0,
+        maximumFamiliarTracks: 2,
+        maximumCentralQualityUnknownTracks: 2,
+      }),
+      budget: {
+        maximumHeuristicWorkUnits: 1,
+        maximumExactNodes: 1,
+        maximumExactWorkUnits: 1,
+      },
+      validateFixedSelection: true,
+    });
+
+    expect(result).toMatchObject({
+      exact: false,
+      unmetConstraints: [
+        "maximum_tracks_per_artist",
+        "adjacent_same_artist",
+      ],
+    });
+    expect(result.selected.map(({ id }) => id))
+      .toEqual(candidates.map(({ id }) => id));
+  });
+
   test("solves canonical quotas jointly with artist diversity instead of rejecting a feasible pool", () => {
     const result = optimizePlaylistV1({
       candidates: [

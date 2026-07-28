@@ -1245,6 +1245,15 @@ function pipelineV3QualificationProjection(
   const evidenceRecordIds = [...new Set(qualification.evidence.bindingIds)]
     .filter((value) => typeof value === "string" && value.trim().length > 0)
     .slice(0, 128);
+  const resolvedArtist = qualification.catalog.artistName?.trim()
+    || candidate.artist.trim();
+  const resolvedTitle = qualification.catalog.trackName?.trim()
+    || candidate.title.trim();
+  const resolvedAlbum = qualification.catalog.albumName === null
+    ? null
+    : qualification.catalog.albumName?.trim()
+      || candidate.album?.trim()
+      || null;
   const qualityResult = {
     evidence: {
       passed: qualification.evidence.passed,
@@ -1264,9 +1273,9 @@ function pipelineV3QualificationProjection(
           observations:
             qualification.centralQualityCriterionObservations,
           policy: queryPlan.playlistQualityPolicy,
-          artist: candidate.artist,
-          title: candidate.title,
-          album: candidate.album,
+          artist: resolvedArtist,
+          title: resolvedTitle,
+          album: resolvedAlbum,
           appleSongId: qualification.catalog.appleSongId ?? "",
           recordingFamilyKey:
             qualification.catalog.recordingFamilyKey ?? "",
@@ -2546,6 +2555,9 @@ function persistedCanonicalEvidenceIntegrityReason(input: {
     persistedPipelineV3EvidenceBindingIndex(input.bindings);
   if (bindingIndex.reason) return bindingIndex.reason;
   const { bindingsByCandidate } = bindingIndex;
+  const clauseById = new Map(
+    input.canonicalPolicy.clauses.map((clause) => [clause.id, clause]),
+  );
   for (const candidateId of input.candidateIds) {
     const qualification = latestQualification.get(candidateId);
     if (!qualification) return "canonical_qualification_projection_missing";
@@ -2590,13 +2602,21 @@ function persistedCanonicalEvidenceIntegrityReason(input: {
       return "canonical_hosted_evidence_snapshot_invalid";
     }
     for (const reference of references) {
+      const clause = clauseById.get(reference.obligationId);
+      if (!clause) return "canonical_predicate_projection_invalid";
       const binding = (bindingsByCandidate.get(candidateId) ?? []).find(
         (candidateBinding) => (
           candidateBinding.id === reference.evidenceId
           && evidenceBindingIsAttestedForSelectionV3(candidateBinding, {
             requireHostedEvidenceSnapshot: true,
             storefront: input.storefront,
-            requiredObligationIds: [reference.obligationId],
+            // The evidence-axis bridge is the meta-policy that an attested,
+            // grade-eligible source exists. It is intentionally not a second
+            // factual claim that the source itself must name. This mirrors
+            // canonicalRequiredEvidenceIntegrityV3 at the live boundary.
+            requiredObligationIds: clause.axis === "evidence"
+              ? []
+              : [reference.obligationId],
           })
         ),
       );
@@ -6516,6 +6536,7 @@ export class Repository {
          WHERE binding.run_id=$1
            AND binding.candidate_id=ANY($2::uuid[])
            AND binding.eligibility='qualifying'
+           AND binding.scope_axis<>'evidence'
            AND binding.pipeline_version='corpus_first_v3'
          ORDER BY binding.candidate_id,binding.id
          FOR SHARE OF binding,source`,
@@ -18477,6 +18498,10 @@ export class Repository {
         evidence_record_ids_json: unknown;
         quality_result_json: unknown;
         catalog_result_json: unknown;
+        discovery_dependency_ids: string[] | null;
+        discovery_provenance_roots: string[] | null;
+        discovery_cache_origin: string | null;
+        discovery_source_fresh_until: Date | null;
       }>(
         `SELECT qualification.candidate_id,
                 qualification.stable_identity_hash,
@@ -18489,7 +18514,11 @@ export class Repository {
                 qualification.predicate_results_json,
                 qualification.evidence_record_ids_json,
                 qualification.quality_result_json,
-                qualification.catalog_result_json
+                qualification.catalog_result_json,
+                lead.dependency_ids discovery_dependency_ids,
+                lead.provenance_roots discovery_provenance_roots,
+                lead.cache_origin discovery_cache_origin,
+                lead.source_fresh_until discovery_source_fresh_until
          FROM playlist_qualification_records qualification
          JOIN track_candidates candidate
            ON candidate.id=qualification.candidate_id
@@ -18497,6 +18526,10 @@ export class Repository {
          JOIN recording_families family
            ON family.id=candidate.recording_family_id
           AND family.run_id=qualification.run_id
+         LEFT JOIN playlist_discovery_leads lead
+           ON lead.id=qualification.discovery_lead_id
+          AND lead.run_id=qualification.run_id
+          AND lead.contract_revision_id=qualification.contract_revision_id
          WHERE qualification.run_id=$1
            AND qualification.contract_revision_id=$2
            AND qualification.candidate_id=ANY($3::uuid[])
@@ -18527,6 +18560,7 @@ export class Repository {
          WHERE binding.run_id=$1
            AND binding.candidate_id=ANY($2::uuid[])
            AND binding.eligibility='qualifying'
+           AND binding.scope_axis<>'evidence'
            AND binding.pipeline_version='corpus_first_v3'
          ORDER BY binding.candidate_id,binding.id
          FOR SHARE OF binding,source`,
@@ -18561,6 +18595,20 @@ export class Repository {
           evidenceBindings: persistedBindingsByCandidate.get(
             qualification.candidate_id,
           ) ?? [],
+          discoveryDependencyIds:
+            qualification.discovery_dependency_ids ?? [],
+          provenanceRoots:
+            qualification.discovery_provenance_roots ?? [],
+          cacheOrigin: [
+            "live",
+            "fresh_cache",
+            "governed_snapshot",
+            "orchestration_local",
+          ].includes(qualification.discovery_cache_origin ?? "")
+            ? qualification.discovery_cache_origin as PersistedCanonicalQualificationV1["cacheOrigin"]
+            : undefined,
+          sourceFreshUntil:
+            qualification.discovery_source_fresh_until?.toISOString() ?? null,
           qualityResult: qualification.quality_result_json,
           catalogResult: qualification.catalog_result_json,
         }));
@@ -18778,6 +18826,7 @@ export class Repository {
              WHERE binding.run_id=$1
                AND binding.candidate_id=ANY($2::uuid[])
                AND binding.eligibility='qualifying'
+               AND binding.scope_axis<>'evidence'
                AND binding.pipeline_version='corpus_first_v3'
              ORDER BY binding.candidate_id,binding.id`,
             [input.runId, candidateIds],
@@ -25432,10 +25481,13 @@ export class Repository {
       || finalSemanticPlan.storefront !== plan.storefront
       || stableStringify(finalSemanticPlan.hardConstraints) !== stableStringify(plan.hardConstraints)
       || stableStringify(finalSemanticPlan.recordingPolicy) !== stableStringify(plan.recordingPolicy)) {
-      throw new HttpError(
-        409,
-        "Pipeline V3 semantic recovery changed an immutable request constraint",
-        "pipeline_v3_result_invalid",
+      throw Object.assign(
+        new HttpError(
+          409,
+          "Pipeline V3 semantic recovery changed an immutable request constraint",
+          "pipeline_v3_result_invalid",
+        ),
+        { operatorCode: "pipeline_v3_result_invalid.semantic_constraint_drift" },
       );
     }
     if (result.selected.length !== result.outcome.selectedTrackCount
@@ -25444,7 +25496,14 @@ export class Repository {
       || (result.outcome.status === "exact_ready" && result.selected.length !== target)
       || (result.outcome.status === "partial_ready" && (result.selected.length < 1 || result.selected.length >= target))
       || (result.outcome.status === "no_compatible_tracks" && result.selected.length !== 0)) {
-      throw new HttpError(409, "Pipeline V3 retrieval counts are internally inconsistent", "pipeline_v3_result_invalid");
+      throw Object.assign(
+        new HttpError(
+          409,
+          "Pipeline V3 retrieval counts are internally inconsistent",
+          "pipeline_v3_result_invalid",
+        ),
+        { operatorCode: "pipeline_v3_result_invalid.counts" },
+      );
     }
     boundedPipelineBatch(
       result.selected,
@@ -25514,7 +25573,14 @@ export class Repository {
     if (selectedFamilyKeys.size !== result.selected.length
       || new Set(result.reserve.map((track) => track.recordingFamilyKey)).size !== result.reserve.length
       || result.reserve.some((track) => selectedFamilyKeys.has(track.recordingFamilyKey))) {
-      throw new HttpError(409, "Pipeline V3 manifest tracks must be recording-family unique", "pipeline_v3_result_invalid");
+      throw Object.assign(
+        new HttpError(
+          409,
+          "Pipeline V3 manifest tracks must be recording-family unique",
+          "pipeline_v3_result_invalid",
+        ),
+        { operatorCode: "pipeline_v3_result_invalid.family_uniqueness" },
+      );
     }
     if (manifestEligibleOutcome
       && isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)) {
@@ -25528,12 +25594,83 @@ export class Repository {
           result.outcome.status === "partial_ready",
       });
       if (!publicationValidation.valid) {
-        throw new HttpError(
-          409,
-          `Pipeline V3 canonical publication preflight failed: ${
-            publicationValidation.reasonCodes.join(",")
-          }`,
-          "pipeline_v3_result_invalid",
+        const reasonCodes = publicationValidation.reasonCodes;
+        const operatorStage = reasonCodes.includes(
+          "canonical_sequence_optimizer_mismatch",
+        )
+          ? "sequence_optimizer"
+          : reasonCodes.some((reason) => reason.startsWith(
+            "canonical_playlist_optimization_failed:",
+          ))
+            ? "playlist_optimization"
+            : reasonCodes.some((reason) => reason.startsWith(
+              "canonical_quota_failed:",
+            ))
+              ? "quota"
+              : reasonCodes.includes("canonical_central_quality_failed")
+                ? "central_quality"
+                : reasonCodes.includes("canonical_track_evidence_invalid")
+                  ? "track_evidence"
+                  : reasonCodes.some((reason) => (
+                    reason === "canonical_track_unknown"
+                    || reason === "canonical_track_failed"
+                  ))
+                    ? "track_eligibility"
+                    : reasonCodes.some((reason) => reason.startsWith(
+                      "canonical_sequence_",
+                    ))
+                      ? "sequence"
+                      : reasonCodes.some((reason) => (
+                        reason === "canonical_exact_count_mismatch"
+                        || reason === "canonical_count_overflow"
+                        || reason === "canonical_recording_family_duplicate"
+                      ))
+                        ? "count_identity"
+                        : "unknown";
+        const operatorReasonClass = operatorStage === "playlist_optimization"
+          ? reasonCodes
+            .find((reason) => reason.startsWith(
+              "canonical_playlist_optimization_failed:",
+            ))
+            ?.slice("canonical_playlist_optimization_failed:".length)
+            .replace(/[:/]/gu, ".")
+            .replace(/^minimum_distinct_albums\./u, "albums.")
+            .slice(0, 48)
+          : null;
+        const retrievalAlbumCount = operatorReasonClass?.startsWith(
+          "albums.",
+        )
+          ? result.playlistOptimization?.distinct.albums
+          : null;
+        const retrievalOutcomeClass = result.outcome.status === "exact_ready"
+          ? "x"
+          : result.outcome.status === "partial_ready"
+            ? "p"
+            : "n";
+        throw Object.assign(
+          new HttpError(
+            409,
+            `Pipeline V3 canonical publication preflight failed: ${
+              publicationValidation.reasonCodes.join(",")
+            }`,
+            "pipeline_v3_result_invalid",
+          ),
+          {
+            operatorCode:
+              `pipeline_v3_result_invalid.canonical_preflight.${operatorStage}${
+                operatorReasonClass ? `.${operatorReasonClass}` : ""
+              }${
+                Number.isSafeInteger(retrievalAlbumCount)
+                  ? `.retrieval.${retrievalAlbumCount}`
+                  : ""
+              }${
+                operatorReasonClass?.startsWith("albums.")
+                  ? `.s${result.selected.length}.e${
+                    result.playlistOptimization?.exact === true ? 1 : 0
+                  }.o${retrievalOutcomeClass}`
+                  : ""
+              }`,
+          },
         );
       }
     }
@@ -25733,7 +25870,14 @@ export class Repository {
       if (supportsGroundedRecoveryAudit) {
         const revisions = result.semanticPlanRevisions ?? [];
         if (revisions.length > 1) {
-          throw new HttpError(409, "Pipeline V3 recovery exceeded its single-repair boundary", "pipeline_v3_result_invalid");
+          throw Object.assign(
+            new HttpError(
+              409,
+              "Pipeline V3 recovery exceeded its single-repair boundary",
+              "pipeline_v3_result_invalid",
+            ),
+            { operatorCode: "pipeline_v3_result_invalid.repair_boundary" },
+          );
         }
         for (const revision of revisions) {
           const existing = await client.query<{
@@ -25802,10 +25946,13 @@ export class Repository {
               && cacheOrigin !== "governed_snapshot")
             || (cacheOrigin === "fresh_cache"
               && (!sourceFreshUntil || sourceFreshUntil <= new Date()))) {
-            throw new HttpError(
-              409,
-              "Pipeline V3 lead provenance is stale or inconsistent",
-              "pipeline_v3_result_invalid",
+            throw Object.assign(
+              new HttpError(
+                409,
+                "Pipeline V3 lead provenance is stale or inconsistent",
+                "pipeline_v3_result_invalid",
+              ),
+              { operatorCode: "pipeline_v3_result_invalid.lead_provenance" },
             );
           }
           await client.query(
@@ -26097,10 +26244,13 @@ export class Repository {
             if (canonical
               && (!canonical.evaluation.eligible
                 || !canonical.evidenceIntegrity.passed)) {
-              throw new HttpError(
-                409,
-                "A schema-4 qualified track does not satisfy its canonical contract",
-                "pipeline_v3_result_invalid",
+              throw Object.assign(
+                new HttpError(
+                  409,
+                  "A schema-4 qualified track does not satisfy its canonical contract",
+                  "pipeline_v3_result_invalid",
+                ),
+                { operatorCode: "pipeline_v3_result_invalid.canonical_qualification" },
               );
             }
             const predicateResults = canonical
@@ -26307,7 +26457,14 @@ export class Repository {
           // A track whose complete proof is authoritative structured catalog
           // metadata therefore needs no manufactured web/source binding.
           || (!canonicalRetrieval && track.evidenceBindingIds.length < 1)) {
-          throw new HttpError(409, "A qualified V3 track is missing identity or evidence", "pipeline_v3_result_invalid");
+          throw Object.assign(
+            new HttpError(
+              409,
+              "A qualified V3 track is missing identity or evidence",
+              "pipeline_v3_result_invalid",
+            ),
+            { operatorCode: "pipeline_v3_result_invalid.identity_evidence" },
+          );
         }
         const familyId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", familyKey: track.recordingFamilyKey });
         const candidateId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", candidateId: track.candidateId, familyKey: track.recordingFamilyKey });
@@ -26380,8 +26537,9 @@ export class Repository {
         for (const binding of bindings) {
           const canonicalPredicates = canonicalRetrieval
             ? (finalSemanticPlan.canonicalContractPolicy?.clauses ?? []).filter(
-                (clause) => track.canonicalClauseAssessments?.[clause.id]
-                  ?.evidenceIds?.includes(binding.id),
+                (clause) => clause.axis !== "evidence"
+                  && track.canonicalClauseAssessments?.[clause.id]
+                    ?.evidenceIds?.includes(binding.id),
               )
             : [];
           // Canonical contracts retain their exact Boolean clause assessments
@@ -27063,6 +27221,7 @@ export class Repository {
            WHERE binding.run_id=$1
              AND binding.candidate_id=ANY($2::uuid[])
              AND binding.eligibility='qualifying'
+             AND binding.scope_axis<>'evidence'
              AND binding.pipeline_version='corpus_first_v3'
            ORDER BY binding.candidate_id,binding.id
            FOR SHARE OF binding,source`,

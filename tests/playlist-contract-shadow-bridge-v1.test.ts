@@ -88,6 +88,10 @@ describe("playlist contract shadow bridge v1", () => {
       brief: requestBrief,
       storefront: "us",
     });
+    selectionPlan.constraints = [
+      ...selectionPlan.constraints,
+      constraint("provider_invented_party", "activity", "prefer", ["party"], "soft"),
+    ];
     const bridged = compilePlaylistContractShadowV1({
       contractId: "run:smooth-reggaeton-heat",
       prompt: SMOOTH_REGGAETON_HEAT_PROMPT,
@@ -131,6 +135,8 @@ describe("playlist contract shadow bridge v1", () => {
       "flirtatious",
       "crowd-pleasing",
     ]));
+    expect(central.map((clause) => clause!.values[0])).not.toContain("party");
+    expect(central).toHaveLength(6);
     expect(central.every((clause) => (
       clause!.kind === "suitability" && clause!.hardness === "soft"
     ))).toBe(true);
@@ -222,6 +228,7 @@ describe("playlist contract shadow bridge v1", () => {
       constraint("exclude_bad_bunny", "artist", "exclude", ["Bad Bunny"], "hard"),
       constraint("ranking_influence", "relationship", "prefer", ["influential"], "soft"),
       constraint("suitability_smooth", "mood", "prefer", ["smooth"], "soft"),
+      constraint("avoid_aggressive", "mood", "avoid", ["aggressive"], "soft"),
     ];
     const selectionPlan: SelectionPlan = {
       ...baseline,
@@ -326,6 +333,17 @@ describe("playlist contract shadow bridge v1", () => {
       kind: "ranking_preference",
       hardness: "soft",
     });
+    expect(clauseForValue("avoid:aggressive")).toMatchObject({
+      kind: "ranking_preference",
+      hardness: "soft",
+      operator: "prefer",
+    });
+    expect(
+      bridged.contract.qualityPolicy.centralSuitabilityClauseIds.some((id) => (
+        bridged.contract.clauses.find((clause) => clause.id === id)
+          ?.values.includes("aggressive")
+      )),
+    ).toBe(false);
     expect(bridged.contract.clauses).toContainEqual(expect.objectContaining({
       id: "bridge:catalog:recording-version-policy",
       kind: "catalog_version",
