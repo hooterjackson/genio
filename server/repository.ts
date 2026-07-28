@@ -18498,6 +18498,10 @@ export class Repository {
         evidence_record_ids_json: unknown;
         quality_result_json: unknown;
         catalog_result_json: unknown;
+        discovery_dependency_ids: string[] | null;
+        discovery_provenance_roots: string[] | null;
+        discovery_cache_origin: string | null;
+        discovery_source_fresh_until: Date | null;
       }>(
         `SELECT qualification.candidate_id,
                 qualification.stable_identity_hash,
@@ -18510,7 +18514,11 @@ export class Repository {
                 qualification.predicate_results_json,
                 qualification.evidence_record_ids_json,
                 qualification.quality_result_json,
-                qualification.catalog_result_json
+                qualification.catalog_result_json,
+                lead.dependency_ids discovery_dependency_ids,
+                lead.provenance_roots discovery_provenance_roots,
+                lead.cache_origin discovery_cache_origin,
+                lead.source_fresh_until discovery_source_fresh_until
          FROM playlist_qualification_records qualification
          JOIN track_candidates candidate
            ON candidate.id=qualification.candidate_id
@@ -18518,6 +18526,10 @@ export class Repository {
          JOIN recording_families family
            ON family.id=candidate.recording_family_id
           AND family.run_id=qualification.run_id
+         LEFT JOIN playlist_discovery_leads lead
+           ON lead.id=qualification.discovery_lead_id
+          AND lead.run_id=qualification.run_id
+          AND lead.contract_revision_id=qualification.contract_revision_id
          WHERE qualification.run_id=$1
            AND qualification.contract_revision_id=$2
            AND qualification.candidate_id=ANY($3::uuid[])
@@ -18583,6 +18595,20 @@ export class Repository {
           evidenceBindings: persistedBindingsByCandidate.get(
             qualification.candidate_id,
           ) ?? [],
+          discoveryDependencyIds:
+            qualification.discovery_dependency_ids ?? [],
+          provenanceRoots:
+            qualification.discovery_provenance_roots ?? [],
+          cacheOrigin: [
+            "live",
+            "fresh_cache",
+            "governed_snapshot",
+            "orchestration_local",
+          ].includes(qualification.discovery_cache_origin ?? "")
+            ? qualification.discovery_cache_origin as PersistedCanonicalQualificationV1["cacheOrigin"]
+            : undefined,
+          sourceFreshUntil:
+            qualification.discovery_source_fresh_until?.toISOString() ?? null,
           qualityResult: qualification.quality_result_json,
           catalogResult: qualification.catalog_result_json,
         }));

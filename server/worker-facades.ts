@@ -274,6 +274,16 @@ export function createPublicationRepositoryFacade(source: PublicationRepository)
         ...args: Parameters<NonNullable<PublicationRepository["advancePublicationReconciliation"]>>
       ) => source.advancePublicationReconciliation!(...args),
     } : {}),
+    ...(source.commitCanonicalPublicationPreflightDecision ? {
+      commitCanonicalPublicationPreflightDecision: (
+        ...args: Parameters<NonNullable<PublicationRepository["commitCanonicalPublicationPreflightDecision"]>>
+      ) => source.commitCanonicalPublicationPreflightDecision!(...args),
+    } : {}),
+    ...(source.updateCanonicalPublicationRun ? {
+      updateCanonicalPublicationRun: (
+        ...args: Parameters<NonNullable<PublicationRepository["updateCanonicalPublicationRun"]>>
+      ) => source.updateCanonicalPublicationRun!(...args),
+    } : {}),
     ...(source.openPlaylistRunBlocker ? {
       openPlaylistRunBlocker: (
         ...args: Parameters<NonNullable<PublicationRepository["openPlaylistRunBlocker"]>>

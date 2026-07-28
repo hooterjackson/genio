@@ -269,6 +269,37 @@ describe("canonical repaired-manifest publication revalidation", () => {
     });
   });
 
+  test("falls back to the immutable discovery provenance when the quality projection omits it", () => {
+    const qualifications = [qualification(0), qualification(1)].map(
+      (value) => {
+        const qualityResult = {
+          ...(value.qualityResult as Record<string, unknown>),
+        };
+        delete qualityResult.provenance;
+        return {
+          ...value,
+          qualityResult,
+          discoveryDependencyIds: ["apple_catalog"] as const,
+          provenanceRoots: ["music.apple.com"],
+          cacheOrigin: "live" as const,
+          sourceFreshUntil: null,
+        };
+      },
+    );
+    const result = revalidateCanonicalManifestRevisionV1({
+      plan: canonicalPlan(2),
+      manifestTracks: [manifestTrack(0), manifestTrack(1)],
+      qualifications,
+    });
+
+    expect(result).toMatchObject({ valid: true, reasonCodes: [] });
+    expect(result.tracks.map(({ cacheOrigin }) => cacheOrigin))
+      .toEqual(["live", "live"]);
+    expect(result.tracks.map(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds
+    ))).toEqual([["apple_catalog"], ["apple_catalog"]]);
+  });
+
   test("rejects a reserve repair that restores count but breaks a canonical quota", () => {
     const plan = canonicalPlan(2, {
       playlistQuotaRules: [{

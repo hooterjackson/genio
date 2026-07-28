@@ -38,6 +38,10 @@ export interface PersistedCanonicalQualificationV1 {
   predicateResults: unknown;
   evidenceRecordIds: unknown;
   evidenceBindings?: readonly EvidenceBindingReferenceV3[];
+  discoveryDependencyIds?: readonly string[];
+  provenanceRoots?: readonly string[];
+  cacheOrigin?: QualifiedTrackV3["cacheOrigin"];
+  sourceFreshUntil?: string | null;
   qualityResult: unknown;
   catalogResult: unknown;
 }
@@ -151,6 +155,27 @@ function reconstructTrack(
     || recordingFamilyKey !== qualification.recordingFamilyKey.trim()) return null;
 
   const evidenceRecordIds = stringArray(qualification.evidenceRecordIds);
+  const persistedDependencyIds = dependencyIdArray(
+    qualification.discoveryDependencyIds,
+  );
+  const qualityDependencyIds = dependencyIdArray(provenance?.dependencyIds);
+  const qualityProvenanceRoots = stringArray(provenance?.provenanceRoots);
+  const persistedCacheOrigin = [
+    "live",
+    "fresh_cache",
+    "governed_snapshot",
+    "orchestration_local",
+  ].includes(String(qualification.cacheOrigin ?? ""))
+    ? qualification.cacheOrigin
+    : undefined;
+  const qualityCacheOrigin = [
+    "live",
+    "fresh_cache",
+    "governed_snapshot",
+    "orchestration_local",
+  ].includes(String(provenance?.cacheOrigin ?? ""))
+    ? provenance!.cacheOrigin as QualifiedTrackV3["cacheOrigin"]
+    : undefined;
   const projectedSignals = optimizationSignals(
     quality?.playlistOptimizationSignals,
   );
@@ -178,18 +203,17 @@ function reconstructTrack(
     sourceObservationIds: [],
     evidenceBindingIds: evidenceRecordIds,
     evidenceBindings: structuredClone(qualification.evidenceBindings ?? []),
-    discoveryDependencyIds: dependencyIdArray(provenance?.dependencyIds),
-    provenanceRoots: stringArray(provenance?.provenanceRoots),
-    ...([
-      "live",
-      "fresh_cache",
-      "governed_snapshot",
-      "orchestration_local",
-    ].includes(String(provenance?.cacheOrigin ?? "")) ? {
-      cacheOrigin: provenance!.cacheOrigin as QualifiedTrackV3["cacheOrigin"],
+    discoveryDependencyIds: qualityDependencyIds.length > 0
+      ? qualityDependencyIds
+      : persistedDependencyIds,
+    provenanceRoots: qualityProvenanceRoots.length > 0
+      ? qualityProvenanceRoots
+      : stringArray(qualification.provenanceRoots),
+    ...(qualityCacheOrigin || persistedCacheOrigin ? {
+      cacheOrigin: qualityCacheOrigin ?? persistedCacheOrigin,
       sourceFreshUntil: typeof provenance?.sourceFreshUntil === "string"
         ? provenance.sourceFreshUntil
-        : null,
+        : qualification.sourceFreshUntil ?? null,
     } : {}),
     canonicalClauseAssessments:
       structuredClone(assessments) as QualifiedTrackV3["canonicalClauseAssessments"],

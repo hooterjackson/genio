@@ -1865,6 +1865,50 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       manifestRevisionHash: persisted.manifestHash!,
       partialPublicationAuthorized: false,
     };
+    const discoveryLeadId = randomUUID();
+    await pool.query(
+      `WITH qualification AS (
+         SELECT contract_revision_id
+         FROM playlist_qualification_records
+         WHERE run_id=$1
+         LIMIT 1
+       )
+       INSERT INTO playlist_discovery_leads(
+         id,run_id,contract_revision_id,execution_attempt_id,
+         provider,dependency_key,dependency_ids,provenance_roots,
+         cache_origin,source_fresh_until,strategy_id,identity_hint_hash,
+         lead_json,status,evidence_eligible)
+       SELECT $2,$1,qualification.contract_revision_id,$3,
+         'apple_music_editorial','apple_catalog',ARRAY['apple_catalog'],
+         ARRAY['music.apple.com'],'live',NULL,
+         'canonical-revalidation-provenance',
+         repeat('a',64),'{}'::jsonb,'qualified',false
+       FROM qualification`,
+      [context.runId, discoveryLeadId, context.fence.contractAttemptId],
+    );
+    await pool.query(
+      `UPDATE playlist_qualification_records
+       SET discovery_lead_id=$2
+       WHERE run_id=$1`,
+      [context.runId, discoveryLeadId],
+    );
+    const provenanceProjection = await pool.query<{
+      quality_has_provenance: boolean;
+      cache_origin: string;
+    }>(
+      `UPDATE playlist_qualification_records qualification
+       SET quality_result_json=qualification.quality_result_json-'provenance'
+       FROM playlist_discovery_leads lead
+       WHERE qualification.run_id=$1
+         AND lead.id=qualification.discovery_lead_id
+       RETURNING qualification.quality_result_json ? 'provenance'
+           quality_has_provenance,
+         lead.cache_origin`,
+      [context.runId],
+    );
+    expect(provenanceProjection.rows).toEqual([
+      { quality_has_provenance: false, cache_origin: "live" },
+    ]);
     await expect(
       publicationRepository.revalidateCanonicalPublicationManifest!(
         prepublicationFence,

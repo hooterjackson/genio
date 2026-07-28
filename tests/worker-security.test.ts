@@ -68,6 +68,8 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("addSources" in publication).toBe(false);
   expect("saveAppleAuthorization" in publication).toBe(false);
   expect("acquireAppleWritePermit" in publication).toBe(true);
+  expect("commitCanonicalPublicationPreflightDecision" in publication).toBe(true);
+  expect("updateCanonicalPublicationRun" in publication).toBe(true);
   expect("acquireAppleWritePermit" in research).toBe(false);
   expect("acquireAppleWritePermit" in matching).toBe(false);
   expect("reserveProviderCost" in appleAuthorization).toBe(false);
