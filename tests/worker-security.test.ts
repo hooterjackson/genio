@@ -84,10 +84,18 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("getActivePlaylistContractRevision" in research).toBe(true);
   expect("savePlaylistContractRevision" in research).toBe(true);
   expect("savePlaylistFeasibilitySnapshot" in research).toBe(true);
+  expect("persistPipelineV3DiscoveryBatch" in research).toBe(true);
+  expect("persistPipelineV3QualificationBatch" in research).toBe(true);
+  expect("persistPipelineV3RuntimeFeasibilitySnapshot" in research).toBe(true);
+  expect("quarantineCanonicalExecution" in research).toBe(true);
   await research.savePlaylistContractRevision?.({} as any);
   await research.savePlaylistFeasibilitySnapshot?.({} as any);
+  await research.persistPipelineV3RuntimeFeasibilitySnapshot?.({} as any);
+  await research.quarantineCanonicalExecution?.({} as any);
   expect(source.savePlaylistContractRevision).toHaveBeenCalledOnce();
   expect(source.savePlaylistFeasibilitySnapshot).toHaveBeenCalledOnce();
+  expect(source.persistPipelineV3RuntimeFeasibilitySnapshot).toHaveBeenCalledOnce();
+  expect(source.quarantineCanonicalExecution).toHaveBeenCalledOnce();
   const researchAuthority = { expectedGeneration: "generation" } as any;
   await research.resolveResearchProviderBlocker?.(
     "run-1",

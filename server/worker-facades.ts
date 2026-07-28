@@ -88,6 +88,11 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
         ...args: Parameters<NonNullable<ResearchRepository["preparePlaylistRunRescueGuidance"]>>
       ) => source.preparePlaylistRunRescueGuidance!(...args),
     } : {}),
+    ...(source.quarantineCanonicalExecution ? {
+      quarantineCanonicalExecution: (
+        ...args: Parameters<NonNullable<ResearchRepository["quarantineCanonicalExecution"]>>
+      ) => source.quarantineCanonicalExecution!(...args),
+    } : {}),
     claimPipelineV3SemanticRecovery: (
       ...args: Parameters<ResearchRepository["claimPipelineV3SemanticRecovery"]>
     ) => source.claimPipelineV3SemanticRecovery(...args),
@@ -109,6 +114,15 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
           >
         >
       ) => source.validatePipelineV3ContinuationQualifications!(...args),
+    } : {}),
+    ...(source.persistPipelineV3RuntimeFeasibilitySnapshot ? {
+      persistPipelineV3RuntimeFeasibilitySnapshot: (
+        ...args: Parameters<
+          NonNullable<
+            ResearchRepository["persistPipelineV3RuntimeFeasibilitySnapshot"]
+          >
+        >
+      ) => source.persistPipelineV3RuntimeFeasibilitySnapshot!(...args),
     } : {}),
     persistPipelineV3RetrievalResult: (
       ...args: Parameters<ResearchRepository["persistPipelineV3RetrievalResult"]>
