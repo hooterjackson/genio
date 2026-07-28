@@ -94,7 +94,16 @@ jobs:
             --arg controllerRevision "$CONTROLLER_REVISION" \
             --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{schemaVersion,sourceRevision,version,imageReference,imageDigest,controllerRevision,runUrl,createdAt}' \
+            '{
+              schemaVersion: $schemaVersion,
+              sourceRevision: $sourceRevision,
+              version: $version,
+              imageReference: $imageReference,
+              imageDigest: $imageDigest,
+              controllerRevision: $controllerRevision,
+              runUrl: $runUrl,
+              createdAt: $createdAt
+            }' \
             > exact-sha-image-receipt.json
           echo "image_reference=$IMAGE_REFERENCE" >> "$GITHUB_OUTPUT"
           echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
