@@ -4065,6 +4065,78 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(firstChunkFailures).toBe(2);
   });
 
+  test("chunks exact quality-seed Apple lookups at the 25-ID provider limit", async () => {
+    const base = plan("twenty-six smooth disco songs", 26);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeeds = Array.from({ length: 26 }, (_, index): CatalogSong => ({
+      ...song(800 + index, `Artist ${index + 1}`, `Track ${index + 1}`),
+      genreNames: ["Disco"],
+    }));
+    const byId = new Map(exactSeeds.map((seed) => [seed.id, seed]));
+    const lookupAppleByIds = vi.fn(async (
+      _storefront: string,
+      ids: readonly string[],
+    ) => {
+      if (ids.length > 25) throw new Error("provider limit exceeded");
+      return ids.map((id) => byId.get(id)!);
+    });
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: vi.fn(async () => emptySearch()) as any,
+      lookupAppleByIds: lookupAppleByIds as any,
+      getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
+      getArtistAlbums: vi.fn(async () => ({ items: [], next: null })) as any,
+      getAlbumTracks: vi.fn(async () => ({ items: [], next: null })) as any,
+      verifyAppleExpansion: vi.fn(async (
+        _request: DiscoveryRequestV3,
+        songs: readonly CatalogSong[],
+      ) => songs.map(
+        (seed, index): HostedWebCandidateV3 => ({
+          artist: seed.artistName,
+          title: seed.name,
+          album: seed.albumName,
+          sourceUrl: `https://example.com/quality/${index}`,
+          provenanceRoot: "example.com",
+          evidenceStrength: 0.9,
+          sourceRank: index + 1,
+        }),
+      )),
+    });
+
+    const batch = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 26,
+      qualifiedRecordingFamilyKeys: exactSeeds.map((seed) => `isrc:${seed.isrc}`),
+      qualifiedTrackSeeds: exactSeeds.map((seed) => ({
+        artist: seed.artistName,
+        title: seed.name,
+        appleSongId: seed.id,
+        recordingFamilyKey: `isrc:${seed.isrc}`,
+      })),
+    });
+
+    expect(lookupAppleByIds.mock.calls.map(([, ids]) => ids.length))
+      .toEqual([25, 1]);
+    expect(batch.candidates).toHaveLength(26);
+  });
+
   test.each([
     {
       label: "album-null evidence with one exact recording family",

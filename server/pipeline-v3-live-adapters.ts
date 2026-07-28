@@ -1772,12 +1772,16 @@ async function discoverQualifiedAppleExpansion(input: {
   const qualitySeedIds = [...new Set(qualitySeedWindow
     .map(({ appleSongId }) => appleSongId.trim())
     .filter((id) => /^\d{1,32}$/u.test(id)))];
-  const qualitySeedSongs = qualitySeedIds.length > 0
-    ? await input.lookupByIds(
+  const qualitySeedIdChunks: string[][] = [];
+  for (let offset = 0; offset < qualitySeedIds.length; offset += 25) {
+    qualitySeedIdChunks.push(qualitySeedIds.slice(offset, offset + 25));
+  }
+  const qualitySeedSongs = qualitySeedIdChunks.length > 0
+    ? (await mapConcurrent(qualitySeedIdChunks, 3, (ids) => input.lookupByIds(
         request.plan.storefront,
-        qualitySeedIds,
+        ids,
         request.signal,
-      )
+      ))).flat()
     : [];
   const qualitySeedById = new Map(qualitySeedWindow.map((seed) => [
     seed.appleSongId,
