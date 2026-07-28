@@ -2620,8 +2620,8 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(result.selected).not.toHaveLength(50);
   });
 
-  test("buckets catalog-qualified tracks without provenance under the shared source cap", async () => {
-    const selection = canonicalDiscoPlan(3);
+  test("does not turn shared live provenance into an accidental playlist count cap", async () => {
+    const selection = canonicalDiscoPlan(50);
     let delivered = false;
     const result = await executeRetrievalV3({
       runId: "optimizer-empty-provenance-source-cap",
@@ -2631,7 +2631,7 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
           if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
           delivered = true;
           return {
-            candidates: Array.from({ length: 3 }, (_, index) => candidate(index)),
+            candidates: Array.from({ length: 50 }, (_, index) => candidate(index)),
             nextCursor: null,
             exhausted: true,
             provenance: {
@@ -2664,18 +2664,19 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       },
     });
 
-    expect(result.qualifiedPool).toHaveLength(3);
+    expect(result.qualifiedPool).toHaveLength(50);
     expect(result.qualifiedPool.every(({ provenanceRoots }) => (
       provenanceRoots?.length === 0
     ))).toBe(true);
     expect(result.outcome).toMatchObject({
-      status: "needs_decision",
-      stopReason: "playlist_optimization_constraints",
-      selectedTrackCount: 2,
-      shortfall: 1,
+      status: "exact_ready",
+      selectedTrackCount: 50,
+      shortfall: 0,
     });
-    expect(result.playlistOptimization?.unmetConstraints)
-      .toContain("exact_count:2/3");
+    expect(result.playlistOptimization).toMatchObject({
+      exact: true,
+      evidenceQualifiedCandidateCount: 50,
+    });
   });
 
   test("replaces a homogeneous cache prefix with lower-ranked qualified diversity", async () => {

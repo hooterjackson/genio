@@ -2861,16 +2861,16 @@ function playlistOptimizationConstraintsV3(
       hardAlbumMaximum,
       immutableDiversity ? plan.diversityGoals.maximumTracksPerAlbum : null,
     ),
-    // These portfolio concentration guards protect open-world curation. A
-    // fixed container, artist catalogue, or factual enumeration can
-    // legitimately come from one authoritative source/dependency and must not
-    // be converted into a false policy shortfall for doing so.
-    maximumTracksPerSource: openWorldCurated
-      ? Math.max(2, Math.ceil(target * 0.6))
-      : null,
-    maximumTracksPerDependency: openWorldCurated
-      ? Math.max(3, Math.ceil(target * 0.85))
-      : null,
+    // Provenance roots and dependency IDs describe operational lineage, not
+    // user-authorized playlist constraints. In particular, every independently
+    // curated Apple editorial container shares the `music.apple.com` root and
+    // every Apple-safe recording shares the `apple_catalog` dependency.
+    // Turning either into a hard per-playlist cap manufactures a 60%/85%
+    // shortfall even when the complete live, evidence-qualified pool satisfies
+    // the immutable contract. Cache concentration remains fail-closed below;
+    // explicit source/dependency quotas must be compiled as canonical rules.
+    maximumTracksPerSource: null,
+    maximumTracksPerDependency: null,
     maximumFreshCacheTracks: openWorldCurated
       ? Math.max(1, Math.floor(target * 0.5))
       : null,
