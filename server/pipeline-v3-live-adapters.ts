@@ -2971,14 +2971,15 @@ export function createPipelineV3LiveAdapters(
       // successful evidence, and fail the strategy only when no chunk can be
       // verified after the bounded three-attempt provider window.
       for (let attempt = 0; attempt < 3 && pending.length > 0; attempt += 1) {
-        // Cost reservations are atomic but concurrent. Launching four verbose
-        // quality chunks together can temporarily reserve the full run budget
-        // even though each call reconciles far below its conservative ceiling.
-        // Two lanes keep useful parallelism without manufacturing a budget
-        // boundary from overlapping reservations.
+        // Cost reservations are atomic but conservative. Even two verbose
+        // quality chunks can temporarily reserve the remaining run budget
+        // although the first reconciles far below its ceiling. Keep this
+        // evidence-only stage on one lane so each reservation is reconciled
+        // before the next starts; the outer discovery portfolio remains
+        // concurrent.
         const results = await mapConcurrent(
           pending,
-          request.plan.playlistQualityPolicy ? 2 : 6,
+          request.plan.playlistQualityPolicy ? 1 : 6,
           async ({ chunk, index }) => {
             try {
               const page = await defaultHostedWebDiscovery(
