@@ -1863,6 +1863,107 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
   });
 
+  test("joins catalog-bound quality proof to a separately membership-qualified recording", async () => {
+    const qualityPlan = canonicalDiscoPlan(1, {
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    });
+    const membershipLead = candidate(201, {
+      artist: "Shared Artist",
+      title: "Shared Track",
+      album: "Shared Album",
+    });
+    const qualityLead = candidate(202, {
+      artist: `${membershipLead.artist} feat. Guest`,
+      title: membershipLead.title,
+      album: membershipLead.album,
+    });
+    const catalogIdentity = {
+      appleSongId: "apple-shared-recording",
+      recordingFamilyKey: "family-shared-recording",
+    };
+    const catalog = {
+      storefrontPlayable: true,
+      ...catalogIdentity,
+      artistName: membershipLead.artist,
+      trackName: membershipLead.title,
+      albumName: membershipLead.album!,
+      confidence: 0.99,
+    };
+    const membership = canonicalDiscoQualification(membershipLead, { catalog });
+    const quality = {
+      ...canonicalDiscoQualification(qualityLead, {
+        catalog,
+        centralQualityCriterionObservations:
+          qualityPlan.playlistQualityPolicy!.criteria.map((criterion) => (
+            createCentralQualityCriterionObservationV3({
+              policy: qualityPlan.playlistQualityPolicy!,
+              criterion,
+              verdict: "pass",
+              sourceKind: "hosted_web_response",
+              sourceId: "quality-only-source",
+              artist: membershipLead.artist,
+              title: membershipLead.title,
+              album: membershipLead.album,
+              catalogIdentity,
+            })
+          )),
+      }),
+      canonicalClauseAssessments: {
+        "genre:disco": {
+          status: "unknown" as const,
+          evidenceGrade: null,
+        },
+      },
+    };
+    let delivered = false;
+    const result = await executeRetrievalV3({
+      runId: "quality-separated-membership-proof",
+      plan: qualityPlan,
+      adapters: {
+        discover: async () => {
+          if (delivered) {
+            return { candidates: [], nextCursor: null, exhausted: true };
+          }
+          delivered = true;
+          return {
+            candidates: [membershipLead, qualityLead],
+            nextCursor: null,
+            exhausted: true,
+          };
+        },
+        qualify: async () => [membership, quality],
+      },
+      policy: {
+        qualifiedPoolGoal: 1,
+        maximumGlobalRounds: 1,
+      },
+    });
+
+    expect(result.outcome).toMatchObject({
+      status: "exact_ready",
+      selectedTrackCount: 1,
+      shortfall: 0,
+    });
+    expect(result.selected[0]).toMatchObject(catalogIdentity);
+    expect(result.centralQuality).toMatchObject({
+      passed: true,
+      passCount: 1,
+      failCount: 0,
+      unknownCount: 0,
+    });
+  });
+
   test("retains conflicting criterion observations and lets a known failure dominate a later pass", async () => {
     const qualityPlan: SelectionPlanV3 = {
       ...plan("one smooth disco track", 1),

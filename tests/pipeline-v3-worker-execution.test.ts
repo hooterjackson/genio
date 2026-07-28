@@ -1316,7 +1316,7 @@ describe("Pipeline V3 durable worker execution", () => {
     assertFenced(repository, plan);
   });
 
-  test("persists a hash-bound 15-minute decision and a publishable verified partial", async () => {
+  test("persists a hash-bound 15-minute decision without freezing an unchanged-contract partial", async () => {
     const plan = queryPlan();
     const contract = compilePlaylistContractRevisionV1({
       contractId: "disco-compute-boundary",
@@ -1411,12 +1411,8 @@ describe("Pipeline V3 durable worker execution", () => {
       },
     });
 
-    expect(repository.persisted).toHaveLength(1);
-    expect(repository.persisted[0]?.result.outcome).toMatchObject({
-      status: "partial_ready",
-      selectedTrackCount: 12,
-      requiresPartialPublicationDecision: true,
-    });
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.checkpoints.has("partial_ready")).toBe(false);
     expect(repository.checkpoints.get("run_decision")).toMatchObject({
       schemaVersion: "genio-run-decision/v1",
       reason: "active_compute_limit",
@@ -1438,6 +1434,67 @@ describe("Pipeline V3 durable worker execution", () => {
       state: {
         decisionHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
+    });
+  });
+
+  test("routes a canonical quality partial to a decision without creating a manifest", async () => {
+    const canonical = canonicalQueryPlan(25);
+    class PartialDecisionRepository extends MemoryRepository {
+      readonly blockers: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          contractHash: canonical.contract.semanticHash,
+          contract: canonical.contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async openPlaylistRunBlocker(input: Record<string, unknown>): Promise<string> {
+        this.blockers.push(structuredClone(input));
+        return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      }
+    }
+    const repository = new PartialDecisionRepository();
+    const base = retrievalResult("partial_ready", 14);
+    const result: RetrievalResultV3 = {
+      ...base,
+      outcome: {
+        ...base.outcome,
+        status: "partial_ready",
+        stopReason: "central_quality_floor",
+        requiresPartialPublicationDecision: true,
+      },
+      deficit: {
+        ...base.deficit,
+        primaryShortfallReason: "central_quality_floor",
+      },
+    };
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: canonical.plan,
+      payload: {
+        ...canonicalPayload(canonical.plan, canonical.contract),
+        __contractRevisionDatabaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      },
+    });
+
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.checkpoints.has("partial_ready")).toBe(false);
+    expect(repository.checkpoints.get("run_decision")).toMatchObject({
+      reason: "central_quality_floor",
+      verifiedTrackCount: 14,
+      actions: {
+        publishVerifiedPartial: false,
+        reduceCount: true,
+      },
+    });
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "needs_decision",
+      phase: "central_quality_floor_missed",
+      error: null,
     });
   });
 

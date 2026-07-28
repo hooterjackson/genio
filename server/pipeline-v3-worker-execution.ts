@@ -2075,7 +2075,13 @@ export class PipelineV3WorkerExecution {
       });
       return;
     }
-    if (mode === "active" && result.outcome.status === "needs_decision") {
+    if (mode === "active" && (
+      result.outcome.status === "needs_decision"
+      || (
+        result.outcome.status === "partial_ready"
+        && isCanonicalQueryPlanV3SchemaVersion(input.queryPlan.schemaVersion)
+      )
+    )) {
       await this.repository.saveResearchCheckpoint(
         input.runId,
         fullCheckpointKey(stageKey),
@@ -2104,58 +2110,11 @@ export class PipelineV3WorkerExecution {
             strategy.status === "available" || strategy.status === "running"
           )).map(({ id }) => id)
         : [];
-      const qualityAllowsPartial = result.centralQuality?.passed !== false;
-      if (computeLimitReached
-        && qualityAllowsPartial
-        && result.selected.length < result.outcome.requestedTrackCount) {
-        if (result.selected.length > 0) {
-          await this.repository.persistPipelineV3RetrievalResult({
-            runId: input.runId,
-            queryPlan: input.queryPlan,
-            plan,
-            result: {
-              ...result,
-              outcome: {
-                ...result.outcome,
-                status: "partial_ready",
-                requiresPartialPublicationDecision: true,
-              },
-              publicationBoundary: {
-                appleWriteAccess: "forbidden",
-                manifestDisposition: "partial_confirmation_required",
-              },
-            },
-            fence,
-          });
-        } else {
-          const outcomeVersion = 1;
-          await this.repository.saveResearchCheckpoint(
-            input.runId,
-            "partial_ready",
-            {
-              outcomeHash: partialOutcomeHash({
-                runId: input.runId,
-                queryPlanHash,
-                outcomeVersion,
-                result,
-              }),
-              outcomeVersion,
-              targetTrackCount: result.outcome.requestedTrackCount,
-              verifiedTrackCount: 0,
-              shortfall: result.outcome.requestedTrackCount,
-              remainingStrategyCount: continuationStrategyIds.length,
-              continueAvailable: continuationStrategyIds.length > 0,
-              continuationStrategyIds,
-              preparedAt: new Date().toISOString(),
-              pipelineVersion: "corpus_first_v3",
-              stageKey,
-              queryPlanHash,
-              queryPlanRevisionId: input.payload?.__queryPlanRevisionId ?? null,
-            },
-            fence,
-          );
-        }
-      }
+      // A selected subset is evidence for the decision panel, never a
+      // publishable manifest under the unchanged exact-count contract.
+      // Publication requires an explicit user-authorized successor revision;
+      // freezing a partial here would silently weaken count and any
+      // count-derived quota/diversity constraints.
       const activeContract = this.repository.getActivePlaylistContractRevision
         ? await this.repository.getActivePlaylistContractRevision({ runId: input.runId })
         : null;

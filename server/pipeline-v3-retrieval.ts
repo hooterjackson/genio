@@ -2685,6 +2685,49 @@ function addQualifiedToFamily(
   return { newFamily: false, meaningfulProgress };
 }
 
+function catalogQualityIdentityKey(
+  appleSongId: string,
+  recordingFamilyKey: string,
+): string {
+  return `${recordingFamilyKey}\u0000${appleSongId}`;
+}
+
+function mergeCatalogBoundQualityIntoFamily(
+  families: Map<string, RecordingFamilyEntryV3>,
+  input: {
+    appleSongId: string;
+    recordingFamilyKey: string;
+    observations: readonly CentralQualityCriterionObservationV3[];
+  },
+): boolean {
+  if (input.observations.length === 0) return false;
+  const family = families.get(input.recordingFamilyKey);
+  if (!family) return false;
+  const variants = [family.primary, ...family.alternates];
+  const index = variants.findIndex(({ appleSongId, recordingFamilyKey }) => (
+    appleSongId === input.appleSongId
+    && recordingFamilyKey === input.recordingFamilyKey
+  ));
+  if (index < 0) return false;
+  const existing = variants[index]!;
+  const observations = [...new Map([
+    ...(existing.centralQualityCriterionObservations ?? []),
+    ...input.observations,
+  ].map((observation) => [observation.observationId, observation])).values()]
+    .sort((left, right) => left.observationId.localeCompare(right.observationId));
+  if (observations.length
+    === (existing.centralQualityCriterionObservations?.length ?? 0)) {
+    return false;
+  }
+  variants[index] = {
+    ...existing,
+    centralQualityCriterionObservations: observations,
+  };
+  family.primary = variants[0]!;
+  family.alternates = variants.slice(1);
+  return true;
+}
+
 function incrementReason(
   reasons: Partial<Record<CandidateDeficitReasonV3, number>>,
   reason: CandidateDeficitReasonV3,
@@ -4293,6 +4336,10 @@ export async function executeRetrievalV3(input: {
   const seenCandidateTracks = new Map<string, { artist: string; title: string }>();
   const rawCandidateLedger = new Map<string, RawCandidateLedgerEntryV3>();
   const families = new Map<string, RecordingFamilyEntryV3>();
+  const qualityObservationsByCatalogIdentity = new Map<
+    string,
+    CentralQualityCriterionObservationV3[]
+  >();
   for (const track of seedTracks) {
     seenCandidateTracks.set(track.candidateId, { artist: track.artist, title: track.title });
     appleIdToFamily.set(track.appleSongId, track.recordingFamilyKey);
@@ -4957,6 +5004,51 @@ export async function executeRetrievalV3(input: {
         rejectLead("qualification_missing");
         continue;
       }
+      const catalogQualityObservations = activePlan.playlistQualityPolicy
+        && qualification.catalog.storefrontPlayable
+        && qualification.catalog.appleSongId
+        && qualification.catalog.recordingFamilyKey
+        && qualification.catalog.artistName?.trim()
+        && qualification.catalog.trackName?.trim()
+        && qualification.catalog.albumName?.trim()
+        ? centralQualityCriterionObservationsForPolicyV3({
+            observations:
+              qualification.centralQualityCriterionObservations,
+            policy: activePlan.playlistQualityPolicy,
+            artist: qualification.catalog.artistName,
+            title: qualification.catalog.trackName,
+            album: qualification.catalog.albumName,
+            appleSongId: qualification.catalog.appleSongId,
+            recordingFamilyKey:
+              qualification.catalog.recordingFamilyKey,
+          })
+        : [];
+      if (catalogQualityObservations.length > 0) {
+        const qualityKey = catalogQualityIdentityKey(
+          qualification.catalog.appleSongId!,
+          qualification.catalog.recordingFamilyKey!,
+        );
+        const cumulativeQualityObservations = [...new Map([
+          ...(qualityObservationsByCatalogIdentity.get(qualityKey) ?? []),
+          ...catalogQualityObservations,
+        ].map((observation) => [
+          observation.observationId,
+          observation,
+        ])).values()].sort((left, right) => (
+          left.observationId.localeCompare(right.observationId)
+        ));
+        qualityObservationsByCatalogIdentity.set(
+          qualityKey,
+          cumulativeQualityObservations,
+        );
+        if (mergeCatalogBoundQualityIntoFamily(families, {
+          appleSongId: qualification.catalog.appleSongId!,
+          recordingFamilyKey: qualification.catalog.recordingFamilyKey!,
+          observations: cumulativeQualityObservations,
+        })) {
+          meaningfulProgress += 1;
+        }
+      }
       const failedPredicates = new Set(qualification.scope.failedMembershipPredicateIds);
       for (const predicate of activePlan.membershipPredicates) {
         if (!failedPredicates.has(predicate.id)) lead?.predicateCoverage.add(predicate.id);
@@ -5121,8 +5213,15 @@ export async function executeRetrievalV3(input: {
         ...(activePlan.playlistQualityPolicy ? {
           centralQualityCriterionObservations:
             centralQualityCriterionObservationsForPolicyV3({
-              observations:
-                qualification.centralQualityCriterionObservations,
+              observations: [
+                ...(qualification.centralQualityCriterionObservations ?? []),
+                ...(qualityObservationsByCatalogIdentity.get(
+                  catalogQualityIdentityKey(
+                    qualification.catalog.appleSongId,
+                    qualification.catalog.recordingFamilyKey,
+                  ),
+                ) ?? []),
+              ],
               policy: activePlan.playlistQualityPolicy,
               artist: resolvedArtist,
               title: resolvedTitle,
