@@ -260,6 +260,12 @@ function providerRetryAfterUntil(
     : null;
 }
 
+function isProviderBudgetBoundary(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) return false;
+  const code = String((error as { code?: unknown }).code ?? "");
+  return code === "run_budget_reached" || code === "monthly_budget_reached";
+}
+
 function asRetrievalDependencyError(
   error: unknown,
   dependencyId: "apple_catalog" | "hosted_web" | "governed_evidence_graph",
@@ -1887,7 +1893,7 @@ async function discoverQualifiedAppleExpansion(input: {
       1,
       Math.ceil(
         eligibleCatalogSongs.length
-          / (request.plan.playlistQualityPolicy ? 5 : 100),
+          / (request.plan.playlistQualityPolicy ? 15 : 100),
       ),
     ),
   };
@@ -2947,11 +2953,12 @@ export function createPipelineV3LiveAdapters(
     ));
   const verifyAppleExpansion = options.verifyAppleExpansion
     ?? (async (request: DiscoveryRequestV3, songs: readonly CatalogSong[]) => {
-      // Central-quality rows are intentionally verbose: each exact recording
-      // carries one tri-state verdict per server-owned criterion. Small
-      // batches keep the strict response within its output budget and give
-      // hosted search enough room to bind every result to the exact track.
-      const chunkSize = request.plan.playlistQualityPolicy ? 5 : 100;
+      // The immutable contract and source-governance instructions dominate
+      // the input token cost of every quality request. Fifteen exact tracks
+      // still fit inside the 8k structured-output envelope, while avoiding
+      // twelve near-identical 15k-token prompts for a 50-track run. Missing
+      // identities are retried separately below.
+      const chunkSize = request.plan.playlistQualityPolicy ? 15 : 100;
       const chunks: CatalogSong[][] = [];
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
         chunks.push(songs.slice(offset, offset + chunkSize));
@@ -2976,6 +2983,11 @@ export function createPipelineV3LiveAdapters(
             return { ok: true as const, index, chunk, page };
           } catch (error) {
             if (request.signal?.aborted) throw request.signal.reason ?? error;
+            // A cost boundary is an execution state, not a transient provider
+            // failure. Preserve it for the retrieval controller so the run
+            // receives an honest budget decision instead of a misleading
+            // partial quality result.
+            if (isProviderBudgetBoundary(error)) throw error;
             return { ok: false as const, index, chunk, error };
           }
         });

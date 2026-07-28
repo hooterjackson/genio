@@ -3984,7 +3984,7 @@ describe("Pipeline V3 live read-only adapters", () => {
         title: string;
         album: string;
       }>;
-      if (catalogCandidates.length === 5 && firstChunkFailures++ === 0) {
+      if (catalogCandidates.length === 6 && firstChunkFailures++ === 0) {
         return { id: "malformed_quality_chunk", output_text: "not-json", output: [] };
       }
       const rows = catalogCandidates.map((candidate, index) => {
@@ -4061,7 +4061,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     });
 
     expect(batch.candidates).toHaveLength(6);
-    expect(createResponse).toHaveBeenCalledTimes(3);
+    expect(createResponse).toHaveBeenCalledTimes(2);
     expect(firstChunkFailures).toBe(2);
   });
 
@@ -4180,6 +4180,61 @@ describe("Pipeline V3 live read-only adapters", () => {
       [exactSeeds[4]!.name],
     ]);
     expect(createResponse).toHaveBeenCalledTimes(2);
+  });
+
+  test("surfaces a quality-evidence budget boundary instead of hiding it as partial coverage", async () => {
+    const base = plan("one smooth disco song", 1);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeed: CatalogSong = {
+      ...song(799, "Budget Artist", "Budget Track"),
+      genreNames: ["Disco"],
+    };
+    const budgetError = Object.assign(
+      new Error("Run needs additional budget approval"),
+      { code: "run_budget_reached" },
+    );
+    const adapters = createPipelineV3LiveAdapters({
+      model: "quality-test-model",
+      escalationModel: "quality-test-model",
+      createResponse: vi.fn(async () => {
+        throw budgetError;
+      }) as any,
+      searchAppleResources: vi.fn(async () => emptySearch()) as any,
+      lookupAppleByIds: vi.fn(async () => [exactSeed]) as any,
+      getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
+      getArtistAlbums: vi.fn(async () => ({ items: [], next: null })) as any,
+      getAlbumTracks: vi.fn(async () => ({ items: [], next: null })) as any,
+    });
+
+    await expect(adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 1,
+      qualifiedRecordingFamilyKeys: [`isrc:${exactSeed.isrc}`],
+      qualifiedTrackSeeds: [{
+        artist: exactSeed.artistName,
+        title: exactSeed.name,
+        appleSongId: exactSeed.id,
+        recordingFamilyKey: `isrc:${exactSeed.isrc}`,
+      }],
+    })).rejects.toMatchObject({ code: "run_budget_reached" });
   });
 
   test("chunks exact quality-seed Apple lookups at the 25-ID provider limit", async () => {
