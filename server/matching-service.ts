@@ -2816,8 +2816,24 @@ export async function matchResearchRun(
     }
   }
   const startedAt = checkpoint?.startedAt ?? new Date().toISOString();
+  // The two-minute route deadline is an interaction SLO, not a semantic
+  // cancellation boundary. A durable research retry can legitimately finish
+  // after that timestamp and hand the first matching job a fully qualified
+  // candidate set. Reusing the expired route deadline in that case aborts
+  // Apple before the request leaves the worker and misreports the result as a
+  // catalog outage. Give only that first, persisted handoff a bounded recovery
+  // window; ordinary matching replays and explicit recovery generations keep
+  // their existing checkpoint/fencing behavior.
+  const lateInitialMatchingHandoff = !recovery
+    && !checkpoint
+    && fast
+    && run.status === "ready_for_matching"
+    && typeof routeDeadlineAt === "string"
+    && Date.parse(routeDeadlineAt) <= Date.now();
   const deadlineAt = recovery
     ? new Date(Date.now() + catalogRecoveryDeadlineMs(run.pipelinePolicySnapshot)).toISOString()
+    : lateInitialMatchingHandoff
+      ? new Date(Date.now() + catalogRecoveryDeadlineMs(run.pipelinePolicySnapshot)).toISOString()
     : fast
       ? routeDeadlineAt
       : undefined;

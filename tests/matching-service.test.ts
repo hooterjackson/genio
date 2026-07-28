@@ -224,12 +224,14 @@ class MemoryMatchingRepository implements MatchingRepository {
     readonly runCreatedAt?: string,
     readonly autoPublish = false,
     readonly runStatus = "matching",
+    readonly runPhase?: string,
   ) {}
 
   async getRun() {
     return {
       brief: this.runBrief,
       status: this.runStatus,
+      phase: this.runPhase,
       autoPublish: this.autoPublish,
       createdAt: this.runCreatedAt,
     };
@@ -3612,6 +3614,36 @@ test("fast matching records a genuine elapsed deadline for later recovery withou
     nextIndex: 2,
     timedOutCandidateCount: 2,
   });
+});
+
+test("a late first matching handoff gets a fresh bounded window after durable research recovery", async () => {
+  vi.mocked(lookupAppleCatalogByIsrc).mockResolvedValue([song]);
+  vi.mocked(searchAppleCatalog).mockResolvedValue([song]);
+  const confirmedAt = new Date(Date.now() - 5 * 60_000);
+  const repository = new MemoryMatchingRepository(
+    [candidate("late-initial-handoff", "verified")],
+    curatedBrief,
+    new Map([
+      ["fast:route:fast_curated_v3", routeCheckpoint(confirmedAt)],
+    ]),
+    confirmedAt.toISOString(),
+    false,
+    "ready_for_matching",
+    "research_complete",
+  );
+
+  await matchResearchRun(repository, "run", "us", undefined, { fast: true });
+
+  expect(lookupAppleCatalogByIsrc).toHaveBeenCalled();
+  expect(repository.bulkTimeoutWrites).toEqual([]);
+  expect(repository.matches).toContainEqual(expect.objectContaining({
+    candidateId: "late-initial-handoff",
+    status: "accepted",
+  }));
+  const matchingCheckpoint = lastMatchingCheckpoint(repository) as {
+    deadlineAt?: string;
+  };
+  expect(Date.parse(matchingCheckpoint.deadlineAt ?? "")).toBeGreaterThan(Date.now());
 });
 
 test("deadline bulk accounting preserves a crash-window match and records only unmatched candidates", async () => {
