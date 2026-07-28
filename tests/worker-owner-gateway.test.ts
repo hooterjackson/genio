@@ -211,6 +211,23 @@ describe("Sites owner gateway boundary", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
   });
 
+  test("the release readiness probe crosses the signed gateway with its cache-busting query", async () => {
+    const response = await worker.fetch(new Request(
+      "https://needle.example/health/ready?release-evidence=probe-123",
+      { headers: { "CF-Connecting-IP": "203.0.113.10" } },
+    ), env as never, ctx);
+
+    expect(response.status).toBe(200);
+    expect(upstreamFetch).toHaveBeenCalledOnce();
+    expect(String(upstreamFetch.mock.calls[0]?.[0])).toBe(
+      "https://railway.example/health/ready?release-evidence=probe-123",
+    );
+    expect(upstreamFetch.mock.calls[0]?.[1]?.method).toBe("GET");
+    expect(forwardedHeaders().has("x-needle-owner-email")).toBe(false);
+    expect(forwardedHeaders().get("x-needle-signature")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
   test("a different Sites identity remains anonymous on public API requests", async () => {
     const response = await worker.fetch(apiRequest("/api/v1/runs", {
       "OAI-Authenticated-User-Email": "visitor@example.com",

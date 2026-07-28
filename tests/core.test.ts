@@ -156,6 +156,8 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
   expect(matchGatewayRoute("GET", "/api/v1/owner/status")).toMatchObject({ owner: true });
   expect(matchGatewayRoute("GET", "/health/live")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/health/live")?.owner).toBeUndefined();
+  expect(matchGatewayRoute("GET", "/health/ready")).toMatchObject({ method: "GET" });
+  expect(matchGatewayRoute("GET", "/health/ready")?.owner).toBeUndefined();
   expect(matchGatewayRoute("GET", "/health/system")).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("GET", "/health/system")?.owner).toBeUndefined();
   expect(matchGatewayRoute("POST", "/health/system")).toBeNull();
