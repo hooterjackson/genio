@@ -4358,7 +4358,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     })).rejects.toMatchObject({ code: "run_budget_reached" });
   });
 
-  test("chunks exact quality-seed Apple lookups and evidence calls at 25 identities", async () => {
+  test("chunks exact quality-seed Apple lookups at 25 and evidence calls at 20 identities", async () => {
     const base = plan("twenty-six smooth disco songs", 26);
     const selection: SelectionPlanV3 = {
       ...base,
@@ -4465,7 +4465,7 @@ describe("Pipeline V3 live read-only adapters", () => {
 
     expect(lookupAppleByIds.mock.calls.map(([, ids]) => ids.length))
       .toEqual([25, 1]);
-    expect(qualityChunkSizes).toEqual([25, 1]);
+    expect(qualityChunkSizes).toEqual([20, 6]);
     expect(createResponse).toHaveBeenCalledTimes(2);
     expect(batch.candidates).toHaveLength(26);
   });

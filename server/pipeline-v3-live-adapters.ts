@@ -1462,7 +1462,7 @@ async function defaultHostedWebDiscovery(
     model,
     reasoning: { effort: "low" },
     max_output_tokens: qualityEnrichment
-      ? Math.min(8_000, Math.max(2_500, 2_000 + limit * 120))
+      ? Math.min(8_000, Math.max(2_500, 1_200 + limit * 100))
       : 8_000,
     max_tool_calls: 3,
     include: ["web_search_call.action.sources"],
@@ -3002,10 +3002,11 @@ export function createPipelineV3LiveAdapters(
     ?? (async (request: DiscoveryRequestV3, songs: readonly CatalogSong[]) => {
       // The immutable contract and source-governance instructions dominate
       // the input token cost of every quality request. Twenty-five exact
-      // tracks fit inside the 8k structured-output envelope and align with
-      // Apple's bounded ID lookup window, avoiding repeated instruction and
-      // hosted-search overhead. Missing identities are retried separately.
-      const chunkSize = request.plan.playlistQualityPolicy ? 25 : 100;
+      // Twenty exact tracks keep the conservative provider reservation small
+      // enough for another productive quality pass near the unchanged public
+      // $0.75 ceiling. Apple lookups remain independently chunked at 25.
+      // Missing identities are retried separately.
+      const chunkSize = request.plan.playlistQualityPolicy ? 20 : 100;
       const chunks: CatalogSong[][] = [];
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
         chunks.push(songs.slice(offset, offset + chunkSize));

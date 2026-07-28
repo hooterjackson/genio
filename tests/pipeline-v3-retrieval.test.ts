@@ -459,6 +459,9 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       "curated_genre_scene", "factual_relationship", "exhaustive",
     ]);
     expect(strategies.some(({ kind }) => kind === "trusted_containers")).toBe(true);
+    expect(strategies
+      .filter(({ kind }) => kind === "trusted_containers")
+      .every(({ maximumRounds }) => maximumRounds === 12)).toBe(true);
     expect(strategies.some(({ kind }) => kind === "graph_traversal")).toBe(true);
     expect(strategies.filter(({ kind }) => kind === "gap_pass")).toHaveLength(2);
     expect(strategies.every(({ zeroQualifiedYieldLimit }) => zeroQualifiedYieldLimit === 2)).toBe(true);

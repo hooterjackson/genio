@@ -269,7 +269,11 @@ function strategy(
 const ENGINE_STRATEGIES: Readonly<Record<RetrievalEngineV3, readonly RetrievalStrategyDefinitionV3[]>> = Object.freeze({
   curated_genre_scene: Object.freeze([
     strategy("curated_genre_scene", "resolve_scope", "scope_resolution", 1, 1, 80),
-    strategy("curated_genre_scene", "trusted_scoped_containers", "trusted_containers", 1, 3),
+    // Apple container pagination is deterministic and carries no hosted-model
+    // cost. Keep a bounded public-count frontier large enough for quality
+    // failures and 100+ track requests; exhaustion, flat-yield, candidate,
+    // round, and active-compute guards still stop it early.
+    strategy("curated_genre_scene", "trusted_scoped_containers", "trusted_containers", 1, 12),
     strategy("curated_genre_scene", "editorial_tracks", "editorial_tracks", 1, 3),
     strategy("curated_genre_scene", "qualified_artist_release_expansion", "qualified_expansion", 2, 4),
     strategy("curated_genre_scene", "multilingual_aliases", "multilingual_aliases", 2, 2),
@@ -277,7 +281,7 @@ const ENGINE_STRATEGIES: Readonly<Record<RetrievalEngineV3, readonly RetrievalSt
   ]),
   mood_activity_theme: Object.freeze([
     strategy("mood_activity_theme", "scoped_editorial_descriptions", "descriptive_tracks", 1, 3),
-    strategy("mood_activity_theme", "trusted_activity_containers", "trusted_containers", 1, 3),
+    strategy("mood_activity_theme", "trusted_activity_containers", "trusted_containers", 1, 12),
     strategy("mood_activity_theme", "qualified_artist_expansion", "qualified_expansion", 2, 3),
     strategy("mood_activity_theme", "deficit_queries", "deficit_query", 3, 3),
   ]),
