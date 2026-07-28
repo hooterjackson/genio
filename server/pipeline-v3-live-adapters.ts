@@ -541,6 +541,56 @@ function predicateEvidenceFloorPassed(
   return independentMediumRoots.size >= 2;
 }
 
+/**
+ * Decide whether an editorial container names a sufficient positive scope for
+ * the immutable canonical Boolean predicate. Catalog/version/content leaves
+ * are intentionally neutral here: they are evaluated against each resolved
+ * recording during qualification. Exclusion leaves are also neutral because
+ * a container association can establish positive membership but cannot prove
+ * the absence of an excluded property.
+ *
+ * This must preserve OR/NOT/EXCEPT/alternative semantics. Flattening the
+ * positive leaves into `every(...)` turns a contract such as
+ * `reggaeton OR dembow OR Latin urban` into an impossible all-of gate.
+ */
+function editorialContainerSupportsCanonicalScope(
+  request: Pick<DiscoveryRequestV3, "plan">,
+  supportedPredicateIds: ReadonlySet<string>,
+): boolean {
+  const policy = request.plan.canonicalContractPolicy;
+  const positiveIds = new Set(positivePredicateIds(request));
+  if (!policy) {
+    return positiveIds.size > 0
+      && [...positiveIds].every((id) => supportedPredicateIds.has(id));
+  }
+  const evaluate = (
+    predicate: NonNullable<SelectionPlanV3["canonicalContractPolicy"]>["trackPredicate"],
+  ): boolean => {
+    if (predicate.op === "clause") {
+      return positiveIds.has(predicate.clauseId)
+        ? supportedPredicateIds.has(predicate.clauseId)
+        : true;
+    }
+    if (predicate.op === "not") return !evaluate(predicate.child);
+    if (predicate.op === "except") {
+      return evaluate(predicate.base)
+        && !predicate.exceptions.some(evaluate);
+    }
+    if (predicate.op === "alternative") {
+      return predicate.choices
+        .slice()
+        .sort((left, right) => (
+          left.priority - right.priority || left.id.localeCompare(right.id)
+        ))
+        .some(({ predicate: choice }) => evaluate(choice));
+    }
+    return predicate.op === "all"
+      ? predicate.children.every(evaluate)
+      : predicate.children.some(evaluate);
+  };
+  return positiveIds.size > 0 && evaluate(policy.trackPredicate);
+}
+
 function editorialContainerMatches(request: DiscoveryRequestV3, playlist: AppleCatalogPlaylist): boolean {
   const curator = normalized(playlist.curatorName);
   // Catalog playlists created by third parties can contain Apple in an
@@ -550,15 +600,16 @@ function editorialContainerMatches(request: DiscoveryRequestV3, playlist: AppleC
   const positivePredicates = evidenceMembershipPredicatesV3(request.plan)
     .filter((predicate) => CONTAINER_TEXT_AXES.has(predicate.axis));
   if (positivePredicates.length === 0) return false;
-  // Every independently parsed membership dimension must be represented in
-  // the container description; alternative values within one predicate are OR.
-  return positivePredicates.every((predicate) => (
+  const supported = new Set(positivePredicates.flatMap((predicate) => (
     predicate.values.length > 0
-    && predicate.values.some((value) => evidenceTextSupportsMembershipValue(
-      value,
-      `${playlist.name} ${playlist.description}`,
-    ))
-  ));
+      && predicate.values.some((value) => evidenceTextSupportsMembershipValue(
+        value,
+        `${playlist.name} ${playlist.description}`,
+      ))
+      ? [predicate.id]
+      : []
+  )));
+  return editorialContainerSupportsCanonicalScope(request, supported);
 }
 
 function liveMetadata(value: unknown): LiveCandidateMetadataV3 | null {
