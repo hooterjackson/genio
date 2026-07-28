@@ -1619,9 +1619,9 @@ export class WorkerRunner {
       const message = job.kind === "apple_authorization"
         ? safeAppleAuthorizationFailure(error)
         : sanitizeFailure(error, failureContextForJob(job.kind));
-      if (job.kind === "research") {
+      if (job.kind === "research" || job.kind === "publication") {
         console.error(
-          "[needle-worker] Unexpected research failure",
+          `[needle-worker] Unexpected ${job.kind} failure`,
           safeTechnicalFailureDiagnostic(error),
         );
       }
