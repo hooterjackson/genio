@@ -6,31 +6,6 @@ on:
   # and publishes itself.
   repository_dispatch:
     types: [genio-release-candidate]
-  # Fallback path for environments where dispatch transport fails before run creation.
-  # This preserves all existing authorization/verification logic while preserving
-  # the same release-candidate contract via explicit input.
-  workflow_dispatch:
-    inputs:
-      candidate_tag:
-        description: "Release candidate tag to run (for example: v2.4.0-rc.2)"
-        required: true
-        type: string
-      release_verification_key_sha256:
-        description: "Optional override: SHA-256 of the release verification key"
-        required: false
-        type: string
-      public_rollout_intent_canary_authority_policy_sha256:
-        description: "Optional override: SHA-256 of the public rollout intent-canary authority policy"
-        required: false
-        type: string
-      stable_authorizer_key_id:
-        description: "Optional override: stable authorizer key identifier"
-        required: false
-        type: string
-      stable_authorizer_key_sha256:
-        description: "Optional override: SHA-256 of the stable authorizer key"
-        required: false
-        type: string
 
 concurrency:
   group: stable-release-mutation
@@ -53,7 +28,7 @@ jobs:
       packages: read
       pull-requests: read
     env:
-      CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag || github.event.inputs.candidate_tag }}
+      CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}
     outputs:
       candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
       source_revision: ${{ steps.identity.outputs.source_revision }}
@@ -80,41 +55,21 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Require a closed release-dispatch payload
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const keys = Object.keys(context.payload.client_payload ?? {}).sort();
+            if (keys.length !== 1 || keys[0] !== "candidate_tag") {
+              core.setFailed("release dispatch accepts exactly one client_payload key: candidate_tag");
+            }
       - id: release_authority
         name: Pin the release verification authority
         env:
-          RELEASE_VERIFICATION_KEY_SHA256: >-
-            ${{
-              github.event.inputs.release_verification_key_sha256 ||
-              github.event.inputs.RELEASE_VERIFICATION_KEY_SHA256 ||
-              github.event.client_payload.release_verification_key_sha256 ||
-              github.event.client_payload.RELEASE_VERIFICATION_KEY_SHA256 ||
-              vars.RELEASE_VERIFICATION_KEY_SHA256
-            }}
-          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: >-
-            ${{
-              github.event.inputs.public_rollout_intent_canary_authority_policy_sha256 ||
-              github.event.inputs.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 ||
-              github.event.client_payload.public_rollout_intent_canary_authority_policy_sha256 ||
-              github.event.client_payload.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 ||
-              vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256
-            }}
-          RELEASE_STABLE_AUTHORIZER_KEY_ID: >-
-            ${{
-              github.event.inputs.stable_authorizer_key_id ||
-              github.event.inputs.RELEASE_STABLE_AUTHORIZER_KEY_ID ||
-              github.event.client_payload.stable_authorizer_key_id ||
-              github.event.client_payload.RELEASE_STABLE_AUTHORIZER_KEY_ID ||
-              vars.RELEASE_STABLE_AUTHORIZER_KEY_ID
-            }}
-          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: >-
-            ${{
-              github.event.inputs.stable_authorizer_key_sha256 ||
-              github.event.inputs.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 ||
-              github.event.client_payload.stable_authorizer_key_sha256 ||
-              github.event.client_payload.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 ||
-              vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256
-            }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
+          RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}
+          RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
         run: |
           if [[ ! "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "RELEASE_VERIFICATION_KEY_SHA256 must be a configured lowercase SHA-256 digest." >&2

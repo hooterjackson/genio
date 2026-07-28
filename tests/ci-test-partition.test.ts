@@ -12,6 +12,22 @@ const productionPostgresImage =
   "ghcr.io/railwayapp-templates/postgres-ssl:18@sha256:764fabc5fceb7166414c425a57bed8722a08cfb7fff508efb21a86eb31e172a6";
 
 describe("CI unit and PostgreSQL test partition", () => {
+  test("fetches the annotated release history in every job that runs Git-bound suites", async () => {
+    const workflow = await readFile(ciWorkflowUrl, "utf8");
+    for (const [jobName, nextJobName] of [
+      ["unit-and-database", "production-database-compatibility"],
+      ["production-database-compatibility", "browser"],
+    ] as const) {
+      const start = workflow.indexOf(`  ${jobName}:\n`);
+      const end = workflow.indexOf(`\n  ${nextJobName}:\n`, start + 1);
+      expect(start).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(start);
+      expect(workflow.slice(start, end)).toMatch(
+        /actions\/checkout@[0-9a-f]{40}\s+# v4\s*\n\s+with:\s*\n\s+fetch-depth: 0/u,
+      );
+    }
+  });
+
   test("keeps every database integration file out of parallel coverage and in the serial DB gate", async () => {
     const packageJson = JSON.parse(await readFile(packageUrl, "utf8")) as {
       scripts?: Record<string, string>;

@@ -100,7 +100,7 @@ databaseDescribe("release-canary durable persistence", () => {
          ('schema_version','18'),
          ('release_manifest_canary_guards_version','1')`,
     );
-  });
+  }, 30_000);
 
   afterAll(async () => {
     if (repository) await repository.close();

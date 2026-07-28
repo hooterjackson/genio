@@ -33,12 +33,30 @@ function job(workflow: string, name: ReleaseCandidateJob): string {
 describe("release-candidate workflow trust boundary", () => {
   test("loads only from the default branch and accepts merged, green RC commits", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
+    const triggers = workflow.slice(0, workflow.indexOf("\nconcurrency:"));
     expect(workflow).toContain("repository_dispatch:");
     expect(workflow).toContain("types: [genio-release-candidate]");
-    expect(workflow).not.toContain("workflow_dispatch:");
+    expect(triggers).not.toContain("workflow_dispatch:");
+    for (const authorityInput of [
+      "release_verification_key_sha256",
+      "public_rollout_intent_canary_authority_policy_sha256",
+      "stable_authorizer_key_id",
+      "stable_authorizer_key_sha256",
+    ]) {
+      expect(triggers).not.toContain(authorityInput);
+    }
     expect(workflow).not.toMatch(/push:\s*\n\s+tags:/u);
     expect(workflow).toContain(
       "CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}",
+    );
+    expect(workflow).toContain(
+      'const keys = Object.keys(context.payload.client_payload ?? {}).sort();',
+    );
+    expect(workflow).toContain(
+      'keys.length !== 1 || keys[0] !== "candidate_tag"',
+    );
+    expect(workflow).toContain(
+      "release dispatch accepts exactly one client_payload key: candidate_tag",
     );
     expect(workflow).toContain(
       'test "$CANDIDATE_SHA" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"',
@@ -228,6 +246,15 @@ describe("release-candidate workflow trust boundary", () => {
     );
     expect(authorization).toContain(
       "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}",
+    );
+    expect(authorization).toContain(
+      "RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}",
+    );
+    expect(authorization).toContain(
+      "RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}",
+    );
+    expect(authorization).not.toMatch(
+      /github\.event\.(?:inputs|client_payload)\.(?:release_verification_key_sha256|RELEASE_VERIFICATION_KEY_SHA256|public_rollout_intent_canary_authority_policy_sha256|RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256|stable_authorizer_key_id|RELEASE_STABLE_AUTHORIZER_KEY_ID|stable_authorizer_key_sha256|RELEASE_STABLE_AUTHORIZER_KEY_SHA256)/u,
     );
     expect(authorization).toContain(
       '[[ ! "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]',
@@ -614,6 +641,10 @@ describe("release-candidate workflow trust boundary", () => {
       "GENIO_BUILD_VERSION=${{ needs.authorize.outputs.version }}",
     );
     expect(workflow).toContain("platforms: linux/amd64");
+    expect(dockerfile).toContain("COPY patches ./patches");
+    expect(dockerfile.indexOf("COPY patches ./patches")).toBeLessThan(
+      dockerfile.indexOf("RUN pnpm install --frozen-lockfile"),
+    );
     expect(dockerfile).toContain('schemaVersion:"genio-embedded-build/v1"');
     expect(dockerfile).toContain(
       "publicRolloutIntentCanaryAuthorityPolicySha256",

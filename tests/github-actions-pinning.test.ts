@@ -56,6 +56,10 @@ const approvedPins = new Map([
     "actions/attest",
     "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
   ],
+  [
+    "oras-project/setup-oras",
+    "22ce207df3b08e061f537244349aac6ae1d214f6",
+  ],
 ]);
 
 describe("GitHub Actions dependency provenance", () => {
