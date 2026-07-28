@@ -3713,6 +3713,27 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(getSimilarArtists).not.toHaveBeenCalled();
   });
 
+  test("keeps qualified expansion available until earlier portfolio strategies produce seeds", async () => {
+    const selection = plan("25 disco songs", 25);
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const adapters = createPipelineV3LiveAdapters();
+
+    const batch = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 25,
+    });
+
+    expect(batch).toMatchObject({
+      candidates: [],
+      exhausted: false,
+      costUnits: 0,
+    });
+    expect(batch.nextCursor).not.toBeNull();
+  });
+
   test("revisits exact qualified Apple seeds for catalog-bound quality enrichment without minting membership evidence", async () => {
     const base = plan("one smooth polished disco song", 1);
     const genrePredicate = base.membershipPredicates

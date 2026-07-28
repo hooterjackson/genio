@@ -1257,6 +1257,7 @@ interface HostedDiscoveryCursorV3 {
   schema: "genio-v3-hosted-cursor/v1";
   strategyId: string;
   completedRound: number;
+  qualifiedSeedRoundsCompleted?: number;
 }
 
 function hostedCursor(request: DiscoveryRequestV3): HostedDiscoveryCursorV3 | null {
@@ -1266,18 +1267,36 @@ function hostedCursor(request: DiscoveryRequestV3): HostedDiscoveryCursorV3 | nu
     if (parsed.schema !== "genio-v3-hosted-cursor/v1"
       || parsed.strategyId !== request.strategy.id
       || !Number.isSafeInteger(parsed.completedRound)
-      || Number(parsed.completedRound) !== request.strategyRound - 1) throw new Error("invalid");
+      || Number(parsed.completedRound) !== request.strategyRound - 1
+      || (
+        parsed.qualifiedSeedRoundsCompleted !== undefined
+        && (
+          !Number.isSafeInteger(parsed.qualifiedSeedRoundsCompleted)
+          || Number(parsed.qualifiedSeedRoundsCompleted) < 0
+          || Number(parsed.qualifiedSeedRoundsCompleted)
+            > Number(parsed.completedRound)
+        )
+      )) throw new Error("invalid");
     return parsed as HostedDiscoveryCursorV3;
   } catch {
     throw new Error("Pipeline V3 hosted discovery cursor is invalid");
   }
 }
 
-function encodeHostedCursor(request: DiscoveryRequestV3): string {
+function encodeHostedCursor(
+  request: DiscoveryRequestV3,
+  options: { qualifiedSeedRoundsCompleted?: number } = {},
+): string {
   return Buffer.from(JSON.stringify({
     schema: "genio-v3-hosted-cursor/v1",
     strategyId: request.strategy.id,
     completedRound: request.strategyRound,
+    ...(options.qualifiedSeedRoundsCompleted === undefined
+      ? {}
+      : {
+          qualifiedSeedRoundsCompleted:
+            options.qualifiedSeedRoundsCompleted,
+        }),
   } satisfies HostedDiscoveryCursorV3), "utf8").toString("base64url");
 }
 
@@ -1617,10 +1636,21 @@ async function discoverQualifiedAppleExpansion(input: {
   verify: (songs: readonly CatalogSong[]) => Promise<readonly HostedWebCandidateV3[]>;
 }): Promise<DiscoveryBatchV3> {
   const { request } = input;
-  hostedCursor(request);
+  const cursorState = hostedCursor(request);
   const referenceNames = expansionReferenceArtists(request);
   if (referenceNames.length === 0) {
-    return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
+    const finalRound = request.strategyRound >= request.strategy.maximumRounds;
+    return {
+      candidates: [],
+      nextCursor: finalRound
+        ? null
+        : encodeHostedCursor(request, {
+            qualifiedSeedRoundsCompleted:
+              cursorState?.qualifiedSeedRoundsCompleted ?? 0,
+          }),
+      exhausted: finalRound,
+      costUnits: 0,
+    };
   }
   const resolved = await mapConcurrent(referenceNames, 4, async (name) => {
     const result = await input.searchResources(
@@ -1709,10 +1739,10 @@ async function discoverQualifiedAppleExpansion(input: {
   }
 
   const qualitySeedWindowSize = 25;
-  const qualitySeedOffset = Math.max(
-    0,
-    request.strategyRound - 1,
-  ) * qualitySeedWindowSize;
+  const qualifiedSeedRoundsCompleted =
+    cursorState?.qualifiedSeedRoundsCompleted ?? 0;
+  const qualitySeedOffset =
+    qualifiedSeedRoundsCompleted * qualitySeedWindowSize;
   const qualitySeedWindow = request.plan.playlistQualityPolicy
     ? request.qualifiedTrackSeeds.slice(
         qualitySeedOffset,
@@ -1765,7 +1795,13 @@ async function discoverQualifiedAppleExpansion(input: {
     const finalRound = request.strategyRound >= request.strategy.maximumRounds;
     return {
       candidates: [],
-      nextCursor: finalRound ? null : encodeHostedCursor(request),
+      nextCursor: finalRound
+        ? null
+        : encodeHostedCursor(request, {
+            qualifiedSeedRoundsCompleted:
+              qualifiedSeedRoundsCompleted
+              + (qualitySeedWindow.length > 0 ? 1 : 0),
+          }),
       exhausted: finalRound,
       costUnits: 0,
     };
@@ -1806,7 +1842,13 @@ async function discoverQualifiedAppleExpansion(input: {
   const finalRound = request.strategyRound >= request.strategy.maximumRounds;
   return {
     candidates,
-    nextCursor: finalRound ? null : encodeHostedCursor(request),
+    nextCursor: finalRound
+      ? null
+      : encodeHostedCursor(request, {
+          qualifiedSeedRoundsCompleted:
+            qualifiedSeedRoundsCompleted
+            + (qualitySeedWindow.length > 0 ? 1 : 0),
+        }),
     exhausted: finalRound,
     costUnits: Math.max(1, Math.ceil(eligibleCatalogSongs.length / 100)),
   };
