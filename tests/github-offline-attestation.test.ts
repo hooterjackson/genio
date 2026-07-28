@@ -106,8 +106,8 @@ describe("GitHub keyless offline release attestation", () => {
       "--source-digest",
       candidate.sourceRevision,
       "--deny-self-hosted-runners",
-      "--no-public-good",
     ]));
+    expect(calls[0]?.args).not.toContain("--no-public-good");
   });
 
   test("rejects a different artifact, candidate source, or verified subject digest", async () => {

@@ -187,7 +187,6 @@ export async function verifyGithubOfflineAttestation(input: {
     "--cert-oidc-issuer",
     "https://token.actions.githubusercontent.com",
     "--deny-self-hosted-runners",
-    "--no-public-good",
     "--format",
     "json",
   ]);
