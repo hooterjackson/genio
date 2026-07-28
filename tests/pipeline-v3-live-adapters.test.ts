@@ -3968,6 +3968,112 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(metadata.centralQualityCriterionObservations).toHaveLength(2);
   });
 
+  test("keeps catalog-bound quality judgments when hosted search has no attested track URL", async () => {
+    const base = plan("one smooth polished disco song", 1);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth", "quality:polished"],
+        criteria: ["smooth", "polished"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeed: CatalogSong = {
+      ...song(452, "Chic", "Good Times"),
+      genreNames: ["Disco"],
+    };
+    const createResponse = vi.fn(async () => ({
+      id: "resp_quality_seed_without_attested_url",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: exactSeed.artistName,
+          title: exactSeed.name,
+          album: exactSeed.albumName,
+          centralQualityScore: 0.95,
+          centralQualityCriteria: [
+            { criterion: "smooth", verdict: "pass" },
+            { criterion: "polished", verdict: "pass" },
+          ],
+          sources: [],
+        }],
+      }),
+      output: [{
+        type: "web_search_call",
+        status: "completed",
+        action: { type: "search", query: "Chic Good Times" },
+      }],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleResources: vi.fn(async () => emptySearch({
+        artists: [{
+          id: "chic",
+          name: exactSeed.artistName,
+          genreNames: ["Disco"],
+        }],
+      })) as any,
+      lookupAppleByIds: vi.fn(async () => [exactSeed]) as any,
+      getArtistTopSongs: vi.fn(async () => ({
+        items: [],
+        next: null,
+      })) as any,
+      getArtistAlbums: vi.fn(async () => ({
+        items: [],
+        next: null,
+      })) as any,
+      getAlbumTracks: vi.fn(async () => ({
+        items: [],
+        next: null,
+      })) as any,
+    });
+
+    const batch = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredTracks: [{
+        artist: exactSeed.artistName,
+        title: exactSeed.name,
+      }],
+      qualifiedRecordingFamilyKeys: [`isrc:${exactSeed.isrc}`],
+      qualifiedTrackSeeds: [{
+        artist: exactSeed.artistName,
+        title: exactSeed.name,
+        appleSongId: exactSeed.id,
+        recordingFamilyKey: `isrc:${exactSeed.isrc}`,
+      }],
+    });
+
+    expect(createResponse).toHaveBeenCalledTimes(1);
+    const providerRequest = (
+      createResponse.mock.calls as unknown as Array<[any]>
+    )[0]![0];
+    expect(providerRequest.max_output_tokens).toBe(2_500);
+    expect(providerRequest.instructions).toContain(
+      "Return exactly one candidate row for every supplied catalogCandidate",
+    );
+    expect(providerRequest.text.format.schema.properties.candidates.minItems)
+      .toBe(1);
+    expect(batch.candidates).toHaveLength(1);
+    const metadata = batch.candidates[0]!.metadata as any;
+    expect(metadata.bindings).toEqual([]);
+    expect(metadata.centralQualityCriterionObservations).toHaveLength(2);
+    expect(metadata.centralQualityCatalogBinding).toMatchObject({
+      appleSongId: exactSeed.id,
+      recordingFamilyKey: `isrc:${exactSeed.isrc}`,
+    });
+  });
+
   test("retries only failed quality-evidence chunks without discarding successful chunks", async () => {
     const base = plan("six smooth disco songs", 6);
     const selection: SelectionPlanV3 = {
