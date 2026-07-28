@@ -3548,6 +3548,7 @@ export function validateCanonicalPublicationSetV3(input: {
         ranked: input.tracks,
         target: optimizationTarget,
         plan: input.plan,
+        validateFixedSelection: true,
       });
       if (!optimized.report.exact) {
         reasons.push(...optimized.report.unmetConstraints.map(
@@ -3654,6 +3655,7 @@ function optimizeQualifiedPlaylistV3(input: {
   ranked: readonly QualifiedTrackV3[];
   target: number;
   plan: SelectionPlanV3;
+  validateFixedSelection?: boolean;
 }): {
   selected: QualifiedTrackV3[];
   report: PlaylistOptimizationReportV3;
@@ -3667,7 +3669,11 @@ function optimizeQualifiedPlaylistV3(input: {
   // concentration, quality, and sequencing. Solving a preferred diversity set
   // first and then replacing it with the first quota-compliant set can discard
   // the only jointly feasible composition and manufacture a false shortfall.
-  const final = optimizePlaylistV1({ candidates, constraints });
+  const final = optimizePlaylistV1({
+    candidates,
+    constraints,
+    validateFixedSelection: input.validateFixedSelection,
+  });
 
   return {
     selected: final.selected.flatMap(({ id }) => {

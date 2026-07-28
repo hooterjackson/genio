@@ -1313,8 +1313,35 @@ export function optimizePlaylistV1(input: {
   candidates: readonly PlaylistOptimizationCandidateV1[];
   constraints: PlaylistOptimizationConstraintsV1;
   budget?: PlaylistOptimizationBudgetV1;
+  /**
+   * Publication preflight may validate a frozen optimizer output directly.
+   * Retrieval selection must leave this false so its bounded search and
+   * retry semantics remain unchanged.
+   */
+  validateFixedSelection?: boolean;
 }): PlaylistOptimizationResultV1 {
   validateConstraints(input.constraints);
+  // Publication preflight commonly receives the optimizer's already ordered
+  // exact selection: there are no alternate rows to choose, so rerunning a
+  // bounded beam can only manufacture false infeasibility. Validate that
+  // fixed set directly in its frozen order before spending any search budget.
+  // This is linear/bounded by the public playlist maximum and does not weaken
+  // a constraint—any mismatch falls through to the normal optimizer.
+  const fixedSet = input.candidates.map(candidate);
+  if (input.validateFixedSelection === true
+    && input.constraints.sequencingMode !== "source_order"
+    && fixedSet.length === input.constraints.targetTrackCount
+    && new Set(fixedSet.map(({ id }) => id)).size === fixedSet.length) {
+    const fixedSummary = constraintSummary(fixedSet, input.constraints);
+    if (fixedSummary.unmetConstraints.length === 0) {
+      return {
+        policyVersion: PLAYLIST_OPTIMIZER_POLICY_VERSION,
+        exact: true,
+        selected: fixedSet,
+        ...fixedSummary,
+      };
+    }
+  }
   const candidates = normalizedCandidateRepresentations(input.candidates);
   const budget = optimizationBudget(input.budget);
   const large = input.constraints.targetTrackCount > 100 || candidates.length > 1_000;
