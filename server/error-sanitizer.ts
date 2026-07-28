@@ -22,10 +22,13 @@ export interface SafeTechnicalFailureDiagnostic {
   name: string;
   code: string | null;
   status: number | null;
+  origin: string | null;
 }
 
 const SAFE_DIAGNOSTIC_NAME = /^[A-Za-z][A-Za-z0-9]{0,79}$/u;
 const SAFE_DIAGNOSTIC_CODE = /^[a-z0-9][a-z0-9_.:-]{0,119}$/u;
+const SAFE_SERVER_STACK_ORIGIN =
+  /(?:^|\n)\s*at (?:[^(\n]+\()?[^()\n]*[/\\]server[/\\]([A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:[cm]?js|tsx?)):(\d{1,7}):(\d{1,5})\)?/u;
 
 /**
  * Retain only bounded machine identifiers for operator logs. Error messages,
@@ -42,6 +45,7 @@ export function safeTechnicalFailureDiagnostic(
       operatorCode?: unknown;
       status?: unknown;
       statusCode?: unknown;
+      stack?: unknown;
     }
     : {};
   const name = typeof value.name === "string"
@@ -67,7 +71,13 @@ export function safeTechnicalFailureDiagnostic(
     && suppliedStatus <= 599
     ? suppliedStatus
     : null;
-  return { name, code, status };
+  const stackOrigin = typeof value.stack === "string"
+    ? SAFE_SERVER_STACK_ORIGIN.exec(value.stack)
+    : null;
+  const origin = stackOrigin
+    ? `${stackOrigin[1]}:${stackOrigin[2]}:${stackOrigin[3]}`
+    : null;
+  return { name, code, status, origin };
 }
 
 const FAILURE_MESSAGES: Record<FailureContext, string> = {

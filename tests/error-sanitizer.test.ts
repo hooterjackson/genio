@@ -25,6 +25,7 @@ describe("durable and public error sanitization", () => {
       name: "HttpError",
       code: "pipeline_v3_result_invalid.canonical_preflight",
       status: 409,
+      origin: null,
     });
     expect(safeTechnicalFailureDiagnostic({
       name: "Error\npostgres://private",
@@ -36,6 +37,20 @@ describe("durable and public error sanitization", () => {
       name: "Error",
       code: null,
       status: null,
+      origin: null,
+    });
+    expect(safeTechnicalFailureDiagnostic({
+      name: "Error",
+      stack: [
+        "Error: private prompt and sk-proj-PRIVATE",
+        "    at verify (/app/server/pipeline-v3-live-adapters.ts:1044:11)",
+        "    at https://private.example/secret",
+      ].join("\n"),
+    })).toEqual({
+      name: "Error",
+      code: null,
+      status: null,
+      origin: "pipeline-v3-live-adapters.ts:1044:11",
     });
   });
 
