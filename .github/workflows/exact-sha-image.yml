@@ -34,11 +34,17 @@ jobs:
         env:
           SOURCE_REVISION: ${{ inputs.source_revision }}
           RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
         run: |
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "source_revision must be a lowercase full SHA-1" >&2; exit 1; }
           [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
             || { echo "release_version must be a stable semantic version" >&2; exit 1; }
+          [[ "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "RELEASE_VERIFICATION_KEY_SHA256 must pin the rollout verification key" >&2; exit 1; }
+          [[ "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 must pin the intent-canary authorities" >&2; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_revision }}
@@ -72,6 +78,8 @@ jobs:
           build-args: |
             GENIO_BUILD_VERSION=${{ inputs.release_version }}
             GENIO_BUILD_REVISION=${{ inputs.source_revision }}
+            GENIO_RELEASE_VERIFICATION_KEY_SHA256=${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+            GENIO_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256=${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
           tags: ghcr.io/${{ github.repository_owner }}/genio:sha-${{ inputs.source_revision }}
       - id: receipt
         name: Write immutable image receipt
@@ -81,6 +89,8 @@ jobs:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/genio
           CONTROLLER_REVISION: ${{ github.sha }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
         run: |
           [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
             || { echo "build did not return an image digest" >&2; exit 1; }
@@ -92,9 +102,11 @@ jobs:
             --arg imageReference "$IMAGE_REFERENCE" \
             --arg imageDigest "$IMAGE_DIGEST" \
             --arg controllerRevision "$CONTROLLER_REVISION" \
+            --arg releaseVerificationKeySha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --arg publicRolloutIntentCanaryAuthorityPolicySha256 "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" \
             --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{schemaVersion,sourceRevision,version,imageReference,imageDigest,controllerRevision,runUrl,createdAt}' \
+            '{schemaVersion,sourceRevision,version,imageReference,imageDigest,controllerRevision,releaseVerificationKeySha256,publicRolloutIntentCanaryAuthorityPolicySha256,runUrl,createdAt}' \
             > exact-sha-image-receipt.json
           echo "image_reference=$IMAGE_REFERENCE" >> "$GITHUB_OUTPUT"
           echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
