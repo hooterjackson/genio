@@ -107,6 +107,44 @@ describe("playlist optimizer v1", () => {
       .toEqual(candidates.map(({ id }) => id));
   });
 
+  test("reports a frozen set's actual violation without replacement search", () => {
+    const candidates = [
+      track("track-1", { artistKey: "same-artist" }),
+      track("track-2", { artistKey: "same-artist" }),
+    ];
+    const result = optimizePlaylistV1({
+      candidates,
+      constraints: constraints({
+        targetTrackCount: 2,
+        maximumTracksPerArtist: 1,
+        minimumDistinctArtists: 1,
+        minimumDistinctAlbums: 1,
+        minimumDistinctEras: 1,
+        minimumDistinctScenes: 1,
+        minimumDistinctGeographies: 1,
+        minimumFamiliarTracks: 0,
+        maximumFamiliarTracks: 2,
+        maximumCentralQualityUnknownTracks: 2,
+      }),
+      budget: {
+        maximumHeuristicWorkUnits: 1,
+        maximumExactNodes: 1,
+        maximumExactWorkUnits: 1,
+      },
+      validateFixedSelection: true,
+    });
+
+    expect(result).toMatchObject({
+      exact: false,
+      unmetConstraints: [
+        "maximum_tracks_per_artist",
+        "adjacent_same_artist",
+      ],
+    });
+    expect(result.selected.map(({ id }) => id))
+      .toEqual(candidates.map(({ id }) => id));
+  });
+
   test("solves canonical quotas jointly with artist diversity instead of rejecting a feasible pool", () => {
     const result = optimizePlaylistV1({
       candidates: [

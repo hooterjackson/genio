@@ -1326,21 +1326,25 @@ export function optimizePlaylistV1(input: {
   // bounded beam can only manufacture false infeasibility. Validate that
   // fixed set directly in its frozen order before spending any search budget.
   // This is linear/bounded by the public playlist maximum and does not weaken
-  // a constraint—any mismatch falls through to the normal optimizer.
+  // a constraint. A frozen set has no replacement frontier, so return its
+  // actual violations instead of manufacturing a different short selection.
   const fixedSet = input.candidates.map(candidate);
   if (input.validateFixedSelection === true
-    && input.constraints.sequencingMode !== "source_order"
-    && fixedSet.length === input.constraints.targetTrackCount
-    && new Set(fixedSet.map(({ id }) => id)).size === fixedSet.length) {
+    && input.constraints.sequencingMode !== "source_order") {
     const fixedSummary = constraintSummary(fixedSet, input.constraints);
-    if (fixedSummary.unmetConstraints.length === 0) {
-      return {
-        policyVersion: PLAYLIST_OPTIMIZER_POLICY_VERSION,
-        exact: true,
-        selected: fixedSet,
-        ...fixedSummary,
-      };
-    }
+    const duplicateCandidateId =
+      new Set(fixedSet.map(({ id }) => id)).size !== fixedSet.length;
+    const unmetConstraints = [
+      ...(duplicateCandidateId ? ["duplicate_candidate_id"] : []),
+      ...fixedSummary.unmetConstraints,
+    ];
+    return {
+      policyVersion: PLAYLIST_OPTIMIZER_POLICY_VERSION,
+      exact: unmetConstraints.length === 0,
+      selected: fixedSet,
+      ...fixedSummary,
+      unmetConstraints,
+    };
   }
   const candidates = normalizedCandidateRepresentations(input.candidates);
   const budget = optimizationBudget(input.budget);
