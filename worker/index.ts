@@ -452,6 +452,7 @@ const worker = {
     if (
       url.pathname.startsWith("/api/v1/")
       || url.pathname === "/health/live"
+      || url.pathname === "/health/ready"
       || url.pathname === "/health/system"
     ) {
       return safeResponse(
