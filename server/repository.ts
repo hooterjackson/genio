@@ -25587,6 +25587,14 @@ export class Repository {
                       ))
                         ? "count_identity"
                         : "unknown";
+        const operatorReasonClass = operatorStage === "playlist_optimization"
+          ? reasonCodes
+            .find((reason) => reason.startsWith(
+              "canonical_playlist_optimization_failed:",
+            ))
+            ?.slice("canonical_playlist_optimization_failed:".length)
+            .split(":")[0]
+          : null;
         throw Object.assign(
           new HttpError(
             409,
@@ -25597,7 +25605,9 @@ export class Repository {
           ),
           {
             operatorCode:
-              `pipeline_v3_result_invalid.canonical_preflight.${operatorStage}`,
+              `pipeline_v3_result_invalid.canonical_preflight.${operatorStage}${
+                operatorReasonClass ? `.${operatorReasonClass}` : ""
+              }`,
           },
         );
       }
