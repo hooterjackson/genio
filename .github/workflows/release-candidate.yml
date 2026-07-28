@@ -6,6 +6,15 @@ on:
   # and publishes itself.
   repository_dispatch:
     types: [genio-release-candidate]
+  # Fallback path for environments where dispatch transport fails before run creation.
+  # This preserves all existing authorization/verification logic while preserving
+  # the same release-candidate contract via explicit input.
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: "Release candidate tag to run (for example: v2.4.0-rc.2)"
+        required: true
+        type: string
 
 concurrency:
   group: stable-release-mutation
@@ -28,7 +37,7 @@ jobs:
       packages: read
       pull-requests: read
     env:
-      CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}
+      CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag || github.event.inputs.candidate_tag }}
     outputs:
       candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
       source_revision: ${{ steps.identity.outputs.source_revision }}
