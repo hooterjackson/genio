@@ -2952,16 +2952,55 @@ export function createPipelineV3LiveAdapters(
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
         chunks.push(songs.slice(offset, offset + chunkSize));
       }
-      const pages = await mapConcurrent(chunks, 6, async (chunk) => (
-        defaultHostedWebDiscovery(
-          { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
-          request.modelRoute ?? modelRoute,
-          createResponse,
-          options.onProviderUsage,
-          chunk,
-        )
-      ));
-      return pages.flatMap((page) => page.candidates);
+      const completed = new Map<number, HostedWebDiscoveryPageV3>();
+      let pending = chunks.map((chunk, index) => ({ chunk, index }));
+      let lastError: unknown = null;
+      // One malformed or transient five-track response must not discard every
+      // independently verified chunk. Retry only the failed chunks, preserve
+      // successful evidence, and fail the strategy only when no chunk can be
+      // verified after the bounded three-attempt provider window.
+      for (let attempt = 0; attempt < 3 && pending.length > 0; attempt += 1) {
+        const results = await mapConcurrent(pending, 6, async ({ chunk, index }) => {
+          try {
+            const page = await defaultHostedWebDiscovery(
+              { ...request, cursor: null, requestedRawCandidateCount: chunk.length },
+              request.modelRoute ?? modelRoute,
+              createResponse,
+              options.onProviderUsage,
+              chunk,
+            );
+            return { ok: true as const, index, page };
+          } catch (error) {
+            if (request.signal?.aborted) throw request.signal.reason ?? error;
+            return { ok: false as const, index, chunk, error };
+          }
+        });
+        pending = [];
+        for (const result of results) {
+          if (result.ok) {
+            completed.set(result.index, result.page);
+          } else {
+            lastError = result.error;
+            pending.push({ index: result.index, chunk: result.chunk });
+          }
+        }
+      }
+      if (completed.size === 0 && chunks.length > 0) {
+        const dependencyError = asRetrievalDependencyError(
+          lastError,
+          "hosted_web",
+        );
+        if (dependencyError) throw dependencyError;
+        throw new RetrievalDependencyErrorV3(
+          "Hosted quality evidence verification remained unavailable",
+          ["hosted_web"],
+          null,
+          "transient",
+        );
+      }
+      return [...completed.entries()]
+        .sort(([left], [right]) => left - right)
+        .flatMap(([, page]) => page.candidates);
     });
 
   return Object.freeze({

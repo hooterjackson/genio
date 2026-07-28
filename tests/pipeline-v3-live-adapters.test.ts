@@ -3953,6 +3953,118 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(metadata.centralQualityCriterionObservations).toHaveLength(2);
   });
 
+  test("retries only failed quality-evidence chunks without discarding successful chunks", async () => {
+    const base = plan("six smooth disco songs", 6);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    const strategy = retrievalStrategiesForEnginesV3([
+      "curated_genre_scene",
+    ]).find((value) => value.kind === "qualified_expansion")!;
+    const exactSeeds = Array.from({ length: 6 }, (_, index): CatalogSong => ({
+      ...song(700 + index, `Artist ${index + 1}`, `Track ${index + 1}`),
+      genreNames: ["Disco"],
+    }));
+    let firstChunkFailures = 0;
+    const createResponse = vi.fn(async (input: any) => {
+      const catalogCandidates = JSON.parse(input.input).catalogCandidates as Array<{
+        artist: string;
+        title: string;
+        album: string;
+      }>;
+      if (catalogCandidates.length === 5 && firstChunkFailures++ === 0) {
+        return { id: "malformed_quality_chunk", output_text: "not-json", output: [] };
+      }
+      const rows = catalogCandidates.map((candidate, index) => {
+        const sourceUrl = `https://example.com/quality/${encodeURIComponent(candidate.artist)}/${index}`;
+        return {
+          candidate,
+          sourceUrl,
+          text: `${candidate.artist} — ${candidate.title} is smooth. [source]`,
+        };
+      });
+      return {
+        id: `quality_chunk_${catalogCandidates.length}_${firstChunkFailures}`,
+        output_text: JSON.stringify({
+          candidates: rows.map(({ candidate, sourceUrl }) => ({
+            ...candidate,
+            centralQualityScore: 0.9,
+            centralQualityCriteria: [{ criterion: "smooth", verdict: "pass" }],
+            sources: [{ url: sourceUrl, predicateIds: [] }],
+          })),
+        }),
+        output: [
+          {
+            type: "web_search_call",
+            action: { sources: rows.map(({ sourceUrl }) => ({ url: sourceUrl })) },
+          },
+          ...rows.map(({ sourceUrl, text }, index) => ({
+            id: `quality_message_${catalogCandidates.length}_${index}`,
+            type: "message",
+            content: [{
+              type: "output_text",
+              text,
+              annotations: [{
+                type: "url_citation",
+                url: sourceUrl,
+                start_index: text.indexOf("[source]"),
+                end_index: text.indexOf("[source]") + "[source]".length,
+              }],
+            }],
+          })),
+        ],
+      };
+    });
+    const adapters = createPipelineV3LiveAdapters({
+      model: "quality-test-model",
+      escalationModel: "quality-test-model",
+      createResponse: createResponse as any,
+      searchAppleResources: vi.fn(async (
+        _storefront: string,
+        query: string,
+      ) => emptySearch({
+        artists: [{
+          id: `artist-${query}`,
+          name: query,
+          genreNames: ["Disco"],
+        }],
+      })) as any,
+      lookupAppleByIds: vi.fn(async () => exactSeeds) as any,
+      getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
+      getArtistAlbums: vi.fn(async () => ({ items: [], next: null })) as any,
+      getAlbumTracks: vi.fn(async () => ({ items: [], next: null })) as any,
+    });
+
+    const batch = await adapters.discover({
+      ...discoveryRequest(selection, "editorial_tracks"),
+      strategy,
+      requestedRawCandidateCount: 6,
+      qualifiedRecordingFamilyKeys: exactSeeds.map((seed) => `isrc:${seed.isrc}`),
+      qualifiedTrackSeeds: exactSeeds.map((seed) => ({
+        artist: seed.artistName,
+        title: seed.name,
+        appleSongId: seed.id,
+        recordingFamilyKey: `isrc:${seed.isrc}`,
+      })),
+    });
+
+    expect(batch.candidates).toHaveLength(6);
+    expect(createResponse).toHaveBeenCalledTimes(3);
+    expect(firstChunkFailures).toBe(2);
+  });
+
   test.each([
     {
       label: "album-null evidence with one exact recording family",
