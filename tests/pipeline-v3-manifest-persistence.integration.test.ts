@@ -1341,6 +1341,13 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       predicateIds: ["genre:reggaeton"],
       sourcePredicateIds: ["genre:dembow", "genre:reggaeton"],
     });
+    expect((await pool.query<{ count: number }>(
+      `SELECT count(*)::int count
+       FROM track_scope_bindings
+       WHERE run_id=$1 AND scope_axis='evidence'
+         AND pipeline_version='corpus_first_v3'`,
+      [context.runId],
+    )).rows[0]?.count).toBe(0);
     await expect(repository.validatePipelineV3ContinuationQualifications({
       runId: context.runId,
       queryPlan: context.queryPlan,

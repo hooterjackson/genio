@@ -2555,6 +2555,9 @@ function persistedCanonicalEvidenceIntegrityReason(input: {
     persistedPipelineV3EvidenceBindingIndex(input.bindings);
   if (bindingIndex.reason) return bindingIndex.reason;
   const { bindingsByCandidate } = bindingIndex;
+  const clauseById = new Map(
+    input.canonicalPolicy.clauses.map((clause) => [clause.id, clause]),
+  );
   for (const candidateId of input.candidateIds) {
     const qualification = latestQualification.get(candidateId);
     if (!qualification) return "canonical_qualification_projection_missing";
@@ -2599,13 +2602,21 @@ function persistedCanonicalEvidenceIntegrityReason(input: {
       return "canonical_hosted_evidence_snapshot_invalid";
     }
     for (const reference of references) {
+      const clause = clauseById.get(reference.obligationId);
+      if (!clause) return "canonical_predicate_projection_invalid";
       const binding = (bindingsByCandidate.get(candidateId) ?? []).find(
         (candidateBinding) => (
           candidateBinding.id === reference.evidenceId
           && evidenceBindingIsAttestedForSelectionV3(candidateBinding, {
             requireHostedEvidenceSnapshot: true,
             storefront: input.storefront,
-            requiredObligationIds: [reference.obligationId],
+            // The evidence-axis bridge is the meta-policy that an attested,
+            // grade-eligible source exists. It is intentionally not a second
+            // factual claim that the source itself must name. This mirrors
+            // canonicalRequiredEvidenceIntegrityV3 at the live boundary.
+            requiredObligationIds: clause.axis === "evidence"
+              ? []
+              : [reference.obligationId],
           })
         ),
       );
@@ -6525,6 +6536,7 @@ export class Repository {
          WHERE binding.run_id=$1
            AND binding.candidate_id=ANY($2::uuid[])
            AND binding.eligibility='qualifying'
+           AND binding.scope_axis<>'evidence'
            AND binding.pipeline_version='corpus_first_v3'
          ORDER BY binding.candidate_id,binding.id
          FOR SHARE OF binding,source`,
@@ -18536,6 +18548,7 @@ export class Repository {
          WHERE binding.run_id=$1
            AND binding.candidate_id=ANY($2::uuid[])
            AND binding.eligibility='qualifying'
+           AND binding.scope_axis<>'evidence'
            AND binding.pipeline_version='corpus_first_v3'
          ORDER BY binding.candidate_id,binding.id
          FOR SHARE OF binding,source`,
@@ -18787,6 +18800,7 @@ export class Repository {
              WHERE binding.run_id=$1
                AND binding.candidate_id=ANY($2::uuid[])
                AND binding.eligibility='qualifying'
+               AND binding.scope_axis<>'evidence'
                AND binding.pipeline_version='corpus_first_v3'
              ORDER BY binding.candidate_id,binding.id`,
             [input.runId, candidateIds],
@@ -26497,8 +26511,9 @@ export class Repository {
         for (const binding of bindings) {
           const canonicalPredicates = canonicalRetrieval
             ? (finalSemanticPlan.canonicalContractPolicy?.clauses ?? []).filter(
-                (clause) => track.canonicalClauseAssessments?.[clause.id]
-                  ?.evidenceIds?.includes(binding.id),
+                (clause) => clause.axis !== "evidence"
+                  && track.canonicalClauseAssessments?.[clause.id]
+                    ?.evidenceIds?.includes(binding.id),
               )
             : [];
           // Canonical contracts retain their exact Boolean clause assessments
@@ -27180,6 +27195,7 @@ export class Repository {
            WHERE binding.run_id=$1
              AND binding.candidate_id=ANY($2::uuid[])
              AND binding.eligibility='qualifying'
+             AND binding.scope_axis<>'evidence'
              AND binding.pipeline_version='corpus_first_v3'
            ORDER BY binding.candidate_id,binding.id
            FOR SHARE OF binding,source`,
