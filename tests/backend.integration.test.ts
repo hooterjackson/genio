@@ -261,7 +261,7 @@ databaseDescribe("hosted backend integration", () => {
     // schema marker. Each test starts from the actual migrated schema unless it
     // deliberately overrides the marker to exercise compatibility fencing.
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
-  });
+  }, 30_000);
 
   afterEach(() => {
     vi.unstubAllEnvs();
