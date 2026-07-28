@@ -2,29 +2,39 @@
 
 ## Topology
 
-Use two Railway projects: `needle-qa` for the isolated staging environment and
-`needle` for production. Each project has its own Postgres, API, and worker
-services; service IDs, environment IDs, credentials, provider projects, Apple
-accounts, and budgets are independently attested.
+Use the isolated `staging` and `production` environments in the `needle`
+Railway project. They reuse the same four logical service definitions, but
+Railway creates a distinct deployment instance and Postgres database in each
+environment. Environment IDs, database identities, variables, deployments,
+and budgets remain independently fenced and attested.
+
+Dedicated staging Apple and provider credentials remain the preferred QA
+configuration. A solo owner may explicitly authorize staging to reuse the
+production credentials for private, capped canaries. That exception must be
+recorded as shared credential custody, may not be represented as independent
+Apple/provider verification, and does not permit public staging traffic.
 
 | Service | Exposure | Config | Responsibility |
 | --- | --- | --- | --- |
 | Sites | Public custom domain | `.openai/hosting.json` | UI, owner identity, client bucket, signed gateway |
 | `needle-api` | Public Railway HTTPS | `.railway/railway.ts` | Validate/enqueue/read state |
 | `needle-worker` | Railway private network | `.railway/railway.ts` | Durable paid jobs and deterministic publication |
+| `needle-deep-worker` | Railway private network | `.railway/railway.ts` | Bounded deep-research and rescue portfolio work |
 | Postgres | Railway private network | `.railway/railway.ts` | Authoritative state, leases, cost ledger |
 
 Sites cannot address Railway's private network, so only the API receives a Railway public domain. The API accepts the fixed `/api/v1` route allowlist only after validating the Sites HMAC. Do not expose the worker.
 
 ## One-time setup
 
-1. Create a private source repository and require tests and build checks before merge.
-2. Create the separate `needle-qa` staging and `needle` production Railway
-   projects, each with its own environment, Postgres, API, and workers.
-3. Give both app services the internal `DATABASE_URL`; give only the API a public Railway domain.
+1. Create the source repository and require tests and build checks before merge.
+2. Create isolated `staging` and `production` environments in the `needle`
+   Railway project. Each environment gets its own Postgres, API, interactive
+   worker, and deep worker instances.
+3. Give all three app services the environment-local internal `DATABASE_URL`;
+   give only the API a public Railway domain.
 4. Preview and apply `.railway/railway.ts` separately while linked to each
-   project; it emits only the selected release environment and is the sole
-   Railway configuration source for both services and Postgres.
+   environment; it emits only the selected release environment and is the sole
+   Railway configuration source for all three app services and Postgres.
 5. Enable seven-day Postgres point-in-time recovery before sharing the URL.
 6. Create the Sites project, attach the chosen custom domain, and set Sites gateway secrets.
 7. Add DNS records for Sites and Resend. Set Apple Music browser origins to the exact HTTPS custom origin.

@@ -423,7 +423,7 @@ jobs:
     expect(workflow).toContain('--source-ref "refs/heads/$DEFAULT_BRANCH"');
     expect(workflow).toContain('--source-digest "$SOURCE_REVISION"');
     expect(workflow).toContain("--deny-self-hosted-runners");
-    expect(workflow).toContain("--no-public-good");
+    expect(workflow).not.toContain("--no-public-good");
     expect(workflow).toContain("Finalization-Evidence-SHA256:");
     expect(workflow).toContain("Stable-Authorization-SHA256:");
     expect(workflow).toContain(

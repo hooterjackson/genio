@@ -2313,7 +2313,6 @@ if (
   || option("--predicate-type") !== ${JSON.stringify(RELEASE_ATTESTATION_PREDICATE_TYPE)}
   || option("--cert-oidc-issuer") !== "https://token.actions.githubusercontent.com"
   || !args.includes("--deny-self-hosted-runners")
-  || !args.includes("--no-public-good")
   || !existsSync(option("--bundle"))
 ) {
   throw new Error("untrusted gh verification arguments");
