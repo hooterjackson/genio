@@ -3831,6 +3831,28 @@ function nextStrategyWave(
   return selected;
 }
 
+/**
+ * Once the deterministic/catalog portfolio has produced enough distinct
+ * recording families for the requested count, central-quality evidence is a
+ * deficit on those exact identities rather than a reason to keep issuing
+ * broad discovery calls. Prefer one qualified expansion lane so it can bind
+ * suitability evidence to the existing Apple records (and then expand from
+ * those qualified artists if the evidence pass rejects some of them).
+ *
+ * The ordinary independent portfolio remains unchanged before a count-sized
+ * pool exists, and resumes automatically when every qualified-expansion lane
+ * is terminal. Shared Apple+hosted dependencies keep this rescue lane
+ * intentionally singular.
+ */
+function nextCentralQualityRecoveryWave(
+  states: readonly MutableStrategyStateV3[],
+): MutableStrategyStateV3[] {
+  const expansion = availableStrategies(states).find(
+    ({ definition }) => definition.kind === "qualified_expansion",
+  );
+  return expansion ? [expansion] : [];
+}
+
 function mutableDependencyState(
   dependencies: Map<RetrievalUpstreamDependencyIdV3, MutableDependencyStateV3>,
   dependencyId: RetrievalUpstreamDependencyIdV3,
@@ -4561,7 +4583,24 @@ export async function executeRetrievalV3(input: {
         remainingGlobalRounds,
         concurrencyByKnownBudget,
       );
-      const wave = nextStrategyWave(states, maximumWaveSize);
+      const centralQualityCapacity = activePlan.playlistQualityPolicy
+        ? selectWithCentralQualityV3({
+            ranked: currentRankedRepresentations,
+            target: requested,
+            policy: activePlan.playlistQualityPolicy,
+          }).eligible.length
+        : requested;
+      const centralQualityRecoveryRequired =
+        activePlan.playlistQualityPolicy !== null
+        && activePlan.playlistQualityPolicy !== undefined
+        && currentRankedRepresentations.length >= requested
+        && centralQualityCapacity < requested;
+      const centralQualityRecoveryWave = centralQualityRecoveryRequired
+        ? nextCentralQualityRecoveryWave(states)
+        : [];
+      const wave = centralQualityRecoveryWave.length > 0
+        ? centralQualityRecoveryWave
+        : nextStrategyWave(states, maximumWaveSize);
       if (wave.length === 0) break;
 
       const remainingCapacity = policy.maximumRawCandidates - seenCandidateIds.size;

@@ -2320,6 +2320,7 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     let replacementIndex = 0;
     let seeded = false;
     const unresolvedSeedCounts: number[] = [];
+    const strategyKinds: string[] = [];
 
     const result = await executeRetrievalV3({
       runId: "quality-deficit-switches-to-fresh-catalog",
@@ -2333,6 +2334,7 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       },
       adapters: {
         discover: async (request) => {
+          strategyKinds.push(request.strategy.kind);
           if (request.strategy.kind === "qualified_expansion"
             && request.qualifiedTrackSeeds.length > 0) {
             const unresolved = request.qualityEvidenceTrackSeeds ?? [];
@@ -2390,6 +2392,13 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
 
     expect(unresolvedSeedCounts).toEqual([6, 0, 0]);
+    const firstQualifiedExpansion = strategyKinds.indexOf("qualified_expansion");
+    const firstBroadEditorial = strategyKinds.indexOf("editorial_tracks");
+    expect(firstQualifiedExpansion).toBeGreaterThan(
+      strategyKinds.indexOf("trusted_containers"),
+    );
+    expect(firstBroadEditorial === -1
+      || firstQualifiedExpansion < firstBroadEditorial).toBe(true);
     expect(result.outcome).toMatchObject({
       status: "exact_ready",
       selectedTrackCount: 6,
