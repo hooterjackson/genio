@@ -25594,13 +25594,19 @@ export class Repository {
             ))
             ?.slice("canonical_playlist_optimization_failed:".length)
             .replace(/[:/]/gu, ".")
+            .replace(/^minimum_distinct_albums\./u, "albums.")
             .slice(0, 48)
           : null;
         const retrievalAlbumCount = operatorReasonClass?.startsWith(
-          "minimum_distinct_albums.",
+          "albums.",
         )
           ? result.playlistOptimization?.distinct.albums
           : null;
+        const retrievalOutcomeClass = result.outcome.status === "exact_ready"
+          ? "x"
+          : result.outcome.status === "partial_ready"
+            ? "p"
+            : "n";
         throw Object.assign(
           new HttpError(
             409,
@@ -25616,6 +25622,12 @@ export class Repository {
               }${
                 Number.isSafeInteger(retrievalAlbumCount)
                   ? `.retrieval.${retrievalAlbumCount}`
+                  : ""
+              }${
+                operatorReasonClass?.startsWith("albums.")
+                  ? `.s${result.selected.length}.e${
+                    result.playlistOptimization?.exact === true ? 1 : 0
+                  }.o${retrievalOutcomeClass}`
                   : ""
               }`,
           },
