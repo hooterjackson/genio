@@ -196,6 +196,14 @@ describe("canonical contract execution bridge", () => {
       zeroKnownFailures: true,
       signalSemantics: "ranking_only_not_factual_evidence",
     });
+    expect(projection.playlistQualityPolicy?.criteria).toHaveLength(6);
+    expect(projection.playlistQualityPolicy?.criteria.map((criterion) => (
+      criterion.toLocaleLowerCase("en-US")
+        .replace(/\s+(?:atmosphere|feel|feeling|mood|vibe)$/u, "")
+    ))).toHaveLength(new Set(projection.playlistQualityPolicy?.criteria.map((criterion) => (
+      criterion.toLocaleLowerCase("en-US")
+        .replace(/\s+(?:atmosphere|feel|feeling|mood|vibe)$/u, "")
+    ))).size);
     expect(projection.selectionPlanV3.diversityGoals).toEqual({
       minimumDistinctArtists: null,
       minimumDistinctAlbums: null,

@@ -106,6 +106,17 @@ function normalized(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+/**
+ * Treat a bare suitability descriptor and the same descriptor followed by a
+ * non-semantic carrier noun as one criterion. The carrier can improve display
+ * prose, but judging both "flirtatious" and "flirtatious vibe" independently
+ * double-weights one user idea and makes the 80% coverage floor stricter than
+ * the immutable request.
+ */
+function suitabilitySemanticKey(value: string): string {
+  return normalized(value).replace(/\s+(?:atmosphere|feel|feeling|mood|vibe)$/u, "");
+}
+
 function unique(values: readonly string[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -258,8 +269,31 @@ function addSuitabilityClause(input: {
   value: string;
   sourceText?: string;
 }): void {
-  const key = normalized(input.value);
-  if (!key || input.seenSuitability.has(key)) return;
+  const key = suitabilitySemanticKey(input.value);
+  if (!key) return;
+  if (input.seenSuitability.has(key)) {
+    // Prefer the bare descriptor as the canonical server-owned wording when
+    // it arrives after a prose-shaped carrier form. Preserve the original
+    // clause identity so the immutable lineage and all references remain
+    // stable.
+    if (normalized(input.value) === key) {
+      const existingIndex = input.clauses.findIndex((clause) => (
+        clause.kind === "suitability"
+        && clause.values?.some((value) => suitabilitySemanticKey(value) === key)
+      ));
+      const existing = input.clauses[existingIndex];
+      if (existingIndex >= 0
+        && existing
+        && existing.values?.every((value) => normalized(value) !== key)) {
+        input.clauses[existingIndex] = {
+          ...existing,
+          values: [input.value],
+          source: promptSource(input.prompt, input.sourceText ?? input.value),
+        };
+      }
+    }
+    return;
+  }
   input.seenSuitability.add(key);
   const id = `bridge:suitability:${safeId(input.idSeed)}`;
   input.clauses.push({
