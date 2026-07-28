@@ -268,9 +268,19 @@ function addSuitabilityClause(input: {
   idSeed: string;
   value: string;
   sourceText?: string;
+  requirePromptSource?: boolean;
 }): void {
   const key = suitabilitySemanticKey(input.value);
   if (!key) return;
+  const source = promptSource(
+    input.prompt,
+    input.sourceText ?? input.value,
+  );
+  // Provider-authored brief prose is allowed to suggest ranking language, but
+  // it cannot add an executable central-suitability obligation that the user
+  // never supplied. The exact user span (or a server-owned prompt extractor
+  // below) is the authority for immutable quality criteria.
+  if (input.requirePromptSource && source.provenance !== "prompt") return;
   if (input.seenSuitability.has(key)) {
     // Prefer the bare descriptor as the canonical server-owned wording when
     // it arrives after a prose-shaped carrier form. Preserve the original
@@ -288,7 +298,7 @@ function addSuitabilityClause(input: {
         input.clauses[existingIndex] = {
           ...existing,
           values: [input.value],
-          source: promptSource(input.prompt, input.sourceText ?? input.value),
+          source,
         };
       }
     }
@@ -304,7 +314,7 @@ function addSuitabilityClause(input: {
     axis: "central_suitability",
     operator: "prefer",
     values: [input.value],
-    source: promptSource(input.prompt, input.sourceText ?? input.value),
+    source,
   });
   input.centralSuitabilityClauseIds.push(id);
 }
@@ -617,6 +627,7 @@ export function buildPlaylistContractShadowDraftV1(
           prompt: input.prompt,
           idSeed: `${constraint.id}-${valueIndex + 1}`,
           value,
+          requirePromptSource: true,
         });
       }
       if (constraint.kind === "hard") softenedHardConstraintIds.push(constraint.id);

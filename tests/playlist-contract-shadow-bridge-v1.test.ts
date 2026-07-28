@@ -88,6 +88,10 @@ describe("playlist contract shadow bridge v1", () => {
       brief: requestBrief,
       storefront: "us",
     });
+    selectionPlan.constraints = [
+      ...selectionPlan.constraints,
+      constraint("provider_invented_party", "activity", "prefer", ["party"], "soft"),
+    ];
     const bridged = compilePlaylistContractShadowV1({
       contractId: "run:smooth-reggaeton-heat",
       prompt: SMOOTH_REGGAETON_HEAT_PROMPT,
@@ -131,6 +135,8 @@ describe("playlist contract shadow bridge v1", () => {
       "flirtatious",
       "crowd-pleasing",
     ]));
+    expect(central.map((clause) => clause!.values[0])).not.toContain("party");
+    expect(central).toHaveLength(6);
     expect(central.every((clause) => (
       clause!.kind === "suitability" && clause!.hardness === "soft"
     ))).toBe(true);

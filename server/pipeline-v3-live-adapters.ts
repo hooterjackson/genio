@@ -1908,7 +1908,7 @@ async function discoverQualifiedAppleExpansion(input: {
       1,
       Math.ceil(
         eligibleCatalogSongs.length
-          / (request.plan.playlistQualityPolicy ? 15 : 100),
+          / (request.plan.playlistQualityPolicy ? 25 : 100),
       ),
     ),
   };
@@ -2969,11 +2969,11 @@ export function createPipelineV3LiveAdapters(
   const verifyAppleExpansion = options.verifyAppleExpansion
     ?? (async (request: DiscoveryRequestV3, songs: readonly CatalogSong[]) => {
       // The immutable contract and source-governance instructions dominate
-      // the input token cost of every quality request. Fifteen exact tracks
-      // still fit inside the 8k structured-output envelope, while avoiding
-      // twelve near-identical 15k-token prompts for a 50-track run. Missing
-      // identities are retried separately below.
-      const chunkSize = request.plan.playlistQualityPolicy ? 15 : 100;
+      // the input token cost of every quality request. Twenty-five exact
+      // tracks fit inside the 8k structured-output envelope and align with
+      // Apple's bounded ID lookup window, avoiding repeated instruction and
+      // hosted-search overhead. Missing identities are retried separately.
+      const chunkSize = request.plan.playlistQualityPolicy ? 25 : 100;
       const chunks: CatalogSong[][] = [];
       for (let offset = 0; offset < songs.length; offset += chunkSize) {
         chunks.push(songs.slice(offset, offset + chunkSize));

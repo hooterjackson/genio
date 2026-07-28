@@ -4252,7 +4252,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     })).rejects.toMatchObject({ code: "run_budget_reached" });
   });
 
-  test("chunks exact quality-seed Apple lookups at the 25-ID provider limit", async () => {
+  test("chunks exact quality-seed Apple lookups and evidence calls at 25 identities", async () => {
     const base = plan("twenty-six smooth disco songs", 26);
     const selection: SelectionPlanV3 = {
       ...base,
@@ -4284,26 +4284,64 @@ describe("Pipeline V3 live read-only adapters", () => {
       if (ids.length > 25) throw new Error("provider limit exceeded");
       return ids.map((id) => byId.get(id)!);
     });
+    const qualityChunkSizes: number[] = [];
+    const createResponse = vi.fn(async (input: any) => {
+      const catalogCandidates = JSON.parse(input.input).catalogCandidates as Array<{
+        artist: string;
+        title: string;
+        album: string;
+      }>;
+      qualityChunkSizes.push(catalogCandidates.length);
+      const rows = catalogCandidates.map((candidate, index) => {
+        const sourceUrl =
+          `https://example.com/quality-batch/${qualityChunkSizes.length}/${index}`;
+        const text = `${candidate.artist} — ${candidate.title} is smooth. [source]`;
+        return { candidate, sourceUrl, text };
+      });
+      return {
+        id: `quality_batch_${qualityChunkSizes.length}`,
+        output_text: JSON.stringify({
+          candidates: rows.map(({ candidate, sourceUrl }) => ({
+            ...candidate,
+            centralQualityScore: 0.9,
+            centralQualityCriteria: [{
+              criterion: "smooth",
+              verdict: "pass",
+            }],
+            sources: [{ url: sourceUrl, predicateIds: [] }],
+          })),
+        }),
+        output: [
+          {
+            type: "web_search_call",
+            action: {
+              sources: rows.map(({ sourceUrl }) => ({ url: sourceUrl })),
+            },
+          },
+          ...rows.map(({ sourceUrl, text }, index) => ({
+            id: `quality_batch_message_${qualityChunkSizes.length}_${index}`,
+            type: "message",
+            content: [{
+              type: "output_text",
+              text,
+              annotations: [{
+                type: "url_citation",
+                url: sourceUrl,
+                start_index: text.indexOf("[source]"),
+                end_index: text.indexOf("[source]") + "[source]".length,
+              }],
+            }],
+          })),
+        ],
+      };
+    });
     const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
       searchAppleResources: vi.fn(async () => emptySearch()) as any,
       lookupAppleByIds: lookupAppleByIds as any,
       getArtistTopSongs: vi.fn(async () => ({ items: [], next: null })) as any,
       getArtistAlbums: vi.fn(async () => ({ items: [], next: null })) as any,
       getAlbumTracks: vi.fn(async () => ({ items: [], next: null })) as any,
-      verifyAppleExpansion: vi.fn(async (
-        _request: DiscoveryRequestV3,
-        songs: readonly CatalogSong[],
-      ) => songs.map(
-        (seed, index): HostedWebCandidateV3 => ({
-          artist: seed.artistName,
-          title: seed.name,
-          album: seed.albumName,
-          sourceUrl: `https://example.com/quality/${index}`,
-          provenanceRoot: "example.com",
-          evidenceStrength: 0.9,
-          sourceRank: index + 1,
-        }),
-      )),
     });
 
     const batch = await adapters.discover({
@@ -4321,6 +4359,8 @@ describe("Pipeline V3 live read-only adapters", () => {
 
     expect(lookupAppleByIds.mock.calls.map(([, ids]) => ids.length))
       .toEqual([25, 1]);
+    expect(qualityChunkSizes).toEqual([25, 1]);
+    expect(createResponse).toHaveBeenCalledTimes(2);
     expect(batch.candidates).toHaveLength(26);
   });
 
