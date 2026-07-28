@@ -25554,6 +25554,39 @@ export class Repository {
           result.outcome.status === "partial_ready",
       });
       if (!publicationValidation.valid) {
+        const reasonCodes = publicationValidation.reasonCodes;
+        const operatorStage = reasonCodes.includes(
+          "canonical_sequence_optimizer_mismatch",
+        )
+          ? "sequence_optimizer"
+          : reasonCodes.some((reason) => reason.startsWith(
+            "canonical_playlist_optimization_failed:",
+          ))
+            ? "playlist_optimization"
+            : reasonCodes.some((reason) => reason.startsWith(
+              "canonical_quota_failed:",
+            ))
+              ? "quota"
+              : reasonCodes.includes("canonical_central_quality_failed")
+                ? "central_quality"
+                : reasonCodes.includes("canonical_track_evidence_invalid")
+                  ? "track_evidence"
+                  : reasonCodes.some((reason) => (
+                    reason === "canonical_track_unknown"
+                    || reason === "canonical_track_failed"
+                  ))
+                    ? "track_eligibility"
+                    : reasonCodes.some((reason) => reason.startsWith(
+                      "canonical_sequence_",
+                    ))
+                      ? "sequence"
+                      : reasonCodes.some((reason) => (
+                        reason === "canonical_exact_count_mismatch"
+                        || reason === "canonical_count_overflow"
+                        || reason === "canonical_recording_family_duplicate"
+                      ))
+                        ? "count_identity"
+                        : "unknown";
         throw Object.assign(
           new HttpError(
             409,
@@ -25562,7 +25595,10 @@ export class Repository {
             }`,
             "pipeline_v3_result_invalid",
           ),
-          { operatorCode: "pipeline_v3_result_invalid.canonical_preflight" },
+          {
+            operatorCode:
+              `pipeline_v3_result_invalid.canonical_preflight.${operatorStage}`,
+          },
         );
       }
     }
