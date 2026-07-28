@@ -4206,11 +4206,16 @@ export async function processBriefInterpretationJob(
       error: null,
     });
   } catch (error) {
+    // A durable worker retry must keep the visitor-visible brief non-terminal.
+    // Persisting `failed` here made the scheduled retry a no-op because the
+    // next worker correctly skips already-terminal requests. Only the queue's
+    // final exhausted attempt owns terminal failure; retryable exceptions
+    // remain queued until then.
+    if (!isBudgetError(error)) throw error;
     await repository.saveBriefResult(briefRequestId, {
       status: "failed",
       expectedStatus: "queued",
       error: error instanceof Error ? error.message.slice(0, 500) : "Brief interpretation failed",
     });
-    if (!isBudgetError(error)) throw error;
   }
 }

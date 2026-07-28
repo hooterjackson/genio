@@ -81,6 +81,13 @@ test("worker handler facades enforce role-specific runtime capabilities", async 
   expect("validateResearchProviderAttempt" in research).toBe(true);
   expect("persistResearchProviderBlocker" in research).toBe(true);
   expect("resolveResearchProviderBlocker" in research).toBe(true);
+  expect("getActivePlaylistContractRevision" in research).toBe(true);
+  expect("savePlaylistContractRevision" in research).toBe(true);
+  expect("savePlaylistFeasibilitySnapshot" in research).toBe(true);
+  await research.savePlaylistContractRevision?.({} as any);
+  await research.savePlaylistFeasibilitySnapshot?.({} as any);
+  expect(source.savePlaylistContractRevision).toHaveBeenCalledOnce();
+  expect(source.savePlaylistFeasibilitySnapshot).toHaveBeenCalledOnce();
   const researchAuthority = { expectedGeneration: "generation" } as any;
   await research.resolveResearchProviderBlocker?.(
     "run-1",

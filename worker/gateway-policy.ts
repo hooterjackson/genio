@@ -94,3 +94,32 @@ export function forwardedCapabilityCookie(cookieHeader: string | null, productio
   if (matches.length > 1) throw new Error("Duplicate gênio capability cookies are not allowed");
   return matches[0] ?? null;
 }
+
+/**
+ * A production-style local QA preview runs over HTTP while its hosted staging
+ * API correctly uses a Secure __Host- cookie. Bridge only the already-filtered
+ * gênio capability cookie; no unrelated browser cookie may cross upstream.
+ */
+export function localQaCapabilityCookieToHosted(
+  cookie: string | null,
+): string | null {
+  if (!cookie) return null;
+  if (!cookie.startsWith("needle-session=")) {
+    throw new Error("Local QA capability cookie has an unexpected name");
+  }
+  return `__Host-needle-session=${cookie.slice("needle-session=".length)}`;
+}
+
+/**
+ * Translate the hosted capability response back to the localhost-only cookie
+ * understood by an HTTP QA preview. Production Sites never calls this bridge.
+ */
+export function hostedCapabilitySetCookieToLocalQa(
+  setCookie: string | null,
+): string | null {
+  if (!setCookie) return null;
+  if (!setCookie.startsWith("__Host-needle-session=")) return setCookie;
+  return setCookie
+    .replace(/^__Host-needle-session=/u, "needle-session=")
+    .replace(/;\s*Secure(?=;|$)/giu, "");
+}

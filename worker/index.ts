@@ -5,7 +5,9 @@ import {
   DEFAULT_GATEWAY_BODY_LIMIT,
   forwardedCapabilityCookie,
   gatewayBodyLimit,
+  hostedCapabilitySetCookieToLocalQa,
   isCrossSiteMutation,
+  localQaCapabilityCookieToHosted,
   matchGatewayRoute,
 } from "./gateway-policy.ts";
 import {
@@ -349,6 +351,9 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
   let cookie: string | null;
   try {
     cookie = forwardedCapabilityCookie(request.headers.get("cookie"), !isLocal);
+    if (isLocal && upstreamBase.protocol === "https:") {
+      cookie = localQaCapabilityCookieToHosted(cookie);
+    }
   } catch (caught) {
     return jsonError(400, caught instanceof Error ? caught.message : "gênio capability cookie is invalid.");
   }
@@ -398,6 +403,12 @@ async function gateway(request: Request, env: Env, url: URL): Promise<Response> 
     "x-powered-by",
   ]) {
     responseHeaders.delete(name);
+  }
+  if (isLocal && upstreamBase.protocol === "https:") {
+    const localSetCookie = hostedCapabilitySetCookieToLocalQa(
+      responseHeaders.get("set-cookie"),
+    );
+    if (localSetCookie) responseHeaders.set("set-cookie", localSetCookie);
   }
   responseHeaders.set("Cache-Control", "no-store");
   return new Response(responseBody, {
