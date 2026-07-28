@@ -770,7 +770,10 @@ lineage fails. For the one-time `v2.3.4` bootstrap predecessor, those baseline f
 are explicitly reconstruction-wrapper-only evidence. The bootstrap
 `wrapperFixtureEvidenceHash` is derived from three typed staging gate
 artifacts and their detached producer attestations and never claims equality
-with unrecovered historical Railway production outputs.
+with unrecovered historical Railway production outputs. Bootstrap v2
+authorization binds the authenticated Railway observation separately from
+the reconstructed wrapper digest and requires the historical artifact
+identity to remain null with equivalence explicitly `not_claimed`.
 The producer invocation additionally requires the handoff hash; the same seven
 reviewer/baseline pins remain mandatory when
 `release:evidence sign` revalidates the signed producer result. A

@@ -11,11 +11,11 @@ import {
   type StableReleaseConsumerManifestV1,
 } from "./authorize-stable-release.ts";
 import {
-  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
-  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
-  STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1,
-  STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1,
-  validateStablePredecessorBootstrapImageAttestationV1,
+  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
+  SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
+  STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2,
+  STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2,
+  validateStablePredecessorBootstrapImageAttestationV2,
   verifyStablePredecessorBootstrapBundle,
 } from "./stable-predecessor-bootstrap.ts";
 
@@ -129,13 +129,13 @@ function isExactBootstrapPair(
   pair: ReturnType<typeof schemaPair>,
 ): boolean {
   return pair.evidenceEnvelope
-      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1
+      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2
     && pair.evidencePayload
-      === STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V1
+      === STABLE_PREDECESSOR_BOOTSTRAP_EVIDENCE_SCHEMA_V2
     && pair.authorizationEnvelope
-      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1
+      === SIGNED_STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2
     && pair.authorizationPayload
-      === STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V1;
+      === STABLE_PREDECESSOR_BOOTSTRAP_AUTHORIZATION_SCHEMA_V2;
 }
 
 function assertProtectedController(input: {
@@ -200,7 +200,7 @@ export function verifyHistoricalStablePredecessor(
     );
   }
   const imageAttestation =
-    validateStablePredecessorBootstrapImageAttestationV1(
+    validateStablePredecessorBootstrapImageAttestationV2(
       input.imageAttestation,
       input.expectedRepository,
       input.expectedDefaultBranch,

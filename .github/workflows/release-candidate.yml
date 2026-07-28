@@ -17,20 +17,348 @@ concurrency:
 permissions: {}
 
 jobs:
-  authorize:
+  control:
+    environment: release-control-audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      actions: read
-      attestations: read
-      checks: read
       contents: read
-      packages: read
-      pull-requests: read
     env:
       CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RC_TAG_RULESET_ID: "19863848"
+    outputs:
+      candidate_tag: ${{ steps.candidate.outputs.candidate_tag }}
+      candidate_tag_object: ${{ steps.candidate.outputs.tag_object }}
+      candidate_tag_target: ${{ steps.candidate.outputs.tag_target }}
+      controller_revision: ${{ steps.candidate.outputs.controller_revision }}
+    steps:
+      - id: control_auditor
+        name: Mint the repository-scoped release control auditor token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+          private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}
+          permission-actions: read
+          # GitHub omits ruleset bypass_actors from read-only callers. This App
+          # has no mutation credential; Administration write exists only so the
+          # immutable ruleset can be inspected exactly.
+          permission-administration: write
+          permission-checks: read
+          permission-contents: read
+          permission-pull-requests: read
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: candidate
+        name: Fence the controller and exact annotated candidate tag
+        env:
+          CLIENT_PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml@refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          node -e 'const value=JSON.parse(process.env.CLIENT_PAYLOAD_JSON??"null"); if(!value||typeof value!=="object"||Array.isArray(value)||Object.keys(value).sort().join(",")!=="candidate_tag") throw new Error("release dispatch accepts exactly one client_payload key: candidate_tag");'
+          case "$CANDIDATE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-rc.[1-9]*) ;;
+            *) echo "candidate tag is invalid" >&2; exit 1 ;;
+          esac
+          git fetch --force origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          CONTROLLER_REVISION="$(git rev-parse HEAD)"
+          TAG_OBJECT="$(git rev-parse "refs/tags/$CANDIDATE_TAG")"
+          test "$(git cat-file -t "$TAG_OBJECT")" = "tag"
+          TAG_TARGET="$(git rev-parse "$TAG_OBJECT^{}")"
+          test "$CONTROLLER_REVISION" = "$GITHUB_SHA"
+          test "$CONTROLLER_REVISION" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test "$TAG_TARGET" = "$CONTROLLER_REVISION"
+          echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_object=$TAG_OBJECT" >> "$GITHUB_OUTPUT"
+          echo "tag_target=$TAG_TARGET" >> "$GITHUB_OUTPUT"
+          echo "controller_revision=$CONTROLLER_REVISION" >> "$GITHUB_OUTPUT"
+      - name: Verify exact repository, review, CI, environment, and tag controls
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.tag_target }}
+          CONTROL_AUDITOR_APP_ID: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+        with:
+          github-token: ${{ steps.control_auditor.outputs.token }}
+          script: |
+            const fail = (message) => {
+              throw new Error(`release control audit: ${message}`);
+            };
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const defaultBranch = context.payload.repository?.default_branch;
+            const requiredChecks = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
+            if (
+              context.payload.repository?.fork !== false
+              || context.ref !== `refs/heads/${defaultBranch}`
+              || context.sha !== process.env.CANDIDATE_SHA
+            ) {
+              fail("controller is forked, stale, or not the default-branch head");
+            }
+            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            if (!["admin", "maintain"].includes(permission.data.permission)) {
+              fail("release dispatch requires maintain or admin permission");
+            }
+            const [branch, protection, githubActionsApp] = await Promise.all([
+              github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: defaultBranch,
+              }),
+              github.rest.repos.getBranchProtection({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: defaultBranch,
+              }),
+              github.rest.apps.getBySlug({ app_slug: "github-actions" }),
+            ]);
+            const githubActionsAppId = Number(githubActionsApp.data.id);
+            const controlAuditorAppId = Number(
+              process.env.CONTROL_AUDITOR_APP_ID,
+            );
+            if (
+              branch.data.protected !== true
+              || branch.data.commit.sha !== process.env.CANDIDATE_SHA
+              || githubActionsApp.data.slug !== "github-actions"
+              || !Number.isSafeInteger(githubActionsAppId)
+              || githubActionsAppId <= 0
+              || !Number.isSafeInteger(controlAuditorAppId)
+              || controlAuditorAppId <= 0
+              || controlAuditorAppId === githubActionsAppId
+            ) {
+              fail("branch or release-control Integration identity is invalid");
+            }
+            const configuredChecks =
+              protection.data.required_status_checks?.checks ?? [];
+            const configuredCheckNames = configuredChecks
+              .map(({ context: name }) => name)
+              .sort();
+            if (
+              protection.data.required_status_checks?.strict !== true
+              || configuredChecks.length !== requiredChecks.length
+              || JSON.stringify(configuredCheckNames)
+                !== JSON.stringify([...requiredChecks].sort())
+              || configuredChecks.some(({ app_id: appId }) =>
+                Number(appId) !== githubActionsAppId
+              )
+              || protection.data.required_pull_request_reviews
+                ?.required_approving_review_count !== 0
+              || protection.data.required_pull_request_reviews
+                ?.dismiss_stale_reviews !== true
+              || protection.data.required_pull_request_reviews
+                ?.require_code_owner_reviews !== false
+              || protection.data.required_pull_request_reviews
+                ?.require_last_push_approval !== false
+              || protection.data.enforce_admins?.enabled !== true
+              || protection.data.required_conversation_resolution?.enabled
+                !== true
+              || protection.data.allow_force_pushes?.enabled !== false
+              || protection.data.allow_deletions?.enabled !== false
+            ) {
+              fail("default-branch protection differs from the exact release policy");
+            }
+            const pulls = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: process.env.CANDIDATE_SHA,
+                per_page: 100,
+              },
+            );
+            const mergedPulls = pulls.filter((pull) =>
+              pull.merged_at
+              && pull.base.ref === defaultBranch
+              && pull.merge_commit_sha === process.env.CANDIDATE_SHA
+            );
+            if (mergedPulls.length !== 1) {
+              fail("candidate must be exactly one merged default-branch PR");
+            }
+            const trustedWorkflowPath = ".github/workflows/ci.yml";
+            const trustedWorkflow = await github.rest.actions.getWorkflow({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: trustedWorkflowPath,
+            });
+            if (
+              trustedWorkflow.data.path !== trustedWorkflowPath
+              || trustedWorkflow.data.state !== "active"
+            ) {
+              fail("trusted CI workflow is not active on the default branch");
+            }
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: trustedWorkflow.data.id,
+                branch: defaultBranch,
+                event: "push",
+                status: "completed",
+                head_sha: process.env.CANDIDATE_SHA,
+                per_page: 100,
+              },
+            );
+            const trustedRuns = workflowRuns.filter((run) =>
+              run.workflow_id === trustedWorkflow.data.id
+              && run.path === trustedWorkflowPath
+              && run.event === "push"
+              && run.head_branch === defaultBranch
+              && run.head_sha === process.env.CANDIDATE_SHA
+              && run.repository?.full_name === repository
+              && run.head_repository?.full_name === repository
+              && run.conclusion === "success"
+            ).sort((left, right) =>
+              Number(right.run_attempt ?? 0) - Number(left.run_attempt ?? 0)
+            );
+            const trustedRun = trustedRuns[0];
+            if (!trustedRun?.check_suite_id) {
+              fail("candidate has no successful trusted default-branch CI run");
+            }
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForSuite,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                check_suite_id: trustedRun.check_suite_id,
+                filter: "latest",
+                per_page: 100,
+              },
+            );
+            const latestChecks = new Map();
+            for (const check of checkRuns) {
+              if (
+                check.head_sha !== process.env.CANDIDATE_SHA
+                || check.app?.id !== githubActionsAppId
+                || check.app?.slug !== "github-actions"
+                || check.check_suite?.id !== trustedRun.check_suite_id
+              ) {
+                fail("candidate check provenance is not the trusted App-bound suite");
+              }
+              const prior = latestChecks.get(check.name);
+              if (!prior || Date.parse(check.completed_at ?? check.started_at ?? "0")
+                > Date.parse(prior.completed_at ?? prior.started_at ?? "0")) {
+                latestChecks.set(check.name, check);
+              }
+            }
+            if (
+              latestChecks.size !== requiredChecks.length
+              || requiredChecks.some((name) =>
+                latestChecks.get(name)?.conclusion !== "success"
+              )
+            ) {
+              fail("candidate does not have the exact successful App-bound checks");
+            }
+            for (const environmentName of [
+              "release-control-audit",
+              "release-candidate",
+            ]) {
+              const environment = await github.request(
+                "GET /repos/{owner}/{repo}/environments/{environment_name}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  environment_name: environmentName,
+                },
+              );
+              const reviewerRule = (environment.data.protection_rules ?? [])
+                .find((rule) => rule.type === "required_reviewers");
+              if (
+                environment.data.name !== environmentName
+                || environment.data.can_admins_bypass !== false
+                || environment.data.deployment_branch_policy?.protected_branches
+                  !== true
+                || environment.data.deployment_branch_policy
+                  ?.custom_branch_policies !== false
+                || !reviewerRule
+                || !Array.isArray(reviewerRule.reviewers)
+                || reviewerRule.reviewers.length !== 1
+                || reviewerRule.reviewers[0]?.type !== "User"
+                || reviewerRule.reviewers[0]?.reviewer?.login?.toLowerCase()
+                  !== context.repo.owner.toLowerCase()
+                || environment.data.prevent_self_review === true
+                || reviewerRule.prevent_self_review === true
+              ) {
+                fail(`${environmentName} lacks exact solo-owner manual approval`);
+              }
+            }
+            const immutableReleases = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            if (immutableReleases.data.enabled !== true) {
+              fail("repository immutable Releases are not enabled");
+            }
+            const rulesetId = Number(process.env.RC_TAG_RULESET_ID);
+            const ruleset = await github.request(
+              "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ruleset_id: rulesetId,
+              },
+            );
+            const ruleTypes = (ruleset.data.rules ?? [])
+              .map(({ type }) => type)
+              .sort();
+            if (
+              rulesetId !== 19863848
+              || ruleset.data.target !== "tag"
+              || ruleset.data.enforcement !== "active"
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.include ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*-rc.*"])
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.exclude ?? [])].sort(),
+              ) !== JSON.stringify([])
+              || JSON.stringify(ruleTypes)
+                !== JSON.stringify(["deletion", "update"])
+              || (ruleset.data.bypass_actors ?? []).length !== 0
+            ) {
+              fail("immutable RC tag ruleset 19863848 differs from policy");
+            }
+
+  authorize:
+    needs: [control]
+    environment: release-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    env:
+      CANDIDATE_TAG: ${{ needs.control.outputs.candidate_tag }}
+      EXPECTED_CANDIDATE_TAG_OBJECT: ${{ needs.control.outputs.candidate_tag_object }}
+      EXPECTED_CANDIDATE_TAG_TARGET: ${{ needs.control.outputs.candidate_tag_target }}
+      EXPECTED_CONTROLLER_REVISION: ${{ needs.control.outputs.controller_revision }}
     outputs:
       candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
+      candidate_tag_object: ${{ steps.identity.outputs.candidate_tag_object }}
+      candidate_tag_target: ${{ steps.identity.outputs.candidate_tag_target }}
+      controller_revision: ${{ steps.identity.outputs.controller_revision }}
       source_revision: ${{ steps.identity.outputs.source_revision }}
       version: ${{ steps.identity.outputs.version }}
       image: ${{ steps.identity.outputs.image }}
@@ -53,16 +381,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Require a closed release-dispatch payload
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            const keys = Object.keys(context.payload.client_payload ?? {}).sort();
-            if (keys.length !== 1 || keys[0] !== "candidate_tag") {
-              core.setFailed("release dispatch accepts exactly one client_payload key: candidate_tag");
-            }
       - id: release_authority
         name: Pin the release verification authority
         env:
@@ -71,16 +392,32 @@ jobs:
           RELEASE_STABLE_AUTHORIZER_KEY_ID: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_ID }}
           RELEASE_STABLE_AUTHORIZER_KEY_SHA256: ${{ vars.RELEASE_STABLE_AUTHORIZER_KEY_SHA256 }}
         run: |
+          if [[ "$RELEASE_VERIFICATION_KEY_SHA256" == "<64-hex>" || "$RELEASE_VERIFICATION_KEY_SHA256" == "<real_64_hex>" || "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^0{64}$ ]]; then
+            echo "RELEASE_VERIFICATION_KEY_SHA256 is still a placeholder." >&2
+            exit 1
+          fi
           if [[ ! "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "RELEASE_VERIFICATION_KEY_SHA256 must be a configured lowercase SHA-256 digest." >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" == "<64-hex>" || "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" == "<real_64_hex>" || "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^0{64}$ ]]; then
+            echo "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 is still a placeholder." >&2
             exit 1
           fi
           if [[ ! "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 must pin the protected source/producer authority set and fixture registry." >&2
             exit 1
           fi
+          if [[ "$RELEASE_STABLE_AUTHORIZER_KEY_ID" == "<key-id>" || "$RELEASE_STABLE_AUTHORIZER_KEY_ID" == "<real_key_id>" ]]; then
+            echo "RELEASE_STABLE_AUTHORIZER_KEY_ID is still a placeholder." >&2
+            exit 1
+          fi
           if [[ ! "$RELEASE_STABLE_AUTHORIZER_KEY_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:+/-]{2,159}$ ]]; then
             echo "RELEASE_STABLE_AUTHORIZER_KEY_ID must pin the protected stable authorizer." >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" == "<64-hex>" || "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" == "<real_64_hex>" || "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" =~ ^0{64}$ ]]; then
+            echo "RELEASE_STABLE_AUTHORIZER_KEY_SHA256 is still a placeholder." >&2
             exit 1
           fi
           if [[ ! "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" =~ ^[0-9a-f]{64}$ || "$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" = "$RELEASE_VERIFICATION_KEY_SHA256" ]]; then
@@ -92,145 +429,26 @@ jobs:
           echo "stable_authorizer_key_id=$RELEASE_STABLE_AUTHORIZER_KEY_ID" >> "$GITHUB_OUTPUT"
           echo "stable_authorizer_key_sha256=$RELEASE_STABLE_AUTHORIZER_KEY_SHA256" >> "$GITHUB_OUTPUT"
       - id: candidate
-        name: Resolve merged candidate from the trusted default branch
+        name: Reverify the authorized controller and annotated candidate tag
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          case "$CANDIDATE_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*-rc.[1-9]*) ;;
-            *) echo "candidate tag is invalid" >&2; exit 1 ;;
-          esac
-          git fetch --force --tags origin
-          test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
-          CANDIDATE_SHA="$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")"
-          test "$CANDIDATE_SHA" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
-          test "$CANDIDATE_SHA" = "$GITHUB_SHA"
+          git fetch --force origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          CANDIDATE_TAG_OBJECT="$(git rev-parse "refs/tags/$CANDIDATE_TAG")"
+          test "$(git cat-file -t "$CANDIDATE_TAG_OBJECT")" = "tag"
+          CANDIDATE_SHA="$(git rev-parse "$CANDIDATE_TAG_OBJECT^{}")"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$(git rev-parse "origin/$DEFAULT_BRANCH")" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$GITHUB_SHA" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$CANDIDATE_TAG_OBJECT" = "$EXPECTED_CANDIDATE_TAG_OBJECT"
+          test "$CANDIDATE_SHA" = "$EXPECTED_CANDIDATE_TAG_TARGET"
+          test "$CANDIDATE_SHA" = "$EXPECTED_CONTROLLER_REVISION"
           echo "sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
-      - name: Require an authorized dispatcher, merged PR, and green checks
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
-        with:
-          script: |
-            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              username: context.actor,
-            });
-            if (!["admin", "maintain"].includes(permission.data.permission)) {
-              core.setFailed("release dispatch requires maintain or admin permission");
-              return;
-            }
-            const pulls = await github.paginate(
-              github.rest.repos.listPullRequestsAssociatedWithCommit,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: process.env.CANDIDATE_SHA,
-                per_page: 100,
-              },
-            );
-            const merged = pulls.find((pull) =>
-              pull.merged_at
-              && pull.base.ref === context.payload.repository.default_branch
-              && pull.merge_commit_sha === process.env.CANDIDATE_SHA
-            );
-            if (!merged) {
-              core.setFailed("candidate must be the merge commit of a PR into the default branch");
-              return;
-            }
-            const trustedWorkflowPath = ".github/workflows/ci.yml";
-            const trustedWorkflow = await github.rest.actions.getWorkflow({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: trustedWorkflowPath,
-            });
-            if (
-              trustedWorkflow.data.path !== trustedWorkflowPath
-              || trustedWorkflow.data.state !== "active"
-            ) {
-              core.setFailed("trusted CI workflow identity is not active on the default branch");
-              return;
-            }
-            const workflowRuns = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: trustedWorkflow.data.id,
-                branch: context.payload.repository.default_branch,
-                event: "push",
-                status: "completed",
-                head_sha: process.env.CANDIDATE_SHA,
-                per_page: 100,
-              },
-            );
-            const repository = `${context.repo.owner}/${context.repo.repo}`;
-            const trustedRuns = workflowRuns.filter((run) =>
-              run.workflow_id === trustedWorkflow.data.id
-              && run.path === trustedWorkflowPath
-              && run.event === "push"
-              && run.head_branch === context.payload.repository.default_branch
-              && run.head_sha === process.env.CANDIDATE_SHA
-              && run.repository?.full_name === repository
-              && run.head_repository?.full_name === repository
-              && run.conclusion === "success"
-            );
-            trustedRuns.sort((left, right) =>
-              Number(right.run_attempt ?? 0) - Number(left.run_attempt ?? 0)
-            );
-            const trustedRun = trustedRuns[0];
-            if (!trustedRun || !trustedRun.check_suite_id) {
-              core.setFailed(
-                "candidate has no successful default-branch run of the trusted CI workflow",
-              );
-              return;
-            }
-            const checkRuns = await github.paginate(
-              github.rest.checks.listForSuite,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                check_suite_id: trustedRun.check_suite_id,
-                filter: "latest",
-                per_page: 100,
-              },
-            );
-            const untrustedChecks = checkRuns.filter((run) =>
-              run.head_sha !== process.env.CANDIDATE_SHA
-              || run.app?.slug !== "github-actions"
-              || run.check_suite?.id !== trustedRun.check_suite_id
-            );
-            if (untrustedChecks.length) {
-              core.setFailed(
-                "candidate checks do not share the trusted GitHub Actions workflow provenance",
-              );
-              return;
-            }
-            const required = [
-              "static",
-              "policy",
-              "unit-and-database",
-              "production-database-compatibility",
-              "browser (mobile-320)",
-              "browser (mobile-390)",
-              "browser (mobile-430)",
-              "browser (desktop)",
-            ];
-            const latest = new Map();
-            for (const run of checkRuns) {
-              const prior = latest.get(run.name);
-              if (!prior || Date.parse(run.completed_at ?? run.started_at ?? "0")
-                > Date.parse(prior.completed_at ?? prior.started_at ?? "0")) {
-                latest.set(run.name, run);
-              }
-            }
-            const failed = required.filter((name) =>
-              latest.get(name)?.conclusion !== "success"
-            );
-            if (failed.length) {
-              core.setFailed(`candidate required checks are not green: ${failed.join(", ")}`);
-            }
+          echo "tag_object=$CANDIDATE_TAG_OBJECT" >> "$GITHUB_OUTPUT"
+          echo "tag_target=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "controller_revision=$EXPECTED_CONTROLLER_REVISION" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.candidate.outputs.sha }}
@@ -240,13 +458,19 @@ jobs:
         with:
           node-version: 22.19.0
       - name: Verify annotated RC identity
-        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+        run: |
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$EXPECTED_CANDIDATE_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$EXPECTED_CANDIDATE_TAG_TARGET"
+          node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
       - id: identity
         name: Resolve candidate identity
         env:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "candidate_tag_object=${{ steps.candidate.outputs.tag_object }}" >> "$GITHUB_OUTPUT"
+          echo "candidate_tag_target=${{ steps.candidate.outputs.tag_target }}" >> "$GITHUB_OUTPUT"
+          echo "controller_revision=${{ steps.candidate.outputs.controller_revision }}" >> "$GITHUB_OUTPUT"
           echo "source_revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${REPOSITORY_OWNER,,}/genio" >> "$GITHUB_OUTPUT"
@@ -419,18 +643,6 @@ jobs:
             if (!candidateVersion) fail("candidate version is invalid");
             if (!SOURCE_REVISION.test(process.env.CANDIDATE_SHA ?? "")) {
               fail("candidate source revision is invalid");
-            }
-
-            const immutableReleases = await github.request(
-              "GET /repos/{owner}/{repo}/immutable-releases",
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                headers: { "X-GitHub-Api-Version": "2026-03-10" },
-              },
-            );
-            if (immutableReleases.data.enabled !== true) {
-              fail("repository immutable releases are not enabled");
             }
 
             const [releases, stableTagRefs] = await Promise.all([
@@ -660,13 +872,13 @@ jobs:
                 === "genio-stable-release-authorization/v2";
             const bootstrapSchemaPair =
               evidenceSchema
-                === "genio-signed-stable-predecessor-bootstrap-evidence/v1"
+                === "genio-signed-stable-predecessor-bootstrap-evidence/v2"
               && evidencePayloadSchema
-                === "genio-stable-predecessor-bootstrap-evidence/v1"
+                === "genio-stable-predecessor-bootstrap-evidence/v2"
               && authorizationSchema
-                === "genio-signed-stable-predecessor-bootstrap-authorization/v1"
+                === "genio-signed-stable-predecessor-bootstrap-authorization/v2"
               && authorizationPayloadSchema
-                === "genio-stable-predecessor-bootstrap-authorization/v1";
+                === "genio-stable-predecessor-bootstrap-authorization/v2";
             if (normalSchemaPair === bootstrapSchemaPair) {
               fail(
                 "evidence and authorization must use one exact supported schema pair",
@@ -979,7 +1191,7 @@ jobs:
                 || metadata.version !== "2.3.4"
                 || metadata.sourceRevision !== BOOTSTRAP_SOURCE_REVISION
                 || bootstrapPayload.schemaVersion
-                  !== "genio-stable-predecessor-bootstrap-evidence/v1"
+                  !== "genio-stable-predecessor-bootstrap-evidence/v2"
                 || bootstrapPayload.issuer
                   !== "genio-protected-stable-predecessor-bootstrap-producer"
                 || bootstrapPayload.kind !== "stable_predecessor_bootstrap"
@@ -1056,6 +1268,12 @@ jobs:
                 || !bootstrapPayload.limitations.includes(
                   "wrapper_fixture_evidence_does_not_prove_historical_production_output_equivalence",
                 )
+                || !bootstrapPayload.limitations.includes(
+                  "recovered_railway_observations_lacked_registry_reference_manifest_config_and_attestation_bytes",
+                )
+                || !bootstrapPayload.limitations.includes(
+                  "no_historical_railway_artifact_identity_or_equivalence_is_claimed",
+                )
               ) {
                 fail(
                   "bootstrap evidence does not bind the exact wrapper-only fixture/browser source set",
@@ -1099,11 +1317,11 @@ jobs:
                   "producerKeySha256",
                   "sitesKeyId",
                   "sitesKeySha256",
-                  "originalRailwayProvenancePayloadHash",
-                  "originalRailwayProvenanceArtifactHash",
-                  "originalRailwayProvenanceKeyId",
-                  "originalRailwayProvenanceKeySha256",
-                  "originalRailwayImageDigest",
+                  "railwayObservationKind",
+                  "wrapperReconstructionMode",
+                  "wrapperImageDigest",
+                  "historicalArtifactEquivalence",
+                  "historicalArtifactIdentity",
                 ],
                 "bootstrap predecessor authorization payload",
               );
@@ -1117,7 +1335,7 @@ jobs:
               );
               if (
                 authorizationPayload.schemaVersion
-                  !== "genio-stable-predecessor-bootstrap-authorization/v1"
+                  !== "genio-stable-predecessor-bootstrap-authorization/v2"
                 || authorizationPayload.issuer
                   !== "genio-protected-stable-predecessor-bootstrap-authorizer"
                 || authorizationPayload.action
@@ -1162,29 +1380,22 @@ jobs:
                 || !SHA256.test(
                   authorizationPayload.sitesKeySha256 ?? "",
                 )
-                || !SHA256.test(
-                  authorizationPayload.originalRailwayProvenancePayloadHash
-                    ?? "",
-                )
-                || !SHA256.test(
-                  authorizationPayload.originalRailwayProvenanceArtifactHash
-                    ?? "",
-                )
-                || !SIGNING_KEY_ID.test(
-                  authorizationPayload.originalRailwayProvenanceKeyId ?? "",
-                )
-                || !SHA256.test(
-                  authorizationPayload.originalRailwayProvenanceKeySha256
-                    ?? "",
-                )
                 || !IMAGE_DIGEST.test(
-                  authorizationPayload.originalRailwayImageDigest ?? "",
+                  authorizationPayload.wrapperImageDigest ?? "",
                 )
+                || authorizationPayload.railwayObservationKind
+                  !== "authenticated_platform_observation_not_supply_chain_attestation"
+                || authorizationPayload.wrapperReconstructionMode
+                  !== "controller_recipe_wrapper_not_historical_railway_artifact"
+                || authorizationPayload.wrapperImageDigest
+                  !== bootstrapCandidate.imageDigest
+                || authorizationPayload.historicalArtifactEquivalence
+                  !== "not_claimed"
+                || authorizationPayload.historicalArtifactIdentity !== null
                 || new Set([
                   authorizationPayload.producerKeySha256,
                   authorizationPayload.sitesKeySha256,
-                  authorizationPayload.originalRailwayProvenanceKeySha256,
-                ]).size !== 3
+                ]).size !== 2
               ) {
                 fail(
                   "bootstrap authorization does not bind the exact predecessor evidence",
@@ -1285,8 +1496,7 @@ jobs:
                   stableAuthorizerKeySha256,
                   authorization.payload.producerKeySha256,
                   authorization.payload.sitesKeySha256,
-                  authorization.payload.originalRailwayProvenanceKeySha256,
-                ]).size !== 5
+                ]).size !== 4
               )
               || verifiedAt < authorizationGeneratedAt - 5 * 60 * 1000
               || verifiedAt >= authorizationExpiresAt
@@ -1323,6 +1533,8 @@ jobs:
                   "historicalBuildIntentSha256",
                   "builderIdentity",
                   "reconstructionMode",
+                  "historicalArtifactEquivalence",
+                  "historicalArtifactIdentity",
                   "subjectImageReference",
                   "subjectImageDigest",
                   "historicalSourceRevision",
@@ -1341,7 +1553,7 @@ jobs:
               );
               if (
                 imageAttestation.schemaVersion
-                  !== "genio-stable-predecessor-bootstrap-image-attestation/v1"
+                  !== "genio-stable-predecessor-bootstrap-image-attestation/v2"
                 || imageAttestation.repository
                   !== `${context.repo.owner}/${context.repo.repo}`
                 || imageAttestation.workflow
@@ -1352,6 +1564,19 @@ jobs:
                   !== controllerSourceRevision
                 || imageAttestation.controllerRecipeSourceRevision
                   !== controllerSourceRevision
+                || imageAttestation.reconstructionMode
+                  !== "controller_recipe_wrapper_not_historical_railway_artifact"
+                || imageAttestation.historicalArtifactEquivalence
+                  !== "not_claimed"
+                || imageAttestation.historicalArtifactIdentity !== null
+                || imageAttestation.recoveredRailwayObservation?.kind
+                  !== "authenticated_platform_observation_not_supply_chain_attestation"
+                || imageAttestation.recoveredRailwayObservation?.capture
+                  ?.registryReferenceRecovered !== false
+                || imageAttestation.recoveredRailwayObservation?.capture
+                  ?.manifestBytesRecovered !== false
+                || imageAttestation.recoveredRailwayObservation?.capture
+                  ?.supplyChainAttestationRecovered !== false
                 || imageAttestation.subjectImageReference
                   !== metadata.imageReference
                 || imageAttestation.subjectImageDigest
@@ -1388,6 +1613,8 @@ jobs:
                   `Wrapper-Image-Digest: ${metadata.imageDigest}`,
                   "Railway-Observation-Kind: authenticated_platform_observation_not_supply_chain_attestation",
                   "Wrapper-Limitation: not historical Railway artifact",
+                  "Historical-Artifact-Equivalence: not claimed",
+                  "Historical-Artifact-Identity: unavailable",
                   `Bootstrap-Evidence-SHA256: ${finalization.payloadHash}`,
                   `Protected-Semantic-Baseline-SHA256: ${metadataSha256}`,
                   `Bootstrap-Authorization-SHA256: ${authorization.payloadHash}`,
@@ -1642,6 +1869,9 @@ jobs:
           --health-retries 10
     env:
       CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.authorize.outputs.candidate_tag_object }}
+      CANDIDATE_TAG_TARGET: ${{ needs.authorize.outputs.candidate_tag_target }}
+      CONTROLLER_REVISION: ${{ needs.authorize.outputs.controller_revision }}
       DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
       APP_ORIGIN: http://localhost:3000
       RAILWAY_API_BASE: http://127.0.0.1:8788
@@ -1936,7 +2166,11 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - name: Verify annotated RC identity
-        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+        run: |
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$CANDIDATE_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$CANDIDATE_TAG_TARGET"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_TAG_TARGET"
+          node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
       - run: pnpm install --frozen-lockfile
       - name: Reclaim known package-manager caches before build
         run: |
@@ -1991,6 +2225,9 @@ jobs:
         project: [mobile-320, mobile-390, mobile-430, desktop]
     env:
       CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.authorize.outputs.candidate_tag_object }}
+      CANDIDATE_TAG_TARGET: ${{ needs.authorize.outputs.candidate_tag_target }}
+      CONTROLLER_REVISION: ${{ needs.authorize.outputs.controller_revision }}
       OWNER_EMAIL: owner@example.com
       OWNER_ALLOWLIST_VERSION: rc-owner-allowlist-v1
     steps:
@@ -2007,7 +2244,11 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - name: Verify annotated RC identity
-        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+        run: |
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$CANDIDATE_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$CANDIDATE_TAG_TARGET"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_TAG_TARGET"
+          node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
       - run: pnpm install --frozen-lockfile
       - name: Install only headless browser engines
         run: pnpm exec playwright install --with-deps chromium-headless-shell webkit
@@ -2061,6 +2302,9 @@ jobs:
           --health-retries 10
     env:
       CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.authorize.outputs.candidate_tag_object }}
+      CANDIDATE_TAG_TARGET: ${{ needs.authorize.outputs.candidate_tag_target }}
+      CONTROLLER_REVISION: ${{ needs.authorize.outputs.controller_revision }}
       DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
       APP_ORIGIN: http://localhost:3000
       RAILWAY_API_BASE: http://127.0.0.1:8788
@@ -2086,7 +2330,11 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - name: Verify annotated RC identity
-        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+        run: |
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$CANDIDATE_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$CANDIDATE_TAG_TARGET"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_TAG_TARGET"
+          node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
       - run: pnpm install --frozen-lockfile
       - name: Reclaim known package-manager caches before production-database QA
         run: |
@@ -2127,6 +2375,9 @@ jobs:
           --health-retries 10
     env:
       CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.authorize.outputs.candidate_tag_object }}
+      CANDIDATE_TAG_TARGET: ${{ needs.authorize.outputs.candidate_tag_target }}
+      CONTROLLER_REVISION: ${{ needs.authorize.outputs.controller_revision }}
       DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
       APP_ORIGIN: http://localhost:3000
       RAILWAY_API_BASE: http://127.0.0.1:8788
@@ -2152,7 +2403,11 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - name: Verify annotated RC identity
-        run: node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
+        run: |
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$CANDIDATE_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$CANDIDATE_TAG_TARGET"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_TAG_TARGET"
+          node scripts/check-release.mjs --require-exact-tag "$CANDIDATE_TAG"
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:database:preflight
       - run: pnpm db:migrate
@@ -2197,6 +2452,10 @@ jobs:
       packages: write
     env:
       CANDIDATE_TAG: ${{ needs.authorize.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.authorize.outputs.candidate_tag_object }}
+      CANDIDATE_TAG_TARGET: ${{ needs.authorize.outputs.candidate_tag_target }}
+      CONTROLLER_REVISION: ${{ needs.authorize.outputs.controller_revision }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       SOURCE_REVISION: ${{ needs.authorize.outputs.source_revision }}
       RELEASE_VERSION: ${{ needs.authorize.outputs.version }}
       IMAGE: ${{ needs.authorize.outputs.image }}
@@ -2464,6 +2723,51 @@ jobs:
                 "authorized predecessor changed after the candidate build",
               );
             }
+      - name: Reread and fence the controller and annotated candidate tag
+        run: |
+          git fetch --force origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          test "$GITHUB_SHA" = "$CONTROLLER_REVISION"
+          test "$(git rev-parse "origin/$DEFAULT_BRANCH")" = "$CONTROLLER_REVISION"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG")" = "$CANDIDATE_TAG_OBJECT"
+          test "$(git cat-file -t "$CANDIDATE_TAG_OBJECT")" = "tag"
+          test "$(git rev-parse "$CANDIDATE_TAG_OBJECT^{}")" = "$CANDIDATE_TAG_TARGET"
+          test "$CANDIDATE_TAG_TARGET" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+      - name: Refuse to overwrite differently bound GHCR aliases
+        env:
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if [[ ! "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "the registry-free build did not expose an immutable image digest" >&2
+            exit 1
+          fi
+          inspect_alias() {
+            local alias_name="$1"
+            local safe_name="${alias_name//[^0-9A-Za-z_.-]/_}"
+            local descriptor_file="$RUNNER_TEMP/ghcr-$safe_name.json"
+            local error_file="$RUNNER_TEMP/ghcr-$safe_name.err"
+            if docker buildx imagetools inspect \
+              "$IMAGE:$alias_name" \
+              --format '{{json .Manifest}}' \
+              > "$descriptor_file" 2> "$error_file"; then
+              local observed
+              observed="$(node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const digest=value.digest??value.Digest; if(!/^sha256:[0-9a-f]{64}$/.test(digest??"")) throw new Error("registry alias descriptor has no immutable digest"); process.stdout.write(digest);' "$descriptor_file")"
+              if [[ "$observed" != "$EXPECTED_DIGEST" ]]; then
+                echo "$IMAGE:$alias_name already binds $observed, not $EXPECTED_DIGEST" >&2
+                exit 1
+              fi
+            elif grep -Eiq 'manifest unknown|not found|404' "$error_file"; then
+              :
+            else
+              cat "$error_file" >&2
+              echo "could not determine whether $IMAGE:$alias_name already exists" >&2
+              exit 1
+            fi
+          }
+          inspect_alias "$CANDIDATE_TAG"
+          inspect_alias "sha-$SOURCE_REVISION"
       - id: push
         name: Push the already-built candidate only after the final fence
         run: |

@@ -37,6 +37,10 @@ const approvedPins = new Map([
     "f28e40c7f34bde8b3046d885e986cb6290c5673b",
   ],
   [
+    "actions/create-github-app-token",
+    "bcd2ba49218906704ab6c1aa796996da409d3eb1",
+  ],
+  [
     "docker/setup-buildx-action",
     "8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
   ],

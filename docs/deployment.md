@@ -130,6 +130,11 @@ logs, or signs the raw secret values.
 
 ## Release procedure
 
+Use the create-only, self-verifying commands in
+[`release-artifact-authoring.md`](./release-artifact-authoring.md) to produce
+protected baseline, finalization-source, bootstrap, authorization, and bounded
+dispatch artifacts. Those commands never dispatch or publish.
+
 1. Prepare the semantic release with `pnpm release:new -- patch|minor|major --title "…" --note "…"`. Repeat `--note` for every user-visible change. This bumps `package.json` and prepends the same version, date, and notes shown on `/about`.
 2. Review the pull request and require every named branch check to pass. Merge
    through the protected default branch. Create an annotated
@@ -697,26 +702,35 @@ logs, or signs the raw secret values.
     controller workflow bytes from Git, reconstructs the exact Git object IDs,
     and compares byte-derived SHA-256 commitments with the signed bootstrap
     evidence; operator-entered digest summaries are not accepted. The
-    publisher remains fail-closed unless the dispatch includes a bounded
-    `genio-signed-stable-predecessor-original-railway-provenance/v1`
-    envelope. That envelope must be signed by the independently operated key
-    pinned in
-    `RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_ID`,
-    `RELEASE_ORIGINAL_RAILWAY_PROVENANCE_KEY_SHA256`, and
-    `RELEASE_ORIGINAL_RAILWAY_PROVENANCE_PUBLIC_KEY_B64URL`; it must bind the
-    exact historical source/tree, all three fixed Railway deployment IDs, the
-    canonical recovered observation hash, and an immutable registry
-    manifest digest. A caller-entered digest without that signature cannot
-    pass. The authorization and publication verifier also require
+    publisher remains fail-closed on the exact canonical recovered Railway
+    observation. It validates all three fixed deployment records and retained
+    build-log commitments, and requires the capture to state that no registry
+    reference, manifest/config bytes, SBOM, or supply-chain attestation was
+    recovered. There is deliberately no caller-entered "original Railway
+    image" reference and no signature that can turn an unknown historical
+    artifact identity into a verified claim. The separately attested GHCR
+    image is only the deterministic reconstruction wrapper.
+
+    Bootstrap evidence, image attestation, and authorization use the v2
+    reduced-claim schemas. The signed authorization binds the canonical
+    Railway observation hash and its
+    `authenticated_platform_observation_not_supply_chain_attestation` kind,
+    plus the wrapper digest and
+    `controller_recipe_wrapper_not_historical_railway_artifact` mode. It must
+    also contain `historicalArtifactEquivalence: "not_claimed"` and a null
+    `historicalArtifactIdentity`; any historical artifact reference, digest,
+    or equivalence claim is rejected. The authorization and publication
+    verifier still require
     `RELEASE_SITES_CONTROL_PLANE_KEY_ID`,
     `RELEASE_SITES_CONTROL_PLANE_KEY_SHA256`, and the protected
     `RELEASE_SITES_CONTROL_PLANE_VERIFICATION_KEY_B64URL`. Missing, expired,
     mismatched, or substituted evidence blocks before publication. The signed
-    bootstrap authorization retains the original-Railway proof hash and
-    verifier identity. Immediately before the Release API mutation, the
-    workflow rereads stable tags and Releases under the shared mutation lock
-    and requires `v2.3.4` to remain the greatest exact stable identity. Every
-    ordinary stable release uses `stable-release.yml`.
+    bootstrap authorization requires four distinct protected authorities:
+    release signer, stable authorizer, gate producer, and Sites control plane.
+    Immediately before the Release API mutation, the workflow rereads stable
+    tags and Releases under the shared mutation lock and requires `v2.3.4` to
+    remain the greatest exact stable identity. Every ordinary stable release
+    uses `stable-release.yml`.
 
     Before any ref or Release write, `stable-release.yml` verifies the exact
     annotated RC/default-branch SHA/package version/image digest, full

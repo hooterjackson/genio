@@ -27,10 +27,7 @@ const workflowUrl = new URL(
   import.meta.url,
 );
 const workflowsDirectory = new URL("../.github/workflows/", import.meta.url);
-const exactContentsWriters = new Set([
-  "bootstrap-stable-predecessor.yml#publish",
-  "stable-release.yml#publish",
-]);
+const exactContentsWriters = new Set<string>();
 
 type WorkflowPermissionMode = "none" | "contents-write";
 
@@ -175,7 +172,7 @@ function effectiveContentsWriters(workflow: string): string[] {
 }
 
 describe("stable release workflow trust boundary", () => {
-  test("loads from the default branch and is a narrowly approved contents writer", async () => {
+  test("loads from the default branch without granting its built-in token write access", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
     expect(workflow).toContain("repository_dispatch:");
     expect(workflow).toContain("types: [genio-stable-release]");
@@ -184,10 +181,30 @@ describe("stable release workflow trust boundary", () => {
     expect(workflow).toContain(
       "concurrency:\n  group: stable-release-mutation\n  cancel-in-progress: false",
     );
-    expect(workflow).toContain("environment: stable-release");
-    expect(workflow).toMatch(
-      /permissions:\s*\n\s+attestations: read\s*\n\s+contents: write\s*\n\s+packages: read/u,
+    expect(workflow.match(/environment: release-control-audit/gu)).toHaveLength(2);
+    expect(workflow.match(/environment: stable-release/gu)).toHaveLength(1);
+    expect(workflow).not.toMatch(/^\s+contents:\s+write\s*$/mu);
+    expect(workflow).toContain(
+      "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
     );
+    expect(workflow).toContain(
+      "app-id: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}",
+    );
+    expect(workflow).toContain(
+      "private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}",
+    );
+    expect(workflow).toContain(
+      "app-id: ${{ vars.STABLE_RELEASE_WRITER_APP_ID }}",
+    );
+    expect(workflow).toContain(
+      "private-key: ${{ secrets.STABLE_RELEASE_WRITER_APP_PRIVATE_KEY }}",
+    );
+    expect(workflow).toContain("permission-actions: read");
+    expect(workflow).toContain("permission-administration: write");
+    expect(workflow).toContain("permission-contents: write");
+    expect(workflow).toContain("permission-pull-requests: read");
+    expect(workflow).not.toContain("STABLE_RELEASE_CONTROL_PLANE_TOKEN");
+    expect(workflow).not.toContain("persist-credentials: true");
 
     const names = await readdir(workflowsDirectory);
     const observedContentsWriters: string[] = [];
@@ -250,26 +267,66 @@ jobs:
 
   test("fails closed on missing GitHub protections before any write", async () => {
     const workflow = await readFile(workflowUrl, "utf8");
-    const protectionIndex = workflow.indexOf(
-      "Require protected branch, environment, tag ruleset, and dispatcher",
-    );
+    const verifierIndex = workflow.indexOf("  verify_and_seal:");
+    const finalIndex = workflow.indexOf("  final_reauthorize:");
+    const publishIndex = workflow.indexOf("  publish:");
     const verifyIndex = workflow.indexOf(
       "Verify finalization evidence and distinct stable authorization",
     );
-    const provenanceIndex = workflow.indexOf(
-      "Verify exact GHCR image provenance",
+    const manifestIndex = workflow.indexOf(
+      "Seal the bounded stable-release mutation inputs",
     );
-    const monotonicityIndex = workflow.indexOf(
-      "Fence stable-version monotonicity immediately before mutation",
+    const receiptIndex = workflow.indexOf(
+      "Seal the final control authorization receipt",
     );
-    const pushIndex = workflow.indexOf('git push origin "refs/tags/$STABLE_TAG"');
+    const immediateIndex = workflow.indexOf(
+      "Reject a stale branch or moved RC immediately before writer minting",
+    );
+    const writerIndex = workflow.indexOf(
+      "Mint the repository-scoped stable writer only for mutation",
+    );
+    const pushIndex = workflow.indexOf('push origin "refs/tags/$STABLE_TAG"');
     const releaseIndex = workflow.indexOf('gh release create "$STABLE_TAG"');
-    expect(protectionIndex).toBeGreaterThan(0);
-    expect(protectionIndex).toBeLessThan(verifyIndex);
-    expect(verifyIndex).toBeLessThan(provenanceIndex);
-    expect(provenanceIndex).toBeLessThan(monotonicityIndex);
-    expect(monotonicityIndex).toBeLessThan(pushIndex);
+    expect(verifierIndex).toBeGreaterThan(0);
+    expect(verifierIndex).toBeLessThan(verifyIndex);
+    expect(verifyIndex).toBeLessThan(manifestIndex);
+    expect(manifestIndex).toBeLessThan(finalIndex);
+    expect(finalIndex).toBeLessThan(receiptIndex);
+    expect(receiptIndex).toBeLessThan(publishIndex);
+    expect(publishIndex).toBeLessThan(immediateIndex);
+    expect(immediateIndex).toBeLessThan(writerIndex);
+    expect(writerIndex).toBeLessThan(pushIndex);
     expect(pushIndex).toBeLessThan(releaseIndex);
+    const verifier = workflow.slice(verifierIndex, finalIndex);
+    const final = workflow.slice(finalIndex, publishIndex);
+    const publish = workflow.slice(publishIndex);
+    for (const auditSection of [verifier, final]) {
+      expect(auditSection).toContain("environment: release-control-audit");
+      expect(auditSection).toContain(
+        "private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}",
+      );
+      expect(auditSection).toContain("permission-administration: write");
+      expect(auditSection).toContain("permission-contents: read");
+      expect(auditSection).not.toContain(
+        "secrets.STABLE_RELEASE_WRITER_APP_PRIVATE_KEY",
+      );
+      expect(auditSection).not.toContain("permission-contents: write");
+    }
+    expect(publish).toContain("environment: stable-release");
+    expect(publish).toContain(
+      "private-key: ${{ secrets.STABLE_RELEASE_WRITER_APP_PRIVATE_KEY }}",
+    );
+    expect(publish).not.toContain("RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY");
+    expect(publish).not.toContain("permission-administration:");
+    const writerMutation = publish.slice(
+      publish.indexOf("Create the exact immutable stable tag and GitHub Release"),
+      publish.indexOf("Verify the published immutable stable Release read-only"),
+    );
+    expect(writerMutation).not.toContain("node");
+    expect(writerMutation).not.toContain("scripts/");
+    expect(writerMutation).not.toContain("gh api");
+    expect(workflow).not.toContain("persist-credentials: true");
+    expect(workflow).not.toContain("|| github.token");
     expect(workflow).toContain("github.rest.repos.getBranchProtection");
     expect(workflow).toContain(
       "GET /repos/{owner}/{repo}/environments/{environment_name}",
@@ -280,20 +337,29 @@ jobs:
     expect(workflow).toContain(
       "GET /repos/{owner}/{repo}/immutable-releases",
     );
+    expect(workflow).toContain("reviewerRule.reviewers.length !== 1");
     expect(workflow).toContain(
-      "protection.data.required_pull_request_reviews",
+      "!== context.repo.owner.toLowerCase()",
+    );
+    expect(workflow).toContain(
+      "environment.data.prevent_self_review === true",
+    );
+    expect(workflow).not.toContain(
+      'actor !== context.actor && state === "APPROVED"',
     );
     expect(workflow).toContain('"production-database-compatibility"');
     expect(workflow).toContain("github.rest.apps.getBySlug");
-    expect(workflow).toContain(
-      "check.app_id === githubActionsApp.data.id",
-    );
     expect(workflow).toContain(
       'githubActionsApp.data.slug !== "github-actions"',
     );
     expect(workflow).toContain(
       "const githubActionsAppId = Number(githubActionsApp.data.id)",
     );
+    expect(workflow).toContain(
+      "Number(process.env.STABLE_RELEASE_WRITER_APP_ID)",
+    );
+    expect(workflow).toContain("controlAuditorAppId");
+    expect(workflow).toContain("]).size !== 3");
     expect(workflow).toContain('ruleset.data.target !== "tag"');
     expect(workflow).toContain('ruleset.data.enforcement !== "active"');
     expect(workflow).toContain(
@@ -302,22 +368,18 @@ jobs:
     expect(workflow).toContain(
       'JSON.stringify(["refs/tags/v*-rc.*"])',
     );
-    expect(workflow).toContain("ruleTypes.size !== 3");
     expect(workflow).toContain(
-      '!["creation", "update", "deletion"]',
+      'bypassActors[0]?.actor_type !== "Integration"',
     );
     expect(workflow).toContain(
-      'bypassActors[0]?.actor_type === "Integration"',
-    );
-    expect(workflow).toContain(
-      "Number(bypassActors[0]?.actor_id) === githubActionsAppId",
+      "Number(bypassActors[0]?.actor_id) !== stableWriterAppId",
     );
     expect(workflow).not.toContain("STABLE_RELEASE_BYPASS_ACTOR_ID");
-    expect(workflow).toContain("token: ${{ github.token }}");
-    expect(workflow).toContain("persist-credentials: true");
-    expect(workflow).toContain(
-      'core.setOutput("github_actions_app_id", String(githubActionsAppId))',
-    );
+    expect(workflow).toContain("stable-release-mutation-manifest.json");
+    expect(workflow).toContain("stable-release-control-authorization.json");
+    expect(workflow).toContain("now - authorizedAt > 5 * 60 * 1000");
+    expect(workflow).toContain("annotated RC target changed after authorization");
+    expect(workflow).toContain("stable annotated tag target changed after authorization");
     expect(workflow).toContain("Tag-Ruleset-ID:");
     expect(workflow).toContain("Tag-Bypass-Integration-ID:");
     expect(workflow).toContain("clientPayloadKeys.length > 10");
@@ -364,25 +426,16 @@ jobs:
     expect(workflow).toContain("--no-public-good");
     expect(workflow).toContain("Finalization-Evidence-SHA256:");
     expect(workflow).toContain("Stable-Authorization-SHA256:");
-    expect(workflow).toContain('git cat-file -t "refs/tags/$STABLE_TAG"');
     expect(workflow).toContain(
-      "existing stable tag annotation is not the exact verified release annotation",
+      "equal stable tag identity changed",
     );
     expect(workflow).toContain('gh release create "$STABLE_TAG"');
     expect(workflow).toContain("--draft");
     expect(workflow).toContain('gh release upload "$STABLE_TAG"');
     expect(workflow).toContain(
-      "scripts/stable-release-assets.ts",
-    );
-    expect(workflow).toContain(
       'gh release delete-asset "$STABLE_TAG" "$ASSET" --yes',
     );
-    expect(workflow).toContain(
-      "stable release left the verified draft state before asset reconciliation",
-    );
-    expect(workflow).toContain(
-      "stable release asset reconciliation did not converge exactly",
-    );
+    expect(workflow).toContain("immutable stable Release assets differ");
     expect(workflow).not.toContain(
       "pre-existing stable release draft is incomplete",
     );
@@ -390,11 +443,9 @@ jobs:
       'gh release edit "$STABLE_TAG" --draft=false',
     );
     expect(workflow).toContain(
-      "release.target_commitish!==process.env.SOURCE_REVISION",
+      "release.target_commitish !== process.env.SOURCE_REVISION",
     );
-    expect(workflow).toContain("release.name!==process.env.STABLE_TAG");
-    expect(workflow).toContain("release.body!==expectedBody");
-    expect(workflow).toContain("release.immutable!==true");
+    expect(workflow).toContain("release.immutable !== true");
   });
 });
 

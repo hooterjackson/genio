@@ -4,7 +4,6 @@ import {
   createPublicKey,
   KeyObject,
 } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import {
   createStrictSignedEnvelope,
@@ -64,6 +63,13 @@ import {
   type ReleaseGateArtifactV1,
   type ReleaseGateName,
 } from "./release-fixtures.ts";
+import {
+  parseCreateOnlyCliOptions,
+  readBoundedJsonFile,
+  readBoundedRegularFile,
+  readProtectedEd25519PrivateKey,
+  writeCanonicalJsonCreateOnly,
+} from "./release-authoring-io.ts";
 
 export const STABLE_RELEASE_AUTHORIZATION_SCHEMA_V1 =
   "genio-stable-release-authorization/v2";
@@ -209,7 +215,7 @@ function assertSameCandidate(
   }
 }
 
-function verifyStableReleaseFinalizationSources(input: {
+export function verifyStableReleaseFinalizationSources(input: {
   value: unknown;
   finalizationEvidence: ReleaseEvidencePayloadV1;
   releaseVerificationKey: string | Buffer | KeyObject;
@@ -828,13 +834,6 @@ function verifyStableReleaseFinalizationSources(input: {
     expiresAt: nestedExpiresAt,
     publicRollout,
   };
-}
-
-function option(args: readonly string[], name: string): string {
-  const index = args.indexOf(name);
-  const value = index >= 0 ? args[index + 1] : "";
-  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-  return value;
 }
 
 function publicKey(value: string | Buffer | KeyObject): KeyObject {
@@ -1514,35 +1513,39 @@ export function verifyHistoricalStableReleaseConsumerBundle(
   });
 }
 
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  if (args.filter((value) => value === CONFIRMATION_FLAG).length !== 1) {
+export function parseStableReleaseAuthorizationArgs(
+  args: readonly string[],
+): Record<string, string> {
+  const parsed = parseCreateOnlyCliOptions(args, {
+    required: [
+      "--candidate-evidence",
+      "--finalization-evidence",
+      "--finalization-source-evidence",
+      "--semantic-review-gate-artifact",
+      "--semantic-review-gate-producer-attestation",
+      "--protected-baseline-metadata",
+      "--release-verification-key",
+      "--release-gate-producer-verification-key",
+      "--authorizer-signing-key",
+      "--output",
+      "--expected-rc-tag",
+      "--expected-version",
+      "--expected-revision",
+      "--expected-image-digest",
+    ],
+    flags: [CONFIRMATION_FLAG],
+  });
+  if (parsed[CONFIRMATION_FLAG] !== "true") {
     throw new Error(
       `stable release authorization requires ${CONFIRMATION_FLAG}`,
     );
   }
-  const allowed = new Set([
-    CONFIRMATION_FLAG,
-    "--candidate-evidence",
-    "--finalization-evidence",
-    "--finalization-source-evidence",
-    "--semantic-review-gate-artifact",
-    "--semantic-review-gate-producer-attestation",
-    "--protected-baseline-metadata",
-    "--release-verification-key",
-    "--release-gate-producer-verification-key",
-    "--authorizer-signing-key",
-    "--output",
-    "--expected-rc-tag",
-    "--expected-version",
-    "--expected-revision",
-    "--expected-image-digest",
-  ]);
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index]!;
-    if (!allowed.has(argument)) throw new Error(`Unknown argument: ${argument}`);
-    if (argument !== CONFIRMATION_FLAG) index += 1;
-  }
+  return parsed;
+}
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const options = parseStableReleaseAuthorizationArgs(args);
   const [
     candidateEvidenceSource,
     finalizationEvidenceSource,
@@ -1554,30 +1557,54 @@ async function main(): Promise<void> {
     releaseGateProducerVerificationKey,
     authorizerSigningKey,
   ] = await Promise.all([
-    readFile(option(args, "--candidate-evidence"), "utf8"),
-    readFile(option(args, "--finalization-evidence"), "utf8"),
-    readFile(option(args, "--finalization-source-evidence"), "utf8"),
-    readFile(option(args, "--semantic-review-gate-artifact"), "utf8"),
-    readFile(
-      option(args, "--semantic-review-gate-producer-attestation"),
-      "utf8",
+    readBoundedJsonFile(
+      options["--candidate-evidence"]!,
+      "candidate evidence",
     ),
-    readFile(option(args, "--protected-baseline-metadata"), "utf8"),
-    readFile(option(args, "--release-verification-key")),
-    readFile(option(args, "--release-gate-producer-verification-key")),
-    readFile(option(args, "--authorizer-signing-key")),
+    readBoundedJsonFile(
+      options["--finalization-evidence"]!,
+      "finalization evidence",
+    ),
+    readBoundedJsonFile(
+      options["--finalization-source-evidence"]!,
+      "finalization source evidence",
+    ),
+    readBoundedJsonFile(
+      options["--semantic-review-gate-artifact"]!,
+      "semantic review gate artifact",
+    ),
+    readBoundedJsonFile(
+      options["--semantic-review-gate-producer-attestation"]!,
+      "semantic review gate producer attestation",
+    ),
+    readBoundedJsonFile(
+      options["--protected-baseline-metadata"]!,
+      "protected baseline metadata",
+    ),
+    readBoundedRegularFile(
+      options["--release-verification-key"]!,
+      "release verification key",
+      16 * 1024,
+    ),
+    readBoundedRegularFile(
+      options["--release-gate-producer-verification-key"]!,
+      "release gate producer verification key",
+      16 * 1024,
+    ),
+    readProtectedEd25519PrivateKey({
+      cliPath: options["--authorizer-signing-key"]!,
+      environmentName: "RELEASE_STABLE_AUTHORIZER_SIGNING_KEY_FILE",
+      label: "stable release authorizer signing key",
+    }),
   ]);
   const authorization = await authorizeStableRelease({
-    candidateEvidence: JSON.parse(candidateEvidenceSource),
-    finalizationEvidence: JSON.parse(finalizationEvidenceSource),
-    finalizationSourceEvidence:
-      JSON.parse(finalizationSourceEvidenceSource),
-    semanticReviewGateArtifact:
-      JSON.parse(semanticReviewGateArtifactSource),
+    candidateEvidence: candidateEvidenceSource,
+    finalizationEvidence: finalizationEvidenceSource,
+    finalizationSourceEvidence: finalizationSourceEvidenceSource,
+    semanticReviewGateArtifact: semanticReviewGateArtifactSource,
     semanticReviewGateProducerAttestation:
-      JSON.parse(semanticReviewGateProducerAttestationSource),
-    protectedBaselineMetadata:
-      JSON.parse(protectedBaselineMetadataSource),
+      semanticReviewGateProducerAttestationSource,
+    protectedBaselineMetadata: protectedBaselineMetadataSource,
     releaseVerificationKey,
     approvedReleaseKeySha256:
       process.env.RELEASE_VERIFICATION_KEY_SHA256?.trim().toLowerCase() ?? "",
@@ -1674,17 +1701,33 @@ async function main(): Promise<void> {
       process.env.RELEASE_STABLE_AUTHORIZER_KEY_SHA256
         ?.trim()
         .toLowerCase() ?? "",
-    expectedRcTag: option(args, "--expected-rc-tag"),
-    expectedVersion: option(args, "--expected-version"),
-    expectedRevision: option(args, "--expected-revision").toLowerCase(),
-    expectedImageDigest: option(args, "--expected-image-digest").toLowerCase(),
+    expectedRcTag: options["--expected-rc-tag"]!,
+    expectedVersion: options["--expected-version"]!,
+    expectedRevision: options["--expected-revision"]!.toLowerCase(),
+    expectedImageDigest:
+      options["--expected-image-digest"]!.toLowerCase(),
   });
-  const output = option(args, "--output");
-  await writeFile(output, `${JSON.stringify(authorization, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-    flag: "wx",
+  const output = options["--output"]!;
+  verifyStableReleaseAuthorization({
+    value: authorization,
+    verificationKey: createPublicKey(authorizerSigningKey),
+    approvedKeyId:
+      process.env.RELEASE_STABLE_AUTHORIZER_KEY_ID?.trim() ?? "",
+    approvedKeySha256:
+      process.env.RELEASE_STABLE_AUTHORIZER_KEY_SHA256
+        ?.trim()
+        .toLowerCase() ?? "",
+    expectedRevision: options["--expected-revision"]!.toLowerCase(),
+    expectedImageDigest:
+      options["--expected-image-digest"]!.toLowerCase(),
+    expectedRcTag: options["--expected-rc-tag"]!,
+    expectedFinalizationEvidencePayloadHash:
+      String(authorization.payload.finalizationEvidencePayloadHash),
+    expectedProtectedBaselineMetadataHash:
+      String(authorization.payload.protectedBaselineMetadataHash),
+    now: String(authorization.payload.generatedAt),
   });
+  await writeCanonicalJsonCreateOnly(output, authorization);
   process.stdout.write(`${JSON.stringify({
     ok: true,
     stableTag:

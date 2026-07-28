@@ -27,17 +27,35 @@ env:
   HISTORICAL_WORKSPACE_SHA256: 204107ece0b6c76b579d0bf514e0cd4b675d751ff792fa1ffdfae6d1c360eb6d
 
 jobs:
-  publish_wrapper_by_digest:
-    environment: stable-predecessor-bootstrap-image
+  authorize_controls:
+    environment: release-control-audit
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     permissions:
-      attestations: write
       contents: read
-      id-token: write
-      packages: write
+    outputs:
+      controller_revision: ${{ steps.identity.outputs.controller_revision }}
+      stable_tag_object: ${{ steps.identity.outputs.stable_tag_object }}
+      stable_tag_target: ${{ steps.identity.outputs.stable_tag_target }}
     steps:
-      - name: Reject payloads and fence the real default-branch controller
+      - id: control_auditor
+        name: Mint the repository-scoped release control auditor token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+          private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}
+          permission-actions: read
+          permission-administration: write
+          permission-checks: read
+          permission-contents: read
+          permission-pull-requests: read
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - id: identity
+        name: Fence the fixed controller and historical stable tag
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CLIENT_PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
@@ -47,74 +65,232 @@ jobs:
           test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$BOOTSTRAP_WORKFLOW@refs/heads/$DEFAULT_BRANCH"
           test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
           node -e 'const value=JSON.parse(process.env.CLIENT_PAYLOAD_JSON??"null"); if(!value||typeof value!=="object"||Array.isArray(value)||Object.keys(value).length!==0) throw new Error("dispatch payload must be an empty object");'
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          path: controller
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.event.repository.default_branch }}
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          path: historical
-          fetch-depth: 0
-          persist-credentials: false
-          ref: 7dc877cfc1537a9936974f9699a4b8ba9740b5f5
-      - name: Verify the exact controller recipe and historical source context
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          test "$(git -C controller rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git -C controller rev-parse "origin/$DEFAULT_BRANCH")" = "$GITHUB_SHA"
-          test "$(git -C historical rev-parse HEAD)" = "$ORIGINAL_SOURCE_REVISION"
-          test "$(git -C historical rev-parse HEAD^{tree})" = "$ORIGINAL_SOURCE_TREE"
-          test "$(git -C historical cat-file -t "$ORIGINAL_TAG_OBJECT")" = "tag"
-          test "$(git -C historical rev-parse "$ORIGINAL_TAG_OBJECT^{}")" = "$ORIGINAL_SOURCE_REVISION"
-          test "$(sha256sum controller/Dockerfile | cut -d' ' -f1)" = "$CONTROLLER_DOCKERFILE_SHA256"
-          test "$(git -C historical show HEAD:.railway/railway.ts | sha256sum | cut -d' ' -f1)" = "$HISTORICAL_BUILD_INTENT_SHA256"
-          test "$(sha256sum historical/package.json | cut -d' ' -f1)" = "$HISTORICAL_PACKAGE_SHA256"
-          test "$(sha256sum historical/pnpm-lock.yaml | cut -d' ' -f1)" = "$HISTORICAL_LOCKFILE_SHA256"
-          test "$(sha256sum historical/pnpm-workspace.yaml | cut -d' ' -f1)" = "$HISTORICAL_WORKSPACE_SHA256"
-          test ! -e historical/Dockerfile
-          test ! -e historical/Containerfile
-          test ! -e historical/nixpacks.toml
-          git -C controller merge-base --is-ancestor "$ORIGINAL_SOURCE_REVISION" "$GITHUB_SHA"
-          git -C historical archive \
-            --format=tar \
-            --output="$RUNNER_TEMP/v2.3.4-source.tar" \
-            "$ORIGINAL_SOURCE_REVISION"
-          test "$(sha256sum "$RUNNER_TEMP/v2.3.4-source.tar" | cut -d' ' -f1)" = "$HISTORICAL_SOURCE_ARCHIVE_SHA256"
-          mkdir historical-context
-          tar -xf "$RUNNER_TEMP/v2.3.4-source.tar" -C historical-context
-          test ! -e historical-context/.git
-          test ! -e historical-context/.gitmodules
-          test "$(sha256sum historical-context/package.json | cut -d' ' -f1)" = "$HISTORICAL_PACKAGE_SHA256"
-          test "$(sha256sum historical-context/pnpm-lock.yaml | cut -d' ' -f1)" = "$HISTORICAL_LOCKFILE_SHA256"
-          test "$(sha256sum historical-context/pnpm-workspace.yaml | cut -d' ' -f1)" = "$HISTORICAL_WORKSPACE_SHA256"
-      - name: Verify one-time reachability and protected controller
+          git fetch --force origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
+          CONTROLLER_REVISION="$(git rev-parse HEAD)"
+          STABLE_TAG_OBJECT="$(git rev-parse "refs/tags/$STABLE_TAG")"
+          test "$(git cat-file -t "$STABLE_TAG_OBJECT")" = "tag"
+          STABLE_TAG_TARGET="$(git rev-parse "$STABLE_TAG_OBJECT^{}")"
+          test "$CONTROLLER_REVISION" = "$GITHUB_SHA"
+          test "$CONTROLLER_REVISION" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test "$STABLE_TAG_OBJECT" = "$ORIGINAL_TAG_OBJECT"
+          test "$STABLE_TAG_TARGET" = "$ORIGINAL_SOURCE_REVISION"
+          git merge-base --is-ancestor "$STABLE_TAG_TARGET" "$CONTROLLER_REVISION"
+          echo "controller_revision=$CONTROLLER_REVISION" >> "$GITHUB_OUTPUT"
+          echo "stable_tag_object=$STABLE_TAG_OBJECT" >> "$GITHUB_OUTPUT"
+          echo "stable_tag_target=$STABLE_TAG_TARGET" >> "$GITHUB_OUTPUT"
+      - name: Verify exact controller, review, CI, environment, and release controls
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CONTROL_AUDITOR_APP_ID: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+          CONTROLLER_REVISION: ${{ steps.identity.outputs.controller_revision }}
         with:
+          github-token: ${{ steps.control_auditor.outputs.token }}
           script: |
             const fail = (message) => {
-              throw new Error(`stable predecessor wrapper: ${message}`);
+              throw new Error(`stable predecessor wrapper control audit: ${message}`);
             };
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const defaultBranch = context.payload.repository?.default_branch;
+            const requiredChecks = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
             if (
-              context.repo.owner.toLowerCase() !== "hooterjackson"
-              || context.repo.repo !== "genio"
+              repository.toLowerCase() !== "hooterjackson/genio"
               || context.payload.repository?.fork !== false
-              || context.ref
-                !== `refs/heads/${context.payload.repository?.default_branch}`
-              || context.sha !== process.env.GITHUB_SHA
+              || context.ref !== `refs/heads/${defaultBranch}`
+              || context.sha !== process.env.CONTROLLER_REVISION
               || Object.keys(context.payload.client_payload ?? {}).length !== 0
             ) {
-              fail("forked, non-default, replayed, or parameterized controller");
+              fail("forked, stale, non-default, or parameterized controller");
             }
-            const branch = await github.rest.repos.getBranch({
+            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              branch: context.payload.repository.default_branch,
+              username: context.actor,
             });
-            if (!branch.data.protected || branch.data.commit.sha !== context.sha) {
-              fail("controller is not the current protected default-branch head");
+            if (!["admin", "maintain"].includes(permission.data.permission)) {
+              fail("bootstrap dispatch requires maintain or admin permission");
+            }
+            const [branch, protection, githubActionsApp] = await Promise.all([
+              github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: defaultBranch,
+              }),
+              github.rest.repos.getBranchProtection({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: defaultBranch,
+              }),
+              github.rest.apps.getBySlug({ app_slug: "github-actions" }),
+            ]);
+            const githubActionsAppId = Number(githubActionsApp.data.id);
+            const controlAuditorAppId = Number(
+              process.env.CONTROL_AUDITOR_APP_ID,
+            );
+            const configuredChecks =
+              protection.data.required_status_checks?.checks ?? [];
+            if (
+              branch.data.protected !== true
+              || branch.data.commit.sha !== process.env.CONTROLLER_REVISION
+              || githubActionsApp.data.slug !== "github-actions"
+              || !Number.isSafeInteger(githubActionsAppId)
+              || githubActionsAppId <= 0
+              || !Number.isSafeInteger(controlAuditorAppId)
+              || controlAuditorAppId <= 0
+              || controlAuditorAppId === githubActionsAppId
+              || protection.data.required_status_checks?.strict !== true
+              || configuredChecks.length !== requiredChecks.length
+              || JSON.stringify(
+                configuredChecks.map(({ context: name }) => name).sort(),
+              ) !== JSON.stringify([...requiredChecks].sort())
+              || configuredChecks.some(({ app_id: appId }) =>
+                Number(appId) !== githubActionsAppId
+              )
+              || protection.data.required_pull_request_reviews
+                ?.required_approving_review_count !== 0
+              || protection.data.required_pull_request_reviews
+                ?.dismiss_stale_reviews !== true
+              || protection.data.required_pull_request_reviews
+                ?.require_code_owner_reviews !== false
+              || protection.data.required_pull_request_reviews
+                ?.require_last_push_approval !== false
+              || protection.data.enforce_admins?.enabled !== true
+              || protection.data.required_conversation_resolution?.enabled
+                !== true
+              || protection.data.allow_force_pushes?.enabled !== false
+              || protection.data.allow_deletions?.enabled !== false
+            ) {
+              fail("default-branch protection differs from the exact release policy");
+            }
+            const pulls = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: process.env.CONTROLLER_REVISION,
+                per_page: 100,
+              },
+            );
+            const mergedPulls = pulls.filter((pull) =>
+              pull.merged_at
+              && pull.base.ref === defaultBranch
+              && pull.merge_commit_sha === process.env.CONTROLLER_REVISION
+            );
+            if (mergedPulls.length !== 1) {
+              fail("controller must be exactly one merged default-branch PR");
+            }
+            const trustedWorkflowPath = ".github/workflows/ci.yml";
+            const trustedWorkflow = await github.rest.actions.getWorkflow({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: trustedWorkflowPath,
+            });
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: trustedWorkflow.data.id,
+                branch: defaultBranch,
+                event: "push",
+                status: "completed",
+                head_sha: process.env.CONTROLLER_REVISION,
+                per_page: 100,
+              },
+            );
+            const trustedRun = workflowRuns.filter((run) =>
+              trustedWorkflow.data.path === trustedWorkflowPath
+              && trustedWorkflow.data.state === "active"
+              && run.workflow_id === trustedWorkflow.data.id
+              && run.path === trustedWorkflowPath
+              && run.event === "push"
+              && run.head_branch === defaultBranch
+              && run.head_sha === process.env.CONTROLLER_REVISION
+              && run.repository?.full_name === repository
+              && run.head_repository?.full_name === repository
+              && run.conclusion === "success"
+            ).sort((left, right) =>
+              Number(right.run_attempt ?? 0) - Number(left.run_attempt ?? 0)
+            )[0];
+            if (!trustedRun?.check_suite_id) {
+              fail("controller has no successful trusted default-branch CI run");
+            }
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForSuite,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                check_suite_id: trustedRun.check_suite_id,
+                filter: "latest",
+                per_page: 100,
+              },
+            );
+            const latestChecks = new Map();
+            for (const check of checkRuns) {
+              if (
+                check.head_sha !== process.env.CONTROLLER_REVISION
+                || check.app?.id !== githubActionsAppId
+                || check.app?.slug !== "github-actions"
+                || check.check_suite?.id !== trustedRun.check_suite_id
+              ) {
+                fail("controller check provenance is not the trusted App-bound suite");
+              }
+              const prior = latestChecks.get(check.name);
+              if (!prior || Date.parse(check.completed_at ?? check.started_at ?? "0")
+                > Date.parse(prior.completed_at ?? prior.started_at ?? "0")) {
+                latestChecks.set(check.name, check);
+              }
+            }
+            if (
+              latestChecks.size !== requiredChecks.length
+              || requiredChecks.some((name) =>
+                latestChecks.get(name)?.conclusion !== "success"
+              )
+            ) {
+              fail("controller lacks the exact successful App-bound checks");
+            }
+            for (const environmentName of [
+              "release-control-audit",
+              "stable-predecessor-bootstrap-image",
+            ]) {
+              const environment = await github.request(
+                "GET /repos/{owner}/{repo}/environments/{environment_name}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  environment_name: environmentName,
+                },
+              );
+              const reviewerRule = (environment.data.protection_rules ?? [])
+                .find((rule) => rule.type === "required_reviewers");
+              if (
+                environment.data.name !== environmentName
+                || environment.data.can_admins_bypass !== false
+                || environment.data.deployment_branch_policy?.protected_branches
+                  !== true
+                || environment.data.deployment_branch_policy
+                  ?.custom_branch_policies !== false
+                || !reviewerRule
+                || !Array.isArray(reviewerRule.reviewers)
+                || reviewerRule.reviewers.length !== 1
+                || reviewerRule.reviewers[0]?.type !== "User"
+                || reviewerRule.reviewers[0]?.reviewer?.login?.toLowerCase()
+                  !== context.repo.owner.toLowerCase()
+                || environment.data.prevent_self_review === true
+                || reviewerRule.prevent_self_review === true
+              ) {
+                fail(`${environmentName} lacks exact solo-owner manual approval`);
+              }
             }
             const immutable = await github.request(
               "GET /repos/{owner}/{repo}/immutable-releases",
@@ -173,13 +349,85 @@ jobs:
                 const match =
                   /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
                     .exec(tag_name ?? "");
-                if (!match) return false;
-                const version = match.slice(1).map(BigInt);
-                return compare(version, target) > 0;
+                return match
+                  ? compare(match.slice(1).map(BigInt), target) > 0
+                  : false;
               })
             ) {
               fail("one-time v2.3.4 bootstrap reachability is closed");
             }
+
+  publish_wrapper_by_digest:
+    needs: [authorize_controls]
+    environment: stable-predecessor-bootstrap-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      EXPECTED_CONTROLLER_REVISION: ${{ needs.authorize_controls.outputs.controller_revision }}
+      EXPECTED_STABLE_TAG_OBJECT: ${{ needs.authorize_controls.outputs.stable_tag_object }}
+      EXPECTED_STABLE_TAG_TARGET: ${{ needs.authorize_controls.outputs.stable_tag_target }}
+    steps:
+      - name: Reject payloads and fence the real default-branch controller
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CLIENT_PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          test "$GITHUB_REPOSITORY" = "$BOOTSTRAP_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$BOOTSTRAP_WORKFLOW@refs/heads/$DEFAULT_BRANCH"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$EXPECTED_STABLE_TAG_OBJECT" = "$ORIGINAL_TAG_OBJECT"
+          test "$EXPECTED_STABLE_TAG_TARGET" = "$ORIGINAL_SOURCE_REVISION"
+          node -e 'const value=JSON.parse(process.env.CLIENT_PAYLOAD_JSON??"null"); if(!value||typeof value!=="object"||Array.isArray(value)||Object.keys(value).length!==0) throw new Error("dispatch payload must be an empty object");'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: controller
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: historical
+          fetch-depth: 0
+          persist-credentials: false
+          ref: 7dc877cfc1537a9936974f9699a4b8ba9740b5f5
+      - name: Verify the exact controller recipe and historical source context
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$(git -C controller rev-parse HEAD)" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$(git -C controller rev-parse "origin/$DEFAULT_BRANCH")" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$(git -C historical rev-parse HEAD)" = "$ORIGINAL_SOURCE_REVISION"
+          test "$(git -C historical rev-parse HEAD^{tree})" = "$ORIGINAL_SOURCE_TREE"
+          test "$(git -C historical cat-file -t "$EXPECTED_STABLE_TAG_OBJECT")" = "tag"
+          test "$(git -C historical rev-parse "$EXPECTED_STABLE_TAG_OBJECT^{}")" = "$EXPECTED_STABLE_TAG_TARGET"
+          test "$(sha256sum controller/.github/release/stable-predecessor-v2.3.4.Dockerfile | cut -d' ' -f1)" = "$CONTROLLER_DOCKERFILE_SHA256"
+          test "$(git -C historical show HEAD:.railway/railway.ts | sha256sum | cut -d' ' -f1)" = "$HISTORICAL_BUILD_INTENT_SHA256"
+          test "$(sha256sum historical/package.json | cut -d' ' -f1)" = "$HISTORICAL_PACKAGE_SHA256"
+          test "$(sha256sum historical/pnpm-lock.yaml | cut -d' ' -f1)" = "$HISTORICAL_LOCKFILE_SHA256"
+          test "$(sha256sum historical/pnpm-workspace.yaml | cut -d' ' -f1)" = "$HISTORICAL_WORKSPACE_SHA256"
+          test ! -e historical/Dockerfile
+          test ! -e historical/Containerfile
+          test ! -e historical/nixpacks.toml
+          git -C controller merge-base --is-ancestor "$EXPECTED_STABLE_TAG_TARGET" "$EXPECTED_CONTROLLER_REVISION"
+          git -C historical archive \
+            --format=tar \
+            --output="$RUNNER_TEMP/v2.3.4-source.tar" \
+            "$ORIGINAL_SOURCE_REVISION"
+          test "$(sha256sum "$RUNNER_TEMP/v2.3.4-source.tar" | cut -d' ' -f1)" = "$HISTORICAL_SOURCE_ARCHIVE_SHA256"
+          mkdir historical-context
+          tar -xf "$RUNNER_TEMP/v2.3.4-source.tar" -C historical-context
+          test ! -e historical-context/.git
+          test ! -e historical-context/.gitmodules
+          test "$(sha256sum historical-context/package.json | cut -d' ' -f1)" = "$HISTORICAL_PACKAGE_SHA256"
+          test "$(sha256sum historical-context/pnpm-lock.yaml | cut -d' ' -f1)" = "$HISTORICAL_LOCKFILE_SHA256"
+          test "$(sha256sum historical-context/pnpm-workspace.yaml | cut -d' ' -f1)" = "$HISTORICAL_WORKSPACE_SHA256"
       - id: identity
         name: Resolve the fixed wrapper repository
         run: |
@@ -199,7 +447,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: historical-context
-          file: controller/Dockerfile
+          file: controller/.github/release/stable-predecessor-v2.3.4.Dockerfile
           platforms: linux/amd64
           provenance: false
           build-args: |
@@ -471,6 +719,23 @@ jobs:
                 "one-time v2.3.4 wrapper publication is closed by a later stable tag or Release",
               );
             }
+      - name: Reread and fence the default head, controller, and historical tag
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git -C controller fetch --force origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git -C historical fetch --force origin \
+            "+refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
+          test "$GITHUB_WORKFLOW_SHA" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$GITHUB_SHA" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$(git -C controller rev-parse HEAD)" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$(git -C controller rev-parse "origin/$DEFAULT_BRANCH")" = "$EXPECTED_CONTROLLER_REVISION"
+          test "$(git -C historical rev-parse "refs/tags/$STABLE_TAG")" = "$EXPECTED_STABLE_TAG_OBJECT"
+          test "$(git -C historical cat-file -t "$EXPECTED_STABLE_TAG_OBJECT")" = "tag"
+          test "$(git -C historical rev-parse "$EXPECTED_STABLE_TAG_OBJECT^{}")" = "$EXPECTED_STABLE_TAG_TARGET"
+          test "$EXPECTED_STABLE_TAG_TARGET" = "$ORIGINAL_SOURCE_REVISION"
+          git -C controller merge-base --is-ancestor "$EXPECTED_STABLE_TAG_TARGET" "$EXPECTED_CONTROLLER_REVISION"
       - id: push
         name: Push exactly the sealed OCI archive without rebuilding or tagging
         env:

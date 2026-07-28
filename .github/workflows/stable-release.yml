@@ -13,26 +13,43 @@ concurrency:
 
 permissions:
   attestations: read
-  contents: write
+  contents: read
   packages: read
 
 jobs:
-  publish:
-    environment: stable-release
+  verify_and_seal:
+    environment: release-control-audit
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      candidate_tag: ${{ steps.target.outputs.candidate_tag }}
+      candidate_tag_object: ${{ steps.target.outputs.candidate_tag_object }}
+      stable_tag: ${{ steps.target.outputs.stable_tag }}
+      source_revision: ${{ steps.target.outputs.source_revision }}
+      image_digest: ${{ steps.target.outputs.image_digest }}
+      mutation_manifest_sha256: ${{ steps.seal.outputs.manifest_sha256 }}
     env:
       CANDIDATE_TAG: ${{ github.event.client_payload.candidate_tag }}
       IMAGE_DIGEST: ${{ github.event.client_payload.image_digest }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
+      - id: control_auditor
+        name: Mint the repository-scoped control auditor token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # Ruleset bypass actors are visible only to an administration writer.
+          # This separate App can audit controls, but cannot mutate contents.
+          app-id: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+          private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}
+          permission-actions: read
+          permission-administration: write
+          permission-checks: read
+          permission-contents: read
+          permission-pull-requests: read
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          # The only ref-writing credential is the job-scoped GitHub Actions
-          # installation token whose Integration ID is verified below.
-          token: ${{ github.token }}
-          persist-credentials: true
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.19.0
@@ -41,32 +58,30 @@ jobs:
         env:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          node -e 'const fs=require("node:fs"); const tag=process.env.CANDIDATE_TAG??""; const match=/^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/.exec(tag); if(!match) throw new Error("candidate tag is invalid"); const digest=process.env.IMAGE_DIGEST??""; if(!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error("image digest is invalid"); fs.appendFileSync(process.env.GITHUB_OUTPUT,`version=${match[1]}\nstable_tag=v${match[1]}\n`);'
+          node -e 'const fs=require("node:fs"); const tag=process.env.CANDIDATE_TAG??""; const match=/^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-rc\.[1-9]\d*$/.exec(tag); if(!match) throw new Error("candidate tag is invalid"); const digest=process.env.IMAGE_DIGEST??""; if(!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error("image digest is invalid"); fs.appendFileSync(process.env.GITHUB_OUTPUT,`candidate_tag=${tag}\nversion=${match[1]}\nstable_tag=v${match[1]}\nimage_digest=${digest}\n`);'
           git fetch --force --tags origin
           test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
+          CANDIDATE_TAG_OBJECT="$(git rev-parse "refs/tags/$CANDIDATE_TAG")"
           SOURCE_REVISION="$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")"
           test "$SOURCE_REVISION" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
           test "$SOURCE_REVISION" = "$GITHUB_SHA"
           test "v$(node -p 'require(\"./package.json\").version')-rc." = "${CANDIDATE_TAG%-rc.*}-rc."
           IMAGE_REPOSITORY="ghcr.io/${REPOSITORY_OWNER,,}/genio"
+          echo "candidate_tag_object=$CANDIDATE_TAG_OBJECT" >> "$GITHUB_OUTPUT"
           echo "source_revision=$SOURCE_REVISION" >> "$GITHUB_OUTPUT"
           echo "image_reference=$IMAGE_REPOSITORY@$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
       - id: protection
         name: Require protected branch, environment, tag ruleset, and dispatcher
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          STABLE_RELEASE_CONTROL_PLANE_TOKEN: >-
-            ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN || github.token }}
+          STABLE_RELEASE_WRITER_APP_ID: >-
+            ${{ vars.STABLE_RELEASE_WRITER_APP_ID }}
+          RELEASE_CONTROL_AUDITOR_APP_ID: >-
+            ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
           STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
         with:
-          github-token: ${{ secrets.STABLE_RELEASE_CONTROL_PLANE_TOKEN || github.token }}
+          github-token: ${{ steps.control_auditor.outputs.token }}
           script: |
-            if (!process.env.STABLE_RELEASE_CONTROL_PLANE_TOKEN) {
-              core.setFailed(
-                "protected stable-release control-plane credential is missing",
-              );
-              return;
-            }
             const clientPayload = context.payload.client_payload ?? {};
             const clientPayloadKeys = Object.keys(clientPayload).sort();
             const expectedClientPayloadKeys = [
@@ -103,8 +118,13 @@ jobs:
               repo: context.repo.repo,
               branch: defaultBranch,
             });
-            if (!branch.data.protected) {
-              core.setFailed("the default branch is not protected");
+            if (
+              !branch.data.protected
+              || branch.data.commit.sha !== context.sha
+              || context.sha !== process.env.GITHUB_SHA
+              || process.env.GITHUB_WORKFLOW_SHA !== context.sha
+            ) {
+              core.setFailed("the controller is not the current protected default-branch head");
               return;
             }
             const protection = await github.rest.repos.getBranchProtection({
@@ -126,54 +146,121 @@ jobs:
               app_slug: "github-actions",
             });
             const githubActionsAppId = Number(githubActionsApp.data.id);
+            const stableWriterAppId =
+              Number(process.env.STABLE_RELEASE_WRITER_APP_ID);
+            const controlAuditorAppId =
+              Number(process.env.RELEASE_CONTROL_AUDITOR_APP_ID);
             if (
               githubActionsApp.data.slug !== "github-actions"
               || !Number.isSafeInteger(githubActionsAppId)
               || githubActionsAppId <= 0
+              || !Number.isSafeInteger(stableWriterAppId)
+              || stableWriterAppId <= 0
+              || !Number.isSafeInteger(controlAuditorAppId)
+              || controlAuditorAppId <= 0
+              || stableWriterAppId === githubActionsAppId
+              || controlAuditorAppId === githubActionsAppId
+              || controlAuditorAppId === stableWriterAppId
             ) {
-              core.setFailed("GitHub Actions Integration identity is invalid");
+              core.setFailed(
+                "GitHub Actions, control auditor, or stable writer Integration identity is invalid",
+              );
               return;
             }
             const configuredChecks =
               protection.data.required_status_checks?.checks ?? [];
             if (
               protection.data.required_status_checks?.strict !== true
+              || configuredChecks.length !== requiredChecks.length
               || requiredChecks.some((name) =>
                 !configuredChecks.some((check) =>
                   check.context === name
-                  && check.app_id === githubActionsApp.data.id
+                  && Number(check.app_id) === githubActionsAppId
                 )
               )
-              || (
-                protection.data.required_pull_request_reviews
-                  ?.required_approving_review_count ?? 0
-              ) < 1
               || protection.data.enforce_admins?.enabled !== true
+              || protection.data.required_conversation_resolution?.enabled
+                !== true
+              || protection.data.allow_force_pushes?.enabled !== false
+              || protection.data.allow_deletions?.enabled !== false
             ) {
               core.setFailed(
-                "default-branch protection lacks app-bound checks, approval, or admin enforcement",
+                "default-branch protection lacks exact review, check, and rewrite controls",
               );
               return;
             }
-            const environment = await github.request(
-              "GET /repos/{owner}/{repo}/environments/{environment_name}",
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForRef,
               {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                environment_name: "stable-release",
+                ref: context.sha,
+                filter: "latest",
+                per_page: 100,
               },
             );
-            if (
-              environment.data.name !== "stable-release"
-              || environment.data.deployment_branch_policy?.protected_branches
-                !== true
-              || environment.data.deployment_branch_policy?.custom_branch_policies
-                !== false
-            ) {
-              core.setFailed(
-                "stable-release environment lacks protected-branch policy",
-              );
+            if (requiredChecks.some((name) => {
+              const matches = checkRuns.filter((run) => run.name === name);
+              return matches.length !== 1
+                || Number(matches[0]?.app?.id) !== githubActionsAppId
+                || matches[0]?.status !== "completed"
+                || matches[0]?.conclusion !== "success";
+            })) {
+              core.setFailed("controller lacks exact successful app-bound checks");
               return;
+            }
+            const associatedPulls = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                per_page: 100,
+              },
+            );
+            const mergedPulls = associatedPulls.filter((pull) =>
+              pull.merged_at
+              && pull.base?.ref === defaultBranch
+              && pull.merge_commit_sha === context.sha
+            );
+            if (mergedPulls.length !== 1) {
+              core.setFailed("controller is not one exact reviewed default-branch merge");
+              return;
+            }
+            for (const environmentName of [
+              "release-control-audit",
+              "stable-release",
+            ]) {
+              const environment = await github.request(
+                "GET /repos/{owner}/{repo}/environments/{environment_name}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  environment_name: environmentName,
+                },
+              );
+              const reviewerRule = (environment.data.protection_rules ?? [])
+                .find((rule) => rule.type === "required_reviewers");
+              if (
+                environment.data.name !== environmentName
+                || environment.data.deployment_branch_policy?.protected_branches
+                  !== true
+                || environment.data.deployment_branch_policy
+                  ?.custom_branch_policies !== false
+                || !reviewerRule
+                || !Array.isArray(reviewerRule.reviewers)
+                || reviewerRule.reviewers.length !== 1
+                || reviewerRule.reviewers[0]?.type !== "User"
+                || reviewerRule.reviewers[0]?.reviewer?.login?.toLowerCase()
+                  !== context.repo.owner.toLowerCase()
+                || environment.data.prevent_self_review === true
+                || reviewerRule.prevent_self_review === true
+              ) {
+                core.setFailed(
+                  `${environmentName} lacks exact solo-owner manual approval`,
+                );
+                return;
+              }
             }
             const immutableReleases = await github.request(
               "GET /repos/{owner}/{repo}/immutable-releases",
@@ -214,7 +301,7 @@ jobs:
             const exactBypass =
               bypassActors.length === 1
               && bypassActors[0]?.actor_type === "Integration"
-              && Number(bypassActors[0]?.actor_id) === githubActionsAppId
+              && Number(bypassActors[0]?.actor_id) === stableWriterAppId
               && bypassActors[0]?.bypass_mode === "always";
             const includePatterns =
               [...(ruleset.data.conditions?.ref_name?.include ?? [])].sort();
@@ -239,6 +326,8 @@ jobs:
               return;
             }
             core.setOutput("github_actions_app_id", String(githubActionsAppId));
+            core.setOutput("stable_writer_app_id", String(stableWriterAppId));
+            core.setOutput("control_auditor_app_id", String(controlAuditorAppId));
             core.setOutput("stable_tag_ruleset_id", String(rulesetId));
       - name: Materialize independently signed release inputs
         env:
@@ -295,11 +384,11 @@ jobs:
           FINALIZATION_HASH: ${{ steps.verify.outputs.finalization_hash }}
           BASELINE_HASH: ${{ steps.verify.outputs.baseline_hash }}
           AUTHORIZATION_HASH: ${{ steps.verify.outputs.authorization_hash }}
-          VERIFIED_GITHUB_ACTIONS_APP_ID: ${{ steps.protection.outputs.github_actions_app_id }}
+          VERIFIED_STABLE_WRITER_APP_ID: ${{ steps.protection.outputs.stable_writer_app_id }}
           VERIFIED_STABLE_TAG_RULESET_ID: ${{ steps.protection.outputs.stable_tag_ruleset_id }}
         run: |
-          node -e 'const fs=require("node:fs"); if(!/^[1-9]\d*$/.test(process.env.VERIFIED_GITHUB_ACTIONS_APP_ID??"")||!/^[1-9]\d*$/.test(process.env.VERIFIED_STABLE_TAG_RULESET_ID??"")) throw new Error("verified stable tag write principal is missing"); const lines=[`gênio stable release ${process.env.STABLE_TAG}`,"",`RC: ${process.env.CANDIDATE_TAG}`,`Source-Revision: ${process.env.SOURCE_REVISION}`,`Image-Digest: ${process.env.IMAGE_DIGEST}`,`Finalization-Evidence-SHA256: ${process.env.FINALIZATION_HASH}`,`Protected-Semantic-Baseline-SHA256: ${process.env.BASELINE_HASH}`,`Stable-Authorization-SHA256: ${process.env.AUTHORIZATION_HASH}`,`Tag-Ruleset-ID: ${process.env.VERIFIED_STABLE_TAG_RULESET_ID}`,`Tag-Bypass-Integration-ID: ${process.env.VERIFIED_GITHUB_ACTIONS_APP_ID}`,""]; fs.writeFileSync("stable-release-notes.txt",lines.join("\n"),{mode:0o600,flag:"wx"});'
-      - name: Fence stable-version monotonicity immediately before mutation
+          node -e 'const fs=require("node:fs"); if(!/^[1-9]\d*$/.test(process.env.VERIFIED_STABLE_WRITER_APP_ID??"")||!/^[1-9]\d*$/.test(process.env.VERIFIED_STABLE_TAG_RULESET_ID??"")) throw new Error("verified stable tag write principal is missing"); const lines=[`gênio stable release ${process.env.STABLE_TAG}`,"",`RC: ${process.env.CANDIDATE_TAG}`,`Source-Revision: ${process.env.SOURCE_REVISION}`,`Image-Digest: ${process.env.IMAGE_DIGEST}`,`Finalization-Evidence-SHA256: ${process.env.FINALIZATION_HASH}`,`Protected-Semantic-Baseline-SHA256: ${process.env.BASELINE_HASH}`,`Stable-Authorization-SHA256: ${process.env.AUTHORIZATION_HASH}`,`Tag-Ruleset-ID: ${process.env.VERIFIED_STABLE_TAG_RULESET_ID}`,`Tag-Bypass-Integration-ID: ${process.env.VERIFIED_STABLE_WRITER_APP_ID}`,""]; fs.writeFileSync("stable-release-notes.txt",lines.join("\n"),{mode:0o600,flag:"wx"});'
+      - name: Fence stable-version monotonicity before sealing
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           STABLE_TAG: ${{ steps.target.outputs.stable_tag }}
@@ -418,92 +507,960 @@ jobs:
                 );
               }
             }
-      - name: Create the immutable stable tag and GitHub Release
+      - id: seal
+        name: Seal the bounded stable-release mutation inputs
         env:
-          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG_OBJECT: ${{ steps.target.outputs.candidate_tag_object }}
           STABLE_TAG: ${{ steps.target.outputs.stable_tag }}
           SOURCE_REVISION: ${{ steps.target.outputs.source_revision }}
+          VERIFIED_CONTROL_AUDITOR_APP_ID: ${{ steps.protection.outputs.control_auditor_app_id }}
+          VERIFIED_STABLE_WRITER_APP_ID: ${{ steps.protection.outputs.stable_writer_app_id }}
+          VERIFIED_STABLE_TAG_RULESET_ID: ${{ steps.protection.outputs.stable_tag_ruleset_id }}
         run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/$STABLE_TAG" >/dev/null 2>&1; then
-            git fetch --force origin "refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
-            test "$(git cat-file -t "refs/tags/$STABLE_TAG")" = "tag"
-            test "$(git rev-parse "refs/tags/$STABLE_TAG^{}")" = "$SOURCE_REVISION"
-            node -e 'const fs=require("node:fs"); const cp=require("node:child_process"); const raw=cp.execFileSync("git",["cat-file","tag",`refs/tags/${process.env.STABLE_TAG}`],{encoding:"utf8"}); const separator=raw.indexOf("\n\n"); if(separator<0) throw new Error("existing stable tag is malformed"); const actual=raw.slice(separator+2); const expected=fs.readFileSync("stable-release-notes.txt","utf8"); if(actual!==expected) throw new Error("existing stable tag annotation is not the exact verified release annotation");'
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { readFileSync, statSync, writeFileSync } = require("node:fs");
+          const files = [
+            "finalization-evidence.json",
+            "protected-semantic-baseline.json",
+            "stable-authorization.json",
+            "stable-image-attestation.json",
+            "stable-release-consumer.json",
+            "stable-release-notes.txt",
+          ];
+          const sha256 = (bytes) =>
+            createHash("sha256").update(bytes).digest("hex");
+          const assets = {};
+          for (const name of files) {
+            const size = statSync(name).size;
+            if (size <= 0 || size > 2 * 1024 * 1024) {
+              throw new Error(`sealed stable-release input ${name} is empty or oversized`);
+            }
+            assets[name] = { size, sha256: sha256(readFileSync(name)) };
+          }
+          const numeric = (value) => /^[1-9]\d*$/.test(value ?? "");
+          if (
+            !/^[0-9a-f]{40}$/.test(process.env.CANDIDATE_TAG_OBJECT ?? "")
+            || !/^[0-9a-f]{40}$/.test(process.env.SOURCE_REVISION ?? "")
+            || !numeric(process.env.VERIFIED_CONTROL_AUDITOR_APP_ID)
+            || !numeric(process.env.VERIFIED_STABLE_WRITER_APP_ID)
+            || !numeric(process.env.VERIFIED_STABLE_TAG_RULESET_ID)
+          ) {
+            throw new Error("sealed stable-release control identity is invalid");
+          }
+          const manifest = {
+            schemaVersion: "genio-stable-release-mutation-manifest/v1",
+            repository: process.env.GITHUB_REPOSITORY,
+            workflow: `${process.env.GITHUB_REPOSITORY}/.github/workflows/stable-release.yml`,
+            workflowSha: process.env.GITHUB_SHA,
+            candidateTag: process.env.CANDIDATE_TAG,
+            candidateTagObject: process.env.CANDIDATE_TAG_OBJECT,
+            stableTag: process.env.STABLE_TAG,
+            sourceRevision: process.env.SOURCE_REVISION,
+            imageDigest: process.env.IMAGE_DIGEST,
+            controlAuditorAppId: Number(process.env.VERIFIED_CONTROL_AUDITOR_APP_ID),
+            stableWriterAppId: Number(process.env.VERIFIED_STABLE_WRITER_APP_ID),
+            stableTagRulesetId: Number(process.env.VERIFIED_STABLE_TAG_RULESET_ID),
+            assets,
+          };
+          const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+          writeFileSync("stable-release-mutation-manifest.json", bytes, {
+            flag: "wx",
+            mode: 0o600,
+          });
+          require("node:fs").appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `manifest_sha256=${sha256(bytes)}\n`,
+          );
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stable-release-mutation-${{ steps.target.outputs.candidate_tag }}
+          path: |
+            finalization-evidence.json
+            protected-semantic-baseline.json
+            stable-authorization.json
+            stable-image-attestation.json
+            stable-release-consumer.json
+            stable-release-notes.txt
+            stable-release-mutation-manifest.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
+
+  final_reauthorize:
+    needs: [verify_and_seal]
+    environment: release-control-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      control_receipt_sha256: ${{ steps.receipt.outputs.sha256 }}
+    env:
+      CANDIDATE_TAG: ${{ needs.verify_and_seal.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.verify_and_seal.outputs.candidate_tag_object }}
+      STABLE_TAG: ${{ needs.verify_and_seal.outputs.stable_tag }}
+      SOURCE_REVISION: ${{ needs.verify_and_seal.outputs.source_revision }}
+      IMAGE_DIGEST: ${{ needs.verify_and_seal.outputs.image_digest }}
+      MUTATION_MANIFEST_SHA256: ${{ needs.verify_and_seal.outputs.mutation_manifest_sha256 }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify_and_seal.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-release-mutation-${{ needs.verify_and_seal.outputs.candidate_tag }}
+          path: stable-release-mutation
+      - name: Verify the sealed mutation inputs before control reauthorization
+        run: |
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { readFileSync, readdirSync, statSync } = require("node:fs");
+          const { join } = require("node:path");
+          const root = "stable-release-mutation";
+          const expectedFiles = [
+            "finalization-evidence.json",
+            "protected-semantic-baseline.json",
+            "stable-authorization.json",
+            "stable-image-attestation.json",
+            "stable-release-consumer.json",
+            "stable-release-mutation-manifest.json",
+            "stable-release-notes.txt",
+          ];
+          const actualFiles = readdirSync(root).sort();
+          if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+            throw new Error("stable-release mutation artifact inventory is not exact");
+          }
+          const sha256 = (bytes) =>
+            createHash("sha256").update(bytes).digest("hex");
+          const manifestBytes = readFileSync(
+            join(root, "stable-release-mutation-manifest.json"),
+          );
+          if (
+            sha256(manifestBytes) !== process.env.MUTATION_MANIFEST_SHA256
+            || manifestBytes.length <= 0
+            || manifestBytes.length > 64 * 1024
+          ) {
+            throw new Error("stable-release mutation manifest hash or bound is invalid");
+          }
+          const manifest = JSON.parse(manifestBytes);
+          const assetNames = Object.keys(manifest.assets ?? {}).sort();
+          const expectedAssets = expectedFiles.filter((name) =>
+            name !== "stable-release-mutation-manifest.json"
+          );
+          if (
+            manifest.schemaVersion !== "genio-stable-release-mutation-manifest/v1"
+            || manifest.repository !== process.env.GITHUB_REPOSITORY
+            || manifest.workflow
+              !== `${process.env.GITHUB_REPOSITORY}/.github/workflows/stable-release.yml`
+            || manifest.workflowSha !== process.env.GITHUB_SHA
+            || manifest.candidateTag !== process.env.CANDIDATE_TAG
+            || manifest.candidateTagObject !== process.env.CANDIDATE_TAG_OBJECT
+            || manifest.stableTag !== process.env.STABLE_TAG
+            || manifest.sourceRevision !== process.env.SOURCE_REVISION
+            || manifest.imageDigest !== process.env.IMAGE_DIGEST
+            || JSON.stringify(assetNames) !== JSON.stringify(expectedAssets)
+          ) {
+            throw new Error("stable-release mutation manifest identity is invalid");
+          }
+          for (const name of expectedAssets) {
+            const path = join(root, name);
+            const bytes = readFileSync(path);
+            const entry = manifest.assets[name];
+            if (
+              bytes.length <= 0
+              || bytes.length > 2 * 1024 * 1024
+              || statSync(path).size !== entry?.size
+              || sha256(bytes) !== entry?.sha256
+            ) {
+              throw new Error(`sealed stable-release input ${name} changed`);
+            }
+          }
+          NODE
+      - id: control_auditor
+        name: Mint the final repository-scoped control auditor token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+          private-key: ${{ secrets.RELEASE_CONTROL_AUDITOR_APP_PRIVATE_KEY }}
+          permission-actions: read
+          permission-administration: write
+          permission-checks: read
+          permission-contents: read
+          permission-pull-requests: read
+      - name: Reauthorize the exact controller and GitHub controls
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RELEASE_CONTROL_AUDITOR_APP_ID: ${{ vars.RELEASE_CONTROL_AUDITOR_APP_ID }}
+          STABLE_RELEASE_WRITER_APP_ID: ${{ vars.STABLE_RELEASE_WRITER_APP_ID }}
+          STABLE_TAG_RULESET_ID: ${{ vars.STABLE_TAG_RULESET_ID }}
+        with:
+          github-token: ${{ steps.control_auditor.outputs.token }}
+          script: |
+            const { readFileSync, writeFileSync } = require("node:fs");
+            const fail = (message) => {
+              throw new Error(`stable release final authorization: ${message}`);
+            };
+            const expectedPayloadKeys = [
+              "candidate_tag",
+              "finalization_evidence_b64url",
+              "image_digest",
+              "protected_baseline_metadata_b64url",
+              "stable_authorization_b64url",
+            ];
+            const payload = context.payload.client_payload ?? {};
+            if (
+              JSON.stringify(Object.keys(payload).sort())
+                !== JSON.stringify(expectedPayloadKeys)
+              || payload.candidate_tag !== process.env.CANDIDATE_TAG
+              || payload.image_digest !== process.env.IMAGE_DIGEST
+              || context.sha !== process.env.SOURCE_REVISION
+              || process.env.GITHUB_WORKFLOW_SHA !== context.sha
+            ) {
+              fail("dispatch or controller identity changed");
+            }
+            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            if (!["admin", "maintain"].includes(permission.data.permission)) {
+              fail("dispatcher no longer has maintain or admin permission");
+            }
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: process.env.DEFAULT_BRANCH,
+            });
+            const candidateRef = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `tags/${process.env.CANDIDATE_TAG}`,
+            });
+            if (
+              !branch.data.protected
+              || branch.data.commit.sha !== process.env.SOURCE_REVISION
+              || candidateRef.data.object.type !== "tag"
+              || candidateRef.data.object.sha !== process.env.CANDIDATE_TAG_OBJECT
+            ) {
+              fail("default-branch head or annotated RC object changed");
+            }
+            const candidateTag = await github.rest.git.getTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_sha: process.env.CANDIDATE_TAG_OBJECT,
+            });
+            if (
+              candidateTag.data.tag !== process.env.CANDIDATE_TAG
+              || candidateTag.data.object.type !== "commit"
+              || candidateTag.data.object.sha !== process.env.SOURCE_REVISION
+            ) {
+              fail("annotated RC target changed");
+            }
+            const protection = await github.rest.repos.getBranchProtection({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: process.env.DEFAULT_BRANCH,
+            });
+            const requiredChecks = [
+              "static",
+              "policy",
+              "unit-and-database",
+              "production-database-compatibility",
+              "browser (mobile-320)",
+              "browser (mobile-390)",
+              "browser (mobile-430)",
+              "browser (desktop)",
+            ];
+            const githubActionsApp = await github.rest.apps.getBySlug({
+              app_slug: "github-actions",
+            });
+            const githubActionsAppId = Number(githubActionsApp.data.id);
+            const stableWriterAppId =
+              Number(process.env.STABLE_RELEASE_WRITER_APP_ID);
+            const controlAuditorAppId =
+              Number(process.env.RELEASE_CONTROL_AUDITOR_APP_ID);
+            const configuredChecks =
+              protection.data.required_status_checks?.checks ?? [];
+            if (
+              githubActionsApp.data.slug !== "github-actions"
+              || !Number.isSafeInteger(githubActionsAppId)
+              || !Number.isSafeInteger(stableWriterAppId)
+              || !Number.isSafeInteger(controlAuditorAppId)
+              || Math.min(
+                githubActionsAppId,
+                stableWriterAppId,
+                controlAuditorAppId,
+              ) <= 0
+              || new Set([
+                githubActionsAppId,
+                stableWriterAppId,
+                controlAuditorAppId,
+              ]).size !== 3
+              || protection.data.required_status_checks?.strict !== true
+              || configuredChecks.length !== requiredChecks.length
+              || requiredChecks.some((name) =>
+                !configuredChecks.some((check) =>
+                  check.context === name
+                  && Number(check.app_id) === githubActionsAppId
+                )
+              )
+              || protection.data.enforce_admins?.enabled !== true
+              || protection.data.required_conversation_resolution?.enabled
+                !== true
+              || protection.data.allow_force_pushes?.enabled !== false
+              || protection.data.allow_deletions?.enabled !== false
+            ) {
+              fail("branch protection or Integration identities changed");
+            }
+            const checkRuns = await github.paginate(
+              github.rest.checks.listForRef,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: process.env.SOURCE_REVISION,
+                filter: "latest",
+                per_page: 100,
+              },
+            );
+            if (requiredChecks.some((name) => {
+              const matches = checkRuns.filter((run) => run.name === name);
+              return matches.length !== 1
+                || Number(matches[0]?.app?.id) !== githubActionsAppId
+                || matches[0]?.status !== "completed"
+                || matches[0]?.conclusion !== "success";
+            })) {
+              fail("exact app-bound check results changed");
+            }
+            const pulls = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: process.env.SOURCE_REVISION,
+                per_page: 100,
+              },
+            );
+            const merged = pulls.filter((pull) =>
+              pull.merged_at
+              && pull.base?.ref === process.env.DEFAULT_BRANCH
+              && pull.merge_commit_sha === process.env.SOURCE_REVISION
+            );
+            if (merged.length !== 1) {
+              fail("controller is no longer one exact reviewed merge");
+            }
+            for (const environmentName of [
+              "release-control-audit",
+              "stable-release",
+            ]) {
+              const environment = await github.request(
+                "GET /repos/{owner}/{repo}/environments/{environment_name}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  environment_name: environmentName,
+                },
+              );
+              const reviewerRule = (environment.data.protection_rules ?? [])
+                .find((rule) => rule.type === "required_reviewers");
+              if (
+                environment.data.name !== environmentName
+                || environment.data.deployment_branch_policy?.protected_branches
+                  !== true
+                || environment.data.deployment_branch_policy
+                  ?.custom_branch_policies !== false
+                || !reviewerRule
+                || !Array.isArray(reviewerRule.reviewers)
+                || reviewerRule.reviewers.length !== 1
+                || reviewerRule.reviewers[0]?.type !== "User"
+                || reviewerRule.reviewers[0]?.reviewer?.login?.toLowerCase()
+                  !== context.repo.owner.toLowerCase()
+                || environment.data.prevent_self_review === true
+                || reviewerRule.prevent_self_review === true
+              ) {
+                fail(`${environmentName} environment controls changed`);
+              }
+            }
+            const immutable = await github.request(
+              "GET /repos/{owner}/{repo}/immutable-releases",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              },
+            );
+            if (immutable.data.enabled !== true) {
+              fail("immutable Releases were disabled");
+            }
+            const rulesetId = Number(process.env.STABLE_TAG_RULESET_ID);
+            const ruleset = await github.request(
+              "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}",
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ruleset_id: rulesetId,
+              },
+            );
+            const ruleTypes = (ruleset.data.rules ?? [])
+              .map(({ type }) => type)
+              .sort();
+            const bypassActors = ruleset.data.bypass_actors ?? [];
+            if (
+              !Number.isSafeInteger(rulesetId)
+              || rulesetId <= 0
+              || ruleset.data.target !== "tag"
+              || ruleset.data.enforcement !== "active"
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.include ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*"])
+              || JSON.stringify(
+                [...(ruleset.data.conditions?.ref_name?.exclude ?? [])].sort(),
+              ) !== JSON.stringify(["refs/tags/v*-rc.*"])
+              || JSON.stringify(ruleTypes)
+                !== JSON.stringify(["creation", "deletion", "update"])
+              || bypassActors.length !== 1
+              || bypassActors[0]?.actor_type !== "Integration"
+              || Number(bypassActors[0]?.actor_id) !== stableWriterAppId
+              || bypassActors[0]?.bypass_mode !== "always"
+            ) {
+              fail("stable tag ruleset changed");
+            }
+            const STABLE_TAG =
+              /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            const tuple = (tag) => {
+              const match = STABLE_TAG.exec(tag ?? "");
+              return match ? match.slice(1).map(BigInt) : null;
+            };
+            const compare = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] < right[index]) return -1;
+                if (left[index] > right[index]) return 1;
+              }
+              return 0;
+            };
+            const targetVersion = tuple(process.env.STABLE_TAG);
+            const [refs, releases] = await Promise.all([
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                headers: { "X-GitHub-Api-Version": "2026-03-10" },
+              }),
+            ]);
+            const stableRefs = refs.flatMap((ref) => {
+              const tag = ref.ref?.replace(/^refs\/tags\//u, "") ?? "";
+              const version = tuple(tag);
+              return version ? [{ ref, tag, version }] : [];
+            });
+            const stableReleases = releases.flatMap((release) => {
+              const version = tuple(release.tag_name);
+              return version ? [{ release, version }] : [];
+            });
+            if (
+              !targetVersion
+              || stableRefs.some(({ version }) =>
+                compare(version, targetVersion) > 0
+              )
+              || stableReleases.some(({ version }) =>
+                compare(version, targetVersion) > 0
+              )
+            ) {
+              fail("stable release would move semantic version backwards");
+            }
+            const equalRefs = stableRefs.filter(({ version }) =>
+              compare(version, targetVersion) === 0
+            );
+            const equalReleases = stableReleases.filter(({ version }) =>
+              compare(version, targetVersion) === 0
+            );
+            const expectedBody = readFileSync(
+              "stable-release-mutation/stable-release-notes.txt",
+              "utf8",
+            );
+            if (equalRefs.length > 1 || equalReleases.length > 1) {
+              fail("stable release identity is duplicated");
+            }
+            if (equalRefs.length === 1) {
+              const ref = equalRefs[0];
+              if (
+                ref.tag !== process.env.STABLE_TAG
+                || ref.ref.object?.type !== "tag"
+              ) {
+                fail("equal stable tag is not annotated");
+              }
+              const tag = await github.rest.git.getTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_sha: ref.ref.object.sha,
+              });
+              if (
+                tag.data.object.type !== "commit"
+                || tag.data.object.sha !== process.env.SOURCE_REVISION
+                || tag.data.message !== expectedBody
+              ) {
+                fail("equal stable tag identity changed");
+              }
+            }
+            if (equalReleases.length === 1) {
+              const release = equalReleases[0].release;
+              if (
+                equalRefs.length !== 1
+                || release.target_commitish !== process.env.SOURCE_REVISION
+                || release.name !== process.env.STABLE_TAG
+                || release.body !== expectedBody
+                || release.prerelease
+                || (release.draft !== true && release.immutable !== true)
+              ) {
+                fail("equal stable Release identity changed");
+              }
+            }
+            const manifest = JSON.parse(readFileSync(
+              "stable-release-mutation/stable-release-mutation-manifest.json",
+              "utf8",
+            ));
+            if (
+              manifest.controlAuditorAppId !== controlAuditorAppId
+              || manifest.stableWriterAppId !== stableWriterAppId
+              || manifest.stableTagRulesetId !== rulesetId
+            ) {
+              fail("sealed App or ruleset identity differs");
+            }
+            const releaseAssetNames = [
+              "finalization-evidence.json",
+              "protected-semantic-baseline.json",
+              "stable-authorization.json",
+              "stable-image-attestation.json",
+              "stable-release-consumer.json",
+            ];
+            const missingAssets = [];
+            const replaceAssets = [];
+            let releaseId = null;
+            let releaseDraft = true;
+            if (equalReleases.length === 0) {
+              missingAssets.push(...releaseAssetNames);
+            } else {
+              const release = equalReleases[0].release;
+              releaseId = release.id;
+              releaseDraft = release.draft;
+              const actualNames = (release.assets ?? [])
+                .map(({ name }) => name)
+                .sort();
+              if (
+                new Set(actualNames).size !== actualNames.length
+                || actualNames.some((name) => !releaseAssetNames.includes(name))
+              ) {
+                fail("equal stable Release has unexpected or duplicate assets");
+              }
+              for (const name of releaseAssetNames) {
+                const matches = (release.assets ?? []).filter(
+                  (asset) => asset.name === name,
+                );
+                if (matches.length === 0) {
+                  missingAssets.push(name);
+                  continue;
+                }
+                if (
+                  matches.length !== 1
+                  || !Number.isSafeInteger(matches[0].id)
+                  || matches[0].id <= 0
+                  || matches[0].state !== "uploaded"
+                  || !Number.isSafeInteger(matches[0].size)
+                  || matches[0].size <= 0
+                ) {
+                  fail(`equal stable Release asset ${name} is invalid`);
+                }
+                const response = await github.request(
+                  "GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    asset_id: matches[0].id,
+                    headers: {
+                      accept: "application/octet-stream",
+                      "X-GitHub-Api-Version": "2026-03-10",
+                    },
+                  },
+                );
+                const bytes = response.data instanceof ArrayBuffer
+                  ? Buffer.from(response.data)
+                  : ArrayBuffer.isView(response.data)
+                    ? Buffer.from(
+                      response.data.buffer,
+                      response.data.byteOffset,
+                      response.data.byteLength,
+                    )
+                    : typeof response.data === "string"
+                      ? Buffer.from(response.data, "utf8")
+                      : null;
+                if (
+                  !bytes
+                  || bytes.length !== matches[0].size
+                  || require("node:crypto").createHash("sha256")
+                    .update(bytes).digest("hex")
+                    !== manifest.assets[name]?.sha256
+                ) {
+                  replaceAssets.push(name);
+                }
+              }
+              if (
+                release.immutable === true
+                && (missingAssets.length > 0 || replaceAssets.length > 0)
+              ) {
+                fail("immutable stable Release assets differ from the sealed inputs");
+              }
+            }
+            writeFileSync(
+              "stable-release-control-authorization.json",
+              `${JSON.stringify({
+                schemaVersion: "genio-stable-release-control-authorization/v1",
+                repository: process.env.GITHUB_REPOSITORY,
+                workflowSha: process.env.GITHUB_SHA,
+                candidateTag: process.env.CANDIDATE_TAG,
+                candidateTagObject: process.env.CANDIDATE_TAG_OBJECT,
+                stableTag: process.env.STABLE_TAG,
+                sourceRevision: process.env.SOURCE_REVISION,
+                mutationManifestSha256: process.env.MUTATION_MANIFEST_SHA256,
+                controlAuditorAppId,
+                stableWriterAppId,
+                stableTagRulesetId: rulesetId,
+                tagExists: equalRefs.length === 1,
+                stableTagObject: equalRefs.length === 1
+                  ? equalRefs[0].ref.object.sha
+                  : null,
+                releaseExists: equalReleases.length === 1,
+                releaseId,
+                releaseDraft,
+                missingAssets,
+                replaceAssets,
+                authorizedAt: new Date().toISOString(),
+              }, null, 2)}\n`,
+              { flag: "wx", mode: 0o600 },
+            );
+      - id: receipt
+        name: Seal the final control authorization receipt
+        run: |
+          node -e 'const crypto=require("node:crypto"); const fs=require("node:fs"); const bytes=fs.readFileSync("stable-release-control-authorization.json"); if(bytes.length<=0||bytes.length>64*1024) throw new Error("control authorization receipt is empty or oversized"); fs.appendFileSync(process.env.GITHUB_OUTPUT,`sha256=${crypto.createHash("sha256").update(bytes).digest("hex")}\n`);'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stable-release-control-${{ needs.verify_and_seal.outputs.candidate_tag }}
+          path: stable-release-control-authorization.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
+
+  publish:
+    needs: [verify_and_seal, final_reauthorize]
+    environment: stable-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CANDIDATE_TAG: ${{ needs.verify_and_seal.outputs.candidate_tag }}
+      CANDIDATE_TAG_OBJECT: ${{ needs.verify_and_seal.outputs.candidate_tag_object }}
+      STABLE_TAG: ${{ needs.verify_and_seal.outputs.stable_tag }}
+      SOURCE_REVISION: ${{ needs.verify_and_seal.outputs.source_revision }}
+      IMAGE_DIGEST: ${{ needs.verify_and_seal.outputs.image_digest }}
+      MUTATION_MANIFEST_SHA256: ${{ needs.verify_and_seal.outputs.mutation_manifest_sha256 }}
+      CONTROL_RECEIPT_SHA256: ${{ needs.final_reauthorize.outputs.control_receipt_sha256 }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify_and_seal.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-release-mutation-${{ needs.verify_and_seal.outputs.candidate_tag }}
+          path: stable-release-mutation
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-release-control-${{ needs.verify_and_seal.outputs.candidate_tag }}
+          path: stable-release-control
+      - name: Verify the sealed mutation authorization
+        env:
+          STABLE_RELEASE_WRITER_APP_ID: ${{ vars.STABLE_RELEASE_WRITER_APP_ID }}
+        run: |
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { readFileSync, readdirSync, writeFileSync } = require("node:fs");
+          const { join } = require("node:path");
+          const sha256 = (bytes) =>
+            createHash("sha256").update(bytes).digest("hex");
+          const mutationRoot = "stable-release-mutation";
+          const manifestBytes = readFileSync(
+            join(mutationRoot, "stable-release-mutation-manifest.json"),
+          );
+          const receiptFiles = readdirSync("stable-release-control");
+          if (
+            receiptFiles.length !== 1
+            || receiptFiles[0] !== "stable-release-control-authorization.json"
+            || sha256(manifestBytes) !== process.env.MUTATION_MANIFEST_SHA256
+          ) {
+            throw new Error("sealed stable-release artifact inventory changed");
+          }
+          const receiptBytes = readFileSync(
+            "stable-release-control/stable-release-control-authorization.json",
+          );
+          if (sha256(receiptBytes) !== process.env.CONTROL_RECEIPT_SHA256) {
+            throw new Error("stable-release control authorization hash changed");
+          }
+          const manifest = JSON.parse(manifestBytes);
+          const receipt = JSON.parse(receiptBytes);
+          const authorizedAt = Date.parse(receipt.authorizedAt);
+          const now = Date.now();
+          if (
+            receipt.schemaVersion
+              !== "genio-stable-release-control-authorization/v1"
+            || receipt.repository !== process.env.GITHUB_REPOSITORY
+            || receipt.workflowSha !== process.env.GITHUB_SHA
+            || receipt.candidateTag !== process.env.CANDIDATE_TAG
+            || receipt.candidateTagObject !== process.env.CANDIDATE_TAG_OBJECT
+            || receipt.stableTag !== process.env.STABLE_TAG
+            || receipt.sourceRevision !== process.env.SOURCE_REVISION
+            || receipt.mutationManifestSha256
+              !== process.env.MUTATION_MANIFEST_SHA256
+            || manifest.stableWriterAppId !== receipt.stableWriterAppId
+            || String(receipt.stableWriterAppId)
+              !== process.env.STABLE_RELEASE_WRITER_APP_ID
+            || !Number.isFinite(authorizedAt)
+            || authorizedAt > now + 30_000
+            || now - authorizedAt > 5 * 60 * 1000
+          ) {
+            throw new Error("stable-release control authorization is stale or mismatched");
+          }
+          const releaseAssetNames = [
+            "finalization-evidence.json",
+            "protected-semantic-baseline.json",
+            "stable-authorization.json",
+            "stable-image-attestation.json",
+            "stable-release-consumer.json",
+          ];
+          if (
+            typeof receipt.tagExists !== "boolean"
+            || (
+              receipt.tagExists
+                ? !/^[0-9a-f]{40}$/u.test(receipt.stableTagObject ?? "")
+                : receipt.stableTagObject !== null
+            )
+            || typeof receipt.releaseExists !== "boolean"
+            || typeof receipt.releaseDraft !== "boolean"
+            || (
+              receipt.releaseExists
+                ? !Number.isSafeInteger(receipt.releaseId)
+                  || receipt.releaseId <= 0
+                : receipt.releaseId !== null
+            )
+            || !Array.isArray(receipt.missingAssets)
+            || !Array.isArray(receipt.replaceAssets)
+            || [...receipt.missingAssets, ...receipt.replaceAssets].some(
+              (name) => !releaseAssetNames.includes(name),
+            )
+            || new Set([
+              ...receipt.missingAssets,
+              ...receipt.replaceAssets,
+            ]).size
+              !== receipt.missingAssets.length + receipt.replaceAssets.length
+          ) {
+            throw new Error("stable-release mutation plan is invalid");
+          }
+          for (const [name, expected] of Object.entries(manifest.assets)) {
+            const bytes = readFileSync(join(mutationRoot, name));
+            if (
+              bytes.length !== expected.size
+              || sha256(bytes) !== expected.sha256
+            ) {
+              throw new Error(`stable-release input ${name} changed after authorization`);
+            }
+          }
+          writeFileSync(
+            "stable-release-missing-assets.txt",
+            `${receipt.missingAssets.join("\n")}\n`,
+            { mode: 0o600 },
+          );
+          writeFileSync(
+            "stable-release-replace-assets.txt",
+            `${receipt.replaceAssets.join("\n")}\n`,
+            { mode: 0o600 },
+          );
+          writeFileSync(
+            "stable-release-mutation-state.env",
+            `TAG_EXISTS=${receipt.tagExists ? "true" : "false"}\n`
+              + `RELEASE_EXISTS=${receipt.releaseExists ? "true" : "false"}\n`
+              + `RELEASE_DRAFT=${receipt.releaseDraft ? "true" : "false"}\n`,
+            { mode: 0o600 },
+          );
+          NODE
+      - name: Reject a stale branch or moved RC immediately before writer minting
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: process.env.DEFAULT_BRANCH,
+            });
+            const ref = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `tags/${process.env.CANDIDATE_TAG}`,
+            });
+            if (
+              !branch.data.protected
+              || branch.data.commit.sha !== process.env.SOURCE_REVISION
+              || context.sha !== process.env.SOURCE_REVISION
+              || process.env.GITHUB_WORKFLOW_SHA !== context.sha
+              || ref.data.object.type !== "tag"
+              || ref.data.object.sha !== process.env.CANDIDATE_TAG_OBJECT
+            ) {
+              throw new Error("branch head, controller, or annotated RC changed after authorization");
+            }
+            const tag = await github.rest.git.getTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_sha: process.env.CANDIDATE_TAG_OBJECT,
+            });
+            if (
+              tag.data.tag !== process.env.CANDIDATE_TAG
+              || tag.data.object.type !== "commit"
+              || tag.data.object.sha !== process.env.SOURCE_REVISION
+            ) {
+              throw new Error("annotated RC target changed after authorization");
+            }
+            const { readFileSync } = require("node:fs");
+            const receipt = JSON.parse(readFileSync(
+              "stable-release-control/stable-release-control-authorization.json",
+              "utf8",
+            ));
+            try {
+              const stableRef = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${process.env.STABLE_TAG}`,
+              });
+              if (
+                !receipt.tagExists
+                || stableRef.data.object.type !== "tag"
+                || stableRef.data.object.sha !== receipt.stableTagObject
+              ) {
+                throw new Error("stable tag changed after authorization");
+              }
+              const stableTag = await github.rest.git.getTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_sha: receipt.stableTagObject,
+              });
+              if (
+                stableTag.data.tag !== process.env.STABLE_TAG
+                || stableTag.data.object.type !== "commit"
+                || stableTag.data.object.sha !== process.env.SOURCE_REVISION
+              ) {
+                throw new Error("stable annotated tag target changed after authorization");
+              }
+            } catch (error) {
+              if (error.status !== 404 || receipt.tagExists) throw error;
+            }
+      - id: stable_writer
+        name: Mint the repository-scoped stable writer only for mutation
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.STABLE_RELEASE_WRITER_APP_ID }}
+          private-key: ${{ secrets.STABLE_RELEASE_WRITER_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Create the exact immutable stable tag and GitHub Release
+        run: |
+          source stable-release-mutation-state.env
+          if test "$TAG_EXISTS" = "false"; then
+            git config user.name "genio-stable-release-writer[bot]"
+            git config user.email "genio-stable-release-writer[bot]@users.noreply.github.com"
             git tag --annotate "$STABLE_TAG" --cleanup=verbatim \
-              --file stable-release-notes.txt "$SOURCE_REVISION"
-            git push origin "refs/tags/$STABLE_TAG"
+              --file stable-release-mutation/stable-release-notes.txt \
+              "$SOURCE_REVISION"
+            git -c "http.extraHeader=Authorization: Bearer ${{ steps.stable_writer.outputs.token }}" \
+              push origin "refs/tags/$STABLE_TAG"
           fi
-          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
-            > stable-release-api.json 2>/dev/null; then
-            gh release create "$STABLE_TAG" \
+          if test "$RELEASE_EXISTS" = "false"; then
+            GH_TOKEN="${{ steps.stable_writer.outputs.token }}" \
+              gh release create "$STABLE_TAG" \
               --draft \
               --verify-tag \
               --target "$SOURCE_REVISION" \
               --title "$STABLE_TAG" \
-              --notes-file stable-release-notes.txt
+              --notes-file stable-release-mutation/stable-release-notes.txt
           fi
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
-            > stable-release-api.json
-          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-release-notes.txt","utf8"); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.prerelease||(!release.draft&&release.immutable!==true)) throw new Error("GitHub Release identity or body does not exactly match the verified stable release");'
-          mkdir existing-release-assets
-          for ASSET in \
-            finalization-evidence.json \
-            protected-semantic-baseline.json \
-            stable-authorization.json \
-            stable-image-attestation.json \
-            stable-release-consumer.json; do
-            if ASSET_NAME="$ASSET" node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); process.exit((release.assets??[]).some(({name})=>name===process.env.ASSET_NAME)?0:1)'; then
-              gh release download "$STABLE_TAG" \
-                --dir existing-release-assets \
-                --pattern "$ASSET" \
-                --clobber
-            fi
-          done
-          node --experimental-transform-types scripts/stable-release-assets.ts \
-            --release stable-release-api.json \
-            --expected-directory . \
-            --downloaded-directory existing-release-assets \
-            --output stable-release-asset-plan.json
-          if node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.exit(plan.missing.length+plan.replace.length>0?0:1)'; then
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
-              > stable-release-before-reconcile.json
-            node -e 'const fs=require("node:fs"); const before=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const current=JSON.parse(fs.readFileSync("stable-release-before-reconcile.json","utf8")); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); if(current.id!==before.id||current.id!==plan.releaseId||current.tag_name!==before.tag_name||current.target_commitish!==before.target_commitish||current.name!==before.name||current.body!==before.body||current.prerelease||!current.draft) throw new Error("stable release left the verified draft state before asset reconciliation");'
-            for ASSET in $(node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.stdout.write(plan.replace.join("\n"))'); do
+          while IFS= read -r ASSET; do
+            test -n "$ASSET" || continue
+            GH_TOKEN="${{ steps.stable_writer.outputs.token }}" \
               gh release delete-asset "$STABLE_TAG" "$ASSET" --yes
-              gh release upload "$STABLE_TAG" "$ASSET"
-            done
-            for ASSET in $(node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-asset-plan.json","utf8")); process.stdout.write(plan.missing.join("\n"))'); do
-              gh release upload "$STABLE_TAG" "$ASSET"
-            done
+            GH_TOKEN="${{ steps.stable_writer.outputs.token }}" \
+              gh release upload "$STABLE_TAG" "stable-release-mutation/$ASSET"
+          done < stable-release-replace-assets.txt
+          while IFS= read -r ASSET; do
+            test -n "$ASSET" || continue
+            GH_TOKEN="${{ steps.stable_writer.outputs.token }}" \
+              gh release upload "$STABLE_TAG" "stable-release-mutation/$ASSET"
+          done < stable-release-missing-assets.txt
+          if test "$RELEASE_DRAFT" = "true"; then
+            GH_TOKEN="${{ steps.stable_writer.outputs.token }}" \
+              gh release edit "$STABLE_TAG" --draft=false
           fi
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
-            > stable-release-api.json
-          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); const expectedBody=fs.readFileSync("stable-release-notes.txt","utf8"); const expectedAssets=["finalization-evidence.json","protected-semantic-baseline.json","stable-authorization.json","stable-image-attestation.json","stable-release-consumer.json"]; const actualAssets=(release.assets??[]).map(({name})=>name).sort(); if(release.tag_name!==process.env.STABLE_TAG||release.target_commitish!==process.env.SOURCE_REVISION||release.name!==process.env.STABLE_TAG||release.body!==expectedBody||release.prerelease||JSON.stringify(actualAssets)!==JSON.stringify(expectedAssets)) throw new Error("GitHub Release identity, body, or assets do not exactly match the verified stable release");'
+      - name: Verify the published immutable stable Release read-only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > published-stable-release-api.json
           mkdir exact-release-assets
           gh release download "$STABLE_TAG" \
             --dir exact-release-assets \
             --pattern finalization-evidence.json \
             --pattern protected-semantic-baseline.json \
             --pattern stable-authorization.json \
-            --pattern stable-release-consumer.json \
-            --pattern stable-image-attestation.json
-          cmp finalization-evidence.json exact-release-assets/finalization-evidence.json
-          cmp protected-semantic-baseline.json exact-release-assets/protected-semantic-baseline.json
-          cmp stable-authorization.json exact-release-assets/stable-authorization.json
-          cmp stable-release-consumer.json exact-release-assets/stable-release-consumer.json
-          cmp stable-image-attestation.json exact-release-assets/stable-image-attestation.json
-          node --experimental-transform-types scripts/stable-release-assets.ts \
-            --release stable-release-api.json \
-            --expected-directory . \
-            --downloaded-directory exact-release-assets \
-            --output stable-release-final-asset-plan.json
-          node -e 'const fs=require("node:fs"); const plan=JSON.parse(fs.readFileSync("stable-release-final-asset-plan.json","utf8")); if(plan.missing.length||plan.replace.length||plan.verified.length!==5) throw new Error("stable release asset reconciliation did not converge exactly");'
-          if node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("stable-release-api.json","utf8")); process.exit(release.draft?0:1)'; then
-            gh release edit "$STABLE_TAG" --draft=false
-          fi
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
-            > published-stable-release-api.json
-          node -e 'const fs=require("node:fs"); const release=JSON.parse(fs.readFileSync("published-stable-release-api.json","utf8")); if(release.draft||release.prerelease||release.immutable!==true) throw new Error("stable GitHub Release is not published and immutable");'
+            --pattern stable-image-attestation.json \
+            --pattern stable-release-consumer.json
+          cmp stable-release-mutation/finalization-evidence.json exact-release-assets/finalization-evidence.json
+          cmp stable-release-mutation/protected-semantic-baseline.json exact-release-assets/protected-semantic-baseline.json
+          cmp stable-release-mutation/stable-authorization.json exact-release-assets/stable-authorization.json
+          cmp stable-release-mutation/stable-image-attestation.json exact-release-assets/stable-image-attestation.json
+          cmp stable-release-mutation/stable-release-consumer.json exact-release-assets/stable-release-consumer.json
+          node <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const release = JSON.parse(
+            readFileSync("published-stable-release-api.json", "utf8"),
+          );
+          const names = [
+            "finalization-evidence.json",
+            "protected-semantic-baseline.json",
+            "stable-authorization.json",
+            "stable-image-attestation.json",
+            "stable-release-consumer.json",
+          ];
+          const actual = (release.assets ?? []).map(({ name }) => name).sort();
+          if (
+            release.tag_name !== process.env.STABLE_TAG
+            || release.target_commitish !== process.env.SOURCE_REVISION
+            || release.name !== process.env.STABLE_TAG
+            || release.body !== readFileSync(
+              "stable-release-mutation/stable-release-notes.txt",
+              "utf8",
+            )
+            || release.draft
+            || release.prerelease
+            || release.immutable !== true
+            || JSON.stringify(actual) !== JSON.stringify(names)
+          ) {
+            throw new Error("stable GitHub Release is not the exact published immutable release");
+          }
+          NODE
