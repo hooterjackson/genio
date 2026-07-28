@@ -4588,7 +4588,13 @@ export async function executeRetrievalV3(input: {
               Math.max(fairShare, qualityEvidenceGoal),
               state.definition.maximumBatchSize,
               Math.max(unallocatedRawGoal, qualityEvidenceGoal),
-              remainingCapacity,
+              // Qualified expansion can be a pure evidence-enrichment pass
+              // over already-qualified Apple identities. Its rows are not new
+              // discovery leads, so the remaining raw-lead capacity must not
+              // truncate the exact quality window (for example 37/57).
+              qualityEvidenceGoal > 1
+                ? Math.max(remainingCapacity, qualityEvidenceGoal)
+                : remainingCapacity,
             ));
         if (!localOnly) {
           unallocatedRawGoal = Math.max(

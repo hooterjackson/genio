@@ -196,6 +196,15 @@ describe("canonical contract execution bridge", () => {
       zeroKnownFailures: true,
       signalSemantics: "ranking_only_not_factual_evidence",
     });
+    expect(projection.selectionPlanV3.diversityGoals).toEqual({
+      minimumDistinctArtists: null,
+      minimumDistinctAlbums: null,
+      minimumDistinctEras: null,
+      minimumDistinctScenes: null,
+      minimumDistinctGeographies: null,
+      maximumTracksPerArtist: null,
+      maximumTracksPerAlbum: null,
+    });
     expect(projection).toMatchObject({
       backend: "corpus_first_v3",
       backendCapabilityVersion: "playlist_contract_backend_capability_v6",

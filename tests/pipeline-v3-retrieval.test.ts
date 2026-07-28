@@ -2146,6 +2146,66 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(result.outcome.stopReason).toBe("central_quality_floor");
   });
 
+  test("does not truncate quality enrichment to remaining raw-lead capacity", async () => {
+    const base = canonicalDiscoPlan(5);
+    const qualityPlan: SelectionPlanV3 = {
+      ...base,
+      playlistQualityPolicy: {
+        policyVersion: "canonical_central_quality_v1",
+        clauseIds: ["quality:smooth"],
+        criteria: ["smooth"],
+        minimumPassRatio: 0.8,
+        maximumUnknownRatio: 0.2,
+        zeroKnownFailures: true,
+        signalDimension: "central_quality",
+        passThreshold: 0.75,
+        failThreshold: 0.4,
+        signalSemantics: "ranking_only_not_factual_evidence",
+      },
+    };
+    let seeded = false;
+    let qualityRequestCount = 0;
+    await executeRetrievalV3({
+      runId: "quality-enrichment-raw-capacity",
+      plan: qualityPlan,
+      policy: {
+        maximumRawCandidates: 6,
+        maximumGlobalRounds: 20,
+        maximumConcurrentDiscovery: 1,
+        qualifiedPoolGoal: 5,
+      },
+      adapters: {
+        discover: async (request) => {
+          if (request.strategy.kind === "qualified_expansion"
+            && request.qualifiedTrackSeeds.length > 0) {
+            qualityRequestCount = Math.max(
+              qualityRequestCount,
+              request.requestedRawCandidateCount,
+            );
+            return { candidates: [], nextCursor: null, exhausted: true };
+          }
+          if (!seeded
+            && request.strategy.discoveryDependencyIds.some(
+              (dependency) => dependency !== "orchestration_local",
+            )) {
+            seeded = true;
+            return {
+              candidates: Array.from({ length: 5 }, (_, index) => candidate(index)),
+              nextCursor: null,
+              exhausted: true,
+            };
+          }
+          return { candidates: [], nextCursor: null, exhausted: true };
+        },
+        qualify: async ({ candidates }) => candidates.map((value) => (
+          canonicalDiscoQualification(value)
+        )),
+      },
+    });
+
+    expect(qualityRequestCount).toBe(5);
+  });
+
   test("does not call a cache-sized qualified pool exact when artist diversity is infeasible", async () => {
     const diversityPlan = canonicalDiscoPlan(3, {
       diversityGoals: {
