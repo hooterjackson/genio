@@ -482,6 +482,7 @@ export interface CanonicalPlaylistContractExecutionPolicyV1 {
 export type SelectionScopeKind =
   | "broad_curated"
   | "artist_catalogue"
+  | "fixed_track_list"
   | "fixed_release_container"
   | "factual_frontier";
 
@@ -489,6 +490,11 @@ export interface SelectionFixedContainerIdentity {
   kind: "album" | "playlist";
   name: string;
   artistName: string | null;
+}
+
+export interface SelectionFixedTrackIdentity {
+  artist: string;
+  title: string;
 }
 
 export interface SelectionPlan {
@@ -500,6 +506,8 @@ export interface SelectionPlan {
   scopeKind?: SelectionScopeKind;
   /** Optional only for persisted plans compiled before fixed identity fencing. */
   fixedContainerIdentity?: SelectionFixedContainerIdentity;
+  /** Immutable source-order membership for an explicit closed track list. */
+  fixedTrackList?: SelectionFixedTrackIdentity[];
   /** Compatibility routing hints only; constraints and intents are authoritative. */
   archetypes?: ResearchArchetype[];
   storefront: string;
