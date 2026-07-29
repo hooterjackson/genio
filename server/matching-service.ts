@@ -102,6 +102,7 @@ import {
   DEPENDENCY_AUTOMATIC_RETRY_WINDOW_MS,
   DEPENDENCY_RETRY_DELAYS_MS,
 } from "./never-dead-end-policy.ts";
+import { fixedTrackListEntryIndex } from "./fixed-track-list-policy.ts";
 
 interface Candidate extends TrackCandidateInput {
   id: string;
@@ -890,6 +891,12 @@ function matchSatisfiesV2HardEligibility(
   const plan = run.selectionPlan;
   if (run.pipelineVersion !== "catalog_first_v2" || !plan) return true;
   if (!candidate || !match.song || !isEvidenceEligible(run.brief, candidate, plan)) return false;
+  if (plan.scopeKind === "fixed_track_list") {
+    if (!plan.fixedTrackList
+      || fixedTrackListEntryIndex(plan.fixedTrackList, candidate, match.song) < 0) {
+      return false;
+    }
+  }
   if (!plan.versionPolicy.allowed.includes(catalogRecordingVersionClass(match.song))) return false;
   const bindings = candidate.scopeBindings ?? [];
   if (!selectionGeographyBindingsSatisfied(plan, bindings.filter((binding) => binding.eligibility === "qualifying"))) {
