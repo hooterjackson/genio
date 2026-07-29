@@ -98,7 +98,7 @@ function configuration(
 ): PublicRolloutConfiguration {
   return {
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",
@@ -511,7 +511,7 @@ describe("signed public cohort rollout evidence", () => {
       toPercent: "1",
       previousRolloutEvidenceHash: null,
       targetConfiguration: {
-        PIPELINE_V2_CURATED_PERCENT: "0",
+        PIPELINE_V2_CURATED_PERCENT: "100",
         PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
         PIPELINE_V3_GENRE_SCENE_PERCENT: "1",
         PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
@@ -889,7 +889,7 @@ describe("signed public cohort rollout evidence", () => {
       }),
       keys.publicKey,
       options(),
-    )).toThrow(/PIPELINE_V2_CURATED_PERCENT=0/u);
+    )).toThrow(/PIPELINE_V2_CURATED_PERCENT=100/u);
   });
 
   test("requires an elapsed post-canary soak and rejects stale or mismatched proof", () => {

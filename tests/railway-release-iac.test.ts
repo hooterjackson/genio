@@ -362,7 +362,7 @@ beforeAll(() => {
         affectedCohorts,
         rolloutFlags: {
           PIPELINE_V2_OWNER_CANARY: "false",
-          PIPELINE_V2_CURATED_PERCENT: "0",
+          PIPELINE_V2_CURATED_PERCENT: "100",
           PIPELINE_V2_SIMILARITY_PERCENT: "0",
           PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
           PIPELINE_V2_FACTUAL_PERCENT: "0",
@@ -388,7 +388,7 @@ beforeAll(() => {
         activationConfiguration: {
           ...REQUIRED_ACTIVATION_EXECUTION_CONTROLS,
           PIPELINE_V2_OWNER_CANARY: "false",
-          PIPELINE_V2_CURATED_PERCENT: "0",
+          PIPELINE_V2_CURATED_PERCENT: "100",
           PIPELINE_V2_SIMILARITY_PERCENT: "0",
           PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
           PIPELINE_V2_FACTUAL_PERCENT: "0",
@@ -775,7 +775,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
         type: "literal",
         value: expandEvidenceHash,
       },
-      PIPELINE_V2_CURATED_PERCENT: { type: "literal", value: "0" },
+      PIPELINE_V2_CURATED_PERCENT: { type: "literal", value: "100" },
       PIPELINE_V2_SIMILARITY_PERCENT: { type: "literal", value: "0" },
       PIPELINE_V2_FACTUAL_PERCENT: { type: "literal", value: "0" },
       PIPELINE_V3_ASSIGNMENT_ENABLED: { type: "literal", value: "true" },
@@ -795,7 +795,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: { type: "literal", value: "true" },
     });
     expect(service(project, "needle-worker").variables).toMatchObject({
-      PIPELINE_V2_CURATED_PERCENT: { type: "literal", value: "0" },
+      PIPELINE_V2_CURATED_PERCENT: { type: "literal", value: "100" },
       PIPELINE_V2_SIMILARITY_PERCENT: { type: "literal", value: "0" },
       PIPELINE_V2_FACTUAL_PERCENT: { type: "literal", value: "0" },
       PIPELINE_V3_ASSIGNMENT_ENABLED: { type: "literal", value: "true" },

@@ -32,7 +32,7 @@ function targetConfiguration(
 ): PublicRolloutConfiguration {
   return {
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",

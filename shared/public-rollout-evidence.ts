@@ -288,7 +288,10 @@ function targetConfiguration(value: unknown): PublicRolloutConfiguration {
   );
   const exactLiterals: Readonly<Record<string, string>> = {
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    // Public V3 assignment is an intent-specific overlay. Requests outside
+    // that governed cohort must remain on the proven V2 curated control
+    // throughout 0 → 1 → 10 → 50 → 100, never fall back to legacy V1.
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",
