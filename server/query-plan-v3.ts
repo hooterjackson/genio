@@ -132,6 +132,16 @@ function isFixedContainerPrompt(prompt: string): boolean {
     || /\b(?:album|soundtrack|compilation)\s+["“][^"”]{2,120}["”]/u.test(normalized);
 }
 
+function hasExplicitMoodActivityThemeCue(prompt: string): boolean {
+  const normalized = prompt.normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLowerCase();
+  return /\b(?:songs?|tracks?|music)\s+(?:about|mentioning|whose theme is)\b/u
+    .test(normalized)
+    || /\b(?:for (?:sleep|studying|study|running|work|dinner|party|road trip)|workout|focus|relaxing|calm|upbeat|dark|melanchol)\b/u
+      .test(normalized);
+}
+
 type PipelineV3IntentProjection = Pick<SelectionPlanV3, "prompt" | "intents">;
 
 export function queryPlanV3Engines(
@@ -161,8 +171,34 @@ export function primaryQueryPlanV3Engine(
 export function pipelineV3RolloutGroup(
   plan: PipelineV3IntentProjection,
 ): PipelineV3RolloutGroup {
-  const engine = primaryQueryPlanV3Engine(plan);
-  return engine === "curated_genre_scene" ? "genre_scene" : engine;
+  // Discovery may use several engines, but rollout ownership must remain
+  // stable across guidance. In particular, adding playlist-level mood or
+  // suitability objectives to an explicit genre request must not move the
+  // accepted contract from genre_scene into mood_activity_theme.
+  if (plan.intents.includes("exhaustive")) return "exhaustive";
+  if (plan.intents.includes("factual_relationship")) {
+    return "factual_relationship";
+  }
+  if (isFixedContainerPrompt(plan.prompt)) return "fixed_container";
+  if (plan.intents.includes("artist_catalogue")) return "artist_catalogue";
+  if (plan.intents.includes("similarity")) return "similarity";
+  const genre = plan.intents.includes("genre_scene")
+    || plan.intents.includes("editorial_ranking");
+  const moodActivityTheme = plan.intents.includes("mood_activity")
+    || plan.intents.includes("theme");
+  if (
+    genre
+    && (
+      !moodActivityTheme
+      || !hasExplicitMoodActivityThemeCue(plan.prompt)
+    )
+  ) {
+    return "genre_scene";
+  }
+  if (moodActivityTheme) {
+    return "mood_activity_theme";
+  }
+  return "genre_scene";
 }
 
 export function pipelineV3RolloutVariable(
