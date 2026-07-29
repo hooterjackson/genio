@@ -529,7 +529,6 @@ export function producePublicRolloutIntentCanaryV1(
     || orderedAppleIds.length !== targetTrackCount
     || manifest.apiConfigurationHash !== apiConfigurationHash
     || manifest.workerRevision !== sourceRevision
-    || manifest.workerConfigurationHash !== apiConfigurationHash
     || manifest.executorIdentityHash !== executorIdentityHash
     || manifest.contractSemanticHash !== contractSemanticHash
     || Object.values(qualityScores).some((score) => (
@@ -543,6 +542,10 @@ export function producePublicRolloutIntentCanaryV1(
       "public rollout manifest does not prove exact candidate execution",
     );
   }
+  const workerConfigurationHash = sha256Digest(
+    manifest.workerConfigurationHash,
+    "public rollout manifest workerConfigurationHash",
+  );
   const guidanceLineageHash = nullableSha256(
     manifest.guidanceLineageHash,
     "public rollout manifest guidanceLineageHash",
@@ -738,7 +741,7 @@ export function producePublicRolloutIntentCanaryV1(
       independentAppleEvidenceHash: sources.apple.payloadHash,
       browserEvidenceHash: sources.browser.payloadHash,
       workerRevision: sourceRevision,
-      workerConfigurationHash: apiConfigurationHash,
+      workerConfigurationHash,
       workerIdentityHash: executorIdentityHash,
       qualityScores,
     },
