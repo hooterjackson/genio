@@ -127,6 +127,7 @@ import {
 import {
   createPublicRolloutAssignmentV1,
   publicRolloutAssignmentStickyKeyV1,
+  publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "./public-rollout-assignment.ts";
 
@@ -860,11 +861,15 @@ app.post<{
       })
     : null;
   const canonicalContractCohortRequested = expandedTrackCountRequested
-    || publicRolloutAssignment?.assigned === true
-    || process.env.GUIDANCE_CONTRACT_V3_ENABLED === "true"
-    || (process.env.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true"
-      && isSmoothReggaetonHeatRequestV3(prompt))
-    || (process.env.GUIDANCE_CONTRACT_V3_OWNER_CANARY === "true" && isOwner(caller));
+    || publicRolloutCanonicalContractRequestedV1({
+      assignment: publicRolloutAssignment,
+      fallbackRequested:
+        process.env.GUIDANCE_CONTRACT_V3_ENABLED === "true"
+        || (process.env.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true"
+          && isSmoothReggaetonHeatRequestV3(prompt))
+        || (process.env.GUIDANCE_CONTRACT_V3_OWNER_CANARY === "true"
+          && isOwner(caller)),
+    });
   const canonicalActivationConfigured = canonicalContractActivationConfigured(process.env);
   const [
     observedDatabaseSchemaVersion,

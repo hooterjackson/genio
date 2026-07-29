@@ -4,6 +4,7 @@ import {
   createPublicRolloutAssignmentV1,
   parsePublicRolloutAssignmentV1,
   publicRolloutAssignmentStickyKeyV1,
+  publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "../server/public-rollout-assignment.ts";
 import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";
@@ -179,6 +180,34 @@ describe("persisted public canonical rollout assignment", () => {
       percentage: 0,
       assigned: false,
     });
+  });
+
+  test("lets the signed assignment override a broad Contract-3 fallback", () => {
+    const similarityControl = assignment(
+      "similarity-contract-control",
+      environment("100"),
+      "Influential music similar to Oasis but not Oasis",
+    );
+    expect(similarityControl).toMatchObject({
+      intentGroup: "similarity",
+      percentage: 0,
+      assigned: false,
+    });
+    expect(publicRolloutCanonicalContractRequestedV1({
+      assignment: similarityControl,
+      fallbackRequested: true,
+    })).toBe(false);
+    expect(publicRolloutCanonicalContractRequestedV1({
+      assignment: assignment(
+        "selected-contract-three",
+        environment("100"),
+      ),
+      fallbackRequested: false,
+    })).toBe(true);
+    expect(publicRolloutCanonicalContractRequestedV1({
+      assignment: null,
+      fallbackRequested: true,
+    })).toBe(true);
   });
 
   test("persists the decision independently of later environment changes", () => {
