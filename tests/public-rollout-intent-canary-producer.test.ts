@@ -26,6 +26,7 @@ import {
 const sourceRevision = "a".repeat(40);
 const imageDigest = `sha256:${"b".repeat(64)}`;
 const apiConfigurationHash = "c".repeat(64);
+const workerConfigurationHash = "7".repeat(64);
 const executorIdentityHash = "d".repeat(64);
 const targetConfigurationHash = "e".repeat(64);
 const fixtureHash =
@@ -172,7 +173,7 @@ function sourcePayloads(input: {
       orderedAppleIds: manifestIds,
       apiConfigurationHash,
       workerRevision: sourceRevision,
-      workerConfigurationHash: apiConfigurationHash,
+      workerConfigurationHash,
       executorIdentityHash,
       qualityScores: {
         relevance: 4,
@@ -316,6 +317,7 @@ describe("public rollout intent canary protected producer", () => {
       execution: {
         manifestContentHash,
         orderedAppleIdsHash: signedArtifactSha256(orderedAppleIds),
+        workerConfigurationHash,
       },
     });
     expect(Object.keys(produced.sourcePayloadHashes).sort()).toEqual([
