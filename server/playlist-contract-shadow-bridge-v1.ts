@@ -221,6 +221,19 @@ function isNegativeConstraint(constraint: SelectionConstraint): boolean {
   return constraint.operator === "exclude" || constraint.operator === "avoid";
 }
 
+function isFixedTrackListClosureConstraint(
+  constraint: SelectionConstraint,
+  values: readonly string[],
+): boolean {
+  if (constraint.axis !== "relationship" || !isNegativeConstraint(constraint)) {
+    return false;
+  }
+  return values.every((value) => (
+    /\b(?:substitut(?:e|es|ion|ions)|any\s+other\s+(?:tracks?|songs?|recordings?)|additional\s+(?:tracks?|songs?|recordings?)|unlisted\s+(?:tracks?|songs?|recordings?))\b/iu
+      .test(value)
+  ));
+}
+
 function isAdjacentLatinUrbanScope(
   prompt: string,
   constraint: SelectionConstraint,
@@ -626,6 +639,16 @@ export function buildPlaylistContractShadowDraftV1(
       // Exact container membership already proves the track-to-release
       // relationship. Keeping model-authored relationship prose as another
       // hard leaf would require Apple to repeat that sentence per track.
+      continue;
+    }
+    if (
+      fixedTrackListDirective
+      && isFixedTrackListClosureConstraint(constraint, values)
+    ) {
+      // The fixed-track membership directive is already an exact closed set.
+      // Recompiling "no substitutions" as an open-world negative relationship
+      // creates an unsupported, redundant verifier obligation and can strand
+      // an otherwise executable fixed list at capability negotiation.
       continue;
     }
     const clauseId = `bridge:constraint:${safeId(constraint.id)}:${constraintIndex + 1}`;

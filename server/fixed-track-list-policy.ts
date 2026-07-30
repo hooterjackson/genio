@@ -18,10 +18,21 @@ function normalizedIdentityText(value: string): string {
 }
 
 function parseFixedTrack(value: string): SelectionFixedTrackIdentity | null {
-  const match = value.normalize("NFKC").trim().match(/^(.+?)\s+(?:—|–|-)\s+(.+)$/u);
-  if (!match) return null;
-  const artist = match[1]!.trim();
-  const title = match[2]!.trim();
+  const compact = value.normalize("NFKC").trim();
+  const artistDashTitle = compact.match(/^(.+?)\s+(?:—|–|-)\s+(.+)$/u);
+  if (artistDashTitle) {
+    const artist = artistDashTitle[1]!.trim();
+    const title = artistDashTitle[2]!.trim();
+    return artist && title ? { artist, title } : null;
+  }
+  // Brief compilation commonly preserves visitor-authored fixed identities as
+  // `"Title" by Artist`. The quotes make this form unambiguous; accepting an
+  // unquoted `by` form would misclassify broad prose and artist biographies as
+  // closed track identities.
+  const quotedTitleByArtist = compact.match(/^["“](.+?)["”]\s+by\s+(.+)$/iu);
+  if (!quotedTitleByArtist) return null;
+  const title = quotedTitleByArtist[1]!.trim();
+  const artist = quotedTitleByArtist[2]!.trim();
   if (!artist || !title) return null;
   return { artist, title };
 }
