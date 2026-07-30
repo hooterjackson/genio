@@ -58,7 +58,7 @@ function queryPlan(target = 25) {
   }), []), GRAPH_SNAPSHOT_ID);
 }
 
-function canonicalQueryPlan(target = 25) {
+function canonicalQueryPlan(target = 25, schemaVersion: 5 | 6 = 5) {
   const prompt = `${target} influential disco recordings`;
   const contract = compilePlaylistContractRevisionV1({
     contractId: `canonical-disco-${target}`,
@@ -90,7 +90,7 @@ function canonicalQueryPlan(target = 25) {
   return {
     contract,
     plan: createQueryPlanV3(selection, GRAPH_SNAPSHOT_ID, {
-      schemaVersion: 5,
+      schemaVersion,
       briefContractVersion: 3,
       playlistContractRevisionId: contract.revisionId,
       playlistContractSemanticHash: contract.semanticHash,
@@ -570,6 +570,55 @@ function assertFenced(repository: MemoryRepository, plan: QueryPlanV3, mode: "ac
 }
 
 describe("Pipeline V3 durable worker execution", () => {
+  test("revalidates schema-6 coverage against the claiming worker configuration", async () => {
+    const canonical = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("exact_ready", 25));
+    const validPayload = {
+      ...canonicalPayload(canonical.plan, canonical.contract),
+      __executorSemanticConfigurationHash:
+        canonical.plan.executionCoverageReport!.configurationHash,
+    };
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: canonical.plan,
+      payload: validPayload,
+    });
+
+    expect(port.execute).toHaveBeenCalledOnce();
+    expect(repository.checkpoints.get("v3:coverage:worker-claim"))
+      .toMatchObject({
+        stage: "worker_claim",
+        complete: true,
+        configurationHash:
+          canonical.plan.executionCoverageReport!.configurationHash,
+      });
+
+    const rejectedRepository = new MemoryRepository();
+    const rejectedPort = execution(retrievalResult("exact_ready", 25));
+    await new PipelineV3WorkerExecution(
+      rejectedRepository,
+      rejectedPort,
+    ).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: canonical.plan,
+      payload: {
+        ...validPayload,
+        __jobId: randomUUID(),
+        __executorSemanticConfigurationHash: "f".repeat(64),
+      },
+    });
+    expect(rejectedPort.execute).not.toHaveBeenCalled();
+    expect(rejectedRepository.updates.at(-1)?.patch).toEqual({
+      status: "failed_integrity",
+      phase: "v3_execution_coverage_worker_claim_failed",
+      error: null,
+    });
+  });
+
   test("fails closed without a provider call for a historical schema-4 fixed-container plan missing typed directives", async () => {
     const { contract, plan: current } = canonicalQueryPlan();
     const legacyPlan: QueryPlanV3 = {

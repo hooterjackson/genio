@@ -81,11 +81,17 @@ export function projectNeverDeadEndRun(input: {
     return { state: "needs_decision", nextAction: "review_contract", terminal: false };
   }
   if (input.status === "no_compatible_tracks") {
-    return {
-      state: "needs_decision",
-      nextAction: input.rescueQuestionsAvailable === false ? "review_contract" : "answer_rescue_guidance",
-      terminal: false,
-    };
+    return input.rescueQuestionsAvailable === false
+      ? {
+          state: "needs_decision",
+          nextAction: "review_contract",
+          terminal: false,
+        }
+      : {
+          state: "needs_input",
+          nextAction: "answer_rescue_guidance",
+          terminal: false,
+        };
   }
   if (input.status === "failed_system" || input.status === "failed") {
     return input.retryableDependency

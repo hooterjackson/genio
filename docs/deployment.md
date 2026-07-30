@@ -43,7 +43,7 @@ Sites cannot address Railway's private network, so only the API receives a Railw
 The Sites artifact contains only Sites metadata. Postgres migrations live in
 `postgres-migrations/` so Sites cannot mistake them for D1 migrations. Railway
 does not run them during an ordinary bridge or activation deploy. The
-schema-18 expand plan attaches `pnpm run db:migrate` to the API pre-deploy
+schema-19 expand plan attaches `pnpm run db:migrate` to the API pre-deploy
 command for an existing environment. A one-time fresh-staging bootstrap uses
 the same command only after an operator explicitly confirms that the new
 staging database is empty; production rejects that phase.
@@ -226,7 +226,7 @@ dispatch artifacts. Those commands never dispatch or publish.
    environment whose Postgres database is known to be fresh and empty, first
    review a one-time plan using the exact candidate image with
    `GENIO_RELEASE_PHASE=bootstrap`,
-   `GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=18`, and
+   `GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19`, and
    `GENIO_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED=true`. Also bind
    `GENIO_STAGING_BOOTSTRAP_PROJECT_ID` and
    `GENIO_STAGING_BOOTSTRAP_ENVIRONMENT_ID` to the selected empty environment;
@@ -238,7 +238,7 @@ dispatch artifacts. Those commands never dispatch or publish.
    started worker. Bootstrap emits no preserved variables and rejects inherited
    database URLs, provider/Apple credentials, gateway/capability credentials,
    and promotion evidence. Do not continue
-   until `/health/ready` reports schema 18,
+   until `/health/ready` reports schema 19,
    `releaseManifestCanaryGuardsVersion: "1"`, and
    `canonicalExecutionHardeningVersion: "1"`. Production rejects bootstrap,
    and the fresh/empty confirmation is invalid in every later phase.
@@ -247,7 +247,7 @@ dispatch artifacts. Those commands never dispatch or publish.
    and retain the exact same image digest, full revision, and stable version.
    Set `GENIO_RELEASE_ENVIRONMENT=staging`, `GENIO_RELEASE_PHASE=bridge`, and
    the observed schema. Run and review the exact `railway config plan`; apply
-   only that reviewed plan. The bridge deploys the same schema-13–18-capable
+   only that reviewed plan. The bridge deploys the same schema-13–19-capable
    artifact to the API and both worker lanes with no migration. Preserved
    canonical contract/query-plan-4-or-5 cohort settings remain inert behind
    the phase fence.
@@ -255,8 +255,8 @@ dispatch artifacts. Those commands never dispatch or publish.
    --expected-capability <none-or-2>
    --expected-manifest-canary-guards <none-or-1>
    --expected-canonical-hardening <none-or-1> ...`. All three values must be
-   `none` for schemas 13–17; schema 18 requires `2`, `1`, and `1`. It must observe
-   two advancing protocol-10 heartbeats for both worker lanes, only the RC
+   `none` for schemas 13–17; schemas 18–19 require `2`, `1`, and `1`. It must observe
+   two advancing protocol-11 heartbeats for both worker lanes, only the RC
    revision/configuration, current schema readiness, and no canonical/schema-4/5
    emission across at least 30 seconds. The protected phase-evidence producer
    is `pnpm release:phase-evidence:produce`; it takes the same explicit schema
@@ -267,13 +267,13 @@ dispatch artifacts. Those commands never dispatch or publish.
    Supply that file as
    `GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE` together with the exact signed
    bridge configuration/schema/composite-capability/both-marker bindings in a
-   new Railway plan with `GENIO_RELEASE_PHASE=expand` and expected schema 18.
+   new Railway plan with `GENIO_RELEASE_PHASE=expand` and expected schema 19.
    A bare observation hash is not promotion evidence. This is the only plan
    that runs the expand-compatible migration.
-6. Run the migration verifier again with `--phase expand --expected-schema 18
+6. Run the migration verifier again with `--phase expand --expected-schema 19
    --expected-capability 2 --expected-manifest-canary-guards 1
    --expected-canonical-hardening 1`.
-   Only after it proves schema 18, both worker lanes, and canonical emission
+   Only after it proves schema 19, both worker lanes, and canonical emission
    still off may the protected producer collect the activation preflight in a
    read-only repeatable-read transaction. The fixed complete query must prove
    every affected DB cohort is disabled, including the global catalog-first V2
@@ -413,7 +413,7 @@ dispatch artifacts. Those commands never dispatch or publish.
 
    `release-secret-versions.json` contains only named SHA-256 credential-version
    digests, never credentials. The command fails unless the Sites version and
-   full source-revision markers, API build/configuration hash, schema-18
+   full source-revision markers, API build/configuration hash, schema-19
    runtime, and the sole eligible worker/configuration in both lanes all match
    the candidate. The evidence signing bundle names that exact runtime snapshot
    and one
@@ -500,8 +500,8 @@ dispatch artifacts. Those commands never dispatch or publish.
    control-plane receipt, convergence, and production canaries to sign and
    verify `promotion` evidence. Promotion evidence deliberately excludes the
    final custom-domain browser gate.
-10. Verify the production PITR window, schema-18 readiness, and two fresh
-   protocol-10 heartbeats for both worker lanes. Pause or drain only work
+10. Verify the production PITR window, schema-19 readiness, and two fresh
+   protocol-11 heartbeats for both worker lanes. Pause or drain only work
    incompatible with the migration; never reinterpret in-flight contracts.
 11. Keep all public cohorts at zero after owner-only activation. Produce a
    protected intent canary first with
@@ -839,8 +839,8 @@ pnpm release:convergence -- \
 ```
 
 The backend-scoped read-only probe fails unless Sites remains on that exact
-prior identity while the API, schema 18, protocol 10, brief contract 3,
-query-plan schema 5, database readiness, interactive worker lane, and deep
+prior identity while the API, schema 19, protocol 11, brief contract 3,
+query-plan schema 6, database readiness, interactive worker lane, and deep
 worker lane remain on the candidate backend artifact in both samples. After
 the Sites deployment, rerun it with `--scope full` and both expected Sites
 arguments set to the candidate identity. Its JSON output includes only
@@ -880,8 +880,8 @@ configuration, secret-version set, model route, policy, schema, or protocol
 change requires new evidence. The signing command prints the aggregate
 configuration and runtime hashes; verification requires both so a correctly
 signed envelope for a prior model route or cohort configuration cannot promote
-a changed runtime. This schema-18/protocol-10 release contract also requires
-`adaptive_guidance_v3` and `governed_evidence_v2`; a legacy policy label makes
+a changed runtime. This schema-19/protocol-11 release contract also requires
+`adaptive_guidance_v4` and `governed_evidence_v2`; a legacy policy label makes
 the payload unsignable. Verification requires the caller to name the expected
 `candidate`, `promotion`, or `finalization` kind, so a staging-only candidate
 envelope can never satisfy production promotion and promotion evidence cannot
@@ -916,11 +916,11 @@ Every gate artifact also requires an Ed25519 producer attestation from its
 approved harness before the release signer will load it.
 
 Never run an automatic destructive down-migration. A worker refuses an
-unsupported schema version. After schema-18 writes, binary rollback to the old
+unsupported schema version. After schema-19 writes, binary rollback to the old
 max-schema-16 release is forbidden. Roll back behavior by setting the affected
-cohort to zero and redeploying this same schema-13–18-compatible artifact in
+cohort to zero and redeploying this same schema-13–19-compatible artifact in
 `bridge` phase; it stops new canonical/schema-4/5 emission while remaining
-able to drain compatible schema-18 work.
+able to drain compatible schema-19 work.
 
 ### Sites production rollback
 

@@ -9,7 +9,6 @@ import {
 } from "./pipeline-v3-policy.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import {
-  CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
   QUERY_PLAN_V3_POLICY_VERSION,
   queryPlanV3EmissionSchemaVersion,
 } from "./query-plan-v3.ts";
@@ -28,6 +27,7 @@ import {
   WORKER_PIPELINE_PROTOCOL_VERSION,
 } from "./worker-protocol.ts";
 import { ADAPTIVE_GUIDANCE_POLICY_VERSION } from "./adaptive-guidance-v3.ts";
+import { ADAPTIVE_GUIDANCE_POLICY_VERSION_V4 } from "./adaptive-guidance-v4.ts";
 import { PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION } from "./playlist-contract-v1.ts";
 import {
   capabilityPepperRotationStatus,
@@ -695,6 +695,8 @@ export function runtimeReleaseContract(
 ): RuntimeReleaseContract {
   const canonicalActivationConfigured = canonicalContractActivationConfigured(environment);
   const canonicalContractActive = canonicalContractCohortConfigured(environment);
+  const emittedQueryPlanSchemaVersion =
+    queryPlanV3EmissionSchemaVersion(environment);
   const ownerAllowlistVersion = releaseOwnerAllowlistVersion(environment);
   const capabilityPepper = capabilityPepperRotationStatus(environment);
   return Object.freeze({
@@ -737,7 +739,7 @@ export function runtimeReleaseContract(
     minimumWorkerProtocol: BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION,
     selectionPlanVersion: SELECTION_PLAN_V3_VERSION,
     queryPlanSchemaVersion: String(canonicalContractActive
-      ? CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      ? emittedQueryPlanSchemaVersion
       : environment.GUIDANCE_CONTRACT_V2_ENABLED === "true"
         ? 3
         : queryPlanV3EmissionSchemaVersion(environment)),
@@ -755,7 +757,9 @@ export function runtimeReleaseContract(
       canonicalActivationConfigured
       && environment.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true",
     guidancePolicyVersion: canonicalContractActive
-      ? ADAPTIVE_GUIDANCE_POLICY_VERSION
+      ? emittedQueryPlanSchemaVersion === 6
+        ? ADAPTIVE_GUIDANCE_POLICY_VERSION_V4
+        : ADAPTIVE_GUIDANCE_POLICY_VERSION
       : GUIDANCE_POLICY_VERSION,
     evidencePolicyVersion: canonicalContractActive
       ? PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION

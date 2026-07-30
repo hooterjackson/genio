@@ -50,7 +50,7 @@ export function expectedReleaseDatabaseSchemaVersion(
   environment: NodeJS.ProcessEnv = process.env,
 ): string | null {
   const value = environment.RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION?.trim() ?? "";
-  return /^(?:1[3-8])$/u.test(value) ? value : null;
+  return /^(?:1[3-9])$/u.test(value) ? value : null;
 }
 
 /**
@@ -150,8 +150,8 @@ export function releaseDatabaseReadinessReady(input: {
 
 /**
  * Environment flags are only activation intent. They cannot enable canonical
- * contract/schema-5 emission until the immutable artifact has completed the
- * explicit expand phase and is configured for schema 18 plus the exact
+ * contract/schema-6 emission until the immutable artifact has completed the
+ * explicit expand phase and is configured for schema 19 plus the exact
  * capability-fenced query-plan protocol. Historical schema-4 plans remain
  * executable, but no activated artifact may create new schema-4 work.
  */

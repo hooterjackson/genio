@@ -84,7 +84,7 @@ export interface ReleaseMigrationPhaseEvidence {
 }
 
 const EVIDENCE_TTL_MS = 24 * 60 * 60 * 1_000;
-const REQUIRED_WORKER_PROTOCOL = "playlist-pipeline-v10";
+const REQUIRED_WORKER_PROTOCOL = "playlist-pipeline-v11";
 const REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 
@@ -182,11 +182,11 @@ export function parseReleaseMigrationVerificationArgs(
     throw new Error("--phase must be bridge or expand");
   }
   const expectedSchemaVersion = values.get("--expected-schema") ?? "";
-  if (!/^(?:1[3-8])$/u.test(expectedSchemaVersion)) {
-    throw new Error("--expected-schema must be an integer from 13 through 18");
+  if (!/^(?:1[3-9])$/u.test(expectedSchemaVersion)) {
+    throw new Error("--expected-schema must be an integer from 13 through 19");
   }
-  if (phase === "expand" && expectedSchemaVersion !== "18") {
-    throw new Error("expand verification requires --expected-schema 18");
+  if (phase === "expand" && expectedSchemaVersion !== "19") {
+    throw new Error("expand verification requires --expected-schema 19");
   }
   const expectedCapabilityValue = values.get("--expected-capability");
   if (
@@ -217,21 +217,21 @@ export function parseReleaseMigrationVerificationArgs(
   }
   const expectedCanonicalExecutionHardeningVersion =
     expectedCanonicalHardeningValue === "1" ? "1" : null;
-  const schema18 = expectedSchemaVersion === "18";
+  const schemaCapabilityActive = Number(expectedSchemaVersion) >= 18;
   if (
-    (schema18 && (
+    (schemaCapabilityActive && (
       expectedDatabaseCapabilityVersion !== "2"
       || expectedReleaseManifestCanaryGuardsVersion !== "1"
       || expectedCanonicalExecutionHardeningVersion !== "1"
     ))
-    || (!schema18 && (
+    || (!schemaCapabilityActive && (
       expectedDatabaseCapabilityVersion !== null
       || expectedReleaseManifestCanaryGuardsVersion !== null
       || expectedCanonicalExecutionHardeningVersion !== null
     ))
   ) {
     throw new Error(
-      "schema 18 requires composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
+      "schemas 18 and 19 require composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
     );
   }
   const expectedRevision = (values.get("--expected-revision") ?? "").toLowerCase();
@@ -385,7 +385,7 @@ export function buildReleaseMigrationPhaseEvidence(input: {
     if (observation.canonicalActivationConfigured) {
       violations.push(`${label}:canonical_activation_enabled_before_activate`);
     }
-    if (observation.runtimeSchemaMinimum !== "13" || observation.runtimeSchemaMaximum !== "18") {
+    if (observation.runtimeSchemaMinimum !== "13" || observation.runtimeSchemaMaximum !== "19") {
       violations.push(`${label}:schema_bridge_support_missing`);
     }
     if (observation.runtimeWorkerProtocol !== REQUIRED_WORKER_PROTOCOL) {
@@ -395,6 +395,7 @@ export function buildReleaseMigrationPhaseEvidence(input: {
       observation.runtimeBriefContractVersion === "3"
       || observation.runtimeQueryPlanSchemaVersion === "4"
       || observation.runtimeQueryPlanSchemaVersion === "5"
+      || observation.runtimeQueryPlanSchemaVersion === "6"
     ) {
       violations.push(`${label}:canonical_emission_not_disabled`);
     }

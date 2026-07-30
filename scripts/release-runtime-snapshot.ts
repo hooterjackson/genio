@@ -380,17 +380,17 @@ function runtimeSnapshot(input: {
   if (
     result.releaseEnvironment !== input.expectedEnvironment
     || result.deploymentPhase !== "activate"
-    || result.databaseSchemaVersion !== "18"
+    || result.databaseSchemaVersion !== "19"
     || result.databaseCapabilityVersion !== "2"
     || result.releaseManifestCanaryGuardsVersion !== "1"
     || result.canonicalExecutionHardeningVersion !== "1"
-    || result.workerProtocol !== "playlist-pipeline-v10"
+    || result.workerProtocol !== "playlist-pipeline-v11"
     || result.briefContractVersion !== "3"
-    || result.queryPlanSchemaVersion !== "5"
-    || result.policyVersions.guidance !== "adaptive_guidance_v3"
+    || result.queryPlanSchemaVersion !== "6"
+    || result.policyVersions.guidance !== "adaptive_guidance_v4"
     || result.policyVersions.evidence !== "governed_evidence_v2"
   ) {
-    throw new Error("runtime does not satisfy the schema-18/protocol-10 release contract");
+    throw new Error("runtime does not satisfy the schema-19/protocol-11 release contract");
   }
   return result;
 }

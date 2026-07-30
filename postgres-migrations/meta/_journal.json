@@ -148,6 +148,20 @@
       "when": 1785556800000,
       "tag": "0020_executor_release_identity_fencing",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1785643200000,
+      "tag": "0021_playlist_run_resolution_v1",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1785729600000,
+      "tag": "0022_guidance_v4_checkpoint",
+      "breakpoints": true
     }
   ]
 }

@@ -39,6 +39,100 @@ function typedPlan(constraints: readonly SelectionConstraint[]): NonNullable<Run
 }
 
 describe("Pipeline V3 typed planning", () => {
+  test("classifies reggaeton as explicit genre membership without a fabricated fallback", () => {
+    const spec = createRunSpecV3({
+      prompt: "Smooth reggaeton for a late-night dance floor",
+      requestedTrackCount: 50,
+    });
+    expect(spec.intents).toContain("genre_scene");
+    expect(spec.intents).toContain("mood_activity");
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      values: ["reggaeton"],
+    }));
+  });
+
+  test("asks a neutral time-width question for the exact 2010 rap incident", () => {
+    const spec = createRunSpecV3({
+      prompt: "create me a playlist fromm the 2010 rap",
+      requestedTrackCount: 50,
+    });
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      values: expect.arrayContaining(["rap"]),
+    }));
+    expect(spec.catalogPolicies).not.toContainEqual(expect.objectContaining({ axis: "era" }));
+    expect(spec.criticalAmbiguities).toContainEqual(expect.objectContaining({
+      key: "temporal_width",
+      yearValue: 2010,
+    }));
+
+    const questions = criticalGuidanceQuestionsV3(spec);
+    expect(questions).toContainEqual(expect.objectContaining({
+      id: "v3-critical:temporal_width",
+      options: [
+        expect.objectContaining({ id: "era_year_only", recommended: false }),
+        expect.objectContaining({ id: "era_around_year", recommended: false }),
+        expect.objectContaining({ id: "era_full_decade", recommended: false }),
+      ],
+    }));
+    const resolved = resolveRunSpecV3(spec, [{
+      key: "temporal_width",
+      optionId: "era_full_decade",
+    }]);
+    expect(resolved.confirmed).toBe(true);
+    expect(resolved.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "era",
+      values: ["2010", "2019"],
+    }));
+  });
+
+  test("does not turn the pronoun us into geography and keeps R&B as membership", () => {
+    const spec = createRunSpecV3({
+      prompt: "i met a girl from long island in del mar 10 years ago and i want r&b music from that time period that relates to us meeting",
+      requestedTrackCount: 25,
+    });
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      values: expect.arrayContaining(["R&B"]),
+    }));
+    expect(spec.membershipPredicates).not.toContainEqual(expect.objectContaining({
+      axis: "geography",
+      values: expect.arrayContaining(["United States"]),
+    }));
+  });
+
+  test("recognizes explicit US musical scope without recognizing lowercase us", () => {
+    const explicit = createRunSpecV3({
+      prompt: "25 US rap tracks",
+      requestedTrackCount: 25,
+    });
+    expect(explicit.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "scene",
+      values: ["American rap"],
+    }));
+    const narrative = createRunSpecV3({
+      prompt: "25 rap tracks that remind us of meeting",
+      requestedTrackCount: 25,
+    });
+    expect(narrative.membershipPredicates).not.toContainEqual(expect.objectContaining({
+      axis: "geography",
+      values: ["United States"],
+    }));
+  });
+
+  test("routes a pure late-night vibe without inventing genre membership", () => {
+    const spec = createRunSpecV3({
+      prompt: "Late-Night Smoke: chill music for gaming and a smoke session",
+      requestedTrackCount: 25,
+    });
+    expect(spec.intents).toContain("mood_activity");
+    expect(spec.intents).not.toContain("genre_scene");
+    expect(spec.membershipPredicates).not.toContainEqual(expect.objectContaining({
+      axis: "genre",
+    }));
+  });
+
   test("provides a deterministic subject-specific fallback for broad Brazilian disco guidance", () => {
     const questions = deterministicGuidanceQuestionsV3(createRunSpecV3({
       prompt: "brazilian disco playlist",

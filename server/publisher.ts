@@ -228,7 +228,7 @@ export interface PublicationRepository extends Pick<AppleAuthorizationStore, "ge
   /**
    * Atomically fence and commit the terminal run, manifest revision, pipeline
    * outcome, and exact Apple publication-attempt generations. Production
-   * schema-18 repositories implement this method; V3 fails closed without it.
+   * schema-19 repositories implement this method; V3 fails closed without it.
    */
   commitPublicationCompletion?(input: PublicationCompletionFence): Promise<void>;
   beginPublicationReconciliation?(

@@ -33,7 +33,7 @@ const releasePhase = railwayReleasePhaseConfiguration(process.env);
 const releasePreDeployCommand = releasePhasePreDeployCommand(releasePhase);
 const workerReplicaCount = releasePhase.phase === "bootstrap" ? 0 : 1;
 // Public cohort rollout is a control-plane promotion step. The running binary
-// remains in the already-proven schema-18 activation mode; only the signed
+// remains in the already-proven schema-19 activation mode; only the signed
 // cohort literals and their evidence marker change.
 const runtimeDeploymentPhase =
   releasePhase.phase === "rollout" ? "activate" : releasePhase.phase;

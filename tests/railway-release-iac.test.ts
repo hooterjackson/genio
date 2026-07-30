@@ -125,20 +125,20 @@ beforeAll(() => {
     semanticExecutionConfigurationHash: hash("0"),
     releaseEnvironment: "staging",
     deploymentPhase: "activate",
-    databaseSchemaVersion: "18",
+    databaseSchemaVersion: "19",
     databaseCapabilityVersion: "2",
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
-    workerProtocol: "playlist-pipeline-v10",
+    workerProtocol: "playlist-pipeline-v11",
     briefContractVersion: "3",
-    queryPlanSchemaVersion: "5",
+    queryPlanSchemaVersion: "6",
     modelIds: {
       brief: "gpt-5.4-mini",
       baseline: "gpt-5.6-luna",
       escalation: "gpt-5.6-terra",
     },
     policyVersions: {
-      guidance: "adaptive_guidance_v3",
+      guidance: "adaptive_guidance_v4",
       evidence: "governed_evidence_v2",
       queryPlan: "query_plan_v3_4",
       selection: "selection_plan_v3",
@@ -330,13 +330,13 @@ beforeAll(() => {
       runtime: {
         releaseEnvironment: "production",
         deploymentPhase: phase,
-        databaseSchemaVersion: phase === "bridge" ? "16" : "18",
+        databaseSchemaVersion: phase === "bridge" ? "16" : "19",
         databaseCapabilityVersion: phase === "bridge" ? null : "2",
         releaseManifestCanaryGuardsVersion:
           phase === "bridge" ? null : "1",
         canonicalExecutionHardeningVersion:
           phase === "bridge" ? null : "1",
-        workerProtocol: "playlist-pipeline-v10",
+        workerProtocol: "playlist-pipeline-v11",
         configurationHash: phase === "bridge"
           ? bridgeConfigurationHash
           : expandConfigurationHash,
@@ -705,20 +705,20 @@ describe("Railway immutable bridge-expand-activate release", () => {
   test("runs the expand-only migration only after bridge convergence evidence exists", async () => {
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "expand",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE: undefined,
     }))).rejects.toThrow(/GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE is required/u);
 
     const project = await railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "expand",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
     }));
     expect(service(project, "needle-api").deploy?.preDeployCommand).toEqual([
       "pnpm run db:migrate",
     ]);
     expect(service(project, "needle-api").variables).toMatchObject({
       RELEASE_DEPLOYMENT_PHASE: { type: "literal", value: "expand" },
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: { type: "literal", value: "18" },
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: { type: "literal", value: "19" },
       RELEASE_BRIDGE_CONVERGENCE_EVIDENCE_HASH: {
         type: "literal",
         value: bridgeEvidenceHash,
@@ -726,35 +726,35 @@ describe("Railway immutable bridge-expand-activate release", () => {
     });
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "expand",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       GENIO_BRIDGE_CONFIGURATION_HASH: hash("0"),
     }))).rejects.toThrow(
       /configuration, schema, composite capability, and authoritative markers/u,
     );
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "expand",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       GENIO_BRIDGE_DATABASE_SCHEMA_VERSION: "15",
     }))).rejects.toThrow(
       /configuration, schema, composite capability, and authoritative markers/u,
     );
   });
 
-  test("activation has no migration and requires both bridge and schema-18 evidence", async () => {
+  test("activation has no migration and requires both bridge and schema-19 evidence", async () => {
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "activate",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       GENIO_EXPAND_CONVERGENCE_EVIDENCE_FILE: undefined,
     }))).rejects.toThrow(/GENIO_EXPAND_CONVERGENCE_EVIDENCE_FILE is required/u);
 
     const project = await railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "activate",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
     }));
     expect(service(project, "needle-api").deploy?.preDeployCommand).toBeUndefined();
     expect(service(project, "needle-api").variables).toMatchObject({
       RELEASE_DEPLOYMENT_PHASE: { type: "literal", value: "activate" },
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: { type: "literal", value: "18" },
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: { type: "literal", value: "19" },
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: {
         type: "literal",
         value: "2",
@@ -781,7 +781,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
       PIPELINE_V3_ASSIGNMENT_ENABLED: { type: "literal", value: "true" },
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: {
         type: "literal",
-        value: "5",
+        value: "6",
       },
       PIPELINE_V3_OWNER_CANARY: { type: "literal", value: "true" },
       PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: {
@@ -813,7 +813,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
       },
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: {
         type: "literal",
-        value: "5",
+        value: "6",
       },
       PIPELINE_V3_OWNER_CANARY: { type: "literal", value: "true" },
       PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: {
@@ -841,23 +841,23 @@ describe("Railway immutable bridge-expand-activate release", () => {
       },
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: {
         type: "literal",
-        value: "5",
+        value: "6",
       },
     });
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "activate",
       GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "17",
-    }))).rejects.toThrow(/requires GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=18/u);
+    }))).rejects.toThrow(/requires GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19/u);
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "activate",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       GENIO_EXPAND_CONFIGURATION_HASH: hash("0"),
     }))).rejects.toThrow(
       /configuration, schema, composite capability, and authoritative markers/u,
     );
     await expect(railwayProject(baseEnvironment({
       GENIO_RELEASE_PHASE: "activate",
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       GENIO_PRODUCTION_DATABASE_IDENTITY_HASH: hash("0"),
     }))).rejects.toThrow(/selected production database/u);
   });
@@ -916,15 +916,15 @@ describe("Railway immutable bridge-expand-activate release", () => {
     })).toThrow(/does not match the selected Railway environment/u);
   });
 
-  test("rollback after schema-18 writes means the same bridge artifact, never a schema-16 binary", async () => {
+  test("rollback after schema-19 writes means the same compatible binary, never a schema-16 binary", async () => {
     expect(DATABASE_SCHEMA_SUPPORT).toEqual({
       minimum: "13",
-      maximum: "18",
-      preferred: "18",
+      maximum: "19",
+      preferred: "19",
     });
-    expect(isDatabaseSchemaVersionCompatible("18", DATABASE_SCHEMA_SUPPORT)).toBe(true);
+    expect(isDatabaseSchemaVersionCompatible("19", DATABASE_SCHEMA_SUPPORT)).toBe(true);
     const project = await railwayProject(baseEnvironment({
-      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
     }));
     expect(service(project, "needle-api").deploy?.preDeployCommand).toBeUndefined();
     expect(runtimeReleaseDeploymentPhase({
@@ -933,7 +933,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
     expect(canonicalContractActivationReady({
       environment: {
         RELEASE_DEPLOYMENT_PHASE: "bridge",
-        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
         GUIDANCE_CONTRACT_V3_ENABLED: "true",
       },
       observedDatabaseSchemaVersion: "18",

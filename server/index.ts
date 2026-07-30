@@ -906,7 +906,7 @@ app.post<{
   ) {
     throw new HttpError(
       503,
-      "Canonical playlist contracts are paused until the schema-18 activation check passes",
+      "Canonical playlist contracts are paused until the schema-19 activation check passes",
       "canonical_contract_activation_not_ready",
     );
   }
@@ -918,7 +918,7 @@ app.post<{
   if (trackCountAdmission.status === "activation_required") {
     throw new HttpError(
       503,
-      "Owner playlist sizes above 300 are paused until the schema-18 activation check passes",
+      "Owner playlist sizes above 300 are paused until the schema-19 activation check passes",
       "expanded_track_count_activation_not_ready",
     );
   }
@@ -993,6 +993,8 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     status: brief.status,
     briefContractVersion: brief.briefContractVersion,
     questionSetHash: brief.questionSetHash,
+    checkpointMode: brief.checkpointMode,
+    interpretationSummary: brief.interpretationSummary,
     brief: canonicalBrief,
     questions: Array.isArray(brief.questions) ? brief.questions : [],
     answers: Array.isArray(brief.answers) && brief.answers.length > 0 ? brief.answers : undefined,
@@ -1309,7 +1311,7 @@ app.post<{
       || interpreted.briefContractVersion !== 3) {
       throw new HttpError(
         503,
-        "Owner playlist sizes above 300 are paused until the schema-18 activation check passes",
+        "Owner playlist sizes above 300 are paused until the schema-19 activation check passes",
         "expanded_track_count_activation_not_ready",
       );
     }

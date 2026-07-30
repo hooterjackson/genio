@@ -476,13 +476,13 @@ export function summarizePublicRolloutObservation(
     || system.releaseManifestCanaryGuardsVersion !== "1"
     || system.canonicalExecutionHardeningVersion !== "1"
     || system.paused !== false
-    || system.workerProtocol.expected !== "playlist-pipeline-v10"
-    || system.workerProtocol.actual !== "playlist-pipeline-v10"
+    || system.workerProtocol.expected !== "playlist-pipeline-v11"
+    || system.workerProtocol.actual !== "playlist-pipeline-v11"
     || interactive.status !== "healthy"
-    || interactive.protocolVersion !== "playlist-pipeline-v10"
+    || interactive.protocolVersion !== "playlist-pipeline-v11"
     || interactive.lastSeenAt === null
     || deep.status !== "healthy"
-    || deep.protocolVersion !== "playlist-pipeline-v10"
+    || deep.protocolVersion !== "playlist-pipeline-v11"
     || deep.lastSeenAt === null
     || publicRollout.databaseAuthorized !== true
     || publicRollout.active !== (runtimeRolloutEvidenceHash !== null)
@@ -514,18 +514,18 @@ export function summarizePublicRolloutObservation(
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
     paused: false,
-    workerProtocolExpected: "playlist-pipeline-v10",
-    workerProtocolActual: "playlist-pipeline-v10",
+    workerProtocolExpected: "playlist-pipeline-v11",
+    workerProtocolActual: "playlist-pipeline-v11",
     interactiveWorker: {
       ...interactive,
       status: "healthy",
-      protocolVersion: "playlist-pipeline-v10",
+      protocolVersion: "playlist-pipeline-v11",
       lastSeenAt: interactive.lastSeenAt,
     },
     deepWorker: {
       ...deep,
       status: "healthy",
-      protocolVersion: "playlist-pipeline-v10",
+      protocolVersion: "playlist-pipeline-v11",
       lastSeenAt: deep.lastSeenAt,
     },
   };
@@ -615,11 +615,11 @@ export function buildPublicRolloutPayload(input: {
         input.promotionPayload.environmentSnapshots.production!
           .sitesSourceRevision,
       sitesCandidateMatched: false,
-      databaseSchemaVersion: "18",
+      databaseSchemaVersion: "19",
       databaseCapabilityVersion: "2",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
-      workerProtocol: "playlist-pipeline-v10",
+      workerProtocol: "playlist-pipeline-v11",
     },
     transition: {
       operation,

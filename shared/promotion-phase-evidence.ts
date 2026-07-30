@@ -16,7 +16,7 @@ export const PROMOTION_PHASE_EVIDENCE_SCHEMA_VERSION =
   "genio-promotion-phase-evidence/v2";
 export const SIGNED_PROMOTION_PHASE_EVIDENCE_SCHEMA_VERSION =
   "genio-signed-promotion-phase-evidence/v2";
-export const REQUIRED_PROMOTION_WORKER_PROTOCOL = "playlist-pipeline-v10";
+export const REQUIRED_PROMOTION_WORKER_PROTOCOL = "playlist-pipeline-v11";
 export const ACTIVATION_COHORT_INVENTORY_STATEMENTS_V1 = [
   "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
   [
@@ -197,15 +197,15 @@ function validateRuntime(value: unknown, phase: PromotionObservedPhase): JsonRec
   }
   if (
     typeof runtime.databaseSchemaVersion !== "string"
-    || !/^(?:1[3-8])$/u.test(runtime.databaseSchemaVersion)
+    || !/^(?:1[3-9])$/u.test(runtime.databaseSchemaVersion)
   ) {
     throw new Error("promotion phase runtime.databaseSchemaVersion is invalid");
   }
-  const schema18 = runtime.databaseSchemaVersion === "18";
+  const schema19 = runtime.databaseSchemaVersion === "19";
   if (
-    runtime.databaseCapabilityVersion !== (schema18 ? "2" : null)
-    || runtime.releaseManifestCanaryGuardsVersion !== (schema18 ? "1" : null)
-    || runtime.canonicalExecutionHardeningVersion !== (schema18 ? "1" : null)
+    runtime.databaseCapabilityVersion !== (schema19 ? "2" : null)
+    || runtime.releaseManifestCanaryGuardsVersion !== (schema19 ? "1" : null)
+    || runtime.canonicalExecutionHardeningVersion !== (schema19 ? "1" : null)
   ) {
     throw new Error(
       "promotion phase runtime does not bind composite capability 2 and both authoritative marker-1 values",

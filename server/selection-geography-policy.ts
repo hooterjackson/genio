@@ -23,7 +23,10 @@ export const SELECTION_GEOGRAPHY_RELATIONSHIPS = new Set<SelectionGeographyRelat
 ]);
 
 export const SELECTION_GEOGRAPHY_TERMS: ReadonlyArray<readonly [string, RegExp]> = [
-  ["American", /\b(?:american|united states|u\.?s\.?(?:a\.)?)\b/iu],
+  ["American", /\b(?:american|united states|usa)\b/iu],
+  // Preserve case for the ambiguous pronoun "us". Only an explicitly
+  // capitalized US/U.S. immediately scoping music is geographic.
+  ["American", /\bU\.?S\.?(?=\s+(?:music|songs?|tracks?|recordings?|artists?|rap|hip[ -]?hop|r\s*(?:&|and)\s*b|jazz|rock|pop|country|drill|house|techno|scene|genre))\b/u],
   ["Brazilian", /\b(?:brazilian|brazil|brasil)\b/iu],
   ["French", /(?:\bfrench\b(?![ -]language)|\bfrance\b)/iu],
   ["German", /(?:\bgerman\b(?![ -]language)|\bgermany\b)/iu],

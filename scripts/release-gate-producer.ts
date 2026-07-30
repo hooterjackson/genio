@@ -131,13 +131,13 @@ export async function loadReleaseProducerRuntimeSnapshot(input: {
     snapshot.origin !== input.origin
     || snapshot.candidate.version !== input.candidate.version
     || snapshot.candidate.sourceRevision !== input.candidate.sourceRevision
-    || snapshot.runtime.databaseSchemaVersion !== "18"
+    || snapshot.runtime.databaseSchemaVersion !== "19"
     || snapshot.runtime.databaseCapabilityVersion !== "2"
     || snapshot.runtime.releaseManifestCanaryGuardsVersion !== "1"
     || snapshot.runtime.canonicalExecutionHardeningVersion !== "1"
-    || snapshot.runtime.workerProtocol !== "playlist-pipeline-v10"
+    || snapshot.runtime.workerProtocol !== "playlist-pipeline-v11"
     || snapshot.runtime.briefContractVersion !== "3"
-    || snapshot.runtime.queryPlanSchemaVersion !== "5"
+    || snapshot.runtime.queryPlanSchemaVersion !== "6"
   ) {
     throw new Error("release producer runtime snapshot does not bind the activated candidate");
   }

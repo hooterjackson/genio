@@ -165,7 +165,7 @@ export const FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1 = Object.freeze([
     fixtureId: "final-public-assignment-mood-activity-theme-v1",
     intentGroup: "mood_activity_theme",
     prompt:
-      "[GENIO PUBLIC ASSIGNMENT CANARY:mood_activity_theme:v1] Create 3 dark ambient tracks for sleep.",
+      "[GENIO PUBLIC ASSIGNMENT CANARY:mood_activity_theme:v1] Create 3 calm, nocturnal tracks for sleep.",
     targetTrackCount: 3,
   }),
   Object.freeze({
@@ -2410,10 +2410,10 @@ export function createOfflineReleaseGateArtifact(input: {
       databaseCapabilityVersion: "2",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
-      databaseSchemaVersion: "18",
-      workerProtocol: "playlist-pipeline-v10",
+      databaseSchemaVersion: "19",
+      workerProtocol: "playlist-pipeline-v11",
       briefContractVersion: "3",
-      queryPlanSchemaVersion: "5",
+      queryPlanSchemaVersion: "6",
     }),
     fixtures: [],
     sources: { offlineSuite },

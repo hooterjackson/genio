@@ -53,7 +53,7 @@ export type PublicRolloutPercentages = Record<
 
 export interface PublicRolloutSoakWorkerLane {
   status: "healthy";
-  protocolVersion: "playlist-pipeline-v10";
+  protocolVersion: "playlist-pipeline-v11";
   compatibleCapacity: number;
   eligibleWorkerCount: number;
   eligibleIdentityCount: number;
@@ -79,8 +79,8 @@ export interface PublicRolloutSoakObservation {
   releaseManifestCanaryGuardsVersion: "1";
   canonicalExecutionHardeningVersion: "1";
   paused: false;
-  workerProtocolExpected: "playlist-pipeline-v10";
-  workerProtocolActual: "playlist-pipeline-v10";
+  workerProtocolExpected: "playlist-pipeline-v11";
+  workerProtocolActual: "playlist-pipeline-v11";
   interactiveWorker: PublicRolloutSoakWorkerLane;
   deepWorker: PublicRolloutSoakWorkerLane;
 }
@@ -302,7 +302,7 @@ function targetConfiguration(value: unknown): PublicRolloutConfiguration {
     RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
     RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
     RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
-    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     GUIDANCE_CONTRACT_V3_ENABLED: "false",
     GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
     GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
@@ -399,13 +399,13 @@ function releaseRuntime(value: unknown): JsonRecord {
   if (
     result.releaseEnvironment !== "production"
     || result.deploymentPhase !== "activate"
-    || result.databaseSchemaVersion !== "18"
+    || result.databaseSchemaVersion !== "19"
     || result.databaseCapabilityVersion !== "2"
     || result.releaseManifestCanaryGuardsVersion !== "1"
     || result.canonicalExecutionHardeningVersion !== "1"
-    || result.workerProtocol !== "playlist-pipeline-v10"
+    || result.workerProtocol !== "playlist-pipeline-v11"
     || result.briefContractVersion !== "3"
-    || result.queryPlanSchemaVersion !== "5"
+    || result.queryPlanSchemaVersion !== "6"
   ) {
     throw new Error("public rollout soak runtime snapshot is not production activation-ready");
   }
@@ -472,7 +472,7 @@ function soakWorkerLane(
   ], label);
   if (
     result.status !== "healthy"
-    || result.protocolVersion !== "playlist-pipeline-v10"
+    || result.protocolVersion !== "playlist-pipeline-v11"
     || !Number.isSafeInteger(result.compatibleCapacity)
     || Number(result.compatibleCapacity) < 1
     || !Number.isSafeInteger(result.eligibleWorkerCount)
@@ -517,7 +517,7 @@ function soakWorkerLane(
   return {
     lane: {
       status: "healthy",
-      protocolVersion: "playlist-pipeline-v10",
+      protocolVersion: "playlist-pipeline-v11",
       compatibleCapacity: Number(result.compatibleCapacity),
       eligibleWorkerCount: Number(result.eligibleWorkerCount),
       eligibleIdentityCount: Number(result.eligibleIdentityCount),
@@ -594,8 +594,8 @@ function soakObservations(input: {
       || result.releaseManifestCanaryGuardsVersion !== "1"
       || result.canonicalExecutionHardeningVersion !== "1"
       || result.paused !== false
-      || result.workerProtocolExpected !== "playlist-pipeline-v10"
-      || result.workerProtocolActual !== "playlist-pipeline-v10"
+      || result.workerProtocolExpected !== "playlist-pipeline-v11"
+      || result.workerProtocolActual !== "playlist-pipeline-v11"
     ) {
       throw new Error(`${label} does not bind the healthy current production rollout`);
     }
@@ -634,8 +634,8 @@ function soakObservations(input: {
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
       paused: false,
-      workerProtocolExpected: "playlist-pipeline-v10",
-      workerProtocolActual: "playlist-pipeline-v10",
+      workerProtocolExpected: "playlist-pipeline-v11",
+      workerProtocolActual: "playlist-pipeline-v11",
       interactiveWorker: interactive.lane,
       deepWorker: deep.lane,
     };
@@ -717,14 +717,14 @@ function payloadValidator(
     );
   }
   if (
-    promotion.databaseSchemaVersion !== "18"
+    promotion.databaseSchemaVersion !== "19"
     || promotion.databaseCapabilityVersion !== "2"
     || promotion.releaseManifestCanaryGuardsVersion !== "1"
     || promotion.canonicalExecutionHardeningVersion !== "1"
-    || promotion.workerProtocol !== "playlist-pipeline-v10"
+    || promotion.workerProtocol !== "playlist-pipeline-v11"
   ) {
     throw new Error(
-      "public rollout promotion requires schema 18, composite capability 2, both authoritative marker-1 values, and protocol 10",
+      "public rollout promotion requires schema 19, composite capability 2, both authoritative marker-1 values, and protocol 11",
     );
   }
   const soak = exactObject(payload.soak, [
@@ -1236,11 +1236,11 @@ function rollbackWarrantPayloadValidator(
     || typeof promotion.sitesRevision !== "string"
     || !FULL_REVISION.test(promotion.sitesRevision)
     || promotion.sitesCandidateMatched !== false
-    || promotion.databaseSchemaVersion !== "18"
+    || promotion.databaseSchemaVersion !== "19"
     || promotion.databaseCapabilityVersion !== "2"
     || promotion.releaseManifestCanaryGuardsVersion !== "1"
     || promotion.canonicalExecutionHardeningVersion !== "1"
-    || promotion.workerProtocol !== "playlist-pipeline-v10"
+    || promotion.workerProtocol !== "playlist-pipeline-v11"
   ) {
     throw new Error(
       "public rollout rollback warrant does not preserve the exact pre-Sites promotion",
@@ -1349,11 +1349,11 @@ export function buildPublicRolloutRollbackWarrantPayload(input: {
     promotion: {
       ...input.promotion,
       sitesCandidateMatched: false,
-      databaseSchemaVersion: "18",
+      databaseSchemaVersion: "19",
       databaseCapabilityVersion: "2",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
-      workerProtocol: "playlist-pipeline-v10",
+      workerProtocol: "playlist-pipeline-v11",
     },
   };
 }

@@ -104,6 +104,7 @@ type ResearchRun = {
   candidateStageCounts?: Partial<Record<string, number>>;
   progress?: RunProgressView;
   resolution?: {
+    generation?: number | null;
     state: "accepted" | "needs_input" | "probing" | "executing" | "blocked_dependency" | "needs_decision" | "ready" | "publishing" | "completed" | "cancelled" | "quarantined";
     nextAction: "none" | "answer_initial_guidance" | "answer_rescue_guidance" | "wait_for_dependency" | "resume_research" | "authorize_apple" | "decide_verified_partial" | "review_contract" | "contact_support";
     terminal: boolean;
@@ -233,7 +234,17 @@ type BriefResponse = {
   questions?: GuidedQuestion[];
   briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
+  checkpointMode?: "correctness_blocking" | "nuance_optional" | "interpretation_confirmation" | null;
+  interpretationSummary?: GuidanceInterpretationSummary | null;
   error?: string;
+};
+
+type GuidanceInterpretationSummary = {
+  mustHave: readonly string[];
+  prefer: readonly string[];
+  avoid: readonly string[];
+  flow: readonly string[];
+  count: number;
 };
 
 type GuidedQuestionOption = {
@@ -258,13 +269,7 @@ type GuidedQuestion = {
   criticality?: "required" | "optional";
   selectionMode?: "single" | "multiple";
   allowCustom?: boolean;
-  interpretationSummary?: {
-    mustHave: readonly string[];
-    prefer: readonly string[];
-    avoid: readonly string[];
-    flow: readonly string[];
-    count: number;
-  };
+  interpretationSummary?: GuidanceInterpretationSummary;
   options: GuidedQuestionOption[];
 };
 
@@ -426,7 +431,14 @@ async function waitForBrief(requestId: string, initialDelayMs = 1_500, signal?: 
     await abortableDelay(delayMs, signal);
     const response = await api<BriefResponse>("/api/v1/brief/" + encodeURIComponent(requestId), { signal });
     if (response.status === "failed") throw new BriefInterpretationError(response.error || "Scope interpretation failed.");
-    if (response.status === "awaiting_answers" && response.questions?.length) return response;
+    if (response.status === "awaiting_answers" && (
+      response.questions?.length
+      || (
+        response.checkpointMode === "interpretation_confirmation"
+        && response.interpretationSummary
+        && response.questionSetHash
+      )
+    )) return response;
     if (response.brief && (!response.status || response.status === "complete")) return response;
     if (attempt >= 15) delayMs = 5_000;
   }
@@ -1825,6 +1837,72 @@ function FinalizingBriefScreen() {
   );
 }
 
+function GuidanceConfirmationScreen({
+  summary,
+  busy,
+  onConfirm,
+  onEdit,
+}: {
+  summary: GuidanceInterpretationSummary;
+  busy: boolean;
+  onConfirm: () => void;
+  onEdit: () => void;
+}) {
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+      titleRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+  return (
+    <section className="guided-question-screen" aria-labelledby="guidance-confirmation-title">
+      <div className="guided-question-body">
+        <p className="guided-question-kicker">CONFIRM THE INTERPRETATION</p>
+        <h1 id="guidance-confirmation-title" ref={titleRef} tabIndex={-1}>
+          Here’s how gênio will build it
+        </h1>
+        <p className="guided-question-reason">
+          <span>NO EXTRA QUESTION NEEDED</span>
+          Your request is already specific. Confirm these rules before research begins.
+        </p>
+        <section
+          className="guided-interpretation-summary"
+          aria-label="Playlist interpretation"
+          data-testid="guidance-confirmation-summary"
+        >
+          {([
+            ["MUST HAVE", summary.mustHave],
+            ["PREFER", summary.prefer],
+            ["AVOID", summary.avoid],
+            ["FLOW", summary.flow],
+          ] as const).map(([label, values]) => (
+            <div key={label}>
+              <strong>{label}</strong>
+              {values.length > 0
+                ? <ul>{values.map((value) => <li key={value}>{value}</li>)}</ul>
+                : <span>NO ADDITIONAL RULE</span>}
+            </div>
+          ))}
+          <div>
+            <strong>COUNT</strong>
+            <span>{summary.count.toLocaleString()} TRACKS · EXACT</span>
+          </div>
+        </section>
+        <div className="guided-actions">
+          <button className="quiet-button" type="button" disabled={busy} onClick={onEdit}>
+            ← EDIT REQUEST
+          </button>
+          <button className="action-button" type="button" disabled={busy} onClick={onConfirm}>
+            {busy ? "CONFIRMING..." : "CREATE THIS PLAYLIST →"}
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function preserveFeedbackSource(): void {
   try {
     window.sessionStorage.setItem("9enio.feedback.sourcePath", window.location.pathname);
@@ -2712,6 +2790,10 @@ export function PlaylistBuilder() {
   const [briefRequestId, setBriefRequestId] = useState<string | null>(null);
   const [guidanceQuestions, setGuidanceQuestions] = useState<GuidedQuestion[]>([]);
   const [guidanceQuestionSetHash, setGuidanceQuestionSetHash] = useState<string | null>(null);
+  const [guidanceConfirmation, setGuidanceConfirmation] = useState<{
+    questionSetHash: string;
+    summary: GuidanceInterpretationSummary;
+  } | null>(null);
   const [guidanceAnswers, setGuidanceAnswers] = useState<Record<string, GuidedAnswer>>({});
   const [guidanceIndex, setGuidanceIndex] = useState(0);
   const [guidanceSubmission, setGuidanceSubmission] = useState<GuidedAnswer[] | null>(null);
@@ -2796,6 +2878,7 @@ export function PlaylistBuilder() {
     setBriefRequestId(null);
     setGuidanceQuestions([]);
     setGuidanceQuestionSetHash(null);
+    setGuidanceConfirmation(null);
     setGuidanceAnswers({});
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
@@ -3012,12 +3095,26 @@ export function PlaylistBuilder() {
           setPrompt(response.prompt ?? "");
           setBriefRequestId(queuedBriefId);
           if (response.status === "awaiting_answers" && response.questions?.length) {
+            setGuidanceConfirmation(null);
             setGuidanceQuestions(response.questions);
             setGuidanceQuestionSetHash(response.questionSetHash ?? null);
             setGuidanceAnswers({});
             setGuidanceIndex(0);
             setGuidanceSubmission(null);
             setGuidanceRecoveryMode(null);
+            setBriefFinalizing(false);
+          } else if (
+            response.status === "awaiting_answers"
+            && response.checkpointMode === "interpretation_confirmation"
+            && response.interpretationSummary
+            && response.questionSetHash
+          ) {
+            setGuidanceQuestions([]);
+            setGuidanceQuestionSetHash(response.questionSetHash);
+            setGuidanceConfirmation({
+              questionSetHash: response.questionSetHash,
+              summary: response.interpretationSummary,
+            });
             setBriefFinalizing(false);
           } else {
             await startResearchFromBrief(
@@ -3246,7 +3343,7 @@ export function PlaylistBuilder() {
       if (
         initialRequestId
         && !response.brief
-        && !(response.status === "awaiting_answers" && response.questions?.length)
+        && response.status !== "awaiting_answers"
       ) {
         setBriefFinalizing(true);
         response = await waitForBrief(initialRequestId, numberValue(response.pollAfterMs, 1_500), controller.signal);
@@ -3262,12 +3359,26 @@ export function PlaylistBuilder() {
       if (!requestId) throw new Error("gênio could not resume this playlist request.");
       setBriefRequestId(requestId);
       if (response.status === "awaiting_answers" && response.questions?.length) {
+        setGuidanceConfirmation(null);
         setGuidanceQuestions(response.questions);
         setGuidanceQuestionSetHash(response.questionSetHash ?? null);
         setGuidanceAnswers({});
         setGuidanceIndex(0);
         setGuidanceSubmission(null);
         setGuidanceRecoveryMode(null);
+        setBriefFinalizing(false);
+      } else if (
+        response.status === "awaiting_answers"
+        && response.checkpointMode === "interpretation_confirmation"
+        && response.interpretationSummary
+        && response.questionSetHash
+      ) {
+        setGuidanceQuestions([]);
+        setGuidanceQuestionSetHash(response.questionSetHash);
+        setGuidanceConfirmation({
+          questionSetHash: response.questionSetHash,
+          summary: response.interpretationSummary,
+        });
         setBriefFinalizing(false);
       } else {
         setBriefFinalizing(true);
@@ -3299,6 +3410,7 @@ export function PlaylistBuilder() {
     }
     setGuidanceQuestions([]);
     setGuidanceQuestionSetHash(null);
+    setGuidanceConfirmation(null);
     setGuidanceAnswers({});
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
@@ -3325,6 +3437,64 @@ export function PlaylistBuilder() {
     setGuidanceRecoveryMode("edit_artist");
     setBriefFinalizing(false);
     guidanceIdempotencyKey.current = null;
+  }
+
+  async function confirmGuidanceInterpretation() {
+    if (!briefRequestId || !guidanceConfirmation || briefRequestRef.current) return;
+    if (!guidanceIdempotencyKey.current) guidanceIdempotencyKey.current = crypto.randomUUID();
+    const controller = new AbortController();
+    briefRequestRef.current = controller;
+    setBusy("guidance");
+    setBriefFinalizing(true);
+    setError("");
+    try {
+      const response = await api<BriefResponse>(
+        "/api/v1/brief/" + encodeURIComponent(briefRequestId) + "/answers",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": guidanceIdempotencyKey.current },
+          body: JSON.stringify({
+            answers: [],
+            questionSetHash: guidanceConfirmation.questionSetHash,
+            idempotencyKey: guidanceIdempotencyKey.current,
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted) return;
+      if (response.status === "failed") {
+        throw new BriefInterpretationError(response.error || "The playlist request could not be confirmed.");
+      }
+      const finalized = response.brief && response.status === "complete"
+        ? response
+        : await waitForBrief(
+          briefRequestId,
+          numberValue(response.pollAfterMs, 1_500),
+          controller.signal,
+        );
+      if (controller.signal.aborted) return;
+      const adopted = adoptAuthoritativeBrief(finalized, brief);
+      if (!adopted) {
+        throw new Error("The playlist size could not be restored. Return to the request and choose it again.");
+      }
+      setGuidanceConfirmation(null);
+      await startResearchFromBrief(
+        adopted.brief,
+        briefRequestId,
+        adopted.requestedTrackCount,
+        controller.signal,
+      );
+    } catch (caught) {
+      if (!isAbortError(caught)) {
+        setBriefFinalizing(false);
+        setError((caught as Error).message);
+      }
+    } finally {
+      if (briefRequestRef.current === controller) {
+        briefRequestRef.current = null;
+        setBusy("");
+      }
+    }
   }
 
   async function continueGuidance() {
@@ -3387,6 +3557,22 @@ export function PlaylistBuilder() {
         guidanceIdempotencyKey.current = null;
         return;
       }
+      if (
+        response.status === "awaiting_answers"
+        && response.checkpointMode === "interpretation_confirmation"
+        && response.interpretationSummary
+        && response.questionSetHash
+      ) {
+        setGuidanceQuestions([]);
+        setGuidanceQuestionSetHash(response.questionSetHash);
+        setGuidanceConfirmation({
+          questionSetHash: response.questionSetHash,
+          summary: response.interpretationSummary,
+        });
+        setBriefFinalizing(false);
+        guidanceIdempotencyKey.current = null;
+        return;
+      }
 
       const finalized = await waitForBrief(
         briefRequestId,
@@ -3404,6 +3590,25 @@ export function PlaylistBuilder() {
         setGuidanceIndex(0);
         setGuidanceSubmission(null);
         setGuidanceRecoveryMode(null);
+        setBriefFinalizing(false);
+        guidanceIdempotencyKey.current = null;
+        return;
+      }
+      if (
+        finalized.status === "awaiting_answers"
+        && finalized.checkpointMode === "interpretation_confirmation"
+        && finalized.interpretationSummary
+        && finalized.questionSetHash
+      ) {
+        if (!adoptAuthoritativeBrief(finalized, brief)) {
+          throw new Error("The playlist size could not be restored. Return to the request and choose it again.");
+        }
+        setGuidanceQuestions([]);
+        setGuidanceQuestionSetHash(finalized.questionSetHash);
+        setGuidanceConfirmation({
+          questionSetHash: finalized.questionSetHash,
+          summary: finalized.interpretationSummary,
+        });
         setBriefFinalizing(false);
         guidanceIdempotencyKey.current = null;
         return;
@@ -3472,6 +3677,16 @@ export function PlaylistBuilder() {
         }
         setGuidanceQuestions(current.questions ?? []);
         setGuidanceQuestionSetHash(current.questionSetHash ?? null);
+        setGuidanceConfirmation(
+          current.checkpointMode === "interpretation_confirmation"
+            && current.interpretationSummary
+            && current.questionSetHash
+            ? {
+                questionSetHash: current.questionSetHash,
+                summary: current.interpretationSummary,
+              }
+            : null,
+        );
         setGuidanceAnswers({});
         setGuidanceIndex(0);
         setGuidanceSubmission(null);
@@ -4101,6 +4316,21 @@ export function PlaylistBuilder() {
         <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <FinalizingBriefScreen />
+      </main>
+    );
+  }
+
+  if (!run && !manifest && !result && entryStage === "command" && guidanceConfirmation) {
+    return (
+      <main className="app-shell one-command-shell guided-shell">
+        <AppHeader onHome={reset} onJobs={() => void openJobs()} />
+        <ErrorBar message={error} onDismiss={() => setError("")} />
+        <GuidanceConfirmationScreen
+          summary={guidanceConfirmation.summary}
+          busy={Boolean(busy)}
+          onConfirm={() => void confirmGuidanceInterpretation()}
+          onEdit={editPlaylistRequest}
+        />
       </main>
     );
   }

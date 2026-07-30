@@ -33,7 +33,7 @@ describe("database schema rollout compatibility", () => {
     ["16", "compatible"],
     ["17", "compatible"],
     ["18", "compatible"],
-    ["19", "too_new"],
+    ["19", "compatible"],
   ] as const)("classifies observed schema %s as %s", (actual, expected) => {
     expect(databaseSchemaCompatibility(actual, DATABASE_SCHEMA_SUPPORT)).toBe(expected);
   });

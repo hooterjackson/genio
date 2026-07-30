@@ -123,10 +123,10 @@ import {
   guidanceRequestClassificationV2,
 } from "./guidance-contract-v2.ts";
 import {
-  deterministicGuidanceCandidatesV3,
-  selectGuidanceRoundV3,
-} from "./adaptive-guidance-v3.ts";
-import { publicGuidanceQuestionV3 } from "./adaptive-guidance-contract-bridge.ts";
+  ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
+  guidanceCheckpointV4,
+} from "./adaptive-guidance-v4.ts";
+import { publicGuidanceQuestionV4 } from "./adaptive-guidance-contract-bridge.ts";
 import {
   compilePlaylistContractShadowV1,
   PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
@@ -136,6 +136,7 @@ import {
   type PlaylistContractRevisionV1,
 } from "./playlist-contract-v1.ts";
 import { assessPlaylistFeasibilityV1 } from "./playlist-feasibility-v1.ts";
+import { musicIntentEnvelopeV1 } from "./music-intent-envelope-v1.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -3924,47 +3925,43 @@ export async function processBriefInterpretationJob(
         reportHash: feasibility.reportHash,
         report: structuredClone(feasibility) as unknown as Record<string, unknown>,
       });
-      const candidates = deterministicGuidanceCandidatesV3({
+      const requestShape = requestClassification === "precise"
+        ? "fully_explicit"
+        : preliminarySelectionPlan.scopeKind === "fixed_release_container"
+          ? "fixed_list"
+          : preliminarySelectionPlan.scopeKind === "factual_frontier"
+            ? "factual"
+            : "curated";
+      const checkpoint = guidanceCheckpointV4({
         prompt: request.prompt,
-        baseContractRevisionId: activeContract.revisionId,
-        baseContractSemanticHash: activeContract.semanticHash,
+        baseContract: activeContract,
         preservedTrackPredicate: shadow.preservedTrackPredicate,
         ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
-        baseContract: activeContract,
         criticalAmbiguities: v3Spec.criticalAmbiguities,
+        requestShape,
+        compilationTimestamp: new Date().toISOString(),
       });
-      const round = selectGuidanceRoundV3({
-        stage: "initial",
-        requestShape: requestClassification === "precise"
-          ? "fully_explicit"
-          : preliminarySelectionPlan.scopeKind === "fixed_release_container"
-            ? "fixed_list"
-            : preliminarySelectionPlan.scopeKind === "factual_frontier"
-              ? "factual"
-              : "curated",
-        candidates,
-      });
-      const questions = round.decisions.map(publicGuidanceQuestionV3);
+      const questions = checkpoint.decisions.map(publicGuidanceQuestionV4);
       const generationMode = questions.length > 0
         ? "deterministic_critical"
         : "no_material_questions";
       const guidanceTelemetry: PlaylistGuidanceTelemetry = {
         generationMode,
         requestClassification,
-        guidancePolicyVersion: "adaptive_guidance_v3",
-        questionSetHash: round.roundHash,
-        proposedQuestionCount: candidates.length,
+        guidancePolicyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
+        questionSetHash: checkpoint.checkpointHash,
+        proposedQuestionCount: checkpoint.decisions.length,
         acceptedQuestionCount: questions.length,
         webSearchCalls: 0,
-        validationIssues: Object.entries(round.rejectedDecisionReasons)
+        validationIssues: Object.entries(checkpoint.rejectedDecisionReasons)
           .map(([id, reason]) => `${id}:${reason}`)
           .slice(0, 12),
       };
       const guidanceContract: PlaylistGuidanceQuestionSetContract = {
-        questionSetHash: round.roundHash,
+        questionSetHash: checkpoint.checkpointHash,
         requestClassification,
         generationMode,
-        guidancePolicyVersion: "adaptive_guidance_v3",
+        guidancePolicyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
         locale: activeContract.locale,
         storefront: activeContract.storefront,
         targetTrackCount: activeContract.requestedTrackCount,
@@ -3973,11 +3970,16 @@ export async function processBriefInterpretationJob(
         baseContractRevisionId: activeContract.revisionId,
         baseContractSemanticHash: activeContract.semanticHash,
         guidanceRound: "initial",
-        trigger: round.decisions[0]?.trigger ?? "nuance",
-        axis: round.decisions[0]?.axis ?? null,
+        trigger: checkpoint.decisions[0]?.trigger ?? "nuance",
+        axis: checkpoint.decisions[0]?.axis ?? null,
         feasibilitySnapshotId: feasibilitySnapshot.id,
+        checkpointMode: checkpoint.mode,
+        interpretationSummary: checkpoint.interpretationSummary,
       };
-      const status = questions.length > 0 ? "awaiting_answers" : "complete";
+      // Guidance V4 is an always-present checkpoint. A precise or fixed
+      // request with no useful question still requires an explicit
+      // interpretation confirmation; it must never silently begin research.
+      const status = "awaiting_answers";
       await repository.saveBriefSelectionPlan?.(briefRequestId, preliminarySelectionPlan);
       await repository.saveBriefResult(briefRequestId, {
         status,
@@ -3987,7 +3989,6 @@ export async function processBriefInterpretationJob(
         guidanceSourceHints: [],
         guidanceTelemetry,
         guidanceContract,
-        ...(status === "complete" ? { estimateUsd: estimateResearchCost(canonicalBrief) } : {}),
         error: null,
       });
       return;
@@ -4051,6 +4052,7 @@ export async function processBriefInterpretationJob(
           canonicalBrief,
           request.model,
           context,
+          musicIntentEnvelopeV1(v3Spec),
         ),
       });
       scout = {

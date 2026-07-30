@@ -11,7 +11,7 @@ describe("public V3 runtime release contract", () => {
     const result = runtimeReleaseContract({
       RELEASE_ENVIRONMENT: "staging",
       RELEASE_DEPLOYMENT_PHASE: "expand",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
@@ -31,7 +31,7 @@ describe("public V3 runtime release contract", () => {
       releaseEnvironment: "staging",
       ownerAllowlistVersion: null,
       deploymentPhase: "expand",
-      expectedDatabaseSchemaVersion: "18",
+      expectedDatabaseSchemaVersion: "19",
       canonicalActivationConfigured: false,
       assignmentEnabled: true,
       ownerCanaryEnabled: true,
@@ -40,11 +40,11 @@ describe("public V3 runtime release contract", () => {
       genreSceneEvidenceApproved: false,
       geographicScopeEvidenceApproved: false,
       factualFeasibilityApproved: false,
-      schemaVersion: "18",
+      schemaVersion: "19",
       schemaMinimum: "13",
-      schemaMaximum: "18",
-      schemaPreferred: "18",
-      workerProtocol: "playlist-pipeline-v10",
+      schemaMaximum: "19",
+      schemaPreferred: "19",
+      workerProtocol: "playlist-pipeline-v11",
       minimumWorkerProtocol: "playlist-pipeline-v8",
       queryPlanSchemaVersion: "3",
       briefContractVersion: "2",
@@ -52,7 +52,7 @@ describe("public V3 runtime release contract", () => {
       guidancePolicyVersion: "intelligent_guidance_v2",
       evidencePolicyVersion: "governed_evidence_v1",
       semanticScopePolicyVersion: "scope_gate_v2_1_2",
-      musicConceptPolicyVersion: "music_concepts_v3_2_0",
+      musicConceptPolicyVersion: "music_concepts_v3_3_0",
       promptVersion: "grounded_recovery_v3_1_prompt_v1",
       baselineProviderModelId: "gpt-5.6-luna",
       escalationProviderModelId: "gpt-5.6-terra",
@@ -94,27 +94,27 @@ describe("public V3 runtime release contract", () => {
     }))).not.toContain("first-owner@example.com");
   });
 
-  test("reports canonical contract-3 and query-plan-5 activation", () => {
+  test("reports canonical contract-3 and query-plan-6 activation", () => {
     const result = runtimeReleaseContract({
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
       RELEASE_EXECUTION_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     });
     expect(result).toMatchObject({
       deploymentPhase: "activate",
-      expectedDatabaseSchemaVersion: "18",
+      expectedDatabaseSchemaVersion: "19",
       canonicalActivationConfigured: true,
-      queryPlanSchemaVersion: "5",
+      queryPlanSchemaVersion: "6",
       briefContractVersion: "3",
       guidanceContractOwnerCanaryEnabled: true,
-      guidancePolicyVersion: "adaptive_guidance_v3",
+      guidancePolicyVersion: "adaptive_guidance_v4",
       evidencePolicyVersion: "governed_evidence_v2",
     });
   });
@@ -123,7 +123,7 @@ describe("public V3 runtime release contract", () => {
     const result = runtimeReleaseContract({
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
@@ -131,14 +131,14 @@ describe("public V3 runtime release contract", () => {
       GUIDANCE_CONTRACT_V2_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_ENABLED: "false",
       GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     });
     expect(result).toMatchObject({
       canonicalActivationConfigured: true,
-      queryPlanSchemaVersion: "5",
+      queryPlanSchemaVersion: "6",
       briefContractVersion: "3",
       guidanceContractReggaetonCanaryEnabled: true,
-      guidancePolicyVersion: "adaptive_guidance_v3",
+      guidancePolicyVersion: "adaptive_guidance_v4",
     });
   });
 
@@ -165,7 +165,7 @@ describe("public V3 runtime release contract", () => {
     expect(result.guidancePolicyVersion).toBe("intelligent_guidance_v2");
     expect(result.evidencePolicyVersion).toBe("governed_evidence_v1");
     expect(result.semanticScopePolicyVersion).toBe("scope_gate_v2_1_2");
-    expect(result.musicConceptPolicyVersion).toBe("music_concepts_v3_2_0");
+    expect(result.musicConceptPolicyVersion).toBe("music_concepts_v3_3_0");
     expect(result.baselineProviderModelId).toBe("gpt-5.6-luna");
     expect(result.modelResolutionMode).toBe("provider_managed_alias");
     expect(result.modelCatalogValidatedAt).toBe("2026-07-20T00:00:00.000Z");
@@ -184,14 +184,15 @@ describe("public V3 runtime release contract", () => {
     for (const deploymentPhase of ["bridge", "expand"] as const) {
       const result = runtimeReleaseContract({
         RELEASE_DEPLOYMENT_PHASE: deploymentPhase,
-        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION:
+          deploymentPhase === "bridge" ? "18" : "19",
         RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
         RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
         RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
         GUIDANCE_CONTRACT_V3_ENABLED: "true",
         GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
         GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "true",
-        PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+        PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
       });
       expect(result).toMatchObject({
         deploymentPhase,

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export const MUSIC_CONCEPT_POLICY_VERSION = "music_concepts_v3_2_0" as const;
+export const MUSIC_CONCEPT_POLICY_VERSION = "music_concepts_v3_3_0" as const;
 
 export type MusicConceptAmbiguity = "none" | "context_required";
 
@@ -64,6 +64,48 @@ const CONCEPTS: readonly MusicConceptV3[] = [
     eligibilityAliases: ["American drill", "US drill", "U.S. drill"],
     discoveryOnlyTerms: ["Chicago drill", "Brooklyn drill", "New York drill"],
     evidencePatterns: [/\b(?:American|U\.?S\.?)\s+drill\b/iu],
+    ambiguity: "none",
+  },
+  {
+    id: "genre:hip-hop",
+    label: "hip-hop",
+    eligibilityAliases: ["hip-hop", "hip hop", "rap"],
+    discoveryOnlyTerms: ["rap music", "hip-hop culture"],
+    evidencePatterns: [/\b(?:hip[ -]?hop|rap)\b/iu],
+    ambiguity: "none",
+  },
+  {
+    id: "genre:r-and-b",
+    label: "R&B",
+    eligibilityAliases: ["R&B", "R and B", "R B", "rhythm and blues"],
+    discoveryOnlyTerms: ["contemporary R&B", "alternative R&B"],
+    evidencePatterns: [/\b(?:r\s*(?:&|and)\s*b|rhythm\s+and\s+blues)\b/iu],
+    ambiguity: "none",
+  },
+  {
+    id: "genre:reggaeton",
+    label: "reggaeton",
+    eligibilityAliases: ["reggaeton"],
+    discoveryOnlyTerms: ["reguetón", "reggaetón", "perreo"],
+    evidencePatterns: [/\b(?:reggaet[oó]n|perreo)\b/iu],
+    ambiguity: "none",
+  },
+  {
+    id: "genre:latin-urban",
+    label: "Latin urban",
+    eligibilityAliases: ["Latin urban", "urbano latino"],
+    discoveryOnlyTerms: ["Latin urbano", "música urbana latina"],
+    evidencePatterns: [
+      /\b(?:Latin\s+urban|urbano\s+latino|Latin\s+urbano|m[uú]sica\s+urbana\s+latina)\b/iu,
+    ],
+    ambiguity: "none",
+  },
+  {
+    id: "genre:dembow",
+    label: "dembow",
+    eligibilityAliases: ["dembow"],
+    discoveryOnlyTerms: ["Dominican dembow"],
+    evidencePatterns: [/\b(?:Dominican\s+)?dembow\b/iu],
     ambiguity: "none",
   },
   {

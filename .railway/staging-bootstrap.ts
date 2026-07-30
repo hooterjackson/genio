@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const STAGING_BOOTSTRAP_PHASE = "bootstrap";
-export const STAGING_BOOTSTRAP_DATABASE_SCHEMA_VERSION = "18";
+export const STAGING_BOOTSTRAP_DATABASE_SCHEMA_VERSION = "19";
 export const STAGING_BOOTSTRAP_DATABASE_CAPABILITY_VERSION = "2";
 export const STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMATION = "true";
 

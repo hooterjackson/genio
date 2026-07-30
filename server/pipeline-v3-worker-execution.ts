@@ -85,6 +85,13 @@ import {
   canonicalExecutionIntegrityError,
   CanonicalExecutionIntegrityError,
 } from "./canonical-execution-integrity.ts";
+import {
+  canonicalExecutorCapabilityForSchemaV1,
+} from "./playlist-contract-backend-capability-v1.ts";
+import {
+  revalidateExecutionCoverageReportV1,
+} from "./verification-expression-v1.ts";
+import { auditSemanticCollapseV1 } from "./semantic-collapse-audit-v1.ts";
 
 /**
  * Durable worker boundary for Pipeline V3 retrieval.
@@ -290,6 +297,9 @@ export interface PipelineV3WorkerPayload {
   __contractRevisionDatabaseId?: string;
   __contractRevisionId?: string;
   __contractSemanticHash?: string;
+  __executorRevision?: string;
+  __executorConfigurationHash?: string;
+  __executorSemanticConfigurationHash?: string;
 }
 
 export const PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS = 15 * 60_000;
@@ -1500,6 +1510,77 @@ export class PipelineV3WorkerExecution {
       }
       return;
     }
+    if (input.queryPlan.schemaVersion === 6) {
+      const recordedAt = new Date().toISOString();
+      try {
+        const expression = input.queryPlan.verificationExpression;
+        const persistedCoverage = input.queryPlan.executionCoverageReport;
+        const runtimeConfigurationHash =
+          input.payload?.__executorSemanticConfigurationHash?.trim() ?? "";
+        const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
+          queryPlanSchemaVersion: 6,
+        });
+        if (!expression
+          || !persistedCoverage
+          || !/^[0-9a-f]{64}$/u.test(runtimeConfigurationHash)
+          || input.queryPlan.executorCapabilityHash !== runtimeCapability.hash
+          || persistedCoverage.workerCapabilityHash !== runtimeCapability.hash
+          || persistedCoverage.configurationHash !== runtimeConfigurationHash
+          || persistedCoverage.ontologyVersion !== MUSIC_CONCEPT_POLICY_VERSION
+          || persistedCoverage.evidencePolicyVersion
+            !== input.queryPlan.evidencePolicyVersion) {
+          throw new Error("execution_coverage_runtime_identity_mismatch");
+        }
+        const workerClaimCoverage = revalidateExecutionCoverageReportV1({
+          expression,
+          persisted: persistedCoverage,
+          stage: "worker_claim",
+          workerCapabilityHash: runtimeCapability.hash,
+          configurationHash: runtimeConfigurationHash,
+          ontologyVersion: MUSIC_CONCEPT_POLICY_VERSION,
+          evidencePolicyVersion: input.queryPlan.evidencePolicyVersion,
+        });
+        if (!workerClaimCoverage.complete) {
+          throw new Error("execution_coverage_incomplete");
+        }
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          "v3:coverage:worker-claim",
+          {
+            ...workerClaimCoverage,
+            queryPlanHash,
+            queryPlanRevisionId:
+              input.payload?.__queryPlanRevisionId ?? null,
+            recordedAt,
+          },
+          fence,
+        );
+      } catch (error) {
+        const reason = error instanceof Error
+          ? error.message
+          : "execution_coverage_worker_claim_failed";
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          fullCheckpointKey(stageKey),
+          {
+            schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+            state: "failed_integrity",
+            stageKey,
+            queryPlanHash,
+            code: "v3_execution_coverage_worker_claim_failed",
+            reason,
+            failedAt: recordedAt,
+          },
+          fence,
+        );
+        await this.repository.updateRun(input.runId, {
+          status: "failed_integrity",
+          phase: "v3_execution_coverage_worker_claim_failed",
+          error: null,
+        }, fence);
+        return;
+      }
+    }
     let modelRoute: PipelineV3ModelRoute;
     try {
       modelRoute = pipelineV3ModelRouteFromPolicySnapshot(input.run.pipelinePolicySnapshot);
@@ -1902,6 +1983,67 @@ export class PipelineV3WorkerExecution {
       input.queryPlan,
       result,
     );
+    if (input.queryPlan.schemaVersion === 6
+      && result.outcome.status === "no_compatible_tracks"
+      && !governedCorpusActionPending) {
+      const collapseAudit = auditSemanticCollapseV1({
+        queryPlan: input.queryPlan,
+        result,
+      });
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        "v3:semantic-collapse:audit",
+        {
+          ...collapseAudit,
+          queryPlanHash,
+          queryPlanRevisionId:
+            input.payload?.__queryPlanRevisionId ?? null,
+          recordedAt: new Date().toISOString(),
+        },
+        fence,
+      );
+      if (collapseAudit.disposition === "technical_quarantine") {
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          fullCheckpointKey(stageKey),
+          {
+            schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+            state: "failed_integrity",
+            code: "v3_semantic_collapse_technical_quarantine",
+            stageKey,
+            queryPlanHash,
+            auditHash: collapseAudit.auditHash,
+            signalCodes: collapseAudit.signalCodes,
+            limitingObligationIds:
+              collapseAudit.limitingObligationIds,
+            failedAt: new Date().toISOString(),
+          },
+          fence,
+        );
+        const quarantined = Boolean(
+          this.repository.quarantineCanonicalExecution
+          && typeof input.payload?.__jobId === "string"
+          && typeof input.payload?.__jobWorkerId === "string"
+          && Number.isSafeInteger(input.payload?.__jobLeaseEpoch)
+          && await this.repository.quarantineCanonicalExecution({
+            runId: input.runId,
+            jobId: input.payload.__jobId,
+            workerId: input.payload.__jobWorkerId,
+            leaseGeneration: Number(input.payload.__jobLeaseEpoch),
+            reasonCode:
+              "v3_semantic_collapse_technical_quarantine",
+          }),
+        );
+        if (!quarantined) {
+          await this.repository.updateRun(input.runId, {
+            status: "failed_integrity",
+            phase: "v3_semantic_collapse_technical_quarantine",
+            error: null,
+          }, fence);
+        }
+        return;
+      }
+    }
     let runtimeFeasibility: PipelineV3RuntimeFeasibilityAssessment | null = null;
     let runtimeFeasibilityDecisionRequired = false;
     if (requiresSeparatedRecoveryPersistence) {

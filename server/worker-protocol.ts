@@ -40,13 +40,13 @@ export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
   canonicalExecutorCapabilities: [],
 };
 
-// v10 is the compatibility bridge for immutable playlist-contract revisions,
-// brief contract 3, historical query-plan schema 4, and directive-aware
-// schema 5. Advertising it does not activate those contracts; feature gates
+// v11 adds Boolean verification, route coverage, and schema-19 resolution
+// fencing while retaining all v10 drain capabilities. Advertising it does not
+// activate those contracts; feature gates
 // and job stamping keep old work drainable.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v10";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 10;
-/** Old-contract bridge capacity remains healthy while v10 workers roll out. */
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v11";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 11;
+/** Old-contract bridge capacity remains healthy while v11 workers roll out. */
 export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION = "playlist-pipeline-v8";
 export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER = 8;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
@@ -56,6 +56,7 @@ export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
   canonicalExecutorCapabilities: [
     canonicalExecutorCapabilityForSchemaV1({ queryPlanSchemaVersion: 4 }),
     canonicalExecutorCapabilityForSchemaV1({ queryPlanSchemaVersion: 5 }),
+    canonicalExecutorCapabilityForSchemaV1({ queryPlanSchemaVersion: 6 }),
   ],
 };
 
@@ -72,6 +73,8 @@ export const CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL = 9;
 export const BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL = 10;
 /** Query-plan schemas 4+ carry the active playlist-contract revision hash. */
 export const CORPUS_FIRST_V3_SCHEMA_4_MINIMUM_WORKER_PROTOCOL = 10;
+/** Boolean verification/query-plan schema 6 requires protocol 11. */
+export const CORPUS_FIRST_V3_SCHEMA_6_MINIMUM_WORKER_PROTOCOL = 11;
 
 export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
   if (pipelineVersion === "corpus_first_v3") return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
@@ -86,6 +89,9 @@ export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersio
 export function minimumWorkerProtocolForQueryPlan(
   queryPlan: Pick<QueryPlanV3, "schemaVersion"> | { readonly schemaVersion: number } | null | undefined,
 ): number {
+  if (typeof queryPlan?.schemaVersion === "number" && queryPlan.schemaVersion >= 6) {
+    return CORPUS_FIRST_V3_SCHEMA_6_MINIMUM_WORKER_PROTOCOL;
+  }
   if (typeof queryPlan?.schemaVersion === "number" && queryPlan.schemaVersion >= 4) {
     return CORPUS_FIRST_V3_SCHEMA_4_MINIMUM_WORKER_PROTOCOL;
   }

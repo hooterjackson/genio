@@ -118,4 +118,37 @@ describe("Pipeline V2 operational alert sweep", () => {
       windowEndedAt: new Date("2026-07-19T12:00:00.000Z"),
     });
   });
+
+  test("interactive housekeeping runs the leased resolution reconciler and outbox while deep workers cannot", async () => {
+    const runPlaylistResolutionReconciler = vi.fn(async () => ({
+      audited: 2,
+      repaired: 1,
+      quarantined: 0,
+      skipped: false,
+    }));
+    const drainPlaylistResolutionOutbox = vi.fn(async () => 2);
+    const repository = methodProxy({
+      runPlaylistResolutionReconciler,
+      drainPlaylistResolutionOutbox,
+    });
+    const handlers = defaultJobHandlers(repository);
+    await handlers.playlist_resolution_reconcile!(
+      {},
+      new AbortController().signal,
+    );
+    await handlers.playlist_resolution_outbox!(
+      { workerId: "worker-resolution-1" },
+      new AbortController().signal,
+    );
+    expect(runPlaylistResolutionReconciler).toHaveBeenCalledWith(100);
+    expect(drainPlaylistResolutionOutbox).toHaveBeenCalledWith(
+      "worker-resolution-1",
+      100,
+    );
+    const deepHandlers = defaultJobHandlers(repository, {
+      queueClass: "deep",
+    });
+    expect(deepHandlers.playlist_resolution_reconcile).toBeUndefined();
+    expect(deepHandlers.playlist_resolution_outbox).toBeUndefined();
+  });
 });

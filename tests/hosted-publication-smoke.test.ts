@@ -528,20 +528,20 @@ describe("hosted publication smoke harness", () => {
     )).toThrow(/non-exact decision/u);
   });
 
-  test("binds the smoke to schema 18, protocol 10, contract 3, query-plan 5, and the exact build", () => {
+  test("binds the smoke to schema 19, protocol 11, contract 3, query-plan 6, and the exact build", () => {
     const live = {
       build: { version: "2.3.5", revision: "a".repeat(40) },
       configurationHash: promotedApiConfigurationHash,
       runtime: {
         releaseEnvironment: "staging",
         deploymentPhase: "activate",
-        expectedDatabaseSchemaVersion: "18",
+        expectedDatabaseSchemaVersion: "19",
         canonicalActivationConfigured: true,
-        schemaVersion: "18",
-        schemaMaximum: "18",
-        schemaPreferred: "18",
-        workerProtocol: "playlist-pipeline-v10",
-        queryPlanSchemaVersion: "5",
+        schemaVersion: "19",
+        schemaMaximum: "19",
+        schemaPreferred: "19",
+        workerProtocol: "playlist-pipeline-v11",
+        queryPlanSchemaVersion: "6",
         briefContractVersion: "3",
       },
     };

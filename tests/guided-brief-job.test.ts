@@ -392,7 +392,7 @@ test("contract-3 keeps a factual possessive ambiguity blocking and suppresses op
       status: "awaiting_answers",
       expectedStatus: "queued",
       questions: [expect.objectContaining({
-        id: "v3-critical:possessive_relationship",
+        id: "v4-critical:possessive_relationship",
         axis: "possessive_relationship",
         trigger: "correctness",
         criticality: "required",
@@ -400,7 +400,7 @@ test("contract-3 keeps a factual possessive ambiguity blocking and suppresses op
         options: expect.arrayContaining([
           expect.objectContaining({
             id: "subject_performed",
-            recommended: true,
+            recommended: false,
             contractPatch: expect.objectContaining({
               operations: expect.arrayContaining([
                 expect.objectContaining({ op: "replace_track_predicate" }),
@@ -414,14 +414,16 @@ test("contract-3 keeps a factual possessive ambiguity blocking and suppresses op
       guidanceContract: expect.objectContaining({
         requestClassification: "critical_ambiguity",
         generationMode: "deterministic_critical",
+        guidancePolicyVersion: "adaptive_guidance_v4",
+        checkpointMode: "correctness_blocking",
         trigger: "correctness",
         axis: "possessive_relationship",
       }),
       guidanceTelemetry: expect.objectContaining({
-        proposedQuestionCount: 2,
+        proposedQuestionCount: 1,
         acceptedQuestionCount: 1,
         validationIssues: expect.arrayContaining([
-          "guidance:flow:shape:request_needs_no_guidance",
+          "guidance:flow:shape:explicit_request_uses_confirmation",
         ]),
       }),
       error: null,
@@ -429,7 +431,86 @@ test("contract-3 keeps a factual possessive ambiguity blocking and suppresses op
   );
 });
 
-test("the durable production brief boundary preserves a valid V3 scout sibling", async () => {
+test("contract-3 precise requests persist an explicit zero-question confirmation checkpoint", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-contract3-confirmation");
+  const exactBrief: PlaylistBrief = {
+    title: "Radiohead studio chronology",
+    description: "Exactly 25 Radiohead studio recordings in chronological order.",
+    mode: "curated",
+    subjectEntities: ["Radiohead"],
+    relationship: "recordings by Radiohead",
+    include: ["studio recordings"],
+    exclude: ["live recordings", "remixes"],
+    versionPolicy: "canonical studio versions only",
+    evidencePolicy: "artist and recording metadata",
+    orderingPolicy: "chronological",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: [],
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    id: "response-contract3-confirmation",
+    model: "gpt-5.4-mini",
+    usage: { input_tokens: 240, output_tokens: 120 },
+    output_text: JSON.stringify(exactBrief),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+  const saveBriefResult = vi.fn(async () => undefined);
+  const savePlaylistContractRevision = vi.fn(async (input: {
+    contractHash: string;
+    contract: Record<string, unknown>;
+  }) => ({
+    id: "contract3-confirmation-base",
+    contractHash: input.contractHash,
+    contract: input.contract,
+  }));
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract3-confirmation",
+      prompt: "Exactly 25 studio recordings by Radiohead, excluding live recordings and remixes, sequenced chronologically.",
+      requestedTrackCount: 25,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 3 as const,
+    })),
+    reserveProviderCost: vi.fn(async () => ({
+      reservationId: "reservation-contract3-confirmation",
+    })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    getActivePlaylistContractRevision: vi.fn(async () => null),
+    savePlaylistContractRevision,
+    savePlaylistFeasibilitySnapshot: vi.fn(async () => ({
+      id: "feasibility-contract3-confirmation",
+      created: true,
+    })),
+    saveBriefSelectionPlan: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract3-confirmation",
+  });
+
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-contract3-confirmation",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      questions: [],
+      guidanceContract: expect.objectContaining({
+        checkpointMode: "interpretation_confirmation",
+        interpretationSummary: expect.objectContaining({ count: 25 }),
+      }),
+    }),
+  );
+  const saved = (saveBriefResult.mock.calls as unknown as Array<
+    [string, Record<string, unknown>]
+  >)[0]?.[1];
+  expect(saved).not.toHaveProperty("estimateUsd");
+});
+
+test("the durable production brief boundary caps every grounded scout question at two attested sources", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-v3-boundary");
   const sourceUrls = [
     "https://example.org/house-history",
@@ -563,13 +644,19 @@ test("the durable production brief boundary preserves a valid V3 scout sibling",
     "brief-v3-boundary",
     expect.objectContaining({
       status: "awaiting_answers",
-      questions: [expect.objectContaining({ decisionKey: "house_lineage_emphasis" })],
+      questions: [
+        expect.objectContaining({ decisionKey: "house_lineage_emphasis" }),
+        expect.objectContaining({
+          decisionKey: "house_era_emphasis",
+          grounding: expect.objectContaining({
+            sourceUrls: sourceUrls.slice(0, 2),
+          }),
+        }),
+      ],
       guidanceTelemetry: expect.objectContaining({
         proposedQuestionCount: 2,
-        acceptedQuestionCount: 1,
-        validationIssues: expect.arrayContaining([
-          "scout:v3:q2:invalid_source_grounding",
-        ]),
+        acceptedQuestionCount: 2,
+        validationIssues: [],
       }),
     }),
   );

@@ -21,11 +21,11 @@ import {
 import { sha256Hex, stableStringify } from "../server/security.ts";
 
 describe("worker pipeline protocol", () => {
-  test("advertises protocol 10 while accepting protocol 8 bridge capacity", () => {
+  test("advertises protocol 11 while accepting protocol 8 bridge capacity", () => {
     const current = { protocolVersion: WORKER_PIPELINE_PROTOCOL_VERSION };
     expect(workerPipelineProtocolVersion(current)).toBe(WORKER_PIPELINE_PROTOCOL_VERSION);
     expect(isWorkerPipelineProtocolCompatible(current)).toBe(true);
-    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(10);
+    expect(WORKER_PIPELINE_PROTOCOL_NUMBER).toBe(11);
     expect(BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER).toBe(8);
     expect(isWorkerPipelineProtocolCompatible({ protocolVersion: "playlist-pipeline-v8" })).toBe(true);
     expect(isWorkerPipelineProtocolCompatible({ protocolVersion: "playlist-pipeline-v7" })).toBe(false);

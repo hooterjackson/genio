@@ -49,7 +49,7 @@ function targetConfiguration(
     RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
     RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
     RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
-    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     GUIDANCE_CONTRACT_V3_ENABLED: "false",
     GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
     GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
@@ -210,7 +210,7 @@ class FakeClient implements PublicRolloutDatabaseClient {
     this.calls.push({ text, values });
     if (text.includes("schema_version")) {
       return {
-        rows: [{ schema_version: "18", capability_version: "1" }],
+        rows: [{ schema_version: "19", capability_version: "1" }],
         rowCount: 1,
       } as unknown as QueryResult<Record<string, unknown>>;
     }

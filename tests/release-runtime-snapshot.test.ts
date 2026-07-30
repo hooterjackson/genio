@@ -35,20 +35,20 @@ function live(configurationHash = hash) {
       semanticExecutionConfigurationHash,
       releaseEnvironment: "staging",
       deploymentPhase: "activate",
-      workerProtocol: "playlist-pipeline-v10",
+      workerProtocol: "playlist-pipeline-v11",
       briefContractVersion: "3",
-      queryPlanSchemaVersion: "5",
+      queryPlanSchemaVersion: "6",
       briefProviderModelId: "gpt-5.4-mini",
       baselineProviderModelId: "gpt-5.6-luna",
       escalationProviderModelId: "gpt-5.6-terra",
       publicRolloutEvidenceHash: null,
       publicRolloutStage: null,
-      guidancePolicyVersion: "adaptive_guidance_v3",
+      guidancePolicyVersion: "adaptive_guidance_v4",
       evidencePolicyVersion: "governed_evidence_v2",
       queryPlanPolicyVersion: "query_plan_v3_4",
       selectionPlanVersion: "selection_plan_v3",
       semanticScopePolicyVersion: "scope_gate_v2_1_2",
-      musicConceptPolicyVersion: "music_concepts_v3_2_0",
+      musicConceptPolicyVersion: "music_concepts_v3_3_0",
       pipelinePolicyVersion: "corpus_first_v3",
       promptVersion: "grounded_recovery_v3_1_prompt_v1",
     },
@@ -58,7 +58,7 @@ function live(configurationHash = hash) {
 function lane(configurationHash: string) {
   return {
     status: "healthy",
-    protocolVersion: "playlist-pipeline-v10",
+    protocolVersion: "playlist-pipeline-v11",
     compatibleCapacity: 1,
     eligibleWorkerCount: 1,
     eligibleIdentityCount: 1,
@@ -76,7 +76,7 @@ function system() {
     ok: true,
     activationReady: true,
     database: "ready",
-    schemaVersion: "18",
+    schemaVersion: "19",
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
     canonicalExecutorReleaseIdentityFencingVersion: "1",
@@ -178,11 +178,11 @@ describe("authoritative release runtime snapshot", () => {
       runtime: {
         semanticExecutionConfigurationHash,
         releaseEnvironment: "staging",
-        databaseSchemaVersion: "18",
+        databaseSchemaVersion: "19",
         databaseCapabilityVersion: "2",
         releaseManifestCanaryGuardsVersion: "1",
         canonicalExecutionHardeningVersion: "1",
-        workerProtocol: "playlist-pipeline-v10",
+        workerProtocol: "playlist-pipeline-v11",
         modelIds: {
           brief: "gpt-5.4-mini",
           baseline: "gpt-5.6-luna",
@@ -429,7 +429,7 @@ describe("authoritative release runtime snapshot", () => {
           releaseEnvironment: "production",
         },
       },
-    })).toThrow(/schema-18\/protocol-10 release contract/u);
+    })).toThrow(/schema-19\/protocol-11 release contract/u);
   });
 
   test("does not derive composite capability 2 unless both database markers are 1", () => {
@@ -454,7 +454,7 @@ describe("authoritative release runtime snapshot", () => {
   test("API configuration identity is deterministic, secret-insensitive, and behavior-sensitive", () => {
     const environment = {
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       OPENAI_API_KEY: "sk-first",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
     };

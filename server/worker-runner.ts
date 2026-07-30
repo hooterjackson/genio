@@ -314,6 +314,16 @@ export interface WorkerQueueRepository {
     windowHours?: number;
     windowEndedAt?: Date;
   }): Promise<unknown>;
+  runPlaylistResolutionReconciler?(limit?: number): Promise<{
+    audited: number;
+    repaired: number;
+    quarantined: number;
+    skipped: boolean;
+  }>;
+  drainPlaylistResolutionOutbox?(
+    workerId: string,
+    limit?: number,
+  ): Promise<number>;
   beginPlaylistExecutionAttempt?(input: {
     runId: string;
     contractRevisionId: string;
@@ -554,6 +564,19 @@ export function defaultJobHandlers(
           ? { windowEndedAt: rawWindowEnd }
           : {}),
       });
+      signal.throwIfAborted();
+    },
+    playlist_resolution_reconcile: async (_payload, signal) => {
+      signal.throwIfAborted();
+      await repository.runPlaylistResolutionReconciler?.(100);
+      signal.throwIfAborted();
+    },
+    playlist_resolution_outbox: async (payload, signal) => {
+      signal.throwIfAborted();
+      const workerId = typeof payload.workerId === "string"
+        ? payload.workerId
+        : "resolution-outbox-worker";
+      await repository.drainPlaylistResolutionOutbox?.(workerId, 100);
       signal.throwIfAborted();
     },
   };
@@ -822,6 +845,21 @@ export class WorkerRunner {
       dedupeKey: `retention:${day}`,
       maxAttempts: 3,
     });
+    const resolutionWindow = Math.floor(Date.now() / (5 * 60_000));
+    await Promise.all([
+      this.repository.enqueueJob({
+        kind: "playlist_resolution_reconcile",
+        payload: { resolutionWindow },
+        dedupeKey: `playlist-resolution-reconcile:${resolutionWindow}`,
+        maxAttempts: 3,
+      }),
+      this.repository.enqueueJob({
+        kind: "playlist_resolution_outbox",
+        payload: { resolutionWindow, workerId: this.workerId },
+        dedupeKey: `playlist-resolution-outbox:${resolutionWindow}`,
+        maxAttempts: 3,
+      }),
+    ]);
     // Sweep only fully closed UTC hours. The durable hourly keys prevent
     // duplicate work across replicas, while the persisted high-water mark
     // backfills up to one day after a worker outage.
@@ -1204,6 +1242,8 @@ export class WorkerRunner {
           __contractSemanticHash: contractAttempt.contractSemanticHash,
           __executorRevision: this.version,
           __executorConfigurationHash: this.configurationHash,
+          __executorSemanticConfigurationHash:
+            this.semanticExecutionConfigurationHash,
         } : {}),
       }, controller.signal);
       if (leaseLost) {

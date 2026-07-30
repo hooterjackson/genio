@@ -78,11 +78,11 @@ function phasePayload(
     runtime: {
       releaseEnvironment: "production",
       deploymentPhase: phase,
-      databaseSchemaVersion: phase === "bridge" ? "16" : "18",
+      databaseSchemaVersion: phase === "bridge" ? "16" : "19",
       databaseCapabilityVersion: phase === "bridge" ? null : "2",
       releaseManifestCanaryGuardsVersion: phase === "bridge" ? null : "1",
       canonicalExecutionHardeningVersion: phase === "bridge" ? null : "1",
-      workerProtocol: "playlist-pipeline-v10",
+      workerProtocol: "playlist-pipeline-v11",
       configurationHash,
       apiConfigurationHash: serviceConfigurationHashes.apiHash,
       interactiveWorkerConfigurationHash:
@@ -158,7 +158,7 @@ function options(phase: "bridge" | "expand") {
     expectedImageDigest: imageDigest,
     expectedCandidateEvidenceHash: candidateEvidenceHash,
     expectedConfigurationHash: configurationHash,
-    expectedDatabaseSchemaVersion: phase === "bridge" ? "16" : "18",
+    expectedDatabaseSchemaVersion: phase === "bridge" ? "16" : "19",
     expectedDatabaseCapabilityVersion: phase === "bridge" ? null : "2",
     expectedReleaseManifestCanaryGuardsVersion:
       phase === "bridge" ? null : "1",
@@ -242,7 +242,7 @@ describe("signed Railway promotion phase evidence", () => {
       }),
       keys.publicKey,
       options("expand"),
-    )).toThrow(/PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION=5/u);
+    )).toThrow(/PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION=6/u);
     expect(() => verifyPromotionPhaseEvidence(
       signedPhase("expand", {
         activationPreflight: {

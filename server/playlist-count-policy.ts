@@ -65,7 +65,7 @@ export function normalizeCustomGuidanceTrackCountAuthorityV1(
 /**
  * The anonymous product boundary and executable owner boundary are separate.
  * Counts above 300 are admitted only for an authenticated owner after the
- * schema-18 activation fence, and always require contract 3/schema 4.
+ * schema-19 activation fence, and always require contract 3.
  */
 export function playlistTrackCountAdmission(input: {
   requestedTrackCount: number | null | undefined;

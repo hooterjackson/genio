@@ -30,7 +30,7 @@ export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
-const MOOD_ACTIVITY_INTENT = /\b(?:mood|sleep|study|studying|workout|running|road\s+trip|dinner|party|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
+const MOOD_ACTIVITY_INTENT = /\b(?:mood|sleep|study|studying|workout|running|road\s+trip|dinner|party|gaming|smok(?:e|ing)|late[ -]?night|chill(?:ed|ing)?|focus(?:\s+(?:music|playlist|session))|relax|meditat|sunset|churrasco)\b/iu;
 const VIBE_INTENT = /\bvibes?\b/iu;
 // `editorial_ranking` is an evidence-bearing intent: every selected track must
 // independently prove the requested ranking or historical claim. Reserve it
@@ -42,7 +42,7 @@ const EDITORIAL_RANKING_INTENT = /\b(?:best|greatest|top(?:\s+\d+)?|ranked|ranki
 const EXPLICIT_EDITORIAL_EVIDENCE_INTENT = /\b(?:require|required|must|only)\b[^.;!?\n]{0,100}\b(?:editorial|historical|documented|cited|ranking|ranked|influence)\b|\b(?:editorial|historical|documented|cited)\b[^.;!?\n]{0,100}\bevidence\b/iu;
 const SOFT_EDITORIAL_DESCRIPTOR = /\b(?:essential|iconic|classic|definitive|representative)\b/giu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
-const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|music|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rock|samba|bossa|disco|soul|metal|punk|reggaet[oó]n|reggae|latin[ -]?urban|dembow|classical|country|electronic)\b/iu;
+const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rap|r\s*(?:&|and)\s*b|rhythm\s+and\s+blues|rock|samba|bossa|disco|soul|metal|punk|reggaet[oó]n|reggae|latin[ -]?urban|dembow|classical|country|electronic)\b/iu;
 const THEME_INTENT_MENTION = /\b(?:(?:songs?|tracks?|recordings?|music)\s+about|lyrics?\s+about|themes?|themed)\b/giu;
 
 const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]> = [
@@ -307,7 +307,9 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
     intents.push("editorial_ranking");
   }
   if (genreSceneIntent) intents.push("genre_scene");
-  if (intents.length === 0) intents.push("genre_scene");
+  // A request without a resolved genre is still a valid curated request.
+  // Leaving the intent set empty retains general relevance qualification
+  // without inventing a per-track genre evidence gate.
   return [...new Set(intents)];
 }
 
@@ -326,7 +328,7 @@ function axisForRule(rule: string): SelectionConstraintAxis {
   if (/venue|club/iu.test(value)) return "venue";
   if (/mood|vibe|energy|dark|bright|calm/iu.test(value)) return "mood";
   if (/sleep|study|workout|party|dinner|road trip/iu.test(value)) return "activity";
-  if (/genre|subgenre|house music|techno|jazz|drill|funk/iu.test(value)) return "genre";
+  if (/genre|subgenre|house music|techno|jazz|drill|funk|hip[ -]?hop|rap|r\s*(?:&|and)\s*b|rhythm\s+and\s+blues/iu.test(value)) return "genre";
   return "relationship";
 }
 
@@ -373,6 +375,8 @@ function coalesceAlternativeScopeRules(rules: readonly ParsedAxisRule[]): Parsed
 const GENRE_TERMS: Array<[string, RegExp]> = [
   ["baile funk", /\b(?:baile funk|funk carioca)\b/iu],
   ["hip-hop", /\bhip[ -]?hop\b/iu],
+  ["rap", /\brap\b/iu],
+  ["R&B", /\br\s*(?:&|and)\s*b\b|\brhythm\s+and\s+blues\b/iu],
   ["bossa nova", /\bbossa nova\b/iu],
   ["reggaeton", /\breggaet[oó]n\b/iu],
   ["Latin urban", /\blatin[ -]?urban\b/iu],
@@ -441,6 +445,10 @@ function eraRules(value: string): ParsedAxisRule[] {
     // "1970s and 1980s" to a single decade.
     return [{ axis: "era", operator: "within", values: unique(decades) }];
   }
+  const ambiguousBareYear = /\b(?:18|19|20)\d{2}\s+(?:rap|hip[ -]?hop|r\s*(?:&|and)\s*b|rhythm\s+and\s+blues|jazz|rock|pop|disco|house|techno|funk|soul)\b/iu.test(value)
+    && !/\b(?:released?|recorded|recordings?|songs?|tracks?|music)\s+(?:from|during|in)\s+(?:the\s+)?(?:18|19|20)\d{2}\b/iu.test(value)
+    && !/\b(?:only|year)\s+(?:18|19|20)\d{2}\b/iu.test(value);
+  if (ambiguousBareYear) return [];
   const year = value.match(/\b(?:19|20)\d{2}\b/u)?.[0];
   if (!year) return [];
   const operator: SelectionConstraint["operator"] = /\bbefore\b/iu.test(value)

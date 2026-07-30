@@ -54,6 +54,8 @@ export type RunNextAction =
   | "contact_support";
 
 export interface RunResolutionView {
+  /** Present once schema 19 is the authoritative resolution source. */
+  generation?: number | null;
   state: NeverDeadEndRunState;
   nextAction: RunNextAction;
   terminal: boolean;
@@ -705,8 +707,61 @@ export interface CanonicalExecutorCapabilityVectorV1 {
   backendDeclaration: Record<string, unknown>;
 }
 
+export type VerificationProducerFamilyV1 =
+  | "apple_catalog"
+  | "structured_music_metadata"
+  | "trusted_container"
+  | "track_editorial"
+  | "factual_source"
+  | "recording_identity"
+  | "content_metadata"
+  | "suitability_assessment";
+
+export interface VerificationLeafV1 {
+  op: "leaf";
+  obligationId: string;
+  clauseId: string;
+  polarity: "positive" | "negative";
+  axis: string;
+  verifierFamilies: VerificationProducerFamilyV1[];
+  permittedEvidenceGrades: CanonicalPlaylistContractEvidenceGradeV1[];
+  unknownPolicy: "defer" | "reject" | "allow";
+  storefront: string;
+  versionPolicy: string;
+  evidencePolicyVersion: string;
+  capableProducerFamilies: VerificationProducerFamilyV1[];
+  /** Negative obligations are executable only inside this declared scope. */
+  negativeScope: "catalog_identity" | "bounded_metadata" | null;
+}
+
+export type VerificationExpressionV1 =
+  | VerificationLeafV1
+  | { op: "allOf" | "anyOf"; children: VerificationExpressionV1[] }
+  | { op: "not"; scope: "catalog_identity" | "bounded_metadata"; child: VerificationExpressionV1 };
+
+export interface ExecutionCoverageReportV1 {
+  version: "execution_coverage_report_v1";
+  stage:
+    | "compiled"
+    | "guided"
+    | "query_plan"
+    | "worker_claim"
+    | "publication_revalidation";
+  routeId: string;
+  dependencyRootIds: string[];
+  workerCapabilityHash: string;
+  configurationHash: string;
+  ontologyVersion: string;
+  evidencePolicyVersion: string;
+  coveredObligationIds: string[];
+  uncoveredObligationIds: string[];
+  producerFamilies: VerificationProducerFamilyV1[];
+  complete: boolean;
+  reportHash: string;
+}
+
 export interface QueryPlanV3 {
-  schemaVersion: 1 | 2 | 3 | 4 | 5;
+  schemaVersion: 1 | 2 | 3 | 4 | 5 | 6;
   pipelineVersion: "corpus_first_v3";
   policyVersion: "corpus_first_v3_policy_v1" | "corpus_first_v3_policy_v2";
   engine: QueryPlanV3Engine;
@@ -775,6 +830,13 @@ export interface QueryPlanV3 {
   /** Exact, schema-aware executor declaration required for canonical work. */
   executorCapabilityHash?: string;
   executorCapabilityVector?: CanonicalExecutorCapabilityVectorV1;
+  /** Schema-6 Boolean verification and route-coverage authority. */
+  verificationExpression?: VerificationExpressionV1;
+  executionCoverageReport?: ExecutionCoverageReportV1;
+  inputHash?: string;
+  semanticHash?: string;
+  executionHash?: string;
+  strategySemanticHash?: string;
   continuation?: QueryPlanV3Continuation;
   corpusReview?: QueryPlanV3CorpusReview;
 }
@@ -1235,10 +1297,14 @@ export interface PlaylistGuidanceQuestion {
   /** Why selecting an answer will materially change the resulting tracks. */
   whyMaterial?: string;
   /** Contract-3 immutable guidance metadata. */
-  schemaVersion?: 3;
+  schemaVersion?: 3 | 4;
   policyVersion?: string;
   questionHash?: string;
   trigger?: "correctness" | "yield_risk" | "nuance";
+  guidanceMode?:
+    | "correctness_blocking"
+    | "nuance_optional"
+    | "interpretation_confirmation";
   axis?: string;
   baseContractRevisionId?: string;
   baseContractSemanticHash?: string;
@@ -1304,6 +1370,18 @@ export interface PlaylistGuidanceQuestionSetContract {
   trigger?: "correctness" | "yield_risk" | "nuance";
   axis?: string | null;
   feasibilitySnapshotId?: string | null;
+  /** V4 always records the checkpoint even when no question is useful. */
+  checkpointMode?:
+    | "correctness_blocking"
+    | "nuance_optional"
+    | "interpretation_confirmation";
+  interpretationSummary?: {
+    mustHave: readonly string[];
+    prefer: readonly string[];
+    avoid: readonly string[];
+    flow: readonly string[];
+    count: number;
+  };
 }
 
 export interface PlaylistGuidanceScoutResult {
@@ -1726,6 +1804,18 @@ export interface PublicBriefStatusView {
   status: string;
   briefContractVersion?: PlaylistBriefContractVersion;
   questionSetHash?: string | null;
+  checkpointMode?:
+    | "correctness_blocking"
+    | "nuance_optional"
+    | "interpretation_confirmation"
+    | null;
+  interpretationSummary?: {
+    mustHave: readonly string[];
+    prefer: readonly string[];
+    avoid: readonly string[];
+    flow: readonly string[];
+    count: number;
+  } | null;
   brief?: PlaylistBrief;
   questions: PlaylistGuidanceQuestion[];
   answers?: PlaylistGuidanceAnswer[];

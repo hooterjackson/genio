@@ -638,6 +638,121 @@ databaseDescribe("intelligent guidance contract persistence", () => {
     })));
   }, 50_000);
 
+  test("persists and accepts a zero-question V4 confirmation without changing the contract", async () => {
+    const clientBucket = `guidance-v4-confirmation-${randomUUID()}`;
+    const prompt = "Exactly 25 studio recordings by Radiohead, excluding live recordings and remixes, sequenced chronologically.";
+    const exactBrief: PlaylistBrief = {
+      title: "Radiohead studio chronology",
+      description: "Exactly 25 Radiohead studio recordings.",
+      mode: "curated",
+      subjectEntities: ["Radiohead"],
+      relationship: "recordings by Radiohead",
+      include: ["studio recordings"],
+      exclude: ["live recordings", "remixes"],
+      versionPolicy: "canonical studio recordings only",
+      evidencePolicy: "artist and recording metadata",
+      orderingPolicy: "chronological",
+      targetSize: { min: 25, max: 25 },
+      ambiguities: [],
+    };
+    const created = await repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 25,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: exactBrief,
+      storefront: "us",
+    });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: `brief:${created.id}`,
+      prompt,
+      brief: exactBrief,
+      selectionPlan,
+      locale: "en",
+    });
+    const persistedBase = await repository.savePlaylistContractRevision({
+      briefRequestId: created.id,
+      expectedParentRevisionId: null,
+      contractHash: shadow.contract.semanticHash,
+      contract: structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+      compilerVersion: shadow.contract.versions.compiler,
+      ontologyVersion: shadow.contract.versions.ontology,
+      evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+      questionTemplateVersion: shadow.contract.versions.questionTemplates,
+      catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+      locale: shadow.contract.locale,
+      storefront: shadow.contract.storefront,
+      answerLineageHash: sha256Hex(stableStringify(shadow.contract.answerLineage)),
+    });
+    const questionSetHash = "c".repeat(64);
+    const interpretationSummary = {
+      mustHave: ["Recordings by Radiohead", "Studio recordings"],
+      prefer: [] as string[],
+      avoid: ["Live recordings", "Remixes"],
+      flow: ["Chronological"],
+      count: 25,
+    };
+    await repository.saveBriefResult(created.id, {
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      brief: exactBrief,
+      questions: [],
+      guidanceContract: {
+        questionSetHash,
+        requestClassification: "precise",
+        generationMode: "no_material_questions",
+        guidancePolicyVersion: "adaptive_guidance_v4",
+        locale: shadow.contract.locale,
+        storefront: shadow.contract.storefront,
+        targetTrackCount: 25,
+        explicitConstraintHash: "d".repeat(64),
+        rejectedQuestionReasons: [],
+        baseContractRevisionId: shadow.contract.revisionId,
+        baseContractSemanticHash: shadow.contract.semanticHash,
+        guidanceRound: "initial",
+        trigger: "nuance",
+        axis: null,
+        checkpointMode: "interpretation_confirmation",
+        interpretationSummary,
+      },
+      error: null,
+    });
+    await expect(repository.getBriefRequest(created.id)).resolves.toMatchObject({
+      status: "awaiting_answers",
+      questionSetHash,
+      checkpointMode: "interpretation_confirmation",
+      interpretationSummary,
+      questions: [],
+    });
+    await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      briefRequestId: created.id,
+      idempotencyKey: `confirm-${randomUUID()}`,
+      questionSetHash,
+      answers: [],
+    })).resolves.toEqual({ status: "finalizing", created: true });
+    await expect(repository.getBriefRequest(created.id)).resolves.toMatchObject({
+      status: "finalizing",
+      answers: [],
+      activePlaylistContract: {
+        semanticHash: shadow.contract.semanticHash,
+      },
+    });
+    const revisions = await pool.query<{ id: string; status: string }>(
+      `SELECT id,status FROM playlist_contract_revisions
+       WHERE brief_request_id=$1 ORDER BY revision`,
+      [created.id],
+    );
+    expect(revisions.rows).toEqual([{ id: persistedBase.id, status: "active" }]);
+  }, 40_000);
+
   test("keeps bare house blocking until its chosen typed delta becomes the active contract", async () => {
     const prompt = "Make me a 25-track house playlist";
     const clientBucket = `guidance-v3-house-${randomUUID()}`;

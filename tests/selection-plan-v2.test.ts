@@ -27,6 +27,79 @@ function brief(overrides: Partial<PlaylistBrief> = {}): PlaylistBrief {
 }
 
 describe("Pipeline V2 selection plan", () => {
+  test("keeps the 2010 rap incident unresolved on time width while preserving rap membership", () => {
+    const prompt = "create me a playlist fromm the 2010 rap";
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "2010 Rap",
+        description: "Rap from the requested period.",
+        subjectEntities: ["rap"],
+        relationship: "is rap from the requested period",
+        include: ["rap recordings"],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).toContain("genre_scene");
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      kind: "hard",
+      values: ["rap"],
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "era",
+      kind: "hard",
+    }));
+  });
+
+  test("treats lowercase us as narrative context and recognizes R&B membership", () => {
+    const prompt = "i met a girl from long island in del mar 10 years ago and i want r&b music from that time period that relates to us meeting";
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "A Coastal R&B Memory",
+        description: "R&B related to a meeting ten years ago.",
+        subjectEntities: ["R&B"],
+        relationship: "evokes the memory of meeting",
+        include: ["R&B recordings"],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      axis: "genre",
+      kind: "hard",
+      values: ["R&B"],
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "geography",
+      values: expect.arrayContaining(["American"]),
+    }));
+  });
+
+  test("does not invent genre-scene evidence for a pure late-night vibe request", () => {
+    const prompt = "Late-Night Smoke: chill music for gaming and a smoke session";
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        title: "Late-Night Smoke",
+        description: "Chill late-night music for gaming.",
+        subjectEntities: ["late-night chill"],
+        relationship: "fits a late-night gaming and smoke session",
+        include: ["chill recordings"],
+        exclude: [],
+      }),
+    });
+
+    expect(plan.intents).toContain("mood_activity");
+    expect(plan.intents).not.toContain("genre_scene");
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "genre",
+      kind: "hard",
+    }));
+  });
+
   test("keeps the production reggaeton request genre-bound while treating its vibe as soft", () => {
     const prompt = "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.";
     const plan = createSelectionPlanV2({

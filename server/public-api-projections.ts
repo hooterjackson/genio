@@ -230,6 +230,9 @@ export function publicRunResolutionView(
   }
 
   return {
+    ...(resolution.generation == null ? {} : {
+      generation: resolution.generation,
+    }),
     state,
     nextAction,
     terminal: resolution.terminal,
@@ -408,6 +411,12 @@ export function publicBriefStatusView(input: {
   status: string;
   briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
+  checkpointMode?:
+    | "correctness_blocking"
+    | "nuance_optional"
+    | "interpretation_confirmation"
+    | null;
+  interpretationSummary?: PublicBriefStatusView["interpretationSummary"];
   brief?: PlaylistBrief;
   questions?: PlaylistGuidanceQuestion[];
   answers?: PlaylistGuidanceAnswer[];
@@ -422,6 +431,8 @@ export function publicBriefStatusView(input: {
     status: input.status,
     briefContractVersion: input.briefContractVersion,
     questionSetHash: input.questionSetHash,
+    checkpointMode: input.checkpointMode,
+    interpretationSummary: input.interpretationSummary,
     brief: input.brief,
     questions: input.questions ?? [],
     answers: input.answers,
