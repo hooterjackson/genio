@@ -19,7 +19,7 @@ function draft(input: {
   predicate?: PlaylistPredicateV1;
   compilerVersion?: string;
   quota?: boolean;
-  catalogAxis?: "recording_version" | "content";
+  catalogAxis?: "recording_version" | "content" | "era";
 } = {}): PlaylistContractDraftV1 {
   const catalogAxis = input.catalogAxis ?? "recording_version";
   const trackPredicate = input.predicate ?? {
@@ -56,8 +56,13 @@ function draft(input: {
         operator: "require",
         values: catalogAxis === "content"
           ? ["explicit-content:clean_only"]
-          : ["allow:canonical"],
-        source: { provenance: "prompt", text: "canonical versions" },
+          : catalogAxis === "era"
+            ? ["2010"]
+            : ["allow:canonical"],
+        source: {
+          provenance: "prompt",
+          text: catalogAxis === "era" ? "released in 2010" : "canonical versions",
+        },
       },
       {
         id: "playlist:core-share",
@@ -449,6 +454,24 @@ describe("playlist-contract backend capability negotiation", () => {
     expect(noEvidenceFloorSemantics.result.missing).toContain(
       "corpus_first_v3:evidence_strength_policy:evidence_strength_partial_order_v1",
     );
+  });
+
+  test("advertises the fail-closed recording-family era evaluator", () => {
+    const exactYear = contract({ catalogAxis: "era" });
+    expect(playlistContractCapabilityRequirementsV1(exactYear).catalogPolicyAxes)
+      .toEqual(["era"]);
+    expect(negotiatePlaylistContractBackendV1({
+      contract: exactYear,
+      backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+    }).result).toEqual({ supported: true, missing: [] });
+
+    const withoutEra = negotiatePlaylistContractBackendV1({
+      contract: exactYear,
+      backends: [without(CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY, {
+        catalogPolicyAxes: ["storefront_availability", "recording_version", "content"],
+      })],
+    });
+    expect(withoutEra.result.missing).toContain("corpus_first_v3:catalog_policy:era");
   });
 
   test.each([
