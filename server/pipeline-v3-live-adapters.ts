@@ -70,6 +70,7 @@ import {
   catalogEraPoliciesV3,
   normalizedCatalogReleaseYear,
 } from "./pipeline-v3-era-policy.ts";
+import { recordingFamilySatisfiesEraConstraint } from "./selection-era-policy.ts";
 import {
   catalogRecordingVersionClass,
   catalogRecordingVersionSignature,
@@ -2660,6 +2661,7 @@ function canonicalClauseAssessments(
   candidate: RawTrackCandidateV3,
   song: CatalogSong | null,
   bindings: readonly LiveEvidenceBindingV3[],
+  compatibleReleaseYears: readonly number[] = [],
 ): Record<string, CanonicalPlaylistContractClauseAssessmentV1> | undefined {
   const policy = request.plan.canonicalContractPolicy;
   if (!policy) return undefined;
@@ -2707,6 +2709,40 @@ function canonicalClauseAssessments(
         status: song ? catalogRecordingVersionAssessment(clause, song) : "unknown",
         evidenceGrade: song ? "authoritative_structured_metadata" : null,
       };
+      continue;
+    }
+    if (clause.axis === "era") {
+      const releaseYear = normalizedCatalogReleaseYear(song?.releaseDate);
+      const observedYears = [
+        releaseYear,
+        ...compatibleReleaseYears,
+      ].filter((value): value is number => (
+        typeof value === "number"
+        && Number.isInteger(value)
+        && value >= 1000
+        && value <= 2999
+      ));
+      result[clause.id] = observedYears.length === 0
+        ? {
+            status: "unknown",
+            evidenceGrade: null,
+          }
+        : {
+            // Clause assessments describe whether the asserted era matches.
+            // The canonical runtime performs the polarity inversion for an
+            // exclusion clause.
+            status: recordingFamilySatisfiesEraConstraint({
+              candidateReleaseYear: releaseYear,
+              appleReleaseDate: song?.releaseDate ?? null,
+              compatibleReleaseYears: observedYears,
+            }, {
+              operator: "within",
+              values: clause.values,
+            })
+              ? "pass"
+              : "fail",
+            evidenceGrade: "authoritative_structured_metadata",
+          };
       continue;
     }
     if (clause.axis === "content") {
@@ -3486,6 +3522,7 @@ export function createPipelineV3LiveAdapters(
               candidate,
               resolved.song,
               attestedBindings,
+              resolved.compatibleReleaseYears,
             ),
           } : {}),
           ...(request.plan.playlistQualityPolicy ? {

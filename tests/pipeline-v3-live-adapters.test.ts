@@ -216,6 +216,16 @@ function canonicalCatalogSelection(
       source: { provenance: "system_default", text: "available in storefront" },
     },
     {
+      id: "catalog:era-2010",
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "era",
+      operator: "require",
+      values: ["2010"],
+      source: { provenance: "prompt", text: "2010" },
+    },
+    {
       id: "catalog:default-version-policy",
       kind: "catalog_version",
       scope: "track",
@@ -266,7 +276,10 @@ async function canonicalCatalogVerdict(
   selection: SelectionPlanV3,
   catalogSong: CatalogSong,
 ): Promise<ReturnType<typeof evaluateCanonicalContractTrackV1>> {
-  const adapters = createPipelineV3LiveAdapters();
+  const adapters = createPipelineV3LiveAdapters({
+    searchAppleSongs: vi.fn(async () => [catalogSong]) as any,
+    lookupAppleByIsrc: vi.fn(async () => []) as any,
+  });
   const request = discoveryRequest(selection, "editorial_tracks");
   const [qualification] = await adapters.qualify({
     ...request,
@@ -1003,6 +1016,32 @@ describe("Pipeline V3 live read-only adapters", () => {
       .resolves.toMatchObject({ status: "pass", eligible: true });
     await expect(canonicalCatalogVerdict(selection, explicit))
       .resolves.toMatchObject({ status: "fail", eligible: false });
+  });
+
+  test("binds canonical era clauses to the exact Apple recording family", async () => {
+    const selection = canonicalCatalogSelection({
+      op: "clause",
+      clauseId: "catalog:era-2010",
+    });
+    const exactYear = {
+      ...song(70, "Drake", "Over"),
+      releaseDate: "2010-03-08",
+    };
+    const wrongYear = {
+      ...song(71, "Drake", "Headlines"),
+      releaseDate: "2011-08-09",
+    };
+    const unknownYear = {
+      ...song(72, "Drake", "Undated Recording"),
+      releaseDate: undefined,
+    };
+
+    await expect(canonicalCatalogVerdict(selection, exactYear))
+      .resolves.toMatchObject({ status: "pass", eligible: true });
+    await expect(canonicalCatalogVerdict(selection, wrongYear))
+      .resolves.toMatchObject({ status: "fail", eligible: false });
+    await expect(canonicalCatalogVerdict(selection, unknownYear))
+      .resolves.toMatchObject({ status: "unknown", eligible: false });
   });
 
   test("treats allowed recording classes as alternatives while retaining exclusions", async () => {

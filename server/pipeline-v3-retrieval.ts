@@ -5577,9 +5577,18 @@ export async function executeRetrievalV3(input: {
         < Math.min(requested, hardAggregate.eligible.length)
       || qualityOptimizerConstraint
     );
+  const optimizerHasNonCountConstraint = playlistOptimization?.unmetConstraints.some(
+    (reason) => !reason.startsWith("exact_count:"),
+  ) ?? false;
+  // An empty or undersized evidence-qualified pool is a retrieval/evidence
+  // shortfall, not proof that playlist-level optimization is infeasible.
+  // Calling exact_count:0/N an optimizer constraint hid semantic-collapse
+  // defects behind a request-revision decision.
   const optimizationConstrained = playlistOptimization !== undefined
     && !playlistOptimization.exact
-    && !qualityConstrained;
+    && !qualityConstrained
+    && qualitySelection.eligible.length >= requested
+    && optimizerHasNonCountConstraint;
   const outcomeStopReason: RetrievalStopReasonV3 = resolvedStopReason === "integrity_failure"
     ? "integrity_failure"
     : qualityConstrained

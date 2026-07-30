@@ -2331,10 +2331,15 @@ export class PipelineV3WorkerExecution {
             consumedActiveComputeMs: runtimeFeasibilityDecisionRequired
               ? runtimeFeasibility?.report.runtimeEvidence?.budgets
                 .activeComputeConsumedMs ?? 0
-              : Math.max(
-                  activeComputeAllowanceMs,
-                  Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
-                ),
+              : computeLimitReached
+                ? Math.max(
+                    activeComputeAllowanceMs,
+                    Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+                  )
+                : Math.max(
+                    0,
+                    Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+                  ),
             activeComputeLimitMs: activeComputeAllowanceMs,
             activeComputeExtensionsUsed: extensionsUsed,
             limitingClauseIds,
