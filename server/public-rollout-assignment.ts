@@ -258,6 +258,15 @@ export function publicRolloutRuntimeDatabaseAuthorityV1(input: {
   databaseAuthority?: PublicRolloutDatabaseAuthorityV1 | null;
 }): PublicRolloutRuntimeDatabaseAuthorityV1 | null {
   const environment = input.environment ?? process.env;
+  const deploymentPhase = environment.RELEASE_DEPLOYMENT_PHASE?.trim() ?? "";
+  // Bridge and expand deliberately preserve the last signed rollout markers
+  // and database authority so rollback lineage is not destroyed during a
+  // forward-only schema migration. They are inert until the exact candidate
+  // reaches activate; treating preserved authority as active here would make
+  // every post-rollout bridge fail its own system-health gate.
+  if (deploymentPhase === "bridge" || deploymentPhase === "expand") {
+    return null;
+  }
   const runtime = {
     evidenceHash:
       environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH?.trim() ?? "",
@@ -274,7 +283,7 @@ export function publicRolloutRuntimeDatabaseAuthorityV1(input: {
   if (!runtimePresent && authority === null) return null;
   if (
     environment.RELEASE_ENVIRONMENT !== "production"
-    || environment.RELEASE_DEPLOYMENT_PHASE !== "activate"
+    || deploymentPhase !== "activate"
     || !SHA256.test(runtime.evidenceHash)
     || !SHA256.test(runtime.rollbackWarrantHash)
     || !SHA256.test(runtime.intentCanaryHash)
