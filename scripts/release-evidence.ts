@@ -329,16 +329,16 @@ const SAFE_LABEL = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$/u;
 const SIGNATURE_VALUE = /^[0-9A-Za-z_-]{64,256}$/u;
 const REQUIRED_RUNTIME_CONTRACT = Object.freeze({
   deploymentPhase: "activate",
-  databaseSchemaVersion: "18",
+  databaseSchemaVersion: "19",
   databaseCapabilityVersion: "2",
   releaseManifestCanaryGuardsVersion: "1",
   canonicalExecutionHardeningVersion: "1",
-  workerProtocol: "playlist-pipeline-v10",
+  workerProtocol: "playlist-pipeline-v11",
   briefContractVersion: "3",
-  queryPlanSchemaVersion: "5",
+  queryPlanSchemaVersion: "6",
 });
 const REQUIRED_RUNTIME_POLICY_VERSIONS = Object.freeze({
-  guidance: "adaptive_guidance_v3",
+  guidance: "adaptive_guidance_v4",
   evidence: "governed_evidence_v2",
 });
 
@@ -516,7 +516,7 @@ function validateRuntimeShape(
     label(runtime[field], `${labelPrefix}.${field}`);
     if (runtime[field] !== REQUIRED_RUNTIME_CONTRACT[field]) {
       throw new Error(
-        `${labelPrefix}.${field} does not match the schema-18/protocol-10 release contract`,
+        `${labelPrefix}.${field} does not match the schema-19/protocol-11 release contract`,
       );
     }
   }
@@ -551,7 +551,7 @@ function validateRuntimeShape(
   for (const field of ["guidance", "evidence"] as const) {
     if (policyVersions[field] !== REQUIRED_RUNTIME_POLICY_VERSIONS[field]) {
       throw new Error(
-        `${labelPrefix}.policyVersions.${field} does not match the schema-18/protocol-10 release contract`,
+        `${labelPrefix}.policyVersions.${field} does not match the schema-19/protocol-11 release contract`,
       );
     }
   }

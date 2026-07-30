@@ -354,7 +354,6 @@ function catalogProviderBlockerV2(input: {
   stoppedBecause:
     | "provider_circuit_open"
     | "provider_degraded"
-    | "provider_call_limit"
     | "timed_out"
     | "lookup_transient"
     | "lookup_timed_out";
@@ -383,7 +382,6 @@ function catalogProviderBlockerV2(input: {
     reasonCode: {
       provider_circuit_open: "apple_provider_circuit_open",
       provider_degraded: "apple_provider_degraded",
-      provider_call_limit: "catalog_provider_call_limit",
       timed_out: "catalog_discovery_timed_out",
       lookup_transient: "apple_lookup_transient",
       lookup_timed_out: "apple_lookup_timed_out",
@@ -2564,7 +2562,6 @@ async function resolveV2CatalogFrontier(
             stoppedBecause: discovery.stoppedBecause as
               | "provider_circuit_open"
               | "provider_degraded"
-              | "provider_call_limit"
               | "timed_out",
             storefront,
             failureCount: providerAuthority?.providerDependencyRetry

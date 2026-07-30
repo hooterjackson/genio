@@ -48,6 +48,22 @@ export interface PublicRolloutRuntimeDatabaseAuthorityV1 {
   targetConfigurationHash: string;
 }
 
+/**
+ * Once a signed public rollout assignment exists, it is the sole authority
+ * for choosing Contract 3. Broad environment flags are only a fallback for
+ * callers outside the signed rollout plane (owners, staging, and release
+ * canaries). This prevents a zero-percent intent from being compiled as
+ * Contract 3 merely because another intent enabled global V3 guidance.
+ */
+export function publicRolloutCanonicalContractRequestedV1(input: {
+  assignment: PersistedPublicRolloutAssignmentV1 | null;
+  fallbackRequested: boolean;
+}): boolean {
+  return input.assignment === null
+    ? input.fallbackRequested
+    : input.assignment.assigned;
+}
+
 const SHA256 = /^[0-9a-f]{64}$/u;
 const STAGE =
   /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(0|1|10|50|100)->(0|1|10|50|100)$/u;

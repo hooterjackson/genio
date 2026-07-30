@@ -43,8 +43,10 @@ import type {
   RunProgressRecentSource,
   RunProgressView,
   RunGuidanceActionView,
+  RunNextAction,
   RunResolutionView,
   RunStatus,
+  NeverDeadEndRunState,
   ResearchRunView,
   SelectionConstraint,
   SelectionPlan,
@@ -239,6 +241,10 @@ import {
   CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY,
   negotiatePlaylistContractBackendV1,
 } from "./playlist-contract-backend-capability-v1.ts";
+import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
+import {
+  revalidateExecutionCoverageReportV1,
+} from "./verification-expression-v1.ts";
 import {
   decideDependencyResumeV1,
   dependencyResumeAuthorizationHashV1,
@@ -331,6 +337,12 @@ import {
   dependencyRetryDecision,
   projectNeverDeadEndRun,
 } from "./never-dead-end-policy.ts";
+import {
+  assertPlaylistResolutionCompanionsV1,
+  drainPlaylistResolutionOutboxV1,
+  runPlaylistResolutionReconcilerV1,
+  type PlaylistResolutionStateV1,
+} from "./playlist-resolution-service-v1.ts";
 import {
   automaticFailureFingerprint,
   classifyAutomaticBriefFailure,
@@ -3166,6 +3178,12 @@ function normalizedGuidanceAnswers(
   submitted: readonly PlaylistGuidanceAnswer[],
   contractVersion: 1 | 2 | 3 = 1,
 ): PlaylistGuidanceAnswer[] {
+  if (contractVersion === 3 && questions.length === 0 && submitted.length === 0) {
+    // A V4 interpretation-confirmation checkpoint has no fabricated
+    // question. The empty, idempotently persisted answer set is the visitor's
+    // explicit confirmation receipt and intentionally produces no patch.
+    return [];
+  }
   if (questions.length < 1 || questions.length > 3
     || submitted.length > questions.length
     || (contractVersion === 1 && submitted.length !== questions.length)) {
@@ -8963,7 +8981,7 @@ export class Repository {
     if (expandedTrackCount && Number(await this.getSchemaVersion() ?? 0) < 18) {
       throw new HttpError(
         503,
-        "Playlist sizes above 300 are paused until schema 18 is active",
+        "Playlist sizes above 300 are paused until schema 19 is active",
         "expanded_track_count_activation_not_ready",
       );
     }
@@ -9069,6 +9087,10 @@ export class Repository {
               brief_contract_version,public_rollout_assignment_json,active_guidance_question_set_id,
               (SELECT question_set_hash FROM guidance_question_sets
                WHERE id=brief_requests.active_guidance_question_set_id) question_set_hash,
+              (SELECT checkpoint_mode FROM guidance_question_sets
+               WHERE id=brief_requests.active_guidance_question_set_id) checkpoint_mode,
+              (SELECT interpretation_summary_json FROM guidance_question_sets
+               WHERE id=brief_requests.active_guidance_question_set_id) interpretation_summary_json,
               (SELECT contract_json FROM playlist_contract_revisions
                WHERE id=brief_requests.active_playlist_contract_revision_id
                  AND status='active') active_playlist_contract_json,
@@ -9114,6 +9136,10 @@ export class Repository {
       ),
       activePlaylistContract: row.active_playlist_contract_json ?? null,
       questionSetHash: typeof row.question_set_hash === "string" ? row.question_set_hash : null,
+      checkpointMode: typeof row.checkpoint_mode === "string"
+        ? row.checkpoint_mode
+        : null,
+      interpretationSummary: row.interpretation_summary_json ?? null,
       pipelineVersion: row.pipeline_version ?? "legacy_v1",
       policyVersion: row.policy_version ?? "legacy_v1",
       selectionPlan: row.selection_plan_json ?? null,
@@ -9263,9 +9289,10 @@ export class Repository {
            id,brief_request_id,revision,question_set_hash,request_classification,generation_mode,
            guidance_policy_version,locale,storefront,target_track_count,explicit_constraint_hash,
            rejected_question_reasons_json,questions_json,active,base_contract_revision_id,
-           feasibility_snapshot_id,guidance_round,trigger,axis)
+           feasibility_snapshot_id,guidance_round,trigger,axis,checkpoint_mode,
+           interpretation_summary_json)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,true,
-                $14,$15,$16,$17,$18)`,
+                $14,$15,$16,$17,$18,$19,$20::jsonb)`,
         [
           questionSetId,
           id,
@@ -9287,6 +9314,10 @@ export class Repository {
           result.guidanceContract.guidanceRound ?? "initial",
           result.guidanceContract.trigger ?? "nuance",
           result.guidanceContract.axis ?? null,
+          result.guidanceContract.checkpointMode ?? null,
+          result.guidanceContract.interpretationSummary == null
+            ? null
+            : JSON.stringify(result.guidanceContract.interpretationSummary),
         ],
       );
       await client.query(
@@ -10897,6 +10928,7 @@ export class Repository {
             [runId, `fast:route:${executionPolicy.version}`, route],
           );
         }
+        await this.shadowPlaylistResolutionV1(client, runId);
       } else {
         const reusedRun = await client.query<{ status: string }>("SELECT status FROM research_runs WHERE id=$1", [runId]);
         status = reusedRun.rows[0]!.status;
@@ -13428,6 +13460,7 @@ export class Repository {
           );
         }
       }
+      await this.shadowPlaylistResolutionV1(client, successorRunId);
 
       return {
         runId: successorRunId,
@@ -13745,6 +13778,334 @@ export class Repository {
     }
   }
 
+  /**
+   * Transactionally maintain the schema-19 compatibility ledger while legacy
+   * columns remain authoritative. The authoritative mode is deliberately not
+   * projected from legacy status: after cutover, callers must use the
+   * resolution transition service.
+   */
+  private async shadowPlaylistResolutionV1(
+    client: PoolClient,
+    runId: string,
+  ): Promise<void> {
+    const settingsResult = await client.query<{ key: string; value: string }>(
+      `SELECT key,value FROM settings
+       WHERE key IN ('schema_version','playlist_resolution_authority_mode')`,
+    );
+    const settingsMap = new Map(
+      settingsResult.rows.map((row) => [row.key, row.value]),
+    );
+    if (Number(settingsMap.get("schema_version") ?? 0) < 19
+      || settingsMap.get("playlist_resolution_authority_mode")
+        === "authoritative"
+      || settingsMap.get("playlist_resolution_authority_mode")
+        === "resolution_service") {
+      return;
+    }
+    const selected = await client.query<{
+      status: RunStatus;
+      phase: string;
+      active_contract_revision_id: string | null;
+      execution_attempt_id: string | null;
+      blocker_id: string | null;
+      blocker_kind: string | null;
+      blocker_state_json: Record<string, unknown> | null;
+      question_set_id: string | null;
+      manifest_id: string | null;
+      requested_track_count: number | null;
+      published_track_count: number;
+    }>(
+      `SELECT run.status,run.phase,run.active_playlist_contract_revision_id,
+              attempt.id execution_attempt_id,
+              blocker.id blocker_id,blocker.blocker_kind,
+              blocker.state_json blocker_state_json,
+              questions.id question_set_id,
+              manifest.id manifest_id,
+              COALESCE(
+                NULLIF(spec.requested_track_count,0),
+                NULLIF(run.selection_plan_json->>'requestedTrackCount','')::int,
+                NULLIF(run.brief_json #>> '{targetSize,max}','')::int,
+                NULLIF(run.brief_json #>> '{targetSize,min}','')::int
+              ) requested_track_count,
+              COALESCE(tracks.published_track_count,0)::int
+                published_track_count
+       FROM research_runs run
+       LEFT JOIN run_specs spec ON spec.run_id=run.id
+       LEFT JOIN LATERAL (
+         SELECT id
+         FROM playlist_execution_attempts
+         WHERE run_id=run.id
+         ORDER BY created_at DESC,id DESC LIMIT 1
+       ) attempt ON true
+       LEFT JOIN LATERAL (
+         SELECT id,blocker_kind,state_json
+         FROM playlist_run_blockers
+         WHERE run_id=run.id AND resolved_at IS NULL
+           AND (
+             run.active_playlist_contract_revision_id IS NULL
+             OR contract_revision_id=run.active_playlist_contract_revision_id
+           )
+         ORDER BY created_at DESC,id DESC LIMIT 1
+       ) blocker ON true
+       LEFT JOIN LATERAL (
+         SELECT id
+         FROM guidance_question_sets
+         WHERE run_id=run.id AND active
+         ORDER BY revision DESC,id DESC LIMIT 1
+       ) questions ON true
+       LEFT JOIN LATERAL (
+         SELECT id
+         FROM manifests
+         WHERE run_id=run.id
+         ORDER BY created_at DESC,id DESC LIMIT 1
+       ) manifest ON true
+       LEFT JOIN LATERAL (
+         SELECT count(*)::int published_track_count
+         FROM manifest_tracks
+         WHERE manifest_id=manifest.id
+       ) tracks ON true
+       WHERE run.id=$1 AND run.deleted_at IS NULL
+       FOR UPDATE OF run`,
+      [runId],
+    );
+    const row = selected.rows[0];
+    if (!row) return;
+    const legacy = projectNeverDeadEndRun({
+      status: row.status,
+      phase: row.phase,
+      rescueQuestionsAvailable: true,
+    });
+    let state = legacy.state as PlaylistResolutionStateV1;
+    let nextAction = legacy.nextAction;
+    if (row.blocker_kind === "provider") {
+      state = "blocked_dependency";
+      nextAction = "wait_for_dependency";
+    } else if (row.blocker_kind === "apple_authorization") {
+      state = "blocked_dependency";
+      nextAction = "authorize_apple";
+    } else if (row.blocker_kind === "guidance") {
+      state = "needs_input";
+      nextAction = row.blocker_state_json?.guidanceRound === "rescue"
+        ? "answer_rescue_guidance"
+        : "answer_initial_guidance";
+    } else if (row.blocker_kind === "scope_decision"
+      || row.blocker_kind === "budget") {
+      state = "needs_decision";
+      nextAction = "review_contract";
+    } else if (row.blocker_kind === "integrity"
+      || row.blocker_kind === "publication_reconciliation") {
+      state = "quarantined";
+      nextAction = "contact_support";
+    }
+    if (row.status === "no_compatible_tracks" && !row.blocker_id) {
+      // Legacy false-empty rows may predate persisted rescue guidance. Never
+      // advertise a question when there is no hash-bound question payload.
+      state = "needs_decision";
+      nextAction = "review_contract";
+    }
+    const requestedTrackCount = row.requested_track_count == null
+      ? null
+      : Number(row.requested_track_count);
+    const publishedTrackCount = Number(row.published_track_count);
+    if (state === "completed" && (
+      !row.manifest_id
+      || !Number.isSafeInteger(requestedTrackCount)
+      || requestedTrackCount! < 1
+      || publishedTrackCount !== requestedTrackCount
+    )) {
+      state = "needs_decision";
+      nextAction = "review_contract";
+    }
+    if ((state === "ready" || state === "publishing") && !row.manifest_id) {
+      state = "quarantined";
+      nextAction = "contact_support";
+    }
+    if ((state === "blocked_dependency" || state === "needs_input")
+      && !row.blocker_id) {
+      state = "quarantined";
+      nextAction = "contact_support";
+    }
+    const decision = state === "needs_decision"
+      ? {
+          kind: "compatibility_decision",
+          legacyStatus: row.status,
+          legacyPhase: row.phase,
+          editableInterpretationSummary: true,
+          ...(row.blocker_state_json ?? {}),
+        }
+      : null;
+    const incidentReference = state === "quarantined"
+      ? `resolution-shadow:${runId}:${row.status}:${row.phase}`.slice(0, 160)
+      : null;
+    const stateJson = {
+      legacyStatus: row.status,
+      legacyPhase: row.phase,
+      requestedTrackCount,
+      publishedTrackCount,
+    };
+    const companions = {
+      activeContractRevisionId: row.active_contract_revision_id,
+      executionAttemptId: row.execution_attempt_id,
+      blockerId: row.blocker_id,
+      questionSetId: row.question_set_id,
+      decision,
+      manifestId: row.manifest_id,
+      incidentReference,
+    };
+    assertPlaylistResolutionCompanionsV1({
+      state,
+      nextAction,
+      companions,
+      stateJson,
+    });
+    const current = await client.query<{
+      generation: number;
+      state: PlaylistResolutionStateV1;
+      next_action: RunNextAction;
+      active_contract_revision_id: string | null;
+      execution_attempt_id: string | null;
+      blocker_id: string | null;
+      question_set_id: string | null;
+      decision_json: Record<string, unknown> | null;
+      manifest_id: string | null;
+      state_json: Record<string, unknown>;
+      incident_reference: string | null;
+    }>(
+      `SELECT generation,state,next_action,active_contract_revision_id,
+              execution_attempt_id,blocker_id,question_set_id,decision_json,
+              manifest_id,state_json,incident_reference
+       FROM playlist_run_resolutions
+       WHERE run_id=$1 FOR UPDATE`,
+      [runId],
+    );
+    const prior = current.rows[0];
+    const nextSnapshot = {
+      state,
+      nextAction,
+      ...companions,
+      stateJson,
+    };
+    const priorSnapshot = prior ? {
+      state: prior.state,
+      nextAction: prior.next_action,
+      activeContractRevisionId: prior.active_contract_revision_id,
+      executionAttemptId: prior.execution_attempt_id,
+      blockerId: prior.blocker_id,
+      questionSetId: prior.question_set_id,
+      decision: prior.decision_json,
+      manifestId: prior.manifest_id,
+      incidentReference: prior.incident_reference,
+      stateJson: prior.state_json,
+    } : null;
+    if (priorSnapshot
+      && stableStringify(priorSnapshot) === stableStringify(nextSnapshot)) {
+      return;
+    }
+    const expectedGeneration = prior ? Number(prior.generation) : 0;
+    const successorGeneration = expectedGeneration + 1;
+    const transitionId = randomUUID();
+    if (prior) {
+      await client.query(
+        `UPDATE playlist_run_resolutions
+         SET generation=$3,state=$4,next_action=$5,
+             active_contract_revision_id=$6,execution_attempt_id=$7,
+             blocker_id=$8,question_set_id=$9,decision_json=$10::jsonb,
+             manifest_id=$11,state_json=$12::jsonb,
+             provenance='protocol11_shadow',incident_reference=$13,
+             completed_at=$14,cancelled_at=$15,updated_at=now()
+         WHERE run_id=$1 AND generation=$2`,
+        [
+          runId,
+          expectedGeneration,
+          successorGeneration,
+          state,
+          nextAction,
+          companions.activeContractRevisionId,
+          companions.executionAttemptId,
+          companions.blockerId,
+          companions.questionSetId,
+          decision ? JSON.stringify(decision) : null,
+          companions.manifestId,
+          JSON.stringify(stateJson),
+          incidentReference,
+          state === "completed" ? new Date() : null,
+          state === "cancelled" ? new Date() : null,
+        ],
+      );
+    } else {
+      await client.query(
+        `INSERT INTO playlist_run_resolutions(
+           run_id,generation,state,next_action,active_contract_revision_id,
+           execution_attempt_id,blocker_id,question_set_id,decision_json,
+           manifest_id,state_json,provenance,incident_reference,
+           completed_at,cancelled_at)
+         VALUES($1,1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,
+                'protocol11_shadow',$11,$12,$13)`,
+        [
+          runId,
+          state,
+          nextAction,
+          companions.activeContractRevisionId,
+          companions.executionAttemptId,
+          companions.blockerId,
+          companions.questionSetId,
+          decision ? JSON.stringify(decision) : null,
+          companions.manifestId,
+          JSON.stringify(stateJson),
+          incidentReference,
+          state === "completed" ? new Date() : null,
+          state === "cancelled" ? new Date() : null,
+        ],
+      );
+    }
+    await client.query(
+      `INSERT INTO playlist_run_resolution_transitions(
+         id,run_id,expected_generation,successor_generation,from_state,to_state,
+         contract_revision_id,execution_attempt_id,blocker_id,
+         companion_artifact_kind,companion_artifact_id,transition_kind,
+         transition_json,idempotency_key)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+              'protocol11_shadow',$12::jsonb,$13)`,
+      [
+        transitionId,
+        runId,
+        expectedGeneration,
+        successorGeneration,
+        prior?.state ?? null,
+        state,
+        companions.activeContractRevisionId,
+        companions.executionAttemptId,
+        companions.blockerId,
+        companions.manifestId ? "manifest"
+          : companions.blockerId ? "blocker" : null,
+        companions.manifestId ?? companions.blockerId,
+        JSON.stringify({
+          stateHash: sha256Hex(stableStringify(stateJson)),
+          nextAction,
+        }),
+        `resolution-shadow:${runId}:${successorGeneration}`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO playlist_resolution_outbox(
+         id,run_id,transition_id,topic,idempotency_key,payload_json)
+       VALUES($1,$2,$3,'resolution.transition',$4,$5::jsonb)
+       ON CONFLICT(idempotency_key) DO NOTHING`,
+      [
+        randomUUID(),
+        runId,
+        transitionId,
+        `resolution-outbox:shadow:${runId}:${successorGeneration}`,
+        JSON.stringify({
+          runId,
+          generation: successorGeneration,
+          state,
+          nextAction,
+        }),
+      ],
+    );
+  }
+
   async updateRun(id: string, values: {
     status?: string;
     phase?: string;
@@ -13785,12 +14146,16 @@ export class Repository {
       values.error !== undefined,
       persistedError ?? null,
     ];
-    const result = fence
-      ? await this.transaction(async (client) => {
+    const result = await this.transaction(async (client) => {
+        if (fence) {
         await assertPipelineWorkerWriteFence(this, client, id, fence);
-        return await client.query(sql, parameters);
-      })
-      : await this.pool.query(sql, parameters);
+        }
+        const updated = await client.query(sql, parameters);
+        if ((updated.rowCount ?? 0) === 1) {
+          await this.shadowPlaylistResolutionV1(client, id);
+        }
+        return updated;
+      });
     if (result.rowCount === 0) throw new HttpError(404, "Research run not found", "run_not_found");
     if (values.status && classifyAutomaticRunFailure(values.status, values.phase ?? null)) {
       await this.captureAutomaticRunFailureSafely(id);
@@ -13805,6 +14170,22 @@ export class Repository {
       // untouched; no operational run fields cross this boundary.
       await this.upsertPublicPlaylistDirectoryForRun(id);
     }
+  }
+
+  async runPlaylistResolutionReconciler(limit = 100): Promise<{
+    audited: number;
+    repaired: number;
+    quarantined: number;
+    skipped: boolean;
+  }> {
+    return runPlaylistResolutionReconcilerV1(this.pool, limit);
+  }
+
+  async drainPlaylistResolutionOutbox(
+    workerId: string,
+    limit = 100,
+  ): Promise<number> {
+    return drainPlaylistResolutionOutboxV1(this.pool, workerId, limit);
   }
 
   private async getRunRow(id: string): Promise<any | null> {
@@ -14217,6 +14598,193 @@ export class Repository {
     return result.rows[0] ?? null;
   }
 
+  /**
+   * Once schema 19 is explicitly cut over, the append-only resolution ledger
+   * is the sole user-visible authority. During legacy_shadow this returns null
+   * so the compatibility projection remains authoritative.
+   */
+  private async getAuthoritativeRunResolutionV1(
+    runId: string,
+  ): Promise<RunResolutionView | null> {
+    const mode = await this.getSetting("playlist_resolution_authority_mode");
+    if (mode !== "authoritative" && mode !== "resolution_service") return null;
+    const result = await this.pool.query<{
+      generation: number;
+      state: string;
+      next_action: string;
+      active_contract_revision_id: string | null;
+      execution_attempt_id: string | null;
+      blocker_id: string | null;
+      question_set_id: string | null;
+      decision_json: Record<string, unknown> | null;
+      manifest_id: string | null;
+      state_json: Record<string, unknown>;
+      incident_reference: string | null;
+      contract_revision: number | null;
+      contract_hash: string | null;
+      blocker_kind: string | null;
+      dependency_key: string | null;
+      retry_count: number | null;
+      next_retry_at: Date | null;
+      automatic_retry_until: Date | null;
+      blocker_state_json: Record<string, unknown> | null;
+    }>(
+      `SELECT resolution.generation,resolution.state,resolution.next_action,
+              resolution.active_contract_revision_id,
+              resolution.execution_attempt_id,resolution.blocker_id,
+              resolution.question_set_id,resolution.decision_json,
+              resolution.manifest_id,resolution.state_json,
+              resolution.incident_reference,
+              contract.revision contract_revision,
+              contract.contract_hash,
+              blocker.blocker_kind,blocker.dependency_key,
+              blocker.retry_count,blocker.next_retry_at,
+              blocker.automatic_retry_until,
+              blocker.state_json blocker_state_json
+       FROM playlist_run_resolutions resolution
+       LEFT JOIN playlist_contract_revisions contract
+         ON contract.id=resolution.active_contract_revision_id
+       LEFT JOIN playlist_run_blockers blocker
+         ON blocker.id=resolution.blocker_id
+       WHERE resolution.run_id=$1`,
+      [runId],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      console.error("[resolution-v1] authoritative row missing", { runId });
+      return {
+        generation: null,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: null,
+        contractRevision: null,
+        contractHash: null,
+        blocker: null,
+      };
+    }
+    const states: readonly NeverDeadEndRunState[] = [
+      "accepted",
+      "needs_input",
+      "probing",
+      "executing",
+      "blocked_dependency",
+      "needs_decision",
+      "ready",
+      "publishing",
+      "completed",
+      "cancelled",
+      "quarantined",
+    ];
+    const actions: readonly RunNextAction[] = [
+      "none",
+      "answer_initial_guidance",
+      "answer_rescue_guidance",
+      "wait_for_dependency",
+      "resume_research",
+      "authorize_apple",
+      "decide_verified_partial",
+      "review_contract",
+      "contact_support",
+    ];
+    if (!states.includes(row.state as NeverDeadEndRunState)
+      || !actions.includes(row.next_action as RunNextAction)) {
+      console.error("[resolution-v1] authoritative value invalid", {
+        runId,
+        generation: row.generation,
+      });
+      return {
+        generation: Number(row.generation),
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: row.active_contract_revision_id,
+        contractRevision: row.contract_revision == null
+          ? null
+          : Number(row.contract_revision),
+        contractHash: row.contract_hash,
+        blocker: null,
+      };
+    }
+    const state = row.state as PlaylistResolutionStateV1;
+    const nextAction = row.next_action as RunNextAction;
+    try {
+      assertPlaylistResolutionCompanionsV1({
+        state,
+        nextAction,
+        companions: {
+          activeContractRevisionId: row.active_contract_revision_id,
+          executionAttemptId: row.execution_attempt_id,
+          blockerId: row.blocker_id,
+          questionSetId: row.question_set_id,
+          decision: row.decision_json,
+          manifestId: row.manifest_id,
+          incidentReference: row.incident_reference,
+        },
+        stateJson: row.state_json,
+      });
+    } catch (error) {
+      console.error("[resolution-v1] authoritative companion invalid", {
+        runId,
+        generation: row.generation,
+        reason: error instanceof Error ? error.message : "invalid_resolution",
+      });
+      return {
+        generation: Number(row.generation),
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: row.active_contract_revision_id,
+        contractRevision: row.contract_revision == null
+          ? null
+          : Number(row.contract_revision),
+        contractHash: row.contract_hash,
+        blocker: null,
+      };
+    }
+    const blockerState = row.blocker_state_json ?? {};
+    const retryAfterUntil = date(blockerState.retryAfterUntil);
+    const versionHash = nextAction === "resume_research"
+      && row.blocker_kind === "provider"
+      && row.blocker_id
+      && row.active_contract_revision_id
+      && row.dependency_key
+      && row.automatic_retry_until
+      && typeof blockerState.stage === "string"
+      && typeof blockerState.decisionHash === "string"
+      && blockerState.nextAction === "resume_revise_or_cancel"
+      ? dependencyResumeBlockerVersionV1({
+          id: row.blocker_id,
+          contractRevisionId: row.active_contract_revision_id,
+          dependencyKey: row.dependency_key,
+          retryCount: Number(row.retry_count ?? 0),
+          automaticRetryUntil: row.automatic_retry_until,
+          retryAfterUntil,
+          stageKey: blockerState.stage,
+          decisionHash: blockerState.decisionHash,
+          nextAction: blockerState.nextAction,
+        })
+      : null;
+    return {
+      generation: Number(row.generation),
+      state,
+      nextAction,
+      terminal: state === "completed" || state === "cancelled",
+      contractRevisionId: row.active_contract_revision_id,
+      contractRevision: row.contract_revision == null
+        ? null
+        : Number(row.contract_revision),
+      contractHash: row.contract_hash,
+      blocker: row.blocker_kind ? {
+        kind: row.blocker_kind,
+        nextRetryAt: row.next_retry_at?.toISOString() ?? null,
+        automaticRetryUntil: row.automatic_retry_until?.toISOString() ?? null,
+        retryCount: Number(row.retry_count ?? 0),
+        versionHash,
+      } : null,
+    };
+  }
+
   private async getRunResolution(
     runId: string,
     status: RunStatus,
@@ -14233,6 +14801,8 @@ export class Repository {
         blocker: null,
       };
     }
+    const authoritative = await this.getAuthoritativeRunResolutionV1(runId);
+    if (authoritative) return authoritative;
     const result = await this.pool.query<{
       contract_revision_id: string | null;
       contract_revision: number | null;
@@ -18444,6 +19014,47 @@ export class Repository {
       );
       if (!contractBound) fail("canonical_publication_contract_stale");
       if (!contractPolicy) fail("canonical_publication_contract_stale");
+      if (queryPlan.schemaVersion === 6) {
+        try {
+          const expression = queryPlan.verificationExpression;
+          const persistedCoverage = queryPlan.executionCoverageReport;
+          const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
+            queryPlanSchemaVersion: 6,
+          });
+          const runtimeConfigurationHash =
+            runtimeReleaseContract().semanticExecutionConfigurationHash;
+          if (!expression
+            || !persistedCoverage
+            || queryPlan.executorCapabilityHash !== runtimeCapability.hash
+            || persistedCoverage.workerCapabilityHash
+              !== runtimeCapability.hash
+            || persistedCoverage.configurationHash
+              !== runtimeConfigurationHash
+            || persistedCoverage.ontologyVersion
+              !== MUSIC_CONCEPT_POLICY_VERSION
+            || persistedCoverage.evidencePolicyVersion
+              !== queryPlan.evidencePolicyVersion) {
+            fail("canonical_publication_execution_coverage_stale");
+          }
+          const publicationCoverage = revalidateExecutionCoverageReportV1({
+            expression: expression!,
+            persisted: persistedCoverage!,
+            stage: "publication_revalidation",
+            workerCapabilityHash: runtimeCapability.hash,
+            configurationHash: runtimeConfigurationHash,
+            ontologyVersion: MUSIC_CONCEPT_POLICY_VERSION,
+            evidencePolicyVersion: queryPlan.evidencePolicyVersion!,
+          });
+          if (!publicationCoverage.complete) {
+            fail("canonical_publication_execution_coverage_incomplete");
+          }
+        } catch (error) {
+          if (error instanceof CanonicalPublicationRevalidationRequiredErrorV1) {
+            throw error;
+          }
+          fail("canonical_publication_execution_coverage_invalid");
+        }
+      }
       const canonicalPolicy = contractPolicy as NonNullable<
         SelectionPlanV3["canonicalContractPolicy"]
       >;

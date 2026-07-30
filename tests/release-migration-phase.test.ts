@@ -32,8 +32,8 @@ function observation(input: {
         expectedDatabaseSchemaVersion: schema,
         canonicalActivationConfigured: input.canonicalActivationConfigured ?? false,
         schemaMinimum: "13",
-        schemaMaximum: "18",
-        workerProtocol: "playlist-pipeline-v10",
+        schemaMaximum: "19",
+        workerProtocol: "playlist-pipeline-v11",
         briefContractVersion: input.briefContractVersion ?? "2",
         queryPlanSchemaVersion: input.queryPlanSchemaVersion ?? "3",
       },
@@ -44,10 +44,10 @@ function observation(input: {
       database: true,
       schemaVersion: schema,
       releaseManifestCanaryGuardsVersion: input.capability === undefined
-        ? schema === "18" ? "1" : null
+        ? Number(schema) >= 18 ? "1" : null
         : input.capability,
       canonicalExecutionHardeningVersion: input.hardening === undefined
-        ? schema === "18" ? "1" : null
+        ? Number(schema) >= 18 ? "1" : null
         : input.hardening,
     },
     systemHttpStatus: 200,
@@ -58,7 +58,7 @@ function observation(input: {
       workerLanes: {
         interactive: {
           status: "healthy",
-          protocolVersion: "playlist-pipeline-v10",
+          protocolVersion: "playlist-pipeline-v11",
           compatibleCapacity: 2,
           eligibleWorkerCount: 1,
           eligibleRevisions: [input.revision ?? revision],
@@ -67,7 +67,7 @@ function observation(input: {
         },
         deep: {
           status: "healthy",
-          protocolVersion: "playlist-pipeline-v10",
+          protocolVersion: "playlist-pipeline-v11",
           compatibleCapacity: 1,
           eligibleWorkerCount: 1,
           eligibleRevisions: [input.revision ?? revision],
@@ -80,7 +80,7 @@ function observation(input: {
 }
 
 describe("release migration phase verification", () => {
-  test("parses only explicit bridge or schema-18 expand probes", () => {
+  test("parses only explicit bridge or schema-19 expand probes", () => {
     expect(parseReleaseMigrationVerificationArgs([
       "--origin", "https://api-staging.example",
       "--expected-revision", revision,
@@ -110,7 +110,7 @@ describe("release migration phase verification", () => {
       "--expected-manifest-canary-guards", "none",
       "--expected-canonical-hardening", "none",
       "--phase", "expand",
-    ])).toThrow(/requires --expected-schema 18/u);
+    ])).toThrow(/requires --expected-schema 19/u);
     expect(() => parseReleaseMigrationVerificationArgs([
       "--origin", "https://api-staging.example",
       "--expected-revision", revision,
@@ -124,7 +124,7 @@ describe("release migration phase verification", () => {
     ])).toThrow(/30 through 120/u);
   });
 
-  test("proves the same bridge artifact and two advancing protocol-10 worker lanes", () => {
+  test("proves the same bridge artifact and two advancing protocol-11 worker lanes", () => {
     const evidence = buildReleaseMigrationPhaseEvidence({
       origin: "https://api-staging.example",
       expectedRevision: revision,
@@ -165,12 +165,12 @@ describe("release migration phase verification", () => {
     });
   });
 
-  test("proves schema 18 capability 2 while canonical schema-4/5 emission remains disabled during expand", () => {
+  test("proves schema 19 capability 2 while canonical schema-4/5 emission remains disabled during expand", () => {
     const evidence = buildReleaseMigrationPhaseEvidence({
       origin: "https://api-staging.example",
       expectedRevision: revision,
       expectedVersion: "2.4.0",
-      expectedDatabaseSchemaVersion: "18",
+      expectedDatabaseSchemaVersion: "19",
       expectedDatabaseCapabilityVersion: "2",
       expectedReleaseManifestCanaryGuardsVersion: "1",
       expectedCanonicalExecutionHardeningVersion: "1",
@@ -180,13 +180,13 @@ describe("release migration phase verification", () => {
       observations: [
         observation({
           phase: "expand",
-          schema: "18",
+          schema: "19",
           observedAt: "2026-07-23T12:00:00.000Z",
           heartbeatAt: "2026-07-23T11:59:55.000Z",
         }),
         observation({
           phase: "expand",
-          schema: "18",
+          schema: "19",
           observedAt: "2026-07-23T12:00:30.000Z",
           heartbeatAt: "2026-07-23T12:00:25.000Z",
         }),
@@ -200,13 +200,13 @@ describe("release migration phase verification", () => {
       "--origin", "https://api-staging.example",
       "--expected-revision", revision,
       "--expected-version", "2.4.0",
-      "--expected-schema", "18",
+      "--expected-schema", "19",
       "--expected-capability", "2",
       "--expected-manifest-canary-guards", "1",
       "--expected-canonical-hardening", "1",
       "--phase", "bridge",
     ])).toMatchObject({
-      expectedSchemaVersion: "18",
+      expectedSchemaVersion: "19",
       expectedDatabaseCapabilityVersion: "2",
       expectedReleaseManifestCanaryGuardsVersion: "1",
       expectedCanonicalExecutionHardeningVersion: "1",
@@ -216,12 +216,12 @@ describe("release migration phase verification", () => {
       "--origin", "https://api-staging.example",
       "--expected-revision", revision,
       "--expected-version", "2.4.0",
-      "--expected-schema", "18",
+      "--expected-schema", "19",
       "--expected-capability", "none",
       "--expected-manifest-canary-guards", "none",
       "--expected-canonical-hardening", "none",
       "--phase", "bridge",
-    ])).toThrow(/schema 18 requires composite capability 2/u);
+    ])).toThrow(/schemas 18 and 19 require composite capability 2/u);
 
     const evidence = buildReleaseMigrationPhaseEvidence({
       origin: "https://api-staging.example",

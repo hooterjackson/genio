@@ -45,7 +45,7 @@ export function catalogDiscoveryOutcomeDisposition(input: {
   }> = {
     provider_call_limit: {
       partialStatus: "partial_catalog_degraded",
-      reasonCode: "catalog_provider_call_limit",
+      reasonCode: "local_catalog_budget_exhausted",
       frontierExhausted: false,
       providerUnavailable: false,
     },
@@ -102,7 +102,6 @@ export function catalogDiscoveryOutcomeDisposition(input: {
     : typed[input.stoppedBecause];
   const zeroTrackProviderUnavailable = safeTrackCount === 0 && (
     disposition.providerUnavailable
-    || input.stoppedBecause === "provider_call_limit"
     || input.stoppedBecause === "timed_out"
   );
   const zeroTrackStatus: PipelineOutcomeStatus = zeroTrackProviderUnavailable

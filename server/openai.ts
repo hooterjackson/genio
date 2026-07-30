@@ -35,6 +35,7 @@ import {
   parseSelectionGeographyConstraints,
   SELECTION_GEOGRAPHY_RELATIONSHIPS,
 } from "./selection-geography-policy.ts";
+import type { MusicIntentEnvelopeV1 } from "./music-intent-envelope-v1.ts";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -418,7 +419,9 @@ const guidanceScoutSchema = {
           sourceUrls: {
             type: "array",
             minItems: 1,
-            maxItems: 3,
+            // Keep generation, salvage, policy validation, and the UI on one
+            // contract. The policy and UI both expose at most two sources.
+            maxItems: 2,
             // OpenAI Structured Outputs supports only a documented subset of
             // JSON Schema. URL formats are therefore enforced by
             // normalizedSourceUrl/assertPublicHttpsUrl after generation rather
@@ -796,7 +799,7 @@ function salvagedGuidanceQuestions(
       const whyMaterial = boundedGuidanceProse(rawWhyMaterial, "materiality", 480);
       if (rawWhyMaterial !== raw.whyMaterial) issues.push(`q${index + 1}:repaired_missing_materiality`);
       const requestedUrls = Array.isArray(raw.sourceUrls)
-        ? [...new Set(raw.sourceUrls.map(normalizedSourceUrl).filter((url): url is string => Boolean(url)))].slice(0, 3)
+        ? [...new Set(raw.sourceUrls.map(normalizedSourceUrl).filter((url): url is string => Boolean(url)))].slice(0, 2)
         : [];
       const attestedRequestedUrls = requestedUrls.filter((url) => sourceUrls.has(url));
       if (attestedRequestedUrls.length === 0) throw new Error("unattested_sources");
@@ -1189,6 +1192,7 @@ export async function scoutPlaylistGuidance(
   brief: PlaylistBrief,
   model: string,
   context: OpenAIRequestContext = {},
+  musicIntentEnvelope?: MusicIntentEnvelopeV1,
 ): Promise<PlaylistGuidanceScoutResult> {
   const scoutStartedAt = Date.now();
   const stableKey = context.idempotencyKey
@@ -1207,23 +1211,25 @@ export async function scoutPlaylistGuidance(
     tool_choice: "required",
     tools: [{ type: "web_search", search_context_size: "low" }],
     instructions: GUIDANCE_SCOUT_INSTRUCTIONS,
-    input: JSON.stringify({
-      request: prompt.slice(0, 4_000),
-      confirmedBrief: {
-        title: brief.title,
-        description: brief.description,
-        mode: brief.mode,
-        subjectEntities: brief.subjectEntities,
-        relationship: brief.relationship,
-        include: brief.include,
-        exclude: brief.exclude,
-        versionPolicy: brief.versionPolicy,
-        evidencePolicy: brief.evidencePolicy,
-        orderingPolicy: brief.orderingPolicy,
-        targetSize: brief.targetSize,
-        ambiguities: brief.ambiguities,
-      },
-    }),
+    input: JSON.stringify(musicIntentEnvelope
+      ? { musicIntentEnvelope }
+      : {
+          request: prompt.slice(0, 4_000),
+          confirmedBrief: {
+            title: brief.title,
+            description: brief.description,
+            mode: brief.mode,
+            subjectEntities: brief.subjectEntities,
+            relationship: brief.relationship,
+            include: brief.include,
+            exclude: brief.exclude,
+            versionPolicy: brief.versionPolicy,
+            evidencePolicy: brief.evidencePolicy,
+            orderingPolicy: brief.orderingPolicy,
+            targetSize: brief.targetSize,
+            ambiguities: brief.ambiguities,
+          },
+        }),
     text: {
       format: {
         type: "json_schema",

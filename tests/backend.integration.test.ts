@@ -117,7 +117,7 @@ function publicRolloutAuthority(
     RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
     RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
     RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
-    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     GUIDANCE_CONTRACT_V3_ENABLED: "false",
     GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
     GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
@@ -579,23 +579,23 @@ databaseDescribe("hosted backend integration", () => {
     expect(constraintAfter.rows).toEqual(constraintBefore.rows);
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
-    // The 2.2.2 bridge remains healthy across the active schema and the future
-    // schema-18 expansion, while failing closed outside its declared window.
+    // The compatibility bridge remains healthy across the active schema-19
+    // expansion while failing closed outside its declared window.
     await repository.setSetting("schema_version", "13");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "12");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).rejects.toThrow(
-      /supported 13-18, found 12/u,
+      /supported 13-19, found 12/u,
     );
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-18, found 12/u);
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-19, found 12/u);
     await repository.setSetting("schema_version", "16");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "17");
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "19");
-    await expect(repository.ensureSchemaVersion()).rejects.toThrow(/supported 13-18, found 19/u);
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "15");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
@@ -3247,7 +3247,7 @@ databaseDescribe("hosted backend integration", () => {
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
       RELEASE_EXECUTION_ENABLED: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
       RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH: evidenceHash,
       RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH: "f".repeat(64),
       RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH: "e".repeat(64),
@@ -4492,6 +4492,160 @@ databaseDescribe("hosted backend integration", () => {
     ]);
   });
 
+  test("shadow-writes schema-19 resolutions transactionally and reads only the ledger after cutover", async () => {
+    await repository.setSetting(
+      "playlist_resolution_authority_mode",
+      "legacy_shadow",
+    );
+    const runId = await repository.createRun(
+      "Schema 19 authoritative resolution",
+      brief,
+      0,
+      1,
+    );
+    const initial = await repository.pool.query<{
+      generation: number;
+      state: string;
+      next_action: string;
+      transition_count: number;
+      outbox_count: number;
+    }>(
+      `SELECT resolution.generation,resolution.state,resolution.next_action,
+              (SELECT count(*)::int
+               FROM playlist_run_resolution_transitions
+               WHERE run_id=resolution.run_id) transition_count,
+              (SELECT count(*)::int
+               FROM playlist_resolution_outbox
+               WHERE run_id=resolution.run_id) outbox_count
+       FROM playlist_run_resolutions resolution
+       WHERE resolution.run_id=$1`,
+      [runId],
+    );
+    expect(initial.rows[0]).toEqual({
+      generation: 1,
+      state: "accepted",
+      next_action: "none",
+      transition_count: 1,
+      outbox_count: 1,
+    });
+
+    await repository.updateRun(runId, {
+      status: "researching",
+      phase: "research",
+    });
+    expect((await repository.pool.query<{
+      generation: number;
+      state: string;
+      next_action: string;
+    }>(
+      `SELECT generation,state,next_action
+       FROM playlist_run_resolutions WHERE run_id=$1`,
+      [runId],
+    )).rows[0]).toEqual({
+      generation: 2,
+      state: "executing",
+      next_action: "none",
+    });
+
+    await repository.setSetting(
+      "playlist_resolution_authority_mode",
+      "authoritative",
+    );
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      resolution: {
+        generation: 2,
+        state: "executing",
+        nextAction: "none",
+      },
+    });
+
+    // A legacy projection may still be updated for old-client compatibility,
+    // but after cutover it cannot overwrite the authoritative ledger.
+    await repository.updateRun(runId, {
+      status: "failed_system",
+      phase: "legacy_projection_failure",
+    });
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      status: "failed_system",
+      resolution: {
+        generation: 2,
+        state: "executing",
+        nextAction: "none",
+      },
+    });
+    expect((await repository.pool.query<{ generation: number }>(
+      `SELECT generation FROM playlist_run_resolutions WHERE run_id=$1`,
+      [runId],
+    )).rows[0]?.generation).toBe(2);
+
+    const sourceJob = await repository.enqueueJob({
+      kind: "research",
+      runId,
+      payload: { runId, phase: "verified_checkpoint_resume" },
+      dedupeKey: `resolution-source:${runId}`,
+      maxAttempts: 3,
+    });
+    await repository.pool.query(
+      `UPDATE job_queue
+       SET status='failed',completed_at=now(),last_error='test checkpoint',
+           updated_at=now()
+       WHERE id=$1`,
+      [sourceJob.id],
+    );
+    await repository.pool.query(
+      `INSERT INTO research_checkpoints(run_id,phase,state_json)
+       VALUES($1,'resolution_reconciler_test',$2::jsonb)`,
+      [runId, JSON.stringify({
+        verified: true,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      })],
+    );
+    await repository.pool.query(
+      `UPDATE playlist_run_resolutions
+       SET updated_at=now()-interval '6 minutes'
+       WHERE run_id=$1`,
+      [runId],
+    );
+    await expect(
+      repository.runPlaylistResolutionReconciler(10),
+    ).resolves.toMatchObject({
+      audited: 1,
+      repaired: 1,
+      quarantined: 0,
+      skipped: false,
+    });
+    expect((await repository.pool.query<{
+      generation: number;
+      repair_count: number;
+      queued_repairs: number;
+    }>(
+      `SELECT resolution.generation,
+              (resolution.state_json->>'reconcilerRepairCount')::int
+                repair_count,
+              (SELECT count(*)::int FROM job_queue job
+               WHERE job.run_id=resolution.run_id
+                 AND job.status='queued'
+                 AND job.dedupe_key LIKE 'resolution-repair:%')
+                queued_repairs
+       FROM playlist_run_resolutions resolution
+       WHERE resolution.run_id=$1`,
+      [runId],
+    )).rows[0]).toEqual({
+      generation: 3,
+      repair_count: 1,
+      queued_repairs: 1,
+    });
+    await expect(
+      repository.drainPlaylistResolutionOutbox("resolution-test-worker", 10),
+    ).resolves.toBe(3);
+    expect((await repository.pool.query<{ pending: number }>(
+      `SELECT count(*)::int pending
+       FROM playlist_resolution_outbox
+       WHERE run_id=$1 AND delivered_at IS NULL`,
+      [runId],
+    )).rows[0]?.pending).toBe(0);
+  });
+
   test("Pipeline V2 manifest lock accepts strong attested unknown-lineage claims but never relaxes proof or version policy", async () => {
     const v2Brief: PlaylistBrief = {
       ...brief,
@@ -4503,8 +4657,9 @@ databaseDescribe("hosted backend integration", () => {
       orderingPolicy: "artist/title",
       targetSize: { min: 3, max: 3 },
     };
-    const runId = await repository.createRun("V2 manifest eligibility", v2Brief, 0, 1);
-    const plan = createSelectionPlanV2({ prompt: "V2 manifest eligibility", brief: v2Brief });
+    const explicitPrompt = "Tracks credited to Integration Test Artist as primary artist";
+    const runId = await repository.createRun(explicitPrompt, v2Brief, 0, 1);
+    const plan = createSelectionPlanV2({ prompt: explicitPrompt, brief: v2Brief });
     await repository.savePipelineSelectionPlan(runId, plan);
     const sourceUrl = `https://v2-evidence.example/${randomUUID()}`;
     const sourceIds = await repository.addSources(runId, [{
@@ -4521,7 +4676,7 @@ databaseDescribe("hosted backend integration", () => {
     const attestedTitles = ["Safe Studio Recording", "Wrong Live Recording"];
     const citations = new Map(attestedTitles.map((title) => [
       title,
-      citationFixture(sourceUrl, title, "primary artist", v2Brief.subjectEntities[0]),
+      citationFixture(sourceUrl, title, "credited as primary artist", v2Brief.subjectEntities[0]),
     ]));
     await repository.addCitationAttestations(
       runId,
@@ -4543,7 +4698,7 @@ databaseDescribe("hosted backend integration", () => {
           supportScope: "track" as const,
           subjectEntity: v2Brief.subjectEntities[0]!,
           subjectRelationship: v2Brief.relationship,
-          relationship: "primary artist",
+          relationship: "credited as primary artist",
           note: "Exact track support.",
           citationSupport: citations.get(title)!.support,
         }],

@@ -16,7 +16,7 @@ import {
   type SelectionPlanV3,
 } from "./selection-plan-v3.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
-import { assertPublicHttpsUrl, stableStringify } from "./security.ts";
+import { assertPublicHttpsUrl, sha256Hex, stableStringify } from "./security.ts";
 import { assertCanonicalContractExecutionPolicyV1 } from "./canonical-contract-runtime-v1.ts";
 import {
   PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
@@ -33,6 +33,12 @@ import {
   executableQueryPlanClauseIdsV3,
   isPipelineV3ConceptDiscoveryHints,
 } from "./pipeline-v3-concept-discovery-hint.ts";
+import {
+  assertVerificationExpressionV1,
+  executionCoverageReportV1,
+  verificationExpressionV1,
+} from "./verification-expression-v1.ts";
+import { semanticExecutionConfigurationHash } from "./runtime-release.ts";
 
 export const LEGACY_QUERY_PLAN_V3_VERSION = 1 as const;
 export const LEGACY_QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -42,6 +48,8 @@ export const CONTRACT_QUERY_PLAN_V3_VERSION = 3 as const;
 export const LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 4 as const;
 /** Directive-aware canonical plan emitted by the current compiler. */
 export const CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 5 as const;
+/** Boolean verification, coverage, and four-hash canonical plan. */
+export const VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION = 6 as const;
 // Schema 2 refines the query contract; it does not create a new persisted run
 // policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -51,15 +59,18 @@ export type QueryPlanV3SchemaVersion =
   | typeof QUERY_PLAN_V3_VERSION
   | typeof CONTRACT_QUERY_PLAN_V3_VERSION
   | typeof LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
-  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+  | typeof VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION;
 
 export function isCanonicalQueryPlanV3SchemaVersion(
   value: unknown,
 ): value is
   | typeof LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
-  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION {
+  | typeof CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+  | typeof VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION {
   return value === LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
-    || value === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+    || value === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    || value === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION;
 }
 
 export function queryPlanV3RequiresLegacyCanonicalExecutor(
@@ -74,6 +85,12 @@ export function queryPlanV3RequiresLegacyCanonicalExecutor(
 export function queryPlanV3EmissionSchemaVersion(
   env: NodeJS.ProcessEnv = process.env,
 ): QueryPlanV3SchemaVersion {
+  if (
+    env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "6"
+    && canonicalContractActivationConfigured(env)
+  ) {
+    return VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION;
+  }
   if (
     env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION === "5"
     && canonicalContractActivationConfigured(env)
@@ -143,10 +160,16 @@ export function queryPlanV3Engines(
   if (isFixedContainerPrompt(plan.prompt)) engines.push("fixed_container");
   if (plan.intents.includes("artist_catalogue")) engines.push("artist_catalogue");
   if (plan.intents.includes("similarity")) engines.push("similarity");
+  // An explicit genre is the membership authority even when the request also
+  // carries a vibe or activity objective. Pure-vibe requests still select the
+  // mood engine, but "smooth reggaeton" must remain in the genre cohort.
+  if (plan.intents.includes("genre_scene") || plan.intents.includes("editorial_ranking")) {
+    engines.push("curated_genre_scene");
+  }
   if (plan.intents.includes("mood_activity") || plan.intents.includes("theme")) {
     engines.push("mood_activity_theme");
   }
-  if (plan.intents.includes("genre_scene") || plan.intents.includes("editorial_ranking") || engines.length === 0) {
+  if (engines.length === 0) {
     engines.push("curated_genre_scene");
   }
   return [...new Set(engines)];
@@ -388,7 +411,7 @@ export function createQueryPlanV3(
     requestedSchemaVersion,
   );
   const directiveAwareCanonicalSchema =
-    requestedSchemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
+    requestedSchemaVersion >= CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION;
   const executorCapability = directiveAwareCanonicalSchema
     ? canonicalExecutorCapabilityForSchemaV1({
         queryPlanSchemaVersion: requestedSchemaVersion,
@@ -491,6 +514,50 @@ export function createQueryPlanV3(
   });
   const conceptDiscoveryHints = plan.conceptDiscoveryHints ?? [];
   assertPipelineV3ConceptDiscoveryHints(conceptDiscoveryHints, executableClauseIds);
+  const verificationExpression = requestedSchemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+    ? verificationExpressionV1(plan.canonicalContractPolicy!)
+    : null;
+  const coverageProducerFamilies = [
+    "apple_catalog",
+    "structured_music_metadata",
+    "trusted_container",
+    "track_editorial",
+    "factual_source",
+    "recording_identity",
+    "content_metadata",
+    "suitability_assessment",
+  ] as const;
+  const coverageReport = verificationExpression && executorCapability
+    ? executionCoverageReportV1({
+        expression: verificationExpression,
+        stage: "query_plan",
+        routeId: `corpus_first_v3:${engines.join("+")}`,
+        dependencyRootIds: ["apple_catalog", "musicbrainz", "openai"],
+        workerCapabilityHash: executorCapability.hash,
+        configurationHash: semanticExecutionConfigurationHash(),
+        ontologyVersion: plan.musicConceptPolicyVersion,
+        evidencePolicyVersion: plan.canonicalContractPolicy!.evidencePolicyVersion,
+        producerFamilies: coverageProducerFamilies,
+      })
+    : null;
+  const semanticHash = options.playlistContractSemanticHash ?? plan.explicitUserConstraintHash;
+  const executionHash = verificationExpression && executorCapability
+    ? sha256Hex(stableStringify({
+        semanticHash,
+        storefront: plan.storefront,
+        engines,
+        executorCapabilityHash: executorCapability.hash,
+        verificationExpression,
+      }))
+    : null;
+  const strategySemanticHash = verificationExpression
+    ? sha256Hex(stableStringify({
+        producerFamilies: coverageProducerFamilies,
+        dependencyRootIds: ["apple_catalog", "musicbrainz", "openai"],
+        deficitObligationIds: coverageReport?.uncoveredObligationIds ?? [],
+        engines,
+      }))
+    : null;
   const schemaTwo: QueryPlanV3 = {
     schemaVersion: canonicalSchema
       ? requestedSchemaVersion
@@ -569,7 +636,9 @@ export function createQueryPlanV3(
     } : {}),
     ...(canonicalSchema ? {
       briefContractVersion: 3 as const,
-      guidancePolicyVersion: "adaptive_guidance_v3",
+      guidancePolicyVersion: requestedSchemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+        ? "adaptive_guidance_v4"
+        : "adaptive_guidance_v3",
       evidencePolicyVersion: PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
       playlistContractRevisionId: options.playlistContractRevisionId,
       playlistContractSemanticHash: options.playlistContractSemanticHash,
@@ -595,6 +664,14 @@ export function createQueryPlanV3(
       } : {}),
       ...(directiveAwareCanonicalSchema && plan.executionDirectives ? {
         executionDirectives: structuredClone(plan.executionDirectives),
+      } : {}),
+      ...(verificationExpression && coverageReport && executionHash && strategySemanticHash ? {
+        verificationExpression,
+        executionCoverageReport: coverageReport,
+        inputHash: plan.explicitUserConstraintHash,
+        semanticHash,
+        executionHash,
+        strategySemanticHash,
       } : {}),
     } : {}),
   };
@@ -930,7 +1007,8 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
   if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION
       && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION
       && row.schemaVersion !== LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
-      && row.schemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION)
+      && row.schemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+      && row.schemaVersion !== VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION)
     || row.policyVersion !== QUERY_PLAN_V3_POLICY_VERSION
     || row.semanticPolicyVersion !== "scope_gate_v2_1_2"
     || row.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
@@ -993,7 +1071,11 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
   )) return false;
   if (isCanonicalQueryPlanV3SchemaVersion(row.schemaVersion)) {
     if (row.briefContractVersion !== 3
-      || row.guidancePolicyVersion !== "adaptive_guidance_v3"
+      || row.guidancePolicyVersion !== (
+        row.schemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+          ? "adaptive_guidance_v4"
+          : "adaptive_guidance_v3"
+      )
       || row.evidencePolicyVersion !== PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION
       || typeof row.playlistContractRevisionId !== "string"
       || !row.playlistContractRevisionId.startsWith("pcr1:")
@@ -1009,13 +1091,13 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
       || !isCanonicalContractRuntimePolicy(row.canonicalContractPolicy, row)) {
       return false;
     }
-    if (row.schemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    if (row.schemaVersion >= CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
       && !canonicalExecutionDirectivesValid(row)) return false;
     if (row.schemaVersion === LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
       && (row.executionDirectives !== undefined
         || row.canonicalContractPolicy?.executionDirectives !== undefined)
       && !canonicalExecutionDirectivesValid(row)) return false;
-    if (row.schemaVersion === CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION) {
+    if (row.schemaVersion >= CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION) {
       const expectedCapability = canonicalExecutorCapabilityForSchemaV1({
         queryPlanSchemaVersion: row.schemaVersion,
       });
@@ -1032,6 +1114,29 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
       if (row.executorCapabilityHash !== expectedCapability.hash
         || stableStringify(row.executorCapabilityVector)
           !== stableStringify(expectedCapability.vector)) return false;
+    }
+    if (row.schemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION) {
+      if (!row.verificationExpression
+        || !row.executionCoverageReport
+        || row.executionCoverageReport.complete !== true
+        || ![row.inputHash, row.semanticHash, row.executionHash, row.strategySemanticHash]
+          .every((value) => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value))) {
+        return false;
+      }
+      try { assertVerificationExpressionV1(row.verificationExpression); } catch { return false; }
+      const expectedReportHash = sha256Hex(stableStringify(Object.fromEntries(
+        Object.entries(row.executionCoverageReport).filter(([key]) => key !== "reportHash"),
+      )));
+      if (row.executionCoverageReport.reportHash !== expectedReportHash) return false;
+    } else if (
+      row.verificationExpression !== undefined
+      || row.executionCoverageReport !== undefined
+      || row.inputHash !== undefined
+      || row.semanticHash !== undefined
+      || row.executionHash !== undefined
+      || row.strategySemanticHash !== undefined
+    ) {
+      return false;
     }
   }
   return true;

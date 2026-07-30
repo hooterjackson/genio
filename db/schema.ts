@@ -368,6 +368,8 @@ export const guidanceQuestionSets = pgTable("guidance_question_sets", {
   guidanceRound: varchar("guidance_round", { length: 24 }).notNull().default("initial"),
   trigger: varchar("trigger", { length: 24 }).notNull().default("nuance"),
   axis: varchar("axis", { length: 80 }),
+  checkpointMode: varchar("checkpoint_mode", { length: 40 }),
+  interpretationSummaryJson: jsonb("interpretation_summary_json"),
   rejectedQuestionReasonsJson: jsonb("rejected_question_reasons_json").notNull().default([]),
   questionsJson: jsonb("questions_json").notNull(),
   active: boolean("active").notNull().default(true),
@@ -383,6 +385,7 @@ export const guidanceQuestionSets = pgTable("guidance_question_sets", {
   check("guidance_question_sets_owner_valid", sql`num_nonnulls(${table.briefRequestId}, ${table.runId}) = 1`),
   check("guidance_question_sets_round_valid", sql`${table.guidanceRound} IN ('initial','rescue')`),
   check("guidance_question_sets_trigger_valid", sql`${table.trigger} IN ('correctness','yield_risk','nuance')`),
+  check("guidance_question_sets_checkpoint_mode_valid", sql`${table.checkpointMode} IS NULL OR ${table.checkpointMode} IN ('correctness_blocking','nuance_optional','interpretation_confirmation')`),
 ]);
 
 export const guidanceAnswerSets = pgTable("guidance_answer_sets", {
@@ -1414,6 +1417,88 @@ export const orphanPlaylists = pgTable("orphan_playlists", {
   cleanedAt: timestamp("cleaned_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/** Schema-19 authoritative user-visible resolution; legacy status is a projection. */
+export const playlistRunResolutions = pgTable("playlist_run_resolutions", {
+  runId: uuid("run_id").primaryKey().references(() => researchRuns.id, { onDelete: "cascade" }),
+  generation: integer("generation").notNull().default(1),
+  state: varchar("state", { length: 40 }).notNull(),
+  nextAction: varchar("next_action", { length: 80 }).notNull(),
+  activeContractRevisionId: uuid("active_contract_revision_id")
+    .references(() => playlistContractRevisions.id, { onDelete: "restrict" }),
+  executionAttemptId: uuid("execution_attempt_id")
+    .references(() => playlistExecutionAttempts.id, { onDelete: "set null" }),
+  blockerId: uuid("blocker_id").references(() => playlistRunBlockers.id, { onDelete: "set null" }),
+  questionSetId: uuid("question_set_id").references(() => guidanceQuestionSets.id, { onDelete: "set null" }),
+  decisionJson: jsonb("decision_json"),
+  manifestId: uuid("manifest_id").references(() => manifests.id, { onDelete: "set null" }),
+  stateJson: jsonb("state_json").notNull().default({}),
+  provenance: varchar("provenance", { length: 40 }).notNull(),
+  incidentReference: varchar("incident_reference", { length: 160 }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+  ...timestamps,
+}, (table) => [
+  index("playlist_run_resolution_state_idx").on(table.state, table.updatedAt),
+  index("playlist_run_resolution_blocker_idx").on(table.blockerId),
+  index("playlist_run_resolution_attempt_idx").on(table.executionAttemptId),
+  check("playlist_run_resolution_generation_valid", sql`${table.generation} > 0`),
+  check("playlist_run_resolution_state_valid", sql`${table.state} IN ('accepted','needs_input','probing','executing','blocked_dependency','needs_decision','ready','publishing','completed','cancelled','quarantined')`),
+]);
+
+/** Append-only optimistic-lock transition ledger. */
+export const playlistRunResolutionTransitions = pgTable("playlist_run_resolution_transitions", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  expectedGeneration: integer("expected_generation").notNull(),
+  successorGeneration: integer("successor_generation").notNull(),
+  fromState: varchar("from_state", { length: 40 }),
+  toState: varchar("to_state", { length: 40 }).notNull(),
+  contractRevisionId: uuid("contract_revision_id")
+    .references(() => playlistContractRevisions.id, { onDelete: "restrict" }),
+  executionAttemptId: uuid("execution_attempt_id")
+    .references(() => playlistExecutionAttempts.id, { onDelete: "set null" }),
+  blockerId: uuid("blocker_id").references(() => playlistRunBlockers.id, { onDelete: "set null" }),
+  companionArtifactKind: varchar("companion_artifact_kind", { length: 48 }),
+  companionArtifactId: uuid("companion_artifact_id"),
+  transitionKind: varchar("transition_kind", { length: 64 }).notNull(),
+  transitionJson: jsonb("transition_json").notNull().default({}),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("playlist_run_resolution_transition_run_idx").on(
+    table.runId,
+    table.successorGeneration,
+  ),
+  check("playlist_run_resolution_transition_generation_valid", sql`
+    ${table.expectedGeneration} >= 0
+    AND ${table.successorGeneration}=${table.expectedGeneration}+1
+  `),
+]);
+
+/** Side effects are emitted only after the same transaction commits. */
+export const playlistResolutionOutbox = pgTable("playlist_resolution_outbox", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, { onDelete: "cascade" }),
+  transitionId: uuid("transition_id").notNull()
+    .references(() => playlistRunResolutionTransitions.id, { onDelete: "cascade" }),
+  topic: varchar("topic", { length: 80 }).notNull(),
+  idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
+  payloadJson: jsonb("payload_json").notNull(),
+  availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+  leaseOwner: varchar("lease_owner", { length: 160 }),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  lastErrorClass: varchar("last_error_class", { length: 80 }),
+  ...timestamps,
+}, (table) => [
+  index("playlist_resolution_outbox_due_idx").on(
+    table.availableAt,
+    table.createdAt,
+  ),
+  check("playlist_resolution_outbox_attempt_valid", sql`${table.attemptCount} >= 0`),
+]);
 
 export const jobQueue = pgTable("job_queue", {
   id: uuid("id").primaryKey(),

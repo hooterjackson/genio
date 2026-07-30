@@ -3,6 +3,7 @@ import {
   assertPublicRolloutExecutionGroupV1,
   createPublicRolloutAssignmentV1,
   parsePublicRolloutAssignmentV1,
+  publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "../server/public-rollout-assignment.ts";
 import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";
@@ -75,7 +76,7 @@ function databaseAuthority(
     RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
     RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
     RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
-    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+    PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     GUIDANCE_CONTRACT_V3_ENABLED:
       authorityEnvironment.GUIDANCE_CONTRACT_V3_ENABLED ?? "false",
     GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
@@ -152,6 +153,34 @@ describe("persisted public canonical rollout assignment", () => {
       percentage: 0,
       assigned: false,
     });
+  });
+
+  test("lets the signed assignment override a broad Contract-3 fallback", () => {
+    const similarityControl = assignment(
+      "similarity-contract-control",
+      environment("100"),
+      "Influential music similar to Oasis but not Oasis",
+    );
+    expect(similarityControl).toMatchObject({
+      intentGroup: "similarity",
+      percentage: 0,
+      assigned: false,
+    });
+    expect(publicRolloutCanonicalContractRequestedV1({
+      assignment: similarityControl,
+      fallbackRequested: true,
+    })).toBe(false);
+    expect(publicRolloutCanonicalContractRequestedV1({
+      assignment: assignment(
+        "selected-contract-three",
+        environment("100"),
+      ),
+      fallbackRequested: false,
+    })).toBe(true);
+    expect(publicRolloutCanonicalContractRequestedV1({
+      assignment: null,
+      fallbackRequested: true,
+    })).toBe(true);
   });
 
   test("persists the decision independently of later environment changes", () => {

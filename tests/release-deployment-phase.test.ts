@@ -29,17 +29,17 @@ describe("runtime release deployment phase", () => {
         RELEASE_ENVIRONMENT: "production",
         RELEASE_DEPLOYMENT_PHASE: "surprise",
       },
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
     })).toBe(false);
     for (const environment of [
       {
         RELEASE_DEPLOYMENT_PHASE: "bridge",
-        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       },
       {
         RELEASE_DEPLOYMENT_PHASE: "expand",
-        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       },
       {
         RELEASE_DEPLOYMENT_PHASE: "activate",
@@ -52,7 +52,7 @@ describe("runtime release deployment phase", () => {
       expect(canonicalContractActivationConfigured(environment)).toBe(false);
       expect(canonicalContractActivationReady({
         environment,
-        observedDatabaseSchemaVersion: "18",
+        observedDatabaseSchemaVersion: "19",
         observedDatabaseCapabilityVersion: "1",
       })).toBe(false);
     }
@@ -62,12 +62,12 @@ describe("runtime release deployment phase", () => {
     const environment = {
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
       RELEASE_EXECUTION_ENABLED: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
     };
     expect(canonicalContractActivationConfigured(environment)).toBe(true);
@@ -78,12 +78,12 @@ describe("runtime release deployment phase", () => {
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: null,
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
@@ -93,7 +93,7 @@ describe("runtime release deployment phase", () => {
     expect(canonicalContractCohortConfigured({
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
@@ -101,11 +101,11 @@ describe("runtime release deployment phase", () => {
     })).toBe(false);
   });
 
-  test("drains schema-4 work but only activates new canonical work under schema 5 hardening", () => {
+  test("drains schema-4/5 work but only activates new canonical work under schema 6 hardening", () => {
     const base = {
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
@@ -120,24 +120,24 @@ describe("runtime release deployment phase", () => {
     expect(canonicalContractActivationConfigured(schema4)).toBe(false);
     expect(canonicalContractActivationReady({
       environment: schema4,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
     })).toBe(false);
 
     const schema5 = {
       ...base,
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     };
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: null,
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
@@ -145,7 +145,7 @@ describe("runtime release deployment phase", () => {
     })).toBe(true);
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: null,
@@ -153,7 +153,7 @@ describe("runtime release deployment phase", () => {
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
@@ -165,12 +165,12 @@ describe("runtime release deployment phase", () => {
     const valid = {
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
       RELEASE_EXECUTION_ENABLED: "true",
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     };
     expect(canonicalContractActivationConfigured(valid)).toBe(true);
     for (const key of [
@@ -206,23 +206,23 @@ describe("runtime release deployment phase", () => {
     })).toBe(true);
     expect(releaseDatabaseReadinessReady({
       environment: bridge,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
     })).toBe(false);
 
     const expand = {
       ...bridge,
       RELEASE_DEPLOYMENT_PHASE: "expand",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
     };
     expect(releaseDatabaseReadinessReady({
       environment: expand,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: null,
     })).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: expand,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",

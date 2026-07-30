@@ -53,6 +53,19 @@ function criticalConstraint(
       relaxationRank: null,
     };
   }
+  if ((question.decisionKey ?? "").includes("temporal_width")
+    || option.startsWith("era_")) {
+    const years = value.match(/(?:18|19|20)\d{2}/gu) ?? [];
+    if (years.length === 0) return null;
+    return {
+      id,
+      axis: "era",
+      operator: years.length > 1 ? "between" : "within",
+      values: years.slice(0, 2),
+      kind: "hard",
+      relaxationRank: null,
+    };
+  }
   if (option.includes("house_genre")) {
     return { id, axis: "genre", operator: "require", values: ["house"], kind: "hard", relaxationRank: null };
   }

@@ -177,7 +177,8 @@ export interface CriticalAmbiguityV3 {
     | "french_jazz_scope"
     | "geographic_genre_scope"
     | "possessive_relationship"
-    | "brazilian_funk_semantics";
+    | "brazilian_funk_semantics"
+    | "temporal_width";
   readonly summary: string;
   readonly blocking: true;
   readonly optionIds: readonly string[];
@@ -189,6 +190,8 @@ export interface CriticalAmbiguityV3 {
   readonly languageValue?: string;
   /** Exact named subject for possessive factual-relationship questions. */
   readonly subjectValue?: string;
+  /** Exact user-authored year whose intended width is unresolved. */
+  readonly yearValue?: number;
 }
 
 export interface RunSpecV3 {
@@ -342,9 +345,9 @@ export function sanitizePipelineV3SourceDiscoveryHints(
 
 const GENRE_TERMS = [
   "ambient", "baile funk", "bossa nova", "classical", "disco", "drill",
-  "dub", "electro", "footwork", "funk carioca", "garage", "house",
-  "jazz", "jungle", "metal", "pop", "punk", "rap", "reggae", "rock",
-  "samba", "soul", "techno", "trance",
+  "dembow", "dub", "electro", "footwork", "funk carioca", "garage", "house",
+  "hip hop", "jazz", "jungle", "metal", "pop", "punk", "r b", "rap", "reggae", "rock",
+  "latin urban", "reggaeton", "samba", "soul", "techno", "trance",
 ] as const;
 
 interface GeographicQualifierV3 {
@@ -374,7 +377,7 @@ const GEOGRAPHIC_QUALIFIERS: readonly GeographicQualifierV3[] = [
   { aliases: ["manchester"], scenePrefix: "Manchester", originValue: "Manchester" },
   { aliases: ["paris", "parisian"], scenePrefix: "Paris", originValue: "Paris", languageValue: "French" },
   { aliases: ["uk", "u k", "british"], scenePrefix: "UK", originValue: "United Kingdom", languageValue: "English" },
-  { aliases: ["american", "us", "u s", "united states"], scenePrefix: "American", originValue: "United States", languageValue: "English" },
+  { aliases: ["american", "usa", "united states"], scenePrefix: "American", originValue: "United States", languageValue: "English" },
   { aliases: ["brazilian", "brazil"], scenePrefix: "Brazilian", originValue: "Brazil", languageValue: "Portuguese" },
   { aliases: ["french", "france"], scenePrefix: "French", originValue: "France", languageValue: "French", ambiguousBareGenre: true },
   { aliases: ["german", "germany"], scenePrefix: "German", originValue: "Germany", languageValue: "German" },
@@ -401,6 +404,13 @@ function normalize(value: string): string {
     .replace(/[^a-z0-9'\s-]+/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
+}
+
+function preserveExplicitUnitedStatesScope(value: string): string {
+  return value.replace(
+    /\bU\.?S\.?(?=\s+(?:music|songs?|tracks?|recordings?|artists?|rap|hip[ -]?hop|r\s*(?:&|and)\s*b|jazz|rock|pop|country|drill|house|techno|scene|genre))/gu,
+    "United States",
+  );
 }
 
 function stableId(prefix: string, value: string): string {
@@ -547,6 +557,10 @@ const TYPED_AXIS_TO_V3: Readonly<Partial<Record<SelectionConstraint["axis"], Mem
 
 function explicitEraPolicyRequested(rawPrompt: string): boolean {
   const prompt = normalize(rawPrompt);
+  const ambiguousBareYear = /\b(?:18|19|20)\d{2}\s+(?:rap|hip hop|r&b|rhythm and blues|jazz|rock|pop|disco|house|techno|funk|soul)\b/u.test(prompt)
+    && !/\b(?:released?|recorded|recordings?|songs?|tracks?|music)\s+(?:from|during|in)\s+(?:the\s+)?(?:18|19|20)\d{2}\b/u.test(prompt)
+    && !/\b(?:only|year)\s+(?:18|19|20)\d{2}\b/u.test(prompt);
+  if (ambiguousBareYear) return false;
   return /\b(?:songs?|tracks?|music|recordings?|releases?)\b[^.;!?]{0,30}\b(?:released\s+)?(?:from|during|in|before|after|between)\s+(?:the\s+)?(?:18|19|20)\d{2}s?\b/u.test(prompt)
     || /\b(?:18|19|20)\d{2}s?\b[^.;!?]{0,30}\b(?:era|songs?|tracks?|music|recordings?|releases?|disco|house|jazz|techno|drill|funk|ambient|rock|soul)\b/u.test(prompt)
     || /\b(?:before|after|between|from)\s+(?:18|19|20)\d{2}\b/u.test(prompt);
@@ -1129,6 +1143,20 @@ function intentEngines(intents: readonly IntentV3[]): IntentEngineV3[] {
 
 function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
   const ambiguities: CriticalAmbiguityV3[] = [];
+  const ambiguousYear = prompt.match(
+    /\b((?:18|19|20)\d{2})\s+(?:rap|hip hop|r&b|rhythm and blues|jazz|rock|pop|disco|house|techno|funk|soul)\b/u,
+  )?.[1];
+  if (ambiguousYear
+    && !/\b(?:released?|recorded|recordings?|songs?|tracks?|music)\s+(?:from|during|in)\s+(?:the\s+)?(?:18|19|20)\d{2}\b/u.test(prompt)
+    && !/\b(?:only|year)\s+(?:18|19|20)\d{2}\b/u.test(prompt)) {
+    ambiguities.push({
+      key: "temporal_width",
+      summary: `“${ambiguousYear}” may mean that exact release year, a nearby window, or the full decade.`,
+      blocking: true,
+      optionIds: ["era_year_only", "era_around_year", "era_full_decade", "custom"],
+      yearValue: Number(ambiguousYear),
+    });
+  }
   const houseAlongsideAnotherGenre = detectedGenreTerms(prompt).some((genre) => genre !== "house");
   const bareHouse = /\bhouse\b/u.test(prompt)
     && !houseAlongsideAnotherGenre
@@ -1197,7 +1225,7 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
 
 /** Deterministically interpret only facts present in the request. */
 export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
-  const prompt = normalize(input.prompt);
+  const prompt = normalize(preserveExplicitUnitedStatesScope(input.prompt));
   if (prompt.length < 2 || prompt.length > 4_000) throw new Error("Playlist prompt must contain 2–4,000 characters");
   if (!Number.isSafeInteger(input.requestedTrackCount)
     || input.requestedTrackCount < 1
@@ -1238,7 +1266,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   }
   if (new RegExp(`\\b(?:${SIMILARITY_CUE_SOURCE}|resembl(?:e|es|ing))\\b`, "u").test(prompt)) intents.push("similarity");
   if (/\b(?:songs?|tracks?|music)\s+(?:about|mentioning|whose theme is)\b/u.test(prompt)) intents.push("theme");
-  if (/\b(?:for (?:sleep|studying|study|running|work|dinner|party|road trip)|workout|focus|relaxing|calm|upbeat|dark|melanchol)\b/u.test(prompt)) {
+  if (/\b(?:for (?:sleep|studying|study|running|work|dinner|party|road trip|gaming|a smoke session)|workout|focus|relaxing|calm|upbeat|dark|melanchol|gaming|smoking|late[ -]?night|chill(?:ed|ing)?)\b/u.test(prompt)) {
     intents.push("mood_activity");
   }
   if (/\b(?:influential|foundational|essential|important|best|canonical|iconic)\b/u.test(prompt)) {
@@ -1428,7 +1456,6 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     objectives.push(objective("similarity", "maximize", 0.9, null, "Rank qualified recordings by supported similarity dimensions.", [seedMatch[1]!.trim()]));
   }
 
-  if (intents.length === 0) intents.push("genre_scene");
   const uniqueIntents = dedupe(intents);
   const scopeKind = input.typedSelectionPlan?.scopeKind
     ?? inferredScopeKind(input.prompt, uniqueIntents);
@@ -1534,6 +1561,7 @@ export type CriticalAmbiguityAnswerV3 =
   | { key: "geographic_genre_scope"; optionId: "geographic_artist_origin" | "geographic_scene" | "geographic_language"; customValue?: never }
   | { key: "possessive_relationship"; optionId: "subject_performed" | "subject_created" | "subject_influenced"; customValue?: never }
   | { key: "brazilian_funk_semantics"; optionId: "funk_carioca" | "brazilian_soul_funk" | "both_funk_traditions"; customValue?: never }
+  | { key: "temporal_width"; optionId: "era_year_only" | "era_around_year" | "era_full_decade"; customValue?: never }
   | { key: CriticalAmbiguityV3["key"]; optionId: "custom"; customValue: string };
 
 function guidedPredicate(
@@ -1550,6 +1578,7 @@ function customAmbiguityAxis(
   key: CriticalAmbiguityV3["key"],
   custom: string,
 ): MembershipAxisV3 {
+  if (key === "temporal_width") return "era";
   if (key === "possessive_relationship") return "factual_relationship";
   if (key === "french_jazz_scope" || key === "geographic_genre_scope") {
     if (/\b(?:language|french[- ]language|francophone|sung|lyrics?)\b/iu.test(custom)) return "language";
@@ -1632,6 +1661,24 @@ export function resolveRunSpecV3(
       if (answer.optionId === "subject_influenced") {
         objectives.push(objective("influence", "maximize", 1, null, "Rank eligible recordings by documented influence."));
       }
+    } else if (answer.key === "temporal_width") {
+      if (!ambiguity.yearValue) throw new Error("Temporal ambiguity is missing its anchor year");
+      const year = ambiguity.yearValue;
+      const decadeStart = Math.floor(year / 10) * 10;
+      const values = answer.optionId === "era_year_only"
+        ? [String(year)]
+        : answer.optionId === "era_around_year"
+          ? [String(year - 2), String(year + 2)]
+          : [String(decadeStart), String(decadeStart + 9)];
+      predicates.push(guidedPredicate(
+        "era",
+        values,
+        answer.optionId === "era_year_only"
+          ? `The visitor selected the exact release year ${year}.`
+          : answer.optionId === "era_around_year"
+            ? `The visitor selected a five-year window centered on ${year}.`
+            : `The visitor selected the full ${decadeStart}s decade.`,
+      ));
     } else {
       intents.push("genre_scene");
       const values = answer.optionId === "both_funk_traditions"
@@ -1731,6 +1778,16 @@ const CRITICAL_QUESTION_COPY: Readonly<Record<StaticCriticalAmbiguityKeyV3, {
       { id: "both_funk_traditions", label: "Both traditions", description: "Build a cross-tradition survey with evidence for either lineage." },
     ],
   },
+  temporal_width: {
+    header: "Time span",
+    question: "What time span should the year cover?",
+    whyMaterial: "One release year, a nearby window, and a full decade produce different eligible catalogues.",
+    options: [
+      { id: "era_year_only", label: "That year only", description: "Use recordings released in the exact named year." },
+      { id: "era_around_year", label: "Around that year", description: "Use a five-year window centered on the named year." },
+      { id: "era_full_decade", label: "The full decade", description: "Use the complete decade containing the named year." },
+    ],
+  },
 };
 
 function criticalQuestionGeographyConstraint(
@@ -1759,7 +1816,30 @@ function criticalQuestionGeographyConstraint(
 /** Critical questions are server-owned and survive scout/provider failure. */
 export function criticalGuidanceQuestionsV3(spec: RunSpecV3): PlaylistGuidanceQuestion[] {
   return spec.criticalAmbiguities.slice(0, 3).map((ambiguity) => {
-    const copy = ambiguity.key === "geographic_genre_scope"
+    const copy = ambiguity.key === "temporal_width" && ambiguity.yearValue
+      ? {
+          header: "Time span",
+          question: `What time span should “${ambiguity.yearValue}” cover?`,
+          whyMaterial: "One release year, a nearby window, and a full decade produce different eligible catalogues.",
+          options: [
+            {
+              id: "era_year_only",
+              label: `${ambiguity.yearValue} only`,
+              description: `Use recordings released in ${ambiguity.yearValue}.`,
+            },
+            {
+              id: "era_around_year",
+              label: `Around ${ambiguity.yearValue}`,
+              description: `Use ${ambiguity.yearValue - 2}–${ambiguity.yearValue + 2}.`,
+            },
+            {
+              id: "era_full_decade",
+              label: `The ${Math.floor(ambiguity.yearValue / 10) * 10}s`,
+              description: `Use ${Math.floor(ambiguity.yearValue / 10) * 10}–${Math.floor(ambiguity.yearValue / 10) * 10 + 9}.`,
+            },
+          ] as const,
+        }
+      : ambiguity.key === "geographic_genre_scope"
       ? {
           header: `${ambiguity.geographicLabel ?? "Geographic"} ${ambiguity.genreLabel ?? "music"}`,
           question: `Which ${ambiguity.geographicLabel ?? "geographic"} relationship should define the tracks?`,
@@ -1793,10 +1873,16 @@ export function criticalGuidanceQuestionsV3(spec: RunSpecV3): PlaylistGuidanceQu
         const geographyConstraint = criticalQuestionGeographyConstraint(ambiguity, option.id);
         return {
           ...option,
-          recommended: index === 0,
+          recommended: ambiguity.key === "temporal_width" ? false : index === 0,
           effect: {
             kind: "research_preference" as const,
-            value: option.id,
+            value: ambiguity.key === "temporal_width" && ambiguity.yearValue
+              ? option.id === "era_year_only"
+                ? String(ambiguity.yearValue)
+                : option.id === "era_around_year"
+                  ? `${ambiguity.yearValue - 2}-${ambiguity.yearValue + 2}`
+                  : `${Math.floor(ambiguity.yearValue / 10) * 10}-${Math.floor(ambiguity.yearValue / 10) * 10 + 9}`
+              : option.id,
             orderingBehavior: null,
             ...(geographyConstraint ? { geographyConstraint } : {}),
           },

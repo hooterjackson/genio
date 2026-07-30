@@ -24,6 +24,7 @@ function confirmed(prompt: string, target = 50) {
     if (ambiguity.key === "french_jazz_scope") return { key: ambiguity.key, optionId: "french_scene" as const };
     if (ambiguity.key === "geographic_genre_scope") return { key: ambiguity.key, optionId: "geographic_scene" as const };
     if (ambiguity.key === "possessive_relationship") return { key: ambiguity.key, optionId: "subject_performed" as const };
+    if (ambiguity.key === "temporal_width") return { key: ambiguity.key, optionId: "era_year_only" as const };
     return { key: ambiguity.key, optionId: "funk_carioca" as const };
   });
   return resolveRunSpecV3(spec, answers);
@@ -227,20 +228,44 @@ describe("query plan V3", () => {
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
     })).toBe(1);
     expect(queryPlanV3EmissionSchemaVersion({
-      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+      PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
       NODE_ENV: "production",
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
       RELEASE_EXECUTION_ENABLED: "true",
-    })).toBe(5);
+    })).toBe(6);
     expect(() => createQueryPlanV3(plan, snapshot, {
       schemaVersion: 5,
       briefContractVersion: 3,
     })).toThrow(/canonical.*fenced contract revision/iu);
+    const verificationQuery = createQueryPlanV3(plan, snapshot, {
+      schemaVersion: 6,
+      briefContractVersion: 3,
+      playlistContractRevisionId: contractRevisionId,
+      playlistContractSemanticHash: contractSemanticHash,
+      playlistContractCompilerVersion: contract.versions.compiler,
+    });
+    expect(verificationQuery).toMatchObject({
+      schemaVersion: 6,
+      guidancePolicyVersion: "adaptive_guidance_v4",
+      inputHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      semanticHash: contractSemanticHash,
+      executionHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      strategySemanticHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      executionCoverageReport: {
+        complete: true,
+        stage: "query_plan",
+      },
+    });
+    expect(verificationQuery.verificationExpression).toMatchObject({
+      op: "leaf",
+      clauseId: "genre:disco",
+    });
+    expect(isQueryPlanV3(verificationQuery)).toBe(true);
     expect(isQueryPlanV3({
       ...query,
       playlistContractSemanticHash: "tampered",
@@ -466,8 +491,8 @@ describe("query plan V3", () => {
     const plan = confirmed("Dark house music like Moodymann but excluding Moodymann for sleep");
     expect(queryPlanV3Engines(plan)).toEqual([
       "similarity",
-      "mood_activity_theme",
       "curated_genre_scene",
+      "mood_activity_theme",
     ]);
   });
 

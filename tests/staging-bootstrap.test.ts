@@ -42,7 +42,7 @@ function bootstrapEnvironment(
     GENIO_RELEASE_VERSION: "2.4.0",
     GENIO_RELEASE_ENVIRONMENT: "staging",
     GENIO_RELEASE_PHASE: "bootstrap",
-    GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+    GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
     GENIO_RELEASE_SECRET_VERSIONS_HASH: "c".repeat(64),
     GENIO_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED: "true",
     GENIO_STAGING_BOOTSTRAP_PROJECT_ID: stagingProjectId,
@@ -142,7 +142,7 @@ describe("fresh staging bootstrap", () => {
     expect(integrated).toMatchObject({
       environment: "staging",
       phase: "bootstrap",
-      expectedDatabaseSchemaVersion: "18",
+      expectedDatabaseSchemaVersion: "19",
       expectedDatabaseCapabilityVersion: "2",
       freshEmptyDatabaseConfirmed: true,
       activationRollout: null,
@@ -171,7 +171,7 @@ describe("fresh staging bootstrap", () => {
       bootstrapEnvironment({
         GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "17",
       }),
-    )).toThrow(/requires GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=18/u);
+    )).toThrow(/requires GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19/u);
     expect(() => railwayStagingBootstrapConfiguration(
       bootstrapEnvironment({
         GENIO_RELEASE_PHASE: "bridge",
@@ -258,7 +258,7 @@ describe("fresh staging bootstrap", () => {
         RELEASE_DEPLOYMENT_PHASE: { type: "literal", value: "bootstrap" },
         RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: {
           type: "literal",
-          value: "18",
+          value: "19",
         },
         RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: {
           type: "literal",
@@ -320,11 +320,11 @@ describe("fresh staging bootstrap", () => {
     }
   });
 
-  test("blocks runtime execution and requires schema 18 plus both capability-2 markers for readiness", () => {
+  test("blocks runtime execution and requires schema 19 plus both capability-2 markers for readiness", () => {
     const runtime = {
       RELEASE_ENVIRONMENT: "staging",
       RELEASE_DEPLOYMENT_PHASE: "bootstrap",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED: "true",
     };
@@ -332,7 +332,7 @@ describe("fresh staging bootstrap", () => {
     expect(releaseExecutionConfigured(runtime)).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
@@ -346,13 +346,13 @@ describe("fresh staging bootstrap", () => {
     })).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: null,
       observedCanonicalExecutionHardeningVersion: "1",
     })).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: null,
     })).toBe(false);
@@ -369,7 +369,7 @@ describe("fresh staging bootstrap", () => {
         ...runtime,
         RELEASE_ENVIRONMENT: "production",
       },
-      observedDatabaseSchemaVersion: "18",
+      observedDatabaseSchemaVersion: "19",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
     })).toBe(false);

@@ -45,11 +45,11 @@ type PromotionReleaseDeploymentPhase = Exclude<
 >;
 export type ReleaseEnvironment = "staging" | "production";
 
-export const EXPANDED_DATABASE_SCHEMA_VERSION = "18";
+export const EXPANDED_DATABASE_SCHEMA_VERSION = "19";
 export { MAXIMUM_STAGING_MONTHLY_COST_USD };
 
 const SHA256 = /^[0-9a-f]{64}$/u;
-const DATABASE_SCHEMA = /^(?:1[3-8])$/u;
+const DATABASE_SCHEMA = /^(?:1[3-9])$/u;
 
 export interface StagingReleaseControls {
   monthlyCostLimitUsd: number;
@@ -781,7 +781,7 @@ export function railwayReleasePhaseConfiguration(
     "GENIO_EXPECTED_DATABASE_SCHEMA_VERSION",
   );
   if (!DATABASE_SCHEMA.test(expectedDatabaseSchemaVersion)) {
-    throw new Error("GENIO_EXPECTED_DATABASE_SCHEMA_VERSION must be an integer from 13 through 18");
+    throw new Error("GENIO_EXPECTED_DATABASE_SCHEMA_VERSION must be an integer from 13 through 19");
   }
   if (
     (phase === "expand" || phase === "activate" || phase === "rollout")

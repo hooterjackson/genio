@@ -12,7 +12,7 @@ const versions = {
 
 describe("Pipeline V2 terminal outcomes", () => {
   test.each([
-    ["provider_call_limit", 10, "partial_catalog_degraded", "catalog_provider_call_limit", false, false],
+    ["provider_call_limit", 10, "partial_catalog_degraded", "local_catalog_budget_exhausted", false, false],
     ["timed_out", 10, "partial_timed_out", "catalog_discovery_timed_out", false, false],
     ["provider_circuit_open", 10, "partial_catalog_degraded", "apple_provider_circuit_open", false, true],
     ["provider_degraded", 10, "partial_catalog_degraded", "apple_provider_degraded", false, true],
@@ -47,7 +47,7 @@ describe("Pipeline V2 terminal outcomes", () => {
   test.each([
     ["provider_degraded", "apple_provider_degraded"],
     ["provider_circuit_open", "apple_provider_circuit_open"],
-    ["provider_call_limit", "catalog_provider_call_limit"],
+    ["provider_call_limit", "local_catalog_budget_exhausted"],
     ["timed_out", "catalog_discovery_timed_out"],
   ] as const)(
     "never maps zero-track %s to no compatible tracks",
@@ -57,10 +57,12 @@ describe("Pipeline V2 terminal outcomes", () => {
         safeTrackCount: 0,
         targetTrackCount: 25,
       })).toEqual({
-        status: "failed_system",
+        status: reasonCode === "local_catalog_budget_exhausted"
+          ? "partial_catalog_degraded"
+          : "failed_system",
         reasonCode,
         frontierExhausted: false,
-        providerUnavailable: true,
+        providerUnavailable: reasonCode !== "local_catalog_budget_exhausted",
       });
     },
   );

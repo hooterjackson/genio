@@ -97,6 +97,78 @@ const run = {
   frontier: [],
 };
 
+test("a precise request shows and explicitly receipts the zero-question V4 checkpoint", async ({
+  page,
+  context,
+}) => {
+  const confirmationRequestId = "brief-v4-interpretation-confirmation";
+  const questionSetHash = "9".repeat(64);
+  const summary = {
+    mustHave: ["Recordings by Radiohead", "Studio recordings"],
+    prefer: [],
+    avoid: ["Live recordings", "Remixes"],
+    flow: ["Chronological"],
+    count: 25,
+  };
+  let submitted: Record<string, unknown> | null = null;
+  await context.route("**/api/v1/brief/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === `/api/v1/brief/${confirmationRequestId}` && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          requestId: confirmationRequestId,
+          prompt: "Exactly 25 studio recordings by Radiohead",
+          requestedTrackCount: 25,
+          status: "awaiting_answers",
+          briefContractVersion: 3,
+          questionSetHash,
+          checkpointMode: "interpretation_confirmation",
+          interpretationSummary: summary,
+          brief: {
+            ...brief,
+            title: "Radiohead studio chronology",
+            targetSize: { min: 25, max: 25 },
+          },
+          questions: [],
+        }),
+      });
+      return;
+    }
+    if (pathname === `/api/v1/brief/${confirmationRequestId}/answers` && request.method() === "POST") {
+      submitted = request.postDataJSON() as Record<string, unknown>;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          requestId: confirmationRequestId,
+          status: "failed",
+          error: "test stopped after confirmation receipt",
+        }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto(`/?brief=${confirmationRequestId}`);
+  await expect(page.getByRole("heading", { name: /here’s how gênio will build it/i })).toBeVisible();
+  const checkpoint = page.getByTestId("guidance-confirmation-summary");
+  await expect(checkpoint).toContainText("Recordings by Radiohead");
+  await expect(checkpoint).toContainText("Live recordings");
+  await expect(checkpoint).toContainText("Chronological");
+  await expect(checkpoint).toContainText("25 TRACKS · EXACT");
+  await expect(page.getByText("QUESTION 1 OF", { exact: false })).toHaveCount(0);
+  await page.getByRole("button", { name: /create this playlist/i }).click();
+  await expect.poll(() => submitted).not.toBeNull();
+  expect(submitted).toMatchObject({
+    answers: [],
+    questionSetHash,
+  });
+});
+
 test("custom hard rules require a visible summary and a stale second tab must review the successor", async ({
   context,
 }) => {

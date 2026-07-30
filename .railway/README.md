@@ -47,7 +47,7 @@ GENIO_RELEASE_VERIFICATION_KEY_SHA256=<pinned-public-key-sha256> \
 railway config plan
 ```
 
-The schema-18 release is three separate plans against the same image digest,
+The schema-19 release is three separate plans against the same image digest,
 revision, version, and environment. A brand-new staging environment with a
 fresh, empty database has one additional one-time bootstrap plan before those
 three plans. Export the reviewed artifact values before each command:
@@ -61,10 +61,10 @@ export GENIO_RELEASE_RC_TAG=v<stable-semver>-rc.<n>
 export GENIO_RELEASE_ENVIRONMENT=staging
 
 # 0. bootstrap (fresh staging only): explicitly assert that the new staging
-#    database is empty. The API runs the schema-18 migration; both worker lanes
+#    database is empty. The API runs the schema-19 migration; both worker lanes
 #    remain at zero replicas and every /api/v1 mutation is runtime-fenced.
 GENIO_RELEASE_PHASE=bootstrap \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=18 \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19 \
 GENIO_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED=true \
 GENIO_STAGING_BOOTSTRAP_PROJECT_ID=<selected-railway-project-uuid> \
 GENIO_STAGING_BOOTSTRAP_ENVIRONMENT_ID=<fresh-staging-environment-uuid> \
@@ -76,7 +76,7 @@ GENIO_STAGING_BOOTSTRAP_CAPABILITY_PEPPER_VERSION=<bootstrap-only-version> \
 GENIO_STAGING_BOOTSTRAP_PRODUCTION_CAPABILITY_PEPPER_SHA256=<production-pepper-fingerprint> \
 railway config plan
 
-# Apply only that reviewed plan, then require /health/ready to report schema 18,
+# Apply only that reviewed plan, then require /health/ready to report schema 19,
 # releaseManifestCanaryGuardsVersion 1, and
 # canonicalExecutionHardeningVersion 1. Unset the one-time confirmation,
 # configure the dedicated staging controls, and retain the same immutable image
@@ -86,16 +86,16 @@ railway config plan
 # only the new Postgres reference and the explicit bootstrap-only credentials;
 # both zero-replica worker lanes receive no provider or publication credentials.
 
-# 1. bridge: deploy schema-13–18-capable API and both protocol-10 worker lanes.
+# 1. bridge: deploy schema-13–19-capable API and both protocol-11 worker lanes.
 #    There is deliberately no pre-deploy migration.
 GENIO_RELEASE_PHASE=bridge \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=<observed-13-through-18> \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=<observed-13-through-19> \
 railway config plan
 
 # 2. expand: only after release:migration:verify produced passing bridge
 #    evidence. This is the only phase whose API has `pnpm run db:migrate`.
 GENIO_RELEASE_PHASE=expand \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=18 \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19 \
 GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE=<signed-bridge-evidence.json> \
 GENIO_BRIDGE_DATABASE_SCHEMA_VERSION=<observed-bridge-schema> \
 GENIO_BRIDGE_DATABASE_CAPABILITY_VERSION=<observed-version-or-none> \
@@ -104,10 +104,10 @@ GENIO_BRIDGE_CANONICAL_EXECUTION_HARDENING_VERSION=<observed-1-or-none> \
 GENIO_BRIDGE_CONFIGURATION_HASH=<signed-bridge-configuration-sha256> \
 railway config plan
 
-# 3. activate: only after another verification proves schema 18 and two fresh
+# 3. activate: only after another verification proves schema 19 and two fresh
 #    worker heartbeats per lane while canonical emission is still disabled.
 GENIO_RELEASE_PHASE=activate \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=18 \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19 \
 GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE=<signed-bridge-evidence.json> \
 GENIO_BRIDGE_DATABASE_SCHEMA_VERSION=<observed-bridge-schema> \
 GENIO_BRIDGE_DATABASE_CAPABILITY_VERSION=<observed-version-or-none> \
@@ -162,7 +162,7 @@ Expand additionally loads
 envelope and `GENIO_EXPAND_CONVERGENCE_EVIDENCE_FILE`. Both are strict signed
 `genio-promotion-phase-evidence/v2` envelopes. Railway verifies their
 signatures, freshness, candidate-evidence hash, immutable image, source,
-configuration aggregate, protocol-10 runtime, database schema, composite
+configuration aggregate, protocol-11 runtime, database schema, composite
 capability 2, release-manifest marker 1, canonical-hardening marker 1,
 two advancing worker heartbeats per lane, and zero eligible old workers. The
 configuration aggregate is recomputed from the API, interactive-worker, and
@@ -264,8 +264,8 @@ and the live rollout evidence hash/stage exactly match the previous signed
 target. API and both worker lanes must expose the candidate identity while
 Sites must retain the exact prior version/revision recorded by the backend
 promotion snapshot. The envelope binds the exact source, image, promotion
-configuration, runtime, production canaries, schema 18, composite capability
-2, both marker-1 values, and protocol 10.
+configuration, runtime, production canaries, schema 19, composite capability
+2, both marker-1 values, and protocol 11.
 
 Review a separate production Railway plan for that exact envelope:
 
@@ -342,7 +342,7 @@ tag/Release creation is not authorized.
   project/environment UUIDs, independent bootstrap-only gateway/capability
   secrets, and non-matching production secret fingerprints. It runs
   `pnpm run db:migrate` on the API, deploys both worker lanes at zero replicas,
-  emits no preserved variables, and reports ready only after schema 18 and
+  emits no preserved variables, and reports ready only after schema 19 and
   both marker-1 values are authoritative. The assertion is invalid in every
   later phase and bootstrap is rejected for production.
 - The configuration fails closed unless `GENIO_RELEASE_IMAGE` is an immutable
@@ -382,7 +382,7 @@ tag/Release creation is not authorized.
   variable.
 - `railway config apply` previews changes and asks before applying unless you pass `--yes`.
 - Destructive changes in non-interactive or agent sessions require `railway config apply --confirm-destructive` after reviewing the plan.
-- After schema-18 writes, rollback means redeploying the same schema-13–18
+- After schema-19 writes, rollback means redeploying the same schema-13–19
   artifact in `bridge` phase and routing new assignments to the last proven
   cohort. Never deploy an older max-schema-16 binary and never down-migrate.
 - Services already managed by `railway.json` / `railway.toml` must be migrated before `.railway/railway.ts` can manage them.

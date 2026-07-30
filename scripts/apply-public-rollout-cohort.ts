@@ -421,10 +421,10 @@ export async function applyPublicRolloutDatabaseTransition(
           WHERE key='release_manifest_canary_guards_version') capability_version`,
     );
     if (
-      readiness.rows[0]?.schema_version !== "18"
+      readiness.rows[0]?.schema_version !== "19"
       || readiness.rows[0]?.capability_version !== "1"
     ) {
-      throw new Error("public rollout database is not schema-18/capability-1 ready");
+      throw new Error("public rollout database is not schema-19/capability-1 ready");
     }
     const globalSettingKey = "public_rollout_state:global";
     const intentSettingKey =

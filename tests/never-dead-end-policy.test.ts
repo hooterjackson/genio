@@ -12,7 +12,7 @@ describe("never-dead-end policy", () => {
       status: "no_compatible_tracks",
       phase: "frontier_exhausted",
     })).toEqual({
-      state: "needs_decision",
+      state: "needs_input",
       nextAction: "answer_rescue_guidance",
       terminal: false,
     });

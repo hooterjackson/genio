@@ -10,12 +10,12 @@ const productionActivateEnvironment = {
   NODE_ENV: "production",
   RELEASE_ENVIRONMENT: "production",
   RELEASE_DEPLOYMENT_PHASE: "activate",
-  RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "18",
+  RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
   RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
   RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
   RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
   RELEASE_EXECUTION_ENABLED: "true",
-  PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "5",
+  PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
   OPENAI_API_KEY: "test-openai-key",
   APPLE_TEAM_ID: "test-team",
   APPLE_KEY_ID: "test-key",
@@ -88,7 +88,7 @@ describe("worker release database fence", () => {
 
   test("production activation cannot start or lease without the schema-18 capability", async () => {
     const repository = repositoryHarness({
-      schemaVersion: "18",
+      schemaVersion: "19",
       capabilityVersion: null,
       hardeningVersion: "1",
     });
@@ -102,7 +102,7 @@ describe("worker release database fence", () => {
 
   test("a capability lost after startup is rechecked before the next lease", async () => {
     const repository = repositoryHarness({
-      schemaVersion: "18",
+      schemaVersion: "19",
       capabilityVersion: "1",
       hardeningVersion: "1",
     });
@@ -135,7 +135,7 @@ describe("worker release database fence", () => {
       { releaseIdentityVersion: "1", releaseIdentitySupported: false },
     ]) {
       const repository = repositoryHarness({
-        schemaVersion: "18",
+        schemaVersion: "19",
         capabilityVersion: "1",
         hardeningVersion: "1",
         ...releaseIdentity,
@@ -150,7 +150,7 @@ describe("worker release database fence", () => {
 
   test("production activation with schema 18 and its capability may lease", async () => {
     const repository = repositoryHarness({
-      schemaVersion: "18",
+      schemaVersion: "19",
       capabilityVersion: "1",
       hardeningVersion: "1",
     });

@@ -60,6 +60,37 @@ describe("public API projections", () => {
     blocker: null,
   });
 
+  test("preserves the V4 interpretation checkpoint without leaking unrelated brief internals", () => {
+    const view = publicBriefStatusView({
+      requestId: "brief-confirmation",
+      prompt: "Exactly 25 studio recordings by Radiohead",
+      requestedTrackCount: 25,
+      status: "awaiting_answers",
+      briefContractVersion: 3,
+      questionSetHash: "a".repeat(64),
+      checkpointMode: "interpretation_confirmation",
+      interpretationSummary: {
+        mustHave: ["Recordings by Radiohead", "Studio recordings"],
+        prefer: [],
+        avoid: ["Live recordings", "Remixes"],
+        flow: ["Chronological"],
+        count: 25,
+      },
+      questions: [],
+      privateCompilerTrace: "must not be public",
+    });
+    expect(view).toMatchObject({
+      status: "awaiting_answers",
+      questions: [],
+      checkpointMode: "interpretation_confirmation",
+      interpretationSummary: {
+        count: 25,
+        flow: ["Chronological"],
+      },
+    });
+    expect(view).not.toHaveProperty("privateCompilerTrace");
+  });
+
   test("narrows owner-only and unimplemented run actions to visitor-supported paths", () => {
     expect(publicRunResolutionView(
       resolution("answer_rescue_guidance", "needs_input"),
