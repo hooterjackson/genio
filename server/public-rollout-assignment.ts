@@ -17,6 +17,29 @@ import { sha256Hex, stableStringify } from "./security.ts";
 export const PUBLIC_ROLLOUT_ASSIGNMENT_VERSION =
   "signed_public_contract_rollout_v1";
 
+export function publicRolloutAssignmentStickyKeyV1(input: {
+  owner: boolean;
+  clientBucket: string;
+  releaseCanary: {
+    canaryId: string;
+    environment: "staging" | "production";
+    operation: "brief" | "run";
+  } | null;
+}): string | null {
+  if (input.owner) return null;
+  if (input.releaseCanary === null) return input.clientBucket;
+  if (
+    input.releaseCanary.environment === "production"
+    && input.releaseCanary.operation === "brief"
+    && /^[0-9A-Za-z][0-9A-Za-z._-]{2,63}$/u.test(
+      input.releaseCanary.canaryId,
+    )
+  ) {
+    return `release-canary:${input.releaseCanary.canaryId}`;
+  }
+  return null;
+}
+
 export interface PersistedPublicRolloutAssignmentV1 {
   version: typeof PUBLIC_ROLLOUT_ASSIGNMENT_VERSION;
   rolloutEvidenceHash: string;

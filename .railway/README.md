@@ -177,10 +177,11 @@ no DB control blocks the owner V3 candidate group. Its non-secret database
 identity digest must exactly match
 `GENIO_PRODUCTION_DATABASE_IDENTITY_HASH`, preventing a valid preflight from a
 different Railway database from being replayed. The resulting activation
-plan writes every public V2/V3 percentage as literal `0`, disables V2 owner
-canaries and global/reggaeton V3 guidance, and enables only the authenticated
-owner `corpus_first_v3` genre-scene candidate route plus the curated-hosted
-evidence approval already established by the required staging gates. It also
+plan keeps the proven public V2 curated control at literal `100`, writes every
+other public V2/V3 percentage as literal `0`, disables V2 owner canaries and
+global/reggaeton V3 guidance, and enables only the authenticated owner
+`corpus_first_v3` genre-scene candidate route plus the curated-hosted evidence
+approval already established by the required staging gates. It also
 writes `PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION=5` and all three database
 expectation literals directly from the signed activation configuration. These
 literals override preserved Railway values. If the protected phase-evidence producer or any

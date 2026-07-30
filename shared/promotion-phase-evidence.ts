@@ -60,7 +60,7 @@ export type PromotionObservedPhase = "bridge" | "expand";
 export interface ActivationRolloutConfiguration
   extends RequiredActivationExecutionControls {
   PIPELINE_V2_OWNER_CANARY: "false";
-  PIPELINE_V2_CURATED_PERCENT: "0";
+  PIPELINE_V2_CURATED_PERCENT: "100";
   PIPELINE_V2_SIMILARITY_PERCENT: "0";
   PIPELINE_V2_FACTUAL_OWNER_CANARY: "false";
   PIPELINE_V2_FACTUAL_PERCENT: "0";
@@ -385,8 +385,9 @@ function validateActivationPreflight(value: unknown): {
     ...Object.keys(OWNER_CANDIDATE_BOOLEAN_FLAGS),
   ], "activation preflight.rolloutFlags");
   for (const flag of PUBLIC_ROLLOUT_PERCENT_FLAGS) {
-    if (rolloutFlags[flag] !== "0") {
-      throw new Error(`activation preflight requires ${flag}=0`);
+    const expected = flag === "PIPELINE_V2_CURATED_PERCENT" ? "100" : "0";
+    if (rolloutFlags[flag] !== expected) {
+      throw new Error(`activation preflight requires ${flag}=${expected}`);
     }
   }
   for (const [flag, expected] of Object.entries(OWNER_CANDIDATE_BOOLEAN_FLAGS)) {
@@ -450,7 +451,7 @@ function validateActivationPreflight(value: unknown): {
   const rollout: ActivationRolloutConfiguration = {
     ...REQUIRED_ACTIVATION_EXECUTION_CONTROLS,
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",

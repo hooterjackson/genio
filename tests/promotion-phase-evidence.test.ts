@@ -44,7 +44,7 @@ function phasePayload(
   }];
   const rolloutFlags = {
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",
@@ -218,7 +218,7 @@ describe("signed Railway promotion phase evidence", () => {
     );
     expect(verified.activationRollout).toMatchObject({
       ...REQUIRED_ACTIVATION_EXECUTION_CONTROLS,
-      PIPELINE_V2_CURATED_PERCENT: "0",
+      PIPELINE_V2_CURATED_PERCENT: "100",
       PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
       PIPELINE_V3_OWNER_CANARY: "true",
       PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",

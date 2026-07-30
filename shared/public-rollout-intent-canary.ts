@@ -133,6 +133,7 @@ export interface VerifiedPublicRolloutIntentCanaryV1 {
     orderedAppleIdsHash: string;
     independentAppleEvidenceHash: string;
     browserEvidenceHash: string;
+    workerConfigurationHash: string;
   };
   stageMetrics: {
     windowStartedAt: string;
@@ -511,7 +512,6 @@ function validatePayload(value: unknown): {
       "public rollout intent canary execution.selectedTrackCount",
     ) !== expectedFixture.targetTrackCount
     || execution.workerRevision !== candidate.sourceRevision
-    || execution.workerConfigurationHash !== apiConfigurationHash
     || execution.workerIdentityHash !== executorIdentityHash
     || execution.contractSemanticHash !== contractSemanticHash
     || (
@@ -524,6 +524,10 @@ function validatePayload(value: unknown): {
   ) {
     throw new Error("public rollout intent canary execution is not exact");
   }
+  const workerConfigurationHash = sha256Digest(
+    execution.workerConfigurationHash,
+    "public rollout intent canary execution.workerConfigurationHash",
+  );
   for (const field of [
     "manifestContentHash",
     "orderedAppleIdsHash",
@@ -798,6 +802,7 @@ function validatePayload(value: unknown): {
           execution.independentAppleEvidenceHash,
         ),
         browserEvidenceHash: String(execution.browserEvidenceHash),
+        workerConfigurationHash,
       },
       stageMetrics: {
         windowStartedAt,

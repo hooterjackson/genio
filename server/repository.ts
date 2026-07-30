@@ -272,6 +272,7 @@ import {
   desiredPlaylistArtistCount,
   selectRankedPlaylistRows,
 } from "../lib/playlist-selection.ts";
+import { fixedTrackListEntryIndex } from "./fixed-track-list-policy.ts";
 import { sequencePlaylist, shouldSequencePlaylist } from "../lib/playlist-sequencing.ts";
 import {
   applyExecutableRequestedTrackCount,
@@ -18140,11 +18141,50 @@ export class Repository {
       const maximumTracks = brief.mode === "curated"
         ? Math.max(1, Math.floor(brief.targetSize?.max ?? 100))
         : Number.POSITIVE_INFINITY;
+      const fixedTrackListRequired = selectionPlan?.scopeKind === "fixed_track_list";
+      if (fixedTrackListRequired
+        && (!selectionPlan.fixedTrackList || selectionPlan.fixedTrackList.length === 0)) {
+        throw new HttpError(
+          409,
+          "The immutable fixed track membership contract is unavailable",
+          "fixed_track_list_contract_missing",
+        );
+      }
+      const fixedTrackList = fixedTrackListRequired
+        ? selectionPlan!.fixedTrackList!
+        : null;
+      let fixedListRejectedMatches: ManifestSelectionRow[] = [];
+      let membershipMatches = matches.rows;
+      if (fixedTrackList) {
+        const selectedCandidateIds = new Set<string>();
+        membershipMatches = fixedTrackList.map((_entry, expectedIndex) => {
+          const exact = matches.rows.find((row) => (
+            !selectedCandidateIds.has(row.candidate_id)
+            && fixedTrackListEntryIndex(
+              fixedTrackList,
+              { artist: row.artist, title: row.title },
+              row.song_json,
+            ) === expectedIndex
+          ));
+          if (!exact) {
+            throw new HttpError(
+              409,
+              `The exact fixed track at position ${expectedIndex + 1} is not catalog-ready`,
+              "fixed_track_list_incomplete",
+            );
+          }
+          selectedCandidateIds.add(exact.candidate_id);
+          return exact;
+        });
+        fixedListRejectedMatches = matches.rows.filter((row) => (
+          !selectedCandidateIds.has(row.candidate_id)
+        ));
+      }
       const familyPartition = pipelineV2
-        ? partitionUniqueRecordingFamilies(matches.rows, (row) => (
+        ? partitionUniqueRecordingFamilies(membershipMatches, (row) => (
           row.recording_family_id ?? recordingFamilyKey({ song: row.song_json })
         ))
-        : { unique: matches.rows, duplicates: [] as ManifestSelectionRow[] };
+        : { unique: membershipMatches, duplicates: [] as ManifestSelectionRow[] };
       const familyDuplicateMatches = familyPartition.duplicates;
       const manifestEligibleMatches = familyPartition.unique;
       let constraintSelection: ConstraintSelection<ManifestSelectionRow> = {
@@ -18152,7 +18192,7 @@ export class Repository {
         selected: manifestEligibleMatches,
         relaxedSoftConstraints: [] as string[],
       };
-      let hardRejectedMatches: ManifestSelectionRow[] = [];
+      let hardRejectedMatches: ManifestSelectionRow[] = fixedListRejectedMatches;
       let ladderOverflowMatches: ManifestSelectionRow[] = familyDuplicateMatches;
       if (selectionPlan && pipelineVersion !== "legacy_v1") {
         const bindingResult = await client.query<{
@@ -18238,8 +18278,16 @@ export class Repository {
               scopeAxis: binding.scopeAxis,
             };
           });
-          const candidateScopeEligible = scopeBindingEligible(brief.mode, summaries, selectionPlan.intents)
-            && selectionGeographyBindingsSatisfied(selectionPlan, bindings);
+          // A fixed artist/title list is its own closed membership authority.
+          // Requiring an unrelated genre/scene binding here used to work only
+          // because the compiler invented a genre fallback for intent-less
+          // requests. Exact candidate and Apple identity matching above plus
+          // the unchanged version policy are the correct eligibility gates.
+          const candidateScopeEligible = fixedTrackList !== null
+            || (
+              scopeBindingEligible(brief.mode, summaries, selectionPlan.intents)
+              && selectionGeographyBindingsSatisfied(selectionPlan, bindings)
+            );
           const violations = manifestConstraintViolations({
             row,
             plan: selectionPlan,
@@ -18301,9 +18349,14 @@ export class Repository {
           ...(rankQualifiedCandidates ? { rankQualifiedCandidates } : {}),
         });
         const selectedIds = new Set(constraintSelection.selected.map((row) => row.candidate_id));
-        hardRejectedMatches = candidates
+        hardRejectedMatches = [
+          ...fixedListRejectedMatches,
+          ...candidates
           .filter((candidate) => candidate.violations.some((violation) => hardRuleIds.has(violation)))
-          .map((candidate) => candidate.value);
+          .map((candidate) => candidate.value),
+        ].filter((match, index, values) => (
+          values.findIndex((candidate) => candidate.candidate_id === match.candidate_id) === index
+        ));
         const hardRejectedIds = new Set(hardRejectedMatches.map((row) => row.candidate_id));
         ladderOverflowMatches = [
           ...familyDuplicateMatches,
@@ -18364,6 +18417,13 @@ export class Repository {
           : 0,
       });
       const selectedMatches = selection.selected;
+      if (fixedTrackList && selectedMatches.length !== fixedTrackList.length) {
+        throw new HttpError(
+          409,
+          "The immutable fixed track list did not survive manifest eligibility",
+          "fixed_track_list_incomplete",
+        );
+      }
       const overflowMatches = [
         ...ladderOverflowMatches,
         ...selection.overflow,

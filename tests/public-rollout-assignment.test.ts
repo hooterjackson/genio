@@ -4,6 +4,7 @@ import {
   createPublicRolloutAssignmentV1,
   parsePublicRolloutAssignmentV1,
   publicRolloutCanonicalContractRequestedV1,
+  publicRolloutAssignmentStickyKeyV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "../server/public-rollout-assignment.ts";
 import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";
@@ -42,7 +43,7 @@ function databaseAuthority(
 ) {
   const configuration = {
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",
@@ -119,6 +120,32 @@ function assignment(
 }
 
 describe("persisted public canonical rollout assignment", () => {
+  test("uses a protected production canary ID as its deterministic sticky key", () => {
+    expect(publicRolloutAssignmentStickyKeyV1({
+      owner: false,
+      clientBucket: "public-bucket",
+      releaseCanary: {
+        canaryId: "genre-scene-1-percent",
+        environment: "production",
+        operation: "brief",
+      },
+    })).toBe("release-canary:genre-scene-1-percent");
+    expect(publicRolloutAssignmentStickyKeyV1({
+      owner: false,
+      clientBucket: "public-bucket",
+      releaseCanary: {
+        canaryId: "staging-control",
+        environment: "staging",
+        operation: "brief",
+      },
+    })).toBeNull();
+    expect(publicRolloutAssignmentStickyKeyV1({
+      owner: true,
+      clientBucket: "owner-bucket",
+      releaseCanary: null,
+    })).toBeNull();
+  });
+
   test("selects only the sticky 1% genre cohort before canonical brief compilation", () => {
     let selected = null as ReturnType<typeof assignment> | null;
     let control = null as ReturnType<typeof assignment> | null;

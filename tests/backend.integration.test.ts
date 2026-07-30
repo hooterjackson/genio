@@ -94,7 +94,7 @@ function publicRolloutAuthority(
   const percentage = environment.PIPELINE_V3_GENRE_SCENE_PERCENT ?? "0";
   const configuration: PublicRolloutConfiguration = {
     PIPELINE_V2_OWNER_CANARY: "false",
-    PIPELINE_V2_CURATED_PERCENT: "0",
+    PIPELINE_V2_CURATED_PERCENT: "100",
     PIPELINE_V2_SIMILARITY_PERCENT: "0",
     PIPELINE_V2_FACTUAL_OWNER_CANARY: "false",
     PIPELINE_V2_FACTUAL_PERCENT: "0",
@@ -4772,6 +4772,118 @@ databaseDescribe("hosted backend integration", () => {
       deficit_count: 2,
       reason_code: "manifest_hard_constraint_shortfall",
     });
+  });
+
+  test("Pipeline V2 fixed lists reject substitutes and preserve the exact requested Apple order", async () => {
+    const fixedBrief: PlaylistBrief = {
+      title: "Pop Classics 3-Pack",
+      description: "The exact original studio recordings in the requested order.",
+      mode: "curated",
+      subjectEntities: ["Michael Jackson", "Madonna", "Earth, Wind & Fire"],
+      relationship: "Exact original studio recordings in a user-specified order",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: ["remixes", "live versions", "radio edits", "covers", "re-recordings", "duplicates"],
+      versionPolicy: "Use only the original studio recording of each listed song; do not substitute alternate versions.",
+      evidencePolicy: "Verify track identity by canonical song title, primary artist, and original studio release version.",
+      orderingPolicy: "Keep the three tracks in the exact order provided by the user.",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const runId = await repository.createRun(fixedBrief.title, fixedBrief, 0, 1);
+    const plan = createSelectionPlanV2({ prompt: fixedBrief.description, brief: fixedBrief });
+    expect(plan.scopeKind).toBe("fixed_track_list");
+    await repository.savePipelineSelectionPlan(runId, plan);
+
+    const sourceUrl = `https://fixed-list.example/${randomUUID()}`;
+    const sourceIds = await repository.addSources(runId, [{
+      url: sourceUrl,
+      title: "Exact recording identity evidence",
+      sourceClass: "web",
+      provenanceRoot: "fixed-list.example",
+      note: "Track-specific fixed-list identity evidence.",
+    }]);
+    const rows = [
+      { rank: 1, artist: "Michael Jackson", title: "Chicago", id: "850697800" },
+      { rank: 2, artist: "Michael Jackson", title: "Don't Stop 'Til You Get Enough", id: "186166292" },
+      { rank: 3, artist: "Michael Jackson", title: "Human Nature", id: "269573405" },
+      { rank: 4, artist: "Michael Jackson", title: "Billie Jean", id: "269573364" },
+      { rank: 5, artist: "Madonna", title: "La Isla Bonita", id: "80815277" },
+      { rank: 6, artist: "Earth, Wind & Fire", title: "September", id: "1456446747" },
+    ];
+    const citations = new Map(rows.map((row) => [
+      row.title,
+      citationFixture(sourceUrl, row.title, fixedBrief.relationship, row.artist),
+    ]));
+    await repository.addCitationAttestations(
+      runId,
+      [...citations.values()].map((citation) => citation.attestation),
+    );
+    await repository.addCandidates(runId, rows.map((row) => ({
+      selectionRank: row.rank,
+      artist: row.artist,
+      title: row.title,
+      album: "Original Studio Album",
+      releaseYear: 1982,
+      durationMs: 240_000,
+      isrc: null,
+      musicbrainzId: null,
+      versionLabel: null,
+      evidence: [{
+        sourceUrl,
+        state: "verified" as const,
+        supportScope: "track" as const,
+        subjectEntity: row.artist,
+        subjectRelationship: fixedBrief.relationship,
+        relationship: fixedBrief.relationship,
+        note: `Exact identity evidence for ${row.artist} — ${row.title}.`,
+        citationSupport: citations.get(row.title)!.support,
+      }],
+    })), sourceIds, "track_verification");
+    const candidates = new Map((await repository.listCandidates(runId)).map((candidate) => [
+      `${candidate.artist}\u0000${candidate.title}`,
+      candidate,
+    ]));
+    for (const row of rows) {
+      const candidate = candidates.get(`${row.artist}\u0000${row.title}`)!;
+      await repository.saveMatch(runId, {
+        candidateId: candidate.id,
+        status: "accepted",
+        basis: "Exact compatible catalog identity",
+        score: 1,
+        song: {
+          id: row.id,
+          name: row.title,
+          artistName: row.artist,
+          albumName: "Original Studio Album",
+          releaseDate: "1982-01-01",
+          durationInMillis: 240_000,
+        },
+        alternatives: [],
+      });
+    }
+    await repository.updateRun(runId, { status: "visitor_review", phase: "exception_review" });
+
+    const manifest = await repository.createManifest(runId);
+    expect(manifest.tracks.map((track) => [track.artist, track.title, track.catalogId])).toEqual([
+      ["Michael Jackson", "Billie Jean", "269573364"],
+      ["Madonna", "La Isla Bonita", "80815277"],
+      ["Earth, Wind & Fire", "September", "1456446747"],
+    ]);
+    const rejected = await repository.pool.query<{ title: string; status: string }>(
+      `SELECT c.title,m.status FROM track_candidates c
+       JOIN catalog_matches m ON m.run_id=c.run_id AND m.candidate_id=c.id
+       WHERE c.run_id=$1 AND m.catalog_id=ANY($2::text[]) ORDER BY c.selection_rank`,
+      [runId, ["850697800", "186166292", "269573405"]],
+    );
+    expect(rejected.rows).toEqual([
+      { title: "Chicago", status: "unsupported" },
+      { title: "Don't Stop 'Til You Get Enough", status: "unsupported" },
+      { title: "Human Nature", status: "unsupported" },
+    ]);
   });
 
   test("Pipeline V2 manifest eligibility retains separate factual and editorial claims for composite requests", async () => {

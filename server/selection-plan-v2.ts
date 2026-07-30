@@ -24,6 +24,7 @@ import {
   selectionGeographyValuesEquivalent,
   uniqueGeographyConstraints,
 } from "./selection-geography-policy.ts";
+import { compileFixedTrackList } from "./fixed-track-list-policy.ts";
 
 export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 
@@ -915,7 +916,9 @@ function selectionScopeKind(
   prompt: string,
   intents: readonly ResearchIntent[],
   brief: PlaylistBrief,
+  hasFixedTrackList: boolean,
 ): SelectionScopeKind {
+  if (hasFixedTrackList) return "fixed_track_list";
   if (fixedReleaseContainerScope(prompt, brief)) return "fixed_release_container";
   if (intents.includes("factual_relationship") || intents.includes("exhaustive")) return "factual_frontier";
   if (intents.includes("artist_catalogue")) return "artist_catalogue";
@@ -1008,7 +1011,13 @@ export function createSelectionPlanV2(input: {
 }): SelectionPlan {
   const guidance = input.guidancePreferences ?? [];
   const intents = intentSet(input.prompt, input.brief);
-  const scopeKind = selectionScopeKind(input.prompt, intents, input.brief);
+  const compiledFixedTrackList = compileFixedTrackList(input.brief);
+  const scopeKind = selectionScopeKind(
+    input.prompt,
+    intents,
+    input.brief,
+    compiledFixedTrackList !== null,
+  );
   const compiledFixedContainerIdentity = scopeKind === "fixed_release_container"
     ? fixedContainerIdentity(input.prompt, input.brief)
     : undefined;
@@ -1046,6 +1055,9 @@ export function createSelectionPlanV2(input: {
     scopeKind,
     ...(compiledFixedContainerIdentity ? {
       fixedContainerIdentity: compiledFixedContainerIdentity,
+    } : {}),
+    ...(compiledFixedTrackList ? {
+      fixedTrackList: compiledFixedTrackList,
     } : {}),
     storefront: (input.storefront ?? "us").toLocaleLowerCase("en-US"),
     requestedTrackCount,
@@ -1204,6 +1216,7 @@ export function selectionPlanResearchContext(plan: SelectionPlan | null | undefi
     softGoalRelaxationOrder: plan.softGoalRelaxationOrder,
     similarityDimensions: plan.similarityDimensions,
     referenceRecordings: plan.referenceRecordings,
+    fixedTrackList: plan.fixedTrackList,
     labels: plan.labels,
     venues: plan.venues,
     diversityGoals: plan.diversityGoals,

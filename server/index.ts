@@ -127,6 +127,7 @@ import {
 import {
   createPublicRolloutAssignmentV1,
   publicRolloutCanonicalContractRequestedV1,
+  publicRolloutAssignmentStickyKeyV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "./public-rollout-assignment.ts";
 
@@ -841,18 +842,21 @@ app.post<{
   }
   const expandedTrackCountRequested = preliminaryTrackCountAdmission.expanded;
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
-  const publicRolloutDatabaseAuthority = !isOwner(caller)
-    && releaseCanary === null
+  const publicRolloutStickyKey = publicRolloutAssignmentStickyKeyV1({
+    owner: isOwner(caller),
+    clientBucket: caller.clientBucket,
+    releaseCanary,
+  });
+  const publicRolloutDatabaseAuthority = publicRolloutStickyKey !== null
     && Number.isSafeInteger(targetTrackCount)
     ? await repository.getPublicRolloutDatabaseAuthority()
     : null;
-  const publicRolloutAssignment = !isOwner(caller)
-    && releaseCanary === null
+  const publicRolloutAssignment = publicRolloutStickyKey !== null
     && Number.isSafeInteger(targetTrackCount)
     ? createPublicRolloutAssignmentV1({
         prompt,
         requestedTrackCount: Number(targetTrackCount),
-        stickyKey: caller.clientBucket,
+        stickyKey: publicRolloutStickyKey,
         databaseAuthority: publicRolloutDatabaseAuthority,
       })
     : null;

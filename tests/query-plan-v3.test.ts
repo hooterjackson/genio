@@ -4,6 +4,7 @@ import {
   createQueryPlanV3,
   createRuntimeQueryPlanV3,
   isQueryPlanV3,
+  pipelineV3RolloutGroup,
   queryPlanV3EmissionSchemaVersion,
   queryPlanV3Engines,
   queryPlanV3Hash,
@@ -494,6 +495,34 @@ describe("query plan V3", () => {
       "curated_genre_scene",
       "mood_activity_theme",
     ]);
+  });
+
+  test("keeps explicit genre requests in the genre rollout when guidance adds mood objectives", () => {
+    const genrePlan = confirmed(
+      "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.",
+      50,
+    );
+    const guidedPlan = {
+      ...genrePlan,
+      intents: [
+        "mood_activity",
+        "theme",
+        "genre_scene",
+        "editorial_ranking",
+      ] as SelectionPlanV3["intents"],
+    };
+    expect(queryPlanV3Engines(guidedPlan)).toEqual([
+      "curated_genre_scene",
+      "mood_activity_theme",
+    ]);
+    expect(pipelineV3RolloutGroup(guidedPlan)).toBe("genre_scene");
+    expect(pipelineV3RolloutGroup({
+      ...guidedPlan,
+      intents: ["mood_activity"],
+    })).toBe("mood_activity_theme");
+    expect(pipelineV3RolloutGroup(
+      confirmed("Create 3 dark ambient tracks for sleep.", 3),
+    )).toBe("mood_activity_theme");
   });
 
   test("persists similarity seeds for worker rehydration while accepting legacy objectives without values", () => {

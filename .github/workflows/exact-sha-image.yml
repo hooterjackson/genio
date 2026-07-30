@@ -1,0 +1,136 @@
+name: exact SHA image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Full merged Git SHA to build
+        required: true
+        type: string
+      release_version:
+        description: Stable semantic version embedded in the image
+        required: true
+        type: string
+
+concurrency:
+  group: exact-sha-image-${{ inputs.source_revision }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: validate and build once
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_reference: ${{ steps.receipt.outputs.image_reference }}
+      image_digest: ${{ steps.receipt.outputs.image_digest }}
+    steps:
+      - name: Validate immutable inputs
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
+        run: |
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "source_revision must be a lowercase full SHA-1" >&2; exit 1; }
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "release_version must be a stable semantic version" >&2; exit 1; }
+          [[ "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "RELEASE_VERIFICATION_KEY_SHA256 must pin the rollout verification key" >&2; exit 1; }
+          [[ "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 must pin the intent-canary authorities" >&2; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require merged exact source and matching version
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          test -f Dockerfile
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        name: Build and push the exact source once
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            GENIO_BUILD_VERSION=${{ inputs.release_version }}
+            GENIO_BUILD_REVISION=${{ inputs.source_revision }}
+            GENIO_RELEASE_VERIFICATION_KEY_SHA256=${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+            GENIO_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256=${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
+          tags: ghcr.io/${{ github.repository_owner }}/genio:sha-${{ inputs.source_revision }}
+      - id: receipt
+        name: Write immutable image receipt
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/genio
+          CONTROLLER_REVISION: ${{ github.sha }}
+          RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+          RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "build did not return an image digest" >&2; exit 1; }
+          IMAGE_REFERENCE="$IMAGE_NAME@$IMAGE_DIGEST"
+          jq -n \
+            --arg schemaVersion "genio-exact-sha-image/v1" \
+            --arg sourceRevision "$SOURCE_REVISION" \
+            --arg version "$RELEASE_VERSION" \
+            --arg imageReference "$IMAGE_REFERENCE" \
+            --arg imageDigest "$IMAGE_DIGEST" \
+            --arg controllerRevision "$CONTROLLER_REVISION" \
+            --arg releaseVerificationKeySha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --arg publicRolloutIntentCanaryAuthorityPolicySha256 "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" \
+            --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              schemaVersion: $schemaVersion,
+              sourceRevision: $sourceRevision,
+              version: $version,
+              imageReference: $imageReference,
+              imageDigest: $imageDigest,
+              controllerRevision: $controllerRevision,
+              releaseVerificationKeySha256: $releaseVerificationKeySha256,
+              publicRolloutIntentCanaryAuthorityPolicySha256: $publicRolloutIntentCanaryAuthorityPolicySha256,
+              runUrl: $runUrl,
+              createdAt: $createdAt
+            }' \
+            > exact-sha-image-receipt.json
+          echo "image_reference=$IMAGE_REFERENCE" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Exact-SHA image"
+            echo
+            echo "- Source: \`$SOURCE_REVISION\`"
+            echo "- Version: \`$RELEASE_VERSION\`"
+            echo "- Image: \`$IMAGE_REFERENCE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: exact-sha-image-${{ inputs.source_revision }}
+          path: exact-sha-image-receipt.json
+          if-no-files-found: error
+          retention-days: 30

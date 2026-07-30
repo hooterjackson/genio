@@ -161,7 +161,7 @@ function payload(input: {
       independentAppleEvidenceHash: "5".repeat(64),
       browserEvidenceHash: "6".repeat(64),
       workerRevision: sourceRevision,
-      workerConfigurationHash: apiConfigurationHash,
+      workerConfigurationHash: "7".repeat(64),
       workerIdentityHash: executorIdentityHash,
       qualityScores: {
         relevance: 4,
