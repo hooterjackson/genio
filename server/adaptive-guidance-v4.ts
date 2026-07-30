@@ -15,6 +15,7 @@ import {
   type PlaylistInterpretationSummaryV1,
 } from "./adaptive-guidance-v3.ts";
 import type { CriticalAmbiguityV3 } from "./selection-plan-v3.ts";
+import type { SelectionFixedTrackIdentity } from "../shared/types.ts";
 
 export const ADAPTIVE_GUIDANCE_POLICY_VERSION_V4 = "adaptive_guidance_v4" as const;
 
@@ -63,6 +64,19 @@ export interface CompiledGuidanceSelectionV4 {
   selectedOptionIds: string[];
   operations: PlaylistContractPatchOperationV1[];
   affectedClauseIds: string[];
+}
+
+export interface GuidanceInterpretationSummaryContextV4 {
+  /**
+   * Server-compiled closed-list membership. Raw prompt prose must never be
+   * reparsed here because the interpretation summary is a contract preview.
+   */
+  fixedTrackList?: readonly SelectionFixedTrackIdentity[];
+  /**
+   * Server-compiled exclusions from the canonical brief. These are display
+   * data only; the immutable contract/selection plan remains authoritative.
+   */
+  explicitAvoid?: readonly string[];
 }
 
 function normalized(value: string): string {
@@ -518,16 +532,57 @@ function lateNightSmokeDecision(
 
 export function interpretationSummaryV4(
   contract: PlaylistContractRevisionV1,
+  context: GuidanceInterpretationSummaryContextV4 = {},
 ): PlaylistInterpretationSummaryV1 {
   const hard = contract.clauses.filter(({ hardness }) => hardness === "hard");
   const soft = contract.clauses.filter(({ hardness }) => hardness === "soft");
+  const fixedTracks = (context.fixedTrackList ?? [])
+    .map(({ artist, title }) => `${artist} — ${title}`);
+  const fixedTrackKeys = new Set(fixedTracks.map(normalizedKey));
+  const softAvoid = soft.filter(({ values }) => (
+    values.some((value) => normalizedKey(value).startsWith("avoid:"))
+  ));
+  const avoidKeys = new Set([
+    ...(context.explicitAvoid ?? []),
+    ...softAvoid.map(({ source }) => source.text),
+  ].map(normalizedKey));
   return {
-    mustHave: hard.filter(({ operator }) => operator !== "exclude").map(({ source }) => source.text),
-    prefer: soft.map(({ source }) => source.text),
-    avoid: hard.filter(({ operator }) => operator === "exclude").map(({ source }) => source.text),
-    flow: contract.sequencingObjectives.map(({ dimension, direction }) => `${dimension}: ${direction}`),
+    mustHave: uniqueInSourceOrder([
+      ...fixedTracks,
+      ...hard
+        .filter(({ operator }) => operator !== "exclude")
+        .map(({ source }) => source.text),
+    ]),
+    prefer: uniqueInSourceOrder(soft
+      .filter((clause) => !softAvoid.includes(clause))
+      .map(({ source }) => source.text)
+      .filter((value) => !fixedTrackKeys.has(normalizedKey(value)))
+      .filter((value) => !avoidKeys.has(normalizedKey(value)))),
+    avoid: uniqueInSourceOrder([
+      ...(context.explicitAvoid ?? []),
+      ...hard
+        .filter(({ operator }) => operator === "exclude")
+        .map(({ source }) => source.text),
+      ...softAvoid.map(({ source }) => source.text),
+    ]),
+    flow: uniqueInSourceOrder(
+      contract.sequencingObjectives.map(({ dimension, direction }) => `${dimension}: ${direction}`),
+    ),
     count: contract.requestedTrackCount,
   };
+}
+
+function uniqueInSourceOrder(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return values
+    .map(normalized)
+    .filter(Boolean)
+    .filter((value) => {
+      const key = normalizedKey(value);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 export function guidanceCheckpointV4(input: {
@@ -537,12 +592,16 @@ export function guidanceCheckpointV4(input: {
   ambiguousScopeClauseIds: readonly string[];
   criticalAmbiguities?: readonly CriticalAmbiguityV3[];
   requestShape: "fully_explicit" | "fixed_list" | "factual" | "curated";
+  interpretationSummaryContext?: GuidanceInterpretationSummaryContextV4;
   compilationTimestamp?: string;
   answeredAxes?: readonly string[];
   priorQuestionHashes?: readonly string[];
   clarificationAttemptsByAxis?: Readonly<Record<string, number>>;
 }): GuidanceCheckpointV4 {
-  const summary = interpretationSummaryV4(input.baseContract);
+  const summary = interpretationSummaryV4(
+    input.baseContract,
+    input.interpretationSummaryContext,
+  );
   const temporalAmbiguities = (input.criticalAmbiguities ?? [])
     .filter(({ key }) => key === "temporal_width");
   const v3Candidates = deterministicGuidanceCandidatesV3({
