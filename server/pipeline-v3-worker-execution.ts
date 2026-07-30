@@ -586,6 +586,11 @@ function canonicalDiscoverySummary(queryPlan: QueryPlanV3): string {
     ...(queryPlan.executionDirectives?.fixedContainer
       ? [`fixed ${queryPlan.executionDirectives.fixedContainer.kind} ${queryPlan.executionDirectives.fixedContainer.name}`]
       : []),
+    ...(queryPlan.executionDirectives?.fixedTrackList
+      ? [`fixed track list ${queryPlan.executionDirectives.fixedTrackList.tracks
+          .map(({ artist, title }) => `${artist} — ${title}`)
+          .join("; ")}`]
+      : []),
     ...(queryPlan.executionDirectives?.similarity
       ? [`similarity seeds ${queryPlan.executionDirectives.similarity.seedArtists.join(" or ")}`]
       : []),

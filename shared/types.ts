@@ -436,6 +436,15 @@ export interface CanonicalPlaylistExecutionDirectivesV1 {
     readonly artistName: string | null;
     readonly membershipClauseId: string;
   } | null;
+  /**
+   * Immutable source-order membership for an explicit closed artist/title
+   * list. Discovery may resolve alternate catalog editions for each entry,
+   * but it may never invent a substitute or reorder the requested identities.
+   */
+  readonly fixedTrackList?: {
+    readonly tracks: readonly SelectionFixedTrackIdentity[];
+    readonly membershipClauseId: string;
+  } | null;
   readonly similarity: {
     readonly seedArtists: readonly string[];
     readonly excludedArtists: readonly string[];

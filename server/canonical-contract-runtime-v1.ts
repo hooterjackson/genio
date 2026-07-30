@@ -198,6 +198,7 @@ export function assertCanonicalContractExecutionPolicyV1(
   const directives = policy.executionDirectives;
   if (directives) {
     if (!directives.fixedContainer
+      && !directives.fixedTrackList
       && !directives.similarity
       && !directives.exactArtistIdentityExclusions) {
       throw new Error("empty_canonical_contract_execution_directives");
@@ -216,6 +217,34 @@ export function assertCanonicalContractExecutionPolicyV1(
         || clause.values.length !== 1
         || clause.values[0] !== fixed.name) {
         throw new Error("invalid_canonical_fixed_container_directive");
+      }
+    }
+    if (directives.fixedTrackList) {
+      const fixed = directives.fixedTrackList;
+      const clause = policy.clauses.find(
+        ({ id }) => id === fixed.membershipClauseId,
+      );
+      const tracks = Array.isArray(fixed.tracks) ? fixed.tracks : [];
+      const expected = tracks.map(
+        ({ artist, title }) => `${artist} — ${title}`,
+      ).sort((left, right) => left.localeCompare(right));
+      const observed = [...(clause?.values ?? [])]
+        .sort((left, right) => left.localeCompare(right));
+      if (!Array.isArray(fixed.tracks)
+        || tracks.length !== policy.requestedTrackCount
+        || tracks.some(({ artist, title }) => (
+          typeof artist !== "string" || !artist.trim()
+          || typeof title !== "string" || !title.trim()
+        ))
+        || new Set(tracks.map(({ artist, title }) => (
+          `${artist.toLocaleLowerCase("en-US")}\u0000${title.toLocaleLowerCase("en-US")}`
+        ))).size !== tracks.length
+        || !clause
+        || clause.kind !== "membership"
+        || clause.axis !== "track"
+        || clause.operator !== "require"
+        || JSON.stringify(observed) !== JSON.stringify(expected)) {
+        throw new Error("invalid_canonical_fixed_track_list_directive");
       }
     }
     if (directives.similarity) {

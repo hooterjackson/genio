@@ -4336,7 +4336,14 @@ export async function executeRetrievalV3(input: {
   const approvedContinuationStrategies = input.continuation && !computeOnlyContinuation
     ? new Set(input.continuation.approvedStrategyIds)
     : null;
-  const definitions = retrievalStrategiesForEnginesV3(engines);
+  const definitions = retrievalStrategiesForEnginesV3(engines)
+    .filter((definition) => (
+      activePlan.scopeKind !== "fixed_track_list"
+      || (
+        definition.engine === "fixed_container"
+        && definition.kind === "container_enumeration"
+      )
+    ));
   if (approvedContinuationStrategies) {
     const known = new Set(definitions.map(({ id }) => id));
     if (approvedContinuationStrategies.size === 0

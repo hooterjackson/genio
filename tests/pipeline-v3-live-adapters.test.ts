@@ -2445,6 +2445,92 @@ describe("Pipeline V3 live read-only adapters", () => {
     );
   });
 
+  test("resolves only immutable fixed-list identities through Apple without hosted discovery or substitutes", async () => {
+    const fixedBrief: PlaylistBrief = {
+      title: "Pop Essentials 3",
+      description: "Three named original studio recordings in a fixed order.",
+      mode: "curated",
+      subjectEntities: [],
+      relationship: "Exact inclusion of three named original studio recordings in the listed order.",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: ["remixes", "live versions", "radio edits", "covers", "re-recordings", "duplicates"],
+      versionPolicy: "Use the original studio recording only for each listed song; no alternate versions.",
+      evidencePolicy: "Verify exact artist, title, and original studio recording identity.",
+      orderingPolicy: "Preserve the user-specified order exactly.",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const selection = canonicalScenario(
+      "Build the three listed original studio recordings in the exact listed order.",
+      fixedBrief,
+    ).selectionPlanV3;
+    const strategy = retrievalStrategiesForEnginesV3(["fixed_container"])
+      .find((value) => value.kind === "container_enumeration")!;
+    const request: DiscoveryRequestV3 = {
+      runId: "fixed-track-list-test",
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: "fixed_container",
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 25,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    const exactSongs = [
+      song(201, "Michael Jackson", "Billie Jean"),
+      song(202, "Madonna", "La Isla Bonita"),
+      song(203, "Earth, Wind & Fire", "September"),
+    ];
+    const searchAppleSongs = vi.fn(async (_storefront: string, query: string) => {
+      const exact = exactSongs.find((candidate) => (
+        query.includes(candidate.artistName) && query.includes(candidate.name)
+      ));
+      return exact
+        ? [song(999, "Substitute Artist", "Substitute Track"), exact]
+        : [];
+    });
+    const discoverHostedWeb = vi.fn();
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleSongs: searchAppleSongs as any,
+      discoverHostedWeb,
+    });
+
+    const batch = await adapters.discover(request);
+    const qualifications = await adapters.qualify({
+      runId: request.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: request.engine,
+      strategy,
+      candidates: batch.candidates,
+    });
+
+    expect(searchAppleSongs).toHaveBeenCalledTimes(3);
+    expect(discoverHostedWeb).not.toHaveBeenCalled();
+    expect(batch.candidates.map(({ artist, title }) => ({ artist, title }))).toEqual(
+      exactSongs.map(({ artistName: artist, name: title }) => ({ artist, title })),
+    );
+    expect(batch.candidates.map((candidate) => (
+      (candidate.metadata as any).bindings[0].sourceRank
+    ))).toEqual([1, 2, 3]);
+    expect(qualifications).toHaveLength(3);
+    expect(qualifications.every((qualification) => (
+      qualification.scope.passed
+      && qualification.evidence.passed
+      && qualification.catalog.storefrontPlayable
+    ))).toBe(true);
+  });
+
   test("contract-3 fixed discovery ignores mutable prompt prose and executes the typed Kind of Blue identity", async () => {
     const prompt = "Every track from the album Kind of Blue, exactly 25 tracks.";
     const projection = canonicalScenario(prompt, {

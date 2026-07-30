@@ -501,7 +501,10 @@ export function createQueryPlanV3(
       throw new Error("Schema-5 execution directives do not match the canonical runtime policy");
     }
     if (plan.engines.includes("fixed_container")
-        !== Boolean(plan.executionDirectives?.fixedContainer)
+        !== Boolean(
+          plan.executionDirectives?.fixedContainer
+          || plan.executionDirectives?.fixedTrackList,
+        )
       || plan.engines.includes("similarity")
         !== Boolean(plan.executionDirectives?.similarity)) {
       throw new Error("Schema-5 routing engines do not match typed execution directives");
@@ -923,7 +926,9 @@ function canonicalExecutionDirectivesValid(row: Partial<QueryPlanV3>): boolean {
   if (!directives) {
     return !engines.includes("fixed_container") && !engines.includes("similarity");
   }
-  if (engines.includes("fixed_container") !== Boolean(directives.fixedContainer)
+  if (engines.includes("fixed_container") !== Boolean(
+    directives.fixedContainer || directives.fixedTrackList
+  )
     || engines.includes("similarity") !== Boolean(directives.similarity)) return false;
   if (directives.fixedContainer) {
     const fixed = directives.fixedContainer;
@@ -932,6 +937,25 @@ function canonicalExecutionDirectivesValid(row: Partial<QueryPlanV3>): boolean {
       || predicate.kind !== fixed.kind
       || membershipOperatorPolarity(predicate.relationship) !== "positive"
       || predicate.subject !== fixed.name) return false;
+  }
+  if (directives.fixedTrackList) {
+    const fixed = directives.fixedTrackList;
+    const predicate = row.membershipPredicates?.find(
+      ({ id }) => id === fixed.membershipClauseId,
+    );
+    const expected = fixed.tracks
+      .map(({ artist, title }) => `${artist} — ${title}`)
+      .sort((left, right) => left.localeCompare(right))
+      .join(" | ");
+    const observed = predicate?.subject
+      .split(" | ")
+      .sort((left, right) => left.localeCompare(right))
+      .join(" | ");
+    if (!predicate
+      || fixed.tracks.length !== row.targetTrackCount
+      || predicate.kind !== "track"
+      || membershipOperatorPolarity(predicate.relationship) !== "positive"
+      || observed !== expected) return false;
   }
   if (directives.similarity) {
     const similarity = directives.similarity;

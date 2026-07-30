@@ -72,6 +72,34 @@ function fixedAlbumBrief(): PlaylistBrief {
   };
 }
 
+function fixedTrackListBrief(): PlaylistBrief {
+  return {
+    title: "Pop Essentials 3",
+    description: "Three named original studio recordings in a fixed order.",
+    mode: "curated",
+    subjectEntities: [],
+    relationship: "Exact inclusion of three named original studio recordings in the listed order.",
+    include: [
+      "Michael Jackson — Billie Jean",
+      "Madonna — La Isla Bonita",
+      "Earth, Wind & Fire — September",
+    ],
+    exclude: [
+      "remixes",
+      "live versions",
+      "radio edits",
+      "covers",
+      "re-recordings",
+      "duplicates",
+    ],
+    versionPolicy: "Use the original studio recording only for each listed song; no alternate versions.",
+    evidencePolicy: "Verify exact artist, title, and original studio recording identity.",
+    orderingPolicy: "Preserve the user-specified order exactly.",
+    targetSize: { min: 3, max: 3 },
+    ambiguities: [],
+  };
+}
+
 function radioheadBrief(): PlaylistBrief {
   return {
     title: "Beyond Radiohead",
@@ -128,6 +156,72 @@ function track(index: number, genre: string): QualifiedTrackV3 {
 }
 
 describe("canonical contract execution bridge", () => {
+  test("binds an explicit fixed track list into canonical membership and source-order execution", () => {
+    const prompt = "Build exactly Billie Jean, La Isla Bonita, and September in the listed order.";
+    const fixedBrief = fixedTrackListBrief();
+    const basePlan = createSelectionPlanV2({
+      prompt,
+      brief: fixedBrief,
+      storefront: "us",
+    });
+    expect(basePlan.scopeKind).toBe("fixed_track_list");
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: "contract:fixed-track-list-runtime",
+      prompt,
+      brief: fixedBrief,
+      selectionPlan: basePlan,
+    });
+    const projection = projectPlaylistContractExecutionV1({
+      contract: shadow.contract,
+      basePlan,
+    });
+
+    expect(shadow.contract.executionDirectives?.fixedTrackList).toEqual({
+      tracks: basePlan.fixedTrackList,
+      membershipClauseId: "bridge:membership:fixed-track-list",
+    });
+    expect(projection.selectionPlanV3).toMatchObject({
+      engines: ["fixed_container"],
+      scopeKind: "fixed_track_list",
+      orderingPolicy: { mode: "source_order" },
+    });
+    expect(projection.plan).toMatchObject({
+      scopeKind: "fixed_track_list",
+      fixedTrackList: basePlan.fixedTrackList,
+    });
+    expect(projection.selectionPlanV3.membershipPredicates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "bridge:membership:fixed-track-list",
+          axis: "track",
+          operator: "require",
+        }),
+      ]),
+    );
+
+    const query = createQueryPlanV3(
+      projection.selectionPlanV3,
+      "00000000-0000-4000-8000-000000000001",
+      {
+        schemaVersion: 6,
+        briefContractVersion: 3,
+        playlistContractRevisionId: shadow.contract.revisionId,
+        playlistContractSemanticHash: shadow.contract.semanticHash,
+        playlistContractCompilerVersion: shadow.contract.versions.compiler,
+      },
+    );
+    expect(isQueryPlanV3(query)).toBe(true);
+    expect(selectionPlanFromQueryPlanV3(query, {})).toMatchObject({
+      engines: ["fixed_container"],
+      scopeKind: "fixed_track_list",
+      executionDirectives: {
+        fixedTrackList: {
+          tracks: basePlan.fixedTrackList,
+        },
+      },
+    });
+  });
+
   test("projects the recommended answer into executable V3 membership and a 70% quota", () => {
     const basePlan = createSelectionPlanV2({
       prompt: SMOOTH_REGGAETON_HEAT_PROMPT,

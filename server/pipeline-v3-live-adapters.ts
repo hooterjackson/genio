@@ -669,6 +669,64 @@ function candidateFromSong(input: {
   };
 }
 
+async function discoverFixedTrackList(input: {
+  request: DiscoveryRequestV3;
+  searchSongs: typeof searchAppleCatalog;
+}): Promise<DiscoveryBatchV3> {
+  const directive = input.request.plan.executionDirectives?.fixedTrackList;
+  if (!directive) {
+    return { candidates: [], nextCursor: null, exhausted: true, costUnits: 0 };
+  }
+  const evidenceClauseIds = input.request.plan.canonicalContractPolicy?.clauses
+    .filter(({ axis }) => axis === "evidence")
+    .map(({ id }) => id) ?? [];
+  const candidates: RawTrackCandidateV3[] = [];
+  for (const [trackIndex, track] of directive.tracks.entries()) {
+    const observed = await input.searchSongs(
+      input.request.plan.storefront,
+      `${track.artist} ${track.title}`,
+      input.request.signal,
+    );
+    const song = observed.find((candidate) => (
+      normalized(candidate.artistName) === normalized(track.artist)
+      && normalized(candidate.name) === normalized(track.title)
+    ));
+    if (!song) continue;
+    const url = song.url
+      ? assertPublicHttpsUrl(song.url).toString()
+      : `https://music.apple.com/${input.request.plan.storefront}/browse`;
+    const binding: LiveEvidenceBindingV3 = {
+      id: `apple-fixed-track:${hash(song.id, url).slice(0, 32)}`,
+      url,
+      provenanceRoot: "music.apple.com",
+      strength: 1,
+      sourceRank: trackIndex + 1,
+      predicateIds: [
+        directive.membershipClauseId,
+        ...evidenceClauseIds,
+      ],
+      kind: "artist_catalogue",
+      governance: runLocalGovernance({
+        accessMethod: "public_api",
+        sourceUrl: url,
+        attribution: "Apple Music",
+      }),
+      eligibilityAttestation: publicTrackScopeAttestationV3(url),
+    };
+    candidates.push(candidateFromSong({
+      song,
+      binding,
+      strategyId: input.request.strategy.id,
+    }));
+  }
+  return {
+    candidates,
+    nextCursor: null,
+    exhausted: true,
+    costUnits: 0,
+  };
+}
+
 function bindingsFromWeb(input: HostedWebCandidateV3, request: DiscoveryRequestV3): LiveEvidenceBindingV3[] {
   // An explicit empty array is meaningful for catalog-bound central-quality
   // enrichment: the provider response is a ranking-quality judgment on a
@@ -3157,6 +3215,18 @@ export function createPipelineV3LiveAdapters(
             getAlbums,
             getAlbumTracks,
           }));
+        return {
+          ...batch,
+          provenance: { cacheOrigin: "live", sourceFreshUntil: null },
+        };
+      }
+      if (request.engine === "fixed_container"
+        && request.strategy.kind === "container_enumeration"
+        && request.plan.executionDirectives?.fixedTrackList) {
+        const batch = await fromRetrievalDependency(
+          "apple_catalog",
+          () => discoverFixedTrackList({ request, searchSongs }),
+        );
         return {
           ...batch,
           provenance: { cacheOrigin: "live", sourceFreshUntil: null },
