@@ -13793,10 +13793,11 @@ export class Repository {
   }
 
   /**
-   * Transactionally maintain the schema-19 compatibility ledger while legacy
-   * columns remain authoritative. The authoritative mode is deliberately not
-   * projected from legacy status: after cutover, callers must use the
-   * resolution transition service.
+   * Transactionally maintain the schema-19 ledger for both shadow comparison
+   * and the resolution-service compatibility bridge. Strict `authoritative`
+   * mode rejects legacy projection; `resolution_service` keeps every existing
+   * orchestration write fenced inside the same transition/outbox transaction
+   * until those callers are migrated to direct typed transitions.
    */
   private async shadowPlaylistResolutionV1(
     client: PoolClient,
@@ -13809,13 +13810,23 @@ export class Repository {
     const settingsMap = new Map(
       settingsResult.rows.map((row) => [row.key, row.value]),
     );
+    const authorityMode = settingsMap.get(
+      "playlist_resolution_authority_mode",
+    );
     if (Number(settingsMap.get("schema_version") ?? 0) < 19
-      || settingsMap.get("playlist_resolution_authority_mode")
-        === "authoritative"
-      || settingsMap.get("playlist_resolution_authority_mode")
-        === "resolution_service") {
+      || authorityMode === "authoritative") {
       return;
     }
+    const resolutionServiceProjection = authorityMode === "resolution_service";
+    const projectionProvenance = resolutionServiceProjection
+      ? "resolution_service"
+      : "protocol11_shadow";
+    const projectionTransitionKind = resolutionServiceProjection
+      ? "resolution_service_projection"
+      : "protocol11_shadow";
+    const projectionKeyPrefix = resolutionServiceProjection
+      ? "resolution-service-projection"
+      : "resolution-shadow";
     const selected = await client.query<{
       status: RunStatus;
       phase: string;
@@ -14043,7 +14054,7 @@ export class Repository {
              active_contract_revision_id=$6,execution_attempt_id=$7,
              blocker_id=$8,question_set_id=$9,decision_json=$10::jsonb,
              manifest_id=$11,state_json=$12::jsonb,
-             provenance='protocol11_shadow',incident_reference=$13,
+             provenance=$16,incident_reference=$13,
              completed_at=$14,cancelled_at=$15,updated_at=now()
          WHERE run_id=$1 AND generation=$2`,
         [
@@ -14062,6 +14073,7 @@ export class Repository {
           incidentReference,
           state === "completed" ? new Date() : null,
           state === "cancelled" ? new Date() : null,
+          projectionProvenance,
         ],
       );
     } else {
@@ -14072,7 +14084,7 @@ export class Repository {
            manifest_id,state_json,provenance,incident_reference,
            completed_at,cancelled_at)
          VALUES($1,1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,
-                'protocol11_shadow',$11,$12,$13)`,
+                $11,$12,$13,$14)`,
         [
           runId,
           state,
@@ -14084,6 +14096,7 @@ export class Repository {
           decision ? JSON.stringify(decision) : null,
           companions.manifestId,
           JSON.stringify(stateJson),
+          projectionProvenance,
           incidentReference,
           state === "completed" ? new Date() : null,
           state === "cancelled" ? new Date() : null,
@@ -14097,7 +14110,7 @@ export class Repository {
          companion_artifact_kind,companion_artifact_id,transition_kind,
          transition_json,idempotency_key)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-              'protocol11_shadow',$12::jsonb,$13)`,
+              $12,$13::jsonb,$14)`,
       [
         transitionId,
         runId,
@@ -14111,11 +14124,12 @@ export class Repository {
         companions.manifestId ? "manifest"
           : companions.blockerId ? "blocker" : null,
         companions.manifestId ?? companions.blockerId,
+        projectionTransitionKind,
         JSON.stringify({
           stateHash: sha256Hex(stableStringify(stateJson)),
           nextAction,
         }),
-        `resolution-shadow:${runId}:${successorGeneration}`,
+        `${projectionKeyPrefix}:${runId}:${successorGeneration}`,
       ],
     );
     await client.query(
@@ -14127,7 +14141,7 @@ export class Repository {
         randomUUID(),
         runId,
         transitionId,
-        `resolution-outbox:shadow:${runId}:${successorGeneration}`,
+        `resolution-outbox:${projectionKeyPrefix}:${runId}:${successorGeneration}`,
         JSON.stringify({
           runId,
           generation: successorGeneration,
