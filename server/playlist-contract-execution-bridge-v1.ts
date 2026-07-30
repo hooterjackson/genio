@@ -306,7 +306,10 @@ function canonicalEngines(
 ): IntentEngineV3[] {
   const axes = new Set(predicates.map(({ axis }) => axis));
   const engines = new Set<IntentEngineV3>();
-  if (contract.executionDirectives?.fixedContainer) engines.add("fixed_container");
+  if (contract.executionDirectives?.fixedContainer
+    || contract.executionDirectives?.fixedTrackList) {
+    engines.add("fixed_container");
+  }
   if (axes.has("factual_relationship")) engines.add("factual_relationship");
   if (axes.has("artist") && axes.size === 1) engines.add("artist_catalogue");
   if ([...axes].some((axis) => ["mood", "activity", "theme"].includes(axis))) {
@@ -343,8 +346,10 @@ function intentsForEngines(engines: readonly IntentEngineV3[]): IntentV3[] {
 }
 
 function canonicalScopeKind(
+  contract: PlaylistContractRevisionV1,
   engines: readonly IntentEngineV3[],
 ): SelectionScopeKind {
+  if (contract.executionDirectives?.fixedTrackList) return "fixed_track_list";
   if (engines.includes("fixed_container")) return "fixed_release_container";
   if (engines.includes("artist_catalogue")) return "artist_catalogue";
   if (engines.includes("factual_relationship") || engines.includes("exhaustive")) {
@@ -410,7 +415,8 @@ function canonicalOrderingPolicy(
   ].some((value) => (
     /\b(?:source[_ -]?order|keep (?:the )?source order)\b/iu.test(value.trim())
   ));
-  const resolvedMode: SelectionOrderingPolicy["mode"] = sourceOrdered
+  const resolvedMode: SelectionOrderingPolicy["mode"] =
+    contract.executionDirectives?.fixedTrackList || sourceOrdered
     ? "source_order"
     : mode;
   return {
@@ -565,7 +571,7 @@ function canonicalSelectionPlanV3(input: {
   const semanticClauses = semantic;
   const catalogPolicies = semantic.filter(({ role }) => role === "catalog_policy");
   const engines = canonicalEngines(input.contract, predicates);
-  const scopeKind = canonicalScopeKind(engines);
+  const scopeKind = canonicalScopeKind(input.contract, engines);
   const summary = input.policy.clauses
     .map((clause) => `${clause.axis} ${clause.operator} ${clause.values.join(" or ")}`)
     .join("; ")
@@ -704,13 +710,18 @@ function canonicalCompatibilityPlanV2(
     pipelineVersion: "catalog_first_v2",
     policyVersion: "relevance_first_2026_07_r2",
     intents,
-    scopeKind: canonicalScopeKind(engines),
+    scopeKind: canonicalScopeKind(contract, engines),
     ...(contract.executionDirectives?.fixedContainer ? {
       fixedContainerIdentity: {
         kind: contract.executionDirectives.fixedContainer.kind,
         name: contract.executionDirectives.fixedContainer.name,
         artistName: contract.executionDirectives.fixedContainer.artistName,
       },
+    } : {}),
+    ...(contract.executionDirectives?.fixedTrackList ? {
+      fixedTrackList: contract.executionDirectives.fixedTrackList.tracks.map(
+        ({ artist, title }) => ({ artist, title }),
+      ),
     } : {}),
     archetypes,
     storefront: contract.storefront,

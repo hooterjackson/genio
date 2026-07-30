@@ -89,6 +89,7 @@ import {
   canonicalExecutorCapabilityForSchemaV1,
 } from "./playlist-contract-backend-capability-v1.ts";
 import {
+  canonicalExecutionEvidencePolicyVersionV1,
   revalidateExecutionCoverageReportV1,
 } from "./verification-expression-v1.ts";
 import { auditSemanticCollapseV1 } from "./semantic-collapse-audit-v1.ts";
@@ -585,6 +586,11 @@ function canonicalDiscoverySummary(queryPlan: QueryPlanV3): string {
     ),
     ...(queryPlan.executionDirectives?.fixedContainer
       ? [`fixed ${queryPlan.executionDirectives.fixedContainer.kind} ${queryPlan.executionDirectives.fixedContainer.name}`]
+      : []),
+    ...(queryPlan.executionDirectives?.fixedTrackList
+      ? [`fixed track list ${queryPlan.executionDirectives.fixedTrackList.tracks
+          .map(({ artist, title }) => `${artist} — ${title}`)
+          .join("; ")}`]
       : []),
     ...(queryPlan.executionDirectives?.similarity
       ? [`similarity seeds ${queryPlan.executionDirectives.similarity.seedArtists.join(" or ")}`]
@@ -1515,6 +1521,8 @@ export class PipelineV3WorkerExecution {
       try {
         const expression = input.queryPlan.verificationExpression;
         const persistedCoverage = input.queryPlan.executionCoverageReport;
+        const executionEvidencePolicyVersion =
+          canonicalExecutionEvidencePolicyVersionV1(input.queryPlan);
         const runtimeConfigurationHash =
           input.payload?.__executorSemanticConfigurationHash?.trim() ?? "";
         const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
@@ -1528,7 +1536,7 @@ export class PipelineV3WorkerExecution {
           || persistedCoverage.configurationHash !== runtimeConfigurationHash
           || persistedCoverage.ontologyVersion !== MUSIC_CONCEPT_POLICY_VERSION
           || persistedCoverage.evidencePolicyVersion
-            !== input.queryPlan.evidencePolicyVersion) {
+            !== executionEvidencePolicyVersion) {
           throw new Error("execution_coverage_runtime_identity_mismatch");
         }
         const workerClaimCoverage = revalidateExecutionCoverageReportV1({
@@ -1538,7 +1546,7 @@ export class PipelineV3WorkerExecution {
           workerCapabilityHash: runtimeCapability.hash,
           configurationHash: runtimeConfigurationHash,
           ontologyVersion: MUSIC_CONCEPT_POLICY_VERSION,
-          evidencePolicyVersion: input.queryPlan.evidencePolicyVersion,
+          evidencePolicyVersion: executionEvidencePolicyVersion,
         });
         if (!workerClaimCoverage.complete) {
           throw new Error("execution_coverage_incomplete");
@@ -2323,10 +2331,15 @@ export class PipelineV3WorkerExecution {
             consumedActiveComputeMs: runtimeFeasibilityDecisionRequired
               ? runtimeFeasibility?.report.runtimeEvidence?.budgets
                 .activeComputeConsumedMs ?? 0
-              : Math.max(
-                  activeComputeAllowanceMs,
-                  Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
-                ),
+              : computeLimitReached
+                ? Math.max(
+                    activeComputeAllowanceMs,
+                    Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+                  )
+                : Math.max(
+                    0,
+                    Number(input.payload?.__contractActiveComputeConsumedMs ?? 0),
+                  ),
             activeComputeLimitMs: activeComputeAllowanceMs,
             activeComputeExtensionsUsed: extensionsUsed,
             limitingClauseIds,

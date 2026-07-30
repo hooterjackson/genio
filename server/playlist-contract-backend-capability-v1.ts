@@ -293,6 +293,9 @@ export function playlistContractCapabilityRequirementsV1(
       ...(contract.executionDirectives?.fixedContainer
         ? ["fixed_container_identity_v1"]
         : []),
+      ...(contract.executionDirectives?.fixedTrackList
+        ? ["fixed_track_list_identity_v1"]
+        : []),
       ...(contract.executionDirectives?.similarity
         ? ["similarity_seed_v1"]
         : []),
@@ -377,12 +380,17 @@ Readonly<BackendCapabilityDeclaration> = Object.freeze({
     "label",
     "venue",
   ],
-  catalogPolicyAxes: ["storefront_availability", "recording_version", "content"],
+  // Era constraints are evaluated fail-closed from recording-family release
+  // evidence by pipeline-v3-era-policy and matching-service. Advertising the
+  // axis is required for typed Guidance V4 year/range successors to reach that
+  // certified evaluator instead of stopping before discovery.
+  catalogPolicyAxes: ["storefront_availability", "recording_version", "content", "era"],
   supportsSequencing: true,
   sequencingDirections: ["ascending", "smooth", "contrast", "editorial"],
   sequencingDimensions: ["playlist_flow"],
   executionFeatures: [
     "fixed_container_identity_v1",
+    "fixed_track_list_identity_v1",
     "similarity_seed_v1",
     "exact_artist_exclusion_v1",
   ],

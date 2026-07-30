@@ -221,6 +221,19 @@ function isNegativeConstraint(constraint: SelectionConstraint): boolean {
   return constraint.operator === "exclude" || constraint.operator === "avoid";
 }
 
+function isFixedTrackListClosureConstraint(
+  constraint: SelectionConstraint,
+  values: readonly string[],
+): boolean {
+  if (constraint.axis !== "relationship" || !isNegativeConstraint(constraint)) {
+    return false;
+  }
+  return values.every((value) => (
+    /\b(?:substitut(?:e|es|ion|ions)|any\s+other\s+(?:tracks?|songs?|recordings?)|additional\s+(?:tracks?|songs?|recordings?)|unlisted\s+(?:tracks?|songs?|recordings?))\b/iu
+      .test(value)
+  ));
+}
+
 function isAdjacentLatinUrbanScope(
   prompt: string,
   constraint: SelectionConstraint,
@@ -355,6 +368,7 @@ export function buildPlaylistContractShadowDraftV1(
   const seenSuitability = new Set<string>();
   const usedClauseIds = new Set<string>();
   let fixedContainerDirective: PlaylistContractExecutionDirectivesV1["fixedContainer"] = null;
+  let fixedTrackListDirective: PlaylistContractExecutionDirectivesV1["fixedTrackList"] = null;
   let similarityDirective: PlaylistContractExecutionDirectivesV1["similarity"] = null;
 
   const addClause = (clause: PlaylistContractClauseDraftV1): void => {
@@ -516,6 +530,41 @@ export function buildPlaylistContractShadowDraftV1(
     };
   }
 
+  if (input.selectionPlan.scopeKind === "fixed_track_list") {
+    const tracks = input.selectionPlan.fixedTrackList;
+    if (!tracks
+      || tracks.length === 0
+      || tracks.length !== input.selectionPlan.requestedTrackCount) {
+      throw new Error("fixed_track_list_identity_unresolved");
+    }
+    const membershipClauseId = "bridge:membership:fixed-track-list";
+    const values = tracks.map(({ artist, title }) => `${artist} — ${title}`);
+    addClause({
+      id: membershipClauseId,
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "track",
+      operator: "require",
+      values,
+      source: {
+        provenance: "migration",
+        text: values.join("; "),
+      },
+      evidence: {
+        required: true,
+        minimumGrade: "authoritative_structured_metadata",
+        permittedGrades: ["authoritative_structured_metadata"],
+      },
+      unknownPolicy: "reject",
+    });
+    hardTrackClauseIds.push(membershipClauseId);
+    fixedTrackListDirective = {
+      tracks: tracks.map(({ artist, title }) => ({ artist, title })),
+      membershipClauseId,
+    };
+  }
+
   if (input.selectionPlan.intents.includes("similarity")) {
     const seedArtists = unique(input.selectionPlan.referenceRecordings);
     if (seedArtists.length === 0) throw new Error("similarity_seed_unresolved");
@@ -590,6 +639,16 @@ export function buildPlaylistContractShadowDraftV1(
       // Exact container membership already proves the track-to-release
       // relationship. Keeping model-authored relationship prose as another
       // hard leaf would require Apple to repeat that sentence per track.
+      continue;
+    }
+    if (
+      fixedTrackListDirective
+      && isFixedTrackListClosureConstraint(constraint, values)
+    ) {
+      // The fixed-track membership directive is already an exact closed set.
+      // Recompiling "no substitutions" as an open-world negative relationship
+      // creates an unsupported, redundant verifier obligation and can strand
+      // an otherwise executable fixed list at capability negotiation.
       continue;
     }
     const clauseId = `bridge:constraint:${safeId(constraint.id)}:${constraintIndex + 1}`;
@@ -789,9 +848,10 @@ export function buildPlaylistContractShadowDraftV1(
         maximumUnknownRatio: 0.2,
         zeroKnownFailures: true,
       },
-      ...(fixedContainerDirective || similarityDirective ? {
+      ...(fixedContainerDirective || fixedTrackListDirective || similarityDirective ? {
         executionDirectives: {
           fixedContainer: fixedContainerDirective,
+          fixedTrackList: fixedTrackListDirective,
           similarity: similarityDirective,
         },
       } : {}),

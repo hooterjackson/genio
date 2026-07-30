@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import {
+  canonicalExecutionEvidencePolicyVersionV1,
   executionCoverageReportV1,
   revalidateExecutionCoverageReportV1,
   verificationExpressionV1,
@@ -64,6 +65,21 @@ function contract() {
 }
 
 describe("VerificationExpressionV1", () => {
+  test("binds coverage to the canonical contract evidence policy, not the legacy query-plan policy", () => {
+    const queryPlan = {
+      evidencePolicyVersion: "governed_evidence_v2",
+      canonicalContractPolicy: {
+        evidencePolicyVersion: "selection_plan_evidence_projection_v2",
+      },
+    };
+    expect(canonicalExecutionEvidencePolicyVersionV1(queryPlan))
+      .toBe("selection_plan_evidence_projection_v2");
+    expect(() => canonicalExecutionEvidencePolicyVersionV1({
+      ...queryPlan,
+      canonicalContractPolicy: null,
+    })).toThrow("execution_coverage_evidence_policy_unavailable");
+  });
+
   test("preserves allOf/anyOf rather than flattening evidence obligations", () => {
     const expression = verificationExpressionV1(
       canonicalContractExecutionPolicyV1(contract()),

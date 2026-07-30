@@ -216,6 +216,16 @@ function canonicalCatalogSelection(
       source: { provenance: "system_default", text: "available in storefront" },
     },
     {
+      id: "catalog:era-2010",
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "era",
+      operator: "require",
+      values: ["2010"],
+      source: { provenance: "prompt", text: "2010" },
+    },
+    {
       id: "catalog:default-version-policy",
       kind: "catalog_version",
       scope: "track",
@@ -266,7 +276,10 @@ async function canonicalCatalogVerdict(
   selection: SelectionPlanV3,
   catalogSong: CatalogSong,
 ): Promise<ReturnType<typeof evaluateCanonicalContractTrackV1>> {
-  const adapters = createPipelineV3LiveAdapters();
+  const adapters = createPipelineV3LiveAdapters({
+    searchAppleSongs: vi.fn(async () => [catalogSong]) as any,
+    lookupAppleByIsrc: vi.fn(async () => []) as any,
+  });
   const request = discoveryRequest(selection, "editorial_tracks");
   const [qualification] = await adapters.qualify({
     ...request,
@@ -405,6 +418,35 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(payload.membershipPredicates).toEqual(selection.membershipPredicates);
     expect(JSON.stringify(payload)).toContain("disco");
     expect(JSON.stringify(payload)).not.toContain("death metal");
+  });
+
+  test("emits a provider-valid strict schema when no central quality policy exists", async () => {
+    const selection = plan("50 influential R&B tracks", 50);
+    expect(selection.playlistQualityPolicy ?? null).toBeNull();
+    const createResponse = vi.fn().mockResolvedValue({
+      output_text: JSON.stringify({ candidates: [] }),
+      output: [{
+        type: "web_search_call",
+        action: { sources: [{ url: "https://www.loc.gov/item/rhythm-and-blues" }] },
+      }],
+    });
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+    });
+
+    await adapters.discover(discoveryRequest(selection, "editorial_tracks"));
+
+    const schema = (createResponse.mock.calls[0]![0] as any)
+      .text.format.schema;
+    expect(
+      schema.properties.candidates.items.properties
+        .centralQualityCriteria.items,
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+      required: [],
+    });
   });
 
   test("uses velvet pulse only as an untrusted Apple and hosted discovery lead after schema-5 worker reconstruction", async () => {
@@ -974,6 +1016,32 @@ describe("Pipeline V3 live read-only adapters", () => {
       .resolves.toMatchObject({ status: "pass", eligible: true });
     await expect(canonicalCatalogVerdict(selection, explicit))
       .resolves.toMatchObject({ status: "fail", eligible: false });
+  });
+
+  test("binds canonical era clauses to the exact Apple recording family", async () => {
+    const selection = canonicalCatalogSelection({
+      op: "clause",
+      clauseId: "catalog:era-2010",
+    });
+    const exactYear = {
+      ...song(70, "Drake", "Over"),
+      releaseDate: "2010-03-08",
+    };
+    const wrongYear = {
+      ...song(71, "Drake", "Headlines"),
+      releaseDate: "2011-08-09",
+    };
+    const unknownYear = {
+      ...song(72, "Drake", "Undated Recording"),
+      releaseDate: undefined,
+    };
+
+    await expect(canonicalCatalogVerdict(selection, exactYear))
+      .resolves.toMatchObject({ status: "pass", eligible: true });
+    await expect(canonicalCatalogVerdict(selection, wrongYear))
+      .resolves.toMatchObject({ status: "fail", eligible: false });
+    await expect(canonicalCatalogVerdict(selection, unknownYear))
+      .resolves.toMatchObject({ status: "unknown", eligible: false });
   });
 
   test("treats allowed recording classes as alternatives while retaining exclusions", async () => {
@@ -2443,6 +2511,92 @@ describe("Pipeline V3 live read-only adapters", () => {
       null,
       undefined,
     );
+  });
+
+  test("resolves only immutable fixed-list identities through Apple without hosted discovery or substitutes", async () => {
+    const fixedBrief: PlaylistBrief = {
+      title: "Pop Essentials 3",
+      description: "Three named original studio recordings in a fixed order.",
+      mode: "curated",
+      subjectEntities: [],
+      relationship: "Exact inclusion of three named original studio recordings in the listed order.",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: ["remixes", "live versions", "radio edits", "covers", "re-recordings", "duplicates"],
+      versionPolicy: "Use the original studio recording only for each listed song; no alternate versions.",
+      evidencePolicy: "Verify exact artist, title, and original studio recording identity.",
+      orderingPolicy: "Preserve the user-specified order exactly.",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const selection = canonicalScenario(
+      "Build the three listed original studio recordings in the exact listed order.",
+      fixedBrief,
+    ).selectionPlanV3;
+    const strategy = retrievalStrategiesForEnginesV3(["fixed_container"])
+      .find((value) => value.kind === "container_enumeration")!;
+    const request: DiscoveryRequestV3 = {
+      runId: "fixed-track-list-test",
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: "fixed_container",
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 25,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    const exactSongs = [
+      song(201, "Michael Jackson", "Billie Jean"),
+      song(202, "Madonna", "La Isla Bonita"),
+      song(203, "Earth, Wind & Fire", "September"),
+    ];
+    const searchAppleSongs = vi.fn(async (_storefront: string, query: string) => {
+      const exact = exactSongs.find((candidate) => (
+        query.includes(candidate.artistName) && query.includes(candidate.name)
+      ));
+      return exact
+        ? [song(999, "Substitute Artist", "Substitute Track"), exact]
+        : [];
+    });
+    const discoverHostedWeb = vi.fn();
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleSongs: searchAppleSongs as any,
+      discoverHostedWeb,
+    });
+
+    const batch = await adapters.discover(request);
+    const qualifications = await adapters.qualify({
+      runId: request.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: request.engine,
+      strategy,
+      candidates: batch.candidates,
+    });
+
+    expect(searchAppleSongs).toHaveBeenCalledTimes(3);
+    expect(discoverHostedWeb).not.toHaveBeenCalled();
+    expect(batch.candidates.map(({ artist, title }) => ({ artist, title }))).toEqual(
+      exactSongs.map(({ artistName: artist, name: title }) => ({ artist, title })),
+    );
+    expect(batch.candidates.map((candidate) => (
+      (candidate.metadata as any).bindings[0].sourceRank
+    ))).toEqual([1, 2, 3]);
+    expect(qualifications).toHaveLength(3);
+    expect(qualifications.every((qualification) => (
+      qualification.scope.passed
+      && qualification.evidence.passed
+      && qualification.catalog.storefrontPlayable
+    ))).toBe(true);
   });
 
   test("contract-3 fixed discovery ignores mutable prompt prose and executes the typed Kind of Blue identity", async () => {

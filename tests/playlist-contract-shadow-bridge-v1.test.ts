@@ -20,6 +20,10 @@ import {
   PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
   PLAYLIST_CONTRACT_SHADOW_EVIDENCE_POLICY_VERSION,
 } from "../server/playlist-contract-shadow-bridge-v1.ts";
+import {
+  CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY,
+  negotiatePlaylistContractBackendV1,
+} from "../server/playlist-contract-backend-capability-v1.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 
 function brief(overrides: Partial<PlaylistBrief> = {}): PlaylistBrief {
@@ -81,6 +85,60 @@ function constraint(
 }
 
 describe("playlist contract shadow bridge v1", () => {
+  test("keeps an explicit quoted fixed list executable without a redundant substitution exclusion", () => {
+    const prompt = "Create a playlist with exactly these three tracks and no substitutions: \"Take on Me\" by a-ha; \"Africa\" by Toto; \"Like a Prayer\" by Madonna.";
+    const requestBrief = brief({
+      title: "80s Pop Essentials",
+      description: "The three explicitly named tracks.",
+      relationship: "Limit to the three explicitly named tracks; preserve the user’s listed order.",
+      include: [
+        "\"Take on Me\" by a-ha",
+        "\"Africa\" by Toto",
+        "\"Like a Prayer\" by Madonna",
+      ],
+      exclude: ["Substitutions"],
+      orderingPolicy: "Preserve the user’s listed order.",
+      targetSize: { min: 3, max: 3 },
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: requestBrief,
+      storefront: "us",
+    });
+    expect(selectionPlan.scopeKind).toBe("fixed_track_list");
+    const bridged = compilePlaylistContractShadowV1({
+      contractId: "run:fixed-three",
+      prompt,
+      brief: requestBrief,
+      selectionPlan,
+    });
+
+    expect(bridged.contract.executionDirectives?.fixedTrackList).toMatchObject({
+      tracks: [
+        { artist: "a-ha", title: "Take on Me" },
+        { artist: "Toto", title: "Africa" },
+        { artist: "Madonna", title: "Like a Prayer" },
+      ],
+    });
+    expect(bridged.contract.clauses).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "exclusion",
+        axis: "relationship",
+        values: ["Substitutions"],
+      }),
+    ]));
+    expect(() => assertPlaylistContractIntegrityV1(bridged.contract)).not.toThrow();
+    const negotiated = negotiatePlaylistContractBackendV1({
+      contract: bridged.contract,
+      backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+    });
+    expect(negotiated.backend?.backend).toBe("corpus_first_v3");
+    expect(negotiated.result).toEqual({
+      supported: true,
+      missing: [],
+    });
+  });
+
   test("turns the exact Smooth Reggaeton scope fork into one required-guidance input", () => {
     const requestBrief = smoothReggaetonBrief();
     const selectionPlan = createSelectionPlanV2({

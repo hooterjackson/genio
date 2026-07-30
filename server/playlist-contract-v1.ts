@@ -173,6 +173,13 @@ export interface PlaylistContractExecutionDirectivesV1 {
     readonly artistName: string | null;
     readonly membershipClauseId: string;
   } | null;
+  readonly fixedTrackList?: {
+    readonly tracks: readonly {
+      readonly artist: string;
+      readonly title: string;
+    }[];
+    readonly membershipClauseId: string;
+  } | null;
   readonly similarity: {
     readonly seedArtists: readonly string[];
     readonly excludedArtists: readonly string[];
@@ -688,6 +695,29 @@ function normalizedExecutionDirectives(
   if (fixedContainer && fixedContainer.kind !== "album" && fixedContainer.kind !== "playlist") {
     throw new Error("invalid_fixed_container_kind");
   }
+  const fixedTrackList = value.fixedTrackList == null
+    ? null
+    : {
+        tracks: value.fixedTrackList.tracks.map((track) => ({
+          artist: normalizedText(track.artist, "fixed_track_artist", 500),
+          title: normalizedText(track.title, "fixed_track_title", 500),
+        })),
+        membershipClauseId: normalizedId(
+          value.fixedTrackList.membershipClauseId,
+          "fixed_track_membership_clause_id",
+        ),
+      };
+  if (fixedTrackList) {
+    if (fixedTrackList.tracks.length === 0) {
+      throw new Error("fixed_track_list_directive_requires_tracks");
+    }
+    const identities = new Set(fixedTrackList.tracks.map((track) => (
+      `${track.artist.toLocaleLowerCase("en-US")}\u0000${track.title.toLocaleLowerCase("en-US")}`
+    )));
+    if (identities.size !== fixedTrackList.tracks.length) {
+      throw new Error("fixed_track_list_directive_duplicate_identity");
+    }
+  }
   const similarity = value.similarity === null
     ? null
     : {
@@ -762,11 +792,12 @@ function normalizedExecutionDirectives(
     ))) {
     throw new Error("invalid_exact_artist_identity_catalog_id");
   }
-  if (!fixedContainer && !similarity && !exactArtistIdentityExclusions) {
+  if (!fixedContainer && !fixedTrackList && !similarity && !exactArtistIdentityExclusions) {
     throw new Error("empty_execution_directives");
   }
   return {
     fixedContainer,
+    ...(value.fixedTrackList !== undefined ? { fixedTrackList } : {}),
     similarity,
     ...(value.exactArtistIdentityExclusions !== undefined
       ? { exactArtistIdentityExclusions }
@@ -862,6 +893,24 @@ function validateContractStructure(input: {
       || !sameDirectiveValues(clause.values, [directive.name])
       || !predicateClauseIds(input.trackPredicate).has(clause.id)) {
       throw new Error("fixed_container_directive_clause_mismatch");
+    }
+  }
+  if (input.executionDirectives?.fixedTrackList) {
+    const directive = input.executionDirectives.fixedTrackList;
+    const clause = byId.get(directive.membershipClauseId);
+    const expectedValues = directive.tracks.map(
+      (track) => `${track.artist} — ${track.title}`,
+    );
+    if (!clause
+      || clause.kind !== "membership"
+      || clause.scope !== "track"
+      || clause.hardness !== "hard"
+      || clause.operator !== "require"
+      || clause.axis !== "track"
+      || directive.tracks.length !== input.requestedTrackCount
+      || !sameDirectiveValues(clause.values, expectedValues)
+      || !predicateClauseIds(input.trackPredicate).has(clause.id)) {
+      throw new Error("fixed_track_list_directive_clause_mismatch");
     }
   }
   if (input.executionDirectives?.similarity) {
@@ -1208,7 +1257,8 @@ export function applyPlaylistContractPatchV1(
         similarity: null,
       };
       executionDirectives = operation.directive === null
-        && !existing.fixedContainer && !existing.similarity
+        && !existing.fixedContainer && !existing.fixedTrackList
+        && !existing.similarity
         ? undefined
         : normalizedExecutionDirectives({
             ...existing,
