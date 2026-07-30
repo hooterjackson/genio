@@ -407,6 +407,35 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(JSON.stringify(payload)).not.toContain("death metal");
   });
 
+  test("emits a provider-valid strict schema when no central quality policy exists", async () => {
+    const selection = plan("50 influential R&B tracks", 50);
+    expect(selection.playlistQualityPolicy ?? null).toBeNull();
+    const createResponse = vi.fn().mockResolvedValue({
+      output_text: JSON.stringify({ candidates: [] }),
+      output: [{
+        type: "web_search_call",
+        action: { sources: [{ url: "https://www.loc.gov/item/rhythm-and-blues" }] },
+      }],
+    });
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+    });
+
+    await adapters.discover(discoveryRequest(selection, "editorial_tracks"));
+
+    const schema = (createResponse.mock.calls[0]![0] as any)
+      .text.format.schema;
+    expect(
+      schema.properties.candidates.items.properties
+        .centralQualityCriteria.items,
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+      required: [],
+    });
+  });
+
   test("uses velvet pulse only as an untrusted Apple and hosted discovery lead after schema-5 worker reconstruction", async () => {
     const prompt = "Make exactly 25 velvet pulse tracks for a late-night set.";
     const unknownBrief: PlaylistBrief = {
