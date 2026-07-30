@@ -9,6 +9,7 @@ type WaitingRun = {
     state?: string;
     nextAction?: string;
     terminal?: boolean;
+    workMotion?: string;
   } | null;
 };
 
@@ -82,6 +83,20 @@ export function isAutomaticPlaylistHandoff(run: WaitingRun): boolean {
 
 export function playlistWorkMotion(run: WaitingRun): PlaylistWorkMotion {
   if (run.resolution) {
+    if (run.resolution.workMotion === "running") return "active";
+    if (run.resolution.workMotion === "retry_scheduled"
+      || run.resolution.workMotion === "waiting_dependency"
+      || run.resolution.workMotion === "paused"
+      || run.resolution.workMotion === "stalled") {
+      return "paused";
+    }
+    if (run.resolution.workMotion === "none") {
+      if (run.resolution.state === "needs_input"
+        || run.resolution.state === "needs_decision") {
+        return "action-required";
+      }
+      return "idle";
+    }
     if (run.resolution.terminal) return "idle";
     if (run.resolution.state === "needs_input" || run.resolution.state === "needs_decision") {
       return "action-required";

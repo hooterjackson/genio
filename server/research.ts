@@ -3979,6 +3979,7 @@ export async function processBriefInterpretationJob(
         axis: checkpoint.decisions[0]?.axis ?? null,
         feasibilitySnapshotId: feasibilitySnapshot.id,
         checkpointMode: checkpoint.mode,
+        confirmationKind: checkpoint.confirmationKind,
         interpretationSummary: checkpoint.interpretationSummary,
       };
       // Guidance V4 is an always-present checkpoint. A precise or fixed

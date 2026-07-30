@@ -416,6 +416,7 @@ export function publicBriefStatusView(input: {
     | "nuance_optional"
     | "interpretation_confirmation"
     | null;
+  confirmationKind?: "unresolved_review" | null;
   interpretationSummary?: PublicBriefStatusView["interpretationSummary"];
   brief?: PlaylistBrief;
   questions?: PlaylistGuidanceQuestion[];
@@ -432,6 +433,7 @@ export function publicBriefStatusView(input: {
     briefContractVersion: input.briefContractVersion,
     questionSetHash: input.questionSetHash,
     checkpointMode: input.checkpointMode,
+    confirmationKind: input.confirmationKind,
     interpretationSummary: input.interpretationSummary,
     brief: input.brief,
     questions: input.questions ?? [],

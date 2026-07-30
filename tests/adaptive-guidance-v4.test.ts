@@ -100,6 +100,7 @@ describe("GuidanceDecisionV4", () => {
     );
     expect(value).toMatchObject({
       mode: "interpretation_confirmation",
+      confirmationKind: "unresolved_review",
       decisions: [],
       showEditableInterpretationSummary: true,
     });
@@ -232,6 +233,64 @@ Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicat
         optionId: "reggaeton_dembow_latin_urban",
       }],
     })).not.toThrow();
+  });
+
+  test("asks the server-owned rap/grime emphasis question without changing hard eligibility", () => {
+    const { contract, value } = checkpoint(
+      "50 rap and grime tracks for a high-energy bike ride",
+    );
+    const decision = value.decisions.find(({ axis }) => axis === "rap_grime_emphasis");
+    expect(decision).toMatchObject({
+      mode: "correctness_blocking",
+      question: "How should rap and grime shape the 25-track mix?",
+      options: [
+        {
+          id: "equal_priority",
+          recommended: true,
+          explicitNoop: true,
+          label: "Equal priority",
+          description: "Keep rap and grime equally eligible and let quality decide.",
+          expectedFeasibilityDirection: "neutral",
+          patch: { operations: [], affectedClauseIds: [] },
+        },
+        expect.objectContaining({ id: "rap_led", recommended: false }),
+        expect.objectContaining({ id: "grime_led", recommended: false }),
+      ],
+    });
+    const equal = compileGuidanceSelectionV4(decision!, {
+      optionIds: ["equal_priority"],
+    });
+    expect(equal).toMatchObject({ state: "accepted", operations: [] });
+    const rapLed = compileGuidanceSelectionV4(decision!, {
+      optionIds: ["rap_led"],
+    });
+    expect(rapLed.operations).toContainEqual(expect.objectContaining({
+      op: "add_clause",
+      clause: expect.objectContaining({
+        hardness: "soft",
+        axis: "genre_emphasis",
+        values: ["rap-led"],
+      }),
+    }));
+    expect(applyPlaylistContractPatchV1(contract, {
+      baseRevisionId: contract.revisionId,
+      baseSemanticHash: contract.semanticHash,
+      answerLineage: {
+        questionSetHash: value.checkpointHash,
+        questionId: decision!.id,
+        answerHash: rapLed.answerHash,
+      },
+      operations: rapLed.operations,
+    }).requestedTrackCount).toBe(contract.requestedTrackCount);
+  });
+
+  test.each([
+    "50 mostly rap tracks with some grime",
+    "50 rap and grime tracks with equal priority",
+  ])("does not ask a redundant rap/grime emphasis question: %s", (prompt) => {
+    const { value } = checkpoint(prompt);
+    expect(value.decisions.some(({ axis }) => axis === "rap_grime_emphasis"))
+      .toBe(false);
   });
 
   test("rejects options whose server-owned executable effects collapse", () => {

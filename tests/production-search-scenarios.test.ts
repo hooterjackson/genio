@@ -162,6 +162,24 @@ describe("retained production searches", () => {
     expect(exercised.some((row) => row.recoveryWasUsed)).toBe(true);
   });
 
+  test("never counts a 50-track manifest as published without ordered-ID reconciliation", () => {
+    const scenario = fixture.scenarios[0]!;
+    const brief = canonicalScenarioBrief(scenario);
+    const profile = fixture.replayProfiles[scenario.replayProfile]!;
+    const replay = replayProductionScenario(brief, {
+      ...profile,
+      publicationReconciliationSucceeds: false,
+    });
+    expect(replay.observation.manifestTrackCount).toBe(
+      replay.observation.requestedTrackCount,
+    );
+    expect(replay.observation.publishedTrackCount).toBe(0);
+    expect(replay.observation.terminalStatus).toBe("failed");
+    expect(
+      assessProductionScenario(replay.observation, "exact_playlist").releaseReady,
+    ).toBe(false);
+  });
+
   test("the promoted Rio regression recovers 88 candidates and 42 strict matches to an exact 50-track playlist", () => {
     const scenario = fixture.scenarios.find((row) => row.id === "2026-07-17-26");
     expect(scenario).toBeDefined();

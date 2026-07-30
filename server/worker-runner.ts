@@ -81,7 +81,7 @@ import {
   runtimeReleaseDeploymentPhase,
 } from "./release-deployment-phase.ts";
 import { buildInformation } from "./build-info.ts";
-import { sha256Hex, stableStringify } from "./security.ts";
+import { HttpError, sha256Hex, stableStringify } from "./security.ts";
 import {
   DEPENDENCY_DURABLE_RETRY_DELAYS_MS_V1,
   decideDependencyCircuitV1,
@@ -102,6 +102,34 @@ const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_CONTROL_INTERVAL_MS = 5_000;
 const PIPELINE_OBSERVABILITY_MAX_CATCHUP_HOURS = 24;
+const IMMEDIATE_INTEGRITY_ERROR_CODES = new Set([
+  "pipeline_v3_evidence_attestation_missing",
+  "pipeline_v3_evidence_predicate_missing",
+  "pipeline_v3_existing_projection_incomplete",
+  "pipeline_v3_result_invalid",
+  "manifest_revision_conflict",
+  "manifest_contract_stale",
+  "pipeline_policy_mismatch",
+]);
+
+function stableFailureCode(error: unknown): string {
+  if (error instanceof CanonicalExecutionIntegrityError) {
+    return error.reasonCode;
+  }
+  if (error instanceof HttpError && error.code) return error.code;
+  if (error instanceof PipelineV3DependencyUnavailableError) {
+    return error.reasonCode;
+  }
+  if (error instanceof PipelineV3OptimizerComputeBudgetError) {
+    return error.code;
+  }
+  if (error instanceof AppleApiError) {
+    return error.retriable ? "apple_api_retryable" : "apple_authorization";
+  }
+  return error instanceof Error
+    ? `unexpected_${error.constructor.name.toLocaleLowerCase("en-US")}`
+    : "unexpected_non_error";
+}
 export const WORKER_CONFIGURATION_ENV_KEYS = Object.freeze([
   "NODE_ENV",
   "RELEASE_ENVIRONMENT",
@@ -359,6 +387,18 @@ export interface WorkerQueueRepository {
     blockerKind?: string | null;
     checkpointCursor?: string | null;
   }): Promise<{ accepted: boolean; discarded: boolean }>;
+  recordPlaylistExecutionFailureFingerprint?(input: {
+    attemptId: string;
+    runId: string;
+    contractRevisionId: string;
+    jobId: string;
+    workerId: string;
+    leaseGeneration: number;
+    errorSignature: string;
+    attemptStrategyHash: string;
+    errorCode: string;
+    stage: string;
+  }): Promise<{ accepted: boolean; repeated: boolean }>;
   discardPlaylistExecutionAttempt?(input: {
     attemptId: string;
     runId: string;
@@ -985,6 +1025,74 @@ export class WorkerRunner {
         contractSemanticHash: contractAttempt.contractSemanticHash,
       };
     };
+    const recordFailureFingerprint = async (error: unknown): Promise<{
+      errorCode: string;
+      errorSignature: string;
+      attemptStrategyHash: string;
+      repeated: boolean;
+    } | null> => {
+      if (!contractAttempt
+        || !job.runId
+        || !this.repository.recordPlaylistExecutionFailureFingerprint) {
+        return null;
+      }
+      const errorCode = stableFailureCode(error);
+      const stage = job.stageKey || job.kind;
+      const providerRoots = Array.isArray(job.payload.dependencyRootIds)
+        ? [...new Set(job.payload.dependencyRootIds
+            .filter((value): value is string => typeof value === "string")
+            .map((value) => value.trim())
+            .filter(Boolean))]
+            .sort()
+        : [];
+      const parsedBudgetGeneration = Number(
+        job.payload.optimizerBudgetPass,
+      );
+      const budgetGeneration = Number.isSafeInteger(parsedBudgetGeneration)
+        ? parsedBudgetGeneration
+        : 0;
+      const attemptStrategyHash = sha256Hex(stableStringify({
+        schemaVersion: "attempt-strategy/v1",
+        contractSemanticHash: contractAttempt.contractSemanticHash,
+        queryPlanRevisionId: job.queryPlanRevisionId ?? null,
+        stage,
+        executorRevision: this.version,
+        semanticExecutionConfigurationHash:
+          this.semanticExecutionConfigurationHash,
+        providerRoots,
+        budgetGeneration,
+      }));
+      const errorSignature = sha256Hex(stableStringify({
+        schemaVersion: "execution-failure/v1",
+        errorCode,
+        stage,
+        contractSemanticHash: contractAttempt.contractSemanticHash,
+        queryPlanRevisionId: job.queryPlanRevisionId ?? null,
+        executorRevision: this.version,
+        semanticExecutionConfigurationHash:
+          this.semanticExecutionConfigurationHash,
+        checkpoint: job.stageKey || null,
+      }));
+      const persisted = await this.repository
+        .recordPlaylistExecutionFailureFingerprint({
+          attemptId: contractAttempt.id,
+          runId: job.runId,
+          contractRevisionId: contractAttempt.contractDatabaseId,
+          jobId: job.id,
+          workerId: this.workerId,
+          leaseGeneration: contractAttempt.leaseGeneration,
+          errorSignature,
+          attemptStrategyHash,
+          errorCode,
+          stage,
+        });
+      return {
+        errorCode,
+        errorSignature,
+        attemptStrategyHash,
+        repeated: persisted.accepted && persisted.repeated,
+      };
+    };
     const renewal = setInterval(() => {
       void this.repository.renewJobLease(job.id, this.workerId, this.leaseMs, job.leaseEpoch).then((renewed) => {
         if (!renewed && !controller.signal.aborted) {
@@ -1319,6 +1427,7 @@ export class WorkerRunner {
         return;
       }
       if (error instanceof CanonicalExecutionIntegrityError) {
+        await recordFailureFingerprint(error);
         await finishContractAttempt("failed", "integrity");
         if (job.runId && this.repository.quarantineCanonicalExecution) {
           await this.repository.quarantineCanonicalExecution({
@@ -1382,6 +1491,32 @@ export class WorkerRunner {
           this.workerId,
           new Date(Date.now() + 60_000),
           reason,
+          job.leaseEpoch,
+        );
+        return;
+      }
+      const failureFingerprint = await recordFailureFingerprint(error);
+      if (contractAttempt
+        && job.runId
+        && failureFingerprint
+        && IMMEDIATE_INTEGRITY_ERROR_CODES.has(
+          failureFingerprint.errorCode,
+        )) {
+        if (!await finishContractAttempt("failed", "integrity")) return;
+        if (this.repository.quarantineCanonicalExecution) {
+          await this.repository.quarantineCanonicalExecution({
+            runId: job.runId,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseGeneration: contractAttempt.leaseGeneration,
+            reasonCode: failureFingerprint.errorCode,
+          });
+        }
+        await this.repository.failJob(
+          job.id,
+          this.workerId,
+          "Canonical execution was quarantined by an integrity fence.",
+          null,
           job.leaseEpoch,
         );
         return;
@@ -1699,21 +1834,10 @@ export class WorkerRunner {
           return;
         }
 
-        // Only the typed dependency error enters the provider circuit above.
-        // Unexpected/programmer/system faults use bounded technical retries
-        // without claiming provider scarcity or asking to revise the user's
-        // musical contract. Exhaustion quarantines the exact leased run.
-        if (retryAt) {
-          await finishContractAttempt("failed", "technical_retry");
-          await this.repository.failJob(
-            job.id,
-            this.workerId,
-            message,
-            retryAt,
-            job.leaseEpoch,
-          );
-          return;
-        }
+        // Only typed provider and optimizer failures may schedule a canonical
+        // retry. Unknown/programmer faults fail closed on their first
+        // occurrence; replaying an unchanged semantic strategy would merely
+        // reproduce the same defect and consume another playlist attempt.
         await finishContractAttempt("failed", "technical_quarantine");
         if (this.repository.quarantineCanonicalExecution) {
           await this.repository.quarantineCanonicalExecution({

@@ -53,6 +53,14 @@ export type RunNextAction =
   | "review_contract"
   | "contact_support";
 
+export type RunWorkMotion =
+  | "running"
+  | "retry_scheduled"
+  | "waiting_dependency"
+  | "paused"
+  | "stalled"
+  | "none";
+
 export interface RunResolutionView {
   /** Present once schema 19 is the authoritative resolution source. */
   generation?: number | null;
@@ -62,6 +70,22 @@ export interface RunResolutionView {
   contractRevisionId: string | null;
   contractRevision: number | null;
   contractHash: string | null;
+  /**
+   * Additive schema-19 execution truth. Old clients may ignore these fields;
+   * new clients must never infer live work from the top-level resolution
+   * state alone.
+   */
+  workMotion?: RunWorkMotion;
+  wallClockMs?: number | null;
+  activeComputeMs?: number;
+  lastWorkerHeartbeatAt?: string | null;
+  lastProgressAt?: string | null;
+  nextRetryAt?: string | null;
+  stageDeadlineAt?: string | null;
+  selectedTrackCount?: number | null;
+  manifestedTrackCount?: number | null;
+  appendedTrackCount?: number | null;
+  reconciledPublishedTrackCount?: number | null;
   blocker: {
     kind: string;
     nextRetryAt: string | null;
@@ -673,7 +697,9 @@ export interface PipelineV3ConceptDiscoveryHint {
   originalText: string;
   normalizedText: string;
   status: "discovery_only" | "unresolved";
-  ontologyVersion: "playlist_music_ontology_v2";
+  ontologyVersion:
+    | "playlist_music_ontology_v2"
+    | "playlist_music_ontology_v3";
   unresolvedTermId: string | null;
   provenance: "immutable_playlist_contract_concept_v1";
   untrusted: true;
@@ -1375,6 +1401,7 @@ export interface PlaylistGuidanceQuestionSetContract {
     | "correctness_blocking"
     | "nuance_optional"
     | "interpretation_confirmation";
+  confirmationKind?: "unresolved_review";
   interpretationSummary?: {
     mustHave: readonly string[];
     prefer: readonly string[];
@@ -1809,6 +1836,7 @@ export interface PublicBriefStatusView {
     | "nuance_optional"
     | "interpretation_confirmation"
     | null;
+  confirmationKind?: "unresolved_review" | null;
   interpretationSummary?: {
     mustHave: readonly string[];
     prefer: readonly string[];

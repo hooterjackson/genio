@@ -43,6 +43,17 @@ describe("reference-artist similarity policy", () => {
     );
   });
 
+  test("treats a named reference point as an excluded primary-artist seed", () => {
+    const result = applySimilaritySeedPolicy(
+      "Rap and grime with Pop Smoke as a reference point, focused on new artists, without centering him",
+      brief({ subjectEntities: ["Pop Smoke"] }),
+    );
+    expect(excludedReferenceArtists(result)).toEqual(["Pop Smoke"]);
+    expect(result.relationship).toBe("stylistically similar to the reference artist");
+    expect(isExcludedReferenceArtist(result, "Pop Smoke")).toBe(true);
+    expect(isExcludedReferenceArtist(result, "New Artist feat. Pop Smoke")).toBe(true);
+  });
+
   test("removes filler entities and unwraps repeated similarity-query fragments", () => {
     const result = applySimilaritySeedPolicy(
       "12 tracks that sound like Radiohead but are by other artists",

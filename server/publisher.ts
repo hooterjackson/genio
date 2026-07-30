@@ -1808,6 +1808,10 @@ export async function publishManifest(
       nextRetryAt: null,
       detail: { exactMembershipVerified: true },
     });
+    // This count is backed by the ordered-ID readback above. It is not a
+    // fallback from manifest cardinality; commitPublicationCompletion binds
+    // it to the reconciliation row and marks that row complete atomically.
+    const reconciledPublishedTrackCount = manifest.tracks.length;
     await assertPublicationControl(repository, authorization, signal, manifest.runId);
     await appendPublicationCandidateStages(
       repository,
@@ -1851,7 +1855,8 @@ export async function publishManifest(
           manifest.tracks.length + preflightOmittedCount,
           Math.min(qualifiedTrackCount, priorPipelineOutcome?.selectedTrackCount ?? 0),
         );
-      const publishedTrackCount = durableStageCounts?.published ?? manifest.tracks.length;
+      const publishedTrackCount = durableStageCounts?.published
+        ?? reconciledPublishedTrackCount;
       const partialStatus = publicationPartialOutcomeStatus({
         priorOutcome: priorPipelineOutcome,
         preflightOmittedCount,

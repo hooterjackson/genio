@@ -89,8 +89,10 @@ export function assertPlaylistResolutionCompanionsV1(input: {
   }
   if (state === "completed") {
     const requested = Number(input.stateJson.requestedTrackCount);
-    const published = Number(input.stateJson.publishedTrackCount);
-    if (!Number.isSafeInteger(requested) || requested < 1 || published !== requested) {
+    const reconciled = Number(input.stateJson.reconciledPublishedTrackCount);
+    if (!Number.isSafeInteger(requested)
+      || requested < 1
+      || reconciled !== requested) {
       throw new Error("resolution_exact_completion_missing");
     }
   }

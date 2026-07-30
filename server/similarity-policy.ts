@@ -4,7 +4,7 @@ export const REFERENCE_ARTIST_EXCLUSION_PREFIX =
   "Reference artist is a style seed; exclude recordings by: ";
 
 const SIMILARITY_INTENT =
-  /\b(?:sounds?\s+(?:a\s+lot\s+)?like|similar\s+to|similar\s+(?:mode|sound|music|artists?)|resembl(?:e|es|ing)|adjacent\s+to|in\s+(?:the\s+)?(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like|music\s+like)\b/gu;
+  /\b(?:sounds?\s+(?:a\s+lot\s+)?like|similar\s+to|similar\s+(?:mode|sound|music|artists?)|resembl(?:e|es|ing)|adjacent\s+to|in\s+(?:the\s+)?(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like|music\s+like|as\s+(?:a\s+)?(?:(?:style|sonic|musical)\s+)?reference\s+point)\b/gu;
 
 const GENERIC_ENTITY =
   /^(?:(?:the|some|any)\s+)?(?:(?:other|similar|related|adjacent|different|new|more|these|those)\s+)?(?:artists?|bands?|acts?|musicians?|songs?|tracks?|recordings?|music|playlists?)$/u;

@@ -807,6 +807,34 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     };
   }
 
+  test("reports LIVE only for a fresh fenced lease and matching heartbeat", async () => {
+    const context = await createLeasedRun(
+      3,
+      "schema-19-work-motion",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      resolution: {
+        workMotion: "running",
+        lastWorkerHeartbeatAt: expect.any(String),
+        activeComputeMs: expect.any(Number),
+      },
+    });
+    await pool.query(
+      `UPDATE worker_heartbeats
+       SET last_seen_at=now()-interval '10 minutes'
+       WHERE worker_id=$1`,
+      [context.fence.workerId],
+    );
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      resolution: {
+        workMotion: "stalled",
+      },
+    });
+  }, 120_000);
+
   test("a stale begin cannot discard the successor lease generation's running attempt", async () => {
     const context = await createLeasedRun(
       3,
@@ -1316,7 +1344,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
            WHERE decision='qualified' AND revoked_at IS NULL
          )::int active,
          count(*) FILTER (
-           WHERE decision='revoked' AND revoked_at IS NOT NULL
+           WHERE decision='qualified' AND revoked_at IS NOT NULL
          )::int revoked
        FROM playlist_qualification_records
        WHERE run_id=$1`,
@@ -1373,8 +1401,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
 
     const duplicatedAuthority = await pool.query(
       `UPDATE playlist_qualification_records
-       SET decision='qualified',revoked_at=NULL
-       WHERE run_id=$1 AND decision='revoked'
+       SET revoked_at=NULL
+       WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NOT NULL
        RETURNING id`,
       [context.runId],
     );
@@ -1435,6 +1463,12 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       route: "corpus_first_v3",
       intentGroup: "genre_scene",
     })).resolves.toBe(true);
+    await expect(repository.renewJobLease(
+      context.fence.jobId,
+      context.fence.workerId,
+      60_000,
+      context.fence.leaseEpoch,
+    )).resolves.toBe(false);
     await repository.setPipelineCohortKillSwitch({
       cohortKey: `test:reenable:${context.runId}`,
       route: "corpus_first_v3",
@@ -1446,6 +1480,12 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       route: "corpus_first_v3",
       intentGroup: "genre_scene",
     })).resolves.toBe(false);
+    await expect(repository.renewJobLease(
+      context.fence.jobId,
+      context.fence.workerId,
+      60_000,
+      context.fence.leaseEpoch,
+    )).resolves.toBe(true);
     await expect(pool.query<{
       cohort_key: string;
       disabled: boolean;
@@ -1486,6 +1526,12 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     });
     const locked = await repository.getManifestById(persisted.manifestId!);
     expect(locked).toBeTruthy();
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      resolution: {
+        manifestedTrackCount: 1,
+        reconciledPublishedTrackCount: null,
+      },
+    });
     const expectedOrderedIdsHash = orderedAppleStableIdsHash(
       locked!.tracks.map((track: { catalogId: string }) => track.catalogId),
     );
@@ -1546,6 +1592,13 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       appendedCount: 1,
       batchCursor: 1,
       detail: { terminalFenceCommitted: true },
+    });
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      resolution: {
+        manifestedTrackCount: 1,
+        appendedTrackCount: 1,
+        reconciledPublishedTrackCount: 1,
+      },
     });
     const stored = (await pool.query<{
       state: string;
@@ -2140,6 +2193,93 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     },
     120_000,
   );
+
+  test("uses database-returned candidate IDs after an upsert conflict", async () => {
+    const context = await createLeasedRun(
+      1,
+      "returned-candidate-id",
+      undefined,
+      "Create 1 reggaeton track",
+      "or_membership",
+    );
+    const result = withCanonicalHostedProof(retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "returned-candidate-id",
+      predicateIds: ["genre:reggaeton"],
+    }), "genre:reggaeton");
+    const track = result.selected[0]!;
+    const existingFamilyId = randomUUID();
+    const existingCandidateId = randomUUID();
+    const canonicalKey = `v3:${sha256Hex(stableStringify({
+      runId: context.runId,
+      sourceCandidateId: track.candidateId,
+      familyKey: track.recordingFamilyKey,
+    }))}`;
+    await pool.query(
+      `INSERT INTO recording_families(
+         id,run_id,family_key,canonical_artist,canonical_title,version_class,
+         metadata_json,pipeline_version,policy_version)
+       VALUES($1,$2,$3,$4,$5,'canonical','{}'::jsonb,
+         'corpus_first_v3','corpus_first_v3_policy_v1')`,
+      [
+        existingFamilyId,
+        context.runId,
+        track.recordingFamilyKey,
+        track.artist,
+        track.title,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO track_candidates(
+         id,run_id,canonical_key,duplicate_cluster_key,artist,title,album,outcome,
+         recording_family_id,candidate_stage,pipeline_version,policy_version)
+       VALUES($1,$2,$3,$4,$5,$6,$7,'accepted',$8,'discovered',
+         'corpus_first_v3','corpus_first_v3_policy_v1')`,
+      [
+        existingCandidateId,
+        context.runId,
+        canonicalKey,
+        track.recordingFamilyKey,
+        track.artist,
+        track.title,
+        track.album,
+        existingFamilyId,
+      ],
+    );
+
+    const persisted = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const binding = (await pool.query<{
+      manifest_candidate_id: string;
+      qualification_candidate_id: string;
+      family_id: string;
+    }>(
+      `SELECT item.candidate_id manifest_candidate_id,
+              qualification.candidate_id qualification_candidate_id,
+              item.recording_family_id family_id
+       FROM manifest_revision_tracks item
+       JOIN playlist_qualification_records qualification
+         ON qualification.run_id=$1
+        AND qualification.candidate_id=item.candidate_id
+        AND qualification.decision='qualified'
+        AND qualification.revoked_at IS NULL
+       WHERE item.manifest_revision_id=$2`,
+      [context.runId, persisted.manifestRevisionId],
+    )).rows[0]!;
+    expect(binding).toEqual({
+      manifest_candidate_id: existingCandidateId,
+      qualification_candidate_id: existingCandidateId,
+      family_id: existingFamilyId,
+    });
+  }, 30_000);
 
   test("claims one semantic repair across crash/restart replay and keeps final persistence idempotent", async () => {
     const previousSchemaVersion = process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION;
@@ -2763,7 +2903,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         originalText: "velvet pulse",
         normalizedText: "velvet pulse",
         status: "unresolved",
-        ontologyVersion: "playlist_music_ontology_v2",
+        ontologyVersion: "playlist_music_ontology_v3",
         unresolvedTermId: `unresolved:${sha256Hex("velvet pulse").slice(0, 16)}`,
         provenance: "immutable_playlist_contract_concept_v1",
         untrusted: true,

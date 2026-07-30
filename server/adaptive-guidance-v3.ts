@@ -47,6 +47,11 @@ export interface GuidanceOptionV3 {
   label: string;
   description: string;
   recommended: boolean;
+  /**
+   * A server-owned, explicitly labelled answer that confirms the already
+   * compiled semantics. This is never an implicit default.
+   */
+  explicitNoop?: boolean;
   expectedFeasibilityDirection: GuidanceFeasibilityDirectionV3;
   patch: GuidancePatchTemplateV3;
 }

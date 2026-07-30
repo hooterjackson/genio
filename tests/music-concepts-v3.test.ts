@@ -9,7 +9,7 @@ import {
 
 describe("server-owned music concept registry", () => {
   test("keeps exact aliases separate from broader discovery terms", () => {
-    expect(MUSIC_CONCEPT_POLICY_VERSION).toBe("music_concepts_v3_3_0");
+    expect(MUSIC_CONCEPT_POLICY_VERSION).toBe("music_concepts_v3_4_0");
     expect(eligibilityAliasesForMusicConceptV3("baile funk")).toEqual(["funk carioca", "baile funk"]);
     expect(discoveryMusicConceptV3("Brazilian funk")?.id).toBe("genre:brazilian-funk-ambiguous");
     expect(eligibilityAliasesForMusicConceptV3("Brazilian funk")).toEqual(["Brazilian funk"]);
@@ -17,6 +17,9 @@ describe("server-owned music concept registry", () => {
     expect(canonicalMusicConceptIdV3("reggaeton")).toBe("genre:reggaeton");
     expect(canonicalMusicConceptIdV3("Latin urban")).toBe("genre:latin-urban");
     expect(canonicalMusicConceptIdV3("dembow")).toBe("genre:dembow");
+    expect(canonicalMusicConceptIdV3("UK grime")).toBe("genre:grime");
+    expect(discoveryMusicConceptV3("UK rap")?.id).toBe("genre:grime");
+    expect(eligibilityAliasesForMusicConceptV3("UK rap")).toEqual(["UK rap"]);
   });
 
   test("supports server-owned semantic evidence patterns without model-promoted aliases", () => {
@@ -30,6 +33,8 @@ describe("server-owned music concept registry", () => {
     )).toBe(true);
     expect(musicConceptEvidenceMatchesV3("genre:funk-carioca", "A 1970s American funk classic.")).toBe(false);
     expect(musicConceptEvidenceMatchesV3("genre:reggaeton", "A polished reggaetón anthem.")).toBe(true);
+    expect(musicConceptEvidenceMatchesV3("genre:grime", "A landmark UK grime single.")).toBe(true);
+    expect(musicConceptEvidenceMatchesV3("genre:grime", "A grimy UK drill track.")).toBe(false);
   });
 
   test("uses stable ids for unknown exact concepts", () => {

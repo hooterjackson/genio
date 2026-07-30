@@ -50,6 +50,7 @@ export interface GuidanceDecisionV4 {
 export interface GuidanceCheckpointV4 {
   policyVersion: typeof ADAPTIVE_GUIDANCE_POLICY_VERSION_V4;
   mode: GuidanceModeV4;
+  confirmationKind?: "unresolved_review";
   decisions: readonly GuidanceDecisionV4[];
   interpretationSummary: PlaylistInterpretationSummaryV1;
   showEditableInterpretationSummary: boolean;
@@ -147,6 +148,7 @@ export function simulateGuidanceDecisionV4(
     const effectHash = sha256Hex(stableStringify({
       operations: option.patch.operations,
       affectedClauseIds: option.patch.affectedClauseIds,
+      explicitNoop: option.explicitNoop === true,
     }));
     if (effectHashes.has(effectHash)) throw new Error("guidance_v4_duplicate_option_effect");
     effectHashes.add(effectHash);
@@ -199,11 +201,19 @@ export function assertGuidanceDecisionV4(
   }
   const allowedOperations = new Set(decision.allowedPatchOperations);
   const allowedClauseIds = new Set(decision.affectedClauseIds);
+  const explicitNoops = decision.options.filter(({ explicitNoop }) => explicitNoop);
+  if (explicitNoops.length > 1) throw new Error("guidance_v4_multiple_explicit_noops");
   for (const option of decision.options) {
     if (!option.id.trim() || !option.label.trim() || !option.description.trim()) {
       throw new Error("invalid_guidance_v4_option");
     }
-    if (option.id === "keep_current_interpretation") {
+    if (option.explicitNoop) {
+      if (decision.mode !== "correctness_blocking"
+        || option.patch.operations.length
+        || option.patch.affectedClauseIds.length) {
+        throw new Error("guidance_v4_invalid_explicit_noop");
+      }
+    } else if (option.id === "keep_current_interpretation") {
       if (option.patch.operations.length || option.patch.affectedClauseIds.length) {
         throw new Error("guidance_v4_keep_option_must_be_noop");
       }
@@ -530,6 +540,93 @@ function lateNightSmokeDecision(
   });
 }
 
+function rapGrimeEmphasisIsExplicit(prompt: string): boolean {
+  return /\b(?:equal(?:ly)?|balanced?|even(?:ly)?|co[- ]?equal(?:ly)?|same\s+priority)\b[^.!?\n]{0,80}\b(?:rap|grime)\b/iu.test(prompt)
+    || /\b(?:rap|grime)\b[^.!?\n]{0,80}\b(?:equal(?:ly)?|balanced?|even(?:ly)?|co[- ]?equal(?:ly)?|same\s+priority)\b/iu.test(prompt)
+    || /\b(?:mostly|mainly|primarily|predominantly)\s+(?:rap|grime)\b/iu.test(prompt)
+    || /\b(?:rap|grime)[ -]?(?:led|heavy|forward|first)\b/iu.test(prompt)
+    || /\b(?:favor|favour|prioriti[sz]e|emphasi[sz]e|lean(?:ing)?)\b[^.!?\n]{0,60}\b(?:rap|grime)\b/iu.test(prompt)
+    || /\b(?:rap|grime)\b[^.!?\n]{0,50}\bwith\s+(?:some|a\s+little|touches?\s+of)\s+(?:rap|grime)\b/iu.test(prompt);
+}
+
+function rapGrimeEmphasisDecision(
+  prompt: string,
+  baseContract: PlaylistContractRevisionV1,
+): GuidanceDecisionV4 | null {
+  const hasRap = /\b(?:rap|hip[ -]?hop)\b/iu.test(prompt);
+  const hasGrime = /\bgrime(?:\s+music)?\b/iu.test(prompt);
+  if (!hasRap || !hasGrime || rapGrimeEmphasisIsExplicit(prompt)) return null;
+
+  const rapClauseId = "guidance:v4:genre-emphasis:rap-led";
+  const grimeClauseId = "guidance:v4:genre-emphasis:grime-led";
+  return createGuidanceDecisionV4({
+    mode: "correctness_blocking",
+    id: "v4-correctness:rap-grime-emphasis",
+    header: "Genre emphasis",
+    question: `How should rap and grime shape the ${baseContract.requestedTrackCount}-track mix?`,
+    axis: "rap_grime_emphasis",
+    trigger: "correctness",
+    criticality: "required",
+    selectionMode: "single",
+    allowCustom: false,
+    baseContractRevisionId: baseContract.revisionId,
+    baseContractSemanticHash: baseContract.semanticHash,
+    whyMaterial: "Both genres remain eligible; this answer controls discovery and ranking emphasis without changing count or evidence rules.",
+    allowedPatchOperations: ["add_clause"],
+    affectedClauseIds: [rapClauseId, grimeClauseId],
+    materialityScore: 96,
+    options: [
+      {
+        id: "equal_priority",
+        label: "Equal priority",
+        description: "Keep rap and grime equally eligible and let quality decide.",
+        recommended: true,
+        explicitNoop: true,
+        expectedFeasibilityDirection: "neutral",
+        patch: { operations: [], affectedClauseIds: [] },
+      },
+      {
+        id: "rap_led",
+        label: "Rap-led",
+        description: "Favor rap during discovery and ranking while grime remains eligible.",
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        patch: {
+          affectedClauseIds: [rapClauseId],
+          operations: [{
+            op: "add_clause",
+            clause: preferenceClause(
+              rapClauseId,
+              "genre_emphasis",
+              "rap-led",
+              "Favor rap during discovery and ranking while grime remains eligible.",
+            ),
+          }],
+        },
+      },
+      {
+        id: "grime_led",
+        label: "Grime-led",
+        description: "Favor grime during discovery and ranking while rap remains eligible.",
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        patch: {
+          affectedClauseIds: [grimeClauseId],
+          operations: [{
+            op: "add_clause",
+            clause: preferenceClause(
+              grimeClauseId,
+              "genre_emphasis",
+              "grime-led",
+              "Favor grime during discovery and ranking while rap remains eligible.",
+            ),
+          }],
+        },
+      },
+    ],
+  });
+}
+
 export function interpretationSummaryV4(
   contract: PlaylistContractRevisionV1,
   context: GuidanceInterpretationSummaryContextV4 = {},
@@ -631,6 +728,11 @@ export function guidanceCheckpointV4(input: {
         ? [lateNightSmokeDecision(input.prompt, input.baseContract)!]
         : []
     ),
+    ...(
+      rapGrimeEmphasisDecision(input.prompt, input.baseContract)
+        ? [rapGrimeEmphasisDecision(input.prompt, input.baseContract)!]
+        : []
+    ),
     ...v3Candidates,
   ];
   const answeredAxes = new Set((input.answeredAxes ?? []).map(normalizedKey));
@@ -671,10 +773,14 @@ export function guidanceCheckpointV4(input: {
     : optional
       ? "nuance_optional"
       : "interpretation_confirmation";
+  const confirmationKind = mode === "interpretation_confirmation"
+    ? "unresolved_review" as const
+    : undefined;
   if (mode === "interpretation_confirmation") showEditableInterpretationSummary = true;
   const body = {
     policyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
     mode,
+    confirmationKind,
     decisionHashes: decisions.map(({ questionHash }) => questionHash),
     summary,
     showEditableInterpretationSummary,
@@ -683,6 +789,9 @@ export function guidanceCheckpointV4(input: {
   return {
     policyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
     mode,
+    ...(confirmationKind
+      ? { confirmationKind }
+      : {}),
     decisions,
     interpretationSummary: summary,
     showEditableInterpretationSummary,

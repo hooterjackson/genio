@@ -173,6 +173,13 @@ latest_blocker AS (
   WHERE resolved_at IS NULL
   ORDER BY run_id,created_at DESC,id DESC
 ),
+latest_reconciliation AS (
+  SELECT DISTINCT ON (run_id)
+    id,run_id,manifest_id,state,expected_count,appended_count,
+    expected_ordered_ids_hash,observed_ordered_ids_hash,completed_at
+  FROM playlist_publication_reconciliations
+  ORDER BY run_id,created_at DESC,id DESC
+),
 mapped AS (
   SELECT
     run.id run_id,
@@ -235,6 +242,9 @@ mapped AS (
   LEFT JOIN latest_manifest manifest ON manifest.run_id=run.id
   LEFT JOIN latest_attempt attempt ON attempt.run_id=run.id
   LEFT JOIN latest_blocker blocker ON blocker.run_id=run.id
+  LEFT JOIN latest_reconciliation reconciliation
+    ON reconciliation.run_id=run.id
+      AND reconciliation.manifest_id=manifest.id
   LEFT JOIN LATERAL (
     SELECT
       COALESCE(
@@ -242,11 +252,16 @@ mapped AS (
         NULLIF(run.brief_json #>> '{targetSize,max}','')::integer,
         NULLIF(run.brief_json #>> '{targetSize,min}','')::integer
       ) requested_track_count,
-      CASE WHEN manifest.id IS NULL THEN 0 ELSE (
-        SELECT count(*)::integer
-        FROM manifest_tracks track
-        WHERE track.manifest_id=manifest.id
-      ) END published_track_count
+      CASE
+        WHEN reconciliation.id IS NULL THEN NULL
+        WHEN reconciliation.state='complete'
+          AND reconciliation.completed_at IS NOT NULL
+          AND reconciliation.appended_count=reconciliation.expected_count
+          AND reconciliation.observed_ordered_ids_hash
+            =reconciliation.expected_ordered_ids_hash
+          THEN reconciliation.expected_count
+        ELSE 0
+      END published_track_count
   ) counts ON true
   WHERE run.deleted_at IS NULL
 )
@@ -266,7 +281,8 @@ SELECT
     'legacyStatus',legacy_status,
     'legacyPhase',legacy_phase,
     'requestedTrackCount',requested_track_count,
-    'publishedTrackCount',published_track_count
+    'publishedTrackCount',published_track_count,
+    'reconciledPublishedTrackCount',published_track_count
   ),
   'legacy_backfill',
   CASE WHEN state='quarantined'
@@ -286,13 +302,27 @@ WITH normalized_legacy_completion AS (
       NULLIF(run.brief_json #>> '{targetSize,max}','')::integer,
       NULLIF(run.brief_json #>> '{targetSize,min}','')::integer
     ) requested_track_count,
-    CASE WHEN resolution.manifest_id IS NULL THEN 0 ELSE (
-      SELECT count(*)::integer
-      FROM manifest_tracks track
-      WHERE track.manifest_id=resolution.manifest_id
-    ) END published_track_count
+    CASE
+      WHEN reconciliation.id IS NULL THEN NULL
+      WHEN reconciliation.state='complete'
+        AND reconciliation.completed_at IS NOT NULL
+        AND reconciliation.appended_count=reconciliation.expected_count
+        AND reconciliation.observed_ordered_ids_hash
+          =reconciliation.expected_ordered_ids_hash
+        THEN reconciliation.expected_count
+      ELSE 0
+    END published_track_count
   FROM playlist_run_resolutions resolution
   JOIN research_runs run ON run.id=resolution.run_id
+  LEFT JOIN LATERAL (
+    SELECT id,state,expected_count,appended_count,
+           expected_ordered_ids_hash,observed_ordered_ids_hash,completed_at
+    FROM playlist_publication_reconciliations
+    WHERE run_id=resolution.run_id
+      AND manifest_id=resolution.manifest_id
+    ORDER BY created_at DESC,id DESC
+    LIMIT 1
+  ) reconciliation ON true
   WHERE resolution.provenance='legacy_backfill'
     AND run.status IN ('complete','partial')
 )
@@ -331,7 +361,8 @@ SET state=CASE
     END,
     state_json=resolution.state_json || jsonb_build_object(
       'requestedTrackCount',normalized.requested_track_count,
-      'publishedTrackCount',normalized.published_track_count
+      'publishedTrackCount',normalized.published_track_count,
+      'reconciledPublishedTrackCount',normalized.published_track_count
     ),
     completed_at=CASE
       WHEN normalized.status='complete'

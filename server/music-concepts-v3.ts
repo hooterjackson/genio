@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export const MUSIC_CONCEPT_POLICY_VERSION = "music_concepts_v3_3_0" as const;
+export const MUSIC_CONCEPT_POLICY_VERSION = "music_concepts_v3_4_0" as const;
 
 export type MusicConceptAmbiguity = "none" | "context_required";
 
@@ -72,6 +72,17 @@ const CONCEPTS: readonly MusicConceptV3[] = [
     eligibilityAliases: ["hip-hop", "hip hop", "rap"],
     discoveryOnlyTerms: ["rap music", "hip-hop culture"],
     evidencePatterns: [/\b(?:hip[ -]?hop|rap)\b/iu],
+    ambiguity: "none",
+  },
+  {
+    id: "genre:grime",
+    label: "grime",
+    eligibilityAliases: ["grime", "grime music", "UK grime"],
+    discoveryOnlyTerms: ["UK rap", "drill", "UK garage", "garage"],
+    evidencePatterns: [
+      /\bgrime(?:\s+music)?\b/iu,
+      /\bUK\s+grime\b/iu,
+    ],
     ambiguity: "none",
   },
   {

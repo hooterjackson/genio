@@ -98,6 +98,33 @@ describe("playlist waiting state", () => {
     })).toBe("idle");
   });
 
+  it("renders LIVE only when schema-19 reports verified running work", () => {
+    expect(playlistWorkMotion({
+      status: "researching",
+      resolution: {
+        state: "executing",
+        terminal: false,
+        workMotion: "running",
+      },
+    })).toBe("active");
+    expect(playlistWorkMotion({
+      status: "researching",
+      resolution: {
+        state: "executing",
+        terminal: false,
+        workMotion: "stalled",
+      },
+    })).toBe("paused");
+    expect(playlistWorkMotion({
+      status: "researching",
+      resolution: {
+        state: "executing",
+        terminal: false,
+        workMotion: "retry_scheduled",
+      },
+    })).toBe("paused");
+  });
+
   it.each([
     ["visitor_review", "exception_review"],
     ["manifest_ready", "manifest"],

@@ -52,6 +52,72 @@ describe("Pipeline V3 typed planning", () => {
     }));
   });
 
+  test("compiles rap and grime as one OR membership predicate", () => {
+    const spec = createRunSpecV3({
+      prompt: "50 rap and grime tracks for a high-energy bike ride",
+      requestedTrackCount: 50,
+    });
+    const genrePredicates = spec.membershipPredicates.filter(({ axis }) => axis === "genre");
+    expect(genrePredicates).toHaveLength(1);
+    expect(genrePredicates[0]).toMatchObject({
+      operator: "require",
+      values: expect.arrayContaining([
+        "hip-hop",
+        "hip hop",
+        "rap",
+        "grime",
+        "grime music",
+        "UK grime",
+      ]),
+    });
+    expect(evaluateCandidateMembershipV3(
+      genreCandidateMemberships(["rap"]),
+      spec.membershipPredicates,
+    ).eligible).toBe(true);
+    expect(evaluateCandidateMembershipV3(
+      genreCandidateMemberships(["UK grime"]),
+      spec.membershipPredicates,
+    ).eligible).toBe(true);
+    expect(evaluateCandidateMembershipV3(
+      genreCandidateMemberships(["drill"]),
+      spec.membershipPredicates,
+    ).eligible).toBe(false);
+  });
+
+  test("compiles Pop Smoke as an excluded primary reference with discovery emphasis", () => {
+    const spec = createRunSpecV3({
+      prompt: "50 rap and grime tracks with Pop Smoke as a reference point, focused on new artists, without centering him",
+      requestedTrackCount: 50,
+      brief: {
+        mode: "curated",
+        title: "Echo Park Ride Drift",
+        description: "Rap and grime for a bike ride.",
+        subjectEntities: ["Pop Smoke"],
+        relationship: "stylistically similar to the reference artist",
+        include: ["New rap and grime artists"],
+        exclude: ["Reference artist is a style seed; exclude recordings by: Pop Smoke"],
+        versionPolicy: "one canonical recording",
+        evidencePolicy: "source-backed",
+        orderingPolicy: "high-energy flow",
+        targetSize: { min: 50, max: 50 },
+        ambiguities: [],
+      },
+    });
+    expect(spec.intents).toContain("similarity");
+    expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
+      axis: "artist",
+      operator: "exclude",
+      values: ["Pop Smoke"],
+    }));
+    expect(spec.rankingObjectives).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dimension: "similarity", values: ["Pop Smoke"] }),
+      expect.objectContaining({
+        dimension: "relevance",
+        values: ["new artists", "emerging artists"],
+      }),
+    ]));
+  });
+
   test("asks a neutral time-width question for the exact 2010 rap incident", () => {
     const spec = createRunSpecV3({
       prompt: "create me a playlist fromm the 2010 rap",
@@ -65,6 +131,8 @@ describe("Pipeline V3 typed planning", () => {
     expect(spec.criticalAmbiguities).toContainEqual(expect.objectContaining({
       key: "temporal_width",
       yearValue: 2010,
+      trust: "server_derived",
+      resolution: "pending_question",
     }));
 
     const questions = criticalGuidanceQuestionsV3(spec);
@@ -81,6 +149,13 @@ describe("Pipeline V3 typed planning", () => {
       optionId: "era_full_decade",
     }]);
     expect(resolved.confirmed).toBe(true);
+    expect(resolved.criticalAmbiguities).toContainEqual(
+      expect.objectContaining({
+        key: "temporal_width",
+        trust: "server_derived",
+        resolution: "answered_successor",
+      }),
+    );
     expect(resolved.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "era",
       values: ["2010", "2019"],

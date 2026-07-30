@@ -41,8 +41,34 @@ describe("playlist resolution service", () => {
       state: "completed",
       nextAction: "none",
       companions: { ...companions, manifestId: "manifest" },
-      stateJson: { requestedTrackCount: 50, publishedTrackCount: 42 },
+      stateJson: {
+        requestedTrackCount: 50,
+        publishedTrackCount: 50,
+        reconciledPublishedTrackCount: 42,
+      },
     })).toThrow("resolution_exact_completion_missing");
+  });
+
+  test("requires an exact native Apple reconciliation for completion", () => {
+    expect(() => assertPlaylistResolutionCompanionsV1({
+      state: "completed",
+      nextAction: "none",
+      companions: { ...companions, manifestId: "manifest" },
+      stateJson: {
+        requestedTrackCount: 50,
+        publishedTrackCount: 50,
+        reconciledPublishedTrackCount: null,
+      },
+    })).toThrow("resolution_exact_completion_missing");
+    expect(() => assertPlaylistResolutionCompanionsV1({
+      state: "completed",
+      nextAction: "none",
+      companions: { ...companions, manifestId: "manifest" },
+      stateJson: {
+        requestedTrackCount: 50,
+        reconciledPublishedTrackCount: 50,
+      },
+    })).not.toThrow();
   });
 
   test("rejects browser actions that do not match the resolution state", () => {

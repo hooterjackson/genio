@@ -32,6 +32,8 @@ export interface ProductionScenarioReplayProfile {
   refillCandidateYieldRate?: number;
   /** Aggregate strict Apple yield for candidates added by a refill. */
   refillStrictMatchRate?: number;
+  /** Explicit ordered-ID reconciliation result; manifest creation is not publication. */
+  publicationReconciliationSucceeds?: boolean;
 }
 
 export interface ProductionScenarioObservation {
@@ -238,6 +240,11 @@ export function replayProductionScenario(
   const manifestTrackCount = complete
     ? requestedTrackCount
     : Math.max(0, strictMatchedCount);
+  const publicationReconciled =
+    profile.publicationReconciliationSucceeds !== false;
+  const reconciledPublishedTrackCount = publicationReconciled
+    ? manifestTrackCount
+    : 0;
 
   const researchDurationMs = research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassDurationMs;
   const initialCatalogDurationMs = PRODUCTION_SCENARIO_REPLAY_TAPE.initialCatalogBaseDurationMs
@@ -253,15 +260,21 @@ export function replayProductionScenario(
     strictMatchedCount,
     accountedCandidateCount: candidateCount,
     manifestTrackCount,
-    publishedTrackCount: manifestTrackCount,
+    publishedTrackCount: reconciledPublishedTrackCount,
     totalCostUsd: PRODUCTION_SCENARIO_REPLAY_TAPE.guidedBriefCostUsd
       + research.passes * PRODUCTION_SCENARIO_REPLAY_TAPE.researchPassCostUsd
       + refillCostUsd,
     activeWorkDurationMs: researchDurationMs + initialCatalogDurationMs + recoveryDurationMs + refillDurationMs,
-    terminalStatus: complete ? "complete" : "partial",
-    terminalPhase: complete
+    terminalStatus: complete && publicationReconciled
+      ? "complete"
+      : publicationReconciled
+        ? "partial"
+        : "failed",
+    terminalPhase: complete && publicationReconciled
       ? "publication_complete"
-      : manifestTrackCount > 0
+      : !publicationReconciled
+        ? "publication_reconciliation_failed"
+        : manifestTrackCount > 0
         ? "publication_partial"
         : "catalog_matching_empty",
     postMatchRefillGenerations: refillCandidateGoals.length,

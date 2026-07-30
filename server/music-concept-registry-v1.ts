@@ -1,6 +1,6 @@
 import { sha256Hex } from "./security.ts";
 
-export const PLAYLIST_CONTRACT_ONTOLOGY_VERSION = "playlist_music_ontology_v2" as const;
+export const PLAYLIST_CONTRACT_ONTOLOGY_VERSION = "playlist_music_ontology_v3" as const;
 
 export type MusicConceptKindV1 =
   | "genre"
@@ -189,7 +189,16 @@ const CONCEPTS: readonly MusicConceptDefinitionV1[] = [
     aliases: ["hip-hop", "hip hop", "rap"],
     discoveryOnlyTerms: ["rap music", "hip-hop culture"],
     parentIds: [],
-    adjacentIds: ["genre:r-and-b"],
+    adjacentIds: ["genre:r-and-b", "genre:grime"],
+  },
+  {
+    id: "genre:grime",
+    kind: "genre",
+    label: "grime",
+    aliases: ["grime", "grime music", "UK grime"],
+    discoveryOnlyTerms: ["UK rap", "drill", "UK garage", "garage"],
+    parentIds: [],
+    adjacentIds: ["genre:hip-hop"],
   },
   {
     id: "genre:r-and-b",

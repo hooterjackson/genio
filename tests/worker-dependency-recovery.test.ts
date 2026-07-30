@@ -122,6 +122,10 @@ function dependencyHarness(input: {
     accepted: true,
     discarded: false,
   });
+  repository.recordPlaylistExecutionFailureFingerprint.mockResolvedValue({
+    accepted: true,
+    repeated: false,
+  });
   repository.getActivePlaylistRunBlocker.mockResolvedValue(input.priorBlocker ?? null);
   repository.getExpiredPlaylistProviderBlocker.mockResolvedValue(input.expiredBlocker ?? null);
   repository.openPlaylistRunBlocker.mockResolvedValue("blocker-provider");
@@ -744,7 +748,7 @@ test("a second deterministic optimizer budget miss quarantines without provider 
   }
 });
 
-test("an unexpected canonical system error retries technically without a provider or scope blocker", async () => {
+test("an unexpected canonical system error fails closed without a blind retry", async () => {
   const { repository, job } = dependencyHarness({ attempts: 1 });
   const runner = new WorkerRunner(repository, {
     queueClass: "deep",
@@ -764,18 +768,24 @@ test("an unexpected canonical system error retries technically without a provide
     await waitFor(() => repository.failJob.mock.calls.length === 1);
     expect(repository.openPlaylistRunBlocker).not.toHaveBeenCalled();
     expect(repository.markPlaylistDependencyDecision).not.toHaveBeenCalled();
-    expect(repository.quarantineCanonicalExecution).not.toHaveBeenCalled();
+    expect(repository.quarantineCanonicalExecution).toHaveBeenCalledWith({
+      runId: job.runId,
+      jobId: job.id,
+      workerId: expect.any(String),
+      leaseGeneration: job.leaseEpoch,
+      reasonCode: "unexpected_system_failure",
+    });
     expect(repository.completePlaylistExecutionAttempt).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "failed",
-        blockerKind: "technical_retry",
+        blockerKind: "technical_quarantine",
       }),
     );
     expect(repository.failJob).toHaveBeenCalledWith(
       job.id,
       expect.any(String),
       expect.any(String),
-      expect.any(Date),
+      null,
       job.leaseEpoch,
     );
   } finally {

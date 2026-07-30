@@ -45,6 +45,7 @@ import type {
   RunGuidanceActionView,
   RunNextAction,
   RunResolutionView,
+  RunWorkMotion,
   RunStatus,
   NeverDeadEndRunState,
   ResearchRunView,
@@ -690,6 +691,81 @@ export interface JobView {
   leaseEpoch: number;
   leaseOwner: string | null;
   leaseExpiresAt: Date | null;
+}
+
+/**
+ * Lease-time cohort authority. Assignment checks alone are insufficient:
+ * queued work can outlive a rollout decision, and an already leased worker
+ * must lose renewal authority as soon as the hard switch is engaged.
+ */
+function pipelineCohortLeaseAllowedSql(jobAlias: "candidate" | "job_queue" | "job"): string {
+  const activePlanId = `COALESCE(
+    ${jobAlias}.query_plan_revision_id,
+    CASE WHEN ${jobAlias}.run_id IS NOT NULL THEN (
+      SELECT active.query_plan_revision_id
+      FROM run_active_query_plans active
+      WHERE active.run_id=${jobAlias}.run_id
+    ) ELSE NULL END
+  )`;
+  const intentGroup = `COALESCE(
+    (
+      SELECT brief.public_rollout_assignment_json->>'intentGroup'
+      FROM brief_requests brief
+      WHERE brief.id=COALESCE(
+        ${jobAlias}.brief_request_id,
+        CASE WHEN ${jobAlias}.run_id IS NOT NULL THEN (
+          SELECT scoped_access.brief_request_id
+          FROM run_accesses scoped_access
+          WHERE scoped_access.run_id=${jobAlias}.run_id
+            AND scoped_access.brief_request_id IS NOT NULL
+          ORDER BY scoped_access.created_at,scoped_access.id
+          LIMIT 1
+        ) ELSE NULL END
+      )
+    ),
+    (
+      SELECT CASE
+        WHEN plan.plan_json->'engines' ? 'exhaustive' THEN 'exhaustive'
+        WHEN plan.plan_json->'engines' ? 'factual_relationship' THEN 'factual_relationship'
+        WHEN plan.plan_json->'engines' ? 'fixed_container' THEN 'fixed_container'
+        WHEN plan.plan_json->'engines' ? 'artist_catalogue' THEN 'artist_catalogue'
+        WHEN plan.plan_json->'engines' ? 'similarity' THEN 'similarity'
+        WHEN (plan.plan_json->'engines'->>0)='mood_activity_theme'
+          THEN 'mood_activity_theme'
+        ELSE 'genre_scene'
+      END
+      FROM query_plan_revisions plan
+      WHERE plan.id=${activePlanId}
+    ),
+    'genre_scene'
+  )`;
+  return `(
+    ${jobAlias}.pipeline_version<>'corpus_first_v3'
+    OR NOT EXISTS (
+      SELECT 1
+      FROM pipeline_cohort_kill_switches hard_switch
+      WHERE hard_switch.route=${jobAlias}.pipeline_version
+        AND hard_switch.disabled
+        AND (
+          hard_switch.intent_group IS NULL
+          OR hard_switch.intent_group=${intentGroup}
+        )
+    )
+  )`;
+}
+
+interface RunWorkTruthV1 {
+  workMotion: RunWorkMotion;
+  wallClockMs: number | null;
+  activeComputeMs: number;
+  lastWorkerHeartbeatAt: string | null;
+  lastProgressAt: string | null;
+  nextRetryAt: string | null;
+  stageDeadlineAt: string | null;
+  selectedTrackCount: number | null;
+  manifestedTrackCount: number | null;
+  appendedTrackCount: number | null;
+  reconciledPublishedTrackCount: number | null;
 }
 
 export interface ResearchRunHistoryItem {
@@ -4925,6 +5001,112 @@ export class Repository {
     return { accepted: false, discarded: (discarded.rowCount ?? 0) === 1 };
   }
 
+  async recordPlaylistExecutionFailureFingerprint(input: {
+    attemptId: string;
+    runId: string;
+    contractRevisionId: string;
+    jobId: string;
+    workerId: string;
+    leaseGeneration: number;
+    errorSignature: string;
+    attemptStrategyHash: string;
+    errorCode: string;
+    stage: string;
+  }): Promise<{ accepted: boolean; repeated: boolean }> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 19) {
+      return { accepted: false, repeated: false };
+    }
+    if (!/^[a-f0-9]{64}$/u.test(input.errorSignature)
+      || !/^[a-f0-9]{64}$/u.test(input.attemptStrategyHash)
+      || !/^[a-z0-9_.:-]{1,120}$/u.test(input.errorCode)
+      || !input.stage.trim()
+      || input.stage.length > 80) {
+      throw new HttpError(
+        400,
+        "Execution failure fingerprint is invalid",
+        "invalid_execution_failure_fingerprint",
+      );
+    }
+    return this.transaction(async (client) => {
+      const authority = await client.query<{ id: string }>(
+        `SELECT run.id
+         FROM research_runs run
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=$2
+          AND attempt.run_id=run.id
+          AND attempt.contract_revision_id=$3
+          AND attempt.job_id=$4
+          AND attempt.lease_generation=$6
+          AND attempt.status='running'
+         JOIN job_queue job
+           ON job.id=attempt.job_id
+          AND job.run_id=run.id
+          AND job.status='leased'
+          AND job.lease_owner=$5
+          AND job.lease_epoch=$6
+          AND job.lease_expires_at>now()
+         WHERE run.id=$1
+           AND run.active_playlist_contract_revision_id=$3
+           AND run.deleted_at IS NULL
+         FOR UPDATE OF run,attempt,job`,
+        [
+          input.runId,
+          input.attemptId,
+          input.contractRevisionId,
+          input.jobId,
+          input.workerId,
+          input.leaseGeneration,
+        ],
+      );
+      if (!authority.rows[0]) return { accepted: false, repeated: false };
+      const checkpoint = await client.query<{
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT state_json FROM research_checkpoints
+         WHERE run_id=$1 AND phase='execution_failure_fingerprint_v1'
+         FOR UPDATE`,
+        [input.runId],
+      );
+      const prior = checkpoint.rows[0]?.state_json;
+      const priorHistory = Array.isArray(prior?.history)
+        ? prior.history.filter((entry): entry is Record<string, unknown> => (
+            Boolean(entry) && typeof entry === "object"
+          )).slice(-15)
+        : [];
+      const repeated = priorHistory.some((entry) => (
+        entry.errorSignature === input.errorSignature
+        && entry.attemptStrategyHash === input.attemptStrategyHash
+      ));
+      const history = [
+        ...priorHistory,
+        {
+          attemptId: input.attemptId,
+          errorSignature: input.errorSignature,
+          attemptStrategyHash: input.attemptStrategyHash,
+          errorCode: input.errorCode,
+          stage: input.stage,
+        },
+      ];
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,'execution_failure_fingerprint_v1',$2::jsonb)
+         ON CONFLICT(run_id,phase) DO UPDATE SET
+           state_json=EXCLUDED.state_json,updated_at=now()`,
+        [
+          input.runId,
+          JSON.stringify({
+            schemaVersion: "execution-failure-fingerprint/v1",
+            lastErrorSignature: input.errorSignature,
+            lastAttemptStrategyHash: input.attemptStrategyHash,
+            repeated,
+            history,
+          }),
+        ],
+      );
+      return { accepted: true, repeated };
+    });
+  }
+
   async discardPlaylistExecutionAttempt(input: {
     attemptId: string;
     runId: string;
@@ -9142,6 +9324,9 @@ export class Repository {
       questionSetHash: typeof row.question_set_hash === "string" ? row.question_set_hash : null,
       checkpointMode: typeof row.checkpoint_mode === "string"
         ? row.checkpoint_mode
+        : null,
+      confirmationKind: row.checkpoint_mode === "interpretation_confirmation"
+        ? "unresolved_review"
         : null,
       interpretationSummary: row.interpretation_summary_json ?? null,
       pipelineVersion: row.pipeline_version ?? "legacy_v1",
@@ -13783,6 +13968,273 @@ export class Repository {
   }
 
   /**
+   * Read execution motion and publication volume from durable authority.
+   * Resolution state describes what the user can do; it does not prove that a
+   * worker is alive. Likewise, a frozen manifest proves selection—not an
+   * Apple side effect.
+   */
+  private async readRunWorkTruthV1(
+    client: Pick<PoolClient, "query">,
+    runId: string,
+    state: PlaylistResolutionStateV1,
+    blockerKind: string | null,
+    blockerNextRetryAt: Date | null,
+    retainedState: Record<string, unknown> = {},
+  ): Promise<RunWorkTruthV1> {
+    const result = await client.query<{
+      created_at: Date;
+      updated_at: Date;
+      selected_track_count: number | null;
+      manifest_id: string | null;
+      manifested_track_count: number | null;
+      reconciliation_id: string | null;
+      reconciliation_state: string | null;
+      reconciliation_expected_hash: string | null;
+      reconciliation_observed_hash: string | null;
+      reconciliation_expected_count: number | null;
+      reconciliation_appended_count: number | null;
+      reconciliation_completed_at: Date | null;
+      reconciliation_updated_at: Date | null;
+      job_status: string | null;
+      job_available_at: Date | null;
+      job_lease_owner: string | null;
+      job_lease_expires_at: Date | null;
+      job_updated_at: Date | null;
+      job_paused: boolean | null;
+      job_hard_disabled: boolean | null;
+      attempt_status: string | null;
+      attempt_last_active_at: Date | null;
+      attempt_lease_generation: number | null;
+      job_lease_epoch: number | null;
+      heartbeat_last_seen_at: Date | null;
+      executor_identity_matches: boolean | null;
+      active_compute_ms: number | string | null;
+      latest_progress_at: Date | null;
+    }>(
+      `SELECT
+         run.created_at,run.updated_at,
+         outcome.selected_track_count,
+         manifest.id manifest_id,
+         manifest.manifested_track_count,
+         reconciliation.id reconciliation_id,
+         reconciliation.state reconciliation_state,
+         reconciliation.expected_ordered_ids_hash reconciliation_expected_hash,
+         reconciliation.observed_ordered_ids_hash reconciliation_observed_hash,
+         reconciliation.expected_count reconciliation_expected_count,
+         reconciliation.appended_count reconciliation_appended_count,
+         reconciliation.completed_at reconciliation_completed_at,
+         reconciliation.updated_at reconciliation_updated_at,
+         job.status job_status,job.available_at job_available_at,
+         job.lease_owner job_lease_owner,
+         job.lease_expires_at job_lease_expires_at,
+         job.updated_at job_updated_at,
+         CASE
+           WHEN job.kind='publication' THEN COALESCE((
+             SELECT value='true' FROM settings WHERE key='publishing_paused'
+           ),false)
+           ELSE COALESCE((
+             SELECT value='true' FROM settings WHERE key='research_paused'
+           ),false)
+         END job_paused,
+         CASE WHEN job.id IS NULL THEN false
+           ELSE NOT ${pipelineCohortLeaseAllowedSql("job")}
+         END job_hard_disabled,
+         attempt.status attempt_status,
+         attempt.last_active_at attempt_last_active_at,
+         attempt.lease_generation attempt_lease_generation,
+         job.lease_epoch job_lease_epoch,
+         heartbeat.last_seen_at heartbeat_last_seen_at,
+         CASE
+           WHEN job.required_executor_revision IS NULL
+             AND job.required_executor_semantic_configuration_hash IS NULL
+             THEN true
+           ELSE heartbeat.metadata_json->>'version'
+                  =job.required_executor_revision
+             AND heartbeat.metadata_json
+                  ->>'semanticExecutionConfigurationHash'
+                  =job.required_executor_semantic_configuration_hash
+         END executor_identity_matches,
+         COALESCE(attempt_totals.active_compute_ms,0) active_compute_ms,
+         GREATEST(
+           run.updated_at,
+           manifest.created_at,
+           reconciliation.updated_at,
+           job.updated_at,
+           attempt.last_active_at
+         ) latest_progress_at
+       FROM research_runs run
+       LEFT JOIN pipeline_outcomes outcome ON outcome.run_id=run.id
+       LEFT JOIN LATERAL (
+         SELECT selected_manifest.id,selected_manifest.created_at,
+                CASE WHEN revision.id IS NULL THEN (
+                  SELECT count(*)::int
+                  FROM manifest_tracks track
+                  WHERE track.manifest_id=selected_manifest.id
+                ) ELSE (
+                  SELECT count(*)::int
+                  FROM manifest_revision_tracks track
+                  WHERE track.manifest_revision_id=revision.id
+                ) END manifested_track_count
+         FROM manifests selected_manifest
+         LEFT JOIN LATERAL (
+           SELECT id
+           FROM manifest_revisions
+           WHERE manifest_id=selected_manifest.id
+           ORDER BY revision DESC,id DESC
+           LIMIT 1
+         ) revision ON true
+         WHERE selected_manifest.run_id=run.id
+         ORDER BY selected_manifest.created_at DESC,selected_manifest.id DESC
+         LIMIT 1
+       ) manifest ON true
+       LEFT JOIN LATERAL (
+         SELECT id,state,expected_ordered_ids_hash,
+                observed_ordered_ids_hash,expected_count,appended_count,
+                completed_at,updated_at
+         FROM playlist_publication_reconciliations
+         WHERE run_id=run.id
+           AND (manifest.id IS NULL OR manifest_id=manifest.id)
+         ORDER BY created_at DESC,id DESC
+         LIMIT 1
+       ) reconciliation ON true
+       LEFT JOIN LATERAL (
+         SELECT queued.*
+         FROM job_queue queued
+         WHERE queued.run_id=run.id
+           AND queued.kind IN ('research','matching','publication')
+           AND queued.status IN ('queued','leased')
+         ORDER BY CASE queued.status WHEN 'leased' THEN 0 ELSE 1 END,
+                  queued.updated_at DESC,queued.created_at DESC,queued.id DESC
+         LIMIT 1
+       ) job ON true
+       LEFT JOIN LATERAL (
+         SELECT status,last_active_at,lease_generation
+         FROM playlist_execution_attempts selected_attempt
+         WHERE selected_attempt.run_id=run.id
+           AND selected_attempt.job_id=job.id
+         ORDER BY selected_attempt.started_at DESC,selected_attempt.id DESC
+         LIMIT 1
+       ) attempt ON true
+       LEFT JOIN worker_heartbeats heartbeat
+         ON heartbeat.worker_id=job.lease_owner
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(sum(active_compute_ms),0)::bigint active_compute_ms
+         FROM playlist_execution_attempts
+         WHERE run_id=run.id
+       ) attempt_totals ON true
+       WHERE run.id=$1 AND run.deleted_at IS NULL`,
+      [runId],
+    );
+    const row = result.rows[0];
+    const retainedInteger = (key: string): number | null => {
+      const value = Number(retainedState[key]);
+      return Number.isSafeInteger(value) && value >= 0 ? value : null;
+    };
+    if (!row) {
+      return {
+        workMotion: "none",
+        wallClockMs: null,
+        activeComputeMs: 0,
+        lastWorkerHeartbeatAt: null,
+        lastProgressAt: null,
+        nextRetryAt: blockerNextRetryAt?.toISOString() ?? null,
+        stageDeadlineAt: null,
+        selectedTrackCount: retainedInteger("selectedTrackCount"),
+        manifestedTrackCount: retainedInteger("manifestedTrackCount"),
+        appendedTrackCount: retainedInteger("appendedTrackCount"),
+        reconciledPublishedTrackCount:
+          retainedInteger("reconciledPublishedTrackCount"),
+      };
+    }
+    const now = Date.now();
+    const activeComputeMs = Math.max(0, Number(row.active_compute_ms ?? 0));
+    const leaseValid = row.job_status === "leased"
+      && row.job_lease_expires_at instanceof Date
+      && row.job_lease_expires_at.getTime() > now;
+    const heartbeatFresh = row.heartbeat_last_seen_at instanceof Date
+      && row.heartbeat_last_seen_at.getTime() > now - 120_000;
+    const attemptFresh = row.attempt_last_active_at instanceof Date
+      && row.attempt_last_active_at.getTime() > now - 120_000;
+    const running = leaseValid
+      && heartbeatFresh
+      && attemptFresh
+      && row.attempt_status === "running"
+      && Number(row.attempt_lease_generation) === Number(row.job_lease_epoch)
+      && row.executor_identity_matches === true
+      && row.job_paused !== true
+      && row.job_hard_disabled !== true;
+    let workMotion: RunWorkMotion;
+    if (state === "completed"
+      || state === "cancelled"
+      || state === "quarantined"
+      || state === "needs_input"
+      || state === "needs_decision"
+      || state === "ready") {
+      workMotion = "none";
+    } else if (blockerKind === "provider") {
+      workMotion = "waiting_dependency";
+    } else if (blockerKind === "apple_authorization"
+      || row.job_paused === true
+      || row.job_hard_disabled === true) {
+      workMotion = "paused";
+    } else if (running) {
+      workMotion = "running";
+    } else if (row.job_status === "queued"
+      && row.job_available_at instanceof Date
+      && row.job_available_at.getTime() > now) {
+      workMotion = "retry_scheduled";
+    } else {
+      workMotion = "stalled";
+    }
+    const exactReconciliation = row.reconciliation_id !== null
+      && row.reconciliation_state === "complete"
+      && row.reconciliation_completed_at instanceof Date
+      && Number(row.reconciliation_appended_count)
+        === Number(row.reconciliation_expected_count)
+      && row.reconciliation_expected_hash !== null
+      && row.reconciliation_observed_hash === row.reconciliation_expected_hash;
+    const reconciledPublishedTrackCount = exactReconciliation
+      ? Number(row.reconciliation_expected_count)
+      : row.reconciliation_id !== null
+        ? 0
+        : retainedInteger("reconciledPublishedTrackCount");
+    const selectedTrackCount = row.selected_track_count == null
+      ? retainedInteger("selectedTrackCount")
+      : Number(row.selected_track_count);
+    const manifestedTrackCount = row.manifested_track_count == null
+      ? retainedInteger("manifestedTrackCount")
+      : Number(row.manifested_track_count);
+    const appendedTrackCount = row.reconciliation_appended_count == null
+      ? retainedInteger("appendedTrackCount")
+      : Number(row.reconciliation_appended_count);
+    const retryAt = blockerNextRetryAt
+      ?? (row.job_status === "queued" ? row.job_available_at : null);
+    const remainingActiveComputeMs = Math.max(
+      0,
+      15 * 60_000 - activeComputeMs,
+    );
+    return {
+      workMotion,
+      wallClockMs: row.created_at instanceof Date
+        ? Math.max(0, now - row.created_at.getTime())
+        : null,
+      activeComputeMs,
+      lastWorkerHeartbeatAt: row.heartbeat_last_seen_at?.toISOString() ?? null,
+      lastProgressAt: row.latest_progress_at?.toISOString()
+        ?? row.updated_at?.toISOString()
+        ?? null,
+      nextRetryAt: retryAt?.toISOString() ?? null,
+      stageDeadlineAt: running
+        ? new Date(now + remainingActiveComputeMs).toISOString()
+        : null,
+      selectedTrackCount,
+      manifestedTrackCount,
+      appendedTrackCount,
+      reconciledPublishedTrackCount,
+    };
+  }
+
+  /**
    * Transactionally maintain the schema-19 compatibility ledger while legacy
    * columns remain authoritative. The authoritative mode is deliberately not
    * projected from legacy status: after cutover, callers must use the
@@ -13817,7 +14269,6 @@ export class Repository {
       question_set_id: string | null;
       manifest_id: string | null;
       requested_track_count: number | null;
-      published_track_count: number;
     }>(
       `SELECT run.status,run.phase,run.active_playlist_contract_revision_id,
               attempt.id execution_attempt_id,
@@ -13830,9 +14281,7 @@ export class Repository {
                 NULLIF(run.selection_plan_json->>'requestedTrackCount','')::int,
                 NULLIF(run.brief_json #>> '{targetSize,max}','')::int,
                 NULLIF(run.brief_json #>> '{targetSize,min}','')::int
-              ) requested_track_count,
-              COALESCE(tracks.published_track_count,0)::int
-                published_track_count
+              ) requested_track_count
        FROM research_runs run
        LEFT JOIN run_specs spec ON spec.run_id=run.id
        LEFT JOIN LATERAL (
@@ -13863,29 +14312,6 @@ export class Repository {
          WHERE run_id=run.id
          ORDER BY created_at DESC,id DESC LIMIT 1
        ) manifest ON true
-       LEFT JOIN LATERAL (
-         SELECT CASE
-           WHEN latest_revision.id IS NULL THEN (
-             SELECT count(*)::int
-             FROM manifest_tracks
-             WHERE manifest_id=manifest.id
-           )
-           ELSE (
-             SELECT count(*)::int
-             FROM manifest_revision_tracks
-             WHERE manifest_revision_id=latest_revision.id
-           )
-         END published_track_count
-         FROM (
-           SELECT (
-             SELECT revision.id
-             FROM manifest_revisions revision
-             WHERE revision.manifest_id=manifest.id
-             ORDER BY revision.revision DESC,revision.id DESC
-             LIMIT 1
-           ) id
-         ) latest_revision
-       ) tracks ON true
        WHERE run.id=$1 AND run.deleted_at IS NULL
        FOR UPDATE OF run`,
       [runId],
@@ -13928,12 +14354,20 @@ export class Repository {
     const requestedTrackCount = row.requested_track_count == null
       ? null
       : Number(row.requested_track_count);
-    const publishedTrackCount = Number(row.published_track_count);
+    const workTruth = await this.readRunWorkTruthV1(
+      client,
+      runId,
+      state,
+      row.blocker_kind,
+      row.blocker_kind === "provider"
+        ? date(row.blocker_state_json?.nextRetryAt)
+        : null,
+    );
     if (state === "completed" && (
       !row.manifest_id
       || !Number.isSafeInteger(requestedTrackCount)
       || requestedTrackCount! < 1
-      || publishedTrackCount !== requestedTrackCount
+      || workTruth.reconciledPublishedTrackCount !== requestedTrackCount
     )) {
       state = "needs_decision";
       nextAction = "review_contract";
@@ -13963,7 +14397,8 @@ export class Repository {
       legacyStatus: row.status,
       legacyPhase: row.phase,
       requestedTrackCount,
-      publishedTrackCount,
+      publishedTrackCount: workTruth.reconciledPublishedTrackCount,
+      ...workTruth,
     };
     const companions = {
       activeContractRevisionId: row.active_contract_revision_id,
@@ -14787,6 +15222,14 @@ export class Repository {
           nextAction: blockerState.nextAction,
         })
       : null;
+    const workTruth = await this.readRunWorkTruthV1(
+      this.pool,
+      runId,
+      state,
+      row.blocker_kind,
+      row.next_retry_at,
+      row.state_json,
+    );
     return {
       generation: Number(row.generation),
       state,
@@ -14797,6 +15240,7 @@ export class Repository {
         ? null
         : Number(row.contract_revision),
       contractHash: row.contract_hash,
+      ...workTruth,
       blocker: row.blocker_kind ? {
         kind: row.blocker_kind,
         nextRetryAt: row.next_retry_at?.toISOString() ?? null,
@@ -15026,11 +15470,21 @@ export class Repository {
         rescueQuestionsAvailable: true,
       });
     }
+    const workTruth = schemaVersion >= 19
+      ? await this.readRunWorkTruthV1(
+          this.pool,
+          runId,
+          projected.state as PlaylistResolutionStateV1,
+          blockerKind,
+          row?.next_retry_at ?? providerCheckpoint?.nextRetryAt ?? null,
+        )
+      : null;
     return {
       ...projected,
       contractRevisionId: row?.contract_revision_id ?? null,
       contractRevision: row?.contract_revision == null ? null : Number(row.contract_revision),
       contractHash: row?.contract_hash ?? null,
+      ...(workTruth ?? {}),
       blocker: blockerKind ? {
         kind: blockerKind,
         nextRetryAt: row?.next_retry_at?.toISOString()
@@ -22409,6 +22863,12 @@ export class Repository {
              )
            )`
         : "";
+    const candidateCohortLeasePredicate = schemaVersion >= 18
+      ? ` AND ${pipelineCohortLeaseAllowedSql("candidate")}`
+      : "";
+    const exhaustedCohortLeasePredicate = schemaVersion >= 18
+      ? ` AND ${pipelineCohortLeaseAllowedSql("job_queue")}`
+      : "";
     // Derive the effective fence from both immutable contracts at lease time.
     // This protects work queued during a rolling migration even if an older
     // trigger physically stamped a lower number on the row.
@@ -22498,6 +22958,7 @@ export class Repository {
              ${queuePredicate}
              ${exhaustedExecutorCapabilityPredicate}
              ${exhaustedExecutorReleaseIdentityPredicate}
+             ${exhaustedCohortLeasePredicate}
              AND cardinality($10::varchar[])>=0
              AND jsonb_typeof($11::jsonb)='array'
              AND $12::varchar IS NOT NULL
@@ -22616,6 +23077,7 @@ export class Repository {
            ${candidateQueuePredicate}
            ${candidateExecutorCapabilityPredicate}
            ${candidateExecutorReleaseIdentityPredicate}
+           ${candidateCohortLeasePredicate}
            AND cardinality($3::varchar[])>=0
            AND jsonb_typeof($4::jsonb)='array'
            AND $5::varchar IS NOT NULL
@@ -22735,6 +23197,9 @@ export class Repository {
            FROM lease_clock clock
            WHERE job.id=$1 AND job.lease_owner=$2 AND job.status='leased'
              AND job.lease_expires_at>clock.observed_at
+             ${schemaVersion >= 18
+               ? `AND ${pipelineCohortLeaseAllowedSql("job")}`
+               : ""}
              AND (
                job.pipeline_version<>'corpus_first_v3'
                OR ($4::bigint IS NOT NULL AND job.lease_epoch=$4)
@@ -22797,6 +23262,9 @@ export class Repository {
       ? await this.pool.query(
         `UPDATE job_queue SET lease_expires_at=$3,updated_at=now()
          WHERE id=$1 AND lease_owner=$2 AND status='leased' AND lease_expires_at>now()
+           ${schemaVersion >= 18
+             ? `AND ${pipelineCohortLeaseAllowedSql("job_queue")}`
+             : ""}
            AND (pipeline_version<>'corpus_first_v3' OR ($4::bigint IS NOT NULL AND lease_epoch=$4))`,
         [jobId, workerId, expiresAt, Number.isSafeInteger(leaseEpoch) ? leaseEpoch : null],
       )
@@ -26417,26 +26885,12 @@ export class Repository {
     // algorithm at persistence and publication time. The wider immutable
     // research contract remains frozen in run_specs, selection_plans,
     // query_plan_revisions, graph snapshots, and the revision snapshots.
-    const manifestHash = !manifestEligibleOutcome || result.selected.length === 0
-      ? null
-      : manifestContentHash(
-      result.selected.map((track) => ({
-        // V3 persists a run-owned UUID for every discovered candidate. The
-        // publisher loads and hashes that persisted UUID, not the adapter's
-        // source-local candidate key, so bind the revision to the same
-        // deterministic identity before the transaction begins.
-        candidateId: deterministicUuid({
-          runId,
-          pipelineVersion: "corpus_first_v3",
-          candidateId: track.candidateId,
-          familyKey: track.recordingFamilyKey,
-        }),
-        catalogId: track.appleSongId,
-      })),
-    );
-    const manifestId = manifestHash ? deterministicUuid({ runId, kind: "pipeline_v3_manifest" }) : null;
-    const manifestRevisionId = manifestHash
-      ? deterministicUuid({ runId, kind: "pipeline_v3_manifest_revision", manifestHash })
+    // Candidate/family/catalog upserts can legitimately encounter a row that
+    // predates the deterministic ID now proposed by this worker. The database
+    // returned IDs are therefore the only IDs allowed into a manifest hash.
+    // Derive the manifest revision only after identity materialization.
+    const manifestId = manifestEligibleOutcome && result.selected.length > 0
+      ? deterministicUuid({ runId, kind: "pipeline_v3_manifest" })
       : null;
 
     const persisted = await this.transaction(async (client) => {
@@ -26557,6 +27011,163 @@ export class Repository {
         throw new HttpError(409, "Pipeline V3 retrieval no longer matches the active immutable plan", "pipeline_v3_plan_stale");
       }
 
+      const existingManifest = await client.query<{
+        manifest_id: string;
+        manifest_revision_id: string | null;
+        content_hash: string;
+        contract_revision_id: string | null;
+        contract_hash: string | null;
+      }>(
+        `SELECT manifest.id manifest_id,
+                revision.id manifest_revision_id,
+                manifest.content_hash,
+                manifest.contract_revision_id,
+                manifest.contract_hash
+         FROM manifests manifest
+         LEFT JOIN LATERAL (
+           SELECT id FROM manifest_revisions
+           WHERE manifest_id=manifest.id
+           ORDER BY revision DESC LIMIT 1
+         ) revision ON true
+         WHERE manifest.run_id=$1
+         FOR UPDATE OF manifest`,
+        [runId],
+      );
+      if (existingManifest.rows[0]) {
+        const existing = existingManifest.rows[0];
+        if (!manifestId
+          || existing.manifest_id !== manifestId
+          || !existing.manifest_revision_id
+          || existing.contract_revision_id
+            !== immutable.active_playlist_contract_revision_id
+          || existing.contract_hash
+            !== (immutable.playlist_contract_json?.semanticHash ?? null)) {
+          throw new HttpError(
+            409,
+            "Existing Pipeline V3 manifest projection is incomplete or stale",
+            "pipeline_v3_existing_projection_incomplete",
+          );
+        }
+        const persistedTracks = await client.query<{
+          position: number;
+          candidate_id: string;
+          recording_family_key: string;
+          catalog_identity_id: string;
+          catalog_id: string;
+          artist: string;
+          title: string;
+          storefront: string | null;
+          stable_identity_hash: string | null;
+          qualification_hash: string | null;
+          qualification_decision: string | null;
+          qualification_revoked_at: Date | null;
+          qualification_candidate_id: string | null;
+          predicate_results_json: Record<string, unknown> | null;
+          evidence_record_ids_json: string[] | null;
+          quality_result_json: Record<string, unknown> | null;
+          catalog_result_json: Record<string, unknown> | null;
+        }>(
+          `SELECT item.position,item.candidate_id,
+                  family.family_key recording_family_key,
+                  item.catalog_identity_id,item.catalog_id,item.artist,item.title,
+                  identity.storefront,
+                  qualification.stable_identity_hash,
+                  qualification.qualification_hash,
+                  qualification.decision qualification_decision,
+                  qualification.revoked_at qualification_revoked_at,
+                  qualification.candidate_id qualification_candidate_id,
+                  qualification.predicate_results_json,
+                  qualification.evidence_record_ids_json,
+                  qualification.quality_result_json,
+                  qualification.catalog_result_json
+           FROM manifest_revision_tracks item
+           JOIN track_candidates candidate
+             ON candidate.id=item.candidate_id AND candidate.run_id=$1
+           JOIN recording_families family
+             ON family.id=item.recording_family_id
+            AND family.id=candidate.recording_family_id
+            AND family.run_id=$1
+           JOIN recording_catalog_identities identity
+             ON identity.id=item.catalog_identity_id
+            AND identity.recording_family_id=family.id
+            AND identity.provider='apple'
+            AND identity.catalog_id=item.catalog_id
+           LEFT JOIN LATERAL (
+             SELECT stable_identity_hash,qualification_hash,decision,revoked_at,
+                    candidate_id,predicate_results_json,evidence_record_ids_json,
+                    quality_result_json,catalog_result_json
+             FROM playlist_qualification_records
+             WHERE run_id=$1
+               AND contract_revision_id=$3
+               AND candidate_id=item.candidate_id
+               AND decision='qualified'
+               AND revoked_at IS NULL
+             ORDER BY qualified_at DESC,id DESC LIMIT 1
+           ) qualification ON true
+           WHERE item.manifest_revision_id=$2
+           ORDER BY item.position`,
+          [
+            runId,
+            existing.manifest_revision_id,
+            immutable.active_playlist_contract_revision_id,
+          ],
+        );
+        const exactTuple = persistedTracks.rows.length === result.selected.length
+          && persistedTracks.rows.every((row, index) => {
+            const expected = result.selected[index];
+            const observedQualificationHash = row.stable_identity_hash
+              && row.predicate_results_json
+              && row.evidence_record_ids_json
+              && row.quality_result_json
+              && row.catalog_result_json
+              ? sha256Hex(stableStringify({
+                  decision: "qualified",
+                  stableIdentityHash: row.stable_identity_hash,
+                  predicateResults: row.predicate_results_json,
+                  evidenceRecordIds: row.evidence_record_ids_json,
+                  qualityResult: row.quality_result_json,
+                  catalogResult: row.catalog_result_json,
+                }))
+              : null;
+            return Boolean(expected)
+              && Number(row.position) === index
+              && row.recording_family_key === expected.recordingFamilyKey
+              && row.catalog_id === expected.appleSongId
+              && row.artist === expected.artist.slice(0, 240)
+              && row.title === expected.title.slice(0, 240)
+              && row.storefront?.toLowerCase() === plan.storefront.toLowerCase()
+              && (!recoveryAuthority || (
+                row.qualification_candidate_id === row.candidate_id
+                && row.qualification_decision === "qualified"
+                && row.qualification_revoked_at === null
+                && typeof row.qualification_hash === "string"
+                && /^[a-f0-9]{64}$/u.test(row.qualification_hash)
+                && row.qualification_hash === observedQualificationHash
+              ));
+          });
+        const observedHash = exactTuple
+          ? manifestContentHash(persistedTracks.rows.map((row) => ({
+              candidateId: row.candidate_id,
+              catalogId: row.catalog_id,
+            })))
+          : null;
+        if (!exactTuple || observedHash !== existing.content_hash) {
+          throw new HttpError(
+            409,
+            "Existing Pipeline V3 manifest does not match its complete persisted identity tuple",
+            "pipeline_v3_existing_projection_incomplete",
+          );
+        }
+        return {
+          manifestId: existing.manifest_id,
+          manifestRevisionId: existing.manifest_revision_id,
+          manifestHash: existing.content_hash,
+          clientBucket: immutable.client_bucket,
+          exact: result.outcome.status === "exact_ready",
+          existing: true,
+        };
+      }
+
       const graphBindings = [...attestedBindingsByTrack.values()]
         .flat()
         .filter((binding): binding is typeof binding & {
@@ -26604,6 +27215,16 @@ export class Repository {
       }
 
       let manifestSelectionPlan = immutable.selection_plan_json;
+      const pendingQualifications: Array<{
+        track: QualifiedTrackV3;
+        discoveryLeadId: string | null;
+        stableIdentityHash: string;
+        predicateResults: Record<string, unknown>;
+        evidenceRecordIds: string[];
+        qualityResult: Record<string, unknown>;
+        catalogResult: Record<string, unknown>;
+        qualificationHash: string;
+      }> = [];
       if (supportsGroundedRecoveryAudit) {
         const revisions = result.semanticPlanRevisions ?? [];
         if (revisions.length > 1) {
@@ -27064,61 +27685,20 @@ export class Repository {
               qualityResult,
               catalogResult,
             }));
-            // Callback persistence is an audit trail, not a second active
-            // publication authority. Supersede every earlier active
-            // projection for this immutable recording identity before
-            // installing the one final result row.
-            await client.query(
-              `UPDATE playlist_qualification_records
-               SET decision='revoked',revoked_at=COALESCE(revoked_at,now())
-               WHERE run_id=$1 AND contract_revision_id=$2
-                 AND stable_identity_hash=$3
-                 AND decision='qualified' AND revoked_at IS NULL`,
-              [
-                runId,
-                recoveryAuthority.contractRevisionId,
-                stableIdentityHash,
-              ],
-            );
-            await client.query(
-              `INSERT INTO playlist_qualification_records(
-                 id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
-                 stable_identity_hash,storefront,predicate_results_json,
-                 evidence_record_ids_json,quality_result_json,catalog_result_json,
-                 decision,qualification_hash)
-               VALUES($1,$2,$3,$4,NULL,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,
-                 $10::jsonb,'qualified',$11)
-               ON CONFLICT(
-                 run_id,contract_revision_id,stable_identity_hash,qualification_hash
-               ) DO UPDATE SET
-                 discovery_lead_id=EXCLUDED.discovery_lead_id,
-                 candidate_id=EXCLUDED.candidate_id,
-                 storefront=EXCLUDED.storefront,
-                 predicate_results_json=EXCLUDED.predicate_results_json,
-                 evidence_record_ids_json=EXCLUDED.evidence_record_ids_json,
-                 quality_result_json=EXCLUDED.quality_result_json,
-                 catalog_result_json=EXCLUDED.catalog_result_json,
-                 decision='qualified',revoked_at=NULL,qualified_at=now()`,
-              [
-                deterministicUuid({
-                  kind: "playlist_qualification_record",
-                  runId,
-                  contractRevisionId: recoveryAuthority.contractRevisionId,
-                  stableIdentityHash,
-                  qualificationHash,
-                }),
-                runId,
-                recoveryAuthority.contractRevisionId,
-                lead.rows[0]?.id ?? null,
-                stableIdentityHash,
-                plan.storefront,
-                JSON.stringify(predicateResults),
-                JSON.stringify(evidenceRecordIds),
-                JSON.stringify(qualityResult),
-                JSON.stringify(catalogResult),
-                qualificationHash,
-              ],
-            );
+            // Final qualification is deferred until the exact recording
+            // family, candidate, and Apple catalog identity have been
+            // materialized. This prevents a callback replay from installing
+            // an active qualification with a null or proposed candidate ID.
+            pendingQualifications.push({
+              track,
+              discoveryLeadId: lead.rows[0]?.id ?? null,
+              stableIdentityHash,
+              predicateResults,
+              evidenceRecordIds,
+              qualityResult,
+              catalogResult,
+              qualificationHash,
+            });
             if (lead.rows[0]) {
               await client.query(
                 `UPDATE playlist_discovery_leads
@@ -27158,35 +27738,19 @@ export class Repository {
         })],
       );
 
-      if (manifestRevisionId) {
-        const existing = await client.query<{ manifest_id: string; content_hash: string }>(
-          `SELECT manifest_id,content_hash FROM manifest_revisions
-           WHERE id=$1 AND pipeline_version='corpus_first_v3'`,
-          [manifestRevisionId],
-        );
-        if (existing.rows[0]) {
-          if (existing.rows[0].manifest_id !== manifestId || existing.rows[0].content_hash !== manifestHash) {
-            throw new HttpError(409, "Pipeline V3 manifest retry conflicts with immutable content", "manifest_revision_conflict");
-          }
-          return {
-            manifestId,
-            manifestRevisionId,
-            manifestHash,
-            clientBucket: immutable.client_bucket,
-            exact: result.outcome.status === "exact_ready",
-            existing: true,
-          };
-        }
-      }
-
-      const persistedTracks: Array<{
+      const persistedIdentities = new Map<string, {
         track: QualifiedTrackV3;
         candidateId: string;
         familyId: string;
         catalogIdentityId: string;
-        reserve: boolean;
-      }> = [];
-      for (const [index, track] of allTracks.entries()) {
+      }>();
+      const materializationTracks = [...new Map(
+        [...result.qualifiedPool, ...allTracks].map((track) => [
+          track.recordingFamilyKey,
+          track,
+        ]),
+      ).values()];
+      for (const track of materializationTracks) {
         if (!track.title.trim() || !track.artist.trim() || !track.appleSongId.trim()
           || !track.recordingFamilyKey.trim() || !Array.isArray(track.evidenceBindingIds)
           // Canonical evaluation above has already proved that every passing
@@ -27203,45 +27767,53 @@ export class Repository {
             { operatorCode: "pipeline_v3_result_invalid.identity_evidence" },
           );
         }
-        const familyId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", familyKey: track.recordingFamilyKey });
-        const candidateId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", candidateId: track.candidateId, familyKey: track.recordingFamilyKey });
-        const catalogIdentityId = deterministicUuid({ familyId, provider: "apple", storefront: plan.storefront, catalogId: track.appleSongId });
+        const proposedFamilyId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", familyKey: track.recordingFamilyKey });
         const canonicalKey = `v3:${sha256Hex(stableStringify({ runId, sourceCandidateId: track.candidateId, familyKey: track.recordingFamilyKey }))}`;
-        await client.query(
+        const family = await client.query<{ id: string }>(
           `INSERT INTO recording_families(
              id,run_id,family_key,canonical_artist,canonical_title,version_class,metadata_json,
              pipeline_version,policy_version)
            VALUES($1,$2,$3,$4,$5,'canonical',$6::jsonb,'corpus_first_v3','corpus_first_v3_policy_v1')
            ON CONFLICT(run_id,family_key) DO UPDATE SET
              canonical_artist=EXCLUDED.canonical_artist,canonical_title=EXCLUDED.canonical_title,
-             metadata_json=EXCLUDED.metadata_json,updated_at=now()`,
-          [familyId, runId, track.recordingFamilyKey, track.artist.slice(0, 240), track.title.slice(0, 240), JSON.stringify({ album: track.album, sourceRank: track.sourceRank })],
+             metadata_json=EXCLUDED.metadata_json,updated_at=now()
+           RETURNING id`,
+          [proposedFamilyId, runId, track.recordingFamilyKey, track.artist.slice(0, 240), track.title.slice(0, 240), JSON.stringify({ album: track.album, sourceRank: track.sourceRank })],
         );
-        await client.query(
+        const familyId = family.rows[0]!.id;
+        const proposedCandidateId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", candidateId: track.candidateId, familyKey: track.recordingFamilyKey });
+        const candidate = await client.query<{ id: string }>(
           `INSERT INTO track_candidates(
              id,run_id,canonical_key,duplicate_cluster_key,artist,title,album,outcome,
              recording_family_id,candidate_stage,pipeline_version,policy_version)
            VALUES($1,$2,$3,$4,$5,$6,$7,'accepted',$8,'discovered','corpus_first_v3','corpus_first_v3_policy_v1')
            ON CONFLICT(run_id,canonical_key) DO UPDATE SET
              artist=EXCLUDED.artist,title=EXCLUDED.title,album=EXCLUDED.album,
-             recording_family_id=EXCLUDED.recording_family_id,outcome='accepted'`,
-          [candidateId, runId, canonicalKey, track.recordingFamilyKey.slice(0, 500), track.artist.slice(0, 240), track.title.slice(0, 240), track.album?.slice(0, 240) ?? null, familyId],
+             recording_family_id=EXCLUDED.recording_family_id,outcome='accepted'
+           RETURNING id`,
+          [proposedCandidateId, runId, canonicalKey, track.recordingFamilyKey.slice(0, 500), track.artist.slice(0, 240), track.title.slice(0, 240), track.album?.slice(0, 240) ?? null, familyId],
         );
+        const candidateId = candidate.rows[0]!.id;
         await client.query(
           `INSERT INTO recording_family_candidates(recording_family_id,candidate_id,relationship)
-           VALUES($1,$2,'qualified_member') ON CONFLICT(candidate_id) DO NOTHING`,
+           VALUES($1,$2,'qualified_member') ON CONFLICT(candidate_id) DO UPDATE SET
+             recording_family_id=EXCLUDED.recording_family_id,
+             relationship=EXCLUDED.relationship`,
           [familyId, candidateId],
         );
-        await client.query(
+        const proposedCatalogIdentityId = deterministicUuid({ familyId, provider: "apple", storefront: plan.storefront, catalogId: track.appleSongId });
+        const catalogIdentity = await client.query<{ id: string }>(
           `INSERT INTO recording_catalog_identities(
              id,recording_family_id,provider,storefront,catalog_id,is_preferred,identity_confidence,
              artist,title,album,metadata_json)
            VALUES($1,$2,'apple',$3,$4,true,$5,$6,$7,$8,$9::jsonb)
            ON CONFLICT(recording_family_id,provider,storefront,catalog_id) DO UPDATE SET
              is_preferred=true,identity_confidence=GREATEST(recording_catalog_identities.identity_confidence,EXCLUDED.identity_confidence),
-             metadata_json=EXCLUDED.metadata_json,updated_at=now()`,
-          [catalogIdentityId, familyId, plan.storefront, track.appleSongId.slice(0, 160), Math.max(0, Math.min(1, track.catalogConfidence)), track.artist.slice(0, 240), track.title.slice(0, 240), track.album?.slice(0, 240) ?? null, JSON.stringify({ compatible: true, versionCompatible: true })],
+             metadata_json=EXCLUDED.metadata_json,updated_at=now()
+           RETURNING id`,
+          [proposedCatalogIdentityId, familyId, plan.storefront, track.appleSongId.slice(0, 160), Math.max(0, Math.min(1, track.catalogConfidence)), track.artist.slice(0, 240), track.title.slice(0, 240), track.album?.slice(0, 240) ?? null, JSON.stringify({ compatible: true, versionCompatible: true })],
         );
+        const catalogIdentityId = catalogIdentity.rows[0]!.id;
         await client.query(
           `INSERT INTO catalog_matches(
              id,run_id,candidate_id,status,basis,score,catalog_id,song_json,alternatives_json,reviewed_at)
@@ -27250,27 +27822,7 @@ export class Repository {
              score=EXCLUDED.score,catalog_id=EXCLUDED.catalog_id,song_json=EXCLUDED.song_json,reviewed_at=now()`,
           [deterministicUuid({ runId, candidateId, kind: "catalog_match" }), runId, candidateId, Math.max(0, Math.min(1, track.catalogConfidence)), track.appleSongId.slice(0, 100), JSON.stringify({ id: track.appleSongId, name: track.title, artistName: track.artist, albumName: track.album ?? "" })],
         );
-        if (recoveryAuthority) {
-          const stableIdentityHash = sha256Hex(stableStringify({
-            kind: "recording_family",
-            recordingFamilyKey: track.recordingFamilyKey,
-          }));
-          await client.query(
-            `UPDATE playlist_qualification_records
-             SET candidate_id=$4
-             WHERE run_id=$1 AND contract_revision_id=$2
-               AND stable_identity_hash=$3
-               AND (candidate_id IS NULL OR candidate_id=$4)`,
-            [
-              runId,
-              recoveryAuthority.contractRevisionId,
-              stableIdentityHash,
-              candidateId,
-            ],
-          );
-        }
-
-        const bindings = attestedBindingsByTrack.get(track)!;
+        const bindings = attestedBindingsByTrack.get(track) ?? [];
         for (const binding of bindings) {
           const canonicalPredicates = canonicalRetrieval
             ? (finalSemanticPlan.canonicalContractPolicy?.clauses ?? []).filter(
@@ -27356,8 +27908,154 @@ export class Repository {
             );
           }
         }
-        persistedTracks.push({ track, candidateId, familyId, catalogIdentityId, reserve: index >= result.selected.length });
+        persistedIdentities.set(track.recordingFamilyKey, {
+          track,
+          candidateId,
+          familyId,
+          catalogIdentityId,
+        });
       }
+
+      if (recoveryAuthority) {
+        for (const qualification of pendingQualifications) {
+          const identity = persistedIdentities.get(
+            qualification.track.recordingFamilyKey,
+          );
+          if (!identity) {
+            throw new HttpError(
+              409,
+              "Qualified recording identity was not materialized",
+              "pipeline_v3_existing_projection_incomplete",
+            );
+          }
+          // Outcomes are immutable. Revocation changes lifecycle state only;
+          // the decision participating in the qualification hash is never
+          // rewritten.
+          await client.query(
+            `UPDATE playlist_qualification_records
+             SET candidate_id=COALESCE(candidate_id,$5),
+                 revoked_at=COALESCE(revoked_at,now())
+             WHERE run_id=$1 AND contract_revision_id=$2
+               AND stable_identity_hash=$3
+               AND decision='qualified' AND revoked_at IS NULL
+               AND qualification_hash<>$4
+               AND (candidate_id IS NULL OR candidate_id=$5)`,
+            [
+              runId,
+              recoveryAuthority.contractRevisionId,
+              qualification.stableIdentityHash,
+              qualification.qualificationHash,
+              identity.candidateId,
+            ],
+          );
+          const persistedQualification = await client.query<{
+            candidate_id: string | null;
+            storefront: string;
+            predicate_results_json: Record<string, unknown>;
+            evidence_record_ids_json: string[];
+            quality_result_json: Record<string, unknown>;
+            catalog_result_json: Record<string, unknown>;
+            decision: string;
+            qualification_hash: string;
+          }>(
+            `INSERT INTO playlist_qualification_records(
+               id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
+               stable_identity_hash,storefront,predicate_results_json,
+               evidence_record_ids_json,quality_result_json,catalog_result_json,
+               decision,qualification_hash)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,
+               $11::jsonb,'qualified',$12)
+             ON CONFLICT(
+               run_id,contract_revision_id,stable_identity_hash,qualification_hash
+             ) DO UPDATE SET
+               discovery_lead_id=EXCLUDED.discovery_lead_id,
+               candidate_id=COALESCE(
+                 playlist_qualification_records.candidate_id,
+                 EXCLUDED.candidate_id
+               ),
+               storefront=EXCLUDED.storefront,
+               revoked_at=NULL
+             RETURNING candidate_id,storefront,predicate_results_json,
+               evidence_record_ids_json,quality_result_json,catalog_result_json,
+               decision,qualification_hash`,
+            [
+              deterministicUuid({
+                kind: "playlist_qualification_record",
+                runId,
+                contractRevisionId: recoveryAuthority.contractRevisionId,
+                stableIdentityHash: qualification.stableIdentityHash,
+                qualificationHash: qualification.qualificationHash,
+              }),
+              runId,
+              recoveryAuthority.contractRevisionId,
+              qualification.discoveryLeadId,
+              identity.candidateId,
+              qualification.stableIdentityHash,
+              plan.storefront,
+              JSON.stringify(qualification.predicateResults),
+              JSON.stringify(qualification.evidenceRecordIds),
+              JSON.stringify(qualification.qualityResult),
+              JSON.stringify(qualification.catalogResult),
+              qualification.qualificationHash,
+            ],
+          );
+          const storedQualification = persistedQualification.rows[0];
+          if (!storedQualification
+            || storedQualification.candidate_id !== identity.candidateId
+            || storedQualification.storefront.toLowerCase()
+              !== plan.storefront.toLowerCase()
+            || storedQualification.decision !== "qualified"
+            || storedQualification.qualification_hash
+              !== qualification.qualificationHash
+            || stableStringify(storedQualification.predicate_results_json)
+              !== stableStringify(qualification.predicateResults)
+            || stableStringify(storedQualification.evidence_record_ids_json)
+              !== stableStringify(qualification.evidenceRecordIds)
+            || stableStringify(storedQualification.quality_result_json)
+              !== stableStringify(qualification.qualityResult)
+            || stableStringify(storedQualification.catalog_result_json)
+              !== stableStringify(qualification.catalogResult)) {
+            throw new HttpError(
+              409,
+              "Qualification retry conflicts with its complete persisted tuple",
+              "pipeline_v3_existing_projection_incomplete",
+            );
+          }
+        }
+      }
+
+      const persistedTracks = allTracks.map((track, index) => {
+        const identity = persistedIdentities.get(track.recordingFamilyKey);
+        if (!identity) {
+          throw new HttpError(
+            409,
+            "Manifest recording identity was not materialized",
+            "pipeline_v3_existing_projection_incomplete",
+          );
+        }
+        return {
+          ...identity,
+          track,
+          reserve: index >= result.selected.length,
+        };
+      });
+      const manifestHash = !manifestId
+        ? null
+        : manifestContentHash(
+            persistedTracks
+              .filter((item) => !item.reserve)
+              .map((item) => ({
+                candidateId: item.candidateId,
+                catalogId: item.track.appleSongId,
+              })),
+          );
+      const manifestRevisionId = manifestHash
+        ? deterministicUuid({
+            runId,
+            kind: "pipeline_v3_manifest_revision",
+            manifestHash,
+          })
+        : null;
 
       await advanceCandidateStagesTransaction(
         client,

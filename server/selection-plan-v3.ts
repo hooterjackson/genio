@@ -181,6 +181,17 @@ export interface CriticalAmbiguityV3 {
     | "temporal_width";
   readonly summary: string;
   readonly blocking: true;
+  readonly trust:
+    | "server_derived"
+    | "model_correlated"
+    | "rejected_untrusted";
+  readonly resolution:
+    | "covered_by_contract"
+    | "nonmaterial_display"
+    | "pending_question"
+    | "answered_successor"
+    | "explicit_summary_consent"
+    | "blocked_unmodeled";
   readonly optionIds: readonly string[];
   /** Context is present for the generic nationality/scene/language question. */
   readonly geographicLabel?: string;
@@ -345,7 +356,7 @@ export function sanitizePipelineV3SourceDiscoveryHints(
 
 const GENRE_TERMS = [
   "ambient", "baile funk", "bossa nova", "classical", "disco", "drill",
-  "dembow", "dub", "electro", "footwork", "funk carioca", "garage", "house",
+  "dembow", "dub", "electro", "footwork", "funk carioca", "garage", "grime", "house",
   "hip hop", "jazz", "jungle", "metal", "pop", "punk", "r b", "rap", "reggae", "rock",
   "latin urban", "reggaeton", "samba", "soul", "techno", "trance",
 ] as const;
@@ -395,6 +406,7 @@ interface GeographicGenreScopeV3 {
 }
 
 const SIMILARITY_CUE_SOURCE = String.raw`(?:similar to|sounds? like|(?:songs?|tracks?|music) like|in the style of|inspired by)`;
+const REFERENCE_POINT_CUE_SOURCE = String.raw`as (?:a )?(?:(?:style|sonic|musical) )?reference point`;
 
 function normalize(value: string): string {
   return value.normalize("NFKD")
@@ -1019,7 +1031,7 @@ function semanticClauseFromObjective(value: RankingObjectiveV3, rawPrompt: strin
   const explicit = value.dimension === "influence"
     ? /\b(?:influential|foundational|important|landmark|shaped)\b/iu.test(rawPrompt)
     : value.dimension === "similarity"
-      ? new RegExp(`\\b${SIMILARITY_CUE_SOURCE}\\b`, "iu").test(rawPrompt)
+      ? new RegExp(`\\b(?:${SIMILARITY_CUE_SOURCE}|${REFERENCE_POINT_CUE_SOURCE})\\b`, "iu").test(rawPrompt)
       : value.values.length > 0 && value.values.some((item) => normalize(rawPrompt).includes(normalize(item)));
   return {
     id: value.id,
@@ -1153,6 +1165,8 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       key: "temporal_width",
       summary: `“${ambiguousYear}” may mean that exact release year, a nearby window, or the full decade.`,
       blocking: true,
+      trust: "server_derived",
+      resolution: "pending_question",
       optionIds: ["era_year_only", "era_around_year", "era_full_decade", "custom"],
       yearValue: Number(ambiguousYear),
     });
@@ -1167,6 +1181,8 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       key: "house_semantics",
       summary: "“House” may mean the music genre or a lyrical theme about houses and homes.",
       blocking: true,
+      trust: "server_derived",
+      resolution: "pending_question",
       optionIds: ["house_genre", "house_theme", "house_both", "custom"],
     });
   }
@@ -1177,6 +1193,8 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       key: "french_jazz_scope",
       summary: "“French jazz” may refer to artist origin, a scene in France, or French-language recordings.",
       blocking: true,
+      trust: "server_derived",
+      resolution: "pending_question",
       optionIds: ["french_artist_origin", "french_scene", "french_language", "custom"],
     });
   }
@@ -1188,6 +1206,8 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       key: "geographic_genre_scope",
       summary: `“${scope.sceneValue}” may refer to artist origin, a scene, or ${scope.qualifier.languageValue ?? "a language relationship"}.`,
       blocking: true,
+      trust: "server_derived",
+      resolution: "pending_question",
       optionIds: ["geographic_artist_origin", "geographic_scene", "geographic_language", "custom"],
       geographicLabel: scope.qualifier.scenePrefix,
       genreLabel: scope.genre,
@@ -1205,6 +1225,8 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       key: "possessive_relationship",
       summary: "The possessive does not say whether the subject performed, wrote, produced, or merely influenced the recordings.",
       blocking: true,
+      trust: "server_derived",
+      resolution: "pending_question",
       optionIds: ["subject_performed", "subject_created", "subject_influenced", "custom"],
       subjectValue: possessive[1]!.trim(),
     });
@@ -1217,6 +1239,8 @@ function detectCriticalAmbiguities(prompt: string): CriticalAmbiguityV3[] {
       key: "brazilian_funk_semantics",
       summary: "“Brazilian funk” may mean funk carioca/baile funk or Brazilian soul-and-funk traditions.",
       blocking: true,
+      trust: "server_derived",
+      resolution: "pending_question",
       optionIds: ["funk_carioca", "brazilian_soul_funk", "both_funk_traditions", "custom"],
     });
   }
@@ -1264,7 +1288,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   if (/\b(?:played|performed|produced|written|composed|arranged|credited|credits?|contributions?|session)\b/u.test(prompt)) {
     intents.push("factual_relationship");
   }
-  if (new RegExp(`\\b(?:${SIMILARITY_CUE_SOURCE}|resembl(?:e|es|ing))\\b`, "u").test(prompt)) intents.push("similarity");
+  if (new RegExp(`\\b(?:${SIMILARITY_CUE_SOURCE}|${REFERENCE_POINT_CUE_SOURCE}|resembl(?:e|es|ing))\\b`, "u").test(prompt)) intents.push("similarity");
   if (/\b(?:songs?|tracks?|music)\s+(?:about|mentioning|whose theme is)\b/u.test(prompt)) intents.push("theme");
   if (/\b(?:for (?:sleep|studying|study|running|work|dinner|party|road trip|gaming|a smoke session)|workout|focus|relaxing|calm|upbeat|dark|melanchol|gaming|smoking|late[ -]?night|chill(?:ed|ing)?)\b/u.test(prompt)) {
     intents.push("mood_activity");
@@ -1451,9 +1475,26 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
     `\\b${SIMILARITY_CUE_SOURCE}\\s+(.{2,120}?)(?=\\s+\\b(?:but|without|excluding|except)\\b|$)`,
     "u",
   ));
-  if (seedMatch) {
-    pushPredicate(predicates, predicate("artist", "exclude", [seedMatch[1]!.trim()], "Similarity defaults to other artists unless inclusion is explicit."));
-    objectives.push(objective("similarity", "maximize", 0.9, null, "Rank qualified recordings by supported similarity dimensions.", [seedMatch[1]!.trim()]));
+  const referencePointSeed = input.brief?.subjectEntities.find((entity) => (
+    new RegExp(
+      `\\b${escapedPattern(normalize(entity))}\\s+${REFERENCE_POINT_CUE_SOURCE}\\b`,
+      "u",
+    ).test(prompt)
+  ));
+  const similaritySeed = seedMatch?.[1]?.trim() ?? referencePointSeed ?? null;
+  if (similaritySeed) {
+    pushPredicate(predicates, predicate("artist", "exclude", [similaritySeed], "The reference artist is excluded as primary artist; featured appearances remain eligible."));
+    objectives.push(objective("similarity", "maximize", 0.9, null, "Rank qualified recordings by supported similarity dimensions.", [similaritySeed]));
+  }
+  if (/\b(?:new|emerging|up-and-coming|up and coming|lesser-known)\s+artists?\b/u.test(prompt)) {
+    objectives.push(objective(
+      "relevance",
+      "maximize",
+      0.85,
+      null,
+      "Favor discovery of new and emerging artists after hard eligibility is proven.",
+      ["new artists", "emerging artists"],
+    ));
   }
 
   const uniqueIntents = dedupe(intents);
@@ -1717,6 +1758,11 @@ export function resolveRunSpecV3(
     engines: intentEngines(uniqueIntents),
     membershipPredicates: predicates,
     rankingObjectives: objectives,
+    criticalAmbiguities: spec.criticalAmbiguities.map((ambiguity) => (
+      seen.has(ambiguity.key)
+        ? { ...ambiguity, resolution: "answered_successor" as const }
+        : ambiguity
+    )),
     semanticClauses,
     contextSignals: semanticClauses.filter(({ role }) => role === "context"),
     catalogPolicies: semanticClauses.filter(({ role }) => role === "catalog_policy"),

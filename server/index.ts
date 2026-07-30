@@ -860,6 +860,20 @@ app.post<{
         databaseAuthority: publicRolloutDatabaseAuthority,
       })
     : null;
+  if (
+    publicRolloutAssignment?.assigned === true
+    && !isOwner(caller)
+    && releaseCanary === null
+    && await repository.getSetting("pipeline_v3_public_assignment_paused")
+      === "true"
+  ) {
+    reply.header("Retry-After", "300");
+    throw new HttpError(
+      503,
+      "This playlist route is temporarily paused; retry shortly",
+      "public_assignment_paused",
+    );
+  }
   const canonicalContractCohortRequested = expandedTrackCountRequested
     || publicRolloutCanonicalContractRequestedV1({
       assignment: publicRolloutAssignment,
@@ -994,6 +1008,7 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     briefContractVersion: brief.briefContractVersion,
     questionSetHash: brief.questionSetHash,
     checkpointMode: brief.checkpointMode,
+    confirmationKind: brief.confirmationKind,
     interpretationSummary: brief.interpretationSummary,
     brief: canonicalBrief,
     questions: Array.isArray(brief.questions) ? brief.questions : [],
