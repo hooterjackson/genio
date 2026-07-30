@@ -207,10 +207,26 @@ export function assertGuidanceDecisionV4(
       }
     }
   }
-  const expectedHash = sha256Hex(stableStringify(Object.fromEntries(
+  const hashBody = Object.fromEntries(
     Object.entries(decision).filter(([key]) => key !== "questionHash"),
-  )));
-  if (decision.questionHash !== expectedHash) throw new Error("guidance_v4_question_hash_mismatch");
+  );
+  const expectedHash = sha256Hex(stableStringify(hashBody));
+  // The first V4 production build upgraded V3 questions with an explicit
+  // `interpretationSummary: undefined`. Its public projection omitted that
+  // non-value, so an otherwise identical in-flight question could not
+  // round-trip its own hash. Accept only that exact legacy representation;
+  // every executable field, option, patch, and contract fence is still
+  // validated above.
+  const legacyUndefinedSummaryHash = decision.interpretationSummary === undefined
+    ? sha256Hex(stableStringify({
+        ...hashBody,
+        interpretationSummary: undefined,
+      }))
+    : null;
+  if (decision.questionHash !== expectedHash
+    && decision.questionHash !== legacyUndefinedSummaryHash) {
+    throw new Error("guidance_v4_question_hash_mismatch");
+  }
   simulateGuidanceDecisionV4(decision, baseContract);
 }
 
@@ -240,7 +256,7 @@ export function upgradeGuidanceDecisionV3(
     const preserveWordingRecommendation = decision.axis === "adjacent_latin_urban_scope";
     options = options.map((option) => ({
       ...option,
-      recommended: preserveWordingRecommendation && option.id === "reggaeton_plus_dembow_latin_urban",
+      recommended: preserveWordingRecommendation && option.id === "reggaeton_dembow_latin_urban",
     }));
   } else {
     if (!options.some(({ id }) => id === "keep_current_interpretation")) {
@@ -270,7 +286,9 @@ export function upgradeGuidanceDecisionV3(
     allowedPatchOperations: decision.allowedPatchOperations,
     affectedClauseIds: decision.affectedClauseIds,
     materialityScore: decision.materialityScore,
-    interpretationSummary: decision.interpretationSummary,
+    ...(decision.interpretationSummary
+      ? { interpretationSummary: decision.interpretationSummary }
+      : {}),
     options,
   });
 }
