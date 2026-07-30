@@ -8,6 +8,7 @@ import {
 import {
   publicGuidanceQuestionV4,
   compileGuidanceRoundPatchV3,
+  guidanceDecisionV4FromPublicQuestion,
 } from "../server/adaptive-guidance-contract-bridge.ts";
 import {
   applyPlaylistContractPatchV1,
@@ -15,6 +16,7 @@ import {
   type PlaylistContractRevisionV1,
 } from "../server/playlist-contract-v1.ts";
 import { createRunSpecV3 } from "../server/selection-plan-v3.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 
 function baseContract(prompt: string, count = 25): PlaylistContractRevisionV1 {
   return compilePlaylistContractRevisionV1({
@@ -126,6 +128,40 @@ describe("GuidanceDecisionV4", () => {
       id: "around_meeting_year",
       recommended: true,
     }));
+  });
+
+  test("round-trips the recommended Smooth Reggaeton question through its public contract", () => {
+    const prompt = "Smooth Reggaeton Heat: A 50-track smooth reggaeton playlist centered on polished, sensual, danceable reggaeton and adjacent Latin urban tracks with a flirtatious, crowd-pleasing vibe.";
+    const { contract, value } = checkpoint(prompt);
+    const decision = value.decisions.find(
+      ({ axis }) => axis === "adjacent_latin_urban_scope",
+    );
+    expect(decision).toBeDefined();
+    expect(decision!.options.filter(({ recommended }) => recommended)).toEqual([
+      expect.objectContaining({ id: "reggaeton_dembow_latin_urban" }),
+    ]);
+
+    const question = publicGuidanceQuestionV4(decision!);
+    expect(() => guidanceDecisionV4FromPublicQuestion(question)).not.toThrow();
+    const current = guidanceDecisionV4FromPublicQuestion(question);
+    const { questionHash: _currentHash, ...currentBody } = current;
+    const legacyQuestion = {
+      ...question,
+      questionHash: sha256Hex(stableStringify({
+        ...currentBody,
+        interpretationSummary: undefined,
+      })),
+    };
+    expect(() => guidanceDecisionV4FromPublicQuestion(legacyQuestion)).not.toThrow();
+    expect(() => compileGuidanceRoundPatchV3({
+      base: contract,
+      questionSetHash: value.checkpointHash,
+      questions: [question],
+      answers: [{
+        questionId: question.id,
+        optionId: "reggaeton_dembow_latin_urban",
+      }],
+    })).not.toThrow();
   });
 
   test("rejects options whose server-owned executable effects collapse", () => {
