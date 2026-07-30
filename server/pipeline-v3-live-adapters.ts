@@ -939,7 +939,18 @@ function hostedCandidateSchema(
               : {
                   type: "array",
                   maxItems: 0,
-                  items: { type: "object" },
+                  // Responses strict schemas validate every object branch even
+                  // when the containing array is constrained to zero items.
+                  // A bare `{ type: "object" }` is rejected with HTTP 400
+                  // because strict object schemas must explicitly close their
+                  // properties. Keep the required empty array field, but make
+                  // its unreachable item schema valid.
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {},
+                    required: [],
+                  },
                 },
             sources: {
               type: "array",

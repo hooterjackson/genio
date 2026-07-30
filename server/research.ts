@@ -3717,11 +3717,43 @@ export async function processBriefInterpretationJob(
         ),
         storefront: process.env.APPLE_STOREFRONT ?? "us",
       });
-      const v3Plan = resolveRunSpecV3(
-        v3Spec,
-        criticalAmbiguityAnswersFromGuidanceV3(v3Spec, request.answers ?? []),
-      );
-      if (!v3Plan.confirmed) throw new Error("Critical playlist scope is unresolved");
+      if (request.briefContractVersion === 3) {
+        // Guidance V4 has already atomically compiled the answers into the
+        // active immutable successor contract. Re-running the legacy V3
+        // question-ID decoder here rejects valid V4 answers (for example
+        // `v4-critical:temporal_width`) because that decoder recognizes only
+        // its historical V3 IDs. The contract revision is the sole semantic
+        // authority for contract-3 finalization.
+        if (!repository.getActivePlaylistContractRevision) {
+          throw new Error("Contract-3 repository capabilities are unavailable");
+        }
+        const active = await repository.getActivePlaylistContractRevision({
+          briefRequestId,
+        });
+        if (!active) throw new Error("Canonical playlist interpretation is unavailable");
+        const contract =
+          active.contract as unknown as PlaylistContractRevisionV1;
+        assertPlaylistContractIntegrityV1(contract);
+        if (active.contractHash !== contract.semanticHash
+          || contract.requestedTrackCount
+            !== requestedTrackCountForV3(
+              executionRequestedTrackCount,
+              executionBrief,
+            )) {
+          throw new Error("Canonical playlist interpretation failed finalization integrity");
+        }
+      } else {
+        const v3Plan = resolveRunSpecV3(
+          v3Spec,
+          criticalAmbiguityAnswersFromGuidanceV3(
+            v3Spec,
+            request.answers ?? [],
+          ),
+        );
+        if (!v3Plan.confirmed) {
+          throw new Error("Critical playlist scope is unresolved");
+        }
+      }
       const selectionPlan = createSelectionPlanV2({
         prompt: request.prompt,
         brief: executionBrief,

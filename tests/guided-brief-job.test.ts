@@ -8,6 +8,7 @@ import type {
   PlaylistGuidanceAnswer,
   PlaylistGuidanceQuestion,
 } from "../shared/types.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -119,6 +120,117 @@ test("guided finalization reapplies the server-owned exact count after an advers
   expect(fetchMock).not.toHaveBeenCalled();
   const persisted = savedResult!.brief!;
   expect([...persisted.include, ...persisted.exclude].join(" ")).not.toMatch(/Taylor Swift/iu);
+});
+
+test("contract-3 finalization accepts a valid Guidance V4 successor contract", async () => {
+  const contract = compilePlaylistContractRevisionV1({
+    contractId: "contract:2010-rap-guided-finalization",
+    rawPrompt: "create me a playlist fromm the 2010 rap",
+    requestedTrackCount: 50,
+    locale: "en-US",
+    storefront: "us",
+    clauses: [
+      {
+        id: "genre:rap",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["rap"],
+        source: { provenance: "prompt", text: "rap" },
+      },
+      {
+        id: "guidance:v4:temporal:era_year_only",
+        kind: "catalog_version",
+        scope: "track",
+        hardness: "hard",
+        axis: "era",
+        operator: "require",
+        values: ["2010"],
+        unknownPolicy: "reject",
+        source: {
+          provenance: "guidance",
+          text: "Use recordings released in 2010.",
+        },
+      },
+    ],
+    trackPredicate: {
+      op: "all",
+      children: [
+        { op: "clause", clauseId: "genre:rap" },
+        {
+          op: "clause",
+          clauseId: "guidance:v4:temporal:era_year_only",
+        },
+      ],
+    },
+  });
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract3-2010-rap",
+      prompt: "create me a playlist fromm the 2010 rap",
+      requestedTrackCount: 50,
+      executionRequestedTrackCount: 50,
+      model: "test-model",
+      status: "finalizing" as const,
+      briefContractVersion: 3 as const,
+      brief: {
+        ...draftBrief,
+        title: "2010 Rap",
+        description: "Rap recordings released in 2010.",
+        subjectEntities: ["rap"],
+        relationship: "is rap released in 2010",
+        targetSize: { min: 50, max: 50 },
+      },
+      questions: [{
+        id: "v4-critical:temporal_width",
+        header: "Time span",
+        question: "What time span should “2010” cover?",
+        options: [{
+          id: "era_year_only",
+          label: "2010 only",
+          description: "Use recordings released in 2010.",
+          recommended: false,
+        }],
+      }],
+      answers: [{
+        questionId: "v4-critical:temporal_width",
+        optionId: "era_year_only",
+      }],
+    })),
+    getActivePlaylistContractRevision: vi.fn(async () => ({
+      id: "contract-db-2010-rap",
+      contractHash: contract.semanticHash,
+      contract,
+    })),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract3-2010-rap",
+  });
+
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-contract3-2010-rap",
+    expect.objectContaining({
+      status: "complete",
+      expectedStatus: "finalizing",
+      brief: expect.objectContaining({
+        targetSize: { min: 50, max: 50 },
+      }),
+      selectionPlan: expect.objectContaining({
+        requestedTrackCount: 50,
+        minimumQualifiedTrackCount: 50,
+      }),
+      error: null,
+    }),
+  );
+  expect(saveBriefResult).not.toHaveBeenCalledWith(
+    "brief-contract3-2010-rap",
+    expect.objectContaining({ status: "failed" }),
+  );
 });
 
 test("guided finalization cannot turn a similarity seed into the playlist's recording artist", async () => {
