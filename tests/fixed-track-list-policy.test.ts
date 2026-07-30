@@ -48,6 +48,24 @@ describe("fixed track list policy", () => {
     });
   });
 
+  test("accepts quoted title-by-artist identities emitted by brief compilation", () => {
+    const compiled = compileFixedTrackList({
+      ...fixedBrief,
+      include: [
+        "\"Take on Me\" by a-ha",
+        "\"Africa\" by Toto",
+        "\"Like a Prayer\" by Madonna",
+      ],
+      relationship: "Limit to the three explicitly named tracks",
+      orderingPolicy: "Preserve the user’s listed order.",
+    });
+    expect(compiled).toEqual([
+      { artist: "a-ha", title: "Take on Me" },
+      { artist: "Toto", title: "Africa" },
+      { artist: "Madonna", title: "Like a Prayer" },
+    ]);
+  });
+
   test("does not infer a closed list without exact count and explicit source order", () => {
     expect(compileFixedTrackList({
       ...fixedBrief,
