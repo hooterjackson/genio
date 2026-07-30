@@ -665,7 +665,7 @@ databaseDescribe("database-backed Apple write gateway", () => {
     const fixture = await createCompletionFenceFixture("authorized");
     await repository.commitPublicationCompletion(fixture);
 
-    const [run, revision] = await Promise.all([
+    const [run, revision, resolution] = await Promise.all([
       repository.pool.query<{ status: string; phase: string }>(
         "SELECT status,phase FROM research_runs WHERE id=$1",
         [fixture.runId],
@@ -674,9 +674,23 @@ databaseDescribe("database-backed Apple write gateway", () => {
         "SELECT status FROM manifest_revisions WHERE id=$1",
         [fixture.manifestRevisionId],
       ),
+      repository.pool.query<{
+        state: string;
+        next_action: string;
+        manifest_id: string | null;
+      }>(
+        `SELECT state,next_action,manifest_id
+         FROM playlist_run_resolutions WHERE run_id=$1`,
+        [fixture.runId],
+      ),
     ]);
     expect(run.rows[0]).toMatchObject({ status: "complete", phase: "published" });
     expect(revision.rows[0]?.status).toBe("published");
+    expect(resolution.rows[0]).toMatchObject({
+      state: "completed",
+      next_action: "none",
+      manifest_id: fixture.manifestId,
+    });
   });
 
   test("rejects terminal completion when a successor contract wins the race", async () => {

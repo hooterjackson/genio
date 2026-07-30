@@ -17,6 +17,9 @@ import {
 } from "../server/playlist-contract-v1.ts";
 import { createRunSpecV3 } from "../server/selection-plan-v3.ts";
 import { sha256Hex, stableStringify } from "../server/security.ts";
+import type { PlaylistBrief } from "../shared/types.ts";
+import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
+import { compilePlaylistContractShadowV1 } from "../server/playlist-contract-shadow-bridge-v1.ts";
 
 function baseContract(prompt: string, count = 25): PlaylistContractRevisionV1 {
   return compilePlaylistContractRevisionV1({
@@ -101,6 +104,73 @@ describe("GuidanceDecisionV4", () => {
       showEditableInterpretationSummary: true,
     });
     expect(value.interpretationSummary.count).toBe(25);
+  });
+
+  test("renders exact fixed-list membership and exclusions truthfully", () => {
+    const prompt = `Build a playlist containing exactly these three original studio recordings, in this order:
+1. Michael Jackson — Billie Jean
+2. Madonna — La Isla Bonita
+3. Earth, Wind & Fire — September
+Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicates.`;
+    const brief: PlaylistBrief = {
+      mode: "curated",
+      title: "Exact three-track control",
+      description: "The exact original studio recordings in the requested order.",
+      subjectEntities: ["Michael Jackson", "Madonna", "Earth, Wind & Fire"],
+      relationship: "Exact original studio recordings in a user-specified order",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: [
+        "remixes",
+        "live versions",
+        "radio edits",
+        "covers",
+        "re-recordings",
+        "duplicates",
+      ],
+      versionPolicy: "Use only the original studio recording of each listed song; do not substitute alternate versions.",
+      evidencePolicy: "Verify track identity by canonical song title, primary artist, and original studio release version.",
+      orderingPolicy: "Keep the three tracks in the exact order provided by the user.",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const selectionPlan = createSelectionPlanV2({ prompt, brief });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: "fixed-list-guidance-summary",
+      prompt,
+      brief,
+      selectionPlan,
+    });
+    const value = guidanceCheckpointV4({
+      prompt,
+      baseContract: shadow.contract,
+      preservedTrackPredicate: shadow.preservedTrackPredicate,
+      ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+      requestShape: "fixed_list",
+      interpretationSummaryContext: {
+        fixedTrackList: selectionPlan.fixedTrackList,
+        explicitAvoid: brief.exclude,
+      },
+    });
+
+    expect(selectionPlan.scopeKind).toBe("fixed_track_list");
+    expect(value).toMatchObject({
+      mode: "interpretation_confirmation",
+      decisions: [],
+      showEditableInterpretationSummary: true,
+    });
+    expect(value.interpretationSummary.mustHave).toEqual(expect.arrayContaining([
+      "Michael Jackson — Billie Jean",
+      "Madonna — La Isla Bonita",
+      "Earth, Wind & Fire — September",
+    ]));
+    expect(value.interpretationSummary.avoid).toEqual(expect.arrayContaining(brief.exclude));
+    expect(value.interpretationSummary.prefer).not.toEqual(expect.arrayContaining(brief.exclude));
+    expect(value.interpretationSummary.prefer.join(" ")).not.toContain("avoid:");
+    expect(value.interpretationSummary.count).toBe(3);
   });
 
   test("offers a protected optional sonic anchor with a no-op keep choice", () => {

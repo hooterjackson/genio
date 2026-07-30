@@ -3925,10 +3925,11 @@ export async function processBriefInterpretationJob(
         reportHash: feasibility.reportHash,
         report: structuredClone(feasibility) as unknown as Record<string, unknown>,
       });
-      const requestShape = requestClassification === "precise"
-        ? "fully_explicit"
-        : preliminarySelectionPlan.scopeKind === "fixed_release_container"
+      const requestShape = preliminarySelectionPlan.scopeKind === "fixed_track_list"
+        || preliminarySelectionPlan.scopeKind === "fixed_release_container"
           ? "fixed_list"
+        : requestClassification === "precise"
+          ? "fully_explicit"
           : preliminarySelectionPlan.scopeKind === "factual_frontier"
             ? "factual"
             : "curated";
@@ -3939,6 +3940,10 @@ export async function processBriefInterpretationJob(
         ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
         criticalAmbiguities: v3Spec.criticalAmbiguities,
         requestShape,
+        interpretationSummaryContext: {
+          fixedTrackList: preliminarySelectionPlan.fixedTrackList,
+          explicitAvoid: canonicalBrief.exclude,
+        },
         compilationTimestamp: new Date().toISOString(),
       });
       const questions = checkpoint.decisions.map(publicGuidanceQuestionV4);

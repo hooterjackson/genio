@@ -13864,9 +13864,27 @@ export class Repository {
          ORDER BY created_at DESC,id DESC LIMIT 1
        ) manifest ON true
        LEFT JOIN LATERAL (
-         SELECT count(*)::int published_track_count
-         FROM manifest_tracks
-         WHERE manifest_id=manifest.id
+         SELECT CASE
+           WHEN latest_revision.id IS NULL THEN (
+             SELECT count(*)::int
+             FROM manifest_tracks
+             WHERE manifest_id=manifest.id
+           )
+           ELSE (
+             SELECT count(*)::int
+             FROM manifest_revision_tracks
+             WHERE manifest_revision_id=latest_revision.id
+           )
+         END published_track_count
+         FROM (
+           SELECT (
+             SELECT revision.id
+             FROM manifest_revisions revision
+             WHERE revision.manifest_id=manifest.id
+             ORDER BY revision.revision DESC,revision.id DESC
+             LIMIT 1
+           ) id
+         ) latest_revision
        ) tracks ON true
        WHERE run.id=$1 AND run.deleted_at IS NULL
        FOR UPDATE OF run`,
@@ -20426,6 +20444,11 @@ export class Repository {
          WHERE id=$1`,
         [input.runId, input.terminalStatus, terminalPhase],
       );
+      // Publication completion uses its own fenced transaction instead of the
+      // generic updateRun path. Keep the schema-19 shadow ledger in that same
+      // transaction so a successfully reconciled Apple playlist cannot remain
+      // user-visible as "publishing" indefinitely.
+      await this.shadowPlaylistResolutionV1(client, input.runId);
     });
 
     await this.captureTerminalDiagnosticsSafely(input.runId);
