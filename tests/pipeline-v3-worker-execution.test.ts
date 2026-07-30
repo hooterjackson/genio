@@ -23,7 +23,7 @@ import {
   type PipelineV3WorkerRepository,
   type PipelineV3WriteFence,
 } from "../server/pipeline-v3-worker-execution.ts";
-import type { QueryPlanV3 } from "../shared/types.ts";
+import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 import {
   createQueryPlanV3,
   queryPlanV3Hash,
@@ -42,6 +42,13 @@ import {
 import type { SemanticPlanRevisionArtifactV3 } from "../server/pipeline-v3-semantic-recovery.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import {
+  compilePlaylistContractShadowV1,
+} from "../server/playlist-contract-shadow-bridge-v1.ts";
+import {
+  projectPlaylistContractExecutionV1,
+} from "../server/playlist-contract-execution-bridge-v1.ts";
+import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 
 const GRAPH_SNAPSHOT_ID = "11111111-1111-4111-8111-111111111111";
 const QUERY_PLAN_REVISION_ID = "22222222-2222-4222-8222-222222222222";
@@ -617,6 +624,80 @@ describe("Pipeline V3 durable worker execution", () => {
       phase: "v3_execution_coverage_worker_claim_failed",
       error: null,
     });
+  });
+
+  test("uses the canonical execution evidence policy when the shadow projection differs from the legacy plan policy", async () => {
+    const prompt = "Build exactly Billie Jean, La Isla Bonita, and September in the listed order.";
+    const brief: PlaylistBrief = {
+      title: "Classic Pop Originals",
+      description: "Three original studio recordings in the requested order.",
+      mode: "curated",
+      subjectEntities: [],
+      relationship: "Exact inclusion of three named original studio recordings in the listed order.",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: [
+        "remixes",
+        "live versions",
+        "radio edits",
+        "covers",
+        "re-recordings",
+        "duplicates",
+      ],
+      versionPolicy: "Use the original studio recording only for each listed song; no alternate versions.",
+      evidencePolicy: "Verify exact artist, title, and original studio recording identity.",
+      orderingPolicy: "Preserve the user-specified order exactly.",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const basePlan = createSelectionPlanV2({ prompt, brief, storefront: "us" });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: "contract:worker-claim:fixed-list",
+      prompt,
+      brief,
+      selectionPlan: basePlan,
+    });
+    const projection = projectPlaylistContractExecutionV1({
+      contract: shadow.contract,
+      basePlan,
+    });
+    const plan = createQueryPlanV3(
+      projection.selectionPlanV3,
+      GRAPH_SNAPSHOT_ID,
+      {
+        schemaVersion: 6,
+        briefContractVersion: 3,
+        playlistContractRevisionId: shadow.contract.revisionId,
+        playlistContractSemanticHash: shadow.contract.semanticHash,
+        playlistContractCompilerVersion: shadow.contract.versions.compiler,
+      },
+    );
+    expect(plan.evidencePolicyVersion).toBe("governed_evidence_v2");
+    expect(plan.executionCoverageReport?.evidencePolicyVersion)
+      .toBe("selection_plan_evidence_projection_v2");
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("exact_ready", 3));
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun(prompt, 3),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, shadow.contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(port.execute).toHaveBeenCalledOnce();
+    expect(repository.checkpoints.get("v3:coverage:worker-claim"))
+      .toMatchObject({
+        complete: true,
+        evidencePolicyVersion: "selection_plan_evidence_projection_v2",
+      });
   });
 
   test("fails closed without a provider call for a historical schema-4 fixed-container plan missing typed directives", async () => {
