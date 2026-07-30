@@ -244,6 +244,7 @@ import {
 } from "./playlist-contract-backend-capability-v1.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "./music-concepts-v3.ts";
 import {
+  canonicalExecutionEvidencePolicyVersionV1,
   revalidateExecutionCoverageReportV1,
 } from "./verification-expression-v1.ts";
 import {
@@ -19108,6 +19109,8 @@ export class Repository {
         try {
           const expression = queryPlan.verificationExpression;
           const persistedCoverage = queryPlan.executionCoverageReport;
+          const executionEvidencePolicyVersion =
+            canonicalExecutionEvidencePolicyVersionV1(queryPlan);
           const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
             queryPlanSchemaVersion: 6,
           });
@@ -19123,7 +19126,7 @@ export class Repository {
             || persistedCoverage.ontologyVersion
               !== MUSIC_CONCEPT_POLICY_VERSION
             || persistedCoverage.evidencePolicyVersion
-              !== queryPlan.evidencePolicyVersion) {
+              !== executionEvidencePolicyVersion) {
             fail("canonical_publication_execution_coverage_stale");
           }
           const publicationCoverage = revalidateExecutionCoverageReportV1({
@@ -19133,7 +19136,7 @@ export class Repository {
             workerCapabilityHash: runtimeCapability.hash,
             configurationHash: runtimeConfigurationHash,
             ontologyVersion: MUSIC_CONCEPT_POLICY_VERSION,
-            evidencePolicyVersion: queryPlan.evidencePolicyVersion!,
+            evidencePolicyVersion: executionEvidencePolicyVersion,
           });
           if (!publicationCoverage.complete) {
             fail("canonical_publication_execution_coverage_incomplete");

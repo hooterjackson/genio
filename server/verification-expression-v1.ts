@@ -10,6 +10,23 @@ import { sha256Hex, stableStringify } from "./security.ts";
 
 export const VERIFICATION_EXPRESSION_VERSION = "verification_expression_v1" as const;
 
+/**
+ * Schema-6 execution coverage is projected from the immutable canonical
+ * contract. The query-plan top-level evidence policy remains a legacy
+ * retrieval policy and must never be used to validate this report.
+ */
+export function canonicalExecutionEvidencePolicyVersionV1(input: {
+  canonicalContractPolicy?: {
+    evidencePolicyVersion?: unknown;
+  } | null;
+}): string {
+  const version = input.canonicalContractPolicy?.evidencePolicyVersion;
+  if (typeof version !== "string" || !version.trim()) {
+    throw new Error("execution_coverage_evidence_policy_unavailable");
+  }
+  return version.trim();
+}
+
 function producerFamilies(input: {
   kind: string;
   axis: string;
