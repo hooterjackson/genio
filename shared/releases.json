@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.1",
+      "releasedAt": "2026-07-30",
+      "title": "Canonical execution resilience",
+      "notes": [
+        "Binds authoritative release-year evidence to the exact Apple recording family so year-scoped requests can qualify tracks without accepting reissue dates as proof of the original recording era.",
+        "Prevents the playlist optimizer from reporting infeasibility when the evidence-qualified pool is below the requested count or when no non-count playlist constraint actually missed.",
+        "Reports real active compute consumption unless the configured compute boundary was genuinely reached, eliminating misleading full-budget exhaustion on early decisions.",
+        "Adds protected regressions for exact-year rap discovery, evidence-gated qualification, reserve shortfalls, and bounded optimizer decisions while preserving exact count and hard constraints."
+      ]
+    },
+    {
       "version": "2.4.0",
       "releasedAt": "2026-07-24",
       "title": "Never-dead-end canonical playlists",
