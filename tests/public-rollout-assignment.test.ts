@@ -3,7 +3,6 @@ import {
   assertPublicRolloutExecutionGroupV1,
   createPublicRolloutAssignmentV1,
   parsePublicRolloutAssignmentV1,
-  publicRolloutCanonicalContractRequestedV1,
   publicRolloutAssignmentStickyKeyV1,
   publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,

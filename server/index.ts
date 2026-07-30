@@ -126,7 +126,6 @@ import {
 } from "./release-manifest-canary.ts";
 import {
   createPublicRolloutAssignmentV1,
-  publicRolloutCanonicalContractRequestedV1,
   publicRolloutAssignmentStickyKeyV1,
   publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
