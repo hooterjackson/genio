@@ -317,6 +317,19 @@ describe("persisted public canonical rollout assignment", () => {
     });
   });
 
+  test("keeps preserved rollout authority inert during bridge and expand", () => {
+    const active = environment("100");
+    for (const deploymentPhase of ["bridge", "expand"]) {
+      expect(publicRolloutRuntimeDatabaseAuthorityV1({
+        environment: {
+          ...active,
+          RELEASE_DEPLOYMENT_PHASE: deploymentPhase,
+        },
+        databaseAuthority: databaseAuthority(active),
+      })).toBeNull();
+    }
+  });
+
   test("fails health proof on partial, stale, or database-only rollout state", () => {
     const env = environment("100");
     expect(() => publicRolloutRuntimeDatabaseAuthorityV1({
