@@ -4709,6 +4709,73 @@ databaseDescribe("hosted backend integration", () => {
     )).rows[0]?.pending).toBe(0);
   });
 
+  test("initializes and advances authoritative rows in resolution-service mode", async () => {
+    await repository.setSetting(
+      "playlist_resolution_authority_mode",
+      "resolution_service",
+    );
+    const runId = await repository.createRun(
+      "Schema 19 resolution-service initialization",
+      brief,
+      0,
+      1,
+    );
+    expect((await repository.pool.query<{
+      generation: number;
+      state: string;
+      next_action: string;
+      provenance: string;
+      transition_kind: string;
+    }>(
+      `SELECT resolution.generation,resolution.state,resolution.next_action,
+              resolution.provenance,transition.transition_kind
+       FROM playlist_run_resolutions resolution
+       JOIN playlist_run_resolution_transitions transition
+         ON transition.run_id=resolution.run_id
+        AND transition.successor_generation=resolution.generation
+       WHERE resolution.run_id=$1`,
+      [runId],
+    )).rows[0]).toEqual({
+      generation: 1,
+      state: "accepted",
+      next_action: "none",
+      provenance: "resolution_service",
+      transition_kind: "resolution_service_projection",
+    });
+
+    await repository.updateRun(runId, {
+      status: "researching",
+      phase: "research",
+    });
+    await expect(repository.getRun(runId)).resolves.toMatchObject({
+      resolution: {
+        generation: 2,
+        state: "executing",
+        nextAction: "none",
+      },
+    });
+    expect((await repository.pool.query<{
+      provenance: string;
+      transition_kind: string;
+      outbox_count: number;
+    }>(
+      `SELECT resolution.provenance,transition.transition_kind,
+              (SELECT count(*)::int
+               FROM playlist_resolution_outbox
+               WHERE run_id=resolution.run_id) outbox_count
+       FROM playlist_run_resolutions resolution
+       JOIN playlist_run_resolution_transitions transition
+         ON transition.run_id=resolution.run_id
+        AND transition.successor_generation=resolution.generation
+       WHERE resolution.run_id=$1`,
+      [runId],
+    )).rows[0]).toEqual({
+      provenance: "resolution_service",
+      transition_kind: "resolution_service_projection",
+      outbox_count: 2,
+    });
+  });
+
   test("Pipeline V2 manifest lock accepts strong attested unknown-lineage claims but never relaxes proof or version policy", async () => {
     const v2Brief: PlaylistBrief = {
       ...brief,
