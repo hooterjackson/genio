@@ -1740,6 +1740,7 @@ describe("Pipeline V3 durable worker execution", () => {
     });
     expect(repository.checkpoints.get("run_decision")).toMatchObject({
       reason: "playlist_optimization_constraints",
+      consumedActiveComputeMs: 0,
       namedPredicates: [{
         clauseId: "prompt:diversity:artists",
         label: "At least 20 distinct artists",

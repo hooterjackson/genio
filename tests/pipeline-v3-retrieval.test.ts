@@ -2565,6 +2565,44 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     })).toMatchObject({ valid: false });
   });
 
+  test("does not misclassify an empty canonical pool as optimizer infeasibility", async () => {
+    const selection = canonicalDiscoPlan(5);
+    let delivered = false;
+    const result = await executeRetrievalV3({
+      runId: "canonical-zero-qualified-is-not-optimizer",
+      plan: selection,
+      adapters: {
+        discover: async () => {
+          if (delivered) return { candidates: [], nextCursor: null, exhausted: true };
+          delivered = true;
+          return {
+            candidates: Array.from({ length: 10 }, (_, index) => candidate(index)),
+            nextCursor: null,
+            exhausted: true,
+          };
+        },
+        qualify: async ({ candidates }) => candidates.map((value) => {
+          const base = canonicalDiscoQualification(value);
+          return {
+            ...base,
+            canonicalClauseAssessments: {
+              "genre:disco": { status: "unknown" as const },
+            },
+          };
+        }),
+      },
+    });
+
+    expect(result.qualifiedPool).toHaveLength(0);
+    expect(result.playlistOptimization?.unmetConstraints).toEqual(["exact_count:0/5"]);
+    expect(result.outcome).toMatchObject({
+      status: "no_compatible_tracks",
+      selectedTrackCount: 0,
+      shortfall: 5,
+    });
+    expect(result.outcome.stopReason).not.toBe("playlist_optimization_constraints");
+  });
+
   test("cannot spoof fifty unattributed discovery candidates into live provenance", async () => {
     const selection = canonicalDiscoPlan(50);
     let targetStrategyId: string | null = null;
@@ -2612,8 +2650,8 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     expect(result.qualifiedPool.every(({ cacheOrigin }) => cacheOrigin === "unknown"))
       .toBe(true);
     expect(result.outcome).toMatchObject({
-      status: "needs_decision",
-      stopReason: "playlist_optimization_constraints",
+      status: "partial_ready",
+      stopReason: "frontier_exhausted",
       requiresPartialPublicationDecision: true,
     });
     expect(result.selected.length).toBeLessThanOrEqual(25);
@@ -4327,8 +4365,8 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
       cacheOrigin: "unknown",
     });
     expect(continued.outcome).toMatchObject({
-      status: "needs_decision",
-      stopReason: "playlist_optimization_constraints",
+      status: "partial_ready",
+      stopReason: "frontier_exhausted",
       selectedTrackCount: 3,
       shortfall: 1,
     });
