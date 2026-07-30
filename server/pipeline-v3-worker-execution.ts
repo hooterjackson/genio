@@ -1520,6 +1520,8 @@ export class PipelineV3WorkerExecution {
       try {
         const expression = input.queryPlan.verificationExpression;
         const persistedCoverage = input.queryPlan.executionCoverageReport;
+        const executionEvidencePolicyVersion =
+          input.queryPlan.canonicalContractPolicy?.evidencePolicyVersion ?? "";
         const runtimeConfigurationHash =
           input.payload?.__executorSemanticConfigurationHash?.trim() ?? "";
         const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
@@ -1533,7 +1535,7 @@ export class PipelineV3WorkerExecution {
           || persistedCoverage.configurationHash !== runtimeConfigurationHash
           || persistedCoverage.ontologyVersion !== MUSIC_CONCEPT_POLICY_VERSION
           || persistedCoverage.evidencePolicyVersion
-            !== input.queryPlan.evidencePolicyVersion) {
+            !== executionEvidencePolicyVersion) {
           throw new Error("execution_coverage_runtime_identity_mismatch");
         }
         const workerClaimCoverage = revalidateExecutionCoverageReportV1({
@@ -1543,7 +1545,7 @@ export class PipelineV3WorkerExecution {
           workerCapabilityHash: runtimeCapability.hash,
           configurationHash: runtimeConfigurationHash,
           ontologyVersion: MUSIC_CONCEPT_POLICY_VERSION,
-          evidencePolicyVersion: input.queryPlan.evidencePolicyVersion,
+          evidencePolicyVersion: executionEvidencePolicyVersion,
         });
         if (!workerClaimCoverage.complete) {
           throw new Error("execution_coverage_incomplete");
