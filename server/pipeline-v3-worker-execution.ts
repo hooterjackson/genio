@@ -89,6 +89,7 @@ import {
   canonicalExecutorCapabilityForSchemaV1,
 } from "./playlist-contract-backend-capability-v1.ts";
 import {
+  canonicalExecutionEvidencePolicyVersionV1,
   revalidateExecutionCoverageReportV1,
 } from "./verification-expression-v1.ts";
 import { auditSemanticCollapseV1 } from "./semantic-collapse-audit-v1.ts";
@@ -1521,7 +1522,7 @@ export class PipelineV3WorkerExecution {
         const expression = input.queryPlan.verificationExpression;
         const persistedCoverage = input.queryPlan.executionCoverageReport;
         const executionEvidencePolicyVersion =
-          input.queryPlan.canonicalContractPolicy?.evidencePolicyVersion ?? "";
+          canonicalExecutionEvidencePolicyVersionV1(input.queryPlan);
         const runtimeConfigurationHash =
           input.payload?.__executorSemanticConfigurationHash?.trim() ?? "";
         const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
