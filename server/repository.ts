@@ -1581,12 +1581,15 @@ async function assertCatalogProviderJobLease(
   const leased = await client.query<{
     payload_json: Record<string, unknown>;
   }>(
-    `SELECT payload_json
-     FROM job_queue
-     WHERE id=$1 AND run_id=$2 AND kind='matching'
-       AND pipeline_version='catalog_first_v2'
-       AND status='leased' AND lease_owner=$3 AND lease_epoch=$4
-       AND lease_expires_at>now() AND available_at<=now()
+    `SELECT job.payload_json
+     FROM job_queue job
+     JOIN research_runs run ON run.id=job.run_id
+     WHERE job.id=$1 AND job.run_id=$2 AND job.kind='matching'
+       AND job.pipeline_version=run.pipeline_version
+       AND run.pipeline_version IN ('legacy_v1','catalog_first_v2')
+       AND job.status='leased' AND job.lease_owner=$3
+       AND job.lease_epoch=$4
+       AND job.lease_expires_at>now() AND job.available_at<=now()
      FOR UPDATE`,
     [
       authority.jobId,
@@ -24331,7 +24334,47 @@ export class Repository {
             "catalog_provider_retry_stale",
           );
         }
-        return { claimToken: randomUUID() };
+        const leasedPayload = await assertCatalogProviderJobLease(
+          client,
+          runId,
+          authority,
+        );
+        if (leasedPayload.providerDecisionOnly === true) return null;
+        const existingClaim = await client.query<{
+          state_json: Record<string, unknown>;
+        }>(
+          `SELECT state_json FROM research_checkpoints
+           WHERE run_id=$1 AND phase='catalog_provider_attempt_v2'
+           FOR UPDATE`,
+          [runId],
+        );
+        const existingClaimState = existingClaim.rows[0]?.state_json ?? {};
+        if (existingClaimState.jobId === authority.jobId
+          && existingClaimState.workerId === authority.workerId
+          && Number(existingClaimState.leaseEpoch) === authority.leaseEpoch
+          && existingClaimState.expectedGeneration === null
+          && typeof existingClaimState.claimToken === "string"
+          && UUID_PATTERN.test(existingClaimState.claimToken)) {
+          return { claimToken: existingClaimState.claimToken };
+        }
+        const claimToken = randomUUID();
+        await client.query(
+          `INSERT INTO research_checkpoints(run_id,phase,state_json)
+           VALUES($1,'catalog_provider_attempt_v2',$2::jsonb)
+           ON CONFLICT(run_id,phase) DO UPDATE
+             SET state_json=EXCLUDED.state_json,updated_at=now()`,
+          [runId, JSON.stringify({
+            schemaVersion: 1,
+            claimToken,
+            jobId: authority.jobId,
+            workerId: authority.workerId,
+            leaseEpoch: authority.leaseEpoch,
+            expectedGeneration: null,
+            providerDependencyRetry: false,
+            claimedAt: new Date().toISOString(),
+          })],
+        );
+        return { claimToken };
       }
       if (![
         "queued",

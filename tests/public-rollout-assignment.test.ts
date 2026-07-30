@@ -5,6 +5,7 @@ import {
   parsePublicRolloutAssignmentV1,
   publicRolloutCanonicalContractRequestedV1,
   publicRolloutAssignmentStickyKeyV1,
+  publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "../server/public-rollout-assignment.ts";
 import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";

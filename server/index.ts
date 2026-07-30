@@ -128,6 +128,7 @@ import {
   createPublicRolloutAssignmentV1,
   publicRolloutCanonicalContractRequestedV1,
   publicRolloutAssignmentStickyKeyV1,
+  publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "./public-rollout-assignment.ts";
 

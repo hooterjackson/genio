@@ -367,6 +367,69 @@ databaseDescribe("hosted backend integration", () => {
     return authority;
   }
 
+  test("legacy matching persists the attempt claim required by schema-18 write fences", async () => {
+    const runId = await repository.createRun(
+      "Legacy catalog attempt claim",
+      { ...brief, mode: "curated", targetSize: { min: 1, max: 1 } },
+      0,
+      1,
+    );
+    const jobId = randomUUID();
+    const workerId = `legacy-provider-test-${randomUUID()}`;
+    await repository.pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,queue_class,dedupe_key,pipeline_version,
+         minimum_worker_protocol,stage_key,payload_json,max_attempts,
+         available_at)
+       VALUES($1,$2,'matching','interactive',$3,'legacy_v1',4,
+         'catalog_matching',$4::jsonb,3,now())`,
+      [
+        jobId,
+        runId,
+        `legacy-provider-attempt:${jobId}`,
+        JSON.stringify({ runId, storefront: "us" }),
+      ],
+    );
+    const leased = await repository.pool.query<{ lease_epoch: number }>(
+      `UPDATE job_queue
+       SET status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1 RETURNING lease_epoch`,
+      [jobId, workerId],
+    );
+    const authority: CatalogProviderJobAuthorityV2 = {
+      jobId,
+      workerId,
+      leaseEpoch: Number(leased.rows[0]?.lease_epoch ?? 0),
+      providerDependencyRetry: false,
+      expectedGeneration: null,
+      priorFailureCount: 0,
+      claimToken: null,
+    };
+
+    const claim = await repository.claimCatalogProviderRetry(runId, authority);
+    expect(claim?.claimToken).toMatch(/^[0-9a-f-]{36}$/u);
+    authority.claimToken = claim!.claimToken;
+    await expect(repository.updateRun(
+      runId,
+      { status: "matching", phase: "catalog_matching", error: null },
+      authority,
+    )).resolves.toBeUndefined();
+
+    const checkpoint = await repository.getResearchCheckpoint(
+      runId,
+      "catalog_provider_attempt_v2",
+    ) as Record<string, unknown>;
+    expect(checkpoint).toMatchObject({
+      jobId,
+      workerId,
+      leaseEpoch: authority.leaseEpoch,
+      expectedGeneration: null,
+      providerDependencyRetry: false,
+      claimToken: claim!.claimToken,
+    });
+  });
+
   async function claimV2ResearchAttempt(
     runId: string,
     payload: Record<string, unknown> = {
