@@ -355,6 +355,7 @@ export function buildPlaylistContractShadowDraftV1(
   const seenSuitability = new Set<string>();
   const usedClauseIds = new Set<string>();
   let fixedContainerDirective: PlaylistContractExecutionDirectivesV1["fixedContainer"] = null;
+  let fixedTrackListDirective: PlaylistContractExecutionDirectivesV1["fixedTrackList"] = null;
   let similarityDirective: PlaylistContractExecutionDirectivesV1["similarity"] = null;
 
   const addClause = (clause: PlaylistContractClauseDraftV1): void => {
@@ -512,6 +513,41 @@ export function buildPlaylistContractShadowDraftV1(
       kind: identity.kind,
       name: identity.name,
       artistName: identity.artistName,
+      membershipClauseId,
+    };
+  }
+
+  if (input.selectionPlan.scopeKind === "fixed_track_list") {
+    const tracks = input.selectionPlan.fixedTrackList;
+    if (!tracks
+      || tracks.length === 0
+      || tracks.length !== input.selectionPlan.requestedTrackCount) {
+      throw new Error("fixed_track_list_identity_unresolved");
+    }
+    const membershipClauseId = "bridge:membership:fixed-track-list";
+    const values = tracks.map(({ artist, title }) => `${artist} — ${title}`);
+    addClause({
+      id: membershipClauseId,
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "track",
+      operator: "require",
+      values,
+      source: {
+        provenance: "migration",
+        text: values.join("; "),
+      },
+      evidence: {
+        required: true,
+        minimumGrade: "authoritative_structured_metadata",
+        permittedGrades: ["authoritative_structured_metadata"],
+      },
+      unknownPolicy: "reject",
+    });
+    hardTrackClauseIds.push(membershipClauseId);
+    fixedTrackListDirective = {
+      tracks: tracks.map(({ artist, title }) => ({ artist, title })),
       membershipClauseId,
     };
   }
@@ -789,9 +825,10 @@ export function buildPlaylistContractShadowDraftV1(
         maximumUnknownRatio: 0.2,
         zeroKnownFailures: true,
       },
-      ...(fixedContainerDirective || similarityDirective ? {
+      ...(fixedContainerDirective || fixedTrackListDirective || similarityDirective ? {
         executionDirectives: {
           fixedContainer: fixedContainerDirective,
+          fixedTrackList: fixedTrackListDirective,
           similarity: similarityDirective,
         },
       } : {}),

@@ -63,6 +63,7 @@ import {
   isQueryPlanV3,
   queryPlanV3EmissionSchemaVersion,
   queryPlanV3Hash,
+  VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION,
 } from "./query-plan-v3.ts";
 import {
   createRunSpecV3,
@@ -10725,7 +10726,10 @@ export class Repository {
           const emittedSchema = queryPlanV3EmissionSchemaVersion(process.env);
           v3QueryPlan = briefContractVersion === 3 && activePlaylistContract
             ? createQueryPlanV3(selectionPlanV3, v3GraphSnapshotId, {
-              schemaVersion: CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
+              schemaVersion: emittedSchema
+                === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+                ? VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+                : CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
               briefContractVersion,
               playlistContractRevisionId: activePlaylistContract.revisionId,
               playlistContractSemanticHash: activePlaylistContract.semanticHash,
@@ -10746,8 +10750,9 @@ export class Repository {
           || !activePlaylistContract
           || !selectionPlanV3
           || !v3QueryPlan
+          || !isCanonicalQueryPlanV3SchemaVersion(v3QueryPlan.schemaVersion)
           || v3QueryPlan.schemaVersion
-            !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+            < CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
           || v3QueryPlan.briefContractVersion !== 3
         )) {
           throw new HttpError(
@@ -12810,8 +12815,12 @@ export class Repository {
           );
         }
         selectionPlanV3 = projection.selectionPlanV3;
+        const emittedSchema = queryPlanV3EmissionSchemaVersion(process.env);
         queryPlan = createQueryPlanV3(selectionPlanV3, graphSnapshotId, {
-          schemaVersion: CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
+          schemaVersion: emittedSchema
+            === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+            ? VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+            : CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
           briefContractVersion: 3,
           playlistContractRevisionId: successorContract.revisionId,
           playlistContractSemanticHash: successorContract.semanticHash,
