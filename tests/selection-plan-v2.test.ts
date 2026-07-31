@@ -457,6 +457,75 @@ describe("Pipeline V2 selection plan", () => {
     expect(plan.versionPolicy.allowed).not.toEqual(expect.arrayContaining(["live", "remix"]));
   });
 
+  test("does not let a quantifier reverse an explicit version exclusion", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Build the exact named original studio recordings",
+      brief: brief({
+        versionPolicy:
+          "Use only the original studio recordings explicitly named or unambiguously matching the canonical album versions; exclude all alternate versions.",
+      }),
+    });
+    expect(plan.versionPolicy.allowed).toEqual(["canonical"]);
+    expect(plan.versionPolicy.preferred).toEqual(["canonical"]);
+    expect(plan.versionPolicy.allowed).not.toContain("alternate");
+  });
+
+  test("keeps every item in a user-authored comma-separated exclusion hard", () => {
+    const prompt = [
+      "Build a playlist containing exactly these three original studio recordings, in this order:",
+      "1. Michael Jackson — Billie Jean",
+      "2. Madonna — La Isla Bonita",
+      "3. Earth, Wind & Fire — September",
+      "Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicates.",
+    ].join("\n");
+    const plan = createSelectionPlanV2({
+      prompt,
+      brief: brief({
+        targetSize: { min: 3, max: 3 },
+        include: [
+          "Michael Jackson — Billie Jean",
+          "Madonna — La Isla Bonita",
+          "Earth, Wind & Fire — September",
+        ],
+        exclude: [
+          "remixes",
+          "live versions",
+          "radio edits",
+          "covers",
+          "re-recordings",
+          "duplicates",
+        ],
+        orderingPolicy: "Preserve the exact listed order.",
+      }),
+    });
+    for (const value of ["covers", "re-recordings", "duplicates"]) {
+      expect(plan.constraints).toContainEqual(expect.objectContaining({
+        kind: "hard",
+        operator: "exclude",
+        values: [value],
+      }));
+    }
+  });
+
+  test("does not extend an exclusion across an adversative inclusion", () => {
+    const plan = createSelectionPlanV2({
+      prompt: "Exclude remixes, but include live recordings.",
+      brief: brief({
+        exclude: ["remixes", "live recordings"],
+      }),
+    });
+    expect(plan.constraints).toContainEqual(expect.objectContaining({
+      kind: "hard",
+      operator: "exclude",
+      values: ["remixes"],
+    }));
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      kind: "hard",
+      operator: "exclude",
+      values: ["live recordings"],
+    }));
+  });
+
   test("does not let an avoidance cue cross an unless boundary and exclude canonical recordings", () => {
     const plan = createSelectionPlanV2({
       prompt: "Brazilian disco, boogie, and disco-funk from the 1970s and 1980s",

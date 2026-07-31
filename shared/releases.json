@@ -2,6 +2,19 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.6",
+      "releasedAt": "2026-07-30",
+      "title": "Fixed-list catalog identity recovery",
+      "notes": [
+        "Separates compiler-added original-studio version labels from immutable artist/title catalog identity while retaining the independent recording-version policy.",
+        "Prevents quantifiers such as “all” from reversing explicit exclusions such as “exclude all alternate versions.”",
+        "Preserves every item in a user-authored comma-separated exclusion list as a hard rule without crossing a later adversative inclusion.",
+        "Keeps genuine title parentheticals intact and fails closed rather than broadening exact fixed-list membership.",
+        "Renders soft avoid clauses under AVOID at runtime decision boundaries instead of mislabeling them as preferences.",
+        "Adds the exact production-shaped three-track fixed control to the live Apple adapter regression path."
+      ]
+    },
+    {
       "version": "2.4.5",
       "releasedAt": "2026-07-30",
       "title": "Candidate-bound evidence persistence",

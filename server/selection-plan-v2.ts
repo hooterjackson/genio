@@ -64,7 +64,10 @@ const VERSION_MARKERS: Array<[RegExp, SelectionVersionPolicy["allowed"][number]]
 type VersionMarkerDisposition = "include" | "exclude";
 
 const VERSION_EXCLUSION_CUE = /\b(?:exclude|excluding|avoid|avoiding|without|no|not|never|omit|omitting|skip|skipping|do\s+not|don['’]?t)\b/giu;
-const VERSION_INCLUSION_CUE = /\b(?:include|including|allow|allowing|prefer|preferring|preferred|only|must|require|required|all|every)\b/giu;
+// `all` and `every` are quantifiers, not positive directives. Treating them
+// as inclusion cues makes "exclude all alternate versions" include alternate
+// recordings because the quantifier appears after the exclusion verb.
+const VERSION_INCLUSION_CUE = /\b(?:include|including|allow|allowing|prefer|preferring|preferred|only|must|require|required)\b/giu;
 const VERSION_NEGATED_INCLUSION = /\b(?:avoid(?:ing)?|do\s+not|don['’]?t|never|not|without)\s+(?:include|including|allow|allowing|prefer|preferring|require|requiring)\b[^.;\n]*$/iu;
 const VERSION_NEGATED_EXCLUSION = /\b(?:do\s+not|don['’]?t|never|not)\s+(?:exclude|excluding|avoid|avoiding|omit|omitting|skip|skipping)\b[^.;\n]*$/iu;
 const VERSION_TRAILING_EXCLUSION = /\b(?:excluded|avoided|omitted|skipped|not\s+allowed|not\s+included)\b/iu;
@@ -206,14 +209,21 @@ const EXCLUSION_MATCH_STOPWORDS = new Set([
 function explicitUserExclusion(prompt: string, rule: string): boolean {
   if (!EXPLICIT_EXCLUSION_CUE.test(prompt)) return false;
   const terms = normalized(rule).split(" ")
-    .filter((term) => term.length >= 3 && !EXCLUSION_MATCH_STOPWORDS.has(term));
+    // NFKD punctuation normalization turns "re-recordings" into
+    // "re recordings"; retain the semantically material `re` prefix even
+    // though it is shorter than the normal token floor.
+    .filter((term) => (term.length >= 3 || term === "re")
+      && !EXCLUSION_MATCH_STOPWORDS.has(term));
   if (terms.length === 0) return false;
   // Generated exclusions may reuse generic words from the positive prompt.
   // A rule is user-authored only when one of its meaningful terms appears in
   // the clause immediately governed by an exclusion cue (for example,
   // "house music, no remixes"), never merely somewhere else in the request.
+  // Commas enumerate one exclusion list; they are not clause boundaries.
+  // Adversatives do end the governed span so "exclude remixes, but include
+  // live recordings" cannot harden the inclusion as another exclusion.
   const exclusionClauses = [...prompt.matchAll(
-    /\b(?:exclude|avoid|without|no|not|never|do\s+not|don['’]?t)\b\s+([^,;.!?\n]{1,160})/giu,
+    /\b(?:exclude|avoid|without|no|not|never|do\s+not|don['’]?t)\b\s+((?:(?!\b(?:but|while|whereas|except)\b)[^;.!?\n]){1,320})/giu,
   )].map((match) => ` ${normalized(match[1] ?? "")} `);
   return terms.some((term) => exclusionClauses.some((clause) => clause.includes(` ${term} `)));
 }

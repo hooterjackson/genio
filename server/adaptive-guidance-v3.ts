@@ -1933,7 +1933,9 @@ export function playlistInterpretationSummaryV1(
   for (const clause of contract.clauses) {
     const label = summaryText(clause.source.text || clause.values.join(", "));
     if (!label) continue;
-    if (clause.kind === "exclusion" || clause.operator === "exclude") {
+    const isSoftAvoid = clause.hardness === "soft"
+      && clause.values.some((value) => normalized(value).startsWith("avoid:"));
+    if (clause.kind === "exclusion" || clause.operator === "exclude" || isSoftAvoid) {
       avoid.push(label);
     } else if (clause.hardness === "hard" && referenced.has(clause.id)) {
       mustHave.push(label);

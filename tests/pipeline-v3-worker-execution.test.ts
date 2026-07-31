@@ -635,9 +635,9 @@ describe("Pipeline V3 durable worker execution", () => {
       subjectEntities: [],
       relationship: "Exact inclusion of three named original studio recordings in the listed order.",
       include: [
-        "Michael Jackson — Billie Jean",
-        "Madonna — La Isla Bonita",
-        "Earth, Wind & Fire — September",
+        "Michael Jackson — Billie Jean (original studio recording)",
+        "Madonna — La Isla Bonita (original studio recording)",
+        "Earth, Wind & Fire — September (original studio recording)",
       ],
       exclude: [
         "remixes",
@@ -675,6 +675,11 @@ describe("Pipeline V3 durable worker execution", () => {
         playlistContractCompilerVersion: shadow.contract.versions.compiler,
       },
     );
+    expect(plan.executionDirectives?.fixedTrackList?.tracks).toEqual([
+      { artist: "Michael Jackson", title: "Billie Jean" },
+      { artist: "Madonna", title: "La Isla Bonita" },
+      { artist: "Earth, Wind & Fire", title: "September" },
+    ]);
     expect(plan.evidencePolicyVersion).toBe("governed_evidence_v2");
     expect(plan.executionCoverageReport?.evidencePolicyVersion)
       .toBe("selection_plan_evidence_projection_v2");
