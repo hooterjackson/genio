@@ -97,7 +97,7 @@ function queryPlan(): QueryPlanV3 {
     selectionPlan(),
     "33333333-3333-4333-8333-333333333333",
     {
-      schemaVersion: 5,
+      schemaVersion: 6,
       briefContractVersion: 3,
       playlistContractRevisionId: contractRevisionId,
       playlistContractSemanticHash: contractSemanticHash,
@@ -229,6 +229,27 @@ function track(
     catalogConfidence: 0.99,
     rankingSignals: { relevance: 1 - index * 0.01 },
     sourceRank: index,
+  };
+}
+
+function publicApiTrack(index: number): QualifiedTrackV3 {
+  const hostedTrack = track(index);
+  const binding = hostedTrack.evidenceBindings![0]!;
+  const {
+    hostedEvidenceSnapshot,
+    ...bindingWithoutHostedSnapshot
+  } = binding;
+  void hostedEvidenceSnapshot;
+  return {
+    ...hostedTrack,
+    evidenceBindings: [{
+      ...bindingWithoutHostedSnapshot,
+      governance: {
+        ...binding.governance,
+        accessMethod: "public_api",
+      },
+      eligibilityAttestation: publicTrackScopeAttestationV3(binding.url!),
+    }],
   };
 }
 
@@ -499,6 +520,44 @@ describe("authenticated staging manifest-only canary", () => {
     expect(evidence().qualifiedManifestHash).toMatch(/^[0-9a-f]{64}$/u);
     expect(evidence().qualifiedReserveHash).toMatch(/^[0-9a-f]{64}$/u);
     expect(evidence().evidenceHash).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  test("accepts schema-6 governed public-API evidence at the canonical boundary", () => {
+    const selected = [publicApiTrack(1), publicApiTrack(2), publicApiTrack(3)];
+    const reserve = [publicApiTrack(4)];
+    expect(evidence({
+      checkpoint: {
+        ...checkpoint(),
+        selected,
+        reserve,
+        playlistOptimization: evaluatePlaylistOptimizationV3({
+          plan: selectionPlan(),
+          tracks: selected,
+        }),
+      },
+    })).toMatchObject({
+      outcome: "exact_ready",
+      requestedTrackCount: 3,
+      selectedTrackCount: 3,
+      reserveTrackCount: 1,
+    });
+  });
+
+  test("rejects governed public-API evidence without its exact-track attestation", () => {
+    const valid = publicApiTrack(1);
+    const invalid = {
+      ...valid,
+      evidenceBindings: valid.evidenceBindings?.map((binding) => ({
+        ...binding,
+        eligibilityAttestation: undefined,
+      } as unknown as EvidenceBindingReferenceV3)),
+    } as QualifiedTrackV3;
+    expect(() => evidence({
+      checkpoint: {
+        ...checkpoint(),
+        selected: [invalid, publicApiTrack(2), publicApiTrack(3)],
+      },
+    })).toThrow(/canonical(?:_| )evidence(?:_| )is(?:_| )unproven/u);
   });
 
   test("fails closed on partial results, stale executors, or any write-path artifact", () => {
