@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.11",
+      "releasedAt": "2026-07-31",
+      "title": "Registry-independent recovery build",
+      "notes": [
+        "Builds the emergency schema-19 release from the last proven immutable gênio image so GitHub Actions no longer bootstraps BuildKit or the Node base layer from Docker Hub.",
+        "Uses the runner's built-in Docker engine and records the pushed GHCR digest before any Railway promotion.",
+        "Preserves the v2.4.10 fixed-list semantics and production-shaped acceptance regression unchanged."
+      ]
+    },
+    {
       "version": "2.4.10",
       "releasedAt": "2026-07-31",
       "title": "Production-shaped fixed-list execution",
