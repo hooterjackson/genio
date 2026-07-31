@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.9",
+      "releasedAt": "2026-07-31",
+      "title": "Exact frontend artifact identity",
+      "notes": [
+        "Rebuilds the production Sites artifact from a clean detached worktree so the web release marker and compiled release metadata match the exact promoted source.",
+        "Preserves the v2.4.8 reference-artist contract, query-plan, worker, and publication semantics unchanged.",
+        "Requires browser acceptance to observe matching web and API versions before this release can be called live."
+      ]
+    },
+    {
       "version": "2.4.8",
       "releasedAt": "2026-07-30",
       "title": "Reference-artist policy recovery",
