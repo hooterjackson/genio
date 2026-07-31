@@ -49,6 +49,7 @@ function hash(value: unknown): string {
 
 interface LegacyManifestRow {
   manifest_revision_id: string;
+  resolution_state: string | null;
   proof_kind: string | null;
   selection_set_id: string | null;
   attestation_set_hash: string | null;
@@ -95,6 +96,7 @@ export interface Schema20BackfillPlan {
   nativeManifestCount: number;
   legacyPublishedVerifiedCount: number;
   legacyPublishedUnverifiedCount: number;
+  terminalUnpublishedCount: number;
   successorRequiredCount: number;
   ambiguousOrTamperedCount: number;
   existingReceiptCount: number;
@@ -160,6 +162,7 @@ async function buildSchema20BackfillPlan(
   const manifestRows = await client.query<LegacyManifestRow>(
     `SELECT
        revision.id manifest_revision_id,
+       resolution.state resolution_state,
        revision.proof_kind,
        revision.selection_set_id,
        revision.attestation_set_hash,
@@ -185,6 +188,8 @@ async function buildSchema20BackfillPlan(
        receipt.receipt_hash existing_receipt_hash
      FROM manifest_revisions revision
      JOIN manifests manifest ON manifest.id=revision.manifest_id
+     LEFT JOIN playlist_run_resolutions resolution
+       ON resolution.run_id=manifest.run_id
      LEFT JOIN LATERAL (
        SELECT
          count(*) FILTER (WHERE state='complete')::int complete_count,
@@ -248,6 +253,7 @@ async function buildSchema20BackfillPlan(
   let existingReceiptCount = 0;
   let legacyPublishedVerifiedCount = 0;
   let legacyPublishedUnverifiedCount = 0;
+  let terminalUnpublishedCount = 0;
   const receipts: LegacyPublishedReceiptPlan[] = [];
   const inventory: Array<Record<string, unknown>> = [];
 
@@ -322,6 +328,13 @@ async function buildSchema20BackfillPlan(
           receipt,
         });
       }
+    } else if (
+      row.resolution_state === "quarantined"
+      || row.resolution_state === "cancelled"
+      || row.resolution_state === "needs_decision"
+    ) {
+      terminalUnpublishedCount += 1;
+      classification = `legacy_unpublished_${row.resolution_state}`;
     } else {
       successorRequiredCount += 1;
       classification = completeProof && row.proof_kind === "shadow"
@@ -355,6 +368,7 @@ async function buildSchema20BackfillPlan(
     nativeManifestCount,
     legacyPublishedVerifiedCount,
     legacyPublishedUnverifiedCount,
+    terminalUnpublishedCount,
     successorRequiredCount,
     ambiguousOrTamperedCount,
     existingReceiptCount,
@@ -469,6 +483,7 @@ export async function executeSchema20ProofBackfill(
         publicPlan.legacyPublishedVerifiedCount,
       legacyPublishedUnverifiedCount:
         publicPlan.legacyPublishedUnverifiedCount,
+      terminalUnpublishedCount: publicPlan.terminalUnpublishedCount,
       nativeManifestCount: publicPlan.nativeManifestCount,
     };
     await client.query(
