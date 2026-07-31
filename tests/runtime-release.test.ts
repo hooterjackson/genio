@@ -52,7 +52,7 @@ describe("public V3 runtime release contract", () => {
       guidancePolicyVersion: "intelligent_guidance_v2",
       evidencePolicyVersion: "governed_evidence_v1",
       semanticScopePolicyVersion: "scope_gate_v2_1_2",
-      musicConceptPolicyVersion: "music_concepts_v3_3_0",
+      musicConceptPolicyVersion: "music_concepts_v3_4_0",
       promptVersion: "grounded_recovery_v3_1_prompt_v1",
       baselineProviderModelId: "gpt-5.6-luna",
       escalationProviderModelId: "gpt-5.6-terra",
@@ -165,7 +165,7 @@ describe("public V3 runtime release contract", () => {
     expect(result.guidancePolicyVersion).toBe("intelligent_guidance_v2");
     expect(result.evidencePolicyVersion).toBe("governed_evidence_v1");
     expect(result.semanticScopePolicyVersion).toBe("scope_gate_v2_1_2");
-    expect(result.musicConceptPolicyVersion).toBe("music_concepts_v3_3_0");
+    expect(result.musicConceptPolicyVersion).toBe("music_concepts_v3_4_0");
     expect(result.baselineProviderModelId).toBe("gpt-5.6-luna");
     expect(result.modelResolutionMode).toBe("provider_managed_alias");
     expect(result.modelCatalogValidatedAt).toBe("2026-07-20T00:00:00.000Z");

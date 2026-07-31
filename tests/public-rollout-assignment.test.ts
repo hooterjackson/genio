@@ -4,6 +4,7 @@ import {
   createPublicRolloutAssignmentV1,
   parsePublicRolloutAssignmentV1,
   publicRolloutAssignmentStickyKeyV1,
+  publicRolloutAssignmentPausedV1,
   publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "../server/public-rollout-assignment.ts";
@@ -120,6 +121,35 @@ function assignment(
 }
 
 describe("persisted public canonical rollout assignment", () => {
+  test("separates the public assignment pause from signed owner-canary access", () => {
+    const assigned = assignment("pause-fixture", environment("100"));
+    expect(assigned.assigned).toBe(true);
+    expect(publicRolloutAssignmentPausedV1({
+      assignment: assigned,
+      owner: false,
+      signedCanary: false,
+      publicAssignmentPaused: true,
+    })).toBe(true);
+    expect(publicRolloutAssignmentPausedV1({
+      assignment: assigned,
+      owner: false,
+      signedCanary: true,
+      publicAssignmentPaused: true,
+    })).toBe(false);
+    expect(publicRolloutAssignmentPausedV1({
+      assignment: assigned,
+      owner: true,
+      signedCanary: false,
+      publicAssignmentPaused: true,
+    })).toBe(false);
+    expect(publicRolloutAssignmentPausedV1({
+      assignment: assigned,
+      owner: false,
+      signedCanary: false,
+      publicAssignmentPaused: false,
+    })).toBe(false);
+  });
+
   test("uses a protected production canary ID as its deterministic sticky key", () => {
     expect(publicRolloutAssignmentStickyKeyV1({
       owner: false,

@@ -579,7 +579,7 @@ function rapGrimeEmphasisDecision(
       {
         id: "equal_priority",
         label: "Equal priority",
-        description: "Keep rap and grime equally eligible and let quality decide.",
+        description: "The request names both genres co-equally, so either remains eligible and quality decides.",
         recommended: true,
         explicitNoop: true,
         expectedFeasibilityDirection: "neutral",

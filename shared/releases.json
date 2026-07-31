@@ -2,6 +2,20 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.2",
+      "releasedAt": "2026-07-30",
+      "title": "Guidance-first integrity recovery",
+      "notes": [
+        "Makes canonical persistence replay-safe by preserving immutable qualification bindings, validating the complete recording/catalog tuple, and quarantining incomplete projections instead of attempting generic repair.",
+        "Classifies retryable dependencies, stale work, optimizer compute rescue, integrity defects, and unknown faults separately while suppressing identical semantic retries under the same strategy.",
+        "Reports durable execution motion and separate selected, manifested, appended, and Apple-reconciled counts so a stale job cannot render LIVE and a 50-track manifest cannot be reported as published.",
+        "Adds canonical grime eligibility and an executable rap-or-grime predicate, with a server-owned Equal priority, Rap-led, or Grime-led guidance decision that preserves exact count and hard scope.",
+        "Compiles Pop Smoke as an exact similarity reference, excludes his primary-artist recordings while allowing features, and keeps Echo Park as story context and biking energy as suitability.",
+        "Enforces route-wide hard switches during assignment and lease renewal while retaining a separate public-assignment pause for bounded signed owner acceptance.",
+        "Adds protected regressions for the quarantined Echo Park incident, deterministic retry suppression, stale worker motion, and exact Apple ordered-ID reconciliation."
+      ]
+    },
+    {
       "version": "2.4.1",
       "releasedAt": "2026-07-30",
       "title": "Canonical execution resilience",

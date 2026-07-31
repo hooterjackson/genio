@@ -31,7 +31,14 @@ function rememberIntro(): void {
 }
 
 export function BrandIntro({ onSettled }: { onSettled?: () => void }) {
-  const [phase, setPhase] = useState<IntroPhase>("checking");
+  // The server and the initial client render both emit no intro markup, so it
+  // is hydration-safe to resolve the two synchronous skip policies here.
+  // Waiting for a zero-delay timer left the composer inert when a saturated
+  // mobile browser delayed effects even though reduced motion or the
+  // session-scoped receipt already made the answer deterministic.
+  const [phase, setPhase] = useState<IntroPhase>(() => (
+    typeof window !== "undefined" && shouldSkipIntro() ? "hidden" : "checking"
+  ));
   const [visibleCharacterCount, setVisibleCharacterCount] = useState(0);
   const intervalRef = useRef<number | undefined>(undefined);
   const timeoutRefs = useRef<number[]>([]);

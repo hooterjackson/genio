@@ -51,6 +51,18 @@ export interface PersistedPublicRolloutAssignmentV1 {
   assignmentHash: string;
 }
 
+export function publicRolloutAssignmentPausedV1(input: {
+  assignment: PersistedPublicRolloutAssignmentV1 | null;
+  owner: boolean;
+  signedCanary: boolean;
+  publicAssignmentPaused: boolean;
+}): boolean {
+  return input.assignment?.assigned === true
+    && !input.owner
+    && !input.signedCanary
+    && input.publicAssignmentPaused;
+}
+
 export interface PublicRolloutDatabaseAuthorityV1 {
   global: unknown;
   intents: Partial<Record<PublicRolloutIntentGroup, unknown>>;

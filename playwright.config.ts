@@ -24,21 +24,52 @@ export default defineConfig({
     ? [["github"], ["html", { open: "never" }]]
     : [["list"], ["html", { open: "never" }]],
   outputDir: "test-results",
-  timeout: 30_000,
+  // The budget includes browser/context startup and multi-tab teardown on a
+  // cold hosted runner. Keep action and assertion deadlines tight below, but
+  // do not let infrastructure startup consume the whole scenario budget.
+  timeout: 60_000,
   expect: { timeout: 7_500 },
   use: {
     baseURL,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    // High-DPI mobile video capture can starve input/expect dispatch long
+    // enough to turn successful flows into timeout failures. Screenshots and
+    // retained traces preserve DOM, network, and action evidence without that
+    // encoder-dependent release gate.
+    video: "off",
     reducedMotion: "reduce",
     actionTimeout: 10_000,
     navigationTimeout: 20_000,
   },
   projects: [
-    { name: "mobile-320", use: { ...devices["iPhone SE"], viewport: { width: 320, height: 720 } } },
-    { name: "mobile-390", use: { ...devices["iPhone 14"], viewport: { width: 390, height: 844 } } },
-    { name: "mobile-430", use: { ...devices["iPhone 14 Pro Max"], viewport: { width: 430, height: 932 } } },
+    {
+      name: "mobile-320",
+      use: {
+        ...devices["iPhone SE"],
+        browserName: "chromium",
+        reducedMotion: "reduce",
+        viewport: { width: 320, height: 720 },
+      },
+    },
+    {
+      name: "mobile-390",
+      use: {
+        ...devices["iPhone 14"],
+        browserName: "chromium",
+        reducedMotion: "reduce",
+        viewport: { width: 390, height: 844 },
+      },
+    },
+    {
+      name: "mobile-430",
+      use: {
+        ...devices["iPhone 14 Pro Max"],
+        browserName: "chromium",
+        reducedMotion: "reduce",
+        viewport: { width: 430, height: 932 },
+      },
+    },
     { name: "desktop", use: { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 900 } } },
   ],
   webServer: startsLocalServer

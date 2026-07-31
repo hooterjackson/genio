@@ -20,6 +20,10 @@ import { sha256Hex, stableStringify } from "../server/security.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 import { compilePlaylistContractShadowV1 } from "../server/playlist-contract-shadow-bridge-v1.ts";
+import { projectPlaylistContractExecutionV1 } from "../server/playlist-contract-execution-bridge-v1.ts";
+import { createQueryPlanV3, queryPlanV3Hash } from "../server/query-plan-v3.ts";
+import { selectionPlanFromQueryPlanV3 } from "../server/pipeline-v3-worker-execution.ts";
+import { selectCandidatesV3 } from "../server/pipeline-v3-policy.ts";
 
 function baseContract(prompt: string, count = 25): PlaylistContractRevisionV1 {
   return compilePlaylistContractRevisionV1({
@@ -215,7 +219,9 @@ Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicat
     const question = publicGuidanceQuestionV4(decision!);
     expect(() => guidanceDecisionV4FromPublicQuestion(question)).not.toThrow();
     const current = guidanceDecisionV4FromPublicQuestion(question);
-    const { questionHash: _currentHash, ...currentBody } = current;
+    const currentBody = Object.fromEntries(
+      Object.entries(current).filter(([key]) => key !== "questionHash"),
+    );
     const legacyQuestion = {
       ...question,
       questionHash: sha256Hex(stableStringify({
@@ -249,7 +255,7 @@ Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicat
           recommended: true,
           explicitNoop: true,
           label: "Equal priority",
-          description: "Keep rap and grime equally eligible and let quality decide.",
+          description: "The request names both genres co-equally, so either remains eligible and quality decides.",
           expectedFeasibilityDirection: "neutral",
           patch: { operations: [], affectedClauseIds: [] },
         },
@@ -282,6 +288,108 @@ Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicat
       },
       operations: rapLed.operations,
     }).requestedTrackCount).toBe(contract.requestedTrackCount);
+  });
+
+  test("carries a non-noop rap/grime answer through the query plan and changes ranking", () => {
+    const { contract, value } = checkpoint(
+      "50 rap and grime tracks for a high-energy bike ride",
+    );
+    const decision = value.decisions.find(({ axis }) => axis === "rap_grime_emphasis")!;
+    const rapLed = compileGuidanceSelectionV4(decision, {
+      optionIds: ["rap_led"],
+    });
+    const successor = applyPlaylistContractPatchV1(contract, {
+      baseRevisionId: contract.revisionId,
+      baseSemanticHash: contract.semanticHash,
+      answerLineage: {
+        questionSetHash: value.checkpointHash,
+        questionId: decision.id,
+        answerHash: rapLed.answerHash,
+      },
+      operations: rapLed.operations,
+    });
+    const basePlan = {
+      requestedTrackCount: contract.requestedTrackCount,
+      minimumQualifiedTrackCount: contract.requestedTrackCount,
+      storefront: contract.storefront,
+    };
+    const originalProjection = projectPlaylistContractExecutionV1({
+      contract,
+      basePlan,
+    });
+    const successorProjection = projectPlaylistContractExecutionV1({
+      contract: successor,
+      basePlan,
+    });
+    const graphSnapshotId = "00000000-0000-4000-8000-000000000042";
+    const originalQuery = createQueryPlanV3(
+      originalProjection.selectionPlanV3,
+      graphSnapshotId,
+      {
+        schemaVersion: 5,
+        briefContractVersion: 3,
+        playlistContractRevisionId: contract.revisionId,
+        playlistContractSemanticHash: contract.semanticHash,
+        playlistContractCompilerVersion: contract.versions.compiler,
+      },
+    );
+    const successorQuery = createQueryPlanV3(
+      successorProjection.selectionPlanV3,
+      graphSnapshotId,
+      {
+        schemaVersion: 5,
+        briefContractVersion: 3,
+        playlistContractRevisionId: successor.revisionId,
+        playlistContractSemanticHash: successor.semanticHash,
+        playlistContractCompilerVersion: successor.versions.compiler,
+      },
+    );
+    expect(successor.semanticHash).not.toBe(contract.semanticHash);
+    expect(queryPlanV3Hash(successorQuery)).not.toBe(queryPlanV3Hash(originalQuery));
+    const workerPlan = selectionPlanFromQueryPlanV3(successorQuery, {
+      prompt: "raw prompt must not be reinterpreted",
+    });
+    expect(workerPlan.rankingObjectives).toContainEqual(expect.objectContaining({
+      dimension: "relevance",
+      values: ["rap-led"],
+    }));
+
+    const candidates = [
+      {
+        id: "grime-first-without-guidance",
+        value: "grime",
+        artist: "Grime Artist",
+        album: null,
+        year: 2026,
+        scene: null,
+        memberships: { genre: ["music", "grime"] },
+        objectiveScores: {},
+        sourceRank: 1,
+      },
+      {
+        id: "rap-preferred-after-guidance",
+        value: "rap",
+        artist: "Rap Artist",
+        album: null,
+        year: 2026,
+        scene: null,
+        memberships: { genre: ["music", "rap"] },
+        objectiveScores: {},
+        sourceRank: 2,
+      },
+    ];
+    expect(selectCandidatesV3({
+      candidates,
+      membershipPredicates: originalProjection.selectionPlanV3.membershipPredicates,
+      rankingObjectives: originalProjection.selectionPlanV3.rankingObjectives,
+      target: 1,
+    }).selected[0]?.id).toBe("grime-first-without-guidance");
+    expect(selectCandidatesV3({
+      candidates,
+      membershipPredicates: workerPlan.membershipPredicates,
+      rankingObjectives: workerPlan.rankingObjectives,
+      target: 1,
+    }).selected[0]?.id).toBe("rap-preferred-after-guidance");
   });
 
   test.each([

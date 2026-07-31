@@ -2194,6 +2194,119 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     120_000,
   );
 
+  test("replays the production-shaped 50 plus 5 reserve state without losing any of 56 source observations", async () => {
+    const context = await createLeasedRun(
+      50,
+      "echo-park-production-shape",
+      undefined,
+      "50 rap and grime tracks with a style reference and new-artist emphasis",
+      "or_membership",
+    );
+    const base = withCanonicalHostedProof(retrievalResult({
+      runId: context.runId,
+      target: 50,
+      selectedCount: 50,
+      reserveCount: 5,
+      status: "exact_ready",
+      prefix: "echo-park-production-shape",
+      predicateIds: ["genre:reggaeton"],
+    }), "genre:reggaeton");
+    const selected = Array.from(
+      { length: base.selected.length },
+      (_, index) => base.selected[(index * 11) % base.selected.length]!,
+    ).map((track, index) => ({
+      ...track,
+      cacheOrigin: "live" as const,
+      discoveryDependencyIds: ["hosted_web"] as const,
+      provenanceRoots: [`echo-park-live-frontier-${index}`],
+      ...(index === 0 ? {
+        sourceObservationIds: [
+          ...track.sourceObservationIds,
+          "echo-park-production-shape:observation:extra",
+        ],
+      } : {}),
+    }));
+    const reserve = base.reserve.map((track, index) => ({
+      ...track,
+      cacheOrigin: "live" as const,
+      discoveryDependencyIds: ["hosted_web"] as const,
+      provenanceRoots: [`echo-park-live-reserve-${index}`],
+    }));
+    const result: RetrievalResultV3 = {
+      ...base,
+      selected,
+      reserve,
+      qualifiedPool: [...selected, ...reserve],
+    };
+
+    const first = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const replay = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    expect(replay).toEqual(first);
+
+    const counts = (await pool.query<{
+      selected_count: number;
+      reserve_count: number;
+      qualification_count: number;
+      null_candidate_count: number;
+      manifest_revision_count: number;
+      publication_job_count: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM manifest_revision_tracks
+          WHERE manifest_revision_id=$2) selected_count,
+         (SELECT count(*)::int FROM manifest_revision_reserve_tracks
+          WHERE manifest_revision_id=$2) reserve_count,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL) qualification_count,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL
+            AND candidate_id IS NULL) null_candidate_count,
+         (SELECT count(*)::int FROM manifest_revisions revision
+          JOIN manifests manifest ON manifest.id=revision.manifest_id
+          WHERE manifest.run_id=$1) manifest_revision_count,
+         (SELECT count(*)::int FROM job_queue
+          WHERE run_id=$1 AND kind='publication') publication_job_count`,
+      [context.runId, first.manifestRevisionId],
+    )).rows[0]!;
+    expect(counts).toEqual({
+      selected_count: 50,
+      reserve_count: 5,
+      qualification_count: 55,
+      null_candidate_count: 0,
+      manifest_revision_count: 1,
+      publication_job_count: 1,
+    });
+
+    const provenance = (await pool.query<{
+      provenance_path_json: Array<{ kind?: string; id?: string }>;
+    }>(
+      `SELECT provenance_path_json
+       FROM track_scope_bindings
+       WHERE run_id=$1 AND eligibility='qualifying'`,
+      [context.runId],
+    )).rows;
+    const sourceObservationIds = provenance.flatMap(({ provenance_path_json: path }) => (
+      path.filter(({ kind }) => kind === "source_observation")
+        .map(({ id }) => id)
+        .filter((id): id is string => typeof id === "string")
+    ));
+    expect(provenance).toHaveLength(55);
+    expect(sourceObservationIds).toHaveLength(56);
+    expect(new Set(sourceObservationIds).size).toBe(56);
+  }, 120_000);
+
   test("uses database-returned candidate IDs after an upsert conflict", async () => {
     const context = await createLeasedRun(
       1,

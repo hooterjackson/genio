@@ -948,7 +948,7 @@ describe("canonical contract execution bridge", () => {
       originalText: "velvet pulse",
       normalizedText: "velvet pulse",
       status: "unresolved",
-      ontologyVersion: "playlist_music_ontology_v2",
+      ontologyVersion: "playlist_music_ontology_v3",
       unresolvedTermId: expect.stringMatching(/^unresolved:[a-f0-9]{16}$/u),
       provenance: "immutable_playlist_contract_concept_v1",
       untrusted: true,

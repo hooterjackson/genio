@@ -48,7 +48,7 @@ function live(configurationHash = hash) {
       queryPlanPolicyVersion: "query_plan_v3_4",
       selectionPlanVersion: "selection_plan_v3",
       semanticScopePolicyVersion: "scope_gate_v2_1_2",
-      musicConceptPolicyVersion: "music_concepts_v3_3_0",
+      musicConceptPolicyVersion: "music_concepts_v3_4_0",
       pipelinePolicyVersion: "corpus_first_v3",
       promptVersion: "grounded_recovery_v3_1_prompt_v1",
     },

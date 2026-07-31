@@ -22312,11 +22312,20 @@ export class Repository {
               approvedAt: new Date().toISOString(),
             })],
           );
+        }
+        if (run.rows[0].active_playlist_contract_revision_id) {
+          // Consuming the exact hash-bound continuation is the user's action
+          // on the current scope decision. Leaving that blocker open would
+          // let schema-19 truthfully record the new work while the public
+          // projection remained frozen on the superseded decision.
           await client.query(
             `UPDATE playlist_run_blockers SET resolved_at=now(),updated_at=now()
              WHERE run_id=$1 AND contract_revision_id=$2
                AND blocker_kind='scope_decision' AND resolved_at IS NULL`,
-            [input.runId, contractRevisionId],
+            [
+              input.runId,
+              run.rows[0].active_playlist_contract_revision_id,
+            ],
           );
         }
         await client.query(
@@ -22352,6 +22361,7 @@ export class Repository {
              error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1`,
           [input.runId],
         );
+        await this.shadowPlaylistResolutionV1(client, input.runId);
         return { queued: true };
       }
       const strategy = raw.continuationJob;
@@ -26946,6 +26956,7 @@ export class Repository {
         selection_plan_json: SelectionPlanV3;
         query_plan_id: string;
         query_plan_revision: number;
+        query_plan_parent_revision_id: string | null;
         query_plan_status: string;
         query_plan_hash: string;
         query_plan_json: QueryPlanV3;
@@ -26961,7 +26972,9 @@ export class Repository {
                 selection.id selection_plan_id,selection.status selection_plan_status,
                 selection.plan_hash selection_plan_hash,
                 selection.plan_json selection_plan_json,
-                query.id query_plan_id,query.revision query_plan_revision,query.status query_plan_status,
+                query.id query_plan_id,query.revision query_plan_revision,
+                query.parent_revision_id query_plan_parent_revision_id,
+                query.status query_plan_status,
                 query.plan_hash query_plan_hash,query.plan_json query_plan_json,
                 query.graph_snapshot_id,graph.status graph_snapshot_status
          FROM research_runs r
@@ -27037,24 +27050,39 @@ export class Repository {
         throw new HttpError(409, "Pipeline V3 retrieval no longer matches the active immutable plan", "pipeline_v3_plan_stale");
       }
 
+      let continuationSourceManifestRevisionId: string | null = null;
+      let reuseContinuationManifestRevision = false;
       const existingManifest = await client.query<{
         manifest_id: string;
         manifest_revision_id: string | null;
         content_hash: string;
         contract_revision_id: string | null;
         contract_hash: string | null;
+        manifest_revision_content_hash: string | null;
+        manifest_revision_status: string | null;
+        manifest_query_plan_revision_id: string | null;
+        source_query_plan_hash: string | null;
+        source_query_plan_status: string | null;
       }>(
         `SELECT manifest.id manifest_id,
                 revision.id manifest_revision_id,
                 manifest.content_hash,
                 manifest.contract_revision_id,
-                manifest.contract_hash
+                manifest.contract_hash,
+                revision.content_hash manifest_revision_content_hash,
+                revision.status manifest_revision_status,
+                revision.query_plan_revision_id manifest_query_plan_revision_id,
+                source_query.plan_hash source_query_plan_hash,
+                source_query.status source_query_plan_status
          FROM manifests manifest
          LEFT JOIN LATERAL (
-           SELECT id FROM manifest_revisions
+           SELECT id,content_hash,status,query_plan_revision_id
+           FROM manifest_revisions
            WHERE manifest_id=manifest.id
            ORDER BY revision DESC LIMIT 1
          ) revision ON true
+         LEFT JOIN query_plan_revisions source_query
+           ON source_query.id=revision.query_plan_revision_id
          WHERE manifest.run_id=$1
          FOR UPDATE OF manifest`,
         [runId],
@@ -27071,6 +27099,107 @@ export class Repository {
           throw new HttpError(
             409,
             "Existing Pipeline V3 manifest projection is incomplete or stale",
+            "pipeline_v3_existing_projection_incomplete",
+          );
+        }
+        const sameQueryPlanReplay =
+          existing.manifest_query_plan_revision_id === immutable.query_plan_id;
+        let authorizedContinuation = false;
+        if (!sameQueryPlanReplay && queryPlan.continuation) {
+          const source = queryPlan.continuation;
+          const checkpoint = await client.query<{
+            state_json: Record<string, unknown>;
+          }>(
+            `SELECT state_json FROM research_checkpoints
+             WHERE run_id=$1 AND phase='partial_ready'
+             FOR UPDATE`,
+            [runId],
+          );
+          const state = checkpoint.rows[0]?.state_json;
+          const sideEffects = await client.query<{
+            decision_count: number;
+            volume_count: number;
+            reconciliation_count: number;
+            publication_job_count: number;
+          }>(
+            `SELECT
+               (SELECT count(*)::int
+                FROM partial_publication_decisions
+                WHERE run_id=$1 AND manifest_revision_id=$2) decision_count,
+               (SELECT count(*)::int
+                FROM publication_volumes
+                WHERE manifest_id=$3 AND manifest_revision_id=$2) volume_count,
+               (SELECT count(*)::int
+                FROM playlist_publication_reconciliations
+                WHERE run_id=$1 AND manifest_id=$3
+                  AND manifest_revision_id=$2) reconciliation_count,
+               (SELECT count(*)::int
+                FROM job_queue
+                WHERE run_id=$1 AND kind='publication'
+                  AND payload_json->>'manifestId'=$3::text) publication_job_count`,
+            [runId, existing.manifest_revision_id, existing.manifest_id],
+          );
+          const effects = sideEffects.rows[0];
+          const authorityChecks = {
+            run_state: ["continuing_research", "researching"].includes(
+              immutable.status,
+            ) && [
+              "continuing_research",
+              "v3_continuing_research",
+              "v3_retrieval",
+            ].includes(immutable.phase),
+            query_parent: immutable.query_plan_parent_revision_id
+              === source.sourceQueryPlanRevisionId,
+            manifest_locked: existing.manifest_revision_status === "locked",
+            manifest_hash: existing.manifest_revision_content_hash
+              === existing.content_hash,
+            manifest_query: existing.manifest_query_plan_revision_id
+              === source.sourceQueryPlanRevisionId,
+            source_query_hash: existing.source_query_plan_hash
+              === source.sourceQueryPlanHash,
+            source_query_state: existing.source_query_plan_status
+              === "superseded",
+            checkpoint_outcome: Boolean(
+              state
+              && state.outcomeHash === source.sourceOutcomeHash
+              && Number(state.outcomeVersion) === source.sourceOutcomeVersion,
+            ),
+            checkpoint_query: Boolean(
+              state
+              && state.stageKey === source.sourceStageKey
+              && state.queryPlanHash === source.sourceQueryPlanHash
+              && state.queryPlanRevisionId === source.sourceQueryPlanRevisionId,
+            ),
+            checkpoint_manifest: Boolean(
+              state
+              && state.manifestId === existing.manifest_id
+              && state.manifestRevisionId === existing.manifest_revision_id
+              && state.manifestHash === existing.content_hash,
+            ),
+            no_publication_side_effect: Number(effects?.decision_count ?? 0) === 0
+              && Number(effects?.volume_count ?? 0) === 0
+              && Number(effects?.reconciliation_count ?? 0) === 0
+              && Number(effects?.publication_job_count ?? 0) === 0,
+          } as const;
+          const failedAuthorityChecks = Object.entries(authorityChecks)
+            .filter(([, passed]) => !passed)
+            .map(([name]) => name);
+          authorizedContinuation = failedAuthorityChecks.length === 0;
+          if (!authorizedContinuation) {
+            throw new HttpError(
+              409,
+              `Existing Pipeline V3 manifest has no valid successor authority: ${
+                failedAuthorityChecks.join(",")
+              }`,
+              "pipeline_v3_existing_projection_incomplete",
+            );
+          }
+          continuationSourceManifestRevisionId =
+            existing.manifest_revision_id;
+        } else if (!sameQueryPlanReplay) {
+          throw new HttpError(
+            409,
+            "Existing Pipeline V3 manifest belongs to another execution plan",
             "pipeline_v3_existing_projection_incomplete",
           );
         }
@@ -27177,21 +27306,28 @@ export class Repository {
               catalogId: row.catalog_id,
             })))
           : null;
-        if (!exactTuple || observedHash !== existing.content_hash) {
+        if (sameQueryPlanReplay
+          && (!exactTuple || observedHash !== existing.content_hash)) {
           throw new HttpError(
             409,
             "Existing Pipeline V3 manifest does not match its complete persisted identity tuple",
             "pipeline_v3_existing_projection_incomplete",
           );
         }
-        return {
-          manifestId: existing.manifest_id,
-          manifestRevisionId: existing.manifest_revision_id,
-          manifestHash: existing.content_hash,
-          clientBucket: immutable.client_bucket,
-          exact: result.outcome.status === "exact_ready",
-          existing: true,
-        };
+        if (sameQueryPlanReplay) {
+          return {
+            manifestId: existing.manifest_id,
+            manifestRevisionId: existing.manifest_revision_id,
+            manifestHash: existing.content_hash,
+            clientBucket: immutable.client_bucket,
+            exact: result.outcome.status === "exact_ready",
+            existing: true,
+          };
+        }
+        reuseContinuationManifestRevision =
+          authorizedContinuation
+          && exactTuple
+          && observedHash === existing.content_hash;
       }
 
       const graphBindings = [...attestedBindingsByTrack.values()]
@@ -28076,11 +28212,13 @@ export class Repository {
               })),
           );
       const manifestRevisionId = manifestHash
-        ? deterministicUuid({
-            runId,
-            kind: "pipeline_v3_manifest_revision",
-            manifestHash,
-          })
+        ? reuseContinuationManifestRevision
+          ? continuationSourceManifestRevisionId
+          : deterministicUuid({
+              runId,
+              kind: "pipeline_v3_manifest_revision",
+              manifestHash,
+            })
         : null;
 
       await advanceCandidateStagesTransaction(
@@ -28221,54 +28359,71 @@ export class Repository {
       );
       const parentRevisionId = latestRevision.rows[0]?.id ?? null;
       const manifestRevisionNumber = Number(latestRevision.rows[0]?.revision ?? 0) + 1;
-      await client.query(
-        `INSERT INTO manifest_revisions(
-           id,manifest_id,revision,parent_revision_id,status,reason,content_hash,pipeline_version,
-           policy_version,selection_plan_id,query_plan_revision_id,graph_snapshot_id,run_spec_hash,
-           selection_plan_snapshot_json,pipeline_policy_snapshot_json,outcome_snapshot_json,
-           deficit_snapshot_json,locked_at)
-         VALUES($1,$2,$3,$4,'locked','Pipeline V3 governed retrieval result',$5,
-           'corpus_first_v3','corpus_first_v3_policy_v1',$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,now())`,
-        [
-          manifestRevisionId,
-          manifestId,
-          manifestRevisionNumber,
-          parentRevisionId,
-          manifestHash,
-          immutable.selection_plan_id,
-          immutable.query_plan_id,
-          immutable.graph_snapshot_id,
-          immutable.run_spec_hash,
-          JSON.stringify(manifestSelectionPlan),
-          JSON.stringify(immutable.pipeline_policy_snapshot_json),
-          JSON.stringify(outcome),
-          JSON.stringify(outcome.deficits),
-        ],
-      );
-      // `manifest_tracks` is the backward-compatible projection of the active
-      // immutable revision. Historical revision rows remain untouched.
-      await client.query("DELETE FROM manifest_tracks WHERE manifest_id=$1", [manifestId]);
-      for (const [position, item] of persistedTracks.filter((item) => !item.reserve).entries()) {
+      if (!reuseContinuationManifestRevision) {
         await client.query(
-          `INSERT INTO manifest_revision_tracks(
-             manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
-             catalog_id,artist,title) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [manifestRevisionId, position, item.candidateId, item.familyId, item.catalogIdentityId, item.track.appleSongId, item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
+          `INSERT INTO manifest_revisions(
+             id,manifest_id,revision,parent_revision_id,status,reason,content_hash,pipeline_version,
+             policy_version,selection_plan_id,query_plan_revision_id,graph_snapshot_id,run_spec_hash,
+             selection_plan_snapshot_json,pipeline_policy_snapshot_json,outcome_snapshot_json,
+             deficit_snapshot_json,locked_at)
+           VALUES($1,$2,$3,$4,'locked','Pipeline V3 governed retrieval result',$5,
+             'corpus_first_v3','corpus_first_v3_policy_v1',$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,now())`,
+          [
+            manifestRevisionId,
+            manifestId,
+            manifestRevisionNumber,
+            parentRevisionId,
+            manifestHash,
+            immutable.selection_plan_id,
+            immutable.query_plan_id,
+            immutable.graph_snapshot_id,
+            immutable.run_spec_hash,
+            JSON.stringify(manifestSelectionPlan),
+            JSON.stringify(immutable.pipeline_policy_snapshot_json),
+            JSON.stringify(outcome),
+            JSON.stringify(outcome.deficits),
+          ],
         );
-        await client.query(
-          `INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title)
-           VALUES($1,$2,$3,$4,$5,$6)`,
-          [manifestId, position, item.candidateId, item.track.appleSongId.slice(0, 100), item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
-        );
-      }
-      for (const [position, item] of persistedTracks.filter((item) => item.reserve).entries()) {
-        await client.query(
-          `INSERT INTO manifest_revision_reserve_tracks(
-             manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
-             catalog_id,artist,title,evidence_eligible,hard_constraints_satisfied,version_compatible,qualified)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,true,true,true,true)`,
-          [manifestRevisionId, position, item.candidateId, item.familyId, item.catalogIdentityId, item.track.appleSongId, item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
-        );
+        // `manifest_tracks` is the backward-compatible projection of the
+        // active immutable revision. Historical revision rows remain
+        // untouched.
+        await client.query("DELETE FROM manifest_tracks WHERE manifest_id=$1", [manifestId]);
+        for (const [position, item] of persistedTracks.filter((item) => !item.reserve).entries()) {
+          await client.query(
+            `INSERT INTO manifest_revision_tracks(
+               manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
+               catalog_id,artist,title) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [manifestRevisionId, position, item.candidateId, item.familyId, item.catalogIdentityId, item.track.appleSongId, item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
+          );
+          await client.query(
+            `INSERT INTO manifest_tracks(manifest_id,position,candidate_id,catalog_id,artist,title)
+             VALUES($1,$2,$3,$4,$5,$6)`,
+            [manifestId, position, item.candidateId, item.track.appleSongId.slice(0, 100), item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
+          );
+        }
+        for (const [position, item] of persistedTracks.filter((item) => item.reserve).entries()) {
+          await client.query(
+            `INSERT INTO manifest_revision_reserve_tracks(
+               manifest_revision_id,position,candidate_id,recording_family_id,catalog_identity_id,
+               catalog_id,artist,title,evidence_eligible,hard_constraints_satisfied,version_compatible,qualified)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,true,true,true,true)`,
+            [manifestRevisionId, position, item.candidateId, item.familyId, item.catalogIdentityId, item.track.appleSongId, item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
+          );
+        }
+        if (continuationSourceManifestRevisionId) {
+          const superseded = await client.query(
+            `UPDATE manifest_revisions SET status='superseded'
+             WHERE id=$1 AND manifest_id=$2 AND status='locked'`,
+            [continuationSourceManifestRevisionId, manifestId],
+          );
+          if ((superseded.rowCount ?? 0) !== 1) {
+            throw new HttpError(
+              409,
+              "Pipeline V3 continuation source manifest is stale",
+              "pipeline_v3_existing_projection_incomplete",
+            );
+          }
+        }
       }
 
       if (result.outcome.status === "partial_ready") {

@@ -219,7 +219,7 @@ describe("immutable playlist contract revision v1", () => {
       partialPolicy: "ask",
       versions: {
         compiler: "playlist_contract_compiler_v1",
-        ontology: "playlist_music_ontology_v2",
+        ontology: "playlist_music_ontology_v3",
         evidencePolicy: "governed_evidence_v2",
         questionTemplates: "guidance_decision_v3",
         catalogPolicy: "catalog_policy_v1",

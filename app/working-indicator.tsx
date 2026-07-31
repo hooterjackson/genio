@@ -67,6 +67,7 @@ type WorkingIndicatorProps = {
   details?: WorkingDetails;
   compact?: boolean;
   note?: string;
+  stateLabelOverride?: string;
 };
 
 function safeCount(value: unknown): number {
@@ -181,16 +182,19 @@ export function WorkingIndicator({
   details,
   compact = false,
   note,
+  stateLabelOverride,
 }: WorkingIndicatorProps) {
   const currentIndex = stages.findIndex((item) => item.id === stage);
   const active = motion === "active";
-  const stateLabel = motion === "action-required"
-    ? "ACTION REQUIRED"
-    : motion === "paused"
-      ? "PAUSED"
-      : motion === "idle"
-        ? "STOPPED"
-        : "LIVE";
+  const stateLabel = stateLabelOverride ?? (
+    motion === "action-required"
+      ? "ACTION REQUIRED"
+      : motion === "paused"
+        ? "PAUSED"
+        : motion === "idle"
+          ? "STOPPED"
+          : "LIVE"
+  );
   const now = useNow(active);
   const created = createdAt ? Date.parse(createdAt) : Number.NaN;
   const elapsedSeconds = now !== null && Number.isFinite(created)
@@ -237,7 +241,7 @@ export function WorkingIndicator({
       data-motion={motion}
     >
       <div className="working-indicator-header">
-        <span>LIVE RESEARCH CONSOLE</span>
+        <span>RESEARCH CONSOLE</span>
         <span className="working-live-state">
           <span className="working-live-dot" aria-hidden="true" />
           {stateLabel}

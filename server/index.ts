@@ -127,6 +127,7 @@ import {
 import {
   createPublicRolloutAssignmentV1,
   publicRolloutAssignmentStickyKeyV1,
+  publicRolloutAssignmentPausedV1,
   publicRolloutCanonicalContractRequestedV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
 } from "./public-rollout-assignment.ts";
@@ -860,13 +861,26 @@ app.post<{
         databaseAuthority: publicRolloutDatabaseAuthority,
       })
     : null;
-  if (
-    publicRolloutAssignment?.assigned === true
-    && !isOwner(caller)
-    && releaseCanary === null
-    && await repository.getSetting("pipeline_v3_public_assignment_paused")
-      === "true"
-  ) {
+  if (publicRolloutAssignment?.assigned === true
+    && await repository.isPipelineCohortDisabled({
+      route: "corpus_first_v3",
+      intentGroup: publicRolloutAssignment.intentGroup,
+    })) {
+    reply.header("Retry-After", "300");
+    throw new HttpError(
+      503,
+      "This playlist route is temporarily unavailable; retry shortly",
+      "pipeline_route_hard_disabled",
+    );
+  }
+  if (publicRolloutAssignmentPausedV1({
+    assignment: publicRolloutAssignment,
+    owner: isOwner(caller),
+    signedCanary: releaseCanary !== null,
+    publicAssignmentPaused:
+      await repository.getSetting("pipeline_v3_public_assignment_paused")
+        === "true",
+  })) {
     reply.header("Retry-After", "300");
     throw new HttpError(
       503,

@@ -671,9 +671,29 @@ function finiteUnit(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
 }
 
+function guidedGenreEmphasisScore<T>(
+  candidate: SelectionCandidateV3<T>,
+  objective: RankingObjectiveV3,
+): number | null {
+  const emphasis = new Set(objective.values.map(normalized));
+  const genres = candidate.memberships.genre ?? [];
+  if (emphasis.has("rap led")) {
+    return genres.some((genre) => [
+      "rap", "hip hop", "hip-hop",
+    ].includes(normalized(genre))) ? 1 : 0;
+  }
+  if (emphasis.has("grime led")) {
+    return genres.some((genre) => [
+      "grime", "grime music", "uk grime",
+    ].includes(normalized(genre))) ? 1 : 0;
+  }
+  return null;
+}
+
 function rankingScore<T>(candidate: SelectionCandidateV3<T>, objectives: readonly RankingObjectiveV3[]): number {
   return objectives.reduce((total, objective) => {
-    const raw = finiteUnit(candidate.objectiveScores[objective.dimension]);
+    const raw = guidedGenreEmphasisScore(candidate, objective)
+      ?? finiteUnit(candidate.objectiveScores[objective.dimension]);
     const contribution = objective.direction === "minimize" ? 1 - raw : raw;
     return total + contribution * Math.max(0, objective.weight);
   }, 0);

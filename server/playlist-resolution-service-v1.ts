@@ -237,7 +237,7 @@ export async function transitionPlaylistResolutionWithClientV1(
       `INSERT INTO playlist_resolution_outbox(
          id,run_id,transition_id,topic,idempotency_key,payload_json,
          available_at)
-       VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)
+       VALUES($1,$2,$3,$4,$5,$6::jsonb,COALESCE($7::timestamptz,now()))
        ON CONFLICT(idempotency_key) DO NOTHING`,
       [
         randomUUID(),
@@ -246,7 +246,7 @@ export async function transitionPlaylistResolutionWithClientV1(
         input.outbox.topic,
         `resolution-outbox:${input.idempotencyKey}`,
         JSON.stringify(input.outbox.payload),
-        input.outbox.availableAt ?? new Date(),
+        input.outbox.availableAt ?? null,
       ],
     );
   }

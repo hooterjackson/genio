@@ -106,6 +106,7 @@ type ResearchRun = {
   resolution?: {
     generation?: number | null;
     state: "accepted" | "needs_input" | "probing" | "executing" | "blocked_dependency" | "needs_decision" | "ready" | "publishing" | "completed" | "cancelled" | "quarantined";
+    workMotion?: "running" | "retry_scheduled" | "waiting_dependency" | "paused" | "stalled" | "none";
     nextAction: "none" | "answer_initial_guidance" | "answer_rescue_guidance" | "wait_for_dependency" | "resume_research" | "authorize_apple" | "decide_verified_partial" | "review_contract" | "contact_support";
     terminal: boolean;
     contractRevisionId: string | null;
@@ -1977,6 +1978,15 @@ function RunScreen({
           createdAt={run.createdAt}
           updatedAt={run.updatedAt}
           progress={run.progress}
+          stateLabelOverride={
+            run.resolution?.workMotion === "stalled"
+              ? "STALLED"
+              : run.resolution?.workMotion === "retry_scheduled"
+                ? "RETRY SCHEDULED"
+                : run.resolution?.workMotion === "waiting_dependency"
+                  ? "WAITING"
+                  : undefined
+          }
           details={{
             relationship: run.brief.relationship,
             evidencePolicy: run.brief.evidencePolicy,

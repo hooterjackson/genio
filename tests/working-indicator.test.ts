@@ -113,6 +113,20 @@ describe("working indicator candidate funnel", () => {
 
     expect(markup).toContain('data-motion="action-required"');
     expect(markup).toContain("ACTION REQUIRED");
-    expect(markup).not.toContain(">LIVE<");
+    expect(markup).not.toContain("LIVE");
+  });
+
+  it("renders a durable stalled label without claiming the run is live", () => {
+    const markup = renderToStaticMarkup(createElement(WorkingIndicator, {
+      stage: "discover",
+      motion: "paused",
+      stateLabelOverride: "STALLED",
+      phaseLabel: "No eligible worker has made progress recently.",
+      targetCount: 50,
+    }));
+
+    expect(markup).toContain("RESEARCH CONSOLE");
+    expect(markup).toContain("STALLED");
+    expect(markup).not.toContain("LIVE");
   });
 });
