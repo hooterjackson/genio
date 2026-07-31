@@ -1,6 +1,9 @@
 import { describe, expect, test } from "vitest";
 import { signReleaseCanaryMetadata } from "../server/release-canary-metadata.ts";
-import { authenticateReleaseCanary } from "../server/release-canary-request.ts";
+import {
+  authenticateReleaseCanary,
+  manifestOnlyReleaseCanaryAllowed,
+} from "../server/release-canary-request.ts";
 
 const secret = "release-canary-test-secret-with-at-least-32-bytes";
 const revision = "a".repeat(40);
@@ -29,6 +32,34 @@ const environment = {
 };
 
 describe("authenticated release canary requests", () => {
+  test("limits production manifest-only execution to an owner while public assignment is paused", () => {
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: "staging",
+      owner: false,
+      publicAssignmentPaused: false,
+    })).toBe(true);
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: "production",
+      owner: true,
+      publicAssignmentPaused: true,
+    })).toBe(true);
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: "production",
+      owner: true,
+      publicAssignmentPaused: false,
+    })).toBe(false);
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: "production",
+      owner: false,
+      publicAssignmentPaused: true,
+    })).toBe(false);
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: null,
+      owner: true,
+      publicAssignmentPaused: true,
+    })).toBe(false);
+  });
+
   test("leaves ordinary public requests unmarked", () => {
     expect(authenticateReleaseCanary(undefined, "brief", {})).toBeNull();
   });

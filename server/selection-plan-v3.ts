@@ -38,6 +38,7 @@ import {
   eligibilityAliasesForMusicConceptV3,
   MUSIC_CONCEPT_POLICY_VERSION,
 } from "./music-concepts-v3.ts";
+import { excludedReferenceArtists } from "./similarity-policy.ts";
 
 export const PIPELINE_V3_VERSION = "corpus_first_v3" as const;
 export const PIPELINE_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -1288,7 +1289,13 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   if (/\b(?:played|performed|produced|written|composed|arranged|credited|credits?|contributions?|session)\b/u.test(prompt)) {
     intents.push("factual_relationship");
   }
-  if (new RegExp(`\\b(?:${SIMILARITY_CUE_SOURCE}|${REFERENCE_POINT_CUE_SOURCE}|resembl(?:e|es|ing))\\b`, "u").test(prompt)) intents.push("similarity");
+  if (
+    new RegExp(
+      `\\b(?:${SIMILARITY_CUE_SOURCE}|${REFERENCE_POINT_CUE_SOURCE}|resembl(?:e|es|ing))\\b`,
+      "u",
+    ).test(prompt)
+    || excludedReferenceArtists(input.brief ?? {}).length > 0
+  ) intents.push("similarity");
   if (/\b(?:songs?|tracks?|music)\s+(?:about|mentioning|whose theme is)\b/u.test(prompt)) intents.push("theme");
   if (/\b(?:for (?:sleep|studying|study|running|work|dinner|party|road trip|gaming|a smoke session)|workout|focus|relaxing|calm|upbeat|dark|melanchol|gaming|smoking|late[ -]?night|chill(?:ed|ing)?)\b/u.test(prompt)) {
     intents.push("mood_activity");
@@ -1481,12 +1488,33 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
       "u",
     ).test(prompt)
   ));
-  const similaritySeed = seedMatch?.[1]?.trim() ?? referencePointSeed ?? null;
-  if (similaritySeed) {
-    pushPredicate(predicates, predicate("artist", "exclude", [similaritySeed], "The reference artist is excluded as primary artist; featured appearances remain eligible."));
-    objectives.push(objective("similarity", "maximize", 0.9, null, "Rank qualified recordings by supported similarity dimensions.", [similaritySeed]));
+  const similaritySeeds = dedupe([
+    ...(seedMatch?.[1]?.trim() ? [seedMatch[1].trim()] : []),
+    ...(referencePointSeed ? [referencePointSeed] : []),
+    ...excludedReferenceArtists(input.brief ?? {}),
+  ]);
+  if (similaritySeeds.length > 0) {
+    pushPredicate(predicates, predicate(
+      "artist",
+      "exclude",
+      similaritySeeds,
+      "The reference artist is excluded as primary artist; featured appearances remain eligible.",
+    ));
+    objectives.push(objective(
+      "similarity",
+      "maximize",
+      0.9,
+      null,
+      "Rank qualified recordings by supported similarity dimensions.",
+      similaritySeeds,
+    ));
   }
-  if (/\b(?:new|emerging|up-and-coming|up and coming|lesser-known)\s+artists?\b/u.test(prompt)) {
+  if (
+    /\b(?:new|emerging|up-and-coming|up and coming|lesser-known)\s+artists?\b/u
+      .test(prompt)
+    || /\b(?:wants?\s+to\s+discover|want\s+to\s+discover|discover(?:ing)?)\s+(?:new|more|different)\s+(?:music|stuff|sounds?|tracks?|songs?)\b/u
+      .test(prompt)
+  ) {
     objectives.push(objective(
       "relevance",
       "maximize",

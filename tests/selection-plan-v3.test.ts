@@ -86,7 +86,7 @@ describe("Pipeline V3 typed planning", () => {
 
   test("compiles Pop Smoke as an excluded primary reference with discovery emphasis", () => {
     const spec = createRunSpecV3({
-      prompt: "50 rap and grime tracks with Pop Smoke as a reference point, focused on new artists, without centering him",
+      prompt: "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff",
       requestedTrackCount: 50,
       brief: {
         mode: "curated",

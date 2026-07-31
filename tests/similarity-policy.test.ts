@@ -43,15 +43,16 @@ describe("reference-artist similarity policy", () => {
     );
   });
 
-  test("treats a named reference point as an excluded primary-artist seed", () => {
+  test("treats a favorite artist plus explicit discovery intent as an excluded primary-artist seed", () => {
     const result = applySimilaritySeedPolicy(
-      "Rap and grime with Pop Smoke as a reference point, focused on new artists, without centering him",
+      "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff",
       brief({ subjectEntities: ["Pop Smoke"] }),
     );
     expect(excludedReferenceArtists(result)).toEqual(["Pop Smoke"]);
     expect(result.relationship).toBe("stylistically similar to the reference artist");
     expect(isExcludedReferenceArtist(result, "Pop Smoke")).toBe(true);
-    expect(isExcludedReferenceArtist(result, "New Artist feat. Pop Smoke")).toBe(true);
+    expect(isExcludedReferenceArtist(result, "New Artist feat. Pop Smoke")).toBe(false);
+    expect(isExcludedReferenceArtist(result, "New Artist & Pop Smoke")).toBe(true);
   });
 
   test("removes filler entities and unwraps repeated similarity-query fragments", () => {
@@ -184,7 +185,7 @@ describe("reference-artist similarity policy", () => {
     expect(isExcludedReferenceArtist(result, "100 gecs")).toBe(true);
   });
 
-  test("excludes collaborations credited to the reference artist without excluding tribute names", () => {
+  test("excludes primary and co-primary credits while retaining explicit featured appearances", () => {
     const scoped = applySimilaritySeedPolicy(
       "Music that sounds like Radiohead",
       brief(),
@@ -192,6 +193,7 @@ describe("reference-artist similarity policy", () => {
 
     expect(isExcludedReferenceArtist(scoped, "Radiohead feat. Other Artist")).toBe(true);
     expect(isExcludedReferenceArtist(scoped, "Other Artist & Radiohead")).toBe(true);
+    expect(isExcludedReferenceArtist(scoped, "Other Artist feat. Radiohead")).toBe(false);
     expect(isExcludedReferenceArtist(scoped, "Radiohead Tribute Band")).toBe(false);
   });
 
@@ -203,6 +205,7 @@ describe("reference-artist similarity policy", () => {
     expect(excludedReferenceArtists(xScoped)).toEqual(["X"]);
     expect(isExcludedReferenceArtist(xScoped, "X")).toBe(true);
     expect(isExcludedReferenceArtist(xScoped, "Other Artist x X")).toBe(true);
+    expect(isExcludedReferenceArtist(xScoped, "Other Artist ft. X")).toBe(false);
 
     const punctuationScoped = applySimilaritySeedPolicy(
       "Dance-punk that sounds like !!!",
@@ -240,6 +243,12 @@ describe("reference-artist similarity policy", () => {
       "Radiohead songs and other music that sounds like Radiohead",
       original,
     )).toEqual(original);
+
+    const favorite = brief({ subjectEntities: ["Pop Smoke"] });
+    expect(applySimilaritySeedPolicy(
+      "My favorite rapper is Pop Smoke; include Pop Smoke and help me discover new artists",
+      favorite,
+    )).toEqual(favorite);
   });
 
   test("does not alter direct artist or exhaustive discography requests", () => {

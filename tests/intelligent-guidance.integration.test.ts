@@ -694,6 +694,30 @@ databaseDescribe("intelligent guidance contract persistence", () => {
     expect(JSON.stringify(shadow.contract.trackPredicate)).not.toContain(
       "bridge:constraint:scope_1",
     );
+    expect(selectionPlan.intents).toContain("similarity");
+    expect(selectionPlan.referenceRecordings).toEqual(["Pop Smoke"]);
+    expect(shadow.contract.clauses).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "bridge:exclusion:similarity-seed-artist",
+        axis: "artist",
+        hardness: "hard",
+        values: ["Pop Smoke"],
+      }),
+      expect.objectContaining({
+        id: "bridge:ranking:similarity-seed",
+        axis: "similarity",
+        hardness: "soft",
+        values: ["Pop Smoke"],
+      }),
+    ]));
+    expect(shadow.contract.executionDirectives?.similarity).toEqual({
+      seedArtists: ["Pop Smoke"],
+      excludedArtists: ["Pop Smoke"],
+      rankingClauseId: "bridge:ranking:similarity-seed",
+      exactArtistExclusionClauseIds: [
+        "bridge:exclusion:similarity-seed-artist",
+      ],
+    });
     await repository.savePlaylistContractRevision({
       briefRequestId: created.id,
       expectedParentRevisionId: null,
@@ -811,6 +835,23 @@ databaseDescribe("intelligent guidance contract persistence", () => {
     expect(JSON.stringify(successorContract.trackPredicate)).not.toContain(
       "bridge:constraint:scope_1",
     );
+    expect(successorContract.executionDirectives?.similarity).toEqual(
+      shadow.contract.executionDirectives?.similarity,
+    );
+    expect(successorContract.clauses).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "bridge:exclusion:similarity-seed-artist",
+        axis: "artist",
+        hardness: "hard",
+        values: ["Pop Smoke"],
+      }),
+      expect.objectContaining({
+        id: "bridge:ranking:similarity-seed",
+        axis: "similarity",
+        hardness: "soft",
+        values: ["Pop Smoke"],
+      }),
+    ]));
   }, 40_000);
 
   test("persists and accepts a zero-question V4 confirmation without changing the contract", async () => {

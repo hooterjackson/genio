@@ -2705,6 +2705,7 @@ describe("Pipeline V3 live read-only adapters", () => {
       song(90, "Radiohead", "Exact Credit"),
       song(91, "Other Artist & Radiohead", "Collaboration Credit"),
       song(92, "Radiohead Tribute Band", "Tribute Credit"),
+      song(93, "Other Artist feat. Radiohead", "Featured Credit"),
     ];
     const candidates: RawTrackCandidateV3[] = catalogSongs.map((catalogSong) => ({
       id: `candidate:${catalogSong.id}`,
@@ -2730,7 +2731,7 @@ describe("Pipeline V3 live read-only adapters", () => {
 
     expect(qualifications.map((qualification) => (
       qualification.canonicalClauseAssessments?.[exclusionClauseId]?.status
-    ))).toEqual(["pass", "pass", "fail"]);
+    ))).toEqual(["pass", "pass", "fail", "fail"]);
   });
 
   test.each([

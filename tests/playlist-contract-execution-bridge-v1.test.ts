@@ -160,15 +160,15 @@ function track(index: number, genre: string): QualifiedTrackV3 {
 
 describe("canonical contract execution bridge", () => {
   test("preserves rap OR grime eligibility through the query-plan and worker projections", () => {
-    const prompt = "Create 50 tracks for bike rides from new rap and grime artists, using Pop Smoke only as a reference point.";
+    const prompt = "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff";
     const requestBrief: PlaylistBrief = {
       title: "Bike Ride Discovery",
       description: "High-energy rap and grime for bike rides.",
       mode: "curated",
       subjectEntities: ["rap", "grime", "Pop Smoke"],
-      relationship: "rap and grime recordings suited to bike rides",
-      include: ["new rap and grime artists"],
-      exclude: ["Pop Smoke as primary artist"],
+      relationship: "stylistically similar to the reference artist",
+      include: ["Recordings by other artists that are stylistically similar to Pop Smoke"],
+      exclude: ["Reference artist is a style seed; exclude recordings by: Pop Smoke"],
       versionPolicy: "Prefer canonical studio recordings.",
       evidencePolicy: "Require track-scope evidence.",
       orderingPolicy: "Use a high-energy editorial flow.",
@@ -210,6 +210,26 @@ describe("canonical contract execution bridge", () => {
       operator: "require",
       values: expect.arrayContaining(["rap", "hip-hop", "grime"]),
     });
+    expect(basePlan.intents).toContain("similarity");
+    expect(basePlan.referenceRecordings).toEqual(["Pop Smoke"]);
+    expect(shadow.contract.executionDirectives?.similarity).toEqual({
+      seedArtists: ["Pop Smoke"],
+      excludedArtists: ["Pop Smoke"],
+      rankingClauseId: "bridge:ranking:similarity-seed",
+      exactArtistExclusionClauseIds: [
+        "bridge:exclusion:similarity-seed-artist",
+      ],
+    });
+    expect(workerPlan.executionDirectives?.similarity).toEqual(
+      shadow.contract.executionDirectives?.similarity,
+    );
+    expect(workerPlan.rankingObjectives).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "bridge:ranking:similarity-seed",
+        dimension: "similarity",
+        values: ["Pop Smoke"],
+      }),
+    ]));
     const candidate = (genre: string) => ({
       id: `candidate:${genre}`,
       artist: "Fixture Artist",
