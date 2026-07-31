@@ -391,6 +391,13 @@ test.describe("Pipeline V3 stitched system E2E", () => {
     process.env.PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED = "true";
     process.env.PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED = "true";
     process.env.PIPELINE_V3_GENRE_SCENE_PERCENT = "100";
+    process.env.PIPELINE_V3_MOOD_ACTIVITY_PERCENT = "100";
+    process.env.PIPELINE_V3_SIMILARITY_PERCENT = "100";
+    process.env.PIPELINE_V3_ARTIST_CATALOGUE_PERCENT = "100";
+    process.env.PIPELINE_V3_FIXED_CONTAINER_PERCENT = "100";
+    process.env.PIPELINE_V3_FACTUAL_PERCENT = "100";
+    process.env.PIPELINE_V3_EXHAUSTIVE_PERCENT = "100";
+    process.env.PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED = "true";
     process.env.RELEASE_ENVIRONMENT = "staging";
     process.env.RELEASE_DEPLOYMENT_PHASE = "activate";
     process.env.RELEASE_EXECUTION_ENABLED = "true";
@@ -441,6 +448,17 @@ test.describe("Pipeline V3 stitched system E2E", () => {
     });
     repository = new Repository(handle);
     await applySql(repository.pool, migrationSql);
+    // Schema 20 fails closed with the route-wide V3 hard switch engaged.
+    // This suite is the bounded synthetic owner gate, so open that exact
+    // control explicitly before submitting any browser work.
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: "system-e2e-owner-gate",
+      route: "corpus_first_v3",
+      intentGroup: null,
+      disabled: false,
+      changedBy: "system-e2e",
+    });
+    await repository.setSetting("pipeline_v3_public_assignment_paused", "false");
     // This clean, synthetic database has no legacy manifests to backfill.
     // Enter the exact native authority state that production may reach only
     // through the separately tested receipt-bound activation transaction.

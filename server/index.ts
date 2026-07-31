@@ -2827,6 +2827,12 @@ app.setErrorHandler((error, request, reply) => {
       ? hintedStatus
       : 500;
   const code = error instanceof HttpError ? error.code : statusCode === 500 ? "internal_error" : "request_error";
+  if (
+    code === "contract_execution_assignment_paused"
+    || code === "contract_execution_cohort_paused"
+  ) {
+    reply.header("Retry-After", "300");
+  }
   if (statusCode >= 500) {
     if (process.env.NODE_ENV === "test" && process.env.GENIO_SYSTEM_E2E === "1") {
       request.log.error({ err: error, code, statusCode }, "system E2E request failed");

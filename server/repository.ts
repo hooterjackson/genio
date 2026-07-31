@@ -11708,48 +11708,23 @@ export class Repository {
             },
           };
         } else if (canonicalBackendAssigned && !assignmentV3.assigned) {
-          // Preserve the accepted contract and its deterministic projection,
-          // but do not enqueue work until the active rollout authority
-          // actually assigns this request. This is deliberately a visible,
-          // non-executable decision rather than a silent V2 downgrade or a
-          // transient error after confirmation.
-          selectionPlanV3 = confirmedV3;
-          contractExecutionPause = {
-            blockerKind: "scope_decision",
-            dependencyKey: "pipeline_assignment:corpus_first_v3",
-            phase: "contract_execution_paused",
-            state: {
-              reasonCode: "contract_execution_assignment_required",
-              route: "corpus_first_v3",
-              intentGroup: assignmentV3.group,
-              assignmentReason: assignmentV3.reason,
-              actions: [
-                "review_contract",
-                "cancel",
-              ],
-              automaticResume: false,
-            },
-          };
+          // Rollout authority is execution policy, not a user-editable music
+          // decision. Keep the confirmed brief retryable and do not create an
+          // actionless run asking the visitor to "refine" unchanged semantics.
+          throw new HttpError(
+            503,
+            "This playlist route is temporarily paused; your confirmed interpretation is saved",
+            "contract_execution_assignment_paused",
+          );
         } else if (canonicalBackendAssigned && cohortDisabled) {
-          // The contract remains valid and fully projected. Persist it as a
-          // visible dependency pause rather than discarding the plan and
-          // returning a transient 503 after the user already accepted it.
-          selectionPlanV3 = confirmedV3;
-          contractExecutionPause = {
-            blockerKind: "scope_decision",
-            dependencyKey: "pipeline_cohort:corpus_first_v3",
-            phase: "contract_execution_paused",
-            state: {
-              reasonCode: "contract_execution_cohort_paused",
-              route: "corpus_first_v3",
-              intentGroup: assignmentV3.group,
-              actions: [
-                "create_user_authored_revision",
-                "cancel",
-              ],
-              automaticResume: false,
-            },
-          };
+          // A hard switch is an operator-controlled retryable service state.
+          // It must never be presented as a musical-scope decision or create
+          // a terminal-looking job with no executable action.
+          throw new HttpError(
+            503,
+            "This playlist route is temporarily paused; your confirmed interpretation is saved",
+            "contract_execution_cohort_paused",
+          );
         } else if (assignmentV3.assigned
           && (
             canonicalBackendAssigned

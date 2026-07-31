@@ -9,7 +9,7 @@ import {
 
 describe("server-owned music concept registry", () => {
   test("keeps exact aliases separate from broader discovery terms", () => {
-    expect(MUSIC_CONCEPT_POLICY_VERSION).toBe("music_concepts_v3_4_0");
+    expect(MUSIC_CONCEPT_POLICY_VERSION).toBe("music_concepts_v3_5_0");
     expect(eligibilityAliasesForMusicConceptV3("baile funk")).toEqual(["funk carioca", "baile funk"]);
     expect(discoveryMusicConceptV3("Brazilian funk")?.id).toBe("genre:brazilian-funk-ambiguous");
     expect(eligibilityAliasesForMusicConceptV3("Brazilian funk")).toEqual(["Brazilian funk"]);
@@ -18,6 +18,8 @@ describe("server-owned music concept registry", () => {
     expect(canonicalMusicConceptIdV3("Latin urban")).toBe("genre:latin-urban");
     expect(canonicalMusicConceptIdV3("dembow")).toBe("genre:dembow");
     expect(canonicalMusicConceptIdV3("UK grime")).toBe("genre:grime");
+    expect(canonicalMusicConceptIdV3("drill")).toBe("genre:drill");
+    expect(canonicalMusicConceptIdV3("UK drill")).toBe("genre:drill");
     expect(discoveryMusicConceptV3("UK rap")?.id).toBe("genre:grime");
     expect(eligibilityAliasesForMusicConceptV3("UK rap")).toEqual(["UK rap"]);
   });
@@ -35,6 +37,7 @@ describe("server-owned music concept registry", () => {
     expect(musicConceptEvidenceMatchesV3("genre:reggaeton", "A polished reggaetón anthem.")).toBe(true);
     expect(musicConceptEvidenceMatchesV3("genre:grime", "A landmark UK grime single.")).toBe(true);
     expect(musicConceptEvidenceMatchesV3("genre:grime", "A grimy UK drill track.")).toBe(false);
+    expect(musicConceptEvidenceMatchesV3("genre:drill", "A landmark UK drill track.")).toBe(true);
   });
 
   test("uses stable ids for unknown exact concepts", () => {

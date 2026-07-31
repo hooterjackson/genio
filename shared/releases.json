@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.5.2",
+      "releasedAt": "2026-07-31",
+      "title": "Drill and grime guidance recovery",
+      "notes": [
+        "Recognizes drill as a versioned selection-grade genre instead of silently treating it as a grime discovery hint.",
+        "Compiles co-named drill and grime as one hard OR predicate so either genre remains eligible without weakening the requested scope.",
+        "Asks a server-owned Equal priority, Drill-led, or Grime-led question whose non-default answers change the immutable query plan and ranking.",
+        "Keeps confirmed briefs retryable during an operator rollout pause instead of creating an actionless job that tells users to revise unchanged music semantics."
+      ]
+    },
+    {
       "version": "2.5.1",
       "releasedAt": "2026-07-31",
       "title": "Truthful production canary provenance",

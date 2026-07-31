@@ -282,7 +282,7 @@ describe("playlist-contract backend capability negotiation", () => {
     expect(playlistContractCapabilityRequirementsV1(contract())).toMatchObject({
       contractSchemaVersion: 1,
       compilerVersion: "playlist_contract_compiler_v1",
-      ontologyVersion: "playlist_music_ontology_v3",
+      ontologyVersion: "playlist_music_ontology_v4",
       evidencePolicyVersion: "governed_evidence_v2",
       evidenceStrengthPolicyVersion: "evidence_strength_partial_order_v1",
       questionTemplateVersion: "guidance_decision_v3",

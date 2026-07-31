@@ -1,6 +1,9 @@
 import { sha256Hex } from "./security.ts";
 
-export const PLAYLIST_CONTRACT_ONTOLOGY_VERSION = "playlist_music_ontology_v3" as const;
+export const LEGACY_PLAYLIST_CONTRACT_ONTOLOGY_VERSION =
+  "playlist_music_ontology_v3" as const;
+export const PLAYLIST_CONTRACT_ONTOLOGY_VERSION =
+  "playlist_music_ontology_v4" as const;
 
 export type MusicConceptKindV1 =
   | "genre"
@@ -192,13 +195,22 @@ const CONCEPTS: readonly MusicConceptDefinitionV1[] = [
     adjacentIds: ["genre:r-and-b", "genre:grime"],
   },
   {
+    id: "genre:drill",
+    kind: "genre",
+    label: "drill",
+    aliases: ["drill", "drill music", "UK drill", "British drill"],
+    discoveryOnlyTerms: ["Chicago drill", "Brooklyn drill", "New York drill"],
+    parentIds: [],
+    adjacentIds: ["genre:hip-hop", "genre:grime"],
+  },
+  {
     id: "genre:grime",
     kind: "genre",
     label: "grime",
     aliases: ["grime", "grime music", "UK grime"],
-    discoveryOnlyTerms: ["UK rap", "drill", "UK garage", "garage"],
+    discoveryOnlyTerms: ["UK rap", "UK garage", "garage"],
     parentIds: [],
-    adjacentIds: ["genre:hip-hop"],
+    adjacentIds: ["genre:hip-hop", "genre:drill"],
   },
   {
     id: "genre:r-and-b",

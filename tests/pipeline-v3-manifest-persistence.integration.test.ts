@@ -49,6 +49,7 @@ import {
   type SemanticPlanRevisionArtifactV3,
 } from "../server/pipeline-v3-semantic-recovery.ts";
 import { assessPlaylistRuntimeFeasibilityV1 } from "../server/playlist-feasibility-v1.ts";
+import { PLAYLIST_CONTRACT_ONTOLOGY_VERSION } from "../server/music-concept-registry-v1.ts";
 import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -3482,7 +3483,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         originalText: "velvet pulse",
         normalizedText: "velvet pulse",
         status: "unresolved",
-        ontologyVersion: "playlist_music_ontology_v3",
+        ontologyVersion: PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
         unresolvedTermId: `unresolved:${sha256Hex("velvet pulse").slice(0, 16)}`,
         provenance: "immutable_playlist_contract_concept_v1",
         untrusted: true,

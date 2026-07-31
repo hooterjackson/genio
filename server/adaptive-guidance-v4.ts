@@ -627,6 +627,93 @@ function rapGrimeEmphasisDecision(
   });
 }
 
+function drillGrimeEmphasisIsExplicit(prompt: string): boolean {
+  return /\b(?:equal(?:ly)?|balanced?|even(?:ly)?|co[- ]?equal(?:ly)?|same\s+priority)\b[^.!?\n]{0,80}\b(?:drill|grime)\b/iu.test(prompt)
+    || /\b(?:drill|grime)\b[^.!?\n]{0,80}\b(?:equal(?:ly)?|balanced?|even(?:ly)?|co[- ]?equal(?:ly)?|same\s+priority)\b/iu.test(prompt)
+    || /\b(?:mostly|mainly|primarily|predominantly)\s+(?:drill|grime)\b/iu.test(prompt)
+    || /\b(?:drill|grime)[ -]?(?:led|heavy|forward|first)\b/iu.test(prompt)
+    || /\b(?:favor|favour|prioriti[sz]e|emphasi[sz]e|lean(?:ing)?)\b[^.!?\n]{0,60}\b(?:drill|grime)\b/iu.test(prompt)
+    || /\b(?:drill|grime)\b[^.!?\n]{0,50}\bwith\s+(?:some|a\s+little|touches?\s+of)\s+(?:drill|grime)\b/iu.test(prompt);
+}
+
+function drillGrimeEmphasisDecision(
+  prompt: string,
+  baseContract: PlaylistContractRevisionV1,
+): GuidanceDecisionV4 | null {
+  const hasDrill = /\bdrill(?:\s+music)?\b/iu.test(prompt);
+  const hasGrime = /\bgrime(?:\s+music)?\b/iu.test(prompt);
+  if (!hasDrill || !hasGrime || drillGrimeEmphasisIsExplicit(prompt)) return null;
+
+  const drillClauseId = "guidance:v4:genre-emphasis:drill-led";
+  const grimeClauseId = "guidance:v4:genre-emphasis:grime-led";
+  return createGuidanceDecisionV4({
+    mode: "correctness_blocking",
+    id: "v4-correctness:drill-grime-emphasis",
+    header: "Genre emphasis",
+    question: `How should drill and grime shape the ${baseContract.requestedTrackCount}-track mix?`,
+    axis: "drill_grime_emphasis",
+    trigger: "correctness",
+    criticality: "required",
+    selectionMode: "single",
+    allowCustom: false,
+    baseContractRevisionId: baseContract.revisionId,
+    baseContractSemanticHash: baseContract.semanticHash,
+    whyMaterial: "Both genres remain eligible; this answer controls discovery and ranking emphasis without changing count or evidence rules.",
+    allowedPatchOperations: ["add_clause"],
+    affectedClauseIds: [drillClauseId, grimeClauseId],
+    materialityScore: 96,
+    options: [
+      {
+        id: "equal_priority",
+        label: "Equal priority",
+        description: "The request names both genres co-equally, so either remains eligible and quality decides.",
+        recommended: true,
+        explicitNoop: true,
+        expectedFeasibilityDirection: "neutral",
+        patch: { operations: [], affectedClauseIds: [] },
+      },
+      {
+        id: "drill_led",
+        label: "Drill-led",
+        description: "Favor drill during discovery and ranking while grime remains eligible.",
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        patch: {
+          affectedClauseIds: [drillClauseId],
+          operations: [{
+            op: "add_clause",
+            clause: preferenceClause(
+              drillClauseId,
+              "genre_emphasis",
+              "drill-led",
+              "Favor drill during discovery and ranking while grime remains eligible.",
+            ),
+          }],
+        },
+      },
+      {
+        id: "grime_led",
+        label: "Grime-led",
+        description: "Favor grime during discovery and ranking while drill remains eligible.",
+        recommended: false,
+        expectedFeasibilityDirection: "neutral",
+        patch: {
+          affectedClauseIds: [grimeClauseId],
+          operations: [{
+            op: "add_clause",
+            clause: preferenceClause(
+              grimeClauseId,
+              "genre_emphasis",
+              "grime-led",
+              "Favor grime during discovery and ranking while drill remains eligible.",
+            ),
+          }],
+        },
+      },
+    ],
+  });
+}
+
 export function interpretationSummaryV4(
   contract: PlaylistContractRevisionV1,
   context: GuidanceInterpretationSummaryContextV4 = {},
@@ -731,6 +818,11 @@ export function guidanceCheckpointV4(input: {
     ...(
       rapGrimeEmphasisDecision(input.prompt, input.baseContract)
         ? [rapGrimeEmphasisDecision(input.prompt, input.baseContract)!]
+        : []
+    ),
+    ...(
+      drillGrimeEmphasisDecision(input.prompt, input.baseContract)
+        ? [drillGrimeEmphasisDecision(input.prompt, input.baseContract)!]
         : []
     ),
     ...v3Candidates,

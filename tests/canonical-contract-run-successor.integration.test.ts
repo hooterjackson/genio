@@ -1167,7 +1167,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       });
   }, 30_000);
 
-  test("persists an accepted contract behind the cohort kill switch as a visible dependency pause", async () => {
+  test("keeps the confirmed brief retryable without creating an actionless run behind the hard switch", async () => {
     await repository.setPipelineCohortKillSwitch({
       cohortKey: `contract-pause:${randomUUID()}`,
       route: "corpus_first_v3",
@@ -1176,67 +1176,17 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       changedBy: "integration",
     });
     try {
-      const fixture = await createCanonicalRun();
-      expect(fixture.created).toMatchObject({
-        created: true,
-        status: "needs_decision",
+      const before = Number((await pool.query<{ count: number }>(
+        "SELECT count(*)::int count FROM research_runs",
+      )).rows[0]?.count ?? 0);
+      await expect(createCanonicalRun()).rejects.toMatchObject({
+        statusCode: 503,
+        code: "contract_execution_cohort_paused",
       });
-      expect((await pool.query<{
-        status: string;
-        phase: string;
-        selection_count: number;
-        query_count: number;
-        job_count: number;
-      }>(
-        `SELECT run.status,run.phase,
-                (SELECT count(*)::int FROM selection_plans
-                 WHERE run_id=run.id) selection_count,
-                (SELECT count(*)::int FROM query_plan_revisions
-                 WHERE run_id=run.id) query_count,
-                (SELECT count(*)::int FROM job_queue
-                 WHERE run_id=run.id) job_count
-         FROM research_runs run WHERE run.id=$1`,
-        [fixture.created.runId],
-      )).rows[0]).toEqual({
-        status: "needs_decision",
-        phase: "contract_execution_paused",
-        selection_count: 1,
-        query_count: 1,
-        job_count: 0,
-      });
-      expect((await pool.query<{
-        blocker_kind: string;
-        dependency_key: string;
-        state_json: Record<string, unknown>;
-      }>(
-        `SELECT blocker_kind,dependency_key,state_json
-         FROM playlist_run_blockers
-         WHERE run_id=$1 AND resolved_at IS NULL`,
-        [fixture.created.runId],
-      )).rows[0]).toMatchObject({
-        blocker_kind: "scope_decision",
-        dependency_key: "pipeline_cohort:corpus_first_v3",
-        state_json: {
-          reasonCode: "contract_execution_cohort_paused",
-          route: "corpus_first_v3",
-          actions: [
-            "create_user_authored_revision",
-            "cancel",
-          ],
-          automaticResume: false,
-        },
-      });
-      expect(await repository.getRunByAccess(fixture.created.accessId))
-        .toMatchObject({
-          resolution: {
-            state: "needs_decision",
-            nextAction: "review_contract",
-            terminal: false,
-            blocker: {
-              kind: "scope_decision",
-            },
-          },
-        });
+      const after = Number((await pool.query<{ count: number }>(
+        "SELECT count(*)::int count FROM research_runs",
+      )).rows[0]?.count ?? 0);
+      expect(after).toBe(before);
     } finally {
       await repository.setPipelineCohortKillSwitch({
         cohortKey: `contract-resume:${randomUUID()}`,
@@ -1247,73 +1197,20 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     }
   }, 30_000);
 
-  test("does not execute an accepted contract when the master assignment is disabled", async () => {
+  test("keeps the confirmed brief retryable when master assignment is disabled", async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "false");
     try {
-      const fixture = await createCanonicalRun();
-      expect(fixture.created).toMatchObject({
-        created: true,
-        status: "needs_decision",
+      const before = Number((await pool.query<{ count: number }>(
+        "SELECT count(*)::int count FROM research_runs",
+      )).rows[0]?.count ?? 0);
+      await expect(createCanonicalRun()).rejects.toMatchObject({
+        statusCode: 503,
+        code: "contract_execution_assignment_paused",
       });
-      expect((await pool.query<{
-        status: string;
-        phase: string;
-        selection_count: number;
-        query_count: number;
-        attempt_count: number;
-        executable_job_count: number;
-      }>(
-        `SELECT run.status,run.phase,
-                (SELECT count(*)::int FROM selection_plans
-                 WHERE run_id=run.id) selection_count,
-                (SELECT count(*)::int FROM query_plan_revisions
-                 WHERE run_id=run.id) query_count,
-                (SELECT count(*)::int FROM playlist_execution_attempts
-                 WHERE run_id=run.id) attempt_count,
-                (SELECT count(*)::int FROM job_queue
-                 WHERE run_id=run.id
-                   AND status IN ('queued','retry','leased')) executable_job_count
-         FROM research_runs run WHERE run.id=$1`,
-        [fixture.created.runId],
-      )).rows[0]).toEqual({
-        status: "needs_decision",
-        phase: "contract_execution_paused",
-        selection_count: 1,
-        query_count: 1,
-        attempt_count: 0,
-        executable_job_count: 0,
-      });
-      expect((await pool.query<{
-        blocker_kind: string;
-        dependency_key: string;
-        state_json: Record<string, unknown>;
-      }>(
-        `SELECT blocker_kind,dependency_key,state_json
-         FROM playlist_run_blockers
-         WHERE run_id=$1 AND resolved_at IS NULL`,
-        [fixture.created.runId],
-      )).rows[0]).toMatchObject({
-        blocker_kind: "scope_decision",
-        dependency_key: "pipeline_assignment:corpus_first_v3",
-        state_json: {
-          reasonCode: "contract_execution_assignment_required",
-          route: "corpus_first_v3",
-          assignmentReason: "master_disabled",
-          actions: ["review_contract", "cancel"],
-          automaticResume: false,
-        },
-      });
-      expect(await repository.getRunByAccess(fixture.created.accessId))
-        .toMatchObject({
-          resolution: {
-            state: "needs_decision",
-            nextAction: "review_contract",
-            terminal: false,
-            blocker: {
-              kind: "scope_decision",
-            },
-          },
-        });
+      const after = Number((await pool.query<{ count: number }>(
+        "SELECT count(*)::int count FROM research_runs",
+      )).rows[0]?.count ?? 0);
+      expect(after).toBe(before);
     } finally {
       vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
     }

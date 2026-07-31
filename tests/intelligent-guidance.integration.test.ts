@@ -153,6 +153,21 @@ const echoParkBrief: PlaylistBrief = {
   ambiguities: [],
 };
 
+const drillGrimeBrief: PlaylistBrief = {
+  title: "Drill & Grime Essentials",
+  description: "A 29-track essentials set spanning drill and grime.",
+  mode: "curated",
+  subjectEntities: ["drill", "grime"],
+  relationship: "tracks that belong to drill or grime",
+  include: ["drill", "grime"],
+  exclude: [],
+  versionPolicy: "Prefer canonical studio recordings.",
+  evidencePolicy: "Require track-scope genre evidence.",
+  orderingPolicy: "Balance both genres with a smooth editorial flow.",
+  targetSize: { min: 29, max: 29 },
+  ambiguities: [],
+};
+
 databaseDescribe("intelligent guidance contract persistence", () => {
   const schemaName = `genio_guidance_v2_${randomUUID().replaceAll("-", "")}`;
   let adminPool: Pool;
@@ -160,6 +175,19 @@ databaseDescribe("intelligent guidance contract persistence", () => {
   let repository: Repository;
 
   beforeAll(async () => {
+    vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
+    vi.stubEnv("PIPELINE_V3_GENRE_SCENE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_MOOD_ACTIVITY_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_SIMILARITY_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_ARTIST_CATALOGUE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_FIXED_CONTAINER_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_EXHAUSTIVE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED", "true");
     adminPool = new Pool({ connectionString: databaseUrl, max: 2, application_name: "guidance-v2-admin" });
     await adminPool.query(`CREATE SCHEMA "${schemaName}"`);
     pool = new Pool({
@@ -173,6 +201,7 @@ databaseDescribe("intelligent guidance contract persistence", () => {
   }, 30_000);
 
   afterAll(async () => {
+    vi.unstubAllEnvs();
     if (pool) await pool.end();
     if (adminPool) {
       await adminPool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
@@ -852,6 +881,147 @@ databaseDescribe("intelligent guidance contract persistence", () => {
         values: ["Pop Smoke"],
       }),
     ]));
+  }, 40_000);
+
+  test("persists the production Drill & Grime question and successor semantics", async () => {
+    const prompt = "Drill & Grime Essentials";
+    const clientBucket = `guidance-v4-drill-grime-${randomUUID()}`;
+    const created = await repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 29,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: drillGrimeBrief,
+      storefront: "us",
+    });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: `brief:${created.id}`,
+      prompt,
+      brief: drillGrimeBrief,
+      selectionPlan,
+      locale: "en",
+    });
+    expect(shadow.contract.versions.ontology).toBe("playlist_music_ontology_v4");
+    expect(shadow.contract.clauses.filter((clause) => (
+      clause.hardness === "hard"
+      && clause.kind === "membership"
+      && clause.axis === "genre"
+    ))).toEqual([
+      expect.objectContaining({
+        id: "bridge:membership:drill-or-grime",
+        values: expect.arrayContaining(["drill", "grime"]),
+      }),
+    ]);
+    expect(JSON.stringify(shadow.contract.trackPredicate)).not.toContain(
+      "bridge:constraint:scope_1",
+    );
+    await repository.savePlaylistContractRevision({
+      briefRequestId: created.id,
+      expectedParentRevisionId: null,
+      contractHash: shadow.contract.semanticHash,
+      contract: structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+      compilerVersion: shadow.contract.versions.compiler,
+      ontologyVersion: shadow.contract.versions.ontology,
+      evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+      questionTemplateVersion: shadow.contract.versions.questionTemplates,
+      catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+      locale: shadow.contract.locale,
+      storefront: shadow.contract.storefront,
+      answerLineageHash: sha256Hex(stableStringify(shadow.contract.answerLineage)),
+    });
+    await repository.saveBriefSelectionPlan(created.id, selectionPlan);
+    const checkpoint = guidanceCheckpointV4({
+      prompt,
+      baseContract: shadow.contract,
+      preservedTrackPredicate: shadow.preservedTrackPredicate,
+      ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+      criticalAmbiguities: [],
+      requestShape: "curated",
+      compilationTimestamp: "2026-07-31T22:00:00.000Z",
+    });
+    const questions = checkpoint.decisions.map(publicGuidanceQuestionV4);
+    expect(questions).toEqual([
+      expect.objectContaining({
+        question: "How should drill and grime shape the 29-track mix?",
+        options: [
+          expect.objectContaining({
+            id: "equal_priority",
+            recommended: true,
+            explicitNoop: true,
+          }),
+          expect.objectContaining({ id: "drill_led", recommended: false }),
+          expect.objectContaining({ id: "grime_led", recommended: false }),
+        ],
+      }),
+    ]);
+    await repository.saveBriefResult(created.id, {
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      brief: drillGrimeBrief,
+      questions,
+      guidanceTelemetry: {
+        generationMode: "deterministic_critical",
+        requestClassification: "broad_curated",
+        guidancePolicyVersion: "adaptive_guidance_v4",
+        questionSetHash: checkpoint.checkpointHash,
+        proposedQuestionCount: checkpoint.decisions.length,
+        acceptedQuestionCount: questions.length,
+        webSearchCalls: 0,
+        validationIssues: [],
+      },
+      guidanceContract: {
+        questionSetHash: checkpoint.checkpointHash,
+        requestClassification: "broad_curated",
+        generationMode: "deterministic_critical",
+        guidancePolicyVersion: "adaptive_guidance_v4",
+        locale: "en",
+        storefront: "us",
+        targetTrackCount: 29,
+        explicitConstraintHash: sha256Hex("drill-grime-hard-constraints"),
+        rejectedQuestionReasons: [],
+        baseContractRevisionId: shadow.contract.revisionId,
+        baseContractSemanticHash: shadow.contract.semanticHash,
+        guidanceRound: "initial",
+        trigger: "correctness",
+        axis: "drill_grime_emphasis",
+        checkpointMode: "correctness_blocking",
+        interpretationSummary: checkpoint.interpretationSummary,
+      },
+    });
+    await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      briefRequestId: created.id,
+      idempotencyKey: randomUUID(),
+      questionSetHash: checkpoint.checkpointHash,
+      answers: [{ questionId: questions[0]!.id, optionId: "drill_led" }],
+    })).resolves.toEqual({ status: "finalizing", created: true });
+
+    const acceptedBrief = await repository.getBriefRequest(created.id);
+    expect(acceptedBrief).toMatchObject({
+      status: "finalizing",
+      activePlaylistContract: {
+        requestedTrackCount: 29,
+        clauses: expect.arrayContaining([
+          expect.objectContaining({
+            id: "bridge:membership:drill-or-grime",
+            hardness: "hard",
+            values: expect.arrayContaining(["drill", "grime"]),
+          }),
+          expect.objectContaining({
+            axis: "genre_emphasis",
+            hardness: "soft",
+            values: ["drill-led"],
+          }),
+        ]),
+      },
+    });
   }, 40_000);
 
   test("persists and accepts a zero-question V4 confirmation without changing the contract", async () => {
