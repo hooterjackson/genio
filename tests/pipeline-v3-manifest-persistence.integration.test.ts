@@ -432,6 +432,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     canonicalRecovery:
       | false
       | "empty"
+      | "closed_world_artist_exclusion"
       | "or_membership"
       | "catalog_membership_with_evidence_meta"
       | "not_exclusion" = false,
@@ -507,7 +508,59 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         `active selection plan missing for ${label} (${created.runId})`,
       ).toBeTruthy();
       const canonicalClauses =
-        canonicalRecovery === "catalog_membership_with_evidence_meta"
+        canonicalRecovery === "closed_world_artist_exclusion"
+        ? [{
+            id: "catalog:storefront-playable",
+            kind: "catalog_version" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "catalog",
+            operator: "require" as const,
+            values: ["storefront playable"],
+            source: {
+              provenance: "system_default" as const,
+              text: "storefront playable",
+            },
+            evidence: {
+              required: true,
+              minimumGrade: "authoritative_structured_metadata" as const,
+              permittedGrades: [
+                "authoritative_structured_metadata" as const,
+              ],
+            },
+          }, {
+            id: "artist:exclude-pop-smoke",
+            kind: "exclusion" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "artist",
+            operator: "exclude" as const,
+            values: ["Pop Smoke"],
+            source: {
+              provenance: "prompt" as const,
+              text: "without centering Pop Smoke",
+            },
+            evidence: {
+              required: true,
+              minimumGrade: "authoritative_structured_metadata" as const,
+              permittedGrades: [
+                "authoritative_structured_metadata" as const,
+              ],
+            },
+          }, {
+            id: "ranking:pop-smoke-similarity",
+            kind: "ranking_preference" as const,
+            scope: "track" as const,
+            hardness: "soft" as const,
+            axis: "similarity",
+            operator: "prefer" as const,
+            values: ["Pop Smoke"],
+            source: {
+              provenance: "prompt" as const,
+              text: "favorite rapper is Pop Smoke",
+            },
+          }]
+        : canonicalRecovery === "catalog_membership_with_evidence_meta"
         ? [{
             id: "bridge:membership:hip-hop-or-grime",
             kind: "membership" as const,
@@ -637,7 +690,17 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         storefront: active.selection_plan.storefront,
         clauses: canonicalClauses,
         trackPredicate:
-          canonicalRecovery === "catalog_membership_with_evidence_meta"
+          canonicalRecovery === "closed_world_artist_exclusion"
+          ? {
+              op: "all",
+              children: canonicalClauses
+                .filter(({ hardness }) => hardness === "hard")
+                .map(({ id }) => ({
+                op: "clause" as const,
+                clauseId: id,
+              })),
+            }
+          : canonicalRecovery === "catalog_membership_with_evidence_meta"
           ? {
               op: "all",
               children: canonicalClauses.map(({ id }) => ({
@@ -674,6 +737,22 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
               op: "clause",
               clauseId: "catalog:storefront-playable",
             },
+        ...(canonicalRecovery === "closed_world_artist_exclusion"
+          ? {
+              executionDirectives: {
+                fixedContainer: null,
+                fixedTrackList: null,
+                similarity: {
+                  seedArtists: ["Pop Smoke"],
+                  excludedArtists: ["Pop Smoke"],
+                  rankingClauseId: "ranking:pop-smoke-similarity",
+                  exactArtistExclusionClauseIds: [
+                    "artist:exclude-pop-smoke",
+                  ],
+                },
+              },
+            }
+          : {}),
       });
       const contractRevision = await repository.savePlaylistContractRevision({
         runId: created.runId,
@@ -691,22 +770,112 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
           stableStringify(contract.answerLineage),
         ),
       });
-      const canonicalSelectionPlan: SelectionPlanV3 = {
+      const canonicalContractPolicy =
+        canonicalContractExecutionPolicyV1(contract);
+      const canonicalSemanticClauses =
+        canonicalRecovery === "closed_world_artist_exclusion"
+          ? [
+              ...active.selection_plan.semanticClauses.filter(
+                ({ id }) => id !== "artist:exclude-pop-smoke",
+              ),
+              {
+                id: "artist:exclude-pop-smoke",
+                role: "membership" as const,
+                axis: "artist" as const,
+                operator: "exclude" as const,
+                values: ["Pop Smoke"],
+                source: "raw_prompt" as const,
+                explicitUserAuthored: true,
+                geographyRelationship: null,
+                reason: "Exclude Pop Smoke as primary artist.",
+              },
+            ]
+          : active.selection_plan.semanticClauses;
+      const canonicalHardConstraintHash = sha256Hex(stableStringify(
+        canonicalSemanticClauses
+          .filter(({ role }) => role === "membership")
+          .map(({ axis, operator, values }) => ({
+            axis,
+            operator,
+            values: values
+              .map((value) => value.normalize("NFKC").trim().toLowerCase())
+              .sort(),
+          })),
+      ));
+      const canonicalSelectionPlan = JSON.parse(JSON.stringify({
         ...active.selection_plan,
-        canonicalContractPolicy:
-          canonicalContractExecutionPolicyV1(contract),
-      };
-      const canonicalQueryPlan = createQueryPlanV3(
-        canonicalSelectionPlan,
-        active.graph_snapshot_id,
-        {
-          schemaVersion: 5,
-          briefContractVersion: 3,
-          playlistContractRevisionId: contract.revisionId,
-          playlistContractSemanticHash: contract.semanticHash,
-          playlistContractCompilerVersion: contract.versions.compiler,
-        },
-      );
+        canonicalContractPolicy,
+        ...(canonicalRecovery === "closed_world_artist_exclusion"
+          ? {
+              semanticClauses: canonicalSemanticClauses,
+              membershipPredicates: [
+                ...active.selection_plan.membershipPredicates.filter(
+                  ({ id }) => id !== "artist:exclude-pop-smoke",
+                ),
+                {
+                  id: "artist:exclude-pop-smoke",
+                  axis: "artist" as const,
+                  operator: "exclude" as const,
+                  values: ["Pop Smoke"],
+                  source: "user" as const,
+                  reason: "Exclude Pop Smoke as primary artist.",
+                },
+              ],
+              rankingObjectives: [
+                ...active.selection_plan.rankingObjectives.filter(
+                  ({ id }) => id !== "ranking:pop-smoke-similarity",
+                ),
+                {
+                  id: "ranking:pop-smoke-similarity",
+                  dimension: "similarity" as const,
+                  direction: "maximize" as const,
+                  weight: 1,
+                  relaxationRank: null,
+                  values: ["Pop Smoke"],
+                  reason: "Use Pop Smoke as the exact similarity seed.",
+                },
+              ],
+              semanticAudit: {
+                ...(active.selection_plan.semanticAudit ?? {
+                  version: "semantic_plan_v3_1" as const,
+                  musicConceptPolicyVersion:
+                    active.selection_plan.musicConceptPolicyVersion,
+                  passed: true,
+                  aliasCollapses: [],
+                  contradictions: [],
+                }),
+                hardConstraintHash: canonicalHardConstraintHash,
+              },
+            }
+          : {}),
+        ...(canonicalContractPolicy.executionDirectives
+          ? {
+              executionDirectives:
+                canonicalContractPolicy.executionDirectives,
+              engines: canonicalContractPolicy.executionDirectives.similarity
+                ? [
+                    ...new Set([
+                      ...active.selection_plan.engines,
+                      "similarity" as const,
+                    ]),
+                  ]
+                : active.selection_plan.engines,
+            }
+          : {}),
+      })) as SelectionPlanV3;
+      const canonicalQueryPlan = JSON.parse(JSON.stringify(
+        createQueryPlanV3(
+          canonicalSelectionPlan,
+          active.graph_snapshot_id,
+          {
+            schemaVersion: 5,
+            briefContractVersion: 3,
+            playlistContractRevisionId: contract.revisionId,
+            playlistContractSemanticHash: contract.semanticHash,
+            playlistContractCompilerVersion: contract.versions.compiler,
+          },
+        ),
+      )) as QueryPlanV3;
       const canonicalSelectionHash =
         selectionPlanV3Hash(canonicalSelectionPlan);
       const canonicalQueryHash = queryPlanV3Hash(canonicalQueryPlan);
@@ -3475,6 +3644,91 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       manifestId: persisted.manifestId!,
       manifestRevisionId: persisted.manifestRevisionId!,
       manifestRevisionHash: persisted.manifestHash!,
+      partialPublicationAuthorized: false,
+    })).resolves.toBeUndefined();
+  }, 30_000);
+
+  test("persists and revalidates a declared exact-artist exclusion from Apple identity alone", async () => {
+    const context = await createLeasedRun(
+      1,
+      "closed-world-pop-smoke-exclusion",
+      undefined,
+      "Create 1 released disco track",
+      "closed_world_artist_exclusion",
+    );
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "closed-world-pop-smoke-exclusion",
+      predicateIds: [],
+    });
+    const selected = base.selected.map((track) => ({
+      ...track,
+      evidenceBindingIds: [],
+      evidenceBindings: [],
+      evidenceStrength: 1,
+      independentProvenanceRoots: 1,
+      canonicalClauseAssessments: {
+        "catalog:storefront-playable": {
+          status: "pass" as const,
+          evidenceGrade: "authoritative_structured_metadata" as const,
+          evidenceIds: [],
+        },
+        "artist:exclude-pop-smoke": {
+          status: "fail" as const,
+          evidenceGrade: "authoritative_structured_metadata" as const,
+          evidenceIds: [],
+        },
+      },
+    }));
+    const result: RetrievalResultV3 = {
+      ...base,
+      selected,
+      qualifiedPool: selected,
+    };
+
+    const first = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    const replay = await repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    });
+    expect(replay).toEqual(first);
+    expect((await pool.query<{
+      decision: string;
+      bindings: number;
+      null_candidates: number;
+    }>(
+      `SELECT qualification.decision,
+              (SELECT count(*)::int FROM track_scope_bindings
+               WHERE run_id=$1) bindings,
+              count(*) FILTER (
+                WHERE qualification.candidate_id IS NULL
+              )::int null_candidates
+       FROM playlist_qualification_records qualification
+       WHERE qualification.run_id=$1
+       GROUP BY qualification.decision`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      decision: "qualified",
+      bindings: 0,
+      null_candidates: 0,
+    });
+    await expect(repository.revalidateCanonicalPublicationManifest({
+      runId: context.runId,
+      manifestId: first.manifestId!,
+      manifestRevisionId: first.manifestRevisionId!,
+      manifestRevisionHash: first.manifestHash!,
       partialPublicationAuthorized: false,
     })).resolves.toBeUndefined();
   }, 30_000);
