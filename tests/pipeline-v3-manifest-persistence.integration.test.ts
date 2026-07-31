@@ -1090,6 +1090,127 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     });
   }, 120_000);
 
+  test("a paused or delayed publication never inherits LIVE from its research lease", async () => {
+    const context = await createLeasedRun(
+      3,
+      "schema-19-publication-work-motion",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    const priorPublishingPause = await repository.getSetting(
+      "publishing_paused",
+    );
+    const publicationJobId = randomUUID();
+    try {
+      await repository.setSetting("publishing_paused", "true");
+      await pool.query(
+        `INSERT INTO job_queue(
+           id,run_id,kind,dedupe_key,status,payload_json,pipeline_version,
+           minimum_worker_protocol,queue_class,query_plan_revision_id,
+           stage_key,required_executor_capability_hash,
+           required_executor_capability_vector,required_executor_revision,
+           required_executor_semantic_configuration_hash)
+         VALUES($1,$2,'publication',$3,'queued','{}'::jsonb,
+           'corpus_first_v3',12,'publication',$4,$5,$6,$7::jsonb,$8,$9)`,
+        [
+          publicationJobId,
+          context.runId,
+          `publication-motion:${context.runId}`,
+          context.fence.queryPlanRevisionId,
+          `publication-motion:${context.runId}`,
+          context.queryPlan.executorCapabilityHash,
+          JSON.stringify(context.queryPlan.executorCapabilityVector),
+          context.executorReleaseIdentity.executorRevision,
+          context.executorReleaseIdentity
+            .semanticExecutionConfigurationHash,
+        ],
+      );
+      await pool.query(
+        `INSERT INTO manifests(
+           id,run_id,name,description,content_hash)
+         VALUES($1,$2,'Publication motion fixture',
+           'A locked manifest proving publication work-state selection.',$3)`,
+        [randomUUID(), context.runId, sha256Hex(context.runId)],
+      );
+      await repository.updateRun(context.runId, {
+        status: "publishing",
+        phase: "publication_queued",
+      });
+
+      await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+        resolution: {
+          state: "publishing",
+          workMotion: "paused",
+        },
+      });
+      await expect(pool.query<{
+        state: string;
+        work_motion: string | null;
+      }>(
+        `SELECT state,state_json->>'workMotion' work_motion
+         FROM playlist_run_resolutions WHERE run_id=$1`,
+        [context.runId],
+      )).resolves.toMatchObject({
+        rows: [{
+          state: "publishing",
+          work_motion: "paused",
+        }],
+      });
+
+      await repository.setSetting("publishing_paused", "false");
+      await pool.query(
+        `UPDATE job_queue
+         SET status='retry',available_at=now()+interval '5 minutes',
+             updated_at=now()
+         WHERE id=$1`,
+        [publicationJobId],
+      );
+      await repository.updateRun(context.runId, {
+        status: "publishing",
+        phase: "publication_retry_scheduled",
+      });
+      await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+        resolution: {
+          state: "publishing",
+          workMotion: "retry_scheduled",
+          nextRetryAt: expect.any(String),
+        },
+      });
+
+      await repository.cancelRunByVisitor(context.runId);
+      await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+        status: "cancelled",
+        resolution: {
+          state: "cancelled",
+          workMotion: "none",
+        },
+      });
+      await expect(pool.query<{
+        state: string;
+        work_motion: string | null;
+      }>(
+        `SELECT state,state_json->>'workMotion' work_motion
+         FROM playlist_run_resolutions WHERE run_id=$1`,
+        [context.runId],
+      )).resolves.toMatchObject({
+        rows: [{
+          state: "cancelled",
+          work_motion: "none",
+        }],
+      });
+    } finally {
+      if (priorPublishingPause == null) {
+        await repository.deleteSetting("publishing_paused");
+      } else {
+        await repository.setSetting(
+          "publishing_paused",
+          priorPublishingPause,
+        );
+      }
+    }
+  }, 120_000);
+
   test("a stale begin cannot discard the successor lease generation's running attempt", async () => {
     const context = await createLeasedRun(
       3,

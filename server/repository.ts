@@ -15164,6 +15164,9 @@ export class Repository {
     blockerNextRetryAt: Date | null,
     retainedState: Record<string, unknown> = {},
   ): Promise<RunWorkTruthV1> {
+    const preferPublicationJob = state === "publishing"
+      || blockerKind === "apple_authorization"
+      || blockerKind === "publication_reconciliation";
     const result = await client.query<{
       created_at: Date;
       updated_at: Date;
@@ -15285,8 +15288,14 @@ export class Repository {
          FROM job_queue queued
          WHERE queued.run_id=run.id
            AND queued.kind IN ('research','matching','publication')
-           AND queued.status IN ('queued','leased')
-         ORDER BY CASE queued.status WHEN 'leased' THEN 0 ELSE 1 END,
+           AND queued.status IN ('queued','retry','leased')
+         ORDER BY
+           CASE
+             WHEN $2::boolean AND queued.kind='publication' THEN 0
+             WHEN NOT $2::boolean AND queued.kind<>'publication' THEN 0
+             ELSE 1
+           END,
+           CASE queued.status WHEN 'leased' THEN 0 ELSE 1 END,
                   queued.updated_at DESC,queued.created_at DESC,queued.id DESC
          LIMIT 1
        ) job ON true
@@ -15306,7 +15315,7 @@ export class Repository {
          WHERE run_id=run.id
        ) attempt_totals ON true
        WHERE run.id=$1 AND run.deleted_at IS NULL`,
-      [runId],
+      [runId, preferPublicationJob],
     );
     const row = result.rows[0];
     const retainedInteger = (key: string): number | null => {
@@ -15362,7 +15371,7 @@ export class Repository {
       workMotion = "paused";
     } else if (running) {
       workMotion = "running";
-    } else if (row.job_status === "queued"
+    } else if ((row.job_status === "queued" || row.job_status === "retry")
       && row.job_available_at instanceof Date
       && row.job_available_at.getTime() > now) {
       workMotion = "retry_scheduled";
@@ -15391,7 +15400,11 @@ export class Repository {
       ? retainedInteger("appendedTrackCount")
       : Number(row.reconciliation_appended_count);
     const retryAt = blockerNextRetryAt
-      ?? (row.job_status === "queued" ? row.job_available_at : null);
+      ?? (
+        row.job_status === "queued" || row.job_status === "retry"
+          ? row.job_available_at
+          : null
+      );
     const remainingActiveComputeMs = Math.max(
       0,
       15 * 60_000 - activeComputeMs,
@@ -23751,6 +23764,7 @@ export class Repository {
          WHERE run_id=$1 AND status IN ('queued','retry')`,
         [runId],
       );
+      await this.shadowPlaylistResolutionV1(client, runId);
     });
   }
 
