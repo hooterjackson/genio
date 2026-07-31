@@ -76,6 +76,9 @@ import {
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION,
+  PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING,
+  PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING,
+  releaseConfigurationDiagnosticCodes,
   releaseDatabaseReadinessReady,
   releaseExecutionConfigured,
   runtimeReleaseDeploymentPhase,
@@ -713,8 +716,11 @@ export class WorkerRunner {
 
   async run(): Promise<void> {
     if (!releaseExecutionConfigured(this.environment)) {
+      const diagnostic = releaseConfigurationDiagnosticCodes(
+        this.environment,
+      )[0] ?? "release_execution_disabled";
       throw new Error(
-        "Workers cannot start during the fresh staging bootstrap phase",
+        `${diagnostic}: worker release configuration is not executable`,
       );
     }
     assertProductionWorkerSecrets(this.environment, this.queueClass);
@@ -799,6 +805,8 @@ export class WorkerRunner {
       observedDatabaseCapabilityVersion,
       observedCanonicalExecutionHardeningVersion,
       observedExecutorReleaseIdentityFencingVersion,
+      observedProofArchitectureVersion,
+      observedProofArchitectureAuthority,
       executorReleaseIdentityFenceSupported,
     ] =
       await Promise.all([
@@ -810,6 +818,12 @@ export class WorkerRunner {
         this.repository.getSetting(
           CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
         ),
+        this.repository.getSetting(
+          PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING,
+        ),
+        this.repository.getSetting(
+          PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING,
+        ),
         this.repository.executorReleaseIdentityFenceAvailable?.()
           ?? Promise.resolve(false),
       ]);
@@ -820,6 +834,8 @@ export class WorkerRunner {
       observedCanonicalExecutionHardeningVersion,
       observedCanonicalExecutorReleaseIdentityFencingVersion:
         observedExecutorReleaseIdentityFencingVersion,
+      observedProofArchitectureVersion,
+      observedProofArchitectureAuthority,
       executorReleaseIdentityFenceSupported,
     })
       || observedExecutorReleaseIdentityFencingVersion
@@ -1877,8 +1893,11 @@ class NonRetriableJobError extends Error {
 
 async function runExecutableWorker(): Promise<void> {
   if (!releaseExecutionConfigured(process.env)) {
+    const diagnostic = releaseConfigurationDiagnosticCodes(
+      process.env,
+    )[0] ?? "release_execution_disabled";
     throw new Error(
-      "Workers cannot initialize during the fresh staging bootstrap phase",
+      `${diagnostic}: worker release configuration is not executable`,
     );
   }
   const repository = new Repository();

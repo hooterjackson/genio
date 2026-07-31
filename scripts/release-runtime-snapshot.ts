@@ -364,6 +364,18 @@ function runtimeSnapshot(input: {
       input.system.canonicalExecutionHardeningVersion,
       "canonical execution hardening version",
     ) as "1",
+    proofArchitectureMode: releaseLabel(
+      runtime.proofArchitectureMode,
+      "proof architecture mode",
+    ) as "native",
+    proofArchitectureVersion: releaseLabel(
+      input.system.proofArchitectureVersion,
+      "proof architecture version",
+    ) as "1",
+    proofArchitectureAuthority: releaseLabel(
+      input.system.proofArchitectureAuthority,
+      "proof architecture authority",
+    ) as "native",
     workerProtocol: releaseLabel(runtime.workerProtocol, "worker protocol"),
     briefContractVersion: releaseLabel(runtime.briefContractVersion, "brief contract version"),
     queryPlanSchemaVersion: releaseLabel(
@@ -380,17 +392,22 @@ function runtimeSnapshot(input: {
   if (
     result.releaseEnvironment !== input.expectedEnvironment
     || result.deploymentPhase !== "activate"
-    || result.databaseSchemaVersion !== "19"
+    || result.databaseSchemaVersion !== "20"
     || result.databaseCapabilityVersion !== "2"
     || result.releaseManifestCanaryGuardsVersion !== "1"
     || result.canonicalExecutionHardeningVersion !== "1"
-    || result.workerProtocol !== "playlist-pipeline-v11"
+    || result.proofArchitectureMode !== "native"
+    || result.proofArchitectureVersion !== "1"
+    || result.proofArchitectureAuthority !== "native"
+    || result.workerProtocol !== "playlist-pipeline-v12"
     || result.briefContractVersion !== "3"
     || result.queryPlanSchemaVersion !== "6"
     || result.policyVersions.guidance !== "adaptive_guidance_v4"
     || result.policyVersions.evidence !== "governed_evidence_v2"
   ) {
-    throw new Error("runtime does not satisfy the schema-19/protocol-11 release contract");
+    throw new Error(
+      "runtime does not satisfy the schema-20/protocol-12 native-proof release contract",
+    );
   }
   return result;
 }

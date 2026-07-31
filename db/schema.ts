@@ -1211,6 +1211,13 @@ export const manifestRevisions = pgTable("manifest_revisions", {
   pipelinePolicySnapshotJson: jsonb("pipeline_policy_snapshot_json"),
   outcomeSnapshotJson: jsonb("outcome_snapshot_json"),
   deficitSnapshotJson: jsonb("deficit_snapshot_json").notNull().default([]),
+  /** Schema-20 immutable proof authority. Legacy and shadowless rows stay null. */
+  selectionSetId: uuid("selection_set_id").references(
+    () => immutableSelectionSets.id,
+    { onDelete: "restrict" },
+  ),
+  attestationSetHash: varchar("attestation_set_hash", { length: 64 }),
+  proofKind: varchar("proof_kind", { length: 32 }),
   lockedAt: timestamp("locked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
@@ -1238,6 +1245,47 @@ export const manifestRevisions = pgTable("manifest_revisions", {
   check(
     "manifest_revision_run_spec_hash_valid",
     sql`${table.runSpecHash} IS NULL OR ${table.runSpecHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check("manifest_revision_schema20_proof_valid", sql`(
+    (
+      ${table.selectionSetId} IS NULL
+      AND ${table.attestationSetHash} IS NULL
+      AND ${table.proofKind} IS NULL
+    ) OR (
+      ${table.selectionSetId} IS NOT NULL
+      AND ${table.attestationSetHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.proofKind} IN ('shadow','native')
+    )
+  )`),
+]);
+
+/** Honest proof boundary for published manifests created before schema 20. */
+export const legacyPublishedReceipts = pgTable("legacy_published_receipts", {
+  manifestRevisionId: uuid("manifest_revision_id").primaryKey().references(
+    () => manifestRevisions.id,
+    { onDelete: "cascade" },
+  ),
+  receiptHash: varchar("receipt_hash", { length: 64 }).notNull().unique(),
+  expectedOrderedIdsHash: varchar("expected_ordered_ids_hash", { length: 64 }),
+  observedOrderedIdsHash: varchar("observed_ordered_ids_hash", { length: 64 }),
+  reconciledCount: integer("reconciled_count"),
+  receiptJson: jsonb("receipt_json").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check("legacy_published_receipt_hashes_valid", sql`
+    ${table.receiptHash} ~ '^[0-9a-f]{64}$'
+    AND (
+      ${table.expectedOrderedIdsHash} IS NULL
+      OR ${table.expectedOrderedIdsHash} ~ '^[0-9a-f]{64}$'
+    )
+    AND (
+      ${table.observedOrderedIdsHash} IS NULL
+      OR ${table.observedOrderedIdsHash} ~ '^[0-9a-f]{64}$'
+    )
+  `),
+  check(
+    "legacy_published_receipt_count_valid",
+    sql`${table.reconciledCount} IS NULL OR ${table.reconciledCount} >= 0`,
   ),
 ]);
 
@@ -1287,6 +1335,12 @@ export const partialPublicationDecisions = pgTable("partial_publication_decision
   decision: varchar("decision", { length: 32 }).notNull().default("pending"),
   targetCount: integer("target_count").notNull(),
   selectedCount: integer("selected_count").notNull(),
+  selectionSetId: uuid("selection_set_id").references(
+    () => immutableSelectionSets.id,
+    { onDelete: "restrict" },
+  ),
+  manifestPayloadHash: varchar("manifest_payload_hash", { length: 64 }),
+  attestationSetHash: varchar("attestation_set_hash", { length: 64 }),
   idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull().unique(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   decidedAt: timestamp("decided_at", { withTimezone: true }),
@@ -1299,6 +1353,17 @@ export const partialPublicationDecisions = pgTable("partial_publication_decision
   ),
   index("partial_publication_decision_run_expiry_idx").on(table.runId, table.expiresAt),
   check("partial_publication_decision_counts_valid", sql`${table.targetCount} BETWEEN 1 AND 1000 AND ${table.selectedCount} BETWEEN 0 AND ${table.targetCount}`),
+  check("partial_publication_schema20_binding_valid", sql`(
+    (
+      ${table.selectionSetId} IS NULL
+      AND ${table.manifestPayloadHash} IS NULL
+      AND ${table.attestationSetHash} IS NULL
+    ) OR (
+      ${table.selectionSetId} IS NOT NULL
+      AND ${table.manifestPayloadHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.attestationSetHash} ~ '^[0-9a-f]{64}$'
+    )
+  )`),
 ]);
 
 /** A durable logical playlist whose active Apple revision changes atomically. */
@@ -1743,6 +1808,351 @@ export const playlistQualificationRecords = pgTable("playlist_qualification_reco
   ),
   index("playlist_qualification_candidate_idx").on(table.candidateId, table.decision),
 ]);
+
+/** Schema-20 cross-run Apple identity authority. Hashes are indexes only. */
+export const canonicalTrackIdentities = pgTable("canonical_track_identities", {
+  id: uuid("id").primaryKey(),
+  identityPolicyVersion: varchar("identity_policy_version", { length: 160 }).notNull(),
+  provider: varchar("provider", { length: 40 }).notNull(),
+  storefront: varchar("storefront", { length: 16 }).notNull(),
+  recordingFamilyKey: text("recording_family_key").notNull(),
+  recordingFamilyPolicyVersion: varchar("recording_family_policy_version", {
+    length: 160,
+  }).notNull(),
+  appleStableId: varchar("apple_stable_id", { length: 160 }).notNull(),
+  identityHash: varchar("identity_hash", { length: 64 }).notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique("canonical_track_identity_tuple_unique").on(
+    table.identityPolicyVersion,
+    table.provider,
+    table.storefront,
+    table.recordingFamilyKey,
+    table.recordingFamilyPolicyVersion,
+    table.appleStableId,
+  ),
+  index("canonical_track_identity_family_idx").on(
+    table.provider,
+    table.storefront,
+    table.recordingFamilyPolicyVersion,
+    table.appleStableId,
+  ),
+  check("canonical_track_identity_provider_valid", sql`${table.provider}='apple'`),
+  check(
+    "canonical_track_identity_storefront_valid",
+    sql`${table.storefront} ~ '^[a-z]{2}$'`,
+  ),
+  check(
+    "canonical_track_identity_hash_valid",
+    sql`${table.identityHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+]);
+
+/** Content-addressed evidence is immutable; revocation is append-only elsewhere. */
+export const contentAddressedEvidenceSnapshots = pgTable(
+  "content_addressed_evidence_snapshots",
+  {
+    id: uuid("id").primaryKey(),
+    contentHash: varchar("content_hash", { length: 64 }).notNull().unique(),
+    sourceUrlHash: varchar("source_url_hash", { length: 64 }).notNull(),
+    sourceHost: varchar("source_host", { length: 240 }).notNull(),
+    excerptHash: varchar("excerpt_hash", { length: 64 }),
+    acquisitionPolicyVersion: varchar("acquisition_policy_version", {
+      length: 160,
+    }).notNull(),
+    snapshotJson: jsonb("snapshot_json").notNull(),
+    acquiredAt: timestamp("acquired_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("evidence_snapshot_host_acquired_idx").on(
+      table.sourceHost,
+      table.acquiredAt,
+    ),
+    check(
+      "evidence_snapshot_content_hash_valid",
+      sql`${table.contentHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "evidence_snapshot_url_hash_valid",
+      sql`${table.sourceUrlHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "evidence_snapshot_excerpt_hash_valid",
+      sql`${table.excerptHash} IS NULL OR ${table.excerptHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
+/** Immutable raw qualification observation bound to the exact fenced attempt. */
+export const selectionQualificationObservations = pgTable(
+  "selection_qualification_observations",
+  {
+    id: uuid("id").primaryKey(),
+    runId: uuid("run_id").notNull().references(() => researchRuns.id, {
+      onDelete: "cascade",
+    }),
+    contractRevisionId: uuid("contract_revision_id").notNull().references(
+      () => playlistContractRevisions.id,
+      { onDelete: "restrict" },
+    ),
+    queryPlanRevisionId: uuid("query_plan_revision_id").notNull().references(
+      () => queryPlanRevisions.id,
+      { onDelete: "restrict" },
+    ),
+    executionAttemptId: uuid("execution_attempt_id").notNull().references(
+      () => playlistExecutionAttempts.id,
+      { onDelete: "restrict" },
+    ),
+    candidateId: uuid("candidate_id").notNull().references(
+      () => trackCandidates.id,
+      { onDelete: "restrict" },
+    ),
+    canonicalTrackIdentityId: uuid("canonical_track_identity_id").notNull()
+      .references(() => canonicalTrackIdentities.id, { onDelete: "restrict" }),
+    sourceQualificationRecordId: uuid("source_qualification_record_id")
+      .references(() => playlistQualificationRecords.id, { onDelete: "set null" }),
+    observationHash: varchar("observation_hash", { length: 64 }).notNull(),
+    observationJson: jsonb("observation_json").notNull(),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("selection_qualification_observation_unique").on(
+      table.executionAttemptId,
+      table.candidateId,
+      table.observationHash,
+    ),
+    index("selection_qualification_observation_run_idx").on(
+      table.runId,
+      table.contractRevisionId,
+      table.queryPlanRevisionId,
+      table.createdAt,
+    ),
+    check(
+      "selection_qualification_observation_hash_valid",
+      sql`${table.observationHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
+/** Publication-grade proof for exactly one candidate and catalog identity. */
+export const immutableSelectionQualifications = pgTable(
+  "immutable_selection_qualifications",
+  {
+    id: uuid("id").primaryKey(),
+    runId: uuid("run_id").notNull().references(() => researchRuns.id, {
+      onDelete: "cascade",
+    }),
+    contractRevisionId: uuid("contract_revision_id").notNull().references(
+      () => playlistContractRevisions.id,
+      { onDelete: "restrict" },
+    ),
+    queryPlanRevisionId: uuid("query_plan_revision_id").notNull().references(
+      () => queryPlanRevisions.id,
+      { onDelete: "restrict" },
+    ),
+    executionAttemptId: uuid("execution_attempt_id").notNull().references(
+      () => playlistExecutionAttempts.id,
+      { onDelete: "restrict" },
+    ),
+    candidateId: uuid("candidate_id").notNull().references(
+      () => trackCandidates.id,
+      { onDelete: "restrict" },
+    ),
+    canonicalTrackIdentityId: uuid("canonical_track_identity_id").notNull()
+      .references(() => canonicalTrackIdentities.id, { onDelete: "restrict" }),
+    qualificationObservationId: uuid("qualification_observation_id").notNull()
+      .references(() => selectionQualificationObservations.id, {
+        onDelete: "restrict",
+      }),
+    evidenceSnapshotIds: uuid("evidence_snapshot_ids").array().notNull()
+      .default(sql`'{}'::uuid[]`),
+    contractHash: varchar("contract_hash", { length: 64 }).notNull(),
+    queryPlanHash: varchar("query_plan_hash", { length: 64 }).notNull(),
+    evidencePolicyHash: varchar("evidence_policy_hash", { length: 64 }).notNull(),
+    catalogPolicyHash: varchar("catalog_policy_hash", { length: 64 }).notNull(),
+    qualificationHash: varchar("qualification_hash", { length: 64 }).notNull()
+      .unique(),
+    decision: varchar("decision", { length: 32 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("immutable_selection_qualification_attempt_candidate_unique").on(
+      table.executionAttemptId,
+      table.candidateId,
+      table.qualificationHash,
+    ),
+    index("immutable_selection_qualification_run_idx").on(
+      table.runId,
+      table.contractRevisionId,
+      table.queryPlanRevisionId,
+      table.createdAt,
+    ),
+    check(
+      "immutable_selection_qualification_decision_valid",
+      sql`${table.decision}='qualified'`,
+    ),
+    check("immutable_selection_qualification_hashes_valid", sql`
+      ${table.contractHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.queryPlanHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.evidencePolicyHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.catalogPolicyHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.qualificationHash} ~ '^[0-9a-f]{64}$'
+    `),
+  ],
+);
+
+export const immutableSelectionSets = pgTable("immutable_selection_sets", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => researchRuns.id, {
+    onDelete: "cascade",
+  }),
+  contractRevisionId: uuid("contract_revision_id").notNull().references(
+    () => playlistContractRevisions.id,
+    { onDelete: "restrict" },
+  ),
+  queryPlanRevisionId: uuid("query_plan_revision_id").notNull().references(
+    () => queryPlanRevisions.id,
+    { onDelete: "restrict" },
+  ),
+  executionAttemptId: uuid("execution_attempt_id").notNull().references(
+    () => playlistExecutionAttempts.id,
+    { onDelete: "restrict" },
+  ),
+  proofMode: varchar("proof_mode", { length: 24 }).notNull(),
+  requestedCount: integer("requested_count").notNull(),
+  selectedCount: integer("selected_count").notNull(),
+  reserveCount: integer("reserve_count").notNull(),
+  selectedAttestationHash: varchar("selected_attestation_hash", {
+    length: 64,
+  }).notNull(),
+  reserveAttestationHash: varchar("reserve_attestation_hash", {
+    length: 64,
+  }).notNull(),
+  attestationSetHash: varchar("attestation_set_hash", { length: 64 }).notNull()
+    .unique(),
+  outputHash: varchar("output_hash", { length: 64 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique("immutable_selection_set_attempt_hash_unique").on(
+    table.executionAttemptId,
+    table.attestationSetHash,
+  ),
+  index("immutable_selection_set_run_idx").on(
+    table.runId,
+    table.contractRevisionId,
+    table.createdAt,
+  ),
+  check(
+    "immutable_selection_set_mode_valid",
+    sql`${table.proofMode} IN ('shadow','native')`,
+  ),
+  check("immutable_selection_set_counts_valid", sql`
+    ${table.requestedCount} BETWEEN 1 AND 1000
+    AND ${table.selectedCount} BETWEEN 0 AND ${table.requestedCount}
+    AND ${table.reserveCount} >= 0
+  `),
+  check("immutable_selection_set_hashes_valid", sql`
+    ${table.selectedAttestationHash} ~ '^[0-9a-f]{64}$'
+    AND ${table.reserveAttestationHash} ~ '^[0-9a-f]{64}$'
+    AND ${table.attestationSetHash} ~ '^[0-9a-f]{64}$'
+    AND ${table.outputHash} ~ '^[0-9a-f]{64}$'
+  `),
+]);
+
+export const immutableSelectionSetItems = pgTable(
+  "immutable_selection_set_items",
+  {
+    selectionSetId: uuid("selection_set_id").notNull().references(
+      () => immutableSelectionSets.id,
+      { onDelete: "cascade" },
+    ),
+    role: varchar("role", { length: 16 }).notNull(),
+    position: integer("position").notNull(),
+    selectionQualificationId: uuid("selection_qualification_id").notNull()
+      .references(() => immutableSelectionQualifications.id, {
+        onDelete: "restrict",
+      }),
+    canonicalTrackIdentityId: uuid("canonical_track_identity_id").notNull()
+      .references(() => canonicalTrackIdentities.id, { onDelete: "restrict" }),
+    appleStableId: varchar("apple_stable_id", { length: 160 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.selectionSetId, table.role, table.position],
+      name: "immutable_selection_set_items_pkey",
+    }),
+    unique("immutable_selection_set_item_identity_unique").on(
+      table.selectionSetId,
+      table.canonicalTrackIdentityId,
+    ),
+    unique("immutable_selection_set_item_qualification_unique").on(
+      table.selectionSetId,
+      table.selectionQualificationId,
+    ),
+    check(
+      "immutable_selection_set_item_role_valid",
+      sql`${table.role} IN ('selected','reserve')`,
+    ),
+    check(
+      "immutable_selection_set_item_position_valid",
+      sql`${table.position} >= 0`,
+    ),
+  ],
+);
+
+export const selectionAttemptOutputAttestations = pgTable(
+  "selection_attempt_output_attestations",
+  {
+    executionAttemptId: uuid("execution_attempt_id").primaryKey().references(
+      () => playlistExecutionAttempts.id,
+      { onDelete: "restrict" },
+    ),
+    selectionSetId: uuid("selection_set_id").notNull().unique().references(
+      () => immutableSelectionSets.id,
+      { onDelete: "restrict" },
+    ),
+    outputHash: varchar("output_hash", { length: 64 }).notNull(),
+    attestationSetHash: varchar("attestation_set_hash", { length: 64 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("selection_attempt_output_hashes_valid", sql`
+      ${table.outputHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.attestationSetHash} ~ '^[0-9a-f]{64}$'
+    `),
+  ],
+);
+
+export const immutableQualificationRevocations = pgTable(
+  "immutable_qualification_revocations",
+  {
+    id: uuid("id").primaryKey(),
+    selectionQualificationId: uuid("selection_qualification_id").notNull()
+      .references(() => immutableSelectionQualifications.id, {
+        onDelete: "restrict",
+      }),
+    reasonCode: varchar("reason_code", { length: 160 }).notNull(),
+    policyVersion: varchar("policy_version", { length: 160 }).notNull(),
+    revocationHash: varchar("revocation_hash", { length: 64 }).notNull().unique(),
+    detailJson: jsonb("detail_json").notNull().default({}),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("immutable_qualification_revocation_qualification_idx").on(
+      table.selectionQualificationId,
+      table.revokedAt,
+    ),
+    check(
+      "immutable_qualification_revocation_hash_valid",
+      sql`${table.revocationHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
 
 export const playlistPublicationReconciliations = pgTable("playlist_publication_reconciliations", {
   id: uuid("id").primaryKey(),

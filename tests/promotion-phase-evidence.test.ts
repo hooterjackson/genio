@@ -78,11 +78,13 @@ function phasePayload(
     runtime: {
       releaseEnvironment: "production",
       deploymentPhase: phase,
-      databaseSchemaVersion: phase === "bridge" ? "16" : "19",
-      databaseCapabilityVersion: phase === "bridge" ? null : "2",
-      releaseManifestCanaryGuardsVersion: phase === "bridge" ? null : "1",
-      canonicalExecutionHardeningVersion: phase === "bridge" ? null : "1",
-      workerProtocol: "playlist-pipeline-v11",
+      databaseSchemaVersion: phase === "bridge" ? "19" : "20",
+      databaseCapabilityVersion: "2",
+      releaseManifestCanaryGuardsVersion: "1",
+      canonicalExecutionHardeningVersion: "1",
+      proofArchitectureVersion: phase === "bridge" ? null : "1",
+      proofArchitectureAuthority: phase === "bridge" ? null : "shadow",
+      workerProtocol: "playlist-pipeline-v12",
       configurationHash,
       apiConfigurationHash: serviceConfigurationHashes.apiHash,
       interactiveWorkerConfigurationHash:
@@ -158,12 +160,12 @@ function options(phase: "bridge" | "expand") {
     expectedImageDigest: imageDigest,
     expectedCandidateEvidenceHash: candidateEvidenceHash,
     expectedConfigurationHash: configurationHash,
-    expectedDatabaseSchemaVersion: phase === "bridge" ? "16" : "19",
-    expectedDatabaseCapabilityVersion: phase === "bridge" ? null : "2",
-    expectedReleaseManifestCanaryGuardsVersion:
-      phase === "bridge" ? null : "1",
-    expectedCanonicalExecutionHardeningVersion:
-      phase === "bridge" ? null : "1",
+    expectedDatabaseSchemaVersion: phase === "bridge" ? "19" : "20",
+    expectedDatabaseCapabilityVersion: "2",
+    expectedReleaseManifestCanaryGuardsVersion: "1",
+    expectedCanonicalExecutionHardeningVersion: "1",
+    expectedProofArchitectureVersion: phase === "bridge" ? null : "1",
+    expectedProofArchitectureAuthority: phase === "bridge" ? null : "shadow",
     expectedDatabaseIdentityHash:
       phase === "bridge" ? null : databaseIdentityHash,
   } as const;
@@ -181,10 +183,12 @@ describe("signed Railway promotion phase evidence", () => {
       phase: "bridge",
       payloadHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
       configurationHash,
-      databaseSchemaVersion: "16",
-      databaseCapabilityVersion: null,
-      releaseManifestCanaryGuardsVersion: null,
-      canonicalExecutionHardeningVersion: null,
+      databaseSchemaVersion: "19",
+      databaseCapabilityVersion: "2",
+      releaseManifestCanaryGuardsVersion: "1",
+      canonicalExecutionHardeningVersion: "1",
+      proofArchitectureVersion: null,
+      proofArchitectureAuthority: null,
       activationRollout: null,
     });
     expect(() => verifyPromotionPhaseEvidence(
@@ -347,7 +351,7 @@ describe("signed Railway promotion phase evidence", () => {
 
   test("rejects tampering, stale evidence, and unknown fields", () => {
     const tampered = signedPhase("bridge");
-    tampered.payload.runtime.databaseSchemaVersion = "17";
+    tampered.payload.candidate.candidateEvidenceHash = "9".repeat(64);
     expect(() => verifyPromotionPhaseEvidence(
       tampered,
       keys.publicKey,

@@ -117,8 +117,11 @@ import {
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION,
+  PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING,
+  PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING,
   canonicalContractActivationConfigured,
   canonicalContractActivationReady,
+  releaseConfigurationDiagnosticCodes,
   releaseDatabaseReadinessReady,
   releaseExecutionConfigured,
 } from "./release-deployment-phase.ts";
@@ -313,6 +316,8 @@ async function customGuidanceTrackCountAuthorityForRequest(
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
     observedCanonicalExecutorReleaseIdentityFencingVersion,
+    observedProofArchitectureVersion,
+    observedProofArchitectureAuthority,
     executorReleaseIdentityFenceSupported,
   ] = await Promise.all([
     repository.getSchemaVersion(),
@@ -323,6 +328,8 @@ async function customGuidanceTrackCountAuthorityForRequest(
     repository.getSetting(
       CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
     ),
+    repository.getSetting(PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING),
+    repository.getSetting(PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING),
     repository.executorReleaseIdentityFenceAvailable(),
   ]);
   return canonicalContractActivationReady({
@@ -331,6 +338,8 @@ async function customGuidanceTrackCountAuthorityForRequest(
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
     observedCanonicalExecutorReleaseIdentityFencingVersion,
+    observedProofArchitectureVersion,
+    observedProofArchitectureAuthority,
     executorReleaseIdentityFenceSupported,
   })
     ? AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1
@@ -511,6 +520,16 @@ app.get("/health/ready", async (_request, reply) => {
       CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
     )
     : null;
+  const proofArchitectureVersion = ok
+    ? await repository.getSetting(
+      PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING,
+    )
+    : null;
+  const proofArchitectureAuthority = ok
+    ? await repository.getSetting(
+      PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING,
+    )
+    : null;
   const executorReleaseIdentityFenceSupported = ok
     ? await repository.executorReleaseIdentityFenceAvailable()
     : false;
@@ -522,8 +541,11 @@ app.get("/health/ready", async (_request, reply) => {
       canonicalExecutionHardeningVersion,
     observedCanonicalExecutorReleaseIdentityFencingVersion:
       canonicalExecutorReleaseIdentityFencingVersion,
+    observedProofArchitectureVersion: proofArchitectureVersion,
+    observedProofArchitectureAuthority: proofArchitectureAuthority,
     executorReleaseIdentityFenceSupported,
   });
+  const diagnosticCodes = releaseConfigurationDiagnosticCodes(process.env);
   const schemaCompatible = ok
     && isDatabaseSchemaVersionCompatible(schemaVersion)
     && deploymentDatabaseReady
@@ -537,6 +559,9 @@ app.get("/health/ready", async (_request, reply) => {
     releaseManifestCanaryGuardsVersion,
     canonicalExecutionHardeningVersion,
     canonicalExecutorReleaseIdentityFencingVersion,
+    proofArchitectureVersion,
+    proofArchitectureAuthority,
+    diagnosticCodes,
     schemaSupport: DATABASE_SCHEMA_SUPPORT,
     capabilityPepper,
   });
@@ -547,6 +572,9 @@ app.get("/health/ready", async (_request, reply) => {
     releaseManifestCanaryGuardsVersion,
     canonicalExecutionHardeningVersion,
     canonicalExecutorReleaseIdentityFencingVersion,
+    proofArchitectureVersion,
+    proofArchitectureAuthority,
+    diagnosticCodes,
     schemaSupport: DATABASE_SCHEMA_SUPPORT,
     capabilityPepper,
   };
@@ -578,6 +606,10 @@ app.get("/health/system", async (_request, reply) => {
         canonicalExecutionHardeningVersion,
       observedCanonicalExecutorReleaseIdentityFencingVersion:
         canonicalExecutorReleaseIdentityFencingVersion,
+      observedProofArchitectureVersion:
+        health.database.proofArchitectureVersion ?? null,
+      observedProofArchitectureAuthority:
+        health.database.proofArchitectureAuthority ?? null,
       executorReleaseIdentityFenceSupported:
         health.database.executorReleaseIdentityFenceSupported === true,
     });
@@ -593,14 +625,30 @@ app.get("/health/system", async (_request, reply) => {
       && capabilityPepper.ready
       && workerLaneReady(health, "interactive");
     const activationReady = ok && workerLaneReady(health, "deep");
+    const diagnosticCodes = [
+      ...releaseConfigurationDiagnosticCodes(process.env),
+      ...(["interactive", "deep"] as const).flatMap((lane) => {
+        const hashes = health.workerLanes[lane]
+          .eligibleSemanticExecutionConfigurationHashes ?? [];
+        return hashes.length > 0
+          && !hashes.includes(api.semanticExecutionConfigurationHash)
+          ? [`semantic_execution_configuration_hash_mismatch:${lane}`]
+          : [];
+      }),
+    ].sort();
     return reply.code(ok ? 200 : 503).send({
       ok,
       activationReady,
+      diagnosticCodes,
       database: schemaCompatible ? "ready" : "schema_mismatch",
       schemaVersion,
       releaseManifestCanaryGuardsVersion,
       canonicalExecutionHardeningVersion,
       canonicalExecutorReleaseIdentityFencingVersion,
+      proofArchitectureVersion:
+        health.database.proofArchitectureVersion ?? null,
+      proofArchitectureAuthority:
+        health.database.proofArchitectureAuthority ?? null,
       executorFencing: health.executorFencing,
       api,
       publicRollout: publicRollout
@@ -702,6 +750,10 @@ app.get("/api/v1/system/health", async () => {
       health.database.canonicalExecutionHardeningVersion ?? null,
     observedCanonicalExecutorReleaseIdentityFencingVersion:
       health.database.canonicalExecutorReleaseIdentityFencingVersion ?? null,
+    observedProofArchitectureVersion:
+      health.database.proofArchitectureVersion ?? null,
+    observedProofArchitectureAuthority:
+      health.database.proofArchitectureAuthority ?? null,
     executorReleaseIdentityFenceSupported:
       health.database.executorReleaseIdentityFenceSupported === true,
   });
@@ -722,6 +774,10 @@ app.get("/api/v1/system/health", async () => {
     canonicalExecutionHardeningVersion:
       health.database.canonicalExecutionHardeningVersion ?? null,
     canonicalExecutorReleaseIdentityFencingVersion,
+    proofArchitectureVersion:
+      health.database.proofArchitectureVersion ?? null,
+    proofArchitectureAuthority:
+      health.database.proofArchitectureAuthority ?? null,
     executorFencing: health.executorFencing,
     publicRollout: publicRollout
       ? {
@@ -907,6 +963,8 @@ app.post<{
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
     observedCanonicalExecutorReleaseIdentityFencingVersion,
+    observedProofArchitectureVersion,
+    observedProofArchitectureAuthority,
     executorReleaseIdentityFenceSupported,
   ] =
     canonicalActivationConfigured || expandedTrackCountRequested
@@ -919,15 +977,19 @@ app.post<{
         repository.getSetting(
           CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
         ),
+        repository.getSetting(PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING),
+        repository.getSetting(PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING),
         repository.executorReleaseIdentityFenceAvailable(),
       ])
-      : [null, null, null, null, false];
+      : [null, null, null, null, null, null, false];
   const canonicalActivationReady = canonicalContractActivationReady({
     environment: process.env,
     observedDatabaseSchemaVersion,
     observedDatabaseCapabilityVersion,
     observedCanonicalExecutionHardeningVersion,
     observedCanonicalExecutorReleaseIdentityFencingVersion,
+    observedProofArchitectureVersion,
+    observedProofArchitectureAuthority,
     executorReleaseIdentityFenceSupported,
   });
   if (
@@ -937,7 +999,7 @@ app.post<{
   ) {
     throw new HttpError(
       503,
-      "Canonical playlist contracts are paused until the schema-19 activation check passes",
+      "Canonical playlist contracts are paused until the schema-20 proof activation check passes",
       "canonical_contract_activation_not_ready",
     );
   }
@@ -949,7 +1011,7 @@ app.post<{
   if (trackCountAdmission.status === "activation_required") {
     throw new HttpError(
       503,
-      "Owner playlist sizes above 300 are paused until the schema-19 activation check passes",
+      "Owner playlist sizes above 300 are paused until the schema-20 proof activation check passes",
       "expanded_track_count_activation_not_ready",
     );
   }
@@ -1324,6 +1386,8 @@ app.post<{
       observedDatabaseCapabilityVersion,
       observedCanonicalExecutionHardeningVersion,
       observedCanonicalExecutorReleaseIdentityFencingVersion,
+      observedProofArchitectureVersion,
+      observedProofArchitectureAuthority,
       executorReleaseIdentityFenceSupported,
     ] =
       await Promise.all([
@@ -1335,6 +1399,8 @@ app.post<{
         repository.getSetting(
           CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
         ),
+        repository.getSetting(PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING),
+        repository.getSetting(PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING),
         repository.executorReleaseIdentityFenceAvailable(),
       ]);
     const trackCountAdmission = playlistTrackCountAdmission({
@@ -1346,6 +1412,8 @@ app.post<{
         observedDatabaseCapabilityVersion,
         observedCanonicalExecutionHardeningVersion,
         observedCanonicalExecutorReleaseIdentityFencingVersion,
+        observedProofArchitectureVersion,
+        observedProofArchitectureAuthority,
         executorReleaseIdentityFenceSupported,
       }),
     });
@@ -1354,7 +1422,7 @@ app.post<{
       || interpreted.briefContractVersion !== 3) {
       throw new HttpError(
         503,
-        "Owner playlist sizes above 300 are paused until the schema-19 activation check passes",
+        "Owner playlist sizes above 300 are paused until the schema-20 proof activation check passes",
         "expanded_track_count_activation_not_ready",
       );
     }
@@ -2113,6 +2181,10 @@ app.get("/api/v1/owner/status", async (request) => {
       health.database.canonicalExecutionHardeningVersion ?? null,
     observedCanonicalExecutorReleaseIdentityFencingVersion:
       health.database.canonicalExecutorReleaseIdentityFencingVersion ?? null,
+    observedProofArchitectureVersion:
+      health.database.proofArchitectureVersion ?? null,
+    observedProofArchitectureAuthority:
+      health.database.proofArchitectureAuthority ?? null,
     executorReleaseIdentityFenceSupported:
       health.database.executorReleaseIdentityFenceSupported === true,
   });
@@ -2773,6 +2845,15 @@ app.setErrorHandler((error, request, reply) => {
 
 const port = Number(process.env.PORT ?? 8788);
 await app.listen({ port, host: "::" });
+const startupDiagnosticCodes = releaseConfigurationDiagnosticCodes(
+  process.env,
+);
+if (startupDiagnosticCodes.length > 0) {
+  app.log.warn(
+    { diagnosticCodes: startupDiagnosticCodes },
+    "release configuration is not ready",
+  );
+}
 
 async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, "shutting down");

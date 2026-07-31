@@ -47,6 +47,11 @@ import { resolveBriefInterpretationModel } from "./brief-model.ts";
 import {
   musicBrainzContactConfigurationLabel,
 } from "./musicbrainz-contact.ts";
+import {
+  proofArchitectureMode,
+  SCHEMA_20_PROOF_ARCHITECTURE_VERSION,
+  type ProofArchitectureMode,
+} from "./schema20-proof-architecture.ts";
 
 export interface RuntimeReleaseContract {
   pipelineVersion: "corpus_first_v3";
@@ -60,6 +65,8 @@ export interface RuntimeReleaseContract {
   stagingBootstrapConfigured: boolean;
   executionEnabled: boolean;
   canonicalActivationConfigured: boolean;
+  proofArchitectureMode: ProofArchitectureMode;
+  proofArchitectureVersion: typeof SCHEMA_20_PROOF_ARCHITECTURE_VERSION;
   assignmentEnabled: boolean;
   ownerCanaryEnabled: boolean;
   productionEvidenceApproved: boolean;
@@ -171,6 +178,7 @@ export const SEMANTIC_EXECUTION_CONFIGURATION_ENV_KEYS_V1 = Object.freeze([
   "PIPELINE_V3_OWNER_CANARY_GROUPS",
   "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
   "PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED",
+  "PIPELINE_V3_PROOF_ARCHITECTURE_MODE",
   "PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION",
   "RESEARCH_MAX_GAP_PASSES",
   "RESEARCH_MAX_SEGMENTS_PER_PASS",
@@ -232,6 +240,7 @@ export const SEMANTIC_EXECUTION_CONFIGURATION_REVIEWED_EXCLUSIONS_V1 =
       "RELEASE_ENVIRONMENT",
       "RELEASE_EXECUTION_ENABLED",
       "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+      "RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION",
       "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
       "RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION",
       "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
@@ -549,6 +558,7 @@ export const API_RELEASE_CONFIGURATION_ENV_KEYS = Object.freeze([
   "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
   "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
   "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+  "RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION",
   "RELEASE_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED",
   "RELEASE_EXECUTION_ENABLED",
   "RELEASE_SECRET_VERSIONS_HASH",
@@ -625,6 +635,7 @@ export const API_RELEASE_CONFIGURATION_ENV_KEYS = Object.freeze([
   "PIPELINE_V3_FACTUAL_PERCENT",
   "PIPELINE_V3_EXHAUSTIVE_PERCENT",
   "PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION",
+  "PIPELINE_V3_PROOF_ARCHITECTURE_MODE",
   "PIPELINE_V3_BASELINE_MODEL_ID",
   "PIPELINE_V3_ESCALATION_MODEL_ID",
   "PIPELINE_V3_MODEL_CATALOG_VALIDATED_AT",
@@ -712,6 +723,8 @@ export function runtimeReleaseContract(
     stagingBootstrapConfigured: stagingBootstrapConfigured(environment),
     executionEnabled: releaseExecutionConfigured(environment),
     canonicalActivationConfigured,
+    proofArchitectureMode: proofArchitectureMode(environment),
+    proofArchitectureVersion: SCHEMA_20_PROOF_ARCHITECTURE_VERSION,
     assignmentEnabled: environment.PIPELINE_V3_ASSIGNMENT_ENABLED === "true",
     ownerCanaryEnabled: environment.PIPELINE_V3_OWNER_CANARY === "true",
     productionEvidenceApproved: environment.PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED === "true",

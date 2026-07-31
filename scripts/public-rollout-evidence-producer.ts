@@ -475,14 +475,16 @@ export function summarizePublicRolloutObservation(
     || system.database !== "ready"
     || system.releaseManifestCanaryGuardsVersion !== "1"
     || system.canonicalExecutionHardeningVersion !== "1"
+    || system.proofArchitectureVersion !== "1"
+    || system.proofArchitectureAuthority !== "native"
     || system.paused !== false
-    || system.workerProtocol.expected !== "playlist-pipeline-v11"
-    || system.workerProtocol.actual !== "playlist-pipeline-v11"
+    || system.workerProtocol.expected !== "playlist-pipeline-v12"
+    || system.workerProtocol.actual !== "playlist-pipeline-v12"
     || interactive.status !== "healthy"
-    || interactive.protocolVersion !== "playlist-pipeline-v11"
+    || interactive.protocolVersion !== "playlist-pipeline-v12"
     || interactive.lastSeenAt === null
     || deep.status !== "healthy"
-    || deep.protocolVersion !== "playlist-pipeline-v11"
+    || deep.protocolVersion !== "playlist-pipeline-v12"
     || deep.lastSeenAt === null
     || publicRollout.databaseAuthorized !== true
     || publicRollout.active !== (runtimeRolloutEvidenceHash !== null)
@@ -513,19 +515,21 @@ export function summarizePublicRolloutObservation(
     databaseCapabilityVersion: "2",
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
+    proofArchitectureVersion: "1",
+    proofArchitectureAuthority: "native",
     paused: false,
-    workerProtocolExpected: "playlist-pipeline-v11",
-    workerProtocolActual: "playlist-pipeline-v11",
+    workerProtocolExpected: "playlist-pipeline-v12",
+    workerProtocolActual: "playlist-pipeline-v12",
     interactiveWorker: {
       ...interactive,
       status: "healthy",
-      protocolVersion: "playlist-pipeline-v11",
+      protocolVersion: "playlist-pipeline-v12",
       lastSeenAt: interactive.lastSeenAt,
     },
     deepWorker: {
       ...deep,
       status: "healthy",
-      protocolVersion: "playlist-pipeline-v11",
+      protocolVersion: "playlist-pipeline-v12",
       lastSeenAt: deep.lastSeenAt,
     },
   };
@@ -615,11 +619,13 @@ export function buildPublicRolloutPayload(input: {
         input.promotionPayload.environmentSnapshots.production!
           .sitesSourceRevision,
       sitesCandidateMatched: false,
-      databaseSchemaVersion: "19",
+      databaseSchemaVersion: "20",
       databaseCapabilityVersion: "2",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
-      workerProtocol: "playlist-pipeline-v11",
+      proofArchitectureVersion: "1",
+      proofArchitectureAuthority: "native",
+      workerProtocol: "playlist-pipeline-v12",
     },
     transition: {
       operation,

@@ -12,6 +12,8 @@ const RUNTIME_EVIDENCE_KEYS = [
   "deploymentPhase",
   "expectedDatabaseSchemaVersion",
   "canonicalActivationConfigured",
+  "proofArchitectureMode",
+  "proofArchitectureVersion",
   "assignmentEnabled",
   "ownerCanaryEnabled",
   "productionEvidenceApproved",
@@ -48,12 +50,14 @@ const RUNTIME_EVIDENCE_KEYS = [
 const REQUIRED_RUNTIME_RELEASE = Object.freeze({
   releaseEnvironment: "production",
   deploymentPhase: "activate",
-  expectedDatabaseSchemaVersion: "19",
+  expectedDatabaseSchemaVersion: "20",
   canonicalActivationConfigured: "true",
-  schemaVersion: "19",
-  schemaMaximum: "19",
+  proofArchitectureMode: "native",
+  proofArchitectureVersion: "1",
+  schemaVersion: "20",
+  schemaMaximum: "20",
   schemaPreferred: "19",
-  workerProtocol: "playlist-pipeline-v11",
+  workerProtocol: "playlist-pipeline-v12",
   queryPlanSchemaVersion: "6",
   briefContractVersion: "3",
 });
@@ -115,6 +119,8 @@ export interface ReleaseConvergenceObservation {
     releaseManifestCanaryGuardsVersion: string | null;
     canonicalExecutionHardeningVersion: string | null;
     canonicalExecutorReleaseIdentityFencingVersion: string | null;
+    proofArchitectureVersion: string | null;
+    proofArchitectureAuthority: string | null;
     executorFencing: {
       ready: boolean;
       incompleteJobs: number;
@@ -489,6 +495,14 @@ export function releaseConvergenceObservation(input: {
         system.canonicalExecutorReleaseIdentityFencingVersion,
         40,
       ),
+      proofArchitectureVersion: safeText(
+        system.proofArchitectureVersion,
+        40,
+      ),
+      proofArchitectureAuthority: safeText(
+        system.proofArchitectureAuthority,
+        40,
+      ),
       executorFencing: {
         ready: executorFencing.ready === true,
         incompleteJobs: count(
@@ -717,6 +731,18 @@ export function buildReleaseConvergenceEvidence(input: {
         `${label}:canonical_executor_release_identity_fencing:${
           observation.system
             .canonicalExecutorReleaseIdentityFencingVersion ?? "missing"
+        }`,
+      );
+    }
+    if (
+      observation.system.proofArchitectureVersion !== "1"
+      || observation.system.proofArchitectureAuthority !== "native"
+    ) {
+      violations.push(
+        `${label}:proof_architecture:${
+          observation.system.proofArchitectureVersion ?? "missing"
+        }/${
+          observation.system.proofArchitectureAuthority ?? "missing"
         }`,
       );
     }

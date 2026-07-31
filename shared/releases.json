@@ -2,6 +2,21 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.5.0",
+      "releasedAt": "2026-07-31",
+      "title": "Immutable selection proof architecture",
+      "notes": [
+        "Adds schema-20 canonical track identities that compare the complete provider, storefront, recording-family, policy, and Apple stable-ID tuple instead of trusting a hash alone.",
+        "Freezes immutable qualification observations, selection qualifications, selected and reserve sets, ordered set items, evidence snapshots, and append-only revocations.",
+        "Binds every native manifest revision to an exact selection set and attestation hash so publication never queries a mutable latest qualification.",
+        "Requires partial-publication consent to bind the exact contract, selection set, manifest payload, attestation, counts, outcome, and unexpired authorization.",
+        "Adds a receipt-bound legacy backfill gate, honest legacy publication receipts, protocol-12 worker fencing, and an explicit native-authority activation preflight.",
+        "Separates eligible submissions from assigned candidate runs at every public rollout stage and retains the route-wide hard switch during migration and owner acceptance.",
+        "Exposes stable startup diagnostics for unconfigured release phases and cross-lane semantic configuration mismatches without disclosing configuration values.",
+        "Keeps database migration outside Railway pre-deploy hooks and builds one exact-SHA GHCR image only after offline, database, browser, and stitched-system gates pass."
+      ]
+    },
+    {
       "version": "2.4.14",
       "releasedAt": "2026-07-31",
       "title": "Schema-6 manifest-canary evidence compatibility",

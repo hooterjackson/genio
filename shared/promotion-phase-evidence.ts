@@ -16,7 +16,7 @@ export const PROMOTION_PHASE_EVIDENCE_SCHEMA_VERSION =
   "genio-promotion-phase-evidence/v2";
 export const SIGNED_PROMOTION_PHASE_EVIDENCE_SCHEMA_VERSION =
   "genio-signed-promotion-phase-evidence/v2";
-export const REQUIRED_PROMOTION_WORKER_PROTOCOL = "playlist-pipeline-v11";
+export const REQUIRED_PROMOTION_WORKER_PROTOCOL = "playlist-pipeline-v12";
 export const ACTIVATION_COHORT_INVENTORY_STATEMENTS_V1 = [
   "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
   [
@@ -89,6 +89,8 @@ export interface VerifiedPromotionPhaseEvidence {
   databaseCapabilityVersion: string | null;
   releaseManifestCanaryGuardsVersion: string | null;
   canonicalExecutionHardeningVersion: string | null;
+  proofArchitectureVersion: string | null;
+  proofArchitectureAuthority: string | null;
   activationRollout: ActivationRolloutConfiguration | null;
 }
 
@@ -186,6 +188,8 @@ function validateRuntime(value: unknown, phase: PromotionObservedPhase): JsonRec
     "databaseCapabilityVersion",
     "releaseManifestCanaryGuardsVersion",
     "canonicalExecutionHardeningVersion",
+    "proofArchitectureVersion",
+    "proofArchitectureAuthority",
     "workerProtocol",
     "configurationHash",
     "apiConfigurationHash",
@@ -197,18 +201,34 @@ function validateRuntime(value: unknown, phase: PromotionObservedPhase): JsonRec
   }
   if (
     typeof runtime.databaseSchemaVersion !== "string"
-    || !/^(?:1[3-9])$/u.test(runtime.databaseSchemaVersion)
+    || !/^(?:1[3-9]|20)$/u.test(runtime.databaseSchemaVersion)
   ) {
     throw new Error("promotion phase runtime.databaseSchemaVersion is invalid");
   }
-  const schema19 = runtime.databaseSchemaVersion === "19";
+  const canonicalSchema = Number(runtime.databaseSchemaVersion) >= 19;
   if (
-    runtime.databaseCapabilityVersion !== (schema19 ? "2" : null)
-    || runtime.releaseManifestCanaryGuardsVersion !== (schema19 ? "1" : null)
-    || runtime.canonicalExecutionHardeningVersion !== (schema19 ? "1" : null)
+    runtime.databaseCapabilityVersion !== (canonicalSchema ? "2" : null)
+    || runtime.releaseManifestCanaryGuardsVersion !== (canonicalSchema ? "1" : null)
+    || runtime.canonicalExecutionHardeningVersion !== (canonicalSchema ? "1" : null)
   ) {
     throw new Error(
       "promotion phase runtime does not bind composite capability 2 and both authoritative marker-1 values",
+    );
+  }
+  if (
+    (phase === "bridge" && (
+      runtime.databaseSchemaVersion !== "19"
+      || runtime.proofArchitectureVersion !== null
+      || runtime.proofArchitectureAuthority !== null
+    ))
+    || (phase === "expand" && (
+      runtime.databaseSchemaVersion !== "20"
+      || runtime.proofArchitectureVersion !== "1"
+      || runtime.proofArchitectureAuthority !== "shadow"
+    ))
+  ) {
+    throw new Error(
+      "promotion phase runtime does not bind schema-19 bridge or schema-20 shadow proof authority",
     );
   }
   if (runtime.workerProtocol !== REQUIRED_PROMOTION_WORKER_PROTOCOL) {
@@ -564,6 +584,8 @@ export function verifyPromotionPhaseEvidence(
     expectedDatabaseCapabilityVersion: string | null;
     expectedReleaseManifestCanaryGuardsVersion: string | null;
     expectedCanonicalExecutionHardeningVersion: string | null;
+    expectedProofArchitectureVersion: string | null;
+    expectedProofArchitectureAuthority: string | null;
     expectedDatabaseIdentityHash: string | null;
     now?: string;
   },
@@ -614,6 +636,10 @@ export function verifyPromotionPhaseEvidence(
       !== options.expectedReleaseManifestCanaryGuardsVersion
     || runtime.canonicalExecutionHardeningVersion
       !== options.expectedCanonicalExecutionHardeningVersion
+    || runtime.proofArchitectureVersion
+      !== options.expectedProofArchitectureVersion
+    || runtime.proofArchitectureAuthority
+      !== options.expectedProofArchitectureAuthority
   ) {
     throw new Error(
       "promotion phase evidence does not bind the expected configuration, schema, composite capability, and authoritative markers",
@@ -655,6 +681,14 @@ export function verifyPromotionPhaseEvidence(
       runtime.canonicalExecutionHardeningVersion === null
         ? null
         : String(runtime.canonicalExecutionHardeningVersion),
+    proofArchitectureVersion:
+      runtime.proofArchitectureVersion === null
+        ? null
+        : String(runtime.proofArchitectureVersion),
+    proofArchitectureAuthority:
+      runtime.proofArchitectureAuthority === null
+        ? null
+        : String(runtime.proofArchitectureAuthority),
     activationRollout,
   };
 }

@@ -65,11 +65,14 @@ const releaseRuntime = {
   semanticExecutionConfigurationHash: "f".repeat(64),
   releaseEnvironment: "production",
   deploymentPhase: "activate",
-  databaseSchemaVersion: "19",
+  databaseSchemaVersion: "20",
   databaseCapabilityVersion: "2",
   releaseManifestCanaryGuardsVersion: "1",
   canonicalExecutionHardeningVersion: "1",
-  workerProtocol: "playlist-pipeline-v11",
+  proofArchitectureMode: "native",
+  proofArchitectureVersion: "1",
+  proofArchitectureAuthority: "native",
+  workerProtocol: "playlist-pipeline-v12",
   briefContractVersion: "3",
   queryPlanSchemaVersion: "6",
   modelIds: {
@@ -121,6 +124,8 @@ function configuration(
     RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
     RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
     RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+    RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: "1",
+    PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
     PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     GUIDANCE_CONTRACT_V3_ENABLED: "false",
     GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
@@ -165,7 +170,7 @@ function payload(input: {
     observedAt: string,
   ) => ({
     status: "healthy",
-    protocolVersion: "playlist-pipeline-v11",
+    protocolVersion: "playlist-pipeline-v12",
     compatibleCapacity: 1,
     eligibleWorkerCount: 1,
     eligibleIdentityCount: 1,
@@ -189,9 +194,11 @@ function payload(input: {
     databaseCapabilityVersion: "2",
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
+    proofArchitectureVersion: "1",
+    proofArchitectureAuthority: "native",
     paused: false,
-    workerProtocolExpected: "playlist-pipeline-v11",
-    workerProtocolActual: "playlist-pipeline-v11",
+    workerProtocolExpected: "playlist-pipeline-v12",
+    workerProtocolActual: "playlist-pipeline-v12",
     interactiveWorker: lane(
       runtimeConfiguration.interactiveWorkerHash,
       observedAt,
@@ -231,11 +238,13 @@ function payload(input: {
       sitesVersion: priorSitesVersion,
       sitesRevision: priorSitesRevision,
       sitesCandidateMatched: false,
-      databaseSchemaVersion: "19",
+      databaseSchemaVersion: "20",
       databaseCapabilityVersion: "2",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
-      workerProtocol: "playlist-pipeline-v11",
+      proofArchitectureVersion: "1",
+      proofArchitectureAuthority: "native",
+      workerProtocol: "playlist-pipeline-v12",
     },
     transition: {
       operation,
@@ -273,6 +282,8 @@ function payload(input: {
               intentCanary!.payload.stageMetrics.windowStartedAt,
             windowCompletedAt:
               intentCanary!.payload.stageMetrics.windowCompletedAt,
+            eligibleSubmissionCount:
+              intentCanary!.payload.stageMetrics.eligibleSubmissionCount,
             candidateAssignedCount:
               intentCanary!.payload.stageMetrics.candidateAssignedCount,
             exactCompletionCount:
@@ -315,20 +326,27 @@ function intentCanaryEnvelope(
   const candidateAssignedCount = fromPercent === "0"
     ? 0
     : fromPercent === "1"
-      ? 20
+      ? 5
       : fromPercent === "10"
-        ? 100
-        : 500;
+        ? 20
+        : 100;
   const controlAssignedCount = fromPercent === "0"
     ? 0
     : fromPercent === "1"
-      ? 1_980
+      ? 495
       : fromPercent === "10"
-        ? 900
-        : 500;
+        ? 180
+        : 100;
+  const stageWindowMs = fromPercent === "0"
+    ? 60_000
+    : fromPercent === "1"
+      ? 60 * 60_000
+      : fromPercent === "10"
+        ? 2 * 60 * 60_000
+        : 6 * 60 * 60_000;
   const stageMetrics = {
     windowStartedAt: new Date(
-      Date.parse(canaryGeneratedAt) - 120_000,
+      Date.parse(canaryGeneratedAt) - 1_000 - stageWindowMs,
     ).toISOString(),
     windowCompletedAt: new Date(
       Date.parse(canaryGeneratedAt) - 1_000,

@@ -3400,15 +3400,44 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
   }, 30_000);
 
   test("locks a partial manifest without any Apple write until capability-bound consent", async () => {
-    const context = await createLeasedRun(50, "french-jazz-partial");
-    const result = retrievalResult({
+    const priorMode = process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE;
+    process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = "native";
+    await pool.query(
+      `UPDATE settings SET value='native',updated_at=now()
+       WHERE key='proof_architecture_authority'`,
+    );
+    try {
+    const context = await createLeasedRun(
+      50,
+      "french-jazz-partial",
+      undefined,
+      "Create 50 rap music and grime recordings",
+      "catalog_membership_with_evidence_meta",
+    );
+    const partialBase = withCanonicalCatalogMembershipAndEvidenceMeta(retrievalResult({
       runId: context.runId,
       target: 50,
       selectedCount: 23,
       status: "partial_ready",
       prefix: "partial-23",
-      predicateIds: positivePredicateIds(context.selectionPlan),
-    });
+      predicateIds: ["bridge:membership:hip-hop-or-grime"],
+    }));
+    const selected = Array.from(
+      { length: partialBase.selected.length },
+      (_, index) => partialBase.selected[
+        (index * 11) % partialBase.selected.length
+      ]!,
+    ).map((track, index) => ({
+      ...track,
+      cacheOrigin: "live" as const,
+      discoveryDependencyIds: ["hosted_web"] as const,
+      provenanceRoots: [`partial-live-frontier-${index}`],
+    }));
+    const result: RetrievalResultV3 = {
+      ...partialBase,
+      selected,
+      qualifiedPool: selected,
+    };
     const persisted = await repository.persistPipelineV3RetrievalResult({
       runId: context.runId,
       queryPlan: context.queryPlan,
@@ -3468,6 +3497,20 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     });
     expect(confirmed).toMatchObject({ id: persisted.manifestId, tracks: expect.any(Array) });
     expect(confirmed.tracks).toHaveLength(23);
+    expect((await pool.query<{
+      selection_set_id: string | null;
+      manifest_payload_hash: string | null;
+      attestation_set_hash: string | null;
+    }>(
+      `SELECT selection_set_id,manifest_payload_hash,attestation_set_hash
+       FROM partial_publication_decisions
+       WHERE run_id=$1 AND manifest_revision_id=$2`,
+      [context.runId, persisted.manifestRevisionId],
+    )).rows[0]).toMatchObject({
+      selection_set_id: expect.any(String),
+      manifest_payload_hash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      attestation_set_hash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    });
     expect((await pool.query<{ count: number }>(
       "SELECT count(*)::int count FROM job_queue WHERE run_id=$1 AND kind='publication'",
       [context.runId],
@@ -3486,6 +3529,17 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       "SELECT count(*)::int count FROM job_queue WHERE run_id=$1 AND kind='publication'",
       [context.runId],
     )).rows[0]?.count).toBe(1);
+    } finally {
+      await pool.query(
+        `UPDATE settings SET value='shadow',updated_at=now()
+         WHERE key='proof_architecture_authority'`,
+      );
+      if (priorMode === undefined) {
+        delete process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE;
+      } else {
+        process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = priorMode;
+      }
+    }
   }, 60_000);
 
   test("completes a zero-compatible result without a manifest or Apple write", async () => {
@@ -4578,6 +4632,204 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       selectedCount: 1,
     })).rejects.toMatchObject({ code: "pipeline_v3_evidence_attestation_missing" });
   }, 30_000);
+
+  test("shadow-writes one immutable schema-20 selection proof and replays as a no-op", async () => {
+    const priorMode = process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE;
+    process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = "shadow";
+    try {
+      const context = await createLeasedRun(
+        1,
+        "schema-20-shadow-proof",
+        undefined,
+        undefined,
+        "empty",
+      );
+      const result = withCanonicalCatalogProof(retrievalResult({
+        runId: context.runId,
+        target: 1,
+        selectedCount: 1,
+        reserveCount: 1,
+        status: "exact_ready",
+        prefix: "schema-20-shadow-proof",
+      }));
+      const first = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result,
+        fence: context.fence,
+      });
+      const replay = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result,
+        fence: context.fence,
+      });
+      expect(replay).toEqual(first);
+
+      const proof = (await pool.query<{
+        selection_set_id: string;
+        attestation_set_hash: string;
+        proof_kind: string;
+        requested_count: number;
+        selected_count: number;
+        reserve_count: number;
+        set_items: number;
+        qualifications: number;
+        identities: number;
+        output_attestations: number;
+      }>(
+        `SELECT revision.selection_set_id,revision.attestation_set_hash,
+                revision.proof_kind,
+                selection.requested_count,selection.selected_count,
+                selection.reserve_count,
+                (SELECT count(*)::int
+                 FROM immutable_selection_set_items item
+                 WHERE item.selection_set_id=selection.id) set_items,
+                (SELECT count(*)::int
+                 FROM immutable_selection_qualifications qualification
+                 WHERE qualification.execution_attempt_id=
+                   selection.execution_attempt_id) qualifications,
+                (SELECT count(*)::int
+                 FROM canonical_track_identities identity
+                 JOIN immutable_selection_set_items item
+                   ON item.canonical_track_identity_id=identity.id
+                 WHERE item.selection_set_id=selection.id) identities,
+                (SELECT count(*)::int
+                 FROM selection_attempt_output_attestations output
+                 WHERE output.execution_attempt_id=
+                   selection.execution_attempt_id) output_attestations
+         FROM manifest_revisions revision
+         JOIN immutable_selection_sets selection
+           ON selection.id=revision.selection_set_id
+         WHERE revision.id=$1`,
+        [first.manifestRevisionId],
+      )).rows[0]!;
+      expect(proof).toMatchObject({
+        selection_set_id: expect.any(String),
+        attestation_set_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        proof_kind: "shadow",
+        requested_count: 1,
+        selected_count: 1,
+        reserve_count: 1,
+        set_items: 2,
+        qualifications: 2,
+        identities: 2,
+        output_attestations: 1,
+      });
+      await expect(pool.query(
+        `UPDATE canonical_track_identities SET apple_stable_id='tampered'
+         WHERE id=$1`,
+        [(await pool.query<{ id: string }>(
+          `SELECT canonical_track_identity_id id
+           FROM immutable_selection_set_items
+           WHERE selection_set_id=$1
+           ORDER BY role,position LIMIT 1`,
+          [proof.selection_set_id],
+        )).rows[0]!.id],
+      )).rejects.toThrow(/immutable/u);
+    } finally {
+      if (priorMode === undefined) {
+        delete process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE;
+      } else {
+        process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = priorMode;
+      }
+    }
+  }, 60_000);
+
+  test("native publication recomputes the frozen proof and rejects an appended revocation", async () => {
+    const priorMode = process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE;
+    process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = "native";
+    await pool.query(
+      `UPDATE settings SET value='native',updated_at=now()
+       WHERE key='proof_architecture_authority'`,
+    );
+    try {
+      const context = await createLeasedRun(
+        1,
+        "schema-20-native-proof",
+        undefined,
+        undefined,
+        "empty",
+      );
+      const persisted = await repository.persistPipelineV3RetrievalResult({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        plan: context.selectionPlan,
+        result: withCanonicalCatalogProof(retrievalResult({
+          runId: context.runId,
+          target: 1,
+          selectedCount: 1,
+          status: "exact_ready",
+          prefix: "schema-20-native-proof",
+        })),
+        fence: context.fence,
+      });
+      await expect(repository.getPublicationGuard({
+        runId: context.runId,
+        manifestId: persisted.manifestId!,
+        manifestRevisionId: persisted.manifestRevisionId!,
+        manifestRevisionHash: persisted.manifestHash!,
+        selectedCount: 1,
+      })).resolves.toMatchObject({
+        requestedTrackCount: 1,
+        enforcement: "required",
+        decision: null,
+      });
+      await expect(repository.revalidateCanonicalPublicationManifest({
+        runId: context.runId,
+        manifestId: persisted.manifestId!,
+        manifestRevisionId: persisted.manifestRevisionId!,
+        manifestRevisionHash: persisted.manifestHash!,
+        partialPublicationAuthorized: false,
+      })).resolves.toBeUndefined();
+
+      const qualification = (await pool.query<{ id: string }>(
+        `SELECT item.selection_qualification_id id
+         FROM manifest_revisions revision
+         JOIN immutable_selection_set_items item
+           ON item.selection_set_id=revision.selection_set_id
+          AND item.role='selected'
+         WHERE revision.id=$1`,
+        [persisted.manifestRevisionId],
+      )).rows[0]!;
+      await pool.query(
+        `INSERT INTO immutable_qualification_revocations(
+           id,selection_qualification_id,reason_code,policy_version,
+           revocation_hash,detail_json,revoked_at)
+         VALUES($1,$2,'test_revocation','selection_attestation_v1',$3,
+           '{"test":true}'::jsonb,now())`,
+        [
+          randomUUID(),
+          qualification.id,
+          sha256Hex(stableStringify({
+            qualificationId: qualification.id,
+            reason: "test_revocation",
+          })),
+        ],
+      );
+      await expect(repository.getPublicationGuard({
+        runId: context.runId,
+        manifestId: persisted.manifestId!,
+        manifestRevisionId: persisted.manifestRevisionId!,
+        manifestRevisionHash: persisted.manifestHash!,
+        selectedCount: 1,
+      })).rejects.toMatchObject({
+        code: "schema20_native_publication_proof_invalid",
+      });
+    } finally {
+      await pool.query(
+        `UPDATE settings SET value='shadow',updated_at=now()
+         WHERE key='proof_architecture_authority'`,
+      );
+      if (priorMode === undefined) {
+        delete process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE;
+      } else {
+        process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = priorMode;
+      }
+    }
+  }, 60_000);
 
   test("rejects a stale lease before it can persist candidates, manifests, or Apple work", async () => {
     const context = await createLeasedRun(25, "stale-lease");

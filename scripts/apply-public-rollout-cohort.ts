@@ -418,13 +418,21 @@ export async function applyPublicRolloutDatabaseTransition(
       `SELECT
          (SELECT value FROM settings WHERE key='schema_version') schema_version,
          (SELECT value FROM settings
-          WHERE key='release_manifest_canary_guards_version') capability_version`,
+          WHERE key='release_manifest_canary_guards_version') capability_version,
+         (SELECT value FROM settings
+          WHERE key='proof_architecture_version') proof_architecture_version,
+         (SELECT value FROM settings
+          WHERE key='proof_architecture_authority') proof_architecture_authority`,
     );
     if (
-      readiness.rows[0]?.schema_version !== "19"
+      readiness.rows[0]?.schema_version !== "20"
       || readiness.rows[0]?.capability_version !== "1"
+      || readiness.rows[0]?.proof_architecture_version !== "1"
+      || readiness.rows[0]?.proof_architecture_authority !== "native"
     ) {
-      throw new Error("public rollout database is not schema-19/capability-1 ready");
+      throw new Error(
+        "public rollout database is not schema-20/native-proof/capability-1 ready",
+      );
     }
     const globalSettingKey = "public_rollout_state:global";
     const intentSettingKey =

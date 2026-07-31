@@ -1,6 +1,6 @@
 {
   "name": "needle-playlist-builder",
-  "version": "2.4.14",
+  "version": "2.5.0",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "engines": {
@@ -45,6 +45,8 @@
     "release:check:deploy": "node scripts/check-release.mjs --require-tag",
     "release:check:rc": "node scripts/check-release.mjs --require-exact-tag",
     "release:migration:verify": "node --experimental-transform-types scripts/verify-release-migration-phase.ts",
+    "release:schema20:backfill": "node --experimental-transform-types scripts/backfill-schema20-proof-architecture.ts",
+    "release:schema20:activate": "node --experimental-transform-types scripts/activate-schema20-proof-authority.ts",
     "release:phase-evidence:produce": "node --experimental-transform-types scripts/promotion-phase-evidence-producer.ts",
     "release:convergence": "node --experimental-transform-types scripts/verify-release-convergence.ts",
     "release:convergence:produce": "node --experimental-transform-types scripts/release-convergence-producer.ts",

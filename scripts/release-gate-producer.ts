@@ -131,11 +131,14 @@ export async function loadReleaseProducerRuntimeSnapshot(input: {
     snapshot.origin !== input.origin
     || snapshot.candidate.version !== input.candidate.version
     || snapshot.candidate.sourceRevision !== input.candidate.sourceRevision
-    || snapshot.runtime.databaseSchemaVersion !== "19"
+    || snapshot.runtime.databaseSchemaVersion !== "20"
     || snapshot.runtime.databaseCapabilityVersion !== "2"
     || snapshot.runtime.releaseManifestCanaryGuardsVersion !== "1"
     || snapshot.runtime.canonicalExecutionHardeningVersion !== "1"
-    || snapshot.runtime.workerProtocol !== "playlist-pipeline-v11"
+    || snapshot.runtime.proofArchitectureMode !== "native"
+    || snapshot.runtime.proofArchitectureVersion !== "1"
+    || snapshot.runtime.proofArchitectureAuthority !== "native"
+    || snapshot.runtime.workerProtocol !== "playlist-pipeline-v12"
     || snapshot.runtime.briefContractVersion !== "3"
     || snapshot.runtime.queryPlanSchemaVersion !== "6"
   ) {

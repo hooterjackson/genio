@@ -88,15 +88,15 @@ function payload(input: {
   const fixture = PUBLIC_ROLLOUT_INTENT_CANARY_FIXTURES[intentGroup];
   const candidateAssignedCount = input.candidateAssignedCount ?? ({
     "0": 0,
-    "1": 20,
-    "10": 100,
-    "50": 500,
+    "1": 5,
+    "10": 20,
+    "50": 50,
   } as const)[fromPercent];
   const controlAssignedCount = input.controlAssignedCount ?? ({
     "0": 0,
-    "1": 1_980,
-    "10": 900,
-    "50": 500,
+    "1": 495,
+    "10": 180,
+    "50": 100,
   } as const)[fromPercent];
   const exactCompletionCount =
     input.exactCompletionCount ?? candidateAssignedCount;
@@ -106,6 +106,12 @@ function payload(input: {
   const protectedContractSemanticHash =
     input.contractSemanticHash ?? contractSemanticHash;
   const completed = input.generatedAt ?? generatedAt;
+  const minimumWindowMs = ({
+    "0": 60_000,
+    "1": 60 * 60_000,
+    "10": 2 * 60 * 60_000,
+    "50": 6 * 60 * 60_000,
+  } as const)[fromPercent];
   const assignmentHash = input.assignmentHash
     ?? publicRolloutIntentAssignmentHashV2({
       sourceRevision,
@@ -171,7 +177,9 @@ function payload(input: {
       },
     },
     stageMetrics: {
-      windowStartedAt: new Date(Date.parse(completed) - 120_000).toISOString(),
+      windowStartedAt: new Date(
+        Date.parse(completed) - 20_000 - minimumWindowMs,
+      ).toISOString(),
       windowCompletedAt: new Date(Date.parse(completed) - 20_000).toISOString(),
       intentGroup,
       stagePercent: fromPercent,
@@ -357,8 +365,8 @@ describe("public rollout intent-specific canary", () => {
       envelope(payload({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 19,
-        exactCompletionCount: 19,
+        candidateAssignedCount: 4,
+        exactCompletionCount: 4,
       })),
       keys.publicKey,
       expected({ fromPercent: "1", toPercent: "10" }),
@@ -367,8 +375,8 @@ describe("public rollout intent-specific canary", () => {
       envelope(payload({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
-        exactCompletionCount: 19,
+        candidateAssignedCount: 5,
+        exactCompletionCount: 4,
         controlExactCompletionRate: 1,
       })),
       keys.publicKey,
@@ -378,8 +386,8 @@ describe("public rollout intent-specific canary", () => {
       envelope(payload({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
-        exactCompletionCount: 20,
+        candidateAssignedCount: 5,
+        exactCompletionCount: 5,
       })),
       keys.publicKey,
       expected({ fromPercent: "1", toPercent: "10" }),
@@ -391,7 +399,7 @@ describe("public rollout intent-specific canary", () => {
       envelope(payload({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
+        candidateAssignedCount: 5,
         eligibleSubmissionCount: 1,
       })),
       keys.publicKey,
@@ -401,9 +409,9 @@ describe("public rollout intent-specific canary", () => {
       envelope(payload({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
-        controlAssignedCount: 1_980,
-        controlExactCompletionCount: 1_979,
+        candidateAssignedCount: 5,
+        controlAssignedCount: 495,
+        controlExactCompletionCount: 494,
         controlExactCompletionRate: 1,
       })),
       keys.publicKey,
@@ -413,9 +421,9 @@ describe("public rollout intent-specific canary", () => {
       envelope(payload({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
+        candidateAssignedCount: 5,
         controlAssignedCount: 0,
-        eligibleSubmissionCount: 20,
+        eligibleSubmissionCount: 5,
       })),
       keys.publicKey,
       expected({ fromPercent: "1", toPercent: "10" }),

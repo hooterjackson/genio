@@ -45,11 +45,11 @@ type PromotionReleaseDeploymentPhase = Exclude<
 >;
 export type ReleaseEnvironment = "staging" | "production";
 
-export const EXPANDED_DATABASE_SCHEMA_VERSION = "19";
+export const EXPANDED_DATABASE_SCHEMA_VERSION = "20";
 export { MAXIMUM_STAGING_MONTHLY_COST_USD };
 
 const SHA256 = /^[0-9a-f]{64}$/u;
-const DATABASE_SCHEMA = /^(?:1[3-9])$/u;
+const DATABASE_SCHEMA = /^(?:1[3-9]|20)$/u;
 
 export interface StagingReleaseControls {
   monthlyCostLimitUsd: number;
@@ -668,6 +668,10 @@ function signedPromotionPhaseEvidence(input: {
         input.expectedReleaseManifestCanaryGuardsVersion,
       expectedCanonicalExecutionHardeningVersion:
         input.expectedCanonicalExecutionHardeningVersion,
+      expectedProofArchitectureVersion:
+        input.expectedPhase === "expand" ? "1" : null,
+      expectedProofArchitectureAuthority:
+        input.expectedPhase === "expand" ? "shadow" : null,
       expectedDatabaseIdentityHash: input.expectedDatabaseIdentityHash,
     },
   );
@@ -781,7 +785,7 @@ export function railwayReleasePhaseConfiguration(
     "GENIO_EXPECTED_DATABASE_SCHEMA_VERSION",
   );
   if (!DATABASE_SCHEMA.test(expectedDatabaseSchemaVersion)) {
-    throw new Error("GENIO_EXPECTED_DATABASE_SCHEMA_VERSION must be an integer from 13 through 19");
+    throw new Error("GENIO_EXPECTED_DATABASE_SCHEMA_VERSION must be an integer from 13 through 20");
   }
   if (
     (phase === "expand" || phase === "activate" || phase === "rollout")
@@ -952,9 +956,6 @@ export function railwayReleasePhaseConfiguration(
 export function releasePhasePreDeployCommand(
   configuration: Pick<RailwayReleasePhaseConfiguration, "phase">,
 ): string | undefined {
-  if (configuration.phase === "bootstrap" || configuration.phase === "expand") {
-    return "pnpm run db:migrate";
-  }
   return configuration.phase === "rollout"
     ? "pnpm run release:rollout:apply"
     : undefined;

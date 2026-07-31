@@ -3,6 +3,8 @@ import {
   CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
+  PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING,
+  PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING,
 } from "../server/release-deployment-phase.ts";
 import { WorkerRunner } from "../server/worker-runner.ts";
 
@@ -10,10 +12,12 @@ const productionActivateEnvironment = {
   NODE_ENV: "production",
   RELEASE_ENVIRONMENT: "production",
   RELEASE_DEPLOYMENT_PHASE: "activate",
-  RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+  RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
   RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
   RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
   RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+  RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: "1",
+  PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
   RELEASE_EXECUTION_ENABLED: "true",
   PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
   OPENAI_API_KEY: "test-openai-key",
@@ -29,6 +33,8 @@ function repositoryHarness(input: {
   hardeningVersion: string | null;
   releaseIdentityVersion?: string | null;
   releaseIdentitySupported?: boolean;
+  proofArchitectureVersion?: string | null;
+  proofArchitectureAuthority?: string | null;
 }) {
   return {
     ensureSchemaVersion: vi.fn(async () => undefined),
@@ -43,7 +49,15 @@ function repositoryHarness(input: {
             ? input.releaseIdentityVersion === undefined
               ? "1"
               : input.releaseIdentityVersion
-          : null),
+          : key === PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING
+            ? input.proofArchitectureVersion === undefined
+              ? "1"
+              : input.proofArchitectureVersion
+            : key === PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING
+              ? input.proofArchitectureAuthority === undefined
+                ? "native"
+                : input.proofArchitectureAuthority
+              : null),
     executorReleaseIdentityFenceAvailable: vi.fn(
       async () => input.releaseIdentitySupported ?? true,
     ),
@@ -86,9 +100,9 @@ describe("worker release database fence", () => {
     expect(repository.leaseNextJob).not.toHaveBeenCalled();
   });
 
-  test("production activation cannot start or lease without the schema-18 capability", async () => {
+  test("production activation cannot start or lease without the canonical capability", async () => {
     const repository = repositoryHarness({
-      schemaVersion: "19",
+      schemaVersion: "20",
       capabilityVersion: null,
       hardeningVersion: "1",
     });
@@ -102,7 +116,7 @@ describe("worker release database fence", () => {
 
   test("a capability lost after startup is rechecked before the next lease", async () => {
     const repository = repositoryHarness({
-      schemaVersion: "19",
+      schemaVersion: "20",
       capabilityVersion: "1",
       hardeningVersion: "1",
     });
@@ -117,6 +131,8 @@ describe("worker release database fence", () => {
       ) {
         return "1";
       }
+      if (key === PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING) return "1";
+      if (key === PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING) return "native";
       if (key !== CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING) return null;
       capabilityChecks += 1;
       return capabilityChecks === 1 ? "1" : null;
@@ -135,7 +151,7 @@ describe("worker release database fence", () => {
       { releaseIdentityVersion: "1", releaseIdentitySupported: false },
     ]) {
       const repository = repositoryHarness({
-        schemaVersion: "19",
+        schemaVersion: "20",
         capabilityVersion: "1",
         hardeningVersion: "1",
         ...releaseIdentity,
@@ -148,9 +164,9 @@ describe("worker release database fence", () => {
     }
   });
 
-  test("production activation with schema 18 and its capability may lease", async () => {
+  test("production activation with schema 20 native proof authority may lease", async () => {
     const repository = repositoryHarness({
-      schemaVersion: "19",
+      schemaVersion: "20",
       capabilityVersion: "1",
       hardeningVersion: "1",
     });
