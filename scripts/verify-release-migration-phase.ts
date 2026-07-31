@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import type { ReleaseDeploymentPhase } from "../server/release-deployment-phase.ts";
+import {
+  REQUIRED_PROMOTION_WORKER_PROTOCOL,
+} from "../shared/promotion-phase-evidence.ts";
 
 type MigrationVerificationPhase = Extract<
   ReleaseDeploymentPhase,
@@ -16,6 +19,8 @@ export interface ReleaseMigrationVerificationArgs {
   expectedDatabaseCapabilityVersion: "2" | null;
   expectedReleaseManifestCanaryGuardsVersion: "1" | null;
   expectedCanonicalExecutionHardeningVersion: "1" | null;
+  expectedProofArchitectureVersion: "1" | null;
+  expectedProofArchitectureAuthority: "shadow" | null;
   phase: MigrationVerificationPhase;
   samples: number;
   intervalMs: number;
@@ -42,6 +47,7 @@ export interface ReleaseMigrationObservation {
   runtimeSchemaMinimum: string | null;
   runtimeSchemaMaximum: string | null;
   runtimeWorkerProtocol: string | null;
+  runtimeProofArchitectureMode: string | null;
   runtimeBriefContractVersion: string | null;
   runtimeQueryPlanSchemaVersion: string | null;
   readyHttpStatus: number;
@@ -50,6 +56,8 @@ export interface ReleaseMigrationObservation {
   databaseCapabilityVersion: string | null;
   releaseManifestCanaryGuardsVersion: string | null;
   canonicalExecutionHardeningVersion: string | null;
+  proofArchitectureVersion: string | null;
+  proofArchitectureAuthority: string | null;
   systemHttpStatus: number;
   systemOk: boolean;
   activationReady: boolean;
@@ -72,6 +80,8 @@ export interface ReleaseMigrationPhaseEvidence {
     databaseCapabilityVersion: "2" | null;
     releaseManifestCanaryGuardsVersion: "1" | null;
     canonicalExecutionHardeningVersion: "1" | null;
+    proofArchitectureVersion: "1" | null;
+    proofArchitectureAuthority: "shadow" | null;
     phase: MigrationVerificationPhase;
     samples: number;
     minimumObservationSpanMs: 30_000;
@@ -84,7 +94,6 @@ export interface ReleaseMigrationPhaseEvidence {
 }
 
 const EVIDENCE_TTL_MS = 24 * 60 * 60 * 1_000;
-const REQUIRED_WORKER_PROTOCOL = "playlist-pipeline-v11";
 const REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 
@@ -182,11 +191,16 @@ export function parseReleaseMigrationVerificationArgs(
     throw new Error("--phase must be bridge or expand");
   }
   const expectedSchemaVersion = values.get("--expected-schema") ?? "";
-  if (!/^(?:1[3-9])$/u.test(expectedSchemaVersion)) {
-    throw new Error("--expected-schema must be an integer from 13 through 19");
+  if (!/^(?:1[3-9]|20)$/u.test(expectedSchemaVersion)) {
+    throw new Error("--expected-schema must be an integer from 13 through 20");
   }
-  if (phase === "expand" && expectedSchemaVersion !== "19") {
-    throw new Error("expand verification requires --expected-schema 19");
+  if (
+    (phase === "bridge" && expectedSchemaVersion !== "19")
+    || (phase === "expand" && expectedSchemaVersion !== "20")
+  ) {
+    throw new Error(
+      "bridge verification requires schema 19 and expand verification requires schema 20",
+    );
   }
   const expectedCapabilityValue = values.get("--expected-capability");
   if (
@@ -231,7 +245,7 @@ export function parseReleaseMigrationVerificationArgs(
     ))
   ) {
     throw new Error(
-      "schemas 18 and 19 require composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
+      "schemas 18 through 20 require composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
     );
   }
   const expectedRevision = (values.get("--expected-revision") ?? "").toLowerCase();
@@ -267,6 +281,8 @@ export function parseReleaseMigrationVerificationArgs(
     expectedDatabaseCapabilityVersion,
     expectedReleaseManifestCanaryGuardsVersion,
     expectedCanonicalExecutionHardeningVersion,
+    expectedProofArchitectureVersion: phase === "expand" ? "1" : null,
+    expectedProofArchitectureAuthority: phase === "expand" ? "shadow" : null,
     phase,
     samples: integer(values.get("--samples") ?? "2", "--samples", 2, 5),
     intervalMs: integer(
@@ -298,6 +314,8 @@ export function releaseMigrationObservation(input: {
   const canonicalExecutionHardeningVersion = text(
     ready.canonicalExecutionHardeningVersion,
   );
+  const proofArchitectureVersion = text(ready.proofArchitectureVersion);
+  const proofArchitectureAuthority = text(ready.proofArchitectureAuthority);
   return {
     observedAt: input.observedAt,
     apiVersion: text(build.version ?? live.version, 64),
@@ -309,6 +327,7 @@ export function releaseMigrationObservation(input: {
     runtimeSchemaMinimum: text(runtime.schemaMinimum),
     runtimeSchemaMaximum: text(runtime.schemaMaximum),
     runtimeWorkerProtocol: text(runtime.workerProtocol),
+    runtimeProofArchitectureMode: text(runtime.proofArchitectureMode),
     runtimeBriefContractVersion: text(runtime.briefContractVersion),
     runtimeQueryPlanSchemaVersion: text(runtime.queryPlanSchemaVersion),
     readyHttpStatus: input.readyHttpStatus,
@@ -321,6 +340,8 @@ export function releaseMigrationObservation(input: {
         : null,
     releaseManifestCanaryGuardsVersion,
     canonicalExecutionHardeningVersion,
+    proofArchitectureVersion,
+    proofArchitectureAuthority,
     systemHttpStatus: input.systemHttpStatus,
     systemOk: system.ok === true,
     activationReady: system.activationReady === true,
@@ -340,6 +361,8 @@ export function buildReleaseMigrationPhaseEvidence(input: {
   expectedDatabaseCapabilityVersion: "2" | null;
   expectedReleaseManifestCanaryGuardsVersion: "1" | null;
   expectedCanonicalExecutionHardeningVersion: "1" | null;
+  expectedProofArchitectureVersion: "1" | null;
+  expectedProofArchitectureAuthority: "shadow" | null;
   phase: MigrationVerificationPhase;
   expectedSamples: number;
   observations: readonly ReleaseMigrationObservation[];
@@ -385,11 +408,20 @@ export function buildReleaseMigrationPhaseEvidence(input: {
     if (observation.canonicalActivationConfigured) {
       violations.push(`${label}:canonical_activation_enabled_before_activate`);
     }
-    if (observation.runtimeSchemaMinimum !== "13" || observation.runtimeSchemaMaximum !== "19") {
+    if (observation.runtimeSchemaMinimum !== "13" || observation.runtimeSchemaMaximum !== "20") {
       violations.push(`${label}:schema_bridge_support_missing`);
     }
-    if (observation.runtimeWorkerProtocol !== REQUIRED_WORKER_PROTOCOL) {
+    if (observation.runtimeWorkerProtocol !== REQUIRED_PROMOTION_WORKER_PROTOCOL) {
       violations.push(`${label}:runtime_worker_protocol:${observation.runtimeWorkerProtocol ?? "missing"}`);
+    }
+    const expectedRuntimeProofMode =
+      input.phase === "expand" ? "shadow" : "off";
+    if (observation.runtimeProofArchitectureMode !== expectedRuntimeProofMode) {
+      violations.push(
+        `${label}:runtime_proof_architecture_mode:${
+          observation.runtimeProofArchitectureMode ?? "missing"
+        }`,
+      );
     }
     if (
       observation.runtimeBriefContractVersion === "3"
@@ -431,6 +463,26 @@ export function buildReleaseMigrationPhaseEvidence(input: {
         `${label}:canonical_execution_hardening:${observation.canonicalExecutionHardeningVersion ?? "missing"}`,
       );
     }
+    if (
+      observation.proofArchitectureVersion
+        !== input.expectedProofArchitectureVersion
+    ) {
+      violations.push(
+        `${label}:proof_architecture_version:${
+          observation.proofArchitectureVersion ?? "missing"
+        }`,
+      );
+    }
+    if (
+      observation.proofArchitectureAuthority
+        !== input.expectedProofArchitectureAuthority
+    ) {
+      violations.push(
+        `${label}:proof_architecture_authority:${
+          observation.proofArchitectureAuthority ?? "missing"
+        }`,
+      );
+    }
     if (observation.systemHttpStatus !== 200 || !observation.systemOk || !observation.activationReady) {
       violations.push(`${label}:worker_lanes_not_ready`);
     }
@@ -438,7 +490,7 @@ export function buildReleaseMigrationPhaseEvidence(input: {
       const current = observation.workerLanes[laneName];
       if (
         current.status !== "healthy"
-        || current.protocolVersion !== REQUIRED_WORKER_PROTOCOL
+        || current.protocolVersion !== REQUIRED_PROMOTION_WORKER_PROTOCOL
         || current.compatibleCapacity < 1
         || current.eligibleWorkerCount < 1
       ) {
@@ -505,6 +557,8 @@ export function buildReleaseMigrationPhaseEvidence(input: {
         input.expectedReleaseManifestCanaryGuardsVersion,
       canonicalExecutionHardeningVersion:
         input.expectedCanonicalExecutionHardeningVersion,
+      proofArchitectureVersion: input.expectedProofArchitectureVersion,
+      proofArchitectureAuthority: input.expectedProofArchitectureAuthority,
       phase: input.phase,
       samples: input.expectedSamples,
       minimumObservationSpanMs: 30_000 as const,
@@ -590,6 +644,10 @@ export async function collectReleaseMigrationPhaseEvidence(
       args.expectedReleaseManifestCanaryGuardsVersion,
     expectedCanonicalExecutionHardeningVersion:
       args.expectedCanonicalExecutionHardeningVersion,
+    expectedProofArchitectureVersion:
+      args.expectedProofArchitectureVersion,
+    expectedProofArchitectureAuthority:
+      args.expectedProofArchitectureAuthority,
     phase: args.phase,
     expectedSamples: args.samples,
     observations,

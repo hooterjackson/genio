@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const STAGING_BOOTSTRAP_PHASE = "bootstrap";
-export const STAGING_BOOTSTRAP_DATABASE_SCHEMA_VERSION = "19";
+export const STAGING_BOOTSTRAP_DATABASE_SCHEMA_VERSION = "20";
 export const STAGING_BOOTSTRAP_DATABASE_CAPABILITY_VERSION = "2";
 export const STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMATION = "true";
 
@@ -125,7 +125,8 @@ function rejectInheritedInputs(environment: NodeJS.ProcessEnv): void {
 
 /**
  * A fresh Railway staging environment has no schema on which a normal bridge
- * can become ready. Bootstrap is a one-time, migration-only phase. It is
+ * can become ready. Bootstrap is a one-time, execution-disabled phase entered
+ * only after the explicit migration phase has established schema 20. It is
  * deliberately parsed before the ordinary bridge/expand/activate contract so
  * production can never inherit this staging-only exception.
  */

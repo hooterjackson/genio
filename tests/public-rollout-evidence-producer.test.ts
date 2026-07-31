@@ -14,7 +14,7 @@ const digest = "b".repeat(64);
 function observation(): ReleaseConvergenceObservation {
   const lane = {
     status: "healthy",
-    protocolVersion: "playlist-pipeline-v11",
+    protocolVersion: "playlist-pipeline-v12",
     compatibleCapacity: 1,
     eligibleWorkerCount: 1,
     eligibleIdentityCount: 1,
@@ -56,6 +56,8 @@ function observation(): ReleaseConvergenceObservation {
       database: "ready",
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
+      proofArchitectureVersion: "1",
+      proofArchitectureAuthority: "native",
       canonicalExecutorReleaseIdentityFencingVersion: "1",
       executorFencing: {
         ready: true,
@@ -73,9 +75,9 @@ function observation(): ReleaseConvergenceObservation {
       },
       paused: false,
       workerProtocol: {
-        expected: "playlist-pipeline-v11",
-        minimumAccepted: "playlist-pipeline-v11",
-        actual: "playlist-pipeline-v11",
+        expected: "playlist-pipeline-v12",
+        minimumAccepted: "playlist-pipeline-v12",
+        actual: "playlist-pipeline-v12",
       },
       workerLanes: {
         interactive: { ...lane },
@@ -173,10 +175,10 @@ describe("public rollout live observation producer", () => {
       releaseManifestCanaryGuardsVersion: "1",
       canonicalExecutionHardeningVersion: "1",
       paused: false,
-      workerProtocolActual: "playlist-pipeline-v11",
+      workerProtocolActual: "playlist-pipeline-v12",
       interactiveWorker: {
         status: "healthy",
-        protocolVersion: "playlist-pipeline-v11",
+        protocolVersion: "playlist-pipeline-v12",
       },
     });
   });

@@ -60,6 +60,8 @@ export interface PromotionPhaseEvidenceProducerArgs {
   expectedDatabaseCapabilityVersion: "2" | null;
   expectedReleaseManifestCanaryGuardsVersion: "1" | null;
   expectedCanonicalExecutionHardeningVersion: "1" | null;
+  expectedProofArchitectureVersion: "1" | null;
+  expectedProofArchitectureAuthority: "shadow" | null;
   candidate: {
     tag: string;
     version: string;
@@ -183,9 +185,13 @@ export function parsePromotionPhaseEvidenceProducerArgs(
     throw new Error("--phase must be bridge or expand");
   }
   const expectedSchemaVersion = releaseProducerOption(argv, "--expected-schema");
-  if (!/^(?:1[3-9])$/u.test(expectedSchemaVersion)
-    || (phase === "expand" && expectedSchemaVersion !== "19")) {
-    throw new Error("--expected-schema must match the observed bridge schema or schema 19 for expand");
+  if (
+    (phase === "bridge" && expectedSchemaVersion !== "19")
+    || (phase === "expand" && expectedSchemaVersion !== "20")
+  ) {
+    throw new Error(
+      "--expected-schema must be 19 for bridge or 20 for expand",
+    );
   }
   const expectedCapabilityValue = releaseProducerOption(
     argv,
@@ -237,7 +243,7 @@ export function parsePromotionPhaseEvidenceProducerArgs(
     ))
   ) {
     throw new Error(
-      "schemas 18 and 19 require composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
+      "schemas 18 through 20 require composite capability 2, manifest-canary marker 1, and canonical-hardening marker 1; schemas 13 through 17 require none",
     );
   }
   const candidate = releaseProducerCandidate({
@@ -272,6 +278,8 @@ export function parsePromotionPhaseEvidenceProducerArgs(
     expectedDatabaseCapabilityVersion,
     expectedReleaseManifestCanaryGuardsVersion,
     expectedCanonicalExecutionHardeningVersion,
+    expectedProofArchitectureVersion: phase === "expand" ? "1" : null,
+    expectedProofArchitectureAuthority: phase === "expand" ? "shadow" : null,
     candidate: {
       tag: candidate.tag,
       version: candidate.version,
@@ -536,6 +544,10 @@ export function buildPromotionPhasePayload(input: {
       !== input.args.expectedReleaseManifestCanaryGuardsVersion
     || input.migrationEvidence.expected.canonicalExecutionHardeningVersion
       !== input.args.expectedCanonicalExecutionHardeningVersion
+    || input.migrationEvidence.expected.proofArchitectureVersion
+      !== input.args.expectedProofArchitectureVersion
+    || input.migrationEvidence.expected.proofArchitectureAuthority
+      !== input.args.expectedProofArchitectureAuthority
     || input.migrationEvidence.expected.phase !== input.args.phase
     || input.migrationEvidence.expected.samples !== input.args.samples
     || input.migrationEvidence.expected.minimumObservationSpanMs !== 30_000
@@ -616,6 +628,26 @@ export function buildPromotionPhasePayload(input: {
       "canonical execution hardening marker does not match the CLI-bound expected marker",
     );
   }
+  const proofArchitectureVersion =
+    observations[0]?.proofArchitectureVersion ?? null;
+  const proofArchitectureAuthority =
+    observations[0]?.proofArchitectureAuthority ?? null;
+  if (
+    observations.some(
+      (observation) =>
+        observation.proofArchitectureVersion !== proofArchitectureVersion
+        || observation.proofArchitectureAuthority
+          !== proofArchitectureAuthority,
+    )
+    || proofArchitectureVersion
+      !== input.args.expectedProofArchitectureVersion
+    || proofArchitectureAuthority
+      !== input.args.expectedProofArchitectureAuthority
+  ) {
+    throw new Error(
+      "proof architecture markers do not match the phase-bound authority",
+    );
+  }
   const oldRevisions = new Set(observations.flatMap((observation) => [
     ...observation.workerLanes.interactive.eligibleRevisions,
     ...observation.workerLanes.deep.eligibleRevisions,
@@ -649,6 +681,8 @@ export function buildPromotionPhasePayload(input: {
       databaseCapabilityVersion,
       releaseManifestCanaryGuardsVersion,
       canonicalExecutionHardeningVersion,
+      proofArchitectureVersion,
+      proofArchitectureAuthority,
       workerProtocol: REQUIRED_PROMOTION_WORKER_PROTOCOL,
       configurationHash: signedArtifactSha256({
         apiHash,
@@ -710,8 +744,12 @@ async function main(): Promise<void> {
       args.expectedDatabaseCapabilityVersion,
     expectedReleaseManifestCanaryGuardsVersion:
       args.expectedReleaseManifestCanaryGuardsVersion,
-    expectedCanonicalExecutionHardeningVersion:
-      args.expectedCanonicalExecutionHardeningVersion,
+      expectedCanonicalExecutionHardeningVersion:
+        args.expectedCanonicalExecutionHardeningVersion,
+      expectedProofArchitectureVersion:
+        args.expectedProofArchitectureVersion,
+      expectedProofArchitectureAuthority:
+        args.expectedProofArchitectureAuthority,
     phase: args.phase,
     samples: args.samples,
     intervalMs: args.intervalMs,
@@ -784,6 +822,14 @@ async function main(): Promise<void> {
         runtime.canonicalExecutionHardeningVersion === null
           ? null
           : String(runtime.canonicalExecutionHardeningVersion),
+      expectedProofArchitectureVersion:
+        runtime.proofArchitectureVersion === null
+          ? null
+          : String(runtime.proofArchitectureVersion),
+      expectedProofArchitectureAuthority:
+        runtime.proofArchitectureAuthority === null
+          ? null
+          : String(runtime.proofArchitectureAuthority),
       expectedDatabaseIdentityHash:
         preflight === null ? null : String(preflight.databaseIdentityHash),
     },

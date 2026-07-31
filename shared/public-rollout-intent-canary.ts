@@ -13,9 +13,9 @@ import {
 } from "./signed-artifact.ts";
 
 export const PUBLIC_ROLLOUT_INTENT_CANARY_SCHEMA_VERSION =
-  "genio-public-rollout-intent-canary/v3" as const;
+  "genio-public-rollout-intent-canary/v4" as const;
 export const SIGNED_PUBLIC_ROLLOUT_INTENT_CANARY_SCHEMA_VERSION =
-  "genio-signed-public-rollout-intent-canary/v3" as const;
+  "genio-signed-public-rollout-intent-canary/v4" as const;
 export const PUBLIC_ROLLOUT_INTENT_ASSIGNMENT_SCHEMA_VERSION =
   "genio-public-rollout-intent-assignment/v2" as const;
 export const PUBLIC_ROLLOUT_INTENT_CANARY_PROVENANCE_SCHEMA_VERSION =
@@ -138,6 +138,7 @@ export interface VerifiedPublicRolloutIntentCanaryV1 {
   stageMetrics: {
     windowStartedAt: string;
     windowCompletedAt: string;
+    eligibleSubmissionCount: number;
     candidateAssignedCount: number;
     exactCompletionCount: number;
   };
@@ -171,10 +172,28 @@ const MINIMUM_STAGE_SAMPLES: Readonly<
   Record<PublicRolloutIntentCanaryPercent, number>
 > = Object.freeze({
   "0": 0,
-  "1": 20,
-  "10": 100,
-  "50": 500,
-  "100": 500,
+  "1": 5,
+  "10": 20,
+  "50": 50,
+  "100": 100,
+});
+const MINIMUM_ELIGIBLE_SUBMISSIONS: Readonly<
+  Record<PublicRolloutIntentCanaryPercent, number>
+> = Object.freeze({
+  "0": 0,
+  "1": 100,
+  "10": 200,
+  "50": 200,
+  "100": 250,
+});
+const MINIMUM_STAGE_DURATION_MS: Readonly<
+  Record<PublicRolloutIntentCanaryPercent, number>
+> = Object.freeze({
+  "0": 60_000,
+  "1": 60 * 60_000,
+  "10": 2 * 60 * 60_000,
+  "50": 6 * 60 * 60_000,
+  "100": 24 * 60 * 60_000,
 });
 
 function isoTimestamp(value: unknown, label: string): string {
@@ -589,7 +608,8 @@ function validatePayload(value: unknown): {
     metrics.intentGroup !== group
     || metrics.stagePercent !== fromPercent
     || Date.parse(windowCompletedAt) <= Date.parse(windowStartedAt)
-    || Date.parse(windowCompletedAt) - Date.parse(windowStartedAt) < 60_000
+    || Date.parse(windowCompletedAt) - Date.parse(windowStartedAt)
+      < MINIMUM_STAGE_DURATION_MS[fromPercent]
   ) {
     throw new Error("public rollout intent canary metrics do not bind the current stage");
   }
@@ -640,6 +660,7 @@ function validatePayload(value: unknown): {
   ];
   if (
     sharedProviderIncidentCount > eligibleSubmissionCount
+    || eligibleSubmissionCount < MINIMUM_ELIGIBLE_SUBMISSIONS[fromPercent]
     || candidateAssignedCount < MINIMUM_STAGE_SAMPLES[fromPercent]
     || candidateAssignedCount + controlAssignedCount
       !== eligibleSubmissionCount
@@ -807,6 +828,7 @@ function validatePayload(value: unknown): {
       stageMetrics: {
         windowStartedAt,
         windowCompletedAt,
+        eligibleSubmissionCount,
         candidateAssignedCount,
         exactCompletionCount,
       },

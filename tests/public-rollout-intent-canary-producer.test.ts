@@ -106,14 +106,14 @@ function sourcePayloads(input: {
   const fromPercent = input.fromPercent ?? "0";
   const toPercent = input.toPercent ?? "1";
   const candidateAssignedCount = input.candidateAssignedCount
-    ?? (fromPercent === "0" ? 0 : 20);
+    ?? (fromPercent === "0" ? 0 : 5);
   const manifestIds = input.manifestIds ?? orderedAppleIds;
   const appleIds = input.appleIds ?? orderedAppleIds;
   const selectedFixtureHash = input.fixtureHash ?? fixtureHash;
   const assignmentContractSemanticHash =
     input.assignmentContractSemanticHash ?? contractSemanticHash;
   const controlAssignedCount = input.controlAssignedCount
-    ?? (fromPercent === "0" ? 0 : 2_000 - candidateAssignedCount);
+    ?? (fromPercent === "0" ? 0 : 500 - candidateAssignedCount);
   const controlExactCompletionCount =
     input.controlExactCompletionCount ?? controlAssignedCount;
   const assignmentHash = publicRolloutIntentAssignmentHashV2({
@@ -214,7 +214,9 @@ function sourcePayloads(input: {
       sourceQueryHash: PUBLIC_ROLLOUT_INTENT_METRICS_QUERY_HASH_V2,
       candidateSourceRevision: sourceRevision,
       apiConfigurationHash,
-      windowStartedAt: "2026-07-25T12:05:00.000Z",
+      windowStartedAt: fromPercent === "0"
+        ? "2026-07-25T12:05:00.000Z"
+        : "2026-07-25T11:05:00.000Z",
       windowCompletedAt: "2026-07-25T12:08:00.000Z",
       intentGroup: "genre_scene",
       stagePercent: fromPercent,
@@ -367,7 +369,7 @@ describe("public rollout intent canary protected producer", () => {
     const payloads = sourcePayloads({
       fromPercent: "1",
       toPercent: "10",
-      candidateAssignedCount: 19,
+      candidateAssignedCount: 4,
     });
     expect(() => producePublicRolloutIntentCanaryV1(
       producerInput(payloads),
@@ -379,7 +381,7 @@ describe("public rollout intent canary protected producer", () => {
       producerInput(sourcePayloads({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
+        candidateAssignedCount: 5,
         eligibleSubmissionCount: 1,
       })),
     )).toThrow(/stage lacks samples or regresses/u);
@@ -387,8 +389,8 @@ describe("public rollout intent canary protected producer", () => {
       producerInput(sourcePayloads({
         fromPercent: "1",
         toPercent: "10",
-        candidateAssignedCount: 20,
-        controlExactCompletionCount: 1_979,
+        candidateAssignedCount: 5,
+        controlExactCompletionCount: 494,
         controlExactCompletionRate: 1,
       })),
     )).toThrow(/controlExactCompletionRate is not recomputable/u);

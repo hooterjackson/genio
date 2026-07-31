@@ -607,12 +607,14 @@ export function assertHostedRuntime(
   const required = {
     releaseEnvironment: expectedEnvironment,
     deploymentPhase: "activate",
-    expectedDatabaseSchemaVersion: "19",
+    expectedDatabaseSchemaVersion: "20",
     canonicalActivationConfigured: "true",
-    schemaVersion: "19",
-    schemaMaximum: "19",
+    proofArchitectureMode: "native",
+    proofArchitectureVersion: "1",
+    schemaVersion: "20",
+    schemaMaximum: "20",
     schemaPreferred: "19",
-    workerProtocol: "playlist-pipeline-v11",
+    workerProtocol: "playlist-pipeline-v12",
     queryPlanSchemaVersion: "6",
     briefContractVersion: "3",
   };

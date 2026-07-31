@@ -39,10 +39,10 @@ function bootstrapEnvironment(
     CAPABILITY_PEPPER: undefined,
     GENIO_RELEASE_IMAGE: releaseImage,
     GENIO_RELEASE_REVISION: releaseRevision,
-    GENIO_RELEASE_VERSION: "2.4.0",
+    GENIO_RELEASE_VERSION: "2.5.0",
     GENIO_RELEASE_ENVIRONMENT: "staging",
     GENIO_RELEASE_PHASE: "bootstrap",
-    GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+    GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
     GENIO_RELEASE_SECRET_VERSIONS_HASH: "c".repeat(64),
     GENIO_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED: "true",
     GENIO_STAGING_BOOTSTRAP_PROJECT_ID: stagingProjectId,
@@ -142,7 +142,7 @@ describe("fresh staging bootstrap", () => {
     expect(integrated).toMatchObject({
       environment: "staging",
       phase: "bootstrap",
-      expectedDatabaseSchemaVersion: "19",
+      expectedDatabaseSchemaVersion: "20",
       expectedDatabaseCapabilityVersion: "2",
       freshEmptyDatabaseConfirmed: true,
       activationRollout: null,
@@ -154,9 +154,7 @@ describe("fresh staging bootstrap", () => {
       },
       staging: null,
     });
-    expect(releasePhasePreDeployCommand(integrated)).toBe(
-      "pnpm run db:migrate",
-    );
+    expect(releasePhasePreDeployCommand(integrated)).toBeUndefined();
     expect(() => railwayStagingBootstrapConfiguration(
       bootstrapEnvironment({
         GENIO_RELEASE_ENVIRONMENT: "production",
@@ -171,7 +169,7 @@ describe("fresh staging bootstrap", () => {
       bootstrapEnvironment({
         GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "17",
       }),
-    )).toThrow(/requires GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19/u);
+    )).toThrow(/requires GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=20/u);
     expect(() => railwayStagingBootstrapConfiguration(
       bootstrapEnvironment({
         GENIO_RELEASE_PHASE: "bridge",
@@ -240,7 +238,7 @@ describe("fresh staging bootstrap", () => {
     }
   });
 
-  test("migrates only the API while both immutable-image worker lanes stay at zero", async () => {
+  test("runs no deploy-hook migration while both immutable-image worker lanes stay at zero", async () => {
     const project = await railwayProject(bootstrapEnvironment());
     const api = service(project, "needle-api");
     const workers = [
@@ -258,7 +256,7 @@ describe("fresh staging bootstrap", () => {
         RELEASE_DEPLOYMENT_PHASE: { type: "literal", value: "bootstrap" },
         RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: {
           type: "literal",
-          value: "19",
+          value: "20",
         },
         RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: {
           type: "literal",
@@ -282,7 +280,7 @@ describe("fresh staging bootstrap", () => {
         ),
       )).toBe(false);
     }
-    expect(api.deploy?.preDeployCommand).toEqual(["pnpm run db:migrate"]);
+    expect(api.deploy?.preDeployCommand).toBeUndefined();
     expect(api.deploy?.multiRegionConfig).toEqual({
       "us-west2": { numReplicas: 1 },
     });
@@ -320,11 +318,11 @@ describe("fresh staging bootstrap", () => {
     }
   });
 
-  test("blocks runtime execution and requires schema 19 plus both capability-2 markers for readiness", () => {
+  test("blocks runtime execution and requires schema 20 plus native-proof bridge markers for readiness", () => {
     const runtime = {
       RELEASE_ENVIRONMENT: "staging",
       RELEASE_DEPLOYMENT_PHASE: "bootstrap",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED: "true",
     };
@@ -332,10 +330,12 @@ describe("fresh staging bootstrap", () => {
     expect(releaseExecutionConfigured(runtime)).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      observedProofArchitectureVersion: "1",
+      observedProofArchitectureAuthority: "shadow",
       executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
     expect(releaseDatabaseReadinessReady({
@@ -346,13 +346,13 @@ describe("fresh staging bootstrap", () => {
     })).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: null,
       observedCanonicalExecutionHardeningVersion: "1",
     })).toBe(false);
     expect(releaseDatabaseReadinessReady({
       environment: runtime,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: null,
     })).toBe(false);

@@ -40,13 +40,13 @@ export const WORKER_PIPELINE_V5_BRIDGE_CAPABILITY: WorkerPipelineCapability = {
   canonicalExecutorCapabilities: [],
 };
 
-// v11 adds Boolean verification, route coverage, and schema-19 resolution
-// fencing while retaining all v10 drain capabilities. Advertising it does not
-// activate those contracts; feature gates
-// and job stamping keep old work drainable.
-export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v11";
-export const WORKER_PIPELINE_PROTOCOL_NUMBER = 11;
-/** Old-contract bridge capacity remains healthy while v11 workers roll out. */
+// v12 adds schema-20 immutable identity, selection-set, and attestation proof
+// support while retaining every v11 drain capability. Advertising protocol 12
+// does not make schema-20 proof authoritative: the database authority marker,
+// proof mode, and job stamp independently fence native writes.
+export const WORKER_PIPELINE_PROTOCOL_VERSION = "playlist-pipeline-v12";
+export const WORKER_PIPELINE_PROTOCOL_NUMBER = 12;
+/** Old-contract bridge capacity remains healthy while v12 workers roll out. */
 export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_VERSION = "playlist-pipeline-v8";
 export const BRIDGE_API_MINIMUM_WORKER_PROTOCOL_NUMBER = 8;
 export const WORKER_PIPELINE_CAPABILITY: WorkerPipelineCapability = {
@@ -73,8 +73,10 @@ export const CORPUS_FIRST_V3_SCHEMA_3_MINIMUM_WORKER_PROTOCOL = 9;
 export const BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL = 10;
 /** Query-plan schemas 4+ carry the active playlist-contract revision hash. */
 export const CORPUS_FIRST_V3_SCHEMA_4_MINIMUM_WORKER_PROTOCOL = 10;
-/** Boolean verification/query-plan schema 6 requires protocol 11. */
+/** Boolean verification/query-plan schema 6 requires protocol 11 or newer. */
 export const CORPUS_FIRST_V3_SCHEMA_6_MINIMUM_WORKER_PROTOCOL = 11;
+/** Schema-20 native proof writes require a protocol-12 executor. */
+export const SCHEMA_20_NATIVE_PROOF_MINIMUM_WORKER_PROTOCOL = 12;
 
 export function minimumWorkerProtocolForPipeline(pipelineVersion: PipelineVersion): number {
   if (pipelineVersion === "corpus_first_v3") return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
@@ -100,6 +102,21 @@ export function minimumWorkerProtocolForQueryPlan(
   }
   if (queryPlan?.schemaVersion === 2) return CORPUS_FIRST_V3_SCHEMA_2_MINIMUM_WORKER_PROTOCOL;
   return CORPUS_FIRST_V3_MINIMUM_WORKER_PROTOCOL;
+}
+
+export function minimumWorkerProtocolForProofArchitecture(input: {
+  readonly nativeProofRequired: boolean;
+  readonly queryPlan: Pick<QueryPlanV3, "schemaVersion">
+    | { readonly schemaVersion: number }
+    | null
+    | undefined;
+}): number {
+  return input.nativeProofRequired
+    ? Math.max(
+        SCHEMA_20_NATIVE_PROOF_MINIMUM_WORKER_PROTOCOL,
+        minimumWorkerProtocolForQueryPlan(input.queryPlan),
+      )
+    : minimumWorkerProtocolForQueryPlan(input.queryPlan);
 }
 
 export function workerPipelineProtocolNumber(value: unknown): number | null {

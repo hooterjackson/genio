@@ -10,6 +10,21 @@ import {
   type DatabaseSchemaSupport,
 } from "../db/index.ts";
 import { settings } from "../db/schema.ts";
+import {
+  assertAttemptOutputDeterministicV1,
+  assertPartialPublicationConsentBindingV1,
+  buildSelectionQualificationAttestationV1,
+  buildSelectionSetAttestationV1,
+  canonicalTrackIdentityHashV1,
+  canonicalTrackIdentityTuplesEqualV1,
+  normalizeCanonicalTrackIdentityTupleV1,
+  proofArchitectureMode,
+  schema20ManifestPayloadHashV1,
+  SCHEMA_20_PROOF_ARCHITECTURE_VERSION,
+  type CanonicalTrackIdentityTupleV1,
+  type PartialPublicationConsentBindingV1,
+  type ProofArchitectureMode,
+} from "./schema20-proof-architecture.ts";
 import type {
   AlternateCatalogIdentity,
   CandidateStage,
@@ -331,9 +346,10 @@ import {
   isWorkerCapabilityValid,
   isWorkerPipelineProtocolCompatible,
   minimumWorkerProtocolForPipeline,
-  minimumWorkerProtocolForQueryPlan,
+  minimumWorkerProtocolForProofArchitecture,
   WORKER_PIPELINE_CAPABILITY,
   type WorkerPipelineCapability,
+  workerPipelineProtocolNumber,
   workerPipelineProtocolVersion,
 } from "./worker-protocol.ts";
 import {
@@ -1049,6 +1065,1061 @@ export function canonicalExecutorReleaseIdentityV1(
 function deterministicUuid(value: unknown): string {
   const hex = sha256Hex(stableStringify(value));
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function minimumWorkerProtocolForActiveProofArchitecture(
+  queryPlan: Pick<QueryPlanV3, "schemaVersion"> | null | undefined,
+): number {
+  return minimumWorkerProtocolForProofArchitecture({
+    nativeProofRequired: proofArchitectureMode() === "native",
+    queryPlan,
+  });
+}
+
+interface Schema20ProofTrackInput {
+  role: "selected" | "reserve";
+  position: number;
+  candidateId: string;
+  recordingFamilyKey: string;
+  appleStableId: string;
+  qualificationHash: string;
+  observation: Record<string, unknown>;
+  evidenceSnapshots: readonly NonNullable<
+    EvidenceBindingReferenceV3["hostedEvidenceSnapshot"]
+  >[];
+}
+
+interface Schema20SelectionProofInput {
+  schemaVersion: number;
+  runId: string;
+  contractRevisionId: string;
+  contractHash: string;
+  queryPlanRevisionId: string;
+  queryPlanHash: string;
+  executionAttemptId: string;
+  storefront: string;
+  requestedCount: number;
+  recordingFamilyPolicyVersion: string;
+  evidencePolicyHash: string;
+  catalogPolicyHash: string;
+  tracks: readonly Schema20ProofTrackInput[];
+}
+
+function previewSchema20SelectionProof(
+  input: Schema20SelectionProofInput,
+) {
+  const items = input.tracks.map((item) => {
+    const identityTuple = normalizeCanonicalTrackIdentityTupleV1({
+      storefront: input.storefront,
+      recordingFamilyKey: item.recordingFamilyKey,
+      recordingFamilyPolicyVersion: input.recordingFamilyPolicyVersion,
+      appleStableId: item.appleStableId,
+    });
+    const canonicalTrackIdentityHash =
+      canonicalTrackIdentityHashV1(identityTuple);
+    const evidenceSnapshotHashes = [
+      ...new Set(
+        item.evidenceSnapshots.map(({ snapshotHash }) => snapshotHash),
+      ),
+    ].sort();
+    const observation = {
+      schemaVersion: "selection-qualification-observation/v1",
+      sourceQualificationHash: item.qualificationHash,
+      canonicalTrackIdentityHash,
+      evidenceSnapshotHashes,
+      observation: item.observation,
+    };
+    const qualificationObservationHash = sha256Hex(
+      `genio/selection-qualification-observation/v1\0${
+        stableStringify(observation)
+      }`,
+    );
+    const qualification = buildSelectionQualificationAttestationV1({
+      runId: input.runId,
+      contractRevisionId: input.contractRevisionId,
+      queryPlanRevisionId: input.queryPlanRevisionId,
+      executionAttemptId: input.executionAttemptId,
+      candidateId: item.candidateId,
+      canonicalTrackIdentityHash,
+      qualificationObservationHash,
+      evidenceSnapshotHashes,
+      contractHash: input.contractHash,
+      queryPlanHash: input.queryPlanHash,
+      evidencePolicyHash: input.evidencePolicyHash,
+      catalogPolicyHash: input.catalogPolicyHash,
+    });
+    return {
+      role: item.role,
+      position: item.position,
+      selectionQualificationHash: qualification.qualificationHash,
+      canonicalTrackIdentityHash,
+      appleStableId: item.appleStableId,
+    };
+  });
+  return buildSelectionSetAttestationV1({
+    runId: input.runId,
+    contractRevisionId: input.contractRevisionId,
+    queryPlanRevisionId: input.queryPlanRevisionId,
+    executionAttemptId: input.executionAttemptId,
+    requestedCount: input.requestedCount,
+    items,
+    allowPendingPartial: true,
+  });
+}
+
+async function schema20ProofModeTransaction(
+  client: PoolClient,
+  schemaVersion: number,
+): Promise<ProofArchitectureMode | null> {
+  const configuredMode = proofArchitectureMode();
+  if (schemaVersion < 20) {
+    if (configuredMode === "native") {
+      throw new HttpError(
+        503,
+        "Native proof authority requires database schema 20",
+        "schema20_proof_architecture_unavailable",
+      );
+    }
+    return null;
+  }
+  const marker = await client.query<{ key: string; value: string }>(
+    `SELECT key,value FROM settings
+     WHERE key IN ('proof_architecture_version','proof_architecture_authority')
+     FOR SHARE`,
+  );
+  const values = new Map(marker.rows.map(({ key, value }) => [key, value]));
+  if (values.get("proof_architecture_version")
+    !== SCHEMA_20_PROOF_ARCHITECTURE_VERSION) {
+    throw new HttpError(
+      503,
+      "Schema-20 proof architecture marker is unavailable",
+      "schema20_proof_architecture_unavailable",
+    );
+  }
+  const authority = values.get("proof_architecture_authority");
+  if (authority !== "shadow" && authority !== "native") {
+    throw new HttpError(
+      503,
+      "Schema-20 proof authority is unconfigured",
+      "schema20_proof_authority_unconfigured",
+    );
+  }
+  if (configuredMode === "off") {
+    if (authority === "native") {
+      throw new HttpError(
+        503,
+        "A native proof database cannot be served by a proof-disabled runtime",
+        "schema20_proof_authority_mismatch",
+      );
+    }
+    return null;
+  }
+  if (configuredMode !== authority) {
+    throw new HttpError(
+      503,
+      "Runtime proof mode does not match database authority",
+      "schema20_proof_authority_mismatch",
+    );
+  }
+  return configuredMode;
+}
+
+async function persistSchema20SelectionProofTransaction(
+  client: PoolClient,
+  input: Schema20SelectionProofInput,
+): Promise<{
+  selectionSetId: string;
+  attestationSetHash: string;
+  proofMode: "shadow" | "native";
+} | null> {
+  const proofMode = await schema20ProofModeTransaction(
+    client,
+    input.schemaVersion,
+  );
+  if (!proofMode || proofMode === "off") return null;
+  const preview = previewSchema20SelectionProof(input);
+
+  const proofItems: Array<{
+    role: "selected" | "reserve";
+    position: number;
+    selectionQualificationId: string;
+    selectionQualificationHash: string;
+    canonicalTrackIdentityId: string;
+    canonicalTrackIdentityHash: string;
+    appleStableId: string;
+  }> = [];
+
+  for (const item of input.tracks) {
+    const identityTuple = normalizeCanonicalTrackIdentityTupleV1({
+      storefront: input.storefront,
+      recordingFamilyKey: item.recordingFamilyKey,
+      recordingFamilyPolicyVersion: input.recordingFamilyPolicyVersion,
+      appleStableId: item.appleStableId,
+    });
+    const identityHash = canonicalTrackIdentityHashV1(identityTuple);
+    const identityId = deterministicUuid({
+      kind: "schema20_canonical_track_identity",
+      identityHash,
+    });
+    await client.query(
+      `INSERT INTO canonical_track_identities(
+         id,identity_policy_version,provider,storefront,recording_family_key,
+         recording_family_policy_version,apple_stable_id,identity_hash)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT DO NOTHING`,
+      [
+        identityId,
+        identityTuple.identityPolicyVersion,
+        identityTuple.provider,
+        identityTuple.storefront,
+        identityTuple.recordingFamilyKey,
+        identityTuple.recordingFamilyPolicyVersion,
+        identityTuple.appleStableId,
+        identityHash,
+      ],
+    );
+    const persistedIdentity = await client.query<{
+      id: string;
+      identity_policy_version: CanonicalTrackIdentityTupleV1["identityPolicyVersion"];
+      provider: CanonicalTrackIdentityTupleV1["provider"];
+      storefront: string;
+      recording_family_key: string;
+      recording_family_policy_version: string;
+      apple_stable_id: string;
+      identity_hash: string;
+    }>(
+      `SELECT id,identity_policy_version,provider,storefront,
+              recording_family_key,recording_family_policy_version,
+              apple_stable_id,identity_hash
+       FROM canonical_track_identities
+       WHERE identity_hash=$1
+          OR (
+            identity_policy_version=$2 AND provider=$3 AND storefront=$4
+            AND recording_family_key=$5
+            AND recording_family_policy_version=$6
+            AND apple_stable_id=$7
+          )
+       FOR SHARE`,
+      [
+        identityHash,
+        identityTuple.identityPolicyVersion,
+        identityTuple.provider,
+        identityTuple.storefront,
+        identityTuple.recordingFamilyKey,
+        identityTuple.recordingFamilyPolicyVersion,
+        identityTuple.appleStableId,
+      ],
+    );
+    if (persistedIdentity.rows.length !== 1) {
+      throw new HttpError(
+        409,
+        "Canonical track identity is ambiguous",
+        "schema20_canonical_identity_conflict",
+      );
+    }
+    const storedIdentity = persistedIdentity.rows[0]!;
+    const storedTuple: CanonicalTrackIdentityTupleV1 = {
+      identityPolicyVersion: storedIdentity.identity_policy_version,
+      provider: storedIdentity.provider,
+      storefront: storedIdentity.storefront,
+      recordingFamilyKey: storedIdentity.recording_family_key,
+      recordingFamilyPolicyVersion:
+        storedIdentity.recording_family_policy_version,
+      appleStableId: storedIdentity.apple_stable_id,
+    };
+    if (storedIdentity.identity_hash !== identityHash
+      || !canonicalTrackIdentityTuplesEqualV1(identityTuple, storedTuple)) {
+      throw new HttpError(
+        409,
+        "Canonical track identity hash conflicts with its complete tuple",
+        "schema20_canonical_identity_conflict",
+      );
+    }
+
+    const evidenceSnapshotRows: Array<{ id: string; contentHash: string }> = [];
+    for (const snapshot of item.evidenceSnapshots) {
+      const source = new URL(snapshot.sourceUrl);
+      const snapshotId = deterministicUuid({
+        kind: "schema20_evidence_snapshot",
+        contentHash: snapshot.snapshotHash,
+      });
+      await client.query(
+        `INSERT INTO content_addressed_evidence_snapshots(
+           id,content_hash,source_url_hash,source_host,excerpt_hash,
+           acquisition_policy_version,snapshot_json,acquired_at,revoked_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
+         ON CONFLICT(content_hash) DO NOTHING`,
+        [
+          snapshotId,
+          snapshot.snapshotHash,
+          sha256Hex(snapshot.sourceUrl),
+          source.hostname.toLowerCase().slice(0, 240),
+          snapshot.excerptHash,
+          snapshot.acquisitionPolicyVersion,
+          JSON.stringify(snapshot),
+          new Date(snapshot.acquiredAt),
+          snapshot.revokedAt ? new Date(snapshot.revokedAt) : null,
+        ],
+      );
+      const persistedSnapshot = await client.query<{
+        id: string;
+        snapshot_json: unknown;
+        revoked_at: Date | null;
+      }>(
+        `SELECT id,snapshot_json,revoked_at
+         FROM content_addressed_evidence_snapshots
+         WHERE content_hash=$1 FOR SHARE`,
+        [snapshot.snapshotHash],
+      );
+      const storedSnapshot = persistedSnapshot.rows[0];
+      if (!storedSnapshot
+        || stableStringify(storedSnapshot.snapshot_json)
+          !== stableStringify(snapshot)
+        || (storedSnapshot.revoked_at?.toISOString() ?? null)
+          !== (snapshot.revokedAt
+            ? new Date(snapshot.revokedAt).toISOString()
+            : null)) {
+        throw new HttpError(
+          409,
+          "Evidence snapshot hash conflicts with its immutable content",
+          "schema20_evidence_snapshot_conflict",
+        );
+      }
+      evidenceSnapshotRows.push({
+        id: storedSnapshot.id,
+        contentHash: snapshot.snapshotHash,
+      });
+    }
+    evidenceSnapshotRows.sort((left, right) =>
+      left.contentHash.localeCompare(right.contentHash)
+    );
+
+    const sourceQualification = await client.query<{
+      id: string;
+      qualification_hash: string;
+    }>(
+      `SELECT id,qualification_hash
+       FROM playlist_qualification_records
+       WHERE run_id=$1 AND contract_revision_id=$2 AND candidate_id=$3
+         AND qualification_hash=$4 AND decision='qualified'
+         AND revoked_at IS NULL
+       ORDER BY qualified_at DESC,id DESC LIMIT 1
+       FOR SHARE`,
+      [
+        input.runId,
+        input.contractRevisionId,
+        item.candidateId,
+        item.qualificationHash,
+      ],
+    );
+    const sourceQualificationRow = sourceQualification.rows[0];
+    if (!sourceQualificationRow) {
+      throw new HttpError(
+        409,
+        "Selection proof is missing its immutable source qualification",
+        "schema20_selection_qualification_missing",
+      );
+    }
+    const observation = {
+      schemaVersion: "selection-qualification-observation/v1",
+      sourceQualificationHash: sourceQualificationRow.qualification_hash,
+      canonicalTrackIdentityHash: identityHash,
+      evidenceSnapshotHashes: evidenceSnapshotRows.map(
+        ({ contentHash }) => contentHash,
+      ),
+      observation: item.observation,
+    };
+    const observationHash = sha256Hex(
+      `genio/selection-qualification-observation/v1\0${
+        stableStringify(observation)
+      }`,
+    );
+    const observationId = deterministicUuid({
+      kind: "schema20_selection_qualification_observation",
+      executionAttemptId: input.executionAttemptId,
+      candidateId: item.candidateId,
+      observationHash,
+    });
+    await client.query(
+      `INSERT INTO selection_qualification_observations(
+         id,run_id,contract_revision_id,query_plan_revision_id,
+         execution_attempt_id,candidate_id,canonical_track_identity_id,
+         source_qualification_record_id,observation_hash,observation_json,
+         observed_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
+       ON CONFLICT(
+         execution_attempt_id,candidate_id,observation_hash
+       ) DO NOTHING`,
+      [
+        observationId,
+        input.runId,
+        input.contractRevisionId,
+        input.queryPlanRevisionId,
+        input.executionAttemptId,
+        item.candidateId,
+        storedIdentity.id,
+        sourceQualificationRow.id,
+        observationHash,
+        JSON.stringify(observation),
+      ],
+    );
+    const storedObservation = await client.query<{
+      id: string;
+      canonical_track_identity_id: string;
+      observation_json: unknown;
+    }>(
+      `SELECT id,canonical_track_identity_id,observation_json
+       FROM selection_qualification_observations
+       WHERE execution_attempt_id=$1 AND candidate_id=$2
+         AND observation_hash=$3
+       FOR SHARE`,
+      [input.executionAttemptId, item.candidateId, observationHash],
+    );
+    const storedObservationRow = storedObservation.rows[0];
+    if (!storedObservationRow
+      || storedObservationRow.canonical_track_identity_id !== storedIdentity.id
+      || stableStringify(storedObservationRow.observation_json)
+        !== stableStringify(observation)) {
+      throw new HttpError(
+        409,
+        "Selection qualification observation conflicts with its hash",
+        "schema20_selection_observation_conflict",
+      );
+    }
+
+    const qualification = buildSelectionQualificationAttestationV1({
+      runId: input.runId,
+      contractRevisionId: input.contractRevisionId,
+      queryPlanRevisionId: input.queryPlanRevisionId,
+      executionAttemptId: input.executionAttemptId,
+      candidateId: item.candidateId,
+      canonicalTrackIdentityHash: identityHash,
+      qualificationObservationHash: observationHash,
+      evidenceSnapshotHashes: evidenceSnapshotRows.map(
+        ({ contentHash }) => contentHash,
+      ),
+      contractHash: input.contractHash,
+      queryPlanHash: input.queryPlanHash,
+      evidencePolicyHash: input.evidencePolicyHash,
+      catalogPolicyHash: input.catalogPolicyHash,
+    });
+    const selectionQualificationId = deterministicUuid({
+      kind: "schema20_immutable_selection_qualification",
+      qualificationHash: qualification.qualificationHash,
+    });
+    await client.query(
+      `INSERT INTO immutable_selection_qualifications(
+         id,run_id,contract_revision_id,query_plan_revision_id,
+         execution_attempt_id,candidate_id,canonical_track_identity_id,
+         qualification_observation_id,evidence_snapshot_ids,contract_hash,
+         query_plan_hash,evidence_policy_hash,catalog_policy_hash,
+         qualification_hash,decision)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid[],$10,$11,$12,$13,$14,
+         'qualified')
+       ON CONFLICT(qualification_hash) DO NOTHING`,
+      [
+        selectionQualificationId,
+        input.runId,
+        input.contractRevisionId,
+        input.queryPlanRevisionId,
+        input.executionAttemptId,
+        item.candidateId,
+        storedIdentity.id,
+        storedObservationRow.id,
+        evidenceSnapshotRows.map(({ id }) => id),
+        input.contractHash,
+        input.queryPlanHash,
+        input.evidencePolicyHash,
+        input.catalogPolicyHash,
+        qualification.qualificationHash,
+      ],
+    );
+    const storedQualification = await client.query<{
+      id: string;
+      run_id: string;
+      contract_revision_id: string;
+      query_plan_revision_id: string;
+      execution_attempt_id: string;
+      candidate_id: string;
+      canonical_track_identity_id: string;
+      qualification_observation_id: string;
+      evidence_snapshot_ids: string[];
+      contract_hash: string;
+      query_plan_hash: string;
+      evidence_policy_hash: string;
+      catalog_policy_hash: string;
+      decision: string;
+    }>(
+      `SELECT id,run_id,contract_revision_id,query_plan_revision_id,
+              execution_attempt_id,candidate_id,canonical_track_identity_id,
+              qualification_observation_id,evidence_snapshot_ids,
+              contract_hash,query_plan_hash,evidence_policy_hash,
+              catalog_policy_hash,decision
+       FROM immutable_selection_qualifications
+       WHERE qualification_hash=$1 FOR SHARE`,
+      [qualification.qualificationHash],
+    );
+    const storedQualificationRow = storedQualification.rows[0];
+    if (!storedQualificationRow
+      || storedQualificationRow.run_id !== input.runId
+      || storedQualificationRow.contract_revision_id
+        !== input.contractRevisionId
+      || storedQualificationRow.query_plan_revision_id
+        !== input.queryPlanRevisionId
+      || storedQualificationRow.execution_attempt_id
+        !== input.executionAttemptId
+      || storedQualificationRow.candidate_id !== item.candidateId
+      || storedQualificationRow.canonical_track_identity_id
+        !== storedIdentity.id
+      || storedQualificationRow.qualification_observation_id
+        !== storedObservationRow.id
+      || stableStringify(storedQualificationRow.evidence_snapshot_ids.sort())
+        !== stableStringify(
+          evidenceSnapshotRows.map(({ id }) => id).sort(),
+        )
+      || storedQualificationRow.contract_hash !== input.contractHash
+      || storedQualificationRow.query_plan_hash !== input.queryPlanHash
+      || storedQualificationRow.evidence_policy_hash
+        !== input.evidencePolicyHash
+      || storedQualificationRow.catalog_policy_hash !== input.catalogPolicyHash
+      || storedQualificationRow.decision !== "qualified") {
+      throw new HttpError(
+        409,
+        "Selection qualification hash conflicts with its complete tuple",
+        "schema20_selection_qualification_conflict",
+      );
+    }
+    proofItems.push({
+      role: item.role,
+      position: item.position,
+      selectionQualificationId: storedQualificationRow.id,
+      selectionQualificationHash: qualification.qualificationHash,
+      canonicalTrackIdentityId: storedIdentity.id,
+      canonicalTrackIdentityHash: identityHash,
+      appleStableId: item.appleStableId,
+    });
+  }
+
+  const selectionSet = buildSelectionSetAttestationV1({
+    runId: input.runId,
+    contractRevisionId: input.contractRevisionId,
+    queryPlanRevisionId: input.queryPlanRevisionId,
+    executionAttemptId: input.executionAttemptId,
+    requestedCount: input.requestedCount,
+    items: proofItems,
+    allowPendingPartial: true,
+  });
+  if (
+    selectionSet.attestationSetHash !== preview.attestationSetHash
+    || selectionSet.outputHash !== preview.outputHash
+  ) {
+    throw new HttpError(
+      409,
+      "Persisted selection proof differs from its pre-manifest attestation",
+      "schema20_selection_preview_conflict",
+    );
+  }
+  const existingAttempt = await client.query<{
+    output_hash: string;
+    attestation_set_hash: string;
+    selection_set_id: string;
+  }>(
+    `SELECT output_hash,attestation_set_hash,selection_set_id
+     FROM selection_attempt_output_attestations
+     WHERE execution_attempt_id=$1 FOR UPDATE`,
+    [input.executionAttemptId],
+  );
+  if (existingAttempt.rows[0]) {
+    assertAttemptOutputDeterministicV1({
+      existingOutputHash: existingAttempt.rows[0].output_hash,
+      existingAttestationSetHash:
+        existingAttempt.rows[0].attestation_set_hash,
+      proposedOutputHash: selectionSet.outputHash,
+      proposedAttestationSetHash: selectionSet.attestationSetHash,
+    });
+  }
+
+  const selectionSetId = existingAttempt.rows[0]?.selection_set_id
+    ?? deterministicUuid({
+      kind: "schema20_immutable_selection_set",
+      executionAttemptId: input.executionAttemptId,
+      attestationSetHash: selectionSet.attestationSetHash,
+    });
+  await client.query(
+    `INSERT INTO immutable_selection_sets(
+       id,run_id,contract_revision_id,query_plan_revision_id,
+       execution_attempt_id,proof_mode,requested_count,selected_count,
+       reserve_count,selected_attestation_hash,reserve_attestation_hash,
+       attestation_set_hash,output_hash)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     ON CONFLICT(attestation_set_hash) DO NOTHING`,
+    [
+      selectionSetId,
+      input.runId,
+      input.contractRevisionId,
+      input.queryPlanRevisionId,
+      input.executionAttemptId,
+      proofMode,
+      selectionSet.requestedCount,
+      selectionSet.selectedCount,
+      selectionSet.reserveCount,
+      selectionSet.selectedAttestationHash,
+      selectionSet.reserveAttestationHash,
+      selectionSet.attestationSetHash,
+      selectionSet.outputHash,
+    ],
+  );
+  const storedSet = await client.query<{
+    id: string;
+    run_id: string;
+    contract_revision_id: string;
+    query_plan_revision_id: string;
+    execution_attempt_id: string;
+    proof_mode: string;
+    requested_count: number;
+    selected_count: number;
+    reserve_count: number;
+    selected_attestation_hash: string;
+    reserve_attestation_hash: string;
+    output_hash: string;
+  }>(
+    `SELECT id,run_id,contract_revision_id,query_plan_revision_id,
+            execution_attempt_id,proof_mode,requested_count,selected_count,
+            reserve_count,selected_attestation_hash,
+            reserve_attestation_hash,output_hash
+     FROM immutable_selection_sets
+     WHERE attestation_set_hash=$1 FOR SHARE`,
+    [selectionSet.attestationSetHash],
+  );
+  const storedSetRow = storedSet.rows[0];
+  if (!storedSetRow
+    || storedSetRow.id !== selectionSetId
+    || storedSetRow.run_id !== input.runId
+    || storedSetRow.contract_revision_id !== input.contractRevisionId
+    || storedSetRow.query_plan_revision_id !== input.queryPlanRevisionId
+    || storedSetRow.execution_attempt_id !== input.executionAttemptId
+    || storedSetRow.proof_mode !== proofMode
+    || Number(storedSetRow.requested_count) !== selectionSet.requestedCount
+    || Number(storedSetRow.selected_count) !== selectionSet.selectedCount
+    || Number(storedSetRow.reserve_count) !== selectionSet.reserveCount
+    || storedSetRow.selected_attestation_hash
+      !== selectionSet.selectedAttestationHash
+    || storedSetRow.reserve_attestation_hash
+      !== selectionSet.reserveAttestationHash
+    || storedSetRow.output_hash !== selectionSet.outputHash) {
+    throw new HttpError(
+      409,
+      "Selection set hash conflicts with its complete tuple",
+      "schema20_selection_set_conflict",
+    );
+  }
+
+  for (const item of proofItems) {
+    await client.query(
+      `INSERT INTO immutable_selection_set_items(
+         selection_set_id,role,position,selection_qualification_id,
+         canonical_track_identity_id,apple_stable_id)
+       VALUES($1,$2,$3,$4,$5,$6)
+       ON CONFLICT(selection_set_id,role,position) DO NOTHING`,
+      [
+        storedSetRow.id,
+        item.role,
+        item.position,
+        item.selectionQualificationId,
+        item.canonicalTrackIdentityId,
+        item.appleStableId,
+      ],
+    );
+  }
+  const storedItems = await client.query<{
+    role: "selected" | "reserve";
+    position: number;
+    selection_qualification_id: string;
+    canonical_track_identity_id: string;
+    apple_stable_id: string;
+  }>(
+    `SELECT role,position,selection_qualification_id,
+            canonical_track_identity_id,apple_stable_id
+     FROM immutable_selection_set_items
+     WHERE selection_set_id=$1
+     ORDER BY CASE role WHEN 'selected' THEN 0 ELSE 1 END,position`,
+    [storedSetRow.id],
+  );
+  if (stableStringify(storedItems.rows.map((row) => ({
+    role: row.role,
+    position: Number(row.position),
+    selectionQualificationId: row.selection_qualification_id,
+    canonicalTrackIdentityId: row.canonical_track_identity_id,
+    appleStableId: row.apple_stable_id,
+  }))) !== stableStringify(proofItems.map((item) => ({
+    role: item.role,
+    position: item.position,
+    selectionQualificationId: item.selectionQualificationId,
+    canonicalTrackIdentityId: item.canonicalTrackIdentityId,
+    appleStableId: item.appleStableId,
+  })))) {
+    throw new HttpError(
+      409,
+      "Selection set items conflict with the immutable attestation",
+      "schema20_selection_set_item_conflict",
+    );
+  }
+  if (!existingAttempt.rows[0]) {
+    await client.query(
+      `INSERT INTO selection_attempt_output_attestations(
+         execution_attempt_id,selection_set_id,output_hash,
+         attestation_set_hash)
+       VALUES($1,$2,$3,$4)`,
+      [
+        input.executionAttemptId,
+        storedSetRow.id,
+        selectionSet.outputHash,
+        selectionSet.attestationSetHash,
+      ],
+    );
+  }
+  return {
+    selectionSetId: storedSetRow.id,
+    attestationSetHash: selectionSet.attestationSetHash,
+    proofMode,
+  };
+}
+
+async function assertSchema20NativeManifestProofTransaction(
+  client: PoolClient,
+  input: {
+    schemaVersion: number;
+    runId: string;
+    manifestId: string;
+    manifestRevisionId: string;
+    manifestRevisionHash: string;
+    selectedCount: number;
+  },
+): Promise<void> {
+  const proofMode = await schema20ProofModeTransaction(
+    client,
+    input.schemaVersion,
+  );
+  if (proofMode !== "native") return;
+  const authority = await client.query<{
+    selection_set_id: string;
+    attestation_set_hash: string;
+    proof_kind: string;
+    run_id: string;
+    contract_revision_id: string;
+    query_plan_revision_id: string;
+    execution_attempt_id: string;
+    requested_count: number;
+    selected_count: number;
+    reserve_count: number;
+    selected_attestation_hash: string;
+    reserve_attestation_hash: string;
+    output_hash: string;
+    attempt_output_hash: string;
+    attempt_attestation_set_hash: string;
+  }>(
+    `SELECT revision.selection_set_id,revision.attestation_set_hash,
+            revision.proof_kind,selection.run_id,
+            selection.contract_revision_id,
+            selection.query_plan_revision_id,
+            selection.execution_attempt_id,
+            selection.requested_count,selection.selected_count,
+            selection.reserve_count,selection.selected_attestation_hash,
+            selection.reserve_attestation_hash,selection.output_hash,
+            output.output_hash attempt_output_hash,
+            output.attestation_set_hash attempt_attestation_set_hash
+     FROM manifest_revisions revision
+     JOIN manifests manifest
+       ON manifest.id=revision.manifest_id
+     JOIN immutable_selection_sets selection
+       ON selection.id=revision.selection_set_id
+      AND selection.attestation_set_hash=revision.attestation_set_hash
+     JOIN selection_attempt_output_attestations output
+       ON output.execution_attempt_id=selection.execution_attempt_id
+      AND output.selection_set_id=selection.id
+     WHERE revision.id=$1 AND revision.manifest_id=$2
+       AND revision.content_hash=$3 AND manifest.run_id=$4
+       AND revision.status IN ('locked','published')
+     FOR SHARE OF revision,manifest,selection,output`,
+    [
+      input.manifestRevisionId,
+      input.manifestId,
+      input.manifestRevisionHash,
+      input.runId,
+    ],
+  );
+  const set = authority.rows[0];
+  if (!set
+    || set.proof_kind !== "native"
+    || set.run_id !== input.runId
+    || Number(set.selected_count) !== input.selectedCount
+    || set.attempt_output_hash !== set.output_hash
+    || set.attempt_attestation_set_hash !== set.attestation_set_hash) {
+    throw new HttpError(
+      409,
+      "Native publication requires a complete immutable selection proof",
+      "schema20_native_publication_proof_missing",
+    );
+  }
+  const rows = await client.query<{
+    role: "selected" | "reserve";
+    position: number;
+    apple_stable_id: string;
+    selection_qualification_id: string;
+    qualification_hash: string;
+    qualification_run_id: string;
+    qualification_contract_revision_id: string;
+    qualification_query_plan_revision_id: string;
+    qualification_execution_attempt_id: string;
+    candidate_id: string;
+    canonical_track_identity_id: string;
+    identity_policy_version: CanonicalTrackIdentityTupleV1["identityPolicyVersion"];
+    provider: CanonicalTrackIdentityTupleV1["provider"];
+    storefront: string;
+    recording_family_key: string;
+    recording_family_policy_version: string;
+    identity_apple_stable_id: string;
+    identity_hash: string;
+    observation_hash: string;
+    observation_json: unknown;
+    evidence_snapshot_hashes: string[];
+    contract_hash: string;
+    query_plan_hash: string;
+    evidence_policy_hash: string;
+    catalog_policy_hash: string;
+    selected_candidate_id: string | null;
+    selected_catalog_id: string | null;
+    reserve_candidate_id: string | null;
+    reserve_catalog_id: string | null;
+    revocation_count: number;
+  }>(
+    `SELECT item.role,item.position,item.apple_stable_id,
+            qualification.id selection_qualification_id,
+            qualification.qualification_hash,
+            qualification.run_id qualification_run_id,
+            qualification.contract_revision_id
+              qualification_contract_revision_id,
+            qualification.query_plan_revision_id
+              qualification_query_plan_revision_id,
+            qualification.execution_attempt_id
+              qualification_execution_attempt_id,
+            qualification.candidate_id,
+            identity.id canonical_track_identity_id,
+            identity.identity_policy_version,identity.provider,
+            identity.storefront,identity.recording_family_key,
+            identity.recording_family_policy_version,
+            identity.apple_stable_id identity_apple_stable_id,
+            identity.identity_hash,
+            observation.observation_hash,observation.observation_json,
+            ARRAY(
+              SELECT snapshot.content_hash
+              FROM unnest(qualification.evidence_snapshot_ids)
+                snapshot_id
+              JOIN content_addressed_evidence_snapshots snapshot
+                ON snapshot.id=snapshot_id
+              ORDER BY snapshot.content_hash
+            ) evidence_snapshot_hashes,
+            qualification.contract_hash,qualification.query_plan_hash,
+            qualification.evidence_policy_hash,
+            qualification.catalog_policy_hash,
+            selected.candidate_id selected_candidate_id,
+            selected.catalog_id selected_catalog_id,
+            reserve.candidate_id reserve_candidate_id,
+            reserve.catalog_id reserve_catalog_id,
+            (
+              SELECT count(*)::int
+              FROM immutable_qualification_revocations revocation
+              WHERE revocation.selection_qualification_id=qualification.id
+            ) revocation_count
+     FROM immutable_selection_set_items item
+     JOIN immutable_selection_qualifications qualification
+       ON qualification.id=item.selection_qualification_id
+     JOIN canonical_track_identities identity
+       ON identity.id=item.canonical_track_identity_id
+      AND identity.id=qualification.canonical_track_identity_id
+     JOIN selection_qualification_observations observation
+       ON observation.id=qualification.qualification_observation_id
+      AND observation.canonical_track_identity_id=identity.id
+     LEFT JOIN manifest_revision_tracks selected
+       ON item.role='selected'
+      AND selected.manifest_revision_id=$2
+      AND selected.position=item.position
+     LEFT JOIN manifest_revision_reserve_tracks reserve
+       ON item.role='reserve'
+      AND reserve.manifest_revision_id=$2
+      AND reserve.position=item.position
+     WHERE item.selection_set_id=$1
+     ORDER BY CASE item.role WHEN 'selected' THEN 0 ELSE 1 END,item.position
+     FOR SHARE OF item,qualification,identity,observation`,
+    [set.selection_set_id, input.manifestRevisionId],
+  );
+  if (rows.rows.length
+    !== Number(set.selected_count) + Number(set.reserve_count)) {
+    throw new HttpError(
+      409,
+      "Native selection-set cardinality does not match its proof",
+      "schema20_native_publication_proof_invalid",
+    );
+  }
+  const items = rows.rows.map((row) => {
+    const tuple = normalizeCanonicalTrackIdentityTupleV1({
+      provider: row.provider,
+      storefront: row.storefront,
+      recordingFamilyKey: row.recording_family_key,
+      recordingFamilyPolicyVersion: row.recording_family_policy_version,
+      appleStableId: row.identity_apple_stable_id,
+    });
+    const recomputedIdentityHash = canonicalTrackIdentityHashV1(tuple);
+    const observationHash = sha256Hex(
+      `genio/selection-qualification-observation/v1\0${
+        stableStringify(row.observation_json)
+      }`,
+    );
+    const qualification = buildSelectionQualificationAttestationV1({
+      runId: row.qualification_run_id,
+      contractRevisionId: row.qualification_contract_revision_id,
+      queryPlanRevisionId: row.qualification_query_plan_revision_id,
+      executionAttemptId: row.qualification_execution_attempt_id,
+      candidateId: row.candidate_id,
+      canonicalTrackIdentityHash: row.identity_hash,
+      qualificationObservationHash: row.observation_hash,
+      evidenceSnapshotHashes: row.evidence_snapshot_hashes,
+      contractHash: row.contract_hash,
+      queryPlanHash: row.query_plan_hash,
+      evidencePolicyHash: row.evidence_policy_hash,
+      catalogPolicyHash: row.catalog_policy_hash,
+    });
+    const projectionMatches = row.role === "selected"
+      ? row.selected_candidate_id === row.candidate_id
+        && row.selected_catalog_id === row.apple_stable_id
+      : row.reserve_candidate_id === row.candidate_id
+        && row.reserve_catalog_id === row.apple_stable_id;
+    if (row.revocation_count !== 0
+      || row.qualification_run_id !== set.run_id
+      || row.qualification_contract_revision_id
+        !== set.contract_revision_id
+      || row.qualification_query_plan_revision_id
+        !== set.query_plan_revision_id
+      || row.qualification_execution_attempt_id
+        !== set.execution_attempt_id
+      || row.identity_hash !== recomputedIdentityHash
+      || row.identity_apple_stable_id !== row.apple_stable_id
+      || row.observation_hash !== observationHash
+      || row.qualification_hash !== qualification.qualificationHash
+      || !projectionMatches) {
+      throw new HttpError(
+        409,
+        "Native selection proof conflicts with its immutable catalog tuple",
+        "schema20_native_publication_proof_invalid",
+      );
+    }
+    return {
+      role: row.role,
+      position: Number(row.position),
+      selectionQualificationHash: row.qualification_hash,
+      canonicalTrackIdentityHash: row.identity_hash,
+      appleStableId: row.apple_stable_id,
+    };
+  });
+  const recomputed = buildSelectionSetAttestationV1({
+    runId: set.run_id,
+    contractRevisionId: set.contract_revision_id,
+    queryPlanRevisionId: set.query_plan_revision_id,
+    executionAttemptId: set.execution_attempt_id,
+    requestedCount: Number(set.requested_count),
+    items,
+    allowPendingPartial: true,
+  });
+  if (recomputed.selectedCount !== Number(set.selected_count)
+    || recomputed.reserveCount !== Number(set.reserve_count)
+    || recomputed.selectedAttestationHash
+      !== set.selected_attestation_hash
+    || recomputed.reserveAttestationHash
+      !== set.reserve_attestation_hash
+    || recomputed.attestationSetHash !== set.attestation_set_hash
+    || recomputed.outputHash !== set.output_hash) {
+    throw new HttpError(
+      409,
+      "Native selection-set attestation is invalid",
+      "schema20_native_publication_proof_invalid",
+    );
+  }
+  if (Number(set.selected_count) < Number(set.requested_count)) {
+    const decision = await client.query<{
+      selection_set_id: string | null;
+      manifest_revision_hash: string;
+      manifest_payload_hash: string | null;
+      attestation_set_hash: string | null;
+      outcome_hash: string;
+      target_count: number;
+      selected_count: number;
+      expires_at: Date;
+    }>(
+      `SELECT selection_set_id,manifest_revision_hash,
+              manifest_payload_hash,attestation_set_hash,outcome_hash,
+              target_count,selected_count,expires_at
+       FROM partial_publication_decisions
+       WHERE run_id=$1 AND manifest_revision_id=$2
+         AND decision='publish_partial' AND expires_at>now()
+       ORDER BY decided_at DESC,id DESC LIMIT 1
+       FOR SHARE`,
+      [set.run_id, input.manifestRevisionId],
+    );
+    const row = decision.rows[0];
+    const manifestPayloadHash = schema20ManifestPayloadHashV1({
+      runId: set.run_id,
+      contractRevisionId: set.contract_revision_id,
+      manifestRevisionId: input.manifestRevisionId,
+      manifestContentHash: input.manifestRevisionHash,
+      selectionSetHash: set.attestation_set_hash,
+      attestationSetHash: set.attestation_set_hash,
+      targetCount: Number(set.requested_count),
+      selectedCount: Number(set.selected_count),
+    });
+    if (!row
+      || row.selection_set_id !== set.selection_set_id
+      || row.manifest_revision_hash !== input.manifestRevisionHash
+      || row.manifest_payload_hash !== manifestPayloadHash
+      || row.attestation_set_hash !== set.attestation_set_hash) {
+      throw new HttpError(
+        409,
+        "Partial native publication requires exact unexpired consent",
+        "schema20_partial_consent_binding_invalid",
+      );
+    }
+    const consent: PartialPublicationConsentBindingV1 = {
+      schemaVersion: "partial-publication-consent-binding/v1",
+      runId: set.run_id,
+      contractRevisionId: set.contract_revision_id,
+      selectionSetHash: set.attestation_set_hash,
+      manifestRevisionId: input.manifestRevisionId,
+      manifestPayloadHash: row.manifest_payload_hash,
+      attestationSetHash: row.attestation_set_hash,
+      outcomeHash: row.outcome_hash,
+      targetCount: Number(row.target_count),
+      selectedCount: Number(row.selected_count),
+      expiresAt: row.expires_at.toISOString(),
+    };
+    try {
+      assertPartialPublicationConsentBindingV1(consent, {
+        runId: set.run_id,
+        contractRevisionId: set.contract_revision_id,
+        selectionSetHash: set.attestation_set_hash,
+        attestationSetHash: set.attestation_set_hash,
+        targetCount: Number(set.requested_count),
+        selectedCount: Number(set.selected_count),
+        manifestRevisionId: input.manifestRevisionId,
+        manifestPayloadHash,
+        outcomeHash: row.outcome_hash,
+      });
+    } catch {
+      throw new HttpError(
+        409,
+        "Partial native publication consent is stale or incomplete",
+        "schema20_partial_consent_binding_invalid",
+      );
+    }
+  }
 }
 
 interface CanonicalCapabilityDecision {
@@ -5987,7 +7058,7 @@ export class Repository {
             dependencyKey: blocker.dependency_key,
           }),
           eligibility.resumeAt,
-          minimumWorkerProtocolForQueryPlan(plan.plan_json),
+          minimumWorkerProtocolForActiveProofArchitecture(plan.plan_json),
           plan.id,
           stageKey,
           queueClass,
@@ -13723,7 +14794,7 @@ export class Repository {
               stageExecutionKey: stageKey,
               predecessorRunId: input.runId,
             }),
-            minimumWorkerProtocolForQueryPlan(queryPlan),
+            minimumWorkerProtocolForActiveProofArchitecture(queryPlan),
             queryPlanRevisionId,
             stageKey,
             queueClass,
@@ -17465,7 +18536,7 @@ export class Repository {
             stageExecutionKey: successorStageKey,
             reviewedGraphSnapshotId: input.reviewedGraphSnapshotId,
           }),
-          minimumWorkerProtocolForQueryPlan(successorPlan),
+          minimumWorkerProtocolForActiveProofArchitecture(successorPlan),
           successorId,
           successorStageKey,
           executorReleaseIdentity.executorRevision,
@@ -19546,7 +20617,8 @@ export class Repository {
     const fail = (...reasonCodes: string[]): never => {
       throw new CanonicalPublicationRevalidationRequiredErrorV1(reasonCodes);
     };
-    if (Number(await this.getSchemaVersion() ?? 0) < 18) {
+    const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
+    if (schemaVersion < 18) {
       fail("canonical_qualification_projection_unavailable");
     }
     await this.transaction(async (client) => {
@@ -19732,6 +20804,14 @@ export class Repository {
           title: track.title,
         }),
       );
+      await assertSchema20NativeManifestProofTransaction(client, {
+        schemaVersion,
+        runId: input.runId,
+        manifestId: input.manifestId,
+        manifestRevisionId: input.manifestRevisionId,
+        manifestRevisionHash: input.manifestRevisionHash,
+        selectedCount: manifestTracks.length,
+      });
       if (manifestContentHash(manifestTracks) !== input.manifestRevisionHash) {
         fail("canonical_manifest_revision_content_invalid");
       }
@@ -19985,6 +21065,16 @@ export class Repository {
           "pipeline_v3_evidence_attestation_missing",
         );
       }
+      await this.transaction((client) =>
+        assertSchema20NativeManifestProofTransaction(client, {
+          schemaVersion,
+          runId: input.runId,
+          manifestId: input.manifestId,
+          manifestRevisionId: input.manifestRevisionId!,
+          manifestRevisionHash: input.manifestRevisionHash,
+          selectedCount: input.selectedCount,
+        })
+      );
       const revisionContract = await this.pool.query<{
         selection_plan_snapshot_json: SelectionPlanV3;
         query_plan_json: QueryPlanV3 | null;
@@ -21883,10 +22973,14 @@ export class Repository {
       target_count: number;
       selected_count: number;
       expires_at: Date;
+      selection_set_id: string | null;
+      manifest_payload_hash: string | null;
+      attestation_set_hash: string | null;
     }>(
       `SELECT d.run_id,mr.manifest_id,d.manifest_revision_id,d.outcome_hash,
               d.manifest_revision_hash,d.capability_session_id,d.target_count,
-              d.selected_count,d.expires_at
+              d.selected_count,d.expires_at,d.selection_set_id,
+              d.manifest_payload_hash,d.attestation_set_hash
        FROM partial_publication_decisions d
        JOIN manifest_revisions mr ON mr.id=d.manifest_revision_id
        WHERE d.idempotency_key=$1 AND d.decision='publish_partial'`,
@@ -21901,6 +22995,9 @@ export class Repository {
       target_count: number;
       selected_count: number;
       expires_at: Date;
+      selection_set_id: string | null;
+      manifest_payload_hash: string | null;
+      attestation_set_hash: string | null;
     }> }));
     if (existing.rows[0]) {
       const prior = existing.rows[0];
@@ -21913,6 +23010,50 @@ export class Repository {
       }
       if (prior.expires_at.getTime() <= Date.now()) {
         throw new HttpError(409, "The partial publication decision has expired", "partial_decision_expired");
+      }
+      if (proofArchitectureMode() === "native") {
+        const proof = await this.pool.query<{
+          selection_set_id: string;
+          attestation_set_hash: string;
+          contract_revision_id: string;
+          requested_count: number;
+          selected_count: number;
+          content_hash: string;
+        }>(
+          `SELECT mr.selection_set_id,mr.attestation_set_hash,
+                  selection.contract_revision_id,
+                  selection.requested_count,selection.selected_count,
+                  mr.content_hash
+           FROM manifest_revisions mr
+           JOIN immutable_selection_sets selection
+             ON selection.id=mr.selection_set_id
+            AND selection.attestation_set_hash=mr.attestation_set_hash
+           WHERE mr.id=$1 AND mr.proof_kind='native'`,
+          [prior.manifest_revision_id],
+        );
+        const binding = proof.rows[0];
+        const payloadHash = binding
+          ? schema20ManifestPayloadHashV1({
+              runId: prior.run_id,
+              contractRevisionId: binding.contract_revision_id,
+              manifestRevisionId: prior.manifest_revision_id,
+              manifestContentHash: binding.content_hash,
+              selectionSetHash: binding.attestation_set_hash,
+              attestationSetHash: binding.attestation_set_hash,
+              targetCount: Number(binding.requested_count),
+              selectedCount: Number(binding.selected_count),
+            })
+          : null;
+        if (!binding
+          || prior.selection_set_id !== binding.selection_set_id
+          || prior.attestation_set_hash !== binding.attestation_set_hash
+          || prior.manifest_payload_hash !== payloadHash) {
+          throw new HttpError(
+            409,
+            "Existing partial consent is not bound to the native selection proof",
+            "schema20_partial_consent_binding_invalid",
+          );
+        }
       }
       return this.getManifestById(prior.manifest_id);
     }
@@ -22041,6 +23182,60 @@ export class Repository {
       const schema = await client.query<{ value: string }>(
         "SELECT value FROM settings WHERE key='schema_version'",
       );
+      let nativeConsentBinding: {
+        selectionSetId: string;
+        attestationSetHash: string;
+        manifestPayloadHash: string;
+      } | null = null;
+      if (Number(schema.rows[0]?.value ?? 0) >= 20
+        && await schema20ProofModeTransaction(client, 20) === "native") {
+        const proof = await client.query<{
+          selection_set_id: string;
+          attestation_set_hash: string;
+          contract_revision_id: string;
+          requested_count: number;
+          selected_count: number;
+          content_hash: string;
+        }>(
+          `SELECT mr.selection_set_id,mr.attestation_set_hash,
+                  selection.contract_revision_id,
+                  selection.requested_count,selection.selected_count,
+                  mr.content_hash
+           FROM manifest_revisions mr
+           JOIN immutable_selection_sets selection
+             ON selection.id=mr.selection_set_id
+            AND selection.attestation_set_hash=mr.attestation_set_hash
+           WHERE mr.id=$1 AND mr.manifest_id=$2
+             AND mr.proof_kind='native' FOR SHARE`,
+          [manifest.revisionId, manifest.id],
+        );
+        const binding = proof.rows[0];
+        if (!binding
+          || binding.content_hash !== manifest.contentHash
+          || Number(binding.requested_count)
+            !== checkpoint.targetTrackCount
+          || Number(binding.selected_count) !== manifest.tracks.length) {
+          throw new HttpError(
+            409,
+            "Partial manifest is missing its native immutable selection proof",
+            "schema20_partial_consent_binding_invalid",
+          );
+        }
+        nativeConsentBinding = {
+          selectionSetId: binding.selection_set_id,
+          attestationSetHash: binding.attestation_set_hash,
+          manifestPayloadHash: schema20ManifestPayloadHashV1({
+            runId: input.runId,
+            contractRevisionId: binding.contract_revision_id,
+            manifestRevisionId: manifest.revisionId,
+            manifestContentHash: manifest.contentHash,
+            selectionSetHash: binding.attestation_set_hash,
+            attestationSetHash: binding.attestation_set_hash,
+            targetCount: checkpoint.targetTrackCount,
+            selectedCount: manifest.tracks.length,
+          }),
+        };
+      }
       if (Number(schema.rows[0]?.value ?? 0) >= 14) {
         const activePlan = await client.query<{ query_plan_revision_id: string }>(
           "SELECT query_plan_revision_id FROM run_active_query_plans WHERE run_id=$1",
@@ -22050,8 +23245,10 @@ export class Repository {
           `INSERT INTO partial_publication_decisions(
              id,run_id,manifest_revision_id,manifest_revision_hash,query_plan_revision_id,
              capability_session_id,outcome_hash,decision,target_count,selected_count,
-             idempotency_key,expires_at,decided_at)
-           VALUES($1,$2,$3,$4,$5,$6,$7,'publish_partial',$8,$9,$10,$11,now())
+             idempotency_key,expires_at,selection_set_id,
+             manifest_payload_hash,attestation_set_hash,decided_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,'publish_partial',$8,$9,$10,$11,
+             $12,$13,$14,now())
            ON CONFLICT DO NOTHING RETURNING id`,
           [
             randomUUID(), input.runId, manifest.revisionId, manifest.contentHash,
@@ -22059,6 +23256,9 @@ export class Repository {
             input.capabilitySessionId, checkpoint.outcomeHash,
             checkpoint.targetTrackCount, manifest.tracks.length,
             input.idempotencyKey, partialDecisionExpiresAt(),
+            nativeConsentBinding?.selectionSetId ?? null,
+            nativeConsentBinding?.manifestPayloadHash ?? null,
+            nativeConsentBinding?.attestationSetHash ?? null,
           ],
         );
         if (!insertedDecision.rows[0]) {
@@ -22071,9 +23271,14 @@ export class Repository {
             target_count: number;
             selected_count: number;
             expires_at: Date;
+            selection_set_id: string | null;
+            manifest_payload_hash: string | null;
+            attestation_set_hash: string | null;
           }>(
             `SELECT run_id,manifest_revision_id,manifest_revision_hash,
-                    capability_session_id,outcome_hash,target_count,selected_count,expires_at
+                    capability_session_id,outcome_hash,target_count,
+                    selected_count,expires_at,selection_set_id,
+                    manifest_payload_hash,attestation_set_hash
              FROM partial_publication_decisions
              WHERE idempotency_key=$1
                 OR (manifest_revision_id=$2 AND outcome_hash=$3 AND decision='publish_partial')
@@ -22089,7 +23294,13 @@ export class Repository {
             || prior.capability_session_id !== input.capabilitySessionId
             || prior.outcome_hash !== checkpoint.outcomeHash
             || Number(prior.target_count) !== checkpoint.targetTrackCount
-            || Number(prior.selected_count) !== manifest.tracks.length) {
+            || Number(prior.selected_count) !== manifest.tracks.length
+            || prior.selection_set_id
+              !== (nativeConsentBinding?.selectionSetId ?? null)
+            || prior.manifest_payload_hash
+              !== (nativeConsentBinding?.manifestPayloadHash ?? null)
+            || prior.attestation_set_hash
+              !== (nativeConsentBinding?.attestationSetHash ?? null)) {
             throw new HttpError(409, "Idempotency key was used for another partial playlist result", "idempotency_conflict");
           }
           if (prior.expires_at.getTime() <= Date.now()) {
@@ -22352,7 +23563,7 @@ export class Repository {
               stageExecutionKey: successorStageKey,
               continuationOutcomeHash: checkpoint.outcomeHash,
             }),
-            minimumWorkerProtocolForQueryPlan(successorPlan),
+            minimumWorkerProtocolForActiveProofArchitecture(successorPlan),
             successorId,
             successorStageKey,
             queueClass,
@@ -22721,7 +23932,7 @@ export class Repository {
       }
       const pipelineMinimum = minimumWorkerProtocolForPipeline(pipelineVersion);
       const planMinimum = pipelineVersion === "corpus_first_v3"
-        ? minimumWorkerProtocolForQueryPlan(activeQueryPlan)
+        ? minimumWorkerProtocolForActiveProofArchitecture(activeQueryPlan)
         : pipelineMinimum;
       // A caller may request a newer worker for another reason, but can never
       // downgrade schema-2 semantic work below protocol 8.
@@ -28330,6 +29541,119 @@ export class Repository {
           reserve: index >= result.selected.length,
         };
       });
+      const manifestContractDatabaseId =
+        immutable.active_playlist_contract_revision_id;
+      const manifestContractHash =
+        immutable.playlist_contract_json?.semanticHash ?? null;
+      if (isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)
+        && (!manifestContractDatabaseId || !manifestContractHash)) {
+        throw new HttpError(
+          409,
+          "Pipeline V3 manifest is missing its canonical contract binding",
+          "manifest_contract_stale",
+        );
+      }
+      if (schemaVersion >= 20
+        && proofArchitectureMode() === "native"
+        && (!recoveryAuthority
+          || !manifestContractDatabaseId
+          || !manifestContractHash)) {
+        throw new HttpError(
+          409,
+          "Native selection proof is missing its canonical execution authority",
+          "schema20_selection_proof_authority_missing",
+        );
+      }
+      const qualificationByFamilyKey = new Map(
+        pendingQualifications.map((qualification) => [
+          qualification.track.recordingFamilyKey,
+          qualification,
+        ]),
+      );
+      const schema20ProofInput: Schema20SelectionProofInput | null =
+        recoveryAuthority
+          && manifestContractDatabaseId
+          && manifestContractHash
+          ? {
+              schemaVersion,
+              runId,
+              contractRevisionId: manifestContractDatabaseId,
+              contractHash: manifestContractHash,
+              queryPlanRevisionId: immutable.query_plan_id,
+              queryPlanHash: queryHash,
+              executionAttemptId: recoveryAuthority.executionAttemptId,
+              storefront: plan.storefront,
+              requestedCount: target,
+              recordingFamilyPolicyVersion:
+                "corpus_first_v3_policy_v1",
+              evidencePolicyHash: sha256Hex(stableStringify({
+                version:
+                  immutable.playlist_contract_json?.versions.evidencePolicy
+                    ?? "legacy_unversioned",
+                canonicalPolicy:
+                  queryPlan.canonicalContractPolicy?.evidencePolicyVersion
+                    ?? null,
+              })),
+              catalogPolicyHash: sha256Hex(stableStringify({
+                version:
+                  immutable.playlist_contract_json?.versions.catalogPolicy
+                    ?? "legacy_unversioned",
+                storefront: plan.storefront,
+                recordingPolicy: finalSemanticPlan.recordingPolicy,
+              })),
+              tracks: persistedTracks.map((item, index) => {
+                const qualification = qualificationByFamilyKey.get(
+                  item.track.recordingFamilyKey,
+                );
+                if (!qualification) {
+                  throw new HttpError(
+                    409,
+                    "Selection proof is missing a materialized qualification",
+                    "schema20_selection_qualification_missing",
+                  );
+                }
+                const snapshots = [
+                  ...new Map(
+                    (attestedBindingsByTrack.get(item.track) ?? [])
+                      .flatMap((binding) =>
+                        binding.hostedEvidenceSnapshot
+                          ? [[
+                              binding.hostedEvidenceSnapshot.snapshotHash,
+                              binding.hostedEvidenceSnapshot,
+                            ] as const]
+                          : []
+                      ),
+                  ).values(),
+                ];
+                return {
+                  role: item.reserve
+                    ? "reserve" as const
+                    : "selected" as const,
+                  position: item.reserve
+                    ? index - result.selected.length
+                    : index,
+                  candidateId: item.candidateId,
+                  recordingFamilyKey: item.track.recordingFamilyKey,
+                  appleStableId: item.track.appleSongId,
+                  qualificationHash: qualification.qualificationHash,
+                  observation: {
+                    stableIdentityHash: qualification.stableIdentityHash,
+                    predicateResults: qualification.predicateResults,
+                    evidenceRecordIds: qualification.evidenceRecordIds,
+                    qualityResult: qualification.qualityResult,
+                    catalogResult: qualification.catalogResult,
+                    sourceQualificationHash:
+                      qualification.qualificationHash,
+                  },
+                  evidenceSnapshots: snapshots,
+                };
+              }),
+            }
+          : null;
+      const schema20ProofPreview =
+        schema20ProofInput && proofArchitectureMode() === "native"
+          ? previewSchema20SelectionProof(schema20ProofInput)
+          : null;
       const manifestHash = !manifestId
         ? null
         : manifestContentHash(
@@ -28345,8 +29669,16 @@ export class Repository {
           ? continuationSourceManifestRevisionId
           : deterministicUuid({
               runId,
-              kind: "pipeline_v3_manifest_revision",
+              kind: schema20ProofPreview
+                ? "pipeline_v3_manifest_revision_native"
+                : "pipeline_v3_manifest_revision",
               manifestHash,
+              ...(schema20ProofPreview
+                ? {
+                    attestationSetHash:
+                      schema20ProofPreview.attestationSetHash,
+                  }
+                : {}),
             })
         : null;
 
@@ -28444,16 +29776,6 @@ export class Repository {
       const normalizedTitle = normalizePlaylistTitle(brief.title, brief);
       const name = appendPlaylistTitleSuffix(normalizedTitle, `· ${new Date().toISOString().slice(0, 10)}`);
       const description = manifestDescriptionForBrief(brief);
-      const manifestContractDatabaseId = immutable.active_playlist_contract_revision_id;
-      const manifestContractHash = immutable.playlist_contract_json?.semanticHash ?? null;
-      if (isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)
-        && (!manifestContractDatabaseId || !manifestContractHash)) {
-        throw new HttpError(
-          409,
-          "Pipeline V3 manifest is missing its canonical contract binding",
-          "manifest_contract_stale",
-        );
-      }
       const savedManifest = await client.query(
         `INSERT INTO manifests(
            id,run_id,name,description,content_hash,pipeline_version,policy_version,
@@ -28537,6 +29859,64 @@ export class Repository {
                catalog_id,artist,title,evidence_eligible,hard_constraints_satisfied,version_compatible,qualified)
              VALUES($1,$2,$3,$4,$5,$6,$7,$8,true,true,true,true)`,
             [manifestRevisionId, position, item.candidateId, item.familyId, item.catalogIdentityId, item.track.appleSongId, item.track.artist.slice(0, 240), item.track.title.slice(0, 240)],
+          );
+        }
+        const schema20Proof = schema20ProofInput
+          ? await persistSchema20SelectionProofTransaction(
+              client,
+              schema20ProofInput,
+            )
+          : null;
+        if (schema20ProofPreview && (
+          !schema20Proof
+          || schema20Proof.attestationSetHash
+            !== schema20ProofPreview.attestationSetHash
+        )) {
+          throw new HttpError(
+            409,
+            "Manifest revision proof changed after its identity was frozen",
+            "schema20_manifest_proof_conflict",
+          );
+        }
+        if (schema20Proof) {
+          const bound = await client.query(
+            `UPDATE manifest_revisions
+             SET selection_set_id=$2,attestation_set_hash=$3,proof_kind=$4
+             WHERE id=$1
+               AND (
+                 (
+                   selection_set_id IS NULL
+                   AND attestation_set_hash IS NULL
+                   AND proof_kind IS NULL
+                 ) OR (
+                   selection_set_id=$2
+                   AND attestation_set_hash=$3
+                   AND proof_kind=$4
+                 )
+               )`,
+            [
+              manifestRevisionId,
+              schema20Proof.selectionSetId,
+              schema20Proof.attestationSetHash,
+              schema20Proof.proofMode,
+            ],
+          );
+          if ((bound.rowCount ?? 0) !== 1) {
+            throw new HttpError(
+              409,
+              "Manifest revision conflicts with its immutable selection proof",
+              "schema20_manifest_proof_conflict",
+            );
+          }
+        } else if (proofArchitectureMode() === "native"
+          && (
+            result.outcome.status === "exact_ready"
+            || result.outcome.status === "partial_ready"
+          )) {
+          throw new HttpError(
+            409,
+            "An exact native manifest requires an immutable selection proof",
+            "schema20_manifest_proof_missing",
           );
         }
         if (continuationSourceManifestRevisionId) {
@@ -30044,6 +31424,8 @@ export class Repository {
       releaseManifestCanaryGuardsVersion,
       canonicalExecutionHardeningVersion,
       canonicalExecutorReleaseIdentityFencingVersion,
+      proofArchitectureVersion,
+      proofArchitectureAuthority,
     ] = await Promise.all([
       this.pool.query("SELECT worker_id,schema_version,capacity,active_jobs,metadata_json,last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC"),
       this.pool.query(
@@ -30088,6 +31470,8 @@ export class Repository {
       this.getSetting(
         CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING,
       ),
+      this.getSetting("proof_architecture_version"),
+      this.getSetting("proof_architecture_authority"),
     ]);
     const queueRow = queue.rows[0] ?? {};
     const notificationRow = notifications.rows[0] ?? {};
@@ -30239,13 +31623,19 @@ export class Repository {
     const evaluatedWorkers = worker.rows.map((row) => {
       const lastSeenAt = date(row.last_seen_at);
       const stale = !lastSeenAt || Date.now() - lastSeenAt.getTime() > staleAfterMs;
+      const protocolNumber = workerPipelineProtocolNumber(row.metadata_json);
       return {
         ...row,
         lastSeenAt: lastSeenAt?.toISOString(),
         stale,
         schemaCompatible: heartbeatSchemaCompatible(row, databaseSchemaVersion),
         protocolVersion: workerPipelineProtocolVersion(row.metadata_json),
-        protocolCompatible: isWorkerPipelineProtocolCompatible(row.metadata_json),
+        protocolCompatible:
+          isWorkerPipelineProtocolCompatible(row.metadata_json)
+          && (
+            proofArchitectureMode() !== "native"
+            || Number(protocolNumber ?? 0) >= 12
+          ),
         queueClass: heartbeatQueueClass(row.metadata_json),
         executorRevision: heartbeatExecutorRevision(row.metadata_json),
         configurationHash: heartbeatConfigurationHash(row.metadata_json),
@@ -30362,6 +31752,8 @@ export class Repository {
         releaseManifestCanaryGuardsVersion,
         canonicalExecutionHardeningVersion,
         canonicalExecutorReleaseIdentityFencingVersion,
+        proofArchitectureVersion,
+        proofArchitectureAuthority,
         executorReleaseIdentityFenceSupported,
       },
       worker: heartbeat ? {

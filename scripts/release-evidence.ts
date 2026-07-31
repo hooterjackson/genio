@@ -232,6 +232,9 @@ export interface ReleaseEvidencePayloadV1 {
     databaseCapabilityVersion: "2";
     releaseManifestCanaryGuardsVersion: "1";
     canonicalExecutionHardeningVersion: "1";
+    proofArchitectureMode: "native";
+    proofArchitectureVersion: "1";
+    proofArchitectureAuthority: "native";
     workerProtocol: string;
     briefContractVersion: string;
     queryPlanSchemaVersion: string;
@@ -329,11 +332,14 @@ const SAFE_LABEL = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$/u;
 const SIGNATURE_VALUE = /^[0-9A-Za-z_-]{64,256}$/u;
 const REQUIRED_RUNTIME_CONTRACT = Object.freeze({
   deploymentPhase: "activate",
-  databaseSchemaVersion: "19",
+  databaseSchemaVersion: "20",
   databaseCapabilityVersion: "2",
   releaseManifestCanaryGuardsVersion: "1",
   canonicalExecutionHardeningVersion: "1",
-  workerProtocol: "playlist-pipeline-v11",
+  proofArchitectureMode: "native",
+  proofArchitectureVersion: "1",
+  proofArchitectureAuthority: "native",
+  workerProtocol: "playlist-pipeline-v12",
   briefContractVersion: "3",
   queryPlanSchemaVersion: "6",
 });
@@ -490,6 +496,9 @@ function validateRuntimeShape(
     "databaseCapabilityVersion",
     "releaseManifestCanaryGuardsVersion",
     "canonicalExecutionHardeningVersion",
+    "proofArchitectureMode",
+    "proofArchitectureVersion",
+    "proofArchitectureAuthority",
     "workerProtocol",
     "briefContractVersion",
     "queryPlanSchemaVersion",
@@ -509,6 +518,9 @@ function validateRuntimeShape(
     "databaseCapabilityVersion",
     "releaseManifestCanaryGuardsVersion",
     "canonicalExecutionHardeningVersion",
+    "proofArchitectureMode",
+    "proofArchitectureVersion",
+    "proofArchitectureAuthority",
     "workerProtocol",
     "briefContractVersion",
     "queryPlanSchemaVersion",
@@ -516,7 +528,7 @@ function validateRuntimeShape(
     label(runtime[field], `${labelPrefix}.${field}`);
     if (runtime[field] !== REQUIRED_RUNTIME_CONTRACT[field]) {
       throw new Error(
-        `${labelPrefix}.${field} does not match the schema-19/protocol-11 release contract`,
+        `${labelPrefix}.${field} does not match the schema-20/protocol-12 native-proof release contract`,
       );
     }
   }
@@ -551,7 +563,7 @@ function validateRuntimeShape(
   for (const field of ["guidance", "evidence"] as const) {
     if (policyVersions[field] !== REQUIRED_RUNTIME_POLICY_VERSIONS[field]) {
       throw new Error(
-        `${labelPrefix}.policyVersions.${field} does not match the schema-19/protocol-11 release contract`,
+        `${labelPrefix}.policyVersions.${field} does not match the schema-20/protocol-12 native-proof release contract`,
       );
     }
   }

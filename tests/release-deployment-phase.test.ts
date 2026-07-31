@@ -5,11 +5,38 @@ import {
   canonicalContractCohortConfigured,
   expectedReleaseDatabaseSchemaVersion,
   releaseDatabaseReadinessReady,
+  releaseConfigurationDiagnosticCodes,
   releaseExecutionConfigured,
   runtimeReleaseDeploymentPhase,
 } from "../server/release-deployment-phase.ts";
 
 describe("runtime release deployment phase", () => {
+  test("reports stable secret-free startup diagnostics", () => {
+    expect(releaseConfigurationDiagnosticCodes({
+      NODE_ENV: "production",
+    })).toEqual([
+      "release_phase_unconfigured",
+      "release_environment_invalid",
+      "release_execution_disabled",
+      "release_expected_schema_invalid",
+    ]);
+    expect(releaseConfigurationDiagnosticCodes({
+      NODE_ENV: "production",
+      RELEASE_ENVIRONMENT: "production",
+      RELEASE_DEPLOYMENT_PHASE: "surprise",
+      RELEASE_EXECUTION_ENABLED: "true",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
+    })).toEqual(["release_phase_invalid"]);
+    expect(releaseConfigurationDiagnosticCodes({
+      NODE_ENV: "production",
+      RELEASE_ENVIRONMENT: "production",
+      RELEASE_DEPLOYMENT_PHASE: "activate",
+      RELEASE_EXECUTION_ENABLED: "true",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
+    })).toEqual([]);
+    expect(releaseConfigurationDiagnosticCodes({})).toEqual([]);
+  });
+
   test("fails closed on missing, invalid, pre-activation, and schema-mismatched configuration", () => {
     expect(runtimeReleaseDeploymentPhase({})).toBe("unconfigured");
     expect(runtimeReleaseDeploymentPhase({ RELEASE_DEPLOYMENT_PHASE: "surprise" })).toBe("invalid");
@@ -62,10 +89,12 @@ describe("runtime release deployment phase", () => {
     const environment = {
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: "1",
+      PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
       RELEASE_EXECUTION_ENABLED: "true",
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
@@ -78,25 +107,29 @@ describe("runtime release deployment phase", () => {
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: null,
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      observedProofArchitectureVersion: "1",
+      observedProofArchitectureAuthority: "native",
       executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
     expect(canonicalContractCohortConfigured(environment)).toBe(true);
     expect(canonicalContractCohortConfigured({
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: "1",
+      PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
       RELEASE_EXECUTION_ENABLED: "true",
     })).toBe(false);
   });
@@ -105,10 +138,12 @@ describe("runtime release deployment phase", () => {
     const base = {
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: "1",
+      PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
       RELEASE_EXECUTION_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
     };
@@ -120,7 +155,7 @@ describe("runtime release deployment phase", () => {
     expect(canonicalContractActivationConfigured(schema4)).toBe(false);
     expect(canonicalContractActivationReady({
       environment: schema4,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
     })).toBe(false);
@@ -131,32 +166,38 @@ describe("runtime release deployment phase", () => {
     };
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: null,
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      observedProofArchitectureVersion: "1",
+      observedProofArchitectureAuthority: "native",
       executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: null,
+      observedProofArchitectureVersion: "1",
+      observedProofArchitectureAuthority: "native",
       executorReleaseIdentityFenceSupported: true,
     })).toBe(false);
     expect(canonicalContractActivationReady({
       environment: schema5,
-      observedDatabaseSchemaVersion: "19",
+      observedDatabaseSchemaVersion: "20",
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      observedProofArchitectureVersion: "1",
+      observedProofArchitectureAuthority: "native",
       executorReleaseIdentityFenceSupported: false,
     })).toBe(false);
   });
@@ -165,10 +206,12 @@ describe("runtime release deployment phase", () => {
     const valid = {
       RELEASE_ENVIRONMENT: "production",
       RELEASE_DEPLOYMENT_PHASE: "activate",
-      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "19",
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
       RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: "2",
       RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: "1",
       RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: "1",
+      RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: "1",
+      PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
       RELEASE_EXECUTION_ENABLED: "true",
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     };
@@ -177,6 +220,8 @@ describe("runtime release deployment phase", () => {
       "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
       "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
       "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+      "RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION",
+      "PIPELINE_V3_PROOF_ARCHITECTURE_MODE",
       "PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION",
     ] as const) {
       const missing = Object.fromEntries(
@@ -226,6 +271,22 @@ describe("runtime release deployment phase", () => {
       observedDatabaseCapabilityVersion: "1",
       observedCanonicalExecutionHardeningVersion: "1",
       observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      executorReleaseIdentityFenceSupported: true,
+    })).toBe(true);
+
+    const schema20Expand = {
+      ...expand,
+      RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
+      PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "shadow",
+    };
+    expect(releaseDatabaseReadinessReady({
+      environment: schema20Expand,
+      observedDatabaseSchemaVersion: "20",
+      observedDatabaseCapabilityVersion: "1",
+      observedCanonicalExecutionHardeningVersion: "1",
+      observedCanonicalExecutorReleaseIdentityFencingVersion: "1",
+      observedProofArchitectureVersion: "1",
+      observedProofArchitectureAuthority: "shadow",
       executorReleaseIdentityFenceSupported: true,
     })).toBe(true);
   });

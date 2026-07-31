@@ -3,6 +3,7 @@ import { Pool, type PoolConfig } from "pg";
 import * as schema from "./schema.ts";
 
 export const DATABASE_SCHEMA_VERSION = "19";
+export const DATABASE_SCHEMA_20_PROOF_VERSION = "20";
 
 export interface DatabaseSchemaSupport {
   minimum: string;
@@ -11,12 +12,14 @@ export interface DatabaseSchemaSupport {
 }
 
 /**
- * Resolution-capable binaries prefer schema 19 while keeping the schema-18
- * forward-recovery baseline readable during the rolling expand/cutover.
+ * The protocol-12 bridge remains schema-19-preferred while accepting the
+ * additive schema-20 proof tables. Native proof authority is activated only
+ * after every protocol-11 worker is fenced and the explicit index/authority
+ * switch succeeds.
  */
 export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",
-  maximum: "19",
+  maximum: DATABASE_SCHEMA_20_PROOF_VERSION,
   preferred: DATABASE_SCHEMA_VERSION,
 };
 
@@ -29,7 +32,7 @@ export const DATABASE_SCHEMA_SUPPORT: DatabaseSchemaSupport = {
  */
 export const DATABASE_SCHEMA_V13_BRIDGE_SUPPORT: DatabaseSchemaSupport = {
   minimum: "13",
-  maximum: "19",
+  maximum: DATABASE_SCHEMA_20_PROOF_VERSION,
   preferred: "18",
 };
 

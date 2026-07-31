@@ -162,6 +162,13 @@
       "when": 1785729600000,
       "tag": "0022_guidance_v4_checkpoint",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785816000000,
+      "tag": "0023_schema20_proof_architecture",
+      "breakpoints": true
     }
   ]
 }

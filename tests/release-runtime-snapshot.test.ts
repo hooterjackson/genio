@@ -35,7 +35,8 @@ function live(configurationHash = hash) {
       semanticExecutionConfigurationHash,
       releaseEnvironment: "staging",
       deploymentPhase: "activate",
-      workerProtocol: "playlist-pipeline-v11",
+      proofArchitectureMode: "native",
+      workerProtocol: "playlist-pipeline-v12",
       briefContractVersion: "3",
       queryPlanSchemaVersion: "6",
       briefProviderModelId: "gpt-5.4-mini",
@@ -58,7 +59,7 @@ function live(configurationHash = hash) {
 function lane(configurationHash: string) {
   return {
     status: "healthy",
-    protocolVersion: "playlist-pipeline-v11",
+    protocolVersion: "playlist-pipeline-v12",
     compatibleCapacity: 1,
     eligibleWorkerCount: 1,
     eligibleIdentityCount: 1,
@@ -76,9 +77,11 @@ function system() {
     ok: true,
     activationReady: true,
     database: "ready",
-    schemaVersion: "19",
+    schemaVersion: "20",
     releaseManifestCanaryGuardsVersion: "1",
     canonicalExecutionHardeningVersion: "1",
+    proofArchitectureVersion: "1",
+    proofArchitectureAuthority: "native",
     canonicalExecutorReleaseIdentityFencingVersion: "1",
     executorFencing: {
       ready: true,
@@ -178,11 +181,14 @@ describe("authoritative release runtime snapshot", () => {
       runtime: {
         semanticExecutionConfigurationHash,
         releaseEnvironment: "staging",
-        databaseSchemaVersion: "19",
+        databaseSchemaVersion: "20",
         databaseCapabilityVersion: "2",
         releaseManifestCanaryGuardsVersion: "1",
         canonicalExecutionHardeningVersion: "1",
-        workerProtocol: "playlist-pipeline-v11",
+        proofArchitectureMode: "native",
+        proofArchitectureVersion: "1",
+        proofArchitectureAuthority: "native",
+        workerProtocol: "playlist-pipeline-v12",
         modelIds: {
           brief: "gpt-5.4-mini",
           baseline: "gpt-5.6-luna",
@@ -429,7 +435,7 @@ describe("authoritative release runtime snapshot", () => {
           releaseEnvironment: "production",
         },
       },
-    })).toThrow(/schema-19\/protocol-11 release contract/u);
+    })).toThrow(/schema-20\/protocol-12 native-proof release contract/u);
   });
 
   test("does not derive composite capability 2 unless both database markers are 1", () => {

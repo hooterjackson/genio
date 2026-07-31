@@ -1,4 +1,4 @@
-import { DATABASE_SCHEMA_VERSION } from "../db/index.ts";
+import { DATABASE_SCHEMA_SUPPORT } from "../db/index.ts";
 import {
   REQUIRED_ACTIVATION_DATABASE_SCHEMA_VERSION,
   REQUIRED_ACTIVATION_EXECUTION_CONTROLS,
@@ -12,6 +12,12 @@ export const RELEASE_DEPLOYMENT_PHASES = [
 ] as const;
 export type ReleaseDeploymentPhase = typeof RELEASE_DEPLOYMENT_PHASES[number];
 export type RuntimeReleaseDeploymentPhase = ReleaseDeploymentPhase | "unconfigured" | "invalid";
+export type ReleaseConfigurationDiagnosticCode =
+  | "release_phase_unconfigured"
+  | "release_phase_invalid"
+  | "release_environment_invalid"
+  | "release_execution_disabled"
+  | "release_expected_schema_invalid";
 
 export const CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION =
   REQUIRED_ACTIVATION_DATABASE_SCHEMA_VERSION;
@@ -31,6 +37,11 @@ export const CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_SETTING =
   "canonical_executor_release_identity_fencing_version";
 export const CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION =
   "1";
+export const PROOF_ARCHITECTURE_DATABASE_VERSION_SETTING =
+  "proof_architecture_version";
+export const PROOF_ARCHITECTURE_DATABASE_AUTHORITY_SETTING =
+  "proof_architecture_authority";
+export const PROOF_ARCHITECTURE_DATABASE_VERSION = "1";
 export const CANONICAL_RELEASE_DATABASE_CAPABILITY_VERSION =
   REQUIRED_ACTIVATION_EXECUTION_CONTROLS
     .RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION;
@@ -50,7 +61,40 @@ export function expectedReleaseDatabaseSchemaVersion(
   environment: NodeJS.ProcessEnv = process.env,
 ): string | null {
   const value = environment.RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION?.trim() ?? "";
-  return /^(?:1[3-9])$/u.test(value) ? value : null;
+  return /^(?:1[3-9]|20)$/u.test(value) ? value : null;
+}
+
+/**
+ * Stable, secret-free startup diagnostics for hosted services. These codes
+ * make an operator-visible configuration defect distinguishable from an
+ * ordinary dependency outage without leaking environment values.
+ */
+export function releaseConfigurationDiagnosticCodes(
+  environment: NodeJS.ProcessEnv = process.env,
+): ReleaseConfigurationDiagnosticCode[] {
+  const phase = runtimeReleaseDeploymentPhase(environment);
+  const hosted = environment.NODE_ENV === "production"
+    || Boolean(environment.RELEASE_ENVIRONMENT?.trim());
+  if (!hosted) return [];
+  const diagnostics: ReleaseConfigurationDiagnosticCode[] = [];
+  if (phase === "unconfigured") {
+    diagnostics.push("release_phase_unconfigured");
+  } else if (phase === "invalid") {
+    diagnostics.push("release_phase_invalid");
+  }
+  if (!["staging", "production"].includes(
+    environment.RELEASE_ENVIRONMENT?.trim() ?? "",
+  )) {
+    diagnostics.push("release_environment_invalid");
+  }
+  if (phase !== "bootstrap"
+    && environment.RELEASE_EXECUTION_ENABLED?.trim() !== "true") {
+    diagnostics.push("release_execution_disabled");
+  }
+  if (expectedReleaseDatabaseSchemaVersion(environment) === null) {
+    diagnostics.push("release_expected_schema_invalid");
+  }
+  return diagnostics;
 }
 
 /**
@@ -107,6 +151,8 @@ export function releaseDatabaseReadinessReady(input: {
   observedDatabaseCapabilityVersion?: string | null;
   observedCanonicalExecutionHardeningVersion?: string | null;
   observedCanonicalExecutorReleaseIdentityFencingVersion?: string | null;
+  observedProofArchitectureVersion?: string | null;
+  observedProofArchitectureAuthority?: string | null;
   executorReleaseIdentityFenceSupported?: boolean;
 }): boolean {
   const phase = runtimeReleaseDeploymentPhase(input.environment);
@@ -120,6 +166,11 @@ export function releaseDatabaseReadinessReady(input: {
         === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION
       && input.observedCanonicalExecutorReleaseIdentityFencingVersion
         === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+      && input.observedProofArchitectureVersion
+        === PROOF_ARCHITECTURE_DATABASE_VERSION
+      && ["shadow", "native"].includes(
+        input.observedProofArchitectureAuthority ?? "",
+      )
       && input.executorReleaseIdentityFenceSupported === true;
   }
   if (phase === "activate") {
@@ -132,7 +183,7 @@ export function releaseDatabaseReadinessReady(input: {
       && expectedSchema !== null
       && input.observedDatabaseSchemaVersion === expectedSchema
       && (
-        expectedSchema !== CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION
+        Number(expectedSchema) < 19
         || (
           input.observedDatabaseCapabilityVersion
             === CANONICAL_ACTIVATION_DATABASE_CAPABILITY_VERSION
@@ -141,6 +192,16 @@ export function releaseDatabaseReadinessReady(input: {
           && input.observedCanonicalExecutorReleaseIdentityFencingVersion
             === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
           && input.executorReleaseIdentityFenceSupported === true
+          && (
+            Number(expectedSchema) < 20
+            || (
+              input.observedProofArchitectureVersion
+                === PROOF_ARCHITECTURE_DATABASE_VERSION
+              && ["shadow", "native"].includes(
+                input.observedProofArchitectureAuthority ?? "",
+              )
+            )
+          )
         )
       );
   }
@@ -151,7 +212,7 @@ export function releaseDatabaseReadinessReady(input: {
 /**
  * Environment flags are only activation intent. They cannot enable canonical
  * contract/schema-6 emission until the immutable artifact has completed the
- * explicit expand phase and is configured for schema 19 plus the exact
+ * explicit expand phase and is configured for schema 20 plus the exact
  * capability-fenced query-plan protocol. Historical schema-4 plans remain
  * executable, but no activated artifact may create new schema-4 work.
  */
@@ -172,9 +233,16 @@ export function canonicalContractActivationConfigured(
     && environment.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION?.trim()
       === REQUIRED_ACTIVATION_EXECUTION_CONTROLS
         .PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION
+    && environment.RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION?.trim()
+      === REQUIRED_ACTIVATION_EXECUTION_CONTROLS
+        .RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION
+    && environment.PIPELINE_V3_PROOF_ARCHITECTURE_MODE?.trim()
+      === REQUIRED_ACTIVATION_EXECUTION_CONTROLS
+        .PIPELINE_V3_PROOF_ARCHITECTURE_MODE
     && expectedReleaseDatabaseSchemaVersion(environment)
       === CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION
-    && DATABASE_SCHEMA_VERSION === CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION;
+    && Number(DATABASE_SCHEMA_SUPPORT.maximum)
+      >= Number(CANONICAL_ACTIVATION_DATABASE_SCHEMA_VERSION);
 }
 
 /**
@@ -188,6 +256,8 @@ export function canonicalContractActivationReady(input: {
   observedDatabaseCapabilityVersion?: string | null;
   observedCanonicalExecutionHardeningVersion?: string | null;
   observedCanonicalExecutorReleaseIdentityFencingVersion?: string | null;
+  observedProofArchitectureVersion?: string | null;
+  observedProofArchitectureAuthority?: string | null;
   executorReleaseIdentityFenceSupported?: boolean;
 }): boolean {
   return canonicalContractActivationConfigured(input.environment)
@@ -198,6 +268,9 @@ export function canonicalContractActivationReady(input: {
       === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION
     && input.observedCanonicalExecutorReleaseIdentityFencingVersion
       === CANONICAL_EXECUTOR_RELEASE_IDENTITY_DATABASE_CAPABILITY_VERSION
+    && input.observedProofArchitectureVersion
+      === PROOF_ARCHITECTURE_DATABASE_VERSION
+    && input.observedProofArchitectureAuthority === "native"
     && input.executorReleaseIdentityFenceSupported === true;
 }
 

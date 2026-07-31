@@ -528,19 +528,21 @@ describe("hosted publication smoke harness", () => {
     )).toThrow(/non-exact decision/u);
   });
 
-  test("binds the smoke to schema 19, protocol 11, contract 3, query-plan 6, and the exact build", () => {
+  test("binds the smoke to schema 20, native proof, protocol 12, contract 3, query-plan 6, and the exact build", () => {
     const live = {
       build: { version: "2.3.5", revision: "a".repeat(40) },
       configurationHash: promotedApiConfigurationHash,
       runtime: {
         releaseEnvironment: "staging",
         deploymentPhase: "activate",
-        expectedDatabaseSchemaVersion: "19",
+        expectedDatabaseSchemaVersion: "20",
         canonicalActivationConfigured: true,
-        schemaVersion: "19",
-        schemaMaximum: "19",
+        proofArchitectureMode: "native",
+        proofArchitectureVersion: "1",
+        schemaVersion: "20",
+        schemaMaximum: "20",
         schemaPreferred: "19",
-        workerProtocol: "playlist-pipeline-v11",
+        workerProtocol: "playlist-pipeline-v12",
         queryPlanSchemaVersion: "6",
         briefContractVersion: "3",
       },

@@ -394,10 +394,12 @@ test.describe("Pipeline V3 stitched system E2E", () => {
     process.env.RELEASE_ENVIRONMENT = "staging";
     process.env.RELEASE_DEPLOYMENT_PHASE = "activate";
     process.env.RELEASE_EXECUTION_ENABLED = "true";
-    process.env.RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION = "19";
+    process.env.RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION = "20";
     process.env.RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION = "2";
     process.env.RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION = "1";
     process.env.RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION = "1";
+    process.env.RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION = "1";
+    process.env.PIPELINE_V3_PROOF_ARCHITECTURE_MODE = "native";
     process.env.PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION = "6";
     process.env.GUIDANCE_CONTRACT_V3_ENABLED = "true";
     // The stitched suite injects deterministic brief/retrieval ports, but the
@@ -439,6 +441,14 @@ test.describe("Pipeline V3 stitched system E2E", () => {
     });
     repository = new Repository(handle);
     await applySql(repository.pool, migrationSql);
+    // This clean, synthetic database has no legacy manifests to backfill.
+    // Enter the exact native authority state that production may reach only
+    // through the separately tested receipt-bound activation transaction.
+    await repository.pool.query(
+      `UPDATE settings
+       SET value='native',updated_at=now()
+       WHERE key='proof_architecture_authority'`,
+    );
     await repository.saveAppleAuthorization({
       ciphertext: "system-e2e-fake-ciphertext",
       iv: "system-e2e-fake-iv",

@@ -47,10 +47,12 @@ GENIO_RELEASE_VERIFICATION_KEY_SHA256=<pinned-public-key-sha256> \
 railway config plan
 ```
 
-The schema-19 release is three separate plans against the same image digest,
+The schema-20 release is three separate plans against the same image digest,
 revision, version, and environment. A brand-new staging environment with a
 fresh, empty database has one additional one-time bootstrap plan before those
-three plans. Export the reviewed artifact values before each command:
+three plans. Database migration and proof backfill are explicit promotion
+commands and never Railway pre-deploy hooks. Export the reviewed artifact
+values before each command:
 
 ```bash
 export GENIO_RELEASE_IMAGE=ghcr.io/<owner>/genio@sha256:<digest>
@@ -61,10 +63,10 @@ export GENIO_RELEASE_RC_TAG=v<stable-semver>-rc.<n>
 export GENIO_RELEASE_ENVIRONMENT=staging
 
 # 0. bootstrap (fresh staging only): explicitly assert that the new staging
-#    database is empty. The API runs the schema-19 migration; both worker lanes
-#    remain at zero replicas and every /api/v1 mutation is runtime-fenced.
+#    database is empty. Apply migrations explicitly before this plan; both
+#    worker lanes remain at zero replicas and every /api/v1 mutation is fenced.
 GENIO_RELEASE_PHASE=bootstrap \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19 \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=20 \
 GENIO_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED=true \
 GENIO_STAGING_BOOTSTRAP_PROJECT_ID=<selected-railway-project-uuid> \
 GENIO_STAGING_BOOTSTRAP_ENVIRONMENT_ID=<fresh-staging-environment-uuid> \
@@ -76,7 +78,7 @@ GENIO_STAGING_BOOTSTRAP_CAPABILITY_PEPPER_VERSION=<bootstrap-only-version> \
 GENIO_STAGING_BOOTSTRAP_PRODUCTION_CAPABILITY_PEPPER_SHA256=<production-pepper-fingerprint> \
 railway config plan
 
-# Apply only that reviewed plan, then require /health/ready to report schema 19,
+# Apply only that reviewed plan, then require /health/ready to report schema 20,
 # releaseManifestCanaryGuardsVersion 1, and
 # canonicalExecutionHardeningVersion 1. Unset the one-time confirmation,
 # configure the dedicated staging controls, and retain the same immutable image
@@ -86,16 +88,17 @@ railway config plan
 # only the new Postgres reference and the explicit bootstrap-only credentials;
 # both zero-replica worker lanes receive no provider or publication credentials.
 
-# 1. bridge: deploy schema-13–19-capable API and both protocol-11 worker lanes.
+# 1. bridge: deploy schema-13–20-capable API and both protocol-12 worker lanes.
 #    There is deliberately no pre-deploy migration.
 GENIO_RELEASE_PHASE=bridge \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=<observed-13-through-19> \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=<observed-13-through-20> \
 railway config plan
 
 # 2. expand: only after release:migration:verify produced passing bridge
-#    evidence. This is the only phase whose API has `pnpm run db:migrate`.
+#    evidence and the operator applied `pnpm db:migrate` as a separate,
+#    receipt-recorded promotion step.
 GENIO_RELEASE_PHASE=expand \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19 \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=20 \
 GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE=<signed-bridge-evidence.json> \
 GENIO_BRIDGE_DATABASE_SCHEMA_VERSION=<observed-bridge-schema> \
 GENIO_BRIDGE_DATABASE_CAPABILITY_VERSION=<observed-version-or-none> \
@@ -104,10 +107,17 @@ GENIO_BRIDGE_CANONICAL_EXECUTION_HARDENING_VERSION=<observed-1-or-none> \
 GENIO_BRIDGE_CONFIGURATION_HASH=<signed-bridge-configuration-sha256> \
 railway config plan
 
-# 3. activate: only after another verification proves schema 19 and two fresh
-#    worker heartbeats per lane while canonical emission is still disabled.
+# Before activation, keep the public pause and route-wide hard switch engaged:
+#   pnpm release:schema20:backfill dry-run
+#   pnpm release:schema20:backfill apply <plan-hash> <idempotency-key>
+#   pnpm release:schema20:activate dry-run
+#   pnpm release:schema20:activate apply <receipt-hash>
+#
+# 3. activate: only after another verification proves schema 20, the completed
+#    backfill receipt, and two fresh protocol-12 heartbeats per lane while
+#    canonical emission is still disabled.
 GENIO_RELEASE_PHASE=activate \
-GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=19 \
+GENIO_EXPECTED_DATABASE_SCHEMA_VERSION=20 \
 GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE=<signed-bridge-evidence.json> \
 GENIO_BRIDGE_DATABASE_SCHEMA_VERSION=<observed-bridge-schema> \
 GENIO_BRIDGE_DATABASE_CAPABILITY_VERSION=<observed-version-or-none> \
@@ -265,8 +275,9 @@ and the live rollout evidence hash/stage exactly match the previous signed
 target. API and both worker lanes must expose the candidate identity while
 Sites must retain the exact prior version/revision recorded by the backend
 promotion snapshot. The envelope binds the exact source, image, promotion
-configuration, runtime, production canaries, schema 19, composite capability
-2, both marker-1 values, and protocol 11.
+configuration, runtime, production canaries, schema 20, composite capability
+2, proof architecture 1/native authority, both marker-1 values, and protocol
+12.
 
 Review a separate production Railway plan for that exact envelope:
 
@@ -341,11 +352,13 @@ tag/Release creation is not authorized.
 - `bootstrap` is accepted only for a new staging database and only with
   `GENIO_STAGING_BOOTSTRAP_FRESH_EMPTY_DATABASE_CONFIRMED=true`, exact Railway
   project/environment UUIDs, independent bootstrap-only gateway/capability
-  secrets, and non-matching production secret fingerprints. It runs
-  `pnpm run db:migrate` on the API, deploys both worker lanes at zero replicas,
-  emits no preserved variables, and reports ready only after schema 19 and
-  both marker-1 values are authoritative. The assertion is invalid in every
-  later phase and bootstrap is rejected for production.
+  secrets, and non-matching production secret fingerprints. Database migration
+  is an explicit operator promotion phase; no Railway service runs migrations
+  as a deploy hook. Bootstrap deploys both worker lanes at zero replicas,
+  emits no preserved variables, and reports ready only after schema 20, proof
+  architecture 1/native authority, and both marker-1 values are authoritative.
+  The assertion is invalid in every later phase and bootstrap is rejected for
+  production.
 - The configuration fails closed unless `GENIO_RELEASE_IMAGE` is an immutable
   GHCR SHA-256 digest and its full Git revision and stable semantic version are
   supplied. It also fails when the release phase or expected database schema
