@@ -11670,12 +11670,10 @@ export class Repository {
         } catch {
           publicRolloutCapabilityChanged = true;
         }
-        // Contract-3 has already been accepted as the user's immutable
-        // execution contract and the bridge above proved that the shipped V3
-        // backend supports every capability it uses. Do not then strand that
-        // accepted contract behind the unrelated public V3 percentage/master
-        // rollout. The database kill switch remains authoritative and can
-        // still stop this intent cohort immediately.
+        // Contract-3 is immutable semantic authority, not execution
+        // authority. The projected contract may be persisted for review, but
+        // it must never bypass the signed assignment/master rollout merely
+        // because the compatible backend is corpus_first_v3.
         const canonicalBackendAssigned = briefContractVersion === 3
           && contractExecutionProjection?.backend === "corpus_first_v3";
         const cohortDisabled = await this.isPipelineCohortDisabled({
@@ -11709,6 +11707,29 @@ export class Repository {
               automaticResume: false,
             },
           };
+        } else if (canonicalBackendAssigned && !assignmentV3.assigned) {
+          // Preserve the accepted contract and its deterministic projection,
+          // but do not enqueue work until the active rollout authority
+          // actually assigns this request. This is deliberately a visible,
+          // non-executable decision rather than a silent V2 downgrade or a
+          // transient error after confirmation.
+          selectionPlanV3 = confirmedV3;
+          contractExecutionPause = {
+            blockerKind: "scope_decision",
+            dependencyKey: "pipeline_assignment:corpus_first_v3",
+            phase: "contract_execution_paused",
+            state: {
+              reasonCode: "contract_execution_assignment_required",
+              route: "corpus_first_v3",
+              intentGroup: assignmentV3.group,
+              assignmentReason: assignmentV3.reason,
+              actions: [
+                "review_contract",
+                "cancel",
+              ],
+              automaticResume: false,
+            },
+          };
         } else if (canonicalBackendAssigned && cohortDisabled) {
           // The contract remains valid and fully projected. Persist it as a
           // visible dependency pause rather than discarding the plan and
@@ -11729,13 +11750,8 @@ export class Repository {
               automaticResume: false,
             },
           };
-        } else if ((
-          canonicalBackendAssigned
-          || (
-            publicRolloutAssignment === null
-            && assignmentV3.assigned
-          )
-        )
+        } else if (canonicalBackendAssigned
+          && assignmentV3.assigned
           && !cohortDisabled) {
           selectionPlanV3 = confirmedV3;
         }
