@@ -751,6 +751,403 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     });
   });
 
+  test("accepts authoritative Apple identity for a declared exact-artist exclusion only", () => {
+    const clauseId = "exclude:pop-smoke";
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:closed-world-pop-smoke-exclusion",
+      rawPrompt: "Discover artists like Pop Smoke without centering him",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: clauseId,
+          kind: "exclusion",
+          scope: "track",
+          hardness: "hard",
+          axis: "artist",
+          operator: "exclude",
+          values: ["Pop Smoke"],
+          source: {
+            provenance: "prompt",
+            text: "without centering Pop Smoke",
+          },
+          evidence: {
+            required: true,
+            minimumGrade: "authoritative_structured_metadata",
+            permittedGrades: ["authoritative_structured_metadata"],
+          },
+        },
+        {
+          id: "ranking:pop-smoke-similarity",
+          kind: "ranking_preference",
+          scope: "track",
+          hardness: "soft",
+          axis: "similarity",
+          operator: "prefer",
+          values: ["Pop Smoke"],
+          source: {
+            provenance: "prompt",
+            text: "artists like Pop Smoke",
+          },
+        },
+      ],
+      trackPredicate: { op: "clause", clauseId },
+    });
+    const basePolicy = canonicalContractExecutionPolicyV1(contract);
+    const assessments = {
+      [clauseId]: {
+        // The exact Apple credit does not match the excluded primary artist.
+        // The canonical runtime inverts this failed exclusion match.
+        status: "fail" as const,
+        evidenceGrade: "authoritative_structured_metadata" as const,
+      },
+    };
+
+    expect(canonicalRequiredEvidenceIntegrityV3({
+      policy: basePolicy,
+      assessments,
+      bindingIds: [],
+      bindings: [],
+      storefront: "us",
+    })).toMatchObject({
+      passed: false,
+      missingRequiredClauseIds: [clauseId],
+    });
+
+    const closedWorldContract = compilePlaylistContractRevisionV1({
+      contractId: "contract:closed-world-pop-smoke-exclusion-authorized",
+      rawPrompt: "Discover artists like Pop Smoke without centering him",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: clauseId,
+          kind: "exclusion",
+          scope: "track",
+          hardness: "hard",
+          axis: "artist",
+          operator: "exclude",
+          values: ["Pop Smoke"],
+          source: {
+            provenance: "prompt",
+            text: "without centering Pop Smoke",
+          },
+          evidence: {
+            required: true,
+            minimumGrade: "authoritative_structured_metadata",
+            permittedGrades: ["authoritative_structured_metadata"],
+          },
+        },
+        {
+          id: "ranking:pop-smoke-similarity",
+          kind: "ranking_preference",
+          scope: "track",
+          hardness: "soft",
+          axis: "similarity",
+          operator: "prefer",
+          values: ["Pop Smoke"],
+          source: {
+            provenance: "prompt",
+            text: "artists like Pop Smoke",
+          },
+        },
+      ],
+      trackPredicate: { op: "clause", clauseId },
+      executionDirectives: {
+        fixedContainer: null,
+        fixedTrackList: null,
+        similarity: {
+          seedArtists: ["Pop Smoke"],
+          excludedArtists: ["Pop Smoke"],
+          rankingClauseId: "ranking:pop-smoke-similarity",
+          exactArtistExclusionClauseIds: [clauseId],
+        },
+      },
+    });
+    const closedWorldPolicy =
+      canonicalContractExecutionPolicyV1(closedWorldContract);
+    expect(canonicalRequiredEvidenceIntegrityV3({
+      policy: closedWorldPolicy,
+      assessments,
+      bindingIds: [],
+      bindings: [],
+      storefront: "us",
+    })).toMatchObject({
+      passed: true,
+      missingRequiredClauseIds: [],
+      obligationMismatchClauseIds: [],
+      evidenceGradeMismatchClauseIds: [],
+    });
+  });
+
+  test("qualifies a production-shaped 50-track rap/grime similarity portfolio", async () => {
+    const membershipClauseId = "bridge:membership:hip-hop-or-grime";
+    const exclusionClauseId = "bridge:exclusion:similarity-seed-artist";
+    const storefrontClauseId = "bridge:catalog:storefront-availability";
+    const versionClauseId = "bridge:catalog:recording-version-policy";
+    const evidenceClauseId = "bridge:evidence:qualification-policy";
+    const rankingClauseId = "bridge:ranking:similarity-seed";
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:echo-park-production-shape",
+      rawPrompt:
+        "Bike rides for someone who loves rap and grime, inspired by Pop Smoke but discovering new artists",
+      requestedTrackCount: 50,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: storefrontClauseId,
+          kind: "catalog_version",
+          scope: "track",
+          hardness: "hard",
+          axis: "storefront_availability",
+          operator: "require",
+          values: ["available:us"],
+          source: { provenance: "system_default", text: "US storefront" },
+          evidence: {
+            required: true,
+            minimumGrade: "authoritative_structured_metadata",
+            permittedGrades: ["authoritative_structured_metadata"],
+          },
+        },
+        {
+          id: versionClauseId,
+          kind: "catalog_version",
+          scope: "track",
+          hardness: "hard",
+          axis: "recording_version",
+          operator: "require",
+          values: ["allow:canonical"],
+          source: { provenance: "system_default", text: "canonical recording" },
+          evidence: {
+            required: true,
+            minimumGrade: "authoritative_structured_metadata",
+            permittedGrades: ["authoritative_structured_metadata"],
+          },
+        },
+        {
+          id: evidenceClauseId,
+          kind: "factual_relationship",
+          scope: "track",
+          hardness: "hard",
+          axis: "evidence",
+          operator: "require",
+          values: ["selection-grade genre evidence"],
+          source: { provenance: "migration", text: "selection-grade evidence" },
+          evidence: {
+            required: true,
+            minimumGrade: null,
+            permittedGrades: ["track_specific_editorial_assertion"],
+          },
+        },
+        {
+          id: exclusionClauseId,
+          kind: "exclusion",
+          scope: "track",
+          hardness: "hard",
+          axis: "artist",
+          operator: "exclude",
+          values: ["Pop Smoke"],
+          source: { provenance: "prompt", text: "without centering Pop Smoke" },
+          evidence: {
+            required: true,
+            minimumGrade: "authoritative_structured_metadata",
+            permittedGrades: ["authoritative_structured_metadata"],
+          },
+        },
+        {
+          id: membershipClauseId,
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["hip-hop", "rap", "grime"],
+          source: { provenance: "prompt", text: "rap and grime" },
+          evidence: {
+            required: true,
+            minimumGrade: "track_specific_editorial_assertion",
+            permittedGrades: ["track_specific_editorial_assertion"],
+          },
+        },
+        {
+          id: rankingClauseId,
+          kind: "ranking_preference",
+          scope: "track",
+          hardness: "soft",
+          axis: "similarity",
+          operator: "prefer",
+          values: ["Pop Smoke"],
+          source: { provenance: "prompt", text: "favorite rapper is Pop Smoke" },
+        },
+      ],
+      trackPredicate: {
+        op: "all",
+        children: [
+          { op: "clause", clauseId: storefrontClauseId },
+          { op: "clause", clauseId: versionClauseId },
+          { op: "clause", clauseId: evidenceClauseId },
+          { op: "clause", clauseId: exclusionClauseId },
+          { op: "clause", clauseId: membershipClauseId },
+        ],
+      },
+      executionDirectives: {
+        fixedContainer: null,
+        fixedTrackList: null,
+        similarity: {
+          seedArtists: ["Pop Smoke"],
+          excludedArtists: ["Pop Smoke"],
+          rankingClauseId,
+          exactArtistExclusionClauseIds: [exclusionClauseId],
+        },
+      },
+    });
+    const base = planWithIntents(["genre_scene", "similarity"], 50);
+    const selection: SelectionPlanV3 = {
+      ...base,
+      membershipPredicates: [
+        {
+          id: exclusionClauseId,
+          axis: "artist",
+          operator: "exclude",
+          values: ["Pop Smoke"],
+          source: "user",
+          reason: "Exclude the exact reference artist.",
+        },
+        {
+          id: membershipClauseId,
+          axis: "genre",
+          operator: "require",
+          values: ["hip-hop", "rap", "grime"],
+          source: "user",
+          reason: "Require hip-hop or grime membership.",
+        },
+      ],
+      canonicalContractPolicy:
+        canonicalContractExecutionPolicyV1(contract),
+      diversityGoals: {
+        minimumDistinctArtists: null,
+        minimumDistinctAlbums: null,
+        minimumDistinctEras: null,
+        minimumDistinctScenes: null,
+        minimumDistinctGeographies: null,
+        maximumTracksPerArtist: null,
+        maximumTracksPerAlbum: null,
+      },
+      softGoalRelaxationOrder: [],
+    };
+    const values = Array.from({ length: 55 }, (_, index) => candidate(
+      500 + index,
+      {
+        artist: `New Artist ${index}`,
+        title: `Rap or Grime Track ${index}`,
+        album: `Release ${index}`,
+      },
+    ));
+    const emittedStrategies = new Set<string>();
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async ({ strategy }) => {
+        if (
+          emittedStrategies.has(strategy.id)
+          || ![
+            "curated_genre_scene:editorial_tracks",
+            "similarity:reference_neighborhood",
+          ].includes(strategy.id)
+        ) {
+          return {
+            candidates: [],
+            nextCursor: null,
+            exhausted: true,
+            costUnits: 0,
+            provenance: {
+              cacheOrigin: "live",
+              sourceFreshUntil: null,
+            },
+          };
+        }
+        emittedStrategies.add(strategy.id);
+        const candidates = strategy.id
+          === "curated_genre_scene:editorial_tracks"
+          ? values.slice(0, 30)
+          : values.slice(30);
+        return {
+          candidates,
+          nextCursor: null,
+          exhausted: true,
+          costUnits: 1,
+          provenance: {
+            cacheOrigin: "live",
+            sourceFreshUntil: null,
+          },
+        };
+      },
+      qualify: async ({ candidates }) => candidates.map((value) => {
+        const proven = withHostedCanonicalEvidence(
+          value,
+          qualification(value),
+          [membershipClauseId],
+        );
+        const bindingId = proven.evidence.bindingIds[0]!;
+        return {
+          ...proven,
+          canonicalClauseAssessments: {
+            [storefrontClauseId]: {
+              status: "pass",
+              evidenceGrade: "authoritative_structured_metadata",
+            },
+            [versionClauseId]: {
+              status: "pass",
+              evidenceGrade: "authoritative_structured_metadata",
+            },
+            [evidenceClauseId]: {
+              status: "pass",
+              evidenceGrade: "track_specific_editorial_assertion",
+              evidenceIds: [bindingId],
+            },
+            [exclusionClauseId]: {
+              status: "fail",
+              evidenceGrade: "authoritative_structured_metadata",
+            },
+            [membershipClauseId]: {
+              status: "pass",
+              evidenceGrade: "track_specific_editorial_assertion",
+              evidenceIds: [bindingId],
+            },
+          },
+        };
+      }),
+    };
+
+    const result = await executeRetrievalV3({
+      runId: "echo-park-production-shape",
+      plan: selection,
+      adapters,
+      policy: {
+        maximumGlobalRounds: 60,
+        maximumRawCandidates: 500,
+        candidateGoal: 55,
+        qualifiedPoolGoal: 55,
+      },
+    });
+    expect(result.outcome).toMatchObject({
+      status: "exact_ready",
+      requestedTrackCount: 50,
+      selectedTrackCount: 50,
+      reserveTrackCount: 5,
+      shortfall: 0,
+    });
+    expect(result.predicateDiagnostics?.attemptedCanonicalClauseIds)
+      .toEqual([
+        evidenceClauseId,
+        storefrontClauseId,
+        versionClauseId,
+        exclusionClauseId,
+        membershipClauseId,
+      ].sort());
+  });
+
   test("rejects an attested low-entailment binding whose assessment claims primary-source proof", () => {
     const clauseId = "relationship:claimed-primary";
     const contract = compilePlaylistContractRevisionV1({

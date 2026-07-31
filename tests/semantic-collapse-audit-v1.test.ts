@@ -98,6 +98,7 @@ function result(patch: Partial<RetrievalResultV3> = {}): RetrievalResultV3 {
       qualificationsObserved: 12,
       scopeFailures: 12,
       failedMembershipPredicateIds: { genre: 12 },
+      attemptedCanonicalClauseIds: ["genre"],
       appleLookupCount: 12,
       appleProviderRequestCount: 1,
       rootCause: "evidence_shortfall",
@@ -160,5 +161,84 @@ describe("SemanticCollapseAuditV1", () => {
       }),
     });
     expect(audit.disposition).toBe("dependency_blocker");
+  });
+
+  test("does not invent missing acquisition axes when canonical qualification assessed every leaf", () => {
+    const base = queryPlan();
+    const verificationExpression = {
+      op: "allOf" as const,
+      children: [
+        {
+          ...base.verificationExpression!,
+          obligationId: "verification:storefront",
+          clauseId: "storefront",
+          axis: "storefront_availability",
+        },
+        {
+          ...base.verificationExpression!,
+          obligationId: "verification:version",
+          clauseId: "version",
+          axis: "recording_version",
+        },
+        {
+          ...base.verificationExpression!,
+          obligationId: "verification:evidence",
+          clauseId: "evidence",
+          axis: "evidence",
+        },
+        base.verificationExpression!,
+      ],
+    };
+    const plan = {
+      ...base,
+      verificationExpression,
+      executionCoverageReport: {
+        ...base.executionCoverageReport!,
+        coveredObligationIds: [
+          "verification:evidence",
+          "verification:genre",
+          "verification:storefront",
+          "verification:version",
+        ],
+      },
+    } as QueryPlanV3;
+    const audit = auditSemanticCollapseV1({
+      queryPlan: plan,
+      result: result({
+        stages: {
+          discovered: 158,
+          validCandidates: 158,
+          scopeEligible: 0,
+          hardConstraintEligible: 0,
+          evidenceEligible: 68,
+          versionCompatible: 123,
+          storefrontPlayable: 123,
+          canonicalUnique: 0,
+          selected: 0,
+          reserve: 0,
+        },
+        predicateDiagnostics: {
+          qualificationsObserved: 158,
+          scopeFailures: 90,
+          failedMembershipPredicateIds: { genre: 36 },
+          attemptedCanonicalClauseIds: [
+            "evidence",
+            "genre",
+            "storefront",
+            "version",
+          ],
+          appleLookupCount: 158,
+          appleProviderRequestCount: 4,
+          rootCause: "evidence_shortfall",
+          recoveryAttemptCount: 0,
+        },
+      }),
+    });
+
+    expect(audit.signalCodes).not.toContain(
+      "required_evidence_axis_has_no_acquisition_attempt",
+    );
+    expect(audit.limitingObligationIds).toEqual([]);
+    expect(audit.disposition).not.toBe("technical_quarantine");
   });
 });
