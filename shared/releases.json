@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.14",
+      "releasedAt": "2026-07-31",
+      "title": "Schema-6 manifest-canary evidence compatibility",
+      "notes": [
+        "Accepts the active Boolean-verification query-plan schema in the release manifest-canary evidence gate while preserving the canonical schema floor.",
+        "Keeps exact contract, query-plan, executor, evidence, reserve, and zero-write proof validation unchanged.",
+        "Adds schema-6 release-evidence regression coverage so future query-plan upgrades cannot strand an otherwise valid owner acceptance run."
+      ]
+    },
+    {
       "version": "2.4.13",
       "releasedAt": "2026-07-31",
       "title": "Production owner manifest-canary recovery",

@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import type { QueryPlanV3 } from "../shared/types.ts";
 import { evaluateCanonicalContractTrackV1 } from "./canonical-contract-runtime-v1.ts";
 import {
+  canonicalRequiredEvidenceIntegrityV3,
   centralQualityCriterionObservationsForPolicyV3,
-  evidenceBindingIsAttestedForSelectionV3,
   evaluateCentralQualityV3,
   evaluatePlaylistOptimizationV3,
   validateCanonicalPublicationSetV3,
@@ -11,6 +11,7 @@ import {
 } from "./pipeline-v3-retrieval.ts";
 import {
   CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
+  isCanonicalQueryPlanV3SchemaVersion,
   queryPlanV3Hash,
 } from "./query-plan-v3.ts";
 import { stableStringify } from "./security.ts";
@@ -285,7 +286,8 @@ function validationPlan(queryPlan: QueryPlanV3): SelectionPlanV3 {
   if (
     targetTrackCount === null
     || targetTrackCount < 1
-    || queryPlan.schemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    || !isCanonicalQueryPlanV3SchemaVersion(queryPlan.schemaVersion)
+    || queryPlan.schemaVersion < CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
     || !queryPlan.canonicalContractPolicy
     || !queryPlan.scopeKind
     || !queryPlan.diversityGoals
@@ -326,88 +328,29 @@ function optimizerRequired(plan: SelectionPlanV3): boolean {
       === "canonical_contract_runtime_v1";
 }
 
-function canonicalEvidenceIds(values: readonly string[] | undefined): string[] | null {
-  if (!Array.isArray(values)
-    || values.some((value) => typeof value !== "string"
-      || value.length === 0
-      || value.trim() !== value)) return null;
-  const ids = [...new Set(values)].sort();
-  return ids.length === values.length ? ids : null;
-}
-
 /**
- * A release canary is intended to prove the live hosted-evidence route, not
- * merely that an adapter can attach an otherwise well-formed URL
- * attestation. Bind each referenced assessment back to its exact contract
- * clause and require the frozen snapshot to carry exactly those obligations
- * for this track.
+ * The manifest canary must prove the same fail-closed evidence boundary used
+ * by selection and publication. Hosted-web bindings retain their immutable
+ * snapshot requirement, while governed public-API and structured-adapter
+ * bindings remain valid when their exact-track attestation and clause binding
+ * satisfy the canonical policy. The evidence-axis bridge is a meta-policy,
+ * not a second factual claim that the source text must name.
  */
-function canonicalCanaryTrackHasBoundHostedEvidence(input: {
+function canonicalCanaryTrackHasBoundEvidence(input: {
   plan: SelectionPlanV3;
   track: QualifiedTrackV3;
 }): boolean {
   const policy = input.plan.canonicalContractPolicy;
   if (!policy || policy.storefront !== input.plan.storefront) return false;
-  const declaredBindingIds = canonicalEvidenceIds(input.track.evidenceBindingIds);
-  const bindings = input.track.evidenceBindings;
-  if (!declaredBindingIds
-    || declaredBindingIds.length === 0
-    || !Array.isArray(bindings)
-    || bindings.length !== declaredBindingIds.length) return false;
-  const bindingById = new Map(bindings.map((binding) => [binding.id, binding]));
-  if (bindingById.size !== bindings.length
-    || declaredBindingIds.some((id) => !bindingById.has(id))) return false;
-
-  const assessments = input.track.canonicalClauseAssessments ?? {};
-  const obligationsByBindingId = new Map<string, Set<string>>();
-  for (const clause of policy.clauses) {
-    const assessment = assessments[clause.id];
-    const evidenceIds = canonicalEvidenceIds(assessment?.evidenceIds ?? []);
-    if (!evidenceIds) return false;
-    const requiresExternalEvidence = clause.evidence.required
-      && (assessment?.status === "pass" || assessment?.status === "fail")
-      && assessment.evidenceGrade !== "authoritative_structured_metadata";
-    if (requiresExternalEvidence && evidenceIds.length === 0) return false;
-    for (const evidenceId of evidenceIds) {
-      if (!declaredBindingIds.includes(evidenceId)) return false;
-      const obligations = obligationsByBindingId.get(evidenceId) ?? new Set<string>();
-      obligations.add(clause.id);
-      obligationsByBindingId.set(evidenceId, obligations);
-    }
-    // Catalog metadata may independently satisfy the clause and therefore
-    // omit evidenceIds. The canary still proves that every hosted binding it
-    // carries is scoped to a passing canonical clause, rather than accepting
-    // an unrelated exact-track citation.
-    if (assessment?.status === "pass") {
-      for (const binding of bindings) {
-        const predicateIds = binding.predicateIds
-          ?? binding.supportedPredicateIds
-          ?? [];
-        if (!predicateIds.includes(clause.id)) continue;
-        const obligations = obligationsByBindingId.get(binding.id)
-          ?? new Set<string>();
-        obligations.add(clause.id);
-        obligationsByBindingId.set(binding.id, obligations);
-      }
-    }
-  }
-  if (obligationsByBindingId.size !== declaredBindingIds.length) return false;
-
-  for (const bindingId of declaredBindingIds) {
-    const binding = bindingById.get(bindingId);
-    const obligationIds = [...(obligationsByBindingId.get(bindingId) ?? [])].sort();
-    if (!binding
-      || binding.governance.accessMethod !== "hosted_web_search"
-      || !binding.hostedEvidenceSnapshot
-      || stableStringify(binding.hostedEvidenceSnapshot.obligationIds)
-        !== stableStringify(obligationIds)
-      || !evidenceBindingIsAttestedForSelectionV3(binding, {
-        requireHostedEvidenceSnapshot: true,
-        storefront: input.plan.storefront,
-        requiredObligationIds: obligationIds,
-      })) return false;
-  }
-  return true;
+  if (!Array.isArray(input.track.evidenceBindingIds)
+    || input.track.evidenceBindingIds.length === 0) return false;
+  return canonicalRequiredEvidenceIntegrityV3({
+    policy,
+    assessments: input.track.canonicalClauseAssessments ?? {},
+    bindingIds: input.track.evidenceBindingIds,
+    bindings: input.track.evidenceBindings,
+    storefront: input.plan.storefront,
+  }).passed;
 }
 
 function usefulReserveTrackCount(input: {
@@ -418,7 +361,7 @@ function usefulReserveTrackCount(input: {
   const policy = input.plan.canonicalContractPolicy;
   if (!policy) return 0;
   return input.reserve.filter((reserveTrack) => {
-    if (!canonicalCanaryTrackHasBoundHostedEvidence({
+    if (!canonicalCanaryTrackHasBoundEvidence({
       plan: input.plan,
       track: reserveTrack,
     })
@@ -465,7 +408,9 @@ export function buildReleaseManifestCanaryEvidence(input: {
     || input.pipelineVersion !== "corpus_first_v3"
     || input.autoPublish !== false
     || !input.queryPlan
-    || input.queryPlan.schemaVersion !== CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
+    || !isCanonicalQueryPlanV3SchemaVersion(input.queryPlan.schemaVersion)
+    || input.queryPlan.schemaVersion
+      < CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
     || input.queryPlan.briefContractVersion !== 3
     || queryPlanV3Hash(input.queryPlan) !== marker.queryPlanHash
     || input.activeQueryPlanRevisionId !== marker.queryPlanRevisionId
@@ -531,7 +476,7 @@ export function buildReleaseManifestCanaryEvidence(input: {
     throw new Error("release_manifest_canary_executor_identity_is_incoherent");
   }
   const plan = validationPlan(input.queryPlan);
-  if (allTracks.some((track) => !canonicalCanaryTrackHasBoundHostedEvidence({
+  if (allTracks.some((track) => !canonicalCanaryTrackHasBoundEvidence({
     plan,
     track,
   }))) {
