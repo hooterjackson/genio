@@ -41,6 +41,10 @@ type RuntimeBuildPayload = {
   };
 };
 
+type RuntimeReadyPayload = {
+  schemaVersion?: unknown;
+};
+
 type RuntimeBuildState =
   | { status: "checking" }
   | {
@@ -75,13 +79,25 @@ export function RuntimeBuild() {
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/health/live", {
-      cache: "no-store",
-      credentials: "same-origin",
-      signal: controller.signal,
-    }).then(async (response) => {
-      if (!response.ok) throw new Error("The API build endpoint is unavailable");
-      const payload = await response.json() as RuntimeBuildPayload;
+    void Promise.all([
+      fetch("/health/live", {
+        cache: "no-store",
+        credentials: "same-origin",
+        signal: controller.signal,
+      }),
+      fetch("/health/ready", {
+        cache: "no-store",
+        credentials: "same-origin",
+        signal: controller.signal,
+      }),
+    ]).then(async ([liveResponse, readyResponse]) => {
+      if (!liveResponse.ok || !readyResponse.ok) {
+        throw new Error("The API runtime endpoints are unavailable");
+      }
+      const [payload, ready] = await Promise.all([
+        liveResponse.json() as Promise<RuntimeBuildPayload>,
+        readyResponse.json() as Promise<RuntimeReadyPayload>,
+      ]);
       const identifier = safeBuildText(payload.build?.identifier, 140);
       const version = safeBuildText(payload.build?.version, 64);
       if (!identifier || !version) throw new Error("The API build response is invalid");
@@ -107,7 +123,8 @@ export function RuntimeBuild() {
         ["ROLLOUT", rollout],
         ["PRODUCTION EVIDENCE", contract?.productionEvidenceApproved === true ? "APPROVED" : "NOT APPROVED"],
         ["FACTUAL FEASIBILITY", contract?.factualFeasibilityApproved === true ? "APPROVED" : "NOT APPROVED"],
-        ["DATABASE SCHEMA", safeBuildText(contract?.schemaVersion, 24) ?? "UNKNOWN"],
+        ["DATABASE SCHEMA", safeBuildText(ready.schemaVersion, 24) ?? "UNKNOWN"],
+        ["DATABASE RUNTIME PREFERRED", safeBuildText(contract?.schemaVersion, 24) ?? "UNKNOWN"],
         ["DATABASE SUPPORT", schemaSupport],
         ["WORKER PROTOCOL", safeBuildText(contract?.workerProtocol, 64) ?? "UNKNOWN"],
         ["BRIDGE MINIMUM", safeBuildText(contract?.minimumWorkerProtocol, 64) ?? "UNKNOWN"],

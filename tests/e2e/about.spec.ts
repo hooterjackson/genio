@@ -38,6 +38,17 @@ test.beforeEach(async ({ page }) => {
       }),
     });
   });
+  await page.route("**/health/ready", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        database: true,
+        schemaVersion: "20",
+      }),
+    });
+  });
 });
 
 test("the hamburger menu opens the current version and patch notes", async ({ page }) => {
@@ -56,6 +67,7 @@ test("the hamburger menu opens the current version and patch notes", async ({ pa
   await expect(page.getByText(`${currentRelease.version}+123456789abc`, { exact: true })).toBeVisible();
   await expect(page.getByText("123456789abc", { exact: true })).toBeVisible();
   await expect(page.getByText("playlist-pipeline-v8", { exact: true })).toBeVisible();
+  await expect(page.getByText("20", { exact: true })).toBeVisible();
   await expect(page.getByText("2", { exact: true })).toBeVisible();
   await expect(page.getByText("scope gate v2 1 2", { exact: true })).toBeVisible();
   await expect(page.getByText("music concepts v3 2 0", { exact: true })).toBeVisible();
