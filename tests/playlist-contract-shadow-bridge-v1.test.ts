@@ -85,6 +85,61 @@ function constraint(
 }
 
 describe("playlist contract shadow bridge v1", () => {
+  test("compiles co-named rap and grime as one hard OR membership clause", () => {
+    const prompt = "Create 50 tracks for bike rides from new rap and grime artists, using Pop Smoke only as a reference point.";
+    const requestBrief = brief({
+      title: "Bike Ride Discovery",
+      description: "High-energy rap and grime for bike rides.",
+      subjectEntities: ["rap", "grime", "Pop Smoke"],
+      relationship: "rap and grime recordings suited to bike rides",
+      include: ["new rap and grime artists"],
+      exclude: ["Pop Smoke as primary artist"],
+      targetSize: { min: 50, max: 50 },
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: requestBrief,
+      storefront: "us",
+    });
+    expect(selectionPlan.constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        axis: expect.stringMatching(/genre|scene|subgenre/u),
+        kind: "hard",
+        values: expect.arrayContaining(["rap"]),
+      }),
+    ]));
+
+    const bridged = compilePlaylistContractShadowV1({
+      contractId: "run:rap-or-grime",
+      prompt,
+      brief: requestBrief,
+      selectionPlan,
+    });
+    const hardGenreClauses = bridged.contract.clauses.filter((clause) => (
+      clause.hardness === "hard"
+      && clause.kind === "membership"
+      && clause.axis === "genre"
+    ));
+    expect(hardGenreClauses).toEqual([
+      expect.objectContaining({
+        id: "bridge:membership:hip-hop-or-grime",
+        operator: "require",
+        values: expect.arrayContaining(["rap", "hip-hop", "grime"]),
+        concepts: expect.arrayContaining([
+          expect.objectContaining({ selectedConceptId: "genre:hip-hop" }),
+          expect.objectContaining({ selectedConceptId: "genre:grime" }),
+        ]),
+      }),
+    ]);
+    expect(JSON.stringify(bridged.contract.trackPredicate)).toContain(
+      "bridge:membership:hip-hop-or-grime",
+    );
+    expect(JSON.stringify(bridged.contract.trackPredicate)).not.toContain(
+      "bridge:constraint:scope_1",
+    );
+    expect(() => assertPlaylistContractIntegrityV1(bridged.contract)).not.toThrow();
+  });
+
   test("keeps an explicit quoted fixed list executable without a redundant substitution exclusion", () => {
     const prompt = "Create a playlist with exactly these three tracks and no substitutions: \"Take on Me\" by a-ha; \"Africa\" by Toto; \"Like a Prayer\" by Madonna.";
     const requestBrief = brief({

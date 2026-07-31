@@ -246,6 +246,45 @@ function isAdjacentLatinUrbanScope(
   return values.includes("reggaeton") && values.includes("latin urban");
 }
 
+const RAP_OR_GRIME_MEMBERSHIP_CLAUSE_ID =
+  "bridge:membership:hip-hop-or-grime";
+const RAP_OR_GRIME_ELIGIBILITY_VALUES = [
+  "rap",
+  "hip-hop",
+  "grime",
+] as const;
+
+function promptCoNamesRapAndGrime(prompt: string): boolean {
+  return /\b(?:rap|hip[ -]?hop)\b/iu.test(prompt)
+    && /\bgrime(?:\s+music)?\b/iu.test(prompt);
+}
+
+function positiveHardRapOrGrimeScope(
+  constraint: SelectionConstraint,
+): "hip-hop" | "grime" | null {
+  if (constraint.kind !== "hard"
+    || isNegativeConstraint(constraint)
+    || !MUSIC_SCOPE_AXES.has(constraint.axis)) {
+    return null;
+  }
+  const selectedConceptIds = conceptResolutionFor(
+    constraint.axis,
+    unique(constraint.values),
+  ).flatMap(({ selectedConceptId }) => (
+    selectedConceptId ? [selectedConceptId] : []
+  ));
+  if (selectedConceptIds.includes("genre:hip-hop")) return "hip-hop";
+  if (selectedConceptIds.includes("genre:grime")) return "grime";
+  const values = constraint.values.map(normalized);
+  if (values.some((value) => ["rap", "hip hop", "hip-hop"].includes(value))) {
+    return "hip-hop";
+  }
+  if (values.some((value) => ["grime", "grime music", "uk grime"].includes(value))) {
+    return "grime";
+  }
+  return null;
+}
+
 function hardClauseKind(
   constraint: SelectionConstraint,
 ): PlaylistContractClauseDraftV1["kind"] {
@@ -616,8 +655,42 @@ export function buildPlaylistContractShadowDraftV1(
     };
   }
 
+  const rapOrGrimeScopeKinds = input.selectionPlan.constraints
+    .map(positiveHardRapOrGrimeScope)
+    .filter((kind): kind is "hip-hop" | "grime" => kind !== null);
+  const consolidateRapOrGrimeMembership = promptCoNamesRapAndGrime(input.prompt)
+    && rapOrGrimeScopeKinds.includes("hip-hop");
+  if (consolidateRapOrGrimeMembership) {
+    addClause({
+      id: RAP_OR_GRIME_MEMBERSHIP_CLAUSE_ID,
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "genre",
+      operator: "require",
+      values: [...RAP_OR_GRIME_ELIGIBILITY_VALUES],
+      conceptInputs: conceptInputsFor(
+        "genre",
+        RAP_OR_GRIME_ELIGIBILITY_VALUES,
+      ),
+      source: {
+        provenance: "prompt",
+        text: "rap and grime",
+      },
+      unknownPolicy: "defer",
+    });
+    hardTrackClauseIds.push(RAP_OR_GRIME_MEMBERSHIP_CLAUSE_ID);
+  }
+
   for (const [constraintIndex, constraint] of input.selectionPlan.constraints.entries()) {
     if (POLICY_OWNED_AXES.has(constraint.axis)) continue;
+    if (consolidateRapOrGrimeMembership
+      && positiveHardRapOrGrimeScope(constraint)) {
+      // The user's co-equal wording is one OR eligibility predicate. Keeping
+      // either source leaf would turn it back into an accidental AND and make
+      // pure grime recordings ineligible.
+      continue;
+    }
     const values = unique(constraint.values);
     if (values.length === 0) continue;
     if (

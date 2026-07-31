@@ -3628,6 +3628,132 @@ describe("Pipeline V3 intent-specific retrieval orchestration", () => {
     }));
   });
 
+  test("keeps canonical assessment bindings atomic when OR branches reuse an evidence id", async () => {
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: "contract:atomic-or-proof",
+      rawPrompt: "One rap or grime recording",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [
+        {
+          id: "genre:rap",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["rap"],
+          source: { provenance: "prompt", text: "rap" },
+        },
+        {
+          id: "genre:grime",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "genre",
+          operator: "require",
+          values: ["grime"],
+          source: { provenance: "prompt", text: "grime" },
+        },
+      ],
+      trackPredicate: {
+        op: "any",
+        children: [
+          { op: "clause", clauseId: "genre:rap" },
+          { op: "clause", clauseId: "genre:grime" },
+        ],
+      },
+    });
+    const selection: SelectionPlanV3 = {
+      ...plan("one rap or grime recording", 1),
+      canonicalContractPolicy: canonicalContractExecutionPolicyV1(contract),
+    };
+    let emitted = false;
+    const adapters: RetrievalAdaptersV3 = {
+      discover: async () => {
+        if (emitted) return { candidates: [], nextCursor: null, exhausted: true };
+        emitted = true;
+        return {
+          candidates: [
+            candidate(501, {
+              id: "atomic-rap-proof",
+              title: "Shared Recording",
+              artist: "One Artist",
+            }),
+            candidate(502, {
+              id: "atomic-grime-proof",
+              title: "Shared Recording",
+              artist: "One Artist",
+            }),
+          ],
+          nextCursor: null,
+          exhausted: true,
+        };
+      },
+      qualify: async ({ candidates }) => candidates.map((value, index) => {
+        const clauseId = index === 0 ? "genre:rap" : "genre:grime";
+        const base = qualification(value, {
+          catalog: {
+            storefrontPlayable: true,
+            appleSongId: "apple-atomic-proof",
+            recordingFamilyKey: "family-atomic-proof",
+            confidence: 0.99,
+          },
+        });
+        const hosted = withHostedCanonicalEvidence(value, base, [clauseId]);
+        const binding = hosted.evidence.bindings![0]!;
+        return {
+          ...hosted,
+          evidence: {
+            ...hosted.evidence,
+            bindingIds: ["shared-proof-binding"],
+            bindings: [{
+              ...binding,
+              id: "shared-proof-binding",
+            }],
+          },
+          canonicalClauseAssessments: {
+            "genre:rap": index === 0
+              ? {
+                  status: "pass" as const,
+                  evidenceGrade: "track_specific_editorial_assertion" as const,
+                  evidenceIds: ["shared-proof-binding"],
+                }
+              : { status: "unknown" as const },
+            "genre:grime": index === 1
+              ? {
+                  status: "pass" as const,
+                  evidenceGrade: "track_specific_editorial_assertion" as const,
+                  evidenceIds: ["shared-proof-binding"],
+                }
+              : { status: "unknown" as const },
+          },
+        };
+      }),
+    };
+
+    const result = await executeRetrievalV3({
+      runId: "atomic-or-proof",
+      plan: selection,
+      adapters,
+    });
+
+    expect(result.outcome.status).toBe("exact_ready");
+    expect(result.selected).toHaveLength(1);
+    expect(canonicalRequiredEvidenceIntegrityV3({
+      policy: selection.canonicalContractPolicy!,
+      assessments: result.selected[0]!.canonicalClauseAssessments,
+      bindingIds: result.selected[0]!.evidenceBindingIds,
+      bindings: result.selected[0]!.evidenceBindings,
+      storefront: selection.storefront,
+    })).toMatchObject({
+      passed: true,
+      missingRequiredClauseIds: [],
+      obligationMismatchClauseIds: [],
+    });
+  });
+
   test("qualifies a same-batch cumulative recording only once", async () => {
     const targetStrategy = "curated_genre_scene:trusted_scoped_containers";
     let emitted = false;

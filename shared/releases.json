@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.4",
+      "releasedAt": "2026-07-30",
+      "title": "Canonical guidance and quarantine integrity",
+      "notes": [
+        "Compiles co-named rap and grime as one hard hip-hop-or-grime membership predicate, preserving pure-grime eligibility through contract, query-plan, and worker projections.",
+        "Keeps canonical assessments and their cited evidence bindings as an atomic proof bundle when repeated discovery observations resolve to the same Apple recording.",
+        "Revalidates evidence attestations across the final selected and reserve sets before reporting a manifest-ready result.",
+        "Transitions integrity failures atomically to the schema-19 quarantined resolution, clears false LIVE motion, and prevents a later job failure from overwriting quarantine.",
+        "Records failed-integrity outcome truth while retaining separately verified selected, manifested, and Apple-reconciled counts."
+      ]
+    },
+    {
       "version": "2.4.3",
       "releasedAt": "2026-07-30",
       "title": "Guidance answer round-trip integrity",
