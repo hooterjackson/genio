@@ -54,8 +54,11 @@ function parseFixedTrack(value: string): SelectionFixedTrackIdentity | null {
 /**
  * Compile only an unambiguous closed artist/title list. A list is fixed when
  * its exact count equals the number of typed pairs and the brief explicitly
- * preserves the supplied order. Broad include examples must never enter this
- * path merely because they happen to contain a dash.
+ * preserves the supplied order. The compiler may add supplemental include
+ * prose (for example, "original studio recordings only") alongside those
+ * pairs; that prose does not change the closed membership set. Broad include
+ * examples must never enter this path merely because they happen to contain a
+ * dash.
  */
 export function compileFixedTrackList(
   brief: PlaylistBrief,
@@ -66,13 +69,13 @@ export function compileFixedTrackList(
     || !Number.isInteger(minimum)
     || minimum < 1
     || minimum !== maximum
-    || brief.include.length !== minimum
     || !ORDER_IS_IMMUTABLE.test(`${brief.relationship} ${brief.orderingPolicy}`)) {
     return null;
   }
-  const entries = brief.include.map(parseFixedTrack);
-  if (entries.some((entry) => entry === null)) return null;
-  const fixed = entries as SelectionFixedTrackIdentity[];
+  const fixed = brief.include
+    .map(parseFixedTrack)
+    .filter((entry): entry is SelectionFixedTrackIdentity => entry !== null);
+  if (fixed.length !== minimum) return null;
   const identities = new Set(fixed.map((entry) => (
     `${normalizedIdentityText(entry.artist)}\u0000${normalizedIdentityText(entry.title)}`
   )));

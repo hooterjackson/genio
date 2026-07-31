@@ -232,6 +232,8 @@ describe("playlist contract shadow bridge v1", () => {
         "Michael Jackson — Billie Jean",
         "Madonna — La Isla Bonita",
         "Earth, Wind & Fire — September",
+        "Original studio recordings only",
+        "Exact order as specified",
       ],
       exclude: [
         "remixes",
@@ -253,6 +255,12 @@ describe("playlist contract shadow bridge v1", () => {
       brief: requestBrief,
       storefront: "us",
     });
+    expect(selectionPlan.scopeKind).toBe("fixed_track_list");
+    expect(selectionPlan.fixedTrackList).toEqual([
+      { artist: "Michael Jackson", title: "Billie Jean" },
+      { artist: "Madonna", title: "La Isla Bonita" },
+      { artist: "Earth, Wind & Fire", title: "September" },
+    ]);
     expect(selectionPlan.constraints).toEqual(expect.arrayContaining([
       expect.objectContaining({
         axis: "recording_version",

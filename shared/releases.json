@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.10",
+      "releasedAt": "2026-07-31",
+      "title": "Production-shaped fixed-list execution",
+      "notes": [
+        "Keeps exact fixed-track membership executable when brief compilation adds descriptive include prose beside the requested artist-title identities.",
+        "Enforces duplicate prevention through immutable fixed-list identity, manifest uniqueness, and Apple ordered-ID reconciliation instead of an unsupported open-world evidence predicate.",
+        "Adds the real production brief shape to capability-negotiation regression coverage before browser and Apple acceptance."
+      ]
+    },
+    {
       "version": "2.4.9",
       "releasedAt": "2026-07-31",
       "title": "Exact frontend artifact identity",
