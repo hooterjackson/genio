@@ -13,7 +13,10 @@ import {
   PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
   PLAYLIST_CONTRACT_SHADOW_EVIDENCE_POLICY_VERSION,
 } from "./playlist-contract-shadow-bridge-v1.ts";
-import { PLAYLIST_CONTRACT_ONTOLOGY_VERSION } from "./music-concept-registry-v1.ts";
+import {
+  LEGACY_PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
+  PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
+} from "./music-concept-registry-v1.ts";
 import {
   PLAYLIST_EVIDENCE_STRENGTH_POLICY_VERSION,
 } from "./playlist-evidence-policy-v1.ts";
@@ -323,7 +326,10 @@ Readonly<BackendCapabilityDeclaration> = Object.freeze({
     PLAYLIST_CONTRACT_COMPILER_VERSION,
     PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
   ],
-  ontologyVersions: [PLAYLIST_CONTRACT_ONTOLOGY_VERSION],
+  ontologyVersions: [
+    LEGACY_PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
+    PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
+  ],
   evidencePolicyVersions: [
     PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
     PLAYLIST_CONTRACT_SHADOW_EVIDENCE_POLICY_VERSION,

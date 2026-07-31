@@ -255,6 +255,76 @@ describe("canonical contract execution bridge", () => {
     ).eligible).toBe(false);
   });
 
+  test("preserves drill OR grime eligibility through query-plan and worker projections", () => {
+    const prompt = "Drill & Grime Essentials";
+    const requestBrief: PlaylistBrief = {
+      title: "Drill & Grime Essentials",
+      description: "Representative drill and grime essentials.",
+      mode: "curated",
+      subjectEntities: ["drill", "grime"],
+      relationship: "tracks that belong to drill or grime",
+      include: ["drill", "grime"],
+      exclude: [],
+      versionPolicy: "Prefer canonical studio recordings.",
+      evidencePolicy: "Require track-scope evidence.",
+      orderingPolicy: "Balance both genres with a smooth flow.",
+      targetSize: { min: 29, max: 29 },
+      ambiguities: [],
+    };
+    const basePlan = createSelectionPlanV2({
+      prompt,
+      brief: requestBrief,
+      storefront: "us",
+    });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: "contract:drill-or-grime-execution",
+      prompt,
+      brief: requestBrief,
+      selectionPlan: basePlan,
+    });
+    const projection = projectPlaylistContractExecutionV1({
+      contract: shadow.contract,
+      basePlan,
+    });
+    const query = createQueryPlanV3(
+      projection.selectionPlanV3,
+      "00000000-0000-4000-8000-000000000052",
+      {
+        schemaVersion: 6,
+        briefContractVersion: 3,
+        playlistContractRevisionId: shadow.contract.revisionId,
+        playlistContractSemanticHash: shadow.contract.semanticHash,
+        playlistContractCompilerVersion: shadow.contract.versions.compiler,
+      },
+    );
+    const workerPlan = selectionPlanFromQueryPlanV3(query, {});
+    const predicate = workerPlan.membershipPredicates.find(
+      ({ id }) => id === "bridge:membership:drill-or-grime",
+    );
+    expect(predicate).toMatchObject({
+      axis: "genre",
+      operator: "require",
+      values: expect.arrayContaining(["drill", "grime"]),
+    });
+    const candidate = (genre: string) => ({
+      id: `candidate:${genre}`,
+      artist: "Fixture Artist",
+      album: null,
+      year: null,
+      scene: null,
+      value: genre,
+      memberships: { genre: [genre] },
+      objectiveScores: {},
+      sourceRank: 1,
+    });
+    expect(evaluateCandidateMembershipV3(candidate("drill"), [predicate!]).eligible)
+      .toBe(true);
+    expect(evaluateCandidateMembershipV3(candidate("grime"), [predicate!]).eligible)
+      .toBe(true);
+    expect(evaluateCandidateMembershipV3(candidate("garage"), [predicate!]).eligible)
+      .toBe(false);
+  });
+
   test("binds an explicit fixed track list into canonical membership and source-order execution", () => {
     const prompt = "Build exactly Billie Jean, La Isla Bonita, and September in the listed order.";
     const fixedBrief = fixedTrackListBrief();
@@ -1047,7 +1117,7 @@ describe("canonical contract execution bridge", () => {
       originalText: "velvet pulse",
       normalizedText: "velvet pulse",
       status: "unresolved",
-      ontologyVersion: "playlist_music_ontology_v3",
+      ontologyVersion: "playlist_music_ontology_v4",
       unresolvedTermId: expect.stringMatching(/^unresolved:[a-f0-9]{16}$/u),
       provenance: "immutable_playlist_contract_concept_v1",
       untrusted: true,

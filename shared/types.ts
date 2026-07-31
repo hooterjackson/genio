@@ -708,7 +708,8 @@ export interface PipelineV3ConceptDiscoveryHint {
   status: "discovery_only" | "unresolved";
   ontologyVersion:
     | "playlist_music_ontology_v2"
-    | "playlist_music_ontology_v3";
+    | "playlist_music_ontology_v3"
+    | "playlist_music_ontology_v4";
   unresolvedTermId: string | null;
   provenance: "immutable_playlist_contract_concept_v1";
   untrusted: true;

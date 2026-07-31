@@ -433,6 +433,80 @@ Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicat
       .toBe(false);
   });
 
+  test("asks the server-owned drill/grime emphasis question for the production regression", () => {
+    const { contract, value } = checkpoint("Drill & Grime Essentials");
+    const decision = value.decisions.find(({ axis }) => axis === "drill_grime_emphasis");
+    expect(value.mode).toBe("correctness_blocking");
+    expect(decision).toMatchObject({
+      mode: "correctness_blocking",
+      question: "How should drill and grime shape the 25-track mix?",
+      options: [
+        {
+          id: "equal_priority",
+          recommended: true,
+          explicitNoop: true,
+        },
+        expect.objectContaining({ id: "drill_led", recommended: false }),
+        expect.objectContaining({ id: "grime_led", recommended: false }),
+      ],
+    });
+    const drillLed = compileGuidanceSelectionV4(decision!, {
+      optionIds: ["drill_led"],
+    });
+    expect(drillLed.operations).toContainEqual(expect.objectContaining({
+      op: "add_clause",
+      clause: expect.objectContaining({
+        hardness: "soft",
+        axis: "genre_emphasis",
+        values: ["drill-led"],
+      }),
+    }));
+    const successor = applyPlaylistContractPatchV1(contract, {
+      baseRevisionId: contract.revisionId,
+      baseSemanticHash: contract.semanticHash,
+      answerLineage: {
+        questionSetHash: value.checkpointHash,
+        questionId: decision!.id,
+        answerHash: drillLed.answerHash,
+      },
+      operations: drillLed.operations,
+    });
+    const originalProjection = projectPlaylistContractExecutionV1({
+      contract,
+      basePlan: {
+        requestedTrackCount: contract.requestedTrackCount,
+        minimumQualifiedTrackCount: contract.requestedTrackCount,
+        storefront: contract.storefront,
+      },
+    });
+    const successorProjection = projectPlaylistContractExecutionV1({
+      contract: successor,
+      basePlan: {
+        requestedTrackCount: contract.requestedTrackCount,
+        minimumQualifiedTrackCount: contract.requestedTrackCount,
+        storefront: contract.storefront,
+      },
+    });
+    expect(successor.semanticHash).not.toBe(contract.semanticHash);
+    expect(successorProjection.selectionPlanV3.rankingObjectives).toContainEqual(
+      expect.objectContaining({
+        dimension: "relevance",
+        values: ["drill-led"],
+      }),
+    );
+    expect(successorProjection.selectionPlanV3.rankingObjectives)
+      .not.toEqual(originalProjection.selectionPlanV3.rankingObjectives);
+  });
+
+  test.each([
+    "25 mostly drill tracks with some grime",
+    "25 drill and grime tracks with equal priority",
+  ])("does not ask a redundant drill/grime emphasis question: %s", (prompt) => {
+    const { value } = checkpoint(prompt);
+    expect(value.decisions.some(({ axis }) => axis === "drill_grime_emphasis"))
+      .toBe(false);
+  });
+
   test("rejects options whose server-owned executable effects collapse", () => {
     expect(() => createGuidanceDecisionV4({
       mode: "correctness_blocking",

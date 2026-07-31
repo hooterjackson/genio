@@ -253,9 +253,20 @@ const RAP_OR_GRIME_ELIGIBILITY_VALUES = [
   "hip-hop",
   "grime",
 ] as const;
+const DRILL_OR_GRIME_MEMBERSHIP_CLAUSE_ID =
+  "bridge:membership:drill-or-grime";
+const DRILL_OR_GRIME_ELIGIBILITY_VALUES = [
+  "drill",
+  "grime",
+] as const;
 
 function promptCoNamesRapAndGrime(prompt: string): boolean {
   return /\b(?:rap|hip[ -]?hop)\b/iu.test(prompt)
+    && /\bgrime(?:\s+music)?\b/iu.test(prompt);
+}
+
+function promptCoNamesDrillAndGrime(prompt: string): boolean {
+  return /\bdrill(?:\s+music)?\b/iu.test(prompt)
     && /\bgrime(?:\s+music)?\b/iu.test(prompt);
 }
 
@@ -278,6 +289,32 @@ function positiveHardRapOrGrimeScope(
   const values = constraint.values.map(normalized);
   if (values.some((value) => ["rap", "hip hop", "hip-hop"].includes(value))) {
     return "hip-hop";
+  }
+  if (values.some((value) => ["grime", "grime music", "uk grime"].includes(value))) {
+    return "grime";
+  }
+  return null;
+}
+
+function positiveHardDrillOrGrimeScope(
+  constraint: SelectionConstraint,
+): "drill" | "grime" | null {
+  if (constraint.kind !== "hard"
+    || isNegativeConstraint(constraint)
+    || !MUSIC_SCOPE_AXES.has(constraint.axis)) {
+    return null;
+  }
+  const selectedConceptIds = conceptResolutionFor(
+    constraint.axis,
+    unique(constraint.values),
+  ).flatMap(({ selectedConceptId }) => (
+    selectedConceptId ? [selectedConceptId] : []
+  ));
+  if (selectedConceptIds.includes("genre:drill")) return "drill";
+  if (selectedConceptIds.includes("genre:grime")) return "grime";
+  const values = constraint.values.map(normalized);
+  if (values.some((value) => ["drill", "drill music", "uk drill", "british drill"].includes(value))) {
+    return "drill";
   }
   if (values.some((value) => ["grime", "grime music", "uk grime"].includes(value))) {
     return "grime";
@@ -681,6 +718,32 @@ export function buildPlaylistContractShadowDraftV1(
     });
     hardTrackClauseIds.push(RAP_OR_GRIME_MEMBERSHIP_CLAUSE_ID);
   }
+  const drillOrGrimeScopeKinds = input.selectionPlan.constraints
+    .map(positiveHardDrillOrGrimeScope)
+    .filter((kind): kind is "drill" | "grime" => kind !== null);
+  const consolidateDrillOrGrimeMembership = promptCoNamesDrillAndGrime(input.prompt)
+    && drillOrGrimeScopeKinds.includes("drill");
+  if (consolidateDrillOrGrimeMembership) {
+    addClause({
+      id: DRILL_OR_GRIME_MEMBERSHIP_CLAUSE_ID,
+      kind: "membership",
+      scope: "track",
+      hardness: "hard",
+      axis: "genre",
+      operator: "require",
+      values: [...DRILL_OR_GRIME_ELIGIBILITY_VALUES],
+      conceptInputs: conceptInputsFor(
+        "genre",
+        DRILL_OR_GRIME_ELIGIBILITY_VALUES,
+      ),
+      source: {
+        provenance: "prompt",
+        text: "drill and grime",
+      },
+      unknownPolicy: "defer",
+    });
+    hardTrackClauseIds.push(DRILL_OR_GRIME_MEMBERSHIP_CLAUSE_ID);
+  }
 
   for (const [constraintIndex, constraint] of input.selectionPlan.constraints.entries()) {
     if (POLICY_OWNED_AXES.has(constraint.axis)) continue;
@@ -689,6 +752,12 @@ export function buildPlaylistContractShadowDraftV1(
       // The user's co-equal wording is one OR eligibility predicate. Keeping
       // either source leaf would turn it back into an accidental AND and make
       // pure grime recordings ineligible.
+      continue;
+    }
+    if (consolidateDrillOrGrimeMembership
+      && positiveHardDrillOrGrimeScope(constraint)) {
+      // Co-named drill and grime are one OR eligibility predicate. Keeping
+      // the source drill leaf would silently turn the request into drill-only.
       continue;
     }
     const values = unique(constraint.values);

@@ -19,6 +19,18 @@ describe("playlist contract music concept resolver", () => {
     });
   });
 
+  test("resolves drill as selection-grade genre while keeping adjacent scenes as discovery leads", () => {
+    expect(resolveMusicConceptV1({ text: "drill", expectedKind: "genre" })).toMatchObject({
+      status: "resolved",
+      ontologyVersion: PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
+      selectedConceptId: "genre:drill",
+    });
+    expect(resolveMusicConceptV1({ text: "UK drill", expectedKind: "genre" })).toMatchObject({
+      status: "resolved",
+      selectedConceptId: "genre:drill",
+    });
+  });
+
   test("keeps material ambiguity explicit until a candidate is selected", () => {
     const ambiguous = resolveMusicConceptV1({ text: "house" });
     expect(ambiguous.status).toBe("ambiguous");
