@@ -475,6 +475,121 @@ databaseDescribe("schema-20 immutable proof migration", () => {
         randomUUID(),
       ],
     );
+    const terminalRunId = randomUUID();
+    const terminalContractId = randomUUID();
+    const terminalSelectionPlanId = randomUUID();
+    const terminalGraphSnapshotId = randomUUID();
+    const terminalQueryPlanId = randomUUID();
+    const terminalManifestId = randomUUID();
+    const terminalRevisionId = randomUUID();
+    await database.query(
+      `INSERT INTO research_runs(
+         id,prompt,brief_json,brief_hash,status,phase,client_bucket,
+         idempotency_key,retention_expires_at,pipeline_version,policy_version
+       ) VALUES(
+         $1,'terminal unpublished fixture','{}'::jsonb,$2,'quarantined',
+         'canonical_integrity_quarantine','schema20-terminal-test',$3,
+         now()+interval '1 day','corpus_first_v3',
+         'corpus_first_v3_policy_v1'
+       )`,
+      [terminalRunId, "1".repeat(64), randomUUID()],
+    );
+    await database.query(
+      `INSERT INTO playlist_contract_revisions(
+         id,run_id,revision,status,contract_hash,contract_json,
+         compiler_version,ontology_version,evidence_policy_version,
+         question_template_version,catalog_policy_version,locale,storefront,
+         answer_lineage_hash)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'compiler','ontology',
+         'evidence','questions','catalog','en','us',$4)`,
+      [
+        terminalContractId,
+        terminalRunId,
+        "2".repeat(64),
+        "3".repeat(64),
+      ],
+    );
+    await database.query(
+      `UPDATE research_runs
+       SET active_playlist_contract_revision_id=$2 WHERE id=$1`,
+      [terminalRunId, terminalContractId],
+    );
+    await database.query(
+      `INSERT INTO selection_plans(
+         id,run_id,revision,status,plan_hash,plan_json,pipeline_version,
+         policy_version,confirmed_at)
+       VALUES($1,$2,1,'active',$3,'{}'::jsonb,'corpus_first_v3',
+         'corpus_first_v3_policy_v1',now())`,
+      [terminalSelectionPlanId, terminalRunId, "4".repeat(64)],
+    );
+    await database.query(
+      `INSERT INTO graph_snapshots(
+         id,status,content_hash,assertion_count,catalog_identity_count,locked_at)
+       VALUES($1,'locked',$2,0,0,now())`,
+      [terminalGraphSnapshotId, "5".repeat(64)],
+    );
+    await database.query(
+      `INSERT INTO query_plan_revisions(
+         id,run_id,selection_plan_id,revision,graph_snapshot_id,engine,status,
+         plan_hash,plan_json,pipeline_version,policy_version,activated_at)
+       VALUES($1,$2,$3,1,$4,'portfolio','active',$5,'{}'::jsonb,
+         'corpus_first_v3','corpus_first_v3_policy_v1',now())`,
+      [
+        terminalQueryPlanId,
+        terminalRunId,
+        terminalSelectionPlanId,
+        terminalGraphSnapshotId,
+        "6".repeat(64),
+      ],
+    );
+    await database.query(
+      `INSERT INTO manifests(
+         id,run_id,name,description,content_hash,pipeline_version,
+         policy_version,contract_revision_id,contract_hash)
+       VALUES($1,$2,'Terminal unpublished','Never publication-authoritative',
+         $3,'corpus_first_v3','corpus_first_v3_policy_v1',$4,$5)`,
+      [
+        terminalManifestId,
+        terminalRunId,
+        "7".repeat(64),
+        terminalContractId,
+        "2".repeat(64),
+      ],
+    );
+    await database.query(
+      `INSERT INTO playlist_run_resolutions(
+         run_id,generation,state,next_action,active_contract_revision_id,
+         state_json,provenance,incident_reference)
+       VALUES($1,1,'quarantined','contact_support',$2,'{}'::jsonb,
+         'owner_repair','schema20-terminal-fixture')`,
+      [terminalRunId, terminalContractId],
+    );
+    await database.query(
+      "ALTER TABLE manifest_revisions DISABLE TRIGGER USER",
+    );
+    try {
+      await database.query(
+        `INSERT INTO manifest_revisions(
+           id,manifest_id,revision,status,reason,content_hash,
+           pipeline_version,policy_version,selection_plan_id,
+           query_plan_revision_id,graph_snapshot_id,run_spec_hash,locked_at)
+         VALUES($1,$2,1,'locked','terminal unpublished schema-19 manifest',$3,
+           'corpus_first_v3','corpus_first_v3_policy_v1',$4,$5,$6,$7,now())`,
+        [
+          terminalRevisionId,
+          terminalManifestId,
+          "7".repeat(64),
+          terminalSelectionPlanId,
+          terminalQueryPlanId,
+          terminalGraphSnapshotId,
+          "8".repeat(64),
+        ],
+      );
+    } finally {
+      await database.query(
+        "ALTER TABLE manifest_revisions ENABLE TRIGGER USER",
+      );
+    }
     await database.query(
       `INSERT INTO settings(key,value)
        VALUES('pipeline_v3_public_assignment_paused','true')
@@ -537,6 +652,7 @@ databaseDescribe("schema-20 immutable proof migration", () => {
       plan: {
         legacyPublishedVerifiedCount: 1,
         legacyPublishedUnverifiedCount: 0,
+        terminalUnpublishedCount: 1,
         successorRequiredCount: 0,
         ambiguousOrTamperedCount: 0,
         plannedReceiptCount: 1,
