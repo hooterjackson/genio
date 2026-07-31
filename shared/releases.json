@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.5.1",
+      "releasedAt": "2026-07-31",
+      "title": "Truthful production canary provenance",
+      "notes": [
+        "Persists the signed manifest-only canary environment instead of labeling production owner acceptance as staging.",
+        "Keeps existing staging evidence valid while allowing the same zero-write marker and evidence schema to represent production truthfully.",
+        "Adds a production owner-canary regression that proves the durable marker environment, public-assignment pause, and publication fence agree."
+      ]
+    },
+    {
       "version": "2.5.0",
       "releasedAt": "2026-07-31",
       "title": "Immutable selection proof architecture",

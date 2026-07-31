@@ -24,6 +24,7 @@ export const RELEASE_MANIFEST_CANARY_MARKER_SCHEMA =
 export const RELEASE_MANIFEST_CANARY_EVIDENCE_SCHEMA =
   "genio-release-manifest-canary-evidence/v1" as const;
 export const RELEASE_MANIFEST_CANARY_MAX_TRACKS = 300;
+export type ReleaseManifestCanaryEnvironment = "staging" | "production";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
@@ -38,7 +39,7 @@ export interface ReleaseManifestCanaryMarkerV1 {
   schemaVersion: typeof RELEASE_MANIFEST_CANARY_MARKER_SCHEMA;
   canaryId: string;
   cacheMode: "reuse_disabled";
-  environment: "staging";
+  environment: ReleaseManifestCanaryEnvironment;
   executionMode: "shadow";
   publicationBoundary: "database_fenced";
   appleWriteAccess: "forbidden";
@@ -76,7 +77,7 @@ export interface ReleaseManifestCanaryEvidenceV1 {
   schemaVersion: typeof RELEASE_MANIFEST_CANARY_EVIDENCE_SCHEMA;
   canaryId: string;
   cacheMode: "reuse_disabled";
-  environment: "staging";
+  environment: ReleaseManifestCanaryEnvironment;
   sourceRevision: string;
   executionMode: "shadow";
   publicationBoundary: "database_fenced";
@@ -170,7 +171,10 @@ export function parseReleaseManifestCanaryMarker(
     || typeof input.canaryId !== "string"
     || !SAFE_CANARY_ID.test(input.canaryId)
     || input.cacheMode !== "reuse_disabled"
-    || input.environment !== "staging"
+    || !new Set<ReleaseManifestCanaryEnvironment>([
+      "staging",
+      "production",
+    ]).has(input.environment as ReleaseManifestCanaryEnvironment)
     || input.executionMode !== "shadow"
     || input.publicationBoundary !== "database_fenced"
     || input.appleWriteAccess !== "forbidden"
@@ -200,6 +204,7 @@ export function parseReleaseManifestCanaryMarker(
 export function createReleaseManifestCanaryMarker(input: {
   canaryId: string;
   cacheMode: "reuse_disabled";
+  environment: ReleaseManifestCanaryEnvironment;
   sourceRevision: string;
   queryPlanHash: string;
   queryPlanRevisionId: string;
@@ -214,7 +219,7 @@ export function createReleaseManifestCanaryMarker(input: {
     schemaVersion: RELEASE_MANIFEST_CANARY_MARKER_SCHEMA,
     canaryId: input.canaryId,
     cacheMode: input.cacheMode,
-    environment: "staging",
+    environment: input.environment,
     executionMode: "shadow",
     publicationBoundary: "database_fenced",
     appleWriteAccess: "forbidden",
@@ -554,7 +559,7 @@ export function buildReleaseManifestCanaryEvidence(input: {
     schemaVersion: RELEASE_MANIFEST_CANARY_EVIDENCE_SCHEMA,
     canaryId: marker.canaryId,
     cacheMode: marker.cacheMode,
-    environment: "staging",
+    environment: marker.environment,
     sourceRevision: marker.sourceRevision,
     executionMode: "shadow",
     publicationBoundary: "database_fenced",

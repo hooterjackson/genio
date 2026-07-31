@@ -12245,6 +12245,7 @@ export class Repository {
             const marker = createReleaseManifestCanaryMarker({
               canaryId: input.releaseCanary.canaryId,
               cacheMode: input.releaseCanary.cacheMode,
+              environment: input.releaseCanary.environment,
               sourceRevision: input.releaseCanary.sourceRevision,
               queryPlanHash: queryHash,
               queryPlanRevisionId,

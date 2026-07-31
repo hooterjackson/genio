@@ -471,6 +471,7 @@ databaseDescribe("manifest-only release canary integration", () => {
       const persisted = (await pool.query<{
         auto_publish: boolean;
         marker_count: number;
+        marker_environment: string | null;
         publication_job_count: number;
       }>(
         `SELECT run.auto_publish,
@@ -478,6 +479,10 @@ databaseDescribe("manifest-only release canary integration", () => {
                  FROM research_checkpoints checkpoint
                  WHERE checkpoint.run_id=run.id
                    AND checkpoint.phase=$2) marker_count,
+                (SELECT checkpoint.state_json->>'environment'
+                 FROM research_checkpoints checkpoint
+                 WHERE checkpoint.run_id=run.id
+                   AND checkpoint.phase=$2) marker_environment,
                 (SELECT count(*)::int
                  FROM job_queue job
                  WHERE job.run_id=run.id
@@ -489,6 +494,7 @@ databaseDescribe("manifest-only release canary integration", () => {
       expect(persisted).toEqual({
         auto_publish: false,
         marker_count: 1,
+        marker_environment: "production",
         publication_job_count: 0,
       });
     } finally {
