@@ -1656,6 +1656,43 @@ function canonicalEvidenceProofWitnessClauseIdsV3(input: {
 }
 
 /**
+ * A failed observation normally cannot prove a negative claim. The sole
+ * catalog-only exception is a server-bound exact artist exclusion whose
+ * execution directive declares a closed Apple identity scope. In that case
+ * the adapter compares the complete Apple credit/artist identity and records
+ * authoritative structured metadata; requiring a web citation for
+ * "this exact Apple credit is not the excluded artist" would turn a
+ * closed-world identity check into an impossible open-world proof.
+ */
+function canonicalClosedWorldStructuredNegativeProofV3(input: {
+  policy: NonNullable<SelectionPlanV3["canonicalContractPolicy"]>;
+  clause: NonNullable<
+    SelectionPlanV3["canonicalContractPolicy"]
+  >["clauses"][number];
+  assessment:
+    | CanonicalPlaylistContractClauseAssessmentV1
+    | undefined;
+  evidenceIds: readonly string[];
+}): boolean {
+  if (
+    input.clause.kind !== "exclusion"
+    || input.clause.axis !== "artist"
+    || input.clause.operator !== "exclude"
+    || input.assessment?.status !== "fail"
+    || input.assessment.evidenceGrade
+      !== "authoritative_structured_metadata"
+    || input.evidenceIds.length !== 0
+  ) return false;
+  const directives = input.policy.executionDirectives;
+  const closedWorldClauseIds = new Set([
+    ...(directives?.similarity?.exactArtistExclusionClauseIds ?? []),
+    ...(directives?.exactArtistIdentityExclusions?.bindings ?? [])
+      .map(({ clauseId }) => clauseId),
+  ]);
+  return closedWorldClauseIds.has(input.clause.id);
+}
+
+/**
  * Proves every half of canonical external evidence: the assessment references
  * an attested binding, that exact binding is hash-bound to the clause it is
  * being used to satisfy, and its server-derived evidence grade is the exact
@@ -1762,15 +1799,26 @@ export function canonicalRequiredEvidenceIntegrityV3(input: {
       && evidenceIds.length === 0
       && assessment.evidenceGrade
         === "authoritative_structured_metadata";
+    const permittedClosedWorldStructuredNegativeWithoutBinding =
+      canonicalClosedWorldStructuredNegativeProofV3({
+        policy: input.policy,
+        clause,
+        assessment,
+        evidenceIds,
+      });
     const proofComplete = assessment?.status === "pass"
       ? gradeEligible && (
         permittedPositiveStructuredMetadataWithoutBinding
         || externalEvidenceGradeMatches
       )
       : assessment?.status === "fail"
-        // A negative observation is never self-authenticating, including when
-        // its asserted grade is structured/catalog metadata.
-        ? gradeEligible && externalEvidenceGradeMatches
+        // Open-world negative observations are never self-authenticating.
+        // The exact-artist exception above is explicitly bound to the
+        // closed Apple catalog-identity scope in the immutable directive.
+        ? gradeEligible && (
+          permittedClosedWorldStructuredNegativeWithoutBinding
+          || externalEvidenceGradeMatches
+        )
         : false;
     if (!proofComplete) unprovenClauseIds.add(clause.id);
   }
@@ -4236,6 +4284,7 @@ function emptyResult(input: {
       qualificationsObserved: 0,
       scopeFailures: 0,
       failedMembershipPredicateIds: {},
+      attemptedCanonicalClauseIds: [],
       appleLookupCount: 0,
       appleProviderRequestCount: 0,
       rootCause: input.stopReason === "provider_failure" || input.stopReason === "provider_circuit_open"
@@ -4497,6 +4546,7 @@ export async function executeRetrievalV3(input: {
   let appleProviderRequestCount = 0;
   let semanticRecoveryAttemptCount = 0;
   const failedMembershipPredicateCounts = new Map<string, number>();
+  const attemptedCanonicalClauseIds = new Set<string>();
   const semanticRecoveryQualificationSample: CandidateQualificationV3[] = [];
   const semanticPlanRevisions: SemanticPlanRevisionArtifactV3[] = [];
   const recoveryAudits: PipelineRecoveryAuditArtifactV3[] = [];
@@ -4528,6 +4578,13 @@ export async function executeRetrievalV3(input: {
         predicateId,
         (failedMembershipPredicateCounts.get(predicateId) ?? 0) + count,
       );
+    }
+    for (const qualification of values) {
+      for (const clauseId of Object.keys(
+        qualification.canonicalClauseAssessments ?? {},
+      )) {
+        attemptedCanonicalClauseIds.add(clauseId);
+      }
     }
     if (options.includeInRecoverySample !== false) {
       semanticRecoveryQualificationSample.push(...values);
@@ -5744,6 +5801,8 @@ export async function executeRetrievalV3(input: {
       failedMembershipPredicateIds: Object.fromEntries(
         [...failedMembershipPredicateCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
       ),
+      attemptedCanonicalClauseIds:
+        [...attemptedCanonicalClauseIds].sort(),
       appleLookupCount,
       appleProviderRequestCount,
       rootCause: diagnosticsRootCause,

@@ -54,6 +54,7 @@ export function auditSemanticCollapseV1(input: {
       ?? input.result.stages.validCandidates,
   );
   const attemptedClauseIds = new Set([
+    ...(input.result.predicateDiagnostics?.attemptedCanonicalClauseIds ?? []),
     ...Object.keys(failureCounts),
     ...(input.result.candidateLeads ?? [])
       .flatMap(({ predicateCoverage }) => predicateCoverage),

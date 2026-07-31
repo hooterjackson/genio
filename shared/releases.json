@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.12",
+      "releasedAt": "2026-07-31",
+      "title": "Closed-world exclusion and collapse-audit recovery",
+      "notes": [
+        "Accepts authoritative Apple artist identity as proof for an immutable exact-artist exclusion while keeping generic and open-world negative claims fail-closed.",
+        "Audits catalog, recording-version, evidence-policy, exclusion, and membership acquisition from the qualification ledger instead of mistaking membership-only lead coverage for missing work.",
+        "Adds a production-shaped 50-track rap-or-grime regression with a Pop Smoke discovery seed, exact primary-artist exclusion, live multi-frontier provenance, and a five-track qualified reserve."
+      ]
+    },
+    {
       "version": "2.4.11",
       "releasedAt": "2026-07-31",
       "title": "Registry-independent recovery build",

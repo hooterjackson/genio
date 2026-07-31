@@ -113,6 +113,14 @@ export interface RetrievalPredicateDiagnosticsV3 {
   readonly qualificationsObserved: number;
   readonly scopeFailures: number;
   readonly failedMembershipPredicateIds: Readonly<Record<string, number>>;
+  /**
+   * Canonical clause assessments actually produced by qualification. This is
+   * the authoritative acquisition ledger for semantic-collapse auditing:
+   * candidate-lead predicate coverage contains only membership evidence and
+   * cannot prove that catalog, version, evidence-policy, or exclusion axes
+   * were attempted.
+   */
+  readonly attemptedCanonicalClauseIds?: readonly string[];
   /** Candidate-level catalog-resolution attempts, retained for compatibility. */
   readonly appleLookupCount: number;
   /** Actual Apple provider read invocations made by the catalog adapter. */
