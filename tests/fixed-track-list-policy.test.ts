@@ -82,6 +82,32 @@ describe("fixed track list policy", () => {
     ]);
   });
 
+  test("ignores compiler-added include prose after the exact typed identities", () => {
+    const compiled = compileFixedTrackList({
+      ...fixedBrief,
+      include: [
+        ...fixedBrief.include,
+        "Original studio recordings only",
+        "Exact order as specified",
+      ],
+    });
+    expect(compiled).toEqual([
+      { artist: "Michael Jackson", title: "Billie Jean" },
+      { artist: "Madonna", title: "La Isla Bonita" },
+      { artist: "Earth, Wind & Fire", title: "September" },
+    ]);
+  });
+
+  test("rejects supplemental prose that contains another artist-title identity", () => {
+    expect(compileFixedTrackList({
+      ...fixedBrief,
+      include: [
+        ...fixedBrief.include,
+        "a-ha — Take on Me",
+      ],
+    })).toBeNull();
+  });
+
   test("preserves genuine title parentheticals", () => {
     const compiled = compileFixedTrackList({
       ...fixedBrief,
