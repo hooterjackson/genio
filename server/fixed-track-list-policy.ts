@@ -17,12 +17,26 @@ function normalizedIdentityText(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+const FIXED_TRACK_VERSION_QUALIFIER =
+  /\s*\((?:original studio (?:recording|version)|studio (?:recording|version))\)\s*$/iu;
+
+/**
+ * Brief compilation may annotate an otherwise exact artist/title identity
+ * with a version-policy label. The label is not part of the catalog title:
+ * version eligibility is enforced independently by the immutable recording
+ * policy. Strip only this narrow, server-understood suffix so genuine title
+ * parentheticals remain part of the identity.
+ */
+function canonicalFixedTrackTitle(value: string): string {
+  return value.replace(FIXED_TRACK_VERSION_QUALIFIER, "").trim();
+}
+
 function parseFixedTrack(value: string): SelectionFixedTrackIdentity | null {
   const compact = value.normalize("NFKC").trim();
   const artistDashTitle = compact.match(/^(.+?)\s+(?:—|–|-)\s+(.+)$/u);
   if (artistDashTitle) {
     const artist = artistDashTitle[1]!.trim();
-    const title = artistDashTitle[2]!.trim();
+    const title = canonicalFixedTrackTitle(artistDashTitle[2]!.trim());
     return artist && title ? { artist, title } : null;
   }
   // Brief compilation commonly preserves visitor-authored fixed identities as
@@ -31,7 +45,7 @@ function parseFixedTrack(value: string): SelectionFixedTrackIdentity | null {
   // closed track identities.
   const quotedTitleByArtist = compact.match(/^["“](.+?)["”]\s+by\s+(.+)$/iu);
   if (!quotedTitleByArtist) return null;
-  const title = quotedTitleByArtist[1]!.trim();
+  const title = canonicalFixedTrackTitle(quotedTitleByArtist[1]!.trim());
   const artist = quotedTitleByArtist[2]!.trim();
   if (!artist || !title) return null;
   return { artist, title };

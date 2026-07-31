@@ -66,6 +66,37 @@ describe("fixed track list policy", () => {
     ]);
   });
 
+  test("separates a compiler-added recording-version suffix from catalog identity", () => {
+    const compiled = compileFixedTrackList({
+      ...fixedBrief,
+      include: [
+        "Michael Jackson — Billie Jean (original studio recording)",
+        "Madonna — La Isla Bonita (original studio version)",
+        "Earth, Wind & Fire — September (studio recording)",
+      ],
+    });
+    expect(compiled).toEqual([
+      { artist: "Michael Jackson", title: "Billie Jean" },
+      { artist: "Madonna", title: "La Isla Bonita" },
+      { artist: "Earth, Wind & Fire", title: "September" },
+    ]);
+  });
+
+  test("preserves genuine title parentheticals", () => {
+    const compiled = compileFixedTrackList({
+      ...fixedBrief,
+      include: [
+        "Rupert Holmes — Escape (The Piña Colada Song)",
+        "Stevie Wonder — Living for the City",
+        "Earth, Wind & Fire — September",
+      ],
+    });
+    expect(compiled?.[0]).toEqual({
+      artist: "Rupert Holmes",
+      title: "Escape (The Piña Colada Song)",
+    });
+  });
+
   test("does not infer a closed list without exact count and explicit source order", () => {
     expect(compileFixedTrackList({
       ...fixedBrief,

@@ -2521,9 +2521,9 @@ describe("Pipeline V3 live read-only adapters", () => {
       subjectEntities: [],
       relationship: "Exact inclusion of three named original studio recordings in the listed order.",
       include: [
-        "Michael Jackson — Billie Jean",
-        "Madonna — La Isla Bonita",
-        "Earth, Wind & Fire — September",
+        "Michael Jackson — Billie Jean (original studio recording)",
+        "Madonna — La Isla Bonita (original studio recording)",
+        "Earth, Wind & Fire — September (original studio recording)",
       ],
       exclude: ["remixes", "live versions", "radio edits", "covers", "re-recordings", "duplicates"],
       versionPolicy: "Use the original studio recording only for each listed song; no alternate versions.",

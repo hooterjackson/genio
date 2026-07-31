@@ -47,6 +47,48 @@ function contract() {
 }
 
 describe("adaptive run decision v1", () => {
+  test("keeps soft avoid clauses out of the preference summary", () => {
+    const base = contract();
+    const avoidContract = compilePlaylistContractRevisionV1({
+      contractId: "fixed-list-decision-summary",
+      rawPrompt: "Three exact tracks; exclude covers",
+      requestedTrackCount: 3,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        ...base.clauses.map((clause) => ({
+          id: clause.id,
+          kind: clause.kind,
+          scope: clause.scope,
+          hardness: clause.hardness,
+          axis: clause.axis,
+          operator: clause.operator,
+          values: clause.values,
+          source: clause.source,
+        })),
+        {
+          id: "bridge:constraint:brief_avoid:covers",
+          kind: "ranking_preference",
+          scope: "track",
+          hardness: "soft",
+          axis: "relationship",
+          operator: "prefer",
+          values: ["avoid:covers"],
+          source: { provenance: "prompt", text: "covers" },
+        },
+      ],
+      trackPredicate: base.trackPredicate,
+    });
+    const decision = createAdaptiveRunDecisionV1({
+      contract: avoidContract,
+      reason: "runtime_feasibility_unknown",
+      verifiedTrackCount: 0,
+      remainingStrategyCount: 0,
+    });
+    expect(decision.interpretationSummary.avoid).toContain("covers");
+    expect(decision.interpretationSummary.prefer).not.toContain("covers");
+  });
+
   test("offers one bounded extension and separate revision/publication actions", () => {
     const decision = createAdaptiveRunDecisionV1({
       contract: contract(),
