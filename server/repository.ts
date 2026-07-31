@@ -28053,18 +28053,56 @@ export class Repository {
         );
         const bindings = attestedBindingsByTrack.get(track) ?? [];
         for (const binding of bindings) {
-          const canonicalPredicates = canonicalRetrieval
-            ? (finalSemanticPlan.canonicalContractPolicy?.clauses ?? []).filter(
+          const canonicalClauses =
+            finalSemanticPlan.canonicalContractPolicy?.clauses ?? [];
+          const directlyProvenCanonicalPredicates = canonicalRetrieval
+            ? canonicalClauses.filter(
                 (clause) => clause.axis !== "evidence"
                   && track.canonicalClauseAssessments?.[clause.id]
                     ?.evidenceIds?.includes(binding.id),
               )
             : [];
+          const citedByEvidencePolicy = canonicalRetrieval
+            && canonicalClauses.some(
+              (clause) => clause.axis === "evidence"
+                && track.canonicalClauseAssessments?.[clause.id]
+                  ?.evidenceIds?.includes(binding.id),
+            );
+          const explicitPredicateIds = new Set(
+            binding.predicateIds ?? binding.supportedPredicateIds ?? [],
+          );
+          // A catalog genre can satisfy membership through authoritative
+          // structured metadata while the evidence-policy meta clause cites
+          // the exact scoped source that led to the recording. Persist that
+          // candidate-specific binding under the factual predicate the source
+          // itself attests. Otherwise the immutable qualification references
+          // evidence that disappears at the publication boundary.
+          const evidencePolicySourcePredicates = citedByEvidencePolicy
+            ? canonicalClauses.filter(
+                (clause) => clause.axis !== "evidence"
+                  && explicitPredicateIds.has(clause.id),
+              )
+            : [];
+          const canonicalPredicates = [
+            ...new Map([
+              ...directlyProvenCanonicalPredicates,
+              ...evidencePolicySourcePredicates,
+            ].map((clause) => [clause.id, clause])).values(),
+          ];
           // Canonical contracts retain their exact Boolean clause assessments
           // in the qualification record. Extra attested sources that do not
           // satisfy a clause are not promoted into a misleading legacy scope
           // binding.
-          if (canonicalRetrieval && canonicalPredicates.length === 0) continue;
+          if (canonicalRetrieval && canonicalPredicates.length === 0) {
+            if (citedByEvidencePolicy) {
+              throw new HttpError(
+                409,
+                "A canonical evidence-policy reference has no attested factual predicate scope",
+                "pipeline_v3_evidence_predicate_missing",
+              );
+            }
+            continue;
+          }
           const normalizedUrl = assertPublicHttpsUrl(binding.url!).toString();
           let sourceRecordId = deterministicUuid({ runId, url: normalizedUrl });
           const source = await client.query<{ id: string }>(
@@ -28076,12 +28114,13 @@ export class Repository {
           );
           sourceRecordId = source.rows[0]!.id;
           const positivePredicates = evidenceMembershipPredicatesV3(finalSemanticPlan);
-          const explicitPredicateIds = binding.predicateIds ?? binding.supportedPredicateIds;
+          const explicitBindingPredicateIds =
+            binding.predicateIds ?? binding.supportedPredicateIds;
           const sourcePredicateIds = binding.hostedEvidenceSnapshot
             ? [...binding.hostedEvidenceSnapshot.predicateIds]
-            : [...new Set(explicitPredicateIds ?? [])].sort();
+            : [...new Set(explicitBindingPredicateIds ?? [])].sort();
           const supportedPredicates = positivePredicates.filter((predicate) => (
-            explicitPredicateIds?.includes(predicate.id)
+            explicitBindingPredicateIds?.includes(predicate.id)
           ));
           // Compatibility is intentionally limited to a single-axis run. A
           // composite binding without typed axis attribution must fail closed.
@@ -28089,7 +28128,8 @@ export class Repository {
             ? canonicalPredicates
             : supportedPredicates.length > 0
               ? supportedPredicates
-              : positivePredicates.length === 1 && explicitPredicateIds === undefined
+              : positivePredicates.length === 1
+                  && explicitBindingPredicateIds === undefined
                 ? positivePredicates
                 : [];
           if (persistedPredicates.length === 0) {

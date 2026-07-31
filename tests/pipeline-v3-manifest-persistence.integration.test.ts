@@ -338,6 +338,36 @@ function withCanonicalHostedProof(
   };
 }
 
+function withCanonicalCatalogMembershipAndEvidenceMeta(
+  result: RetrievalResultV3,
+): RetrievalResultV3 {
+  const membershipClauseId = "bridge:membership:hip-hop-or-grime";
+  const evidenceClauseId = "bridge:evidence:qualification-policy";
+  const prove = (track: QualifiedTrackV3): QualifiedTrackV3 => ({
+    ...track,
+    canonicalClauseAssessments: {
+      [membershipClauseId]: {
+        status: "pass",
+        evidenceGrade: "authoritative_structured_metadata",
+        evidenceIds: [],
+      },
+      [evidenceClauseId]: {
+        status: "pass",
+        evidenceGrade: "track_specific_editorial_assertion",
+        evidenceIds: [...track.evidenceBindingIds],
+      },
+    },
+  });
+  const selected = result.selected.map(prove);
+  const reserve = result.reserve.map(prove);
+  return {
+    ...result,
+    selected,
+    reserve,
+    qualifiedPool: [...selected, ...reserve],
+  };
+}
+
 databaseDescribe("Pipeline V3 governed manifest persistence", () => {
   const schemaName = `genio_v3_manifest_${randomUUID().replaceAll("-", "")}`;
   const graphSnapshotId = randomUUID();
@@ -403,6 +433,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       | false
       | "empty"
       | "or_membership"
+      | "catalog_membership_with_evidence_meta"
       | "not_exclusion" = false,
   ): Promise<{
     runId: string;
@@ -475,7 +506,53 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         active?.selection_plan,
         `active selection plan missing for ${label} (${created.runId})`,
       ).toBeTruthy();
-      const canonicalClauses = canonicalRecovery === "or_membership"
+      const canonicalClauses =
+        canonicalRecovery === "catalog_membership_with_evidence_meta"
+        ? [{
+            id: "bridge:membership:hip-hop-or-grime",
+            kind: "membership" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "genre",
+            operator: "require" as const,
+            values: ["hip-hop", "grime"],
+            source: {
+              provenance: "prompt" as const,
+              text: "rap music and grime",
+            },
+            evidence: {
+              required: true,
+              minimumGrade: null,
+              permittedGrades: [
+                "authoritative_structured_metadata" as const,
+                "trusted_scoped_container" as const,
+                "track_specific_editorial_assertion" as const,
+              ],
+            },
+            unknownPolicy: "reject" as const,
+          }, {
+            id: "bridge:evidence:qualification-policy",
+            kind: "factual_relationship" as const,
+            scope: "track" as const,
+            hardness: "hard" as const,
+            axis: "evidence",
+            operator: "require" as const,
+            values: ["selection-grade evidence"],
+            source: {
+              provenance: "system_default" as const,
+              text: "Require selection-grade evidence.",
+            },
+            evidence: {
+              required: true,
+              minimumGrade: null,
+              permittedGrades: [
+                "trusted_scoped_container" as const,
+                "track_specific_editorial_assertion" as const,
+              ],
+            },
+            unknownPolicy: "defer" as const,
+          }]
+        : canonicalRecovery === "or_membership"
         ? [{
             id: "genre:reggaeton",
             kind: "membership" as const,
@@ -559,7 +636,16 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         locale: "en-US",
         storefront: active.selection_plan.storefront,
         clauses: canonicalClauses,
-        trackPredicate: canonicalRecovery === "or_membership"
+        trackPredicate:
+          canonicalRecovery === "catalog_membership_with_evidence_meta"
+          ? {
+              op: "all",
+              children: canonicalClauses.map(({ id }) => ({
+                op: "clause" as const,
+                clauseId: id,
+              })),
+            }
+          : canonicalRecovery === "or_membership"
           ? {
               op: "any",
               children: canonicalClauses.map(({ id }) => ({
@@ -2200,17 +2286,17 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       "echo-park-production-shape",
       undefined,
       "50 rap and grime tracks with a style reference and new-artist emphasis",
-      "or_membership",
+      "catalog_membership_with_evidence_meta",
     );
-    const base = withCanonicalHostedProof(retrievalResult({
+    const base = withCanonicalCatalogMembershipAndEvidenceMeta(retrievalResult({
       runId: context.runId,
       target: 50,
       selectedCount: 50,
       reserveCount: 5,
       status: "exact_ready",
       prefix: "echo-park-production-shape",
-      predicateIds: ["genre:reggaeton"],
-    }), "genre:reggaeton");
+      predicateIds: ["bridge:membership:hip-hop-or-grime"],
+    }));
     const selected = Array.from(
       { length: base.selected.length },
       (_, index) => base.selected[(index * 11) % base.selected.length]!,
@@ -2288,6 +2374,16 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       manifest_revision_count: 1,
       publication_job_count: 1,
     });
+    await expect(repository.getPublicationGuard({
+      runId: context.runId,
+      manifestId: first.manifestId!,
+      manifestRevisionId: first.manifestRevisionId!,
+      manifestRevisionHash: first.manifestHash!,
+      selectedCount: 50,
+    })).resolves.toMatchObject({
+      enforcement: "required",
+      decision: null,
+    });
 
     const provenance = (await pool.query<{
       provenance_path_json: Array<{ kind?: string; id?: string }>;
@@ -2306,6 +2402,86 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     expect(sourceObservationIds).toHaveLength(56);
     expect(new Set(sourceObservationIds).size).toBe(56);
   }, 120_000);
+
+  test("rejects an evidence-policy citation that has no factual predicate scope", async () => {
+    const context = await createLeasedRun(
+      1,
+      "unscoped-evidence-policy-binding",
+      undefined,
+      "1 rap or grime track",
+      "catalog_membership_with_evidence_meta",
+    );
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "unscoped-evidence-policy-binding",
+      predicateIds: ["bridge:membership:hip-hop-or-grime"],
+    });
+    const selected = base.selected.map((track) => {
+      const binding = track.evidenceBindings![0]!;
+      const {
+        hostedEvidenceSnapshot: ignoredHostedEvidenceSnapshot,
+        ...unhosted
+      } = binding;
+      void ignoredHostedEvidenceSnapshot;
+      return {
+        ...track,
+        evidenceBindings: [{
+          ...unhosted,
+          kind: "apple_editorial_container",
+          predicateIds: [],
+          governance: {
+            ...binding.governance,
+            accessMethod: "public_api" as const,
+            licenseState: "reusable" as const,
+            licenseVersion: "apple-test-v1",
+            termsVersion: "apple-test-v1",
+            sourceHash: "a".repeat(64),
+            sourceRevision: "a".repeat(64),
+          },
+          eligibilityAttestation: publicTrackScopeAttestationV3(binding.url!),
+        }],
+        canonicalClauseAssessments: {
+          "bridge:membership:hip-hop-or-grime": {
+            status: "pass" as const,
+            evidenceGrade: "authoritative_structured_metadata" as const,
+            evidenceIds: [],
+          },
+          "bridge:evidence:qualification-policy": {
+            status: "pass" as const,
+            evidenceGrade: "trusted_scoped_container" as const,
+            evidenceIds: [...track.evidenceBindingIds],
+          },
+        },
+      } satisfies QualifiedTrackV3;
+    });
+
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result: {
+        ...base,
+        selected,
+        qualifiedPool: selected,
+      },
+      fence: context.fence,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_evidence_predicate_missing",
+    });
+    expect((await pool.query<{ manifests: number; qualifications: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM manifests WHERE run_id=$1) manifests,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1) qualifications`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      manifests: 0,
+      qualifications: 0,
+    });
+  }, 30_000);
 
   test("uses database-returned candidate IDs after an upsert conflict", async () => {
     const context = await createLeasedRun(

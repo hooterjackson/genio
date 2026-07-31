@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.5",
+      "releasedAt": "2026-07-30",
+      "title": "Candidate-bound evidence persistence",
+      "notes": [
+        "Persists every candidate-specific attested source cited by the canonical evidence-policy clause under the exact factual predicate that source supports, including catalog-metadata-qualified genre tracks.",
+        "Fails closed before manifest creation when an evidence-policy citation has no attested factual predicate scope instead of silently dropping the binding.",
+        "Adds a production-shaped 50-selected, five-reserve, 56-observation replay regression that exercises immutable qualification persistence and the final publication evidence guard."
+      ]
+    },
+    {
       "version": "2.4.4",
       "releasedAt": "2026-07-30",
       "title": "Canonical guidance and quarantine integrity",
