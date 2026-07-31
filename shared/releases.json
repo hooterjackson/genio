@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.3",
+      "releasedAt": "2026-07-30",
+      "title": "Guidance answer round-trip integrity",
+      "notes": [
+        "Preserves an intentional correctness no-op across the public guidance contract so the Equal priority, Rap-led, and Grime-led options reconstruct the exact immutable server decision that produced them.",
+        "Accepts the exact v2.4.2 persisted representation by recovering only a server-owned empty correctness patch as the explicit no-op, while retaining the original question hash and all stale-answer fencing.",
+        "Adds a production-shaped public-contract regression proving that both a non-default Rap-led answer and the existing v2.4.2 question can compile into a successor without changing count or hard eligibility."
+      ]
+    },
+    {
       "version": "2.4.2",
       "releasedAt": "2026-07-30",
       "title": "Guidance-first integrity recovery",

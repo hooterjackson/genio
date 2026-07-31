@@ -15,7 +15,11 @@ import {
   selectGuidanceRoundV3,
   SMOOTH_REGGAETON_HEAT_PROMPT,
 } from "../server/adaptive-guidance-v3.ts";
-import { publicGuidanceQuestionV3 } from "../server/adaptive-guidance-contract-bridge.ts";
+import {
+  publicGuidanceQuestionV3,
+  publicGuidanceQuestionV4,
+} from "../server/adaptive-guidance-contract-bridge.ts";
+import { guidanceCheckpointV4 } from "../server/adaptive-guidance-v4.ts";
 import {
   AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
   PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
@@ -131,6 +135,21 @@ const ambiguousHouseBrief: PlaylistBrief = {
   evidencePolicy: "Require track-specific evidence for the selected meaning.",
   orderingPolicy: "Use an editorial sequence.",
   targetSize: { min: 25, max: 25 },
+  ambiguities: [],
+};
+
+const echoParkBrief: PlaylistBrief = {
+  title: "Echo Park Ride Drift",
+  description: "Rap and grime for a high-energy bike ride.",
+  mode: "curated",
+  subjectEntities: ["Pop Smoke"],
+  relationship: "stylistically similar to the reference artist",
+  include: ["New rap and grime artists"],
+  exclude: ["Reference artist is a style seed; exclude recordings by: Pop Smoke"],
+  versionPolicy: "one canonical recording",
+  evidencePolicy: "source-backed",
+  orderingPolicy: "high-energy flow",
+  targetSize: { min: 50, max: 50 },
   ambiguities: [],
 };
 
@@ -637,6 +656,133 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       policyVersion: authority?.spec_policy_version,
     })));
   }, 50_000);
+
+  test("persists and accepts the production-shaped rap/grime V4 public question", async () => {
+    const prompt = "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff";
+    const clientBucket = `guidance-v4-rap-grime-${randomUUID()}`;
+    const created = await repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 50,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: echoParkBrief,
+      storefront: "us",
+    });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: `brief:${created.id}`,
+      prompt,
+      brief: echoParkBrief,
+      selectionPlan,
+      locale: "en",
+    });
+    await repository.savePlaylistContractRevision({
+      briefRequestId: created.id,
+      expectedParentRevisionId: null,
+      contractHash: shadow.contract.semanticHash,
+      contract: structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+      compilerVersion: shadow.contract.versions.compiler,
+      ontologyVersion: shadow.contract.versions.ontology,
+      evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+      questionTemplateVersion: shadow.contract.versions.questionTemplates,
+      catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+      locale: shadow.contract.locale,
+      storefront: shadow.contract.storefront,
+      answerLineageHash: sha256Hex(stableStringify(shadow.contract.answerLineage)),
+    });
+    await repository.saveBriefSelectionPlan(created.id, selectionPlan);
+    const runSpec = createRunSpecV3({
+      prompt,
+      requestedTrackCount: 50,
+      storefront: "us",
+      brief: echoParkBrief,
+    });
+    const checkpoint = guidanceCheckpointV4({
+      prompt,
+      baseContract: shadow.contract,
+      preservedTrackPredicate: shadow.preservedTrackPredicate,
+      ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+      criticalAmbiguities: runSpec.criticalAmbiguities,
+      requestShape: "curated",
+      compilationTimestamp: "2026-07-30T20:00:00.000Z",
+    });
+    const questions = checkpoint.decisions.map(publicGuidanceQuestionV4);
+    expect(questions).toEqual([
+      expect.objectContaining({
+        question: "How should rap and grime shape the 50-track mix?",
+        options: expect.arrayContaining([
+          expect.objectContaining({
+            id: "equal_priority",
+            explicitNoop: true,
+          }),
+          expect.objectContaining({ id: "rap_led" }),
+          expect.objectContaining({ id: "grime_led" }),
+        ]),
+      }),
+    ]);
+    await repository.saveBriefResult(created.id, {
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      brief: echoParkBrief,
+      questions,
+      guidanceTelemetry: {
+        generationMode: "deterministic_critical",
+        requestClassification: "broad_curated",
+        guidancePolicyVersion: "adaptive_guidance_v4",
+        questionSetHash: checkpoint.checkpointHash,
+        proposedQuestionCount: checkpoint.decisions.length,
+        acceptedQuestionCount: questions.length,
+        webSearchCalls: 0,
+        validationIssues: [],
+      },
+      guidanceContract: {
+        questionSetHash: checkpoint.checkpointHash,
+        requestClassification: "broad_curated",
+        generationMode: "deterministic_critical",
+        guidancePolicyVersion: "adaptive_guidance_v4",
+        locale: "en",
+        storefront: "us",
+        targetTrackCount: 50,
+        explicitConstraintHash: sha256Hex("rap-grime-hard-constraints"),
+        rejectedQuestionReasons: [],
+        baseContractRevisionId: shadow.contract.revisionId,
+        baseContractSemanticHash: shadow.contract.semanticHash,
+        guidanceRound: "initial",
+        trigger: "correctness",
+        axis: "rap_grime_emphasis",
+        checkpointMode: "correctness_blocking",
+        interpretationSummary: checkpoint.interpretationSummary,
+      },
+    });
+
+    await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      briefRequestId: created.id,
+      idempotencyKey: randomUUID(),
+      questionSetHash: checkpoint.checkpointHash,
+      answers: [{ questionId: questions[0]!.id, optionId: "rap_led" }],
+    })).resolves.toEqual({ status: "finalizing", created: true });
+
+    expect(await repository.getBriefRequest(created.id)).toMatchObject({
+      status: "finalizing",
+      activePlaylistContract: {
+        requestedTrackCount: 50,
+        clauses: expect.arrayContaining([
+          expect.objectContaining({
+            axis: "genre_emphasis",
+            hardness: "soft",
+            values: ["rap-led"],
+          }),
+        ]),
+      },
+    });
+  }, 40_000);
 
   test("persists and accepts a zero-question V4 confirmation without changing the contract", async () => {
     const clientBucket = `guidance-v4-confirmation-${randomUUID()}`;

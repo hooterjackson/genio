@@ -1271,6 +1271,13 @@ export interface PlaylistGuidanceOption {
   description: string;
   /** Exactly the first option is recommended. */
   recommended: boolean;
+  /**
+   * An intentional no-op in a correctness-blocking decision. This must
+   * survive the public round trip because it is part of the signed question
+   * semantics and distinguishes a faithful "keep scope" answer from a broken
+   * empty patch.
+   */
+  explicitNoop?: boolean;
   /** Estimated breadth after applying this option. Required by contract 2. */
   feasibility?: PlaylistGuidanceFeasibility;
   /** Deterministic server-owned execution change. Required by contract 2. */

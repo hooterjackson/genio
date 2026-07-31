@@ -288,6 +288,38 @@ Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicat
       },
       operations: rapLed.operations,
     }).requestedTrackCount).toBe(contract.requestedTrackCount);
+
+    const question = publicGuidanceQuestionV4(decision!);
+    expect(question.options[0]).toMatchObject({
+      id: "equal_priority",
+      explicitNoop: true,
+    });
+    expect(() => guidanceDecisionV4FromPublicQuestion(question)).not.toThrow();
+    expect(() => compileGuidanceRoundPatchV3({
+      base: contract,
+      questionSetHash: value.checkpointHash,
+      questions: [question],
+      answers: [{ questionId: question.id, optionId: "rap_led" }],
+    })).not.toThrow();
+
+    // v2.4.2 persisted the question without explicitNoop. The bridge may
+    // recover that exact server-owned correctness no-op while the immutable
+    // question hash still verifies every executable field.
+    const v242PersistedQuestion = {
+      ...question,
+      options: question.options.map((option) => {
+        const persisted = { ...option };
+        delete persisted.explicitNoop;
+        return persisted;
+      }),
+    };
+    expect(() => guidanceDecisionV4FromPublicQuestion(v242PersistedQuestion)).not.toThrow();
+    expect(() => compileGuidanceRoundPatchV3({
+      base: contract,
+      questionSetHash: value.checkpointHash,
+      questions: [v242PersistedQuestion],
+      answers: [{ questionId: question.id, optionId: "rap_led" }],
+    })).not.toThrow();
   });
 
   test("carries a non-noop rap/grime answer through the query plan and changes ranking", () => {

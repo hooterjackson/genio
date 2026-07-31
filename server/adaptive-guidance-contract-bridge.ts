@@ -107,6 +107,7 @@ export function publicGuidanceQuestionV4(
       label: option.label,
       description: option.description,
       recommended: option.recommended,
+      ...(option.explicitNoop === true ? { explicitNoop: true } : {}),
       feasibility: feasibility(option.expectedFeasibilityDirection),
       contractPatch: {
         operations: option.patch.operations.map((operation) => (
@@ -222,11 +223,23 @@ export function guidanceDecisionV4FromPublicQuestion(
       : {}),
     options: question.options.map((option) => {
       if (!option.contractPatch) throw new Error("missing_contract4_guidance_patch");
+      const emptyPatch = option.contractPatch.operations.length === 0
+        && option.contractPatch.affectedClauseIds.length === 0;
       return {
         id: option.id,
         label: option.label,
         description: option.description,
         recommended: option.recommended,
+        ...(
+          option.explicitNoop === true
+          || (
+            option.explicitNoop === undefined
+            && question.guidanceMode === "correctness_blocking"
+            && emptyPatch
+          )
+            ? { explicitNoop: true }
+            : {}
+        ),
         expectedFeasibilityDirection: option.contractPatch.expectedFeasibilityDirection,
         patch: {
           operations: option.contractPatch.operations.map((operation) => (
