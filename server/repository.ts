@@ -10322,18 +10322,25 @@ export class Repository {
     forceFreshResearch?: boolean;
     releaseCanary?: UnsignedReleaseCanaryMetadata | null;
     releaseManifestCanary?: boolean;
+    releaseManifestCanaryOwnerAuthorized?: boolean;
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
+    const stagingManifestCanary = input.releaseManifestCanary === true
+      && process.env.RELEASE_ENVIRONMENT === "staging"
+      && input.releaseCanary?.environment === "staging";
+    const productionOwnerManifestCanary = input.releaseManifestCanary === true
+      && process.env.RELEASE_ENVIRONMENT === "production"
+      && input.releaseCanary?.environment === "production"
+      && input.releaseManifestCanaryOwnerAuthorized === true;
     if (input.releaseManifestCanary && (
-      process.env.RELEASE_ENVIRONMENT !== "staging"
-      || input.releaseCanary?.environment !== "staging"
-      || input.releaseCanary.operation !== "run"
+      (!stagingManifestCanary && !productionOwnerManifestCanary)
+      || input.releaseCanary?.operation !== "run"
       || input.autoPublish === true
     )) {
       throw new HttpError(
         409,
-        "Manifest-only release canaries require an authenticated staging run with publication disabled",
+        "Manifest-only release canaries require an authorized release environment with publication disabled",
         "release_manifest_canary_scope_invalid",
       );
     }
@@ -10793,6 +10800,21 @@ export class Repository {
       : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
       await lockClientAliases(client, `run:${input.idempotencyKey}`, input.clientBucketAliases);
+      if (productionOwnerManifestCanary) {
+        const assignmentPause = await client.query<{ value: string }>(
+          `SELECT value
+           FROM settings
+           WHERE key='pipeline_v3_public_assignment_paused'
+           FOR SHARE`,
+        );
+        if (assignmentPause.rows[0]?.value !== "true") {
+          throw new HttpError(
+            409,
+            "Production manifest-only canaries require public assignment to remain paused",
+            "release_manifest_canary_scope_invalid",
+          );
+        }
+      }
       if (briefContractVersion === 3) {
         if (!input.briefRequestId
           || !activePlaylistContractDatabaseId

@@ -1413,6 +1413,7 @@ app.post<{
     forceFreshResearch: isOwner(caller) || releaseCanary !== null,
     releaseCanary,
     releaseManifestCanary: manifestOnly,
+    releaseManifestCanaryOwnerAuthorized: manifestOnly && isOwner(caller),
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
