@@ -11750,8 +11750,14 @@ export class Repository {
               automaticResume: false,
             },
           };
-        } else if (canonicalBackendAssigned
-          && assignmentV3.assigned
+        } else if (assignmentV3.assigned
+          && (
+            canonicalBackendAssigned
+            || (
+              briefContractVersion !== 3
+              && publicRolloutAssignment === null
+            )
+          )
           && !cohortDisabled) {
           selectionPlanV3 = confirmedV3;
         }
