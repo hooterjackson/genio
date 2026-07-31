@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.7",
+      "releasedAt": "2026-07-30",
+      "title": "Fixed-list execution capability recovery",
+      "notes": [
+        "Compiles user-authored cover and re-recording exclusions into the catalog recording-version policy supported by the canonical executor.",
+        "Enforces fixed-list duplicate protection through immutable track identity, manifest uniqueness, and final ordered Apple reconciliation instead of an unsupported open-world relationship predicate.",
+        "Recognizes explicit re-recording catalog labels as alternate recordings so the original-studio policy rejects them before selection.",
+        "Adds the exact production fixed-three contract to repository-level capability negotiation, proving it creates active canonical plans with no execution blocker."
+      ]
+    },
+    {
       "version": "2.4.6",
       "releasedAt": "2026-07-30",
       "title": "Fixed-list catalog identity recovery",

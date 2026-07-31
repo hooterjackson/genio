@@ -33,6 +33,7 @@ import {
   dependencyResumeBlockerVersionV1,
 } from "../server/dependency-resume-v1.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
+import { compilePlaylistContractShadowV1 } from "../server/playlist-contract-shadow-bridge-v1.ts";
 import { sha256Hex, stableStringify } from "../server/security.ts";
 import { WORKER_PIPELINE_CAPABILITY } from "../server/worker-protocol.ts";
 import type { PlaylistBrief } from "../shared/types.ts";
@@ -448,6 +449,111 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       contractDatabaseId: persisted.id,
       briefRequestId: briefRequest.id,
       createInput,
+      created,
+    };
+  }
+
+  async function createProductionFixedThreeRun() {
+    const rawPrompt = [
+      "Build a playlist containing exactly these three original studio recordings, in this order:",
+      "1. Michael Jackson — Billie Jean",
+      "2. Madonna — La Isla Bonita",
+      "3. Earth, Wind & Fire — September",
+      "Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicates.",
+    ].join("\n");
+    const clientBucket = `fixed-three-successor-${randomUUID()}`;
+    const playlistBrief: PlaylistBrief = {
+      title: "Pop Classics Trio",
+      description: "The exact three original studio recordings.",
+      mode: "curated",
+      subjectEntities: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      relationship:
+        "Exact requested three-track sequence of original studio recordings.",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: [
+        "remixes",
+        "live versions",
+        "radio edits",
+        "covers",
+        "re-recordings",
+        "duplicates",
+      ],
+      versionPolicy:
+        "Use only the original studio recording for each listed song.",
+      evidencePolicy:
+        "Verify each track against authoritative release metadata to confirm it is the original studio version.",
+      orderingPolicy:
+        "Preserve the user-specified order exactly; do not reorder or substitute tracks.",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const compatibilityPlan = createSelectionPlanV2({
+      prompt: rawPrompt,
+      brief: playlistBrief,
+      storefront: "us",
+    });
+    const value = compilePlaylistContractShadowV1({
+      contractId: `contract:fixed-three:${sha256Hex(rawPrompt).slice(0, 16)}`,
+      prompt: rawPrompt,
+      brief: playlistBrief,
+      selectionPlan: compatibilityPlan,
+    }).contract;
+    const briefRequest = await repository.createBriefRequest({
+      prompt: rawPrompt,
+      requestedTrackCount: 3,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+    });
+    const persisted = await repository.savePlaylistContractRevision({
+      briefRequestId: briefRequest.id,
+      expectedParentRevisionId: null,
+      contractHash: value.semanticHash,
+      contract: structuredClone(value) as unknown as Record<string, unknown>,
+      compilerVersion: value.versions.compiler,
+      ontologyVersion: value.versions.ontology,
+      evidencePolicyVersion: value.versions.evidencePolicy,
+      questionTemplateVersion: value.versions.questionTemplates,
+      catalogPolicyVersion: value.versions.catalogPolicy,
+      locale: value.locale,
+      storefront: value.storefront,
+      answerLineageHash: sha256Hex(stableStringify(value.answerLineage)),
+    });
+    await repository.saveBriefSelectionPlan(briefRequest.id, compatibilityPlan);
+    await repository.saveBriefResult(briefRequest.id, {
+      status: "complete",
+      expectedStatus: "queued",
+      brief: playlistBrief,
+      estimateUsd: 0,
+    });
+    const created = await repository.createRunIdempotent({
+      prompt: rawPrompt,
+      briefRequestId: briefRequest.id,
+      brief: playlistBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 0.75,
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      autoPublish: false,
+      reuseDays: 0,
+      globalLimit: 100,
+      forceFreshResearch: true,
+    });
+    return {
+      compatibilityPlan,
+      contract: value,
+      contractDatabaseId: persisted.id,
       created,
     };
   }
@@ -925,6 +1031,68 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
         created: false,
         status: "needs_decision",
       });
+  }, 30_000);
+
+  test("creates an executable plan for the production fixed-three exclusion contract", async () => {
+    const fixture = await createProductionFixedThreeRun();
+
+    expect(fixture.compatibilityPlan).toMatchObject({
+      scopeKind: "fixed_track_list",
+      fixedTrackList: [
+        { artist: "Michael Jackson", title: "Billie Jean" },
+        { artist: "Madonna", title: "La Isla Bonita" },
+        { artist: "Earth, Wind & Fire", title: "September" },
+      ],
+    });
+    expect(fixture.compatibilityPlan.constraints).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          axis: "recording_version",
+          operator: "exclude",
+          values: ["covers"],
+        }),
+        expect.objectContaining({
+          axis: "recording_version",
+          operator: "exclude",
+          values: ["re-recordings"],
+        }),
+      ]),
+    );
+    expect(fixture.compatibilityPlan.constraints).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          axis: "relationship",
+          operator: "exclude",
+          values: ["duplicates"],
+        }),
+      ]),
+    );
+    expect(fixture.created).toMatchObject({
+      created: true,
+      reused: false,
+      status: "queued",
+    });
+    expect((await pool.query<{
+      blocker_count: number;
+      active_selection_plan_count: number;
+      active_query_plan_count: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int
+          FROM playlist_run_blockers
+          WHERE run_id=$1 AND resolved_at IS NULL) blocker_count,
+         (SELECT count(*)::int
+          FROM selection_plans
+          WHERE run_id=$1 AND status='active') active_selection_plan_count,
+         (SELECT count(*)::int
+          FROM query_plan_revisions
+          WHERE run_id=$1 AND status='active') active_query_plan_count`,
+      [fixture.created.runId],
+    )).rows[0]).toEqual({
+      blocker_count: 0,
+      active_selection_plan_count: 1,
+      active_query_plan_count: 1,
+    });
   }, 30_000);
 
   test("persists a rollout intent change as a durable immutable decision instead of a 409 or downgrade", async () => {

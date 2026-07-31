@@ -15,6 +15,12 @@ import {
 } from "../server/pipeline-v2-policy.ts";
 
 describe("Pipeline V2 production policy", () => {
+  test("classifies explicit re-recordings as alternate catalog versions", () => {
+    expect(catalogRecordingVersionClass({
+      name: "September (Re-Recorded Version)",
+    })).toBe("alternate");
+  });
+
   test("classifies exact citations per binding axis instead of per run intent", () => {
     expect(classifyTrackScopeBindingEvidence({
       bindingKind: "track_specific_source",

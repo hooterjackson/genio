@@ -331,7 +331,9 @@ function axisForRule(rule: string): SelectionConstraintAxis {
   // "not songs about literal houses" into a synthetic era constraint.
   if (/\b(?:(?:songs?|tracks?|recordings?|music|lyrics?)\s+about|themes?|themed)\b/iu.test(value)) return "theme";
   if (/\b(?:year|decade|era|century|before|after|between)\b/iu.test(value)) return "era";
-  if (/live|remix|edit|version|studio|acoustic|instrumental/iu.test(value)) return "recording_version";
+  if (/live|remix|edit|version|studio|acoustic|instrumental|covers?|re recordings?/iu.test(value)) {
+    return "recording_version";
+  }
   if (/explicit|clean|lyrics/iu.test(value)) return "content";
   if (/country|city|scene|origin|resident|recorded in|geograph|french|brazil|berlin|american/iu.test(value)) return "geography";
   if (/label|imprint/iu.test(value)) return "label";
@@ -528,6 +530,7 @@ function constraintsForBrief(
   brief: PlaylistBrief,
   guidance: readonly PlaylistGuidancePreference[],
   intents: readonly ResearchIntent[],
+  fixedTrackList: boolean,
 ): SelectionConstraint[] {
   const constraints: SelectionConstraint[] = [];
   const constraintKeys = new Set<string>();
@@ -650,6 +653,17 @@ function constraintsForBrief(
   }
   for (const rule of brief.exclude) {
     const userAuthored = explicitUserExclusion(prompt, rule);
+    // A compiled fixed list already proves that its immutable artist/title
+    // identities are unique. Turning the visitor's duplicate guard into an
+    // open-world per-track relationship exclusion would require evidence that
+    // no duplicate exists before the list can execute. Preserve the rule in
+    // the interpretation summary and enforce it through fixed-list identity,
+    // manifest uniqueness, and ordered Apple reconciliation instead.
+    if (fixedTrackList
+      && userAuthored
+      && /\bduplicates?\b/iu.test(normalized(rule))) {
+      continue;
+    }
     const generatedRequiredComplement = !userAuthored && constraints.some((constraint) => (
       constraint.kind === "hard"
       && !["exclude", "avoid", "maximum"].includes(constraint.operator)
@@ -1037,7 +1051,13 @@ export function createSelectionPlanV2(input: {
   const explicitArtistMaximum = explicitMaximumTracksPerArtist(input.prompt);
   const maxArtist = explicitArtistMaximum
     ?? (fixedScope ? null : Math.max(1, Math.ceil(requestedTrackCount * 0.15)));
-  const constraints = constraintsForBrief(input.prompt, input.brief, guidance, intents);
+  const constraints = constraintsForBrief(
+    input.prompt,
+    input.brief,
+    guidance,
+    intents,
+    compiledFixedTrackList !== null,
+  );
   if (explicitArtistMaximum !== null) {
     constraints.push({
       id: "artist_concentration_hard",
