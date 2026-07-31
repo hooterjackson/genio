@@ -86,14 +86,14 @@ function constraint(
 
 describe("playlist contract shadow bridge v1", () => {
   test("compiles co-named rap and grime as one hard OR membership clause", () => {
-    const prompt = "Create 50 tracks for bike rides from new rap and grime artists, using Pop Smoke only as a reference point.";
+    const prompt = "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff";
     const requestBrief = brief({
       title: "Bike Ride Discovery",
       description: "High-energy rap and grime for bike rides.",
       subjectEntities: ["rap", "grime", "Pop Smoke"],
-      relationship: "rap and grime recordings suited to bike rides",
-      include: ["new rap and grime artists"],
-      exclude: ["Pop Smoke as primary artist"],
+      relationship: "stylistically similar to the reference artist",
+      include: ["Recordings by other artists that are stylistically similar to Pop Smoke"],
+      exclude: ["Reference artist is a style seed; exclude recordings by: Pop Smoke"],
       targetSize: { min: 50, max: 50 },
     });
     const selectionPlan = createSelectionPlanV2({
@@ -137,6 +137,28 @@ describe("playlist contract shadow bridge v1", () => {
     expect(JSON.stringify(bridged.contract.trackPredicate)).not.toContain(
       "bridge:constraint:scope_1",
     );
+    expect(bridged.contract.clauses).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "bridge:exclusion:similarity-seed-artist",
+        axis: "artist",
+        hardness: "hard",
+        values: ["Pop Smoke"],
+      }),
+      expect.objectContaining({
+        id: "bridge:ranking:similarity-seed",
+        axis: "similarity",
+        hardness: "soft",
+        values: ["Pop Smoke"],
+      }),
+    ]));
+    expect(bridged.contract.executionDirectives?.similarity).toEqual({
+      seedArtists: ["Pop Smoke"],
+      excludedArtists: ["Pop Smoke"],
+      rankingClauseId: "bridge:ranking:similarity-seed",
+      exactArtistExclusionClauseIds: [
+        "bridge:exclusion:similarity-seed-artist",
+      ],
+    });
     expect(() => assertPlaylistContractIntegrityV1(bridged.contract)).not.toThrow();
   });
 

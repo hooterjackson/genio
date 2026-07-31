@@ -108,7 +108,10 @@ import {
 import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
 import { isSmoothReggaetonHeatRequestV3 } from "./adaptive-guidance-v3.ts";
 import { readReleaseCanaryInventory } from "./release-canary-inventory.ts";
-import { authenticateReleaseCanary } from "./release-canary-request.ts";
+import {
+  authenticateReleaseCanary,
+  manifestOnlyReleaseCanaryAllowed,
+} from "./release-canary-request.ts";
 import {
   CANONICAL_ACTIVATION_DATABASE_CAPABILITY_SETTING,
   CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
@@ -1230,6 +1233,7 @@ app.post<{
     request.body?.releaseCanary,
     "run",
   );
+  const caller = identity(request);
   const manifestOnly = request.body?.manifestOnly === true;
   if (request.body?.manifestOnly !== undefined && !manifestOnly) {
     throw new HttpError(
@@ -1238,16 +1242,26 @@ app.post<{
       "invalid_manifest_canary_mode",
     );
   }
-  if (manifestOnly && releaseCanary?.environment !== "staging") {
+  const manifestCanaryAllowed = !manifestOnly
+    || manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: releaseCanary?.environment ?? null,
+      owner: isOwner(caller),
+      publicAssignmentPaused:
+        await repository.getSetting("pipeline_v3_public_assignment_paused")
+          === "true",
+    });
+  if (
+    manifestOnly
+    && !manifestCanaryAllowed
+  ) {
     throw new HttpError(
       403,
-      "Manifest-only live-provider canaries are available only in staging",
-      "release_manifest_canary_staging_only",
+      "Production manifest-only canaries require a signed owner request while public assignment is paused",
+      "release_manifest_canary_owner_gate_required",
     );
   }
   await assertNotPaused("research");
   await requireWorkerForNewWork();
-  const caller = identity(request);
   const briefRequestId = uuid(request.body?.briefRequestId, "Brief request ID");
   const briefSession = await capabilities.authenticateForBrief(request, briefRequestId);
   const interpreted = await repository.getBriefRequest(briefRequestId);

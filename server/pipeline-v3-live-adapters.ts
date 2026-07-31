@@ -90,6 +90,7 @@ import {
   fixedContainerDirectiveHashV1,
   type FixedContainerResolutionIdentityV1,
 } from "./fixed-container-resolution-proof-v1.ts";
+import { artistCreditMatchesPrimaryArtist } from "./similarity-policy.ts";
 
 /**
  * The production V3 retrieval boundary. It intentionally imports only Apple
@@ -2809,9 +2810,13 @@ function canonicalClauseAssessments(
               return "fail" as const;
             })()
           : null;
-        const matches = clause.values.some((value) => (
-          credits.includes(normalized(value))
-        ));
+        const matches = exactSimilarityArtist
+          ? clause.values.some((value) => (
+              artistCreditMatchesPrimaryArtist(song.artistName, value)
+            ))
+          : clause.values.some((value) => (
+              credits.includes(normalized(value))
+            ));
         result[clause.id] = {
           // Exclusion assessments describe whether the excluded claim matches.
           status: exactStandaloneStatus ?? (matches ? "pass" : "fail"),

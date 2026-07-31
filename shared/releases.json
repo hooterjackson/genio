@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.8",
+      "releasedAt": "2026-07-30",
+      "title": "Reference-artist policy recovery",
+      "notes": [
+        "Compiles a named favorite artist plus an explicit new-music discovery request into a typed similarity seed and hard primary-artist exclusion.",
+        "Carries the exact reference artist through the immutable contract, query plan, worker directive, and catalog qualification boundary instead of retaining it only as model-authored ranking prose.",
+        "Allows explicit featured appearances while excluding exact primary and co-primary reference-artist credits.",
+        "Adds the exact production Echo Park wording to contract, query-plan, worker, guidance, and live-adapter regressions.",
+        "Permits signed production manifest-only canaries only for the owner while public assignment remains paused."
+      ]
+    },
+    {
       "version": "2.4.7",
       "releasedAt": "2026-07-30",
       "title": "Fixed-list execution capability recovery",

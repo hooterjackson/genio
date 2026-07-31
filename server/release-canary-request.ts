@@ -21,6 +21,19 @@ function releaseEnvironment(
   return value;
 }
 
+export function manifestOnlyReleaseCanaryAllowed(input: {
+  releaseEnvironment: "staging" | "production" | null;
+  owner: boolean;
+  publicAssignmentPaused: boolean;
+}): boolean {
+  return input.releaseEnvironment === "staging"
+    || (
+      input.releaseEnvironment === "production"
+      && input.owner
+      && input.publicAssignmentPaused
+    );
+}
+
 /**
  * Public traffic may omit canary metadata. Once the field is present, however,
  * it must be a current server-authenticated marker for this exact artifact;

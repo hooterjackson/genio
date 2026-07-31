@@ -25,6 +25,7 @@ import {
   uniqueGeographyConstraints,
 } from "./selection-geography-policy.ts";
 import { compileFixedTrackList } from "./fixed-track-list-policy.ts";
+import { excludedReferenceArtists } from "./similarity-policy.ts";
 
 export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
 
@@ -297,7 +298,10 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
     && (GENRE_SCENE_INTENT.test(scope) || /genre|scene|style/iu.test(brief.relationship));
   if (brief.mode === "exhaustive" || brief.mode === "hybrid" || EXHAUSTIVE_INTENT.test(directIntentScope)) intents.push("exhaustive");
   if (assertsFactualTrackRelationship(`${brief.relationship} ${prompt}`)) intents.push("factual_relationship");
-  if (SIMILARITY_INTENT.test(directIntentScope)) intents.push("similarity");
+  if (
+    SIMILARITY_INTENT.test(directIntentScope)
+    || excludedReferenceArtists(brief).length > 0
+  ) intents.push("similarity");
   // A generic "vibe" modifier on an explicit genre request is a soft
   // curation preference unless the visitor also names a concrete mood or
   // activity. Treating the word itself as an evidence-bearing intent made
@@ -1098,7 +1102,13 @@ export function createSelectionPlanV2(input: {
     similarityDimensions: intents.includes("similarity") ? similarityDimensions(input.prompt) : [],
     labels: unique(input.brief.include.filter((value) => /label|imprint/iu.test(value))),
     venues: unique(input.brief.include.filter((value) => /venue|club/iu.test(value))),
-    referenceRecordings: intents.includes("similarity") ? unique(input.brief.subjectEntities) : [],
+    referenceRecordings: intents.includes("similarity")
+      ? unique(
+          excludedReferenceArtists(input.brief).length > 0
+            ? excludedReferenceArtists(input.brief)
+            : input.brief.subjectEntities,
+        )
+      : [],
     softGoalRelaxationOrder: [
       "sequencing_preferences",
       "album_concentration",

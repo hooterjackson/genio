@@ -49,7 +49,9 @@ function negativeScope(input: {
   operator: string;
 }): VerificationLeafV1["negativeScope"] {
   if (input.operator !== "exclude") return null;
-  if (["artist_identity", "recording_identity"].includes(input.axis)) return "catalog_identity";
+  if (["artist", "artist_identity", "recording_identity"].includes(input.axis)) {
+    return "catalog_identity";
+  }
   if (["content", "recording_version"].includes(input.axis)
     || input.kind === "catalog_version") return "bounded_metadata";
   throw new Error(`unscoped_negative_verification:${input.axis}`);

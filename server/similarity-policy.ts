@@ -18,6 +18,9 @@ const COMPLEMENT_BOUNDARY =
 const CONTEXT_BOUNDARY =
   /\b(?:but|except|excluding|without|rather\s+than|instead\s+of|while)\b/u;
 
+const DISCOVERY_AWAY_FROM_FAVORITE_INTENT =
+  /\b(?:wants?\s+to\s+discover|want\s+to\s+discover|discover(?:ing)?|looking\s+for)\s+(?:new|more|different)\s+(?:artists?|music|stuff|sounds?|tracks?|songs?)\b|\bfocused?\s+on\s+new\s+artists?\b|\bwithout\s+centering\b/u;
+
 function normalized(value: string): string {
   return value.normalize("NFKD")
     .replace(/[\u0300-\u036f]/gu, "")
@@ -25,6 +28,40 @@ function normalized(value: string): string {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/gu, " ");
+}
+
+function favoriteDiscoveryReferenceSeeds(
+  prompt: string,
+  brief: PlaylistBrief,
+): string[] {
+  const normalizedPrompt = normalized(prompt);
+  if (!DISCOVERY_AWAY_FROM_FAVORITE_INTENT.test(normalizedPrompt)) return [];
+  return brief.subjectEntities.filter((entity) => {
+    const entityText = normalized(entity);
+    if (!entityText) return false;
+    let entityIndex = normalizedPrompt.indexOf(entityText);
+    while (entityIndex >= 0) {
+      const before = normalizedPrompt.slice(
+        Math.max(0, entityIndex - 100),
+        entityIndex,
+      );
+      const after = normalizedPrompt.slice(
+        entityIndex + entityText.length,
+        entityIndex + entityText.length + 80,
+      );
+      if (
+        /\b(?:(?:my|his|her|their|our|the)\s+)?favou?rite\s+(?:rapper|artist|band|musician|singer|producer|group|act)?\s*(?:is|was|:)?\s*$/u
+          .test(before)
+        || /^\s*(?:is|was)\s+(?:(?:my|his|her|their|our|the)\s+)?favou?rite\b/u
+          .test(after)
+      ) return true;
+      entityIndex = normalizedPrompt.indexOf(
+        entityText,
+        entityIndex + entityText.length,
+      );
+    }
+    return false;
+  });
 }
 
 function shorthandSimilaritySeeds(prompt: string, brief: PlaylistBrief): string[] {
@@ -156,11 +193,13 @@ function explicitlyIncludesSeed(prompt: string, seed: string): boolean {
   return false;
 }
 
-function normalizedArtistCredits(value: string): string[] {
-  return value.normalize("NFKD")
+function normalizedPrimaryArtistCredits(value: string): string[] {
+  const primaryCredits = value.normalize("NFKD")
     .replace(/[\u0300-\u036f]/gu, "")
     .toLocaleLowerCase("en-US")
-    .replace(/\b(?:feat(?:uring)?|ft|with|and)\.?\b/gu, "|")
+    .split(/\b(?:feat(?:uring)?|ft|with)\.?\b/u, 1)[0] ?? "";
+  return primaryCredits
+    .replace(/\band\b/gu, "|")
     .replace(/[&,/+]/gu, "|")
     .split("|")
     // Treat a spaced “x” as a collaboration delimiter without erasing the
@@ -191,7 +230,8 @@ export function applySimilaritySeedPolicy(prompt: string, brief: PlaylistBrief):
     // Trust that typed relationship only when the prompt also explicitly
     // excludes a confirmed entity, so direct artist requests cannot be
     // reclassified accidentally.
-    || structuredExcludedSeeds.length > 0;
+    || structuredExcludedSeeds.length > 0
+    || favoriteDiscoveryReferenceSeeds(prompt, brief).length > 0;
   if (!hasSimilarityIntent) return brief;
 
   const subjectEntities = cleanSimilaritySubjectEntities(brief.subjectEntities);
@@ -200,7 +240,9 @@ export function applySimilaritySeedPolicy(prompt: string, brief: PlaylistBrief):
     : brief;
   const seeds = structuredExcludedSeeds.length > 0
     ? structuredExcludedSeeds
-    : similaritySeedEntities(prompt, scopedBrief);
+    : favoriteDiscoveryReferenceSeeds(prompt, scopedBrief).length > 0
+      ? favoriteDiscoveryReferenceSeeds(prompt, scopedBrief)
+      : similaritySeedEntities(prompt, scopedBrief);
   if (seeds.length === 0) return scopedBrief;
   const excludedSeeds = seeds.filter((seed) => (
     explicitlyExcludesSeed(prompt, seed) || !explicitlyIncludesSeed(prompt, seed)
@@ -241,16 +283,29 @@ export function isExcludedReferenceArtist(
   brief: Partial<Pick<PlaylistBrief, "exclude">>,
   artist: string,
 ): boolean {
-  const candidateCredits = normalizedArtistCredits(artist);
-  const candidateIdentity = normalized(artist)
-    || artist.normalize("NFKC").toLocaleLowerCase("en-US").trim().replace(/\s+/gu, " ");
-  return candidateCredits.length > 0 && excludedReferenceArtists(brief)
-    .some((seed) => {
-      const seedIdentity = normalized(seed)
-        || seed.normalize("NFKC").toLocaleLowerCase("en-US").trim().replace(/\s+/gu, " ");
-      return Boolean(seedIdentity
-        && (candidateIdentity === seedIdentity || candidateCredits.includes(seedIdentity)));
-    });
+  return excludedReferenceArtists(brief)
+    .some((seed) => artistCreditMatchesPrimaryArtist(artist, seed));
+}
+
+/**
+ * A similarity seed excludes the named artist only when the catalog credit
+ * makes that artist primary or co-primary. An explicit `feat.`, `ft.`, or
+ * `with` boundary leaves later credits eligible, matching the user-visible
+ * promise that featured appearances may still be discovered.
+ */
+export function artistCreditMatchesPrimaryArtist(
+  artist: string,
+  expectedPrimaryArtist: string,
+): boolean {
+  const seedIdentity = normalized(expectedPrimaryArtist)
+    || expectedPrimaryArtist.normalize("NFKC")
+      .toLocaleLowerCase("en-US")
+      .trim()
+      .replace(/\s+/gu, " ");
+  return Boolean(
+    seedIdentity
+    && normalizedPrimaryArtistCredits(artist).includes(seedIdentity),
+  );
 }
 
 export function similarityResearchInstruction(

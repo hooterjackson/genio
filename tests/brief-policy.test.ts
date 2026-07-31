@@ -106,6 +106,31 @@ describe("playlist brief policy", () => {
     });
   });
 
+  test("repairs the exact Echo Park favorite-artist discovery wording at the durable brief boundary", () => {
+    const canonical = canonicalBriefForRequest({
+      prompt: "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff",
+      requestedTrackCount: 50,
+    }, {
+      ...brief("curated"),
+      title: "Echo Park Ride",
+      subjectEntities: ["Pop Smoke"],
+      relationship: "rap and grime for bike rides",
+      include: ["rap", "grime", "new music"],
+      targetSize: { min: 50, max: 50 },
+    });
+
+    expect(canonical).toMatchObject({
+      relationship: "stylistically similar to the reference artist",
+      targetSize: { min: 50, max: 50 },
+    });
+    expect(canonical.include).toContain(
+      "Recordings by other artists that are stylistically similar to Pop Smoke",
+    );
+    expect(canonical.exclude).toContain(
+      "Reference artist is a style seed; exclude recordings by: Pop Smoke",
+    );
+  });
+
   test("builds a bounded researchable brief for the exact baile-funk failure prompt", () => {
     const fallback = deterministicBriefFallback({
       prompt: "Iconic baile funk songs with drill inspiration",
