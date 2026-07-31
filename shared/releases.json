@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.4.13",
+      "releasedAt": "2026-07-31",
+      "title": "Production owner manifest-canary recovery",
+      "notes": [
+        "Allows a signed production owner to run a manifest-only canary only while the database-backed public-assignment pause remains engaged.",
+        "Rechecks the public-assignment pause under the run transaction before creating a zero-write shadow execution, preventing a stale preflight from authorizing publication-capable work.",
+        "Keeps production manifest canaries publication-disabled and preserves the existing staging-only path, immutable release binding, and signed canary fencing."
+      ]
+    },
+    {
       "version": "2.4.12",
       "releasedAt": "2026-07-31",
       "title": "Closed-world exclusion and collapse-audit recovery",

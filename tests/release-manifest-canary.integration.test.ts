@@ -126,12 +126,15 @@ function playlistContract(
 function releaseCanary(
   canaryId: string,
   operation: "brief" | "run",
+  environment: "staging" | "production" = "staging",
 ): UnsignedReleaseCanaryMetadata {
   return {
     version: "genio-release-canary/v1",
     canaryId,
-    environment: "staging",
-    audience: "https://staging.9enio.example",
+    environment,
+    audience: environment === "staging"
+      ? "https://staging.9enio.example"
+      : "https://9enio.com",
     operation,
     sourceRevision,
     issuedAt: new Date().toISOString(),
@@ -158,7 +161,7 @@ interface ManifestCanaryFixture extends PreparedCanaryBrief {
   selectionPlan: SelectionPlanV3;
 }
 
-databaseDescribe("staging manifest-only release canary integration", () => {
+databaseDescribe("manifest-only release canary integration", () => {
   const schemaName =
     `genio_manifest_canary_${randomUUID().replaceAll("-", "")}`;
   let adminPool: Pool;
@@ -239,6 +242,7 @@ databaseDescribe("staging manifest-only release canary integration", () => {
 
   async function prepareCanonicalBrief(
     label = randomUUID().slice(0, 8),
+    environment: "staging" | "production" = "staging",
   ): Promise<PreparedCanaryBrief> {
     const canaryId = `manifest-${label}`;
     const prompt = `Create exactly 3 source-qualified reggaeton tracks ${label}`;
@@ -253,7 +257,7 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       briefContractVersion: 3,
-      releaseCanary: releaseCanary(canaryId, "brief"),
+      releaseCanary: releaseCanary(canaryId, "brief", environment),
     });
     const selectionPlan = createSelectionPlanV2({
       prompt,
@@ -295,6 +299,7 @@ databaseDescribe("staging manifest-only release canary integration", () => {
   function runInput(
     prepared: PreparedCanaryBrief,
     marker = releaseCanary(prepared.canaryId, "run"),
+    productionOwnerAuthorized = false,
   ) {
     return {
       prompt: prepared.prompt,
@@ -311,6 +316,7 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       forceFreshResearch: true,
       releaseCanary: marker,
       releaseManifestCanary: true,
+      releaseManifestCanaryOwnerAuthorized: productionOwnerAuthorized,
     };
   }
 
@@ -359,6 +365,7 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       statusCode: 409,
       code: "release_canary_conflict",
     });
+
     expect((await pool.query<{ count: number }>(
       `SELECT (
          (SELECT count(*) FROM research_runs)
@@ -428,6 +435,66 @@ databaseDescribe("staging manifest-only release canary integration", () => {
       queryPlanHash: persisted.query_plan_hash,
     });
   }, 30_000);
+
+  test("permits a signed production owner manifest canary only while public assignment is paused", async () => {
+    vi.stubEnv("RELEASE_ENVIRONMENT", "production");
+    try {
+      const prepared = await prepareCanonicalBrief("production-owner", "production");
+      const marker = releaseCanary(prepared.canaryId, "run", "production");
+      await expect(repository.createRunIdempotent(
+        runInput(prepared, marker),
+      )).rejects.toMatchObject({
+        statusCode: 409,
+        code: "release_manifest_canary_scope_invalid",
+      });
+
+      await pool.query(
+        `INSERT INTO settings(key,value)
+         VALUES('pipeline_v3_public_assignment_paused','false')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      );
+      await expect(repository.createRunIdempotent(
+        runInput(prepared, marker, true),
+      )).rejects.toMatchObject({
+        statusCode: 409,
+        code: "release_manifest_canary_scope_invalid",
+      });
+
+      await pool.query(
+        `UPDATE settings
+         SET value='true'
+         WHERE key='pipeline_v3_public_assignment_paused'`,
+      );
+      const created = await repository.createRunIdempotent(
+        runInput(prepared, marker, true),
+      );
+      const persisted = (await pool.query<{
+        auto_publish: boolean;
+        marker_count: number;
+        publication_job_count: number;
+      }>(
+        `SELECT run.auto_publish,
+                (SELECT count(*)::int
+                 FROM research_checkpoints checkpoint
+                 WHERE checkpoint.run_id=run.id
+                   AND checkpoint.phase=$2) marker_count,
+                (SELECT count(*)::int
+                 FROM job_queue job
+                 WHERE job.run_id=run.id
+                   AND job.kind='publication') publication_job_count
+         FROM research_runs run
+         WHERE run.id=$1`,
+        [created.runId, RELEASE_MANIFEST_CANARY_MARKER_PHASE],
+      )).rows[0]!;
+      expect(persisted).toEqual({
+        auto_publish: false,
+        marker_count: 1,
+        publication_job_count: 0,
+      });
+    } finally {
+      vi.stubEnv("RELEASE_ENVIRONMENT", "staging");
+    }
+  });
 
   test("fails closed when the durable canary marker is malformed", async () => {
     const fixture = await createManifestCanary("malformed");
