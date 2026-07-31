@@ -470,7 +470,7 @@ describe("Pipeline V2 selection plan", () => {
     expect(plan.versionPolicy.allowed).not.toContain("alternate");
   });
 
-  test("keeps every item in a user-authored comma-separated exclusion hard", () => {
+  test("keeps fixed-list exclusions hard without inventing an open-world duplicate predicate", () => {
     const prompt = [
       "Build a playlist containing exactly these three original studio recordings, in this order:",
       "1. Michael Jackson — Billie Jean",
@@ -498,13 +498,25 @@ describe("Pipeline V2 selection plan", () => {
         orderingPolicy: "Preserve the exact listed order.",
       }),
     });
-    for (const value of ["covers", "re-recordings", "duplicates"]) {
+    for (const value of ["covers", "re-recordings"]) {
       expect(plan.constraints).toContainEqual(expect.objectContaining({
+        axis: "recording_version",
         kind: "hard",
         operator: "exclude",
         values: [value],
       }));
     }
+    expect(plan.constraints).not.toContainEqual(expect.objectContaining({
+      axis: "relationship",
+      kind: "hard",
+      operator: "exclude",
+      values: ["duplicates"],
+    }));
+    expect(plan.fixedTrackList).toEqual([
+      { artist: "Michael Jackson", title: "Billie Jean" },
+      { artist: "Madonna", title: "La Isla Bonita" },
+      { artist: "Earth, Wind & Fire", title: "September" },
+    ]);
   });
 
   test("does not extend an exclusion across an adversative inclusion", () => {

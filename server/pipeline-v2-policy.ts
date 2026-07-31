@@ -391,6 +391,9 @@ function catalogRecordingVersionMarkerClass(value: string): RecordingVersionClas
   if (/\b(remix|mix)\b/u.test(value)) return "remix";
   if (/\b(live|ao vivo|en vivo)\b/u.test(value)) return "live";
   if (/\b(remaster(?:ed)?)\b/u.test(value)) return "remaster";
+  if (/\b(?:re[ -]?record(?:ed|ing)?|new recording)\b/u.test(value)) {
+    return "alternate";
+  }
   if (/\b(?:(?:radio|single)\s+)?edit\b/u.test(value)) return "radio_edit";
   if (/\b(extended)\b/u.test(value)) return "extended";
   if (/\b(acoustic)\b/u.test(value)) return "acoustic";

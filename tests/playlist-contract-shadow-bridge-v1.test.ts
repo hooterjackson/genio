@@ -194,6 +194,77 @@ describe("playlist contract shadow bridge v1", () => {
     });
   });
 
+  test("keeps the production fixed-three exclusion list executable", () => {
+    const prompt = [
+      "Build a playlist containing exactly these three original studio recordings, in this order:",
+      "1. Michael Jackson — Billie Jean",
+      "2. Madonna — La Isla Bonita",
+      "3. Earth, Wind & Fire — September",
+      "Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicates.",
+    ].join("\n");
+    const requestBrief = brief({
+      title: "Pop Classics Trio",
+      description: "The exact three original studio recordings.",
+      relationship: "Exact requested three-track sequence of original studio recordings.",
+      include: [
+        "Michael Jackson — Billie Jean",
+        "Madonna — La Isla Bonita",
+        "Earth, Wind & Fire — September",
+      ],
+      exclude: [
+        "remixes",
+        "live versions",
+        "radio edits",
+        "covers",
+        "re-recordings",
+        "duplicates",
+      ],
+      versionPolicy: "Use only the original studio recording for each listed song.",
+      evidencePolicy:
+        "Verify each track against authoritative release metadata to confirm it is the original studio version.",
+      orderingPolicy:
+        "Preserve the user-specified order exactly; do not reorder or substitute tracks.",
+      targetSize: { min: 3, max: 3 },
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: requestBrief,
+      storefront: "us",
+    });
+    expect(selectionPlan.constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        axis: "recording_version",
+        operator: "exclude",
+        values: ["covers"],
+      }),
+      expect.objectContaining({
+        axis: "recording_version",
+        operator: "exclude",
+        values: ["re-recordings"],
+      }),
+    ]));
+    const bridged = compilePlaylistContractShadowV1({
+      contractId: "run:production-fixed-three",
+      prompt,
+      brief: requestBrief,
+      selectionPlan,
+    });
+
+    expect(bridged.contract.clauses).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "exclusion",
+        axis: "relationship",
+        values: ["duplicates"],
+      }),
+    ]));
+    const negotiated = negotiatePlaylistContractBackendV1({
+      contract: bridged.contract,
+      backends: [CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY],
+    });
+    expect(negotiated.backend?.backend).toBe("corpus_first_v3");
+    expect(negotiated.result).toEqual({ supported: true, missing: [] });
+  });
+
   test("turns the exact Smooth Reggaeton scope fork into one required-guidance input", () => {
     const requestBrief = smoothReggaetonBrief();
     const selectionPlan = createSelectionPlanV2({
