@@ -113,6 +113,7 @@ function marker() {
   return createReleaseManifestCanaryMarker({
     canaryId: "manifest-rc-1",
     cacheMode: "reuse_disabled",
+    environment: "staging",
     sourceRevision: revision,
     queryPlanHash: planHash,
     queryPlanRevisionId,
@@ -463,6 +464,12 @@ describe("authenticated staging manifest-only canary", () => {
     expect(parseReleaseManifestCanaryMarker({
       ...marker(),
       environment: "production",
+    })).toMatchObject({
+      environment: "production",
+    });
+    expect(parseReleaseManifestCanaryMarker({
+      ...marker(),
+      environment: "development",
     })).toBeNull();
     expect(parseReleaseManifestCanaryMarker({
       ...marker(),
