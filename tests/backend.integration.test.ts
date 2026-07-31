@@ -36,6 +36,7 @@ import {
   hmacHex,
   randomToken,
   sha256Hex,
+  stableStringify,
 } from "../server/security.ts";
 import {
   WORKER_PIPELINE_CAPABILITY,
@@ -45,6 +46,9 @@ import {
 import { parseFeedbackSubmission } from "../server/feedback.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 import { buildPipelineOutcome } from "../server/pipeline-outcome-v2.ts";
+import {
+  compilePlaylistContractRevisionV1,
+} from "../server/playlist-contract-v1.ts";
 import type { CatalogProviderJobAuthorityV2 } from "../server/matching-service.ts";
 import {
   createPublicRolloutAssignmentV1,
@@ -4773,6 +4777,187 @@ databaseDescribe("hosted backend integration", () => {
       provenance: "resolution_service",
       transition_kind: "resolution_service_projection",
       outbox_count: 2,
+    });
+  });
+
+  test("keeps an integrity quarantine authoritative after the worker fails its leased job", async () => {
+    await repository.setSetting(
+      "playlist_resolution_authority_mode",
+      "resolution_service",
+    );
+    const runId = await repository.createRun(
+      "Integrity quarantine resolution",
+      brief,
+      0,
+      1,
+    );
+    const contract = compilePlaylistContractRevisionV1({
+      contractId: `run:${runId}`,
+      rawPrompt: "One verified integration-test recording",
+      requestedTrackCount: 1,
+      locale: "en-US",
+      storefront: "us",
+      clauses: [{
+        id: "membership:integration-test",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "artist",
+        operator: "require",
+        values: ["Integration Test Artist"],
+        source: {
+          provenance: "prompt",
+          text: "Integration Test Artist",
+        },
+      }],
+      trackPredicate: {
+        op: "clause",
+        clauseId: "membership:integration-test",
+      },
+    });
+    await repository.savePlaylistContractRevision({
+      runId,
+      expectedParentRevisionId: null,
+      contractHash: contract.semanticHash,
+      contract: structuredClone(contract) as unknown as Record<string, unknown>,
+      compilerVersion: contract.versions.compiler,
+      ontologyVersion: contract.versions.ontology,
+      evidencePolicyVersion: contract.versions.evidencePolicy,
+      questionTemplateVersion: contract.versions.questionTemplates,
+      catalogPolicyVersion: contract.versions.catalogPolicy,
+      locale: contract.locale,
+      storefront: contract.storefront,
+      answerLineageHash: sha256Hex(stableStringify(contract.answerLineage)),
+    });
+    await repository.updateRun(runId, {
+      status: "researching",
+      phase: "research",
+    });
+    await repository.savePipelineOutcome(runId, buildPipelineOutcome({
+      pipelineVersion: "legacy_v1",
+      policyVersion: "legacy_v1",
+      status: "partial_evidence_shortfall",
+      targetTrackCount: 1,
+      discoveredTrackCount: 1,
+      qualifiedTrackCount: 1,
+      selectedTrackCount: 1,
+      publishedTrackCount: 0,
+      reasonCodes: ["manifest_ready_before_integrity_guard"],
+    }));
+    const queued = await repository.enqueueJob({
+      kind: "research",
+      runId,
+      payload: { runId },
+      dedupeKey: `integrity-quarantine:${runId}`,
+      maxAttempts: 1,
+    });
+    const leased = (await repository.pool.query<{
+      id: string;
+      lease_epoch: string;
+    }>(
+      `UPDATE job_queue
+       SET status='leased',lease_owner='integrity-worker',
+           lease_epoch=lease_epoch+1,
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1
+       RETURNING id,lease_epoch`,
+      [queued.id],
+    )).rows[0]!;
+    await expect(repository.quarantineCanonicalExecution({
+      runId,
+      jobId: leased.id,
+      workerId: "integrity-worker",
+      leaseGeneration: Number(leased.lease_epoch),
+      reasonCode: "pipeline_v3_evidence_attestation_missing",
+    })).resolves.toBe(true);
+    const firstQuarantine = (await repository.pool.query<{
+      generation: number;
+      blocker_count: number;
+    }>(
+      `SELECT resolution.generation,
+              (SELECT count(*)::int
+               FROM playlist_run_blockers
+               WHERE run_id=resolution.run_id
+                 AND blocker_kind='integrity'
+                 AND resolved_at IS NULL) blocker_count
+       FROM playlist_run_resolutions resolution
+       WHERE resolution.run_id=$1`,
+      [runId],
+    )).rows[0]!;
+    await expect(repository.quarantineCanonicalExecution({
+      runId,
+      jobId: leased.id,
+      workerId: "integrity-worker",
+      leaseGeneration: Number(leased.lease_epoch),
+      reasonCode: "pipeline_v3_evidence_attestation_missing",
+    })).resolves.toBe(true);
+    expect((await repository.pool.query<{
+      generation: number;
+      blocker_count: number;
+    }>(
+      `SELECT resolution.generation,
+              (SELECT count(*)::int
+               FROM playlist_run_blockers
+               WHERE run_id=resolution.run_id
+                 AND blocker_kind='integrity'
+                 AND resolved_at IS NULL) blocker_count
+       FROM playlist_run_resolutions resolution
+       WHERE resolution.run_id=$1`,
+      [runId],
+    )).rows[0]).toEqual(firstQuarantine);
+    expect(firstQuarantine.blocker_count).toBe(1);
+    await repository.failJob(
+      leased.id,
+      "integrity-worker",
+      "pipeline_v3_evidence_attestation_missing",
+      null,
+      Number(leased.lease_epoch),
+    );
+
+    expect((await repository.pool.query<{
+      run_status: string;
+      run_phase: string;
+      resolution_state: string;
+      next_action: string;
+      work_motion: string;
+      incident_reference: string | null;
+      blocker_kind: string | null;
+      job_status: string;
+      executable_jobs: number;
+      outcome_status: string | null;
+    }>(
+      `SELECT run.status run_status,run.phase run_phase,
+              resolution.state resolution_state,
+              resolution.next_action,
+              resolution.state_json->>'workMotion' work_motion,
+              resolution.incident_reference,
+              blocker.blocker_kind,
+              job.status job_status,
+              outcome.status outcome_status,
+              (SELECT count(*)::int
+               FROM job_queue executable
+               WHERE executable.run_id=run.id
+                 AND executable.status IN ('queued','leased'))
+                executable_jobs
+       FROM research_runs run
+       JOIN playlist_run_resolutions resolution ON resolution.run_id=run.id
+       LEFT JOIN playlist_run_blockers blocker
+         ON blocker.id=resolution.blocker_id
+       LEFT JOIN pipeline_outcomes outcome ON outcome.run_id=run.id
+       JOIN job_queue job ON job.id=$2
+       WHERE run.id=$1`,
+      [runId, leased.id],
+    )).rows[0]).toEqual({
+      run_status: "quarantined",
+      run_phase: "canonical_integrity_quarantine",
+      resolution_state: "quarantined",
+      next_action: "contact_support",
+      work_motion: "none",
+      incident_reference: expect.stringContaining("resolution-shadow:"),
+      blocker_kind: "integrity",
+      job_status: "failed",
+      executable_jobs: 0,
+      outcome_status: "failed_integrity",
     });
   });
 

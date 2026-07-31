@@ -1499,6 +1499,7 @@ async function persistPipelineOutcomeTransaction(
     | "provider_block"
     | "provider_recovered"
     | "research_provider_block"
+    | "integrity_failure"
     | null = null,
 ): Promise<PipelineOutcome> {
   const selectedRun = await client.query<{
@@ -1582,6 +1583,14 @@ async function persistPipelineOutcomeTransaction(
       "invalid_catalog_provider_transition",
     );
   }
+  if (transition === "integrity_failure"
+    && incoming.status !== "failed_integrity") {
+    throw new HttpError(
+      409,
+      "Integrity transition outcome is invalid",
+      "invalid_integrity_transition",
+    );
+  }
   const selectedOutcome = await client.query<{ outcome_json: PipelineOutcome }>(
     "SELECT outcome_json FROM pipeline_outcomes WHERE run_id=$1 FOR UPDATE",
     [runId],
@@ -1591,6 +1600,7 @@ async function persistPipelineOutcomeTransaction(
     merged = transition === "provider_block"
       || transition === "provider_recovered"
       || transition === "research_provider_block"
+      || transition === "integrity_failure"
       ? incoming
       : selectedOutcome.rows[0]
         ? mergePipelineOutcomes(selectedOutcome.rows[0].outcome_json, incoming)
@@ -4151,8 +4161,10 @@ export class Repository {
     return this.transaction(async (client) => {
       const authority = await client.query<{
         contract_revision_id: string | null;
+        run_status: string;
       }>(
-        `SELECT run.active_playlist_contract_revision_id contract_revision_id
+        `SELECT run.active_playlist_contract_revision_id contract_revision_id,
+                run.status run_status
          FROM job_queue job
          JOIN research_runs run ON run.id=job.run_id
          WHERE job.id=$1 AND job.run_id=$2 AND job.status='leased'
@@ -4162,6 +4174,7 @@ export class Repository {
       );
       const row = authority.rows[0];
       if (!row) return false;
+      if (row.run_status === "quarantined") return true;
       await client.query(
         `UPDATE research_runs
          SET status='quarantined',phase='canonical_integrity_quarantine',
@@ -4171,24 +4184,69 @@ export class Repository {
         [input.runId],
       );
       if (row.contract_revision_id) {
-        await client.query(
-          `INSERT INTO playlist_run_blockers(
-             id,run_id,contract_revision_id,blocker_kind,dependency_key,
-             retry_count,next_retry_at,automatic_retry_until,state_json)
-           VALUES($1,$2,$3,'integrity','canonical_contract',0,NULL,NULL,$4::jsonb)`,
+        const existingBlocker = await client.query<{ id: string }>(
+          `SELECT id
+           FROM playlist_run_blockers
+           WHERE run_id=$1 AND contract_revision_id=$2
+             AND blocker_kind='integrity'
+             AND dependency_key='canonical_contract'
+             AND resolved_at IS NULL
+             AND state_json->>'reasonCode'=$3
+           ORDER BY created_at,id
+           LIMIT 1
+           FOR UPDATE`,
           [
-            randomUUID(),
             input.runId,
             row.contract_revision_id,
-            JSON.stringify({
-              stage: "canonical_integrity_quarantine",
-              reasonCode: input.reasonCode.slice(0, 120),
-              nextAction: "contact_support",
-              retryable: false,
-            }),
+            input.reasonCode.slice(0, 120),
           ],
         );
+        if (!existingBlocker.rows[0]) {
+          await client.query(
+            `INSERT INTO playlist_run_blockers(
+               id,run_id,contract_revision_id,blocker_kind,dependency_key,
+               retry_count,next_retry_at,automatic_retry_until,state_json)
+             VALUES($1,$2,$3,'integrity','canonical_contract',0,NULL,NULL,$4::jsonb)`,
+            [
+              randomUUID(),
+              input.runId,
+              row.contract_revision_id,
+              JSON.stringify({
+                stage: "canonical_integrity_quarantine",
+                reasonCode: input.reasonCode.slice(0, 120),
+                nextAction: "contact_support",
+                retryable: false,
+              }),
+            ],
+          );
+        }
       }
+      const priorOutcome = await client.query<{
+        outcome_json: PipelineOutcome;
+      }>(
+        `SELECT outcome_json
+         FROM pipeline_outcomes
+         WHERE run_id=$1
+         FOR UPDATE`,
+        [input.runId],
+      );
+      if (priorOutcome.rows[0]) {
+        const outcome = priorOutcome.rows[0].outcome_json;
+        await persistPipelineOutcomeTransaction(client, input.runId, {
+          ...outcome,
+          status: "failed_integrity",
+          reasonCodes: [...new Set([
+            ...outcome.reasonCodes,
+            input.reasonCode.slice(0, 120),
+          ])].sort(),
+          completedAt: new Date().toISOString(),
+        }, "integrity_failure");
+      }
+      // Schema 19 resolution is the user-visible authority. Quarantine and
+      // its integrity blocker must become one fenced transition/outbox event
+      // before the worker releases its lease; otherwise the UI can remain
+      // falsely LIVE after the legacy run row has already failed closed.
+      await this.shadowPlaylistResolutionV1(client, input.runId);
       return true;
     });
   }
@@ -23465,10 +23523,19 @@ export class Repository {
       } else if (!retry && current.rows[0].run_id && ["research", "matching", "publication"].includes(current.rows[0].kind)) {
         const failedRun = await client.query(
           `UPDATE research_runs SET status='failed',phase=$2,error=$3,completed_at=COALESCE(completed_at,now()),updated_at=now()
-           WHERE id=$1 AND status NOT IN ('complete','partial','failed','expired','deleted','waiting_for_apple_authorization')`,
+           WHERE id=$1 AND status NOT IN (
+             'complete','partial','failed','expired','deleted','cancelled',
+             'quarantined','waiting_for_apple_authorization'
+           )`,
           [current.rows[0].run_id, `${current.rows[0].kind}_failed`, persistedError.slice(0, 2_000)],
         );
-        if (failedRun.rowCount) captured.push({ source: "run", id: current.rows[0].run_id });
+        if (failedRun.rowCount) {
+          await this.shadowPlaylistResolutionV1(
+            client,
+            current.rows[0].run_id,
+          );
+          captured.push({ source: "run", id: current.rows[0].run_id });
+        }
       }
       if (!retry && current.rows[0].kind === "publication") {
         await markTerminalPublicationVolumes(client, current.rows[0].payload_json, error);

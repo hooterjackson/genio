@@ -2562,13 +2562,27 @@ function mergeQualifiedTrack(
     ...existing.sourceObservationIds,
     ...incoming.sourceObservationIds,
   ])];
+  // A canonical assessment and the exact binding objects it cites are one
+  // immutable proof bundle. Repeated discovery can add observations and
+  // independent bindings, but a later binding with the same id must never
+  // replace the object used by the retained assessment. Doing so can turn two
+  // independently valid OR-branch qualifications into one internally
+  // inconsistent qualification that passes retrieval and fails persistence.
+  const canonicalProofBase = existing.canonicalClauseAssessments
+    ? existing
+    : incoming.canonicalClauseAssessments
+      ? incoming
+      : existing;
+  const supplementalProof = canonicalProofBase === existing
+    ? incoming
+    : existing;
   const bindings = [...new Map([
-    ...(existing.evidenceBindings ?? []),
-    ...(incoming.evidenceBindings ?? []),
+    ...(supplementalProof.evidenceBindings ?? []),
+    ...(canonicalProofBase.evidenceBindings ?? []),
   ].map((binding) => [binding.id, binding])).values()];
   const bindingIds = [...new Set([
-    ...existing.evidenceBindingIds,
-    ...incoming.evidenceBindingIds,
+    ...canonicalProofBase.evidenceBindingIds,
+    ...supplementalProof.evidenceBindingIds,
     ...bindings.map(({ id }) => id),
   ])];
   const rankingSignals = { ...existing.rankingSignals };
@@ -2627,11 +2641,9 @@ function mergeQualifiedTrack(
       incoming.sourceFreshUntil,
     ].filter((value): value is string => typeof value === "string")
       .sort()[0] ?? null,
-    canonicalClauseAssessments: existing.canonicalClauseAssessments
-      ? structuredClone(existing.canonicalClauseAssessments)
-      : incoming.canonicalClauseAssessments
-        ? structuredClone(incoming.canonicalClauseAssessments)
-        : undefined,
+    canonicalClauseAssessments: canonicalProofBase.canonicalClauseAssessments
+      ? structuredClone(canonicalProofBase.canonicalClauseAssessments)
+      : undefined,
     playlistOptimizationSignals: mergePlaylistOptimizationSignalsV3(
       existing.playlistOptimizationSignals,
       incoming.playlistOptimizationSignals,
@@ -5564,6 +5576,22 @@ export async function executeRetrievalV3(input: {
     reserveFamilies.add(recordingFamilyKey);
     return true;
   }).slice(0, reserveGoal);
+  const finalCanonicalEvidenceInvalid = Boolean(
+    activePlan.canonicalContractPolicy
+    && [...selected, ...reserve].some((track) => (
+      !canonicalRequiredEvidenceIntegrityV3({
+        policy: activePlan.canonicalContractPolicy!,
+        assessments: track.canonicalClauseAssessments,
+        bindingIds: track.evidenceBindingIds,
+        bindings: track.evidenceBindings,
+        storefront: activePlan.storefront,
+      }).passed
+    )),
+  );
+  if (finalCanonicalEvidenceInvalid) {
+    integrityFailureCount += 1;
+    integrityEvents.push("canonical_evidence_attestation_invalid_at_final_selection");
+  }
   const shortfall = Math.max(0, requested - selected.length);
   const qualityOptimizerConstraint = playlistOptimization?.unmetConstraints.some(
     (reason) => reason.startsWith("minimum_central_quality_pass_tracks:")
@@ -5589,7 +5617,9 @@ export async function executeRetrievalV3(input: {
     && !qualityConstrained
     && qualitySelection.eligible.length >= requested
     && optimizerHasNonCountConstraint;
-  const outcomeStopReason: RetrievalStopReasonV3 = resolvedStopReason === "integrity_failure"
+  const outcomeStopReason: RetrievalStopReasonV3 = finalCanonicalEvidenceInvalid
+    ? "integrity_failure"
+    : resolvedStopReason === "integrity_failure"
     ? "integrity_failure"
     : qualityConstrained
       ? "central_quality_floor"
@@ -5610,7 +5640,7 @@ export async function executeRetrievalV3(input: {
     resolvedStopReason === "provider_failure" || resolvedStopReason === "provider_circuit_open"
   )
     ? "failed_system"
-    : resolvedStopReason === "integrity_failure"
+    : finalCanonicalEvidenceInvalid || resolvedStopReason === "integrity_failure"
       ? "failed_integrity"
       : resolvedStopReason === "deadline_reached" && selected.length === 0
         ? "needs_decision"

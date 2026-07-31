@@ -681,6 +681,19 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       selectionPlan,
       locale: "en",
     });
+    expect(shadow.contract.clauses.filter((clause) => (
+      clause.hardness === "hard"
+      && clause.kind === "membership"
+      && clause.axis === "genre"
+    ))).toEqual([
+      expect.objectContaining({
+        id: "bridge:membership:hip-hop-or-grime",
+        values: expect.arrayContaining(["rap", "hip-hop", "grime"]),
+      }),
+    ]);
+    expect(JSON.stringify(shadow.contract.trackPredicate)).not.toContain(
+      "bridge:constraint:scope_1",
+    );
     await repository.savePlaylistContractRevision({
       briefRequestId: created.id,
       expectedParentRevisionId: null,
@@ -769,7 +782,8 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       answers: [{ questionId: questions[0]!.id, optionId: "rap_led" }],
     })).resolves.toEqual({ status: "finalizing", created: true });
 
-    expect(await repository.getBriefRequest(created.id)).toMatchObject({
+    const acceptedBrief = await repository.getBriefRequest(created.id);
+    expect(acceptedBrief).toMatchObject({
       status: "finalizing",
       activePlaylistContract: {
         requestedTrackCount: 50,
@@ -782,6 +796,21 @@ databaseDescribe("intelligent guidance contract persistence", () => {
         ]),
       },
     });
+    const successorContract = acceptedBrief!
+      .activePlaylistContract! as PlaylistContractRevisionV1;
+    expect(successorContract.clauses.filter((clause) => (
+      clause.hardness === "hard"
+      && clause.kind === "membership"
+      && clause.axis === "genre"
+    ))).toEqual([
+      expect.objectContaining({
+        id: "bridge:membership:hip-hop-or-grime",
+        values: expect.arrayContaining(["rap", "hip-hop", "grime"]),
+      }),
+    ]);
+    expect(JSON.stringify(successorContract.trackPredicate)).not.toContain(
+      "bridge:constraint:scope_1",
+    );
   }, 40_000);
 
   test("persists and accepts a zero-question V4 confirmation without changing the contract", async () => {
