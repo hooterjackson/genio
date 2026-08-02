@@ -180,6 +180,24 @@ test("builds a bounded public-safe live progress summary from durable run state"
       if (text.includes("SELECT r.status run_status")) {
         return { rows: [], rowCount: 0 };
       }
+      if (text.includes("route.state_json route_receipt")) {
+        return {
+          rows: [{
+            route_receipt: null,
+            candidates: 32,
+            identity_bound: 22,
+            version_compatible: 22,
+            storefront_playable: 21,
+            evidence_passed: 21,
+            evidence_unknown: 2,
+            evidence_failed: 9,
+            selected: 0,
+            manifested: 0,
+            reconciled_published: null,
+          }],
+          rowCount: 1,
+        };
+      }
       throw new Error(`Unexpected repository query: ${text}`);
     }),
     end: vi.fn(),

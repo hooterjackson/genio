@@ -184,6 +184,7 @@ export function validateStagingManifestCanaryEvidence(
     "matchingJobs",
     "publicationJobs",
     "publicationVolumeRows",
+    "orphanPlaylistRows",
   ], "manifest canary zero-write proof");
   exactKeys(selectionValidation, [
     "canonicalPublicationValid",
@@ -246,6 +247,7 @@ export function validateStagingManifestCanaryEvidence(
     || Number(zeroWriteProof.matchingJobs) !== 0
     || Number(zeroWriteProof.publicationJobs) !== 0
     || Number(zeroWriteProof.publicationVolumeRows) !== 0
+    || Number(zeroWriteProof.orphanPlaylistRows) !== 0
     || selectionValidation.canonicalPublicationValid !== true
     || typeof selectionValidation.centralQualityRequired !== "boolean"
     || (selectionValidation.centralQualityRequired

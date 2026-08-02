@@ -7,12 +7,18 @@ import type {
   PartialPublicationActionView,
   PublicResearchRunView,
   ResearchRunView,
+  RunEvidenceCoverageView,
+  RunExecutionRouteReceiptView,
   RunGuidanceActionView,
   RunProgressView,
+  RunRepairReplayActionView,
   RunResolutionView,
 } from "../shared/types.ts";
 import { EXECUTABLE_PLAYLIST_MAXIMUM_TRACKS } from "../shared/product-policy.ts";
-import { publicAdaptiveRunDecisionV1 } from "./adaptive-run-decision-v1.ts";
+import {
+  advancingAdaptiveRunDecisionActionV1,
+  publicAdaptiveRunDecisionV1,
+} from "./adaptive-run-decision-v1.ts";
 import {
   guidanceDecisionV3FromPublicQuestion,
   publicGuidanceQuestionV3,
@@ -190,6 +196,197 @@ function publicExplore(value: unknown): ExplorePreferenceView | null {
   };
 }
 
+function publicRepairReplayAction(
+  value: unknown,
+): RunRepairReplayActionView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const expectedGeneration = publicProgressOptionalCount(
+    row.expectedGeneration,
+  );
+  const incidentReference = publicProgressText(row.incidentReference, 160);
+  const contractRevisionId = publicProgressText(row.contractRevisionId, 80);
+  const contractSemanticHash = publicProgressText(
+    row.contractSemanticHash,
+    64,
+  ).toLowerCase();
+  const availabilityReason = publicProgressText(
+    row.availabilityReason,
+    40,
+  );
+  const successorBriefRequestId = publicProgressText(
+    row.successorBriefRequestId,
+    80,
+  );
+  if (row.kind !== "repair_replay"
+    || expectedGeneration === null
+    || expectedGeneration < 1
+    || !incidentReference
+    || !contractRevisionId
+    || !/^[a-f0-9]{64}$/u.test(contractSemanticHash)
+    || typeof row.available !== "boolean"
+    || !new Set([
+      "ready",
+      "repair_pending",
+      "route_paused",
+      "already_started",
+    ]).has(availabilityReason)
+    || (row.available && availabilityReason !== "ready")
+    || (!row.available && availabilityReason === "ready")
+    || (availabilityReason === "already_started"
+      && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+        successorBriefRequestId,
+      ))
+    || row.resultReuse !== false
+    || row.autoPublication !== false) {
+    return null;
+  }
+  return {
+    kind: "repair_replay",
+    expectedGeneration,
+    incidentReference,
+    contractRevisionId,
+    contractSemanticHash,
+    available: row.available,
+    availabilityReason: availabilityReason as
+      RunRepairReplayActionView["availabilityReason"],
+    ...(successorBriefRequestId ? { successorBriefRequestId } : {}),
+    resultReuse: false,
+    autoPublication: false,
+  };
+}
+
+function publicExecutionRouteReceipt(
+  value: unknown,
+): RunExecutionRouteReceiptView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const trafficClass = publicProgressText(row.trafficClass, 32);
+  const assignmentKind = publicProgressText(row.assignmentKind, 40);
+  const guidanceVersion = publicProgressText(row.guidanceVersion, 80);
+  const executionRoute = publicProgressText(row.executionRoute, 80);
+  const releaseRevision = publicProgressText(row.releaseRevision, 80);
+  const executorConfigurationHash = publicProgressText(
+    row.executorConfigurationHash,
+    64,
+  ).toLowerCase();
+  const intentGroup = row.intentGroup === null
+    ? null
+    : publicProgressText(row.intentGroup, 80);
+  const receiptHash = publicProgressText(row.receiptHash, 64).toLowerCase();
+  const queryPlanSchema = publicProgressOptionalCount(row.queryPlanSchema);
+  const contractVersion = Number(row.contractVersion);
+  const queryPlanHash = row.queryPlanHash === null
+    ? null
+    : publicProgressText(row.queryPlanHash, 64).toLowerCase();
+  const capabilitySnapshotHash = row.capabilitySnapshotHash === null
+    ? null
+    : publicProgressText(row.capabilitySnapshotHash, 64).toLowerCase();
+  if (row.version !== "execution_route_receipt_v1"
+    || !["public", "owner_canary", "synthetic", "replay"].includes(
+      trafficClass,
+    )
+    || ![
+      "signed_public_rollout",
+      "signed_public_direct_exposure",
+      "signed_owner_canary",
+      "signed_release_canary",
+      "authenticated_legacy_repair",
+      "legacy_control",
+    ].includes(assignmentKind)
+    || !guidanceVersion
+    || !executionRoute
+    || !releaseRevision
+    || !Number.isInteger(contractVersion)
+    || contractVersion < 1
+    || contractVersion > 3
+    || (row.intentGroup !== null && !intentGroup)
+    || (row.queryPlanSchema !== null
+      && (queryPlanSchema === null || queryPlanSchema < 1))
+    || (queryPlanHash !== null && !/^[a-f0-9]{64}$/u.test(queryPlanHash))
+    || (capabilitySnapshotHash !== null
+      && !/^[a-f0-9]{64}$/u.test(capabilitySnapshotHash))
+    || !/^[a-f0-9]{64}$/u.test(executorConfigurationHash)
+    || !/^[a-f0-9]{64}$/u.test(receiptHash)) {
+    return null;
+  }
+  return {
+    version: "execution_route_receipt_v1",
+    trafficClass:
+      trafficClass as RunExecutionRouteReceiptView["trafficClass"],
+    contractVersion: contractVersion as 1 | 2 | 3,
+    guidanceVersion,
+    executionRoute,
+    queryPlanSchema,
+    queryPlanHash,
+    capabilitySnapshotHash,
+    releaseRevision,
+    executorConfigurationHash,
+    assignmentKind:
+      assignmentKind as RunExecutionRouteReceiptView["assignmentKind"],
+    intentGroup,
+    receiptHash,
+  };
+}
+
+function publicEvidenceCoverage(value: unknown): RunEvidenceCoverageView {
+  const row = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const rawObligations = row.obligationCounts
+    && typeof row.obligationCounts === "object"
+    && !Array.isArray(row.obligationCounts)
+    ? row.obligationCounts as Record<string, unknown>
+    : {};
+  const obligationCounts = Object.fromEntries(
+    Object.entries(rawObligations).flatMap(([obligationId, raw]) => {
+      if (!/^[0-9A-Za-z._:-]{1,160}$/u.test(obligationId)
+        || !raw
+        || typeof raw !== "object"
+        || Array.isArray(raw)) return [];
+      const counts = raw as Record<string, unknown>;
+      return [[obligationId, {
+        pass: publicProgressCount(counts.pass),
+        fail: publicProgressCount(counts.fail),
+        unknown: publicProgressCount(counts.unknown),
+      }]];
+    }),
+  );
+  const qualificationObservationCount = publicProgressCount(
+    row.qualificationObservationCount,
+  );
+  const observationCount = publicProgressCount(
+    row.observationCount ?? row.qualificationObservationCount,
+  );
+  const materializedCandidateCount = publicProgressCount(
+    row.materializedCandidateCount ?? row.candidates,
+  );
+  return {
+    observationCount,
+    qualificationObservationCount,
+    legacyUnboundQualificationCount: publicProgressCount(
+      row.legacyUnboundQualificationCount,
+    ),
+    uniqueLeadCount: publicProgressCount(row.uniqueLeadCount),
+    candidates: materializedCandidateCount,
+    materializedCandidateCount,
+    identityBound: publicProgressCount(row.identityBound),
+    appleResolvedCount: publicProgressCount(row.appleResolvedCount),
+    versionCompatible: publicProgressCount(row.versionCompatible),
+    storefrontPlayable: publicProgressCount(row.storefrontPlayable),
+    obligationCounts,
+    evidencePassed: publicProgressCount(row.evidencePassed),
+    evidenceUnknown: publicProgressCount(row.evidenceUnknown),
+    evidenceFailed: publicProgressCount(row.evidenceFailed),
+    selected: publicProgressCount(row.selected),
+    manifested: publicProgressCount(row.manifested),
+    appendedCount: publicProgressCount(row.appendedCount),
+    reconciledPublished: publicProgressOptionalCount(
+      row.reconciledPublished,
+    ),
+  };
+}
+
 /**
  * The capability-authenticated visitor API must advertise only actions that
  * the visitor can actually complete. Rescue guidance is preserved only when
@@ -202,14 +399,38 @@ export function publicRunResolutionView(
   resolution: RunResolutionView,
   partialAction: PartialPublicationActionView | null,
   guidanceAction: RunGuidanceActionView | null = null,
+  decisionAction: ReturnType<typeof publicAdaptiveRunDecisionV1> = null,
 ): RunResolutionView {
   let state = resolution.state;
   let nextAction = resolution.nextAction;
+  const workMotion = resolution.workMotion;
+  const validWorkMotion = workMotion === "running"
+    || workMotion === "retry_scheduled"
+    || workMotion === "waiting_dependency"
+    || workMotion === "paused"
+    || workMotion === "stalled"
+    || workMotion === "none"
+    ? workMotion
+    : undefined;
+  const dependencyMotion = validWorkMotion === "retry_scheduled"
+    || validWorkMotion === "waiting_dependency";
+
+  if (dependencyMotion
+    && (resolution.blocker?.kind === "provider"
+      || resolution.blocker?.kind === "apple_authorization")) {
+    state = "blocked_dependency";
+    nextAction = "wait_for_dependency";
+  } else if (validWorkMotion === "paused"
+    || validWorkMotion === "stalled"
+    || dependencyMotion) {
+    state = "quarantined";
+    nextAction = "contact_support";
+  }
 
   if (nextAction === "answer_initial_guidance"
     || (nextAction === "answer_rescue_guidance" && !guidanceAction)) {
-    state = "needs_decision";
-    nextAction = "review_contract";
+    state = "quarantined";
+    nextAction = "contact_support";
   } else if (nextAction === "authorize_apple") {
     state = "blocked_dependency";
     nextAction = "wait_for_dependency";
@@ -219,14 +440,34 @@ export function publicRunResolutionView(
       && typeof resolution.blocker.versionHash === "string"
       && /^[a-f0-9]{64}$/u.test(resolution.blocker.versionHash);
     if (!dependencyResume) {
-      state = "needs_decision";
-      nextAction = partialAction?.canContinueResearch
-        ? "decide_verified_partial"
-        : "review_contract";
+      if (partialAction?.canContinueResearch) {
+        state = "needs_decision";
+        nextAction = "decide_verified_partial";
+      } else {
+        state = "quarantined";
+        nextAction = "contact_support";
+      }
     }
   } else if (nextAction === "decide_verified_partial" && !partialAction) {
-    state = "needs_decision";
-    nextAction = "review_contract";
+    state = "quarantined";
+    nextAction = "contact_support";
+  }
+
+  if (state === "needs_decision"
+    && (nextAction === "review_contract" || nextAction === "resume_research")) {
+    const guidanceReview = nextAction === "review_contract"
+      && guidanceAction?.kind === "interpretation_summary";
+    const adaptiveAction = decisionAction
+      && typeof resolution.contractSemanticRevisionId === "string"
+      && decisionAction.contractRevisionId
+        === resolution.contractSemanticRevisionId
+      && decisionAction.contractSemanticHash === resolution.contractHash
+      ? advancingAdaptiveRunDecisionActionV1(decisionAction)
+      : null;
+    if (!guidanceReview && adaptiveAction !== nextAction) {
+      state = "quarantined";
+      nextAction = "contact_support";
+    }
   }
 
   return {
@@ -235,10 +476,67 @@ export function publicRunResolutionView(
     }),
     state,
     nextAction,
-    terminal: resolution.terminal,
+    terminal: state === "completed" || state === "cancelled",
     contractRevisionId: resolution.contractRevisionId,
+    ...(resolution.contractSemanticRevisionId === undefined
+      ? {}
+      : {
+          contractSemanticRevisionId:
+            resolution.contractSemanticRevisionId,
+        }),
     contractRevision: resolution.contractRevision,
     contractHash: resolution.contractHash,
+    ...(validWorkMotion === undefined ? {} : { workMotion: validWorkMotion }),
+    ...(resolution.wallClockMs === undefined
+      ? {}
+      : { wallClockMs: publicProgressOptionalCount(resolution.wallClockMs) }),
+    ...(resolution.activeComputeMs === undefined
+      ? {}
+      : { activeComputeMs: publicProgressCount(resolution.activeComputeMs) }),
+    ...(resolution.lastWorkerHeartbeatAt === undefined
+      ? {}
+      : {
+          lastWorkerHeartbeatAt: publicProgressDate(
+            resolution.lastWorkerHeartbeatAt,
+          ),
+        }),
+    ...(resolution.lastProgressAt === undefined
+      ? {}
+      : { lastProgressAt: publicProgressDate(resolution.lastProgressAt) }),
+    ...(resolution.nextRetryAt === undefined
+      ? {}
+      : { nextRetryAt: publicProgressDate(resolution.nextRetryAt) }),
+    ...(resolution.stageDeadlineAt === undefined
+      ? {}
+      : { stageDeadlineAt: publicProgressDate(resolution.stageDeadlineAt) }),
+    ...(resolution.selectedTrackCount === undefined
+      ? {}
+      : {
+          selectedTrackCount: publicProgressOptionalCount(
+            resolution.selectedTrackCount,
+          ),
+        }),
+    ...(resolution.manifestedTrackCount === undefined
+      ? {}
+      : {
+          manifestedTrackCount: publicProgressOptionalCount(
+            resolution.manifestedTrackCount,
+          ),
+        }),
+    ...(resolution.appendedTrackCount === undefined
+      ? {}
+      : {
+          appendedTrackCount: publicProgressOptionalCount(
+            resolution.appendedTrackCount,
+          ),
+        }),
+    ...(resolution.reconciledPublishedTrackCount === undefined
+      ? {}
+      : {
+          reconciledPublishedTrackCount: publicProgressOptionalCount(
+            resolution.reconciledPublishedTrackCount,
+          ),
+        }),
     blocker: resolution.blocker ? {
       kind: resolution.blocker.kind,
       nextRetryAt: resolution.blocker.nextRetryAt,
@@ -372,6 +670,44 @@ export function publicResearchRunView(
 ): PublicResearchRunView {
   const partialAction = publicPartialAction(run.partialAction);
   const guidanceAction = publicRunGuidanceAction(run.guidanceAction);
+  const repairReplayAction = publicRepairReplayAction(
+    run.repairReplayAction,
+  );
+  const decisionAction = publicAdaptiveRunDecisionV1(run.decisionAction);
+  const resolution = run.resolution
+    ? publicRunResolutionView(
+        run.resolution,
+        partialAction,
+        guidanceAction,
+        decisionAction,
+      )
+    : undefined;
+  const repairFenceMatchesResolution = resolution?.state === "quarantined"
+    && repairReplayAction !== null
+    && resolution.contractRevisionId === repairReplayAction.contractRevisionId
+    && resolution.contractHash === repairReplayAction.contractSemanticHash
+    && (
+      resolution.generation == null
+      || resolution.generation === repairReplayAction.expectedGeneration
+    );
+  if (resolution
+    && repairReplayAction
+    && repairFenceMatchesResolution) {
+    // During the schema-19 compatibility shadow, the public resolution is
+    // still projected from legacy status and therefore has no generation.
+    // The authenticated repair receipt is loaded from the authoritative
+    // resolution row, so expose that exact generation to let the browser
+    // verify the same optimistic-lock fence before rendering an action.
+    resolution.generation = repairReplayAction.expectedGeneration;
+  }
+  if (resolution
+    && repairReplayAction
+    && repairFenceMatchesResolution
+    && (repairReplayAction.available
+      || (repairReplayAction.availabilityReason === "already_started"
+        && Boolean(repairReplayAction.successorBriefRequestId)))) {
+    resolution.nextAction = "replay_after_repair";
+  }
   return {
     id: identity?.id ?? run.id,
     prompt: identity?.prompt ?? run.prompt,
@@ -391,12 +727,15 @@ export function publicResearchRunView(
     candidateStageCounts: run.candidateStageCounts,
     progress: run.progress ? publicRunProgressView(run.progress) : undefined,
     partialAction,
-    decisionAction: publicAdaptiveRunDecisionV1(run.decisionAction),
+    decisionAction,
     guidanceAction,
     explore: publicExplore(run.explore),
-    resolution: run.resolution
-      ? publicRunResolutionView(run.resolution, partialAction, guidanceAction)
-      : undefined,
+    resolution,
+    repairReplayAction,
+    executionRouteReceipt: publicExecutionRouteReceipt(
+      run.executionRouteReceipt,
+    ),
+    evidenceCoverage: publicEvidenceCoverage(run.evidenceCoverage),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     completedAt: run.completedAt,
@@ -415,9 +754,11 @@ export function publicBriefStatusView(input: {
     | "correctness_blocking"
     | "nuance_optional"
     | "interpretation_confirmation"
+    | "execution_decision"
     | null;
   confirmationKind?: "unresolved_review" | null;
   interpretationSummary?: PublicBriefStatusView["interpretationSummary"];
+  executionAction?: PublicBriefStatusView["executionAction"];
   brief?: PlaylistBrief;
   questions?: PlaylistGuidanceQuestion[];
   answers?: PlaylistGuidanceAnswer[];
@@ -435,6 +776,7 @@ export function publicBriefStatusView(input: {
     checkpointMode: input.checkpointMode,
     confirmationKind: input.confirmationKind,
     interpretationSummary: input.interpretationSummary,
+    executionAction: input.executionAction,
     brief: input.brief,
     questions: input.questions ?? [],
     answers: input.answers,

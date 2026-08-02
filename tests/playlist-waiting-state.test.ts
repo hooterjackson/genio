@@ -125,6 +125,22 @@ describe("playlist waiting state", () => {
     })).toBe("paused");
   });
 
+  it("renders evidence collapse as paused verification repair instead of active discovery", () => {
+    expect(playlistWorkState({
+      status: "needs_decision",
+      phase: "capability_evidence_coverage_audit",
+      resolution: {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        workMotion: "paused",
+      },
+    })).toEqual({
+      stage: "verify",
+      motion: "paused",
+    });
+  });
+
   it.each([
     ["visitor_review", "exception_review"],
     ["manifest_ready", "manifest"],

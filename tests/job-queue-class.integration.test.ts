@@ -46,12 +46,12 @@ databaseDescribe("schema-14 durable worker queue isolation", () => {
 
   beforeAll(async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
-    // Owner canaries are intentionally restricted to explicitly allowlisted
-    // engines. Make this fixture an actual V3 factual run instead of silently
-    // exercising the V2 control path (whose research lane is interactive).
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_GROUPS", "factual_relationship,exhaustive");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "25");
+    // This suite verifies queue isolation, not canary authentication. Admit
+    // the factual run through an explicit public rollout so freshness cannot
+    // silently act as owner route authority.
+    vi.stubEnv("PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_PERCENT", "100");
     vi.stubEnv("APPLE_STOREFRONT", "us");
     adminPool = new Pool({ connectionString: databaseUrl, max: 2 });
     await adminPool.query(`CREATE SCHEMA "${schemaName}"`);

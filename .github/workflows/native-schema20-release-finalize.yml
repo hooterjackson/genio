@@ -1,0 +1,513 @@
+name: native schema20 release finalization
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Full merged Git SHA already promoted
+        required: true
+        type: string
+      release_version:
+        description: Candidate version
+        required: true
+        type: string
+      candidate_tag:
+        description: Immutable RC tag
+        required: true
+        type: string
+      backend_promotion_run_id:
+        description: Successful native schema20 point-release run
+        required: true
+        type: string
+      direct_exposure_run_id:
+        description: Successful signed direct 0 to 100 exposure run
+        required: true
+        type: string
+      direct_exposure_artifact:
+        description: Artifact containing authority, warrant, activation, and runtime receipts
+        required: true
+        type: string
+      production_proof_run_id:
+        description: Run with post-exposure convergence and real public browser proof
+        required: true
+        type: string
+      production_proof_artifact:
+        description: Combined exact-SHA convergence and direct-browser artifact
+        required: true
+        type: string
+      apple_gate_run_id:
+        description: Run with signed owner fixed-three control plus Irish V5.1 execution, recovery, and ordered Apple-ID evidence
+        required: true
+        type: string
+      apple_gate_artifact:
+        description: Artifact containing mandatory production_fixed_three_track and production_affected_regression gates and attestations
+        required: true
+        type: string
+      burn_in_run_id:
+        description: Successful final 24-hour frozen-candidate burn-in segment
+        required: true
+        type: string
+      burn_in_artifact:
+        description: Artifact containing the completed burn-in receipt
+        required: true
+        type: string
+
+concurrency:
+  group: native-schema20-production-release-finalization
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  finalize:
+    name: validate all proof and publish the exact stable release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64 }}
+      RELEASE_GATE_PRODUCER_KEY_ID: ${{ vars.RELEASE_GATE_PRODUCER_KEY_ID }}
+      RELEASE_GATE_PRODUCER_KEY_SHA256: ${{ vars.RELEASE_GATE_PRODUCER_KEY_SHA256 }}
+      RELEASE_VERIFICATION_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_VERIFICATION_PUBLIC_KEY_BASE64 }}
+      RELEASE_VERIFICATION_KEY_ID: ${{ vars.RELEASE_VERIFICATION_KEY_ID }}
+      RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+    steps:
+      - name: Validate exact evidence selectors
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          BACKEND_RUN_ID: ${{ inputs.backend_promotion_run_id }}
+          DIRECT_RUN_ID: ${{ inputs.direct_exposure_run_id }}
+          DIRECT_ARTIFACT: ${{ inputs.direct_exposure_artifact }}
+          PROOF_RUN_ID: ${{ inputs.production_proof_run_id }}
+          PROOF_ARTIFACT: ${{ inputs.production_proof_artifact }}
+          APPLE_RUN_ID: ${{ inputs.apple_gate_run_id }}
+          APPLE_ARTIFACT: ${{ inputs.apple_gate_artifact }}
+          BURN_IN_RUN_ID: ${{ inputs.burn_in_run_id }}
+          BURN_IN_ARTIFACT: ${{ inputs.burn_in_artifact }}
+        run: |
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$CANDIDATE_TAG" =~ ^v"$RELEASE_VERSION"-rc\.[1-9][0-9]*$ ]]
+          [[ "$BACKEND_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$DIRECT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PROOF_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPLE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$DIRECT_ARTIFACT" = "v254-editorial-direct-exposure-$SOURCE_REVISION"
+          test "$PROOF_ARTIFACT" = "v254-production-proof-$SOURCE_REVISION"
+          test "$APPLE_ARTIFACT" = "v254-owner-apple-gate-$SOURCE_REVISION"
+          [[ "$BURN_IN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BURN_IN_ARTIFACT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$RELEASE_GATE_PRODUCER_KEY_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:-]{2,79}$ ]]
+          [[ "$RELEASE_GATE_PRODUCER_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_VERIFICATION_KEY_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:-]{2,79}$ ]]
+          [[ "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test -n "$RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64"
+          test -n "$RELEASE_VERIFICATION_PUBLIC_KEY_BASE64"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require exact merged candidate
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_REVISION"
+          test "$GITHUB_WORKFLOW_SHA" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
+          git fetch --force origin \
+            "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$SOURCE_REVISION"
+
+      - name: Require successful evidence-producing runs for the exact SHA
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          BACKEND_RUN_ID: ${{ inputs.backend_promotion_run_id }}
+          DIRECT_RUN_ID: ${{ inputs.direct_exposure_run_id }}
+          PROOF_RUN_ID: ${{ inputs.production_proof_run_id }}
+          APPLE_RUN_ID: ${{ inputs.apple_gate_run_id }}
+          BURN_IN_RUN_ID: ${{ inputs.burn_in_run_id }}
+        run: |
+          for RUN_ID in "$BACKEND_RUN_ID" "$DIRECT_RUN_ID" "$PROOF_RUN_ID" "$APPLE_RUN_ID" "$BURN_IN_RUN_ID"; do
+            RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+            test "$(jq -r '.status' <<<"$RUN")" = "completed"
+            test "$(jq -r '.conclusion' <<<"$RUN")" = "success"
+            test "$(jq -r '.head_sha' <<<"$RUN")" = "$SOURCE_REVISION"
+          done
+          BACKEND="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BACKEND_RUN_ID")"
+          test "$(jq -r '.path' <<<"$BACKEND")" = ".github/workflows/native-schema20-release.yml"
+          DIRECT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DIRECT_RUN_ID")"
+          test "$(jq -r '.path' <<<"$DIRECT")" = ".github/workflows/v254-editorial-direct-exposure.yml"
+          PROOF="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PROOF_RUN_ID")"
+          test "$(jq -r '.path' <<<"$PROOF")" = ".github/workflows/v254-production-proof.yml"
+          APPLE="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$APPLE_RUN_ID")"
+          test "$(jq -r '.path' <<<"$APPLE")" = ".github/workflows/v254-owner-apple-gate.yml"
+          BURN_IN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BURN_IN_RUN_ID")"
+          test "$(jq -r '.path' <<<"$BURN_IN")" = ".github/workflows/v254-production-burn-in.yml"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-schema20-promotion-${{ inputs.source_revision }}
+          path: ${{ runner.temp }}/backend
+          run-id: ${{ inputs.backend_promotion_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.direct_exposure_artifact }}
+          path: ${{ runner.temp }}/direct
+          run-id: ${{ inputs.direct_exposure_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.production_proof_artifact }}
+          path: ${{ runner.temp }}/proof
+          run-id: ${{ inputs.production_proof_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.apple_gate_artifact }}
+          path: ${{ runner.temp }}/apple
+          run-id: ${{ inputs.apple_gate_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.burn_in_artifact }}
+          path: ${{ runner.temp }}/burn-in
+          run-id: ${{ inputs.burn_in_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install exact lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Materialize protected producer and direct-authority verification keys
+        run: |
+          umask 077
+          printf '%s' "$RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64" \
+            | base64 --decode \
+            > "$RUNNER_TEMP/release-gate-producer-public-key.pem"
+          printf '%s' "$RELEASE_VERIFICATION_PUBLIC_KEY_BASE64" \
+            | base64 --decode \
+            > "$RUNNER_TEMP/release-verification-public-key.pem"
+
+      - name: Fail closed unless all final production gates pass
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          pnpm release:native:finalize -- \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --backend-promotion "$RUNNER_TEMP/backend/native-schema20-promotion.json" \
+            --direct-exposure-authority "$RUNNER_TEMP/direct/v254-direct-exposure-authority.json" \
+            --direct-exposure-rollback-warrant "$RUNNER_TEMP/direct/v254-direct-exposure-rollback-warrant.json" \
+            --direct-exposure-database-activate-receipt "$RUNNER_TEMP/direct/direct-exposure-database-activate.json" \
+            --direct-exposure-runtime-receipt "$RUNNER_TEMP/direct/direct-exposure-runtime-apply.json" \
+            --direct-exposure-verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+            --direct-exposure-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --direct-exposure-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --producer-verification-key "$RUNNER_TEMP/release-gate-producer-public-key.pem" \
+            --producer-key-id "$RELEASE_GATE_PRODUCER_KEY_ID" \
+            --producer-key-sha256 "$RELEASE_GATE_PRODUCER_KEY_SHA256" \
+            --release-convergence-artifact "$RUNNER_TEMP/proof/release-convergence.gate.json" \
+            --release-convergence-attestation "$RUNNER_TEMP/proof/release-convergence.attestation.json" \
+            --final-browser-artifact "$RUNNER_TEMP/proof/final-custom-domain-browser.gate.json" \
+            --final-browser-attestation "$RUNNER_TEMP/proof/final-custom-domain-browser.attestation.json" \
+            --fixed-three-artifact "$RUNNER_TEMP/apple/production-fixed-three-track.gate.json" \
+            --fixed-three-attestation "$RUNNER_TEMP/apple/production-fixed-three-track.attestation.json" \
+            --apple-artifact "$RUNNER_TEMP/apple/production-affected-regression.gate.json" \
+            --apple-attestation "$RUNNER_TEMP/apple/production-affected-regression.attestation.json" \
+            --burn-in-receipt "$RUNNER_TEMP/burn-in/v254-production-burn-in.json" \
+            --output "$RUNNER_TEMP/native-schema20-finalization.json"
+
+      - name: Prepare exact stable tag and immutable Release payload
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          pnpm release:native:prepare-stable -- \
+            --confirm-native-stable-release \
+            --finalization-receipt "$RUNNER_TEMP/native-schema20-finalization.json" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --output "$RUNNER_TEMP/native-schema20-stable-release.json" \
+            --notes-output "$RUNNER_TEMP/native-schema20-stable-release-notes.txt"
+
+      - id: stable_writer
+        name: Mint the existing stable-tag writer when configured
+        if: vars.STABLE_RELEASE_WRITER_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.STABLE_RELEASE_WRITER_APP_ID }}
+          private-key: ${{ secrets.STABLE_RELEASE_WRITER_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Create or verify the exact annotated stable tag
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          STABLE_PLAN_PATH: ${{ runner.temp }}/native-schema20-stable-release.json
+          STABLE_NOTES_PATH: ${{ runner.temp }}/native-schema20-stable-release-notes.txt
+        with:
+          github-token: >-
+            ${{ steps.stable_writer.outputs.token || github.token }}
+          script: |
+            const fs = require("node:fs");
+            const plan = JSON.parse(
+              fs.readFileSync(process.env.STABLE_PLAN_PATH, "utf8"),
+            );
+            const message = fs.readFileSync(
+              process.env.STABLE_NOTES_PATH,
+              "utf8",
+            );
+            const tagName = plan.candidate.stableTag;
+            const sourceRevision = plan.candidate.sourceRevision;
+            const versionParts = (value) => {
+              const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
+                .exec(value);
+              return match
+                ? match.slice(1).map((part) => Number(part))
+                : null;
+            };
+            const compareVersions = (left, right) => {
+              for (let index = 0; index < 3; index += 1) {
+                if (left[index] !== right[index]) {
+                  return left[index] > right[index] ? 1 : -1;
+                }
+              }
+              return 0;
+            };
+            const candidateVersion = versionParts(tagName);
+            if (!candidateVersion) {
+              throw new Error("native stable tag version is invalid");
+            }
+            const [refs, releases] = await Promise.all([
+              github.paginate(github.rest.git.listMatchingRefs, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: "tags/v",
+                per_page: 100,
+              }),
+              github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              }),
+            ]);
+            const publishedVersions = [
+              ...refs.map((ref) => ref.ref.replace(/^refs\/tags\//, "")),
+              ...releases.map((release) => release.tag_name),
+            ];
+            if (publishedVersions.some((published) => {
+              const version = versionParts(published);
+              return version
+                && compareVersions(version, candidateVersion) > 0;
+            })) {
+              throw new Error(
+                "a newer stable tag or GitHub Release already exists",
+              );
+            }
+
+            async function verifyTag() {
+              const ref = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tagName}`,
+              });
+              if (ref.data.object.type !== "tag") {
+                throw new Error("native stable ref is not an annotated tag");
+              }
+              const tag = await github.rest.git.getTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_sha: ref.data.object.sha,
+              });
+              if (
+                tag.data.tag !== tagName
+                || tag.data.object.type !== "commit"
+                || tag.data.object.sha !== sourceRevision
+                || tag.data.message !== message
+              ) {
+                throw new Error(
+                  "existing native stable tag has a different identity",
+                );
+              }
+              return ref.data.object.sha;
+            }
+
+            let tagObject;
+            try {
+              tagObject = await verifyTag();
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              const created = await github.rest.git.createTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tagName,
+                message,
+                object: sourceRevision,
+                type: "commit",
+              });
+              try {
+                await github.rest.git.createRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `refs/tags/${tagName}`,
+                  sha: created.data.sha,
+                });
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
+              }
+              tagObject = await verifyTag();
+            }
+            core.info(
+              `Verified ${tagName} annotated object ${tagObject} at `
+              + sourceRevision,
+            );
+
+      - name: Create, complete, or verify the exact GitHub Release
+        env:
+          GH_TOKEN: >-
+            ${{ steps.stable_writer.outputs.token || github.token }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          STABLE_TAG="v$RELEASE_VERSION"
+          NOTES="$RUNNER_TEMP/native-schema20-stable-release-notes.txt"
+          FINALIZATION="$RUNNER_TEMP/native-schema20-finalization.json"
+          STABLE_PLAN="$RUNNER_TEMP/native-schema20-stable-release.json"
+          RELEASE_JSON="$RUNNER_TEMP/native-schema20-stable-release-api.json"
+          if ! gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+              > "$RELEASE_JSON" 2>/dev/null; then
+            gh release create "$STABLE_TAG" \
+              --draft \
+              --verify-tag \
+              --target "$SOURCE_REVISION" \
+              --title "$STABLE_TAG" \
+              --notes-file "$NOTES"
+            gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+              > "$RELEASE_JSON"
+          fi
+          jq -e \
+            --arg tag "$STABLE_TAG" \
+            --arg revision "$SOURCE_REVISION" \
+            '.tag_name == $tag
+              and .name == $tag
+              and .target_commitish == $revision
+              and .prerelease == false' \
+            "$RELEASE_JSON" >/dev/null
+          jq -r '.body // ""' "$RELEASE_JSON" \
+            > "$RUNNER_TEMP/native-schema20-published-notes.txt"
+          cmp "$NOTES" "$RUNNER_TEMP/native-schema20-published-notes.txt"
+          RELEASE_DRAFT="$(jq -r '.draft' "$RELEASE_JSON")"
+          for ASSET_PATH in "$FINALIZATION" "$STABLE_PLAN"; do
+            ASSET="$(basename "$ASSET_PATH")"
+            ASSET_COUNT="$(
+              jq -r --arg asset "$ASSET" \
+                '[.assets[] | select(.name == $asset)] | length' \
+                "$RELEASE_JSON"
+            )"
+            if test "$ASSET_COUNT" = "0"; then
+              test "$RELEASE_DRAFT" = "true"
+              gh release upload "$STABLE_TAG" "$ASSET_PATH"
+            else
+              test "$ASSET_COUNT" = "1"
+              mkdir -p "$RUNNER_TEMP/published-assets"
+              gh release download "$STABLE_TAG" \
+                --dir "$RUNNER_TEMP/published-assets" \
+                --pattern "$ASSET"
+              cmp "$ASSET_PATH" "$RUNNER_TEMP/published-assets/$ASSET"
+            fi
+          done
+          gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > "$RELEASE_JSON"
+          test "$(
+            jq -r \
+              '[.assets[].name] | sort
+                == ["native-schema20-finalization.json",
+                    "native-schema20-stable-release.json"]' \
+              "$RELEASE_JSON"
+          )" = "true"
+          if test "$(jq -r '.draft' "$RELEASE_JSON")" = "true"; then
+            gh release edit "$STABLE_TAG" --draft=false
+          fi
+
+      - name: Verify stable source, tag, Release, notes, and assets read-only
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          STABLE_TAG="v$RELEASE_VERSION"
+          git fetch --force origin \
+            "+refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
+          test "$(git cat-file -t "refs/tags/$STABLE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$STABLE_TAG^{}")" = "$SOURCE_REVISION"
+          pnpm release:check:native-stable -- "$STABLE_TAG"
+          RELEASE_JSON="$RUNNER_TEMP/native-schema20-published-release.json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" \
+            > "$RELEASE_JSON"
+          test "$(jq -r '.draft' "$RELEASE_JSON")" = "false"
+          test "$(jq -r '.prerelease' "$RELEASE_JSON")" = "false"
+          test "$(jq -r '.target_commitish' "$RELEASE_JSON")" = "$SOURCE_REVISION"
+          jq -r '.body // ""' "$RELEASE_JSON" \
+            > "$RUNNER_TEMP/native-schema20-verified-notes.txt"
+          cmp \
+            "$RUNNER_TEMP/native-schema20-stable-release-notes.txt" \
+            "$RUNNER_TEMP/native-schema20-verified-notes.txt"
+          mkdir "$RUNNER_TEMP/verified-assets"
+          gh release download "$STABLE_TAG" \
+            --dir "$RUNNER_TEMP/verified-assets" \
+            --pattern native-schema20-finalization.json \
+            --pattern native-schema20-stable-release.json
+          cmp \
+            "$RUNNER_TEMP/native-schema20-finalization.json" \
+            "$RUNNER_TEMP/verified-assets/native-schema20-finalization.json"
+          cmp \
+            "$RUNNER_TEMP/native-schema20-stable-release.json" \
+            "$RUNNER_TEMP/verified-assets/native-schema20-stable-release.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-schema20-finalization-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/native-schema20-finalization.json
+            ${{ runner.temp }}/native-schema20-stable-release.json
+            ${{ runner.temp }}/native-schema20-stable-release-notes.txt
+            ${{ runner.temp }}/native-schema20-published-release.json
+          if-no-files-found: error
+          retention-days: 30

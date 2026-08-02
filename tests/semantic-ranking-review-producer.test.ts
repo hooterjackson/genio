@@ -302,7 +302,7 @@ function runtimeSnapshot() {
       escalation: "gpt-5.6-terra",
     },
     policyVersions: {
-      guidance: "adaptive_guidance_v4",
+      guidance: "adaptive_guidance_v5",
       evidence: "governed_evidence_v2",
       queryPlan: "query_plan_v3_4",
       selection: "selection_plan_v3",

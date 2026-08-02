@@ -11,6 +11,10 @@ on:
         description: Stable semantic version embedded in the image
         required: true
         type: string
+      candidate_tag:
+        description: Annotated RC tag bound to the exact merged SHA
+        required: true
+        type: string
 
 concurrency:
   group: exact-sha-image-${{ inputs.source_revision }}
@@ -37,6 +41,7 @@ jobs:
         env:
           SOURCE_REVISION: ${{ inputs.source_revision }}
           RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
           RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
         run: |
@@ -44,6 +49,8 @@ jobs:
             || { echo "source_revision must be a lowercase full SHA-1" >&2; exit 1; }
           [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
             || { echo "release_version must be a stable semantic version" >&2; exit 1; }
+          [[ "$CANDIDATE_TAG" =~ ^v"$RELEASE_VERSION"-rc\.[1-9][0-9]*$ ]] \
+            || { echo "candidate_tag must match the stable release version" >&2; exit 1; }
           [[ "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
             || { echo "RELEASE_VERIFICATION_KEY_SHA256 must pin the rollout verification key" >&2; exit 1; }
           [[ "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
@@ -126,6 +133,7 @@ jobs:
         env:
           SOURCE_REVISION: ${{ inputs.source_revision }}
           RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
@@ -133,6 +141,10 @@ jobs:
           git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
           test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
           test -f Dockerfile.ghcr-recovery
+          git fetch --force origin "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          TAG_OBJECT="$(git rev-parse "refs/tags/$CANDIDATE_TAG")"
+          test "$(git cat-file -t "$TAG_OBJECT")" = "tag"
+          test "$(git rev-parse "$TAG_OBJECT^{}")" = "$SOURCE_REVISION"
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -219,9 +231,20 @@ jobs:
             echo "- Version: \`$RELEASE_VERSION\`"
             echo "- Image: \`$IMAGE_REFERENCE\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Produce native v2.5.4 candidate evidence from the exact-SHA receipt
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          node --experimental-transform-types \
+            scripts/native-v254-candidate-evidence.ts \
+            --exact-sha-image-receipt exact-sha-image-receipt.json \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --output native-v254-candidate-evidence.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: exact-sha-image-${{ inputs.source_revision }}
-          path: exact-sha-image-receipt.json
+          path: |
+            exact-sha-image-receipt.json
+            native-v254-candidate-evidence.json
           if-no-files-found: error
           retention-days: 30

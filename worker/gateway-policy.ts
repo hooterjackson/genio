@@ -33,6 +33,8 @@ const ROUTE_RULES: readonly GatewayRouteRule[] = [
   { method: "DELETE", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+$/ },
   { method: "GET", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/progress$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/research\/continue$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/dependency\/resume$/ },
+  { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/replay-after-repair$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/partial\/confirm$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/cancel$/ },
   { method: "POST", path: /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/explore$/ },

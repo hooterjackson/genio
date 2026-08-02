@@ -136,6 +136,17 @@ describe("typed selection geography", () => {
     ]);
   });
 
+  test("preserves Irish and Ireland as one governed geographic family", () => {
+    expect(parseSelectionGeographyConstraints("Irish music")).toEqual([
+      { value: "Irish", relationship: "unspecified" },
+    ]);
+    expect(parseSelectionGeographyConstraints("music by artists from Ireland"))
+      .toContainEqual({
+        value: "Irish",
+        relationship: "artist_origin",
+      });
+  });
+
   test.each([
     ["disco a 65-year-old listener in Brazil may plausibly have heard", "Brazilian"],
     ["iconic disco songs my father might have listened to growing up in Brazil", "Brazilian"],

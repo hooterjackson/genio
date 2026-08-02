@@ -116,6 +116,74 @@ describe("working indicator candidate funnel", () => {
     expect(markup).not.toContain("LIVE");
   });
 
+  it("keeps provider observations separate from unique leads and candidates", () => {
+    const markup = renderToStaticMarkup(createElement(WorkingIndicator, {
+      stage: "verify",
+      motion: "action-required",
+      phaseLabel: "Evidence coverage needs technical attention.",
+      sourceCount: 1_005,
+      sourceCountOverride: 189,
+      observationCount: 1_005,
+      candidateCount: 77,
+      unresolvedCount: 77,
+      targetCount: 25,
+      progress: {
+        targetTrackCount: 25,
+        latestActivityAt: "2026-08-02T10:00:00.000Z",
+        sourceSummary: {
+          total: 1_005,
+          recentSources: [],
+        },
+        frontierSummary: {
+          total: 2,
+          complete: 2,
+          active: 0,
+          unresolved: 0,
+          inaccessible: 0,
+          discoveredCount: 1_005,
+          recoveredCount: 1_005,
+        },
+        containerSummary: {
+          total: 0,
+          complete: 0,
+          active: 0,
+          unresolved: 0,
+          inaccessible: 0,
+          advertisedCount: 0,
+          recoveredCount: 0,
+        },
+        matchSummary: {
+          attempted: 77,
+          accepted: 73,
+          review: 0,
+          unavailable: 4,
+          duplicate: 0,
+          rejected: 0,
+          unsupported: 0,
+          overflow: 0,
+          shortfall: 0,
+        },
+        publicationSummary: {
+          volumeCount: 0,
+          completedVolumes: 0,
+          totalTracks: 0,
+          appendedTracks: 0,
+          currentVolume: null,
+          status: null,
+        },
+      },
+    }));
+
+    expect(markup).toContain("SOURCES</small><strong>189</strong>");
+    expect(markup).toContain("DISCOVERED</small><strong>77</strong>");
+    expect(markup).toContain(
+      "OBSERVATIONS</small><strong>1,005</strong>",
+    );
+    expect(markup).not.toContain(
+      "DISCOVERED</small><strong>1,005</strong>",
+    );
+  });
+
   it("renders a durable stalled label without claiming the run is live", () => {
     const markup = renderToStaticMarkup(createElement(WorkingIndicator, {
       stage: "discover",

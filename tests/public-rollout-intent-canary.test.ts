@@ -161,7 +161,10 @@ function payload(input: {
         input.selectedTrackCount ?? fixture.targetTrackCount,
       contractSemanticHash:
         input.executionContractSemanticHash ?? protectedContractSemanticHash,
-      guidanceLineageHash: intentGroup === "genre_scene" ? "2".repeat(64) : null,
+      guidanceLineageHash:
+        intentGroup === "genre_scene" || intentGroup === "editorial_influence"
+          ? "2".repeat(64)
+          : null,
       manifestContentHash: "3".repeat(64),
       orderedAppleIdsHash: "4".repeat(64),
       independentAppleEvidenceHash: "5".repeat(64),
@@ -257,6 +260,11 @@ describe("public rollout intent-specific canary", () => {
   test("pins the affected regression to the exact code-owned release fixture", () => {
     expect(PUBLIC_ROLLOUT_INTENT_CANARY_FIXTURES.genre_scene.fixtureHash)
       .toBe(RELEASE_FIXTURES["smooth-reggaeton-heat-50-v1"].fixtureHash);
+    expect(PUBLIC_ROLLOUT_INTENT_CANARY_FIXTURES.editorial_influence)
+      .toMatchObject({
+        fixtureId: "irish-influence-25-v1",
+        targetTrackCount: 25,
+      });
   });
 
   test("accepts the exact signed owner canary and current-stage metrics", () => {
@@ -280,6 +288,34 @@ describe("public rollout intent-specific canary", () => {
       },
     });
     expect(verified.payloadHash).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  test("accepts an independently governed editorial-influence owner canary", () => {
+    const intentGroup = "editorial_influence" as const;
+    const verified = verifyPublicRolloutIntentCanaryV1(
+      envelope(payload({ intentGroup })),
+      keys.publicKey,
+      expected({ intentGroup }),
+    );
+    expect(verified).toMatchObject({
+      transition: { intentGroup },
+      fixture: {
+        fixtureId: "irish-influence-25-v1",
+        targetTrackCount: 25,
+      },
+    });
+    const questionless = payload({ intentGroup });
+    expect(() => verifyPublicRolloutIntentCanaryV1(
+      envelope({
+        ...questionless,
+        execution: {
+          ...questionless.execution,
+          guidanceLineageHash: null,
+        },
+      }),
+      keys.publicKey,
+      expected({ intentGroup }),
+    )).toThrow(/execution is not exact/u);
   });
 
   test("rejects a hand-authored claim without protected source provenance", () => {

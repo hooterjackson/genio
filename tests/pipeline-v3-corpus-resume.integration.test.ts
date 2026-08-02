@@ -68,9 +68,11 @@ databaseDescribe("Pipeline V3 cold corpus review and resume", () => {
 
   beforeAll(async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_GROUPS", "exhaustive");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    // Corpus resume tests exercise an admitted exhaustive route. Use explicit
+    // public rollout authority instead of overloading forceFreshResearch.
+    vi.stubEnv("PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_EXHAUSTIVE_PERCENT", "100");
     vi.stubEnv("APPLE_STOREFRONT", "us");
     vi.stubEnv("WORKER_CONCURRENCY", "2");
     adminPool = new Pool({ connectionString: databaseUrl, max: 2 });

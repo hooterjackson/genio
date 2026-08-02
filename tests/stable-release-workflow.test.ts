@@ -27,7 +27,14 @@ const workflowUrl = new URL(
   import.meta.url,
 );
 const workflowsDirectory = new URL("../.github/workflows/", import.meta.url);
-const exactContentsWriters = new Set<string>();
+// The native schema-20 finalizer is the sole built-in-token publisher. It is
+// manually dispatched only after exact-SHA promotion, signed browser/Apple
+// evidence, and the completed 24-hour burn-in have all been revalidated.
+// Every other workflow must continue to publish through the protected App
+// boundary rather than inheriting repository write authority.
+const exactContentsWriters = new Set<string>([
+  "native-schema20-release-finalize.yml#finalize",
+]);
 
 type WorkflowPermissionMode = "none" | "contents-write";
 

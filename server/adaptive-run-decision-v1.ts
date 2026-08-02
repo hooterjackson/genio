@@ -50,6 +50,37 @@ export interface AdaptiveRunDecisionV1 {
   readonly reachedAt: string;
 }
 
+type AdaptiveRunDecisionBodyV1 = Omit<
+  AdaptiveRunDecisionV1,
+  "decisionHash"
+>;
+
+function adaptiveRunDecisionHashV1(
+  body: AdaptiveRunDecisionBodyV1,
+): string {
+  return sha256Hex(stableStringify(body));
+}
+
+/**
+ * Returns the one browser action that can actually advance this immutable
+ * contract. Pause/cancel are lifecycle controls, not research decisions, and
+ * a partial publication is authorized only by the separate manifest-bound
+ * consent flow.
+ */
+export function advancingAdaptiveRunDecisionActionV1(
+  decision: RunDecisionActionView,
+): "resume_research" | "review_contract" | null {
+  if (decision.reason === "dependency_retry_window_expired"
+    && decision.actions.resumeLater) {
+    return "resume_research";
+  }
+  return decision.actions.anotherBoundedPass
+    || decision.actions.reviseNamedPredicate
+    || decision.actions.reduceCount
+    ? "review_contract"
+    : null;
+}
+
 function boundedInteger(
   value: number,
   minimum: number,
@@ -161,7 +192,7 @@ export function createAdaptiveRunDecisionV1(input: {
   };
   return {
     ...body,
-    decisionHash: sha256Hex(stableStringify(body)),
+    decisionHash: adaptiveRunDecisionHashV1(body),
   };
 }
 
@@ -182,6 +213,18 @@ function stringList(value: unknown, maximumItems = 20): string[] {
     : [];
 }
 
+function exactStringList(
+  value: unknown,
+  maximumItems = 1_000,
+): string[] | null {
+  if (!Array.isArray(value)
+    || value.length > maximumItems
+    || value.some((item) => typeof item !== "string")) {
+    return null;
+  }
+  return [...value] as string[];
+}
+
 /**
  * Positive allowlist for the capability API. A malformed or internal blocker
  * state produces no action instead of leaking data or advertising dead UI.
@@ -199,6 +242,7 @@ export function publicAdaptiveRunDecisionV1(value: unknown): RunDecisionActionVi
     || typeof row.decisionHash !== "string"
     || !/^[a-f0-9]{64}$/u.test(row.decisionHash)
     || typeof row.contractRevisionId !== "string"
+    || row.contractRevisionId.length === 0
     || typeof row.contractSemanticHash !== "string"
     || !/^[a-f0-9]{64}$/u.test(row.contractSemanticHash)) {
     return null;
@@ -249,16 +293,97 @@ export function publicAdaptiveRunDecisionV1(value: unknown): RunDecisionActionVi
     : null;
   if (!actionRow || !summaryRow) return null;
   const reachedAt = stringValue(row.reachedAt, 64);
-  if (!Number.isFinite(Date.parse(reachedAt))) return null;
-  const namedPredicates = Array.isArray(row.namedPredicates)
-    ? row.namedPredicates.flatMap((value) => {
-      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-      const predicate = value as Record<string, unknown>;
-      const clauseId = stringValue(predicate.clauseId, 160);
-      const label = stringValue(predicate.label, 180);
-      return clauseId && label ? [{ clauseId, label }] : [];
-    }).slice(0, 5)
-    : [];
+  if (!Number.isFinite(Date.parse(reachedAt))
+    || new Date(Date.parse(reachedAt)).toISOString() !== row.reachedAt) {
+    return null;
+  }
+  if (!Array.isArray(row.namedPredicates) || row.namedPredicates.length > 5) {
+    return null;
+  }
+  const namedPredicates = row.namedPredicates.flatMap((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const predicate = value as Record<string, unknown>;
+    const clauseId = stringValue(predicate.clauseId, 160);
+    const label = stringValue(predicate.label, 180);
+    return clauseId
+      && label
+      && clauseId === predicate.clauseId
+      && label === predicate.label
+      ? [{ clauseId, label }]
+      : [];
+  });
+  if (namedPredicates.length !== row.namedPredicates.length) return null;
+  const mustHave = exactStringList(summaryRow.mustHave);
+  const prefer = exactStringList(summaryRow.prefer);
+  const avoid = exactStringList(summaryRow.avoid);
+  const flow = exactStringList(summaryRow.flow);
+  if (!mustHave || !prefer || !avoid || !flow
+    || summaryRow.count !== targetTrackCount) {
+    return null;
+  }
+  const actions = {
+    anotherBoundedPass: actionRow.anotherBoundedPass,
+    reviseNamedPredicate: actionRow.reviseNamedPredicate,
+    reduceCount: actionRow.reduceCount,
+    publishVerifiedPartial: actionRow.publishVerifiedPartial,
+    pause: actionRow.pause,
+    resumeLater: actionRow.resumeLater,
+    cancel: actionRow.cancel,
+  };
+  if (Object.values(actions).some((value) => typeof value !== "boolean")
+    || actions.pause !== true
+    || actions.cancel !== true
+    || actions.anotherBoundedPass !== (
+      reason === "active_compute_limit"
+      && remainingStrategyCount > 0
+      && activeComputeExtensionsUsed < MAX_ACTIVE_COMPUTE_EXTENSIONS_V1
+    )
+    || actions.reviseNamedPredicate !== (namedPredicates.length > 0)
+    || actions.reduceCount !== (
+      verifiedTrackCount > 0 && verifiedTrackCount < targetTrackCount
+    )
+    || actions.publishVerifiedPartial !== (
+      (reason === "active_compute_limit"
+        || reason === "frontier_exhausted_under_policy")
+      && verifiedTrackCount > 0
+      && verifiedTrackCount < targetTrackCount
+    )
+    || actions.resumeLater !== (
+      reason === "dependency_retry_window_expired"
+    )) {
+    return null;
+  }
+  const hashBody: AdaptiveRunDecisionBodyV1 = {
+    schemaVersion: ADAPTIVE_RUN_DECISION_SCHEMA_V1,
+    contractRevisionId: row.contractRevisionId,
+    contractSemanticHash: row.contractSemanticHash,
+    reason,
+    targetTrackCount,
+    verifiedTrackCount,
+    remainingStrategyCount,
+    consumedActiveComputeMs,
+    activeComputeLimitMs,
+    activeComputeExtensionsUsed,
+    namedPredicates,
+    interpretationSummary: {
+      mustHave,
+      prefer,
+      avoid,
+      flow,
+      count: targetTrackCount,
+    },
+    actions: {
+      anotherBoundedPass: actions.anotherBoundedPass,
+      reviseNamedPredicate: actions.reviseNamedPredicate,
+      reduceCount: actions.reduceCount,
+      publishVerifiedPartial: actions.publishVerifiedPartial,
+      pause: true,
+      resumeLater: actions.resumeLater,
+      cancel: true,
+    },
+    reachedAt,
+  };
+  if (adaptiveRunDecisionHashV1(hashBody) !== row.decisionHash) return null;
   return {
     kind: "research_boundary",
     decisionHash: row.decisionHash,
@@ -273,20 +398,20 @@ export function publicAdaptiveRunDecisionV1(value: unknown): RunDecisionActionVi
     activeComputeExtensionsUsed,
     namedPredicates,
     interpretationSummary: {
-      mustHave: stringList(summaryRow.mustHave),
-      prefer: stringList(summaryRow.prefer),
-      avoid: stringList(summaryRow.avoid),
-      flow: stringList(summaryRow.flow),
+      mustHave: stringList(mustHave),
+      prefer: stringList(prefer),
+      avoid: stringList(avoid),
+      flow: stringList(flow),
       count: targetTrackCount,
     },
     actions: {
-      anotherBoundedPass: actionRow.anotherBoundedPass === true,
-      reviseNamedPredicate: actionRow.reviseNamedPredicate === true && namedPredicates.length > 0,
-      reduceCount: actionRow.reduceCount === true,
-      publishVerifiedPartial: actionRow.publishVerifiedPartial === true,
-      pause: actionRow.pause === true,
-      resumeLater: actionRow.resumeLater === true,
-      cancel: actionRow.cancel === true,
+      anotherBoundedPass: actions.anotherBoundedPass,
+      reviseNamedPredicate: actions.reviseNamedPredicate,
+      reduceCount: actions.reduceCount,
+      publishVerifiedPartial: actions.publishVerifiedPartial,
+      pause: actions.pause,
+      resumeLater: actions.resumeLater,
+      cancel: actions.cancel,
     },
     reachedAt: new Date(Date.parse(reachedAt)).toISOString(),
   };

@@ -24,6 +24,7 @@ import {
   publicGuidanceQuestionV3,
 } from "../server/adaptive-guidance-contract-bridge.ts";
 import {
+  canonicalExecutorReleaseIdentityV1,
   Repository,
   type CreateCanonicalRunSuccessorInput,
 } from "../server/repository.ts";
@@ -41,6 +42,7 @@ import {
   PUBLIC_ROLLOUT_ASSIGNMENT_VERSION,
   type PersistedPublicRolloutAssignmentV1,
 } from "../server/public-rollout-assignment.ts";
+import { queryPlanV3Hash } from "../server/query-plan-v3.ts";
 import type { PublicRolloutConfiguration } from "../shared/public-rollout-evidence.ts";
 import { signedArtifactSha256 } from "../shared/signed-artifact.ts";
 import {
@@ -53,6 +55,20 @@ import {
   AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
   PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
 } from "../server/playlist-count-policy.ts";
+import type { UnsignedReleaseCanaryMetadata } from "../server/release-canary-metadata.ts";
+import {
+  EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+  type ExecutionRouteReceiptV1,
+} from "../server/execution-route-receipt-v1.ts";
+import {
+  createLegacyExecutionRouteDrainV1,
+  legacyExecutionRouteDrainAuthorizesJobV1,
+  LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1,
+  LEGACY_EXECUTION_ROUTE_DRAIN_VERSION_V1,
+} from "../server/legacy-execution-route-drain-v1.ts";
+import {
+  executeLegacyExecutionRouteDrainInventoryV1,
+} from "../scripts/inventory-legacy-execution-route-drain.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
@@ -65,6 +81,22 @@ const migrationSql = readdirSync(migrationDirectory)
     "utf8",
   ))
   .join("\n-- statement-breakpoint\n");
+
+function ownerCanaryMarker(
+  operation: "brief" | "run",
+  canaryId: string,
+): UnsignedReleaseCanaryMetadata {
+  return {
+    version: "genio-release-canary/v1",
+    canaryId,
+    environment: "staging",
+    audience: "https://staging.9enio.example",
+    operation,
+    sourceRevision: "a".repeat(40),
+    issuedAt: "2026-08-01T12:00:00.000Z",
+    cacheMode: "reuse_disabled",
+  };
+}
 
 async function applySql(pool: Pool, sql: string): Promise<void> {
   const client = await pool.connect();
@@ -248,6 +280,7 @@ function mismatchedRolloutAuthority(): {
     PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
     PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
     PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
     PIPELINE_V3_SIMILARITY_PERCENT: "100",
@@ -309,6 +342,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
   let repository: Repository;
 
   beforeAll(async () => {
+    vi.stubEnv("SOURCE_COMMIT_SHA", "a".repeat(40));
     vi.stubEnv("APPLE_STOREFRONT", "us");
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
     vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
@@ -350,13 +384,22 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
 
   beforeEach(async () => {
     // This suite owns its unique PostgreSQL schema, but earlier cases may
-    // intentionally leave work queued. Drain only those suite-local rows so a
-    // lease assertion can never select another case's older job.
+    // intentionally leave work queued or runs admitted against the global
+    // capacity guard. Drain only those suite-local rows so neither a lease nor
+    // a successor assertion can observe another case's active work.
     await pool.query(
       `UPDATE job_queue
        SET status='complete',completed_at=COALESCE(completed_at,now()),
            lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
        WHERE status IN ('queued','retry','leased')`,
+    );
+    await pool.query(
+      `UPDATE research_runs
+       SET status='cancelled',phase='test_isolation_cleanup',
+           completed_at=COALESCE(completed_at,now()),updated_at=now()
+       WHERE status IN (
+         'queued','researching','ready_for_matching','matching','publishing'
+       )`,
     );
   });
 
@@ -373,6 +416,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     compiler?: string;
     idempotencyKey?: string;
     rolloutIntentMismatch?: boolean;
+    ordinaryOwner?: boolean;
   } = {}) {
     const rawPrompt =
       `Create 20 reggaeton tracks ${randomUUID().slice(0, 8)}`;
@@ -386,6 +430,8 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     const rollout = input.rolloutIntentMismatch
       ? mismatchedRolloutAuthority()
       : null;
+    const canaryId = `owner-route-${randomUUID()}`;
+    const ownerCanary = !input.rolloutIntentMismatch && !input.ordinaryOwner;
     const briefRequest = await repository.createBriefRequest({
       prompt: rawPrompt,
       requestedTrackCount: 20,
@@ -395,6 +441,9 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       idempotencyKey: randomUUID(),
       briefContractVersion: 3,
       publicRolloutAssignment: rollout?.assignment ?? null,
+      releaseCanary: ownerCanary
+        ? ownerCanaryMarker("brief", canaryId)
+        : null,
     });
     if (rollout) {
       await pool.query(
@@ -447,6 +496,10 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       reuseDays: 0,
       globalLimit: 100,
       forceFreshResearch: !input.rolloutIntentMismatch,
+      releaseCanary: ownerCanary
+        ? ownerCanaryMarker("run", canaryId)
+        : null,
+      releaseCanaryOwnerAuthorized: ownerCanary,
     };
     const created = await repository.createRunIdempotent(createInput);
     return {
@@ -460,6 +513,202 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     };
   }
 
+  test("force-fresh owner traffic cannot become implicit Contract-3 canary authority", async () => {
+    await expect(createCanonicalRun({
+      ordinaryOwner: true,
+    })).rejects.toMatchObject({
+      statusCode: 503,
+      code: "contract_execution_assignment_paused",
+    });
+  });
+
+  test("authenticated owner canary persists one exact route receipt", async () => {
+    const fixture = await createCanonicalRun();
+    const receipt = await repository.getResearchCheckpoint(
+      fixture.created.runId,
+      EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+    ) as ExecutionRouteReceiptV1 | null;
+    expect(receipt).toMatchObject({
+      version: EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+      trafficClass: "owner_canary",
+      contractVersion: 3,
+      executionRoute: "corpus_first_v3",
+      assignmentAuthority: {
+        kind: "signed_owner_canary",
+        assignmentReason: "owner_canary",
+      },
+      queryPlanSchema: expect.any(Number),
+      queryPlanHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      capabilitySnapshotHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      receiptHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    });
+  });
+
+  test("leases a hash-bound continuation without replacing its immutable route receipt", async () => {
+    const fixture = await createCanonicalRun();
+    const receiptBefore = await repository.getResearchCheckpoint(
+      fixture.created.runId,
+      EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+    ) as ExecutionRouteReceiptV1;
+    const source = (await pool.query<{
+      id: string;
+      plan_hash: string;
+    }>(
+      `SELECT query.id,query.plan_hash
+       FROM run_active_query_plans active
+       JOIN query_plan_revisions query
+         ON query.id=active.query_plan_revision_id
+       WHERE active.run_id=$1`,
+      [fixture.created.runId],
+    )).rows[0]!;
+    const sourceStageKey =
+      `v3-retrieval:active:${source.plan_hash.slice(0, 48)}`;
+    const outcomeHash = sha256Hex(`partial:${fixture.created.runId}`);
+    const strategyIds = [
+      "curated_genre_scene:trusted_scoped_containers",
+    ];
+    await pool.query(
+      `UPDATE job_queue SET status='complete',completed_at=now(),updated_at=now()
+       WHERE run_id=$1 AND status IN ('queued','retry','leased')`,
+      [fixture.created.runId],
+    );
+    await repository.saveResearchCheckpoint(
+      fixture.created.runId,
+      "partial_ready",
+      {
+        outcomeHash,
+        outcomeVersion: 1,
+        targetTrackCount: 20,
+        verifiedTrackCount: 16,
+        shortfall: 4,
+        remainingStrategyCount: 1,
+        continueAvailable: true,
+        continuationStrategyIds: strategyIds,
+        queryPlanRevisionId: source.id,
+        queryPlanHash: source.plan_hash,
+        stageKey: sourceStageKey,
+        preparedAt: new Date().toISOString(),
+      },
+    );
+    await repository.updateRun(fixture.created.runId, {
+      status: "partial_ready",
+      phase: "partial_confirmation_required",
+      error: null,
+    });
+
+    await expect(repository.continuePartialResearch({
+      runId: fixture.created.runId,
+      outcomeVersion: 1,
+      idempotencyKey: randomUUID(),
+    })).resolves.toEqual({ queued: true });
+
+    const receiptAfter = await repository.getResearchCheckpoint(
+      fixture.created.runId,
+      EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+    );
+    expect(receiptAfter).toEqual(receiptBefore);
+    const continuation = await repository.getResearchCheckpoint(
+      fixture.created.runId,
+      "partial_research_continuation",
+    ) as Record<string, unknown>;
+    expect(continuation).toMatchObject({
+      sourceQueryPlanRevisionId: source.id,
+      sourceQueryPlanHash: source.plan_hash,
+      sourceStageKey,
+      strategyIds,
+      outcomeHash,
+      outcomeVersion: 1,
+      successorQueryPlanRevisionId: expect.any(String),
+      successorQueryPlanHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      successorStageKey: expect.any(String),
+      jobId: expect.any(String),
+    });
+
+    const continuationWorkerId = `continuation-worker-${randomUUID()}`;
+    const queuedAuthority = (await pool.query<{
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue WHERE id=$1`,
+      [continuation.jobId],
+    )).rows[0]!;
+    await repository.updateWorkerHeartbeat(continuationWorkerId, {
+      version: queuedAuthority.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        queuedAuthority.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
+    const leased = await repository.leaseNextJob(
+      continuationWorkerId,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    );
+    expect(leased).toMatchObject({
+      id: continuation.jobId,
+      runId: fixture.created.runId,
+      kind: "research",
+      pipelineVersion: "corpus_first_v3",
+      queryPlanRevisionId: continuation.successorQueryPlanRevisionId,
+      stageKey: continuation.successorStageKey,
+    });
+
+    await pool.query(
+      `UPDATE job_queue
+       SET status='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+       WHERE id=$1`,
+      [continuation.jobId],
+    );
+    await pool.query(
+      "UPDATE query_plan_revisions SET status='active' WHERE id=$1",
+      [source.id],
+    );
+    await expect(repository.leaseNextJob(
+      `reactivated-parent-worker-${randomUUID()}`,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    )).rejects.toMatchObject({
+      statusCode: 409,
+      code: "execution_route_receipt_mismatch",
+    });
+    expect((await pool.query<{ status: string }>(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [continuation.jobId],
+    )).rows[0]?.status).toBe("queued");
+    await pool.query(
+      "UPDATE query_plan_revisions SET status='superseded' WHERE id=$1",
+      [source.id],
+    );
+    await pool.query(
+      `UPDATE research_checkpoints
+       SET state_json=jsonb_set(
+         state_json,
+         '{strategyIds}',
+         '["forged:strategy"]'::jsonb
+       ),updated_at=now()
+       WHERE run_id=$1 AND phase='partial_research_continuation'`,
+      [fixture.created.runId],
+    );
+    await expect(repository.leaseNextJob(
+      `tampered-continuation-worker-${randomUUID()}`,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    )).rejects.toMatchObject({
+      statusCode: 409,
+      code: "execution_route_receipt_mismatch",
+    });
+    expect((await pool.query<{ status: string }>(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [continuation.jobId],
+    )).rows[0]?.status).toBe("queued");
+  }, 30_000);
+
   async function createProductionFixedThreeRun() {
     const rawPrompt = [
       "Build a playlist containing exactly these three original studio recordings, in this order:",
@@ -469,6 +718,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       "Exclude remixes, live versions, radio edits, covers, re-recordings, and duplicates.",
     ].join("\n");
     const clientBucket = `fixed-three-successor-${randomUUID()}`;
+    const canaryId = `owner-fixed-three-${randomUUID()}`;
     const playlistBrief: PlaylistBrief = {
       title: "Pop Classics Trio",
       description: "The exact three original studio recordings.",
@@ -521,6 +771,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       briefContractVersion: 3,
+      releaseCanary: ownerCanaryMarker("brief", canaryId),
     });
     const persisted = await repository.savePlaylistContractRevision({
       briefRequestId: briefRequest.id,
@@ -556,6 +807,8 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       reuseDays: 0,
       globalLimit: 100,
       forceFreshResearch: true,
+      releaseCanary: ownerCanaryMarker("run", canaryId),
+      releaseCanaryOwnerAuthorized: true,
     });
     return {
       compatibilityPlan,
@@ -947,7 +1200,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     ]);
   }, 30_000);
 
-  test("accepts an unsupported future contract as an actionable decision with no execution job", async () => {
+  test("fails closed when an unsupported future contract lacks a public advancing-action artifact", async () => {
     const fixture = await createCanonicalRun({
       compiler: "playlist_contract_compiler_v99",
     });
@@ -1019,8 +1272,8 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
       status: "needs_decision",
       phase: "capability_decision_required",
       resolution: {
-        state: "needs_decision",
-        nextAction: "review_contract",
+        state: "quarantined",
+        nextAction: "contact_support",
         terminal: false,
         contractRevisionId: fixture.contractDatabaseId,
         blocker: {
@@ -1102,7 +1355,7 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     });
   }, 30_000);
 
-  test("persists a rollout intent change as a durable immutable decision instead of a 409 or downgrade", async () => {
+  test("persists a rollout intent change and quarantines its expired public action", async () => {
     const fixture = await createCanonicalRun({
       rolloutIntentMismatch: true,
     });
@@ -1160,8 +1413,8 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
         status: "needs_decision",
         phase: "public_rollout_successor_required",
         resolution: {
-          state: "needs_decision",
-          nextAction: "review_contract",
+          state: "quarantined",
+          nextAction: "contact_support",
           blocker: { kind: "scope_decision" },
         },
       });
@@ -1214,6 +1467,330 @@ databaseDescribe("canonical contract capability decisions and successor runs", (
     } finally {
       vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
     }
+  }, 30_000);
+
+  test("refuses to lease Contract-3 work after its admission receipt is mutated", async () => {
+    const fixture = await createCanonicalRun();
+    const queryPlan = await repository.getActiveQueryPlan(
+      fixture.created.runId,
+    );
+    expect(queryPlan).not.toBeNull();
+    const queued = await repository.enqueueJob(
+      pipelineV3ResearchJob(fixture.created.runId, queryPlan!),
+    );
+    await pool.query(
+      `UPDATE research_checkpoints
+       SET state_json=jsonb_set(
+         state_json,
+         '{releaseRevision}',
+         to_jsonb('tampered-after-admission'::text)
+       )
+       WHERE run_id=$1 AND phase=$2`,
+      [fixture.created.runId, EXECUTION_ROUTE_RECEIPT_PHASE_V1],
+    );
+
+    await expect(repository.leaseNextJob(
+      `route-receipt-worker-${randomUUID()}`,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    )).rejects.toMatchObject({
+      statusCode: 409,
+      code: "execution_route_receipt_mismatch",
+    });
+    expect((await pool.query<{ status: string }>(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [queued.id],
+    )).rows[0]?.status).toBe("queued");
+
+    await pool.query(
+      `UPDATE job_queue
+       SET status='retry',available_at=now(),updated_at=now()
+       WHERE id=$1`,
+      [queued.id],
+    );
+  }, 30_000);
+
+  test("refuses a missing Contract-3 route receipt unless the exact pre-cutoff job was inventoried", async () => {
+    const fixture = await createCanonicalRun();
+    const queryPlan = await repository.getActiveQueryPlan(
+      fixture.created.runId,
+    );
+    expect(queryPlan).not.toBeNull();
+    const queued = await repository.enqueueJob(
+      pipelineV3ResearchJob(fixture.created.runId, queryPlan!),
+    );
+    const persisted = (await pool.query<{
+      id: string;
+      kind: "research";
+      query_plan_revision_id: string;
+      stage_key: string;
+      created_at: Date;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT id,kind,query_plan_revision_id,stage_key,created_at,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue WHERE id=$1`,
+      [queued.id],
+    )).rows[0]!;
+    await pool.query(
+      `DELETE FROM research_checkpoints
+       WHERE run_id=$1 AND phase=$2`,
+      [fixture.created.runId, EXECUTION_ROUTE_RECEIPT_PHASE_V1],
+    );
+
+    await expect(repository.leaseNextJob(
+      `missing-route-receipt-worker-${randomUUID()}`,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    )).rejects.toMatchObject({
+      statusCode: 409,
+      code: "execution_route_receipt_mismatch",
+    });
+    expect((await pool.query<{ status: string }>(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [queued.id],
+    )).rows[0]?.status).toBe("queued");
+
+    const inventoriedAt = new Date(
+      persisted.created_at.getTime() + 1_000,
+    ).toISOString();
+    const inventoryInput = {
+      acceptedBefore: inventoriedAt,
+      inventoriedAt,
+      targetReleaseRevision: persisted.required_executor_revision,
+      targetSemanticConfigurationHash:
+        persisted.required_executor_semantic_configuration_hash,
+    };
+    const inventoryClient = await pool.connect();
+    try {
+      const dryRun =
+        await executeLegacyExecutionRouteDrainInventoryV1(
+          inventoryClient,
+          {
+            ...inventoryInput,
+            mode: "dry-run",
+            expectedReceiptHash: null,
+          },
+        );
+      expect(dryRun).toMatchObject({
+        mode: "dry-run",
+        safeToApply: true,
+        runCount: 1,
+        jobCount: 1,
+      });
+      await expect(executeLegacyExecutionRouteDrainInventoryV1(
+        inventoryClient,
+        {
+          ...inventoryInput,
+          mode: "apply",
+          expectedReceiptHash: String(dryRun.receiptHash),
+        },
+      )).resolves.toMatchObject({
+        mode: "apply",
+        applied: true,
+        runCount: 1,
+        jobCount: 1,
+      });
+    } finally {
+      inventoryClient.release();
+    }
+    const inventoryBinding = (await pool.query<{
+      state_json: unknown;
+      active_contract_revision_id: string;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+      query_plan_hash: string;
+      created_at: Date;
+    }>(
+      `SELECT checkpoint.state_json,
+              run.active_playlist_contract_revision_id
+                active_contract_revision_id,
+              job.required_executor_revision,
+              job.required_executor_semantic_configuration_hash,
+              query.plan_hash query_plan_hash,
+              job.created_at
+       FROM job_queue job
+       JOIN research_runs run ON run.id=job.run_id
+       JOIN query_plan_revisions query
+         ON query.id=job.query_plan_revision_id
+       JOIN research_checkpoints checkpoint
+         ON checkpoint.run_id=run.id
+        AND checkpoint.phase=$2
+       WHERE job.id=$1`,
+      [queued.id, LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1],
+    )).rows[0]!;
+    const currentReleaseIdentity = canonicalExecutorReleaseIdentityV1();
+    expect(inventoryBinding).toMatchObject({
+      active_contract_revision_id: fixture.contractDatabaseId,
+      required_executor_revision:
+        currentReleaseIdentity.executorRevision,
+      required_executor_semantic_configuration_hash:
+        currentReleaseIdentity.semanticExecutionConfigurationHash,
+    });
+    expect(legacyExecutionRouteDrainAuthorizesJobV1({
+      value: inventoryBinding.state_json,
+      runId: fixture.created.runId,
+      contractRevisionId: inventoryBinding.active_contract_revision_id,
+      executionRoute: "corpus_first_v3",
+      targetReleaseRevision: currentReleaseIdentity.executorRevision,
+      targetSemanticConfigurationHash:
+        currentReleaseIdentity.semanticExecutionConfigurationHash,
+      jobId: persisted.id,
+      kind: persisted.kind,
+      queryPlanRevisionId: persisted.query_plan_revision_id,
+      queryPlanHash: inventoryBinding.query_plan_hash,
+      stageKey: persisted.stage_key,
+      createdAt: inventoryBinding.created_at,
+    })).toBe(true);
+
+    const drainWorkerId =
+      `inventoried-route-drain-worker-${randomUUID()}`;
+    await pool.query(
+      `INSERT INTO worker_heartbeats(
+         worker_id,schema_version,capacity,active_jobs,metadata_json,
+         started_at,last_seen_at
+       ) VALUES(
+         $1,'20',1,0,
+         jsonb_build_object(
+           'version',$2::text,
+           'semanticExecutionConfigurationHash',$3::text,
+           'protocolNumber',12,
+           'protocolVersion','playlist-pipeline-v12',
+           'queueClass','deep',
+           'observedSchemaVersion','20'
+         ),
+         now(),now()
+       )`,
+      [
+        drainWorkerId,
+        currentReleaseIdentity.executorRevision,
+        currentReleaseIdentity.semanticExecutionConfigurationHash,
+      ],
+    );
+    const leased = await repository.leaseNextJob(
+      drainWorkerId,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    );
+    expect(leased).toMatchObject({
+      id: queued.id,
+      runId: fixture.created.runId,
+      pipelineVersion: "corpus_first_v3",
+      queryPlanRevisionId: persisted.query_plan_revision_id,
+    });
+  }, 30_000);
+
+  test("does not let a direct post-inventory Contract-3 job inherit the legacy drain exemption", async () => {
+    const fixture = await createCanonicalRun();
+    const queryPlan = await repository.getActiveQueryPlan(
+      fixture.created.runId,
+    );
+    expect(queryPlan).not.toBeNull();
+    const source = await repository.enqueueJob(
+      pipelineV3ResearchJob(fixture.created.runId, queryPlan!),
+    );
+    const sourceRow = (await pool.query<{
+      id: string;
+      kind: "research";
+      query_plan_revision_id: string;
+      stage_key: string;
+      created_at: Date;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT id,kind,query_plan_revision_id,stage_key,created_at,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue WHERE id=$1`,
+      [source.id],
+    )).rows[0]!;
+    const acceptedBefore = new Date(
+      sourceRow.created_at.getTime() + 1_000,
+    ).toISOString();
+    const drain = createLegacyExecutionRouteDrainV1({
+      version: LEGACY_EXECUTION_ROUTE_DRAIN_VERSION_V1,
+      runId: fixture.created.runId,
+      contractRevisionId: fixture.contractDatabaseId,
+      executionRoute: "corpus_first_v3",
+      targetReleaseRevision: sourceRow.required_executor_revision,
+      targetSemanticConfigurationHash:
+        sourceRow.required_executor_semantic_configuration_hash,
+      acceptedBefore,
+      inventoriedAt: acceptedBefore,
+      jobs: [{
+        jobId: sourceRow.id,
+        kind: sourceRow.kind,
+        queryPlanRevisionId: sourceRow.query_plan_revision_id,
+        queryPlanHash: queryPlanV3Hash(queryPlan!),
+        stageKey: sourceRow.stage_key,
+        createdAt: sourceRow.created_at.toISOString(),
+        sourceExecutorRevision: sourceRow.required_executor_revision,
+        sourceSemanticConfigurationHash:
+          sourceRow.required_executor_semantic_configuration_hash,
+      }],
+    });
+    await pool.query(
+      `DELETE FROM research_checkpoints
+       WHERE run_id=$1 AND phase=$2`,
+      [fixture.created.runId, EXECUTION_ROUTE_RECEIPT_PHASE_V1],
+    );
+    await repository.saveResearchCheckpoint(
+      fixture.created.runId,
+      LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1,
+      drain as unknown as Record<string, unknown>,
+    );
+    await pool.query(
+      `UPDATE job_queue
+       SET status='complete',completed_at=now(),updated_at=now()
+       WHERE id=$1`,
+      [source.id],
+    );
+    const directId = randomUUID();
+    await pool.query(
+      `INSERT INTO job_queue(
+         id,run_id,kind,dedupe_key,payload_json,max_attempts,
+         pipeline_version,minimum_worker_protocol,query_plan_revision_id,
+         stage_key,queue_class,required_executor_revision,
+         required_executor_semantic_configuration_hash)
+       SELECT $1,$2,'research',$3,$4::jsonb,1,'corpus_first_v3',
+              minimum_worker_protocol,$5,$6,queue_class,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue WHERE id=$7`,
+      [
+        directId,
+        fixture.created.runId,
+        `direct-after-inventory:${directId}`,
+        JSON.stringify({
+          runId: fixture.created.runId,
+          phase: "v3_retrieval",
+          v3ExecutionMode: "active",
+          stageExecutionKey: sourceRow.stage_key,
+        }),
+        sourceRow.query_plan_revision_id,
+        sourceRow.stage_key,
+        source.id,
+      ],
+    );
+
+    await expect(repository.leaseNextJob(
+      `post-inventory-route-drain-worker-${randomUUID()}`,
+      120_000,
+      WORKER_PIPELINE_CAPABILITY,
+      "all",
+    )).rejects.toMatchObject({
+      statusCode: 409,
+      code: "execution_route_receipt_mismatch",
+    });
+    expect((await pool.query<{ status: string }>(
+      "SELECT status FROM job_queue WHERE id=$1",
+      [directId],
+    )).rows[0]?.status).toBe("queued");
   }, 30_000);
 
   test("creates one linked successor, fences a leased old worker, and preserves immutable history", async () => {

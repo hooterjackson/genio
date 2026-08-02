@@ -35,6 +35,7 @@ export const PUBLIC_ROLLOUT_PERCENT_FLAGS = [
   "PIPELINE_V2_CURATED_PERCENT",
   "PIPELINE_V2_SIMILARITY_PERCENT",
   "PIPELINE_V2_FACTUAL_PERCENT",
+  "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
   "PIPELINE_V3_GENRE_SCENE_PERCENT",
   "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
   "PIPELINE_V3_SIMILARITY_PERCENT",
@@ -69,6 +70,7 @@ export interface ActivationRolloutConfiguration
   PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true";
   PIPELINE_V3_OWNER_CANARY_GROUPS: string;
   PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: string;
+  PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0";
   PIPELINE_V3_GENRE_SCENE_PERCENT: "0";
   PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0";
   PIPELINE_V3_SIMILARITY_PERCENT: "0";
@@ -102,6 +104,7 @@ const SAFE_LABEL = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$/u;
 const SAFE_COHORT_KEY = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$/u;
 const SAFE_INTENT_GROUP = /^[a-z][a-z0-9_]{0,79}$/u;
 const OWNER_ROUTE_GROUPS = [
+  "editorial_influence",
   "genre_scene",
   "mood_activity_theme",
   "similarity",
@@ -442,10 +445,12 @@ function validateActivationPreflight(value: unknown): {
   if (
     groups.length < 1
     || groups.length !== new Set(groups).size
-    || !groups.includes("genre_scene")
+    || !groups.some((group) => (
+      group === "genre_scene" || group === "editorial_influence"
+    ))
   ) {
     throw new Error(
-      "activation preflight owner candidate groups must uniquely include genre_scene",
+      "activation preflight owner candidate groups must uniquely include genre_scene or editorial_influence",
     );
   }
   if (
@@ -481,6 +486,7 @@ function validateActivationPreflight(value: unknown): {
     PIPELINE_V3_OWNER_CANARY_GROUPS: groups.join(","),
     PIPELINE_V3_OWNER_CANARY_MAX_TRACKS:
       String(ownerCandidateRoute.maximumTrackCount),
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
     PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
     PIPELINE_V3_SIMILARITY_PERCENT: "0",

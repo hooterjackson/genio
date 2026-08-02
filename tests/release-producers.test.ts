@@ -12,6 +12,9 @@ import { createStrictSignedEnvelope } from "../shared/signed-artifact.ts";
 import {
   createSitesProductionRollbackTargetV1,
 } from "../shared/sites-production-rollback.ts";
+import { guidanceCheckpointV5 } from "../server/adaptive-guidance-v5.ts";
+import { publicGuidanceQuestionV5 } from "../server/adaptive-guidance-contract-bridge.ts";
+import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import {
   parseReleaseConvergenceProducerArgs,
 } from "../scripts/release-convergence-producer.ts";
@@ -40,7 +43,54 @@ import {
 const revision = "a".repeat(40);
 const imageDigest = `sha256:${"b".repeat(64)}`;
 const publicRolloutEvidenceHash = "e".repeat(64);
-const publicRolloutStage = "exhaustive:50->100";
+const publicRolloutStage = "editorial_influence:50->100";
+
+function irishGuidancePayload() {
+  const baseContract = compilePlaylistContractRevisionV1({
+    contractId: "release-producer:irish-influence",
+    rawPrompt: "Infuential irish music",
+    requestedTrackCount: 25,
+    locale: "en",
+    storefront: "us",
+    clauses: [
+      {
+        id: "membership:origin",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "artist_origin",
+        operator: "require",
+        values: ["Irish"],
+        source: { provenance: "prompt", text: "irish" },
+      },
+      {
+        id: "ranking:influence",
+        kind: "ranking_preference",
+        scope: "track",
+        hardness: "soft",
+        axis: "influence",
+        operator: "prefer",
+        values: ["historical influence"],
+        source: { provenance: "prompt", text: "Infuential" },
+      },
+    ],
+    trackPredicate: { op: "clause", clauseId: "membership:origin" },
+  });
+  const checkpoint = guidanceCheckpointV5({
+    prompt: baseContract.rawPrompt,
+    baseContract,
+    preservedTrackPredicate: baseContract.trackPredicate,
+    ambiguousScopeClauseIds: [],
+    criticalAmbiguities: [],
+    requestShape: "curated",
+    capabilitySnapshotHash: "a".repeat(64),
+    semanticConfigurationHash: "b".repeat(64),
+  });
+  return {
+    questionSetHash: "c".repeat(64),
+    questions: [publicGuidanceQuestionV5(checkpoint.decisions[0]!)],
+  };
+}
 
 function producerFiles(): string[] {
   return [
@@ -221,7 +271,36 @@ describe("live release gate producers", () => {
     expect(() => parseFinalCustomDomainBrowserProducerArgs(
       invalidRolloutStage,
       trustedSitesEnvironment,
-    )).toThrow(/encode a governed intent transition/u);
+    )).toThrow(/encode editorial_influence transitioning/u);
+    const direct = [...base];
+    for (const option of [
+      "--expected-public-rollout-evidence-hash",
+      "--expected-public-rollout-stage",
+    ]) {
+      const optionIndex = direct.indexOf(option);
+      expect(optionIndex).toBeGreaterThanOrEqual(0);
+      direct.splice(optionIndex, 2);
+    }
+    direct.push(
+      "--direct-exposure",
+      "--expected-direct-exposure-authority-hash",
+      "9".repeat(64),
+      "--sites-control-plane-evidence",
+      "/tmp/sites-control-plane.json",
+      "--sites-control-plane-attestation",
+      "/tmp/sites-attestation.json",
+      "--sites-control-plane-verification-key",
+      "/tmp/sites-public.pem",
+    );
+    expect(parseFinalCustomDomainBrowserProducerArgs(
+      direct,
+      trustedSitesEnvironment,
+    )).toMatchObject({
+      assignmentMode: "direct_exposure",
+      expectedPublicRolloutEvidenceHash: null,
+      expectedPublicRolloutStage: null,
+      expectedDirectExposureAuthorityHash: "9".repeat(64),
+    });
     expect(() => parseFinalCustomDomainBrowserProducerArgs([
       ...base,
       "--sites-control-plane-evidence", "/tmp/sites-control-plane.json",
@@ -271,33 +350,100 @@ describe("live release gate producers", () => {
     }
   });
 
-  test("uses code-owned prompts that classify into every public rollout intent", () => {
+  test("uses one code-owned Irish prompt for editorial-only public rollout", () => {
     expect(assertFinalPublicAssignmentProbeFixtureClassifications())
       .toBeUndefined();
     expect(FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture) => (
       fixture.intentGroup
     ))).toEqual([
-      "genre_scene",
-      "mood_activity_theme",
-      "similarity",
-      "artist_catalogue",
-      "fixed_container",
-      "factual_relationship",
-      "exhaustive",
+      "editorial_influence",
+      "editorial_influence",
     ]);
   });
 
   test("sanitizes a live public assignment lifecycle and fails closed", () => {
-    const fixture = FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1[0];
+    const fixture = FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1[0]!;
+    const guidancePayload = irishGuidancePayload();
     const result = {
       postStatus: 202,
       requestIdValid: true,
       rolloutEvidenceHash: publicRolloutEvidenceHash,
       rolloutStage: publicRolloutStage,
       assignmentHash: "f".repeat(64),
+      assignmentReceiptHash: "f".repeat(64),
       getStatus: 200,
       contractVersion: 3,
-      cleanupStatus: 204,
+      guidancePayload,
+      questionVisible: true,
+      selectedOptionVisible: true,
+      answerStatus: 202,
+      finalBriefStatus: "complete",
+      runCreateStatus: 202,
+      runReused: false,
+      runAccessIdValid: true,
+      runAccessIdHash: "1".repeat(64),
+      runUiVisible: true,
+      noPublishedUi: true,
+      runGetStatus: 200,
+      resultGetStatus: 200,
+      executionRouteReceipt: {
+        version: "execution_route_receipt_v1",
+        trafficClass: "synthetic",
+        guidanceVersion: "adaptive_guidance_v5",
+        executionRoute: "corpus_first_v3",
+        queryPlanSchema: 6,
+        assignmentKind: "signed_public_rollout",
+        intentGroup: "editorial_influence",
+        releaseRevision: revision,
+        receiptHash: "2".repeat(64),
+      },
+      resultPayload: {
+        status: "complete",
+        totalTracks: 0,
+        completedTracks: 0,
+        manifest: null,
+        executionProof: {
+          contractHash: "3".repeat(64),
+          workerConsumption: {
+            status: "consumed",
+            questionSetHash: guidancePayload.questionSetHash,
+            questionHash: guidancePayload.questions[0]!.questionHash,
+            selectedOptionId: "balanced_influence",
+            axis: "influence_scope",
+            queryPlanHash: "5".repeat(64),
+            contractSemanticHash: "3".repeat(64),
+            executionField: "rankingObjectives",
+            effectHash: "6".repeat(64),
+            resultEffectHash: "7".repeat(64),
+            receiptHash: "8".repeat(64),
+          },
+        },
+      },
+      manifestCanaryEvidence: {
+        schemaVersion: "genio-release-manifest-canary-evidence/v1",
+        environment: "production",
+        sourceRevision: revision,
+        executionMode: "shadow",
+        publicationBoundary: "database_fenced",
+        appleWriteAccess: "forbidden",
+        outcome: "exact_ready",
+        requestedTrackCount: 25,
+        selectedTrackCount: 25,
+        reserveTrackCount: 5,
+        evidenceHash: "4".repeat(64),
+        qualifiedManifestHash: "5".repeat(64),
+        attempts: [{}],
+        executorIdentityHashes: ["a".repeat(64)],
+        configurationHashes: ["b".repeat(64)],
+        zeroWriteProof: {
+          autoPublish: false,
+          manifestRows: 0,
+          matchingJobs: 0,
+          publicationJobs: 0,
+          publicationVolumeRows: 0,
+          orphanPlaylistRows: 0,
+        },
+      },
     };
     const evidence = validateBrowserPublicAssignmentProbeResultV1({
       fixture,
@@ -312,8 +458,42 @@ describe("live release gate producers", () => {
       rolloutEvidenceHash: publicRolloutEvidenceHash,
       rolloutStage: publicRolloutStage,
       assignmentHash: "f".repeat(64),
+      assignmentAuthority: "signed_public_rollout",
+      assignmentReceiptHash: "f".repeat(64),
+      publicPercentageBypass: false,
+      organicAssignment: true,
       contractVersion: 3,
-      cleanupStatus: 204,
+      guidancePolicyVersion: "adaptive_guidance_v5",
+      questionSetHash: guidancePayload.questionSetHash,
+      questionHash: guidancePayload.questions[0]!.questionHash,
+      axis: "influence_scope",
+      selectedOptionId: "balanced_influence",
+      answerAccepted: true,
+      successorContractHash: "3".repeat(64),
+      queryPlanHash: "5".repeat(64),
+      executionRouteReceiptHash: "2".repeat(64),
+      runAccessIdHash: "1".repeat(64),
+      workerConsumptionReceiptHash: "8".repeat(64),
+      workerExecutionEffectHash: "6".repeat(64),
+      workerResultEffectHash: "7".repeat(64),
+      manifestCanaryEvidenceHash: "4".repeat(64),
+      qualifiedManifestHash: "5".repeat(64),
+      selectedTrackCount: 25,
+      reserveTrackCount: 5,
+      attemptCount: 1,
+      executorIdentityHashes: ["a".repeat(64)],
+      configurationHashes: ["b".repeat(64)],
+      manifestOnly: true,
+      appleWriteAccess: "forbidden",
+      autoPublish: false,
+      manifestRows: 0,
+      matchingJobs: 0,
+      publicationJobs: 0,
+      publicationVolumeRows: 0,
+      orphanPlaylistRows: 0,
+      noPublishedUi: true,
+      runReused: false,
+      realUiPath: true,
     });
     expect(JSON.stringify(evidence)).not.toMatch(
       /prompt|requestId|cookie|capability/iu,
@@ -323,15 +503,42 @@ describe("live release gate producers", () => {
       { rolloutStage: "genre_scene:50->100" },
       { assignmentHash: null },
       { contractVersion: 2 },
-      { cleanupStatus: 200 },
+      { runUiVisible: false },
     ]) {
       expect(() => validateBrowserPublicAssignmentProbeResultV1({
         fixture,
         result: { ...result, ...mutation },
         expectedRolloutEvidenceHash: publicRolloutEvidenceHash,
         expectedRolloutStage: publicRolloutStage,
-      })).toThrow(/exact contract-3 assignment and cleanup/u);
+      })).toThrow(/exact manifest-only UI execution/u);
     }
+    const directAuthorityHash = "9".repeat(64);
+    const directEvidence = validateBrowserPublicAssignmentProbeResultV1({
+      fixture,
+      result: {
+        ...result,
+        rolloutEvidenceHash: directAuthorityHash,
+        rolloutStage:
+          "editorial_influence:0->100:fully_exposed_unproven",
+        executionRouteReceipt: {
+          ...result.executionRouteReceipt,
+          assignmentKind: "signed_public_direct_exposure",
+        },
+      },
+      assignmentMode: "direct_exposure",
+      expectedRolloutEvidenceHash: directAuthorityHash,
+      expectedRolloutStage: null,
+    });
+    expect(directEvidence).toMatchObject({
+      rolloutEvidenceHash: directAuthorityHash,
+      rolloutStage:
+        "editorial_influence:0->100:fully_exposed_unproven",
+      assignmentAuthority: "signed_public_direct_exposure",
+      publicPercentageBypass: false,
+      organicAssignment: false,
+      manifestOnly: true,
+      appleWriteAccess: "forbidden",
+    });
   });
 
   test("emits separate typed source, gate, and producer attestation files", async () => {
@@ -359,10 +566,39 @@ describe("live release gate producers", () => {
         rolloutStage: publicRolloutStage,
         assignmentHash: (index + 1).toString(16).padStart(64, "0"),
         contractVersion: 3,
-        cleanupStatus: 204,
+        guidancePolicyVersion: "adaptive_guidance_v5",
+        questionSetHash: irishGuidancePayload().questionSetHash,
+        questionHash: irishGuidancePayload().questions[0]!.questionHash,
+        axis: "influence_scope",
+        selectedOptionId: "balanced_influence",
+        answerAccepted: true,
+        successorContractHash: "6".repeat(64),
+        executionRouteReceiptHash: "7".repeat(64),
+        runAccessIdHash: "8".repeat(64),
+        workerConsumptionReceiptHash: "9".repeat(64),
+        workerExecutionEffectHash: "a".repeat(64),
+        workerResultEffectHash: "b".repeat(64),
+        manifestCanaryEvidenceHash: "c".repeat(64),
+        qualifiedManifestHash: "d".repeat(64),
+        selectedTrackCount: 25,
+        reserveTrackCount: 5,
+        attemptCount: 1,
+        executorIdentityHashes: ["e".repeat(64)],
+        configurationHashes: ["f".repeat(64)],
+        manifestOnly: true,
+        appleWriteAccess: "forbidden",
+        autoPublish: false,
+        manifestRows: 0,
+        matchingJobs: 0,
+        publicationJobs: 0,
+        publicationVolumeRows: 0,
+        orphanPlaylistRows: 0,
+        noPublishedUi: true,
+        runReused: false,
+        realUiPath: true,
       }));
     const browserUnsigned = {
-      schemaVersion: "genio-final-custom-domain-browser/v2",
+      schemaVersion: "genio-final-custom-domain-browser/v6",
       origin: "https://9enio.com",
       candidateRevision: revision,
       observedAt,
@@ -371,7 +607,12 @@ describe("live release gate producers", () => {
       anonymousPlaylistDirectory: true,
       publicPlaylistContentsVisible: true,
       privacyProjectionPassed: true,
-      screenshotHashes: ["c".repeat(64)],
+      noDirectRailwayRequests: true,
+      screenshotHashes: [
+        "c".repeat(64),
+        "d".repeat(64),
+        "e".repeat(64),
+      ],
       publicAssignmentProbes,
     };
     const priorRevision = "f".repeat(40);
@@ -570,13 +811,10 @@ describe("live release gate producers", () => {
     })).toThrow(/missing or unapproved fields/u);
     const duplicateAssignmentUnsigned = {
       ...browserUnsigned,
-      publicAssignmentProbes: browserUnsigned.publicAssignmentProbes.map(
-        (probe) => ({
-          ...probe,
-          assignmentHash:
-            browserUnsigned.publicAssignmentProbes[0]!.assignmentHash,
-        }),
-      ),
+      publicAssignmentProbes: [
+        ...browserUnsigned.publicAssignmentProbes,
+        browserUnsigned.publicAssignmentProbes[0]!,
+      ],
     };
     expect(() => createReleaseGateArtifactFromSources({
       gate: "final_custom_domain_browser",
@@ -592,7 +830,7 @@ describe("live release gate producers", () => {
           evidenceHash: releaseFixtureSha256(duplicateAssignmentUnsigned),
         },
       },
-    })).toThrow(/one exact signed rollout state/u);
+    })).toThrow(/did not prove|did not pass/u);
   });
 
   test("preflights the producer key and immutable output paths before live work", async () => {

@@ -1,7 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
 import {
+  createCentralQualityCriterionObservationV3,
+  createHostedWebEvidenceSnapshotV3,
   PIPELINE_V3_RETRIEVAL_SCHEMA,
+  publicTrackScopeAttestationV3,
   RetrievalDependencyErrorV3,
   RetrievalPlaylistOptimizationBudgetExceededErrorV3,
   type QualifiedTrackV3,
@@ -12,6 +15,7 @@ import {
   governedCorpusActionReasonV3,
   PIPELINE_V3_ACTIVE_COMPUTE_LIMIT_MS,
   PipelineV3DependencyUnavailableError,
+  PipelineV3EvidenceEnrichmentRetryError,
   PipelineV3OptimizerComputeBudgetError,
   PipelineV3WorkerExecution,
   createPipelineV3RetrievalExecutionPort,
@@ -41,7 +45,9 @@ import {
 } from "../server/pipeline-v3-policy.ts";
 import type { SemanticPlanRevisionArtifactV3 } from "../server/pipeline-v3-semantic-recovery.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
+import { applyPlaylistContractPatchV1 } from "../server/playlist-contract-v1.ts";
 import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import { canonicalExecutorCapabilityForSchemaV1 } from "../server/playlist-contract-backend-capability-v1.ts";
 import {
   compilePlaylistContractShadowV1,
 } from "../server/playlist-contract-shadow-bridge-v1.ts";
@@ -49,6 +55,32 @@ import {
   projectPlaylistContractExecutionV1,
 } from "../server/playlist-contract-execution-bridge-v1.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
+import {
+  centralQualityVerificationLeavesV1,
+  verificationLeavesV1,
+} from "../server/verification-expression-v1.ts";
+import { resolveMusicConceptV1 } from "../server/music-concept-registry-v1.ts";
+import {
+  PIPELINE_V3_CONCEPT_DISCOVERY_HINT_PROVENANCE,
+  PIPELINE_V3_CONCEPT_DISCOVERY_HINT_USAGE,
+} from "../server/pipeline-v3-concept-discovery-hint.ts";
+import { guidanceCheckpointV5 } from "../server/adaptive-guidance-v5.ts";
+import {
+  compileGuidanceRoundPatchV3,
+  publicGuidanceQuestionV5,
+} from "../server/adaptive-guidance-contract-bridge.ts";
+import {
+  createGuidanceWorkerExecutionAuthorityV5,
+  GUIDANCE_V5_EXECUTION_AUTHORITY_CHECKPOINT,
+  guidanceWorkerConsumptionCheckpointKeyV5,
+} from "../server/guidance-worker-consumption-v5.ts";
+import { semanticExecutionConfigurationHash } from "../server/runtime-release.ts";
+import {
+  createSemanticCollapseDatabaseFactsV2,
+} from "../server/semantic-collapse-coverage-v2.ts";
+import { publicAdaptiveRunDecisionV1 } from "../server/adaptive-run-decision-v1.ts";
+import { reduceResolutionFactsV1 } from "../server/resolution-facts-v1.ts";
+import { runResolutionControls } from "../app/playlist-builder-ui-policy.ts";
 
 const GRAPH_SNAPSHOT_ID = "11111111-1111-4111-8111-111111111111";
 const QUERY_PLAN_REVISION_ID = "22222222-2222-4222-8222-222222222222";
@@ -104,6 +136,189 @@ function canonicalQueryPlan(target = 25, schemaVersion: 5 | 6 = 5) {
       playlistContractCompilerVersion: contract.versions.compiler,
     }),
   };
+}
+
+function canonicalQualityQueryPlan(
+  target = 25,
+  schemaVersion: 5 | 6 = 5,
+) {
+  const prompt = `${target} influential disco recordings with dance-floor energy`;
+  const contract = compilePlaylistContractRevisionV1({
+    contractId: `canonical-disco-quality-${target}`,
+    rawPrompt: prompt,
+    requestedTrackCount: target,
+    locale: "en",
+    storefront: "us",
+    clauses: [
+      {
+        id: "prompt:genre:disco",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "genre",
+        operator: "require",
+        values: ["disco"],
+        source: { provenance: "prompt", text: "Disco" },
+      },
+      {
+        id: "prompt:quality:dance-floor-energy",
+        kind: "suitability",
+        scope: "track",
+        hardness: "soft",
+        axis: "energy",
+        operator: "prefer",
+        values: ["dance-floor energy"],
+        source: { provenance: "prompt", text: "Dance-floor energy" },
+        evidence: {
+          required: true,
+          minimumGrade: null,
+          permittedGrades: [
+            "track_specific_editorial_assertion",
+            "independent_secondary_source",
+          ],
+        },
+        unknownPolicy: "defer",
+      },
+    ],
+    trackPredicate: { op: "clause", clauseId: "prompt:genre:disco" },
+    qualityPolicy: {
+      centralSuitabilityClauseIds: ["prompt:quality:dance-floor-energy"],
+      minimumPassRatio: 0.8,
+      maximumUnknownRatio: 0.2,
+      zeroKnownFailures: true,
+    },
+  });
+  const selection: SelectionPlanV3 = {
+    ...resolveRunSpecV3(createRunSpecV3({
+      prompt,
+      requestedTrackCount: target,
+      storefront: "us",
+    }), []),
+    canonicalContractPolicy: canonicalContractExecutionPolicyV1(contract),
+    diversityGoals: {
+      minimumDistinctArtists: null,
+      minimumDistinctAlbums: null,
+      minimumDistinctEras: null,
+      minimumDistinctScenes: null,
+      minimumDistinctGeographies: null,
+      maximumTracksPerArtist: null,
+      maximumTracksPerAlbum: null,
+    },
+    softGoalRelaxationOrder: [],
+    playlistQualityPolicy: {
+      policyVersion: "canonical_central_quality_v1",
+      clauseIds: ["prompt:quality:dance-floor-energy"],
+      criteria: ["dance-floor energy"],
+      minimumPassRatio: 0.8,
+      maximumUnknownRatio: 0.2,
+      zeroKnownFailures: true,
+      signalDimension: "central_quality",
+      passThreshold: 0.75,
+      failThreshold: 0.4,
+      signalSemantics: "ranking_only_not_factual_evidence",
+    },
+  };
+  return {
+    prompt,
+    contract,
+    plan: createQueryPlanV3(selection, GRAPH_SNAPSHOT_ID, {
+      schemaVersion,
+      briefContractVersion: 3,
+      playlistContractRevisionId: contract.revisionId,
+      playlistContractSemanticHash: contract.semanticHash,
+      playlistContractCompilerVersion: contract.versions.compiler,
+    }),
+  };
+}
+
+function guidanceV5CanonicalFixture(optionId = "balanced_influence") {
+  const base = compilePlaylistContractRevisionV1({
+    contractId: "canonical-guidance-v5-worker",
+    rawPrompt: "Infuential irish music",
+    requestedTrackCount: 25,
+    locale: "en",
+    storefront: "us",
+    clauses: [
+      {
+        id: "membership:irish-origin",
+        kind: "membership",
+        scope: "track",
+        hardness: "hard",
+        axis: "artist_origin",
+        operator: "require",
+        values: ["Irish"],
+        source: { provenance: "prompt", text: "irish" },
+      },
+      {
+        id: "ranking:influence",
+        kind: "ranking_preference",
+        scope: "track",
+        hardness: "soft",
+        axis: "influence",
+        operator: "prefer",
+        values: ["documented musical influence"],
+        source: { provenance: "prompt", text: "Infuential" },
+      },
+    ],
+    trackPredicate: {
+      op: "clause",
+      clauseId: "membership:irish-origin",
+    },
+  });
+  const capabilitySnapshotHash = canonicalExecutorCapabilityForSchemaV1({
+    queryPlanSchemaVersion: 6,
+  }).hash;
+  const semanticConfigurationHash =
+    semanticExecutionConfigurationHash(process.env);
+  const checkpoint = guidanceCheckpointV5({
+    prompt: base.rawPrompt,
+    baseContract: base,
+    preservedTrackPredicate: base.trackPredicate,
+    ambiguousScopeClauseIds: [],
+    criticalAmbiguities: [],
+    requestShape: "curated",
+    capabilitySnapshotHash,
+    semanticConfigurationHash,
+  });
+  const question = publicGuidanceQuestionV5(checkpoint.decisions[0]!);
+  const answer = { questionId: question.id, optionId };
+  const patch = compileGuidanceRoundPatchV3({
+    base,
+    questionSetHash: checkpoint.checkpointHash,
+    questions: [question],
+    answers: [answer],
+  });
+  const contract = patch ? applyPlaylistContractPatchV1(base, patch) : base;
+  const projection = projectPlaylistContractExecutionV1({
+    contract,
+    basePlan: {
+      requestedTrackCount: contract.requestedTrackCount,
+      minimumQualifiedTrackCount: contract.requestedTrackCount,
+      storefront: contract.storefront,
+    },
+  });
+  const plan = createQueryPlanV3(
+    projection.selectionPlanV3,
+    GRAPH_SNAPSHOT_ID,
+    {
+      schemaVersion: 6,
+      briefContractVersion: 3,
+      playlistContractRevisionId: contract.revisionId,
+      playlistContractSemanticHash: contract.semanticHash,
+      playlistContractCompilerVersion: contract.versions.compiler,
+      guidancePolicyVersion: "adaptive_guidance_v5",
+    },
+  );
+  const authority = createGuidanceWorkerExecutionAuthorityV5({
+    questionSetHash: checkpoint.checkpointHash,
+    question,
+    answer,
+    baseContract: base,
+    successorContract: contract,
+    queryPlan: plan,
+    queryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+  });
+  return { base, contract, projection, plan, authority };
 }
 
 function legacyQueryPlan(target = 25) {
@@ -200,6 +415,99 @@ function track(index: number): QualifiedTrackV3 {
   };
 }
 
+const HOSTED_TEST_ACQUIRED_AT = "2026-07-20T12:00:00.000Z";
+const HOSTED_TEST_FRESH_UNTIL = "2026-08-18T12:00:00.000Z";
+
+function canonicalDiscoTrack(
+  index: number,
+  options: {
+    qualityPolicy?: NonNullable<SelectionPlanV3["playlistQualityPolicy"]>;
+    qualityVerdict?: "pass" | "fail" | "unknown";
+  } = {},
+): QualifiedTrackV3 {
+  const value = track(index);
+  const predicateId = "prompt:genre:disco";
+  const bindingId = `binding-${index}`;
+  const sourceUrl = `https://candidate-${index}.evidence.example.test/tracks/${index}`;
+  const excerpt = `${value.artist} — ${value.title}: track-specific editorial evidence for disco.`;
+  const snapshot = createHostedWebEvidenceSnapshotV3({
+    sourceUrl,
+    excerpt,
+    responseId: `response-${index}`,
+    outputItemId: `output-${index}`,
+    contentIndex: 0,
+    citationStartIndex: 0,
+    citationEndIndex: excerpt.length,
+    excerptStartIndex: 0,
+    excerptEndIndex: excerpt.length,
+    acquiredAt: HOSTED_TEST_ACQUIRED_AT,
+    storefront: "us",
+    freshnessExpiresAt: HOSTED_TEST_FRESH_UNTIL,
+    predicateIds: [predicateId],
+    obligationIds: [predicateId],
+  });
+  const centralQualityCriterionObservations = options.qualityPolicy
+    ? options.qualityPolicy.criteria.map((criterion) => (
+        createCentralQualityCriterionObservationV3({
+          policy: options.qualityPolicy!,
+          criterion,
+          verdict: options.qualityVerdict ?? "pass",
+          sourceKind: "hosted_web_response",
+          sourceId: `quality-${index}`,
+          artist: value.artist,
+          title: value.title,
+          album: value.album,
+          catalogIdentity: {
+            appleSongId: value.appleSongId,
+            recordingFamilyKey: value.recordingFamilyKey,
+          },
+        })
+      ))
+    : undefined;
+  return {
+    ...value,
+    cacheOrigin: "live",
+    evidenceBindingIds: [bindingId],
+    evidenceBindings: [{
+      id: bindingId,
+      url: sourceUrl,
+      provenanceRoot: `candidate-${index}.evidence.example.test`,
+      strength: 0.9,
+      sourceRank: 1,
+      kind: "hosted_web_track",
+      predicateIds: [predicateId],
+      governance: {
+        policyVersion: "evidence-source-governance-v3",
+        useScope: "run_local",
+        approvalState: "approved",
+        accessMethod: "hosted_web_search",
+        licenseState: "citation_only",
+        licenseVersion: "test-citation-v1",
+        termsVersion: "test-terms-v1",
+        attribution: "Test exact track source",
+        cachePolicy: "excerpt_only",
+        retentionPolicy: "ninety_days",
+        freshnessPolicy: "revalidate_30d",
+        acquiredAt: snapshot.acquiredAt,
+        freshnessExpiresAt: snapshot.freshnessExpiresAt,
+        revokedAt: null,
+        sourceHash: snapshot.snapshotHash,
+        sourceRevision: snapshot.snapshotHash,
+      },
+      hostedEvidenceSnapshot: snapshot,
+      eligibilityAttestation: publicTrackScopeAttestationV3(sourceUrl, snapshot),
+    }],
+    canonicalClauseAssessments: {
+      [predicateId]: {
+        status: "pass",
+        evidenceGrade: "track_specific_editorial_assertion",
+        evidenceIds: [bindingId],
+      },
+    },
+    centralQualityCriterionObservations,
+  };
+}
+
 function retrievalResult(
   status: RetrievalOutcomeStatusV3,
   selectedCount: number,
@@ -287,6 +595,162 @@ function retrievalResult(
   };
 }
 
+function productionShapedAllUnknownResult(
+  plan: QueryPlanV3,
+  options: {
+    unhealthyHostedWeb?: boolean;
+    stopReason?: RetrievalResultV3["outcome"]["stopReason"];
+  } = {},
+): RetrievalResultV3 {
+  const base = retrievalResult("no_compatible_tracks", 0, 25);
+  const leaves = verificationLeavesV1(plan.verificationExpression!);
+  return {
+    ...base,
+    outcome: {
+      ...base.outcome,
+      stopReason: options.stopReason ?? "frontier_exhausted",
+    },
+    stages: {
+      ...base.stages,
+      discovered: 80,
+      validCandidates: 77,
+      scopeEligible: 77,
+      hardConstraintEligible: 77,
+      evidenceEligible: 0,
+      versionCompatible: 73,
+      storefrontPlayable: 73,
+      canonicalUnique: 73,
+    },
+    deficit: {
+      ...base.deficit,
+      discovered: 80,
+      validCandidates: 77,
+      scopeEligible: 77,
+      hardConstraintEligible: 77,
+      evidenceEligible: 0,
+      versionCompatible: 73,
+      storefrontPlayable: 73,
+      canonicalUnique: 73,
+      discardedByReason: { canonical_contract_unknown: 77 },
+    },
+    strategies: [{
+      ...base.strategies[0]!,
+      id: "curated_genre_scene:editorial_tracks",
+      kind: "editorial_tracks",
+      discoveryDependencyIds: ["hosted_web"],
+      qualificationDependencyIds: ["apple_catalog"],
+      rounds: 1,
+      rawCandidates: 80,
+      newQualifiedFamilies: 0,
+    }, {
+      ...base.strategies[0]!,
+      id: "curated_genre_scene:deficit_queries",
+      kind: "deficit_query",
+      discoveryDependencyIds: ["hosted_web"],
+      qualificationDependencyIds: ["apple_catalog"],
+      rounds: 0,
+      rawCandidates: 0,
+      newQualifiedFamilies: 0,
+    }],
+    dependencyOutages: options.unhealthyHostedWeb ? [{
+      dependencyId: "hosted_web",
+      failureClass: "transient",
+      outageCount: 1,
+      failureAttempts: 3,
+      active: true,
+      circuitOpen: true,
+      retryAfterUntil: "2026-08-02T05:00:00.000Z",
+      affectedStrategyIds: ["curated_genre_scene:editorial_tracks"],
+    }] : [],
+    predicateDiagnostics: {
+      qualificationsObserved: 77,
+      scopeFailures: 0,
+      failedMembershipPredicateIds: {},
+      attemptedCanonicalClauseIds: leaves.map(({ clauseId }) => clauseId),
+      canonicalClauseDispositionCounts: Object.fromEntries(
+        leaves.map(({ clauseId }) => [
+          clauseId,
+          { pass: 0, fail: 0, unknown: 77 },
+        ]),
+      ),
+      // Evaluating a clause as unknown is not an evidence acquisition call.
+      evidenceAcquisitionAttempts: [],
+      appleLookupCount: 77,
+      appleProviderRequestCount: 1,
+      rootCause: "semantic_contract",
+      recoveryAttemptCount: 0,
+    },
+    candidateLeads: Array.from({ length: 80 }, (_, index) => ({
+      strategyId: "curated_genre_scene:editorial_tracks",
+      candidateKey: createHash("sha256")
+        .update(`irish-lead-${index}`)
+        .digest("hex"),
+      artist: `Artist ${index}`,
+      title: `Track ${index}`,
+      album: null,
+      sourceRecordIds: [],
+      citationHashes: [],
+      predicateCoverage: [],
+      rejectionCode: "canonical_contract_unknown",
+      discoveryDependencyIds: ["hosted_web"],
+      provenanceRoots: ["hosted_web"],
+      cacheOrigin: "live",
+      sourceFreshUntil: null,
+    })),
+  };
+}
+
+function productionShapedObservedFailResult(
+  plan: QueryPlanV3,
+  stopReason: RetrievalResultV3["outcome"]["stopReason"],
+): RetrievalResultV3 {
+  const unknown = productionShapedAllUnknownResult(plan, { stopReason });
+  const leaves = verificationLeavesV1(plan.verificationExpression!);
+  return {
+    ...unknown,
+    strategies: [
+      ...unknown.strategies,
+      {
+        ...unknown.strategies[0]!,
+        id: "curated_genre_scene:independent_graph_frontier",
+        discoveryDependencyIds: ["governed_evidence_graph"],
+        qualificationDependencyIds: ["apple_catalog"],
+        rounds: 1,
+        rawCandidates: 77,
+      },
+    ],
+    predicateDiagnostics: {
+      ...unknown.predicateDiagnostics!,
+      canonicalClauseDispositionCounts: Object.fromEntries(
+        leaves.map(({ clauseId }) => [
+          clauseId,
+          { pass: 0, fail: 77, unknown: 0 },
+        ]),
+      ),
+      evidenceAcquisitionAttempts: leaves.flatMap((leaf) => (
+        leaf.capableProducerFamilies.flatMap((producerFamily) => (
+          (producerFamily === "apple_catalog"
+            || producerFamily === "recording_identity"
+            || producerFamily === "content_metadata"
+            ? ["apple_catalog"] as const
+            : ["hosted_web", "governed_evidence_graph"] as const
+          ).map((dependencyRootId) => ({
+            obligationId: leaf.obligationId,
+            producerFamily,
+            dependencyRootId,
+            operation: "qualify" as const,
+            attemptedAt: "2026-07-30T12:00:00.000Z",
+            outcome: "success" as const,
+            strategyDeltaProofHash: "a".repeat(64),
+            automaticRescueOrdinal: 1 as const,
+            attemptCount: 1,
+          }))
+        ))
+      )),
+    },
+  };
+}
+
 function factualNoCompatibleResult(rawCandidates: number): RetrievalResultV3 {
   const base = retrievalResult("no_compatible_tracks", 0);
   return {
@@ -332,6 +796,13 @@ class MemoryRepository implements PipelineV3WorkerRepository {
       PipelineV3WorkerRepository["persistPipelineV3QualificationBatch"]
     >>[0]
   > = [];
+  readonly evidenceAcquisitionAttempts: Array<
+    Parameters<NonNullable<
+      PipelineV3WorkerRepository[
+        "persistPipelineV3EvidenceAcquisitionAttempt"
+      ]
+    >>[0]
+  > = [];
   readonly runtimeFeasibilitySnapshots: Array<
     Parameters<NonNullable<
       PipelineV3WorkerRepository["persistPipelineV3RuntimeFeasibilitySnapshot"]
@@ -344,6 +815,19 @@ class MemoryRepository implements PipelineV3WorkerRepository {
       ]
     >>[0]
   > = [];
+  semanticCollapseDatabaseFactsOverride: {
+    observationCount: number;
+    uniqueLeadCount: number;
+    materializedCandidateCount: number;
+    uniqueRecordingFamilyCount: number;
+    storefrontPlayableCount: number;
+    evidenceQualifiedCount: number;
+    nullCandidateQualificationCount: number;
+    canonicalClauseDispositionCounts: Record<
+      string,
+      { pass: number; fail: number; unknown: number }
+    >;
+  } | null = null;
 
   constructor(
     private readonly exactPublicationState: "queued" | "waiting_for_apple_authorization" = "queued",
@@ -401,6 +885,75 @@ class MemoryRepository implements PipelineV3WorkerRepository {
     >>[0],
   ): Promise<void> {
     this.qualificationBatches.push(structuredClone(input));
+  }
+
+  async persistPipelineV3EvidenceAcquisitionAttempt(
+    input: Parameters<NonNullable<
+      PipelineV3WorkerRepository[
+        "persistPipelineV3EvidenceAcquisitionAttempt"
+      ]
+    >>[0],
+  ): Promise<void> {
+    this.evidenceAcquisitionAttempts.push(structuredClone(input));
+  }
+
+  async readPipelineV3SemanticCollapseDatabaseFacts(
+    input: Parameters<NonNullable<
+      PipelineV3WorkerRepository[
+        "readPipelineV3SemanticCollapseDatabaseFacts"
+      ]
+    >>[0],
+  ): Promise<ReturnType<typeof createSemanticCollapseDatabaseFactsV2>> {
+    const diagnostics = input.result.predicateDiagnostics;
+    const candidateCount = diagnostics?.qualificationsObserved
+      ?? input.result.stages.validCandidates;
+    return createSemanticCollapseDatabaseFactsV2({
+      queryPlanHash: input.queryPlanHash,
+      contractRevisionId:
+        input.fence.contractRevisionDatabaseId ?? "test-contract",
+      ...(this.semanticCollapseDatabaseFactsOverride ?? {
+        observationCount: input.result.stages.discovered,
+        uniqueLeadCount: new Set(
+          (input.result.candidateLeads ?? [])
+            .map(({ candidateKey }) => candidateKey),
+        ).size,
+        materializedCandidateCount: candidateCount,
+        uniqueRecordingFamilyCount: input.result.stages.canonicalUnique,
+        storefrontPlayableCount: input.result.stages.storefrontPlayable,
+        evidenceQualifiedCount: input.result.stages.evidenceEligible,
+        nullCandidateQualificationCount: 0,
+        canonicalClauseDispositionCounts:
+          diagnostics?.canonicalClauseDispositionCounts
+          ?? (input.result.stages.evidenceEligible > 0
+            ? Object.fromEntries(
+                verificationLeavesV1(input.queryPlan.verificationExpression!)
+                  .map(({ clauseId }) => [
+                    clauseId,
+                    {
+                      pass: input.result.stages.evidenceEligible,
+                      fail: 0,
+                      unknown: 0,
+                    },
+                  ]),
+              )
+            : {}),
+      }),
+      evidenceAcquisitionAttempts:
+        (diagnostics?.evidenceAcquisitionAttempts ?? []).map(
+          (attempt) => ({
+            ...attempt,
+            operation: attempt.operation ?? "discover",
+            attemptedAt:
+              attempt.attemptedAt ?? "2026-07-30T12:00:00.000Z",
+            outcome: attempt.outcome ?? "success",
+            strategyDeltaProofHash:
+              attempt.strategyDeltaProofHash ?? "a".repeat(64),
+            automaticRescueOrdinal:
+              attempt.automaticRescueOrdinal ?? 1,
+          }),
+        ),
+      capturedAt: input.capturedAt,
+    });
   }
 
   async validatePipelineV3ContinuationQualifications(
@@ -489,6 +1042,37 @@ class FenceValidatingMemoryRepository extends MemoryRepository {
     this.validate(fence);
     await super.updateRun(runId, patch, fence);
   }
+}
+
+function usePersistedFacts(
+  repository: MemoryRepository,
+  plan: QueryPlanV3,
+  result: RetrievalResultV3,
+): void {
+  const observed = Math.max(
+    0,
+    result.predicateDiagnostics?.qualificationsObserved
+      ?? result.stages.validCandidates,
+  );
+  repository.semanticCollapseDatabaseFactsOverride = {
+    observationCount: result.stages.discovered,
+    uniqueLeadCount: new Set(
+      (result.candidateLeads ?? []).map(({ candidateKey }) => candidateKey),
+    ).size,
+    materializedCandidateCount: observed,
+    uniqueRecordingFamilyCount: result.stages.canonicalUnique,
+    storefrontPlayableCount: result.stages.storefrontPlayable,
+    evidenceQualifiedCount: result.stages.evidenceEligible,
+    nullCandidateQualificationCount: 0,
+    canonicalClauseDispositionCounts:
+      result.predicateDiagnostics?.canonicalClauseDispositionCounts
+      ?? Object.fromEntries(
+        verificationLeavesV1(plan.verificationExpression!).map(({ clauseId }) => [
+          clauseId,
+          { pass: 0, fail: 0, unknown: observed },
+        ]),
+      ),
+  };
 }
 
 function payload(plan: QueryPlanV3, mode: "active" | "shadow" = "active"): PipelineV3WorkerPayload {
@@ -620,6 +1204,269 @@ describe("Pipeline V3 durable worker execution", () => {
     });
     expect(rejectedPort.execute).not.toHaveBeenCalled();
     expect(rejectedRepository.updates.at(-1)?.patch).toEqual({
+      status: "failed_integrity",
+      phase: "v3_execution_coverage_worker_claim_failed",
+      error: null,
+    });
+  });
+
+  test("persists each evaluated schema-6 candidate in its own fenced transaction", async () => {
+    const canonical = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const candidates = [
+      {
+        id: "candidate-first-1",
+        artist: "Artist One",
+        title: "Track One",
+        album: "Album One",
+        sourceObservationIds: ["observation-1"],
+      },
+      {
+        id: "candidate-first-2",
+        artist: "Artist Two",
+        title: "Track Two",
+        album: "Album Two",
+        sourceObservationIds: ["observation-2"],
+      },
+    ];
+    const qualifications = candidates.map((candidate, index) => ({
+      candidateId: candidate.id,
+      scope: {
+        passed: index === 0,
+        failedMembershipPredicateIds: index === 0 ? [] : ["membership:genre"],
+        fit: index === 0 ? 1 : 0,
+      },
+      hardConstraints: {
+        passed: true,
+        failedConstraintIds: [],
+      },
+      evidence: {
+        passed: index === 0,
+        bindingIds: [],
+        strength: index === 0 ? 1 : 0,
+        independentProvenanceRoots: index === 0 ? 1 : 0,
+      },
+      version: { compatible: true, confidence: 1 },
+      catalog: {
+        lookupAttempted: true,
+        storefrontPlayable: true,
+        appleSongId: `apple-${index + 1}`,
+        recordingFamilyKey: `family-${index + 1}`,
+        confidence: 1,
+      },
+      rankingSignals: {},
+      sourceRank: index + 1,
+    }));
+    const port: PipelineV3RetrievalExecutionPort = {
+      execute: vi.fn(async (input) => {
+        await input.recordQualificationBatch?.(
+          {
+            runId: input.runId,
+            executionMode: input.executionMode,
+            appleWriteAccess: "forbidden",
+            plan: input.plan,
+            engine: "curated_genre_scene",
+            strategy: {
+              id: "curated_genre_scene:trusted_scoped_containers",
+              engine: "curated_genre_scene",
+              kind: "trusted_containers",
+              discoveryDependencyIds: ["apple_catalog"],
+              qualificationDependencyIds: ["apple_catalog"],
+              maximumBatchSize: 25,
+              maximumRounds: 1,
+              priority: 1,
+            },
+            candidates,
+          },
+          qualifications,
+        );
+        return retrievalResult("exact_ready", 25);
+      }),
+    };
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3-candidate-first",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: canonical.plan,
+      payload: {
+        ...canonicalPayload(canonical.plan, canonical.contract),
+        __executorSemanticConfigurationHash:
+          canonical.plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(repository.qualificationBatches).toHaveLength(2);
+    expect(repository.qualificationBatches.map(({ request, qualifications: batch }) => ({
+      candidateIds: request.candidates.map(({ id }) => id),
+      qualificationIds: batch.map(({ candidateId }) => candidateId),
+    }))).toEqual([
+      {
+        candidateIds: ["candidate-first-1"],
+        qualificationIds: ["candidate-first-1"],
+      },
+      {
+        candidateIds: ["candidate-first-2"],
+        qualificationIds: ["candidate-first-2"],
+      },
+    ]);
+    for (const batch of repository.qualificationBatches) {
+      expect(batch.fence).toEqual(expect.objectContaining({
+        jobId: JOB_ID,
+        leaseEpoch: 7,
+        queryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+        contractSemanticHash: canonical.contract.semanticHash,
+      }));
+    }
+  });
+
+  test("persists a fenced Guidance V5 worker-consumption receipt before retrieval", async () => {
+    const fixture = guidanceV5CanonicalFixture();
+    class GuidanceRepository extends MemoryRepository {
+      constructor() {
+        super();
+        this.checkpoints.set(
+          GUIDANCE_V5_EXECUTION_AUTHORITY_CHECKPOINT,
+          fixture.authority,
+        );
+      }
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "77777777-7777-4777-8777-777777777777",
+          contractHash: fixture.contract.semanticHash,
+          contract: structuredClone(fixture.contract) as unknown as Record<string, unknown>,
+        };
+      }
+    }
+    const repository = new GuidanceRepository();
+    const port = execution(retrievalResult("exact_ready", 25));
+    const queryHash = queryPlanV3Hash(fixture.plan);
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3-guidance-v5",
+      run: {
+        prompt: fixture.contract.rawPrompt,
+        pipelinePolicySnapshot: createPipelinePolicySnapshotV3({
+          plan: fixture.projection.selectionPlanV3,
+          capturedAt: "2026-08-01T12:00:00.000Z",
+        }),
+      },
+      queryPlan: fixture.plan,
+      payload: {
+        ...canonicalPayload(fixture.plan, fixture.contract),
+        __executorSemanticConfigurationHash:
+          fixture.plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(port.execute).toHaveBeenCalledOnce();
+    expect(repository.checkpoints.get(
+      guidanceWorkerConsumptionCheckpointKeyV5(queryHash),
+    )).toMatchObject({
+      kind: "worker_consumption",
+      status: "consumed",
+      authorityHash: fixture.authority.authorityHash,
+      executionField: "rankingObjectives",
+      effectHash: fixture.authority.executionEffect!.effectHash,
+      queryPlanHash: queryHash,
+      contractSemanticHash: fixture.contract.semanticHash,
+    });
+    expect(repository.writes.find(({ key }) => (
+      key === guidanceWorkerConsumptionCheckpointKeyV5(queryHash)
+    ))?.fence).toEqual({
+      jobId: JOB_ID,
+      workerId: "worker-v3",
+      leaseEpoch: 7,
+      queryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+      stageKey: v3RetrievalStageKey(fixture.plan, "active"),
+      contractAttemptId: "66666666-6666-4666-8666-666666666666",
+      contractRevisionDatabaseId:
+        "77777777-7777-4777-8777-777777777777",
+      contractRevisionId: fixture.contract.revisionId,
+      contractSemanticHash: fixture.contract.semanticHash,
+    });
+  });
+
+  test("fails closed before retrieval when a Guidance V5 authority checkpoint is missing", async () => {
+    const fixture = guidanceV5CanonicalFixture();
+    class GuidanceRepository extends MemoryRepository {
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "77777777-7777-4777-8777-777777777777",
+          contractHash: fixture.contract.semanticHash,
+          contract: structuredClone(fixture.contract) as unknown as Record<string, unknown>,
+        };
+      }
+    }
+    const repository = new GuidanceRepository();
+    const port = execution(retrievalResult("exact_ready", 25));
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3-guidance-v5",
+      run: {
+        prompt: fixture.contract.rawPrompt,
+        pipelinePolicySnapshot: createPipelinePolicySnapshotV3({
+          plan: fixture.projection.selectionPlanV3,
+          capturedAt: "2026-08-01T12:00:00.000Z",
+        }),
+      },
+      queryPlan: fixture.plan,
+      payload: {
+        ...canonicalPayload(fixture.plan, fixture.contract),
+        __executorSemanticConfigurationHash:
+          fixture.plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(port.execute).not.toHaveBeenCalled();
+    expect(repository.checkpoints.get(
+      v3RetrievalStageKey(fixture.plan, "active"),
+    )).toMatchObject({
+      state: "failed_integrity",
+      code: "v3_guidance_worker_consumption_failed",
+      reason: "guidance_v5_worker_authority_missing",
+    });
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "failed_integrity",
+      phase: "v3_guidance_worker_consumption_failed",
+      error: null,
+    });
+  });
+
+  test("fails worker admission before retrieval when a required obligation has no capable producer", async () => {
+    const canonical = canonicalQueryPlan(25, 6);
+    const expression = canonical.plan.verificationExpression!;
+    expect(expression.op).toBe("leaf");
+    if (expression.op !== "leaf") throw new Error("expected_leaf_fixture");
+    const plan: QueryPlanV3 = {
+      ...canonical.plan,
+      verificationExpression: {
+        ...expression,
+        capableProducerFamilies: [],
+      },
+    };
+    const repository = new MemoryRepository();
+    const port = execution(retrievalResult("no_compatible_tracks", 0));
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, canonical.contract),
+        __executorSemanticConfigurationHash:
+          canonical.plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(port.execute).not.toHaveBeenCalled();
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active")))
+      .toMatchObject({
+        state: "failed_integrity",
+        code: "v3_execution_coverage_worker_claim_failed",
+        reason: "invalid_verification_leaf",
+      });
+    expect(repository.updates.at(-1)?.patch).toEqual({
       status: "failed_integrity",
       phase: "v3_execution_coverage_worker_claim_failed",
       error: null,
@@ -976,6 +1823,150 @@ describe("Pipeline V3 durable worker execution", () => {
       });
   });
 
+  test("fails closed when a schema-6 continuation source omits cumulative candidate leads", async () => {
+    const canonical = canonicalQueryPlan(1, 6);
+    const sourceStageKey = "v3-retrieval:active:source";
+    const sourceQueryPlanHash = "b".repeat(64);
+    const sourceOutcomeHash = "c".repeat(64);
+    const sourceTrack = track(0);
+    const successor: QueryPlanV3 = {
+      ...canonical.plan,
+      continuation: {
+        sourceQueryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+        sourceQueryPlanHash,
+        sourceStageKey,
+        sourceOutcomeHash,
+        sourceOutcomeVersion: 1,
+        strategyIds: ["curated_genre_scene:trusted_scoped_containers"],
+      },
+    };
+    const repository = new MemoryRepository();
+    const sourceResult = retrievalResult("partial_ready", 1, 2);
+    repository.checkpoints.set(sourceStageKey, {
+      schemaVersion: "genio-pipeline-v3-worker/v1",
+      state: "complete",
+      stageKey: sourceStageKey,
+      queryPlanHash: sourceQueryPlanHash,
+      queryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+      selected: [sourceTrack],
+      reserve: [],
+      strategies: sourceResult.strategies,
+      stages: sourceResult.stages,
+      compatibleAlternatesByRecordingFamily: {},
+    });
+    repository.checkpoints.set("partial_ready", {
+      outcomeHash: sourceOutcomeHash,
+      outcomeVersion: 1,
+    });
+    const port = execution(retrievalResult("exact_ready", 1, 1));
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("1 influential disco recording", 1),
+      queryPlan: successor,
+      payload: {
+        ...canonicalPayload(successor, canonical.contract),
+        __executorSemanticConfigurationHash:
+          successor.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(port.execute).not.toHaveBeenCalled();
+    expect(repository.updates.at(-1)?.patch).toMatchObject({
+      status: "failed_integrity",
+      phase: "v3_continuation_source_invalid",
+    });
+  });
+
+  test("carries qualified and rejected source leads through a schema-6 continuation", async () => {
+    const canonical = canonicalQueryPlan(1, 6);
+    const sourceStageKey = "v3-retrieval:active:source";
+    const sourceQueryPlanHash = "b".repeat(64);
+    const sourceOutcomeHash = "c".repeat(64);
+    const sourceTrack = track(0);
+    const successor: QueryPlanV3 = {
+      ...canonical.plan,
+      continuation: {
+        sourceQueryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+        sourceQueryPlanHash,
+        sourceStageKey,
+        sourceOutcomeHash,
+        sourceOutcomeVersion: 1,
+        strategyIds: ["curated_genre_scene:trusted_scoped_containers"],
+      },
+    };
+    const strategyId =
+      "curated_genre_scene:trusted_scoped_containers";
+    const sourceCandidateLeads = [
+      {
+        strategyId,
+        candidateKey: createHash("sha256")
+          .update("qualified-source-lead")
+          .digest("hex"),
+        artist: sourceTrack.artist,
+        title: sourceTrack.title,
+        album: sourceTrack.album,
+        sourceRecordIds: ["source-qualified"],
+        citationHashes: [],
+        predicateCoverage: ["prompt:genre:disco"],
+        rejectionCode: null,
+      },
+      {
+        strategyId,
+        candidateKey: createHash("sha256")
+          .update("rejected-source-lead")
+          .digest("hex"),
+        artist: "Rejected Artist",
+        title: "Rejected Track",
+        album: null,
+        sourceRecordIds: ["source-rejected"],
+        citationHashes: [],
+        predicateCoverage: [],
+        rejectionCode: "canonical_contract_unknown",
+      },
+    ];
+    const repository = new MemoryRepository();
+    const sourceResult = retrievalResult("partial_ready", 1, 2);
+    repository.checkpoints.set(sourceStageKey, {
+      schemaVersion: "genio-pipeline-v3-worker/v1",
+      state: "complete",
+      stageKey: sourceStageKey,
+      queryPlanHash: sourceQueryPlanHash,
+      queryPlanRevisionId: QUERY_PLAN_REVISION_ID,
+      selected: [sourceTrack],
+      reserve: [],
+      strategies: sourceResult.strategies,
+      stages: sourceResult.stages,
+      compatibleAlternatesByRecordingFamily: {},
+      candidateLeads: sourceCandidateLeads,
+    });
+    repository.checkpoints.set("partial_ready", {
+      outcomeHash: sourceOutcomeHash,
+      outcomeVersion: 1,
+    });
+    const result = retrievalResult("exact_ready", 1, 1);
+    usePersistedFacts(repository, successor, result);
+    const port = execution(result);
+
+    await new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("1 influential disco recording", 1),
+      queryPlan: successor,
+      payload: {
+        ...canonicalPayload(successor, canonical.contract),
+        __executorSemanticConfigurationHash:
+          successor.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(port.execute).toHaveBeenCalledOnce();
+    expect(vi.mocked(port.execute).mock.calls[0]?.[0].continuation)
+      .toMatchObject({
+        qualifiedTracks: [sourceTrack],
+        candidateLeads: sourceCandidateLeads,
+      });
+  });
+
   test.each([
     ["exact_ready", 25, "publishing", "publication_queued", "queued"],
     ["partial_ready", 14, "partial_ready", "partial_confirmation_required", "partial_confirmation_required"],
@@ -1187,6 +2178,858 @@ describe("Pipeline V3 durable worker execution", () => {
     assertFenced(repository, plan);
   });
 
+  test("quarantines a schema-6 candidate-rich canonical-unknown collapse when no certified producer is routed", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const base = retrievalResult("no_compatible_tracks", 0);
+    const result: RetrievalResultV3 = {
+      ...base,
+      stages: {
+        ...base.stages,
+        discovered: 30,
+        validCandidates: 25,
+        canonicalUnique: 25,
+      },
+      deficit: {
+        ...base.deficit,
+        discovered: 30,
+        validCandidates: 25,
+        canonicalUnique: 25,
+        discardedByReason: {
+          canonical_contract_unknown: 25,
+        },
+      },
+      predicateDiagnostics: {
+        qualificationsObserved: 25,
+        scopeFailures: 25,
+        failedMembershipPredicateIds: {},
+        attemptedCanonicalClauseIds: ["prompt:genre:disco"],
+        canonicalClauseDispositionCounts: Object.fromEntries(
+          verificationLeavesV1(plan.verificationExpression!).map(
+            ({ clauseId }) => [
+              clauseId,
+              { pass: 0, fail: 0, unknown: 25 },
+            ],
+          ),
+        ),
+        appleLookupCount: 25,
+        appleProviderRequestCount: 1,
+        rootCause: "semantic_contract",
+        recoveryAttemptCount: 0,
+      },
+    };
+    usePersistedFacts(repository, plan, result);
+
+    await new PipelineV3WorkerExecution(
+      repository,
+      execution(result),
+    ).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:audit"))
+      .toMatchObject({
+        version: "semantic_collapse_audit_v2",
+        disposition: "technical_quarantine",
+        reasonCode: "capability_gap",
+        signalCodes: expect.arrayContaining([
+          "candidate_rich_zero_qualification",
+          "hard_obligation_has_no_certified_producer",
+        ]),
+      });
+    expect(repository.quarantines).toEqual([expect.objectContaining({
+      reasonCode: "v3_semantic_collapse_capability_gap",
+    })]);
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.runtimeFeasibilitySnapshots).toHaveLength(0);
+  });
+
+  test("pauses the same schema-6 verifier collapse when its evidence dependency is actively unavailable", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const base = retrievalResult("no_compatible_tracks", 0);
+    const result: RetrievalResultV3 = {
+      ...base,
+      stages: {
+        ...base.stages,
+        discovered: 30,
+        validCandidates: 25,
+        canonicalUnique: 25,
+      },
+      deficit: {
+        ...base.deficit,
+        discovered: 30,
+        validCandidates: 25,
+        canonicalUnique: 25,
+        discardedByReason: {
+          canonical_contract_unknown: 25,
+        },
+      },
+      predicateDiagnostics: {
+        qualificationsObserved: 25,
+        scopeFailures: 25,
+        failedMembershipPredicateIds: {},
+        attemptedCanonicalClauseIds: ["prompt:genre:disco"],
+        canonicalClauseDispositionCounts: Object.fromEntries(
+          verificationLeavesV1(plan.verificationExpression!).map(
+            ({ clauseId }) => [
+              clauseId,
+              { pass: 0, fail: 0, unknown: 25 },
+            ],
+          ),
+        ),
+        appleLookupCount: 25,
+        appleProviderRequestCount: 1,
+        rootCause: "semantic_contract",
+        recoveryAttemptCount: 0,
+      },
+      dependencyOutages: [{
+        dependencyId: "hosted_web",
+        failureClass: "transient",
+        outageCount: 1,
+        failureAttempts: 1,
+        active: true,
+        circuitOpen: true,
+        retryAfterUntil: "2026-08-01T12:05:00.000Z",
+        affectedStrategyIds: [
+          "curated_genre_scene:trusted_scoped_containers",
+        ],
+      }],
+      strategies: base.strategies.map((strategy) => ({
+        ...strategy,
+        discoveryDependencyIds: ["hosted_web"],
+        qualificationDependencyIds: ["apple_catalog"],
+      })),
+    };
+    usePersistedFacts(repository, plan, result);
+
+    await expect(new PipelineV3WorkerExecution(
+      repository,
+      execution(result),
+    ).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    })).rejects.toMatchObject({
+      dependencyKey: "v3_evidence_enrichment_provider",
+      reasonCode: "v3_semantic_collapse_evidence_dependency",
+    });
+
+    expect(repository.checkpoints.get("v3:retrieval:latest"))
+      .toMatchObject({
+        state: "waiting_provider",
+        reasonCode: "v3_semantic_collapse_evidence_dependency",
+      });
+    expect(repository.updates.at(-1)?.patch).toMatchObject({
+      status: "queued",
+      phase: "v3_waiting_for_evidence_enrichment_provider",
+    });
+    expect(repository.quarantines).toHaveLength(0);
+    expect(repository.runtimeFeasibilitySnapshots).toHaveLength(0);
+  });
+
+  test("persists and validates 80/77/73/0 coverage before scheduling one proof-bound producer pass", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const productionShape = productionShapedAllUnknownResult(plan);
+    const result: RetrievalResultV3 = {
+      ...productionShape,
+      // No family survived the evidence gate, even though candidate-first
+      // persistence observed 77 distinct recording families.
+      stages: {
+        ...productionShape.stages,
+        canonicalUnique: 0,
+      },
+      deficit: {
+        ...productionShape.deficit,
+        canonicalUnique: 0,
+      },
+    };
+    usePersistedFacts(repository, plan, result);
+    repository.semanticCollapseDatabaseFactsOverride = {
+      ...repository.semanticCollapseDatabaseFactsOverride!,
+      uniqueRecordingFamilyCount: 77,
+    };
+    const port = execution(result);
+
+    await expect(new PipelineV3WorkerExecution(repository, port).process({
+      runId: "run-v3",
+      run: workerRun("Infuential irish music"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    })).rejects.toBeInstanceOf(PipelineV3EvidenceEnrichmentRetryError);
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:coverage:v2"))
+      .toMatchObject({
+        version: "semantic_collapse_coverage_v2",
+        uniqueLeadCount: 80,
+        materializedCandidateCount: 77,
+        uniqueRecordingFamilyCount: 77,
+        storefrontPlayableCount: 73,
+        evidenceQualifiedCount: 0,
+        telemetryDivergenceCodes: [],
+        obligations: expect.arrayContaining([expect.objectContaining({
+          pass: 0,
+          fail: 0,
+          unknown: 77,
+          acquisitionAttemptCount: 0,
+          attemptedProducerFamilies: [],
+        })]),
+      });
+    expect(repository.checkpoints.get("v3:semantic-collapse:audit"))
+      .toMatchObject({
+        version: "semantic_collapse_audit_v2",
+        disposition: "deficit_research",
+        reasonCode: "bounded_evidence_enrichment_required",
+      });
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active")))
+      .toMatchObject({
+        state: "waiting_evidence_enrichment",
+        code: "v3_semantic_collapse_bounded_evidence_enrichment",
+        strategyDeltaProof: {
+          version: "strategy_delta_proof_v1",
+          automaticRescueOrdinal: 1,
+        },
+        evidenceEnrichment: {
+          automaticRescueOrdinal: 1,
+        },
+        nextAction: { kind: "resume_at" },
+      });
+    expect(repository.updates.at(-1)?.patch).toMatchObject({
+      status: "recovering",
+      phase: "v3_bounded_evidence_enrichment_retry",
+    });
+    expect(repository.persisted).toHaveLength(0);
+  });
+
+  test("quarantines DB/telemetry divergence instead of trusting a self-consistent worker checkpoint", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const result = productionShapedAllUnknownResult(plan);
+    usePersistedFacts(repository, plan, result);
+    repository.semanticCollapseDatabaseFactsOverride = {
+      ...repository.semanticCollapseDatabaseFactsOverride!,
+      storefrontPlayableCount: 72,
+    };
+
+    await new PipelineV3WorkerExecution(
+      repository,
+      execution(result),
+    ).process({
+      runId: "run-v3",
+      run: workerRun("Infuential irish music"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:coverage:v2"))
+      .toMatchObject({
+        telemetryDivergenceCodes: expect.arrayContaining([
+          "storefront_playable_count_mismatch",
+        ]),
+      });
+    expect(repository.quarantines).toEqual([expect.objectContaining({
+      reasonCode: "v3_semantic_collapse_database_telemetry_divergence",
+    })]);
+    expect(repository.persisted).toHaveLength(0);
+  });
+
+  test("audits candidate-rich unknown evidence before a deadline decision can escape", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const base = productionShapedAllUnknownResult(plan);
+    const result: RetrievalResultV3 = {
+      ...base,
+      outcome: {
+        ...base.outcome,
+        status: "needs_decision",
+        stopReason: "deadline_reached",
+      },
+    };
+    usePersistedFacts(repository, plan, result);
+
+    await expect(new PipelineV3WorkerExecution(
+      repository,
+      execution(result),
+    ).process({
+      runId: "run-v3",
+      run: workerRun("Infuential irish music"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    })).rejects.toBeInstanceOf(PipelineV3EvidenceEnrichmentRetryError);
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:audit"))
+      .toMatchObject({
+        triggered: true,
+        disposition: "deficit_research",
+      });
+    expect(repository.checkpoints.get("run_decision")).toBeUndefined();
+  });
+
+  test("quarantines healthy-producer wrong-axis evidence instead of reporting scarcity or asking for refinement", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const leaves = verificationLeavesV1(plan.verificationExpression!);
+    const baseResult = productionShapedAllUnknownResult(plan);
+    const result: RetrievalResultV3 = {
+      ...baseResult,
+      predicateDiagnostics: {
+        ...baseResult.predicateDiagnostics!,
+        canonicalClauseDispositionCounts: Object.fromEntries(
+          leaves.map(({ clauseId }) => [
+            clauseId,
+            { pass: 77, fail: 0, unknown: 0 },
+          ]),
+        ),
+        evidenceAcquisitionAttempts: leaves.map((leaf) => ({
+          obligationId: leaf.obligationId,
+          producerFamily: leaf.capableProducerFamilies[0]!,
+          dependencyRootId: "hosted_web" as const,
+          operation: "qualify" as const,
+          attemptedAt: "2026-07-30T12:00:00.000Z",
+          outcome: "success" as const,
+          strategyDeltaProofHash: "a".repeat(64),
+          automaticRescueOrdinal: 1 as const,
+          attemptCount: 77,
+        })),
+        evidenceBindingDefects: leaves.map(({ obligationId }) => ({
+          obligationId,
+          malformedEvidenceCount: 0,
+          wrongAxisEvidenceCount: 77,
+        })),
+      },
+    };
+    usePersistedFacts(repository, plan, result);
+
+    await new PipelineV3WorkerExecution(
+      repository,
+      execution(result),
+    ).process({
+      runId: "run-v3",
+      run: workerRun("Infuential irish music"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:coverage:v2"))
+      .toMatchObject({
+        obligations: expect.arrayContaining([expect.objectContaining({
+          pass: 0,
+          unknown: 77,
+          wrongAxisEvidenceCount: 77,
+        })]),
+      });
+    expect(repository.checkpoints.get("v3:semantic-collapse:audit"))
+      .toMatchObject({
+        disposition: "technical_quarantine",
+        reasonCode: "evidence_binding_defect",
+        signalCodes: expect.arrayContaining([
+          "evidence_binding_structural_defect",
+        ]),
+      });
+    expect(repository.quarantines).toEqual([expect.objectContaining({
+      reasonCode: "v3_semantic_collapse_evidence_binding_defect",
+    })]);
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.runtimeFeasibilitySnapshots).toHaveLength(0);
+  });
+
+  test("carries the new producer directive into the next pass and quarantines after two bounded deltas", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const result = productionShapedAllUnknownResult(plan);
+    usePersistedFacts(repository, plan, result);
+    const port: PipelineV3RetrievalExecutionPort = {
+      execute: vi.fn(async () => result),
+    };
+    const process = (leaseEpoch: number) => new PipelineV3WorkerExecution(
+      repository,
+      port,
+    ).process({
+      runId: "run-v3",
+      run: workerRun("Infuential irish music"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __jobLeaseEpoch: leaseEpoch,
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    await expect(process(7)).rejects
+      .toBeInstanceOf(PipelineV3EvidenceEnrichmentRetryError);
+    const makeDue = () => {
+      const key = v3RetrievalStageKey(plan, "active");
+      repository.checkpoints.set(key, {
+        ...(repository.checkpoints.get(key) as Record<string, unknown>),
+        nextRetryAt: "2026-01-01T00:00:00.000Z",
+      });
+    };
+    makeDue();
+    await expect(process(8)).rejects
+      .toBeInstanceOf(PipelineV3EvidenceEnrichmentRetryError);
+    expect(port.execute).toHaveBeenLastCalledWith(expect.objectContaining({
+      continuation: expect.objectContaining({
+        evidenceEnrichment: expect.objectContaining({
+          automaticRescueOrdinal: 1,
+          strategyDeltaProofHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        }),
+      }),
+    }));
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active")))
+      .toMatchObject({
+        strategyDeltaProof: { automaticRescueOrdinal: 2 },
+      });
+    makeDue();
+    await process(9);
+    expect(repository.quarantines.at(-1)).toMatchObject({
+      reasonCode: "v3_semantic_collapse_evidence_enrichment_exhausted",
+    });
+    expect(port.execute).toHaveBeenCalledTimes(3);
+  });
+
+  test("retains the exact enrichment proof across provider waiting and enforces it on retry", async () => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    const repository = new MemoryRepository();
+    const unknown = productionShapedAllUnknownResult(plan);
+    usePersistedFacts(repository, plan, unknown);
+    const failedPassLead = {
+      ...unknown.candidateLeads![0]!,
+      candidateKey: "f".repeat(64),
+      artist: "Failed-pass Artist",
+      title: "Failed-pass Track",
+      sourceRecordIds: ["failed-pass-source"],
+    };
+    const providerFailed: RetrievalResultV3 = {
+      ...unknown,
+      stages: {
+        ...unknown.stages,
+        discovered: 81,
+        validCandidates: 78,
+      },
+      deficit: {
+        ...unknown.deficit,
+        discovered: 81,
+        validCandidates: 78,
+      },
+      strategies: unknown.strategies.map((strategy, index) => (
+        index === 0
+          ? {
+              ...strategy,
+              rounds: strategy.rounds + 1,
+              rawCandidates: strategy.rawCandidates + 1,
+            }
+          : strategy
+      )),
+      candidateLeads: [...unknown.candidateLeads!, failedPassLead],
+      outcome: {
+        ...unknown.outcome,
+        status: "failed_system",
+        stopReason: "provider_failure",
+      },
+      dependencyOutages: [{
+        dependencyId: "hosted_web",
+        failureClass: "rate_limited",
+        outageCount: 1,
+        failureAttempts: 3,
+        active: true,
+        circuitOpen: false,
+        retryAfterUntil: "2030-01-02T03:04:05.000Z",
+        affectedStrategyIds: [unknown.strategies[0]!.id],
+      }],
+    };
+    const port: PipelineV3RetrievalExecutionPort = {
+      execute: vi.fn()
+        .mockResolvedValueOnce(unknown)
+        .mockResolvedValueOnce(providerFailed)
+        .mockResolvedValueOnce(unknown),
+    };
+    const process = (leaseEpoch: number) => new PipelineV3WorkerExecution(
+      repository,
+      port,
+    ).process({
+      runId: "run-v3",
+      run: workerRun("Infuential irish music"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __jobLeaseEpoch: leaseEpoch,
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+    const stageKey = v3RetrievalStageKey(plan, "active");
+
+    await expect(process(7)).rejects
+      .toBeInstanceOf(PipelineV3EvidenceEnrichmentRetryError);
+    repository.checkpoints.set(stageKey, {
+      ...(repository.checkpoints.get(stageKey) as Record<string, unknown>),
+      nextRetryAt: "2026-01-01T00:00:00.000Z",
+    });
+    const scheduled = structuredClone(
+      repository.checkpoints.get(stageKey),
+    ) as Record<string, unknown>;
+
+    await expect(process(8)).rejects.toMatchObject({
+      dependencyKey: "v3_evidence_enrichment_provider",
+      failureClass: "rate_limited",
+    });
+    const waiting = repository.checkpoints.get(stageKey) as
+      Record<string, unknown>;
+    expect(waiting).toMatchObject({
+      state: "waiting_provider",
+      reasonCode: "v3_retrieval_provider_failed",
+      strategyDeltaProof: scheduled.strategyDeltaProof,
+      evidenceEnrichment: scheduled.evidenceEnrichment,
+      approvedStrategyIds: scheduled.approvedStrategyIds,
+      stages: providerFailed.stages,
+      strategies: providerFailed.strategies,
+      candidateLeads: providerFailed.candidateLeads,
+    });
+    const waitingProofHash = (
+      waiting.strategyDeltaProof as { proofHash: string }
+    ).proofHash;
+    repository.checkpoints.set(stageKey, {
+      ...waiting,
+      retryAfterUntil: "2026-01-01T00:00:00.000Z",
+    });
+
+    await expect(process(9)).rejects
+      .toBeInstanceOf(PipelineV3EvidenceEnrichmentRetryError);
+    expect(port.execute).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({
+        continuation: expect.objectContaining({
+          approvedStrategyIds: scheduled.approvedStrategyIds,
+          stages: providerFailed.stages,
+          strategies: providerFailed.strategies,
+          candidateLeads: providerFailed.candidateLeads,
+          evidenceEnrichment: expect.objectContaining({
+            strategyDeltaProofHash: waitingProofHash,
+            automaticRescueOrdinal: 1,
+          }),
+        }),
+      }),
+    );
+    expect(repository.checkpoints.get(stageKey)).toMatchObject({
+      strategyDeltaProof: { automaticRescueOrdinal: 2 },
+    });
+  });
+
+  test("turns genuinely unresolved user semantics into a fenced question instead of scarcity", async () => {
+    const { contract, plan: basePlan } = canonicalQueryPlan(25, 6);
+    const resolution = resolveMusicConceptV1({
+      text: "velvet pulse",
+      expectedKind: "genre",
+    });
+    expect(resolution.status).toBe("unresolved");
+    if (resolution.status !== "unresolved") {
+      throw new Error("expected_unresolved_concept_fixture");
+    }
+    const plan: QueryPlanV3 = {
+      ...basePlan,
+      conceptDiscoveryHints: [{
+        clauseId: "discovery:genre:velvet_pulse",
+        axis: "genre",
+        originalText: resolution.originalText,
+        normalizedText: resolution.normalizedText,
+        status: "unresolved",
+        ontologyVersion: resolution.ontologyVersion,
+        unresolvedTermId: resolution.unresolvedTermId,
+        provenance: PIPELINE_V3_CONCEPT_DISCOVERY_HINT_PROVENANCE,
+        untrusted: true,
+        usage: PIPELINE_V3_CONCEPT_DISCOVERY_HINT_USAGE,
+      }],
+    };
+    class GuidanceRepository extends MemoryRepository {
+      readonly guidanceInputs: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "77777777-7777-4777-8777-777777777777",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async preparePlaylistRunRescueGuidance(input: Record<string, unknown>) {
+        this.guidanceInputs.push(structuredClone(input));
+        return { questionSetHash: "e".repeat(64) };
+      }
+    }
+    const repository = new GuidanceRepository();
+    const result = productionShapedObservedFailResult(
+      plan,
+      "frontier_exhausted",
+    );
+    usePersistedFacts(repository, plan, result);
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun("25 velvet pulse recordings"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:audit"))
+      .toMatchObject({
+        disposition: "needs_input",
+        reasonCode: "unresolved_user_semantics",
+      });
+    expect(repository.guidanceInputs).toEqual([expect.objectContaining({
+      runId: "run-v3",
+      contractRevisionId: "77777777-7777-4777-8777-777777777777",
+    })]);
+    expect(repository.checkpoints.get(v3RetrievalStageKey(plan, "active")))
+      .toMatchObject({
+        state: "awaiting_guidance",
+        code: "v3_semantic_collapse_needs_input",
+        nextAction: {
+          kind: "answer_question",
+          questionSetHash: "e".repeat(64),
+        },
+      });
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "awaiting_guidance",
+      phase: "v3_semantic_collapse_guidance_required",
+      error: null,
+    });
+  });
+
+  test.each([
+    {
+      label: "local budget",
+      stopReason: "budget_reached" as const,
+      disposition: "actionable_decision",
+      reasonCode: "local_budget_exhausted",
+    },
+    {
+      label: "independent healthy frontier",
+      stopReason: "frontier_exhausted" as const,
+      disposition: "scarcity_decision",
+      reasonCode: "frontier_exhausted_under_policy",
+    },
+  ])("turns $label into a named advancing decision", async ({
+    stopReason,
+    disposition,
+    reasonCode,
+  }) => {
+    const { contract, plan } = canonicalQueryPlan(25, 6);
+    class DecisionRepository extends MemoryRepository {
+      readonly blockers: Array<Record<string, unknown>> = [];
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "77777777-7777-4777-8777-777777777777",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+      async openPlaylistRunBlocker(input: Record<string, unknown>) {
+        this.blockers.push(structuredClone(input));
+        return "88888888-8888-4888-8888-888888888888";
+      }
+    }
+    const repository = new DecisionRepository();
+    const result = productionShapedObservedFailResult(plan, stopReason);
+    usePersistedFacts(repository, plan, result);
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun("25 influential Irish recordings"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    expect(repository.checkpoints.get("v3:semantic-collapse:audit"))
+      .toMatchObject({ disposition, reasonCode });
+    expect(repository.checkpoints.get("run_decision")).toMatchObject({
+      reasonCode,
+      namedPredicates: [{
+        clauseId: "prompt:genre:disco",
+        label: "Disco",
+      }],
+      actions: {
+        reviseNamedPredicate: true,
+      },
+    });
+    expect(repository.blockers).toHaveLength(1);
+    expect(repository.persisted).toHaveLength(0);
+    expect(repository.updates.at(-1)?.patch).toMatchObject({
+      status: "needs_decision",
+      phase: reasonCode,
+    });
+  });
+
+  test("keeps a central-quality local-budget decision actionable through the public reducer and UI", async () => {
+    const { contract, plan } = canonicalQualityQueryPlan(25, 6);
+    const hardLeaves = verificationLeavesV1(plan.verificationExpression!);
+    const qualityLeaves = centralQualityVerificationLeavesV1({
+      policy: plan.canonicalContractPolicy!,
+      qualityPolicy: plan.playlistQualityPolicy,
+    });
+    expect(qualityLeaves).toHaveLength(1);
+
+    class CentralQualityDecisionRepository extends MemoryRepository {
+      readonly blockers: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "77777777-7777-4777-8777-777777777777",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async openPlaylistRunBlocker(input: Record<string, unknown>) {
+        this.blockers.push(structuredClone(input));
+        return "88888888-8888-4888-8888-888888888888";
+      }
+    }
+
+    const repository = new CentralQualityDecisionRepository();
+    const base = productionShapedObservedFailResult(plan, "budget_reached");
+    const result: RetrievalResultV3 = {
+      ...base,
+      predicateDiagnostics: {
+        ...base.predicateDiagnostics!,
+        attemptedCanonicalClauseIds: [
+          ...hardLeaves.map(({ clauseId }) => clauseId),
+          ...qualityLeaves.map(({ clauseId }) => clauseId),
+        ],
+        canonicalClauseDispositionCounts: {
+          ...Object.fromEntries(hardLeaves.map(({ clauseId }) => [
+            clauseId,
+            { pass: 77, fail: 0, unknown: 0 },
+          ])),
+          ...Object.fromEntries(qualityLeaves.map(({ clauseId }) => [
+            clauseId,
+            { pass: 0, fail: 77, unknown: 0 },
+          ])),
+        },
+        evidenceAcquisitionAttempts: qualityLeaves.flatMap((leaf) => (
+          leaf.capableProducerFamilies.flatMap((producerFamily) => (
+            ["hosted_web", "governed_evidence_graph"].map(
+              (dependencyRootId) => ({
+                obligationId: leaf.obligationId,
+                producerFamily,
+                dependencyRootId: dependencyRootId as
+                  "hosted_web" | "governed_evidence_graph",
+                operation: "qualify" as const,
+                attemptedAt: "2026-07-30T12:00:00.000Z",
+                outcome: "success" as const,
+                strategyDeltaProofHash: "a".repeat(64),
+                automaticRescueOrdinal: 1 as const,
+                attemptCount: 1,
+              }),
+            )
+          ))
+        )),
+      },
+    };
+    usePersistedFacts(repository, plan, result);
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun("25 influential disco recordings with dance-floor energy"),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __executorSemanticConfigurationHash:
+          plan.executionCoverageReport!.configurationHash,
+      },
+    });
+
+    const decisionCheckpoint = repository.checkpoints.get("run_decision");
+    expect(decisionCheckpoint).toMatchObject({
+      reason: "runtime_feasibility_unknown",
+      reasonCode: "local_budget_exhausted",
+      namedPredicates: [{
+        clauseId: "prompt:quality:dance-floor-energy",
+        label: "Dance-floor energy",
+      }],
+      actions: {
+        anotherBoundedPass: false,
+        reviseNamedPredicate: true,
+      },
+    });
+    expect(decisionCheckpoint).not.toHaveProperty("advancingActions");
+    expect(decisionCheckpoint).not.toHaveProperty("nextAction");
+
+    const publicDecision = publicAdaptiveRunDecisionV1(decisionCheckpoint);
+    expect(publicDecision).not.toBeNull();
+    const reduction = reduceResolutionFactsV1({
+      legacyStatus: "needs_decision",
+      legacyPhase: "local_budget_exhausted",
+      blockerKind: "scope_decision",
+      blockerId: "88888888-8888-4888-8888-888888888888",
+      questionSetId: null,
+      manifestId: null,
+      requestedTrackCount: 25,
+      reconciledPublishedTrackCount: null,
+      exactAppleReconciliation: false,
+      approvedPartialPublication: false,
+      workMotion: "none",
+      integrityIncident: false,
+      cancellationRequested: false,
+      activeContractSemanticRevisionId: contract.revisionId,
+      activeContractSemanticHash: contract.semanticHash,
+      decision: publicDecision,
+      verifiedPartialDecisionAvailable: false,
+    });
+    expect(reduction).toMatchObject({
+      state: "needs_decision",
+      nextAction: "review_contract",
+      reasonCode: "explicit_bound_user_decision_required",
+    });
+    expect(runResolutionControls({
+      status: "needs_decision",
+      decisionAction: publicDecision,
+      resolution: {
+        state: reduction.state,
+        nextAction: reduction.nextAction,
+        terminal: false,
+      },
+    })).toEqual(["refine_request", "cancel_job"]);
+  });
+
   test("turns an inadequately independent canonical empty frontier into an actionable decision", async () => {
     const { contract, plan } = canonicalQueryPlan();
     class RuntimeDecisionRepository extends MemoryRepository {
@@ -1235,7 +3078,6 @@ describe("Pipeline V3 durable worker execution", () => {
         recoveryAttemptCount: 0,
       },
     };
-
     await new PipelineV3WorkerExecution(repository, execution(result)).process({
       runId: "run-v3",
       run: workerRun("25 influential disco recordings"),
@@ -1572,8 +3414,8 @@ describe("Pipeline V3 durable worker execution", () => {
     });
   });
 
-  test("routes a canonical quality partial to a decision without creating a manifest", async () => {
-    const canonical = canonicalQueryPlan(25);
+  test("freezes a policy-valid quality-constrained partial for explicit manifest-bound consent", async () => {
+    const canonical = canonicalQualityQueryPlan(25);
     class PartialDecisionRepository extends MemoryRepository {
       readonly blockers: Array<Record<string, unknown>> = [];
 
@@ -1592,20 +3434,43 @@ describe("Pipeline V3 durable worker execution", () => {
     }
     const repository = new PartialDecisionRepository();
     const base = retrievalResult("partial_ready", 14);
+    const selected = Array.from({ length: 14 }, (_, index) => (
+      canonicalDiscoTrack(index, {
+        qualityPolicy: canonical.plan.playlistQualityPolicy!,
+        qualityVerdict: "pass",
+      })
+    ));
+    const rejectedQualityTrack = canonicalDiscoTrack(999, {
+      qualityPolicy: canonical.plan.playlistQualityPolicy!,
+      qualityVerdict: "fail",
+    });
     const result: RetrievalResultV3 = {
       ...base,
+      selected,
+      qualifiedPool: [...selected, rejectedQualityTrack],
       outcome: {
         ...base.outcome,
         status: "partial_ready",
         stopReason: "central_quality_floor",
+        qualifiedTrackCount: 15,
         requiresPartialPublicationDecision: true,
       },
       deficit: {
         ...base.deficit,
         primaryShortfallReason: "central_quality_floor",
       },
+      centralQuality: {
+        policyVersion: "canonical_central_quality_v1",
+        criteria: ["dance-floor energy"],
+        passed: true,
+        passCount: 14,
+        failCount: 0,
+        unknownCount: 0,
+        passRatio: 1,
+        unknownRatio: 0,
+        reasonCodes: [],
+      },
     };
-
     await new PipelineV3WorkerExecution(repository, execution(result)).process({
       runId: "run-v3",
       run: workerRun("25 influential disco recordings"),
@@ -1616,15 +3481,111 @@ describe("Pipeline V3 durable worker execution", () => {
       },
     });
 
+    expect(repository.persisted).toHaveLength(1);
+    expect(repository.persisted[0]).toMatchObject({
+      result: {
+        outcome: {
+          status: "partial_ready",
+          stopReason: "central_quality_floor",
+          selectedTrackCount: 14,
+        },
+      },
+    });
+    expect(repository.checkpoints.get("partial_ready")).toMatchObject({
+      targetTrackCount: 25,
+      verifiedTrackCount: 14,
+      shortfall: 11,
+      manifestId: MANIFEST_ID,
+      manifestRevisionId: MANIFEST_REVISION_ID,
+      manifestHash: MANIFEST_HASH,
+    });
+    expect(repository.checkpoints.has("run_decision")).toBe(false);
+    expect(repository.updates.at(-1)?.patch).toEqual({
+      status: "partial_ready",
+      phase: "partial_confirmation_required",
+      error: null,
+    });
+  });
+
+  test("keeps a true selected-set quality miss nonpublishable and names the quality clause", async () => {
+    const canonical = canonicalQualityQueryPlan(25);
+    const { prompt, contract, plan } = canonical;
+    class QualityDecisionRepository extends MemoryRepository {
+      readonly blockers: Array<Record<string, unknown>> = [];
+
+      async getActivePlaylistContractRevision() {
+        return {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          contractHash: contract.semanticHash,
+          contract: contract as unknown as Record<string, unknown>,
+        };
+      }
+
+      async openPlaylistRunBlocker(input: Record<string, unknown>): Promise<string> {
+        this.blockers.push(structuredClone(input));
+        return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      }
+    }
+    const repository = new QualityDecisionRepository();
+    const base = retrievalResult("partial_ready", 14);
+    const selected = Array.from({ length: 14 }, (_, index) => (
+      canonicalDiscoTrack(index, {
+        qualityPolicy: plan.playlistQualityPolicy!,
+        qualityVerdict: index < 8 ? "pass" : index === 8 ? "fail" : "unknown",
+      })
+    ));
+    const result: RetrievalResultV3 = {
+      ...base,
+      selected,
+      qualifiedPool: selected,
+      outcome: {
+        ...base.outcome,
+        stopReason: "central_quality_floor",
+      },
+      centralQuality: {
+        policyVersion: "canonical_central_quality_v1",
+        criteria: ["dance-floor energy"],
+        passed: false,
+        passCount: 8,
+        failCount: 1,
+        unknownCount: 5,
+        passRatio: 8 / 14,
+        unknownRatio: 5 / 14,
+        reasonCodes: [
+          "central_quality_known_failure",
+          "central_suitability_coverage_below_floor",
+          "central_suitability_unknown_above_ceiling",
+        ],
+      },
+    };
+
+    await new PipelineV3WorkerExecution(repository, execution(result)).process({
+      runId: "run-v3",
+      run: workerRun(prompt),
+      queryPlan: plan,
+      payload: {
+        ...canonicalPayload(plan, contract),
+        __contractRevisionDatabaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      },
+    });
+
     expect(repository.persisted).toHaveLength(0);
     expect(repository.checkpoints.has("partial_ready")).toBe(false);
     expect(repository.checkpoints.get("run_decision")).toMatchObject({
       reason: "central_quality_floor",
-      verifiedTrackCount: 14,
+      namedPredicates: [{
+        clauseId: "prompt:quality:dance-floor-energy",
+        label: "Dance-floor energy",
+      }],
       actions: {
         publishVerifiedPartial: false,
+        reviseNamedPredicate: true,
         reduceCount: true,
       },
+    });
+    expect(repository.blockers[0]).toMatchObject({
+      blockerKind: "scope_decision",
+      dependencyKey: "central_quality",
     });
     expect(repository.updates.at(-1)?.patch).toEqual({
       status: "needs_decision",
@@ -2571,7 +4532,7 @@ describe("Pipeline V3 durable worker execution", () => {
     expect(port.execute).not.toHaveBeenCalled();
   });
 
-  test("flushes separated discovery and qualification observations outside provider classification", async () => {
+  test("persists separated discovery and qualification observations immediately without provider misclassification", async () => {
     const query = queryPlan(1);
     const plan = selectionPlanFromQueryPlanV3(query, {
       prompt: "One influential disco recording",
@@ -2689,7 +4650,7 @@ describe("Pipeline V3 durable worker execution", () => {
     })).rejects.toBe(persistenceFailure);
   });
 
-  test("flushes paid discovery and qualification observations before rethrowing a later retrieval failure", async () => {
+  test("persists paid discovery and qualification observations before a later retrieval failure", async () => {
     const query = queryPlan(2);
     const plan = selectionPlanFromQueryPlanV3(query, {
       prompt: "Two influential disco recordings",
@@ -2703,11 +4664,15 @@ describe("Pipeline V3 durable worker execution", () => {
     };
     const laterFailure = new Error("later retrieval operation failed");
     let discoveryCall = 0;
+    const persistenceOrder: string[] = [];
     const port = createPipelineV3RetrievalExecutionPort({
       adapters: {
         discover: vi.fn(async () => {
           discoveryCall += 1;
-          if (discoveryCall > 1) throw laterFailure;
+          if (discoveryCall > 1) {
+            expect(persistenceOrder).toEqual(["discovery", "qualification"]);
+            throw laterFailure;
+          }
           return {
             candidates: [rawCandidate],
             nextCursor: null,
@@ -2745,8 +4710,12 @@ describe("Pipeline V3 durable worker execution", () => {
         }]),
       },
     });
-    const recordDiscoveryBatch = vi.fn(async () => undefined);
-    const recordQualificationBatch = vi.fn(async () => undefined);
+    const recordDiscoveryBatch = vi.fn(async () => {
+      persistenceOrder.push("discovery");
+    });
+    const recordQualificationBatch = vi.fn(async () => {
+      persistenceOrder.push("qualification");
+    });
     const snapshot = workerRun("Two influential disco recordings", 2)
       .pipelinePolicySnapshot;
 
@@ -2773,5 +4742,6 @@ describe("Pipeline V3 durable worker execution", () => {
 
     expect(recordDiscoveryBatch).toHaveBeenCalledOnce();
     expect(recordQualificationBatch).toHaveBeenCalledOnce();
+    expect(persistenceOrder).toEqual(["discovery", "qualification"]);
   });
 });

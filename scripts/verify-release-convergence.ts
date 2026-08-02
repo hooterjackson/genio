@@ -526,7 +526,7 @@ export function releaseConvergenceObservation(input: {
             : null,
         stage:
           typeof publicRollout.stage === "string"
-            && /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u.test(
+            && /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u.test(
               publicRollout.stage,
             )
             ? publicRollout.stage

@@ -24,6 +24,10 @@ import {
   CORPUS_FIRST_V3_PLAYLIST_CONTRACT_CAPABILITY,
   negotiatePlaylistContractBackendV1,
 } from "../server/playlist-contract-backend-capability-v1.ts";
+import {
+  projectPlaylistContractExecutionV1,
+} from "../server/playlist-contract-execution-bridge-v1.ts";
+import { pipelineV3RolloutGroup } from "../server/query-plan-v3.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 
 function brief(overrides: Partial<PlaylistBrief> = {}): PlaylistBrief {
@@ -85,6 +89,99 @@ function constraint(
 }
 
 describe("playlist contract shadow bridge v1", () => {
+  test("keeps geographic music scope as membership on the editorial-influence route", () => {
+    const prompt = "Infuential irish music";
+    const requestBrief = brief({
+      title: "Influential Irish music",
+      description: prompt,
+      subjectEntities: ["Irish music"],
+      relationship: "music by Irish artists",
+      include: ["Irish music"],
+      targetSize: { min: 25, max: 25 },
+    });
+    const baseline = createSelectionPlanV2({
+      prompt,
+      brief: requestBrief,
+      storefront: "us",
+    });
+    const bridged = compilePlaylistContractShadowV1({
+      contractId: "run:irish-influence-membership",
+      prompt,
+      brief: requestBrief,
+      selectionPlan: baseline,
+    });
+    const projection = projectPlaylistContractExecutionV1({
+      contract: bridged.contract,
+      basePlan: baseline,
+    });
+
+    expect(bridged.contract.clauses).toContainEqual(expect.objectContaining({
+      kind: "membership",
+      axis: "geography",
+      hardness: "hard",
+      values: ["Irish"],
+    }));
+    expect(projection.selectionPlanV3.membershipPredicates).toContainEqual(
+      expect.objectContaining({
+        axis: "geography",
+        operator: "require",
+        values: ["Irish"],
+      }),
+    );
+    const influenceSuitabilityId =
+      bridged.contract.qualityPolicy.centralSuitabilityClauseIds.find((id) => (
+        bridged.contract.clauses.some((clause) => (
+          clause.id === id && clause.axis === "influence"
+        ))
+      ));
+    expect(influenceSuitabilityId).toBeDefined();
+    expect(bridged.contract.clauses).toContainEqual(expect.objectContaining({
+      id: influenceSuitabilityId,
+      kind: "suitability",
+      scope: "track",
+      hardness: "soft",
+      axis: "influence",
+      operator: "prefer",
+      values: ["documented historical influence"],
+      evidence: {
+        required: true,
+        minimumGrade: null,
+        permittedGrades: [
+          "independent_secondary_source",
+          "track_specific_editorial_assertion",
+        ],
+        claim: "influence:prefer",
+      },
+      unknownPolicy: "defer",
+    }));
+    expect(bridged.contract.trackPredicate).not.toEqual({
+      op: "clause",
+      clauseId: influenceSuitabilityId,
+    });
+    expect(projection.selectionPlanV3.playlistQualityPolicy).toMatchObject({
+      clauseIds: expect.arrayContaining([influenceSuitabilityId]),
+      criteria: expect.arrayContaining(["documented historical influence"]),
+    });
+    expect(projection.selectionPlanV3.rankingObjectives).toContainEqual(
+      expect.objectContaining({
+        dimension: "influence",
+        values: ["documented historical influence"],
+      }),
+    );
+    expect(projection.selectionPlanV3.engines).toContain(
+      "curated_genre_scene",
+    );
+    expect(projection.selectionPlanV3.engines).not.toContain(
+      "mood_activity_theme",
+    );
+    expect(projection.selectionPlanV3.engines).not.toContain(
+      "factual_relationship",
+    );
+    expect(pipelineV3RolloutGroup(projection.selectionPlanV3)).toBe(
+      "editorial_influence",
+    );
+  });
+
   test("compiles co-named rap and grime as one hard OR membership clause", () => {
     const prompt = "create a playlist for bike rides for a hipster who loves rap music and grime. His favorite rapper is Pop Smoke but he wants to discover new stuff";
     const requestBrief = brief({
@@ -582,17 +679,17 @@ describe("playlist contract shadow bridge v1", () => {
       operator: "exclude",
     });
     expect(clauseForValue("2010")).toMatchObject({
-      kind: "factual_relationship",
+      kind: "membership",
       hardness: "hard",
       axis: "era",
     });
     expect(clauseForValue("France")).toMatchObject({
-      kind: "factual_relationship",
+      kind: "membership",
       hardness: "hard",
       axis: "geography",
     });
     expect(clauseForValue("Spanish")).toMatchObject({
-      kind: "factual_relationship",
+      kind: "membership",
       hardness: "hard",
       axis: "language",
     });
@@ -631,12 +728,12 @@ describe("playlist contract shadow bridge v1", () => {
         "language:Spanish",
       ]),
     }));
-    expect(bridged.contract.clauses).toContainEqual(expect.objectContaining({
+    expect(bridged.contract.clauses).not.toContainEqual(expect.objectContaining({
       id: "bridge:evidence:qualification-policy",
-      kind: "factual_relationship",
-      hardness: "hard",
-      values: [requestBrief.evidencePolicy],
     }));
+    expect(bridged.contract.clauses
+      .filter(({ hardness }) => hardness === "hard")
+      .every(({ evidence }) => evidence.required)).toBe(true);
     expect(JSON.stringify(bridged.preservedTrackPredicate)).not.toContain("genre_brazilian_funk");
     expect(JSON.stringify(bridged.preservedTrackPredicate)).not.toContain("genre_perreo");
     expect(() => assertPlaylistContractIntegrityV1(bridged.contract)).not.toThrow();

@@ -15,6 +15,11 @@ import {
 } from "../server/playlist-contract-backend-capability-v1.ts";
 import { Repository } from "../server/repository.ts";
 import { WORKER_PIPELINE_CAPABILITY } from "../server/worker-protocol.ts";
+import {
+  createLegacyExecutionRouteDrainV1,
+  LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1,
+  LEGACY_EXECUTION_ROUTE_DRAIN_VERSION_V1,
+} from "../server/legacy-execution-route-drain-v1.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
@@ -108,7 +113,7 @@ databaseDescribe("canonical executor release identity migration 0020", () => {
          idempotency_key,retention_expires_at,brief_contract_version,
          pipeline_version)
        VALUES($1,$2,'{}'::jsonb,$3,'queued','queued',$4,$5,
-         now()+interval '1 day',3,'corpus_first_v3')`,
+         now()+interval '1 day',2,'corpus_first_v3')`,
       [
         runId,
         `executor release ${input.suffix}`,
@@ -207,6 +212,39 @@ databaseDescribe("canonical executor release identity migration 0020", () => {
         ],
       );
     }
+    const createdAt = (await pool.query<{ created_at: Date }>(
+      "SELECT created_at FROM job_queue WHERE id=$1",
+      [jobId],
+    )).rows[0]!.created_at.toISOString();
+    const drain = createLegacyExecutionRouteDrainV1({
+      version: LEGACY_EXECUTION_ROUTE_DRAIN_VERSION_V1,
+      runId,
+      contractRevisionId: contractId,
+      executionRoute: "corpus_first_v3",
+      targetReleaseRevision: targetRevision,
+      targetSemanticConfigurationHash: targetSemanticHash,
+      acceptedBefore: createdAt,
+      inventoriedAt: createdAt,
+      jobs: [{
+        jobId,
+        kind: "research",
+        queryPlanRevisionId: queryPlanId,
+        queryPlanHash: "6".repeat(64),
+        stageKey: `v3-retrieval:active:${input.suffix}`,
+        createdAt,
+        sourceExecutorRevision: input.schemaVersion === 5
+          ? targetRevision
+          : null,
+        sourceSemanticConfigurationHash: input.schemaVersion === 5
+          ? targetSemanticHash
+          : null,
+      }],
+    });
+    await pool.query(
+      `INSERT INTO research_checkpoints(run_id,phase,state_json)
+       VALUES($1,$2,$3::jsonb)`,
+      [runId, LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1, JSON.stringify(drain)],
+    );
     return { runId, contractId, queryPlanId, jobId };
   }
 

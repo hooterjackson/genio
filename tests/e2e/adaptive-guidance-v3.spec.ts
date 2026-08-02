@@ -1484,7 +1484,8 @@ test("the 24-hour provider boundary is labeled as retryable service state with v
   await expect(panel).toContainText("PROGRESS IS SAVED");
   await expect(page.getByRole("button", { name: /resume later/i }))
     .toBeVisible();
-  await expect(page.getByRole("button", { name: /refine request/i })).toBeVisible();
+  await expect(page.getByRole("button", { name: /refine request/i }))
+    .toHaveCount(0);
   await expect(page.getByRole("button", { name: /cancel job/i })).toBeVisible();
   await expect(page.getByText(/no verified tracks are ready yet/i)).toHaveCount(0);
 
@@ -1553,24 +1554,26 @@ test("a rollout capability change is a durable decision and never offers an auto
   await expect(panel).toContainText("accepted request is unchanged");
   await expect(panel).toContainText("will not be silently downgraded");
   await expect(panel).toContainText(
-    "SAVED DURABLY · REFINE OR CANCEL",
+    "SAVED DURABLY · TECHNICAL ATTENTION REQUIRED",
+  );
+  await expect(panel).toContainText(
+    "This is a rollout-control problem, not a prompt problem.",
   );
   await expect(
     page.getByRole("button", { name: /create control successor/i }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: /refine request/i }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("link", { name: /contact support/i }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: /cancel job/i }),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: /refine request/i }).click();
   await expect(
-    page.getByRole("textbox", { name: /playlist request/i }),
-  ).toHaveValue(rolloutDecisionRun.prompt);
-  await expect(
-    page.getByRole("button", { name: "50 tracks", exact: true }),
+    page.getByText(/request needs no rewrite/i),
   ).toBeVisible();
 });
 

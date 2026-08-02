@@ -1,0 +1,463 @@
+name: v254 editorial direct exposure
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact merged v2.5.4 source revision
+        required: true
+        type: string
+      release_version:
+        description: Exact candidate version
+        required: true
+        type: string
+      candidate_tag:
+        description: Immutable annotated RC tag
+        required: true
+        type: string
+      image_digest:
+        description: Immutable promoted backend image digest
+        required: true
+        type: string
+      backend_promotion_run_id:
+        description: Successful native schema20 promotion and signed authority run
+        required: true
+        type: string
+      sites_handoff_run_id:
+        description: Successful exact-SHA Sites connector handoff run
+        required: true
+        type: string
+      sites_handoff_artifact:
+        description: Exact Sites connector handoff artifact
+        required: true
+        type: string
+      owner_gate_run_id:
+        description: Successful owner Apple acceptance run
+        required: true
+        type: string
+      owner_gate_artifact:
+        description: Exact owner Apple acceptance artifact
+        required: true
+        type: string
+      route_authority_run_id:
+        description: Successful paused pre-exposure database route run
+        required: true
+        type: string
+      route_authority_artifact:
+        description: Exact paused pre-exposure database route artifact
+        required: true
+        type: string
+      clean_gate_run_id:
+        description: Successful zero-write clean non-owner browser run
+        required: true
+        type: string
+      clean_gate_artifact:
+        description: Exact zero-write clean non-owner browser artifact
+        required: true
+        type: string
+
+concurrency:
+  group: v254-editorial-direct-exposure
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  expose:
+    name: signed editorial_influence 0 to 100
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROJECT_ID: 7e7a44ee-3e54-453c-9120-3cb1f33db76e
+      RAILWAY_INTERACTIVE_SERVICE_ID: 3affc435-074d-4f6f-806f-1c2b552a8b17
+      RAILWAY_DEEP_SERVICE_ID: a3469457-f56e-4871-8a10-5ea6c052640c
+      RAILWAY_API_SERVICE_ID: 11ba75aa-2495-4f28-bbde-64c43efbe731
+      RELEASE_VERIFICATION_KEY_ID: ${{ vars.RELEASE_VERIFICATION_KEY_ID }}
+      RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+      RELEASE_GATE_PRODUCER_KEY_ID: ${{ vars.RELEASE_GATE_PRODUCER_KEY_ID }}
+      RELEASE_GATE_PRODUCER_KEY_SHA256: ${{ vars.RELEASE_GATE_PRODUCER_KEY_SHA256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the exact immutable candidate and upstream graph
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          BACKEND_RUN_ID: ${{ inputs.backend_promotion_run_id }}
+          SITES_RUN_ID: ${{ inputs.sites_handoff_run_id }}
+          SITES_ARTIFACT: ${{ inputs.sites_handoff_artifact }}
+          OWNER_RUN_ID: ${{ inputs.owner_gate_run_id }}
+          OWNER_ARTIFACT: ${{ inputs.owner_gate_artifact }}
+          ROUTE_RUN_ID: ${{ inputs.route_authority_run_id }}
+          ROUTE_ARTIFACT: ${{ inputs.route_authority_artifact }}
+          CLEAN_RUN_ID: ${{ inputs.clean_gate_run_id }}
+          CLEAN_ARTIFACT: ${{ inputs.clean_gate_artifact }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_WORKFLOW_SHA" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_TAG" =~ ^v"$RELEASE_VERSION"-rc\.[1-9][0-9]*$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$SITES_ARTIFACT" = "v254-sites-connector-handoff-$SOURCE_REVISION"
+          test "$OWNER_ARTIFACT" = "v254-owner-apple-gate-$SOURCE_REVISION"
+          test "$ROUTE_ARTIFACT" = "v254-pre-exposure-route-pause-public_canary-$SOURCE_REVISION"
+          test "$CLEAN_ARTIFACT" = "v254-pre-exposure-clean-nonowner-$SOURCE_REVISION"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
+          git fetch --force origin "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$SOURCE_REVISION"
+          for RUN_ID in "$BACKEND_RUN_ID" "$SITES_RUN_ID" "$OWNER_RUN_ID" "$ROUTE_RUN_ID" "$CLEAN_RUN_ID"; do
+            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+            test "$(jq -r '.event' <<<"$RUN")" = "workflow_dispatch"
+            test "$(jq -r '.status' <<<"$RUN")" = "completed"
+            test "$(jq -r '.conclusion' <<<"$RUN")" = "success"
+            test "$(jq -r '.head_sha' <<<"$RUN")" = "$SOURCE_REVISION"
+          done
+          BACKEND="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BACKEND_RUN_ID")"
+          SITES="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SITES_RUN_ID")"
+          OWNER="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$OWNER_RUN_ID")"
+          ROUTE="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ROUTE_RUN_ID")"
+          CLEAN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CLEAN_RUN_ID")"
+          test "$(jq -r '.path' <<<"$BACKEND")" = ".github/workflows/native-schema20-release.yml"
+          test "$(jq -r '.path' <<<"$SITES")" = ".github/workflows/v254-sites-connector-handoff.yml"
+          test "$(jq -r '.path' <<<"$OWNER")" = ".github/workflows/v254-owner-apple-gate.yml"
+          test "$(jq -r '.path' <<<"$ROUTE")" = ".github/workflows/v254-pre-exposure-route-pause.yml"
+          test "$(jq -r '.path' <<<"$CLEAN")" = ".github/workflows/v254-pre-exposure-clean-nonowner.yml"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-schema20-promotion-${{ inputs.source_revision }}
+          path: ${{ runner.temp }}/backend
+          run-id: ${{ inputs.backend_promotion_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-schema20-rollout-promotion-authority-${{ inputs.source_revision }}
+          path: ${{ runner.temp }}/native-authority
+          run-id: ${{ inputs.backend_promotion_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.sites_handoff_artifact }}
+          path: ${{ runner.temp }}/sites
+          run-id: ${{ inputs.sites_handoff_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.owner_gate_artifact }}
+          path: ${{ runner.temp }}/owner
+          run-id: ${{ inputs.owner_gate_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.route_authority_artifact }}
+          path: ${{ runner.temp }}/route
+          run-id: ${{ inputs.route_authority_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.clean_gate_artifact }}
+          path: ${{ runner.temp }}/clean
+          run-id: ${{ inputs.clean_gate_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install exact lockfile and pinned Railway CLI
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          npm install --global @railway/cli@4.65.0
+          test "$(railway --version)" = "railway 4.65.0"
+
+      - name: Materialize and pin protected signing and verification keys
+        env:
+          RELEASE_VERIFICATION_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_VERIFICATION_PUBLIC_KEY_BASE64 }}
+          RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64: ${{ secrets.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64 }}
+          RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$RELEASE_VERIFICATION_PUBLIC_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/release-verification-public-key.pem"
+          printf '%s' "$RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/direct-exposure-signing-key.pem"
+          printf '%s' "$RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/release-gate-producer-public-key.pem"
+          node -e 'const c=require("node:crypto"),f=require("node:fs"); const pub=c.createPublicKey(f.readFileSync(process.argv[1])); const priv=c.createPrivateKey(f.readFileSync(process.argv[2])); const gate=c.createPublicKey(f.readFileSync(process.argv[3])); const fp=k=>c.createHash("sha256").update(k.export({format:"der",type:"spki"})).digest("hex"); if(fp(pub)!==process.env.RELEASE_VERIFICATION_KEY_SHA256||fp(c.createPublicKey(priv))!==process.env.RELEASE_VERIFICATION_KEY_SHA256||fp(gate)!==process.env.RELEASE_GATE_PRODUCER_KEY_SHA256) throw new Error("protected release keys do not match their configured fingerprints");' "$RUNNER_TEMP/release-verification-public-key.pem" "$RUNNER_TEMP/direct-exposure-signing-key.pem" "$RUNNER_TEMP/release-gate-producer-public-key.pem"
+
+      - id: prepare
+        name: Independently derive one shared post-exposure semantic hash
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          pnpm release:v254:direct-exposure:runtime -- prepare \
+            --promotion-receipt "$RUNNER_TEMP/backend/native-schema20-promotion.json" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --project-id "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --interactive-service "$RAILWAY_INTERACTIVE_SERVICE_ID" \
+            --deep-service "$RAILWAY_DEEP_SERVICE_ID" \
+            --api-service "$RAILWAY_API_SERVICE_ID" \
+            --origin https://9enio.com \
+            --deployment-timeout-seconds 600 \
+            --poll-interval-seconds 10 \
+            --output "$RUNNER_TEMP/direct-exposure-runtime-plan.json"
+          POST_HASH="$(jq -er '.postSemanticConfigurationHash | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/direct-exposure-runtime-plan.json")"
+          echo "post_hash=$POST_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Mint and verify the single-use 0 to 100 authority and rollback warrant
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          POST_HASH: ${{ steps.prepare.outputs.post_hash }}
+        run: |
+          set -euo pipefail
+          pnpm release:v254:direct-exposure:authorize -- \
+            --promotion-receipt "$RUNNER_TEMP/backend/native-schema20-promotion.json" \
+            --native-authority "$RUNNER_TEMP/native-authority/native-schema20-rollout-promotion-authority.json" \
+            --native-verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+            --native-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --native-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --sites-control-plane "$RUNNER_TEMP/sites/v254-sites-connector-handoff.json" \
+            --owner-gate "$RUNNER_TEMP/owner/production-affected-regression.gate.json" \
+            --owner-attestation "$RUNNER_TEMP/owner/production-affected-regression.attestation.json" \
+            --clean-gate "$RUNNER_TEMP/clean/pre-exposure-clean-nonowner.gate.json" \
+            --clean-attestation "$RUNNER_TEMP/clean/pre-exposure-clean-nonowner.attestation.json" \
+            --gate-verification-key "$RUNNER_TEMP/release-gate-producer-public-key.pem" \
+            --gate-key-id "$RELEASE_GATE_PRODUCER_KEY_ID" \
+            --gate-key-sha256 "$RELEASE_GATE_PRODUCER_KEY_SHA256" \
+            --database-route-receipt "$RUNNER_TEMP/route/v254-editorial-route-authority.json" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --post-semantic-configuration-hash "$POST_HASH" \
+            --signing-key "$RUNNER_TEMP/direct-exposure-signing-key.pem" \
+            --signing-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --signing-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --authority-output "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+            --rollback-warrant-output "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json"
+
+      - id: plan
+        name: Verify the exact database plan before mutation
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types scripts/apply-v254-direct-exposure.ts plan \
+            --authority "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+            --rollback-warrant "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json" \
+            --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+            --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --expected-source-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-image-digest "$IMAGE_DIGEST" \
+            --output "$RUNNER_TEMP/direct-exposure-database-plan.json"
+
+      - id: arm
+        name: Arm the durable authority while route and publication stay paused
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          railway run --service Postgres --project "$RAILWAY_PROJECT_ID" --environment production --no-local -- \
+            sh -lc 'export DATABASE_URL="$DATABASE_PUBLIC_URL"; export PGSSLMODE=no-verify; exec node --experimental-transform-types scripts/apply-v254-direct-exposure.ts "$@"' sh arm \
+              --authority "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+              --rollback-warrant "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json" \
+              --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+              --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+              --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+              --expected-source-revision "$SOURCE_REVISION" \
+              --expected-version "$RELEASE_VERSION" \
+              --expected-image-digest "$IMAGE_DIGEST" \
+              --output "$RUNNER_TEMP/direct-exposure-database-arm.json"
+          jq -e '.operation == "arm" and .state == "armed" and .terminal == false' "$RUNNER_TEMP/direct-exposure-database-arm.json"
+          echo "armed=true" >> "$GITHUB_OUTPUT"
+
+      - id: runtime
+        name: Redeploy the existing workers first and API last from the same image
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          pnpm release:v254:direct-exposure:runtime -- apply \
+            --promotion-receipt "$RUNNER_TEMP/backend/native-schema20-promotion.json" \
+            --authority "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+            --rollback-warrant "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json" \
+            --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+            --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --project-id "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --interactive-service "$RAILWAY_INTERACTIVE_SERVICE_ID" \
+            --deep-service "$RAILWAY_DEEP_SERVICE_ID" \
+            --api-service "$RAILWAY_API_SERVICE_ID" \
+            --origin https://9enio.com \
+            --deployment-timeout-seconds 600 \
+            --poll-interval-seconds 10 \
+            --output "$RUNNER_TEMP/direct-exposure-runtime-apply.json"
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+
+      - id: activate
+        name: Activate the database authority last
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          railway run --service Postgres --project "$RAILWAY_PROJECT_ID" --environment production --no-local -- \
+            sh -lc 'export DATABASE_URL="$DATABASE_PUBLIC_URL"; export PGSSLMODE=no-verify; exec node --experimental-transform-types scripts/apply-v254-direct-exposure.ts "$@"' sh activate \
+              --authority "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+              --rollback-warrant "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json" \
+              --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+              --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+              --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+              --expected-source-revision "$SOURCE_REVISION" \
+              --expected-version "$RELEASE_VERSION" \
+              --expected-image-digest "$IMAGE_DIGEST" \
+              --output "$RUNNER_TEMP/direct-exposure-database-activate.json"
+          jq -e '.operation == "activate" and .state == "active" and .terminal == false' "$RUNNER_TEMP/direct-exposure-database-activate.json"
+          echo "activated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prove the active exact runtime and absence of staged authority
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          for PATHNAME in live ready system; do
+            curl --fail --silent --show-error --location --max-time 20 \
+              -H 'cache-control: no-cache' \
+              "https://9enio.com/health/$PATHNAME?v254-direct=$RANDOM" \
+              > "$RUNNER_TEMP/health-$PATHNAME.json"
+          done
+          jq -e --arg version "$RELEASE_VERSION" --arg revision "$SOURCE_REVISION" \
+            '(.build // .).version == $version and (.build // .).revision == $revision' \
+            "$RUNNER_TEMP/health-live.json"
+          jq -e \
+            '.ok == true
+             and .activationReady == true
+             and (.schemaVersion | tostring) == "20"
+             and .workerProtocol.actual == "playlist-pipeline-v12"
+             and .executorFencing.uncoveredJobs == 0
+             and .publicRollout.active == false
+             and .directExposure.active == true
+             and .directExposure.state == "active"
+             and .directExposure.exposureClass == "fully_exposed_unproven"
+             and .directExposure.organicReliabilityProven == false
+             and (.directExposure.authorityPayloadHash | test("^[0-9a-f]{64}$"))
+             and (.directExposure.rollbackWarrantPayloadHash | test("^[0-9a-f]{64}$"))' \
+            "$RUNNER_TEMP/health-system.json"
+
+      - name: Roll back database first, then exact image and configuration
+        if: failure() && steps.arm.outputs.armed == 'true'
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set +e
+          railway run --service Postgres --project "$RAILWAY_PROJECT_ID" --environment production --no-local -- \
+            sh -lc 'export DATABASE_URL="$DATABASE_PUBLIC_URL"; export PGSSLMODE=no-verify; exec node --experimental-transform-types scripts/apply-v254-direct-exposure.ts "$@"' sh rollback \
+              --authority "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+              --rollback-warrant "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json" \
+              --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+              --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+              --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+              --expected-source-revision "$SOURCE_REVISION" \
+              --expected-version "$RELEASE_VERSION" \
+              --expected-image-digest "$IMAGE_DIGEST" \
+              --output "$RUNNER_TEMP/direct-exposure-database-rollback.json"
+          DB_STATUS=$?
+          pnpm release:v254:direct-exposure:runtime -- rollback \
+            --promotion-receipt "$RUNNER_TEMP/backend/native-schema20-promotion.json" \
+            --authority "$RUNNER_TEMP/v254-direct-exposure-authority.json" \
+            --rollback-warrant "$RUNNER_TEMP/v254-direct-exposure-rollback-warrant.json" \
+            --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+            --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --project-id "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --interactive-service "$RAILWAY_INTERACTIVE_SERVICE_ID" \
+            --deep-service "$RAILWAY_DEEP_SERVICE_ID" \
+            --api-service "$RAILWAY_API_SERVICE_ID" \
+            --origin https://9enio.com \
+            --deployment-timeout-seconds 600 \
+            --poll-interval-seconds 10 \
+            --output "$RUNNER_TEMP/direct-exposure-runtime-rollback.json"
+          RUNTIME_STATUS=$?
+          test "$DB_STATUS" -eq 0
+          test "$RUNTIME_STATUS" -eq 0
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: v254-editorial-direct-exposure-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/direct-exposure-runtime-plan.json
+            ${{ runner.temp }}/v254-direct-exposure-authority.json
+            ${{ runner.temp }}/v254-direct-exposure-rollback-warrant.json
+            ${{ runner.temp }}/direct-exposure-database-plan.json
+            ${{ runner.temp }}/direct-exposure-database-arm.json
+            ${{ runner.temp }}/direct-exposure-runtime-apply.json
+            ${{ runner.temp }}/direct-exposure-database-activate.json
+            ${{ runner.temp }}/direct-exposure-database-rollback.json
+            ${{ runner.temp }}/direct-exposure-runtime-rollback.json
+            ${{ runner.temp }}/health-live.json
+            ${{ runner.temp }}/health-ready.json
+            ${{ runner.temp }}/health-system.json
+          if-no-files-found: warn
+          retention-days: 30

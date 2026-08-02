@@ -67,7 +67,11 @@ import {
   frenchJazzGuidanceDecisionV3,
   smoothReggaetonHeatGuidanceDecisionV3,
 } from "../server/adaptive-guidance-v3.ts";
-import { publicGuidanceQuestionV3 } from "../server/adaptive-guidance-contract-bridge.ts";
+import { guidanceCheckpointV5 } from "../server/adaptive-guidance-v5.ts";
+import {
+  publicGuidanceQuestionV3,
+  publicGuidanceQuestionV5,
+} from "../server/adaptive-guidance-contract-bridge.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import {
   RELEASE_EVIDENCE_TTL_MS,
@@ -287,6 +291,7 @@ function gate(
     fixtures: releaseFixtureBindingsForGate(name as ReleaseGateName, {
       "smooth-reggaeton-heat-50-v1": "7".repeat(64),
       "french-jazz-guided-constraint-25-v1": "8".repeat(64),
+      "irish-influence-recovery-25-v1": "9".repeat(64),
     }),
     cacheMode: environment === "offline" ? "not_applicable" : "reuse_disabled",
     budgetStatus: environment === "staging" ? "within_cap" : "not_applicable",
@@ -368,7 +373,7 @@ function payload(
       escalation: "gpt-5.6-terra",
     },
     policyVersions: {
-      guidance: "adaptive_guidance_v4",
+      guidance: "adaptive_guidance_v5",
       evidence: "governed_evidence_v2",
       queryPlan: "query_plan_v3_4",
       selection: "selection_plan_v3",
@@ -457,7 +462,7 @@ function payload(
             promotionEvidenceGeneratedAt: phaseGeneratedAt.promotion,
             publicRolloutEvidencePayloadHash: "d".repeat(64),
             publicRolloutCompletedAt: "2026-07-23T12:26:00.000Z",
-            publicRolloutIntentGroup: "genre_scene",
+            publicRolloutIntentGroup: "editorial_influence",
             publicRolloutFromPercent: "50",
             publicRolloutToPercent: "100",
             publicRolloutTargetConfigurationHash: "4".repeat(64),
@@ -559,7 +564,7 @@ function payload(
               active: true,
               databaseAuthorized: true,
               evidenceHash: "d".repeat(64),
-              stage: "genre_scene:50->100",
+              stage: "editorial_influence:50->100",
               targetConfigurationHash: "4".repeat(64),
             }
           : {
@@ -895,12 +900,16 @@ function runtimeSnapshot(
 function fixtureGuidancePayload(
   fixtureId: Extract<
     ReleaseFixtureId,
-    "smooth-reggaeton-heat-50-v1" | "french-jazz-guided-constraint-25-v1"
+    | "smooth-reggaeton-heat-50-v1"
+    | "french-jazz-guided-constraint-25-v1"
+    | "irish-influence-recovery-25-v1"
   >,
 ) {
   const questionSetHash = fixtureId === "smooth-reggaeton-heat-50-v1"
     ? "a".repeat(64)
-    : "b".repeat(64);
+    : fixtureId === "french-jazz-guided-constraint-25-v1"
+      ? "b".repeat(64)
+      : "c".repeat(64);
   if (fixtureId === "smooth-reggaeton-heat-50-v1") {
     const decision = smoothReggaetonHeatGuidanceDecisionV3({
       prompt: releaseFixturePrompt(fixtureId),
@@ -913,6 +922,52 @@ function fixtureGuidancePayload(
     return {
       questionSetHash,
       questions: [publicGuidanceQuestionV3(decision)],
+    };
+  }
+  if (fixtureId === "irish-influence-recovery-25-v1") {
+    const baseContract = compilePlaylistContractRevisionV1({
+      contractId: "release-fixture:irish-influence-recovery-25-v1",
+      rawPrompt: releaseFixturePrompt(fixtureId),
+      requestedTrackCount: 25,
+      locale: "en",
+      storefront: "us",
+      clauses: [
+        {
+          id: "membership:origin",
+          kind: "membership",
+          scope: "track",
+          hardness: "hard",
+          axis: "artist_origin",
+          operator: "require",
+          values: ["Irish"],
+          source: { provenance: "prompt", text: "irish" },
+        },
+        {
+          id: "ranking:influence",
+          kind: "ranking_preference",
+          scope: "track",
+          hardness: "soft",
+          axis: "influence",
+          operator: "prefer",
+          values: ["historical influence"],
+          source: { provenance: "prompt", text: "Infuential" },
+        },
+      ],
+      trackPredicate: { op: "clause", clauseId: "membership:origin" },
+    });
+    const checkpoint = guidanceCheckpointV5({
+      prompt: baseContract.rawPrompt,
+      baseContract,
+      preservedTrackPredicate: baseContract.trackPredicate,
+      ambiguousScopeClauseIds: [],
+      criticalAmbiguities: [],
+      requestShape: "curated",
+      capabilitySnapshotHash: "a".repeat(64),
+      semanticConfigurationHash: "b".repeat(64),
+    });
+    return {
+      questionSetHash,
+      questions: [publicGuidanceQuestionV5(checkpoint.decisions[0]!)],
     };
   }
   const prompt = releaseFixturePrompt(fixtureId);
@@ -1023,7 +1078,8 @@ function sourceEvidence(
       guidancePayload: fixtures[0].guidanceMode === "recommended"
         ? fixtureGuidancePayload(fixtures[0].fixtureId as
           | "smooth-reggaeton-heat-50-v1"
-          | "french-jazz-guided-constraint-25-v1")
+          | "french-jazz-guided-constraint-25-v1"
+          | "irish-influence-recovery-25-v1")
         : null,
     })
     : null;
@@ -1043,6 +1099,7 @@ function sourceEvidence(
         matchingJobs: 0,
         publicationJobs: 0,
         publicationVolumeRows: 0,
+        orphanPlaylistRows: 0,
       },
       selectionValidation: {
         canonicalPublicationValid: true,
@@ -1358,7 +1415,7 @@ function sourceEvidence(
         briefContractVersion: "3",
         guidanceContractOwnerCanaryEnabled: "true",
         guidanceContractReggaetonCanaryEnabled: "true",
-        guidancePolicyVersion: "adaptive_guidance_v4",
+        guidancePolicyVersion: "adaptive_guidance_v5",
         evidencePolicyVersion: "governed_evidence_v2",
         queryPlanPolicyVersion: "query_plan_v3_4",
         semanticScopePolicyVersion: "scope_gate_v2_1_2",
@@ -1513,7 +1570,7 @@ function sourceEvidence(
       rollbackTarget,
     };
     const browserUnsigned = {
-      schemaVersion: "genio-final-custom-domain-browser/v2",
+      schemaVersion: "genio-final-custom-domain-browser/v6",
       origin: "https://9enio.com",
       candidateRevision: candidate.sourceRevision,
       observedAt: sourceGeneratedAt,
@@ -1522,7 +1579,12 @@ function sourceEvidence(
       anonymousPlaylistDirectory: true,
       publicPlaylistContentsVisible: true,
       privacyProjectionPassed: true,
-      screenshotHashes: ["c".repeat(64)],
+      noDirectRailwayRequests: true,
+      screenshotHashes: [
+        "c".repeat(64),
+        "d".repeat(64),
+        "e".repeat(64),
+      ],
       publicAssignmentProbes:
         FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture, index) => ({
           fixtureId: fixture.fixtureId,
@@ -1534,7 +1596,36 @@ function sourceEvidence(
             releaseRuntimeSnapshot.publicRollout.stage!,
           assignmentHash: String((index % 9) + 1).repeat(64),
           contractVersion: 3,
-          cleanupStatus: 204,
+          guidancePolicyVersion: "adaptive_guidance_v5",
+          questionSetHash: "a".repeat(64),
+          questionHash: "b".repeat(64),
+          axis: "influence_scope",
+          selectedOptionId: "balanced_influence",
+          answerAccepted: true,
+          successorContractHash: "c".repeat(64),
+          executionRouteReceiptHash: "d".repeat(64),
+          runAccessIdHash: "e".repeat(64),
+          workerConsumptionReceiptHash: "f".repeat(64),
+          workerExecutionEffectHash: "1".repeat(64),
+          workerResultEffectHash: "2".repeat(64),
+          manifestCanaryEvidenceHash: "3".repeat(64),
+          qualifiedManifestHash: "4".repeat(64),
+          selectedTrackCount: 25,
+          reserveTrackCount: 5,
+          attemptCount: 1,
+          executorIdentityHashes: ["5".repeat(64)],
+          configurationHashes: ["6".repeat(64)],
+          manifestOnly: true,
+          appleWriteAccess: "forbidden",
+          autoPublish: false,
+          manifestRows: 0,
+          matchingJobs: 0,
+          publicationJobs: 0,
+          publicationVolumeRows: 0,
+          orphanPlaylistRows: 0,
+          noPublishedUi: true,
+          runReused: false,
+          realUiPath: true,
         })),
     };
     const sitesControlPlane = {
@@ -1614,8 +1705,19 @@ function sourceEvidence(
     ...independentUnsigned,
     evidenceHash: sha256(independentUnsigned),
   };
+  const ownerUiUnsigned = {
+    schemaVersion: "genio-owner-ui-publication/v1",
+    exercised: true,
+    publishRequestObserved: true,
+    publishResponseStatus: 202,
+    selectedTrackCount: fixture.targetTrackCount,
+    completedUiVisible: true,
+    directoryEntryVisible: true,
+    runAccessIdHash: "8".repeat(64),
+    screenshotHash: "9".repeat(64),
+  };
   const hostedUnsigned = {
-    schemaVersion: "genio-hosted-publication-smoke/v1",
+    schemaVersion: "genio-hosted-publication-smoke/v2",
     canaryId,
     cacheMode: "reuse_disabled",
     targetTrackCount: fixture.targetTrackCount,
@@ -1632,6 +1734,13 @@ function sourceEvidence(
     allAttemptsComplete: true,
     serverReportedOrderedAppleReconciliation: true,
     orderedAppleIdsHash: orderedHash,
+    ownerUiPublication:
+      fixture.fixtureId === "irish-influence-recovery-25-v1"
+        ? {
+            ...ownerUiUnsigned,
+            evidenceHash: sha256(ownerUiUnsigned),
+          }
+        : null,
     independentAppleEvidenceHash: independentApple.evidenceHash,
     volumes: [{
       index: 1,
@@ -1640,7 +1749,7 @@ function sourceEvidence(
       shareUrl: "https://music.apple.com/us/playlist/test/pl.u-test",
     }],
   };
-  return {
+  const publicationSources: Record<string, unknown> = {
     hostedPublication: {
       ...hostedUnsigned,
       evidenceHash: createHash("sha256").update(JSON.stringify(hostedUnsigned)).digest("hex"),
@@ -1648,6 +1757,76 @@ function sourceEvidence(
     independentApple,
     fixtureExecution,
   };
+  if (fixture.fixtureId === "irish-influence-recovery-25-v1") {
+    const irishUnsigned = {
+      schemaVersion: "genio-irish-influence-release-proof/v1",
+      fixtureId: "irish-influence-recovery-25-v1",
+      candidate: {
+        version: candidate.version,
+        sourceRevision: candidate.sourceRevision,
+        workerConfigurationHash: hash,
+      },
+      ownerAcceptance: {
+        trafficClass: "owner_canary",
+        assignmentKind: "signed_owner_canary",
+        intentGroup: "editorial_influence",
+        executionRoute: "corpus_first_v3",
+        contractVersion: 3,
+        guidanceVersion: "adaptive_guidance_v5",
+        hardMembershipAxis: "geography",
+        hardMembershipValue: "Irish",
+        influenceKind: "influence",
+        assignmentReceiptHash: "a".repeat(64),
+        routeReceiptHash: "b".repeat(64),
+        questionSetHash: fixtureExecution!.questionSetHash,
+        questionHash: fixtureExecution!.questionHash,
+        axis: "influence_scope",
+        selectedOptionId: "balanced_influence",
+        baseContractSemanticHash: "c".repeat(64),
+        successorContractSemanticHash: hostedUnsigned.contractHash,
+        queryPlanSchema: 6,
+        queryPlanHash: "d".repeat(64),
+        queryPlanRevisionHash: hostedUnsigned.queryPlanRevisionHash,
+        optionSimulationReceiptHash: "e".repeat(64),
+        executionEffectHash: "f".repeat(64),
+        workerConsumptionReceiptHash: "1".repeat(64),
+        workerConsumptionStatus: "consumed",
+      },
+      recoveryInjection: {
+        discoveryObservationCount: 80,
+        uniqueLeadCount: 80,
+        qualificationObservationCount: 77,
+        candidateBoundQualificationCount: 77,
+        legacyUnboundQualificationCount: 0,
+        qualificationBindingMismatchCount: 0,
+        qualificationBindingSetHash: "9".repeat(64),
+        materializedCandidateCount: 77,
+        applePlayableCount: 73,
+        evidenceQualifiedCount: 0,
+        limitingObligationUnknownCount: 77,
+        limitingObligationFailCount: 0,
+        acquisitionAttemptCount: 2,
+        disposition: "blocked_dependency",
+        nextActionKind: "resume_at",
+        scarcityReported: false,
+        actionless: false,
+      },
+      publication: {
+        selectedCount: 25,
+        manifestedCount: 25,
+        appendedCount: 25,
+        reconciledPublishedCount: 25,
+        expectedOrderedAppleIdsHash: orderedHash,
+        observedOrderedAppleIdsHash: orderedHash,
+      },
+      observedAt: sourceGeneratedAt,
+    };
+    publicationSources.irishInfluenceRecovery = {
+      ...irishUnsigned,
+      evidenceHash: sha256(irishUnsigned),
+    };
+  }
+  return publicationSources;
 }
 
 const STABLE_CONTROL_PLANE_SOURCE_FIXTURE_FILE =
@@ -1930,6 +2109,7 @@ function writeSigningBundle(
     const fixtures = releaseFixtureBindingsForGate(item.name, {
         "smooth-reggaeton-heat-50-v1": "7".repeat(64),
         "french-jazz-guided-constraint-25-v1": "8".repeat(64),
+        "irish-influence-recovery-25-v1": "9".repeat(64),
       });
     const artifact = item.name === "offline_suite"
       ? createOfflineReleaseGateArtifact({
@@ -2134,7 +2314,7 @@ function stableFinalizationSourceEvidence(
 }
 
 function rolloutConfiguration(
-  genreScenePercent: "50" | "100",
+  editorialInfluencePercent: "50" | "100",
 ): PublicRolloutConfiguration {
   return {
     PIPELINE_V2_OWNER_CANARY: "false",
@@ -2145,15 +2325,16 @@ function rolloutConfiguration(
     PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
     PIPELINE_V3_OWNER_CANARY: "true",
     PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
-    PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
+    PIPELINE_V3_OWNER_CANARY_GROUPS: "editorial_influence",
     PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
-    PIPELINE_V3_GENRE_SCENE_PERCENT: genreScenePercent,
-    PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "100",
-    PIPELINE_V3_SIMILARITY_PERCENT: "100",
-    PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "100",
-    PIPELINE_V3_FIXED_CONTAINER_PERCENT: "100",
-    PIPELINE_V3_FACTUAL_PERCENT: "100",
-    PIPELINE_V3_EXHAUSTIVE_PERCENT: "100",
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: editorialInfluencePercent,
+    PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
+    PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
+    PIPELINE_V3_SIMILARITY_PERCENT: "0",
+    PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "0",
+    PIPELINE_V3_FIXED_CONTAINER_PERCENT: "0",
+    PIPELINE_V3_FACTUAL_PERCENT: "0",
+    PIPELINE_V3_EXHAUSTIVE_PERCENT: "0",
     PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "false",
@@ -2178,7 +2359,7 @@ function completedPublicRolloutEvidence(
   signingKey: KeyObject,
 ): ReturnType<typeof createStrictSignedEnvelope> {
   const previousRolloutEvidenceHash = "1".repeat(64);
-  const previousRolloutStage = "genre_scene:10->50";
+  const previousRolloutStage = "editorial_influence:10->50";
   const startedAt = "2026-07-23T12:20:00.000Z";
   const completedAt = "2026-07-23T12:21:00.000Z";
   const current = rolloutConfiguration("50");
@@ -2262,7 +2443,7 @@ function completedPublicRolloutEvidence(
     },
     transition: {
       operation: "advance",
-      intentGroup: "genre_scene",
+      intentGroup: "editorial_influence",
       fromPercent: "50",
       toPercent: "100",
       currentPercentages: publicRolloutPercentages(current),
@@ -2734,6 +2915,104 @@ describe("signed release evidence", () => {
     })).toThrow(/canonical recomputation/u);
   });
 
+  test("accepts honest direct-exposure browser v8 evidence and rejects staged or overstated claims", () => {
+    const value = payload("finalization");
+    const directExposureAuthorityHash = "7".repeat(64);
+    const directExposureStage =
+      "editorial_influence:0->100:fully_exposed_unproven";
+    const snapshot = runtimeSnapshot(value, "production", {
+      payloadHash: "6".repeat(64),
+      payload: {
+        transition: {
+          intentGroup: "editorial_influence",
+          fromPercent: "50",
+          toPercent: "100",
+        },
+        targetConfigurationHash: "5".repeat(64),
+      },
+    });
+    const fixtures = releaseFixtureBindingsForGate(
+      "final_custom_domain_browser",
+    );
+    const sources = sourceEvidence(
+      "final_custom_domain_browser",
+      value.candidate,
+      fixtures,
+      "production",
+      snapshot.credentialVersionHashes.appleQaVerifier,
+      snapshot,
+      "4".repeat(64),
+    );
+    const browserV6 = sources.browser as Record<string, any>;
+    const browserV8Unsigned: Record<string, any> = {
+      ...browserV6,
+      schemaVersion: "genio-final-custom-domain-browser/v8",
+      assignmentMode: "direct_exposure",
+      exposureClass: "fully_exposed_unproven",
+      organicReliabilityProven: false,
+      publicAssignmentProbes: browserV6.publicAssignmentProbes.map(
+        (probe: Record<string, unknown>, index: number) => {
+          const assignmentHash = String(index + 1).repeat(64);
+          return {
+            ...probe,
+            rolloutEvidenceHash: directExposureAuthorityHash,
+            rolloutStage: directExposureStage,
+            assignmentHash,
+            assignmentAuthority: "signed_public_direct_exposure",
+            assignmentReceiptHash: assignmentHash,
+            publicPercentageBypass: false,
+            organicAssignment: false,
+            queryPlanHash: String(index + 4).repeat(64),
+          };
+        },
+      ),
+    };
+    delete browserV8Unsigned.evidenceHash;
+    const directSources = {
+      ...sources,
+      browser: {
+        ...browserV8Unsigned,
+        evidenceHash: sha256(browserV8Unsigned),
+      },
+    };
+    const artifact = createReleaseGateArtifactFromSources({
+      gate: "final_custom_domain_browser",
+      completedAt: value.generatedAt,
+      candidate: value.candidate,
+      configurationHash: snapshot.configurationHash,
+      runtimeHash: snapshot.runtimeHash,
+      fixtures,
+      sources: directSources,
+    });
+
+    expect(validateReleaseGateArtifact(artifact)).toEqual(artifact);
+
+    const rehashArtifact = (input: typeof artifact) => {
+      const mutated = structuredClone(input) as any;
+      const browser = mutated.sources.browser;
+      delete browser.evidenceHash;
+      browser.evidenceHash = sha256(browser);
+      delete mutated.evidenceHash;
+      mutated.evidenceHash = sha256(mutated);
+      return mutated;
+    };
+
+    const overstated = structuredClone(artifact) as any;
+    overstated.sources.browser.organicReliabilityProven = true;
+    expect(() => validateReleaseGateArtifact(rehashArtifact(overstated)))
+      .toThrow(/final custom-domain browser evidence did not pass/u);
+
+    const staged = structuredClone(artifact) as any;
+    for (const probe of staged.sources.browser.publicAssignmentProbes) {
+      probe.rolloutStage = "editorial_influence:50->100";
+      probe.assignmentAuthority = "signed_public_rollout";
+      probe.publicPercentageBypass = true;
+      probe.organicAssignment = true;
+    }
+    expect(() => validateReleaseGateArtifact(rehashArtifact(staged)))
+      .toThrow(/did not prove its code-owned V3 assignment/u);
+  });
+
   test("recompiles both immutable guided fixtures from the actual server-owned questions", () => {
     const reggaeton = validateReleaseFixtureGuidancePayload(
       "smooth-reggaeton-heat-50-v1",
@@ -3158,7 +3437,7 @@ describe("signed release evidence", () => {
       for (const mutation of [
         {
           lineage: { publicRolloutFromPercent: "10" },
-          runtime: { stage: "genre_scene:10->100" },
+          runtime: { stage: "editorial_influence:10->100" },
         },
         {
           lineage: {
@@ -3197,7 +3476,7 @@ describe("signed release evidence", () => {
         structuredClone(finalization.payload);
       changedRolloutTargetPayload.lineage.publicRolloutToPercent = "50";
       changedRolloutTargetPayload.environmentSnapshots.production!
-        .publicRollout.stage = "genre_scene:50->50";
+        .publicRollout.stage = "editorial_influence:50->50";
       expect(() => resignReleaseEvidence({
         payload: changedRolloutTargetPayload,
         signature: finalization.signature,
@@ -4421,7 +4700,7 @@ describe("signed release evidence", () => {
   test("preserves the exact rollout transition in signed finalization lineage", () => {
     expect(validateReleaseEvidencePayload(payload("finalization")).lineage)
       .toMatchObject({
-        publicRolloutIntentGroup: "genre_scene",
+        publicRolloutIntentGroup: "editorial_influence",
         publicRolloutFromPercent: "50",
         publicRolloutToPercent: "100",
         publicRolloutTargetConfigurationHash: "4".repeat(64),

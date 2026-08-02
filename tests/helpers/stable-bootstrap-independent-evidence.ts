@@ -30,7 +30,7 @@ import {
   releaseGateProducerTrustPolicyV1,
 } from "../../scripts/release-evidence.ts";
 import {
-  FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1,
+  LEGACY_FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1,
   attestReleaseGateArtifact,
   createReleaseFixtureExecutionProof,
   createReleaseGateArtifactFromSources,
@@ -448,7 +448,7 @@ function finalBrowserSources(input: {
       releaseFixtureSha256("bootstrap-final-browser-screenshot"),
     ],
     publicAssignmentProbes:
-      FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture) => ({
+      LEGACY_FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture) => ({
         fixtureId: fixture.fixtureId,
         intentGroup: fixture.intentGroup,
         targetTrackCount: fixture.targetTrackCount,

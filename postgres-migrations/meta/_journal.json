@@ -169,6 +169,13 @@
       "when": 1785816000000,
       "tag": "0023_schema20_proof_architecture",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785902400000,
+      "tag": "0024_guidance_v5_execution_decision",
+      "breakpoints": true
     }
   ]
 }

@@ -50,6 +50,12 @@ export const LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 4 as const;
 export const CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION = 5 as const;
 /** Boolean verification, coverage, and four-hash canonical plan. */
 export const VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION = 6 as const;
+export const CANONICAL_QUERY_PLAN_GUIDANCE_POLICY_VERSIONS = Object.freeze([
+  "adaptive_guidance_v4",
+  "adaptive_guidance_v5",
+] as const);
+export type CanonicalQueryPlanGuidancePolicyVersion =
+  typeof CANONICAL_QUERY_PLAN_GUIDANCE_POLICY_VERSIONS[number];
 // Schema 2 refines the query contract; it does not create a new persisted run
 // policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -188,6 +194,7 @@ export function queryPlanV3EmissionSchemaVersion(
 }
 
 export type PipelineV3RolloutGroup =
+  | "editorial_influence"
   | "genre_scene"
   | "mood_activity_theme"
   | "similarity"
@@ -238,7 +245,22 @@ function hasExplicitMoodActivityThemeCue(prompt: string): boolean {
       .test(normalized);
 }
 
-type PipelineV3IntentProjection = Pick<SelectionPlanV3, "prompt" | "intents">;
+type PipelineV3IntentProjection = Pick<
+  SelectionPlanV3,
+  "prompt" | "intents" | "rankingObjectives"
+>;
+
+/**
+ * Identify the compiler-produced historical-influence objective without
+ * looking at prompt wording. Both typed signals are required so generic
+ * editorial quality and ordinary genre work remain in their existing cohort.
+ */
+export function hasHistoricalInfluenceObjectiveV3(
+  plan: PipelineV3IntentProjection,
+): boolean {
+  return plan.intents.includes("editorial_ranking")
+    && plan.rankingObjectives.some(({ dimension }) => dimension === "influence");
+}
 
 export function queryPlanV3Engines(
   plan: PipelineV3IntentProjection,
@@ -284,6 +306,7 @@ export function pipelineV3RolloutGroup(
   if (isFixedContainerPrompt(plan.prompt)) return "fixed_container";
   if (plan.intents.includes("artist_catalogue")) return "artist_catalogue";
   if (plan.intents.includes("similarity")) return "similarity";
+  if (hasHistoricalInfluenceObjectiveV3(plan)) return "editorial_influence";
   const genre = plan.intents.includes("genre_scene")
     || plan.intents.includes("editorial_ranking");
   const moodActivityTheme = plan.intents.includes("mood_activity")
@@ -307,6 +330,7 @@ export function pipelineV3RolloutVariable(
   group: PipelineV3RolloutGroup,
 ): string {
   switch (group) {
+    case "editorial_influence": return "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT";
     case "genre_scene": return "PIPELINE_V3_GENRE_SCENE_PERCENT";
     case "mood_activity_theme": return "PIPELINE_V3_MOOD_ACTIVITY_PERCENT";
     case "similarity": return "PIPELINE_V3_SIMILARITY_PERCENT";
@@ -328,7 +352,8 @@ function ownerCanaryAllows(
       .split(",")
       .map((value) => value.trim())
       .filter((value): value is PipelineV3RolloutGroup => (
-        value === "genre_scene"
+        value === "editorial_influence"
+        || value === "genre_scene"
         || value === "mood_activity_theme"
         || value === "similarity"
         || value === "artist_catalogue"
@@ -369,7 +394,8 @@ export function assignPipelineV3(input: {
     && predicate.geographyRelationship !== "sound_association"
   ));
   const requiresCuratedHostedEvidence = (
-    group === "genre_scene"
+    group === "editorial_influence"
+    || group === "genre_scene"
     || group === "mood_activity_theme"
     || group === "similarity"
   ) && env.PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED !== "true";
@@ -519,6 +545,12 @@ export function createQueryPlanV3(
     readonly playlistContractRevisionId?: string;
     readonly playlistContractSemanticHash?: string;
     readonly playlistContractCompilerVersion?: string;
+    /**
+     * Schema-6 plans bind the exact guidance compiler that produced the
+     * immutable contract. Historical schema-6 rows default to V4; new V5
+     * admission must pass V5 explicitly.
+     */
+    readonly guidancePolicyVersion?: CanonicalQueryPlanGuidancePolicyVersion;
   } = {},
 ): QueryPlanV3 {
   const requestedSchemaVersion = options.schemaVersion ?? QUERY_PLAN_V3_VERSION;
@@ -559,6 +591,19 @@ export function createQueryPlanV3(
       || typeof options.playlistContractCompilerVersion !== "string"
       || options.playlistContractCompilerVersion.length < 1)) {
     throw new Error("Canonical query plans require a fenced contract revision");
+  }
+  if (
+    options.guidancePolicyVersion !== undefined
+    && (
+      requestedSchemaVersion !== VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+      || !CANONICAL_QUERY_PLAN_GUIDANCE_POLICY_VERSIONS.includes(
+        options.guidancePolicyVersion,
+      )
+    )
+  ) {
+    throw new Error(
+      "Canonical guidance identity is supported only by schema-6 query plans",
+    );
   }
   if (canonicalSchema) {
     if (!plan.canonicalContractPolicy) {
@@ -755,7 +800,7 @@ export function createQueryPlanV3(
     ...(canonicalSchema ? {
       briefContractVersion: 3 as const,
       guidancePolicyVersion: requestedSchemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
-        ? "adaptive_guidance_v4"
+        ? options.guidancePolicyVersion ?? "adaptive_guidance_v4"
         : "adaptive_guidance_v3",
       evidencePolicyVersion: PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION,
       playlistContractRevisionId: options.playlistContractRevisionId,
@@ -833,6 +878,7 @@ export function createRuntimeQueryPlanV3(
     readonly playlistContractRevisionId?: string;
     readonly playlistContractSemanticHash?: string;
     readonly playlistContractCompilerVersion?: string;
+    readonly guidancePolicyVersion?: CanonicalQueryPlanGuidancePolicyVersion;
   } = {},
 ): QueryPlanV3 {
   return createQueryPlanV3(plan, graphSnapshotId, {
@@ -1209,12 +1255,14 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
     || !/^[a-f0-9]{64}$/u.test(row.executionDeltaHash)
   )) return false;
   if (isCanonicalQueryPlanV3SchemaVersion(row.schemaVersion)) {
+    const canonicalGuidanceVersionValid =
+      row.schemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+        ? CANONICAL_QUERY_PLAN_GUIDANCE_POLICY_VERSIONS.includes(
+            row.guidancePolicyVersion as CanonicalQueryPlanGuidancePolicyVersion,
+          )
+        : row.guidancePolicyVersion === "adaptive_guidance_v3";
     if (row.briefContractVersion !== 3
-      || row.guidancePolicyVersion !== (
-        row.schemaVersion === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
-          ? "adaptive_guidance_v4"
-          : "adaptive_guidance_v3"
-      )
+      || !canonicalGuidanceVersionValid
       || row.evidencePolicyVersion !== PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION
       || typeof row.playlistContractRevisionId !== "string"
       || !row.playlistContractRevisionId.startsWith("pcr1:")

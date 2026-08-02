@@ -48,6 +48,7 @@ import type { PipelineVersion } from "../shared/types.ts";
 import {
   createPipelineV3RetrievalExecutionPort,
   PipelineV3DependencyUnavailableError,
+  PipelineV3EvidenceEnrichmentRetryError,
   PipelineV3OptimizerComputeBudgetError,
   type PipelineV3WriteFence,
   type PipelineV3RetrievalExecutionPort,
@@ -123,6 +124,9 @@ function stableFailureCode(error: unknown): string {
   if (error instanceof PipelineV3DependencyUnavailableError) {
     return error.reasonCode;
   }
+  if (error instanceof PipelineV3EvidenceEnrichmentRetryError) {
+    return error.code;
+  }
   if (error instanceof PipelineV3OptimizerComputeBudgetError) {
     return error.code;
   }
@@ -132,6 +136,54 @@ function stableFailureCode(error: unknown): string {
   return error instanceof Error
     ? `unexpected_${error.constructor.name.toLocaleLowerCase("en-US")}`
     : "unexpected_non_error";
+}
+
+export interface ExecutionFailureSemanticFingerprintInputV2 {
+  errorCode: string;
+  stage: string;
+  contractSemanticHash: string;
+  queryPlanHash: string | null;
+  strategySemanticHash: string | null;
+  semanticExecutionConfigurationHash: string;
+  providerRoots: readonly string[];
+  budgetGeneration: number;
+}
+
+/**
+ * Stable retry identity. Database revision IDs, worker release revisions,
+ * attempt IDs, timestamps, and nonces are deliberately excluded: changing
+ * any of them cannot make an unchanged semantic strategy retryable.
+ */
+export function executionFailureSemanticFingerprintV2(
+  input: ExecutionFailureSemanticFingerprintInputV2,
+): { errorSignature: string; attemptStrategyHash: string } {
+  const providerRoots = [...new Set(input.providerRoots
+    .map((value) => value.trim())
+    .filter(Boolean))].sort();
+  const semanticPlan = {
+    queryPlanHash: input.queryPlanHash ?? "legacy_unhashed_query_plan",
+    strategySemanticHash:
+      input.strategySemanticHash ?? "legacy_unhashed_strategy",
+  };
+  return {
+    attemptStrategyHash: sha256Hex(stableStringify({
+      schemaVersion: "attempt-strategy/v2",
+      contractSemanticHash: input.contractSemanticHash,
+      ...semanticPlan,
+      stage: input.stage,
+      semanticExecutionConfigurationHash:
+        input.semanticExecutionConfigurationHash,
+      providerRoots,
+      budgetGeneration: input.budgetGeneration,
+    })),
+    errorSignature: sha256Hex(stableStringify({
+      schemaVersion: "execution-failure/v2",
+      errorCode: input.errorCode,
+      stage: input.stage,
+      contractSemanticHash: input.contractSemanticHash,
+      ...semanticPlan,
+    })),
+  };
 }
 export const WORKER_CONFIGURATION_ENV_KEYS = Object.freeze([
   "NODE_ENV",
@@ -201,6 +253,7 @@ export const WORKER_CONFIGURATION_ENV_KEYS = Object.freeze([
   "PIPELINE_V3_OWNER_CANARY",
   "PIPELINE_V3_OWNER_CANARY_GROUPS",
   "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
+  "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
   "PIPELINE_V3_GENRE_SCENE_PERCENT",
   "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
   "PIPELINE_V3_SIMILARITY_PERCENT",
@@ -284,6 +337,10 @@ export interface DurableJob {
   minimumWorkerProtocol: number;
   /** Present on schema-14 jobs; optional while schema-13 bridge workers drain. */
   queryPlanRevisionId?: string | null;
+  /** Stable persisted semantic plan identity; never a database revision ID. */
+  queryPlanHash?: string | null;
+  /** Producer/dependency/budget semantics excluding attempt-local identity. */
+  strategySemanticHash?: string | null;
   requiredExecutorCapabilityHash?: string | null;
   requiredExecutorCapabilityVector?: Record<string, unknown> | null;
   requiredExecutorRevision?: string | null;
@@ -1067,28 +1124,18 @@ export class WorkerRunner {
       const budgetGeneration = Number.isSafeInteger(parsedBudgetGeneration)
         ? parsedBudgetGeneration
         : 0;
-      const attemptStrategyHash = sha256Hex(stableStringify({
-        schemaVersion: "attempt-strategy/v1",
-        contractSemanticHash: contractAttempt.contractSemanticHash,
-        queryPlanRevisionId: job.queryPlanRevisionId ?? null,
-        stage,
-        executorRevision: this.version,
-        semanticExecutionConfigurationHash:
-          this.semanticExecutionConfigurationHash,
-        providerRoots,
-        budgetGeneration,
-      }));
-      const errorSignature = sha256Hex(stableStringify({
-        schemaVersion: "execution-failure/v1",
-        errorCode,
-        stage,
-        contractSemanticHash: contractAttempt.contractSemanticHash,
-        queryPlanRevisionId: job.queryPlanRevisionId ?? null,
-        executorRevision: this.version,
-        semanticExecutionConfigurationHash:
-          this.semanticExecutionConfigurationHash,
-        checkpoint: job.stageKey || null,
-      }));
+      const { attemptStrategyHash, errorSignature } =
+        executionFailureSemanticFingerprintV2({
+          errorCode,
+          stage,
+          contractSemanticHash: contractAttempt.contractSemanticHash,
+          queryPlanHash: job.queryPlanHash ?? null,
+          strategySemanticHash: job.strategySemanticHash ?? null,
+          semanticExecutionConfigurationHash:
+            this.semanticExecutionConfigurationHash,
+          providerRoots,
+          budgetGeneration,
+        });
       const persisted = await this.repository
         .recordPlaylistExecutionFailureFingerprint({
           attemptId: contractAttempt.id,
@@ -1443,6 +1490,13 @@ export class WorkerRunner {
         return;
       }
       if (error instanceof CanonicalExecutionIntegrityError) {
+        if (process.env.NODE_ENV === "test"
+          && process.env.GENIO_SYSTEM_E2E === "1") {
+          process.stderr.write(
+            `[genio-system-e2e] ${job.kind} job failed canonical integrity: `
+              + `${error.reasonCode}: ${error.message}\n`,
+          );
+        }
         await recordFailureFingerprint(error);
         await finishContractAttempt("failed", "integrity");
         if (job.runId && this.repository.quarantineCanonicalExecution) {
@@ -1532,6 +1586,49 @@ export class WorkerRunner {
           job.id,
           this.workerId,
           "Canonical execution was quarantined by an integrity fence.",
+          null,
+          job.leaseEpoch,
+        );
+        return;
+      }
+      if (error instanceof PipelineV3EvidenceEnrichmentRetryError) {
+        const retryAt = job.attempts < job.maxAttempts
+          ? error.nextRetryAt
+          : null;
+        if (retryAt) {
+          if (!await finishContractAttempt(
+            "blocked",
+            "semantic_collapse_evidence_enrichment",
+          )) return;
+          await this.repository.failJob(
+            job.id,
+            this.workerId,
+            `A bounded evidence-enrichment pass ${error.automaticRescueOrdinal} is scheduled.`,
+            retryAt,
+            job.leaseEpoch,
+          );
+          return;
+        }
+        if (!await finishContractAttempt(
+          "failed",
+          "semantic_collapse_evidence_enrichment_exhausted",
+        )) return;
+        if (contractAttempt
+          && job.runId
+          && this.repository.quarantineCanonicalExecution) {
+          await this.repository.quarantineCanonicalExecution({
+            runId: job.runId,
+            jobId: job.id,
+            workerId: this.workerId,
+            leaseGeneration: contractAttempt.leaseGeneration,
+            reasonCode:
+              "v3_semantic_collapse_evidence_enrichment_exhausted",
+          });
+        }
+        await this.repository.failJob(
+          job.id,
+          this.workerId,
+          "Bounded evidence enrichment requires an operator repair.",
           null,
           job.leaseEpoch,
         );

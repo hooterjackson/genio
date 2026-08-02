@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdir } from "node:fs/promises";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import pg from "pg";
 import {
   releaseCanaryAudience,
   signReleaseCanaryMetadata,
@@ -20,6 +23,9 @@ import {
   type ReleaseFixtureId,
   type ReleaseGateName,
 } from "./release-fixtures.ts";
+import {
+  collectIrishInfluenceReleaseProofV1,
+} from "./irish-influence-release-proof-producer.ts";
 import {
   emitReleaseGateProducerArtifacts,
   loadReleaseProducerRuntimeSnapshot,
@@ -78,9 +84,14 @@ export interface SmokeArgs {
   expectedVersion: string;
   environment: ReleaseCanaryEnvironment;
   cacheMode: ReleaseCanaryCacheMode;
+  runtimeSnapshotScope: "backend" | "full";
   runtimeSnapshotPath: string;
   candidateTag: string;
   imageDigest: string;
+  irishRecoveryAccessId: string | null;
+  irishRecoveryCookie: string | null;
+  ownerBrowserCookie: string | null;
+  productionDatabaseUrl: string | null;
   files: ReleaseProducerFiles;
 }
 
@@ -95,6 +106,19 @@ export type ExpectedHostedGuidanceExecution = {
   questionSetHash: string;
   executionDeltaHash: string;
 };
+
+export interface OwnerUiPublicationEvidenceV1 {
+  schemaVersion: "genio-owner-ui-publication/v1";
+  exercised: true;
+  publishRequestObserved: true;
+  publishResponseStatus: number;
+  selectedTrackCount: number;
+  completedUiVisible: true;
+  directoryEntryVisible: true;
+  runAccessIdHash: string;
+  screenshotHash: string;
+  evidenceHash: string;
+}
 
 function asRecord(value: unknown): ApiResponse {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -146,11 +170,13 @@ export function parseHostedSmokeArgs(
       "fixed-three-track-control-v1": "staging_fixed_three_track",
       "smooth-reggaeton-heat-50-v1": "staging_affected_regression",
       "french-jazz-guided-constraint-25-v1": "staging_guided_constraint",
+      "irish-influence-recovery-25-v1": null,
     },
     production: {
       "fixed-three-track-control-v1": "production_fixed_three_track",
-      "smooth-reggaeton-heat-50-v1": "production_affected_regression",
+      "smooth-reggaeton-heat-50-v1": null,
       "french-jazz-guided-constraint-25-v1": null,
+      "irish-influence-recovery-25-v1": "production_affected_regression",
     },
   } as const;
   const gate = gateByFixture[environment][typedFixtureId];
@@ -205,6 +231,38 @@ export function parseHostedSmokeArgs(
     throw new Error(`--origin must exactly match ${releaseOriginName}`);
   }
   const fixture = RELEASE_FIXTURES[typedFixtureId];
+  const irishRecoveryAccessId =
+    releaseOrigins.RELEASE_IRISH_RECOVERY_ACCESS_ID?.trim() ?? null;
+  const irishRecoveryCookie =
+    releaseOrigins.RELEASE_IRISH_RECOVERY_COOKIE?.trim() ?? null;
+  const productionDatabaseUrl =
+    releaseOrigins.RELEASE_PRODUCTION_DATABASE_URL?.trim() ?? null;
+  const ownerBrowserCookie =
+    releaseOrigins.RELEASE_OWNER_BROWSER_COOKIE?.trim() ?? null;
+  if (
+    typedFixtureId === "irish-influence-recovery-25-v1"
+      ? (
+          !irishRecoveryAccessId
+          || !UUID.test(irishRecoveryAccessId)
+          || !irishRecoveryCookie
+          || !ownerBrowserCookie
+          || !/^[^=;\s]+=[^;\r\n]+(?:;\s*[^=;\s]+=[^;\r\n]+)*$/u
+            .test(ownerBrowserCookie)
+          || !productionDatabaseUrl
+        )
+      : (
+          irishRecoveryAccessId !== null
+          || irishRecoveryCookie !== null
+          || ownerBrowserCookie !== null
+          || productionDatabaseUrl !== null
+        )
+  ) {
+    throw new Error(
+      typedFixtureId === "irish-influence-recovery-25-v1"
+        ? "the Irish production regression requires protected durable recovery DB/API selectors"
+        : "Irish recovery DB/API selectors are accepted only for the Irish production regression",
+    );
+  }
   const canaryId = `${gate}-${fixture.fixtureHash.slice(0, 12)}`;
   return {
     confirmLiveWrite: true,
@@ -218,9 +276,19 @@ export function parseHostedSmokeArgs(
     expectedVersion,
     environment,
     cacheMode: "reuse_disabled",
+    runtimeSnapshotScope:
+      environment === "staging"
+        || gate === "production_fixed_three_track"
+        || gate === "production_affected_regression"
+        ? "full"
+        : "backend",
     runtimeSnapshotPath: releaseProducerOption(argv, "--runtime-snapshot"),
     candidateTag,
     imageDigest,
+    irishRecoveryAccessId,
+    irishRecoveryCookie,
+    ownerBrowserCookie,
+    productionDatabaseUrl,
     files: {
       sourceOutputPath: releaseProducerOption(argv, "--source-output"),
       artifactOutputPath: releaseProducerOption(argv, "--output"),
@@ -632,6 +700,7 @@ export function hostedPublicationEvidence(
   cacheMode: ReleaseCanaryCacheMode = "reuse_disabled",
   independentAppleEvidenceHash?: string,
   expectedWorkerConfigurationHashes: readonly string[] = [],
+  ownerUiPublication: OwnerUiPublicationEvidenceV1 | null = null,
 ): Record<string, unknown> {
   const result = asRecord(resultValue);
   const manifest = asRecord(result.manifest);
@@ -663,7 +732,7 @@ export function hostedPublicationEvidence(
     );
   }
   const evidence = {
-    schemaVersion: "genio-hosted-publication-smoke/v1",
+    schemaVersion: "genio-hosted-publication-smoke/v2",
     canaryId,
     cacheMode,
     targetTrackCount,
@@ -700,6 +769,7 @@ export function hostedPublicationEvidence(
       && reconciliation.expectedOrderedIdsHash === reconciliation.observedOrderedIdsHash
       && Number(reconciliation.expectedCount) === targetTrackCount,
     orderedAppleIdsHash: reconciliation.observedOrderedIdsHash,
+    ownerUiPublication,
     ...(independentAppleEvidenceHash === undefined
       ? {}
       : /^[0-9a-f]{64}$/u.test(independentAppleEvidenceHash)
@@ -747,12 +817,27 @@ function safeMessage(payload: unknown, status: number): string {
 }
 
 function scopedCapabilityCookie(setCookie: string | null, current: string): string {
-  if (!setCookie) return current;
+  const cookies = new Map<string, string>();
+  for (const item of current.split(/;\s*/u)) {
+    const separator = item.indexOf("=");
+    if (separator > 0) {
+      cookies.set(item.slice(0, separator), item.slice(separator + 1));
+    }
+  }
+  if (!setCookie) {
+    return [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+  }
   for (const name of ["__Host-needle-session", "needle-session"]) {
     const match = setCookie.match(new RegExp(`(?:^|,\\s*)(${name}=[^;,\\s]+)`, "u"));
-    if (match?.[1]) return match[1];
+    if (match?.[1]) {
+      const separator = match[1].indexOf("=");
+      cookies.set(
+        match[1].slice(0, separator),
+        match[1].slice(separator + 1),
+      );
+    }
   }
-  return current;
+  return [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
 }
 
 async function request(
@@ -799,6 +884,229 @@ async function wait(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function browserCookies(
+  origin: string,
+  cookieHeader: string,
+): Array<{
+  name: string;
+  value: string;
+  url: string;
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: "Lax";
+}> {
+  return cookieHeader.split(/;\s*/u).flatMap((item) => {
+    const separator = item.indexOf("=");
+    if (separator < 1) return [];
+    return [{
+      name: item.slice(0, separator),
+      value: item.slice(separator + 1),
+      url: origin,
+      httpOnly: true,
+      secure: true,
+      sameSite: "Lax" as const,
+    }];
+  });
+}
+
+export async function publishOwnerCanaryThroughRealUi(input: {
+  origin: string;
+  accessId: string;
+  cookie: string;
+  targetTrackCount: number;
+  artifactDirectory: string;
+  deadlineAt: number;
+}): Promise<OwnerUiPublicationEvidenceV1> {
+  const { chromium } = await import("@playwright/test");
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext({
+      ignoreHTTPSErrors: false,
+      storageState: { cookies: [], origins: [] },
+    });
+    const cookies = browserCookies(input.origin, input.cookie);
+    if (cookies.length < 1) {
+      throw new Error("Protected owner browser cookie is unavailable");
+    }
+    await context.addCookies(cookies);
+    const directRailwayRequests: string[] = [];
+    context.on("request", (request) => {
+      const hostname = new URL(request.url()).hostname.toLocaleLowerCase(
+        "en-US",
+      );
+      if (
+        hostname === "railway.app"
+        || hostname.endsWith(".railway.app")
+        || hostname.endsWith(".up.railway.app")
+      ) {
+        directRailwayRequests.push(request.url());
+      }
+    });
+    const page = await context.newPage();
+    const navigation = await page.goto(
+      `${input.origin}/?run=${encodeURIComponent(input.accessId)}&release-owner-publication=1`,
+      {
+        waitUntil: "domcontentloaded",
+        timeout: Math.max(
+          1,
+          Math.min(60_000, input.deadlineAt - Date.now()),
+        ),
+      },
+    );
+    if (!navigation || navigation.status() !== 200) {
+      throw new Error("Owner publication UI did not load");
+    }
+    const publishResponsePromise = page.waitForResponse(
+      (response) => (
+        response.request().method() === "POST"
+        && response.url() ===
+          `${input.origin}/api/v1/runs/${
+            encodeURIComponent(input.accessId)
+          }/publish`
+      ),
+      {
+        timeout: Math.max(
+          1,
+          Math.min(5 * 60_000, input.deadlineAt - Date.now()),
+        ),
+      },
+    );
+    const continueButton = page.getByRole("button", {
+      name: new RegExp(
+        `^CONTINUE WITH ${input.targetTrackCount.toLocaleString("en-US")}`,
+        "iu",
+      ),
+    });
+    const publishButton = page.getByRole("button", {
+      name: /PUBLISH TO APPLE MUSIC/iu,
+    });
+    await Promise.race([
+      continueButton.waitFor({
+        state: "visible",
+        timeout: Math.max(
+          1,
+          Math.min(90_000, input.deadlineAt - Date.now()),
+        ),
+      }),
+      publishButton.waitFor({
+        state: "visible",
+        timeout: Math.max(
+          1,
+          Math.min(90_000, input.deadlineAt - Date.now()),
+        ),
+      }),
+    ]);
+    if (await continueButton.isVisible()) {
+      await continueButton.click();
+    } else {
+      await publishButton.click();
+    }
+    const publishResponse = await publishResponsePromise;
+    if (![200, 201, 202].includes(publishResponse.status())) {
+      throw new Error("Owner publication UI received a non-success response");
+    }
+    const completedHeading = page.getByRole("heading", {
+      name: "Playlist published",
+      exact: true,
+    });
+    await completedHeading.waitFor({
+      state: "visible",
+      timeout: Math.max(
+        1,
+        Math.min(10 * 60_000, input.deadlineAt - Date.now()),
+      ),
+    });
+    const result = await page.evaluate(async (accessId) => {
+      const response = await fetch(
+        `/api/v1/runs/${encodeURIComponent(accessId)}/result`,
+        { cache: "no-store", credentials: "same-origin" },
+      );
+      return {
+        status: response.status,
+        value: await response.json().catch(() => ({})),
+      };
+    }, input.accessId);
+    const resultPayload = asRecord(result.value);
+    const manifest = asRecord(resultPayload.manifest);
+    const volumes = Array.isArray(resultPayload.volumes)
+      ? resultPayload.volumes.map(asRecord)
+      : [];
+    if (
+      result.status !== 200
+      || manifest.trackCount !== input.targetTrackCount
+      || typeof manifest.name !== "string"
+      || !manifest.name
+      || volumes.length < 1
+      || typeof volumes[0]?.shareUrl !== "string"
+    ) {
+      throw new Error("Owner publication UI did not expose an exact result");
+    }
+    await page.goto(`${input.origin}/playlists?release-owner-publication=1`, {
+      waitUntil: "domcontentloaded",
+      timeout: Math.max(
+        1,
+        Math.min(60_000, input.deadlineAt - Date.now()),
+      ),
+    });
+    await page.getByRole("heading", {
+      name: manifest.name,
+      exact: true,
+    }).first().waitFor({
+      state: "visible",
+      timeout: Math.max(
+        1,
+        Math.min(60_000, input.deadlineAt - Date.now()),
+      ),
+    });
+    const directoryAppleLink = page.locator(
+      `a[href="${String(volumes[0]!.shareUrl).replaceAll('"', '\\"')}"]`,
+    ).first();
+    await directoryAppleLink.waitFor({
+      state: "visible",
+      timeout: Math.max(
+        1,
+        Math.min(30_000, input.deadlineAt - Date.now()),
+      ),
+    });
+    if (directRailwayRequests.length > 0) {
+      throw new Error("Owner publication UI called Railway directly");
+    }
+    await mkdir(input.artifactDirectory, { recursive: true });
+    const screenshot = await page.screenshot({
+      fullPage: true,
+      path: resolve(
+        input.artifactDirectory,
+        "production-owner-ui-publication.png",
+      ),
+      timeout: Math.max(
+        1,
+        Math.min(30_000, input.deadlineAt - Date.now()),
+      ),
+    });
+    const unsigned = {
+      schemaVersion: "genio-owner-ui-publication/v1" as const,
+      exercised: true as const,
+      publishRequestObserved: true as const,
+      publishResponseStatus: publishResponse.status(),
+      selectedTrackCount: input.targetTrackCount,
+      completedUiVisible: true as const,
+      directoryEntryVisible: true as const,
+      runAccessIdHash: createHash("sha256")
+        .update(input.accessId)
+        .digest("hex"),
+      screenshotHash: createHash("sha256").update(screenshot).digest("hex"),
+    };
+    return {
+      ...unsigned,
+      evidenceHash: createHash("sha256")
+        .update(stableStringify(unsigned))
+        .digest("hex"),
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
 export function assertHostedCanaryStillExact(
   runValue: unknown,
   deadlineAt: number,
@@ -833,9 +1141,14 @@ async function main(): Promise<void> {
     expectedVersion,
     environment,
     cacheMode,
+    runtimeSnapshotScope,
     runtimeSnapshotPath,
     candidateTag,
     imageDigest,
+    irishRecoveryAccessId,
+    irishRecoveryCookie,
+    ownerBrowserCookie,
+    productionDatabaseUrl,
     files,
   } = parseHostedSmokeArgs(process.argv.slice(2));
   await preflightReleaseProducerFiles(files);
@@ -848,9 +1161,17 @@ async function main(): Promise<void> {
   const runtimeSnapshot = await loadReleaseProducerRuntimeSnapshot({
     path: runtimeSnapshotPath,
     environment,
+    expectedScope: runtimeSnapshotScope,
     origin,
     candidate,
   });
+  const artifactDirectory =
+    process.env.RELEASE_BROWSER_ARTIFACT_DIR?.trim() ?? "";
+  if (!artifactDirectory) {
+    throw new Error(
+      "RELEASE_BROWSER_ARTIFACT_DIR is required for browser evidence",
+    );
+  }
   const canaryRequest = (
     path: string,
     init: RequestInit = {},
@@ -877,7 +1198,9 @@ async function main(): Promise<void> {
     revision,
   });
   const briefKey = `hosted-smoke-brief-${randomUUID()}`;
-  let briefCookie = "";
+  let briefCookie = fixtureId === "irish-influence-recovery-25-v1"
+    ? ownerBrowserCookie!
+    : "";
   const briefStart = await canaryRequest("/api/v1/brief", {
     method: "POST",
     headers: { "Idempotency-Key": briefKey },
@@ -927,7 +1250,8 @@ async function main(): Promise<void> {
       const validation = validateReleaseFixtureGuidancePayload(
         fixtureId as
           | "smooth-reggaeton-heat-50-v1"
-          | "french-jazz-guided-constraint-25-v1",
+          | "french-jazz-guided-constraint-25-v1"
+          | "irish-influence-recovery-25-v1",
         guidancePayload,
       );
       const submission = {
@@ -1028,7 +1352,7 @@ async function main(): Promise<void> {
   const exchanged = await canaryRequest("/api/v1/capabilities/exchange", {
     method: "POST",
     body: JSON.stringify({ token: capability }),
-  });
+  }, briefCookie);
   let cookie = exchanged.cookie;
   if (!cookie) throw new Error("gênio did not establish the scoped capability cookie");
   log("run_started", { canaryId, status: initialRun.status });
@@ -1058,8 +1382,41 @@ async function main(): Promise<void> {
     run = nextRun;
   }
   assertHostedCanaryStillExact(run, deadlineAt);
-  if (REVIEW_RUN_STATUSES.has(String(run.status))) {
+  let ownerUiPublication: OwnerUiPublicationEvidenceV1 | null = null;
+  if (
+    fixtureId === "irish-influence-recovery-25-v1"
+    && REVIEW_RUN_STATUSES.has(String(run.status))
+  ) {
+    ownerUiPublication = await publishOwnerCanaryThroughRealUi({
+      origin,
+      accessId,
+      cookie,
+      targetTrackCount,
+      artifactDirectory,
+      deadlineAt,
+    });
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const response = await canaryRequest(
+        `/api/v1/runs/${encodeURIComponent(accessId)}`,
+        {},
+        cookie,
+      );
+      cookie = response.cookie;
+      run = asRecord(response.payload.run ?? response.payload);
+      if (TERMINAL_RUN_STATUSES.has(String(run.status))
+        || run.status === "waiting_for_apple_authorization") break;
+      await wait(2_000);
+    }
+  } else if (REVIEW_RUN_STATUSES.has(String(run.status))) {
     throw new Error("Automatic one-command publication unexpectedly stopped for manual review");
+  }
+  if (
+    fixtureId === "irish-influence-recovery-25-v1"
+    && ownerUiPublication === null
+  ) {
+    throw new Error(
+      "Irish production acceptance did not exercise owner publication through the real UI",
+    );
   }
   if (run.status === "waiting_for_apple_authorization") {
     throw new Error("Apple Music owner authorization is not currently valid");
@@ -1097,10 +1454,6 @@ async function main(): Promise<void> {
   );
   const executionProof = asRecord(result.executionProof);
   const reconciliation = asRecord(executionProof.publicationReconciliation);
-  const artifactDirectory = process.env.RELEASE_BROWSER_ARTIFACT_DIR?.trim() ?? "";
-  if (!artifactDirectory) {
-    throw new Error("RELEASE_BROWSER_ARTIFACT_DIR is required for independent browser evidence");
-  }
   const independentEvidence = await independentAppleReleaseEvidence({
     result,
     targetTrackCount,
@@ -1127,6 +1480,7 @@ async function main(): Promise<void> {
       runtimeSnapshot.configuration.interactiveWorkerHash,
       runtimeSnapshot.configuration.deepWorkerHash,
     ],
+    ownerUiPublication,
   );
   const guidanceLineageHash = RELEASE_FIXTURES[fixtureId].guidanceMode === "recommended"
     ? String(hostedEvidence.guidanceLineageHash ?? "")
@@ -1139,6 +1493,63 @@ async function main(): Promise<void> {
     guidanceLineageHash,
     guidancePayload: fixtureGuidancePayload,
   });
+  const irishInfluenceRecovery = fixtureId
+    === "irish-influence-recovery-25-v1"
+    ? await (async () => {
+        if (
+          !irishRecoveryAccessId
+          || !irishRecoveryCookie
+          || !productionDatabaseUrl
+        ) {
+          throw new Error(
+            "Irish-influence durable recovery selectors are missing",
+          );
+        }
+        const client = new pg.Client({
+          connectionString: productionDatabaseUrl,
+          ssl: productionDatabaseUrl.includes("railway.internal")
+            ? undefined
+            : { rejectUnauthorized: false },
+        });
+        await client.connect();
+        try {
+          return await collectIrishInfluenceReleaseProofV1({
+            database: client,
+            runtime: {
+              async fetchJson(url, scopedCookie) {
+                const response = await fetch(url, {
+                  cache: "no-store",
+                  redirect: "error",
+                  headers: {
+                    "cache-control": "no-cache",
+                    pragma: "no-cache",
+                    ...(scopedCookie ? { cookie: scopedCookie } : {}),
+                  },
+                  signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+                });
+                let value: unknown = {};
+                try {
+                  value = JSON.parse(await response.text());
+                } catch {
+                  value = {};
+                }
+                return { status: response.status, value };
+              },
+              now: () => new Date(),
+            },
+            origin: "https://9enio.com",
+            publicationAccessId: accessId,
+            publicationCookie: cookie,
+            recoveryAccessId: irishRecoveryAccessId,
+            recoveryCookie: irishRecoveryCookie,
+            expectedVersion,
+            expectedRevision,
+          });
+        } finally {
+          await client.end();
+        }
+      })()
+    : null;
   const completedAt = new Date().toISOString();
   assertHostedCanaryStillExact(run, deadlineAt);
   const produced = await emitReleaseGateProducerArtifacts({
@@ -1151,6 +1562,9 @@ async function main(): Promise<void> {
       hostedPublication: hostedEvidence,
       independentApple: independentEvidence,
       fixtureExecution,
+      ...(irishInfluenceRecovery
+        ? { irishInfluenceRecovery }
+        : {}),
     },
     files,
   });

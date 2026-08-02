@@ -121,7 +121,64 @@ describe("hosted publication smoke harness", () => {
       expectedVersion: "2.4.0",
       environment: "staging",
       cacheMode: "reuse_disabled",
+      runtimeSnapshotScope: "full",
     });
+  });
+
+  test("derives Irish recovery proof only from protected durable DB/API selectors", () => {
+    const irishArgs = hostedProducerArgs(
+      "irish-influence-recovery-25-v1",
+      "production",
+    );
+    expect(() => parseHostedSmokeArgs([
+      "--confirm-live-write",
+      ...irishArgs,
+    ])).toThrow(/protected durable recovery DB\/API selectors/u);
+    expect(parseHostedSmokeArgsWithOrigins([
+      "--confirm-live-write",
+      ...irishArgs,
+    ], {
+      ...releaseOrigins,
+      RELEASE_IRISH_RECOVERY_ACCESS_ID:
+        "11111111-1111-4111-8111-111111111111",
+      RELEASE_IRISH_RECOVERY_COOKIE: "genio_run=protected",
+      RELEASE_OWNER_BROWSER_COOKIE: "owner_session=protected",
+      RELEASE_PRODUCTION_DATABASE_URL:
+        "postgresql://protected.example/production",
+    })).toMatchObject({
+      fixtureId: "irish-influence-recovery-25-v1",
+      gate: "production_affected_regression",
+      targetTrackCount: 25,
+      runtimeSnapshotScope: "full",
+      irishRecoveryAccessId:
+        "11111111-1111-4111-8111-111111111111",
+      irishRecoveryCookie: "genio_run=protected",
+      ownerBrowserCookie: "owner_session=protected",
+      productionDatabaseUrl:
+        "postgresql://protected.example/production",
+    });
+    expect(parseHostedSmokeArgsWithOrigins([
+      "--confirm-live-write",
+      ...hostedProducerArgs(
+        "fixed-three-track-control-v1",
+        "production",
+      ),
+    ], releaseOrigins)).toMatchObject({
+      gate: "production_fixed_three_track",
+      runtimeSnapshotScope: "full",
+    });
+    expect(() => parseHostedSmokeArgsWithOrigins([
+      "--confirm-live-write",
+      ...hostedProducerArgs(),
+    ], {
+      ...releaseOrigins,
+      RELEASE_IRISH_RECOVERY_ACCESS_ID:
+        "11111111-1111-4111-8111-111111111111",
+      RELEASE_IRISH_RECOVERY_COOKIE: "genio_run=protected",
+      RELEASE_OWNER_BROWSER_COOKIE: "owner_session=protected",
+      RELEASE_PRODUCTION_DATABASE_URL:
+        "postgresql://protected.example/production",
+    })).toThrow(/accepted only for the Irish production regression/u);
   });
 
   test("rejects caller-owned prompts, counts, and guidance semantics", () => {

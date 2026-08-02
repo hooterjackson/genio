@@ -276,7 +276,7 @@ describe("persisted worker pipeline routing", () => {
     });
     const assignment = assignPipelineV2({
       plan: proposedPlan,
-      owner: true,
+      signedOwnerCanary: false,
       stickyKey: "owner:factual",
       env: { PIPELINE_V2_FACTUAL_CANARY: "1", PIPELINE_V2_CURATED_PERCENT: "100" },
     });
@@ -299,7 +299,7 @@ describe("persisted worker pipeline routing", () => {
 
     const factualCanary = assignPipelineV2({
       plan: proposedPlan,
-      owner: true,
+      signedOwnerCanary: true,
       stickyKey: "owner:factual",
       env: { PIPELINE_V2_FACTUAL_OWNER_CANARY: "true" },
     });

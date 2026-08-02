@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { RunNextAction } from "../shared/types.ts";
+import {
+  advancingAdaptiveRunDecisionActionV1,
+  publicAdaptiveRunDecisionV1,
+} from "./adaptive-run-decision-v1.ts";
 import { sha256Hex, stableStringify } from "./security.ts";
 
 export const PLAYLIST_RESOLUTION_SERVICE_VERSION = "playlist_resolution_service_v1" as const;
@@ -80,6 +84,34 @@ export function assertPlaylistResolutionCompanionsV1(input: {
   if (state === "needs_decision" && !companions.decision) {
     throw new Error("resolution_decision_missing");
   }
+  if (state === "needs_decision") {
+    if (input.nextAction === "decide_verified_partial") {
+      if (companions.decision?.kind !== "verified_partial_publication"
+        || input.stateJson.verifiedPartialDecisionAvailable !== true
+        || !nonempty(companions.manifestId)) {
+        throw new Error("resolution_partial_decision_invalid");
+      }
+    } else {
+      const decision = publicAdaptiveRunDecisionV1(companions.decision);
+      const contractRevisionId =
+        typeof input.stateJson.activeContractSemanticRevisionId === "string"
+          ? input.stateJson.activeContractSemanticRevisionId
+          : null;
+      const contractSemanticHash =
+        typeof input.stateJson.activeContractSemanticHash === "string"
+          ? input.stateJson.activeContractSemanticHash
+          : null;
+      const advancingAction = decision
+        ? advancingAdaptiveRunDecisionActionV1(decision)
+        : null;
+      if (!decision
+        || decision.contractRevisionId !== contractRevisionId
+        || decision.contractSemanticHash !== contractSemanticHash
+        || advancingAction !== input.nextAction) {
+        throw new Error("resolution_decision_not_actionable");
+      }
+    }
+  }
   if (["ready", "publishing", "completed"].includes(state)
     && !nonempty(companions.manifestId)) {
     throw new Error("resolution_manifest_missing");
@@ -90,9 +122,18 @@ export function assertPlaylistResolutionCompanionsV1(input: {
   if (state === "completed") {
     const requested = Number(input.stateJson.requestedTrackCount);
     const reconciled = Number(input.stateJson.reconciledPublishedTrackCount);
-    if (!Number.isSafeInteger(requested)
-      || requested < 1
-      || reconciled !== requested) {
+    const exactCompletion = Number.isSafeInteger(requested)
+      && requested > 0
+      && reconciled === requested;
+    const approvedPartialCompletion = Number.isSafeInteger(requested)
+      && requested > 0
+      && Number.isSafeInteger(reconciled)
+      && reconciled > 0
+      && reconciled < requested
+      && input.stateJson.approvedPartialPublication === true
+      && input.stateJson.resolutionReasonCode
+        === "approved_partial_apple_reconciliation";
+    if (!exactCompletion && !approvedPartialCompletion) {
       throw new Error("resolution_exact_completion_missing");
     }
   }

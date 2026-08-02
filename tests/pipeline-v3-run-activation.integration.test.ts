@@ -66,8 +66,10 @@ databaseDescribe("Pipeline V3 direct run activation", () => {
 
   beforeAll(async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    // Direct activation is public route behavior. It must not rely on the
+    // caller looking like an owner merely because the run bypasses reuse.
+    vi.stubEnv("PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_GENRE_SCENE_PERCENT", "100");
     vi.stubEnv("PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED", "true");
     vi.stubEnv("PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED", "true");
     vi.stubEnv("PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION", "2");

@@ -8,7 +8,11 @@ import {
   type PipelineV3WorkerPayload,
 } from "../server/pipeline-v3-worker-execution.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
-import { WorkerRunner, type DurableJob } from "../server/worker-runner.ts";
+import {
+  executionFailureSemanticFingerprintV2,
+  WorkerRunner,
+  type DurableJob,
+} from "../server/worker-runner.ts";
 import { createQueryPlanV3 } from "../server/query-plan-v3.ts";
 import {
   createRunSpecV3,
@@ -24,6 +28,33 @@ function methodProxy(): any {
     },
   });
 }
+
+test("semantic retry fingerprints ignore mutable plan and executor identities", () => {
+  const base = {
+    errorCode: "v3_retrieval_provider_failed",
+    stage: "v3-retrieval:active:semantic",
+    contractSemanticHash: "1".repeat(64),
+    queryPlanHash: "2".repeat(64),
+    strategySemanticHash: "3".repeat(64),
+    semanticExecutionConfigurationHash: "4".repeat(64),
+    providerRoots: ["provider-b", "provider-a", "provider-a"],
+    budgetGeneration: 0,
+  };
+  const first = executionFailureSemanticFingerprintV2(base);
+  const clonedRevision = executionFailureSemanticFingerprintV2({
+    ...base,
+    providerRoots: ["provider-a", "provider-b"],
+  });
+  expect(clonedRevision).toEqual(first);
+  expect(executionFailureSemanticFingerprintV2({
+    ...base,
+    strategySemanticHash: "5".repeat(64),
+  }).attemptStrategyHash).not.toBe(first.attemptStrategyHash);
+  expect(executionFailureSemanticFingerprintV2({
+    ...base,
+    budgetGeneration: 1,
+  }).attemptStrategyHash).not.toBe(first.attemptStrategyHash);
+});
 
 async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

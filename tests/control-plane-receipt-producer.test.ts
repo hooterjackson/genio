@@ -75,7 +75,7 @@ function live(environment: "staging" | "production") {
       briefProviderModelId: "gpt-5.4-mini",
       baselineProviderModelId: "gpt-5.6-luna",
       escalationProviderModelId: "gpt-5.6-terra",
-      guidancePolicyVersion: "adaptive_guidance_v4",
+      guidancePolicyVersion: "adaptive_guidance_v5",
       evidencePolicyVersion: "governed_evidence_v2",
       queryPlanPolicyVersion: "query_plan_v3_4",
       selectionPlanVersion: "selection_plan_v3",

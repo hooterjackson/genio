@@ -12,6 +12,8 @@ import {
 } from "../shared/fast-run-sla.ts";
 import type {
   RunDecisionActionView,
+  RunEvidenceCoverageView,
+  RunExecutionRouteReceiptView,
   RunGuidanceActionView,
   RunProgressView,
 } from "../shared/types.ts";
@@ -23,12 +25,15 @@ import { WorkingIndicator } from "./working-indicator";
 import {
   actionRequiredJobLabel,
   apiErrorCode,
+  briefExecutionDecisionDisposition,
   evidenceCountSummary,
   partialDecisionHeading,
   partialDecisionSummary,
   partialReadyView,
   publishedTrackCountSummary,
   publishedResultHeading,
+  runEvidenceDisplayCounts,
+  runExecutionRouteAuthorityIssue,
   runResolutionControls,
   shouldKeepPollingBlockedRun,
   shouldPresentShortfallWithoutError,
@@ -89,6 +94,7 @@ type ResearchRun = {
   frontier: FrontierItem[];
   pipelineVersion?: string;
   policyVersion?: string;
+  executionRouteReceipt?: RunExecutionRouteReceiptView | null;
   selectionPlan?: {
     requestedTrackCount?: number;
     reserveTrackCount?: number;
@@ -108,12 +114,13 @@ type ResearchRun = {
   decisionAction?: RunDecisionActionView | null;
   guidanceAction?: RunGuidanceActionView | null;
   candidateStageCounts?: Partial<Record<string, number>>;
+  evidenceCoverage?: RunEvidenceCoverageView;
   progress?: RunProgressView;
   resolution?: {
     generation?: number | null;
     state: "accepted" | "needs_input" | "probing" | "executing" | "blocked_dependency" | "needs_decision" | "ready" | "publishing" | "completed" | "cancelled" | "quarantined";
     workMotion?: "running" | "retry_scheduled" | "waiting_dependency" | "paused" | "stalled" | "none";
-    nextAction: "none" | "answer_initial_guidance" | "answer_rescue_guidance" | "wait_for_dependency" | "resume_research" | "authorize_apple" | "decide_verified_partial" | "review_contract" | "contact_support";
+    nextAction: "none" | "answer_initial_guidance" | "answer_rescue_guidance" | "wait_for_dependency" | "resume_research" | "replay_after_repair" | "authorize_apple" | "decide_verified_partial" | "review_contract" | "contact_support";
     terminal: boolean;
     contractRevisionId: string | null;
     contractRevision: number | null;
@@ -126,6 +133,22 @@ type ResearchRun = {
       versionHash: string | null;
     } | null;
   };
+  repairReplayAction?: {
+    kind: "repair_replay";
+    expectedGeneration: number;
+    incidentReference: string;
+    contractRevisionId: string;
+    contractSemanticHash: string;
+    available: boolean;
+    availabilityReason:
+      | "ready"
+      | "repair_pending"
+      | "route_paused"
+      | "already_started";
+    successorBriefRequestId?: string | null;
+    resultReuse: false;
+    autoPublication: false;
+  } | null;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -241,8 +264,23 @@ type BriefResponse = {
   questions?: GuidedQuestion[];
   briefContractVersion?: 1 | 2 | 3;
   questionSetHash?: string | null;
-  checkpointMode?: "correctness_blocking" | "nuance_optional" | "interpretation_confirmation" | null;
+  checkpointMode?:
+    | "correctness_blocking"
+    | "nuance_optional"
+    | "interpretation_confirmation"
+    | "execution_decision"
+    | null;
   interpretationSummary?: GuidanceInterpretationSummary | null;
+  executionAction?: {
+    decisionHash: string;
+    optionId: string;
+    kind:
+      | "execute_confirmed_contract"
+      | "review_interpretation"
+      | "cancel_request";
+    startsResearch: boolean;
+    actionHash: string;
+  } | null;
   error?: string;
 };
 
@@ -259,7 +297,15 @@ type GuidedQuestionOption = {
   label: string;
   description?: string;
   recommended?: boolean;
+  recommendationReason?: string;
   feasibility?: "broad" | "moderate" | "narrow";
+  executionAction?: {
+    kind:
+      | "execute_confirmed_contract"
+      | "review_interpretation"
+      | "cancel_request";
+    startsResearch: boolean;
+  };
 };
 
 type GuidedQuestionGrounding = {
@@ -276,6 +322,11 @@ type GuidedQuestion = {
   criticality?: "required" | "optional";
   selectionMode?: "single" | "multiple";
   allowCustom?: boolean;
+  guidanceMode?:
+    | "correctness_blocking"
+    | "nuance_optional"
+    | "interpretation_confirmation"
+    | "execution_decision";
   interpretationSummary?: GuidanceInterpretationSummary;
   options: GuidedQuestionOption[];
 };
@@ -438,6 +489,12 @@ async function waitForBrief(requestId: string, initialDelayMs = 1_500, signal?: 
     await abortableDelay(delayMs, signal);
     const response = await api<BriefResponse>("/api/v1/brief/" + encodeURIComponent(requestId), { signal });
     if (response.status === "failed") throw new BriefInterpretationError(response.error || "Scope interpretation failed.");
+    const executionDisposition =
+      briefExecutionDecisionDisposition(response);
+    if (executionDisposition === "review"
+      || executionDisposition === "cancelled") {
+      return response;
+    }
     if (response.status === "awaiting_answers" && (
       response.questions?.length
       || (
@@ -755,7 +812,27 @@ async function copyText(value: string): Promise<void> {
   if (!copied) throw new Error("The transfer link could not be copied in this browser.");
 }
 
+function isTechnicalRepairRun(run: ResearchRun): boolean {
+  const phase = run.phase.trim().toLowerCase();
+  return run.resolution?.state === "quarantined"
+    || phase === "capability_evidence_coverage_audit"
+    || phase === "runtime_feasibility_unknown"
+    || phase === "canonical_contract_unknown"
+    || phase === "evidence_verification_unknown"
+    || phase.startsWith("v3_semantic_collapse_");
+}
+
 function phaseMessage(run: ResearchRun): string {
+  const routeAuthorityIssue = runExecutionRouteAuthorityIssue(run);
+  if (routeAuthorityIssue === "missing_execution_route_receipt") {
+    return "Execution is paused because this active run has no immutable execution-route receipt. Your request is preserved for technical repair; rewriting it will not fix the route authority.";
+  }
+  if (routeAuthorityIssue === "execution_route_mismatch") {
+    return "Execution is paused because the saved route receipt does not match the displayed execution route. Your request is preserved and no route will be trusted until the mismatch is repaired.";
+  }
+  if (routeAuthorityIssue === "invalid_execution_route_receipt") {
+    return "Execution is paused because its immutable route receipt could not be validated. Your request is preserved for technical repair.";
+  }
   if (run.phase === "dependency_resume_scheduled") {
     return "You authorized another exact-contract attempt. It will run when the dependency and matching executor are available.";
   }
@@ -774,6 +851,16 @@ function phaseMessage(run: ResearchRun): string {
     return retryAt
       ? `Research is safely paused for a dependency and will retry after ${new Date(retryAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
       : "Research is safely paused for a dependency. Your progress remains saved.";
+  }
+  if (isTechnicalRepairRun(run)) {
+    if (run.evidenceCoverage) {
+      return `We found ${
+        run.evidenceCoverage.uniqueLeadCount.toLocaleString()
+      } unique leads and ${
+        run.evidenceCoverage.storefrontPlayable.toLocaleString()
+      } Apple-available candidates, but the evidence service could not verify the required obligations. Your request is preserved.`;
+    }
+    return "Research found candidate recordings, but the evidence verifier could not validate the required proof. Your saved request is preserved for technical repair; you do not need to rewrite it.";
   }
   if (run.resolution?.state === "needs_input") {
     return run.resolution.nextAction === "answer_rescue_guidance"
@@ -846,7 +933,7 @@ function useRunPolling(
     const automaticHandoff = !actionRequired && autoPublish && Boolean(
       runStatus && (reviewStatuses.has(runStatus) || runStatus === "manifest_ready"),
     );
-    if (actionRequired) return;
+    if (actionRequired && !pollWhileBlocked) return;
     if (runStatus && !automaticHandoff && !pollWhileBlocked
       && (terminalStatuses.has(runStatus) || reviewStatuses.has(runStatus) || runStatus === "manifest_ready")) return;
     let cancelled = false;
@@ -862,7 +949,7 @@ function useRunPolling(
         const nextBlocked = shouldKeepPollingBlockedRun(next);
         const nextAutomaticHandoff = !nextActionRequired && next.autoPublish === true
           && (reviewStatuses.has(next.status) || next.status === "manifest_ready");
-        if (nextActionRequired) return;
+        if (nextActionRequired && !nextBlocked) return;
         if (!nextAutomaticHandoff && !nextBlocked
           && (terminalStatuses.has(next.status) || reviewStatuses.has(next.status) || next.status === "manifest_ready")) return;
         pollCount += 1;
@@ -1262,6 +1349,10 @@ function GuidedQuestionScreen({
   const currentAnswer = answers[question.id];
   const customSelected = typeof currentAnswer?.customText === "string";
   const customText = currentAnswer?.customText ?? "";
+  const selectedExecutionAction = question.guidanceMode === "execution_decision"
+    ? question.options.find(({ id }) => id === currentAnswer?.optionId)
+      ?.executionAction?.kind
+    : undefined;
   const orderedOptions = [...question.options]
     .sort((left, right) => Number(right.recommended) - Number(left.recommended))
     .slice(0, 4);
@@ -1413,6 +1504,11 @@ function GuidedQuestionScreen({
                     {option.recommended && <small>RECOMMENDED</small>}
                   </strong>
                   {option.description && <span id={descriptionId}>{option.description}</span>}
+                  {option.recommended && option.recommendationReason && (
+                    <span className="guided-recommendation-reason">
+                      Why recommended: {option.recommendationReason}
+                    </span>
+                  )}
                 </span>
               </label>
             );
@@ -1446,7 +1542,10 @@ function GuidedQuestionScreen({
               onChange={(event) => onAnswer({ questionId: question.id, customText: event.target.value })}
             />
           </div>}
-          {question.criticality === "optional" && (
+          {question.criticality === "optional"
+            && !question.options.some(
+              ({ id }) => id === "keep_current_interpretation",
+            ) && (
             <label
               className="guided-option-card"
               data-selected={currentAnswer?.skipped || undefined}
@@ -1505,7 +1604,13 @@ function GuidedQuestionScreen({
                 : locked
               ? "RETRY CREATE →"
               : lastQuestion
-                ? mode === "rescue" ? "APPLY AND CONTINUE →" : "CREATE PLAYLIST →"
+                ? mode === "rescue"
+                  ? "APPLY AND CONTINUE →"
+                  : selectedExecutionAction === "review_interpretation"
+                    ? "RETURN TO REQUEST →"
+                    : selectedExecutionAction === "cancel_request"
+                      ? "CANCEL REQUEST →"
+                      : "CREATE PLAYLIST →"
                 : "NEXT →"}
         </button>
       </div>
@@ -1874,6 +1979,40 @@ function FinalizingBriefScreen() {
   );
 }
 
+function CancelledBriefScreen({
+  onNewRequest,
+}: {
+  onNewRequest: () => void;
+}) {
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+      titleRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+  return (
+    <section className="guided-question-screen" aria-labelledby="brief-cancelled-title">
+      <div className="guided-question-body">
+        <p className="guided-question-kicker">REQUEST CANCELLED</p>
+        <h1 id="brief-cancelled-title" ref={titleRef} tabIndex={-1}>
+          Nothing was researched or published
+        </h1>
+        <p className="guided-question-reason">
+          <span>SAVED OUTCOME</span>
+          This playlist request was cancelled at the guidance checkpoint.
+        </p>
+      </div>
+      <div className="step-footer">
+        <button className="guided-next" type="button" onClick={onNewRequest}>
+          START A NEW REQUEST →
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function GuidanceConfirmationScreen({
   summary,
   busy,
@@ -1954,6 +2093,7 @@ function RunScreen({
   onNew,
   onRefine,
   onResumeDependency,
+  onReplayAfterRepair,
   onChangeEarlierAnswer,
   onCancel,
 }: {
@@ -1962,15 +2102,21 @@ function RunScreen({
   onNew: () => void;
   onRefine: () => void;
   onResumeDependency: () => void;
+  onReplayAfterRepair: () => void;
   onChangeEarlierAnswer: () => void;
   onCancel: () => void;
 }) {
   const showReset = run.resolution ? run.resolution.terminal : terminalStatuses.has(run.status);
+  const routeAuthorityIssue = runExecutionRouteAuthorityIssue(run);
   const controls = runResolutionControls(run);
   const needsDecision = run.resolution?.state === "needs_decision"
     || run.resolution?.state === "needs_input"
     || run.resolution?.state === "quarantined";
   const dependencyPaused = run.resolution?.state === "blocked_dependency";
+  const technicalRepair = (
+    isTechnicalRepairRun(run)
+    || routeAuthorityIssue !== null
+  ) && !dependencyPaused;
   const controlSuccessorRequired =
     run.phase === "public_rollout_successor_required";
   const profile = run.brief.mode === "curated" ? "CURATED" : "EXHAUSTIVE";
@@ -1978,6 +2124,10 @@ function RunScreen({
   const publishing = automaticHandoff
     || ["publishing", "waiting_for_apple_authorization", "manifest_ready"].includes(run.status);
   const work = playlistWorkState(run);
+  const displayedWorkMotion = routeAuthorityIssue
+    ? "action-required"
+    : work.motion;
+  const evidenceDisplayCounts = runEvidenceDisplayCounts(run);
   const targetCount = run.selectionPlan?.requestedTrackCount
     ?? run.pipelineOutcome?.targetTrackCount
     ?? exactRequestedTrackCount(run.brief);
@@ -1986,15 +2136,17 @@ function RunScreen({
     <section
       className="screen flow-screen research-screen"
       aria-labelledby="run-title"
-      aria-busy={work.motion === "active"}
+      aria-busy={displayedWorkMotion === "active"}
     >
       <div className="flow-body research-body">
         <span className="tag profile-tag">[{profile} · {automaticHandoff ? "ASSEMBLING" : statusLabel(run.status).toUpperCase()}]</span>
         <h1 id="run-title">{
           dependencyPaused
             ? "Your playlist is safely paused"
+            : technicalRepair
+              ? "Your playlist needs technical repair"
             : publishing
-            ? "Creating your playlist"
+              ? "Creating your playlist"
             : needsDecision
               ? "Your playlist needs a decision"
               : "Researching your playlist"
@@ -2002,20 +2154,30 @@ function RunScreen({
         <p className="run-subject">{run.brief.title}</p>
         <WorkingIndicator
           stage={work.stage}
-          motion={work.motion}
+          motion={displayedWorkMotion}
           phaseLabel={phaseMessage(run)}
-          sourceCount={run.sourceCount}
-          candidateCount={run.candidateCount}
+          sourceCount={evidenceDisplayCounts.uniqueLeadCount}
+          sourceCountOverride={
+            run.evidenceCoverage
+              ? evidenceDisplayCounts.uniqueLeadCount
+              : undefined
+          }
+          observationCount={evidenceDisplayCounts.observationCount}
+          candidateCount={evidenceDisplayCounts.materializedCandidateCount}
           unresolvedCount={run.unresolvedCount}
           targetCount={run.progress?.targetTrackCount ?? targetCount}
           reserveCount={run.selectionPlan?.reserveTrackCount}
           candidateStageCounts={run.candidateStageCounts}
+          qualifiedCountOverride={run.evidenceCoverage?.evidencePassed}
+          appleReadyCountOverride={run.evidenceCoverage?.storefrontPlayable}
           frontier={run.frontier}
           createdAt={run.createdAt}
           updatedAt={run.updatedAt}
           progress={run.progress}
           stateLabelOverride={
-            run.resolution?.workMotion === "stalled"
+            routeAuthorityIssue
+              ? "ROUTE UNVERIFIED"
+              : run.resolution?.workMotion === "stalled"
               ? "STALLED"
               : run.resolution?.workMotion === "retry_scheduled"
                 ? "RETRY SCHEDULED"
@@ -2029,10 +2191,66 @@ function RunScreen({
             versionPolicy: run.brief.versionPolicy,
             intents: run.selectionPlan?.intents,
             storefront: run.selectionPlan?.storefront,
-            pipelineVersion: run.pipelineVersion,
+            pipelineVersion: routeAuthorityIssue
+              ? "unverified_route_authority"
+              : run.executionRouteReceipt?.executionRoute
+                ?? run.pipelineVersion,
           }}
-          note={work.motion === "active" ? "Progress is saved in Jobs. You can leave this page." : undefined}
+          note={displayedWorkMotion === "active" ? "Progress is saved in Jobs. You can leave this page." : undefined}
         />
+        {routeAuthorityIssue && (
+          <div
+            className="run-decision-panel"
+            data-testid="route-authority-error"
+          >
+            <span>EXECUTION ROUTE NOT VERIFIED</span>
+            <p>
+              The execution route presented by this screen could not be
+              verified against its immutable route receipt. The run is shown
+              as technical attention—not live work—and your saved request
+              remains unchanged.
+            </p>
+            <small>
+              FAIL-CLOSED · REPORT THE TECHNICAL ISSUE OR CANCEL THIS SAVED RUN
+            </small>
+          </div>
+        )}
+        {technicalRepair && !routeAuthorityIssue && run.evidenceCoverage && (
+          <div
+            className="run-decision-panel"
+            data-testid="technical-evidence-coverage"
+          >
+            <span>TECHNICAL COVERAGE AUDIT</span>
+            <p>
+              We recorded {
+                run.evidenceCoverage.observationCount.toLocaleString()
+              } discovery observations representing {
+                run.evidenceCoverage.uniqueLeadCount.toLocaleString()
+              } unique leads, materialized {
+                run.evidenceCoverage.materializedCandidateCount.toLocaleString()
+              } unique candidates, recorded {
+                run.evidenceCoverage.qualificationObservationCount
+                  .toLocaleString()
+              } qualification observations, exactly bound {
+                run.evidenceCoverage.appleResolvedCount.toLocaleString()
+              } to Apple catalog identities, and resolved {
+                run.evidenceCoverage.storefrontPlayable.toLocaleString()
+              } as playable in Apple Music. The evidence service verified {
+                run.evidenceCoverage.evidencePassed.toLocaleString()
+              }. Apple append progress is {
+                run.evidenceCoverage.appendedCount.toLocaleString()
+              }; nothing was mislabeled as musical scarcity.
+            </p>
+            <small>
+              REQUEST PRESERVED · {
+                run.evidenceCoverage.evidenceUnknown.toLocaleString()
+              } EVIDENCE-UNKNOWN OBSERVATIONS · {
+                run.evidenceCoverage.legacyUnboundQualificationCount
+                  .toLocaleString()
+              } LEGACY_UNBOUND
+            </small>
+          </div>
+        )}
         {run.decisionAction && (
           <div className="run-decision-panel" data-testid="run-decision-panel">
             <span>SAFE RESEARCH BOUNDARY</span>
@@ -2099,13 +2317,15 @@ function RunScreen({
               Your accepted request is unchanged and remains saved. Its
               confirmed capabilities are outside the current signed cohort,
               so it will not be silently downgraded or resumed automatically.
-              Create a user-authored revision now, or cancel this saved run.
+              This is a rollout-control problem, not a prompt problem. Your
+              request needs no rewrite; report the technical issue or cancel
+              this saved run.
             </p>
             <small>
               COUNT REMAINS EXACT · {targetCount?.toLocaleString() ?? "—"} TRACKS
             </small>
             <small>
-              SAVED DURABLY · REFINE OR CANCEL
+              SAVED DURABLY · TECHNICAL ATTENTION REQUIRED
             </small>
           </div>
         )}
@@ -2128,8 +2348,33 @@ function RunScreen({
               href="/feedback"
               onClick={preserveFeedbackSource}
             >
-              CONTACT SUPPORT →
+              {technicalRepair ? "REPORT TECHNICAL ISSUE →" : "CONTACT SUPPORT →"}
             </a>
+          )}
+          {controls.includes("repair_pending") && (
+            <p
+              className="run-action-status"
+              role="status"
+              data-testid="repair-replay-pending"
+            >
+              {run.repairReplayAction?.availabilityReason === "route_paused"
+                ? "TECHNICAL REPAIR IS SAFELY PAUSED · YOUR REQUEST AND INCIDENT REFERENCE ARE PRESERVED"
+                : "TECHNICAL REPAIR IS IN PROGRESS · REPLAY WILL APPEAR HERE WHEN A REPAIRED BUILD IS AVAILABLE"}
+              {run.repairReplayAction?.incidentReference
+                ? ` · INCIDENT ${run.repairReplayAction.incidentReference}`
+                : ""}
+            </p>
+          )}
+          {controls.includes("continue_repair") && (
+            <button
+              className="action-button step-primary"
+              type="button"
+              onClick={onReplayAfterRepair}
+              disabled={Boolean(busy)}
+              data-testid="continue-repair"
+            >
+              CONTINUE REPAIRED REQUEST →
+            </button>
           )}
           {controls.includes("resume_dependency") && (
             <button
@@ -2141,6 +2386,19 @@ function RunScreen({
               {busy === "resume-dependency"
                 ? "SCHEDULING RESUME..."
                 : "RESUME LATER →"}
+            </button>
+          )}
+          {controls.includes("replay_after_repair") && (
+            <button
+              className="action-button step-primary"
+              type="button"
+              onClick={onReplayAfterRepair}
+              disabled={Boolean(busy)}
+              data-testid="replay-after-repair"
+            >
+              {busy === "repair-replay"
+                ? "STARTING CLEAN REPLAY..."
+                : "RETRY AFTER TECHNICAL REPAIR →"}
             </button>
           )}
           {controls.includes("refine_request") && (
@@ -2845,6 +3103,8 @@ export function PlaylistBuilder() {
   const [guidanceSubmission, setGuidanceSubmission] = useState<GuidedAnswer[] | null>(null);
   const [guidanceRecoveryMode, setGuidanceRecoveryMode] =
     useState<GuidanceRecoveryMode | null>(null);
+  const [briefDecisionOutcome, setBriefDecisionOutcome] =
+    useState<"cancelled" | null>(null);
   const [runGuidanceState, setRunGuidanceState] = useState<{
     questionSetHash: string | null;
     answers: Record<string, GuidedAnswer>;
@@ -2882,6 +3142,10 @@ export function PlaylistBuilder() {
     decisionHash: string;
     value: string;
   } | null>(null);
+  const repairReplayIdempotencyKey = useRef<{
+    incidentReference: string;
+    value: string;
+  } | null>(null);
   const submittedTrackCountRef = useRef<number | null>(null);
   const publishingRef = useRef(false);
   const matchingRetryAttempted = useRef<Set<string>>(new Set());
@@ -2908,7 +3172,11 @@ export function PlaylistBuilder() {
   }, []);
 
   const clearCurrent = useCallback((nextStage: "command" | "jobs") => {
-    if (briefRequestId && !run && !manifest && !result) {
+    if (briefRequestId
+      && briefDecisionOutcome !== "cancelled"
+      && !run
+      && !manifest
+      && !result) {
       deleteAbandonedBrief(briefRequestId);
     }
     briefRequestRef.current?.abort();
@@ -2929,6 +3197,7 @@ export function PlaylistBuilder() {
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
     setGuidanceRecoveryMode(null);
+    setBriefDecisionOutcome(null);
     setRunGuidanceState({
       questionSetHash: null,
       answers: {},
@@ -2951,11 +3220,19 @@ export function PlaylistBuilder() {
     runGuidanceIdempotencyKey.current = null;
     guidanceRevisionIdempotencyKey.current = null;
     dependencyResumeIdempotencyKey.current = null;
+    repairReplayIdempotencyKey.current = null;
     submittedTrackCountRef.current = null;
     publishingRef.current = false;
     matchingRetryAttempted.current.clear();
     window.history.replaceState(null, "", window.location.pathname);
-  }, [briefRequestId, deleteAbandonedBrief, manifest, result, run]);
+  }, [
+    briefDecisionOutcome,
+    briefRequestId,
+    deleteAbandonedBrief,
+    manifest,
+    result,
+    run,
+  ]);
 
   const reset = useCallback(() => clearCurrent("command"), [clearCurrent]);
   const newJob = useCallback(() => clearCurrent("command"), [clearCurrent]);
@@ -2985,7 +3262,10 @@ export function PlaylistBuilder() {
     Boolean(partialReadyView(run))
       || run?.resolution?.state === "needs_input"
       || run?.resolution?.state === "needs_decision"
-      || run?.resolution?.state === "quarantined",
+      || (
+        run?.resolution?.state === "quarantined"
+        && run.resolution.terminal === true
+      ),
     shouldKeepPollingBlockedRun(run),
     updateRun,
     setError,
@@ -3118,6 +3398,48 @@ export function PlaylistBuilder() {
     return { brief: nextBrief, requestedTrackCount };
   }, []);
 
+  const applyBriefExecutionDecision = useCallback((
+    response: BriefResponse,
+  ): boolean => {
+    const disposition = briefExecutionDecisionDisposition(response);
+    if (disposition !== "review" && disposition !== "cancelled") return false;
+    const preservedPrompt = response.prompt?.trim() || prompt.trim();
+    const preservedCount = response.requestedTrackCount
+      ?? (response.brief ? exactRequestedTrackCount(response.brief) : null)
+      ?? (brief ? exactRequestedTrackCount(brief) : null)
+      ?? (/^[0-9]+$/u.test(trackCount)
+        ? Number.parseInt(trackCount, 10)
+        : PUBLIC_PLAYLIST_DEFAULT_TRACKS);
+    setPrompt(preservedPrompt);
+    setTrackCount(String(preservedCount));
+    submittedTrackCountRef.current = preservedCount;
+    setGuidanceQuestions([]);
+    setGuidanceQuestionSetHash(null);
+    setGuidanceConfirmation(null);
+    setGuidanceAnswers({});
+    setGuidanceIndex(0);
+    setGuidanceSubmission(null);
+    setGuidanceRecoveryMode(null);
+    setBriefFinalizing(false);
+    setBusy("");
+    setError("");
+    guidanceIdempotencyKey.current = null;
+    idempotencyKey.current = null;
+    if (disposition === "review") {
+      // The server has already durably stopped the prior brief. Return its
+      // wording to the editor without deleting or auto-starting that record.
+      setBriefDecisionOutcome(null);
+      setBrief(null);
+      setBriefRequestId(null);
+      briefIdempotencyKey.current = null;
+      window.history.replaceState(null, "", window.location.pathname);
+      return true;
+    }
+    setBriefDecisionOutcome("cancelled");
+    if (response.brief) setBrief(response.brief);
+    return true;
+  }, [brief, prompt, trackCount]);
+
   useEffect(() => {
     if (restoreStartedRef.current) return;
     restoreStartedRef.current = true;
@@ -3136,9 +3458,10 @@ export function PlaylistBuilder() {
           setBriefRequestId(queuedBriefId);
           setBriefFinalizing(true);
           const response = await waitForBrief(queuedBriefId);
+          setPrompt(response.prompt ?? "");
+          if (applyBriefExecutionDecision(response)) return;
           const restored = adoptAuthoritativeBrief(response);
           if (!restored) throw new Error("The playlist request could not be restored.");
-          setPrompt(response.prompt ?? "");
           setBriefRequestId(queuedBriefId);
           if (response.status === "awaiting_answers" && response.questions?.length) {
             setGuidanceConfirmation(null);
@@ -3204,6 +3527,7 @@ export function PlaylistBuilder() {
     void restore();
   }, [
     adoptAuthoritativeBrief,
+    applyBriefExecutionDecision,
     exchangeCapability,
     loadRun,
     openJobs,
@@ -3395,6 +3719,7 @@ export function PlaylistBuilder() {
         response = await waitForBrief(initialRequestId, numberValue(response.pollAfterMs, 1_500), controller.signal);
       }
       if (controller.signal.aborted) return;
+      if (applyBriefExecutionDecision(response)) return;
       if (!response.brief) throw new Error("Scope interpretation is taking longer than expected. Retry with the same request.");
       assertExactBriefTrackCount(response.brief, requestedTrackCount);
       const adopted = adoptAuthoritativeBrief(response);
@@ -3461,11 +3786,27 @@ export function PlaylistBuilder() {
     setGuidanceIndex(0);
     setGuidanceSubmission(null);
     setGuidanceRecoveryMode(null);
+    setBriefDecisionOutcome(null);
     setBriefFinalizing(false);
     setBrief(null);
     setBriefRequestId(null);
     setBusy("");
     setError("");
+    briefIdempotencyKey.current = null;
+    guidanceIdempotencyKey.current = null;
+    idempotencyKey.current = null;
+    window.history.replaceState(null, "", window.location.pathname);
+  }
+
+  function startNewAfterCancelledBrief() {
+    // Cancellation is already a durable server outcome. Leaving its receipt
+    // must not turn into a best-effort DELETE of the cancelled brief.
+    setBriefDecisionOutcome(null);
+    setBrief(null);
+    setBriefRequestId(null);
+    setPrompt("");
+    setTrackCount(String(PUBLIC_PLAYLIST_DEFAULT_TRACKS));
+    submittedTrackCountRef.current = null;
     briefIdempotencyKey.current = null;
     guidanceIdempotencyKey.current = null;
     idempotencyKey.current = null;
@@ -3589,6 +3930,7 @@ export function PlaylistBuilder() {
       if (response.status === "failed") {
         throw new BriefInterpretationError(response.error || "The playlist request could not be finalized.");
       }
+      if (applyBriefExecutionDecision(response)) return;
       if (response.status === "awaiting_answers" && response.questions?.length) {
         if (response.brief && !adoptAuthoritativeBrief(response)) {
           throw new Error("The playlist size could not be restored. Return to the request and choose it again.");
@@ -3626,6 +3968,7 @@ export function PlaylistBuilder() {
         controller.signal,
       );
       if (controller.signal.aborted) return;
+      if (applyBriefExecutionDecision(finalized)) return;
       if (finalized.status === "awaiting_answers" && finalized.questions?.length) {
         if (!adoptAuthoritativeBrief(finalized, brief)) {
           throw new Error("The playlist size could not be restored. Return to the request and choose it again.");
@@ -4179,6 +4522,106 @@ export function PlaylistBuilder() {
     }
   }
 
+  async function replayAfterRepair() {
+    if (!run || operationRequestRef.current) return;
+    const action = run.repairReplayAction;
+    const resolution = run.resolution;
+    if (action?.availabilityReason === "already_started"
+      && typeof action.successorBriefRequestId === "string"
+      && action.successorBriefRequestId.length > 0
+      && resolution?.state === "quarantined") {
+      window.location.assign(
+        `${window.location.pathname}?brief=${encodeURIComponent(
+          action.successorBriefRequestId,
+        )}`,
+      );
+      return;
+    }
+    const eligible = action?.kind === "repair_replay"
+      && resolution?.state === "quarantined"
+      && resolution.nextAction === "replay_after_repair"
+      && resolution.generation === action.expectedGeneration
+      && resolution.contractRevisionId === action.contractRevisionId
+      && resolution.contractHash === action.contractSemanticHash
+      && action.available === true
+      && action.availabilityReason === "ready"
+      && action.resultReuse === false
+      && action.autoPublication === false;
+    if (!eligible || !action) {
+      setError("This technical replay is no longer current. Refresh the job before continuing.");
+      return;
+    }
+    if (repairReplayIdempotencyKey.current?.incidentReference
+      !== action.incidentReference) {
+      repairReplayIdempotencyKey.current = {
+        incidentReference: action.incidentReference,
+        value: `repair-replay-${crypto.randomUUID()}`,
+      };
+    }
+    const key = repairReplayIdempotencyKey.current.value;
+    const sourceAccessId = run.id;
+    const controller = new AbortController();
+    operationRequestRef.current = controller;
+    setBusy("repair-replay");
+    setError("");
+    try {
+      const response = await api<JsonObject>(
+        `/api/v1/runs/${encodeURIComponent(sourceAccessId)}/replay-after-repair`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": key },
+          body: JSON.stringify({
+            expectedGeneration: action.expectedGeneration,
+            incidentReference: action.incidentReference,
+            expectedContractRevisionId: action.contractRevisionId,
+            expectedContractSemanticHash: action.contractSemanticHash,
+            idempotencyKey: key,
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (controller.signal.aborted || activeRunId.current !== sourceAccessId) {
+        return;
+      }
+      const requestId = typeof response.requestId === "string"
+        ? response.requestId
+        : "";
+      if (!requestId) {
+        throw new Error(
+          "gênio could not establish the repaired guidance request.",
+        );
+      }
+      repairReplayIdempotencyKey.current = null;
+      window.location.assign(
+        `${window.location.pathname}?brief=${encodeURIComponent(requestId)}`,
+      );
+    } catch (caught) {
+      if (isAbortError(caught) || activeRunId.current !== sourceAccessId) {
+        return;
+      }
+      const conflict = caught instanceof ApiError && [
+        "repair_replay_stale",
+        "repair_replay_integrity",
+        "repair_replay_route_receipt_invalid",
+        "repair_replay_route_paused",
+        "repair_replay_not_quarantined",
+        "repair_replay_incident_ineligible",
+        "technical_repair_source_missing",
+        "technical_repair_route_receipt_invalid",
+        "technical_repair_consumption_integrity",
+        "technical_repair_already_used",
+      ].includes(caught.code ?? "");
+      setError(conflict
+        ? `${caught.message} Refresh the job to review its current state.`
+        : (caught as Error).message);
+    } finally {
+      if (operationRequestRef.current === controller) {
+        operationRequestRef.current = null;
+        if (activeRunId.current === sourceAccessId) setBusy("");
+      }
+    }
+  }
+
   async function publishPartialPlaylist() {
     if (!run || operationRequestRef.current || publishingRef.current) return;
     const decision = partialReadyView(run);
@@ -4362,6 +4805,17 @@ export function PlaylistBuilder() {
         <AppHeader onHome={reset} onJobs={() => void openJobs()} />
         <ErrorBar message={error} onDismiss={() => setError("")} />
         <FinalizingBriefScreen />
+      </main>
+    );
+  }
+
+  if (!run && !manifest && !result && entryStage === "command"
+    && briefDecisionOutcome === "cancelled") {
+    return (
+      <main className="app-shell one-command-shell guided-shell">
+        <AppHeader onHome={startNewAfterCancelledBrief} onJobs={() => void openJobs()} />
+        <ErrorBar message={error} onDismiss={() => setError("")} />
+        <CancelledBriefScreen onNewRequest={startNewAfterCancelledBrief} />
       </main>
     );
   }
@@ -4576,6 +5030,7 @@ export function PlaylistBuilder() {
           onNew={newJob}
           onRefine={retryWithUpdatedInterpretation}
           onResumeDependency={() => void resumeDependencyResearch()}
+          onReplayAfterRepair={() => void replayAfterRepair()}
           onChangeEarlierAnswer={() => void openGuidanceHistory()}
           onCancel={() => void cancelRun()}
         />

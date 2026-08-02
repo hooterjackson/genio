@@ -2,17 +2,155 @@ import { describe, expect, it } from "vitest";
 import {
   actionRequiredJobLabel,
   apiErrorCode,
+  briefExecutionDecisionDisposition,
   evidenceCountSummary,
   partialDecisionHeading,
   partialDecisionSummary,
   partialReadyView,
   publishedTrackCountSummary,
   publishedResultHeading,
+  runEvidenceDisplayCounts,
+  runExecutionRouteAuthorityIssue,
   runResolutionControls,
   shouldKeepPollingBlockedRun,
   shouldPresentShortfallWithoutError,
   shouldQuietlyClearInitialRunRestore,
 } from "../app/playlist-builder-ui-policy.ts";
+
+const validRouteReceipt = {
+  version: "execution_route_receipt_v1",
+  executionRoute: "corpus_first_v3",
+  receiptHash: "a".repeat(64),
+  executorConfigurationHash: "b".repeat(64),
+};
+
+describe("run route authority and truthful display counts", () => {
+  it("accepts a matching immutable execution route receipt", () => {
+    expect(runExecutionRouteAuthorityIssue({
+      status: "researching",
+      pipelineVersion: "corpus_first_v3",
+      executionRouteReceipt: validRouteReceipt,
+    })).toBeNull();
+  });
+
+  it("fails active corpus-first work closed when its route receipt is missing", () => {
+    const run = {
+      status: "researching",
+      pipelineVersion: "corpus_first_v3",
+      resolution: {
+        state: "executing",
+        nextAction: "none",
+        terminal: false,
+      },
+    };
+    expect(runExecutionRouteAuthorityIssue(run))
+      .toBe("missing_execution_route_receipt");
+    expect(runResolutionControls(run)).toEqual([
+      "contact_support",
+      "cancel_job",
+    ]);
+  });
+
+  it("fails a contradictory route receipt closed even when work claims to be live", () => {
+    const run = {
+      status: "researching",
+      pipelineVersion: "catalog_first_v2",
+      executionRouteReceipt: validRouteReceipt,
+      resolution: {
+        state: "executing",
+        nextAction: "none",
+        terminal: false,
+      },
+    };
+    expect(runExecutionRouteAuthorityIssue(run))
+      .toBe("execution_route_mismatch");
+    expect(runResolutionControls(run)).toEqual([
+      "contact_support",
+      "cancel_job",
+    ]);
+  });
+
+  it("keeps a terminal legacy corpus-first result readable without inventing a receipt", () => {
+    expect(runExecutionRouteAuthorityIssue({
+      status: "complete",
+      pipelineVersion: "corpus_first_v3",
+      executionRouteReceipt: null,
+      resolution: {
+        state: "completed",
+        nextAction: "none",
+        terminal: true,
+      },
+    })).toBeNull();
+  });
+
+  it("does not inflate unique leads or candidates with cumulative observations", () => {
+    expect(runEvidenceDisplayCounts({
+      sourceCount: 1_005,
+      candidateCount: 1_005,
+      evidenceCoverage: {
+        observationCount: 1_005,
+        uniqueLeadCount: 189,
+        materializedCandidateCount: 77,
+      },
+    })).toEqual({
+      observationCount: 1_005,
+      uniqueLeadCount: 189,
+      materializedCandidateCount: 77,
+    });
+  });
+});
+
+describe("brief execution-decision browser policy", () => {
+  const action = {
+    decisionHash: "a".repeat(64),
+    actionHash: "b".repeat(64),
+  };
+
+  it("returns Review to the editor without polling or starting research", () => {
+    expect(briefExecutionDecisionDisposition({
+      status: "review_required",
+      executionAction: {
+        ...action,
+        optionId: "review_interpretation",
+        kind: "review_interpretation",
+        startsResearch: false,
+      },
+    })).toBe("review");
+  });
+
+  it("renders a durable cancelled outcome without polling or starting research", () => {
+    expect(briefExecutionDecisionDisposition({
+      status: "cancelled",
+      executionAction: {
+        ...action,
+        optionId: "cancel_request",
+        kind: "cancel_request",
+        startsResearch: false,
+      },
+    })).toBe("cancelled");
+  });
+
+  it("permits research only for the matching explicit execute action", () => {
+    expect(briefExecutionDecisionDisposition({
+      status: "finalizing",
+      executionAction: {
+        ...action,
+        optionId: "execute_confirmed_contract",
+        kind: "execute_confirmed_contract",
+        startsResearch: true,
+      },
+    })).toBe("execute");
+    expect(briefExecutionDecisionDisposition({
+      status: "finalizing",
+      executionAction: {
+        ...action,
+        optionId: "cancel_request",
+        kind: "cancel_request",
+        startsResearch: false,
+      },
+    })).toBeNull();
+  });
+});
 
 describe("initial run restoration", () => {
   it("quietly clears a stale or inaccessible run only during initial run restoration", () => {
@@ -143,6 +281,29 @@ describe("Pipeline V3 partial publication decisions", () => {
     });
   });
 
+  it("does not reuse retained partial consent as an action after publication handoff", () => {
+    const retainedAction = {
+      kind: "partial_publication",
+      targetTrackCount: 25,
+      qualifiedTrackCount: 20,
+      remainingStrategyCount: 0,
+      canContinueResearch: false,
+      outcomeHash: "a".repeat(64),
+    };
+    for (const status of [
+      "manifest_ready",
+      "publishing",
+      "waiting_for_apple_authorization",
+      "complete",
+      "partial",
+    ]) {
+      expect(partialReadyView({
+        status,
+        partialAction: retainedAction,
+      })).toBeNull();
+    }
+  });
+
   it("keeps typed completeness shortfalls out of the red error treatment", () => {
     expect(shouldPresentShortfallWithoutError({
       status: "partial",
@@ -158,7 +319,7 @@ describe("Pipeline V3 partial publication decisions", () => {
 });
 
 describe("never-dead-end run controls", () => {
-  it("keeps dependency recovery automatic while exposing revision and cancellation exits", () => {
+  it("keeps dependency recovery automatic without implying that prompt revision repairs an outage", () => {
     const run = {
       status: "failed_system",
       resolution: {
@@ -173,13 +334,12 @@ describe("never-dead-end run controls", () => {
     };
     expect(runResolutionControls(run)).toEqual([
       "wait_for_retry",
-      "refine_request",
       "cancel_job",
     ]);
     expect(shouldKeepPollingBlockedRun(run)).toBe(true);
   });
 
-  it("routes quarantine to a real support link and retains safe exits", () => {
+  it("routes durable quarantine to a real support link without polling forever", () => {
     const run = {
       status: "failed_integrity",
       resolution: {
@@ -190,10 +350,143 @@ describe("never-dead-end run controls", () => {
     };
     expect(runResolutionControls(run)).toEqual([
       "contact_support",
-      "refine_request",
       "cancel_job",
     ]);
     expect(shouldKeepPollingBlockedRun(run)).toBe(false);
+  });
+
+  it("keeps polling a provisional quarantine emitted during an active handoff", () => {
+    const run = {
+      status: "publishing",
+      resolution: {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+      },
+    };
+    expect(shouldKeepPollingBlockedRun(run)).toBe(true);
+    expect(shouldKeepPollingBlockedRun({
+      ...run,
+      resolution: {
+        ...run.resolution,
+        terminal: true,
+      },
+    })).toBe(false);
+  });
+
+  it("offers a clean replay only with the complete immutable repair fence", () => {
+    const eligible = {
+      status: "failed_integrity",
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 4,
+        incidentReference: "incident:technical:4",
+        contractRevisionId: "contract-revision-id",
+        contractSemanticHash: "a".repeat(64),
+        available: true,
+        availabilityReason: "ready",
+        resultReuse: false,
+        autoPublication: false,
+      },
+      resolution: {
+        generation: 4,
+        state: "quarantined",
+        nextAction: "replay_after_repair",
+        terminal: false,
+        contractRevisionId: "contract-revision-id",
+        contractHash: "a".repeat(64),
+      },
+    };
+    expect(runResolutionControls(eligible)).toEqual([
+      "replay_after_repair",
+      "cancel_job",
+    ]);
+    expect(runResolutionControls({
+      ...eligible,
+      repairReplayAction: {
+        ...eligible.repairReplayAction,
+        autoPublication: true,
+      },
+    })).toEqual(["contact_support", "cancel_job"]);
+    expect(runResolutionControls({
+      ...eligible,
+      resolution: {
+        ...eligible.resolution,
+        generation: 5,
+      },
+    })).toEqual(["contact_support", "cancel_job"]);
+    expect(runResolutionControls({
+      ...eligible,
+      repairReplayAction: null,
+    })).toEqual(["contact_support", "cancel_job"]);
+  });
+
+  it("shows the incident repair path while a repaired build is pending", () => {
+    const pending = {
+      status: "failed_integrity",
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 4,
+        incidentReference: "incident:evidence-binding",
+        contractRevisionId: "contract-revision-id",
+        contractSemanticHash: "a".repeat(64),
+        available: false,
+        availabilityReason: "repair_pending",
+        resultReuse: false,
+        autoPublication: false,
+      },
+      resolution: {
+        generation: 4,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-revision-id",
+        contractHash: "a".repeat(64),
+      },
+    };
+    expect(runResolutionControls(pending)).toEqual([
+      "repair_pending",
+      "contact_support",
+      "cancel_job",
+    ]);
+    expect(runResolutionControls({
+      ...pending,
+      repairReplayAction: {
+        ...pending.repairReplayAction,
+        availabilityReason: "route_paused",
+      },
+    })).toEqual([
+      "repair_pending",
+      "contact_support",
+      "cancel_job",
+    ]);
+  });
+
+  it("continues the single already-created planning successor", () => {
+    expect(runResolutionControls({
+      status: "failed_integrity",
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 4,
+        incidentReference: "incident:evidence-binding",
+        contractRevisionId: "contract-revision-id",
+        contractSemanticHash: "a".repeat(64),
+        available: false,
+        availabilityReason: "already_started",
+        successorBriefRequestId:
+          "00000000-0000-4000-8000-000000000004",
+        resultReuse: false,
+        autoPublication: false,
+      },
+      resolution: {
+        generation: 4,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-revision-id",
+        contractHash: "a".repeat(64),
+      },
+    })).toEqual(["continue_repair", "cancel_job"]);
   });
 
   it("offers Resume later only for a hash-bound retained dependency decision", () => {
@@ -219,7 +512,6 @@ describe("never-dead-end run controls", () => {
     };
     expect(runResolutionControls(eligible)).toEqual([
       "resume_dependency",
-      "refine_request",
       "cancel_job",
     ]);
     expect(runResolutionControls({
@@ -231,7 +523,7 @@ describe("never-dead-end run controls", () => {
           versionHash: null,
         },
       },
-    })).toEqual(["refine_request", "cancel_job"]);
+    })).toEqual(["contact_support", "cancel_job"]);
     expect(runResolutionControls({
       ...eligible,
       resolution: {
@@ -241,10 +533,10 @@ describe("never-dead-end run controls", () => {
           kind: "scope_decision",
         },
       },
-    })).toEqual(["refine_request", "cancel_job"]);
+    })).toEqual(["contact_support", "cancel_job"]);
   });
 
-  it("does not expose a fake partial action when the signed decision is absent", () => {
+  it("does not expose a fake user repair when the signed partial decision is absent", () => {
     expect(runResolutionControls({
       status: "partial_ready",
       resolution: {
@@ -252,7 +544,30 @@ describe("never-dead-end run controls", () => {
         nextAction: "decide_verified_partial",
         terminal: false,
       },
+    })).toEqual(["contact_support", "cancel_job"]);
+  });
+
+  it("offers contract refinement only when a signed decision contains a supported advancing action", () => {
+    expect(runResolutionControls({
+      status: "needs_decision",
+      decisionAction: {
+        decisionHash: "c".repeat(64),
+        actions: { reviseNamedPredicate: true },
+      },
+      resolution: {
+        state: "needs_decision",
+        nextAction: "review_contract",
+        terminal: false,
+      },
     })).toEqual(["refine_request", "cancel_job"]);
+    expect(runResolutionControls({
+      status: "needs_decision",
+      resolution: {
+        state: "needs_decision",
+        nextAction: "review_contract",
+        terminal: false,
+      },
+    })).toEqual(["contact_support", "cancel_job"]);
   });
 
   it("leaves a valid explicit partial decision to the dedicated decision screen", () => {

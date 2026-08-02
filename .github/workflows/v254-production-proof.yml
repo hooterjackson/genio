@@ -1,0 +1,317 @@
+name: v254 post-exposure production proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact merged v2.5.4 source revision
+        required: true
+        type: string
+      release_version:
+        description: Exact candidate version
+        required: true
+        type: string
+      candidate_tag:
+        description: Immutable annotated RC tag
+        required: true
+        type: string
+      image_digest:
+        description: Immutable promoted backend image digest
+        required: true
+        type: string
+      sites_handoff_run_id:
+        description: Successful connector evidence handoff run
+        required: true
+        type: string
+      sites_handoff_artifact:
+        description: Exact connector evidence handoff artifact
+        required: true
+        type: string
+      direct_exposure_run_id:
+        description: Successful signed direct-exposure run
+        required: true
+        type: string
+      direct_exposure_artifact:
+        description: Exact signed direct-exposure artifact
+        required: true
+        type: string
+
+concurrency:
+  group: v254-post-exposure-proof-${{ inputs.source_revision }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prove:
+    name: full convergence and real public direct-exposure browser proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_PRODUCTION_ORIGIN: https://9enio.com
+      RELEASE_CANARY_HMAC_SECRET: ${{ secrets.RELEASE_CANARY_HMAC_SECRET }}
+      RELEASE_VERIFICATION_KEY_ID: ${{ vars.RELEASE_VERIFICATION_KEY_ID }}
+      RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+      RELEASE_GATE_PRODUCER_KEY_ID: ${{ vars.RELEASE_GATE_PRODUCER_KEY_ID }}
+      RELEASE_SITES_CONTROL_PLANE_KEY_ID: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_ID }}
+      RELEASE_SITES_CONTROL_PLANE_KEY_SHA256: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256 }}
+      RELEASE_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/public-browser
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the exact immutable candidate and direct-exposure producer
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SITES_RUN_ID: ${{ inputs.sites_handoff_run_id }}
+          SITES_ARTIFACT: ${{ inputs.sites_handoff_artifact }}
+          DIRECT_RUN_ID: ${{ inputs.direct_exposure_run_id }}
+          DIRECT_ARTIFACT: ${{ inputs.direct_exposure_artifact }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_WORKFLOW_SHA" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_TAG" =~ ^v"$RELEASE_VERSION"-rc\.[1-9][0-9]*$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$SITES_ARTIFACT" = "v254-sites-connector-handoff-$SOURCE_REVISION"
+          test "$DIRECT_ARTIFACT" = "v254-editorial-direct-exposure-$SOURCE_REVISION"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
+          git fetch --force origin "+refs/tags/$CANDIDATE_TAG:refs/tags/$CANDIDATE_TAG"
+          test "$(git cat-file -t "refs/tags/$CANDIDATE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$CANDIDATE_TAG^{}")" = "$SOURCE_REVISION"
+          for RUN_ID in "$SITES_RUN_ID" "$DIRECT_RUN_ID"; do
+            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+            test "$(jq -r '.event' <<<"$RUN")" = "workflow_dispatch"
+            test "$(jq -r '.status' <<<"$RUN")" = "completed"
+            test "$(jq -r '.conclusion' <<<"$RUN")" = "success"
+            test "$(jq -r '.head_sha' <<<"$RUN")" = "$SOURCE_REVISION"
+          done
+          SITES="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SITES_RUN_ID")"
+          DIRECT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DIRECT_RUN_ID")"
+          test "$(jq -r '.path' <<<"$SITES")" = ".github/workflows/v254-sites-connector-handoff.yml"
+          test "$(jq -r '.path' <<<"$DIRECT")" = ".github/workflows/v254-editorial-direct-exposure.yml"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.sites_handoff_artifact }}
+          path: ${{ runner.temp }}/sites
+          run-id: ${{ inputs.sites_handoff_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.direct_exposure_artifact }}
+          path: ${{ runner.temp }}/direct
+          run-id: ${{ inputs.direct_exposure_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install exact dependencies and browser
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Materialize protected proof inputs
+        env:
+          RELEASE_SECRET_VERSIONS_BASE64: ${{ secrets.RELEASE_SECRET_VERSIONS_BASE64 }}
+          RELEASE_VERIFICATION_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_VERIFICATION_PUBLIC_KEY_BASE64 }}
+          RELEASE_GATE_PRODUCER_PRIVATE_KEY_BASE64: ${{ secrets.RELEASE_GATE_PRODUCER_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$RELEASE_SECRET_VERSIONS_BASE64" | base64 --decode > "$RUNNER_TEMP/release-secret-versions.json"
+          printf '%s' "$RELEASE_VERIFICATION_PUBLIC_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/release-verification-public-key.pem"
+          printf '%s' "$RELEASE_GATE_PRODUCER_PRIVATE_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/release-gate-producer-private-key.pem"
+          node -e 'const c=require("node:crypto"),f=require("node:fs"); const pub=c.createPublicKey(f.readFileSync(process.argv[1])); const fp=c.createHash("sha256").update(pub.export({format:"der",type:"spki"})).digest("hex"); if(fp!==process.env.RELEASE_VERIFICATION_KEY_SHA256) throw new Error("protected release verification key mismatch");' "$RUNNER_TEMP/release-verification-public-key.pem"
+
+      - id: bind
+        name: Cryptographically bind Sites, direct authority, database activation, and runtime apply
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SITES_PROJECT_ID: appgprj_6a5565cf7d6c8191ab9f2084e8eda856
+        run: |
+          set -euo pipefail
+          SITES="$RUNNER_TEMP/sites/v254-sites-connector-handoff.json"
+          AUTHORITY="$RUNNER_TEMP/direct/v254-direct-exposure-authority.json"
+          WARRANT="$RUNNER_TEMP/direct/v254-direct-exposure-rollback-warrant.json"
+          RUNTIME="$RUNNER_TEMP/direct/direct-exposure-runtime-apply.json"
+          ACTIVATE="$RUNNER_TEMP/direct/direct-exposure-database-activate.json"
+          jq -e --arg sha "$SOURCE_REVISION" --arg version "$RELEASE_VERSION" --arg digest "$IMAGE_DIGEST" --arg project "$SITES_PROJECT_ID" \
+            '.schemaVersion == "genio-v254-sites-connector-handoff/v1"
+             and .candidate.sourceRevision == $sha
+             and .candidate.version == $version
+             and .candidate.imageDigest == $digest
+             and .projectId == $project
+             and .connectorProduced == true
+             and .importedVia == "bounded_workflow_dispatch_input"
+             and (.sitesControlPlaneEvidenceHash | test("^[0-9a-f]{64}$"))
+             and (.sitesControlPlaneAttestationPayloadHash | test("^[0-9a-f]{64}$"))
+             and (.handoffHash | test("^[0-9a-f]{64}$"))
+             and (.versionId | type == "string" and length > 0)
+             and (.deploymentId | type == "string" and length > 0)' "$SITES"
+          node --experimental-transform-types scripts/apply-v254-direct-exposure.ts plan \
+            --authority "$AUTHORITY" \
+            --rollback-warrant "$WARRANT" \
+            --verification-key "$RUNNER_TEMP/release-verification-public-key.pem" \
+            --expected-key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --expected-source-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-image-digest "$IMAGE_DIGEST" \
+            --output "$RUNNER_TEMP/direct-exposure-proof-plan.json"
+          AUTHORITY_HASH="$(jq -er '.authorityPayloadHash | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/direct-exposure-proof-plan.json")"
+          WARRANT_HASH="$(jq -er '.rollbackWarrantPayloadHash | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/direct-exposure-proof-plan.json")"
+          jq -e --arg sha "$SOURCE_REVISION" --arg authority "$AUTHORITY_HASH" --arg warrant "$WARRANT_HASH" \
+            '.schemaVersion == "genio-v254-direct-exposure-runtime/v1"
+             and .operation == "apply"
+             and .candidate.sourceRevision == $sha
+             and .authorityPayloadHash == $authority
+             and .rollbackWarrantPayloadHash == $warrant
+             and .exposureClass == "fully_exposed_unproven"
+             and .organicReliabilityProven == false
+             and (.services.interactive.deploymentId | type == "string" and length > 0)
+             and (.services.deep.deploymentId | type == "string" and length > 0)
+             and (.services.api.deploymentId | type == "string" and length > 0)
+             and (.heartbeatFenceHash | test("^[0-9a-f]{64}$"))
+             and (.healthHash | test("^[0-9a-f]{64}$"))
+             and (.receiptHash | test("^[0-9a-f]{64}$"))' "$RUNTIME"
+          jq -e --arg authority "$AUTHORITY_HASH" --arg warrant "$WARRANT_HASH" \
+            '.schemaVersion == "genio-v254-direct-exposure-apply-receipt/v1"
+             and .operation == "activate"
+             and .state == "active"
+             and .terminal == false
+             and .authorityPayloadHash == $authority
+             and .rollbackWarrantPayloadHash == $warrant
+             and .exposureClass == "fully_exposed_unproven"
+             and .organicReliabilityProven == false
+             and (.receiptHash | test("^[0-9a-f]{64}$"))' "$ACTIVATE"
+          echo "authority_hash=$AUTHORITY_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Capture full exact-SHA runtime snapshot
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types scripts/release-runtime-snapshot.ts \
+            --origin https://9enio.com \
+            --environment production \
+            --scope full \
+            --expected-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --secret-versions "$RUNNER_TEMP/release-secret-versions.json" \
+            --output "$RUNNER_TEMP/full-runtime-snapshot.json"
+
+      - name: Produce full release convergence
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types scripts/release-convergence-producer.ts \
+            --confirm-production-probe \
+            --origin https://9enio.com \
+            --scope full \
+            --expected-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-sites-revision "$SOURCE_REVISION" \
+            --expected-sites-version "$RELEASE_VERSION" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --image-digest "$IMAGE_DIGEST" \
+            --runtime-snapshot "$RUNNER_TEMP/full-runtime-snapshot.json" \
+            --samples 3 \
+            --interval-seconds 30 \
+            --source-output "$RUNNER_TEMP/release-convergence.source.json" \
+            --output "$RUNNER_TEMP/release-convergence.gate.json" \
+            --attestation-output "$RUNNER_TEMP/release-convergence.attestation.json" \
+            --producer-signing-key "$RUNNER_TEMP/release-gate-producer-private-key.pem" \
+            --producer-key-id "$RELEASE_GATE_PRODUCER_KEY_ID"
+
+      - name: Produce real clean non-owner direct-exposure browser proof
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          DIRECT_AUTHORITY_HASH: ${{ steps.bind.outputs.authority_hash }}
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types scripts/final-custom-domain-browser-producer.ts \
+            --confirm-production-browser \
+            --direct-exposure \
+            --origin https://9enio.com \
+            --expected-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-direct-exposure-authority-hash "$DIRECT_AUTHORITY_HASH" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --image-digest "$IMAGE_DIGEST" \
+            --runtime-snapshot "$RUNNER_TEMP/full-runtime-snapshot.json" \
+            --sites-control-plane-evidence "$RUNNER_TEMP/sites/sites-control-plane.json" \
+            --sites-control-plane-attestation "$RUNNER_TEMP/sites/sites-control-plane.attestation.json" \
+            --sites-control-plane-verification-key "$RUNNER_TEMP/sites/sites-control-plane-public-key.pem" \
+            --browser-artifact-dir "$RELEASE_BROWSER_ARTIFACT_DIR" \
+            --source-output "$RUNNER_TEMP/final-custom-domain-browser.source.json" \
+            --output "$RUNNER_TEMP/final-custom-domain-browser.gate.json" \
+            --attestation-output "$RUNNER_TEMP/final-custom-domain-browser.attestation.json" \
+            --producer-signing-key "$RUNNER_TEMP/release-gate-producer-private-key.pem" \
+            --producer-key-id "$RELEASE_GATE_PRODUCER_KEY_ID"
+          jq -e --arg authority "$DIRECT_AUTHORITY_HASH" \
+            '.gate == "final_custom_domain_browser"
+             and .sources.browser.schemaVersion == "genio-final-custom-domain-browser/v8"
+             and .sources.browser.assignmentMode == "direct_exposure"
+             and .sources.browser.exposureClass == "fully_exposed_unproven"
+             and .sources.browser.organicReliabilityProven == false
+             and (.sources.browser.publicAssignmentProbes | length) == 2
+             and all(.sources.browser.publicAssignmentProbes[];
+               .rolloutEvidenceHash == $authority
+               and .rolloutStage == "editorial_influence:0->100:fully_exposed_unproven"
+               and .assignmentAuthority == "signed_public_direct_exposure"
+               and .publicPercentageBypass == false
+               and .organicAssignment == false
+               and .manifestOnly == true
+               and .appleWriteAccess == "forbidden")' \
+            "$RUNNER_TEMP/final-custom-domain-browser.gate.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: v254-production-proof-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/direct-exposure-proof-plan.json
+            ${{ runner.temp }}/full-runtime-snapshot.json
+            ${{ runner.temp }}/release-convergence.source.json
+            ${{ runner.temp }}/release-convergence.gate.json
+            ${{ runner.temp }}/release-convergence.attestation.json
+            ${{ runner.temp }}/final-custom-domain-browser.source.json
+            ${{ runner.temp }}/final-custom-domain-browser.gate.json
+            ${{ runner.temp }}/final-custom-domain-browser.attestation.json
+            ${{ runner.temp }}/public-browser
+          if-no-files-found: error
+          retention-days: 30

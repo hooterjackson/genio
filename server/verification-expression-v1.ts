@@ -1,6 +1,7 @@
 import type {
   CanonicalPlaylistContractExecutionPolicyV1,
   CanonicalPlaylistContractPredicateV1,
+  CanonicalPlaylistQualityPolicy,
   ExecutionCoverageReportV1,
   VerificationExpressionV1,
   VerificationLeafV1,
@@ -57,7 +58,7 @@ function negativeScope(input: {
   throw new Error(`unscoped_negative_verification:${input.axis}`);
 }
 
-function leaf(
+export function verificationLeafForClauseV1(
   policy: CanonicalPlaylistContractExecutionPolicyV1,
   clauseId: string,
 ): VerificationLeafV1 {
@@ -85,7 +86,9 @@ function expression(
   policy: CanonicalPlaylistContractExecutionPolicyV1,
   predicate: CanonicalPlaylistContractPredicateV1,
 ): VerificationExpressionV1 {
-  if (predicate.op === "clause") return leaf(policy, predicate.clauseId);
+  if (predicate.op === "clause") {
+    return verificationLeafForClauseV1(policy, predicate.clauseId);
+  }
   if (predicate.op === "not") {
     const child = expression(policy, predicate.child);
     if (child.op !== "leaf" || child.negativeScope === null) {
@@ -134,6 +137,37 @@ export function verificationLeavesV1(
   if (value.op === "leaf") return [value];
   if (value.op === "not") return verificationLeavesV1(value.child);
   return value.children.flatMap(verificationLeavesV1);
+}
+
+/**
+ * Central-suitability clauses are deliberately absent from the hard track
+ * predicate, but an evidence-backed quality floor is still an executable
+ * obligation. Expose those leaves to coverage and recovery auditing without
+ * changing hard membership semantics.
+ */
+export function centralQualityVerificationLeavesV1(input: {
+  policy: CanonicalPlaylistContractExecutionPolicyV1;
+  qualityPolicy: CanonicalPlaylistQualityPolicy | null | undefined;
+}): VerificationLeafV1[] {
+  if (!input.qualityPolicy) return [];
+  const policyClauseIds = new Set(input.policy.clauses.map(({ id }) => id));
+  return [...new Set(input.qualityPolicy.clauseIds)]
+    .sort()
+    // Plans persisted before central-quality clause binding remain readable.
+    // Current schema validation/compiler conformance is responsible for
+    // rejecting a newly emitted policy that references a missing clause.
+    .filter((clauseId) => policyClauseIds.has(clauseId))
+    .map((clauseId) => {
+      const base = verificationLeafForClauseV1(input.policy, clauseId);
+      return {
+        ...base,
+        obligationId: `central_quality:${clauseId}`,
+        // Central quality is a playlist-level coverage objective. Unknown is
+        // neither a pass nor a musical failure, but it must be visible to the
+        // recovery audit when the configured coverage floor cannot be met.
+        unknownPolicy: "defer" as const,
+      };
+    });
 }
 
 export function assertVerificationExpressionV1(value: VerificationExpressionV1): void {

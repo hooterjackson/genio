@@ -1,6 +1,20 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "releases": [
+    {
+      "version": "2.5.4",
+      "status": "candidate",
+      "releasedAt": null,
+      "title": "Irish-influence evidence and guidance recovery",
+      "notes": [
+        "Materializes every evaluated candidate before persisting pass, fail, or unknown qualification observations so evidence deficits cannot erase catalog truth or produce null candidate bindings.",
+        "Separates Irish membership, historical influence, catalog identity, recording version, storefront availability, and central quality into axis-specific evidence obligations with bounded deficit enrichment.",
+        "Audits per-obligation unknown coverage and routes provider outages, acquisition capability gaps, and genuine evidence exhaustion to distinct actionable states instead of false scarcity.",
+        "Adds generalized Guidance V5.1 influence-scope choices whose typed patches preserve count and hard membership while changing a declared worker-consumed ranking objective.",
+        "Reports independent lead, candidate, Apple-safe, evidence, selection, manifest, append, and reconciliation counts and rejects action-required states that have no advancing action.",
+        "Binds each new canonical execution to one explicit route receipt covering traffic class, assignment authority, contract, query plan, capability, release, and semantic configuration."
+      ]
+    },
     {
       "version": "2.5.3",
       "releasedAt": "2026-08-01",

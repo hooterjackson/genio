@@ -106,6 +106,22 @@ export function createResearchRepositoryFacade(source: ResearchRepository): Rese
         ...args: Parameters<NonNullable<ResearchRepository["persistPipelineV3QualificationBatch"]>>
       ) => source.persistPipelineV3QualificationBatch!(...args),
     } : {}),
+    ...(source.persistPipelineV3EvidenceAcquisitionAttempt ? {
+      persistPipelineV3EvidenceAcquisitionAttempt: (
+        ...args: Parameters<NonNullable<
+          ResearchRepository["persistPipelineV3EvidenceAcquisitionAttempt"]
+        >>
+      ) => source.persistPipelineV3EvidenceAcquisitionAttempt!(...args),
+    } : {}),
+    ...(source.readPipelineV3SemanticCollapseDatabaseFacts ? {
+      readPipelineV3SemanticCollapseDatabaseFacts: (
+        ...args: Parameters<
+          NonNullable<
+            ResearchRepository["readPipelineV3SemanticCollapseDatabaseFacts"]
+          >
+        >
+      ) => source.readPipelineV3SemanticCollapseDatabaseFacts!(...args),
+    } : {}),
     ...(source.validatePipelineV3ContinuationQualifications ? {
       validatePipelineV3ContinuationQualifications: (
         ...args: Parameters<

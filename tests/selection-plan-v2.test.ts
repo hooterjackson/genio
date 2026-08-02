@@ -382,7 +382,7 @@ describe("Pipeline V2 selection plan", () => {
     ]));
   });
 
-  test.each(["influential", "foundational", "best", "ranked"])(
+  test.each(["influential", "foundational"])(
     "%s remains a strict editorial-ranking request",
     (descriptor) => {
       const plan = createSelectionPlanV2({
@@ -397,6 +397,31 @@ describe("Pipeline V2 selection plan", () => {
       });
 
       expect(plan.intents).toEqual(expect.arrayContaining(["genre_scene", "editorial_ranking"]));
+    },
+  );
+
+  test.each(["best", "ranked", "top", "greatest", "canonical"])(
+    "%s remains a soft curation preference rather than historical influence",
+    (descriptor) => {
+      const plan = createSelectionPlanV2({
+        prompt: `50 ${descriptor} Brazilian disco tracks`,
+        brief: brief({
+          title: "Brazilian Disco",
+          subjectEntities: ["Brazilian disco"],
+          relationship: `is ${descriptor} in Brazilian disco`,
+          include: [`${descriptor} Brazilian disco recordings.`],
+          exclude: [],
+        }),
+      });
+
+      expect(plan.intents).toContain("genre_scene");
+      expect(plan.intents).not.toContain("editorial_ranking");
+      expect(plan.constraints).toContainEqual(expect.objectContaining({
+        axis: "relationship",
+        operator: "prefer",
+        kind: "soft",
+        values: [descriptor],
+      }));
     },
   );
 
@@ -1303,15 +1328,29 @@ describe("Pipeline V2 selection plan", () => {
     expect(plan.constraints.some((constraint) => constraint.kind === "soft" && constraint.axis === "scene")).toBe(true);
   });
 
-  test("rollout enables owner curated canaries only after the explicit worker-safety gate", () => {
+  test("rollout enables only signed owner curated canaries after the explicit worker-safety gate", () => {
     const plan = createSelectionPlanV2({ prompt: "House music", brief: brief() });
-    expect(assignPipelineV2({ plan, owner: true, stickyKey: "owner", env: {} })).toMatchObject({
+    expect(assignPipelineV2({
+      plan,
+      signedOwnerCanary: false,
+      stickyKey: "owner",
+      env: {},
+    })).toMatchObject({
       assigned: false,
       reason: "legacy_control",
     });
     expect(assignPipelineV2({
       plan,
-      owner: true,
+      signedOwnerCanary: false,
+      stickyKey: "owner",
+      env: { PIPELINE_V2_OWNER_CANARY: "true" },
+    })).toMatchObject({
+      assigned: false,
+      reason: "legacy_control",
+    });
+    expect(assignPipelineV2({
+      plan,
+      signedOwnerCanary: true,
       stickyKey: "owner",
       env: { PIPELINE_V2_OWNER_CANARY: "true" },
     })).toMatchObject({
@@ -1320,13 +1359,13 @@ describe("Pipeline V2 selection plan", () => {
     });
     const first = assignPipelineV2({
       plan,
-      owner: false,
+      signedOwnerCanary: false,
       stickyKey: "visitor-a",
       env: { PIPELINE_V2_CURATED_PERCENT: "25" },
     });
     const repeated = assignPipelineV2({
       plan,
-      owner: false,
+      signedOwnerCanary: false,
       stickyKey: "visitor-a",
       env: { PIPELINE_V2_CURATED_PERCENT: "25" },
     });
@@ -1370,19 +1409,19 @@ describe("Pipeline V2 selection plan", () => {
 
     expect(assignPipelineV2({
       plan: similarityPlan,
-      owner: false,
+      signedOwnerCanary: false,
       stickyKey: pipelineRolloutStickyKey("visitor-a", similarityPlan),
       env: { PIPELINE_V2_CURATED_PERCENT: "100", PIPELINE_V2_SIMILARITY_PERCENT: "0" },
     })).toMatchObject({ assigned: false, percentage: 0, reason: "legacy_control" });
     expect(assignPipelineV2({
       plan: similarityPlan,
-      owner: false,
+      signedOwnerCanary: false,
       stickyKey: pipelineRolloutStickyKey("visitor-a", similarityPlan),
       env: { PIPELINE_V2_CURATED_PERCENT: "0", PIPELINE_V2_SIMILARITY_PERCENT: "100" },
     })).toMatchObject({ assigned: true, percentage: 100, reason: "sticky_rollout" });
   });
 
-  test("factual V2 uses independent owner and sticky rollout gates", () => {
+  test("factual V2 uses independent signed-canary and sticky rollout gates", () => {
     const plan = createSelectionPlanV2({
       prompt: "Every Paulinho da Costa credit",
       brief: brief({
@@ -1392,25 +1431,30 @@ describe("Pipeline V2 selection plan", () => {
         targetSize: null,
       }),
     });
-    expect(assignPipelineV2({ plan, owner: true, stickyKey: "owner", env: {} })).toMatchObject({
+    expect(assignPipelineV2({
+      plan,
+      signedOwnerCanary: false,
+      stickyKey: "owner",
+      env: {},
+    })).toMatchObject({
       assigned: false,
       reason: "legacy_control",
     });
     expect(assignPipelineV2({
       plan,
-      owner: true,
+      signedOwnerCanary: false,
       stickyKey: "owner",
       env: { PIPELINE_V2_FACTUAL_CANARY: "1" },
     })).toMatchObject({ assigned: false, percentage: 0, reason: "legacy_control" });
     expect(assignPipelineV2({
       plan,
-      owner: true,
+      signedOwnerCanary: true,
       stickyKey: "owner",
       env: { PIPELINE_V2_FACTUAL_OWNER_CANARY: "true" },
     })).toMatchObject({ assigned: true, percentage: 100, reason: "owner_canary" });
     expect(assignPipelineV2({
       plan,
-      owner: false,
+      signedOwnerCanary: false,
       stickyKey: "public-factual",
       env: { PIPELINE_V2_FACTUAL_PERCENT: "100", PIPELINE_V2_CURATED_PERCENT: "0" },
     })).toMatchObject({ assigned: true, percentage: 100, reason: "sticky_rollout" });

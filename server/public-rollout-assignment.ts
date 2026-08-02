@@ -7,6 +7,14 @@ import {
 } from "../shared/public-rollout-evidence.ts";
 import { signedArtifactSha256 } from "../shared/signed-artifact.ts";
 import {
+  validateV254DirectExposureConfigurationV1,
+  validateV254DirectExposureRuntimeTransitionV1,
+  type V254DirectExposureCandidateV1,
+  type V254DirectExposureConfigurationV1,
+  type V254DirectExposureRuntimeTransitionV1,
+} from "../shared/v254-direct-exposure-authority.ts";
+import { semanticExecutionConfigurationHash } from "./runtime-release.ts";
+import {
   pipelineV3RolloutCohort,
   pipelineV3RolloutGroup,
   QUERY_PLAN_V3_POLICY_VERSION,
@@ -16,6 +24,8 @@ import { sha256Hex, stableStringify } from "./security.ts";
 
 export const PUBLIC_ROLLOUT_ASSIGNMENT_VERSION =
   "signed_public_contract_rollout_v1";
+export const V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION =
+  "signed_public_direct_exposure_v1";
 
 export function publicRolloutAssignmentStickyKeyV1(input: {
   owner: boolean;
@@ -26,7 +36,10 @@ export function publicRolloutAssignmentStickyKeyV1(input: {
     operation: "brief" | "run";
   } | null;
 }): string | null {
-  if (input.owner) return null;
+  // Ordinary owner identity must not select a different canonical-contract
+  // cohort from the same browser. A signed owner canary remains outside the
+  // public assignment plane and is admitted by its explicit canary receipt.
+  if (input.owner && input.releaseCanary !== null) return null;
   if (input.releaseCanary === null) return input.clientBucket;
   if (
     input.releaseCanary.environment === "production"
@@ -41,7 +54,9 @@ export function publicRolloutAssignmentStickyKeyV1(input: {
 }
 
 export interface PersistedPublicRolloutAssignmentV1 {
-  version: typeof PUBLIC_ROLLOUT_ASSIGNMENT_VERSION;
+  version:
+    | typeof PUBLIC_ROLLOUT_ASSIGNMENT_VERSION
+    | typeof V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION;
   rolloutEvidenceHash: string;
   rolloutStage: string;
   intentGroup: PublicRolloutIntentGroup;
@@ -51,16 +66,56 @@ export interface PersistedPublicRolloutAssignmentV1 {
   assignmentHash: string;
 }
 
+export interface V254DirectExposureDatabaseAuthorityV1 {
+  active: unknown;
+}
+
 export function publicRolloutAssignmentPausedV1(input: {
   assignment: PersistedPublicRolloutAssignmentV1 | null;
-  owner: boolean;
+  classifiedIntentGroup?: PublicRolloutIntentGroup | null;
   signedCanary: boolean;
   publicAssignmentPaused: boolean;
+  intentPublicAssignmentPaused?: boolean;
 }): boolean {
-  return input.assignment?.assigned === true
-    && !input.owner
-    && !input.signedCanary
-    && input.publicAssignmentPaused;
+  if (input.signedCanary) return false;
+  // The route-wide pause only fences traffic that would otherwise be assigned
+  // to V3. An intent pause is deliberately stricter: it fences the classified
+  // request before contract selection even when the signed percentage is 0,
+  // preventing an affected request from silently falling through to V2.
+  return (
+    input.classifiedIntentGroup !== null
+    && input.classifiedIntentGroup !== undefined
+    && input.intentPublicAssignmentPaused === true
+  )
+    || (
+      input.assignment?.assigned === true
+      && input.publicAssignmentPaused
+  );
+}
+
+export type PublicRolloutAdmissionDispositionV1 =
+  | "admit"
+  | "hard_disabled"
+  | "public_paused";
+
+/**
+ * Decide route admission before contract selection. The hard switch is
+ * intentionally evaluated ahead of canary/public-pause semantics: no caller,
+ * including a signed canary, may bypass a hard-disabled intent.
+ */
+export function publicRolloutAdmissionDispositionV1(input: {
+  assignment: PersistedPublicRolloutAssignmentV1 | null;
+  classifiedIntentGroup: PublicRolloutIntentGroup | null;
+  signedCanary: boolean;
+  hardSwitchDisabled: boolean;
+  publicAssignmentPaused: boolean;
+  intentPublicAssignmentPaused: boolean;
+}): PublicRolloutAdmissionDispositionV1 {
+  if (input.classifiedIntentGroup !== null && input.hardSwitchDisabled) {
+    return "hard_disabled";
+  }
+  if (publicRolloutAssignmentPausedV1(input)) return "public_paused";
+  return "admit";
 }
 
 export interface PublicRolloutDatabaseAuthorityV1 {
@@ -83,12 +138,27 @@ export interface PublicRolloutRuntimeDatabaseAuthorityV1 {
   targetConfigurationHash: string;
 }
 
+/** Classify intent for admission controls without requiring rollout authority. */
+export function publicRolloutIntentGroupForPromptV1(input: {
+  prompt: string;
+  requestedTrackCount: number;
+  environment?: NodeJS.ProcessEnv;
+}): PublicRolloutIntentGroup {
+  const environment = input.environment ?? process.env;
+  return pipelineV3RolloutGroup(createRunSpecV3({
+    prompt: input.prompt,
+    requestedTrackCount: input.requestedTrackCount,
+    storefront: environment.APPLE_STOREFRONT ?? "us",
+  }));
+}
+
 /**
  * Once a signed public rollout assignment exists, it is the sole authority
  * for choosing Contract 3. Broad environment flags are only a fallback for
- * callers outside the signed rollout plane (owners, staging, and release
- * canaries). This prevents a zero-percent intent from being compiled as
- * Contract 3 merely because another intent enabled global V3 guidance.
+ * authenticated release canaries outside the signed public rollout plane.
+ * Ordinary owners remain in the public assignment cohort. This prevents a
+ * zero-percent intent from being compiled as Contract 3 merely because
+ * another intent enabled global V3 guidance.
  */
 export function publicRolloutCanonicalContractRequestedV1(input: {
   assignment: PersistedPublicRolloutAssignmentV1 | null;
@@ -101,8 +171,9 @@ export function publicRolloutCanonicalContractRequestedV1(input: {
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const STAGE =
-  /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(0|1|10|50|100)->(0|1|10|50|100)$/u;
+  /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(0|1|10|50|100)->(0|1|10|50|100)$/u;
 const GROUPS = new Set<PublicRolloutIntentGroup>([
+  "editorial_influence",
   "genre_scene",
   "mood_activity_theme",
   "similarity",
@@ -116,6 +187,14 @@ function hashMaterial(
   value: Omit<PersistedPublicRolloutAssignmentV1, "assignmentHash">,
 ): string {
   return sha256Hex(stableStringify(value));
+}
+
+export function publicRolloutAssignmentAuthoritySettingKeyV1(
+  assignment: PersistedPublicRolloutAssignmentV1,
+): string {
+  return assignment.version === V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION
+    ? `v254_direct_exposure_authority:${assignment.rolloutEvidenceHash}`
+    : `public_rollout_authority:${assignment.rolloutEvidenceHash}`;
 }
 
 function rolloutPercentage(
@@ -143,7 +222,8 @@ function publicRolloutConfigurationReady(
   }
   if (
     (
-      intentGroup === "genre_scene"
+      intentGroup === "editorial_influence"
+      || intentGroup === "genre_scene"
       || intentGroup === "mood_activity_theme"
       || intentGroup === "similarity"
     )
@@ -152,7 +232,7 @@ function publicRolloutConfigurationReady(
     return false;
   }
   if (
-    intentGroup === "genre_scene"
+    (intentGroup === "editorial_influence" || intentGroup === "genre_scene")
     && configuration.PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED !== "true"
   ) {
     return false;
@@ -174,6 +254,248 @@ function authorityRecord(
     throw new Error(`public rollout ${label} database authority is invalid`);
   }
   return value as Record<string, unknown>;
+}
+
+function parseV254DirectExposureDatabaseAuthorityV1(
+  value: V254DirectExposureDatabaseAuthorityV1 | null | undefined,
+): {
+  state: "armed" | "active" | "rolled_back";
+  authorityPayloadHash: string;
+  rollbackWarrantPayloadHash: string;
+  currentConfigurationHash: string;
+  currentConfiguration: V254DirectExposureConfigurationV1;
+  targetConfigurationHash: string;
+  targetConfiguration: V254DirectExposureConfigurationV1;
+  preconditionsHash: string;
+  rollbackPlanHash: string;
+  runtimeTransition: V254DirectExposureRuntimeTransitionV1;
+} | null {
+  if (!value) return null;
+  const active = authorityRecord(value.active, "direct exposure active");
+  if (
+    active.schemaVersion
+      !== "genio-v254-direct-exposure-database-authority/v1"
+    || active.intentGroup !== "editorial_influence"
+    || !["armed", "active", "rolled_back"].includes(
+      String(active.state ?? ""),
+    )
+    || active.fromPercent !== "0"
+    || active.toPercent !== "100"
+    || active.exposureClass !== "fully_exposed_unproven"
+    || active.organicReliabilityProven !== false
+    || typeof active.candidateHash !== "string"
+    || !SHA256.test(active.candidateHash)
+    || typeof active.authorityPayloadHash !== "string"
+    || !SHA256.test(active.authorityPayloadHash)
+    || typeof active.rollbackWarrantPayloadHash !== "string"
+    || !SHA256.test(active.rollbackWarrantPayloadHash)
+    || typeof active.targetConfigurationHash !== "string"
+    || !SHA256.test(active.targetConfigurationHash)
+    || typeof active.currentConfigurationHash !== "string"
+    || !SHA256.test(active.currentConfigurationHash)
+    || typeof active.preconditionsHash !== "string"
+    || !SHA256.test(active.preconditionsHash)
+    || typeof active.rollbackPlanHash !== "string"
+    || !SHA256.test(active.rollbackPlanHash)
+  ) throw new Error("direct exposure database authority is invalid");
+  const currentConfiguration = validateV254DirectExposureConfigurationV1(
+    active.currentConfiguration,
+  );
+  const targetConfiguration = validateV254DirectExposureConfigurationV1(
+    active.targetConfiguration,
+  );
+  if (
+    signedArtifactSha256(targetConfiguration)
+      !== active.targetConfigurationHash
+    || signedArtifactSha256(currentConfiguration)
+      !== active.currentConfigurationHash
+    || currentConfiguration.PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT !== "0"
+    || targetConfiguration.PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT !== "100"
+  ) throw new Error("direct exposure target configuration is invalid");
+  const runtimeTransition = validateV254DirectExposureRuntimeTransitionV1(
+    active.runtimeTransition,
+    active.candidate as V254DirectExposureCandidateV1,
+    String(
+      authorityRecord(
+        active.runtimeTransition,
+        "direct exposure runtime transition",
+      ).preExposureSemanticConfigurationHash ?? "",
+    ),
+  );
+  if (signedArtifactSha256(active.candidate) !== active.candidateHash) {
+    throw new Error("direct exposure database candidate does not match");
+  }
+  for (const [intent, flag] of Object.entries(
+    PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
+  ) as Array<[PublicRolloutIntentGroup, keyof PublicRolloutConfiguration]>) {
+    if (intent !== "editorial_influence" && targetConfiguration[flag] !== "0") {
+      throw new Error("direct exposure changed an unrelated intent");
+    }
+  }
+  return {
+    state: active.state as "armed" | "active" | "rolled_back",
+    authorityPayloadHash: active.authorityPayloadHash,
+    rollbackWarrantPayloadHash: active.rollbackWarrantPayloadHash,
+    currentConfigurationHash: active.currentConfigurationHash,
+    currentConfiguration,
+    targetConfigurationHash: active.targetConfigurationHash,
+    targetConfiguration,
+    preconditionsHash: active.preconditionsHash,
+    rollbackPlanHash: active.rollbackPlanHash,
+    runtimeTransition,
+  };
+}
+
+export function publicRolloutDatabaseAuthorityActiveV1(
+  value: PublicRolloutDatabaseAuthorityV1 | null | undefined,
+): boolean {
+  const authority = parsePublicRolloutDatabaseAuthorityV1(value);
+  if (!authority) return false;
+  return (Object.keys(PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS) as
+    PublicRolloutIntentGroup[]).some(
+      (intent) => rolloutPercentage(authority.targetConfiguration, intent) > 0,
+    );
+}
+
+export function v254DirectExposureRuntimeDatabaseAuthorityV1(input: {
+  environment?: NodeJS.ProcessEnv;
+  databaseAuthority?: V254DirectExposureDatabaseAuthorityV1 | null;
+}): {
+  state: "armed" | "active" | "rolled_back";
+  active: boolean;
+  authorityPayloadHash: string;
+  rollbackWarrantPayloadHash: string;
+  stage: "editorial_influence:0->100:fully_exposed_unproven";
+  targetConfigurationHash: string;
+  exposureClass: "fully_exposed_unproven";
+  organicReliabilityProven: false;
+} | null {
+  const environment = input.environment ?? process.env;
+  const authority = parseV254DirectExposureDatabaseAuthorityV1(
+    input.databaseAuthority,
+  );
+  const runtime = {
+    preconditionsHash:
+      environment.RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH?.trim() ?? "",
+    rollbackPlanHash:
+      environment.RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH?.trim()
+        ?? "",
+    stage: environment.RELEASE_V254_DIRECT_EXPOSURE_STAGE?.trim() ?? "",
+    targetConfigurationHash:
+      environment.RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH
+        ?.trim() ?? "",
+  };
+  const present = Object.values(runtime).some(Boolean);
+  if (!present && !authority) return null;
+  const runtimeComplete = Object.values(runtime).every(Boolean);
+  const expectedConfiguration = runtimeComplete
+    ? authority?.targetConfiguration ?? null
+    : (() => {
+      if (!authority) return null;
+      return authority.currentConfiguration;
+    })();
+  const runtimeMatchesSignedConfiguration = expectedConfiguration !== null
+    && (Object.keys(expectedConfiguration) as Array<
+      keyof PublicRolloutConfiguration
+    >).every((key) => (
+      (environment[key]?.trim() ?? "") === expectedConfiguration[key]
+    ));
+  if (
+    !authority
+    || environment.RELEASE_ENVIRONMENT !== "production"
+    || environment.RELEASE_DEPLOYMENT_PHASE !== "activate"
+    || (authority.state === "active" && !runtimeComplete)
+    || (present && !runtimeComplete)
+    || (runtimeComplete && (
+      runtime.preconditionsHash !== authority.preconditionsHash
+      || runtime.rollbackPlanHash !== authority.rollbackPlanHash
+      || runtime.stage
+        !== "editorial_influence:0->100:fully_exposed_unproven"
+      || runtime.targetConfigurationHash !== authority.targetConfigurationHash
+    ))
+    || !runtimeMatchesSignedConfiguration
+    || semanticExecutionConfigurationHash(environment)
+      !== (authority.state === "active"
+        ? authority.runtimeTransition.postExposureSemanticConfigurationHash
+        : authority.runtimeTransition.preExposureSemanticConfigurationHash)
+    || [
+      environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH,
+      environment.RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH,
+      environment.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH,
+      environment.RELEASE_PUBLIC_ROLLOUT_STAGE,
+    ].some((value) => (value?.trim() ?? "") !== "")
+  ) throw new Error("direct exposure runtime does not match database authority");
+  return {
+    state: authority.state,
+    active: authority.state === "active",
+    authorityPayloadHash: authority.authorityPayloadHash,
+    rollbackWarrantPayloadHash: authority.rollbackWarrantPayloadHash,
+    stage: "editorial_influence:0->100:fully_exposed_unproven",
+    targetConfigurationHash: authority.targetConfigurationHash,
+    exposureClass: "fully_exposed_unproven",
+    organicReliabilityProven: false,
+  };
+}
+
+export function createV254DirectExposureAssignmentV1(input: {
+  prompt: string;
+  requestedTrackCount: number;
+  stickyKey: string;
+  environment?: NodeJS.ProcessEnv;
+  databaseAuthority?: V254DirectExposureDatabaseAuthorityV1 | null;
+}): PersistedPublicRolloutAssignmentV1 | null {
+  const environment = input.environment ?? process.env;
+  const authority = parseV254DirectExposureDatabaseAuthorityV1(
+    input.databaseAuthority,
+  );
+  if (!authority || authority.state !== "active") return null;
+  const preconditionsHash =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH?.trim() ?? "";
+  const rollbackPlanHash =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH?.trim()
+      ?? "";
+  const stage = environment.RELEASE_V254_DIRECT_EXPOSURE_STAGE?.trim() ?? "";
+  const targetHash =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH
+      ?.trim() ?? "";
+  if (
+    environment.RELEASE_ENVIRONMENT !== "production"
+    || environment.RELEASE_DEPLOYMENT_PHASE !== "activate"
+    || preconditionsHash !== authority.preconditionsHash
+    || rollbackPlanHash !== authority.rollbackPlanHash
+    || targetHash !== authority.targetConfigurationHash
+    || stage
+      !== "editorial_influence:0->100:fully_exposed_unproven"
+    || semanticExecutionConfigurationHash(environment)
+      !== authority.runtimeTransition.postExposureSemanticConfigurationHash
+    || [
+      environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH,
+      environment.RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH,
+      environment.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH,
+      environment.RELEASE_PUBLIC_ROLLOUT_STAGE,
+    ].some((value) => (value?.trim() ?? "") !== "")
+  ) throw new Error("direct exposure runtime does not match database authority");
+  const intentGroup = publicRolloutIntentGroupForPromptV1({
+    prompt: input.prompt,
+    requestedTrackCount: input.requestedTrackCount,
+    environment,
+  });
+  if (intentGroup !== "editorial_influence") return null;
+  const material: Omit<PersistedPublicRolloutAssignmentV1, "assignmentHash"> = {
+    version: V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION,
+    rolloutEvidenceHash: authority.authorityPayloadHash,
+    rolloutStage: "editorial_influence:0->100",
+    intentGroup,
+    cohort: pipelineV3RolloutCohort(
+      `${input.stickyKey}:${intentGroup}:${QUERY_PLAN_V3_POLICY_VERSION}`,
+    ),
+    percentage: 100,
+    assigned: true,
+  };
+  return Object.freeze({
+    ...material,
+    assignmentHash: hashMaterial(material),
+  });
 }
 
 export function parsePublicRolloutDatabaseAuthorityV1(
@@ -323,6 +645,23 @@ export function assertPublicRolloutAssignmentDatabaseAuthorityV1(
 ): void {
   const parsed = parsePublicRolloutAssignmentV1(assignment);
   const record = authorityRecord(value, "historical");
+  if (parsed?.version === V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION) {
+    const direct = parseV254DirectExposureDatabaseAuthorityV1({
+      active: record,
+    });
+    if (
+      !direct
+      || !parsed.assigned
+      || parsed.intentGroup !== "editorial_influence"
+      || parsed.percentage !== 100
+      || direct.authorityPayloadHash !== parsed.rolloutEvidenceHash
+    ) {
+      throw new Error(
+        "direct exposure assignment has no authoritative database lineage",
+      );
+    }
+    return;
+  }
   if (
     !parsed
     || !parsed.assigned
@@ -389,12 +728,11 @@ export function createPublicRolloutAssignmentV1(input: {
       "public rollout runtime identity does not match its database authority",
     );
   }
-  const preliminary = createRunSpecV3({
+  const intentGroup = publicRolloutIntentGroupForPromptV1({
     prompt: input.prompt,
     requestedTrackCount: input.requestedTrackCount,
-    storefront: environment.APPLE_STOREFRONT ?? "us",
+    environment,
   });
-  const intentGroup = pipelineV3RolloutGroup(preliminary);
   const percentage = publicRolloutConfigurationReady(
     authority.targetConfiguration,
     intentGroup,
@@ -444,7 +782,10 @@ export function parsePublicRolloutAssignmentV1(
   if (
     actual.length !== expected.length
     || actual.some((key, index) => key !== expected[index])
-    || record.version !== PUBLIC_ROLLOUT_ASSIGNMENT_VERSION
+    || (
+      record.version !== PUBLIC_ROLLOUT_ASSIGNMENT_VERSION
+      && record.version !== V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION
+    )
     || typeof record.rolloutEvidenceHash !== "string"
     || !SHA256.test(record.rolloutEvidenceHash)
     || typeof record.rolloutStage !== "string"
@@ -465,7 +806,7 @@ export function parsePublicRolloutAssignmentV1(
     PersistedPublicRolloutAssignmentV1,
     "assignmentHash"
   > = {
-    version: PUBLIC_ROLLOUT_ASSIGNMENT_VERSION,
+    version: record.version as PersistedPublicRolloutAssignmentV1["version"],
     rolloutEvidenceHash: record.rolloutEvidenceHash,
     rolloutStage: record.rolloutStage,
     intentGroup: record.intentGroup as PublicRolloutIntentGroup,
@@ -474,7 +815,13 @@ export function parsePublicRolloutAssignmentV1(
     assigned: record.assigned,
   };
   if (
-    material.assigned !== (material.cohort < material.percentage * 100)
+    (
+      material.version === V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION
+        ? material.intentGroup !== "editorial_influence"
+          || material.percentage !== 100
+          || material.assigned !== true
+        : material.assigned !== (material.cohort < material.percentage * 100)
+    )
     || record.assignmentHash !== hashMaterial(material)
   ) {
     throw new Error("persisted public rollout assignment hash does not match");

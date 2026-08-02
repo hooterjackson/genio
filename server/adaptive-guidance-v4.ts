@@ -56,6 +56,13 @@ export interface GuidanceCheckpointV4 {
   showEditableInterpretationSummary: boolean;
   showDecisionPanel: boolean;
   rejectedDecisionReasons: Readonly<Record<string, string>>;
+  /**
+   * Correctness axes detected before attempt/hash/round filtering. Downstream
+   * guidance must not mistake a bounded-but-unanswered correctness fork for a
+   * fully confirmed request merely because its question is no longer eligible
+   * to be displayed.
+   */
+  correctnessCandidateAxes: readonly string[];
   checkpointHash: string;
 }
 
@@ -581,6 +588,8 @@ function rapGrimeEmphasisDecision(
         label: "Equal priority",
         description: "The request names both genres co-equally, so either remains eligible and quality decides.",
         recommended: true,
+        recommendationReason:
+          "The request names rap and grime co-equally, so equal priority preserves the original wording without adding an unstated preference.",
         explicitNoop: true,
         expectedFeasibilityDirection: "neutral",
         patch: { operations: [], affectedClauseIds: [] },
@@ -668,6 +677,8 @@ function drillGrimeEmphasisDecision(
         label: "Equal priority",
         description: "The request names both genres co-equally, so either remains eligible and quality decides.",
         recommended: true,
+        recommendationReason:
+          "The request names drill and grime co-equally, so equal priority preserves the original wording without adding an unstated preference.",
         explicitNoop: true,
         expectedFeasibilityDirection: "neutral",
         patch: { operations: [], affectedClauseIds: [] },
@@ -830,6 +841,11 @@ export function guidanceCheckpointV4(input: {
   const answeredAxes = new Set((input.answeredAxes ?? []).map(normalizedKey));
   const priorQuestionHashes = new Set(input.priorQuestionHashes ?? []);
   const rejectedDecisionReasons: Record<string, string> = {};
+  const correctnessCandidateAxes = [
+    ...new Set(candidates
+      .filter(({ mode }) => mode === "correctness_blocking")
+      .map(({ axis }) => normalizedKey(axis))),
+  ].sort();
   let showDecisionPanel = false;
   let showEditableInterpretationSummary = false;
   const eligible = candidates.filter((candidate) => {
@@ -877,6 +893,7 @@ export function guidanceCheckpointV4(input: {
     summary,
     showEditableInterpretationSummary,
     showDecisionPanel,
+    correctnessCandidateAxes,
   };
   return {
     policyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
@@ -889,6 +906,7 @@ export function guidanceCheckpointV4(input: {
     showEditableInterpretationSummary,
     showDecisionPanel,
     rejectedDecisionReasons,
+    correctnessCandidateAxes,
     checkpointHash: sha256Hex(stableStringify(body)),
   };
 }
