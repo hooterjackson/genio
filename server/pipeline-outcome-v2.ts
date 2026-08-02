@@ -156,36 +156,60 @@ function deficitKind(status: PipelineOutcomeStatus): PipelineDeficitKind {
   return "catalog_availability";
 }
 
-const STATUS_PRECEDENCE: Record<PipelineOutcomeStatus, number> = {
-  complete: 100,
-  partial_frontier_exhausted: 90,
-  partial_evidence_shortfall: 89,
-  partial_catalog_degraded: 88,
-  partial_timed_out: 87,
-  partial_policy_conflict: 86,
-  no_compatible_tracks: 80,
-  waiting_for_owner_authorization: 70,
-  failed_integrity: 20,
-  failed_system: 10,
-  cancelled: 0,
-};
-
-function outcomePrecedence(outcome: PipelineOutcome): readonly number[] {
-  return [
-    boundedCount(outcome.publishedTrackCount),
-    boundedCount(outcome.selectedTrackCount),
-    boundedCount(outcome.qualifiedTrackCount),
-    boundedCount(outcome.discoveredTrackCount),
-    STATUS_PRECEDENCE[outcome.status],
-  ];
-}
-
 function compareNumbers(left: readonly number[], right: readonly number[]): number {
   for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
     const delta = (left[index] ?? 0) - (right[index] ?? 0);
     if (delta !== 0) return delta;
   }
   return 0;
+}
+
+function mergeObservedStatus(input: {
+  left: PipelineOutcome;
+  right: PipelineOutcome;
+  targetTrackCount: number;
+  publishedTrackCount: number;
+}): PipelineOutcomeStatus {
+  const statuses = new Set<PipelineOutcomeStatus>([
+    input.left.status,
+    input.right.status,
+  ]);
+  // Integrity is orthogonal to progress and can never be hidden by a larger
+  // count. Attempt fencing must discard stale failures before they reach this
+  // reducer; an accepted integrity observation always fails closed.
+  if (statuses.has("failed_integrity")) return "failed_integrity";
+
+  const exactPublished = input.targetTrackCount > 0
+    && input.publishedTrackCount === input.targetTrackCount;
+  if (exactPublished && statuses.has("complete")) return "complete";
+
+  // Cancellation is retained when no publication was observed. A cancellation
+  // after an Apple side effect is resolved by ResolutionFactsV1, which keeps
+  // the user cancellation and publication incident as separate facets.
+  if (statuses.has("cancelled") && input.publishedTrackCount === 0) {
+    return "cancelled";
+  }
+  if (statuses.has("failed_system")) return "failed_system";
+  if (statuses.has("waiting_for_owner_authorization")) {
+    return "waiting_for_owner_authorization";
+  }
+  if (statuses.has("complete")) {
+    return input.publishedTrackCount < input.targetTrackCount
+      ? "partial_evidence_shortfall"
+      : "failed_integrity";
+  }
+  if (statuses.has("no_compatible_tracks")) {
+    const other = input.left.status === "no_compatible_tracks"
+      ? input.right.status
+      : input.left.status;
+    // A typed operational/partial observation is more truthful than a bare
+    // false-empty compatibility marker.
+    return other === "no_compatible_tracks" ? "no_compatible_tracks" : other;
+  }
+  // Remaining values are completeness descriptions, not operational
+  // authority. Deterministic lexical selection is deliberately semantically
+  // neutral; the deficit ledger retains the complete multi-axis detail.
+  return [...statuses].sort()[0]!;
 }
 
 function deficitKey(entry: PipelineDeficitLedgerEntry): string {
@@ -248,12 +272,27 @@ export function mergePipelineOutcomes(
   if (boundedCount(left.targetTrackCount) !== boundedCount(right.targetTrackCount)) {
     throw new Error("Pipeline outcome target is immutable");
   }
-  const winnerComparison = compareNumbers(outcomePrecedence(left), outcomePrecedence(right));
+  const winnerComparison = compareNumbers(
+    [
+      boundedCount(left.publishedTrackCount),
+      boundedCount(left.selectedTrackCount),
+      boundedCount(left.qualifiedTrackCount),
+      boundedCount(left.discoveredTrackCount),
+    ],
+    [
+      boundedCount(right.publishedTrackCount),
+      boundedCount(right.selectedTrackCount),
+      boundedCount(right.qualifiedTrackCount),
+      boundedCount(right.discoveredTrackCount),
+    ],
+  );
   const winner = winnerComparison > 0
     ? left
     : winnerComparison < 0
       ? right
-      : left.status.localeCompare(right.status) >= 0 ? left : right;
+      : left.reasonCodes.join("\u0000").localeCompare(
+        right.reasonCodes.join("\u0000"),
+      ) >= 0 ? left : right;
   const targetTrackCount = boundedCount(left.targetTrackCount);
   const discoveredTrackCount = Math.max(
     boundedCount(left.discoveredTrackCount),
@@ -273,7 +312,12 @@ export function mergePipelineOutcomes(
   ));
   const exactCountSatisfied = targetTrackCount > 0 && publishedTrackCount === targetTrackCount;
   const status = countConsistentStatus({
-    status: winner.status,
+    status: mergeObservedStatus({
+      left,
+      right,
+      targetTrackCount,
+      publishedTrackCount,
+    }),
     targetTrackCount,
     publishedTrackCount,
   });

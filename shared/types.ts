@@ -1289,6 +1289,22 @@ export interface PlaylistGuidanceOption {
     affectedClauseIds: readonly string[];
     expectedFeasibilityDirection: "narrower" | "neutral" | "broader";
   };
+  /** V5 proof that a non-noop option reaches a registered worker consumer. */
+  executionEffect?: {
+    field:
+      | "membershipPredicates"
+      | "rankingObjectives"
+      | "orderingPolicy"
+      | "playlistQuotaRules"
+      | "playlistQualityPolicy";
+    consumerId: string;
+    effectHash: string;
+  } | null;
+  optionSimulation?: {
+    patchHash: string;
+    successorSemanticHash: string | null;
+    valid: true;
+  };
   /**
    * Machine-readable effect of selecting this answer. Optional only so runs
    * created before the grounded question scout remain readable.
@@ -1340,20 +1356,25 @@ export interface PlaylistGuidanceQuestion {
   /** Why selecting an answer will materially change the resulting tracks. */
   whyMaterial?: string;
   /** Contract-3 immutable guidance metadata. */
-  schemaVersion?: 3 | 4;
+  schemaVersion?: 3 | 4 | 5;
   policyVersion?: string;
   questionHash?: string;
   trigger?: "correctness" | "yield_risk" | "nuance";
   guidanceMode?:
     | "correctness_blocking"
     | "nuance_optional"
-    | "interpretation_confirmation";
+    | "interpretation_confirmation"
+    | "execution_decision";
   axis?: string;
   baseContractRevisionId?: string;
   baseContractSemanticHash?: string;
   allowedPatchOperations?: readonly string[];
   affectedClauseIds?: readonly string[];
   materialityScore?: number;
+  axisRegistryVersion?: string;
+  simulationPolicyVersion?: string;
+  capabilitySnapshotHash?: string;
+  semanticConfigurationHash?: string;
   /** Present for a custom-answer confirmation successor question. */
   interpretationSummary?: {
     mustHave: readonly string[];
@@ -1383,7 +1404,9 @@ export type PlaylistGuidanceGenerationMode =
   | "no_material_questions"
   | "scout_unavailable"
   | "balanced_default"
-  | "guidance_unavailable";
+  | "guidance_unavailable"
+  | "generalized_axis_registry"
+  | "typed_execution_decision";
 
 export interface PlaylistGuidanceTelemetry {
   generationMode: PlaylistGuidanceGenerationMode;

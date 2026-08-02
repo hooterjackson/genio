@@ -52,6 +52,8 @@ export interface PlaylistRuntimeFeasibilityBudgetV1 {
 
 export interface PlaylistRuntimeFeasibilityEvidenceV1 {
   source: "pipeline_v3_retrieval";
+  /** Distinct normalized candidate identities, never cumulative observations. */
+  uniqueCandidateCount?: number;
   discoveredCount: number;
   qualifiedCount: number;
   storefrontSafeCount: number;
@@ -131,6 +133,8 @@ export interface PlaylistRuntimeFeasibilityInputV1 {
   scope: "open_world" | "closed_set";
   stopReason: string;
   discoveredCount: number;
+  /** Distinct normalized candidate identities, never cumulative observations. */
+  uniqueCandidateCount?: number;
   qualifiedCount: number;
   storefrontSafeCount: number;
   contradictions: readonly string[];
@@ -167,7 +171,42 @@ export interface PlaylistRuntimeFeasibilityInputV1 {
 export type PlaylistRuntimeNoCompatibleDispositionV1 =
   | "allow"
   | "dependency_pause"
+  | "coverage_audit"
   | "actionable_decision";
+
+export type PlaylistCoverageAuditReasonV1 =
+  | "candidate_rich_zero_qualification"
+  | "catalog_safe_target_zero_qualification";
+
+/**
+ * Rich inventory with zero qualification is an evidence/capability signal,
+ * not proof that the music does not exist. It must be audited before any
+ * scarcity statement is allowed.
+ */
+export function playlistCoverageAuditReasonV1(input: {
+  uniqueCandidateCount: number;
+  qualifiedCount: number;
+  storefrontSafeCount: number;
+  targetTrackCount: number;
+}): PlaylistCoverageAuditReasonV1 | null {
+  const uniqueCandidateCount = Math.max(
+    0,
+    Math.floor(input.uniqueCandidateCount),
+  );
+  const qualifiedCount = Math.max(0, Math.floor(input.qualifiedCount));
+  const storefrontSafeCount = Math.max(
+    0,
+    Math.floor(input.storefrontSafeCount),
+  );
+  const targetTrackCount = Math.max(1, Math.floor(input.targetTrackCount));
+  if (qualifiedCount > 0) return null;
+  if (storefrontSafeCount >= targetTrackCount) {
+    return "catalog_safe_target_zero_qualification";
+  }
+  return uniqueCandidateCount >= 10
+    ? "candidate_rich_zero_qualification"
+    : null;
+}
 
 function nonNegativeInteger(value: number, field: string): void {
   if (!Number.isInteger(value) || value < 0) {
@@ -487,6 +526,10 @@ export function assessPlaylistRuntimeFeasibilityV1(
   );
   const runtimeEvidence: PlaylistRuntimeFeasibilityEvidenceV1 = {
     source: "pipeline_v3_retrieval",
+    uniqueCandidateCount: Math.max(
+      0,
+      Math.floor(input.uniqueCandidateCount ?? input.discoveredCount),
+    ),
     discoveredCount: input.discoveredCount,
     qualifiedCount: input.qualifiedCount,
     storefrontSafeCount: input.storefrontSafeCount,
@@ -534,6 +577,16 @@ export function playlistRuntimeNoCompatibleDispositionV1(input: {
   scope: "open_world" | "closed_set";
 }): PlaylistRuntimeNoCompatibleDispositionV1 {
   if (input.report.dependencyHealth !== "healthy") return "dependency_pause";
+  const evidence = input.report.runtimeEvidence;
+  if (evidence && playlistCoverageAuditReasonV1({
+    uniqueCandidateCount:
+      evidence.uniqueCandidateCount ?? evidence.discoveredCount,
+    qualifiedCount: evidence.qualifiedCount,
+    storefrontSafeCount: evidence.storefrontSafeCount,
+    targetTrackCount: input.report.targetTrackCount,
+  })) {
+    return "coverage_audit";
+  }
   if (input.scope === "open_world"
     && input.report.state === "frontier_exhausted_under_policy"
     && input.report.frontierProof !== null) {

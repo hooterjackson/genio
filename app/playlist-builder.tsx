@@ -73,6 +73,12 @@ type ResearchRun = {
   id: string;
   prompt: string;
   brief: PlaylistBrief;
+  trafficClass?:
+    | "user"
+    | "owner_canary"
+    | "synthetic_qa"
+    | "historical_replay"
+    | "release_control";
   status: string;
   phase: string;
   autoPublish?: boolean;
@@ -929,18 +935,48 @@ function JobsScreen({
   onNew: () => void;
   onOpen: (runId: string) => void;
 }) {
+  const trafficClasses = [
+    ["user", "USER WORK"],
+    ["owner_canary", "OWNER CANARIES"],
+    ["synthetic_qa", "SYNTHETIC QA"],
+    ["historical_replay", "HISTORICAL REPLAYS"],
+    ["release_control", "RELEASE CONTROLS"],
+  ] as const;
+  const [trafficClass, setTrafficClass] =
+    useState<(typeof trafficClasses)[number][0]>("user");
+  const visibleJobs = jobs.filter(
+    (job) => (job.trafficClass ?? "user") === trafficClass,
+  );
   return (
     <section className="screen flow-screen jobs-screen" aria-labelledby="jobs-title">
       <div className="flow-body jobs-body">
         <button className="flow-back" type="button" onClick={onBack}>← CREATE</button>
         <h1 id="jobs-title">Your jobs</h1>
-        <p>Open or continue a playlist saved in this browser.</p>
+        <p>Open or continue a playlist saved in this browser. Test and release work is separated from genuine requests.</p>
+
+        <nav className="jobs-traffic-tabs" aria-label="Job traffic class">
+          {trafficClasses.map(([value, label]) => {
+            const count = jobs.filter(
+              (job) => (job.trafficClass ?? "user") === value,
+            ).length;
+            return (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={trafficClass === value}
+                onClick={() => setTrafficClass(value)}
+              >
+                {label} <span>{count}</span>
+              </button>
+            );
+          })}
+        </nav>
 
         {loading && <div className="loading-line" role="status"><span className="cursor">▋</span>LOADING JOBS</div>}
-        {!loading && jobs.length === 0 && <div className="jobs-empty">NO JOBS FOUND</div>}
-        {!loading && jobs.length > 0 && (
+        {!loading && visibleJobs.length === 0 && <div className="jobs-empty">NO JOBS IN THIS VIEW</div>}
+        {!loading && visibleJobs.length > 0 && (
           <div className="jobs-list">
-            {jobs.map((job) => {
+            {visibleJobs.map((job) => {
               const actionLabel = actionRequiredJobLabel(job);
               const displayStatus = actionLabel ?? statusLabel(job.status).toUpperCase();
               return (

@@ -4,6 +4,7 @@ import {
   assessPlaylistRuntimeFeasibilityV1,
   assertPlaylistFeasibilityReportIntegrityV1,
   playlistCandidateGoalV1,
+  playlistCoverageAuditReasonV1,
   playlistReserveTrackCountV1,
   playlistRuntimeNoCompatibleDispositionV1,
   type PlaylistFeasibilityObservationV1,
@@ -234,6 +235,7 @@ describe("playlist feasibility v1", () => {
       scope: "open_world",
       stopReason: "frontier_exhausted",
       discoveredCount: 70,
+      uniqueCandidateCount: 5,
       qualifiedCount: 0,
       storefrontSafeCount: 0,
       contradictions: [],
@@ -300,6 +302,7 @@ describe("playlist feasibility v1", () => {
       scope: "open_world",
       stopReason: "frontier_exhausted",
       discoveredCount: 30,
+      uniqueCandidateCount: 5,
       qualifiedCount: 0,
       storefrontSafeCount: 0,
       contradictions: [],
@@ -338,6 +341,57 @@ describe("playlist feasibility v1", () => {
       report: insufficient,
       scope: "open_world",
     })).toBe("actionable_decision");
+  });
+
+  test("requires a coverage audit for candidate-rich zero qualification", () => {
+    const report = assessPlaylistRuntimeFeasibilityV1({
+      contractRevisionId: "pcr1:candidate-rich-zero-yield",
+      contractSemanticHash: "f".repeat(64),
+      targetTrackCount: 50,
+      scope: "open_world",
+      stopReason: "maximum_candidates_reached",
+      discoveredCount: 1_005,
+      uniqueCandidateCount: 189,
+      qualifiedCount: 0,
+      storefrontSafeCount: 0,
+      contradictions: [],
+      limitingPredicateIds: ["genre-membership"],
+      strategies: [{
+        id: "hosted",
+        status: "exhausted",
+        rounds: 4,
+        rawCandidates: 650,
+        newQualifiedFamilies: 0,
+        discoveryDependencyIds: ["hosted_web"],
+      }, {
+        id: "catalog",
+        status: "exhausted",
+        rounds: 4,
+        rawCandidates: 355,
+        newQualifiedFamilies: 0,
+        discoveryDependencyIds: ["apple_catalog"],
+      }],
+      dependencyOutages: [],
+      budgets: {
+        activeComputeConsumedMs: 850_000,
+        activeComputeAllowanceMs: 900_000,
+        maximumGlobalRounds: 48,
+        maximumRawCandidates: 1_000,
+        maximumCostUnits: 48,
+        qualifiedPoolGoal: 55,
+      },
+      policyVersions: { pipeline: "corpus_first_v3" },
+    });
+    expect(playlistCoverageAuditReasonV1({
+      uniqueCandidateCount: 189,
+      qualifiedCount: 0,
+      storefrontSafeCount: 0,
+      targetTrackCount: 50,
+    })).toBe("candidate_rich_zero_qualification");
+    expect(playlistRuntimeNoCompatibleDispositionV1({
+      report,
+      scope: "open_world",
+    })).toBe("coverage_audit");
   });
 
   test("requires exact fixed-container resolution and complete enumeration for a known ceiling", () => {

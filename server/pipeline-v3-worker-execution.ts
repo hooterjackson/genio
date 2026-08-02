@@ -77,7 +77,9 @@ import type {
 import type { SemanticPlanRevisionArtifactV3 } from "./pipeline-v3-semantic-recovery.ts";
 import {
   assessPlaylistRuntimeFeasibilityV1,
+  playlistCoverageAuditReasonV1,
   playlistRuntimeNoCompatibleDispositionV1,
+  type PlaylistCoverageAuditReasonV1,
   type PlaylistFeasibilityReportV1,
   type PlaylistRuntimeNoCompatibleDispositionV1,
 } from "./playlist-feasibility-v1.ts";
@@ -405,6 +407,7 @@ export interface PipelineV3RuntimeFeasibilityAssessment {
   readonly report: PlaylistFeasibilityReportV1;
   readonly scope: "open_world" | "closed_set";
   readonly noCompatibleDisposition: PlaylistRuntimeNoCompatibleDispositionV1;
+  readonly coverageAuditReason: PlaylistCoverageAuditReasonV1 | null;
 }
 
 /**
@@ -441,6 +444,7 @@ export function assessPipelineV3RuntimeFeasibility(input: {
     scope,
     stopReason: input.result.outcome.stopReason,
     discoveredCount: input.result.stages.discovered,
+    uniqueCandidateCount: input.result.stages.validCandidates,
     qualifiedCount: input.result.outcome.qualifiedTrackCount,
     storefrontSafeCount: input.result.stages.storefrontPlayable,
     contradictions: input.queryPlan.semanticAuditMetadata?.contradictions ?? [],
@@ -480,9 +484,16 @@ export function assessPipelineV3RuntimeFeasibility(input: {
       playlistContractCompiler: input.queryPlan.playlistContractCompilerVersion ?? "unknown",
     },
   });
+  const coverageAuditReason = playlistCoverageAuditReasonV1({
+    uniqueCandidateCount: input.result.stages.validCandidates,
+    qualifiedCount: input.result.outcome.qualifiedTrackCount,
+    storefrontSafeCount: input.result.stages.storefrontPlayable,
+    targetTrackCount: Number(input.queryPlan.targetTrackCount),
+  });
   return {
     report,
     scope,
+    coverageAuditReason,
     noCompatibleDisposition: playlistRuntimeNoCompatibleDispositionV1({
       report,
       scope,
@@ -2103,14 +2114,21 @@ export class PipelineV3WorkerExecution {
               manifestDisposition: "blocked_operational_failure",
             },
           };
-        } else if (runtimeFeasibility.noCompatibleDisposition === "actionable_decision") {
+        } else if (
+          runtimeFeasibility.noCompatibleDisposition === "coverage_audit"
+          || runtimeFeasibility.noCompatibleDisposition === "actionable_decision"
+        ) {
           runtimeFeasibilityDecisionRequired = true;
           result = {
             ...result,
             outcome: {
               ...result.outcome,
               status: "needs_decision",
-              stopReason: "frontier_exhausted",
+              // Preserve the legacy enum for old clients; the typed audit
+              // reason is stored in the decision checkpoint below.
+              stopReason: runtimeFeasibility.coverageAuditReason
+                ? "maximum_candidates_reached"
+                : "frontier_exhausted",
               requiresPartialPublicationDecision: false,
             },
             publicationBoundary: {
@@ -2372,7 +2390,8 @@ export class PipelineV3WorkerExecution {
               contractRevisionId: activeContract.id,
               blockerKind: "scope_decision",
               dependencyKey: runtimeFeasibilityDecisionRequired
-                ? "runtime_feasibility"
+                ? runtimeFeasibility?.coverageAuditReason
+                  ?? "runtime_feasibility"
                 : computeLimitReached
                 ? "active_compute"
                 : playlistConstraintsMissed
@@ -2386,7 +2405,9 @@ export class PipelineV3WorkerExecution {
       await this.repository.saveResearchCheckpoint(
         input.runId,
         runtimeFeasibilityDecisionRequired
-          ? "runtime_feasibility_decision"
+          ? runtimeFeasibility?.coverageAuditReason
+            ? "capability_evidence_coverage_audit"
+            : "runtime_feasibility_decision"
           : computeLimitReached
           ? "active_compute_limit"
           : playlistConstraintsMissed
@@ -2395,7 +2416,8 @@ export class PipelineV3WorkerExecution {
         {
           schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
           state: "needs_decision",
-          reasonCode: result.outcome.stopReason,
+          reasonCode: runtimeFeasibility?.coverageAuditReason
+            ?? result.outcome.stopReason,
           ...(runtimeFeasibilityDecisionRequired ? {
             feasibilityState: runtimeFeasibility?.report.state ?? "unknown",
             feasibilityReportHash: runtimeFeasibility?.report.reportHash ?? null,
@@ -2427,7 +2449,9 @@ export class PipelineV3WorkerExecution {
         phase: rescueGuidanceOffered
           ? "rescue_guidance_required"
           : runtimeFeasibilityDecisionRequired
-            ? "runtime_feasibility_unknown"
+            ? runtimeFeasibility?.coverageAuditReason
+              ? "capability_evidence_coverage_audit"
+              : "runtime_feasibility_unknown"
           : computeLimitReached
           ? "active_compute_limit_reached"
           : playlistConstraintsMissed

@@ -16,7 +16,9 @@ concurrency:
   group: exact-sha-image-${{ inputs.source_revision }}
   cancel-in-progress: false
 
-permissions: {}
+permissions:
+  actions: read
+  contents: read
 
 jobs:
   build:
@@ -24,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       packages: write
     outputs:
@@ -45,6 +48,75 @@ jobs:
             || { echo "RELEASE_VERIFICATION_KEY_SHA256 must pin the rollout verification key" >&2; exit 1; }
           [[ "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
             || { echo "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 must pin the intent-canary authorities" >&2; exit 1; }
+      - id: ci
+        name: Require successful aggregate CI for the exact merged SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          RUNS="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SOURCE_REVISION&status=completed&per_page=100"
+          )"
+          CHECKS_RUN_ID="$(
+            jq -r \
+              --arg sha "$SOURCE_REVISION" \
+              --arg branch "$DEFAULT_BRANCH" \
+              '[
+                .workflow_runs[]
+                | select(
+                    .head_sha == $sha
+                    and .head_branch == $branch
+                    and .event == "push"
+                    and .conclusion == "success"
+                  )
+              ]
+              | sort_by(.run_attempt, .created_at)
+              | last
+              | .id // empty' <<<"$RUNS"
+          )"
+          [[ "$CHECKS_RUN_ID" =~ ^[0-9]+$ ]] \
+            || {
+              echo "No successful default-branch checks run exists for exact SHA $SOURCE_REVISION" >&2
+              exit 1
+            }
+          ARTIFACTS="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CHECKS_RUN_ID/artifacts?per_page=100"
+          )"
+          ARTIFACT_ID="$(
+            jq -r \
+              --arg name "exact-sha-ci-$SOURCE_REVISION" \
+              '[
+                .artifacts[]
+                | select(.name == $name and .expired == false)
+              ]
+              | sort_by(.created_at)
+              | last
+              | .id // empty' <<<"$ARTIFACTS"
+          )"
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] \
+            || {
+              echo "Successful checks run has no aggregate exact-SHA receipt" >&2
+              exit 1
+            }
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            > exact-sha-ci-receipt.zip
+          unzip -q exact-sha-ci-receipt.zip -d exact-sha-ci-receipt
+          RECEIPT=exact-sha-ci-receipt/exact-sha-ci-receipt.json
+          test -f "$RECEIPT"
+          test "$(jq -r '.schemaVersion' "$RECEIPT")" = "genio-exact-sha-ci/v1"
+          test "$(jq -r '.sourceRevision' "$RECEIPT")" = "$SOURCE_REVISION"
+          test "$(jq -r '.event' "$RECEIPT")" = "push"
+          test "$(jq -r '.headBranch' "$RECEIPT")" = "$DEFAULT_BRANCH"
+          test "$(
+            jq -r '[.gates[] | select(. != "success")] | length' "$RECEIPT"
+          )" = "0"
+          CI_RECEIPT_SHA256="$(sha256sum "$RECEIPT" | cut -d' ' -f1)"
+          [[ "$CI_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          echo "checks_run_id=$CHECKS_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "receipt_sha256=$CI_RECEIPT_SHA256" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_revision }}
@@ -102,6 +174,8 @@ jobs:
           IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
           IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/genio
           CONTROLLER_REVISION: ${{ github.sha }}
+          CHECKS_RUN_ID: ${{ steps.ci.outputs.checks_run_id }}
+          CI_RECEIPT_SHA256: ${{ steps.ci.outputs.receipt_sha256 }}
           RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
           RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256: ${{ vars.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256 }}
         run: |
@@ -115,6 +189,8 @@ jobs:
             --arg imageReference "$IMAGE_REFERENCE" \
             --arg imageDigest "$IMAGE_DIGEST" \
             --arg controllerRevision "$CONTROLLER_REVISION" \
+            --arg checksRunId "$CHECKS_RUN_ID" \
+            --arg ciReceiptSha256 "$CI_RECEIPT_SHA256" \
             --arg releaseVerificationKeySha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
             --arg publicRolloutIntentCanaryAuthorityPolicySha256 "$RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256" \
             --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
@@ -126,6 +202,8 @@ jobs:
               imageReference: $imageReference,
               imageDigest: $imageDigest,
               controllerRevision: $controllerRevision,
+              checksRunId: $checksRunId,
+              ciReceiptSha256: $ciReceiptSha256,
               releaseVerificationKeySha256: $releaseVerificationKeySha256,
               publicRolloutIntentCanaryAuthorityPolicySha256: $publicRolloutIntentCanaryAuthorityPolicySha256,
               runUrl: $runUrl,

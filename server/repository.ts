@@ -363,6 +363,7 @@ import {
   runPlaylistResolutionReconcilerV1,
   type PlaylistResolutionStateV1,
 } from "./playlist-resolution-service-v1.ts";
+import { reduceResolutionFactsV1 } from "./resolution-facts-v1.ts";
 import {
   automaticFailureFingerprint,
   classifyAutomaticBriefFailure,
@@ -784,12 +785,19 @@ interface RunWorkTruthV1 {
   manifestedTrackCount: number | null;
   appendedTrackCount: number | null;
   reconciledPublishedTrackCount: number | null;
+  exactAppleReconciliation: boolean;
 }
 
 export interface ResearchRunHistoryItem {
   id: string;
   prompt: string;
   brief: PlaylistBrief;
+  trafficClass:
+    | "user"
+    | "owner_canary"
+    | "synthetic_qa"
+    | "historical_replay"
+    | "release_control";
   status: string;
   phase: string;
   candidateCount: number;
@@ -4342,6 +4350,13 @@ function normalizedGuidanceAnswers(
   contractVersion: 1 | 2 | 3 = 1,
 ): PlaylistGuidanceAnswer[] {
   if (contractVersion === 3 && questions.length === 0 && submitted.length === 0) {
+    if (process.env.GUIDANCE_V5_ENABLED === "true") {
+      throw new HttpError(
+        409,
+        "This request is missing its required guidance question",
+        "guidance_v5_question_required",
+      );
+    }
     // A V4 interpretation-confirmation checkpoint has no fabricated
     // question. The empty, idempotently persisted answer set is the visitor's
     // explicit confirmation receipt and intentionally produces no patch.
@@ -6191,25 +6206,50 @@ export class Repository {
       );
       if (!authority.rows[0]) return { accepted: false, repeated: false };
       const checkpoint = await client.query<{
+        run_id: string;
         state_json: Record<string, unknown>;
       }>(
-        `SELECT state_json FROM research_checkpoints
-         WHERE run_id=$1 AND phase='execution_failure_fingerprint_v1'
-         FOR UPDATE`,
+        `WITH RECURSIVE lineage(run_id,path) AS (
+           SELECT $1::uuid,ARRAY[$1::uuid]
+           UNION ALL
+           SELECT predecessor.id,lineage.path || predecessor.id
+           FROM lineage
+           JOIN research_checkpoints edge
+             ON edge.run_id=lineage.run_id
+            AND edge.phase='canonical_predecessor'
+           JOIN research_runs predecessor
+             ON predecessor.id::text=edge.state_json->>'sourceRunId'
+           WHERE array_length(lineage.path,1)<100
+             AND NOT predecessor.id=ANY(lineage.path)
+         )
+         SELECT checkpoint.run_id,checkpoint.state_json
+         FROM research_checkpoints checkpoint
+         JOIN lineage ON lineage.run_id=checkpoint.run_id
+         WHERE checkpoint.phase='execution_failure_fingerprint_v1'
+         ORDER BY checkpoint.updated_at,checkpoint.run_id
+         FOR UPDATE OF checkpoint`,
         [input.runId],
       );
-      const prior = checkpoint.rows[0]?.state_json;
-      const priorHistory = Array.isArray(prior?.history)
-        ? prior.history.filter((entry): entry is Record<string, unknown> => (
-            Boolean(entry) && typeof entry === "object"
-          )).slice(-15)
-        : [];
+      const priorHistory = checkpoint.rows.flatMap(({ state_json }) => (
+        Array.isArray(state_json?.history)
+          ? state_json.history.filter((entry): entry is Record<string, unknown> => (
+              Boolean(entry) && typeof entry === "object"
+            ))
+          : []
+      )).slice(-31);
       const repeated = priorHistory.some((entry) => (
         entry.errorSignature === input.errorSignature
         && entry.attemptStrategyHash === input.attemptStrategyHash
       ));
+      const currentRunHistory = checkpoint.rows.find(
+        ({ run_id }) => run_id === input.runId,
+      )?.state_json?.history;
       const history = [
-        ...priorHistory,
+        ...(Array.isArray(currentRunHistory)
+          ? currentRunHistory.filter((entry): entry is Record<string, unknown> => (
+              Boolean(entry) && typeof entry === "object"
+            )).slice(-15)
+          : []),
         {
           attemptId: input.attemptId,
           errorSignature: input.errorSignature,
@@ -6227,6 +6267,7 @@ export class Repository {
           input.runId,
           JSON.stringify({
             schemaVersion: "execution-failure-fingerprint/v1",
+            scope: "canonical_root_lineage",
             lastErrorSignature: input.errorSignature,
             lastAttemptStrategyHash: input.attemptStrategyHash,
             repeated,
@@ -8015,6 +8056,21 @@ export class Repository {
       throw new Error(
         `Database schema mismatch: supported ${support.minimum}-${support.maximum}, found ${actual ?? "uninitialized"}`,
       );
+    }
+    if (Number(actual ?? 0) >= 19) {
+      const authorityMode = await this.getSetting(
+        "playlist_resolution_authority_mode",
+      );
+      if (authorityMode === "authoritative") {
+        // v2.5.3 deliberately retains the transactionally coupled
+        // resolution_service bridge. The repository still contains audited
+        // legacy status writers, so activating a strict ledger-only mode
+        // would allow those callers to bypass typed transitions. Fail closed
+        // until the v2.6 writer-removal receipt is complete.
+        throw new Error(
+          "playlist resolution authoritative mode requires the completed writer audit",
+        );
+      }
     }
   }
 
@@ -12788,7 +12844,8 @@ export class Repository {
         : [];
       return (Array.isArray(row.questions_json) ? row.questions_json : [])
         .flatMap((question) => {
-          if (question.schemaVersion !== 3
+          if (typeof question.schemaVersion !== "number"
+            || ![3, 4, 5].includes(question.schemaVersion)
             || typeof question.questionHash !== "string") return [];
           const answer = answers.find((candidate) => (
             candidate.questionId === question.id
@@ -13093,7 +13150,9 @@ export class Repository {
     );
     const target = selected.rows[0];
     const targetQuestion = target?.questions_json.find((question) => (
-      question.id === input.questionId && question.schemaVersion === 3
+      question.id === input.questionId
+      && typeof question.schemaVersion === "number"
+      && [3, 4, 5].includes(question.schemaVersion)
     ));
     if (!target || !targetQuestion) {
       throw new HttpError(
@@ -15312,6 +15371,7 @@ export class Repository {
         appendedTrackCount: retainedInteger("appendedTrackCount"),
         reconciledPublishedTrackCount:
           retainedInteger("reconciledPublishedTrackCount"),
+        exactAppleReconciliation: false,
       };
     }
     const now = Date.now();
@@ -15351,6 +15411,19 @@ export class Repository {
       && row.job_available_at instanceof Date
       && row.job_available_at.getTime() > now) {
       workMotion = "retry_scheduled";
+    } else if ((row.job_status === "queued" || row.job_status === "retry")
+      && row.job_updated_at instanceof Date
+      && row.job_updated_at.getTime() > now - 120_000) {
+      // A freshly admitted, immediately available job has not yet produced a
+      // worker observation. Keep the user-visible resolution accepted during
+      // that bounded pickup window; calling it executing or stalled would
+      // manufacture liveness before an eligible worker actually leases it.
+      workMotion = "none";
+    } else if (row.job_status === null && state === "accepted") {
+      // Accepted work without a job is repaired by the leased reconciler.
+      // The absence of that repair observation is not itself an executing or
+      // stalled worker state.
+      workMotion = "none";
     } else {
       workMotion = "stalled";
     }
@@ -15403,6 +15476,7 @@ export class Repository {
       manifestedTrackCount,
       appendedTrackCount,
       reconciledPublishedTrackCount,
+      exactAppleReconciliation: exactReconciliation,
     };
   }
 
@@ -15506,64 +15580,62 @@ export class Repository {
       phase: row.phase,
       rescueQuestionsAvailable: true,
     });
-    let state = legacy.state as PlaylistResolutionStateV1;
-    let nextAction = legacy.nextAction;
-    if (row.blocker_kind === "provider") {
-      state = "blocked_dependency";
-      nextAction = "wait_for_dependency";
-    } else if (row.blocker_kind === "apple_authorization") {
-      state = "blocked_dependency";
-      nextAction = "authorize_apple";
-    } else if (row.blocker_kind === "guidance") {
-      state = "needs_input";
-      nextAction = row.blocker_state_json?.guidanceRound === "rescue"
-        ? "answer_rescue_guidance"
-        : "answer_initial_guidance";
-    } else if (row.blocker_kind === "scope_decision"
-      || row.blocker_kind === "budget") {
-      state = "needs_decision";
-      nextAction = "review_contract";
-    } else if (row.blocker_kind === "integrity"
-      || row.blocker_kind === "publication_reconciliation") {
-      state = "quarantined";
-      nextAction = "contact_support";
-    }
-    if (row.status === "no_compatible_tracks" && !row.blocker_id) {
-      // Legacy false-empty rows may predate persisted rescue guidance. Never
-      // advertise a question when there is no hash-bound question payload.
-      state = "needs_decision";
-      nextAction = "review_contract";
-    }
+    const provisionalState = legacy.state as PlaylistResolutionStateV1;
     const requestedTrackCount = row.requested_track_count == null
       ? null
       : Number(row.requested_track_count);
     const workTruth = await this.readRunWorkTruthV1(
       client,
       runId,
-      state,
+      provisionalState,
       row.blocker_kind,
       row.blocker_kind === "provider"
         ? date(row.blocker_state_json?.nextRetryAt)
         : null,
     );
-    if (state === "completed" && (
-      !row.manifest_id
-      || !Number.isSafeInteger(requestedTrackCount)
-      || requestedTrackCount! < 1
-      || workTruth.reconciledPublishedTrackCount !== requestedTrackCount
-    )) {
-      state = "needs_decision";
-      nextAction = "review_contract";
-    }
-    if ((state === "ready" || state === "publishing") && !row.manifest_id) {
-      state = "quarantined";
-      nextAction = "contact_support";
+    const reduction = reduceResolutionFactsV1({
+      legacyStatus: row.status,
+      legacyPhase: row.phase,
+      blockerKind: row.blocker_kind,
+      blockerId: row.blocker_id,
+      questionSetId: row.question_set_id,
+      manifestId: row.manifest_id,
+      requestedTrackCount,
+      reconciledPublishedTrackCount:
+        workTruth.reconciledPublishedTrackCount,
+      exactAppleReconciliation: workTruth.exactAppleReconciliation,
+      workMotion: workTruth.workMotion,
+      integrityIncident: row.status === "failed_integrity"
+        || row.blocker_kind === "integrity"
+        || row.blocker_kind === "publication_reconciliation",
+      cancellationRequested: row.status === "cancelled",
+      decisionAvailable: row.status === "needs_decision"
+        || row.status === "awaiting_budget"
+        || row.status === "partial_ready"
+        || row.status === "partial"
+        || row.status === "no_compatible_tracks",
+    });
+    let state = reduction.state;
+    let nextAction = reduction.nextAction;
+    if (state === "needs_input"
+      && row.blocker_state_json?.guidanceRound === "rescue") {
+      nextAction = "answer_rescue_guidance";
     }
     if ((state === "blocked_dependency" || state === "needs_input")
       && !row.blocker_id) {
       state = "quarantined";
       nextAction = "contact_support";
     }
+    const projectedWorkTruth = (
+      state === "completed"
+      || state === "cancelled"
+      || state === "quarantined"
+      || state === "needs_input"
+      || state === "needs_decision"
+      || state === "ready"
+    )
+      ? { ...workTruth, workMotion: "none" as const, stageDeadlineAt: null }
+      : workTruth;
     const decision = state === "needs_decision"
       ? {
           kind: "compatibility_decision",
@@ -15581,7 +15653,10 @@ export class Repository {
       legacyPhase: row.phase,
       requestedTrackCount,
       publishedTrackCount: workTruth.reconciledPublishedTrackCount,
-      ...workTruth,
+      resolutionReasonCode: reduction.reasonCode,
+      observedAppleSideEffect: reduction.observedAppleSideEffect,
+      incidentRequired: reduction.incidentRequired,
+      ...projectedWorkTruth,
     };
     const companions = {
       activeContractRevisionId: row.active_contract_revision_id,
@@ -17209,6 +17284,22 @@ export class Repository {
          r.brief_json,
          r.status,
          r.phase,
+         CASE
+           WHEN EXISTS (
+             SELECT 1 FROM research_checkpoints control
+             WHERE control.run_id=r.id
+               AND control.phase='release_manifest_canary_marker'
+           ) THEN 'release_control'
+           WHEN EXISTS (
+             SELECT 1 FROM research_checkpoints predecessor
+             WHERE predecessor.run_id=r.id
+               AND predecessor.phase='canonical_predecessor'
+           ) OR marker.canary_id LIKE 'hist-%'
+             THEN 'historical_replay'
+           WHEN marker.environment='staging' THEN 'synthetic_qa'
+           WHEN marker.environment='production' THEN 'owner_canary'
+           ELSE 'user'
+         END traffic_class,
          a.created_at,
          r.updated_at,
          (SELECT count(*)::int FROM track_candidates tc WHERE tc.run_id=r.id) AS candidate_count,
@@ -17226,6 +17317,7 @@ export class Repository {
        JOIN capability_sessions s ON s.id=csa.session_id
        JOIN run_accesses a ON a.id=csa.access_id AND a.run_id=csa.run_id
        JOIN research_runs r ON r.id=csa.run_id
+       LEFT JOIN release_canary_markers marker ON marker.run_id=r.id
        WHERE csa.session_id=$1
          AND s.revoked_at IS NULL AND s.expires_at>now()
          AND a.deleted_at IS NULL AND a.expires_at>now()
@@ -17238,6 +17330,7 @@ export class Repository {
       id: row.access_id,
       prompt: row.prompt,
       brief: row.brief_json,
+      trafficClass: row.traffic_class,
       status: row.status,
       phase: row.phase,
       candidateCount: Number(row.candidate_count),

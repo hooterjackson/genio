@@ -2,6 +2,19 @@
   "schemaVersion": 1,
   "releases": [
     {
+      "version": "2.5.3",
+      "releasedAt": "2026-08-01",
+      "title": "Truthful resolution and false-scarcity recovery",
+      "notes": [
+        "Reduces orthogonal resolution facts so exact Apple reconciliation, cancellation, integrity incidents, blockers, and executable work cannot overwrite one another by scalar precedence.",
+        "Requires a frozen exact manifest and matching ordered Apple-ID reread before a run can project completed.",
+        "Fences deterministic retries across the complete canonical root lineage by stable error and strategy semantics rather than attempt IDs or timestamps.",
+        "Audits candidate-rich zero qualification as a capability or evidence defect before any musical-scarcity decision.",
+        "Verifies historical query plans with their original versioned policy and keeps unsupported legacy plans read-only instead of rehashing them under current semantics.",
+        "Adds truthful work-motion and publication-count projections while preserving the schema-20 and protocol-12 production boundary."
+      ]
+    },
+    {
       "version": "2.5.2",
       "releasedAt": "2026-07-31",
       "title": "Drill and grime guidance recovery",
