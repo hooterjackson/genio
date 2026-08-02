@@ -181,3 +181,69 @@ jobs:
             playwright-report/
             test-results/
           if-no-files-found: ignore
+
+  aggregate-exact-sha:
+    name: aggregate exact-SHA gate
+    if: always()
+    needs:
+      - static
+      - policy
+      - unit-and-database
+      - production-database-compatibility
+      - browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require every exact-SHA gate
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          SOURCE_REVISION: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_BRANCH: ${{ github.ref_name }}
+        run: |
+          FAILURES="$(
+            jq -r '
+              to_entries[]
+              | select(.value.result != "success")
+              | "\(.key)=\(.value.result)"
+            ' <<<"$NEEDS_JSON"
+          )"
+          if [[ -n "$FAILURES" ]]; then
+            echo "Exact-SHA aggregate gate failed:" >&2
+            echo "$FAILURES" >&2
+            exit 1
+          fi
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "GitHub did not expose a full source SHA" >&2; exit 1; }
+          jq -n \
+            --arg schemaVersion "genio-exact-sha-ci/v1" \
+            --arg sourceRevision "$SOURCE_REVISION" \
+            --arg event "$EVENT_NAME" \
+            --arg headBranch "$HEAD_BRANCH" \
+            --arg defaultBranch "$DEFAULT_BRANCH" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson gates "$NEEDS_JSON" \
+            '{
+              schemaVersion: $schemaVersion,
+              sourceRevision: $sourceRevision,
+              event: $event,
+              headBranch: $headBranch,
+              defaultBranch: $defaultBranch,
+              runId: $runId,
+              runAttempt: $runAttempt,
+              runUrl: $runUrl,
+              createdAt: $createdAt,
+              gates: ($gates | with_entries(.value = .value.result))
+            }' > exact-sha-ci-receipt.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: exact-sha-ci-${{ github.sha }}
+          path: exact-sha-ci-receipt.json
+          if-no-files-found: error
+          retention-days: 30

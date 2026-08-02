@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  assessQueryPlanV3Compatibility,
   assignPipelineV3,
   createQueryPlanV3,
   createRuntimeQueryPlanV3,
@@ -303,6 +304,35 @@ describe("query plan V3", () => {
         musicConceptPolicyVersion: "music_concepts_future",
       },
     })).toBe(false);
+  });
+
+  test("reads allowlisted historical plans without authorizing current execution", () => {
+    const current = createQueryPlanV3(
+      confirmed("25 disco songs", 25),
+      "00000000-0000-4000-8000-000000000001",
+    );
+    const historical = {
+      ...current,
+      musicConceptPolicyVersion: "music_concepts_v3_4_0",
+      semanticAuditMetadata: {
+        ...current.semanticAuditMetadata!,
+        musicConceptPolicyVersion: "music_concepts_v3_4_0",
+      },
+    };
+    expect(isQueryPlanV3(historical)).toBe(true);
+    expect(assessQueryPlanV3Compatibility(historical)).toEqual({
+      status: "legacy_read_only",
+      reasonCode: "historical_policy_requires_successor",
+      schemaVersion: 2,
+      musicConceptPolicyVersion: "music_concepts_v3_4_0",
+    });
+    expect(assessQueryPlanV3Compatibility({
+      ...historical,
+      musicConceptPolicyVersion: "music_concepts_future",
+    })).toMatchObject({
+      status: "unsupported",
+      reasonCode: "unknown_music_concept_policy",
+    });
   });
 
   test("rejects drift between schema-2 membership clauses and their legacy projection", () => {

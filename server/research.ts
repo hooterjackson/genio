@@ -126,7 +126,14 @@ import {
   ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
   guidanceCheckpointV4,
 } from "./adaptive-guidance-v4.ts";
-import { publicGuidanceQuestionV4 } from "./adaptive-guidance-contract-bridge.ts";
+import {
+  ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
+  guidanceCheckpointV5,
+} from "./adaptive-guidance-v5.ts";
+import {
+  publicGuidanceQuestionV4,
+  publicGuidanceQuestionV5,
+} from "./adaptive-guidance-contract-bridge.ts";
 import {
   compilePlaylistContractShadowV1,
   PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
@@ -135,8 +142,17 @@ import {
   assertPlaylistContractIntegrityV1,
   type PlaylistContractRevisionV1,
 } from "./playlist-contract-v1.ts";
-import { assessPlaylistFeasibilityV1 } from "./playlist-feasibility-v1.ts";
+import {
+  assessPlaylistFeasibilityV1,
+  playlistCoverageAuditReasonV1,
+} from "./playlist-feasibility-v1.ts";
 import { musicIntentEnvelopeV1 } from "./music-intent-envelope-v1.ts";
+import {
+  canonicalExecutorCapabilityForSchemaV1,
+} from "./playlist-contract-backend-capability-v1.ts";
+import {
+  semanticExecutionConfigurationHash,
+} from "./runtime-release.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -1500,6 +1516,42 @@ export class ResearchOrchestrator {
     const catalogFirstRecovery = eligibleCount === 0
       && pipeline.route === "catalog_first_v2_curated";
     if (eligibleCount === 0 && !catalogFirstRecovery) {
+      const coverage = await this.repository.getCoverage(runId);
+      const uniqueCandidateCount = Math.max(
+        0,
+        Math.floor(Number(coverage.candidateCount ?? 0)),
+      );
+      const coverageAuditReason = playlistCoverageAuditReasonV1({
+        uniqueCandidateCount,
+        qualifiedCount: 0,
+        storefrontSafeCount: 0,
+        targetTrackCount: Math.max(
+          1,
+          Math.floor(Number(run.brief?.targetSize?.max ?? 1)),
+        ),
+      });
+      if (coverageAuditReason) {
+        await this.repository.saveResearchCheckpoint(
+          runId,
+          "capability_evidence_coverage_audit",
+          {
+            schemaVersion: 1,
+            state: "needs_decision",
+            reasonCode: coverageAuditReason,
+            uniqueCandidateCount,
+            qualifiedCandidateCount: 0,
+            nextAction: "review_contract_or_resume_after_repair",
+            recordedAt: new Date().toISOString(),
+          },
+          authority,
+        );
+        await this.repository.updateRun(runId, {
+          status: "needs_decision",
+          phase: "capability_evidence_coverage_audit",
+          error: null,
+        }, authority);
+        return "partial";
+      }
       // An empty Apple playlist cannot be published. A bounded research
       // shortfall is still a valid, transparent outcome rather than a task
       // failure: preserve the frontier/checkpoint report and finish without a
@@ -3965,7 +4017,28 @@ export async function processBriefInterpretationJob(
           : preliminarySelectionPlan.scopeKind === "factual_frontier"
             ? "factual"
             : "curated";
-      const checkpoint = guidanceCheckpointV4({
+      const guidanceV5Enabled = process.env.GUIDANCE_V5_ENABLED === "true";
+      const checkpoint = guidanceV5Enabled
+        ? guidanceCheckpointV5({
+            prompt: request.prompt,
+            baseContract: activeContract,
+            preservedTrackPredicate: shadow.preservedTrackPredicate,
+            ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+            criticalAmbiguities: v3Spec.criticalAmbiguities,
+            requestShape,
+            interpretationSummaryContext: {
+              fixedTrackList: preliminarySelectionPlan.fixedTrackList,
+              explicitAvoid: canonicalBrief.exclude,
+            },
+            compilationTimestamp: new Date().toISOString(),
+            capabilitySnapshotHash:
+              canonicalExecutorCapabilityForSchemaV1({
+                queryPlanSchemaVersion: 6,
+              }).hash,
+            semanticConfigurationHash:
+              semanticExecutionConfigurationHash(process.env),
+          })
+        : guidanceCheckpointV4({
         prompt: request.prompt,
         baseContract: activeContract,
         preservedTrackPredicate: shadow.preservedTrackPredicate,
@@ -3978,14 +4051,32 @@ export async function processBriefInterpretationJob(
         },
         compilationTimestamp: new Date().toISOString(),
       });
-      const questions = checkpoint.decisions.map(publicGuidanceQuestionV4);
+      const questions = guidanceV5Enabled
+        ? checkpoint.decisions.map((decision) => (
+            publicGuidanceQuestionV5(
+              decision as import("./adaptive-guidance-v5.ts").GuidanceDecisionV5,
+            )
+          ))
+        : checkpoint.decisions.map((decision) => (
+            publicGuidanceQuestionV4(
+              decision as import("./adaptive-guidance-v4.ts").GuidanceDecisionV4,
+            )
+          ));
       const generationMode = questions.length > 0
-        ? "deterministic_critical"
+        ? guidanceV5Enabled
+          ? "generalized_axis_registry"
+          : "deterministic_critical"
         : "no_material_questions";
+      if (guidanceV5Enabled && questions.length === 0) {
+        throw new Error("Guidance V5 requires one executable question");
+      }
+      const guidancePolicyVersion = guidanceV5Enabled
+        ? ADAPTIVE_GUIDANCE_POLICY_VERSION_V5
+        : ADAPTIVE_GUIDANCE_POLICY_VERSION_V4;
       const guidanceTelemetry: PlaylistGuidanceTelemetry = {
         generationMode,
         requestClassification,
-        guidancePolicyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
+        guidancePolicyVersion,
         questionSetHash: checkpoint.checkpointHash,
         proposedQuestionCount: checkpoint.decisions.length,
         acceptedQuestionCount: questions.length,
@@ -3998,7 +4089,7 @@ export async function processBriefInterpretationJob(
         questionSetHash: checkpoint.checkpointHash,
         requestClassification,
         generationMode,
-        guidancePolicyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V4,
+        guidancePolicyVersion,
         locale: activeContract.locale,
         storefront: activeContract.storefront,
         targetTrackCount: activeContract.requestedTrackCount,
@@ -4011,7 +4102,10 @@ export async function processBriefInterpretationJob(
         axis: checkpoint.decisions[0]?.axis ?? null,
         feasibilitySnapshotId: feasibilitySnapshot.id,
         checkpointMode: checkpoint.mode,
-        confirmationKind: checkpoint.confirmationKind,
+        ...("confirmationKind" in checkpoint
+          && checkpoint.confirmationKind
+          ? { confirmationKind: checkpoint.confirmationKind }
+          : {}),
         interpretationSummary: checkpoint.interpretationSummary,
       };
       // Guidance V4 is an always-present checkpoint. A precise or fixed

@@ -543,8 +543,9 @@ test("contract-3 keeps a factual possessive ambiguity blocking and suppresses op
   );
 });
 
-test("contract-3 precise requests persist an explicit zero-question confirmation checkpoint", async () => {
+test("Guidance V5 gives precise contract-3 requests a useful executable nuance question", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-contract3-confirmation");
+  vi.stubEnv("GUIDANCE_V5_ENABLED", "true");
   const exactBrief: PlaylistBrief = {
     title: "Radiohead studio chronology",
     description: "Exactly 25 Radiohead studio recordings in chronological order.",
@@ -609,9 +610,26 @@ test("contract-3 precise requests persist an explicit zero-question confirmation
     "brief-contract3-confirmation",
     expect.objectContaining({
       status: "awaiting_answers",
-      questions: [],
+      questions: [expect.objectContaining({
+        schemaVersion: 5,
+        axis: "familiarity_balance",
+        guidanceMode: "nuance_optional",
+        options: expect.arrayContaining([
+          expect.objectContaining({
+            id: "balanced_discovery",
+            executionEffect: expect.objectContaining({
+              field: "rankingObjectives",
+            }),
+          }),
+          expect.objectContaining({
+            id: "keep_current_interpretation",
+          }),
+        ]),
+      })],
       guidanceContract: expect.objectContaining({
-        checkpointMode: "interpretation_confirmation",
+        checkpointMode: "nuance_optional",
+        generationMode: "generalized_axis_registry",
+        guidancePolicyVersion: "adaptive_guidance_v5",
         interpretationSummary: expect.objectContaining({ count: 25 }),
       }),
     }),

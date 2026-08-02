@@ -902,6 +902,43 @@ summary:focus-visible {
   padding: clamp(100px, 18vh, 180px) 0;
 }
 
+.jobs-traffic-tabs {
+  display: flex;
+  margin-top: 34px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.jobs-traffic-tabs button {
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--faint);
+  background: transparent;
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: .08em;
+}
+
+.jobs-traffic-tabs button:hover,
+.jobs-traffic-tabs button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.jobs-traffic-tabs button[aria-pressed="true"] {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.jobs-traffic-tabs span {
+  color: var(--accent);
+}
+
+.jobs-empty {
+  margin-top: 46px;
+}
+
 .jobs-list {
   margin-top: 46px;
   border-top: 1px solid var(--line);

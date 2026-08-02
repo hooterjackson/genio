@@ -54,6 +54,85 @@ export const VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION = 6 as const;
 // policy. Both schemas drain under the frozen V3 policy-v1 contract.
 export const QUERY_PLAN_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
 
+/**
+ * Query plans are immutable audit records. Historical plans must remain
+ * structurally readable under the exact ontology version they persisted, but
+ * they must not be re-executed by a worker that only implements today's
+ * ontology. Keep this registry explicit: adding an entry is a compatibility
+ * decision, not a permissive semver comparison.
+ */
+export const QUERY_PLAN_V3_MUSIC_CONCEPT_POLICY_REGISTRY = Object.freeze({
+  music_concepts_v3_2_0: "legacy_read_only",
+  music_concepts_v3_3_0: "legacy_read_only",
+  music_concepts_v3_4_0: "legacy_read_only",
+  [MUSIC_CONCEPT_POLICY_VERSION]: "current_executable",
+} as const);
+
+export type QueryPlanV3MusicConceptPolicyVersion =
+  keyof typeof QUERY_PLAN_V3_MUSIC_CONCEPT_POLICY_REGISTRY;
+
+export interface QueryPlanV3CompatibilityAssessment {
+  readonly status:
+    | "current_executable"
+    | "legacy_read_only"
+    | "unsupported";
+  readonly reasonCode:
+    | "current_policy"
+    | "historical_policy_requires_successor"
+    | "unknown_music_concept_policy"
+    | "missing_music_concept_policy";
+  readonly schemaVersion: number | null;
+  readonly musicConceptPolicyVersion: string | null;
+}
+
+export function assessQueryPlanV3Compatibility(
+  value: Pick<Partial<QueryPlanV3>, "schemaVersion" | "musicConceptPolicyVersion">,
+): QueryPlanV3CompatibilityAssessment {
+  const schemaVersion = Number.isSafeInteger(value.schemaVersion)
+    ? Number(value.schemaVersion)
+    : null;
+  if (schemaVersion === LEGACY_QUERY_PLAN_V3_VERSION) {
+    return {
+      status: "legacy_read_only",
+      reasonCode: "historical_policy_requires_successor",
+      schemaVersion,
+      musicConceptPolicyVersion: null,
+    };
+  }
+  if (typeof value.musicConceptPolicyVersion !== "string") {
+    return {
+      status: "unsupported",
+      reasonCode: "missing_music_concept_policy",
+      schemaVersion,
+      musicConceptPolicyVersion: null,
+    };
+  }
+  const disposition = Object.prototype.hasOwnProperty.call(
+    QUERY_PLAN_V3_MUSIC_CONCEPT_POLICY_REGISTRY,
+    value.musicConceptPolicyVersion,
+  )
+    ? QUERY_PLAN_V3_MUSIC_CONCEPT_POLICY_REGISTRY[
+        value.musicConceptPolicyVersion as QueryPlanV3MusicConceptPolicyVersion
+      ]
+    : null;
+  if (!disposition) {
+    return {
+      status: "unsupported",
+      reasonCode: "unknown_music_concept_policy",
+      schemaVersion,
+      musicConceptPolicyVersion: value.musicConceptPolicyVersion,
+    };
+  }
+  return {
+    status: disposition,
+    reasonCode: disposition === "current_executable"
+      ? "current_policy"
+      : "historical_policy_requires_successor",
+    schemaVersion,
+    musicConceptPolicyVersion: value.musicConceptPolicyVersion,
+  };
+}
+
 export type QueryPlanV3SchemaVersion =
   | typeof LEGACY_QUERY_PLAN_V3_VERSION
   | typeof QUERY_PLAN_V3_VERSION
@@ -1064,6 +1143,7 @@ function semanticRoleProjectionMatches(
 }
 
 function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
+  const compatibility = assessQueryPlanV3Compatibility(row);
   if ((row.schemaVersion !== QUERY_PLAN_V3_VERSION
       && row.schemaVersion !== CONTRACT_QUERY_PLAN_V3_VERSION
       && row.schemaVersion !== LEGACY_CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION
@@ -1071,7 +1151,7 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
       && row.schemaVersion !== VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION)
     || row.policyVersion !== QUERY_PLAN_V3_POLICY_VERSION
     || row.semanticPolicyVersion !== "scope_gate_v2_1_2"
-    || row.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
+    || compatibility.status === "unsupported"
     || !Array.isArray(row.semanticClauses)
     || row.semanticClauses.length < 1 || row.semanticClauses.length > 500
     || !row.semanticClauses.every(isSemanticClause)
@@ -1103,7 +1183,6 @@ function typedQueryPlanContractValid(row: Partial<QueryPlanV3>): boolean {
   const catalogPolicyClauseCount = clauses.filter((clause) => clause.role === "catalog_policy").length;
   const audit = row.semanticAuditMetadata;
   if (audit.semanticPolicyVersion !== row.semanticPolicyVersion
-    || audit.musicConceptPolicyVersion !== MUSIC_CONCEPT_POLICY_VERSION
     || audit.musicConceptPolicyVersion !== row.musicConceptPolicyVersion
     || audit.passed !== true
     || audit.hardConstraintHash !== row.hardConstraintHash

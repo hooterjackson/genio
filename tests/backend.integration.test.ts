@@ -665,6 +665,19 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
     await repository.setSetting("schema_version", "19");
     await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
+    await repository.setSetting(
+      "playlist_resolution_authority_mode",
+      "resolution_service",
+    );
+    await expect(repository.ensureSchemaVersion()).resolves.toBeUndefined();
+    await repository.setSetting(
+      "playlist_resolution_authority_mode",
+      "authoritative",
+    );
+    await expect(repository.ensureSchemaVersion()).rejects.toThrow(
+      /completed writer audit/u,
+    );
+    await repository.deleteSetting("playlist_resolution_authority_mode");
     await repository.setSetting("schema_version", "15");
     await expect(repository.ensureSchemaVersion(DATABASE_SCHEMA_V13_BRIDGE_SUPPORT)).resolves.toBeUndefined();
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
@@ -7634,6 +7647,7 @@ databaseDescribe("hosted backend integration", () => {
     expect(history.map((item) => item.id)).toEqual([third.accessId, right.accessId, left.accessId]);
     expect(history[0]).toMatchObject({
       prompt: "Capability scope third",
+      trafficClass: "user",
       status: "queued",
       phase: "queued",
       candidateCount: 0,
@@ -7641,6 +7655,36 @@ databaseDescribe("hosted backend integration", () => {
       unresolvedCount: 0,
       brief: { title: "Capability scope third" },
     });
+    await repository.pool.query(
+      `INSERT INTO release_canary_markers(
+         id,canary_id,environment,audience,operation,source_revision,
+         cache_mode,run_id)
+       VALUES($1,'owner-acceptance','production','https://9enio.com',
+         'run',$2,'reuse_disabled',$3)`,
+      [randomUUID(), "a".repeat(40), third.runId],
+    );
+    await repository.pool.query(
+      `INSERT INTO research_checkpoints(run_id,phase,state_json)
+       VALUES($1,'canonical_predecessor',$2::jsonb)`,
+      [right.runId, JSON.stringify({ predecessorRunId: left.runId })],
+    );
+    const separatedHistory = await repository.listRunsForCapabilitySession(
+      session.id,
+    );
+    expect(separatedHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: third.accessId,
+        trafficClass: "owner_canary",
+      }),
+      expect.objectContaining({
+        id: right.accessId,
+        trafficClass: "historical_replay",
+      }),
+      expect.objectContaining({
+        id: left.accessId,
+        trafficClass: "user",
+      }),
+    ]));
 
     const mergeReply = new ReplyStub();
     await expect(capabilities.exchange(
